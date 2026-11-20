@@ -1330,7 +1330,9 @@ struct GroupRow {
 /// the rows — their user data and streams, and their images and provider
 /// ids through the move (a local version then takes its primary's, below) —
 /// and gives them the shape the scan would store, so an adopted database's
-/// first scan writes nothing for them (owner decision D9c):
+/// first scan moves nothing for them (owner decision D9c);
+/// [`rederive_adopted_versions`] then hands its local versions back to that
+/// scan to probe and name as the rows upstream's scan creates:
 ///
 /// - a local version — a row at a path in a movie's, music video's,
 ///   video's or episode's `LocalAlternateVersions`, or a `ChildType` 2 link's child, in
@@ -1342,8 +1344,9 @@ struct GroupRow {
 ///   it takes the primary as `OwnerId` and `PrimaryVersionId`, the
 ///   primary's `PresentationUniqueKey` (its N-format id), `ParentId`,
 ///   `TopParentId`, `IsInMixedFolder` and ancestors, and is linked under it
-///   as a local version (`ChildType` 2). Its name stands: the scan never
-///   renames an owned version (`library_scan::renamed_extra`).
+///   as a local version (`ChildType` 2). Its name stands here: the scan
+///   gives it the resolver's once [`rederive_adopted_versions`] handed it
+///   back (`library_scan::renamed_extra`).
 ///
 ///   Upstream's scan then finds the primary's version links short of its
 ///   `LocalAlternateVersions` — the deleted row took its link along — and
@@ -1538,10 +1541,91 @@ fn uuid_of(id: &str) -> Result<Uuid, ServiceError> {
     Uuid::parse_str(id).map_err(|err| ServiceError::Backend(err.to_string()))
 }
 
-/// [`rehome_local_versions`] and its log line, for the composition root.
+/// Hands every local alternate version of a database adopted from Jellyfin
+/// 10.11 back to the scan, to be derived afresh with its id, user data and
+/// links kept (owner decision on gl-1599). Jellyfin 12.x deletes a 10.11
+/// local version stored as a `Video` (`MigrateLinkedChildren.
+/// CleanupWrongTypeAlternateVersions`) and its scan creates it again
+/// (`LibraryManager.ResolveAlternateVersion`, `Video.RefreshMetadataForVersions`,
+/// `Video.cs:578-627`): the resolver names it, and its first refresh probes
+/// the file, so its `TotalBitrate` and streams are its own where 10.11 had
+/// stored the primary's bitrate and its own probe's zeros.
+/// [`rehome_local_versions`] keeps the row instead (D9c), so this clears its
+/// refresh stamp: the next scan refreshes it as that new row, probe and
+/// remote providers included, and gives it the resolver's name in place of
+/// the file name 10.11 gave it, unless the item or its name is locked or the
+/// name was edited (`library_scan::adopted_version_name`).
+///
+/// Upstream re-creates only the versions whose type is not their primary's
+/// (`ChildType != ParentType`), and 10.11 stored every local version as a
+/// `Video` (`GetLocalAlternateVersionIds`, 10.11.8 `Video.cs:367-370`): so
+/// the versions handed back are those linked as a local one (`ChildType` 2)
+/// under a primary that is not a `Video`. A home video's versions keep their
+/// row as upstream keeps it. The ones a scan created since the adoption are
+/// handed back too, and so is a version 10.11 already stored with its
+/// primary's type (the Merge Versions plugin links movies of other folders
+/// as local versions): one more probe and first refresh each, the price of
+/// re-deriving a database an earlier Ferrofin adopted and repaired, whose
+/// versions all have their primary's type by now.
+/// It runs once per database adopted from 10.11 ([`adopted_from_10_11`]),
+/// after [`rehome_local_versions`] has completed (until then its versions
+/// are not all linked yet); the stamp a scan of the version beside this one
+/// in a rolling update writes after it stands. Returns the number of
+/// versions handed back.
 ///
 /// # Errors
-/// Returns [`ServiceError`] if the repair's queries fail.
+/// Returns [`ServiceError`] if a query fails; the repair is not marked done
+/// then, and the next boot runs it again.
+pub async fn rederive_adopted_versions(db: &Database) -> Result<u64, ServiceError> {
+    const KEY: &str = "rederive_adopted_versions_v160";
+    const REHOME_KEY: &str = "rehome_local_versions_v12";
+    if once(db, REHOME_KEY).await? || !once(db, KEY).await? || !adopted_from_10_11(db).await? {
+        return Ok(0);
+    }
+    let handed_back = sqlx::query(
+        r#"UPDATE "BaseItems" SET "DateLastRefreshed" = NULL
+           WHERE "DateLastRefreshed" IS NOT NULL
+             AND "Id" IN (SELECT link."ChildId" FROM "LinkedChildren" AS link
+                          JOIN "BaseItems" AS primary_item ON primary_item."Id" = link."ParentId"
+                          WHERE link."ChildType" = ?1 AND primary_item."Type" IS NOT ?2)"#,
+    )
+    .bind(LOCAL_ALTERNATE_VERSION)
+    .bind(stored_type_name(BaseItemKind::Video))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    done(db, KEY).await?;
+    Ok(handed_back)
+}
+
+/// Whether the database was adopted from Jellyfin 10.11, so Jellyfin 12.0's
+/// `MigrateLinkedChildren` (whose `CleanupWrongTypeAlternateVersions` has the
+/// versions re-created) never ran on it: its adoption record names a 10.11
+/// release, or, adopted by a Ferrofin before 1.2 that wrote no record, its
+/// Jellyfin history, which adoption leaves untouched, lacks the routine. A
+/// Ferrofin-native database has neither.
+async fn adopted_from_10_11(db: &Database) -> Result<bool, ServiceError> {
+    if let Some(adoption) = db.adoption_state().await? {
+        return Ok(adoption.generation.starts_with("10.11."));
+    }
+    let jellyfin: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
+    )
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(jellyfin.is_some()
+        && !db
+            .jellyfin_migration_applied("20260113120000_MigrateLinkedChildren")
+            .await?)
+}
+
+/// [`rehome_local_versions`], then [`rederive_adopted_versions`], and their
+/// log lines, for the composition root.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a repair's queries fail.
 pub async fn run_rehome_local_versions(
     db: &Database,
     derivation: &IdDerivation,
@@ -1565,6 +1649,13 @@ pub async fn run_rehome_local_versions(
             versions = rehomed.versions,
             parts = rehomed.parts,
             "gave local alternate versions and stacked parts their owner's shape"
+        );
+    }
+    let handed_back = rederive_adopted_versions(db).await?;
+    if handed_back > 0 {
+        tracing::info!(
+            items = handed_back,
+            "repaired adopted local alternate versions: the next scan probes and names them afresh"
         );
     }
     Ok(())
@@ -5209,6 +5300,119 @@ mod tests {
         seed_user_data(db, user, adopted, true, None).await;
 
         [adopted, part, older]
+    }
+
+    async fn refreshed(db: &Database, id: Uuid) -> Option<String> {
+        shape(db, id).await.and_then(|shape| shape.7)
+    }
+
+    /// [`rederive_adopted_versions`] hands the local versions of a database
+    /// adopted from 10.11 back to the scan, once its [`rehome_local_versions`]
+    /// completed: their refresh stamps go, and only theirs (the primary keeps
+    /// its own, and so does a home video's version, which 10.11 stored with
+    /// its primary's type and upstream keeps). A 12.x or Ferrofin-native
+    /// database is left as it is, and a second run, even after a scan stamped
+    /// the version again, changes nothing.
+    #[rstest::rstest]
+    #[case::from_10_11_8(Some("10.11.8"), None, 1)]
+    #[case::from_10_11_11(Some("10.11.11"), None, 1)]
+    #[case::from_12_2(Some("12.2.0"), None, 0)]
+    #[case::native(None, None, 0)]
+    #[case::from_10_11_before_the_record(None, Some(false), 1)]
+    #[case::from_12_before_the_record(None, Some(true), 0)]
+    #[tokio::test]
+    async fn adopted_10_11_versions_are_handed_back_to_the_scan_once(
+        #[case] generation: Option<&str>,
+        #[case] history_migrated_linked_children: Option<bool>,
+        #[case] handed_back: u64,
+    ) {
+        const STAMP: &str = "2026-09-03 08:00:00.0000000";
+        let db = test_db().await;
+        if let Some(generation) = generation {
+            db.record_adoption(generation).await.unwrap();
+        }
+        // A Ferrofin before 1.2 wrote no adoption record; Jellyfin's own
+        // history, which adoption leaves untouched, tells the release.
+        if let Some(migrated) = history_migrated_linked_children {
+            sqlx::query(
+                r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT)"#,
+            )
+            .execute(db.writer())
+            .await
+            .unwrap();
+            let id = if migrated {
+                "20260113120000_MigrateLinkedChildren"
+            } else {
+                "20250714044826_ResetJournalMode"
+            };
+            sqlx::query(r#"INSERT INTO "__EFMigrationsHistory" VALUES (?1, '9.0.0')"#)
+                .bind(id)
+                .execute(db.writer())
+                .await
+                .unwrap();
+        }
+        let g = seed_group(&db).await;
+        seed_10_11_rows(&db, &g).await;
+        set_columns(
+            &db,
+            g.primary,
+            r#""DateLastRefreshed" = ?2"#,
+            &[Some(STAMP.to_owned())],
+        )
+        .await;
+        assert_eq!(
+            rederive_adopted_versions(&db).await.unwrap(),
+            0,
+            "nothing is handed back before the rehome has completed"
+        );
+        rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
+            .await
+            .unwrap();
+        let alternate = derive_item_id_with(&DERIVATION, BaseItemKind::Movie, ALTERNATE).unwrap();
+        let adopted_stamp = refreshed(&db, alternate).await;
+        assert!(adopted_stamp.is_some());
+        let home_version = Uuid::from_u128(0x1002);
+        seed_item(&db, home_version, BaseItemKind::Video).await;
+        set_columns(
+            &db,
+            home_version,
+            r#""OwnerId" = ?2, "PrimaryVersionId" = ?2, "DateLastRefreshed" = ?3"#,
+            &[Some(guid_to_db(g.stack)), Some(STAMP.to_owned())],
+        )
+        .await;
+        link(&db, g.stack, home_version, LOCAL_ALTERNATE_VERSION, 0).await;
+        // A version merged by hand is its own title, not a local version.
+        let merged = Uuid::from_u128(0x1003);
+        seed_item(&db, merged, BaseItemKind::Movie).await;
+        set_columns(
+            &db,
+            merged,
+            r#""PrimaryVersionId" = ?2, "DateLastRefreshed" = ?3"#,
+            &[Some(guid_to_db(g.primary)), Some(STAMP.to_owned())],
+        )
+        .await;
+        link(&db, g.primary, merged, LINKED_ALTERNATE_VERSION, 1).await;
+
+        assert_eq!(rederive_adopted_versions(&db).await.unwrap(), handed_back);
+        assert_eq!(refreshed(&db, home_version).await.as_deref(), Some(STAMP));
+        assert_eq!(refreshed(&db, merged).await.as_deref(), Some(STAMP));
+        let expected = if handed_back > 0 {
+            None
+        } else {
+            adopted_stamp.clone()
+        };
+        assert_eq!(refreshed(&db, alternate).await, expected);
+        assert_eq!(refreshed(&db, g.primary).await.as_deref(), Some(STAMP));
+
+        set_columns(
+            &db,
+            alternate,
+            r#""DateLastRefreshed" = ?2"#,
+            &[Some(STAMP.to_owned())],
+        )
+        .await;
+        assert_eq!(rederive_adopted_versions(&db).await.unwrap(), 0);
+        assert_eq!(refreshed(&db, alternate).await.as_deref(), Some(STAMP));
     }
 
     /// A 10.11 `Data` carries both path lists on every video, almost always

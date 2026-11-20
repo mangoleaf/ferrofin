@@ -1,7 +1,8 @@
 //! The pending OIDC flows: each sign-in started and not yet called back, in
-//! memory, keyed by its `state` and bounded (D19). A restart forgets them, as
-//! does a pod a callback reaches that did not start it: its refusal page's
-//! "Try again" covers both.
+//! memory, keyed by its `state` and bounded (D19), and each exchange code a
+//! completion page holds and has not yet swapped for a session. A restart
+//! forgets both, as does a pod a callback or an exchange reaches that did not
+//! start it: the refusal's "Try again" covers both.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -9,10 +10,18 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use openidconnect::{Nonce, PkceCodeVerifier};
+use uuid::Uuid;
+
+use super::sign_in::VerifiedIdentity;
 
 /// How long a sign-in may take, from its start to its callback: 10 minutes.
 /// Candidate setting (D19): a constant until the owner asks for it.
 pub const FLOW_LIFETIME: Duration = Duration::from_mins(10);
+
+/// How long a completion page's exchange code can be swapped for a session:
+/// 60 seconds, plenty for a script that posts it at once.
+/// Candidate setting (D19): a constant until the owner asks for it.
+pub const EXCHANGE_CODE_LIFETIME: Duration = Duration::from_secs(60);
 
 /// The pending flows one address may hold; its next start drops its oldest.
 /// Quick Connect's default per-address cap (`DEFAULT_PENDING_PER_IP`).
@@ -105,6 +114,82 @@ impl PendingFlows {
     }
 
     /// Whether no flow is pending.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A verified sign-in whose completion page holds its exchange code: who
+/// signs in, and the browser the code is bound to. `Debug` leaves the claims
+/// out.
+#[derive(Debug)]
+pub struct PendingExchange {
+    /// The SHA-256 of the flow cookie's value the sign-in was verified with:
+    /// the exchange must bring the same cookie.
+    pub binding_hash: [u8; 32],
+    /// The account the verified identity signs in to.
+    pub user_id: Uuid,
+    /// The verified identity, its provider and claims.
+    pub identity: VerifiedIdentity,
+    /// When the code was issued.
+    pub created: Instant,
+}
+
+impl PendingExchange {
+    /// Whether the code is older than [`EXCHANGE_CODE_LIFETIME`].
+    #[must_use]
+    pub fn expired(&self) -> bool {
+        self.created.elapsed() >= EXCHANGE_CODE_LIFETIME
+    }
+}
+
+/// The exchange codes not yet swapped, by code, capped at
+/// [`MAX_PENDING_FLOWS`] in all. Each costs a whole sign-in at the identity
+/// provider and lives a minute, so no address has a cap of its own.
+#[derive(Default)]
+pub struct ExchangeCodes {
+    codes: Mutex<HashMap<String, PendingExchange>>,
+}
+
+impl ExchangeCodes {
+    /// Keeps `exchange` under `code`, after dropping every expired code, then
+    /// the oldest while [`MAX_PENDING_FLOWS`] are held.
+    pub fn insert(&self, code: String, exchange: PendingExchange) {
+        let mut codes = self.codes.lock().unwrap_or_else(PoisonError::into_inner);
+        codes.retain(|_, pending| !pending.expired());
+        // One at a time, so one removal keeps the cap.
+        // shortcut: an O(n) scan per code over at most MAX_PENDING_FLOWS; index by age if the cap grows.
+        if codes.len() >= MAX_PENDING_FLOWS
+            && let Some(oldest) = codes
+                .iter()
+                .min_by_key(|(_, pending)| pending.created)
+                .map(|(code, _)| code.clone())
+        {
+            codes.remove(&oldest);
+        }
+        codes.insert(code, exchange);
+    }
+
+    /// Removes and returns the exchange `code` names, expired or not: a code
+    /// is used once, whatever its exchange's outcome.
+    pub fn take(&self, code: &str) -> Option<PendingExchange> {
+        self.codes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(code)
+    }
+
+    /// How many codes are held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.codes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Whether no code is held.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0

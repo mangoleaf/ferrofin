@@ -2961,6 +2961,12 @@ mod tests {
         ) -> Result<bool, ServiceError> {
             self.0.run_library_scan(trigger, progress).await
         }
+        async fn run_requested_library_scans(
+            &self,
+            progress: Option<ferrofin_traits::library::ScanProgressSink>,
+        ) -> Result<bool, ServiceError> {
+            self.0.run_requested_library_scans(progress).await
+        }
         fn is_scan_running(&self) -> bool {
             self.0.is_scan_running()
         }
