@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use ferrofin_core::config_export::{self, ConfigExport};
 use ferrofin_db::export::{
-    DOCKER, DatabaseEdits, EXPORTED_DATABASE, ExportSummary, HistoryRewrite, LOSS_REPORT, LeftOut,
-    Preflight, SourceDirs,
+    ContainerFile, DOCKER, DatabaseEdits, EXPORTED_DATABASE, ExportSummary, HistoryRewrite,
+    LOSS_REPORT, LeftOut, LibraryContainer, Preflight, SourceDirs,
 };
 
 use crate::config::Config;
@@ -357,6 +357,12 @@ struct ReportInputs {
     /// Whether the metadata directory the server's settings name, kept outside
     /// the data directory, was not found.
     metadata_missing: bool,
+    /// The playlists' and box sets' metadata files in Jellyfin's own folders
+    /// of the data directory, relative to it, each left out or kept.
+    container_files: Vec<(PathBuf, ContainerFile)>,
+    /// The playlists and box sets in media libraries with a metadata file
+    /// Jellyfin may read, or whose path was not found.
+    library_containers: Vec<LibraryContainer>,
 }
 
 /// Reads what the loss report needs from the files: the size of
@@ -411,6 +417,8 @@ async fn report_inputs(
         left_out,
         ran_elsewhere: !ran_elsewhere(config, summary).is_empty(),
         metadata_missing: metadata_missing(config, dirs),
+        container_files: summary.container_files.clone(),
+        library_containers: summary.library_containers.clone(),
     })
 }
 
@@ -418,7 +426,10 @@ async fn report_inputs(
 /// Jellyfin's first start will change, the settings `configuration` does not
 /// carry, and, from `inputs`, the room the first start needs and the backups
 /// and scheduled-task state Jellyfin cannot use. It names no path of the
-/// source or the output, so two exports of one source write the same.
+/// source or the output, so two exports of one source write the same where
+/// the same directories are reachable (the media paths it names are the
+/// database's, and whether their files were found depends on what is mounted
+/// where the export runs).
 fn loss_report(
     edits: &DatabaseEdits,
     configuration: &ConfigExport,
@@ -476,7 +487,13 @@ fn loss_report(
             "  The database's root and library rows name another data directory than the one exported: the server ran at another path, or the directory moved since. The stored paths under it were rewritten for Jellyfin too; the export printed both directories.\n",
         );
     }
-    if inputs.left_out.is_empty() && !inputs.metadata_missing && !inputs.ran_elsewhere {
+    container_files(&mut report, inputs);
+    if inputs.left_out.is_empty()
+        && !inputs.metadata_missing
+        && !inputs.ran_elsewhere
+        && inputs.container_files.is_empty()
+        && inputs.library_containers.is_empty()
+    {
         report.push_str("  None.\n");
     }
 
@@ -497,6 +514,90 @@ fn loss_report(
         report.push_str("  None.\n");
     }
     report
+}
+
+/// The loss report's lines on the playlists' and box sets' metadata files
+/// (gl-1903): those left out of the copy and why, a `collection.xml` kept, and
+/// those in media libraries, which the export never writes.
+fn container_files(report: &mut String, inputs: &ReportInputs) {
+    use std::fmt::Write as _;
+
+    let left_out = |name: &str| {
+        inputs
+            .container_files
+            .iter()
+            .filter(|(path, what)| {
+                *what == ContainerFile::LeftOut && path.file_name().is_some_and(|file| file == name)
+            })
+            .count() as u64
+    };
+    let files: Vec<String> = [
+        (
+            left_out("playlist.xml"),
+            "playlist.xml of",
+            "playlist in data/playlists",
+            "playlists in data/playlists",
+        ),
+        (
+            left_out("collection.xml"),
+            "collection.xml of",
+            "collection in data/collections",
+            "collections in data/collections",
+        ),
+    ]
+    .into_iter()
+    .filter(|(n, ..)| *n > 0)
+    .map(|(n, file, one, many)| format!("{file} {}", count(n, one, many)))
+    .collect();
+    if !files.is_empty() {
+        let _ = writeln!(
+            report,
+            "  {}: left out of the copy. Each may hold what Jellyfin last wrote rather than the changes made in Ferrofin since (a share or a member removed, a rename), which Jellyfin's metadata refresh would merge back; Jellyfin finds the playlists and collections without them, and writes each file again from the database when it next saves the playlist or collection.",
+            files.join(", ")
+        );
+    }
+    for (path, _) in inputs
+        .container_files
+        .iter()
+        .filter(|(_, what)| *what == ContainerFile::Kept)
+    {
+        let _ = writeln!(
+            report,
+            "  {}: kept, though it may hold what Jellyfin last wrote rather than the changes made in Ferrofin since: its folder's name lacks [boxset], so the file is what makes the folder a collection for Jellyfin.",
+            path.display()
+        );
+    }
+    for container in inputs.library_containers.iter().filter(|c| c.found) {
+        let what = if container.kind == "playlist" {
+            "the members and shares it lists back into the playlist"
+        } else {
+            "the members it lists back into the collection"
+        };
+        let _ = writeln!(
+            report,
+            "  {}: the {} it belongs to is in a media library, which the export never writes, so the file stays; Jellyfin's metadata refresh may merge {what}.",
+            container.file.display(),
+            container.kind
+        );
+    }
+    // A library not mounted where the export ran hides every one of them: one line.
+    let unchecked: Vec<&LibraryContainer> = inputs
+        .library_containers
+        .iter()
+        .filter(|c| !c.found)
+        .collect();
+    if let Some(first) = unchecked.first() {
+        let _ = writeln!(
+            report,
+            "  {} in media libraries not found where the export ran (the first: {}): whether each has a metadata file that Jellyfin's metadata refresh may merge back is not known. Export where the media is mounted at the paths Ferrofin used, so each can be checked.",
+            count(
+                unchecked.len() as u64,
+                "playlist or collection",
+                "playlists and collections"
+            ),
+            first.file.display()
+        );
+    }
 }
 
 /// The loss report's section on what Jellyfin changes on its first start: the
@@ -761,7 +862,10 @@ async fn write_configuration(export: &ConfigExport, out: &Path) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use ferrofin_core::config_export::{ConfigExport, NotExported};
-    use ferrofin_db::export::{DatabaseEdits, DroppedObjects, DroppedTable, HistoryRewrite};
+    use ferrofin_db::export::{
+        ContainerFile, DatabaseEdits, DroppedObjects, DroppedTable, HistoryRewrite,
+        LibraryContainer,
+    };
 
     use super::{ReportInputs, amount, loss_report, mebibytes};
 
@@ -824,6 +928,41 @@ mod tests {
             ],
             ran_elsewhere: true,
             metadata_missing: true,
+            container_files: vec![
+                (
+                    "data/collections/Odd/collection.xml".into(),
+                    ContainerFile::Kept,
+                ),
+                (
+                    "data/collections/Saga [boxset]/collection.xml".into(),
+                    ContainerFile::LeftOut,
+                ),
+                (
+                    "data/playlists/Mix/playlist.xml".into(),
+                    ContainerFile::LeftOut,
+                ),
+                (
+                    "data/playlists/Road/playlist.xml".into(),
+                    ContainerFile::LeftOut,
+                ),
+            ],
+            library_containers: vec![
+                LibraryContainer {
+                    kind: "collection",
+                    file: "/media/movies/Heist [boxset]/collection.xml".into(),
+                    found: true,
+                },
+                LibraryContainer {
+                    kind: "playlist",
+                    file: "/media/music/Gone [playlist]/playlist.xml".into(),
+                    found: false,
+                },
+                LibraryContainer {
+                    kind: "playlist",
+                    file: "/media/music/Road.xml".into(),
+                    found: true,
+                },
+            ],
         };
         assert_eq!(
             loss_report(&edits, &configuration, &inputs),

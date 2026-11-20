@@ -210,9 +210,10 @@ EOS
   for route in 10.11.8 12.4-from-123; do
     checks=$(jq -r --arg r "$route" 'select(.event == "check" and .fixture == $r) | "\(.stage)|\(.check)|\(.verdict)"' \
       "$TMP/w/results.jsonl")
-    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 17 ]
+    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 18 ]
     grep -qx "Export|the export completes|PASS" <<<"$checks"
     grep -qx "Export|every stored path is in the export, none under the directory Ferrofin ran at|PASS" <<<"$checks"
+    grep -qx "Jellyfin|every playlist's full metadata refresh completes|PASS" <<<"$checks"
     grep -qx "Jellyfin|answers equal Ferrofin's before the stop|PASS" <<<"$checks"
     grep -qx "Jellyfin|every library keeps its folder row and DateCreated through its scan|PASS" <<<"$checks"
   done
@@ -374,6 +375,15 @@ EOS
   [ "$status" -eq 1 ]
   [[ "$output" == *"FAIL  12.4-from-123  2 line(s) differ, first: < userdata synthetic-admin "*" fav=1 "* ]]
   jq -e 'select(.event == "check" and .check == "answers equal Ferrofin'"'"'s before the stop") | .verdict == "FAIL"' \
+    "$TMP/w/results.jsonl" >/dev/null
+}
+
+@test "run.sh: a share removed in Ferrofin that Jellyfin's playlist refresh brings back fails the comparison" {
+  FAKE_JELLYFIN=reshares run run_gate "$TMP/w" --only 12.4-from-123
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  12.4-from-123  2 line(s) differ, first: < shares synthetic-adult Synthetic mixed order = -"* ]]
+  grep -qx 'shares synthetic-adult Synthetic mixed order = synthetic-child:0' "$TMP/w/12.4-from-123/answers.txt"
+  jq -e 'select(.event == "check" and .check == "every playlist'"'"'s full metadata refresh completes") | .verdict == "PASS"' \
     "$TMP/w/results.jsonl" >/dev/null
 }
 

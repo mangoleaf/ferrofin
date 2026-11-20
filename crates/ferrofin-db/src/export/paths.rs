@@ -228,7 +228,7 @@ fn moved(path: &str, moves: &[(String, String)]) -> Option<String> {
 }
 
 /// Whether the database has the table `name`.
-async fn has_table(conn: &mut SqliteConnection, name: &str) -> Result<bool> {
+pub(super) async fn has_table(conn: &mut SqliteConnection, name: &str) -> Result<bool> {
     Ok(sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
     )
