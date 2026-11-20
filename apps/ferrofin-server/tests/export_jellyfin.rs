@@ -4,12 +4,15 @@
 //! XML Jellyfin reads (gl-1579), leaves the source byte for byte as it was,
 //! and gives the same output on a second run. It refuses an export that would
 //! be unsafe or meaningless (gl-1550), naming the cause, and a failed export
-//! leaves no output.
+//! leaves no output. The exported database holds Jellyfin's schema and nothing
+//! of Ferrofin's, and the loss report it writes and prints names every
+//! Ferrofin table that held rows (gl-1553).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use ferrofin_db::export::LOSS_REPORT;
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
@@ -249,14 +252,22 @@ async fn export_jellyfin_copies_a_stopped_data_directory_and_leaves_it_untouched
             .contains("<SaveLocalMetadata>true</SaveLocalMetadata>")
     );
     assert_eq!(configuration["data/device.txt"], SERVER_ID);
-    // The certificate is reported by name, and its password nowhere.
+    // The loss report is written into the output and printed; the
+    // certificate is reported by name, and its password nowhere.
+    let report = String::from_utf8(copied.remove(Path::new(LOSS_REPORT)).unwrap()).unwrap();
+    assert!(stdout.ends_with(&report), "{stdout}");
     assert!(
-        stdout.contains("Not exported: CertificatePassword in config/network.xml"),
-        "{stdout}"
+        report.contains("  CertificatePassword in config/network.xml: "),
+        "{report}"
     );
     assert!(
-        stdout.contains("Not exported: CertificatePath in config/network.xml"),
-        "{stdout}"
+        report.contains("  CertificatePath in config/network.xml: "),
+        "{report}"
+    );
+    assert!(report.contains("  _sqlx_migrations (0 rows): "), "{report}");
+    assert!(
+        report.ends_with("Backups and scheduled tasks:\n  None.\n"),
+        "{report}"
     );
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(!stdout.contains(CERTIFICATE_PASSWORD) && !stderr.contains(CERTIFICATE_PASSWORD));
@@ -276,6 +287,10 @@ async fn export_jellyfin_copies_a_stopped_data_directory_and_leaves_it_untouched
     assert_eq!(
         std::fs::read(again.join("data/jellyfin.db")).unwrap(),
         snapshot
+    );
+    assert_eq!(
+        std::fs::read_to_string(again.join(LOSS_REPORT)).unwrap(),
+        report
     );
     for (path, contents) in &configuration {
         assert_eq!(
@@ -841,4 +856,268 @@ async fn export_jellyfin_reads_a_bounded_answer_from_the_port() {
         "the export stopped reading ({sent} bytes sent)"
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(60));
+}
+
+/// The Jellyfin 10.11.8 schema the adoption tests seed a database from.
+const JELLYFIN_10_11_8_SCHEMA: &str =
+    include_str!("../../../crates/ferrofin-db/tests/data/jellyfin-10.11.8-schema.sql");
+
+/// The Jellyfin schema an exported database must have: the 12.2 pin (12.3
+/// and 12.4 add no schema migration).
+const JELLYFIN_12_2_SCHEMA: &str =
+    include_str!("../../../crates/ferrofin-db/tests/data/jellyfin-12.2-schema.sql");
+
+/// Writes a backup archive at `path` whose manifest names `engine` as its
+/// backup engine version.
+fn archive(path: &Path, engine: &str) {
+    use std::io::Write as _;
+
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    write!(
+        zip,
+        r#"{{"Path":"x","DateCreated":"2026-11-01T00:00:00Z","ServerVersion":"10.11.8","BackupEngineVersion":"{engine}","Options":{{}}}}"#
+    )
+    .unwrap();
+    zip.finish().unwrap();
+}
+
+/// [`source`] with its database replaced by a Jellyfin 10.11.8 database that
+/// Ferrofin adopted and used: a user, two Intro Skipper segments and a
+/// retained watch state, beside the rows the migrations themselves write. Its
+/// backups directory holds an archive of Ferrofin's and one Jellyfin made
+/// before adoption, and Ferrofin's scheduled-task files are there.
+async fn adopted_source(scratch: &Path) -> PathBuf {
+    let source = source(scratch).await;
+    std::fs::create_dir_all(source.join("data/backups")).unwrap();
+    archive(&source.join("data/backups/ferrofin-backup.zip"), "1.0.0");
+    archive(&source.join("data/backups/jellyfin-backup.zip"), "0.2.0");
+    std::fs::write(source.join("config/task_triggers.json"), "{}").unwrap();
+    std::fs::write(source.join("task_results.json"), "{}").unwrap();
+    let database = source.join("data/jellyfin.db");
+    std::fs::remove_file(&database).unwrap();
+    std::fs::remove_file(with_suffix(&database, "-wal")).unwrap();
+    let generation = ferrofin_db::JELLYFIN_GENERATIONS
+        .iter()
+        .find(|g| g.name == "10.11.8")
+        .unwrap();
+    let mut conn = SqliteConnectOptions::new()
+        .filename(&database)
+        .create_if_missing(true)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::raw_sql(JELLYFIN_10_11_8_SCHEMA)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    for id in generation.migration_ids {
+        sqlx::query(r#"INSERT INTO "__EFMigrationsHistory" VALUES (?1, '10.11.8.0')"#)
+            .bind(id)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    sqlx::Connection::close(conn).await.unwrap();
+
+    let db =
+        ferrofin_db::Database::connect_sized(&format!("sqlite://{}", database.display()), Some(2))
+            .await
+            .unwrap();
+    db.run_migrations().await.unwrap();
+    let user = "5D1E2C3B-4A59-4687-9C8B-7A6F5E4D3C2B";
+    for statement in [
+        r#"INSERT INTO "Users" ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess", "HidePlayedInLatest",
+            "InternalId", "InvalidLoginAttemptCount", "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack", "RememberAudioSelections",
+            "RememberSubtitleSelections", "RowVersion", "SubtitleMode", "SyncPlayAccess",
+            "Username", "NormalizedUsername")
+           VALUES (?1, 'auth', 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 'reset', 1, 1, 1, 0, 0, 0, 'ann', 'ANN')"#,
+        r#"INSERT INTO "FerrofinIntroSkipperSegments" ("ItemId", "Type", "Start", "End")
+           VALUES ('a8b7c6d5-e4f3-4a2b-9c1d-0e1f2a3b4c5d', 0, 12.5, 88.0),
+                  ('a8b7c6d5-e4f3-4a2b-9c1d-0e1f2a3b4c5d', 1, 1300.0, 1380.0)"#,
+        r#"INSERT INTO "FerrofinUserDataRetentionSnapshots" ("ItemId", "UserId", "CustomDataKey",
+            "IsFavorite", "PlayCount", "PlaybackPositionTicks", "Played", "RetentionDate")
+           VALUES ('B1C2D3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E', ?1, 'tmdb-603', 1, 2, 0, 1,
+                   '2026-11-01 00:00:00.0000000')"#,
+        r#"INSERT INTO "FerrofinUserDataRetentionKeys" VALUES (1, 'identity', 'tmdb-603')"#,
+    ] {
+        let query = sqlx::query(statement);
+        // Only the user and the snapshot name the user.
+        let query = if statement.contains("?1") {
+            query.bind(user)
+        } else {
+            query
+        };
+        query.execute(db.writer()).await.unwrap();
+    }
+    db.pool().close().await;
+    db.writer().close().await;
+    source
+}
+
+/// The row count of every table of Ferrofin's in the database at `path`.
+async fn ferrofin_tables(path: &Path) -> Vec<(String, i64)> {
+    let mut conn = SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .connect()
+        .await
+        .unwrap();
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' \
+         AND (name GLOB 'Ferrofin*' OR name = '_sqlx_migrations') ORDER BY name",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    let mut tables = Vec::new();
+    for name in names {
+        let rows = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            r#"SELECT COUNT(*) FROM "{name}""#
+        )))
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        tables.push((name, rows));
+    }
+    sqlx::Connection::close(conn).await.unwrap();
+    tables
+}
+
+/// Every table (its columns) and index (its columns, an expression as
+/// `<expr>`, and whether it is unique) of `conn`'s database, one line each,
+/// SQLite's own objects and the partial indexes' `WHERE` aside: the schema
+/// conformance test compares those.
+async fn schema(conn: &mut sqlx::SqliteConnection) -> std::collections::BTreeSet<String> {
+    let objects: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT type, name, tbl_name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    let mut lines = std::collections::BTreeSet::new();
+    for (kind, name, table) in objects {
+        let detail: Vec<String> = match kind.as_str() {
+            "table" => sqlx::query_as::<_, (String, String, i64, Option<String>, i64)>(
+                "SELECT name, upper(type), \"notnull\", dflt_value, pk FROM pragma_table_info(?1)",
+            )
+            .bind(&name)
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|column| format!("{column:?}"))
+            .collect(),
+            "index" => sqlx::query_scalar(
+                "SELECT coalesce(name, '<expr>') FROM pragma_index_info(?1) \
+                 UNION ALL SELECT 'unique=' || \"unique\" FROM pragma_index_list(?2) WHERE name = ?1",
+            )
+            .bind(&name)
+            .bind(&table)
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap(),
+            _ => Vec::new(),
+        };
+        lines.insert(format!("{kind} {name} on {table}: {detail:?}"));
+    }
+    lines
+}
+
+/// B7: the exported database of an adopted, used source holds Jellyfin's
+/// schema and nothing of Ferrofin's, and the loss report names every table of
+/// Ferrofin's that held rows, with its count.
+#[tokio::test]
+async fn export_jellyfin_reports_every_ferrofin_table_and_leaves_jellyfins_schema() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = adopted_source(scratch.path()).await;
+    let held = ferrofin_tables(&source.join("data/jellyfin.db")).await;
+    let out = scratch.path().join("out");
+
+    let run = export(&source, &out);
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{}\n{stdout}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let report = std::fs::read_to_string(out.join(LOSS_REPORT)).unwrap();
+    assert!(stdout.ends_with(&report), "{stdout}");
+    for wanted in [
+        "FerrofinIntroSkipperSegments",
+        "FerrofinUserDataRetentionKeys",
+        "FerrofinUserDataRetentionSnapshots",
+        "FerrofinAdoption",
+        "_sqlx_migrations",
+    ] {
+        assert!(
+            held.iter().any(|(name, rows)| name == wanted && *rows > 0),
+            "{wanted} holds rows in the source: {held:?}"
+        );
+    }
+    for (name, rows) in held.iter().filter(|(_, rows)| *rows > 0) {
+        let noun = if *rows == 1 { "row" } else { "rows" };
+        assert!(
+            report.contains(&format!("\n  {name} ({rows} {noun}): ")),
+            "{name} held {rows} rows and is not in the report:\n{report}"
+        );
+    }
+    assert!(
+        report.contains(
+            "(the database was adopted as Jellyfin 10.11.8):\n  DisableLegacyAuthorization: "
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "Backups and scheduled tasks:\n  1 backup archive in data/backups made by Ferrofin, which Jellyfin cannot restore.\n  Scheduled tasks: "
+        ),
+        "{report}"
+    );
+
+    let mut exported = SqliteConnectOptions::new()
+        .filename(out.join("data/jellyfin.db"))
+        .read_only(true)
+        .connect()
+        .await
+        .unwrap();
+    let mut pinned = SqliteConnectOptions::new()
+        .in_memory(true)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::raw_sql(JELLYFIN_12_2_SCHEMA)
+        .execute(&mut pinned)
+        .await
+        .unwrap();
+    let (exported_schema, pinned_schema) = (schema(&mut exported).await, schema(&mut pinned).await);
+    assert_eq!(
+        exported_schema
+            .difference(&pinned_schema)
+            .collect::<Vec<_>>(),
+        Vec::<&String>::new(),
+        "only in the export"
+    );
+    assert_eq!(
+        pinned_schema
+            .difference(&exported_schema)
+            .collect::<Vec<_>>(),
+        Vec::<&String>::new(),
+        "only in Jellyfin's schema"
+    );
+    let sequences: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_sequence")
+        .fetch_all(&mut exported)
+        .await
+        .unwrap();
+    assert!(
+        sequences.iter().all(|name| !name.starts_with("Ferrofin")),
+        "{sequences:?}"
+    );
+    sqlx::Connection::close(exported).await.unwrap();
+    sqlx::Connection::close(pinned).await.unwrap();
 }

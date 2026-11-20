@@ -6,8 +6,8 @@
 //! source before and after to show that it left the source as it found it.
 //! It writes a copy of the directory with a consistent snapshot of the
 //! database, whose migration history it rewrites for the Jellyfin release
-//! `UPSTREAM_TAG` names; the removal of Ferrofin's own objects (below) is
-//! still to come.
+//! `UPSTREAM_TAG` names and from which it removes Ferrofin's own objects, so
+//! the file is a Jellyfin database and nothing else.
 //!
 //! Each concern has its own file, so the phases that build the export each
 //! touch their own:
@@ -16,7 +16,8 @@
 //! - `history`: the `__EFMigrationsHistory` the target release must find;
 //! - `classify`: which migrations are schema and which are code migrations;
 //! - `drop_objects`: removing Ferrofin's own tables and indexes from the copy;
-//! - `report`: what the export leaves behind, for the operator;
+//! - `report`: what the removed tables held and what Jellyfin's first start
+//!   changes, for the operator's loss report;
 //! - `refusal`: the conditions under which an export must not run.
 //!
 //! The database steps are SQLite-only by design: the export takes a SQLite
@@ -32,7 +33,9 @@ use crate::{DbError, Result};
 pub use classify::{
     CODE_PRODUCT_VERSION, Disposition, JELLYFIN_MIGRATIONS, SCHEMA_PRODUCT_VERSION,
 };
+pub use drop_objects::{DroppedObjects, DroppedTable};
 pub use history::HistoryRewrite;
+pub use report::{first_start_effects, table_note};
 
 mod classify;
 mod drop_objects;
@@ -45,6 +48,10 @@ mod tree;
 /// Where an export writes the database, relative to its output directory:
 /// Jellyfin's `{DataPath}/jellyfin.db`.
 pub const EXPORTED_DATABASE: &str = "data/jellyfin.db";
+
+/// Where `ferrofin-server export-jellyfin` writes its loss report, relative to
+/// its output directory: what the export left behind, which it also prints.
+pub const LOSS_REPORT: &str = "ferrofin-export-report.txt";
 
 /// Jellyfin's list of the migrations it applied before 10.11, under the
 /// configuration directory of the docker layout. Jellyfin 10.11 moved its
@@ -119,6 +126,8 @@ pub struct ExportSummary {
 pub struct DatabaseEdits {
     /// The rewrite of `__EFMigrationsHistory`.
     pub history: HistoryRewrite,
+    /// Ferrofin's own tables and indexes, removed.
+    pub dropped: DroppedObjects,
 }
 
 /// The export's changes to its staged copy of the database, in order, on the
@@ -134,6 +143,7 @@ async fn edit_staged(
     let mut tx = sqlx::Connection::begin(conn).await?;
     let edits = DatabaseEdits {
         history: history::rewrite(&mut tx, history).await?,
+        dropped: drop_objects::remove(&mut tx).await?,
     };
     tx.commit().await?;
     Ok(edits)
@@ -154,7 +164,9 @@ async fn edit_staged(
 /// files of each. The snapshot holds what they do. Also left out is a
 /// `config/migrations.xml`, which Jellyfin would read again: from one listing
 /// migrations it writes history rows, or stops its start.
-/// The snapshot's `__EFMigrationsHistory` is rewritten ([`HistoryRewrite`]).
+/// The snapshot's `__EFMigrationsHistory` is rewritten ([`HistoryRewrite`]),
+/// and Ferrofin's own tables and indexes are removed from it
+/// ([`DroppedObjects`]).
 ///
 /// The source is digested while it is copied and again once the database
 /// snapshot is written, and so are the files SQLite keeps beside the

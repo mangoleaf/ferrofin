@@ -1,0 +1,22 @@
+What the export to Jellyfin left behind
+
+Ferrofin-only data in the database, removed from the export:
+  FerrofinIntroSkipperSegments (3 rows): Intro Skipper's segments as detected and edited; those it published stay in Jellyfin's MediaSegments.
+  FerrofinMeta (1 row): Ferrofin's settings for this database and the one-time repairs it ran; nothing Jellyfin needs.
+  FerrofinNew (0 rows): a table of Ferrofin's own.
+  _sqlx_migrations (52 rows): Ferrofin's own migration history; nothing Jellyfin needs.
+  2 indexes of Ferrofin's own on Jellyfin's tables (an index holds no data of its own).
+
+What Jellyfin will change on its first start, running the code migrations its history leaves out (the database was adopted as Jellyfin 10.11.8):
+  DisableLegacyAuthorization: turns EnableLegacyAuthorization off in system.xml, so clients that sign in the legacy way stop working until it is turned on again.
+  HarmonizeConflictingUserData: where one item has several play-state rows for a user that disagree, gives them all the most recently played one's values.
+  UpdateNormalizedUsername: recomputes stored values from the same inputs; nothing should change.
+  Before them Jellyfin copies the database (41.2 MiB) into data/SQLiteBackups, and after them it rebuilds it, so the output's volume needs about 82.4 MiB free besides the export. A start whose migrations fail restores the database from that copy and keeps the copy, one more each time.
+
+Settings Jellyfin is not given:
+  CertificatePath in config/network.xml: a path in Ferrofin's filesystem.
+  Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported.
+
+Backups and scheduled tasks:
+  2 backup archives in data/backups made by Ferrofin, which Jellyfin cannot restore.
+  Scheduled tasks: Ferrofin keeps their triggers in task_triggers.json and their last results in task_results.json, which Jellyfin does not read. Its tasks keep what its own files held before adoption, or its defaults.

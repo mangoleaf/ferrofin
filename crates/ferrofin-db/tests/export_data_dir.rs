@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ferrofin_db::DbError;
-use ferrofin_db::export::{DatabaseEdits, EXPORTED_DATABASE, export_data_dir};
+use ferrofin_db::export::{
+    DatabaseEdits, DroppedObjects, DroppedTable, EXPORTED_DATABASE, HistoryRewrite, export_data_dir,
+};
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
@@ -154,8 +156,21 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
     );
     assert_eq!(summary.files, 3);
     assert_eq!(summary.database, out.join(EXPORTED_DATABASE));
-    // A native database has no Jellyfin history to rewrite.
-    assert_eq!(summary.edits, DatabaseEdits::default());
+    // A native database has no Jellyfin history to rewrite; Ferrofin's own
+    // table goes.
+    assert_eq!(
+        summary.edits,
+        DatabaseEdits {
+            history: HistoryRewrite::default(),
+            dropped: DroppedObjects {
+                tables: vec![DroppedTable {
+                    name: "_sqlx_migrations".to_owned(),
+                    rows: 0
+                }],
+                indexes: Vec::new(),
+            },
+        }
+    );
     assert_eq!(exported_names(&out).await, ["one", "two", "three"]);
 }
 

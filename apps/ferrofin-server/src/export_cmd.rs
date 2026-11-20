@@ -6,13 +6,14 @@
 //!
 //! The copy is [`ferrofin_db::export::export_data_dir`] and the configuration
 //! is [`ferrofin_core::config_export`]; this file holds the subcommand's
-//! arguments and its report, so the phases that extend the export add their
-//! flags here.
+//! arguments and its loss report, so the phases that extend the export add
+//! their flags and their report lines here.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ferrofin_core::config_export::{self, ConfigExport};
+use ferrofin_db::export::{DatabaseEdits, EXPORTED_DATABASE, HistoryRewrite, LOSS_REPORT};
 
 use crate::config::Config;
 
@@ -36,7 +37,11 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// read without end.
 const PROBE_ANSWER_LIMIT: usize = 64 * 1024;
 
-/// Exports `config`'s data directory into `args.out` and prints what it wrote.
+/// Jellyfin's backups directory under the output (`{DataPath}/backups`).
+const JELLYFIN_BACKUPS: &str = "data/backups";
+
+/// Exports `config`'s data directory into `args.out`, writes the loss report
+/// into it ([`LOSS_REPORT`]) and prints what it wrote and the report.
 ///
 /// Before anything is written, the export refuses to run when completing it
 /// would be unsafe or meaningless ([`ferrofin_db::export::refuse_unsafe`], a
@@ -49,7 +54,9 @@ const PROBE_ANSWER_LIMIT: usize = 64 * 1024;
 /// Returns the refusal, or the export's error with the source and output
 /// named, when a file cannot be copied, the database snapshot fails or the
 /// staged database fails its checks, the source changed while it was
-/// exported, or the configuration cannot be written.
+/// exported, the configuration cannot be written, or the loss report cannot
+/// be gathered (the exported database, the backups directory or the
+/// scheduled-task files cannot be read) or written.
 pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<()> {
     log_warnings_to_stderr();
     let (source, out) = (&config.data_dir, &args.out);
@@ -90,6 +97,15 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
         let summary =
             ferrofin_db::export::export_data_dir(source, &config.database_path(), &partial).await?;
         write_configuration(&configuration, &partial).await?;
+        let report = loss_report(
+            &summary.edits,
+            &configuration,
+            &report_inputs(config, &partial).await?,
+        );
+        let written = partial.join(LOSS_REPORT);
+        tokio::fs::write(&written, &report)
+            .await
+            .with_context(|| format!("could not write {}", written.display()))?;
         tokio::fs::rename(&partial, &target)
             .await
             .with_context(|| {
@@ -99,11 +115,11 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
                     target.display()
                 )
             })?;
-        anyhow::Ok(summary)
+        anyhow::Ok((summary, report))
     }
     .await;
-    let summary = match written {
-        Ok(summary) => summary,
+    let (summary, report) = match written {
+        Ok(written) => written,
         Err(error) => {
             let cleanup = partial.clone();
             let removed = match tokio::task::spawn_blocking(move || {
@@ -128,14 +144,14 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
             )));
         }
     };
-    print_report(source, out, &target, &summary, &configuration, replaced);
+    print_summary(source, out, &target, &summary, &configuration, replaced);
+    print!("\n{report}");
     Ok(())
 }
 
 /// Prints what the export of `source` into `out` (resolved to `target`) wrote:
-/// `summary`'s copy and database changes, and `configuration`'s files and the
-/// settings it could not export.
-fn print_report(
+/// `summary`'s copy and database changes, and `configuration`'s files.
+fn print_summary(
     source: &Path,
     out: &Path,
     target: &Path,
@@ -147,9 +163,7 @@ fn print_report(
         "Exported {} into {}: the database snapshot at {} and {} other files ({} bytes), then {} configuration files for Jellyfin over them. The source is unchanged.",
         source.display(),
         out.display(),
-        target
-            .join(ferrofin_db::export::EXPORTED_DATABASE)
-            .display(),
+        target.join(EXPORTED_DATABASE).display(),
         summary.files,
         summary.bytes,
         configuration.files.len()
@@ -168,12 +182,169 @@ fn print_report(
             target.display()
         );
     }
+    println!(
+        "What it left behind is below, and in {}.",
+        target.join(LOSS_REPORT).display()
+    );
+}
+
+/// What the loss report reads from the exported database file and the
+/// source's directories.
+#[derive(Debug, Default)]
+struct ReportInputs {
+    /// The size of the exported database, in bytes.
+    database_bytes: u64,
+    /// The backup archives in the output that Jellyfin cannot restore.
+    backups: usize,
+    /// Whether the source keeps scheduled-task state Jellyfin does not read.
+    task_state: bool,
+}
+
+/// Reads what the loss report needs from the files: the size of
+/// the database exported into `partial`, the backups copied there, and
+/// whether `config`'s directories keep scheduled-task state.
+async fn report_inputs(config: &Config, partial: &Path) -> anyhow::Result<ReportInputs> {
+    let database = partial.join(EXPORTED_DATABASE);
+    let database_bytes = tokio::fs::metadata(&database)
+        .await
+        .with_context(|| format!("could not read {}", database.display()))?
+        .len();
+    let dir = partial.join(JELLYFIN_BACKUPS);
+    let backups = tokio::task::spawn_blocking(move || {
+        ferrofin_core::backup::archives_jellyfin_cannot_restore(&dir)
+            .with_context(|| format!("could not list the backups in {}", dir.display()))
+    })
+    .await
+    .context("the backups' listing did not finish")??;
+    let mut task_state = false;
+    for file in [
+        config.config_dir.join("task_triggers.json"),
+        config.data_dir.join("task_results.json"),
+    ] {
+        task_state |= tokio::fs::try_exists(&file)
+            .await
+            .with_context(|| format!("could not read {}", file.display()))?;
+    }
+    Ok(ReportInputs {
+        database_bytes,
+        backups,
+        task_state,
+    })
+}
+
+/// The loss report: what the export removed from the database (`edits`), what
+/// Jellyfin's first start will change, the settings `configuration` does not
+/// carry, and, from `inputs`, the room the first start needs and the backups
+/// and scheduled-task state Jellyfin cannot use. It names no path of the
+/// source or the output, so two exports of one source write the same.
+fn loss_report(
+    edits: &DatabaseEdits,
+    configuration: &ConfigExport,
+    inputs: &ReportInputs,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut report = String::from("What the export to Jellyfin left behind\n");
+    report.push_str("\nFerrofin-only data in the database, removed from the export:\n");
+    for table in &edits.dropped.tables {
+        let _ = writeln!(
+            report,
+            "  {} ({}): {}.",
+            table.name,
+            count(table.rows, "row", "rows"),
+            ferrofin_db::export::table_note(&table.name)
+        );
+    }
+    if !edits.dropped.indexes.is_empty() {
+        let _ = writeln!(
+            report,
+            "  {} of Ferrofin's own on Jellyfin's tables (an index holds no data of its own).",
+            count(edits.dropped.indexes.len() as u64, "index", "indexes")
+        );
+    }
+    if edits.dropped.tables.is_empty() && edits.dropped.indexes.is_empty() {
+        report.push_str("  None.\n");
+    }
+
+    first_start(&mut report, &edits.history, inputs.database_bytes);
+
+    report.push_str("\nSettings Jellyfin is not given:\n");
     for setting in &configuration.not_exported {
-        println!(
-            "Not exported: {} in {} ({})",
+        let _ = writeln!(
+            report,
+            "  {} in {}: {}.",
             setting.setting, setting.file, setting.reason
         );
     }
+    report.push_str(
+        "  Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported.\n",
+    );
+
+    report.push_str("\nBackups and scheduled tasks:\n");
+    if inputs.backups > 0 {
+        let _ = writeln!(
+            report,
+            "  {} in {JELLYFIN_BACKUPS} made by Ferrofin, which Jellyfin cannot restore.",
+            count(inputs.backups as u64, "backup archive", "backup archives")
+        );
+    }
+    if inputs.task_state {
+        report.push_str(
+            "  Scheduled tasks: Ferrofin keeps their triggers in task_triggers.json and their last results in task_results.json, which Jellyfin does not read. Its tasks keep what its own files held before adoption, or its defaults.\n",
+        );
+    }
+    if inputs.backups == 0 && !inputs.task_state {
+        report.push_str("  None.\n");
+    }
+    report
+}
+
+/// The loss report's section on what Jellyfin changes on its first start: the
+/// code migrations `history` leaves to run, and the room they take beside a
+/// database of `database_bytes`.
+fn first_start(report: &mut String, history: &HistoryRewrite, database_bytes: u64) {
+    use std::fmt::Write as _;
+
+    report.push_str("\nWhat Jellyfin will change on its first start");
+    let Some(generation) = history.generation else {
+        report.push_str(
+            ":\n  Not known: the database was never adopted from Jellyfin, so it has no Jellyfin migration history.\n",
+        );
+        return;
+    };
+    let _ = writeln!(
+        report,
+        ", running the code migrations its history leaves out (the database was adopted as Jellyfin {generation}):"
+    );
+    for (routine, effect) in ferrofin_db::export::first_start_effects(&history.left_to_run) {
+        let _ = writeln!(report, "  {routine}: {effect}.");
+    }
+    if history.left_to_run.is_empty() {
+        report.push_str("  None.\n");
+        return;
+    }
+    // One copy for the backup, one for the VACUUM that follows the migrations.
+    // Jellyfin copies only for a routine marked `JellyfinMigrationBackup(JellyfinDb
+    // = true)`; every set a supported source leaves holds one
+    // (HarmonizeConflictingUserData among them), so every non-empty one copies.
+    let _ = writeln!(
+        report,
+        "  Before them Jellyfin copies the database ({}) into data/SQLiteBackups, and after them it rebuilds it, so the output's volume needs about {} free besides the export. A start whose migrations fail restores the database from that copy and keeps the copy, one more each time.",
+        mebibytes(database_bytes),
+        mebibytes(database_bytes.saturating_mul(2))
+    );
+}
+
+/// `n` and the noun for it, `one` or `many`.
+fn count(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// `bytes` in mebibytes, to one decimal, rounded up: a size the report gives
+/// is space the operator must find.
+fn mebibytes(bytes: u64) -> String {
+    let tenths = bytes.saturating_mul(10).div_ceil(1024 * 1024);
+    format!("{}.{} MiB", tenths / 10, tenths % 10)
 }
 
 /// Sends warnings to stderr. The export runs without the server's logging,
@@ -388,4 +559,115 @@ async fn write_configuration(export: &ConfigExport, out: &Path) -> anyhow::Resul
             .with_context(|| format!("could not replace {}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ferrofin_core::config_export::{ConfigExport, NotExported};
+    use ferrofin_db::export::{DatabaseEdits, DroppedObjects, DroppedTable, HistoryRewrite};
+
+    use super::{ReportInputs, loss_report, mebibytes};
+
+    fn table(name: &str, rows: u64) -> DroppedTable {
+        DroppedTable {
+            name: name.to_owned(),
+            rows,
+        }
+    }
+
+    /// Every kind of line the report has, in its order: the golden file is
+    /// what an operator reads.
+    #[test]
+    fn the_loss_report_reads_as_its_golden_file() {
+        let edits = DatabaseEdits {
+            history: HistoryRewrite {
+                generation: Some("10.11.8"),
+                recorded: vec!["20260113102337_AddLinkedChildrenTable"],
+                left_to_run: vec![
+                    "20260522092304_UpdateNormalizedUsername",
+                    "20260531160000_DisableLegacyAuthorization",
+                    "20260912120000_HarmonizeConflictingUserData",
+                ],
+            },
+            dropped: DroppedObjects {
+                tables: vec![
+                    table("FerrofinIntroSkipperSegments", 3),
+                    table("FerrofinMeta", 1),
+                    table("FerrofinNew", 0),
+                    table("_sqlx_migrations", 52),
+                ],
+                indexes: vec![
+                    "FerrofinIX_BaseItems_Name".to_owned(),
+                    "FerrofinIX_UserData_UserId".to_owned(),
+                ],
+            },
+        };
+        let configuration = ConfigExport {
+            files: Vec::new(),
+            not_exported: vec![NotExported {
+                file: "config/network.xml".to_owned(),
+                setting: "CertificatePath".to_owned(),
+                reason: "a path in Ferrofin's filesystem",
+            }],
+        };
+        let inputs = ReportInputs {
+            database_bytes: 43_198_464,
+            backups: 2,
+            task_state: true,
+        };
+        assert_eq!(
+            loss_report(&edits, &configuration, &inputs),
+            include_str!("export_cmd/testdata/loss_report.txt")
+        );
+    }
+
+    /// A Ferrofin-native database has no Jellyfin history to tell what
+    /// Jellyfin runs from, and a source without backups or task state leaves
+    /// nothing outside the database.
+    #[test]
+    fn an_empty_section_says_so() {
+        let edits = DatabaseEdits {
+            history: HistoryRewrite::default(),
+            dropped: DroppedObjects {
+                tables: vec![table("_sqlx_migrations", 1)],
+                indexes: Vec::new(),
+            },
+        };
+        let report = loss_report(&edits, &ConfigExport::default(), &ReportInputs::default());
+        assert!(
+            report.contains(
+                "What Jellyfin will change on its first start:\n  Not known: the database was never adopted from Jellyfin, so it has no Jellyfin migration history.\n\nSettings Jellyfin is not given:\n  Settings given"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.ends_with("Backups and scheduled tasks:\n  None.\n"),
+            "{report}"
+        );
+        assert!(report.contains("  _sqlx_migrations (1 row): "), "{report}");
+        assert!(!report.contains("indexes"), "{report}");
+
+        // An adopted database whose history leaves nothing to run.
+        let edits = DatabaseEdits {
+            history: HistoryRewrite {
+                generation: Some("12.2.0"),
+                ..HistoryRewrite::default()
+            },
+            ..edits
+        };
+        let report = loss_report(&edits, &ConfigExport::default(), &ReportInputs::default());
+        assert!(
+            report.contains("(the database was adopted as Jellyfin 12.2.0):\n  None.\n\n"),
+            "{report}"
+        );
+        assert!(!report.contains("SQLiteBackups"), "{report}");
+    }
+
+    #[test]
+    fn sizes_are_mebibytes_rounded_up_to_one_decimal() {
+        assert_eq!(mebibytes(0), "0.0 MiB");
+        assert_eq!(mebibytes(1024 * 1024 * 3 / 2), "1.5 MiB");
+        assert_eq!(mebibytes(1), "0.1 MiB", "rounded up");
+        assert_eq!(mebibytes(u64::MAX), "1759218604441.6 MiB");
+    }
 }
