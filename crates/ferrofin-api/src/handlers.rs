@@ -2511,7 +2511,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    the MaxCastMembers and MaxCrewMembers caps, HideMissingCastMembers and \
                    HideMissingCrewMembers), series_people (the creators, outside the caps), \
                    season_details_for_language and season_details_from, \
-                   episode_extras_for_language and episode_people_from (guest stars); \
+                   episode_extras_for_language and episode_people_from (guest stars), and \
+                   people_entities, which folds every credit in order through \
+                   container_types.rs add_person, as each provider's MetadataResult.AddPerson \
+                   runs PeopleHelper.AddPerson (gl-1651); \
                    ferrofin-core library_scan.rs fetch_tmdb_metadata (a pinned TMDb id, else \
                    find_tmdb_id's /find by an IMDb id, a series also by its TVDB id, else the \
                    parsed-name search and find_best_match, for a movie only without an IMDb \
@@ -2532,7 +2535,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
                    TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
                    this row.",
-        date: "2026-11-15",
+        date: "2026-11-20",
         divergences: &[
             "A movie, series, season or episode TMDb has no overview for answers the \
              refresh no Overview, so Identify → Apply and a Replace all metadata refresh \
