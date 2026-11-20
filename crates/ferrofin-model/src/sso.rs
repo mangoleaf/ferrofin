@@ -22,14 +22,18 @@ pub const DEFAULT_SCOPES: &str = "openid profile";
 /// The ID token claim a new provider names users by.
 pub const DEFAULT_USERNAME_CLAIM: &str = "preferred_username";
 
+/// The claim a new provider reads users' roles from.
+pub const DEFAULT_ROLE_CLAIM: &str = "groups";
+
 /// One OIDC provider's settings.
 ///
 /// A member a body or a stored provider leaves out takes its default: enabled,
 /// [`DEFAULT_SCOPES`], [`DEFAULT_USERNAME_CLAIM`], an `https` issuer only,
-/// accounts created at a first sign-in, and empty text otherwise. `Debug`
-/// leaves the secret out.
+/// accounts created at a first sign-in, [`DEFAULT_ROLE_CLAIM`], role sync off,
+/// and empty text otherwise. `Debug` leaves the secret out.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
+#[allow(clippy::struct_excessive_bools)] // one field per setting, each its own switch
 pub struct OidcProvider {
     /// The provider's key, the `{provider}` of its sign-in and callback URLs:
     /// 1 to 32 lowercase letters, digits and `-`. It is fixed once the
@@ -65,6 +69,23 @@ pub struct OidcProvider {
     /// account is linked to is refused. A name an account already has is
     /// refused either way: no account is ever taken over by name.
     pub create_users: bool,
+    /// The claim a user's roles are read from: a top-level claim holding an
+    /// array of strings or one string, from the ID token, else from the
+    /// userinfo answer. A nested claim (Keycloak's `realm_access.roles`) is
+    /// not read. Required while a role setting is in use.
+    pub role_claim: String,
+    /// The role a user must have to sign in, compared exactly; empty lets
+    /// every user in. A user without it is refused, and no account is created
+    /// or signed in to for them, whatever [`role_sync`](Self::role_sync) says.
+    pub required_role: String,
+    /// Keeps a user's rights in step with their roles at each sign-in (D6).
+    /// Off, a sign-in never changes a user's policy.
+    pub role_sync: bool,
+    /// With [`role_sync`](Self::role_sync) on, the role that makes a user an
+    /// administrator: a user with it is made one at sign-in, and a user
+    /// without it loses the flag, except the last administrator. Empty never
+    /// changes the flag.
+    pub admin_role: String,
 }
 
 impl Default for OidcProvider {
@@ -80,6 +101,10 @@ impl Default for OidcProvider {
             username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
             allow_http_issuer: false,
             create_users: true,
+            role_claim: DEFAULT_ROLE_CLAIM.to_owned(),
+            required_role: String::new(),
+            role_sync: false,
+            admin_role: String::new(),
         }
     }
 }
@@ -183,6 +208,10 @@ mod tests {
         assert!(provider.enabled);
         assert!(!provider.allow_http_issuer);
         assert!(provider.create_users, "D4: on by default");
+        assert_eq!(provider.role_claim, DEFAULT_ROLE_CLAIM);
+        assert_eq!(provider.required_role, "");
+        assert!(!provider.role_sync, "D6: off by default");
+        assert_eq!(provider.admin_role, "");
         assert_eq!(
             provider.client_secret.as_ref().map(Secret::expose),
             Some("s3cr3t-value")

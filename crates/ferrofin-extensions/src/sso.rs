@@ -26,6 +26,9 @@
 //!   its link or created, and [`SsoAuthProvider`](accounts::SsoAuthProvider),
 //!   the authentication provider of the accounts it creates, which refuses
 //!   every password;
+//! - [`roles`]: a user's roles in the provider's role claim, the required
+//!   role a sign-in is refused without, and role sync, which keeps the
+//!   administrator flag in step with them;
 //! - [`complete`]: the completion page the callback answers, and the
 //!   exchange of its one-time code for the session, under the account rules
 //!   of a password sign-in.
@@ -60,6 +63,7 @@ pub mod discovery;
 pub mod fake_idp;
 pub mod flows;
 pub mod oidc_http;
+pub mod roles;
 pub mod sign_in;
 
 use discovery::MetadataCache;
@@ -196,6 +200,9 @@ pub fn validate_provider(provider: &OidcProvider) -> Result<(), String> {
         ("client id", &provider.client_id),
         ("scopes", &provider.scopes),
         ("username claim", &provider.username_claim),
+        ("role claim", &provider.role_claim),
+        ("required role", &provider.required_role),
+        ("administrator role", &provider.admin_role),
     ] {
         if value.chars().any(char::is_control) || value.trim() != value.as_str() {
             return Err(format!(
@@ -219,6 +226,9 @@ pub fn validate_provider(provider: &OidcProvider) -> Result<(), String> {
     }
     if provider.username_claim.trim().is_empty() {
         return Err("the username claim is required".to_owned());
+    }
+    if roles::reads_roles(provider) && provider.role_claim.is_empty() {
+        return Err("the role claim is required for a required role or role sync".to_owned());
     }
     Ok(())
 }
@@ -492,6 +502,9 @@ impl SsoManager for SsoService {
             &mut provider.client_id,
             &mut provider.scopes,
             &mut provider.username_claim,
+            &mut provider.role_claim,
+            &mut provider.required_role,
+            &mut provider.admin_role,
         ] {
             *value = value.trim().to_owned();
         }
