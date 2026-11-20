@@ -303,7 +303,9 @@ fn lower_normalization_priority(child: &tokio::process::Child, program: &str) {
 /// Parses the integrated-loudness value from ffmpeg `ebur128` stderr output.
 ///
 /// Port of the C# `^\s+I:\s+(.*?)\s+LUFS` regex: the first summary line of the
-/// form `I: -23.1 LUFS` wins.
+/// form `I: -23.1 LUFS` wins. The value is a float, as upstream's `float.Parse`
+/// and `float?` column make it, widened for the `REAL` column: `-23.1` is
+/// stored as `-23.100000381469727`, as Jellyfin stores it.
 #[must_use]
 pub fn parse_lufs(stderr: &str) -> Option<f64> {
     for line in stderr.lines() {
@@ -314,9 +316,9 @@ pub fn parse_lufs(stderr: &str) -> Option<f64> {
         if parts.next() == Some("I:")
             && let Some(value) = parts.next()
             && parts.next() == Some("LUFS")
-            && let Ok(lufs) = value.parse::<f64>()
+            && let Ok(lufs) = value.parse::<f32>()
         {
-            return Some(lufs);
+            return Some(f64::from(lufs));
         }
     }
     None
@@ -1965,7 +1967,7 @@ mod tests {
             .await
             .expect("sh runs");
         assert_eq!(stderr, "title: caf\u{fffd}\n    I: -23.1 LUFS\n");
-        assert_eq!(parse_lufs(&stderr), Some(-23.1));
+        assert_eq!(parse_lufs(&stderr), Some(f64::from(-23.1_f32)));
 
         let clean = super::TokioFfmpegRunner
             .run_stderr("sh", &["-c".to_owned(), "printf 'ok' >&2".to_owned()])
@@ -1985,7 +1987,9 @@ mod tests {
             "    I:         -23.1 LUFS\n",
             "    Threshold: -33.6 LUFS\n",
         );
-        assert_eq!(parse_lufs(stderr), Some(-23.1));
+        // Parsed as a float, as upstream's `float.Parse`, and stored widened,
+        // as its `float?` column is: not -23.1.
+        assert_eq!(parse_lufs(stderr), Some(-23.100_000_381_469_727));
         assert_eq!(parse_lufs("no summary here"), None);
         assert_eq!(parse_lufs("    I: not-a-number LUFS"), None);
         assert_eq!(parse_lufs("I: -21.0 LUFS"), None);
@@ -3178,6 +3182,8 @@ mod tests {
             ("nan", None),
             ("-inf", None),
             ("inf", None),
+            // Past a float's range: parsed as infinity, so no measurement.
+            ("1e39", None),
             ("-21.5", Some(-21.5)),
         ] {
             let task = AudioNormalizationTask::new(
