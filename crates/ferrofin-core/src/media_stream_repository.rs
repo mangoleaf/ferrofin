@@ -439,10 +439,10 @@ mod tests {
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
         let repo = FerrofinMediaStreamRepository::new(db);
-        let languages: Vec<String> = (0..25).map(|i| format!("l{i:02}")).collect();
-        let streams: Vec<MediaStreamInfoEntity> = (0..25)
-            .map(|i| stream(i, 2, Some(&languages[usize::try_from(i).expect("index")])))
-            .collect();
+        let languages: Vec<String> = Vec::from_fn(25, |i| format!("l{i:02}"));
+        let streams: Vec<MediaStreamInfoEntity> = Vec::from_fn(25, |i| {
+            stream(i64::try_from(i).expect("index"), 2, Some(&languages[i]))
+        });
         repo.save_media_streams(item, &streams).await.expect("save");
         let got: Vec<(i64, Option<String>)> = repo
             .get_media_streams(&MediaStreamQuery {

@@ -879,9 +879,8 @@ mod tests {
         assert_eq!(pushed.len(), 1);
         assert_eq!(pushed[0].items_updated.len(), 1);
 
-        let items: Vec<BaseItemEntity> = (0..MAX_BATCH_SIZE)
-            .map(|_| movie(Uuid::new_v4(), parent, library))
-            .collect();
+        let items: Vec<BaseItemEntity> =
+            Vec::from_fn(MAX_BATCH_SIZE, |_| movie(Uuid::new_v4(), parent, library));
         n.record_added(&items[..MAX_BATCH_SIZE - 1]);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(events.library_updates().len(), 1, "one short of the cap");
@@ -897,9 +896,9 @@ mod tests {
 
         // One call over twice the cap goes out as two full batches at once,
         // and the remainder waits out a window of its own.
-        let items: Vec<BaseItemEntity> = (0..=2 * MAX_BATCH_SIZE)
-            .map(|_| movie(Uuid::new_v4(), parent, library))
-            .collect();
+        let items: Vec<BaseItemEntity> = Vec::from_fn(2 * MAX_BATCH_SIZE + 1, |_| {
+            movie(Uuid::new_v4(), parent, library)
+        });
         n.record_added(&items);
         tokio::time::sleep(Duration::from_millis(100)).await;
         let pushed = events.library_updates();
@@ -959,9 +958,8 @@ mod tests {
         });
         n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
         for _ in 0..3 {
-            let items: Vec<BaseItemEntity> = (0..MAX_BATCH_SIZE)
-                .map(|_| movie(Uuid::new_v4(), parent, library))
-                .collect();
+            let items: Vec<BaseItemEntity> =
+                Vec::from_fn(MAX_BATCH_SIZE, |_| movie(Uuid::new_v4(), parent, library));
             n.record_added(&items);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1083,7 +1081,7 @@ mod tests {
         let mut folder = movie(Uuid::new_v4(), library, library);
         folder.is_folder = true;
         folder.type_ = "MediaBrowser.Controller.Entities.Folder".to_owned();
-        let children: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
+        let children: Vec<Uuid> = Vec::from_fn(2, |_| Uuid::new_v4());
 
         n.record_removed_subtree(&folder, &children);
         tokio::time::sleep(Duration::from_secs(31)).await;

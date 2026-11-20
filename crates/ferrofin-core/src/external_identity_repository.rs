@@ -396,7 +396,7 @@ mod tests {
     async fn concurrent_links_lose_no_entry() {
         let (store, _users, ids) = fixture(&["u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7"]).await;
         let store = Arc::new(store);
-        let uids: Vec<String> = (0..ids.len()).map(|i| format!("uid-{i}")).collect();
+        let uids: Vec<String> = Vec::from_fn(ids.len(), |i| format!("uid-{i}"));
         let mut tasks = Vec::new();
         for (id, uid) in ids.iter().copied().zip(uids.iter().cloned()) {
             let store = Arc::clone(&store);

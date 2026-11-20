@@ -15164,9 +15164,7 @@ mod tests {
         };
         let before = cached(&db).await;
         for n in 1..=20 {
-            let keys: Vec<_> = (0..n)
-                .map(|i| (BaseItemKind::Genre, format!("genre {i}")))
-                .collect();
+            let keys: Vec<_> = Vec::from_fn(n, |i| (BaseItemKind::Genre, format!("genre {i}")));
             by_name_ids_by_clean_name(&db, &keys, false)
                 .await
                 .expect("ids");

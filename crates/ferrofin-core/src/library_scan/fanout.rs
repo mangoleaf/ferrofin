@@ -209,7 +209,7 @@ pub(super) fn map<T: Sync, R: Send + Default>(
     let chunks: Vec<_> = entries.chunks(width).collect();
     let seed = Seed::of(ctx);
     std::thread::scope(|scope| {
-        let mut results: Vec<Option<Vec<R>>> = (0..chunks.len()).map(|_| None).collect();
+        let mut results: Vec<Option<Vec<R>>> = Vec::from_fn(chunks.len(), |_| None);
         let mut handles = Vec::new();
         let mut permits = permits.into_iter();
         let mut can_spawn = true;

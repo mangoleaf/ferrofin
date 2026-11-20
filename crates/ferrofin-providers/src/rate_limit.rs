@@ -1342,9 +1342,7 @@ mod tests {
     #[test]
     fn jitter_only_lengthens_the_delay() {
         let backoff = Duration::from_secs(2);
-        let delays: Vec<_> = (0..32)
-            .map(|_| RequestRate::default().failed(Duration::ZERO))
-            .collect();
+        let delays: Vec<_> = Vec::from_fn(32, |_| RequestRate::default().failed(Duration::ZERO));
         assert!(
             delays
                 .iter()

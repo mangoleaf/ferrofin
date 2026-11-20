@@ -430,9 +430,8 @@ mod tests {
         // Eleven at once, none settled: the first five go straight in, the
         // fifth starting the pacing, and each later one waits behind the last
         // (1, 1 + 2, 1 + 2 + 4, ... = 15 s); the next would wait 31 s.
-        let admitted: Vec<_> = (0..11)
-            .map(|_| backoff.admit(&who(ACCOUNT, Some(ADDRESS)), t0))
-            .collect();
+        let admitted: Vec<_> =
+            Vec::from_fn(11, |_| backoff.admit(&who(ACCOUNT, Some(ADDRESS)), t0));
         let waits: Vec<_> = admitted
             .iter()
             .map(|a| a.as_ref().map(|(wait, _)| wait.as_secs()))
@@ -461,14 +460,12 @@ mod tests {
         let t0 = Instant::now();
         // Many addresses at once on one account: none is refused, and none
         // waits longer than the maximum.
-        let admitted: Vec<_> = (0..40)
-            .map(|n| {
-                let address = format!("198.51.100.{n}");
-                backoff
-                    .admit(&who(ACCOUNT, Some(&address)), t0)
-                    .expect("never refused")
-            })
-            .collect();
+        let admitted: Vec<_> = Vec::from_fn(40, |n| {
+            let address = format!("198.51.100.{n}");
+            backoff
+                .admit(&who(ACCOUNT, Some(&address)), t0)
+                .expect("never refused")
+        });
         assert!(admitted.iter().all(|(wait, _)| *wait <= SETTINGS.max_delay));
         assert_eq!(admitted.last().unwrap().0, SETTINGS.max_delay);
         drop(admitted);
@@ -512,13 +509,11 @@ mod tests {
     fn a_refused_attempt_changes_nothing() {
         let backoff = LoginBackoff::new(SETTINGS);
         let t0 = Instant::now();
-        let _held: Vec<_> = (0..9)
-            .map(|_| {
-                backoff
-                    .admit(&who(ACCOUNT, Some(ADDRESS)), t0)
-                    .expect("admitted")
-            })
-            .collect();
+        let _held: Vec<_> = Vec::from_fn(9, |_| {
+            backoff
+                .admit(&who(ACCOUNT, Some(ADDRESS)), t0)
+                .expect("admitted")
+        });
         let before = backoff.streaks.lock().unwrap().by_key.clone();
         assert!(backoff.admit(&who(ACCOUNT, Some(ADDRESS)), t0).is_none());
         let after = backoff.streaks.lock().unwrap().by_key.clone();

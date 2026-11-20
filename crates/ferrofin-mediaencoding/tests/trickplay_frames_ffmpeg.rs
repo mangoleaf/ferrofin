@@ -193,12 +193,10 @@ fn sampling_factors(path: &str) -> Vec<(u8, u8)> {
         if bytes[i + 1] == 0xC0 {
             // SOF0: FF C0, length, precision, height, width, count, then
             // (id, sampling, table) per component.
-            return (0..usize::from(bytes[i + 9]))
-                .map(|component| {
-                    let sampling = bytes[i + 11 + 3 * component];
-                    (sampling >> 4, sampling & 0x0F)
-                })
-                .collect();
+            return Vec::from_fn(usize::from(bytes[i + 9]), |component| {
+                let sampling = bytes[i + 11 + 3 * component];
+                (sampling >> 4, sampling & 0x0F)
+            });
         }
         i += 2 + ((usize::from(bytes[i + 2]) << 8) | usize::from(bytes[i + 3]));
     }

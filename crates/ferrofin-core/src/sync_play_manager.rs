@@ -2748,7 +2748,7 @@ mod tests {
 
     fn play(items: usize) -> PlaybackRequest {
         PlaybackRequest::Play {
-            playing_queue: (0..items).map(|_| Uuid::new_v4()).collect(),
+            playing_queue: Vec::from_fn(items, |_| Uuid::new_v4()),
             playing_item_position: 0,
             start_position_ticks: 0,
         }
@@ -4193,7 +4193,7 @@ mod tests {
     /// `len` queued items with the one at `playing` playing — `CreateQueue`
     /// plus `SetPlayingItemByIndex` in v12.2 `PlayQueueManagerTests`.
     fn queue_playing(len: usize, playing: i32) -> PlayQueue {
-        let ids: Vec<Uuid> = (0..len).map(|_| Uuid::new_v4()).collect();
+        let ids: Vec<Uuid> = Vec::from_fn(len, |_| Uuid::new_v4());
         let mut q = PlayQueue::default();
         q.set(&ids, playing);
         q
@@ -4436,7 +4436,7 @@ mod tests {
         m.handle_request(
             &a,
             PlaybackRequest::Play {
-                playing_queue: (0..3).map(|_| Uuid::new_v4()).collect(),
+                playing_queue: Vec::from_fn(3, |_| Uuid::new_v4()),
                 playing_item_position: 2,
                 start_position_ticks: 0,
             },
@@ -4639,7 +4639,7 @@ mod tests {
         m.handle_request(
             a,
             PlaybackRequest::Play {
-                playing_queue: (0..len).map(|_| Uuid::new_v4()).collect(),
+                playing_queue: Vec::from_fn(len, |_| Uuid::new_v4()),
                 playing_item_position: position,
                 start_position_ticks: 0,
             },

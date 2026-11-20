@@ -815,7 +815,7 @@ pub fn next_up_projection_sql(
     series_keys: usize,
     rewatching: bool,
 ) -> String {
-    let keys: Vec<String> = (0..series_keys).map(|n| n.to_string()).collect();
+    let keys: Vec<String> = Vec::from_fn(series_keys, |n| n.to_string());
     let access = Access {
         filter,
         top_parents,
@@ -871,7 +871,7 @@ pub fn next_up_specials_sql(
     top_parents: &[Uuid],
     series_keys: usize,
 ) -> String {
-    let keys: Vec<String> = (0..series_keys).map(|n| n.to_string()).collect();
+    let keys: Vec<String> = Vec::from_fn(series_keys, |n| n.to_string());
     let access = Access {
         filter,
         top_parents,

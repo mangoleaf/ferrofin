@@ -150,12 +150,10 @@ fn plain_config() -> LdapConfig {
 
 fn entries(count: usize) -> SearchOutcome {
     SearchOutcome {
-        entries: (0..count)
-            .map(|i| LdapEntry {
-                dn: format!("uid=user{i},dc=example,dc=org"),
-                attributes: Vec::new(),
-            })
-            .collect(),
+        entries: Vec::from_fn(count, |i| LdapEntry {
+            dn: format!("uid=user{i},dc=example,dc=org"),
+            attributes: Vec::new(),
+        }),
         references: Vec::new(),
     }
 }

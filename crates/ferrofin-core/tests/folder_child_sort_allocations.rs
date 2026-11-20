@@ -117,24 +117,22 @@ const PER_ROW_BUDGET: usize = 4;
 /// `count` children of one folder, in a scrambled order, with mixed-case
 /// names whose sort names tie in pairs, so both keys are compared.
 fn children(count: usize) -> Vec<BaseItemEntity> {
-    (0..count)
-        .map(|n| {
-            // Visit the numbers in a scrambled order (7919 is prime and does
-            // not divide ROWS), so the sort has real work to do.
-            let key = (n * 7919) % count;
-            let name = if key.is_multiple_of(2) {
-                format!("child {key:05}")
-            } else {
-                format!("Child {key:05}")
-            };
-            BaseItemEntity {
-                type_: "MediaBrowser.Controller.Entities.Video".to_owned(),
-                sort_name: Some(format!("child {:05}", key / 2)),
-                name: Some(name),
-                ..Default::default()
-            }
-        })
-        .collect()
+    Vec::from_fn(count, |n| {
+        // Visit the numbers in a scrambled order (7919 is prime and does
+        // not divide ROWS), so the sort has real work to do.
+        let key = (n * 7919) % count;
+        let name = if key.is_multiple_of(2) {
+            format!("child {key:05}")
+        } else {
+            format!("Child {key:05}")
+        };
+        BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Video".to_owned(),
+            sort_name: Some(format!("child {:05}", key / 2)),
+            name: Some(name),
+            ..Default::default()
+        }
+    })
 }
 
 #[tokio::test(flavor = "current_thread")]

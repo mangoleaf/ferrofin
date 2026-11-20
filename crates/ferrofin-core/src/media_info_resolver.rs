@@ -1372,9 +1372,9 @@ mod tests {
         #[case] file_count: usize,
         #[case] stream_count: usize,
     ) {
-        let files: Vec<String> = (0..file_count)
-            .map(|i| format!("{VIDEO_DIRECTORY_PATH}/My.Video.{i}.srt"))
-            .collect();
+        let files: Vec<String> = Vec::from_fn(file_count, |i| {
+            format!("{VIDEO_DIRECTORY_PATH}/My.Video.{i}.srt")
+        });
         let fs = FakeFs::new(
             &[VIDEO_DIRECTORY_PATH, METADATA_DIRECTORY_PATH],
             vec![
@@ -1382,12 +1382,10 @@ mod tests {
                 (METADATA_DIRECTORY_PATH, Vec::new()),
             ],
         );
-        let media_streams = (0..stream_count)
-            .map(|_| MediaStream {
-                stream_type: MediaStreamType::Subtitle,
-                ..MediaStream::default()
-            })
-            .collect();
+        let media_streams = Vec::from_fn(stream_count, |_| MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            ..MediaStream::default()
+        });
         let resolver = resolver(DlnaProfileType::Subtitle, media_streams, fs);
 
         let start_index = 1;

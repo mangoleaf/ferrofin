@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn salt_bytes_are_uniform_and_non_zero() {
         let provider = CryptographyProvider::new();
-        let salts: Vec<Vec<u8>> = (0..4096).map(|_| provider.generate_salt()).collect();
+        let salts: Vec<Vec<u8>> = Vec::from_fn(4096, |_| provider.generate_salt());
         let zero = salts.iter().find(|s| s.contains(&0));
         assert!(zero.is_none(), "{zero:?}");
         let fixed = |i: usize, shift: u8, bits: u8| salts.iter().all(|s| s[i] >> shift == bits);

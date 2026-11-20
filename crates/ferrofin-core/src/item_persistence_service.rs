@@ -6692,17 +6692,15 @@ fn owned_extra_items_sql(libraries: usize, roots: usize) -> String {
 /// three binds each ([`path_prefix_range`]): the root itself, or the range
 /// under it.
 fn root_terms(libraries: usize, n: usize) -> String {
-    (0..n)
-        .map(|i| {
-            let at = libraries + 1 + 3 * i;
-            format!(
-                r#""Path" = ?{at} OR ("Path" >= ?{} AND "Path" < ?{})"#,
-                at + 1,
-                at + 2
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ")
+    Vec::from_fn(n, |i| {
+        let at = libraries + 1 + 3 * i;
+        format!(
+            r#""Path" = ?{at} OR ("Path" >= ?{} AND "Path" < ?{})"#,
+            at + 1,
+            at + 2
+        )
+    })
+    .join(" OR ")
 }
 
 /// [`ItemPersistenceService::items_in_scope`]'s path-less rows of the
@@ -9897,7 +9895,7 @@ mod tests {
         let movie = Uuid::new_v4();
         seed_item(&db, movie, BaseItemKind::Movie).await;
         let svc = FerrofinItemPersistenceService::new(db.clone());
-        let values: Vec<(i32, String)> = (0..300).map(|i| (2, format!("Genre {i:03}"))).collect();
+        let values: Vec<(i32, String)> = Vec::from_fn(300, |i| (2, format!("Genre {i:03}")));
         svc.save_item_values(movie, &values)
             .await
             .expect("save values");
@@ -11446,7 +11444,7 @@ mod tests {
         let db = test_db().await;
         let svc = FerrofinItemPersistenceService::new(db.clone());
         let item = Uuid::new_v4();
-        let parents: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let parents: Vec<Uuid> = Vec::from_fn(3, |_| Uuid::new_v4());
         for id in std::iter::once(item).chain(parents.iter().copied()) {
             seed_item(&db, id, BaseItemKind::Folder).await;
         }
@@ -12947,7 +12945,7 @@ mod tests {
         use crate::people_repository::{seed_credit, seed_people_row};
         let db = test_db().await;
         let svc = FerrofinItemPersistenceService::new(db.clone());
-        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+        let ids: Vec<Uuid> = Vec::from_fn(6, |_| Uuid::new_v4());
         let (parent, child, extra, survivor, shared, orphan) =
             (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
         seed_item(&db, parent, BaseItemKind::Folder).await;
@@ -14544,7 +14542,7 @@ mod tests {
     async fn season_with_links(
         db: &ferrofin_db::Database,
     ) -> (Uuid, Uuid, Uuid, Uuid, Uuid, Uuid, Uuid) {
-        let ids: Vec<Uuid> = (0..7).map(|_| Uuid::new_v4()).collect();
+        let ids: Vec<Uuid> = Vec::from_fn(7, |_| Uuid::new_v4());
         let (series, season, episode, extra, season_extra, playlist, boxset) =
             (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], ids[6]);
         seed_item(db, series, BaseItemKind::Series).await;
@@ -15636,7 +15634,7 @@ mod tests {
         #[case] owner_of_first: Option<usize>,
     ) {
         let db = test_db().await;
-        let ids: Vec<Uuid> = (0..rows.len()).map(|_| Uuid::new_v4()).collect();
+        let ids: Vec<Uuid> = Vec::from_fn(rows.len(), |_| Uuid::new_v4());
         for (index, _, _) in rows {
             seed_item(&db, ids[*index], BaseItemKind::Movie).await;
         }

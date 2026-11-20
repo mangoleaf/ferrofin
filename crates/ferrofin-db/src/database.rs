@@ -3716,21 +3716,19 @@ mod tests {
         // Saturate the 2-connection reader pool with slow-ish reads while a
         // write goes through the dedicated writer — the write must not wait on
         // (or error against) the reader pool. WAL keeps them independent.
-        let readers: Vec<_> = (0..2)
-            .map(|_| {
-                let db = db.clone();
-                tokio::spawn(async move {
-                    // A long JOIN-ish scan holds a reader connection a while.
-                    let _: i64 = sqlx::query_scalar(
-                        r#"SELECT COUNT(*) FROM "BaseItems" a, "BaseItems" b, "BaseItems" c"#,
-                    )
-                    .fetch_one(db.pool())
-                    .await
-                    .expect("read");
-                    0
-                })
+        let readers: Vec<_> = Vec::from_fn(2, |_| {
+            let db = db.clone();
+            tokio::spawn(async move {
+                // A long JOIN-ish scan holds a reader connection a while.
+                let _: i64 = sqlx::query_scalar(
+                    r#"SELECT COUNT(*) FROM "BaseItems" a, "BaseItems" b, "BaseItems" c"#,
+                )
+                .fetch_one(db.pool())
+                .await
+                .expect("read");
+                0
             })
-            .collect();
+        });
         sqlx::query(
             r#"INSERT INTO "ActivityLogs"
                ("Name","Type","UserId","DateCreated","LogSeverity","RowVersion")

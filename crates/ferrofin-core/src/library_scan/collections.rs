@@ -412,13 +412,11 @@ mod tests {
     #[tokio::test]
     async fn automatic_collections_page_past_one_thousand_and_obey_cancellation() {
         let f = Fixture::new().await;
-        let movies: Vec<_> = (0..1001)
-            .map(|index| {
-                let mut row = Fixture::movie("Large", f.enabled);
-                row.name = Some(format!("Movie {index:04}"));
-                row
-            })
-            .collect();
+        let movies: Vec<_> = Vec::from_fn(1001, |index| {
+            let mut row = Fixture::movie("Large", f.enabled);
+            row.name = Some(format!("Movie {index:04}"));
+            row
+        });
         f.scanner.persistence.save_items(&movies).await.unwrap();
         let cancel = super::super::ScanCancel::new();
         cancel.cancel();

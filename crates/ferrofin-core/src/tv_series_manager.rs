@@ -1073,7 +1073,7 @@ mod tests {
                 batch_result(None, Some(episode(Uuid::new_v4(), 1, 1))),
             );
         }
-        let keys: Vec<String> = (0..n).map(|i| format!("series-{i}")).collect();
+        let keys: Vec<String> = Vec::from_fn(n, |i| format!("series-{i}"));
         (keys, batch)
     }
 
@@ -1193,7 +1193,7 @@ mod tests {
 
         // Five series played a day apart, newest first; the keys run the
         // other way, so the page comes off the sorted picks.
-        let picks: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let picks: Vec<Uuid> = Vec::from_fn(5, |_| Uuid::new_v4());
         let mut batch = HashMap::new();
         let mut keys = Vec::new();
         for (days_ago, pick) in (0_i64..).zip(&picks) {

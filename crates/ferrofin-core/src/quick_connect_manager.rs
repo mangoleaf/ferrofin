@@ -927,9 +927,7 @@ mod tests {
     /// variant at 16 and 48.
     #[test]
     fn secrets_are_uppercase_hex_with_no_fixed_uuid_digits() {
-        let secrets: Vec<String> = (0..256)
-            .map(|_| FerrofinQuickConnect::generate_secret())
-            .collect();
+        let secrets: Vec<String> = Vec::from_fn(256, |_| FerrofinQuickConnect::generate_secret());
         for secret in &secrets {
             assert_eq!(secret.len(), SECRET_BYTES * 2);
             assert!(

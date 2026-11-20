@@ -1858,9 +1858,8 @@ mod tests {
         let svc = FerrofinItemCountService::new(db.clone());
         assert!(svc.get_extra_counts_batch(&[]).await.unwrap().is_empty());
         // Distinct fillers, so the list still spans two chunks once deduplicated.
-        let mut owners: Vec<Uuid> = (0..=ferrofin_db::BATCH_BIND_CHUNK)
-            .map(|_| Uuid::new_v4())
-            .collect();
+        let mut owners: Vec<Uuid> =
+            Vec::from_fn(ferrofin_db::BATCH_BIND_CHUNK + 1, |_| Uuid::new_v4());
         owners[0] = owner;
         owners[ferrofin_db::BATCH_BIND_CHUNK] = owner;
         let counts = svc.get_extra_counts_batch(&owners).await.unwrap();

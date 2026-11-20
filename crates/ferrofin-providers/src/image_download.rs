@@ -667,7 +667,7 @@ mod negative_cache_tests {
     #[test]
     fn the_entry_closest_to_expiring_makes_room() {
         let cache = NegativeImageCache::with_capacity(Duration::from_hours(1), 3);
-        let urls: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let urls: Vec<Uuid> = Vec::from_fn(5, |_| Uuid::new_v4());
         for url in &urls {
             cache.insert(*url);
             std::thread::sleep(Duration::from_millis(1));
