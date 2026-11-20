@@ -587,6 +587,20 @@ pub async fn build_app_state(
             tracing::warn!(%err, "forced sort-name repair failed; items with a sort-title override may sort by the 10.11.8 key until the next boot retries it");
         }
     }
+    // One-shot: sort keys earlier builds stored for non-Latin names were not
+    // romanised; move them to upstream's (`ModifySortChunks` → `Transliterated`).
+    match item_persistence_impl
+        .repair_transliterated_sort_names()
+        .await
+    {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(repaired, "romanised the sort names of non-Latin titles");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "sort-name transliteration repair failed; non-Latin titles may sort as written until the next boot retries it");
+        }
+    }
     // One-shot: box sets and playlists an older build created had no dates,
     // and a renamed playlist kept its old name's `CleanName`/`SortName`, so a
     // search for its new name missed it.
