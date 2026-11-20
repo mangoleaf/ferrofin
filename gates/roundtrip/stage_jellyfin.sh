@@ -37,8 +37,10 @@ jellyfin_stage() {
     rt_docker logs "$name" > "$dst/jellyfin-boot.log" 2>&1
     check reasons python3 "$HERE/checks_boot.py" migrations "$dst/jellyfin-boot.log"
     mark Jellyfin "every migration it began finished"
-    # what Jellyfin's own first start on this route's source ran, as build-fixtures.sh logged it
-    check reasons python3 "$HERE/checks_boot.py" ran "$dst/jellyfin-boot.log" "$FIXTURES/$first_start.server.log"
+    # what Jellyfin's own first start on this route's source ran, as build-fixtures.sh logged it, less what the
+    # source's history (as Ferrofin stopped with it) records
+    check reasons python3 "$HERE/checks_boot.py" ran "$dst/jellyfin-boot.log" "$FIXTURES/$first_start.server.log" \
+      "$dst/ferrofin/data/jellyfin.db"
     mark Jellyfin "it ran the code migrations it runs on the source, and no schema migration"
     check reasons python3 "$HERE/checks_boot.py" errors "$dst/jellyfin-boot.log"
     mark Jellyfin "no ERR or FTL outside the allowlist"

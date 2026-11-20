@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """Jellyfin's boot on a round trip's export, read from its console log (stdlib only).
 
-    checks_boot.py migrations LOG   a line per migration Jellyfin began and never finished, with the error it
-                                    died of (the SQLite error when there is one)
-    checks_boot.py errors LOG       ERR and FTL entries outside ALLOWED: how many, and the first few
-    checks_boot.py ran LOG ORACLE   the schema migrations Jellyfin began (the exported history should record
-                                    every one), and the code migrations it ran that differ from those ORACLE, the
-                                    log of its own first start on the route's source, shows it running
+    checks_boot.py migrations LOG      a line per migration Jellyfin began and never finished, with the error it
+                                       died of (the SQLite error when there is one)
+    checks_boot.py errors LOG          ERR and FTL entries outside ALLOWED: how many, and the first few
+    checks_boot.py ran LOG ORACLE DB   the schema migrations Jellyfin began (the exported history should record
+                                       every one), and the code migrations it ran that differ from those ORACLE,
+                                       the log of its own first start on the route's source, shows it running,
+                                       less those the source's history (the database DB) records
 
 Exit status 0 when there is nothing to say, 1 with the reasons on stdout, 2 when a log cannot be read or
-holds no entry at all (an empty capture, or a format this no longer parses, must never pass).
+holds no entry at all (an empty capture, or a format this no longer parses, must never pass), or DB's
+history cannot be read.
 The log is the container's output: entries such as `[07:53:39] [INF] [10] Main: Jellyfin version: 12.4.0`,
 a multi-line entry continuing on the lines that do not start one.
 """
 
+from contextlib import closing
+from pathlib import Path
 import re
+import sqlite3
 import sys
 
 ENTRY = re.compile(r"^\[\d\d:\d\d:\d\d\] \[(VRB|DBG|INF|WRN|ERR|FTL)\] \[\d+\] ([^:]+): ?(.*)$")
@@ -68,9 +73,18 @@ def performed(log):
     return code, schema
 
 
-def ran(log, oracle):
+def recorded(path):
+    """The ids the `__EFMigrationsHistory` of the database at path records."""
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        return {row[0] for row in db.execute('SELECT "MigrationId" FROM "__EFMigrationsHistory"')}
+
+
+def ran(log, oracle, source=frozenset()):
     code, schema = performed(log)
-    expected = performed(oracle)[0]
+    # A routine the source records ran there only because a schema migration applied before it reverted the one
+    # whose Down() drops its row (on 10.11.10 and 10.11.11, AddNormalizedUsername's drops UpdateNormalizedUsername's,
+    # JellyfinMigrationService.MigrateStepAsync): the export applies no schema migration, so it stays recorded.
+    expected = [m for m in performed(oracle)[0] if m not in source]
     reasons = []
     if schema:
         reasons.append(f"it began {len(schema)} schema migration(s) the history should have recorded: "
@@ -98,11 +112,11 @@ def errors(log):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if not argv or len(argv) != {"migrations": 2, "errors": 2, "ran": 3}.get(argv[0], 0):
+    if not argv or len(argv) != {"migrations": 2, "errors": 2, "ran": 4}.get(argv[0], 0):
         print(__doc__.split("\n\n")[1], file=sys.stderr)
         return 2
     logs = []
-    for path in argv[1:]:
+    for path in argv[1:3]:
         try:
             with open(path, encoding="utf-8", errors="replace") as handle:
                 logs.append(handle.read())
@@ -111,6 +125,12 @@ def main(argv=None):
             return 2
         if not entries(logs[-1]):
             print(f"no Jellyfin log entry in {path}")
+            return 2
+    if argv[0] == "ran":
+        try:
+            logs.append(recorded(argv[3]))
+        except sqlite3.Error as error:
+            print(f"cannot read the source's history in {argv[3]}: {error}")
             return 2
     reasons = {"migrations": migrations, "errors": errors, "ran": ran}[argv[0]](*logs)
     for reason in reasons:
