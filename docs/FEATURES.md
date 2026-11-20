@@ -286,14 +286,21 @@ Wired and working, with a documented limitation or lighter verification:
 - **Playlist files are read, never written** — a library scan makes a playlist of each
   `.m3u`/`.m3u8`/`.pls`/`.wpl`/`.zpl` file in a music or untyped library and of each folder
   named `… [playlist]` or holding a `playlist.xml` (members from the file, or from the
-  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. Of a folder's
-  `playlist.xml` only the members and the media type are read so far — its title, overview,
-  shares and lock are not — and Ferrofin does not write it back after a refresh, as Jellyfin
-  does where it saves XML metadata. Such a playlist belongs to nobody and is open to everyone,
-  so, as on Jellyfin, nobody may edit it and the file is never rewritten. Where Jellyfin 12.2
-  saves XML metadata into the library (a library whose metadata savers are unset), the
-  `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
-  playlist stays empty; Ferrofin always reads the entries and never that sidecar.
+  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. A playlist file belongs to
+  nobody and is open to everyone, so, as on Jellyfin, nobody may edit it and the file is never
+  rewritten. Where Jellyfin 12.2 saves XML metadata into the library (a library whose metadata
+  savers are unset), the `<name>.xml` sidecar it writes beside a playlist file hides the
+  file's entries and the playlist stays empty; Ferrofin always reads the entries and neither
+  reads nor writes that sidecar.
+- **A playlist folder's `playlist.xml`** is read as Jellyfin reads it, when it changes or on a
+  full refresh: its title, overview, lock, locked fields, genres, studios, tags, dates and
+  ratings, its media type, its shares (who may see and edit the playlist) and, for a folder in
+  a media library, its members. Shares merge as Jellyfin merges them: a scan or refresh that
+  replaces takes the file's (an empty `<Shares />` removes every share), "Search for missing
+  metadata" adds the file's to the stored ones. Ferrofin writes the file as Jellyfin writes it,
+  with the owner, the members and the shares, on every change to the playlist and every
+  refresh that saves it: always for a playlist made in Ferrofin (`{data}/playlists`), and for a
+  playlist folder in a media library only when that library opts in, as for a box set below.
   A collection made in Ferrofin gets
   Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before 1.4.0 get it, and the
   id it derives, at the first boot of 1.5.2 or later), and its membership lives in the

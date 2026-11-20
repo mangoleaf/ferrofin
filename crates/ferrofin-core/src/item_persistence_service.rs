@@ -3129,6 +3129,17 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+            // `PlaylistMetadataService.MergeData`'s shares, into the row the
+            // playlist has by now.
+            if let Some(shares) = &playlist.shares {
+                crate::item_data::merge_playlist_shares_in(
+                    &mut tx,
+                    playlist.id,
+                    shares,
+                    playlist.replace,
+                )
+                .await?;
+            }
             if let Some(ids) = resolved {
                 let written = write_scanned_members(&mut tx, &id, ids, playlist.replace)
                     .await
@@ -3150,6 +3161,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             tx.commit().await.map_err(db_err)?;
         }
         Ok(())
+    }
+
+    async fn playlist_ownership(
+        &self,
+        playlist: Uuid,
+    ) -> Result<Option<ferrofin_traits::persistence::PlaylistOwnership>, ServiceError> {
+        crate::item_data::playlist_ownership(&self.db, playlist).await
     }
 
     async fn merge_box_set_members(

@@ -930,6 +930,96 @@ pub(crate) async fn add_listed_shares_in(
     Ok(())
 }
 
+/// A playlist's owner and every share row, in share order, from the
+/// permission tables (what the `Data` copy is synced from); `None` when it
+/// has no `FerrofinPlaylists` row.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub(crate) async fn playlist_ownership(
+    db: &Database,
+    playlist: Uuid,
+) -> Result<Option<ferrofin_traits::persistence::PlaylistOwnership>, ServiceError> {
+    let playlist_db = guid_to_db(playlist);
+    let owner: Option<Option<String>> = sqlx::query_scalar(
+        r#"SELECT "OwnerUserId" FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#,
+    )
+    .bind(&playlist_db)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let shares: Vec<(String, bool)> = sqlx::query_as(
+        r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
+           WHERE "PlaylistId" = ?1 ORDER BY rowid"#,
+    )
+    .bind(&playlist_db)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(Some(ferrofin_traits::persistence::PlaylistOwnership {
+        owner: owner
+            .as_deref()
+            .and_then(|owner| Uuid::parse_str(owner).ok()),
+        shares: shares
+            .into_iter()
+            .filter_map(|(user, can_edit)| {
+                Uuid::parse_str(&user).ok().map(|user| {
+                    ferrofin_model::entities_media::PlaylistUserPermissions::new(user, can_edit)
+                })
+            })
+            .collect(),
+    }))
+}
+
+/// Merges the shares a playlist's `playlist.xml` names into its share rows,
+/// as `PlaylistMetadataService.MergeData` merges `Shares`: `file` replaces the
+/// stored rows when `replace` is set or none is stored — an empty `file`
+/// removes every share — else its entries come first and the stored shares
+/// of the users it does not name follow, each user once (`DistinctBy(s =>
+/// s.UserId)`, the first entry kept). The playlist has its
+/// `FerrofinPlaylists` row by then (the caller writes it), and `Data`
+/// follows the rows. On a connection the caller holds, normally a writer
+/// transaction.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub(crate) async fn merge_playlist_shares_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+    file: &[ferrofin_model::entities_media::PlaylistUserPermissions],
+    replace: bool,
+) -> Result<(), ServiceError> {
+    let playlist_db = guid_to_db(playlist);
+    let stored: Vec<(String, bool)> = sqlx::query_as(
+        r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
+           WHERE "PlaylistId" = ?1 ORDER BY rowid"#,
+    )
+    .bind(&playlist_db)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let mut merged: Vec<(Uuid, bool)> = file.iter().map(|s| (s.user_id, s.can_edit)).collect();
+    if !replace && !stored.is_empty() {
+        merged.extend(
+            stored
+                .iter()
+                .filter_map(|(user, can_edit)| Some((Uuid::parse_str(user).ok()?, *can_edit))),
+        );
+        let mut seen = std::collections::HashSet::new();
+        merged.retain(|(user, _)| seen.insert(*user));
+    }
+    sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
+        .bind(&playlist_db)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    add_listed_shares_in(conn, &playlist_db, &merged).await?;
+    sync_container_data_in(conn, playlist).await
+}
+
 /// Folds a playlist's owner / open-access / shares permission rows into its
 /// parsed `Data` object (the `OwnerUserId` / `OpenAccess` / `Shares` keys).
 async fn sync_playlist_meta(
@@ -1608,6 +1698,76 @@ mod tests {
         // 12.0 marks Folder.LinkedChildren [JsonIgnore]: membership is table-only.
         assert!(!has_linked_children_key(&map));
         let _ = child;
+    }
+
+    /// `playlist_ownership` reads the permission rows, not a `Data` that lags
+    /// them, and is `None` for a playlist without its row; the share merge
+    /// replaces or unions (file first, each user once), its `Data` copy
+    /// following the rows.
+    #[tokio::test]
+    async fn the_saver_reads_the_rows_and_the_file_merges_into_them() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions as Share;
+        let db = test_db().await;
+        let (playlist, legacy) = (Uuid::new_v4(), Uuid::new_v4());
+        let (owner, a, b, c) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_named_item(&db, playlist, BaseItemKind::Playlist, "Mix").await;
+        seed_named_item(&db, legacy, BaseItemKind::Playlist, "Old").await;
+        assert_eq!(playlist_ownership(&db, legacy).await.expect("read"), None);
+        seed_playlist_owner(&db, playlist, owner).await;
+        let merge = |file: Vec<Share>, replace: bool| {
+            let db = db.clone();
+            async move {
+                let mut tx = db.writer().begin().await.expect("tx");
+                merge_playlist_shares_in(&mut tx, playlist, &file, replace)
+                    .await
+                    .expect("merge");
+                tx.commit().await.expect("commit");
+            }
+        };
+        merge(vec![Share::new(a, true), Share::new(b, false)], false).await;
+        // A `Data` that fell behind the rows is not what the saver writes.
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = '{"Shares":[]}' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(playlist))
+            .execute(db.writer())
+            .await
+            .expect("lag");
+        let read = playlist_ownership(&db, playlist)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(read.owner, Some(owner));
+        assert_eq!(read.shares, [Share::new(a, true), Share::new(b, false)]);
+        merge(vec![Share::new(c, false), Share::new(b, true)], false).await;
+        let read = playlist_ownership(&db, playlist)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            read.shares,
+            [
+                Share::new(c, false),
+                Share::new(b, true),
+                Share::new(a, true)
+            ]
+        );
+        merge(Vec::new(), true).await;
+        let read = playlist_ownership(&db, playlist)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(read.shares, []);
+        let data: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(playlist))
+                .fetch_one(db.pool())
+                .await
+                .expect("data");
+        assert_eq!(parse_data(data.as_deref())["Shares"], serde_json::json!([]));
     }
 
     /// An entry edit's `Data` sync that starts while a share revoke holds the

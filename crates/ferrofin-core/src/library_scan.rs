@@ -600,6 +600,9 @@ struct LocalNfo {
     /// The artwork the file names by URL (`<thumb>`, `<fanart><thumb>`), the
     /// first of each type: upstream's `localItem.RemoteImages`.
     remote_images: Vec<(String, ImageType)>,
+    /// A playlist folder's `playlist.xml`: the members and shares the walk
+    /// merges once every row is saved ([`playlists`]).
+    playlist: Option<playlists::PlaylistXmlRead>,
 }
 
 /// The `People` of an answer from a provider that only ever `AddPerson`s
@@ -871,13 +874,20 @@ impl<'a> FetcherPolicy<'a> {
     }
 
     /// Whether a metadata saver will rewrite `row`'s metadata
-    /// ([`ferrofin_providers::nfo_save::saves_metadata`]), with this policy's
-    /// library and server-wide options. It reads the configuration only, not
-    /// whether this scanner was given savers: the composition root always
-    /// wires the Nfo saver, as upstream always registers it.
+    /// ([`ferrofin_providers::nfo_save::saves_metadata`], and a box set's
+    /// `collection.xml` or a playlist folder's `playlist.xml`,
+    /// [`ferrofin_providers::container_xml::saves_metadata`]),
+    /// with this policy's library and server-wide options. It reads the
+    /// configuration only, not whether this scanner was given savers: the
+    /// composition root always wires both, as upstream always registers them.
     fn saves_metadata(self, row: &BaseItemEntity) -> bool {
         let kind = row.type_.rsplit('.').next().unwrap_or_default();
         ferrofin_providers::nfo_save::saves_metadata(row, self.options, self.global_for(kind))
+            || ferrofin_providers::container_xml::saves_metadata(
+                row,
+                self.options,
+                self.global_for(kind),
+            )
     }
 
     /// Whether the library enabled metadata fetcher `name` for `kind`.
@@ -3031,6 +3041,9 @@ struct ItemState<'s, 'a> {
     /// its children. Its stamp is withheld until the end, except a stamp the
     /// scan could not read, which the save keeps.
     save_attempted: bool,
+    /// Set by [`LibraryScanner::scan_item`] when it read a playlist folder's
+    /// `playlist.xml`: what the walk merges once every row is saved.
+    playlist_xml: Option<playlists::PlaylistXmlRead>,
 }
 
 /// Whether [`LibraryScanner::scan_item`] wrote the item.
@@ -7121,7 +7134,8 @@ impl LibraryScanner {
             if run.cancel.is_cancelled() {
                 self.sync_local_version_groups(&[], &released).await;
                 self.copy_to_owned_videos(&owners, false).await;
-                self.sync_playlists(&due_playlists, key_folders).await;
+                // A stopped walk writes no file back ([`Self::save_playlist_files`]).
+                let _ = self.sync_playlists(&due_playlists, key_folders).await;
                 let stop = self.stop_early(
                     &mut probes,
                     (&items_added, &items_updated, &moved_away),
@@ -7250,12 +7264,14 @@ impl LibraryScanner {
                 refresh: &refresh,
                 renamed_extra: false,
                 save_attempted: false,
+                playlist_xml: None,
             };
             // Boxed: the per-item pipeline is the deepest future the scan
             // holds, and inlining it puts the scan future over clippy's
             // `large_futures` ceiling.
             let scanned_item = Box::pin(self.scan_item(pass, &mut state)).await;
             let extra_renamed = state.renamed_extra;
+            let mut playlist_xml = state.playlist_xml.take();
             let save_attempted = state.save_attempted;
             if undecodable || scanned_item.is_err() {
                 self.keep_stored_series_key(item, &mut series_keys).await;
@@ -7367,10 +7383,14 @@ impl LibraryScanner {
                     == Some(BaseItemKind::Playlist)
                 && let Some(path) = item.entity.path.clone()
             {
+                // `isLocalLocked` merges as a replace.
+                let xml = playlist_xml.take();
                 due_playlists.push(playlists::DuePlaylist {
                     id: item.id,
                     path,
-                    replace: playlists::replaces_members(request.options),
+                    replace: playlists::replaces_members(request.options)
+                        || xml.as_ref().is_some_and(|xml| xml.locked),
+                    xml,
                 });
             }
             // `RefreshWithProviders`' custom providers (`MetadataService.cs:
@@ -7434,7 +7454,8 @@ impl LibraryScanner {
                     let at = "inside an item, before any write";
                     self.sync_local_version_groups(&[], &released).await;
                     self.copy_to_owned_videos(&owners, false).await;
-                    self.sync_playlists(&due_playlists, key_folders).await;
+                    // A stopped walk writes no file back ([`Self::save_playlist_files`]).
+                    let _ = self.sync_playlists(&due_playlists, key_folders).await;
                     return Ok(self.stop_early(
                         &mut probes,
                         (&items_added, &items_updated, &moved_away),
@@ -7491,7 +7512,8 @@ impl LibraryScanner {
         if run.cancel.is_cancelled() {
             self.sync_local_version_groups(&[], &released).await;
             self.copy_to_owned_videos(&owners, false).await;
-            self.sync_playlists(&due_playlists, key_folders).await;
+            // A stopped walk writes no file back ([`Self::save_playlist_files`]).
+            let _ = self.sync_playlists(&due_playlists, key_folders).await;
             let stop = self.stop_early(
                 &mut probes,
                 (&items_added, &items_updated, &moved_away),
@@ -7513,7 +7535,9 @@ impl LibraryScanner {
         self.copy_to_owned_videos(&owners, scope.is_none()).await;
         // After every row is saved, so each entry finds its item, and before
         // the closing passes, whose collage draws the members.
-        self.sync_playlists(&due_playlists, key_folders).await;
+        if self.sync_playlists(&due_playlists, key_folders).await {
+            self.save_playlist_files(&due_playlists).await;
+        }
         let touched = Box::pin(self.serve_lane_reach(run)).await;
         work.served(&touched);
         let removed = Box::pin(self.prune_after_scan(
@@ -8308,11 +8332,12 @@ impl LibraryScanner {
             && !locked
             && search.is_none()
             && !(options.replace_all_metadata && policy.saves_metadata(&entity));
-        let local = if run_local {
+        let mut local = if run_local {
             self.fetch_local_nfo(&mut entity, policy).await
         } else {
             LocalNfo::default()
         };
+        state.playlist_xml = local.playlist.take();
         // An NFO always credits a list, empty when it names nobody
         // (`BaseNfoParser` calls `ResetPeople`).
         let nfo_people = local.found.then_some(local.people);
@@ -9098,19 +9123,23 @@ impl LibraryScanner {
                 .set_date_last_refreshed(item.id, stamp)
                 .await?;
         }
-        self.save_metadata_sidecars(
-            item.id,
-            if has_remote_metadata || options.force_save || options.replace_all_metadata {
-                ItemUpdateType::MetadataDownload
-            } else if images_changed {
-                ItemUpdateType::ImageUpdate
-            } else if probe_ran || local.found || embedded_found {
-                ItemUpdateType::MetadataImport
-            } else {
-                ItemUpdateType::None
-            },
-        )
-        .await;
+        // A playlist folder whose `playlist.xml` this pass read is written
+        // once its members and shares are merged ([`playlists`]).
+        if state.playlist_xml.is_none() {
+            self.save_metadata_sidecars(
+                item.id,
+                if has_remote_metadata || options.force_save || options.replace_all_metadata {
+                    ItemUpdateType::MetadataDownload
+                } else if images_changed {
+                    ItemUpdateType::ImageUpdate
+                } else if probe_ran || local.found || embedded_found {
+                    ItemUpdateType::MetadataImport
+                } else {
+                    ItemUpdateType::None
+                },
+            )
+            .await;
+        }
         Ok(ItemSaved::Saved)
     }
 
@@ -11381,6 +11410,10 @@ impl LibraryScanner {
         use ferrofin_providers::xbmc::{
             self, base_parser::NoDirectoryService, config::NfoConfiguration, item::NfoItemKind,
         };
+        // A playlist folder's reader is `PlaylistXmlProvider`, no NFO.
+        if item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Playlist) {
+            return playlists::read_folder_xml(entity).await.unwrap_or_default();
+        }
         if !policy.local_reader_enabled(fetcher_names::NFO) {
             return LocalNfo::default();
         }
@@ -11493,6 +11526,7 @@ impl LibraryScanner {
             is_locked: result.item.is_locked,
             locked_fields: result.item.locked_fields.clone(),
             remote_images: result.remote_images,
+            playlist: None,
         }
     }
 

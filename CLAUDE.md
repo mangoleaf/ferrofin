@@ -521,12 +521,13 @@ The real remaining gaps are **by design**, not un-ported routes:
   (`SaveLocalMetadata`), so with it off the media folders stay untouched and need no write
   permission. The metadata savers follow the same rule: in a library without a saver list
   (`MetadataSavers` null) and with `SaveLocalMetadata` off, no edit or member change writes
-  an `.nfo` or a box set's `collection.xml` into its media folders, not even over a file
-  already there (a library with a saver list writes what the list names). In a library
-  without a saver list, upstream's `ProviderManager.IsSaverEnabledForItem` rewrites a
-  saver's existing file on an edit, and `BoxSet.IsSaveLocalMetadataEnabled()` always writes
-  `collection.xml`; here a file left in place can be read again at a refresh until the
-  library names the saver or turns saving on.
+  an `.nfo`, a box set's `collection.xml` or a playlist folder's `playlist.xml` into its
+  media folders, not even over a file already there (a library with a saver list writes what
+  the list names). In a library without a saver list, upstream's
+  `ProviderManager.IsSaverEnabledForItem` rewrites a saver's existing file on an edit, and
+  `BoxSet.IsSaveLocalMetadataEnabled()` and `Playlist.IsSaveLocalMetadataEnabled()` always
+  write `collection.xml` and `playlist.xml`; here a file left in place can be read again at a
+  refresh until the library names the saver or turns saving on.
 - **Hardware transcoding is NVENC, VAAPI and QSV only.** AMF (AMD on Windows),
   VideoToolbox (macOS), RKMPP (Rockchip) and V4L2M2M are **not supported** — an owner
   decision (2026-08-26), not an un-ported route: their filter chains cannot be verified

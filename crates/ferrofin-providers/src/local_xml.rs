@@ -13,16 +13,12 @@
 //!
 //! # Where the server reads and writes it
 //!
-//! - A box set's `collection.xml`: [`crate::box_set_xml`] reads it in the box
-//!   set's refresh (`BoxSetXmlProvider`) and writes it from the metadata save
-//!   (`BoxSetXmlSaver`).
-//! - A playlist FOLDER's `playlist.xml`: the library scan reads its members
-//!   and media type (`PlaylistXmlProvider`; see `ferrofin-core`'s
-//!   `library_scan/playlists.rs`, whose TODO records what of it is not yet
-//!   applied). Nothing writes it yet: upstream's `PlaylistXmlSaver` (its
-//!   `OwnerUserId` and `<Shares>` included) is an open work item, gl-341.
-//!   [`save_playlist_xml`] writes the common nodes, the item list and the
-//!   media type, and is wired nowhere.
+//! - A box set's `collection.xml` and a playlist FOLDER's `playlist.xml`:
+//!   [`crate::container_xml`] reads them in the item's refresh
+//!   (`BoxSetXmlProvider`, `PlaylistXmlProvider`) and writes them from the
+//!   metadata save (`BoxSetXmlSaver`, `PlaylistXmlSaver`). The library scan
+//!   reads a playlist folder's file too (`ferrofin-core`'s
+//!   `library_scan/playlists.rs`).
 //!
 //! # Upstream round-trip bugs not ported (owner decision 2026-11-14)
 //!
@@ -39,6 +35,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use ferrofin_db::entities::base_items::PeopleEntity;
 use ferrofin_model::data::{BaseItemKind, PersonKind};
 use ferrofin_model::entities::MetadataField;
+use ferrofin_model::entities_media::PlaylistUserPermissions;
 use ferrofin_util::finite::finite_or_none;
 use serde_json::{Map, Value};
 
@@ -91,6 +88,12 @@ pub struct LocalContainerXml {
     /// the container, with the path it resolves to (`None` when it resolves
     /// to none, which upstream counts but does not write).
     pub children: Vec<LocalLinkedChild>,
+    /// A playlist's `<OwnerUserId>`, when it names a user. Read, as upstream
+    /// reads it, but no refresh merges it (`MergeData` copies no owner).
+    pub owner_user_id: Option<uuid::Uuid>,
+    /// A playlist's `<Shares>`, in file order (`IHasShares`; a box set has
+    /// none). Empty when the file has no share, or no `<Shares>` at all.
+    pub shares: Vec<PlaylistUserPermissions>,
 }
 
 /// Parses a `collection.xml` (`BoxSetXmlParser`, `kind` [`BaseItemKind::BoxSet`])
@@ -180,8 +183,19 @@ impl Parser<'_> {
             "CountryCode" => {
                 item.preferred_metadata_country_code = Some(read_normalized_string(reader));
             }
+            // `Guid.TryParse`, and never the empty id; a playlist's only.
+            "OwnerUserId" => {
+                let value = read_normalized_string(reader);
+                if self.kind == BaseItemKind::Playlist {
+                    self.out.owner_user_id =
+                        uuid::Uuid::parse_str(&value).ok().filter(|id| !id.is_nil());
+                }
+            }
+            "Shares" if self.kind == BaseItemKind::Playlist => {
+                self.out.shares = shares(reader);
+            }
             // A person's birthplace; nothing else keeps it.
-            "PlaceOfBirth" | "AspectRatio" | "OwnerUserId" | "Format3D" => {
+            "PlaceOfBirth" | "AspectRatio" | "Format3D" => {
                 let _ = reader.read_element_content_as_string();
             }
             "LockedFields" => {
@@ -307,7 +321,7 @@ impl Parser<'_> {
                     add_distinct(&mut self.studios, studio);
                 }
             }
-            // A playlist's `<Shares>` is gl-341's; a box set has none.
+            // A box set has no shares (`IHasShares`).
             "Shares" | "Countries" => reader.skip(),
             name => {
                 let key = if name.eq_ignore_ascii_case("IMDB") {
@@ -426,6 +440,53 @@ fn read_linked_child(sub: &mut XmlCursor) -> Option<LocalLinkedChild> {
     child.is_linked().then_some(child)
 }
 
+/// `FetchFromSharesNode`: each `<Share>` of the `<Shares>` the cursor is on
+/// with a `<UserId>` that parses (`GetShare`), and `CanEdit` only for `true`
+/// in any case.
+fn shares(reader: &mut XmlCursor) -> Vec<PlaylistUserPermissions> {
+    let mut shares = Vec::new();
+    if reader.is_empty_element() {
+        reader.read();
+        return shares;
+    }
+    let mut sub = reader.read_subtree();
+    sub.move_to_content();
+    sub.read();
+    while !sub.eof() {
+        if !sub.is_element() {
+            sub.read();
+        } else if sub.name() == "Share" && !sub.is_empty_element() {
+            let mut entry = sub.read_subtree();
+            entry.move_to_content();
+            entry.read();
+            let (mut user, mut can_edit) = (None, false);
+            while !entry.eof() {
+                if !entry.is_element() {
+                    entry.read();
+                    continue;
+                }
+                match entry.name() {
+                    "UserId" => {
+                        user = uuid::Uuid::parse_str(&read_normalized_string(&mut entry)).ok();
+                    }
+                    "CanEdit" => {
+                        can_edit = read_normalized_string(&mut entry).eq_ignore_ascii_case("true");
+                    }
+                    _ => entry.skip(),
+                }
+            }
+            if let Some(user) = user {
+                shares.push(PlaylistUserPermissions::new(user, can_edit));
+            }
+        } else if sub.name() == "Share" {
+            sub.read();
+        } else {
+            sub.skip();
+        }
+    }
+    shares
+}
+
 /// The non-empty `<item_element>` values of the list the cursor is on
 /// (`FetchFromGenresNode` and its siblings), in order.
 fn list_values(reader: &mut XmlCursor, item_element: &str) -> Vec<String> {
@@ -528,6 +589,17 @@ fn person_entity(person: PersonInfo) -> PeopleEntity {
     }
 }
 
+/// The `MediaType` name a playlist takes from its file's
+/// `<PlaylistMediaType>` (`PlaylistXmlParser`): one of the enum's names, or
+/// `Unknown`, the enum's default.
+#[must_use]
+pub fn playlist_media_type(declared: Option<&str>) -> &'static str {
+    ["Video", "Audio", "Photo", "Book"]
+        .into_iter()
+        .find(|known| declared.is_some_and(|d| d.eq_ignore_ascii_case(known)))
+        .unwrap_or("Unknown")
+}
+
 /// Serializes a `collection.xml` (`BoxSetXmlSaver`): the common nodes, then
 /// `<CollectionItems>` with the path of each of `container.children`.
 #[must_use]
@@ -545,20 +617,44 @@ pub fn save_collection_xml(container: &LocalContainerXml) -> String {
     writer.finish()
 }
 
-/// Serializes a `playlist.xml` (`PlaylistXmlSaver`): the common nodes, the
-/// item list, then `<PlaylistMediaType>` (`WriteCustomElementsAsync` runs
-/// after `AddCommonNodesAsync`). `OwnerUserId` and `<Shares>` are gl-341's.
+/// Serializes a playlist folder's `playlist.xml` (`PlaylistXmlSaver`): the
+/// common nodes, `<OwnerUserId>` (the empty id for a playlist owned by
+/// nobody), the item list and `<Shares>`, then `<PlaylistMediaType>`
+/// (`WriteCustomElementsAsync` runs after `AddCommonNodesAsync`).
 #[must_use]
 pub fn save_playlist_xml(container: &LocalContainerXml) -> String {
     let mut writer = NfoWriter::new();
     writer.start_element("Item");
     write_common_nodes(&mut writer, &container.item, BaseItemKind::Playlist);
+    // `OwnerUserId.ToString("N")`.
+    writer.element(
+        "OwnerUserId",
+        &container
+            .owner_user_id
+            .unwrap_or_default()
+            .simple()
+            .to_string(),
+    );
     write_linked_children(
         &mut writer,
         &container.children,
         "PlaylistItems",
         "PlaylistItem",
     );
+    // `AddSharesAsync`: always, `<Shares />` when there is none; each id as
+    // `Guid.ToString()`, `CanEdit` in lower case.
+    if container.shares.is_empty() {
+        writer.element("Shares", "");
+    } else {
+        writer.start_element("Shares");
+        for share in &container.shares {
+            writer.start_element("Share");
+            writer.element("UserId", &share.user_id.hyphenated().to_string());
+            writer.element("CanEdit", if share.can_edit { "true" } else { "false" });
+            writer.end_element("Share");
+        }
+        writer.end_element("Shares");
+    }
     if let Some(media_type) = container
         .playlist_media_type
         .as_deref()
@@ -1159,6 +1255,7 @@ mod tests {
                 },
                 LocalLinkedChild::default(),
             ],
+            ..LocalContainerXml::default()
         }
     }
 
@@ -1329,15 +1426,35 @@ mod tests {
                     item_id: None,
                 },
             ],
+            owner_user_id: Some(uuid::Uuid::from_u128(0xabc)),
+            shares: vec![
+                PlaylistUserPermissions::new(uuid::Uuid::from_u128(2), true),
+                PlaylistUserPermissions::new(uuid::Uuid::from_u128(1), false),
+            ],
         };
         let xml = save_playlist_xml(&original);
         assert!(xml.contains("<PlaylistMediaType>Audio</PlaylistMediaType>"));
         assert!(!xml.contains("<DisplayOrder>"), "{xml}");
-        // C# writes the media type from `WriteCustomElementsAsync`, which runs
-        // after the common nodes have emitted the item list.
+        // `BaseXmlSaver`'s order: the owner and the item list, then the
+        // shares; the media type from `WriteCustomElementsAsync`, which runs
+        // after the common nodes.
+        let at = |element: &str| xml.find(element).expect(element);
         assert!(
-            xml.find("<PlaylistItems>") < xml.find("<PlaylistMediaType>"),
-            "the item list comes first: {xml}"
+            at("<OwnerUserId>") < at("<PlaylistItems>")
+                && at("<PlaylistItems>") < at("<Shares>")
+                && at("<Shares>") < at("<PlaylistMediaType>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<OwnerUserId>00000000000000000000000000000abc</OwnerUserId>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                "<Share>\n      <UserId>00000000-0000-0000-0000-000000000002</UserId>\n      \
+                 <CanEdit>true</CanEdit>\n    </Share>"
+            ),
+            "{xml}"
         );
         // Only `<Path>` is written (C# `AddLinkedChildren` resolves ids to
         // paths), so an id does not survive the round trip — the reader still
@@ -1358,6 +1475,37 @@ mod tests {
         );
         assert_eq!(reparsed.item.item.name.as_deref(), Some("Road Trip"));
         assert_eq!(reparsed.playlist_media_type, original.playlist_media_type);
+        assert_eq!(reparsed.owner_user_id, original.owner_user_id);
+        assert_eq!(reparsed.shares, original.shares);
+    }
+
+    /// `GetShare`: a share needs a `<UserId>` that parses, in any GUID form;
+    /// `CanEdit` is `true` in any case, anything else is `false`. No share
+    /// writes `<Shares />`, which reads back as none; an empty owner is none.
+    #[test]
+    fn a_playlists_shares_read_as_get_share_reads_them() {
+        let xml = "<Item><OwnerUserId>00000000000000000000000000000000</OwnerUserId><Shares>\
+             <Share><UserId>00000000000000000000000000000001</UserId><CanEdit>TRUE</CanEdit></Share>\
+             <Share><UserId>{00000000-0000-0000-0000-000000000002}</UserId><CanEdit>yes</CanEdit></Share>\
+             <Share><UserId>not a guid</UserId><CanEdit>true</CanEdit></Share>\
+             <Share><CanEdit>true</CanEdit></Share><Share /><Other>x</Other>\
+             </Shares></Item>";
+        let parsed = parse_container_xml(xml, BaseItemKind::Playlist, &[]).expect("parses");
+        assert_eq!(parsed.owner_user_id, None);
+        assert_eq!(
+            parsed.shares,
+            vec![
+                PlaylistUserPermissions::new(uuid::Uuid::from_u128(1), true),
+                PlaylistUserPermissions::new(uuid::Uuid::from_u128(2), false),
+            ]
+        );
+        // A box set is no `IHasShares`.
+        let box_set = parse_container_xml(xml, BaseItemKind::BoxSet, &[]).expect("parses");
+        assert!(box_set.shares.is_empty() && box_set.owner_user_id.is_none());
+        let none = save_playlist_xml(&LocalContainerXml::default());
+        assert!(none.contains("<Shares />"), "{none}");
+        let reparsed = parse_container_xml(&none, BaseItemKind::Playlist, &[]).expect("parses");
+        assert_eq!(reparsed.shares, []);
     }
 
     /// A provider key `XmlWriter` cannot name an element after is left out.
