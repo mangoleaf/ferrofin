@@ -2942,15 +2942,6 @@ mod tests {
         }
     }
 
-    /// Counts a dropped (abandoned) run.
-    struct Abandoned(Arc<std::sync::atomic::AtomicUsize>);
-
-    impl Drop for Abandoned {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
     #[async_trait]
     impl Transcoder for PacedTranscoder {
         async fn get_process_output(
@@ -2979,7 +2970,10 @@ mod tests {
                 std::fs::write(dir.join(format!("{i:08}.jpg")), b"jpg").expect("write frame");
             }
             if pace.hang {
-                let _abandoned = Abandoned(Arc::clone(&self.abandoned));
+                // Counts a dropped (abandoned) run.
+                let _abandoned = std::mem::DropGuard::new(Arc::clone(&self.abandoned), |n| {
+                    n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
                 std::future::pending::<()>().await;
             }
             Ok(ProcessOutput {

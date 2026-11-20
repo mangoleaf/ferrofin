@@ -1772,15 +1772,6 @@ mod tests {
         }
     }
 
-    /// Counts a dropped (abandoned) run.
-    struct Abandoned(Arc<std::sync::atomic::AtomicUsize>);
-
-    impl Drop for Abandoned {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
     #[async_trait]
     impl Transcoder for HangingTranscoder {
         async fn get_process_output(
@@ -1798,7 +1789,10 @@ mod tests {
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok();
             if hang {
-                let _abandoned = Abandoned(Arc::clone(&self.abandoned));
+                // Counts a dropped (abandoned) run.
+                let _abandoned = std::mem::DropGuard::new(Arc::clone(&self.abandoned), |n| {
+                    n.fetch_add(1, Ordering::SeqCst);
+                });
                 std::future::pending::<()>().await;
             }
             let argv = crate::encoder::split_args(arguments)?;
