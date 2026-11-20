@@ -160,6 +160,35 @@ pub fn should_ignore_path(path: &str) -> bool {
         .any(|rule| rule.matches(&lower, &segments, file_name))
 }
 
+/// The name the directory `dir` resolves with when its name holds `marker`
+/// (lower case, matched in any case) or, failing that, `holds_file()` says it
+/// holds its resolver's metadata file; `None` when neither. The directory arm
+/// of `PlaylistResolver` (`[playlist]`, `playlist.xml`) and of
+/// `BoxSetResolver` (`[boxset]`, `collection.xml`): the name is the folder's
+/// with the marker cut (`Replace(marker, "", OrdinalIgnoreCase).Trim()`, one
+/// left-to-right pass), and `EnsureName` gives a name left empty the folder's
+/// own.
+pub(crate) fn marked_folder_name(
+    dir: &str,
+    marker: &str,
+    holds_file: impl FnOnce() -> bool,
+) -> Option<String> {
+    let name = std::path::Path::new(dir).file_name()?.to_str()?.to_owned();
+    let lower = name.to_ascii_lowercase();
+    if lower.contains(marker) {
+        let mut cut = String::with_capacity(name.len());
+        let mut rest = 0;
+        for (at, _) in lower.match_indices(marker) {
+            cut.push_str(&name[rest..at]);
+            rest = at + marker.len();
+        }
+        cut.push_str(&name[rest..]);
+        let cut = cut.trim();
+        return Some(if cut.is_empty() { name } else { cut.to_owned() });
+    }
+    holds_file().then_some(name)
+}
+
 /// The provider ids a new item's resolver reads from its own name, as
 /// `TrySetProviderId` keeps them (trimmed, valid for their provider):
 ///
@@ -202,7 +231,9 @@ pub fn path_provider_ids(entity: &BaseItemEntity) -> Vec<(String, String)> {
             let just_name = if entity.is_in_mixed_folder {
                 file_name(path)
             } else {
-                file_name(&containing_folder_path(entity, path))
+                file_name(&crate::video_versions::containing_folder_path_at(
+                    entity, path,
+                ))
             };
             let file = file_name(path);
             let mut found: Vec<(&'static str, Option<String>)> =
@@ -268,22 +299,6 @@ pub fn path_provider_ids(entity: &BaseItemEntity) -> Vec<(String, String)> {
     )
 }
 
-/// `Video.ContainingFolderPath`: a disc rip's own folder, a folder row
-/// itself, else the folder holding the file.
-fn containing_folder_path(entity: &BaseItemEntity, path: &str) -> String {
-    let data = crate::item_data::parse_data(entity.data.as_deref());
-    let rip = crate::item_data::read_data_string(&data, "VideoType")
-        .is_some_and(|video_type| matches!(video_type.as_str(), "Dvd" | "BluRay"));
-    if rip || entity.is_folder {
-        return path.to_owned();
-    }
-    std::path::Path::new(path)
-        .parent()
-        .and_then(|parent| parent.to_str())
-        .unwrap_or_default()
-        .to_owned()
-}
-
 /// A minimal filesystem-watch seam so the [`crate::library_monitor`] can be
 /// tested against a fake.
 ///
@@ -328,6 +343,8 @@ mod tests {
     #[case::a_mixed_folder_reads_the_file_only(BaseItemKind::Movie, "/m/All [tmdbid-1]/Heat [tvdbid-2].mkv", true, None, &[("Tvdb", "2")])]
     #[case::imdb_anywhere_in_the_path(BaseItemKind::Movie, "/m/tt0113277/Heat.mkv", false, None, &[("Imdb", "tt0113277")])]
     #[case::a_disc_rip_reads_its_own_folder(BaseItemKind::Movie, "/m/Heat [tmdbid-949]", false, Some(r#"{"VideoType":"Dvd"}"#), &[("Tmdb", "949")])]
+    #[case::a_stacked_rip_reads_the_sets_folder(BaseItemKind::Movie, "/m/Set [tmdbid-1]/Set - Disc 1", false, Some(r#"{"VideoType":"Dvd","AdditionalParts":["/m/Set [tmdbid-1]/Set - Disc 2"]}"#), &[("Tmdb", "1")])]
+    #[case::a_placeholder_rip_reads_its_parent(BaseItemKind::Movie, "/m/Heat [tmdbid-949]/Heat.disc", false, Some(r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#), &[("Tmdb", "949")])]
     #[case::music_video(BaseItemKind::MusicVideo, "/mv/Song [tvdb-4]/Song.mkv", false, None, &[("Tvdb", "4")])]
     #[case::series(BaseItemKind::Series, "/tv/Show [tvmazeid-5] [anidbid-7]", false, None, &[("TvMaze", "5"), ("AniDB", "7")])]
     #[case::season(BaseItemKind::Season, "/tv/Show/Season 02 [anilistid-9]", false, None, &[("AniList", "9")])]

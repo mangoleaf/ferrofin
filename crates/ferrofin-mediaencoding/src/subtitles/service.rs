@@ -216,8 +216,8 @@ mod tests {
         ) -> Option<String> {
             None
         }
-        async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<(), String> {
-            Ok(())
+        async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<String, String> {
+            Ok(String::new())
         }
     }
 
@@ -359,11 +359,7 @@ mod tests {
             Err(format!("GET {url}: HTTP 503"))
         }
         fn path_protocol(&self, path: &str) -> MediaProtocol {
-            if path.starts_with("http") {
-                MediaProtocol::Http
-            } else {
-                MediaProtocol::File
-            }
+            ferrofin_model::media_info::path_protocol(path)
         }
         fn subtitle_cache_path(
             &self,
@@ -375,8 +371,8 @@ mod tests {
                 "/cache/{media_source_id}-{subtitle_stream_index}{output_extension}"
             ))
         }
-        async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<(), String> {
-            Ok(())
+        async fn extract(&self, _args: &str, _output_paths: &[String]) -> Result<String, String> {
+            Ok(String::new())
         }
         fn file_exists(&self, _path: &str) -> bool {
             false

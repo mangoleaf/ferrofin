@@ -407,10 +407,9 @@ WITH_REQUESTS='.[1].requests = 3 | .[3].requests = 1 | .[4].requests = 2 | .[8].
 
 # tv_scenario [jq-filter]: the same for a TV library: the scratch series, made by the refresh
 # before the rows from its tvshow.nfo, then its season and its episodes. Only the episodes are
-# ever updated: a folder is not refreshed because a file came or went. Row 8 leaves the cleared
-# official rating null, as the editor save rewrote the episode's NFO without it (and "Replace
-# all metadata" reads no NFO a saver would rewrite). No request at all, as the scratch series
-# has no provider ids.
+# ever updated: a folder is not refreshed because a file came or went. Row 8 refills the cleared
+# official rating from the episode's NFO, which the editor save left alone (no saver chosen,
+# media folders closed). No request at all, as the scratch series has no provider ids.
 tv_scenario() {
   jq "${1:-.}" > scenario.json <<'EOJ'
 [
@@ -422,7 +421,7 @@ tv_scenario() {
   {"removed": 1},
   {"updated": 1, "unchanged": 4, "patch": {"S01E03": {"Overview": "Rewritten by the verify script."}}},
   {"unchanged": 5},
-  {"updated": 1, "probes": 1},
+  {"updated": 1, "probes": 1, "patch": {"S01E01": {"OfficialRating": "PG"}}},
   {"updated": 1, "probes": 1, "patch": {"S01E01": {"Overview": ""}}},
   {"updated": 1, "probes": 1, "patch": {"S01E01": {"CommunityRating": null}}},
   {"updated": 1, "probes": 1, "patch": {"S01E02": {"ImageTags": {"Primary": "t"}}}},
@@ -607,13 +606,22 @@ LIB_ID=f137a2dd21bbc1b99aa5c0f6bf02a805
 @test "run: row 8 refills the rating unless the editor save rewrote the NFO" {
   SCRATCH="lib/Ferrofin Verify Show"
   mkdir -p "$SCRATCH"
-  # A TV library with no savers chosen: the edit rewrote the episode's NFO, so a refill fails.
-  tv_scenario '.[8].patch = {"S01E01": {"OfficialRating": "PG"}}'
-  FAKE_KIND=tvshows fake
+  # A TV library with no savers chosen that saves into its media folders: the edit rewrote the
+  # episode's NFO, so the refill the scenario plays back fails.
+  tv_scenario
+  FAKE_KIND=tvshows FAKE_SAVE_LOCAL=true fake
   whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
   [ "$status" -eq 1 ]
   [[ "$output" == *"an editor save writes the NFO the scan reads (the NFO saver): true"* ]]
   [[ "$output" == *"   8  FAIL"*"OfficialRating 'PG' (want 'null')"* ]]
+  stop_fake
+  # No savers chosen and the media folders closed (as run.sh's libraries): the episode's NFO
+  # exists, but the edit does not rewrite it, so the rating is refilled.
+  FAKE_KIND=tvshows fake
+  whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"the NFO saver): false"* ]]
+  [[ "$output" == *"summary: 13 PASS, 0 FAIL, 0 SKIP"* ]]
   stop_fake
   # Savers chosen without Nfo (the dashboard's default): the NFO keeps the rating.
   FAKE_KIND=tvshows FAKE_SAVERS='[]' fake
@@ -622,15 +630,16 @@ LIB_ID=f137a2dd21bbc1b99aa5c0f6bf02a805
   [[ "$output" == *"the NFO saver): false"* ]]
   [[ "$output" == *"summary: 13 PASS, 0 FAIL, 0 SKIP"* ]]
   stop_fake
-  tv_scenario
+  tv_scenario 'del(.[8].patch)'
   FAKE_KIND=tvshows FAKE_SAVERS='[]' fake
   whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
   [ "$status" -eq 1 ]
   [[ "$output" == *"   8  FAIL"*"the cleared official rating was not filled"* ]]
   stop_fake
-  # None chosen, but the server disables the Nfo saver for episodes: the rating is refilled.
-  tv_scenario '.[8].patch = {"S01E01": {"OfficialRating": "PG"}}'
-  FAKE_KIND=tvshows FAKE_CONFIG='{"MetadataOptions":[{"ItemType":"Episode","DisabledMetadataSavers":["Nfo"]}]}' fake
+  # None chosen and the media folders open, but the server disables the Nfo saver for
+  # episodes: the rating is refilled.
+  tv_scenario
+  FAKE_KIND=tvshows FAKE_SAVE_LOCAL=true FAKE_CONFIG='{"MetadataOptions":[{"ItemType":"Episode","DisabledMetadataSavers":["Nfo"]}]}' fake
   whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
   [ "$status" -eq 0 ]
   [[ "$output" == *"the NFO saver): false"* ]]

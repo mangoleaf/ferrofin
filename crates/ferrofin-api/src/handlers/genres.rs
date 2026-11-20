@@ -11,20 +11,20 @@
 //! tab empty. Both run the same query; only the by-name row kind returned
 //! differs (`BaseItemRepository.ByName.cs:44-54`).
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use ferrofin_db::entities::base_items::BaseItemEntity;
-use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::options::DtoOptions;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{Query, RequiredRouteString, RouteParameter};
 use crate::handlers::by_name::{
-    ByNameItemQuery, ByNameListQuery, project_query_result, resolve_by_name_or_slug,
+    ByNameItemQuery, ValueListQuery, project_query_result, resolve_by_name_or_slug,
 };
 use crate::handlers::items::resolve_user_or_api_key;
 use crate::state::AppState;
@@ -44,11 +44,12 @@ use crate::state::AppState;
 async fn get_genres(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<ByNameListQuery>,
+    Query(query): Query<ValueListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
+    let query = query.genres();
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     let parent = query.parent(&state, &auth, user.as_deref()).await?;
-    let internal = query.base_query(user.clone())?;
+    let internal = query.base_query(user.clone(), parent.as_ref())?;
     let result = if is_music_collection_folder(parent.as_ref()) {
         state.library.get_music_genres(&internal).await?
     } else {
@@ -74,8 +75,9 @@ async fn get_genres(
 /// `musicvideos` (`GenresController.cs:141-150`).
 ///
 /// A library's collection type is stored in its row's `Data` blob, the same
-/// field its DTO's `CollectionType` comes from. Another kind of parent, no
-/// stored type, or no parent keeps the plain genres answer.
+/// field its DTO's `CollectionType` comes from, and binds the same way
+/// ([`CollectionType::from_item_data`]). Another kind of parent, no stored
+/// type, or no parent keeps the plain genres answer.
 fn is_music_collection_folder(parent: Option<&BaseItemEntity>) -> bool {
     let Some(parent) = parent else {
         return false;
@@ -83,16 +85,17 @@ fn is_music_collection_folder(parent: Option<&BaseItemEntity>) -> bool {
     if parent.type_.rsplit('.').next() != Some("CollectionFolder") {
         return false;
     }
-    let data: serde_json::Value = parent
-        .data
-        .as_deref()
-        .and_then(|data| serde_json::from_str(data).ok())
-        .unwrap_or_default();
-    data.get("CollectionType")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|kind| {
-            kind.eq_ignore_ascii_case("music") || kind.eq_ignore_ascii_case("musicvideos")
-        })
+    matches!(
+        CollectionType::from_item_data(parent.data.as_deref(), "CollectionType"),
+        Some(CollectionType::music | CollectionType::musicvideos)
+    )
+}
+
+/// `{genreName}`, the `[FromRoute, Required] string` of `GetGenre`.
+struct GenreName;
+
+impl RouteParameter for GenreName {
+    const NAME: &'static str = "genreName";
 }
 
 /// `GET /Genres/{genreName}` — a single genre by name.
@@ -118,7 +121,7 @@ fn is_music_collection_folder(parent: Option<&BaseItemEntity>) -> bool {
 async fn get_genre(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(genre_name): Path<String>,
+    RequiredRouteString(genre_name, _): RequiredRouteString<GenreName>,
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
@@ -141,4 +144,26 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route("/Genres", get(get_genres))
         .route("/Genres/{genreName}", get(get_genre))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A music library's type binds as its DTO's does: a padded name or the
+    /// number (`3`, `4`) counts as music too.
+    #[rstest::rstest]
+    #[case(r#"{"CollectionType":"Music"}"#, true)]
+    #[case(r#"{"CollectionType":3}"#, true)]
+    #[case(r#"{"CollectionType":" musicvideos "}"#, true)]
+    #[case(r#"{"CollectionType":"movies"}"#, false)]
+    #[case(r#"{"CollectionType":"mixed"}"#, false)]
+    fn a_music_library_is_found_by_its_bound_type(#[case] data: &str, #[case] music: bool) {
+        let library = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.CollectionFolder".to_owned(),
+            data: Some(data.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(is_music_collection_folder(Some(&library)), music);
+    }
 }

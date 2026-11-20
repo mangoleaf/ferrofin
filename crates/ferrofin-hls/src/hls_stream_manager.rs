@@ -20,7 +20,8 @@
 //!   from the cache dir;
 //! - the legacy transcode-folder file resolution +
 //!   `HlsSegmentController.ValidateTranscodePath` path-traversal guard;
-//! - stop-encoding → `TranscodeManager::kill_transcoding_jobs`.
+//! - stop-encoding → `TranscodeManagerImpl::stop_transcoding_jobs` (the
+//!   playback-stop reports' awaited form → `TranscodeManager::kill_transcoding_jobs`).
 //!
 //! Turning the raw [`HlsStreamRequest`] into a concrete transcode plan
 //! (media-source resolution, `StreamState`, and the ffmpeg command line) —
@@ -35,6 +36,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use ferrofin_mediaencoding::encoding_helper::helper::{
+    is_mp4_segment_container, segment_file_extension,
+};
 use ferrofin_mediaencoding::keyed_locks::KeyedLocks;
 use ferrofin_mediaencoding::transcoding::manager::StartFfMpegRequest;
 use ferrofin_mediaencoding::transcoding::segment_transcoder::SegmentTranscoder;
@@ -49,6 +53,7 @@ use ferrofin_traits::media_encoding::{
 };
 use ferrofin_traits::system::ServerApplicationPaths;
 use ferrofin_traits::trickplay::TrickplayManager;
+use ferrofin_util::string_extensions::ordinal_ignore_case_key;
 
 use crate::create_main_playlist_request::CreateMainPlaylistRequest;
 use crate::dynamic_hls_playlist_generator::{
@@ -509,8 +514,10 @@ where
     ///
     /// Both existence checks in [`Self::resolve_dynamic_segment`] — the
     /// pre-lock fast path and the post-lock re-check — go through here, so
-    /// neither can serve a client without restamping the job.
-    fn serve_if_present(
+    /// neither can serve a client without restamping the job. The check runs on
+    /// the blocking pool, never as an inline `stat` on a runtime worker
+    /// (gl-1378): `false` on any error, as `Path::exists` was.
+    async fn serve_if_present(
         &self,
         playlist_key: &str,
         segment_path: &Path,
@@ -518,7 +525,7 @@ where
         ending_ticks: i64,
         segment_index: i64,
     ) -> Option<ServedFile> {
-        if !segment_path.exists() {
+        if !tokio::fs::try_exists(segment_path).await.unwrap_or(false) {
             return None;
         }
         // The guard's drop restarts the idle countdown from now.
@@ -567,7 +574,7 @@ where
         // segment (gl-1254).
         let (playlist_path, segment_container) = self.planner.hls_output(request, is_audio).await?;
         let playlist_key = playlist_path.to_string_lossy().into_owned();
-        let ext = segment_extension(&segment_container);
+        let ext = segment_file_extension(&segment_container);
         let segment_path = segment_file(&playlist_path, segment_id, ext);
         // These are the exact durations the playlist placed in the URL, also
         // for variable keyframe-based remux segments. Missing query values stay 0.
@@ -578,13 +585,16 @@ where
         // Fast path: the segment already exists (a live job produced it) → mark
         // the consumer active (keep-alive) and serve it. Port of the
         // `File.Exists` try-1; the guard drop restarts the idle countdown.
-        if let Some(file) = self.serve_if_present(
-            &playlist_key,
-            &segment_path,
-            ext,
-            ending_ticks,
-            i64::from(segment_id),
-        ) {
+        if let Some(file) = self
+            .serve_if_present(
+                &playlist_key,
+                &segment_path,
+                ext,
+                ending_ticks,
+                i64::from(segment_id),
+            )
+            .await
+        {
             return Ok(file);
         }
 
@@ -599,13 +609,16 @@ where
         // it open-coded the check without the keep-alive it left
         // `last_activity` stale and the idle reaper free to kill a job that was
         // actively being consumed.
-        if let Some(file) = self.serve_if_present(
-            &playlist_key,
-            &segment_path,
-            ext,
-            ending_ticks,
-            i64::from(segment_id),
-        ) {
+        if let Some(file) = self
+            .serve_if_present(
+                &playlist_key,
+                &segment_path,
+                ext,
+                ending_ticks,
+                i64::from(segment_id),
+            )
+            .await
+        {
             return Ok(file);
         }
 
@@ -630,19 +643,19 @@ where
             .flatten()
         {
             // `current` is the front of this job's own run of segments, from its
-            // `-start_number`: killed jobs leave theirs on disk (gl-52). It sees
-            // in-progress `.tmp` segments too, so a live job that is still
-            // encoding reads as progress, not absence. Listed on the blocking
+            // `-start_number`: killed jobs leave theirs on disk (gl-52), and
+            // until the job has finished its start segment or served one, none
+            // past its start are its own (gl-1520). Listed on the blocking
             // pool: the directory holds every segment of every live transcode
             // (gl-1255).
             let start = self.manager.segment_start_number(&handle).unwrap_or(0);
+            let has_served = self.manager.has_served_segment_from(&handle, start);
             let listed = playlist_path.clone();
-            let current =
-                tokio::task::spawn_blocking(move || current_transcoding_index(&listed, ext, start))
-                    .await
-                    .map_err(|error| {
-                        ServiceError::backend(format!("list transcode segments: {error}"))
-                    })?;
+            let current = tokio::task::spawn_blocking(move || {
+                current_transcoding_index(&listed, ext, start, has_served)
+            })
+            .await
+            .map_err(|error| ServiceError::backend(format!("list transcode segments: {error}")))?;
             if should_wait_for_running_job(start, current, segment_id) {
                 // The wait is an active consumer: the guard keeps the idle
                 // reaper away and self-releases if the client disconnects.
@@ -653,7 +666,7 @@ where
                     .manager
                     .wait_for_segment(&handle, &playlist_path, segment_id)
                     .await
-                    && segment_path.exists()
+                    && tokio::fs::try_exists(&segment_path).await.unwrap_or(false)
                 {
                     self.clear_restart_failures(&playlist_key);
                     let mut file = served(&segment_path, ext);
@@ -722,7 +735,7 @@ where
             .manager
             .wait_for_segment(&handle, &playlist_path, segment_id)
             .await
-            && segment_path.exists()
+            && tokio::fs::try_exists(&segment_path).await.unwrap_or(false)
         {
             self.clear_restart_failures(&playlist_key);
             let mut file = served(&segment_path, ext);
@@ -771,7 +784,7 @@ where
             .planner
             .plan(request, is_audio, Some(0), PlaylistKind::Vod)
             .await?;
-        let ext = segment_extension(&plan.segment_container);
+        let ext = segment_file_extension(&plan.segment_container);
         let init_path = init_segment_file(&plan.playlist_path, ext);
 
         // Start the transcode at the RESUME segment, not segment 0. The fMP4
@@ -802,7 +815,7 @@ where
         };
         let start_segment = segment_file(&plan.playlist_path, start, ext);
 
-        if init_is_complete(&init_path, &start_segment) {
+        if init_is_complete(&init_path, &start_segment).await {
             // A completed/earlier job left both — complete by construction.
             let mut file = served(&init_path, ext);
             file.progress = self.manager.segment_progress(
@@ -825,7 +838,7 @@ where
         // Not "the start segment exists": an earlier job's start segment can
         // sit beside an init that a later job recreated empty and died on, and
         // then nothing would ever start a job to fill it (gl-1417).
-        if !init_is_complete(&init_path, &start_segment) {
+        if !init_is_complete(&init_path, &start_segment).await {
             let mut delivered = false;
             if let Some(handle) = self
                 .manager
@@ -839,9 +852,10 @@ where
                 // past `start`, or one far behind it, would hold the playlist
                 // lock until it ended (gl-1395).
                 let first = self.manager.segment_start_number(&handle).unwrap_or(start);
+                let has_served = self.manager.has_served_segment_from(&handle, first);
                 let listed = plan.playlist_path.clone();
                 let current = tokio::task::spawn_blocking(move || {
-                    current_transcoding_index(&listed, ext, first)
+                    current_transcoding_index(&listed, ext, first, has_served)
                 })
                 .await
                 .map_err(|error| {
@@ -860,7 +874,7 @@ where
                     let _rg = self
                         .manager
                         .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
-                    let first_written = init_has_data(&init_path)
+                    let first_written = init_has_data(&init_path).await
                         || self
                             .manager
                             .wait_for_segment(&handle, &plan.playlist_path, first)
@@ -872,7 +886,7 @@ where
                             .manager
                             .wait_for_segment(&handle, &plan.playlist_path, start)
                             .await
-                        && init_is_complete(&init_path, &start_segment);
+                        && init_is_complete(&init_path, &start_segment).await;
                 }
                 if !delivered {
                     // A seek, or the job exited without those segments, or its
@@ -937,7 +951,7 @@ where
             }
         }
 
-        if init_is_complete(&init_path, &start_segment) {
+        if init_is_complete(&init_path, &start_segment).await {
             self.clear_restart_failures(&playlist_key);
             let mut file = served(&init_path, ext);
             file.progress = self.manager.segment_progress(
@@ -985,11 +999,16 @@ where
             .map_err(|error| ServiceError::backend(format!("list transcode segments: {error}")))?;
         self.manager.kill_and_remove(handle, false, false).await;
         let listed = playlist_path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            delete_cut_short_segment(&listed, ext, job_start, before);
-        })
-        .await
-        .map_err(|error| ServiceError::backend(format!("delete a cut-short segment: {error}")))
+        let cut_short =
+            tokio::task::spawn_blocking(move || cut_short_segment(&listed, ext, job_start, before))
+                .await
+                .map_err(|error| {
+                    ServiceError::backend(format!("find a cut-short segment: {error}"))
+                })?;
+        if let Some(path) = cut_short {
+            delete_cut_short_segment(&path).await;
+        }
+        Ok(())
     }
 
     /// The transcode cache directory (`GetTranscodePath`), prepared on the
@@ -1005,12 +1024,13 @@ where
     ///
     /// Port of `HlsSegmentController.ValidateTranscodePath`: the resolved path must
     /// stay inside the transcode folder. `require_m3u8` additionally requires a
-    /// `.m3u8` extension (the legacy playlist route).
+    /// `.m3u8` extension (the legacy playlist route). Returns the folder and the
+    /// file, so a caller walks the folder once.
     async fn resolve_in_transcode_dir(
         &self,
         file_name: &str,
         require_m3u8: bool,
-    ) -> Result<PathBuf, ServiceError> {
+    ) -> Result<(PathBuf, PathBuf), ServiceError> {
         let dir = self.transcode_dir().await?;
         let candidate = dir.join(file_name);
         // Reject any name that escapes the transcode dir (`..`, absolute, etc.).
@@ -1030,7 +1050,46 @@ where
         {
             return Err(ServiceError::invalid_input("invalid segment"));
         }
-        Ok(candidate)
+        Ok((dir, candidate))
+    }
+
+    /// The playlist lookup of `HlsSegmentController.GetHlsVideoSegmentLegacy`:
+    /// the first file at the top of the transcode folder, in the order the
+    /// directory lists them, whose extension is the segment's or `.m3u8` and
+    /// whose path contains `playlist_id` (`OrdinalIgnoreCase`). Read on the
+    /// blocking pool; an entry that cannot be read is skipped, as
+    /// `IgnoreInaccessible` skips it.
+    async fn find_legacy_playlist(
+        dir: PathBuf,
+        playlist_id: &str,
+        segment: &Path,
+    ) -> Result<Option<PathBuf>, ServiceError> {
+        let needle = ordinal_ignore_case_key(playlist_id);
+        let container = segment.extension().map(std::ffi::OsStr::to_owned);
+        tokio::task::spawn_blocking(move || {
+            for entry in std::fs::read_dir(&dir)? {
+                let Ok(entry) = entry else { continue };
+                let path = entry.path();
+                let listed = path.extension().is_some_and(|e| {
+                    e.eq_ignore_ascii_case("m3u8")
+                        || container
+                            .as_deref()
+                            .is_some_and(|c| e.eq_ignore_ascii_case(c))
+                });
+                if listed
+                    && ordinal_ignore_case_key(&path.to_string_lossy()).contains(&needle)
+                    && path.is_file()
+                {
+                    return Ok(Some(path));
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("transcode folder scan task failed: {e}")))?
+        .map_err(|e: std::io::Error| {
+            ServiceError::backend(format!("list the transcode folder: {e}"))
+        })
     }
 }
 
@@ -1110,12 +1169,12 @@ where
             .manager
             .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
 
-        if !playlist_path.exists() {
+        if !tokio::fs::try_exists(&playlist_path).await.unwrap_or(false) {
             // `_transcodeManager.LockAsync(playlistPath)`: one starter per
             // playlist; a concurrent request re-checks under the lock.
             let lock = self.playlist_lock(&playlist_key);
             let _guard = lock.lock().await;
-            if !playlist_path.exists() {
+            if !tokio::fs::try_exists(&playlist_path).await.unwrap_or(false) {
                 // An event playlist is reloaded by the client on a timer, so a
                 // source that keeps killing ffmpeg would otherwise turn every
                 // reload into a fresh spawn — the same storm the segment path
@@ -1165,7 +1224,7 @@ where
                     self.wait_for_minimum_segment_count(&handle, &playlist_path, plan.min_segments)
                         .await;
                 }
-                if playlist_path.exists() {
+                if tokio::fs::try_exists(&playlist_path).await.unwrap_or(false) {
                     self.clear_restart_failures(&playlist_key);
                 } else {
                     // ffmpeg died before its first segment boundary, so it never
@@ -1212,32 +1271,43 @@ where
         &self,
         file_name: &str,
         require_m3u8: bool,
+        playlist_id: Option<&str>,
     ) -> Result<ServedFile, ServiceError> {
-        let path = self
+        let (dir, path) = self
             .resolve_in_transcode_dir(file_name, require_m3u8)
             .await?;
-        // `Path::exists` off the runtime worker: `false` on any error, as before.
-        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            return Err(ServiceError::invalid_input("invalid segment"));
-        }
-        // Refresh the owning job's keep-alive timer (OnTranscodeBeginRequest on
-        // the playlist that owns this file). This comment used to stand alone
-        // over code that never made the call: a client driving playback through
-        // the legacy `hls` routes never touched `last_activity`, so unless it
-        // also sent playback-progress pings the idle reaper killed its ffmpeg
-        // 60s in — mid-playback. Upstream `HlsSegmentController.GetFileResult`
-        // does exactly this for the legacy video-segment and playlist routes.
-        // The legacy *audio* route serves without it upstream; sharing the
-        // refresh here is a deliberate, response-invisible superset (it can
-        // only stop a reap of a job a client is actively consuming).
-        let _rg = self
+        // `GetHlsVideoSegmentLegacy` serves only beside the playlist it names.
+        let playlist = match playlist_id {
+            Some(id) => Self::find_legacy_playlist(dir, id, &path)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("Hls segment not found."))?,
+            None => path.clone(),
+        };
+        // `GetFileResult`: `OnTranscodeBeginRequest` on the playlist before the
+        // file is opened, ended by `Response.OnCompleted`, so the observer rides
+        // the response body, and a poll for a segment not written yet still
+        // restamps the job as it drops. A client driving playback through the
+        // legacy `hls` routes would otherwise never touch `last_activity`, and
+        // unless it also sent playback-progress pings the idle reaper killed
+        // its ffmpeg 60s in, mid-playback. The legacy *audio* route serves
+        // without it upstream; sharing it here is a deliberate,
+        // response-invisible superset (it can only stop a reap of a job a
+        // client is actively consuming).
+        let progress = self
             .manager
-            .begin_request_guard_for_file(&path, TranscodingJobType::Hls);
+            .request_progress_for_file(&playlist, TranscodingJobType::Hls);
+        // `Path::exists` off the runtime worker: `false` on any error, as before.
+        // Upstream's `PhysicalFile` throws `FileNotFoundException`, a 404.
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Err(ServiceError::not_found("transcode file not found"));
+        }
         let ext = path
             .extension()
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default();
-        Ok(served(&path, &ext))
+        let mut file = served(&path, &ext);
+        file.progress = progress;
+        Ok(file)
     }
 
     async fn transcode_stream(
@@ -1260,7 +1330,7 @@ where
         }
         let lock = self.playlist_lock(&output);
         let _guard = lock.lock().await;
-        if !Path::new(&output).exists() {
+        if !tokio::fs::try_exists(&output).await.unwrap_or(false) {
             let state = self.labelled(&plan.state, request.item_id).await;
             let start = StartFfMpegRequest {
                 program: &self.ffmpeg_path,
@@ -1284,6 +1354,17 @@ where
     }
 
     async fn stop_encoding(&self, request: &HlsStreamRequest) -> Result<(), ServiceError> {
+        let device = request.device_id.as_deref().unwrap_or_default();
+        self.manager
+            .stop_transcoding_jobs(device, request.play_session_id.as_deref())
+            .await;
+        Ok(())
+    }
+
+    async fn stop_encoding_awaiting_deletion(
+        &self,
+        request: &HlsStreamRequest,
+    ) -> Result<(), ServiceError> {
         use ferrofin_traits::media_encoding::TranscodeManager as _;
         let device = request.device_id.as_deref().unwrap_or_default();
         self.manager
@@ -1443,7 +1524,7 @@ async fn count_playlist_segments(path: &Path) -> i32 {
 /// `hls/{stem}/{stem}-1.mp4` route the segments already use via
 /// `-hls_base_url`.
 fn live_playlist_text(text: &str, playlist_path: &Path, segment_container: &str) -> String {
-    if !segment_container.trim().eq_ignore_ascii_case("mp4") {
+    if !is_mp4_segment_container(segment_container) {
         return text.to_owned();
     }
     let stem = playlist_path
@@ -1453,30 +1534,6 @@ fn live_playlist_text(text: &str, playlist_path: &Path, segment_container: &str)
     let init_file_name = format!("{stem}-1.mp4");
     let routed_init = format!("hls/{stem}/{init_file_name}");
     text.replace(&init_file_name, &routed_init)
-}
-
-/// The segment file extension for `segment_container` (`.ts` default).
-///
-/// Mirrors `EncodingHelper.GetSegmentFileExtension` and the transcode manager's
-/// own helper so the served path agrees with what ffmpeg wrote.
-fn segment_extension(segment_container: &str) -> &'static str {
-    // ACCEPTED DIVERGENCE, deliberately: upstream's `GetSegmentFileExtension`
-    // is literally `"." + segmentContainer`, so it echoes the client's raw
-    // string. Ferrofin normalises instead, exactly as the planner's
-    // `segment_file_extension`/`hls_segment_type` do when they tell ffmpeg what
-    // to write — otherwise `segmentContainer=TS` (or any unknown container)
-    // makes the serve path look for `out0.TS` while ffmpeg wrote `out0.ts`, a
-    // permanent miss on a case-sensitive filesystem that reads to the client as
-    // a dead transcode.
-    //
-    // The transcode manager's own `segment_file_extension`
-    // (`ferrofin-mediaencoding`, `transcoding/manager.rs`) normalises the same
-    // way; change both together.
-    if segment_container.trim().eq_ignore_ascii_case("mp4") {
-        ".mp4"
-    } else {
-        ".ts"
-    }
 }
 
 /// The on-disk path of segment `index` for `playlist` (`GetSegmentPath`).
@@ -1536,7 +1593,7 @@ fn segment_containing(starts: &[i64], ticks: i64) -> (i32, i64) {
 /// The progress front of the running job for `playlist` that writes from
 /// segment `start` (its `-start_number`): the last segment of the unbroken run
 /// of `{stem}{n}{ext}` files from the lowest one at or past `start`. `None`
-/// when nothing at or past `start` is on disk yet. Used to decide whether a
+/// while the job is still encoding `start` (below). Used to decide whether a
 /// segment or fMP4 init request is a read-ahead (wait) or a seek (evict +
 /// restart).
 ///
@@ -1548,16 +1605,27 @@ fn segment_containing(starts: &[i64], ticks: i64) -> (i32, i64) {
 /// replacement's first are written within the same second. A segment below
 /// `start` or past a gap in the run is an earlier job's. Leftovers that adjoin
 /// the run count toward its front: the job writes over them before it reaches
-/// anything past them, so a request there waits rather than restarts. The run
-/// can begin past `start` once rolling deletion removed the job's first
-/// segments. Blocking: an async caller runs it on the blocking pool.
-fn current_transcoding_index(playlist: &Path, ext: &str, start: i32) -> Option<i32> {
-    // `-hls_flags temp_file` writes the in-progress segment as `<name>.tmp`
-    // and renames on completion; counting it keeps the encoder's front visible
-    // during the (possibly long) first-segment encode — otherwise a retry
-    // arriving in that window reads "no progress" and kills a healthy job.
-    let indices: std::collections::BTreeSet<i32> = segment_entries(playlist, ext)
-        .ok()?
+/// anything past them, so a request there waits rather than restarts.
+///
+/// The job is still encoding `start` until its file is finished on disk: the
+/// hls muxer holds a segment in memory and writes it out, as a `.tmp` it then
+/// renames, only once the segment is finished (gl-1520). The run can begin past
+/// `start` once rolling deletion removed the job's first segments, but it does
+/// so only up to one the job has served (`served`: whether it has served a
+/// segment at or past `start`), so until then anything else at or past `start`
+/// is an earlier job's. Blocking: an async caller runs it on the blocking pool.
+fn current_transcoding_index(playlist: &Path, ext: &str, start: i32, served: bool) -> Option<i32> {
+    let entries = segment_entries(playlist, ext).ok()?;
+    if !served
+        && !entries
+            .iter()
+            .any(|&(index, being_written, _)| index == start && !being_written)
+    {
+        return None;
+    }
+    // `-hls_flags temp_file`: a `.tmp` being written out counts, as does one a
+    // job killed hard left behind.
+    let indices: std::collections::BTreeSet<i32> = entries
         .into_iter()
         .map(|(index, _, _)| index)
         .filter(|&index| index >= start)
@@ -1569,8 +1637,8 @@ fn current_transcoding_index(playlist: &Path, ext: &str, start: i32) -> Option<i
     Some(front)
 }
 
-/// Every `{stem}{n}{ext}` segment of `playlist` in its folder, finished or an
-/// in-progress `{stem}{n}{ext}.tmp`: its index, whether it is the `.tmp`, and
+/// Every `{stem}{n}{ext}` segment of `playlist` in its folder, finished or a
+/// `{stem}{n}{ext}.tmp` being written out: its index, whether it is the `.tmp`, and
 /// its entry. An error when the folder cannot be read. Blocking.
 fn segment_entries(
     playlist: &Path,
@@ -1609,7 +1677,7 @@ fn segment_entries(
 type SegmentWrite = (u64, Option<std::time::SystemTime>);
 
 /// The segment files of the job writing from `start`, keyed by index and
-/// whether the file is the in-progress `.tmp`, each with its [`SegmentWrite`].
+/// whether the file is a `.tmp` being written out, each with its [`SegmentWrite`].
 type SegmentWrites = std::collections::BTreeMap<(i32, bool), SegmentWrite>;
 
 /// The [`SegmentWrites`] of the job writing from `start`. An error when the
@@ -1626,7 +1694,14 @@ fn segment_writes(playlist: &Path, ext: &str, start: i32) -> std::io::Result<Seg
     Ok(writes)
 }
 
-/// Deletes the segment a seek restart's killed job was encoding: the `q` exit
+/// `DynamicHlsController.DeleteFile` gives up after this many attempts (its
+/// `retryCount >= 5` guard).
+const DELETE_FILE_ATTEMPTS: u32 = 5;
+
+/// `DynamicHlsController.DeleteFile`'s `Task.Delay(100)` before each retry.
+const DELETE_FILE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The segment a seek restart's killed job was encoding: the `q` exit
 /// finalises it, cut short, under its normal name, and every later request
 /// would serve it as complete (gl-1396). Port of `GetDynamicSegment`'s
 /// `DeleteLastFile`, which takes the newest file by mtime; this takes the
@@ -1634,13 +1709,13 @@ fn segment_writes(playlist: &Path, ext: &str, start: i32) -> std::io::Result<Seg
 /// just before the kill, because where mtimes are coarse the newest file can
 /// be an earlier job's (gl-52). A job killed hard (no exit within the `q`
 /// timeout) still has the `.tmp` after that segment, which is then whole, and
-/// nothing is deleted. Blocking.
-fn delete_cut_short_segment(
+/// there is none. Blocking.
+fn cut_short_segment(
     playlist: &Path,
     ext: &str,
     start: i32,
     before: std::io::Result<SegmentWrites>,
-) {
+) -> Option<PathBuf> {
     let (before, after) = match (before, segment_writes(playlist, ext, start)) {
         (Ok(before), Ok(after)) => (before, after),
         (Err(error), _) | (_, Err(error)) => {
@@ -1649,7 +1724,7 @@ fn delete_cut_short_segment(
                 %error,
                 "cannot list a killed transcode's segments; one it cut short may be served short"
             );
-            return;
+            return None;
         }
     };
     let written: Vec<(i32, bool)> = after
@@ -1657,41 +1732,77 @@ fn delete_cut_short_segment(
         .filter(|(key, write)| before.get(key) != Some(write))
         .map(|(key, _)| key)
         .collect();
-    let Some(index) = written
+    let index = written
         .iter()
         .filter(|&&(_, in_progress)| !in_progress)
         .map(|&(index, _)| index)
-        .max()
-    else {
-        return;
-    };
-    if written.contains(&(index.saturating_add(1), true)) {
-        return;
-    }
-    let path = segment_file(playlist, index, ext);
-    tracing::debug!(path = %path.display(), "deleting a killed transcode's cut-short segment");
-    match std::fs::remove_file(&path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            tracing::warn!(
-                path = %path.display(),
-                %error,
-                "deleting a killed transcode's cut-short segment failed; it is served short"
-            );
+        .max()?;
+    (!written.contains(&(index.saturating_add(1), true)))
+        .then(|| segment_file(playlist, index, ext))
+}
+
+/// Deletes a seek restart's cut-short segment at `path`, retrying as
+/// `DynamicHlsController.DeleteFile` does: [`DELETE_FILE_RETRY_DELAY`] after an
+/// `IOException`, at most [`DELETE_FILE_ATTEMPTS`] attempts (upstream also
+/// waits once after the last, for nothing), and no retry for access denied
+/// (.NET's `UnauthorizedAccessException`). Upstream logs every
+/// failed attempt at Error; here one that will be retried is a `warn!` and
+/// only the last an `error!` (LOGGING.md rules 1 and 2).
+async fn delete_cut_short_segment(path: &Path) {
+    for attempt in 1..=DELETE_FILE_ATTEMPTS {
+        tracing::debug!(path = %path.display(), attempt, "deleting a killed transcode's cut-short segment");
+        match tokio::fs::remove_file(path).await {
+            // `File.Delete` succeeds on a file already gone.
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error)
+                if attempt < DELETE_FILE_ATTEMPTS
+                    && error.kind() != std::io::ErrorKind::PermissionDenied =>
+            {
+                tracing::warn!(
+                    path = %path.display(),
+                    attempt,
+                    %error,
+                    "deleting a killed transcode's cut-short segment failed; retrying"
+                );
+                tokio::time::sleep(DELETE_FILE_RETRY_DELAY).await;
+            }
+            Err(error) => {
+                tracing::error!(
+                    path = %path.display(),
+                    attempt,
+                    %error,
+                    "deleting a killed transcode's cut-short segment failed; it is served short"
+                );
+                return;
+            }
         }
-        _ => {}
     }
 }
 
 /// Whether the fMP4 init at `init` is complete: ffmpeg fills it in the flush
 /// that finishes `start_segment`, so the start segment's (renamed, final) file
 /// existing implies the init was written and closed; the size check is only a
-/// guard against a stale empty file from a job that died at its header.
-fn init_is_complete(init: &Path, start_segment: &Path) -> bool {
-    start_segment.exists() && init_has_data(init)
+/// guard against a stale empty file from a job that died at its header. Both
+/// stats run in one hop on the blocking pool, never inline on a runtime worker
+/// (gl-1378); a hop that fails reads as incomplete.
+async fn init_is_complete(init: &Path, start_segment: &Path) -> bool {
+    let (init, start_segment) = (init.to_path_buf(), start_segment.to_path_buf());
+    tokio::task::spawn_blocking(move || start_segment.exists() && init_file_has_data(&init))
+        .await
+        .unwrap_or(false)
 }
 
-/// Whether the fMP4 init at `init` exists and is not empty.
-fn init_has_data(init: &Path) -> bool {
+/// [`init_file_has_data`] on the blocking pool (gl-1378).
+async fn init_has_data(init: &Path) -> bool {
+    let init = init.to_path_buf();
+    tokio::task::spawn_blocking(move || init_file_has_data(&init))
+        .await
+        .unwrap_or(false)
+}
+
+/// Whether the fMP4 init at `init` exists and is not empty. A blocking `stat`.
+fn init_file_has_data(init: &Path) -> bool {
     std::fs::metadata(init).is_ok_and(|m| m.len() > 0)
 }
 
@@ -1700,8 +1811,8 @@ fn init_has_data(init: &Path) -> bool {
 /// than kill and restart it (`GetDynamicSegment`'s current-index decision).
 /// `current` is the job's front ([`current_transcoding_index`]).
 ///
-/// `None` (nothing of the job's on disk yet, not even a `.tmp`) means it is
-/// still encoding segment `start`: a client retry of that first encode must not
+/// `None` (nothing of the job's on disk yet) means it is still encoding
+/// segment `start`: a client retry of that first encode must not
 /// kill a healthy job (the cast-receiver kill/restart storm). Wait when the
 /// request is at or at most [`SEGMENT_WAIT_GAP`] ahead of the front (upstream
 /// also waits on `segment_id == current`). Behind it, which includes a segment
@@ -1859,12 +1970,12 @@ mod tests {
                 output_audio_bitrate: None,
                 output_audio_channels: None,
                 output_container: None,
-                output_video_sync: None,
                 output_file_path: playlist.to_string_lossy().into_owned(),
                 input_container: None,
                 is_input_video: true,
                 subtitle_delivery_method: ferrofin_model::dlna::SubtitleDeliveryMethod::Encode,
                 trimmed_subtitle_path: None,
+                transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
                 run_time_ticks: Some(60 * 10_000_000),
                 transcoding_type: if kind == PlaylistKind::Progressive {
                     TranscodingJobType::Progressive
@@ -2291,16 +2402,6 @@ mod tests {
         assert_eq!(count_playlist_segments(&pl).await, 0);
     }
 
-    #[test]
-    fn segment_extension_normalises_the_container() {
-        assert_eq!(segment_extension("MP4"), ".mp4");
-        assert_eq!(segment_extension(" mp4 "), ".mp4");
-        // Everything else is mpegts — the planner tells ffmpeg exactly that,
-        // so the serve path must look for the same file.
-        assert_eq!(segment_extension("TS"), ".ts");
-        assert_eq!(segment_extension("webm"), ".ts");
-    }
-
     #[tokio::test]
     async fn dynamic_segment_starts_transcode_and_serves_segment() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2341,6 +2442,27 @@ mod tests {
             .unwrap()
             .get(&key)
             .map_or(0, |(count, _)| *count)
+    }
+
+    /// A segment start whose ffmpeg exits non-zero leaves its exited job
+    /// registered (gl-1373); the retry replaces it with a fresh start, and
+    /// the breaker counts one failure per start.
+    #[tokio::test]
+    async fn a_segment_retry_after_a_failed_start_restarts_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            exit_code: 1,
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "ts");
+        for attempt in 1..=2 {
+            let err = mgr.dynamic_segment(&req(), 0, false).await.unwrap_err();
+            assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+            assert_eq!(restart_failures(&mgr, tmp.path()), attempt);
+            assert_eq!(mgr.manager.active_job_count(), 1, "the exited job is kept");
+        }
+        assert_eq!(mgr.transcoder.requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -2524,13 +2646,22 @@ mod tests {
 
     /// The same leftover beside a job still encoding towards its first segment
     /// boundary, whose init is empty until then: the request waits for that
-    /// job to fill it rather than killing a healthy job.
+    /// job to fill it rather than killing a healthy job when the job writes the
+    /// start segment soon, within the wait gap of its own start. A leftover
+    /// further on is an earlier job's, not this job's front, until the job has
+    /// finished its start segment (gl-1520), so the job is replaced there.
+    #[rstest::rstest]
+    #[case::within_the_wait_gap_waits(2, 0)]
+    #[case::past_the_wait_gap_restarts(5, 1)]
     #[tokio::test]
-    async fn an_empty_init_beside_a_leftover_start_segment_waits_on_a_live_job() {
+    async fn an_empty_init_beside_a_leftover_start_segment_and_a_live_job(
+        #[case] start: i32,
+        #[case] restarts: usize,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
-        // What a needless restart at the resume segment would write.
+        // What a restart at the resume segment writes.
         let script = FakeScript {
-            segment_files: vec!["out5.mp4".to_owned()],
+            segment_files: vec![format!("out{start}.mp4")],
             extra_files: vec!["out-1.mp4".to_owned(), "out.m3u8".to_owned()],
             exits_immediately: true,
             ..FakeScript::default()
@@ -2543,12 +2674,13 @@ mod tests {
             ..FakeScript::default()
         });
         start_job_at(&mgr, tmp.path(), &running, 0).await;
-        // The client resumes at 30 s, segment 5, which an earlier job left.
-        std::fs::write(tmp.path().join("out5.mp4"), b"leftover").unwrap();
+        // The client resumes at `start` (6 s segments), which an earlier job
+        // left.
+        std::fs::write(tmp.path().join(format!("out{start}.mp4")), b"leftover").unwrap();
         std::fs::write(tmp.path().join("out-1.mp4"), b"").unwrap();
         let resume_req = HlsStreamRequest {
             segment_container: Some("mp4".to_owned()),
-            start_time_ticks: Some(30 * 10_000_000),
+            start_time_ticks: Some(i64::from(start) * 6 * 10_000_000),
             ..req()
         };
 
@@ -2562,10 +2694,7 @@ mod tests {
             std::fs::read(tmp.path().join("out-1.mp4")).unwrap(),
             b"fake\n"
         );
-        assert!(
-            spawns.requests.lock().unwrap().is_empty(),
-            "the live job was replaced"
-        );
+        assert_eq!(spawns.requests.lock().unwrap().len(), restarts);
     }
 
     /// A job whose init is filled is waited on for the start segment alone:
@@ -2581,7 +2710,15 @@ mod tests {
             ..FakeScript::default()
         });
         start_job_at(&mgr, tmp.path(), &running, 0).await;
-        // The job is at segment 4; its segments 0 to 2 were deleted.
+        // The job is at segment 4; it served its segments 0 to 2, and rolling
+        // deletion removed them.
+        let key = tmp.path().join("out.m3u8").to_string_lossy().into_owned();
+        for index in 0..3 {
+            drop(
+                mgr.manager
+                    .segment_progress(&key, (index + 1) * 6 * 10_000_000, index),
+            );
+        }
         for name in ["out3.mp4", "out4.mp4", "out-1.mp4"] {
             std::fs::write(tmp.path().join(name), b"written").unwrap();
         }
@@ -2769,12 +2906,23 @@ mod tests {
         );
     }
 
-    /// A manager running at most one re-encoding job.
-    fn manager_capped_at_one(dir: &Path) -> Mgr {
-        let script = FakeScript {
+    /// What the fake ffmpeg writes for [`manager_capped_at_one`]'s jobs.
+    fn capped_script() -> FakeScript {
+        FakeScript {
             segment_files: vec!["out0.ts".to_owned(), "out-1.ts".to_owned()],
             extra_files: vec!["out.m3u8".to_owned(), "out.ts".to_owned()],
             ..FakeScript::default()
+        }
+    }
+
+    /// A manager running at most one re-encoding job. The jobs it starts
+    /// exit once written, as a short clip does: the placeholder playlist lists
+    /// no segment, so a live-playlist start whose job kept running would wait
+    /// out `MIN_SEGMENT_WAIT_TIMEOUT` for the planner's three.
+    fn manager_capped_at_one(dir: &Path) -> Mgr {
+        let script = FakeScript {
+            exits_immediately: true,
+            ..capped_script()
         };
         let limits = TranscodeLimits {
             server: 1,
@@ -2785,6 +2933,8 @@ mod tests {
     }
 
     /// Starts a job of `user` that takes the only slot, on another playlist.
+    /// It runs through its own fake ffmpeg, not the manager's, which exits:
+    /// this one keeps running, so the job keeps the slot.
     async fn take_the_slot(
         mgr: &Mgr,
         dir: &Path,
@@ -2800,7 +2950,7 @@ mod tests {
         let output_path = dir.join("held").join("out.m3u8");
         mgr.manager
             .start_ffmpeg(
-                &mgr.transcoder,
+                &FakeSegmentTranscoder::new(capped_script()),
                 StartFfMpegRequest {
                     program: "ffmpeg",
                     state: &state,
@@ -2939,9 +3089,15 @@ mod tests {
                 user_id: alice,
                 ..req()
             };
-            start_through(&mgr, path, &as_alice)
-                .await
-                .unwrap_or_else(|error| panic!("{path:?}: {error}"));
+            // Bounded well under `MIN_SEGMENT_WAIT_TIMEOUT`, so a start that
+            // waited out a deadline fails here instead of passing late.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                start_through(&mgr, path, &as_alice),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{path:?}: the admitted start hung"))
+            .unwrap_or_else(|error| panic!("{path:?}: {error}"));
         }
     }
 
@@ -3031,14 +3187,14 @@ mod tests {
     /// `GetDynamicSegment`'s decision (its own wait gap, and `.tmp` segments
     /// count). A seek behind the job's start or past the wait gap restarts, and
     /// a request at or just ahead of the front waits, also when the front is a
-    /// `.tmp` segment still being encoded. Segments an earlier, killed job left
+    /// `.tmp` segment being written out. Segments an earlier, killed job left
     /// on disk are not the running job's front (gl-52).
     #[rstest::rstest]
     #[case::just_ahead_waits(0, &[], 1, false)]
     #[case::at_the_wait_gap_waits(0, &[], SEGMENT_WAIT_GAP, false)]
     #[case::a_seek_past_the_wait_gap_restarts(0, &[], SEGMENT_WAIT_GAP + 1, true)]
     #[case::a_seek_behind_the_jobs_start_restarts(10, &["out11.ts"], 5, true)]
-    #[case::the_segment_being_encoded_is_the_front(
+    #[case::a_segment_being_written_out_is_the_front(
         0,
         &["out1.ts", "out2.ts.tmp"],
         2 + SEGMENT_WAIT_GAP,
@@ -3087,6 +3243,91 @@ mod tests {
             if restarts { 2 } else { 1 },
             "segment {segment} restarted the transcode: {restarts}"
         );
+    }
+
+    /// Until a job's start segment is finished on disk, segments an earlier
+    /// job left at or past it are not the job's run: ffmpeg writes a segment's
+    /// file only once the segment is finished, so the job is still encoding its
+    /// start. A client's retry of that segment, after giving up on the slow
+    /// first encode, waits for it instead of killing the job and encoding it
+    /// again, and a request past the wait gap from the start is a seek
+    /// (gl-1520). This table's job writes nothing, which the table above, whose
+    /// job writes its start, cannot express.
+    #[rstest::rstest]
+    #[case::adjoining_leftovers_do_not_restart_a_retry(&["out6.ts", "out7.ts", "out8.ts"], 5, false)]
+    #[case::leftovers_past_a_gap_do_not_restart_a_retry(&["out15.ts", "out16.ts"], 5, false)]
+    #[case::nor_while_its_start_is_written_out(&["out5.ts.tmp", "out6.ts", "out7.ts"], 5, false)]
+    #[case::within_the_wait_gap_of_its_start_waits(&["out20.ts"], 5 + SEGMENT_WAIT_GAP, false)]
+    #[case::past_the_wait_gap_of_its_start_restarts(&["out6.ts", "out7.ts"], 6 + SEGMENT_WAIT_GAP, true)]
+    #[tokio::test]
+    async fn a_job_whose_start_is_not_finished_is_still_encoding_it(
+        #[case] leftovers: &[&str],
+        #[case] segment: i32,
+        #[case] restarts: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        // The child keeps running and writes nothing, as ffmpeg encoding its
+        // first segment.
+        let script = FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "ts");
+        // The client gives up on the first encode.
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            mgr.dynamic_segment(&req(), 5, false),
+        )
+        .await;
+        assert!(dropped.is_err(), "segment 5 was answered: {dropped:?}");
+        for name in leftovers {
+            std::fs::write(tmp.path().join(name), b"seg").unwrap();
+        }
+
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            mgr.dynamic_segment(&req(), segment, false),
+        )
+        .await;
+        assert!(
+            parked.is_err(),
+            "segment {segment} was answered: {parked:?}"
+        );
+        assert_eq!(
+            spawns.requests.lock().unwrap().len(),
+            if restarts { 2 } else { 1 },
+            "segment {segment} restarted the transcode: {restarts}"
+        );
+    }
+
+    /// Once the job has served its first segments, rolling deletion may have
+    /// removed them: a run that begins past its start is its own, and a
+    /// request for a removed segment is a seek back that restarts it.
+    #[tokio::test]
+    async fn a_seek_back_to_a_segment_rolling_deletion_removed_restarts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "ts");
+        drop(mgr.dynamic_segment(&req(), 0, false).await.unwrap());
+        for n in [1, 2] {
+            std::fs::write(tmp.path().join(format!("out{n}.ts")), b"seg").unwrap();
+            drop(mgr.dynamic_segment(&req(), n, false).await.unwrap());
+        }
+        for n in [0, 1] {
+            std::fs::remove_file(tmp.path().join(format!("out{n}.ts"))).unwrap();
+        }
+
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            mgr.dynamic_segment(&req(), 1, false),
+        )
+        .await;
+        assert!(parked.is_err(), "segment 1 was answered: {parked:?}");
+        assert_eq!(spawns.requests.lock().unwrap().len(), 2, "no restart");
     }
 
     /// A seek restart deletes the segment the killed job's graceful `q` exit
@@ -3143,6 +3384,62 @@ mod tests {
                 "{name} after the restart"
             );
         }
+    }
+
+    /// `DynamicHlsController.DeleteFile`: an `IOException` is retried 100 ms
+    /// later, five attempts in all; a file already gone is no failure.
+    #[rstest::rstest]
+    #[case::deleted_at_once("out1.ts", true, 0)]
+    #[case::already_gone("out2.ts", false, 0)]
+    #[case::retried_until_it_gives_up("not-a-dir/out1.ts", false, 4)]
+    #[tokio::test(start_paused = true)]
+    async fn the_cut_short_segment_delete_retries_as_delete_file_does(
+        #[case] name: &str,
+        #[case] exists: bool,
+        #[case] retries: u32,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        // A path under a regular file fails with ENOTDIR, an IOException.
+        std::fs::write(tmp.path().join("not-a-dir"), b"").unwrap();
+        let path = tmp.path().join(name);
+        if exists {
+            std::fs::write(&path, b"cut short").unwrap();
+        }
+
+        let started = tokio::time::Instant::now();
+        delete_cut_short_segment(&path).await;
+
+        assert_eq!(started.elapsed(), DELETE_FILE_RETRY_DELAY * retries);
+        assert!(!path.exists());
+    }
+
+    /// `StopEncodingProcess` does not await `KillTranscodingJobs`; the stop
+    /// reports do. Both stop the job first; only the awaiting one returns
+    /// once its partial files are gone.
+    #[rstest::rstest]
+    #[case::stop_encoding(false)]
+    #[case::awaiting_deletion(true)]
+    #[tokio::test(start_paused = true)]
+    async fn only_the_awaiting_stop_waits_for_the_partial_files(#[case] awaiting: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "ts");
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        let segment = tmp.path().join("out0.ts");
+        assert!(segment.exists());
+
+        if awaiting {
+            mgr.stop_encoding_awaiting_deletion(&req()).await.unwrap();
+        } else {
+            mgr.stop_encoding(&req()).await.unwrap();
+        }
+
+        assert_eq!(mgr.manager.active_job_count(), 0);
+        assert_eq!(segment.exists(), !awaiting);
     }
 
     #[tokio::test]
@@ -3291,7 +3588,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("abc0.ts"), b"seg").unwrap();
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
-        let served = mgr.resolve_transcode_file("abc0.ts", false).await.unwrap();
+        let served = mgr
+            .resolve_transcode_file("abc0.ts", false, None)
+            .await
+            .unwrap();
         assert!(served.path.ends_with("abc0.ts"));
         assert_eq!(served.content_type, "video/mp2t");
     }
@@ -3322,7 +3622,7 @@ mod tests {
 
             let starved = tokio::time::timeout(
                 std::time::Duration::from_millis(250),
-                mgr.resolve_transcode_file("abc0.ts", false),
+                mgr.resolve_transcode_file("abc0.ts", false, None),
             )
             .await;
             assert!(
@@ -3332,7 +3632,10 @@ mod tests {
 
             release_tx.send(()).unwrap();
             hog.await.unwrap();
-            let served = mgr.resolve_transcode_file("abc0.ts", false).await.unwrap();
+            let served = mgr
+                .resolve_transcode_file("abc0.ts", false, None)
+                .await
+                .unwrap();
             assert!(served.path.ends_with("abc0.ts"));
         });
     }
@@ -3361,7 +3664,7 @@ mod tests {
                 first_rx.recv().ok();
             });
             busy_rx.await.unwrap();
-            let serve = mgr.resolve_transcode_file("abc0.ts", false);
+            let serve = mgr.resolve_transcode_file("abc0.ts", false, None);
             tokio::pin!(serve);
             let queued = tokio::time::timeout(std::time::Duration::from_millis(10), &mut serve);
             assert!(queued.await.is_err(), "served before the directory was prepared");
@@ -3384,6 +3687,131 @@ mod tests {
             second.await.unwrap();
             let served = serve.await.unwrap();
             assert!(served.path.ends_with("abc0.ts"));
+        });
+    }
+
+    /// A runtime with a single blocking thread, for the tests that hold it.
+    fn one_blocking_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+    }
+
+    /// Polls `serve` with the blocking pool's only thread held busy and asserts
+    /// it cannot finish, then frees the thread and returns its output. A check
+    /// made inline on the runtime worker would have let it finish (gl-1378).
+    async fn needs_the_blocking_pool<F: std::future::Future>(serve: F) -> F::Output {
+        let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hog = tokio::task::spawn_blocking(move || {
+            busy_tx.send(()).ok();
+            release_rx.recv().ok();
+        });
+        busy_rx.await.unwrap();
+        tokio::pin!(serve);
+        let starved = tokio::time::timeout(std::time::Duration::from_millis(250), &mut serve).await;
+        assert!(
+            starved.is_err(),
+            "served with the blocking pool starved, so the existence check ran inline"
+        );
+        release_tx.send(()).unwrap();
+        hog.await.unwrap();
+        serve.await
+    }
+
+    /// The segment fast path, every current client's segment request, checks
+    /// the file on the blocking pool (gl-1378).
+    #[test]
+    fn a_segment_on_disk_is_checked_on_the_blocking_pool() {
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("out0.ts"), b"seg").unwrap();
+            let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+            let served = needs_the_blocking_pool(mgr.dynamic_segment(&req(), 0, false))
+                .await
+                .unwrap();
+            assert!(served.path.ends_with("out0.ts"));
+        });
+    }
+
+    /// The fMP4 init's completeness check runs on the blocking pool (gl-1378).
+    #[test]
+    fn a_complete_init_is_checked_on_the_blocking_pool() {
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("out-1.mp4"), b"moov").unwrap();
+            std::fs::write(tmp.path().join("out0.mp4"), b"seg").unwrap();
+            let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "mp4");
+            let served = needs_the_blocking_pool(mgr.dynamic_segment(&req(), -1, false))
+                .await
+                .unwrap();
+            assert!(served.path.ends_with("out-1.mp4"), "{served:?}");
+        });
+    }
+
+    /// A progressive stream whose output exists checks it on the blocking pool
+    /// (gl-1378).
+    #[test]
+    fn a_progressive_output_is_checked_on_the_blocking_pool() {
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("out.ts"), b"seg").unwrap();
+            let (mgr, _, spawns) = manager_full(tmp.path(), FakeScript::default(), "ts");
+            let served = needs_the_blocking_pool(mgr.transcode_stream(&req(), false))
+                .await
+                .unwrap();
+            assert!(served.path.ends_with("out.ts"));
+            assert!(spawns.requests.lock().unwrap().is_empty(), "spawned");
+        });
+    }
+
+    /// A live playlist reload checks the playlist on the blocking pool before
+    /// it reads it there (gl-1378): with the thread taken again once the check
+    /// is through, the reload cannot finish, which an inline check followed by
+    /// the read alone would.
+    #[test]
+    fn a_live_playlist_is_checked_on_the_blocking_pool() {
+        one_blocking_thread().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("out.m3u8"),
+                "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\nout0.ts\n",
+            )
+            .unwrap();
+            let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_first, first_rx) = std::sync::mpsc::channel::<()>();
+            let first = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                first_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+            let request = req();
+            let reload = mgr.live_playlist(&request);
+            tokio::pin!(reload);
+            let queued = tokio::time::timeout(std::time::Duration::from_millis(10), &mut reload);
+            assert!(queued.await.is_err(), "reloaded with the pool held");
+
+            // Queued behind the reload's first hop, so it takes the thread next.
+            let (release_second, second_rx) = std::sync::mpsc::channel::<()>();
+            let second = tokio::task::spawn_blocking(move || {
+                second_rx.recv().ok();
+            });
+            release_first.send(()).unwrap();
+            let starved =
+                tokio::time::timeout(std::time::Duration::from_millis(250), &mut reload).await;
+            assert!(
+                starved.is_err(),
+                "reloaded with the pool taken, so the existence check ran inline"
+            );
+
+            release_second.send(()).unwrap();
+            first.await.unwrap();
+            second.await.unwrap();
+            assert!(reload.await.unwrap().contains("out0.ts"));
         });
     }
 
@@ -3477,7 +3905,16 @@ mod tests {
             .expect("job registered");
         assert!(before >= 50, "idle clock should have advanced: {before}ms");
 
-        mgr.resolve_transcode_file("out7.ts", false).await.unwrap();
+        // The legacy video route names the job's playlist; the response's
+        // observer is the keep-alive.
+        let served = mgr
+            .resolve_transcode_file("out7.ts", false, Some("OUT"))
+            .await
+            .unwrap();
+        assert!(
+            served.progress.is_some(),
+            "the response holds the job active"
+        );
 
         let after = mgr
             .manager
@@ -3487,6 +3924,29 @@ mod tests {
             after < before,
             "legacy serve must restamp the owning job: {before}ms -> {after}ms"
         );
+
+        // Upstream begins the request before PhysicalFile finds the segment
+        // missing, so a client polling for one not written yet still restamps
+        // the job (its end request pings the timer).
+        drop(served);
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let before = mgr
+            .manager
+            .millis_since_activity(&key, TranscodingJobType::Hls)
+            .expect("job registered");
+        let err = mgr
+            .resolve_transcode_file("out99.ts", false, Some("out"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+        let after = mgr
+            .manager
+            .millis_since_activity(&key, TranscodingJobType::Hls)
+            .expect("job still registered");
+        assert!(
+            after < before,
+            "a poll for a missing segment must restamp the job: {before}ms -> {after}ms"
+        );
     }
 
     #[tokio::test]
@@ -3494,7 +3954,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
         let err = mgr
-            .resolve_transcode_file("../etc/passwd", false)
+            .resolve_transcode_file("../etc/passwd", false, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ServiceError::InvalidInput(_)));
@@ -3507,7 +3967,7 @@ mod tests {
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
         // A .ts file fails the m3u8 requirement.
         let err = mgr
-            .resolve_transcode_file("abc.ts", true)
+            .resolve_transcode_file("abc.ts", true, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ServiceError::InvalidInput(_)));
@@ -3518,19 +3978,97 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("pl.m3u8"), b"#EXTM3U").unwrap();
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
-        let served = mgr.resolve_transcode_file("pl.m3u8", true).await.unwrap();
+        let served = mgr
+            .resolve_transcode_file("pl.m3u8", true, None)
+            .await
+            .unwrap();
         assert_eq!(served.content_type, "application/vnd.apple.mpegurl");
     }
 
+    /// A missing file is upstream's `FileNotFoundException`, a 404, not a 400.
     #[tokio::test]
-    async fn missing_transcode_file_is_invalid_input() {
+    async fn missing_transcode_file_is_not_found() {
         let tmp = tempfile::tempdir().unwrap();
         let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+        for require_m3u8 in [false, true] {
+            let name = if require_m3u8 { "nope.m3u8" } else { "nope.ts" };
+            let err = mgr
+                .resolve_transcode_file(name, require_m3u8, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ServiceError::NotFound(_)), "{name}: {err:?}");
+        }
+    }
+
+    /// `GetHlsVideoSegmentLegacy` serves a segment only when the transcode
+    /// folder holds a `.m3u8` or a file of the segment's extension whose path
+    /// contains `{playlistId}` (`OrdinalIgnoreCase`); otherwise it is
+    /// `NotFound("Hls segment not found.")`, before the file itself is looked
+    /// up. The traversal check still comes first.
+    #[tokio::test]
+    async fn legacy_video_segment_needs_a_file_of_its_playlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("pl7.m3u8"), b"#EXTM3U").unwrap();
+        std::fs::write(tmp.path().join("9.ts"), b"seg").unwrap();
+        std::fs::write(tmp.path().join("only3.ts"), b"seg").unwrap();
+        std::fs::write(tmp.path().join("wrongext.mp4"), b"seg").unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+        let not_found = |err: ServiceError| match err {
+            ServiceError::NotFound(message) => message,
+            other => panic!("expected a 404, got {other:?}"),
+        };
+
+        std::fs::write(tmp.path().join("UP8.M3U8"), b"#EXTM3U").unwrap();
+        // The folder's own path is searched too, as upstream searches it.
+        let folder = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        for playlist in ["pl7", "PL7", "only", "pl7.m3", "up8", folder.as_str()] {
+            let served = mgr
+                .resolve_transcode_file("9.ts", false, Some(playlist))
+                .await
+                .unwrap();
+            assert!(served.path.ends_with("9.ts"), "{playlist}");
+        }
+        // The whole path is searched, so the misses name nothing a temporary
+        // directory could hold; `wrongext.mp4` is neither a playlist nor a `.ts`.
+        for playlist in ["absent-playlist", "wrongext"] {
+            let err = mgr
+                .resolve_transcode_file("9.ts", false, Some(playlist))
+                .await
+                .unwrap_err();
+            assert_eq!(not_found(err), "Hls segment not found.", "{playlist}");
+        }
+        // The playlist lookup comes before the file's: a missing segment of a
+        // playlist that exists is the plain 404.
         let err = mgr
-            .resolve_transcode_file("nope.ts", false)
+            .resolve_transcode_file("missing.ts", false, Some("absent-playlist"))
             .await
             .unwrap_err();
-        assert!(matches!(err, ServiceError::InvalidInput(_)));
+        assert_eq!(not_found(err), "Hls segment not found.");
+        let err = mgr
+            .resolve_transcode_file("missing.ts", false, Some("pl7"))
+            .await
+            .unwrap_err();
+        assert_ne!(not_found(err), "Hls segment not found.");
+        // A name that escapes the folder is refused whatever the playlist.
+        let err = mgr
+            .resolve_transcode_file("../etc/passwd", false, Some("pl7"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+
+        // An empty folder holds no playlist.
+        let empty = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(empty.path(), FakeScript::default(), "ts");
+        let err = mgr
+            .resolve_transcode_file("9.ts", false, Some("pl7"))
+            .await
+            .unwrap_err();
+        assert_eq!(not_found(err), "Hls segment not found.");
     }
 
     #[tokio::test]
@@ -3581,15 +4119,15 @@ mod tests {
 
     #[test]
     fn segment_extension_and_mime_mapping() {
-        assert_eq!(segment_extension("ts"), ".ts");
-        assert_eq!(segment_extension("mp4"), ".mp4");
-        assert_eq!(segment_extension(""), ".ts");
-        assert_eq!(segment_extension("MP4"), ".mp4");
+        assert_eq!(segment_file_extension("ts"), ".ts");
+        assert_eq!(segment_file_extension("mp4"), ".mp4");
+        assert_eq!(segment_file_extension(""), ".ts");
+        assert_eq!(segment_file_extension("MP4"), ".mp4");
         assert_eq!(mime_for_extension(".m3u8"), "application/vnd.apple.mpegurl");
         assert_eq!(mime_for_extension("ts"), "video/mp2t");
         assert_eq!(mime_for_extension(".aac"), "audio/aac");
         assert_eq!(mime_for_extension(".mp3"), "audio/mpeg");
-        assert_eq!(mime_for_extension(".xyz"), "application/octet-stream");
+        assert_eq!(mime_for_extension(".zzz"), "application/octet-stream");
     }
 
     #[test]
@@ -3604,31 +4142,49 @@ mod tests {
         let playlist = dir.path().join("abc123.m3u8");
         let write = |name: &str| std::fs::write(dir.path().join(name), b"x").unwrap();
         // Nothing produced yet.
-        assert_eq!(current_transcoding_index(&playlist, ".ts", 0), None);
+        assert_eq!(current_transcoding_index(&playlist, ".ts", 0, false), None);
         // A job from 0 wrote segments 0,1,2 beside its playlist and a foreign file.
         for n in [0, 1, 2] {
             write(&format!("abc123{n}.ts"));
         }
         write("abc123.m3u8");
         write("other9.ts"); // different stem
-        assert_eq!(current_transcoding_index(&playlist, ".ts", 0), Some(2));
-        // An in-progress `temp_file` segment counts as the encoder's front —
-        // during the first-segment encode the job must not read as "no progress".
+        assert_eq!(
+            current_transcoding_index(&playlist, ".ts", 0, false),
+            Some(2)
+        );
+        // A `temp_file` segment being written out counts.
         write("abc1233.ts.tmp");
-        assert_eq!(current_transcoding_index(&playlist, ".ts", 0), Some(3));
+        assert_eq!(
+            current_transcoding_index(&playlist, ".ts", 0, false),
+            Some(3)
+        );
         // A killed job's 20 and 21 lie past a gap: not this job's front (gl-52).
         write("abc12320.ts");
         write("abc12321.ts");
-        assert_eq!(current_transcoding_index(&playlist, ".ts", 0), Some(3));
+        assert_eq!(
+            current_transcoding_index(&playlist, ".ts", 0, false),
+            Some(3)
+        );
         // For the job that started at 20, 0 to 3 are an earlier job's.
-        assert_eq!(current_transcoding_index(&playlist, ".ts", 20), Some(21));
-        // A job started at 19 whose first segment rolling deletion removed.
-        assert_eq!(current_transcoding_index(&playlist, ".ts", 19), Some(21));
+        assert_eq!(
+            current_transcoding_index(&playlist, ".ts", 20, false),
+            Some(21)
+        );
+        // A job started at 19 whose first segment rolling deletion removed:
+        // it has served one.
+        assert_eq!(
+            current_transcoding_index(&playlist, ".ts", 19, true),
+            Some(21)
+        );
+        // Before it has, it is still encoding 19 and 20 and 21 are an earlier
+        // job's (gl-1520).
+        assert_eq!(current_transcoding_index(&playlist, ".ts", 19, false), None);
         // Nothing of a job started at 30 is on disk yet.
-        assert_eq!(current_transcoding_index(&playlist, ".ts", 30), None);
+        assert_eq!(current_transcoding_index(&playlist, ".ts", 30, false), None);
         // The fMP4 init (`{stem}-1.mp4`) is not a segment of any job.
         write("abc123-1.mp4");
-        assert_eq!(current_transcoding_index(&playlist, ".mp4", 0), None);
+        assert_eq!(current_transcoding_index(&playlist, ".mp4", 0, false), None);
     }
 
     #[test]

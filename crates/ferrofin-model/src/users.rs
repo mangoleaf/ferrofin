@@ -5,7 +5,7 @@
 //! defined here (as forward references) because [`UserPolicy`] embeds them in
 //! the wire contract and they have no dedicated port unit.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -336,14 +336,14 @@ pub struct UserPolicy {
     ///
     /// `[Required(AllowEmptyStrings = false)]` upstream: a `null` binds as
     /// `""`, which the policy endpoints refuse as they refuse a missing one.
-    #[serde(deserialize_with = "null_as_empty")]
+    #[serde(deserialize_with = "crate::json::value::null_as_default")]
     pub authentication_provider_id: String,
 
     /// Gets or sets the password reset provider id.
     ///
     /// `[Required(AllowEmptyStrings = false)]` upstream, read as
     /// [`Self::authentication_provider_id`] is.
-    #[serde(deserialize_with = "null_as_empty")]
+    #[serde(deserialize_with = "crate::json::value::null_as_default")]
     pub password_reset_provider_id: String,
 
     /// Gets or sets a value indicating what `SyncPlay` features the user can
@@ -355,7 +355,7 @@ pub struct UserPolicy {
 /// `true`, `LoginAttemptsBeforeLockout = -1` (unlimited) and `SyncPlayAccess =
 /// CreateAndJoinGroups`. The rest are the C# defaults: `false`, `0`, empty
 /// arrays, and `null` provider ids (`""`).
-fn constructor_policy() -> UserPolicy {
+pub(crate) fn constructor_policy() -> UserPolicy {
     UserPolicy {
         is_hidden: true,
         enable_user_preference_access: true,
@@ -378,12 +378,6 @@ fn constructor_policy() -> UserPolicy {
         sync_play_access: SyncPlayUserAccessType::CreateAndJoinGroups,
         ..UserPolicy::default()
     }
-}
-
-/// A C# `string` member under `#nullable disable`: System.Text.Json binds a
-/// `null` to it, so it reads as `""` here rather than failing the body.
-fn null_as_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[cfg(test)]

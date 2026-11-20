@@ -7,22 +7,23 @@
 //! fake matching the C# `Mock<IDirectoryService>` setup.
 
 use std::fs;
+use std::sync::Arc;
 
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::dto::DayOfWeek;
 use ferrofin_model::entities::{ImageType, SeriesStatus, Video3DFormat};
 
+use ferrofin_providers::DirectoryService;
 use ferrofin_providers::container_types::{FileSystemMetadata, MetadataResult};
 use ferrofin_providers::xbmc::base_parser::FetchError;
-use ferrofin_providers::xbmc::base_parser::{DirectoryService, NoDirectoryService};
+use ferrofin_providers::xbmc::base_parser::NoDirectoryService;
 use ferrofin_providers::xbmc::config::NfoConfiguration;
 use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
 use ferrofin_providers::xbmc::{
     StaticExternalIds, fetch_episode, fetch_movie, fetch_music, fetch_season, fetch_series,
     new_result,
 };
-
-const TICKS_PER_SECOND: i64 = 10_000_000;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// Reads a fixture from `tests/data` by its C# `Test Data/<name>` path.
 fn read_fixture(test_data_path: &str) -> String {
@@ -38,6 +39,10 @@ struct FakeDirectoryService {
 }
 
 impl DirectoryService for FakeDirectoryService {
+    fn file_system_entries(&self, _path: &str) -> Arc<[FileSystemMetadata]> {
+        Arc::from([])
+    }
+
     fn get_file(&self, path: &str) -> Option<FileSystemMetadata> {
         if path == self.full_name {
             Some(FileSystemMetadata {
@@ -55,6 +60,16 @@ impl DirectoryService for FakeDirectoryService {
             None
         }
     }
+}
+
+// The service the scan parses NFOs with resolves no path, even an existing
+// file: an NFO's local `<thumb>` must not reach the item until gl-1818 decides
+// which files an NFO may name.
+#[test]
+fn no_directory_service_resolves_no_file() {
+    let existing = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    assert!(std::path::Path::new(existing).is_file());
+    assert_eq!(NoDirectoryService.get_file(existing), None);
 }
 
 fn get_provider_id<'a>(item: &'a NfoBaseItem, provider: &str) -> Option<&'a str> {
@@ -337,6 +352,36 @@ fn movie_parse_escaped_xml_special_characters() {
     );
     assert!(item.overview.as_deref().unwrap().starts_with(">>"));
     assert!(item.overview.as_deref().unwrap().ends_with("<<"));
+}
+
+/// A trailer with a multi-byte character across the YouTube plugin prefix's
+/// length (45 bytes; `é` spans bytes 44-45 here) is no plugin link: it is
+/// skipped, not sliced inside the character, and the next trailer is read.
+#[test]
+fn movie_parse_non_ascii_trailer_across_the_plugin_prefix_length() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Movie);
+    let not_a_plugin_link = format!("https://example.org/{}é", "x".repeat(24));
+    let nfo = format!(
+        "<movie><title>Trailers</title>\
+         <trailer>{not_a_plugin_link}</trailer>\
+         <trailer>plugin://plugin.video.youtube/play/?video_id=dQw4w9WgXcQ</trailer>\
+         </movie>"
+    );
+    fetch_movie(
+        &mut result,
+        "/media/Trailers.nfo",
+        &nfo,
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+
+    assert_eq!(
+        result.item.remote_trailers,
+        ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]
+    );
 }
 
 #[test]

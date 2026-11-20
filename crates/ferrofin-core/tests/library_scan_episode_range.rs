@@ -45,6 +45,8 @@ async fn episode_library(root: &Path, file: &str, nfo: Option<&str>) -> (Library
             path_infos: vec![MediaPathInfo {
                 path: media.to_string_lossy().into_owned(),
             }],
+            // The Nfo saver is on, which only "Replace all metadata" asks.
+            metadata_savers: Some(vec!["Nfo".into()]),
             ..LibraryOptions::default()
         },
     )
@@ -179,7 +181,7 @@ async fn an_inverted_file_name_range_is_no_range() {
 /// "Replace all metadata" on a stored episode whose NFO exists: the path
 /// re-sets the range (here to nothing, the name has none) before the
 /// providers run, the stored range goes with it, and the NFO is not read,
-/// because a metadata saver will rewrite it. Upstream
+/// because a metadata saver (the library names Nfo) will rewrite it. Upstream
 /// `MetadataService.RefreshWithProviders`: "Do not execute local providers
 /// if we are identifying or replacing with local metadata saving enabled".
 #[tokio::test]

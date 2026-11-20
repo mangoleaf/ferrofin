@@ -4,13 +4,73 @@
 //! Jellyfin's `/health` outside the mount redirects into it. Ferrofin's own
 //! probe endpoints (`/health/live`, `/health/ready`) also remain available at
 //! the root so deployments can keep probing while the base URL changes.
+//!
+//! The mount matches the decoded path with the decoded base, so a base saved
+//! as `/my jellyfin` or `/my%20jellyfin` mounts `/my%20jellyfin/…`. Jellyfin
+//! 12.4 (probed live) mounts only the escaped spelling: its redirect middleware
+//! compares the re-escaped path with the base as saved, so the other loops. A
+//! Jellyfin bug not ported (gl-1685).
+//!
+//! [`resolve`] picks the base URL a server lifetime serves under, and
+//! [`restart_listener`] marks a restart pending when a Networking page save
+//! changes it.
+
+use std::sync::Arc;
 
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use ferrofin_core::system_manager::LifecycleController;
+use ferrofin_networking::NetworkConfiguration;
+use ferrofin_traits::configuration::ConfigurationListener;
 
+// A Location carries the base escaped, so `/my jellyfin` makes a valid header.
+use ferrofin_networking::escape_base_url as escape;
 pub(crate) use ferrofin_networking::normalize_base_url as normalize;
+
+/// The base URL a server lifetime mounts, redirects to and advertises: the
+/// `FERROFIN_BASE_URL` variable when `variable_set`, else the Networking
+/// page's `BaseUrl` saved in `network` when it is not empty, else
+/// `config.toml`'s `base_url`, else none (owner decision on gl-555).
+/// `bootstrap` is the loader's pick of the variable and the file.
+///
+/// Upstream mounts `BaseUrl` once per host (`Startup.Configure`'s `app.Map`),
+/// while its redirect middleware and `GetLocalApiUrl` read the saved value
+/// live. Here the one value serves the whole lifetime, so a request never
+/// meets two prefixes; a changed one waits for the restart.
+pub(crate) fn resolve(
+    bootstrap: &str,
+    variable_set: bool,
+    network: &NetworkConfiguration,
+) -> String {
+    let saved = normalize(&network.base_url);
+    if variable_set || saved.is_empty() {
+        normalize(bootstrap)
+    } else {
+        saved
+    }
+}
+
+/// Marks a restart pending in `lifecycle` when a saved network configuration
+/// resolves ([`resolve`]) to another base URL than `running`, the one this
+/// lifetime serves under. Upstream's `OnConfigurationUpdated` flags no restart
+/// for `BaseUrl`, though its mount keeps the old value until one; the owner's
+/// decision on gl-555 is that the dashboard says so.
+pub(crate) fn restart_listener(
+    running: String,
+    bootstrap: String,
+    variable_set: bool,
+    lifecycle: Arc<dyn LifecycleController>,
+) -> Arc<ConfigurationListener> {
+    crate::state::network_restart_listener(
+        running,
+        move |saved| resolve(&bootstrap, variable_set, saved),
+        "serve under the new base URL",
+        lifecycle,
+        |_| {},
+    )
+}
 
 /// Strip the mount before case canonicalization/routing, and retain it in redirects.
 pub(crate) async fn rewrite(
@@ -26,16 +86,15 @@ pub(crate) async fn rewrite(
         return next.run(request).await;
     }
 
-    let has_prefix = path
-        .get(..base.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&base));
-    let suffix = path.get(base.len()..).unwrap_or_default();
-    if !has_prefix || suffix.is_empty() || suffix == "/" {
+    let suffix = ferrofin_networking::base_url_prefix_len(path, &base)
+        .and_then(|at| path.get(at..))
+        .unwrap_or_default();
+    if suffix.is_empty() || suffix == "/" {
         // Upstream sends a health check outside the mount into it.
         if path.eq_ignore_ascii_case("/health") || path.eq_ignore_ascii_case("/health/") {
             return (
                 StatusCode::FOUND,
-                [(header::LOCATION, format!("{base}/health"))],
+                [(header::LOCATION, format!("{}/health", escape(&base)))],
             )
                 .into_response();
         }
@@ -43,7 +102,7 @@ pub(crate) async fn rewrite(
         // web path. Use 302 (not Axum Redirect's 303/307/308).
         return (
             StatusCode::FOUND,
-            [(header::LOCATION, format!("{base}/web/"))],
+            [(header::LOCATION, format!("{}/web/", escape(&base)))],
         )
             .into_response();
     }
@@ -74,7 +133,7 @@ pub(crate) async fn rewrite(
         && let Ok(location) = location.to_str()
         && location.starts_with('/')
         && !location.starts_with("//")
-        && let Ok(location) = HeaderValue::from_str(&format!("{base}{location}"))
+        && let Ok(location) = HeaderValue::from_str(&format!("{}{location}", escape(&base)))
     {
         response.headers_mut().insert(header::LOCATION, location);
     }
@@ -86,6 +145,7 @@ mod tests {
     use axum::Router;
     use axum::body::{Body, to_bytes};
     use axum::routing::get;
+    use ferrofin_traits::configuration::ConfigurationUpdate;
     use tower::{Layer as _, ServiceExt as _};
 
     use super::*;
@@ -215,6 +275,55 @@ mod tests {
         }
     }
 
+    /// gl-1685: a base holding a character clients escape mounts the path
+    /// they send, saved escaped or not, and the redirects carry it escaped.
+    #[rstest::rstest]
+    #[case::space("/my jellyfin", "/MY%20Jellyfin", "/my%20jellyfin")]
+    #[case::space_saved_escaped("/my%20jellyfin", "/my%20jellyfin", "/my%20jellyfin")]
+    #[case::non_ascii("/m\u{e9}dias", "/m%c3%a9dias", "/m%C3%A9dias")]
+    #[case::non_ascii_saved_escaped("/m%C3%A9dias", "/M%C3%A9DIAS", "/m%C3%A9dias")]
+    #[tokio::test]
+    async fn a_base_clients_escape_mounts_decoded(
+        #[case] base: &str,
+        #[case] mount: &str,
+        #[case] location: &str,
+    ) {
+        let response = send(base, &format!("{mount}/system/info/public?key=a%2Fb")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, "/System/Info/Public?key=a%2Fb");
+        for (path, target) in [
+            ("/System/Info/Public".to_owned(), "web/"),
+            (mount.to_owned(), "web/"),
+            (format!("{mount}/"), "web/"),
+            ("/health".to_owned(), "health"),
+        ] {
+            let response = send(base, &path).await;
+            assert_eq!(response.status(), StatusCode::FOUND, "{path}");
+            assert_eq!(
+                response.headers()[header::LOCATION],
+                format!("{location}/{target}")
+            );
+        }
+        let response = send(base, &format!("{mount}/web")).await;
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            format!("{location}/web/")
+        );
+        let other = format!("{mount}-other/web");
+        assert_eq!(send(base, &other).await.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `%2F` is not a `/`, as Kestrel leaves it escaped in the path.
+    #[tokio::test]
+    async fn an_escaped_slash_is_not_a_separator() {
+        let path = "/a%2fb/System/Info/Public";
+        assert_eq!(send("/a/b", path).await.status(), StatusCode::FOUND);
+        assert_eq!(send("/a%2Fb", path).await.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn empty_base_preserves_root_routes() {
         assert_eq!(
@@ -223,5 +332,70 @@ mod tests {
         );
         assert_eq!(send("/", "/web").await.headers()[header::LOCATION], "/web/");
         assert_eq!(send("", "/HEALTH").await.status(), StatusCode::OK);
+    }
+
+    fn saved(base_url: &str) -> NetworkConfiguration {
+        NetworkConfiguration {
+            base_url: base_url.to_owned(),
+            ..NetworkConfiguration::default()
+        }
+    }
+
+    /// gl-555: the variable, else the Networking page, else `config.toml`,
+    /// else none. A blank variable is set (to the root), as the loader reads it.
+    #[rstest::rstest]
+    #[case::variable_outranks_the_page("/env", true, "/page", "/env")]
+    #[case::blank_variable_outranks_the_page("", true, "/page", "")]
+    #[case::page_outranks_the_file("/file", false, "page/", "/page")]
+    #[case::page_alone("", false, "/page", "/page")]
+    #[case::empty_page_leaves_the_file("/file", false, "", "/file")]
+    #[case::slash_page_leaves_the_file("/file/", false, "/", "/file")]
+    #[case::none("", false, "", "")]
+    fn resolve_follows_the_owners_precedence(
+        #[case] bootstrap: &str,
+        #[case] variable_set: bool,
+        #[case] page: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(resolve(bootstrap, variable_set, &saved(page)), expected);
+    }
+
+    /// A Networking save marks a restart only when it changes the base URL
+    /// served, and the variable keeps it from changing.
+    #[test]
+    fn a_saved_base_url_change_marks_a_restart() {
+        let save = |running: &str, variable_set: bool, json: &str| {
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            let lifecycle = Arc::new(crate::state::FerrofinLifecycleController::new(tx));
+            let listener = restart_listener(
+                running.to_owned(),
+                "/file".to_owned(),
+                variable_set,
+                lifecycle.clone(),
+            );
+            listener(&ConfigurationUpdate::Named {
+                key: "network".to_owned(),
+                json: json.into(),
+            });
+            lifecycle.has_pending_restart()
+        };
+        assert!(save("/file", false, r#"{"BaseUrl":"/jellyfin"}"#));
+        assert!(save("/jellyfin", false, r#"{"BaseUrl":""}"#));
+        assert!(
+            save("/jellyfin", false, "not json"),
+            "boots as the defaults"
+        );
+        assert!(!save("/jellyfin", false, r#"{"BaseUrl":"jellyfin/"}"#));
+        assert!(!save("/file", false, r#"{"BaseUrl":""}"#));
+        assert!(!save("/file", true, r#"{"BaseUrl":"/jellyfin"}"#));
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let lifecycle = Arc::new(crate::state::FerrofinLifecycleController::new(tx));
+        let listener = restart_listener(String::new(), String::new(), false, lifecycle.clone());
+        listener(&ConfigurationUpdate::Named {
+            key: "encoding".to_owned(),
+            json: r#"{"BaseUrl":"/jellyfin"}"#.into(),
+        });
+        assert!(!lifecycle.has_pending_restart(), "another document");
     }
 }

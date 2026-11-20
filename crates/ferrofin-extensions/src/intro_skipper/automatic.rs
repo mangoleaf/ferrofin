@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ferrofin_core::TaskProgress;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::tasks::TaskProgress;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -86,6 +86,9 @@ pub struct Runtime {
     /// after each save. A tokio lock held across the read, so a save landing
     /// mid-read still ends with the cache empty, never stale.
     pub(super) config: tokio::sync::Mutex<Option<Arc<super::IntroSkipperConfig>>>,
+    /// The episodes a season's analysis is working on, so a changed file's
+    /// prune meanwhile is applied again once it has stored its results.
+    pub(super) analyses: ferrofin_util::change_watch::ChangeWatch<Uuid>,
 }
 
 /// `PluginWarning.InvalidChromaprintFingerprint`: a fingerprint failed.
@@ -314,7 +317,7 @@ impl DetectSegmentsTask {
             let config = self.load_config().await;
             match self.queue(&config, Some(&seasons)).await {
                 Ok(queue) => {
-                    self.analyze_queue(&queue, &config, &TaskProgress::default())
+                    self.analyze_queue(queue, &config, &TaskProgress::default())
                         .await;
                 }
                 Err(err) => {

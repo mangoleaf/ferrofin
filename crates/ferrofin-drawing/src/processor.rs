@@ -43,7 +43,10 @@ use ferrofin_traits::drawing::{
     ImageEncoder, ImageProcessor as ImageProcessorTrait, ProcessedImage,
 };
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::options::{ImageCollageOptions, ImageProcessingOptions, ItemImageInfo};
+use ferrofin_traits::options::{
+    ImageCollageOptions, ImageProcessingOptions, ItemImageInfo, file_date_modified,
+};
+use ferrofin_util::ticks::{TICKS_PER_SECOND, UNIX_EPOCH_TICKS};
 use uuid::Uuid;
 
 /// The cache-invalidation version stamped into every resized-image cache key.
@@ -69,13 +72,9 @@ const TRANSPARENT_IMAGE_TYPES: [&str; 4] = [".png", ".webp", ".gif", ".svg"];
 /// passes through untouched. Port of the C# `MediaTypeNames.Image.Gif` check.
 const GIF_MIME_TYPE: &str = "image/gif";
 
-/// The number of `.NET` ticks (100-nanosecond intervals) in one second.
-const TICKS_PER_SECOND: i64 = 10_000_000;
-
 /// The offset, in seconds, from the `.NET` `DateTime` epoch (`0001-01-01`) to
-/// the Unix epoch (`1970-01-01`). `62_135_596_800 * TICKS_PER_SECOND` is the
-/// well-known `621_355_968_000_000_000` Unix-epoch tick constant.
-const DOTNET_EPOCH_UNIX_OFFSET_SECS: i64 = 62_135_596_800;
+/// the Unix epoch (`1970-01-01`): 62 135 596 800.
+const DOTNET_EPOCH_UNIX_OFFSET_SECS: i64 = UNIX_EPOCH_TICKS / TICKS_PER_SECOND;
 
 /// Read-only filesystem metadata the [`process_image`](ImageProcessor::process_image)
 /// pipeline needs, behind a seam so tests can fake it.
@@ -108,15 +107,12 @@ impl FileMeta for StdFileMeta {
         Path::new(path).exists()
     }
 
-    /// Port of `IFileSystem.GetLastWriteTimeUtc`. Falls back to [`Utc::now`] when
-    /// the file cannot be stat'd (mirroring the C# fallback to `DateTime.MinValue`
-    /// only loosely — the value is used solely as the returned
-    /// [`ProcessedImage::date_modified`], never re-hashed).
+    /// Port of `IFileSystem.GetLastWriteTimeUtc`: [`file_date_modified`], which
+    /// falls back to [`Utc::now`] when the file cannot be stat'd (mirroring the
+    /// C# fallback to `DateTime.MinValue` only loosely — the value is used solely
+    /// as the returned [`ProcessedImage::date_modified`], never re-hashed).
     fn last_write_time_utc(&self, path: &str) -> DateTime<Utc> {
-        match std::fs::metadata(path).and_then(|m| m.modified()) {
-            Ok(modified) => DateTime::<Utc>::from(modified),
-            Err(_) => Utc::now(),
-        }
+        file_date_modified(Path::new(path))
     }
 }
 
@@ -411,10 +407,11 @@ impl<F: FileMeta> ImageProcessor<F> {
 }
 
 /// The 25 container/extension formats the processor advertises as readable
-/// input. Port of the C# `SupportedInputFormats` set (order preserved; the
-/// lookup itself is case-insensitive in C#, but the set is only ever surfaced,
-/// not matched against, in this unit).
-const SUPPORTED_INPUT_FORMATS: [&str; 25] = [
+/// input, without the dot. Port of `ImageProcessor.SupportedInputFormats`
+/// (order preserved), which `PhotoResolver.IsImageFile` tests a file's
+/// extension against, case-insensitively, to decide it is a photo. Not the
+/// encoder's list, which is `image_encoder`'s own.
+pub const SUPPORTED_INPUT_FORMATS: [&str; 25] = [
     "tiff", "tif", "jpeg", "jpg", "png", "cr2", "crw", "nef", "orf", "pef", "arw", "webp", "gif",
     "bmp", "erf", "raf", "rw2", "nrw", "dng", "ico", "astc", "ktx", "pkm", "wbmp", "avif",
 ];
@@ -832,8 +829,8 @@ impl<F: FileMeta + 'static> ImageProcessor<F> {
 mod tests {
     //! Round-trip cases transliterated from `ImageProcessor.cs`: the cache tag is
     //! a stable 32-char hex sensitive to path and ticks; the cache key changes per
-    //! option and carries `v=3`; default options pass the original through; a
-    //! resize produces then hits the cache.
+    //! option and carries `v=` and [`DEFAULT_CACHE_VERSION`]; default options pass
+    //! the original through; a resize produces then hits the cache.
     use super::*;
     use crate::error::DrawingError;
     use crate::image_encoder::ImageCrateEncoder;

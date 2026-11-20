@@ -69,6 +69,43 @@ crate::json::enums::wire_enum! {
     }
 }
 
+/// `MediaSourceManager.GetPathProtocol`: the protocol a path or URL is read
+/// over. An empty path is a file; then the first of `rtsp`, `rtmp`, `http`,
+/// `rtp`, `ftp` and `udp` the path starts with, in any case; then a path that
+/// `IFileSystem.IsPathFile` says is no file (it contains `://` anywhere and
+/// does not start with `file://`) is HTTP.
+#[must_use]
+pub fn path_protocol(path: &str) -> MediaProtocol {
+    const PREFIXES: [(&str, MediaProtocol); 6] = [
+        ("rtsp", MediaProtocol::Rtsp),
+        ("rtmp", MediaProtocol::Rtmp),
+        ("http", MediaProtocol::Http),
+        ("rtp", MediaProtocol::Rtp),
+        ("ftp", MediaProtocol::Ftp),
+        ("udp", MediaProtocol::Udp),
+    ];
+    let starts_with = |prefix: &str| {
+        path.as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+    };
+    if let Some((_, protocol)) = PREFIXES.iter().find(|(prefix, _)| starts_with(prefix)) {
+        *protocol
+    } else if !path.contains("://") || starts_with("file://") {
+        MediaProtocol::File
+    } else {
+        MediaProtocol::Http
+    }
+}
+
+/// Whether [`path_protocol`] reads `path` as a local file (the
+/// `GetPathProtocol(path) == MediaProtocol.File` behind
+/// `BaseItem.IsFileProtocol`).
+#[must_use]
+pub fn is_file_protocol(path: &str) -> bool {
+    path_protocol(path) == MediaProtocol::File
+}
+
 /// The type of timestamps used in a transport stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -83,6 +120,47 @@ pub enum TransportStreamTimestamp {
     /// An unnamed C# enum value, retained on read and written as a number.
     #[serde(untagged)]
     Unrecognized(i32),
+}
+
+impl TransportStreamTimestamp {
+    /// How many bytes [`from_mpeg_header`](Self::from_mpeg_header) reads:
+    /// `GetMpegTimestamp`'s buffer, through offset 196, the sync byte of the
+    /// second 192-byte M2TS packet (a 4-byte timecode and a 188-byte TS packet).
+    pub const MPEG_HEADER_LEN: usize = 197;
+
+    /// `ProbeResultNormalizer.GetMpegTimestamp` over a file's first
+    /// [`MPEG_HEADER_LEN`](Self::MPEG_HEADER_LEN) bytes: plain TS (a sync
+    /// byte first) and anything without M2TS-aligned sync bytes is `None`; an
+    /// M2TS whose first timecode is zero is `Zero`; any other M2TS is `Valid`.
+    #[must_use]
+    pub fn from_mpeg_header(packet: &[u8; Self::MPEG_HEADER_LEN]) -> Self {
+        const SYNC: u8 = 0x47;
+        if packet[0] == SYNC || packet[4] != SYNC || packet[196] != SYNC {
+            Self::None
+        } else if packet[..4] == [0; 4] {
+            Self::Zero
+        } else {
+            Self::Valid
+        }
+    }
+
+    /// `ProbeResultNormalizer.ExtractTimestamp`'s guards: only a local
+    /// (`MediaProtocol.File`, jellyfin/jellyfin#16290) `VideoFile` in an
+    /// `mpeg2ts`, `m2ts` or `ts` container is read.
+    #[must_use]
+    pub fn applies_to(
+        video_type: Option<crate::entities::VideoType>,
+        protocol: MediaProtocol,
+        container: Option<&str>,
+    ) -> bool {
+        video_type == Some(crate::entities::VideoType::VideoFile)
+            && protocol == MediaProtocol::File
+            && container.is_some_and(|c| {
+                ["mpeg2ts", "m2ts", "ts"]
+                    .iter()
+                    .any(|ts| c.eq_ignore_ascii_case(ts))
+            })
+    }
 }
 
 crate::json::enums::wire_enum! {
@@ -407,6 +485,38 @@ pub struct MediaInfo {
 mod tests {
     use super::*;
 
+    /// v12.4 `MediaSourceManager.GetPathProtocol` (:240-278) over
+    /// `ManagedFileSystem.IsPathFile` (:533-542): a prefix match, not a scheme
+    /// match, so `httpfoo` is HTTP and `ftps://` FTP, and any other path
+    /// containing `://` (not after a leading `file`) is HTTP.
+    #[rstest::rstest]
+    #[case("", MediaProtocol::File)]
+    #[case("/media/a.mkv", MediaProtocol::File)]
+    #[case("C:\\media\\a.mkv", MediaProtocol::File)]
+    #[case("file:///media/a.mkv", MediaProtocol::File)]
+    #[case("FILE:///media/a.mkv", MediaProtocol::File)]
+    #[case("http://h/a", MediaProtocol::Http)]
+    #[case("HTTPS://h/a", MediaProtocol::Http)]
+    #[case("httpfoo", MediaProtocol::Http)]
+    #[case("rtsp://h/a", MediaProtocol::Rtsp)]
+    #[case("rtspu://h/a", MediaProtocol::Rtsp)]
+    #[case("rtmp://h/a", MediaProtocol::Rtmp)]
+    #[case("RTMPS://h/a", MediaProtocol::Rtmp)]
+    #[case("rtp://h/a", MediaProtocol::Rtp)]
+    #[case("ftp://h/a", MediaProtocol::Ftp)]
+    #[case("ftps://h/a", MediaProtocol::Ftp)]
+    #[case("udp://239.0.0.1:1234", MediaProtocol::Udp)]
+    #[case("smb://nas/share/a.mkv", MediaProtocol::Http)]
+    #[case("mms://h/a", MediaProtocol::Http)]
+    #[case(" http://h/a", MediaProtocol::Http)]
+    #[case("é://h/a", MediaProtocol::Http)]
+    #[case("/media/a://b.mkv", MediaProtocol::Http)]
+    #[case("r", MediaProtocol::File)]
+    fn the_protocol_follows_the_path_prefix(#[case] path: &str, #[case] expected: MediaProtocol) {
+        assert_eq!(path_protocol(path), expected);
+        assert_eq!(is_file_protocol(path), expected == MediaProtocol::File);
+    }
+
     #[test]
     fn stream_identifiers_preserve_native_boundary_and_reject_path_separators() {
         for value in ["", "..", "-._,|", "hevc,h264", &"x".repeat(40)] {
@@ -443,6 +553,97 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&MediaProtocol::Http).unwrap(),
             "\"Http\""
+        );
+    }
+
+    /// `ProbeResultNormalizer.GetMpegTimestamp` and `ExtractTimestamp`'s guards.
+    #[rstest::rstest]
+    #[case::plain_ts(0x47, 0x47, 0x47, TransportStreamTimestamp::None)]
+    #[case::first_packet_unaligned(1, 0, 0x47, TransportStreamTimestamp::None)]
+    #[case::second_packet_unaligned(1, 0x47, 0, TransportStreamTimestamp::None)]
+    #[case::zero_timecode(0, 0x47, 0x47, TransportStreamTimestamp::Zero)]
+    #[case::valid_timecode(1, 0x47, 0x47, TransportStreamTimestamp::Valid)]
+    fn mpeg_header_classifies_like_get_mpeg_timestamp(
+        #[case] first: u8,
+        #[case] fifth: u8,
+        #[case] last: u8,
+        #[case] expected: TransportStreamTimestamp,
+    ) {
+        let mut packet = [0u8; TransportStreamTimestamp::MPEG_HEADER_LEN];
+        packet[0] = first;
+        packet[4] = fifth;
+        packet[196] = last;
+        assert_eq!(
+            TransportStreamTimestamp::from_mpeg_header(&packet),
+            expected
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::File,
+        Some("mpeg2ts"),
+        true
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::File,
+        Some("M2TS"),
+        true
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::File,
+        Some("ts"),
+        true
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::File,
+        Some("mkv"),
+        false
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::File,
+        None,
+        false
+    )]
+    #[case(
+        Some(crate::entities::VideoType::BluRay),
+        MediaProtocol::File,
+        Some("ts"),
+        false
+    )]
+    #[case(None, MediaProtocol::File, Some("ts"), false)]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::Http,
+        Some("ts"),
+        false
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::Rtsp,
+        Some("ts"),
+        false
+    )]
+    #[case(
+        Some(crate::entities::VideoType::VideoFile),
+        MediaProtocol::Udp,
+        Some("ts"),
+        false
+    )]
+    fn the_timestamp_is_read_only_for_a_local_ts_video_file(
+        #[case] video_type: Option<crate::entities::VideoType>,
+        #[case] protocol: MediaProtocol,
+        #[case] container: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            TransportStreamTimestamp::applies_to(video_type, protocol, container),
+            expected
         );
     }
 

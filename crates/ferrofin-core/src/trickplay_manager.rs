@@ -57,6 +57,7 @@ use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::{LibraryOptions, TrickplayOptions};
 use ferrofin_model::entities::{MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
+use ferrofin_util::change_watch::{ChangeWatch, Watch};
 use ferrofin_util::keyed_locks::KeyedLocks;
 use uuid::Uuid;
 
@@ -71,14 +72,11 @@ use ferrofin_traits::options::ImageCollageOptions;
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::system::{MediaLocation, PathManager};
 use ferrofin_traits::trickplay::{TrickplayCheck, TrickplayManager};
+use ferrofin_util::ticks::TICKS_PER_MS;
 
 use crate::db_error::db_err;
 use crate::library_scan::off_runtime;
 use crate::media_source_manager::stream_to_dto;
-
-/// The number of 100-nanosecond ticks per millisecond
-/// (`TimeSpan.TicksPerMillisecond`).
-const TICKS_PER_MS: i64 = 10_000;
 
 /// The minimum valid trickplay interval, in milliseconds — smaller configured
 /// values are reset to this, mirroring the C# guard in
@@ -149,6 +147,8 @@ pub struct FerrofinTrickplayManager {
     image_encoder: Arc<dyn ImageEncoder>,
     live_tv: Option<std::sync::Weak<dyn ferrofin_traits::stubs::LiveTvManager>>,
     virtual_folders: Arc<std::sync::OnceLock<Arc<dyn VirtualFolderManager>>>,
+    /// What generation made since its last summary line.
+    generation_tally: Arc<std::sync::Mutex<GenerationTally>>,
     /// Bounds how many items extract and tile at once, across scans and the
     /// scheduled task. An item holds one slot across the run that extracts
     /// all of its widths that generate and their tiling, so its sets are made
@@ -162,6 +162,9 @@ pub struct FerrofinTrickplayManager {
     /// then finds the first one's tiles and row and skips them, and one
     /// refresh's prune never removes a folder the other has just moved in.
     item_locks: Arc<KeyedLocks>,
+    /// The items a refresh or move is running for, so one a changed file's
+    /// prune lands in removes what it saved once done (gl-1694).
+    prunes: Arc<ChangeWatch<Uuid>>,
     /// One read-and-write of the recorded pass settings at a time, so a set
     /// recorded as made while a pass begins or finishes is not lost.
     pass_settings: Arc<tokio::sync::Mutex<()>>,
@@ -185,6 +188,123 @@ impl Drop for TemporaryTrickplayDirectory {
         {
             tracing::warn!(directory = %self.0.display(), %error, "cannot remove trickplay temporary directory");
         }
+    }
+}
+
+/// How long trickplay generation stays idle before the videos it made since
+/// the last summary are logged in one info line, so a scan's or a task's run
+/// gives one line rather than one per video (LOGGING.md rule 1).
+const GENERATION_SUMMARY_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The generations under way and what they made since the last summary.
+#[derive(Debug, Default)]
+struct GenerationTally {
+    /// Generations under way, those waiting for a slot included.
+    running: usize,
+    /// Videos that got at least one set.
+    videos: usize,
+    /// Sets made.
+    sets: usize,
+    /// When the first generation began.
+    started: Option<tokio::time::Instant>,
+    /// When the last one ended.
+    ended: Option<tokio::time::Instant>,
+    /// Whether a summary task is waiting for the window to pass.
+    pending: bool,
+}
+
+/// One video's generation in the [`GenerationTally`]: running while it
+/// lives, its `sets` added when it drops, also when the generation's future is
+/// dropped. The last one under way to end starts the summary's wait, unless
+/// one is waiting already.
+struct GenerationRun {
+    tally: Arc<std::sync::Mutex<GenerationTally>>,
+    sets: usize,
+}
+
+impl GenerationRun {
+    fn start(tally: &Arc<std::sync::Mutex<GenerationTally>>) -> Self {
+        let mut counts = tally
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        counts.running += 1;
+        counts.started.get_or_insert_with(tokio::time::Instant::now);
+        Self {
+            tally: Arc::clone(tally),
+            sets: 0,
+        }
+    }
+}
+
+impl Drop for GenerationRun {
+    fn drop(&mut self) {
+        let runtime = {
+            let mut counts = self
+                .tally
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            counts.running = counts.running.saturating_sub(1);
+            if self.sets > 0 {
+                counts.videos += 1;
+                counts.sets += self.sets;
+            }
+            counts.ended = Some(tokio::time::Instant::now());
+            // shortcut: a batch still waiting for its window when the process
+            // exits never gets its line; its videos were each logged at debug.
+            // `pending` only with a runtime to spawn on: it means a task waits.
+            let Some(runtime) = tokio::runtime::Handle::try_current()
+                .ok()
+                .filter(|_| counts.running == 0 && !counts.pending)
+            else {
+                return;
+            };
+            counts.pending = true;
+            runtime
+        };
+        let tally = Arc::clone(&self.tally);
+        let summary = async move {
+            let finished = loop {
+                let wake = {
+                    let mut counts = tally
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if counts.running > 0 {
+                        // The last of those to end waits again.
+                        counts.pending = false;
+                        return;
+                    }
+                    let wake = counts
+                        .ended
+                        .map_or_else(tokio::time::Instant::now, |ended| {
+                            ended + GENERATION_SUMMARY_QUIET
+                        });
+                    if wake <= tokio::time::Instant::now() {
+                        break std::mem::take(&mut *counts);
+                    }
+                    wake
+                };
+                tokio::time::sleep_until(wake).await;
+            };
+            if finished.videos > 0 {
+                let elapsed = finished
+                    .started
+                    .zip(finished.ended)
+                    .map(|(started, ended)| ended.saturating_duration_since(started))
+                    .unwrap_or_default();
+                tracing::info!(
+                    videos = finished.videos,
+                    sets = finished.sets,
+                    elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    "created trickplay files"
+                );
+            }
+        };
+        // Its own root, one per batch: the batch spans scans, tasks and
+        // refreshes alike.
+        runtime.spawn(tracing::Instrument::instrument(
+            summary,
+            tracing::info_span!(parent: None, "trickplay_summary"),
+        ));
     }
 }
 
@@ -256,11 +376,9 @@ impl FerrofinTrickplayManager {
         let Some(live_tv) = self.live_tv.as_ref().and_then(std::sync::Weak::upgrade) else {
             return Ok(false);
         };
-        Ok(live_tv
-            .active_recording_paths()
-            .await?
-            .iter()
-            .any(|path| entity.path.as_ref() == Some(path)))
+        live_tv
+            .is_active_recording(entity.path.as_deref().unwrap_or_default())
+            .await
     }
 
     /// Creates a trickplay manager over the given database, path manager,
@@ -286,11 +404,13 @@ impl FerrofinTrickplayManager {
             frame_extractor,
             image_encoder,
             live_tv: None,
+            generation_tally: Arc::default(),
             virtual_folders: Arc::new(std::sync::OnceLock::new()),
             generation_slots: Arc::new(tokio::sync::Semaphore::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),
             item_locks: Arc::new(KeyedLocks::new()),
+            prunes: Arc::default(),
             pass_settings: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -535,6 +655,7 @@ impl FerrofinTrickplayManager {
         if sets.is_empty() {
             return Vec::new();
         }
+        let mut run = GenerationRun::start(&self.generation_tally);
         let _slot = match Arc::clone(&self.generation_slots).acquire_owned().await {
             Ok(slot) => slot,
             Err(e) => {
@@ -551,14 +672,17 @@ impl FerrofinTrickplayManager {
             // Upstream warns "video width is smaller than trickplay setting"
             // before its existing-tiles check, so once per pass over every
             // narrow video. Using the video's width is the intended outcome,
-            // so it is a field of the one line a generation logs
-            // (`video_width` present when the setting was narrowed).
-            tracing::info!(
+            // so it is a field of the line a generation logs (`video_width`
+            // present when the setting was narrowed). Upstream logs this line
+            // at Information; debug here, as a first run over a library logs
+            // it once per video, and the tally's summary is the info line
+            // (LOGGING.md rule 1).
+            tracing::debug!(
                 width = set.actual_width,
                 trickplay_width = set.width,
                 video_width = set.narrower,
                 path = ctx.media_path,
-                item = %ctx.item_id,
+                item_id = %ctx.item_id,
                 "creating trickplay files"
             );
         }
@@ -624,6 +748,8 @@ impl FerrofinTrickplayManager {
             drop(frames.take());
             if result.is_err() {
                 drop_probed_folder(ctx, set);
+            } else {
+                run.sets += 1;
             }
             results.push(result);
         }
@@ -660,7 +786,7 @@ impl FerrofinTrickplayManager {
             return Err(e);
         }
         rows.insert(info.width, info);
-        tracing::info!(
+        tracing::debug!(
             path = ctx.media_path,
             width = set.actual_width,
             "finished creation of trickplay files"
@@ -834,7 +960,10 @@ impl FerrofinTrickplayManager {
                 .collect()
         });
         for width in orphaned {
-            tracing::info!(
+            // Information upstream; debug here, as a removed trickplay folder
+            // gives one per video (LOGGING.md rule 1).
+            tracing::debug!(
+                item_id = %item_id,
                 width,
                 path = media_path,
                 "removed orphaned trickplay DB entry"
@@ -952,6 +1081,8 @@ impl FerrofinTrickplayManager {
                 for entry in entries.filter_map(Result::ok) {
                     let path = entry.path();
                     if path.is_dir() && !expected.contains(&path) {
+                        // A warn, as upstream: it deletes files, and a run
+                        // that leaves no stray folder never reaches it.
                         tracing::warn!(folder = %path.display(), "pruning trickplay files");
                         if let Err(e) = std::fs::remove_dir_all(&path) {
                             tracing::warn!(
@@ -986,8 +1117,16 @@ impl FerrofinTrickplayManager {
         &self,
         item_id: Uuid,
     ) -> Result<(), ServiceError> {
+        let watch = self.prunes.watch(item_id).await;
         let lock = self.item_locks.get(&item_id.to_string());
         let _item = lock.lock().await;
+        let moved = self.move_generated(item_id).await;
+        self.undo_if_pruned(&watch).await?;
+        moved
+    }
+
+    /// [`Self::move_generated_library_trickplay_data`] under the item's lock.
+    async fn move_generated(&self, item_id: Uuid) -> Result<(), ServiceError> {
         let Some(entity) = self.items.retrieve_item(item_id).await? else {
             return Ok(());
         };
@@ -1046,13 +1185,61 @@ impl FerrofinTrickplayManager {
                 && (!destination.is_dir() || has_files(&destination)?)
             {
                 move_content(&source, &destination)?;
-                tracing::info!(item = %item_id, to = %destination.display(), "moved trickplay images");
+                // Information upstream; debug here, one per video: the
+                // migration task logs the count (LOGGING.md rule 1).
+                tracing::debug!(item_id = %item_id, to = %destination.display(), "moved trickplay images");
             }
         }
         Ok(())
     }
-    /// Scan callers supply the fresh probe context; scheduled tasks read it
-    /// from the repository. Both use one extraction and storage implementation.
+
+    /// After a refresh or move of the item, under its lock: when a changed
+    /// file's prune ran since it began ([`TrickplayManager::prune_trickplay_data`]),
+    /// what it saved came from the old file, so its folders and rows go
+    /// again. Whether they did.
+    async fn undo_if_pruned(&self, watch: &Watch<Uuid>) -> Result<bool, ServiceError> {
+        if !self.prunes.changed(watch).await {
+            return Ok(false);
+        }
+        let item_id = *watch.key();
+        tracing::debug!(%item_id, "the file changed during a trickplay refresh; removing what it saved");
+        if let Some(path) = self
+            .items
+            .retrieve_item(item_id)
+            .await?
+            .and_then(|e| e.path)
+        {
+            self.remove_trickplay_folders(item_id, MediaLocation::of_file(&path));
+        }
+        self.delete_trickplay_data(item_id).await?;
+        Ok(true)
+    }
+
+    /// Removes the item's trickplay folders, internal and beside `media`,
+    /// logging and passing over a failure.
+    fn remove_trickplay_folders(&self, item_id: Uuid, media: MediaLocation<'_>) {
+        let folders = [false, true].map(|with_media| {
+            self.path_manager
+                .trickplay_directory(item_id, media, with_media)
+        });
+        off_runtime(|| {
+            for folder in folders {
+                // Never the root, an empty path or a relative one.
+                if !crate::item_deletion::is_deletable_path(Path::new(&folder)) {
+                    continue;
+                }
+                if let Err(error) = std::fs::remove_dir_all(&folder)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(item_id = %item_id, path = folder, %error, "unable to prune trickplay data");
+                }
+            }
+        });
+    }
+
+    /// The scan and Generate Trickplay Images hand in the row and streams
+    /// they hold; the by-id forms read them from the repository. All use one
+    /// extraction and storage implementation.
     ///
     /// `check` is a checking pass ([`TrickplayManager::check_trickplay_data`]),
     /// for which this returns whether the item's sets now match
@@ -1066,12 +1253,42 @@ impl FerrofinTrickplayManager {
         check: Option<&TrickplayCheck>,
         library_options: &LibraryOptions,
     ) -> Result<bool, ServiceError> {
+        // Watched before the lock, so a refresh queued behind another (or for
+        // a generation slot) when the prune runs counts as running.
+        let watch = self.prunes.watch(item_id).await;
         // Held across discovery, the existing-tiles checks, generation and
         // the prune, as upstream's `_resourcePool` is held across the first
         // three; a generation slot bounds the ffmpeg work, held per video
         // across the one run that extracts its widths and their tiling.
         let lock = self.item_locks.get(&item_id.to_string());
         let _item = lock.lock().await;
+        let refreshed = self
+            .refresh_locked(
+                item_id,
+                entity,
+                media_streams,
+                replace,
+                check,
+                library_options,
+            )
+            .await;
+        // shortcut: a refresh dropped (a task stop, shutdown) between saving
+        // a set and here keeps it; run this from a drop guard if that shows up.
+        let undone = self.undo_if_pruned(&watch).await?;
+        // Its sets went with the undo: a checking pass checks again.
+        Ok(refreshed? && !undone)
+    }
+
+    /// [`Self::refresh_media`] under the item's lock.
+    async fn refresh_locked(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        media_streams: Vec<MediaStream>,
+        replace: bool,
+        check: Option<&TrickplayCheck>,
+        library_options: &LibraryOptions,
+    ) -> Result<bool, ServiceError> {
         let has_streams = !media_streams.is_empty();
         let video_stream = media_streams
             .iter()
@@ -1514,6 +1731,25 @@ impl TrickplayManager for FerrofinTrickplayManager {
             .await
     }
 
+    async fn check_trickplay_for_media(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        streams: &[ferrofin_db::entities::base_items::MediaStreamInfoEntity],
+        check: &TrickplayCheck,
+        library_options: &LibraryOptions,
+    ) -> Result<bool, ServiceError> {
+        self.refresh_media(
+            item_id,
+            entity,
+            streams.iter().cloned().map(stream_to_dto).collect(),
+            false,
+            Some(check),
+            library_options,
+        )
+        .await
+    }
+
     async fn finish_trickplay_pass(&self, check: &TrickplayCheck) -> Result<(), ServiceError> {
         let PassCheck {
             settings: mut finished,
@@ -1604,6 +1840,22 @@ impl TrickplayManager for FerrofinTrickplayManager {
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn prune_trickplay_data(
+        &self,
+        item_id: Uuid,
+        media: MediaLocation<'_>,
+    ) -> Result<(), ServiceError> {
+        // Without the item's lock, which a refresh holds while it waits for
+        // a generation slot: a refresh or move in flight removes what it
+        // saved once done ([`Self::undo_if_pruned`]), where upstream's would
+        // keep its set from the old file (gl-1694).
+        let prune = async {
+            self.remove_trickplay_folders(item_id, media);
+            self.delete_trickplay_data(item_id).await
+        };
+        self.prunes.change(&item_id, prune).await
     }
 
     async fn get_trickplay_resolutions_batch(
@@ -2263,8 +2515,8 @@ mod tests {
 
     use super::FerrofinTrickplayManager;
 
-    /// One hour, as runtime ticks.
-    const HOUR_TICKS: i64 = 3_600_000 * 10_000;
+    // These tests name the unit HOUR_TICKS.
+    use ferrofin_util::ticks::TICKS_PER_HOUR as HOUR_TICKS;
 
     /// A config manager returning the [`TrickplayOptions`] a test sets.
     struct FixedConfig {
@@ -2865,6 +3117,118 @@ mod tests {
         // Both scratch directories are gone once the generation is done.
         assert!(!frames.exists());
         assert!(tiles.iter().all(|tile| !Path::new(tile).exists()));
+    }
+
+    /// gl-275: generating several videos logs one info line, a summary, once
+    /// generation has been idle for the quiet window; each video's lines are
+    /// debug (LOGGING.md rule 1).
+    #[tokio::test]
+    async fn a_run_of_generations_logs_one_summary_line_at_info() {
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+        let db = test_db().await;
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        for _ in 0..2 {
+            let item = Uuid::new_v4();
+            seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+            r.mgr
+                .refresh_trickplay_data(item, false, &extraction_on())
+                .await
+                .expect("refresh");
+        }
+        assert!(!logs.text().contains("trickplay files"), "{}", logs.text());
+
+        // Paused, the clock jumps to the summary's timer, then to this one.
+        tokio::time::pause();
+        tokio::time::sleep(super::GENERATION_SUMMARY_QUIET * 2).await;
+        let text = logs.text();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("trickplay files"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].contains("created trickplay files"), "{text}");
+        assert!(lines[0].contains("videos=2 sets=2"), "{text}");
+    }
+
+    /// gl-275: the summary waits until generation has stayed idle for the
+    /// quiet window. A generation under way when an earlier one's window ends
+    /// holds the line back, so do overlapping generations until the last one
+    /// ends, and one that ends while the summary waits moves the window. A
+    /// batch that made nothing logs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_trickplay_summary_waits_for_generation_to_stay_idle() {
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+        let summaries = || {
+            logs.text()
+                .lines()
+                .filter(|line| line.contains("created trickplay files"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let quiet = super::GENERATION_SUMMARY_QUIET;
+        let tally: Arc<std::sync::Mutex<super::GenerationTally>> = Arc::default();
+
+        let mut first = super::GenerationRun::start(&tally);
+        first.sets = 1;
+        drop(first);
+        tokio::time::sleep(quiet / 2).await;
+        let mut second = super::GenerationRun::start(&tally);
+        // The first one's window ends while the second is under way.
+        tokio::time::sleep(quiet).await;
+        assert!(summaries().is_empty(), "{}", logs.text());
+        second.sets = 2;
+        drop(second);
+        tokio::time::sleep(quiet * 2).await;
+        let lines = summaries();
+        assert_eq!(lines.len(), 1, "{}", logs.text());
+        assert!(lines[0].contains("videos=2 sets=3"), "{}", logs.text());
+
+        drop(super::GenerationRun::start(&tally));
+        tokio::time::sleep(quiet * 2).await;
+        assert_eq!(summaries().len(), 1, "{}", logs.text());
+
+        // Two at once (generation slots): the first to end waits for the other.
+        let mut first = super::GenerationRun::start(&tally);
+        let mut second = super::GenerationRun::start(&tally);
+        first.sets = 1;
+        drop(first);
+        tokio::time::sleep(quiet * 2).await;
+        assert_eq!(summaries().len(), 1, "{}", logs.text());
+        second.sets = 1;
+        drop(second);
+        tokio::time::sleep(quiet * 2).await;
+        let lines = summaries();
+        assert_eq!(lines.len(), 2, "{}", logs.text());
+        assert!(lines[1].contains("videos=2 sets=2"), "{}", logs.text());
+
+        // One that starts and ends while the summary waits moves its window.
+        let mut first = super::GenerationRun::start(&tally);
+        first.sets = 1;
+        drop(first);
+        tokio::time::sleep(quiet / 2).await;
+        let mut second = super::GenerationRun::start(&tally);
+        second.sets = 1;
+        drop(second);
+        tokio::time::sleep(quiet / 2 + std::time::Duration::from_secs(1)).await;
+        assert_eq!(summaries().len(), 2, "{}", logs.text());
+        tokio::time::sleep(quiet).await;
+        let lines = summaries();
+        assert_eq!(lines.len(), 3, "{}", logs.text());
+        assert!(lines[2].contains("videos=2 sets=2"), "{}", logs.text());
     }
 
     #[tokio::test]
@@ -4682,6 +5046,116 @@ mod tests {
             Some((10_000, 200)),
             "no fresh probe still carries persisted stream dimensions"
         );
+    }
+
+    /// gl-1694: a changed file's prune while a refresh of the item generates
+    /// from the old file does not wait for it (the scan would wait behind the
+    /// refresh's queue for a generation slot); the refresh removes the set it
+    /// swapped in and its row once done, and so does one queued behind it for
+    /// the item's lock. Kept, the row came back, and tiles left without one
+    /// would be imported by the next refresh. A refresh that begins after the
+    /// prune keeps its set.
+    #[tokio::test]
+    async fn a_refresh_the_prune_lands_in_removes_its_set() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut extractor = FakeExtractor::new(4, 180);
+        extractor.hold = Some((entered.clone(), release.clone()));
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), extractor);
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let refresh = || {
+            let manager = r.mgr.clone();
+            tokio::spawn(async move {
+                manager
+                    .refresh_trickplay_data(item, false, &extraction_on())
+                    .await
+            })
+        };
+        let running = refresh();
+        entered.notified().await;
+        let queued = refresh();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), entered.notified())
+                .await
+                .is_err(),
+            "the second refresh waits for the item's lock"
+        );
+        // It has watched the item once it holds a handle on the item's lock
+        // (the map's, each refresh's, and this one).
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while Arc::strong_count(&r.mgr.item_locks.get(&item.to_string())) < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second refresh queues for the item's lock");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            r.mgr
+                .prune_trickplay_data(item, MediaLocation::of_file(&media)),
+        )
+        .await
+        .expect("the prune does not wait for the refresh")
+        .expect("prune");
+        release.notify_one();
+        entered.notified().await;
+        release.notify_one();
+        running.await.unwrap().expect("running refresh");
+        queued.await.unwrap().expect("queued refresh");
+        assert_eq!(stored_widths(&r, item).await, Vec::<i32>::new());
+        assert!(!set_dir(&r, item, &media, 320).exists());
+
+        release.notify_one();
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("the next refresh");
+        assert_eq!(stored_widths(&r, item).await, vec![320]);
+        assert!(set_dir(&r, item, &media, 320).exists());
+    }
+
+    /// gl-1694: a checking pass's refresh that a prune lands in answers that
+    /// the item's sets do not match, so the pass is not recorded and checks
+    /// again.
+    #[tokio::test]
+    async fn a_checking_refresh_the_prune_lands_in_does_not_match() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut extractor = FakeExtractor::new(4, 180);
+        extractor.hold = Some((entered.clone(), release.clone()));
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), extractor);
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        release.notify_one();
+        run_pass(&r, &[item]).await;
+        // The permit that pass's extraction left.
+        entered.notified().await;
+        r.set_options(options_2x2(&[640]));
+        let check = r
+            .mgr
+            .begin_trickplay_pass()
+            .await
+            .expect("begin")
+            .expect("check");
+        let manager = r.mgr.clone();
+        let checking = tokio::spawn(async move {
+            manager
+                .check_trickplay_data(item, &check, &extraction_on())
+                .await
+        });
+        entered.notified().await;
+        r.mgr
+            .prune_trickplay_data(item, MediaLocation::of_file(&media))
+            .await
+            .expect("prune");
+        release.notify_one();
+
+        assert!(!checking.await.unwrap().expect("check"));
+        assert_eq!(stored_widths(&r, item).await, Vec::<i32>::new());
     }
 
     #[tokio::test]

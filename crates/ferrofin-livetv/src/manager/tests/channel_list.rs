@@ -1,5 +1,6 @@
 //! `GET /LiveTv/Channels` reads the guide only for the kinds it filters on,
-//! and lists only the channels the user's parental restrictions allow.
+//! lists only the channels the user's parental restrictions allow, and sorts
+//! on the user's play state.
 //!
 //! The movie/series/kids kinds are derived from the airings, one correlated
 //! pass over each channel's programmes per kind, and only the channel kind
@@ -9,7 +10,8 @@
 use std::collections::HashMap;
 
 use ferrofin_db::Database;
-use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
+use ferrofin_model::dto::SortOrder;
+use ferrofin_model::live_tv::{ItemSortBy, ListingsProviderInfo, TunerHostInfo};
 use ferrofin_traits::options::DtoOptions;
 use ferrofin_traits::stubs::{LiveTvChannelQuery, LiveTvManager as _};
 
@@ -214,6 +216,113 @@ async fn the_lineup_hides_what_a_users_parental_restrictions_hide() {
     assert_eq!(lineup(mgr, &limited, None).await, two_only);
 }
 
+/// What the user does to Channel Two before the list is read.
+#[derive(Debug, Clone, Copy)]
+enum Mark {
+    /// Starts playing it.
+    Play,
+    /// Marks it played.
+    Played,
+    /// Makes it a favourite.
+    Favourite,
+}
+
+/// jellyfin-web's guide in its "Recently watched" channel order asks for
+/// `SortBy=DatePlayed&SortOrder=Descending`, favourites first (`guide.js`).
+/// Upstream's `OrderMapper` sorts it, and the other play-state keys, on the
+/// user data written on the channel item: playback stamps `LastPlayedDate`
+/// and `PlayCount` (`SessionManager.OnPlaybackStart`; a channel has no played
+/// status, so only a mark-played sets `Played`). A channel never played has
+/// no row and sorts as `NULL`, or unplayed. Each key loads the user data
+/// itself, with favourite sorting off too.
+#[rstest::rstest]
+#[case::recently_watched(ItemSortBy::DatePlayed, SortOrder::Descending, true, Mark::Play)]
+#[case::date_played(ItemSortBy::DatePlayed, SortOrder::Descending, false, Mark::Play)]
+#[case::most_played(ItemSortBy::PlayCount, SortOrder::Descending, false, Mark::Play)]
+#[case::played_first(ItemSortBy::IsPlayed, SortOrder::Descending, false, Mark::Played)]
+#[case::unplayed_last(ItemSortBy::IsUnplayed, SortOrder::Ascending, false, Mark::Played)]
+#[case::favourite_key(
+    ItemSortBy::IsFavoriteOrLiked,
+    SortOrder::Descending,
+    false,
+    Mark::Favourite
+)]
+#[tokio::test]
+async fn a_channel_the_user_played_leads_on_each_play_state_key(
+    #[case] sort_by: ItemSortBy,
+    #[case] sort_order: SortOrder,
+    #[case] enable_favorite_sorting: bool,
+    #[case] mark: Mark,
+) {
+    use std::sync::Arc;
+
+    use ferrofin_traits::library::{UserDataManager as _, UserManager as _};
+
+    let lab = super::channel_item_lab().await;
+    lab.mgr.refresh_guide().await.expect("refresh");
+    let users = ferrofin_core::user_manager::FerrofinUserManager::new(lab.mgr.db.clone());
+    let user = Arc::new(users.create_user("viewer").await.expect("user"));
+    let root = tempfile::tempdir().expect("root");
+    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
+        root.path().join("program"),
+        root.path().join("log"),
+        root.path().join("config"),
+        root.path().join("cache"),
+        root.path().join("web"),
+    ));
+    let config = ferrofin_core::FerrofinServerConfigurationManager::load(paths)
+        .await
+        .expect("configuration");
+    let user_data =
+        ferrofin_core::FerrofinUserDataManager::new(lab.mgr.db.clone(), Arc::new(config));
+    let [_, two] = super::channel_ids(&lab.mgr).await[..] else {
+        panic!("two channels");
+    };
+    let user_id = uuid::Uuid::parse_str(&user.id).expect("user id");
+    match mark {
+        Mark::Play => user_data
+            .record_playback_start(user_id, two)
+            .await
+            .expect("play Channel Two"),
+        Mark::Played => {
+            user_data
+                .mark_played(user_id, two, None)
+                .await
+                .expect("mark Channel Two played");
+        }
+        Mark::Favourite => {
+            let favourite = ferrofin_model::dto::UpdateUserItemDataDto {
+                is_favorite: Some(true),
+                ..ferrofin_model::dto::UpdateUserItemDataDto::default()
+            };
+            user_data
+                .save_user_data(user_id, two, &favourite)
+                .await
+                .expect("favourite Channel Two");
+        }
+    }
+
+    let names: Vec<String> = lab
+        .mgr
+        .get_channels(
+            &LiveTvChannelQuery {
+                user: Some(user),
+                sort_by: vec![sort_by],
+                sort_order: Some(sort_order),
+                enable_favorite_sorting,
+                ..LiveTvChannelQuery::default()
+            },
+            &DtoOptions::default(),
+        )
+        .await
+        .expect("channels")
+        .items
+        .into_iter()
+        .filter_map(|c| c.name)
+        .collect();
+    assert_eq!(names, ["Channel Two", "Channel One"]);
+}
+
 /// A restricted lineup read, with every rule on (a maximum rating, a blocked
 /// unrated kind, a blocked tag) and with a kind filter or without, probes each
 /// channel's item by its key and keeps every step of the unrestricted plan:
@@ -265,4 +374,89 @@ async fn a_restricted_lineup_read_probes_the_channel_item_by_key() {
             "{restricted:?}"
         );
     }
+}
+
+/// With no user (an API key), `SortBy=DatePlayed` orders the lineup by the
+/// newest play any user made on each channel: upstream's `OrderMapper` reads
+/// all of `UserData` when the query has no user (`OrderMapper.cs:32-48`).
+/// One viewer plays Channel One, then another plays Channel Two, so Channel
+/// Two leads descending, against the name order a missing key would leave.
+#[tokio::test]
+async fn without_a_user_date_played_orders_by_anyones_newest_play() {
+    use std::sync::Arc;
+
+    use ferrofin_traits::library::{UserDataManager as _, UserManager as _};
+
+    let lab = super::channel_item_lab().await;
+    lab.mgr.refresh_guide().await.expect("refresh");
+    let users = ferrofin_core::user_manager::FerrofinUserManager::new(lab.mgr.db.clone());
+    let root = tempfile::tempdir().expect("root");
+    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
+        root.path().join("program"),
+        root.path().join("log"),
+        root.path().join("config"),
+        root.path().join("cache"),
+        root.path().join("web"),
+    ));
+    let config = ferrofin_core::FerrofinServerConfigurationManager::load(paths)
+        .await
+        .expect("configuration");
+    let user_data =
+        ferrofin_core::FerrofinUserDataManager::new(lab.mgr.db.clone(), Arc::new(config));
+    let [one, two] = super::channel_ids(&lab.mgr).await[..] else {
+        panic!("two channels");
+    };
+    for (name, channel) in [("first", one), ("second", two)] {
+        let user = users.create_user(name).await.expect("user");
+        let user_id = uuid::Uuid::parse_str(&user.id).expect("user id");
+        user_data
+            .record_playback_start(user_id, channel)
+            .await
+            .expect("play");
+    }
+
+    // The other user-data keys, and favourite sorting, still tie without a
+    // user, so `DatePlayed` decides behind them too.
+    for (sort_by, enable_favorite_sorting) in [
+        (vec![ItemSortBy::DatePlayed], false),
+        (vec![ItemSortBy::PlayCount, ItemSortBy::DatePlayed], false),
+        (vec![ItemSortBy::IsPlayed, ItemSortBy::DatePlayed], false),
+        (vec![ItemSortBy::DatePlayed], true),
+    ] {
+        let names: Vec<String> = lab
+            .mgr
+            .get_channels(
+                &LiveTvChannelQuery {
+                    sort_by: sort_by.clone(),
+                    sort_order: Some(SortOrder::Descending),
+                    enable_favorite_sorting,
+                    ..LiveTvChannelQuery::default()
+                },
+                &DtoOptions::default(),
+            )
+            .await
+            .expect("channels")
+            .items
+            .into_iter()
+            .filter_map(|c| c.name)
+            .collect();
+        assert_eq!(names, ["Channel Two", "Channel One"], "{sort_by:?}");
+    }
+}
+
+/// The no-user `DatePlayed` read seeks each channel's rows by item, never
+/// scanning every user's `UserData`.
+#[tokio::test]
+async fn the_no_user_last_played_read_seeks_user_data_by_item() {
+    let db = Database::connect_in_memory().await.expect("db");
+    db.run_migrations().await.expect("migrate");
+    let plan = crate::guide_repository::test_support::channel_last_played_plan(&db)
+        .await
+        .expect("plan");
+    assert!(
+        plan.iter()
+            .any(|d| d.starts_with("SEARCH ud USING ") && d.ends_with("(ItemId=?)")),
+        "{plan:?}"
+    );
+    assert!(!plan.iter().any(|d| d.starts_with("SCAN ud")), "{plan:?}");
 }

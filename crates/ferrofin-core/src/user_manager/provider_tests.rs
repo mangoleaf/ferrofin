@@ -1002,9 +1002,6 @@ impl UserManager for Delegating {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         self.0.get_users().await
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        self.0.get_user_ids().await
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         self.0.initialize().await
     }

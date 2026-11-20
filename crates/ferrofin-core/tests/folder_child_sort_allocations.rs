@@ -8,11 +8,16 @@
 //! on every request. This binary counts the heap allocations the sort makes
 //! on its own thread, with its own global allocator, and checks that they
 //! grow with the number of rows, not with the number of comparisons.
+//!
+//! The sort also used to move every row beside its keys, so a second copy of
+//! the whole child list was alive at once (gl-1493). The same allocator
+//! tracks the bytes the sort holds beyond its input, which must stay below
+//! one copy of the rows.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
 use ferrofin_core::FerrofinItemRepository;
 use ferrofin_core::item_type_lookup::ItemTypeLookup;
@@ -31,40 +36,65 @@ thread_local! {
 /// Allocations (and reallocations) made by a counting thread.
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
+/// Bytes a counting thread has allocated less those it freed, and the most
+/// that ever was. A buffer allocated before counting began and freed during
+/// it counts negative, so the peak never overstates what the sort added.
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
+
 /// The system allocator, counting what the current thread allocates while
 /// [`COUNTING`] is set. The database's worker threads are never counted.
 struct Counting;
 
 impl Counting {
-    fn count() {
-        if COUNTING.try_with(Cell::get).unwrap_or(false) {
+    fn counting() -> bool {
+        COUNTING.try_with(Cell::get).unwrap_or(false)
+    }
+
+    /// Counts an allocation of `bytes` (a reallocation's growth).
+    fn count(bytes: isize) {
+        if Self::counting() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            Self::hold(bytes);
         }
     }
+
+    fn hold(bytes: isize) {
+        let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        PEAK.fetch_max(live, Ordering::Relaxed);
+    }
+}
+
+/// A layout size as a signed byte count.
+fn bytes(size: usize) -> isize {
+    isize::try_from(size).unwrap_or(isize::MAX)
 }
 
 // SAFETY: every call is forwarded unchanged to `System`; the counter is an
 // atomic and the flag a const-initialised thread-local, neither allocates.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        Self::count();
+        Self::count(bytes(layout.size()));
         // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        Self::count();
+        Self::count(bytes(layout.size()));
         // SAFETY: the caller upholds `GlobalAlloc::alloc_zeroed`'s contract.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if Self::counting() {
+            Self::hold(-bytes(layout.size()));
+        }
         // SAFETY: the caller upholds `GlobalAlloc::dealloc`'s contract.
         unsafe { System.dealloc(ptr, layout) };
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        Self::count();
+        Self::count(bytes(new_size) - bytes(layout.size()));
         // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -121,10 +151,13 @@ async fn sorting_a_folder_by_name_allocates_per_row_not_per_comparison() {
     let rows = children(ROWS);
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
+    LIVE.store(0, Ordering::Relaxed);
+    PEAK.store(0, Ordering::Relaxed);
     COUNTING.with(|counting| counting.set(true));
     let sorted = repo.sort_folder_children(rows, &query).await;
     COUNTING.with(|counting| counting.set(false));
     let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let peak = PEAK.load(Ordering::Relaxed);
 
     let sorted = sorted.expect("sort");
     assert_eq!(sorted.len(), ROWS);
@@ -144,5 +177,13 @@ async fn sorting_a_folder_by_name_allocates_per_row_not_per_comparison() {
         allocations <= PER_ROW_BUDGET * ROWS,
         "sorting {ROWS} rows made {allocations} allocations, more than \
          {PER_ROW_BUDGET} per row: the comparator is allocating"
+    );
+    // The keys and the order are a small fraction of a row each; the rows
+    // themselves must not be copied or moved into a second list.
+    let copy = bytes(ROWS * std::mem::size_of::<BaseItemEntity>());
+    assert!(
+        peak < copy,
+        "sorting {ROWS} rows held {peak} bytes beyond its input at its peak, \
+         where a copy of the rows is {copy}: the rows are being moved"
     );
 }

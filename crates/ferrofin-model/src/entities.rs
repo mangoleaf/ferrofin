@@ -366,6 +366,27 @@ pub enum CollectionTypeOptions {
     mixed = 7,
 }
 
+impl CollectionTypeOptions {
+    /// The [`CollectionType`](crate::data::CollectionType) a library of these
+    /// options reports (C# `CollectionFolder.CollectionType`, parsed from the
+    /// `<type>.collection` marker). `mixed` has no single type and maps to
+    /// `None`, as Jellyfin's mixed-content library does.
+    #[must_use]
+    pub fn collection_type(self) -> Option<crate::data::CollectionType> {
+        use crate::data::CollectionType;
+        Some(match self {
+            Self::movies => CollectionType::movies,
+            Self::tvshows => CollectionType::tvshows,
+            Self::music => CollectionType::music,
+            Self::musicvideos => CollectionType::musicvideos,
+            Self::homevideos => CollectionType::homevideos,
+            Self::boxsets => CollectionType::boxsets,
+            Self::books => CollectionType::books,
+            Self::mixed => return None,
+        })
+    }
+}
+
 /// Enum containing deinterlace methods. Lowercase for wire compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -653,4 +674,27 @@ pub mod person_type {
     pub const MIXER: &str = "Mixer";
     /// A person who remixed a recording from one or more other tracks.
     pub const REMIXER: &str = "Remixer";
+}
+
+#[cfg(test)]
+mod collection_type_tests {
+    use super::CollectionTypeOptions;
+    use crate::data::CollectionType;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(CollectionTypeOptions::movies, Some(CollectionType::movies))]
+    #[case(CollectionTypeOptions::tvshows, Some(CollectionType::tvshows))]
+    #[case(CollectionTypeOptions::music, Some(CollectionType::music))]
+    #[case(CollectionTypeOptions::musicvideos, Some(CollectionType::musicvideos))]
+    #[case(CollectionTypeOptions::homevideos, Some(CollectionType::homevideos))]
+    #[case(CollectionTypeOptions::boxsets, Some(CollectionType::boxsets))]
+    #[case(CollectionTypeOptions::books, Some(CollectionType::books))]
+    #[case(CollectionTypeOptions::mixed, None)]
+    fn collection_type_maps_library_options_to_the_folder_type(
+        #[case] options: CollectionTypeOptions,
+        #[case] expected: Option<CollectionType>,
+    ) {
+        assert_eq!(options.collection_type(), expected);
+    }
 }

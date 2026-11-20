@@ -280,30 +280,72 @@ pub fn get_clean_value(value: &str) -> String {
 /// characters that lowercase onto an ASCII letter under full Unicode rules —
 /// the Kelvin sign `K` (U+212A) lowercases to `k` in Rust — stay distinct. Lower
 /// casing both sides folds those together and would match strings .NET does not.
+/// Nor is it [`upper_invariant`]: ordinal casing keeps the long s `ſ`, which
+/// `ToUpperInvariant` maps to `S`.
 #[must_use]
 pub fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
     left.chars()
-        .map(to_upper_invariant)
-        .eq(right.chars().map(to_upper_invariant))
+        .map(to_upper_ordinal)
+        .eq(right.chars().map(to_upper_ordinal))
 }
 
-/// `StringComparer.OrdinalIgnoreCase.Compare(a, b)`: the same simple invariant
-/// uppercase mapping as [`equals_ordinal_ignore_case`], then an ordinal
-/// comparison of UTF-16 code units (so a supplementary-plane character sorts by
-/// its surrogate pair, as in .NET, not by its scalar value).
+/// `StringComparer.OrdinalIgnoreCase.Compare(a, b)`: the same per-character
+/// uppercase mapping as [`equals_ordinal_ignore_case`], then the characters
+/// compared by scalar value. Unlike `string.CompareOrdinal`, which compares
+/// UTF-16 code units, .NET's ignore-case comparison sorts a supplementary-plane
+/// character after U+E000-U+FFFF (measured on .NET 10), so the order is the
+/// byte order of [`ordinal_ignore_case_key`].
 #[must_use]
 pub fn compare_ordinal_ignore_case(left: &str, right: &str) -> std::cmp::Ordering {
-    let utf16 = |text: &str| -> Vec<u16> {
-        text.chars()
-            .map(to_upper_invariant)
-            .collect::<String>()
-            .encode_utf16()
-            .collect()
-    };
-    utf16(left).cmp(&utf16(right))
+    left.chars()
+        .map(to_upper_ordinal)
+        .cmp(right.chars().map(to_upper_ordinal))
+}
+
+/// The key of a `StringComparer.OrdinalIgnoreCase` dictionary or set: two
+/// strings get the same key exactly when [`equals_ordinal_ignore_case`] calls
+/// them equal.
+#[must_use]
+pub fn ordinal_ignore_case_key(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_uppercase();
+    }
+    text.chars().map(to_upper_ordinal).collect()
+}
+
+/// `string.Equals(a, b, StringComparison.InvariantCultureIgnoreCase)` as .NET
+/// computes it with ICU: root collation at the secondary strength that
+/// `CompareOptions.IgnoreCase` selects. Case alone never differs (`ärne`,
+/// `Ärne`), and neither do canonically equivalent spellings, ignorable
+/// characters or compatibility variants (`ﬁ`, `fi`); accents, `ß` against `ss`
+/// and the dotless `ı` against `I` do. Unlike .NET, character width and kana
+/// type do not count (`ｂ` against `b`, `あ` against `ア`): see gl-1793.
+///
+/// The collator reads ICU4X's baked root data; a build without it compares
+/// as [`equals_ordinal_ignore_case`] rather than failing.
+#[must_use]
+pub fn equals_invariant_ignore_case(left: &str, right: &str) -> bool {
+    // shortcut: .NET adds tailoring rules that keep character width and kana type apart
+    // (`ｂ` and `b`, `あ` and `ア` differ there, equal here); ICU4X takes no runtime rules,
+    // so porting them needs their tables; replace this when gl-1793 lands.
+    static COLLATOR: OnceLock<Option<icu_collator::CollatorBorrowed<'static>>> = OnceLock::new();
+    COLLATOR
+        .get_or_init(|| {
+            let mut options = icu_collator::options::CollatorOptions::default();
+            options.strength = Some(icu_collator::options::Strength::Secondary);
+            icu_collator::Collator::try_new(icu_collator::CollatorPreferences::default(), options)
+                .ok()
+        })
+        .as_ref()
+        .map_or_else(
+            || equals_ordinal_ignore_case(left, right),
+            |collator| collator.compare(left, right).is_eq(),
+        )
 }
 
 /// .NET invariant uppercase for a string, using ICU's simple mappings.
+///
+/// Not an `OrdinalIgnoreCase` key: that is [`ordinal_ignore_case_key`].
 #[must_use]
 pub fn upper_invariant(text: &str) -> String {
     if text.is_ascii() {
@@ -331,9 +373,32 @@ pub fn lower_invariant(text: &str) -> String {
         .collect()
 }
 
-fn to_upper_invariant(c: char) -> char {
+/// One character as `OrdinalIgnoreCase` folds it: the invariant simple
+/// uppercase, except the long s `ſ` (U+017F), which the runtime's ordinal
+/// casing table keeps as itself (measured on .NET 10: the only character where
+/// it differs from `ToUpperInvariant`). For ports that compare `char` by `char`;
+/// whole strings go through [`equals_ordinal_ignore_case`].
+#[must_use]
+pub fn to_upper_ordinal(c: char) -> char {
+    if c.is_ascii() {
+        c.to_ascii_uppercase()
+    } else if c == '\u{017f}' {
+        c
+    } else {
+        to_upper_invariant(c)
+    }
+}
+
+/// .NET's invariant uppercase of one Unicode scalar (`char.ToUpperInvariant`,
+/// or `Rune.ToUpperInvariant` beyond the BMP): the simple uppercase, keeping
+/// the dotless `ı` (U+0131) and the pairs newer than .NET's ICU. Whole strings
+/// go through [`upper_invariant`].
+#[must_use]
+pub fn to_upper_invariant(c: char) -> char {
     // .NET ChangeCaseInvariant preserves dotless i, unlike Unicode's default.
-    if c == '\u{0131}' || NEWER_UNICODE_CASE_PAIRS.binary_search(&c).is_ok() {
+    if c.is_ascii() {
+        c.to_ascii_uppercase()
+    } else if c == '\u{0131}' || NEWER_UNICODE_CASE_PAIRS.binary_search(&c).is_ok() {
         c
     } else {
         icu_casemap::CaseMapper::new().simple_uppercase(c)
@@ -426,6 +491,16 @@ mod tests {
                 char::from_u32(lower).unwrap().to_string(),
                 "lowercase U+{scalar:04X}"
             );
+            // The per-character folds too: the strings above take an ASCII
+            // shortcut that never reaches them.
+            let upper = char::from_u32(upper).unwrap();
+            assert_eq!(
+                to_upper_invariant(c),
+                upper,
+                "char uppercase U+{scalar:04X}"
+            );
+            let ordinal = if c == '\u{017f}' { c } else { upper };
+            assert_eq!(to_upper_ordinal(c), ordinal, "ordinal U+{scalar:04X}");
         }
     }
 
@@ -624,6 +699,18 @@ mod tests {
     #[case("Ａｂｃ", "ａｂｃ")] // fullwidth letters lowercase and survive
     #[case("  padded  ", "padded")]
     #[case("tab\tand\nnewline", "tab and newline")]
+    // Upstream `SearchPunctuationTests.cs` (jellyfin/jellyfin PR 14879), the
+    // C# expected values verbatim.
+    #[case("Mr. Robot", "mr robot")]
+    #[case("Spider-Man: Homecoming", "spider man homecoming")]
+    #[case("Beyoncé — Live!", "beyonce live")]
+    #[case("Hello, World!", "hello world")]
+    #[case("(The) Good, the Bad & the Ugly", "the good the bad the ugly")]
+    #[case("Wall-E", "wall e")]
+    #[case("No. 1: The Beginning", "no 1 the beginning")]
+    #[case("Café-au-lait", "cafe au lait")]
+    #[case("Face/Off", "face off")]
+    #[case("V/H/S", "v h s")]
     fn get_clean_value_normalizes(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(expected, get_clean_value(input));
     }
@@ -642,6 +729,72 @@ mod tests {
         assert_eq!("\u{212a}".to_lowercase(), "k", "the trap this avoids");
     }
 
+    // Expected values from .NET 10.0.13's native ICU collation
+    // (`GlobalizationNative_CompareString` on the invariant sort handle with
+    // `CompareOptions.IgnoreCase`, ICU 78.3), which `string.Equals` with
+    // `InvariantCultureIgnoreCase` returns.
+    #[rstest]
+    #[case("ärne", "Ärne", true)]
+    #[case("admin", "Admin", true)]
+    #[case("ΣΊΣΥΦΟΣ", "σίσυφος", true)] // the final sigma too
+    #[case("\u{1c4}", "\u{1c6}", true)]
+    #[case("\u{10428}", "\u{10400}", true)] // a supplementary-plane letter (Deseret)
+    #[case("\u{212a}", "k", true)] // the Kelvin sign, unlike OrdinalIgnoreCase
+    #[case("ﬁ", "fi", true)]
+    #[case("²", "2", true)]
+    #[case("a\u{301}", "á", true)] // canonically equivalent
+    #[case("Bob\u{200b}", "Bob", true)] // an ignorable character
+    #[case("Ab\u{ad}", "ab", true)]
+    #[case("Bob", "Bób", false)]
+    #[case("Ärne", "Arne", false)]
+    #[case("bob", "bob ", false)]
+    #[case("ß", "ss", false)]
+    #[case("straße", "STRASSE", false)]
+    #[case("\u{17f}", "s", false)]
+    #[case("\u{131}", "I", false)]
+    #[case("i", "\u{130}", false)]
+    #[case("æ", "AE", false)]
+    #[case("Œ", "oe", false)]
+    fn invariant_ignore_case_matches_dotnet(
+        #[case] left: &str,
+        #[case] right: &str,
+        #[case] equal: bool,
+    ) {
+        assert_eq!(equals_invariant_ignore_case(left, right), equal);
+        assert_eq!(equals_invariant_ignore_case(right, left), equal);
+    }
+
+    /// `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)` as .NET 10.0.14
+    /// answers it, for the comparison and for the dictionary key.
+    #[rstest]
+    #[case("Disney", "DISNEY", true)]
+    #[case("SOCIÉTÉ", "Société", true)]
+    #[case("ö", "Ö", true)]
+    #[case("ß", "SS", false)]
+    #[case("straße", "STRASSE", false)]
+    #[case("ß", "ẞ", false)]
+    #[case("STRAßE", "straße", true)]
+    #[case("\u{17f}", "S", false)] // the long s: ToUpperInvariant maps it to S, ordinal casing does not
+    #[case("\u{17f}", "s", false)]
+    #[case("\u{131}", "I", false)] // the dotless i keeps its case in both
+    #[case("\u{212a}", "k", false)]
+    #[case("\u{212a}", "K", false)]
+    #[case("\u{1c5}", "\u{1c4}", true)]
+    #[case("\u{1c5}", "\u{1c6}", true)]
+    #[case("\u{10428}", "\u{10400}", true)] // a supplementary-plane letter (Deseret)
+    #[case("ﬁ", "FI", false)]
+    fn ordinal_ignore_case_key_matches_dotnet(
+        #[case] left: &str,
+        #[case] right: &str,
+        #[case] equal: bool,
+    ) {
+        assert_eq!(equals_ordinal_ignore_case(left, right), equal);
+        assert_eq!(
+            ordinal_ignore_case_key(left) == ordinal_ignore_case_key(right),
+            equal
+        );
+    }
+
     #[test]
     fn compare_ordinal_ignore_case_matches_dotnet() {
         use std::cmp::Ordering::{Equal, Greater, Less};
@@ -650,8 +803,22 @@ mod tests {
         // Uppercased first: `_` (0x5F) sorts after `A` (0x41) but before `a`.
         assert_eq!(compare_ordinal_ignore_case("_x", "ax"), Greater);
         assert_eq!(compare_ordinal_ignore_case("", "a"), Less);
-        // UTF-16 order: a surrogate (0xD83C…) sorts below U+FF21 `Ａ`.
-        assert_eq!(compare_ordinal_ignore_case("\u{1F3AC}", "\u{FF21}"), Less);
+        // Scalar order, not UTF-16 order: .NET 10 sorts U+1F3AC after U+FF21 `Ａ`
+        // and U+10000 after U+E000, although their surrogates (0xD83C, 0xD800)
+        // are lower code units.
+        assert_eq!(
+            compare_ordinal_ignore_case("\u{1F3AC}", "\u{FF21}"),
+            Greater
+        );
+        assert_eq!(
+            compare_ordinal_ignore_case("\u{10000}", "\u{E000}"),
+            Greater
+        );
+        assert_eq!(compare_ordinal_ignore_case("\u{E000}", "\u{10000}"), Less);
+        assert_eq!(compare_ordinal_ignore_case("\u{10428}", "\u{10400}"), Equal);
+        assert_eq!(compare_ordinal_ignore_case("ab", "a"), Greater);
+        // The long s stays U+017F, so it sorts after every ASCII letter.
+        assert_eq!(compare_ordinal_ignore_case("\u{17f}", "T"), Greater);
     }
 
     /// `ToUpperInvariant` is the simple mapping: one char in, one char out.

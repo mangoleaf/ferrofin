@@ -128,7 +128,7 @@ them when it sends, so limiters made before the restart see the new values too:
 
 A variable that is not a whole number logs a warning and is ignored, so the `config.toml` value
 or the default applies; a value outside the range logs a warning and is clamped to it.
-The timeout runs to the end of the response body. A body read as bytes also stops at
+The timeout runs to the end of the response body. Every response body also stops at
 [`image_download_max_mb`](CONFIG.md#remote-images).
 Attempts, the adaptive backoff cap, recovery streak/quiet period, and jitter
 remain internal policy rather than user settings. The gate deliberately holds

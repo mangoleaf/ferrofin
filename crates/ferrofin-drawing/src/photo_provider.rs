@@ -36,10 +36,11 @@ use ferrofin_model::drawing::ImageOrientation;
 use ferrofin_model::entities::ImageType;
 use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::options::{ItemImageInfo, file_date_modified};
 use ferrofin_traits::providers::ItemUpdateType;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -209,16 +210,6 @@ impl PhotoItem {
     }
 }
 
-/// `path`'s last write time: the value `file_date_modified` in
-/// `ferrofin-providers` stores for every other local image, the current time
-/// when the file cannot be read included, so the scan's
-/// `image_metadata_is_current` compares like with like.
-fn last_write_time(path: &str) -> DateTime<Utc> {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
-}
-
 /// Metadata provider for photos — the embedded-information provider.
 ///
 /// Port of `Emby.Photos.PhotoProvider`. Holds the shared
@@ -273,7 +264,9 @@ impl PhotoProvider {
         // On the blocking pool like the EXIF read below: a stalled mount holds
         // a stat as long as it holds an open.
         let owned = path.clone();
-        let modified = tokio::task::spawn_blocking(move || last_write_time(&owned))
+        // `file_date_modified` is what every other local image row stores, so
+        // the scan's `image_metadata_is_current` compares like with like.
+        let modified = tokio::task::spawn_blocking(move || file_date_modified(Path::new(&owned)))
             .await
             .unwrap_or_else(|_| Utc::now());
         item.set_image_path(ImageType::Primary, &path, modified);

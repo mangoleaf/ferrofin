@@ -1,18 +1,19 @@
 //! The LDAP-Auth directory client and sign-in against a real directory:
 //! OpenLDAP 2.6 in a container, over plain LDAP, LDAPS and StartTLS.
 //!
-//! Hand-run, like the ffmpeg gates; CI does not run it (D8):
+//! `#[ignore]`d like the ffmpeg tests, so a default run lists it as skipped;
+//! CI does not run it (D8):
 //!
 //! ```bash
-//! FERROFIN_LDAP_TESTS=1 cargo test -p ferrofin-extensions --test ldap_directory -- --nocapture
+//! cargo test -p ferrofin-extensions --test ldap_directory -- --include-ignored --nocapture
 //! ```
 //!
-//! It needs `docker`. The first run builds a small image from `alpine:3.22`
-//! with Alpine's OpenLDAP packages; certificates are generated per run under
-//! the target directory. Two servers start: one that takes any client, and one
-//! that demands a client certificate; the referral case starts two more, one
-//! referring to the other and to a name that does not resolve. Without
-//! `FERROFIN_LDAP_TESTS=1` the test says so and passes.
+//! It needs `docker`, and fails without it. The first run builds a small image
+//! from `alpine:3.22` with Alpine's OpenLDAP packages; certificates are
+//! generated per run under the target directory. Two servers start: one that
+//! takes any client, and one that demands a client certificate; the referral
+//! case starts two more, one referring to the other and to a name that does
+//! not resolve.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -371,13 +372,8 @@ fn testing() -> Option<String> {
 }
 
 #[tokio::test]
+#[ignore = "starts OpenLDAP in docker; run with --ignored"]
 async fn the_directory_client_against_openldap() {
-    if std::env::var("FERROFIN_LDAP_TESTS").as_deref() != Ok("1") {
-        eprintln!(
-            "skipping the live LDAP directory test: set FERROFIN_LDAP_TESTS=1 (needs docker)"
-        );
-        return;
-    }
     let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("scratch");
     let conf = scratch.path().join("conf");
     let mtls_conf = scratch.path().join("mtls");

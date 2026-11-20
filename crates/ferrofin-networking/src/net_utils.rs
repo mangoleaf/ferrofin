@@ -169,12 +169,12 @@ pub fn try_parse_to_subnet(value: &str, negated: bool) -> Option<IpData> {
     }
 
     if let Some(slash) = value.find('/') {
-        let address = parse_ip(&value[..slash])?;
+        let address = try_parse_ip_address(&value[..slash])?;
         let subnet = parse_ip_network(value)?;
         return Some(IpData::new(address, Some(subnet), String::new()));
     }
 
-    let address = parse_ip(value)?;
+    let address = try_parse_ip_address(value)?;
     match address {
         IpAddr::V4(v4) => {
             if v4 == Ipv4Addr::UNSPECIFIED {
@@ -351,7 +351,7 @@ pub fn try_parse_host_with(
         }
 
         // IPv4 or IPv4:port (or IP/mask).
-        if let Some(address) = parse_ip(left_part(first_part, '/')) {
+        if let Some(address) = try_parse_ip_address(left_part(first_part, '/')) {
             let family = AddressFamily::of(address);
             if (family == AddressFamily::InterNetwork && (!is_ipv4_enabled && is_ipv6_enabled))
                 || (family == AddressFamily::InterNetworkV6
@@ -364,7 +364,7 @@ pub fn try_parse_host_with(
         }
     } else if !hosts.is_empty() && hosts.len() <= 9 {
         // 8 octets + port.
-        if let Some(address) = parse_ip(left_part(host, '/')) {
+        if let Some(address) = try_parse_ip_address(left_part(host, '/')) {
             return Some(vec![address]);
         }
     }
@@ -372,45 +372,126 @@ pub fn try_parse_host_with(
     None
 }
 
-/// Parses `value` as an [`IpAddr`] with the leniencies of .NET
-/// `IPAddress.Parse` for IPv6: a surrounding `[ ]` with an optional `:port`
-/// after the bracket, and a `%zone` scope suffix (both of which `std`'s parser
-/// rejects). The scope/port are irrelevant to the address value and dropped.
-fn parse_ip(value: &str) -> Option<IpAddr> {
-    // Bracketed IPv6: `[addr]`, `[addr]:port`, `[addr%scope]`, ...
-    if let Some(rest) = value.strip_prefix('[') {
-        let close = rest.find(']')?;
-        let inner = &rest[..close];
-        let after = &rest[close + 1..];
-        // Anything after ']' must be empty or a `:port`.
-        if !after.is_empty() {
-            let port = after.strip_prefix(':')?;
-            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-        }
-        return parse_v6_with_optional_scope(inner);
+/// Port of .NET `IPAddress.TryParse`: `value` is read as IPv6 when it holds a
+/// colon, and as IPv4 otherwise.
+///
+/// - IPv4 takes every spelling `IPv4AddressHelper.ParseNonCanonical` reads:
+///   one to four parts split by `.`, each decimal, octal after a leading `0`
+///   or hexadecimal after `0x`. Each part but the last is one byte and the last
+///   fills the bytes left, so `127.1`, `0x7f.1` and `2130706433` are all
+///   127.0.0.1.
+/// - IPv6 follows `IPv6AddressHelper.IsValidStrict`: one optional pair of
+///   brackets, after which only a `:port` may come (decimal, or hexadecimal
+///   after `0x`; it is not read), and an optional `%scope` that runs to the
+///   closing bracket and holds no `/`. An embedded IPv4 address is read as
+///   `IPv4AddressHelper.IsValidCanonical` reads it, which lets its last part,
+///   and only that one, start with one zero (`::192.168.0.010` is
+///   `::192.168.0.10`).
+///
+/// The scope is dropped: an [`IpAddr`] has none.
+#[must_use]
+pub fn try_parse_ip_address(value: &str) -> Option<IpAddr> {
+    if value.contains(':') {
+        try_parse_ipv6(value).map(IpAddr::V6)
+    } else {
+        try_parse_ipv4(value).map(IpAddr::V4)
     }
-
-    if let Ok(address) = value.parse::<IpAddr>() {
-        return Some(address);
-    }
-
-    // Bare scoped IPv6 (`fe80::1%16`): only IPv6 carries a `%zone`.
-    if value.contains('%') && value.contains(':') {
-        return parse_v6_with_optional_scope(value);
-    }
-
-    None
 }
 
-/// Parses an IPv6 address that may carry a trailing `%zone` scope id.
-fn parse_v6_with_optional_scope(value: &str) -> Option<IpAddr> {
-    let base = value.split('%').next().unwrap_or(value);
-    match base.parse::<IpAddr>() {
-        Ok(IpAddr::V6(v6)) => Some(IpAddr::V6(v6)),
-        _ => None,
+/// The IPv4 half of [`try_parse_ip_address`]: `ParseNonCanonical`, which has
+/// to read all of `value`.
+fn try_parse_ipv4(value: &str) -> Option<Ipv4Addr> {
+    let parts = value.split('.').count();
+    if parts > 4 {
+        return None;
     }
+    let mut address = 0u32;
+    for (index, part) in value.split('.').enumerate() {
+        let (digits, radix) = match part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None if part.len() > 1 && part.starts_with('0') => (&part[1..], 8),
+            None => (part, 10),
+        };
+        // Checked first: `from_str_radix` also takes a sign.
+        if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+            return None;
+        }
+        let number = u32::from_str_radix(digits, radix).ok()?;
+        if index + 1 < parts {
+            if number > 0xFF {
+                return None;
+            }
+            address |= number << (8 * (3 - index));
+        } else {
+            let bits = 8 * (4 - index);
+            if bits < 32 && number >> bits != 0 {
+                return None;
+            }
+            address |= number;
+        }
+    }
+    Some(Ipv4Addr::from(address))
+}
+
+/// The IPv6 half of [`try_parse_ip_address`]: `IsValidStrict`, then `Parse`.
+fn try_parse_ipv6(value: &str) -> Option<Ipv6Addr> {
+    let address = match value.strip_prefix('[') {
+        Some(inner) => {
+            let (address, after) = inner.split_once(']')?;
+            if !after.is_empty() {
+                let port = after.strip_prefix(':')?;
+                let valid = match port.strip_prefix("0x") {
+                    Some(hex) => hex.bytes().all(|b| b.is_ascii_hexdigit()),
+                    None => port.bytes().all(|b| b.is_ascii_digit()),
+                };
+                if !valid {
+                    return None;
+                }
+            }
+            address
+        }
+        None if value.contains(']') => return None,
+        None => value,
+    };
+    let (address, scope) = address.split_once('%').unwrap_or((address, ""));
+    if scope.contains('/') {
+        return None;
+    }
+    if let Ok(v6) = address.parse() {
+        return Some(v6);
+    }
+    // std refuses only one embedded IPv4 spelling .NET reads: a leading zero
+    // in its last part. Spelled out as two groups, the rest is std's to check.
+    let (head, tail) = address.rsplit_once(':')?;
+    if !tail.contains('.') {
+        return None;
+    }
+    let [a, b, c, d] = try_parse_embedded_ipv4(tail)?.octets();
+    let high = u16::from_be_bytes([a, b]);
+    let low = u16::from_be_bytes([c, d]);
+    format!("{head}:{high:x}:{low:x}").parse().ok()
+}
+
+/// An IPv4 address that ends an IPv6 one (`IsValidCanonical`): four decimal
+/// parts of at most 255. No part starts with `00`, and a part of more than one
+/// digit starts with a zero only when it is the last part (`::1.2.3.010` and
+/// `::1.2.3.0255` end in 10 and 255; `::1.2.03.4` does not parse).
+fn try_parse_embedded_ipv4(value: &str) -> Option<Ipv4Addr> {
+    let mut octets = [0u8; 4];
+    let mut parts = value.split('.');
+    for (index, octet) in octets.iter_mut().enumerate() {
+        let part = parts.next()?;
+        let leading_zero = part.len() > 1 && part.starts_with('0');
+        if part.is_empty()
+            || !part.bytes().all(|b| b.is_ascii_digit())
+            || part.starts_with("00")
+            || (leading_zero && index < 3)
+        {
+            return None;
+        }
+        *octet = part.parse().ok()?;
+    }
+    parts.next().is_none().then(|| Ipv4Addr::from(octets))
 }
 
 /// Returns the substring of `s` before the first `needle`, or all of `s`
@@ -466,7 +547,7 @@ pub fn ip_none() -> IpAddr {
 /// on a malformed address or an out-of-range prefix.
 fn parse_ip_network(value: &str) -> Option<IpNetwork> {
     let (addr_part, prefix_part) = value.split_once('/')?;
-    let base = parse_ip(addr_part)?;
+    let base = try_parse_ip_address(addr_part)?;
     let prefix: u8 = prefix_part.parse().ok()?;
 
     let normalized = match base {

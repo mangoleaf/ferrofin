@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use ferrofin_model::dlna::DlnaProfileType;
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::entities::MediaStreamType;
+use ferrofin_model::entities::{MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::io::FileSystemEntryType;
 use ferrofin_model::media_info::MediaProtocol;
@@ -28,7 +28,9 @@ use ferrofin_naming::external_files::{ExternalPathParser, ExternalPathParserResu
 use ferrofin_naming::path as naming_path;
 use ferrofin_traits::filesystem::FileSystem;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
+use ferrofin_util::string_extensions::to_upper_ordinal;
 
+use crate::library_scan::off_runtime;
 use crate::localization_manager::LocalizationManager;
 
 /// The video an external-stream search is run for: the three path facts
@@ -45,9 +47,33 @@ pub struct ExternalMediaTarget {
     /// also searched — subtitles uploaded against a read-only library are
     /// written there. `None` when the caller has no metadata root.
     pub internal_metadata_path: Option<String>,
+    /// Whether the video is a DVD or Blu-ray rip, whose sidecars are named
+    /// after its whole path name (`Video.FileNameWithoutExtension`).
+    pub disc: bool,
 }
 
 impl ExternalMediaTarget {
+    /// The target for `video` at `path`, as `Video` overrides the base item:
+    /// the folder is its `ContainingFolderPath` (a disc rip's own folder, a
+    /// stacked set's parent folder, else the file's directory), and a DVD or
+    /// Blu-ray is named by its whole path name.
+    #[must_use]
+    pub fn for_video(
+        video: &ferrofin_db::entities::base_items::BaseItemEntity,
+        path: &str,
+        internal_metadata_path: Option<String>,
+    ) -> Self {
+        Self {
+            path: path.to_owned(),
+            containing_folder: crate::video_versions::containing_folder_path_at(video, path),
+            internal_metadata_path,
+            disc: matches!(
+                crate::item_data::video_format(video.data.as_deref()).video_type,
+                VideoType::Dvd | VideoType::BluRay
+            ),
+        }
+    }
+
     /// A target for a plain video **file**: the containing folder is the
     /// file's directory (`Path.GetDirectoryName`).
     #[cfg(test)]
@@ -61,34 +87,28 @@ impl ExternalMediaTarget {
             path,
             containing_folder,
             internal_metadata_path,
+            disc: false,
         }
     }
 
     /// The video's file name without extension — the prefix every external
-    /// file's name must start with (`Video.FileNameWithoutExtension`).
+    /// file's name must start with (`Video.FileNameWithoutExtension`). A DVD
+    /// or Blu-ray keeps its whole name (`GetFileName`), so a rip folder's
+    /// dots stay.
     #[must_use]
     pub fn file_name_without_extension(&self) -> &str {
-        naming_path::file_name_without_extension(&self.path)
+        if self.disc {
+            naming_path::file_name(&self.path)
+        } else {
+            naming_path::file_name_without_extension(&self.path)
+        }
     }
 }
 
-/// Whether a path is a local file rather than a network stream — the port of
-/// `MediaSourceManager.GetPathProtocol(path) == MediaProtocol.File`, which
-/// `BaseItem.IsFileProtocol` reads. External files are only ever looked for
-/// next to a local file.
-#[must_use]
-pub fn is_file_protocol(path: &str) -> bool {
-    const STREAM_SCHEMES: [&str; 6] = ["rtsp", "rtmp", "http", "rtp", "ftp", "udp"];
-    let lower = path.to_ascii_lowercase();
-    if STREAM_SCHEMES
-        .iter()
-        .any(|scheme| lower.starts_with(scheme))
-    {
-        return false;
-    }
-    // `IFileSystem.IsPathFile`: a scheme other than `file://` is not a file.
-    !lower.contains("://") || lower.starts_with("file://")
-}
+/// Whether a path is a local file rather than a network stream
+/// (`BaseItem.IsFileProtocol`). External files are only ever looked for next to
+/// a local file.
+pub use ferrofin_model::media_info::is_file_protocol;
 
 /// Resolves external files of one [`DlnaProfileType`] (subtitle or audio)
 /// for a video. Port of the abstract `MediaInfoResolver`; the
@@ -227,15 +247,27 @@ impl MediaInfoResolver {
     /// come from the probe when it has them, else from the filename. A probe
     /// failure logs and skips that file — one bad sidecar never loses the
     /// others. `.strm` sidecars are never probed.
+    ///
+    /// The scan does not call this: it lists both resolvers' files in one
+    /// hand-off ([`ExternalStreamResolvers::external_streams`]).
     pub async fn get_external_streams(
         &self,
         video: &ExternalMediaTarget,
+        start_index: i32,
+    ) -> Vec<MediaStream> {
+        let path_infos = off_runtime(|| self.get_external_files(video));
+        self.probe_external_files(path_infos, start_index).await
+    }
+
+    /// The half of [`get_external_streams`](Self::get_external_streams)
+    /// that awaits: probes `path_infos`, the files
+    /// [`get_external_files`](Self::get_external_files) found for a video,
+    /// numbering their streams from `start_index`.
+    async fn probe_external_files(
+        &self,
+        path_infos: Vec<ExternalPathParserResult>,
         mut start_index: i32,
     ) -> Vec<MediaStream> {
-        if !is_file_protocol(&video.path) {
-            return Vec::new();
-        }
-        let path_infos = self.get_external_files(video);
         if path_infos.is_empty() {
             return Vec::new();
         }
@@ -358,11 +390,14 @@ impl MediaInfoResolver {
     /// (`IDirectoryService.GetFilePaths`, non-recursive) whose stem starts
     /// with `prefix` (ignoring case): the only ones [`get_external_files`]
     /// can match, taken before the paths are copied out of the listing,
-    /// which a scan shares between every item in the folder.
+    /// which a scan shares between every item in the folder. Sorted as
+    /// upstream's `GetFilePaths` sorts its listing (`OrderBy(x => x)`), so
+    /// external streams are numbered in that order, not the directory's.
     ///
     /// [`get_external_files`]: Self::get_external_files
     fn file_paths(&self, folder: &str, prefix: &str) -> Vec<String> {
-        self.file_system
+        let mut paths: Vec<String> = self
+            .file_system
             .shared_file_system_entries(folder)
             .iter()
             .filter(|entry| entry.type_ == FileSystemEntryType::File)
@@ -374,7 +409,9 @@ impl MediaInfoResolver {
                 .is_some()
             })
             .map(|entry| entry.path.clone())
-            .collect()
+            .collect();
+        paths.sort_by(|a, b| ferrofin_naming::culture_cmp(a, b));
+        paths
     }
 
     /// Probes one external file as this resolver's media type. Port of the
@@ -469,7 +506,7 @@ fn strip_prefix_ignore_case<'a>(name: &'a str, prefix: &str) -> Option<&'a str> 
     let mut name_chars = name.char_indices();
     for expected in prefix.chars() {
         let (_, actual) = name_chars.next()?;
-        if !actual.to_lowercase().eq(expected.to_lowercase()) {
+        if to_upper_ordinal(actual) != to_upper_ordinal(expected) {
             return None;
         }
     }
@@ -548,9 +585,8 @@ impl ExternalStreamResolvers {
         &self.lyrics
     }
 
-    /// The search target for a video at `path`: its containing folder is the
-    /// file's directory, or the folder itself for a disc rip (see
-    /// [`containing_folder_for`]).
+    /// The search target for an audio track at `path`: its containing folder
+    /// is the file's directory (see [`containing_folder_for`]).
     #[must_use]
     pub fn target_for(
         &self,
@@ -561,27 +597,36 @@ impl ExternalStreamResolvers {
             path: path.to_owned(),
             containing_folder: containing_folder_for(path, self.subtitles.file_system.as_ref()),
             internal_metadata_path,
+            disc: false,
         }
     }
 
     /// Every external stream of `video` — subtitles numbered from
     /// `start_index`, then audio continuing after them — in the order
-    /// `FFProbeVideoInfo.Fetch` adds them.
+    /// `FFProbeVideoInfo.Fetch` adds them. Both resolvers' files are found
+    /// first, in one `off_runtime` hand-off (the stats and listings
+    /// block), and only then probed.
     pub async fn external_streams(
         &self,
         video: &ExternalMediaTarget,
         start_index: i32,
     ) -> Vec<MediaStream> {
+        let (subtitles, audio) = off_runtime(|| {
+            (
+                self.subtitles.get_external_files(video),
+                self.audio.get_external_files(video),
+            )
+        });
         let mut streams = self
             .subtitles
-            .get_external_streams(video, start_index)
+            .probe_external_files(subtitles, start_index)
             .await;
         let next = streams
             .iter()
             .map(|s| s.index)
             .max()
             .map_or(start_index, |max| max + 1);
-        streams.extend(self.audio.get_external_streams(video, next).await);
+        streams.extend(self.audio.probe_external_files(audio, next).await);
         streams
     }
 
@@ -603,8 +648,9 @@ impl ExternalStreamResolvers {
     }
 }
 
-/// Whether `path` names a directory on disk — a disc rip's containing folder
-/// is the rip folder itself (`Video.ContainingFolderPath` for BluRay/DVD).
+/// The folder of the file at `path` (`BaseItem.ContainingFolderPath`), or
+/// `path` itself when it names a directory on disk. A video's folder is
+/// [`ExternalMediaTarget::for_video`]'s.
 #[must_use]
 pub fn containing_folder_for(path: &str, file_system: &dyn FileSystem) -> String {
     if file_system.directory_exists(path) {
@@ -864,6 +910,7 @@ mod tests {
             path: format!("{VIDEO_DIRECTORY_PATH}/My.Video.mkv"),
             containing_folder: containing_folder.to_owned(),
             internal_metadata_path: Some(metadata_path.to_owned()),
+            disc: false,
         };
 
         let _ignored = resolver.get_external_files(&video);
@@ -908,6 +955,58 @@ mod tests {
         let actual = &streams[0];
         assert_eq!(actual.language.as_deref(), language);
         assert_eq!(actual.title, None);
+    }
+
+    /// `Video.ContainingFolderPath` and `FileNameWithoutExtension` of a DVD
+    /// rip: a single rip's sidecars sit inside its folder, a stacked set's in
+    /// the set's folder, both named after the whole disc folder name, dots
+    /// included.
+    #[rstest]
+    #[case::rip("The.Film.2020", None, "The.Film.2020")]
+    #[case::stacked_set("Set.2020 - Disc 1", Some("Set.2020 - Disc 2"), VIDEO_DIRECTORY_PATH)]
+    fn a_disc_rips_sidecars_are_named_after_its_whole_folder(
+        #[case] disc: &str,
+        #[case] next_part: Option<&str>,
+        #[case] folder: &str,
+    ) {
+        let rip = format!("{VIDEO_DIRECTORY_PATH}/{disc}");
+        let folder = if folder == VIDEO_DIRECTORY_PATH {
+            folder.to_owned()
+        } else {
+            format!("{VIDEO_DIRECTORY_PATH}/{folder}")
+        };
+        let stem = disc.split('.').next().unwrap();
+        let fs = FakeFs::new(
+            &[VIDEO_DIRECTORY_PATH, rip.as_str()],
+            vec![(
+                folder.as_str(),
+                vec![
+                    format!("{folder}/{disc}.en.srt"),
+                    format!("{folder}/{stem}.srt"),
+                ],
+            )],
+        );
+        let data = match next_part {
+            Some(part) => serde_json::json!({
+                "VideoType": "Dvd",
+                "AdditionalParts": [format!("{VIDEO_DIRECTORY_PATH}/{part}")],
+            }),
+            None => serde_json::json!({ "VideoType": "Dvd" }),
+        };
+        let row = ferrofin_db::entities::base_items::BaseItemEntity {
+            path: Some(rip.clone()),
+            data: Some(data.to_string()),
+            ..Default::default()
+        };
+        let resolver = resolver(DlnaProfileType::Subtitle, vec![MediaStream::default()], fs);
+        let video = ExternalMediaTarget::for_video(&row, &rip, None);
+
+        assert_eq!(video.containing_folder, folder);
+        assert_eq!(video.file_name_without_extension(), disc);
+        let streams = resolver.get_external_files(&video);
+        assert_eq!(streams.len(), 1, "{streams:?}");
+        assert_eq!(streams[0].language.as_deref(), Some("eng"));
+        assert_eq!(streams[0].title, None);
     }
 
     // GetExternalFiles_NameMatching_RejectsNonMatches
@@ -1005,6 +1104,72 @@ mod tests {
         let paths = external_paths(video_files, metadata_files);
         let extensions: Vec<&str> = paths.iter().map(|p| naming_path::extension(p)).collect();
         assert_eq!(extensions, expected_extensions, "{paths:?}");
+    }
+
+    /// Upstream's `DirectoryService.GetFilePaths` hands each folder's files
+    /// over sorted (`OrderBy(x => x)`, the current culture), whatever order
+    /// the directory lists them in: case-blind first, lowercase before
+    /// uppercase on a tie, each folder on its own, the video folder first.
+    #[test]
+    fn get_external_files_sorts_each_folder_listing() {
+        let paths = external_paths(
+            &[
+                "My.Video.fr.srt",
+                "My.Video.EN.srt",
+                "My.Video.de.srt",
+                "My.Video.en.srt",
+                "My.Video.en.sdh.srt",
+            ],
+            &["My.Video.ja.srt", "My.Video.af.srt"],
+        );
+        let video = |f: &str| format!("{VIDEO_DIRECTORY_PATH}/{f}");
+        let metadata = |f: &str| format!("{METADATA_DIRECTORY_PATH}/{f}");
+        assert_eq!(
+            paths,
+            [
+                video("My.Video.de.srt"),
+                video("My.Video.en.sdh.srt"),
+                video("My.Video.en.srt"),
+                video("My.Video.EN.srt"),
+                video("My.Video.fr.srt"),
+                metadata("My.Video.af.srt"),
+                metadata("My.Video.ja.srt"),
+            ]
+        );
+    }
+
+    /// External streams are numbered in the sorted file order, not the
+    /// directory's.
+    #[tokio::test]
+    async fn get_external_streams_numbers_sidecars_in_sorted_order() {
+        let fs = FakeFs::new(
+            &[VIDEO_DIRECTORY_PATH],
+            vec![(
+                VIDEO_DIRECTORY_PATH,
+                ["My.Video.fr.srt", "My.Video.de.srt", "My.Video.en.srt"]
+                    .iter()
+                    .map(|f| format!("{VIDEO_DIRECTORY_PATH}/{f}"))
+                    .collect(),
+            )],
+        );
+        let subtitle = MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            ..MediaStream::default()
+        };
+        let resolver = resolver(DlnaProfileType::Subtitle, vec![subtitle], fs);
+
+        let streams = resolver
+            .get_external_streams(&video("My.Video.mkv"), 2)
+            .await;
+
+        let numbered: Vec<(i32, Option<&str>)> = streams
+            .iter()
+            .map(|s| (s.index, s.language.as_deref()))
+            .collect();
+        assert_eq!(
+            numbered,
+            [(2, Some("deu")), (3, Some("eng")), (4, Some("fra"))]
+        );
     }
 
     // GetExternalStreams_BadPaths_ReturnsNoSubtitles
@@ -1487,18 +1652,6 @@ mod tests {
         assert_eq!(streams[0].index, 0);
     }
 
-    #[rstest]
-    #[case("/media/Movie.mkv", true)]
-    #[case("file:///media/Movie.mkv", true)]
-    #[case("C:\\media\\Movie.mkv", true)]
-    #[case("https://url.com/My.Video.mkv", false)]
-    #[case("HTTP://url.com/My.Video.mkv", false)]
-    #[case("rtsp://cam/stream", false)]
-    #[case("smb://nas/share/Movie.mkv", false)]
-    fn is_file_protocol_matches_get_path_protocol(#[case] path: &str, #[case] is_file: bool) {
-        assert_eq!(is_file_protocol(path), is_file);
-    }
-
     // `GetExternalStreams(Audio, …)`: every lyric sidecar whose stem is the
     // track's (any case, then a media-flag delimiter), in the folder then the
     // metadata folder, becomes an unprobed Lyric stream numbered from
@@ -1582,6 +1735,13 @@ mod tests {
     #[case("My.Video Sequel", "My.Video", Some(" Sequel"))]
     #[case("My.Vid", "My.Video", None)]
     #[case("Other.Video", "My.Video", None)]
+    // .NET's per-character `OrdinalIgnoreCase` fold, not Rust's full lowercase:
+    // the Kelvin sign `K` (U+212A) is not `k`, the dotless `ı` and the long `ſ`
+    // keep their own case, and `ᾳ` is `ᾼ` (`ferrofin-util`'s .NET 10 table).
+    #[case("\u{212A}ey.en", "key", None)]
+    #[case("V\u{131}deo", "VIDEO", None)]
+    #[case("\u{17F}how", "show", None)]
+    #[case("\u{1FBC}x.en", "\u{1FB3}x", Some(".en"))]
     fn strip_prefix_ignores_case(
         #[case] name: &str,
         #[case] prefix: &str,

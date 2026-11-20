@@ -178,10 +178,10 @@ fn is_file_protocol(path: Option<&str>) -> bool {
 ///   supports deleting (there is no channel-plugin mechanism), so `false`;
 /// - `Video.CanDelete` is `false` while a recording writes its file;
 /// - otherwise `IsFileProtocol`: an item with no path, or a streamed one,
-///   cannot be deleted. The exceptions are a collection an older Ferrofin
-///   created (gl-738 tracks giving it a folder), and a playlist an older
+///   cannot be deleted. The exceptions are a box set or a playlist an older
 ///   Ferrofin created that the boot repair could not give a folder
-///   ([`crate::adoption_repairs::rekey_pathless_playlists`]): their rows have
+///   ([`crate::adoption_repairs::rekey_pathless_box_sets`],
+///   [`crate::adoption_repairs::rekey_pathless_playlists`]): their rows have
 ///   no path, where upstream's sit in the data directory
 ///   (`collections/<name> [boxset]`, `playlists/<name>`,
 ///   `PlaylistManager.cs:83-141`), so upstream's `CanDelete()` is `true` for
@@ -323,11 +323,11 @@ fn file_system_info(path: &Path) -> DeletePath {
 }
 
 /// `string.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)`: the
-/// invariant simple uppercase mapping keeps every character one character,
+/// ordinal case fold keeps every character one character,
 /// so comparing the mapped strings is comparing character by character.
 fn starts_with_ordinal_ignore_case(text: &str, prefix: &str) -> bool {
-    use ferrofin_util::string_extensions::upper_invariant;
-    upper_invariant(text).starts_with(&upper_invariant(prefix))
+    use ferrofin_util::string_extensions::ordinal_ignore_case_key;
+    ordinal_ignore_case_key(text).starts_with(&ordinal_ignore_case_key(prefix))
 }
 
 /// `BaseItem.GetLocalMetadataFilesToDelete` (`BaseItem.cs:2606-2618`): for a
@@ -1130,5 +1130,7 @@ mod tests {
         assert!(starts_with_ordinal_ignore_case("ALIENS", "alien"));
         assert!(starts_with_ordinal_ignore_case("Élan vital", "élan"));
         assert!(!starts_with_ordinal_ignore_case("Ali", "Alien"));
+        // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+        assert!(!starts_with_ordinal_ignore_case("Croſs", "cross"));
     }
 }

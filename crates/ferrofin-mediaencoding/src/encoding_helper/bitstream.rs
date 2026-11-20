@@ -119,8 +119,9 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
         return HdrMetadataRemoval::None;
     }
     let wants = |t: VideoRangeType| {
-        let name = range_type_name(t);
-        requested.iter().any(|r| r.eq_ignore_ascii_case(&name))
+        requested
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(&t.json_name()))
     };
     let has_hdr10 = wants(VideoRangeType::Hdr10);
     let has_dovi = wants(VideoRangeType::Dovi);
@@ -160,11 +161,6 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
     }
 }
 
-/// The wire name of a range type, as the client spells it in its profile.
-fn range_type_name(t: VideoRangeType) -> String {
-    t.json_name().into_owned()
-}
-
 /// Whether Ferrofin strips the Dolby Vision RPU from this copy where upstream
 /// copies it through.
 ///
@@ -189,8 +185,9 @@ pub fn strips_dovi_for_a_client_without_dovi(state: &EncodingJobInfo) -> bool {
     }
     let requested = state.requested_range_types(video.codec.as_deref().unwrap_or_default());
     let wants = |t: VideoRangeType| {
-        let name = range_type_name(t);
-        requested.iter().any(|r| r.eq_ignore_ascii_case(&name))
+        requested
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(&t.json_name()))
     };
     !requested.is_empty()
         && !wants(VideoRangeType::Dovi)
@@ -443,7 +440,7 @@ pub fn audio_bit_stream_arguments(
     if let Some(ref f) = noise {
         filters.push(f);
     }
-    let segment_is_mp4 = segment_container.eq_ignore_ascii_case("mp4");
+    let segment_is_mp4 = super::helper::is_mp4_segment_container(segment_container);
     if segment_is_mp4
         && (media_source_container.eq_ignore_ascii_case("ts")
             || media_source_container.eq_ignore_ascii_case("aac")
@@ -624,12 +621,12 @@ mod tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: "/tmp/out.mp4".to_owned(),
             input_container: None,
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::enums::SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: Some(1),
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Progressive,
             supported_video_codecs: Vec::new(),
@@ -1170,12 +1167,12 @@ mod tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: String::new(),
             input_container: Some(input_container.to_owned()),
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::enums::SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: Some(6_000_000_000),
             transcoding_type: job_type,
             supported_video_codecs: Vec::new(),

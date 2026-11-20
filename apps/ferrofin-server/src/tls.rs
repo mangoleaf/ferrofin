@@ -72,11 +72,11 @@ impl HttpsServing {
     ///
     /// HTTPS on the HTTP port is not served either: the two listeners cannot
     /// share it. Jellyfin resets both ports to their defaults in that case
-    /// (`ApplicationHost.Init`), because its ports come from the dashboard.
-    /// Until Ferrofin reads the dashboard's ports (gl-554), they come from the
-    /// operator (`FERROFIN_PORT`, `FERROFIN_HTTPS_PORT`), so the HTTP port
-    /// stays where it was put and the clash is logged as an error. Port 0 (an
-    /// ephemeral port each) never clashes.
+    /// (`ApplicationHost.Init`), because its ports come from the dashboard;
+    /// `listen::ports` does that to the dashboard's ports. Equal ports that
+    /// remain involve one the operator set (a flag, a variable or
+    /// `config.toml`), so the HTTP port stays where it was put and the clash
+    /// is logged as an error. Port 0 (an ephemeral port each) never clashes.
     #[must_use]
     pub fn from_network_configuration(
         network: &NetworkConfiguration,
@@ -87,14 +87,10 @@ impl HttpsServing {
             return None;
         }
         if tls_port != 0 && tls_port == plain_port {
-            // TODO(gl-554): when the dashboard's InternalHttpPort and
-            // InternalHttpsPort are read, port `ApplicationHost.Init`'s reset of
-            // equal ports to 8096/8920 into the port resolution, where it also
-            // applies with HTTPS off; this check then never sees equal ports.
             tracing::error!(
                 port = tls_port,
-                "HTTPS is enabled on the HTTP port; set FERROFIN_HTTPS_PORT to another port. \
-                 Serving HTTP only"
+                "HTTPS is enabled on the HTTP port; give HTTPS another port (Dashboard → \
+                 Networking, FERROFIN_HTTPS_PORT or https_port in config.toml). Serving HTTP only"
             );
             return None;
         }
@@ -395,7 +391,7 @@ pub async fn redirect_to_https(
         );
         HeaderValue::from_str(&format!(
             "https://{authority}{}{path}{query}",
-            redirect.base
+            ferrofin_networking::escape_base_url(&redirect.base)
         ))
         .ok()
     });
@@ -422,8 +418,8 @@ pub async fn redirect_to_https(
     let network = redirect.network.as_deref();
     ferrofin_api::response_time::with_response_time(
         config,
-        |peer, forwarded_for| {
-            ferrofin_api::forwarded_headers::client_address_through(network, peer, forwarded_for)
+        |peer, headers| {
+            ferrofin_api::forwarded_headers::client_address_through(network, peer, headers)
         },
         request,
         cors,
@@ -453,11 +449,8 @@ fn host_without_port(host: &str) -> &str {
 /// save returns) is also answered `404` and stays saved; that is the
 /// [`CommittedConfigurationCheck`] the API runs.
 ///
-/// TODO(gl-554): `OnConfigurationUpdated` also flags a restart when the
-/// dashboard's `InternalHttpPort` or `InternalHttpsPort` differ from the ports
-/// in use, both non-zero, while `IsPortAuthorized` is set; it then clears
-/// `IsPortAuthorized` and saves (`ApplicationHost.cs:803-818`). Port it with the
-/// dashboard ports.
+/// The rest of `OnConfigurationUpdated`, the restart a changed port takes, is
+/// `listen::restart_listener`.
 pub struct CertificatePathCheck {
     loaded_path: String,
     network: Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>,
@@ -986,6 +979,13 @@ mod tests {
         "example.com:8096",
         "/System/Info/Public?x=1",
         "https://example.com:8920/jf/System/Info/Public?x=1"
+    )]
+    #[case::base_escaped(
+        8920,
+        "/my jellyfin",
+        "example.com:8096",
+        "/web/",
+        "https://example.com:8920/my%20jellyfin/web/"
     )]
     #[case::default_port_left_out(
         443,

@@ -1,18 +1,11 @@
-//! Real-ffmpeg integration for [`FfmpegMediaExtractor`] — gated like every
-//! ffmpeg test: `FERROFIN_FFMPEG_TESTS=1`, skipped when ffmpeg is absent.
+//! Real-ffmpeg integration for [`FfmpegMediaExtractor`] — `#[ignore]`d like
+//! every ffmpeg test; asked for, it needs ffmpeg on `PATH`.
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
 use ferrofin_mediaencoding::FfmpegMediaExtractor;
 use ferrofin_traits::media_analysis::{AudioSpec, MediaExtractor as _};
-
-fn gated() -> Option<String> {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").ok().as_deref() != Some("1") {
-        return None;
-    }
-    which_ffmpeg()
-}
 
 fn which_ffmpeg() -> Option<String> {
     std::process::Command::new("ffmpeg")
@@ -24,11 +17,9 @@ fn which_ffmpeg() -> Option<String> {
 }
 
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn extracts_pcm_and_frames_from_generated_media() {
-    let Some(ffmpeg) = gated() else {
-        eprintln!("skipped: FERROFIN_FFMPEG_TESTS!=1 or no ffmpeg");
-        return;
-    };
+    let ffmpeg = which_ffmpeg().expect("ffmpeg not found on PATH");
     let dir = tempfile::tempdir().unwrap();
     let media = dir.path().join("tone.mkv");
     // 3 s of sine + solid color video.
@@ -120,11 +111,9 @@ async fn stalled_extraction_times_out_and_kills_the_child() {
 }
 
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn extracts_an_embedded_subtitle_track() {
-    let Some(ffmpeg) = gated() else {
-        eprintln!("skipped: FERROFIN_FFMPEG_TESTS!=1 or no ffmpeg");
-        return;
-    };
+    let ffmpeg = which_ffmpeg().expect("ffmpeg not found on PATH");
     let dir = tempfile::tempdir().unwrap();
     let srt = dir.path().join("in.srt");
     std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:02,000\nhello ferrofin\n\n").unwrap();

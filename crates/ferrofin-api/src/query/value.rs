@@ -15,8 +15,13 @@
 //!   and [`Pairs`] refuses an empty one before binding;
 //! * `bool` is `bool.TryParse`: either case, surrounding whitespace ignored
 //!   (`True` — the spelling `StreamInfo::to_url` emits — was a 400 here);
-//! * integers and floats are trimmed before parsing (`NumberStyles.Integer`
-//!   / `Float` allow surrounding whitespace);
+//! * integers are trimmed before parsing (`NumberStyles.Integer` allows
+//!   surrounding whitespace), and a decimal one may end in NULs (measured on
+//!   12.4);
+//! * a `double` or `float` is ASP.NET's `DoubleModelBinder`/`FloatModelBinder`,
+//!   not a `TypeConverter`: `NumberStyles.Float | AllowThousands` in the
+//!   invariant culture ([`invariant_float::parse`]), so `1,000` binds and
+//!   Rust's `inf` does not (measured on 12.4);
 //! * an enum name matches ignoring case, and its underlying number binds too
 //!   (`EnumConverter` → `Enum.Parse(…, true)`) — by its C# value, from Jellyfin's
 //!   reflection inventory, never serde's variant index. A number no member has
@@ -35,6 +40,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use ferrofin_util::invariant_float;
 use serde::de::value::{MapDeserializer, StrDeserializer, U32Deserializer};
 use serde::de::{self, IntoDeserializer, Visitor};
 use serde::forward_to_deserialize_any;
@@ -152,7 +158,8 @@ fn radix16_digits(text: &str) -> Option<&str> {
 
 /// `deserialize_<integer>` for [`Value`]: trimmed, then parsed as decimal or
 /// (with a hex prefix) as the same-width unsigned value reinterpreted, as
-/// `Convert.ToInt32(text, 16)` reads `FFFFFFFF` as -1.
+/// `Convert.ToInt32(text, 16)` reads `FFFFFFFF` as -1. A decimal may end in
+/// NULs after its ASCII white space (`int.Parse`'s `TrailingZeros`).
 macro_rules! parse_integer {
     ($($method:ident => $visit:ident: $ty:ty as $unsigned:ty),* $(,)?) => {$(
         #[allow(clippy::cast_possible_wrap)]
@@ -163,7 +170,10 @@ macro_rules! parse_integer {
                     Some(digits) => <$unsigned>::from_str_radix(digits, 16).map(|n| n as $ty),
                     None => return Err(de::Error::custom(format!("invalid hex number `{text}`"))),
                 },
-                None => text.parse::<$ty>(),
+                None => text
+                    .trim_end_matches('\0')
+                    .trim_end_matches(|c| matches!(c, ' ' | '\t'..='\r'))
+                    .parse::<$ty>(),
             };
             match parsed {
                 Ok(n) => visitor.$visit(n),
@@ -173,13 +183,15 @@ macro_rules! parse_integer {
     )*};
 }
 
-/// `deserialize_<float>` for [`Value`]: trimmed, then parsed (no hex).
+/// `deserialize_<float>` for [`Value`]: `DoubleModelBinder`/`FloatModelBinder`'s
+/// parse, [`invariant_float::parse`] (no hex).
 macro_rules! parse_float {
     ($($method:ident => $visit:ident: $ty:ty),* $(,)?) => {$(
         fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-            match self.text.trim().parse::<$ty>() {
-                Ok(n) => visitor.$visit(n),
-                Err(e) => Err(de::Error::custom(e)),
+            match invariant_float::parse::<$ty>(&self.text) {
+                Some(n) => visitor.$visit(n),
+                // The 400's wording, as Rust's `ParseFloatError` gave it.
+                None => Err(de::Error::custom("invalid float literal")),
             }
         }
     )*};
@@ -283,6 +295,8 @@ impl<'de> de::Deserializer<'de> for Value<'_> {
         visitor: V,
     ) -> Result<V::Value, Error> {
         let text = self.text.trim();
+        // TODO(gl-1441): Enum.Parse's trailing NULs, untrimmed end and comma
+        // lists are not ported yet (measured on 12.4 there).
         // `Enum.Parse` also takes the underlying number (wire enums parse
         // numbers themselves). A Jellyfin enum binds the member with that C#
         // value; an enum outside the inventory has its values in declaration
@@ -450,6 +464,7 @@ mod tests {
         long: Option<i64>,
         byte: Option<u8>,
         float: Option<f64>,
+        single: Option<f32>,
     }
 
     fn numbers(query: &str) -> Result<Numbers, String> {
@@ -497,6 +512,78 @@ mod tests {
             "int=1.0",
         ] {
             assert!(numbers(query).is_err(), "{query}");
+        }
+    }
+
+    /// `DoubleModelBinder`/`FloatModelBinder`: `NumberStyles.Float |
+    /// AllowThousands` in the invariant culture (the grammar's cases are
+    /// `ferrofin_util::invariant_float`'s). Measured on Jellyfin 12.4 with
+    /// `/Items?minCommunityRating=` and `/Videos/{itemId}/stream?maxFramerate=`.
+    #[rstest::rstest]
+    #[case("float=1%2C000&single=1%2C000", Some(1000.0))]
+    #[case("float=12%2C34.5&single=12%2C34.5", Some(1234.5))]
+    #[case("float=1%00&single=1%00", Some(1.0))]
+    #[case("float=%C2%A0Infinity&single=Infinity", Some(f64::INFINITY))]
+    #[case("float=-infinity&single=-INFINITY", Some(f64::NEG_INFINITY))]
+    #[case("float=%C2%A0&single=%20", None)]
+    fn floats_bind_like_double_parse(#[case] query: &str, #[case] expected: Option<f64>) {
+        let bound = numbers(query).expect(query);
+        assert_eq!(bound.float, expected, "{query}");
+        #[allow(clippy::cast_possible_truncation)]
+        let narrowed = expected.map(|v| v as f32);
+        assert_eq!(bound.single, narrowed, "{query}");
+    }
+
+    #[rstest::rstest]
+    #[case("float=inf")]
+    #[case("single=%2Binf")]
+    #[case("float=-INF")]
+    #[case("float=%C2%A01")]
+    #[case("single=1%C2%A0")]
+    #[case("float=%2C1")]
+    #[case("float=1.5%2C0")]
+    #[case("float=1%00%20")]
+    #[case("single=%E2%88%9E")]
+    fn floats_refuse_what_double_parse_refuses(#[case] query: &str) {
+        let error = numbers(query).expect_err(query);
+        let member = query.split('=').next().unwrap_or_default();
+        assert!(error.starts_with(member), "{query}: {error}");
+    }
+
+    /// `Int32Converter` trims (Unicode white space), then `int.Parse` takes
+    /// NULs after the number and its white space: `?limit=1%00` is page size
+    /// 1 on Jellyfin 12.4, and `%001` a 400.
+    #[test]
+    fn integers_take_trailing_nuls() {
+        for (query, int) in [
+            ("int=1%00", 1),
+            ("int=1%00%00", 1),
+            ("int=1%20%00", 1),
+            ("int=1%09%00", 1),
+            ("int=1%0B%00", 1),
+            ("int=1%00%20", 1),
+            ("int=%C2%A01%00", 1),
+            ("int=%C2%A01", 1),
+            ("int=1%C2%A0", 1),
+            ("int=-1%00", -1),
+        ] {
+            assert_eq!(numbers(query).expect(query).int, Some(int), "{query}");
+        }
+        assert_eq!(numbers("long=7%00").unwrap().long, Some(7));
+        assert_eq!(numbers("byte=7%00").unwrap().byte, Some(7));
+        for query in [
+            "int=%00",
+            "int=%00%20",
+            "int=%001",
+            "int=1%005",
+            "int=1%00%20%00",
+            "int=0x1%00",
+            "int=1%C2%A0%00",
+            "int=1%2C000",
+            "int=1%2C",
+        ] {
+            let error = numbers(query).expect_err(query);
+            assert!(error.starts_with("int"), "{query}: {error}");
         }
     }
 

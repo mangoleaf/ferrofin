@@ -45,6 +45,7 @@ use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{CollectionTypeOptions, MediaStreamType, Video3DFormat};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::io::FileSystemEntryInfo;
+use ferrofin_model::media_info::MediaInfo;
 use ferrofin_providers::TmdbClient;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::filesystem::{FileMetadata, FileSystem};
@@ -53,7 +54,7 @@ use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, MediaStreamRepository};
 
 /// An ffprobe stand-in: every file has a video and an audio stream, a
-/// `.srt` one subtitle stream.
+/// `.srt` one subtitle stream, and an audio track's tags carry lyrics.
 #[derive(Default)]
 struct Probe;
 
@@ -105,6 +106,18 @@ impl MediaEncoder for Probe {
                 },
             ],
             ..MediaSourceInfo::default()
+        })
+    }
+    async fn get_media_info_full(
+        &self,
+        request: &MediaInfoRequest,
+    ) -> Result<MediaInfo, ServiceError> {
+        Ok(MediaInfo {
+            media_source: self.get_media_info(request).await?,
+            raw_audio_tags: request
+                .media_is_audio
+                .then(|| HashMap::from([("lyrics".to_owned(), "Words".to_owned())])),
+            ..MediaInfo::default()
         })
     }
     async fn extract_audio_image(
@@ -230,6 +243,7 @@ fn series_requests(lines: &[String]) -> Vec<&String> {
 struct CountingFs {
     listed: Mutex<Vec<String>>,
     stall: Mutex<Option<Stall>>,
+    stats: Mutex<Option<StatStall>>,
 }
 
 /// The next listing of `dir` sleeps until the runtime has run a task, as a
@@ -243,9 +257,33 @@ struct Stall {
     starved: Arc<AtomicBool>,
 }
 
+/// Every stat of one of `paths` sleeps until the runtime has run a task, as
+/// a stat on a slow mount does. One made inline on the only worker holds
+/// that task off until `patience` runs out, and is recorded in `starved`.
+struct StatStall {
+    paths: Vec<String>,
+    stat: Arc<tokio::sync::Notify>,
+    ran: std::sync::mpsc::Receiver<()>,
+    patience: Duration,
+    starved: Vec<String>,
+}
+
 impl CountingFs {
     fn take(&self) -> Vec<String> {
         std::mem::take(&mut *self.listed.lock().expect("lock"))
+    }
+
+    fn stat(&self, call: &str, path: &str) {
+        let mut stats = self.stats.lock().expect("lock");
+        let Some(stall) = stats.as_mut().filter(|s| s.paths.iter().any(|p| p == path)) else {
+            return;
+        };
+        // What the task sent for an earlier stat that starved.
+        while stall.ran.try_recv().is_ok() {}
+        stall.stat.notify_one();
+        if stall.ran.recv_timeout(stall.patience).is_err() {
+            stall.starved.push(format!("{call} {path}"));
+        }
     }
 }
 
@@ -271,9 +309,11 @@ impl FileSystem for CountingFs {
         Vec::new()
     }
     fn file_exists(&self, path: &str) -> bool {
+        self.stat("file_exists", path);
         FerrofinFileSystem::new().file_exists(path)
     }
     fn directory_exists(&self, path: &str) -> bool {
+        self.stat("directory_exists", path);
         FerrofinFileSystem::new().directory_exists(path)
     }
     fn validate_writable(&self, _path: &str) -> Result<(), ServiceError> {
@@ -1201,6 +1241,186 @@ async fn a_changed_paths_listing_leaves_the_runtime_worker_free() {
     assert!(
         !starved.load(Ordering::SeqCst),
         "the listing held the only worker"
+    );
+}
+
+/// The prune's stats go through `off_runtime` too: whether the library's
+/// location is there, whether a stale row's file still is, and whether the
+/// version a pruned owner leaves behind is. On a runtime with one worker, a
+/// task still runs while each of them is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_removed_files_prune_leaves_the_runtime_worker_free() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("media");
+    let heat = media.join("Heat (1995)");
+    touch(&heat, "Heat (1995).mkv");
+    touch(&media.join("Ronin (1998)"), "Ronin (1998).mkv");
+    let gone = heat.join("Heat (1995).mkv");
+    let version = media.join("Ronin (1998)").join("Ronin (1998).mkv");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::movies)
+        .await
+        .scanned()
+        .await;
+    let owner = id(BaseItemKind::Movie, &gone);
+    // A version stored outside its owner's folder: no walk of that folder
+    // plans it, so the prune releases it.
+    sqlx::query(r#"UPDATE "BaseItems" SET "OwnerId" = ?2 WHERE "Id" = ?1"#)
+        .bind(id(BaseItemKind::Movie, &version))
+        .bind(&owner)
+        .execute(fx.db.writer())
+        .await
+        .expect("own");
+
+    let (ran, stalled_for) = std::sync::mpsc::channel();
+    let stat = Arc::new(tokio::sync::Notify::new());
+    *fx.fs.stats.lock().expect("lock") = Some(StatStall {
+        paths: [&media, &gone, &version]
+            .map(|p| p.to_string_lossy().into_owned())
+            .to_vec(),
+        stat: Arc::clone(&stat),
+        ran: stalled_for,
+        patience: Duration::from_secs(2),
+        starved: Vec::new(),
+    });
+    tokio::spawn(async move {
+        loop {
+            stat.notified().await;
+            if ran.send(()).is_err() {
+                break;
+            }
+        }
+    });
+
+    std::fs::remove_file(&gone).expect("rm");
+    // On the worker: the test's own future runs on the thread that started it.
+    let fx = tokio::spawn(async move {
+        let outcome = fx.report(&[&heat]).await;
+        assert_eq!(outcome.removed, 1, "{outcome:?}");
+        fx
+    })
+    .await
+    .expect("the scan finished");
+
+    assert!(!fx.rows().await.contains_key(&owner), "pruned");
+    let owners: i64 =
+        sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "OwnerId" IS NOT NULL"#)
+            .fetch_one(fx.db.pool())
+            .await
+            .expect("owners");
+    assert_eq!(owners, 0, "the version is released");
+    let stall = fx.fs.stats.lock().expect("lock").take().expect("stall");
+    assert!(
+        stall.starved.is_empty(),
+        "these stats held the only worker: {:?}",
+        stall.starved
+    );
+}
+
+/// A probed item's sidecar search goes through `off_runtime` too: a track's
+/// own stat (is it a folder?), and the stats of the folders a video's
+/// subtitles and audio, a track's lyrics, or the lyrics a track's tags carry
+/// once saved are looked for in. On a runtime with one worker, a task still
+/// runs while each of them is answered, and the sidecar is still the item's
+/// stream. The folders' listings come from the scan's cache here. A stat
+/// made at dispatch follows the plan's own hand-off in the same poll, where
+/// it cannot starve the worker, so the unit test
+/// `dispatching_a_probe_leaves_its_sidecar_search_to_the_task` pins that
+/// dispatch makes none. Reading the tags and writing the `.lrc` go through
+/// `std::fs`, which this filesystem cannot stall.
+#[rstest::rstest]
+#[case::subtitle(
+    CollectionTypeOptions::movies,
+    BaseItemKind::Movie,
+    "Heat (1995).mkv",
+    Some("Heat (1995).eng.srt")
+)]
+#[case::lyric(
+    CollectionTypeOptions::music,
+    BaseItemKind::Audio,
+    "Artist/Album/01 - Song.flac",
+    Some("Artist/Album/01 - Song.lrc")
+)]
+#[case::embedded_lyric(
+    CollectionTypeOptions::music,
+    BaseItemKind::Audio,
+    "Artist/Album/01 - Song.flac",
+    None
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_probes_sidecar_search_leaves_the_runtime_worker_free(
+    #[case] kind: CollectionTypeOptions,
+    #[case] item: BaseItemKind,
+    #[case] file: &str,
+    #[case] sidecar: Option<&str>,
+) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("media");
+    let file = media.join(file);
+    let folder = file.parent().expect("folder");
+    touch(folder, &file.file_name().expect("name").to_string_lossy());
+    let dashless = derive_item_id(item, &file.to_string_lossy())
+        .expect("id")
+        .simple()
+        .to_string();
+    let internal = tmp
+        .path()
+        .join("metadata")
+        .join(&dashless[..2])
+        .join(&dashless);
+    // The sidecar beside the file, or the one the scan saves the tags' lyrics to.
+    let sidecar = match sidecar {
+        Some(name) => {
+            let sidecar = media.join(name);
+            std::fs::write(&sidecar, b"1\n").expect("sidecar");
+            sidecar
+        }
+        None => internal.join(file.with_extension("lrc").file_name().expect("name")),
+    };
+    let fx = Fixture::new(tmp.path(), &media, kind).await;
+
+    let (ran, stalled_for) = std::sync::mpsc::channel();
+    let stat = Arc::new(tokio::sync::Notify::new());
+    *fx.fs.stats.lock().expect("lock") = Some(StatStall {
+        paths: [&file, &internal]
+            .map(|p| p.to_string_lossy().into_owned())
+            .to_vec(),
+        stat: Arc::clone(&stat),
+        ran: stalled_for,
+        patience: Duration::from_secs(2),
+        starved: Vec::new(),
+    });
+    tokio::spawn(async move {
+        loop {
+            stat.notified().await;
+            if ran.send(()).is_err() {
+                break;
+            }
+        }
+    });
+
+    // On the worker: the test's own future runs on the thread that started it.
+    let fx = tokio::spawn(async move {
+        let outcome = fx.scanner.scan_all().await.expect("scan");
+        assert!(outcome.created > 0, "{outcome:?}");
+        fx
+    })
+    .await
+    .expect("the scan finished");
+
+    let found: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM "MediaStreamInfos" WHERE "ItemId" = ?1 AND "Path" = ?2"#,
+    )
+    .bind(id(item, &file))
+    .bind(sidecar.to_string_lossy().into_owned())
+    .fetch_one(fx.db.pool())
+    .await
+    .expect("streams");
+    assert_eq!(found, 1, "{} is the item's stream", sidecar.display());
+    let stall = fx.fs.stats.lock().expect("lock").take().expect("stall");
+    assert!(
+        stall.starved.is_empty(),
+        "these stats held the only worker: {:?}",
+        stall.starved
     );
 }
 
