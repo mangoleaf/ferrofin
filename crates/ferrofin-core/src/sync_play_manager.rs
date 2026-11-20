@@ -2093,24 +2093,6 @@ fn sweep_group_waits(
     )
 }
 
-/// Marks the sweep stopped if its task unwinds, so the next new group starts
-/// it again, and makes the panic visible (LOGGING.md: panics must be visible).
-struct SweepPanicGuard(Weak<Mutex<Registry>>);
-
-impl Drop for SweepPanicGuard {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            tracing::error!(
-                task = SWEEP_TASK,
-                "sync-play group-wait sweep panicked; the next new group restarts it"
-            );
-            if let Some(registry) = self.0.upgrade() {
-                lock_registry(&registry).sweeping = false;
-            }
-        }
-    }
-}
-
 /// The group-wait sweep task (`SyncPlayManager._groupWaitTimer`, 12.1). It
 /// holds the registry weakly, so it ends with the manager, and it delivers
 /// after releasing the lock, as the request paths do.
@@ -2119,7 +2101,20 @@ async fn run_group_wait_sweep(
     bus: Arc<dyn SessionMessageBus>,
     every: StdDuration,
 ) {
-    let _panic_guard = SweepPanicGuard(registry.clone());
+    // Marks the sweep stopped if its task unwinds, so the next new group
+    // starts it again, and makes the panic visible (LOGGING.md: panics must be
+    // visible).
+    let _panic_guard = std::mem::DropGuard::new(registry.clone(), |weak| {
+        if std::thread::panicking() {
+            tracing::error!(
+                task = SWEEP_TASK,
+                "sync-play group-wait sweep panicked; the next new group restarts it"
+            );
+            if let Some(registry) = weak.upgrade() {
+                lock_registry(&registry).sweeping = false;
+            }
+        }
+    });
     let mut ticker = tokio::time::interval(every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick completes at once; the first sweep is one interval in.

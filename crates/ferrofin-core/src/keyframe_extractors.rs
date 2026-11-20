@@ -131,20 +131,13 @@ impl KeyframeExtractor for FfProbeKeyframeExtractor {
         // A dropped wait (its task stopped) ends ffprobe too: the blocking
         // pool would otherwise run it over the whole file for nobody.
         let stop = Arc::new(AtomicBool::new(false));
-        let _stop_on_drop = StopOnDrop(Arc::clone(&stop));
+        let _stop_on_drop = std::mem::DropGuard::new(Arc::clone(&stop), |stop| {
+            stop.store(true, Ordering::Relaxed);
+        });
         extract_on_blocking_pool("ffprobe", file_path, move || {
             ferrofin_keyframes::ff_probe::get_keyframe_data(&probe_path, &path, &stop)
         })
         .await
-    }
-}
-
-/// Sets its flag when dropped.
-struct StopOnDrop(Arc<AtomicBool>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
     }
 }
 
