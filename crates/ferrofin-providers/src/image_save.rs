@@ -3,6 +3,7 @@
 mod policy;
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::store::datetime_to_db;
 use ferrofin_model::configuration::{ImageSavingConvention, XbmcMetadataOptions};
 use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_model::entities_media::VirtualFolderInfo;
@@ -192,9 +193,21 @@ impl ImageFileSaver {
         images: &mut [ItemImageInfo],
         previous: &[ItemImageInfo],
     ) -> Result<(), ServiceError> {
-        let acquired = |image: &ItemImageInfo| {
-            !previous.contains(image) && self.managed(Path::new(&image.path))
+        // An image the item already stores is no acquisition, as `ImageSaver`
+        // writes only what a provider just saved: the same file at the same
+        // time, at the database's 100 ns precision (a listing of the art
+        // folder reads the file's nanoseconds, and no size yet). Comparing
+        // whole rows published a generated copy beside the media on the scan
+        // after it was drawn.
+        let stored = |image: &ItemImageInfo| {
+            previous.iter().any(|old| {
+                old.image_type == image.image_type
+                    && old.path == image.path
+                    && datetime_to_db(old.date_modified) == datetime_to_db(image.date_modified)
+            })
         };
+        let acquired =
+            |image: &ItemImageInfo| !stored(image) && self.managed(Path::new(&image.path));
         // A scan saves every item through here, most of them with no image
         // acquired this pass: their destinations are never asked for.
         if !images.iter().any(&acquired) {

@@ -10,6 +10,7 @@
 //! | `MusicGenreImageProvider`   | `MusicGenre` | 4 random `MusicAlbum`/`MusicVideo`/`Audio` with the genre + Primary |
 //! | `PlaylistImageProvider`     | `Playlist`   | the playlist's members (episode → its series, song → its album)   |
 //! | `PhotoAlbumImageProvider`   | `PhotoAlbum` | the album's first child with a Primary (`BaseFolderImageProvider`) |
+//! | `MusicAlbumImageProvider`   | `MusicAlbum` | the album's first child that is no folder, with a Primary (`BaseFolderImageProvider`) |
 //! | `FolderImageProvider`       | any `Folder` | the folder's first descendant with a Primary (`BaseFolderImageProvider`) |
 //! | `ArtistImageProvider`       | `MusicArtist`| none — upstream returns `Array.Empty` (see [`ArtistSources`])       |
 //!
@@ -31,11 +32,16 @@
 //!
 //! Every provider here supports only `ImageType.Primary`, and the base class
 //! routes all five kinds to `CreateSquareCollage` — a
-//! [`SQUARE_COLLAGE_SIZE`]-pixel square 2×2 tile — except the photo album,
-//! whose `BaseFolderImageProvider` copies the single source image verbatim
-//! (`CreateSingleImage`). The source image preference is upstream's
-//! `GetStripCollageImagePaths`: Primary, then Thumb (the Backdrop-first rule is
-//! reserved for `CollectionFolder`/`UserView`).
+//! [`SQUARE_COLLAGE_SIZE`]-pixel square 2×2 tile — except the music and photo
+//! albums, whose `BaseFolderImageProvider` copies the single source image
+//! verbatim (`CreateSingleImage`). A music album with no image of its own (no
+//! `folder.jpg` beside it, no upload) takes a copy of its first track's
+//! cover, in its own art folder whatever "Save artwork into media folders"
+//! says (`FetchToFileInternal` saves with `saveLocallyWithMedia: false`).
+//!
+//! The source image preference is upstream's `GetStripCollageImagePaths`:
+//! Primary, then Thumb (the Backdrop-first rule is reserved for
+//! `CollectionFolder`/`UserView`).
 //!
 //! # When an image is (re)generated
 //!
@@ -56,7 +62,8 @@
 //!   no path of its own to save beside) →
 //!   regenerated only when the file's modification time no longer matches the
 //!   recorded `DateModified` (`HasChangedByDate`; an upload records its file's
-//!   time), or when the refresh is forced (`FullRefresh` /
+//!   time; never for a music album, `BaseFolderImageProvider.HasChangedByDate`),
+//!   or when the refresh is forced (`FullRefresh` /
 //!   `ReplaceAllMetadata`, [`DynamicImageProviders::refresh_item`] with
 //!   `force`), which draws over such an upload (as upstream does for a photo
 //!   album or folder; upstream saves every playlist's upload beside its path,
@@ -156,6 +163,8 @@ pub enum DynamicImageKind {
     Playlist,
     /// `PhotoAlbumImageProvider`.
     PhotoAlbum,
+    /// `MusicAlbumImageProvider`.
+    MusicAlbum,
     /// `ArtistImageProvider` — supported, but upstream gives it no sources.
     MusicArtist,
     /// `FolderImageProvider` — a generic folder that is not a top parent.
@@ -172,6 +181,7 @@ impl DynamicImageKind {
             BaseItemKind::MusicGenre => Some(Self::MusicGenre),
             BaseItemKind::Playlist => Some(Self::Playlist),
             BaseItemKind::PhotoAlbum => Some(Self::PhotoAlbum),
+            BaseItemKind::MusicAlbum => Some(Self::MusicAlbum),
             BaseItemKind::MusicArtist => Some(Self::MusicArtist),
             // `FolderImageProvider : BaseFolderImageProvider<Folder>` — every
             // `Folder`, minus the two album kinds handled above and minus the
@@ -195,8 +205,8 @@ impl DynamicImageKind {
             // `IsTopParent` (BaseItem.cs:733-757).
             //
             // Confirmed on the batch pair: 10.11.8 serves NO `ImageTags.Primary`
-            // for any Series, Season, MusicAlbum, BoxSet or plain Folder on the
-            // fixture, only for the two roots (and for Playlists, which is
+            // for any Series, Season, BoxSet or plain Folder on the fixture,
+            // only for the two roots (and for Playlists, which is
             // `PlaylistImageProvider`, handled above).
             BaseItemKind::Folder | BaseItemKind::UserRootFolder | BaseItemKind::AggregateFolder => {
                 Some(Self::Folder)
@@ -220,6 +230,20 @@ impl ArtistSources {
         Vec::new()
     }
 }
+
+/// The kinds the scan-time pass draws, in order. A music album copies its
+/// track's cover before the music-genre and playlist collages sample album
+/// covers, as upstream draws an album's in its refresh, before the
+/// validators and playlists that follow the walk.
+const PASS_KINDS: &[BaseItemKind] = &[
+    BaseItemKind::MusicAlbum,
+    BaseItemKind::Genre,
+    BaseItemKind::MusicGenre,
+    BaseItemKind::Playlist,
+    BaseItemKind::PhotoAlbum,
+    // `FolderImageProvider`.
+    BaseItemKind::Folder,
+];
 
 /// What one pass over the library produced.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -325,8 +349,8 @@ impl DynamicImageProviders {
     /// leaving out the rows in `done` (the ones a forced pass already drew).
     ///
     /// Cost is bounded by the gate: a row with a current generated image costs
-    /// one image-row read and one `stat`; only rows without a Primary run their
-    /// provider's (`LIMIT`ed) source query. Per-row failures are logged and
+    /// its share of one image-row read per window and a `stat` per file; only
+    /// rows without a Primary run their provider's (`LIMIT`ed) source query. Per-row failures are logged and
     /// skipped — one unreadable poster must not lose every other collage.
     ///
     /// `Genre` and `MusicGenre` are separate rows, as upstream keeps them: a
@@ -340,26 +364,16 @@ impl DynamicImageProviders {
     ///
     /// # Errors
     ///
-    /// Only when a supported kind's id list, or a window of its rows, cannot
-    /// be read; a failure on one row is logged and the pass continues.
+    /// Only when a supported kind's id list, or a window of its rows or of
+    /// their images, cannot be read; a failure on one row is logged and the
+    /// pass continues.
     pub async fn refresh_all_between<'b>(
         &self,
         done: &std::collections::HashSet<Uuid>,
         between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
     ) -> Result<DynamicImageReport, ServiceError> {
         let report = self
-            .refresh_kinds_between(
-                &[
-                    BaseItemKind::Genre,
-                    BaseItemKind::MusicGenre,
-                    BaseItemKind::Playlist,
-                    BaseItemKind::PhotoAlbum,
-                    // `FolderImageProvider`.
-                    BaseItemKind::Folder,
-                ],
-                done,
-                between,
-            )
+            .refresh_kinds_between(PASS_KINDS, done, between)
             .await?;
         tracing::debug!(
             examined = report.examined,
@@ -515,7 +529,10 @@ impl DynamicImageProviders {
     /// `rows` in order, each behind its gate and forced as listed, tallied
     /// into `report`. Whole rows are read a bind-sized window at a time, so a
     /// pass holds one window however many rows it draws; an id with no row
-    /// is skipped.
+    /// is skipped. The window's image rows are read with it, and a row they
+    /// settle ([`is_settled`](Self::is_settled)) costs no read of its own: a
+    /// rescan of a music library reads no album's images one at a time
+    /// (gl-1277).
     async fn refresh_windows<'b>(
         &self,
         rows: &[(Uuid, bool)],
@@ -531,11 +548,16 @@ impl DynamicImageProviders {
                 .into_iter()
                 .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
                 .collect();
+            let stored = self.items.get_image_infos_batch(&ids).await?;
             for &(id, force) in chunk {
                 let Some(row) = found.remove(&id) else {
                     continue;
                 };
                 between().await;
+                if !row.is_locked && self.is_settled(&row, id, stored.get(&id), force) {
+                    report.examined += 1;
+                    continue;
+                }
                 self.refresh_tallied(&row, force, report).await;
             }
         }
@@ -615,15 +637,10 @@ impl DynamicImageProviders {
             tracing::warn!(%err, item_id = %item_id, "failed to drop the item's missing images");
         }
         let item_dir = self.item_dir(item_id);
-        if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary) {
-            // `FetchAsync`: an image that is not ours is never replaced.
-            if !is_own_image(&self.metadata_dir.resolve(), item_id, primary) {
-                return Ok(ItemUpdateType::None);
-            }
-            // `HasChanged` → `HasChangedByDate`: unchanged on disk means done.
-            if !force && !has_changed_by_date(primary) {
-                return Ok(ItemUpdateType::None);
-            }
+        if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary)
+            && self.primary_is_settled(kind, item_id, primary, force)
+        {
+            return Ok(ItemUpdateType::None);
         }
 
         let sources = self.sources_for(kind, item, item_id).await?;
@@ -640,7 +657,7 @@ impl DynamicImageProviders {
         })?;
         let output = if matches!(
             kind,
-            DynamicImageKind::PhotoAlbum | DynamicImageKind::Folder
+            DynamicImageKind::PhotoAlbum | DynamicImageKind::MusicAlbum | DynamicImageKind::Folder
         ) {
             // One closure: the stale Primaries go before the copy lands.
             off_runtime(|| copy_single_image(&item_dir, &sources[0]))?
@@ -682,6 +699,47 @@ impl DynamicImageProviders {
         self.persistence.save_item_images(item_id, &images).await?;
         tracing::debug!(item_id = %item.id, kind = ?kind, "dynamic image generated");
         Ok(ItemUpdateType::ImageUpdate)
+    }
+
+    /// Whether the item's stored `primary` leaves `kind`'s provider nothing to
+    /// do: `FetchAsync` never replaces an image that is not the item's own,
+    /// and `HasChanged` → `HasChangedByDate` redraws its own only when the
+    /// file changed on disk (never a music album's), unless `force`.
+    fn primary_is_settled(
+        &self,
+        kind: DynamicImageKind,
+        item_id: Uuid,
+        primary: &ItemImageInfo,
+        force: bool,
+    ) -> bool {
+        !is_own_image(&self.metadata_dir.resolve(), item_id, primary)
+            || (!force && (kind == DynamicImageKind::MusicAlbum || !has_changed_by_date(primary)))
+    }
+
+    /// Whether `row` needs no refresh by its `stored` images, read for its
+    /// whole window before the pass reached it: every local file is still
+    /// there, so `ValidateImages` drops none, and its Primary is settled
+    /// ([`primary_is_settled`](Self::primary_is_settled)). A row this cannot
+    /// settle is refreshed, which reads its images afresh, so one a lane
+    /// refresh changed since the window's read is never drawn from stale rows.
+    fn is_settled(
+        &self,
+        row: &BaseItemEntity,
+        item_id: Uuid,
+        stored: Option<&Vec<ItemImageInfo>>,
+        force: bool,
+    ) -> bool {
+        let (Some(kind), Some(images)) = (DynamicImageKind::for_entity(row), stored) else {
+            return false;
+        };
+        let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary) else {
+            return false;
+        };
+        off_runtime(|| {
+            images
+                .iter()
+                .all(|image| !image.is_local_file() || Path::new(&image.path).is_file())
+        }) && self.primary_is_settled(kind, item_id, primary, force)
     }
 
     /// `FolderImageProvider.Supports` for a row [`DynamicImageKind::for_entity`]
@@ -752,8 +810,9 @@ impl DynamicImageProviders {
             }
             DynamicImageKind::Playlist => self.playlist_sources(item_id).await,
             DynamicImageKind::PhotoAlbum | DynamicImageKind::Folder => {
-                self.folder_sources(item_id).await
+                self.folder_sources(item_id, false).await
             }
+            DynamicImageKind::MusicAlbum => self.folder_sources(item_id, true).await,
             DynamicImageKind::MusicArtist => Ok(ArtistSources::image_paths()),
         }
     }
@@ -855,14 +914,32 @@ impl DynamicImageProviders {
     }
 
     /// `BaseFolderImageProvider.GetItemsWithImages` (BaseFolderImageProvider.cs:29-44),
-    /// shared by `PhotoAlbumImageProvider` and `FolderImageProvider`: the
-    /// folder's first descendant with a Primary — files before folders, then by
-    /// sort name, `Limit = 1`.
-    async fn folder_sources(&self, album_id: Uuid) -> Result<Vec<String>, ServiceError> {
-        let ids = self
+    /// shared by the music and photo album providers and `FolderImageProvider`:
+    /// the folder's first descendant with a Primary — files before folders, then by
+    /// sort name, `Limit = 1`. With `files_only`, `MusicAlbumImageProvider`'s:
+    /// that row is dropped when it is a folder (an `IsFolder` filter in the
+    /// query would steer it onto the `IsFolder` index, every file of the
+    /// library, where the subtree drives it now).
+    async fn folder_sources(
+        &self,
+        album_id: Uuid,
+        files_only: bool,
+    ) -> Result<Vec<String>, ServiceError> {
+        let mut ids = self
             .items
             .get_item_ids(&folder_sources_query(album_id))
             .await?;
+        if files_only && !ids.is_empty() {
+            let files: std::collections::HashSet<Uuid> = self
+                .items
+                .retrieve_items(&ids)
+                .await?
+                .into_iter()
+                .filter(|row| !row.is_folder)
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect();
+            ids.retain(|id| files.contains(id));
+        }
         // `CreateSingleImage` takes the Primary only (no Thumb fallback) and
         // needs a file extension to carry over.
         let mut paths = Vec::new();
@@ -2030,6 +2107,139 @@ mod tests {
         assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 0);
     }
 
+    /// `MusicAlbumImageProvider`: an album copies its first child that is no
+    /// folder and has a Primary; a folder below it with one is no source.
+    #[tokio::test]
+    async fn a_music_album_copies_its_first_file_never_a_folder() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let album = fx
+            .seed(BaseItemKind::MusicAlbum, "Kind of Blue", None, None)
+            .await;
+        let child = |kind: BaseItemKind, name: &str, colour: u8| {
+            let path = media.join(format!("{name}.png"));
+            image::RgbImage::from_pixel(4, 4, image::Rgb([colour, 0, 0]))
+                .save(&path)
+                .expect("png");
+            (Uuid::new_v4(), kind, name.to_owned(), path)
+        };
+        let folder = child(BaseItemKind::Folder, "A folder", 10);
+        let track = child(BaseItemKind::Audio, "Z track", 20);
+        for (id, kind, name, path) in [&folder, &track] {
+            fx.persistence
+                .save_items(&[BaseItemEntity {
+                    id: guid_to_db(*id),
+                    type_: stored_type_name(*kind).unwrap().to_owned(),
+                    name: Some(name.clone()),
+                    sort_name: Some(name.clone()),
+                    is_folder: *kind == BaseItemKind::Folder,
+                    parent_id: Some(guid_to_db(album)),
+                    ..Default::default()
+                }])
+                .await
+                .expect("child");
+            fx.persistence
+                .set_ancestors(*id, &[album])
+                .await
+                .expect("ancestors");
+            if *kind == BaseItemKind::Folder {
+                seed_images(
+                    &fx.db,
+                    *id,
+                    &[image_info(
+                        ImageType::Primary,
+                        &path.to_string_lossy(),
+                        None,
+                    )],
+                )
+                .await;
+            }
+        }
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 0);
+        assert!(
+            fx.primary_of(album).await.is_none(),
+            "a folder is no source"
+        );
+
+        seed_images(
+            &fx.db,
+            track.0,
+            &[image_info(
+                ImageType::Primary,
+                &track.3.to_string_lossy(),
+                None,
+            )],
+        )
+        .await;
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 1);
+        let copy = fx.primary_of(album).await.expect("album primary");
+        assert_eq!(
+            std::fs::read(&copy.path).unwrap(),
+            std::fs::read(&track.3).unwrap()
+        );
+        // Its copy is not drawn again by date (`HasChangedByDate`).
+        std::fs::File::options()
+            .write(true)
+            .open(&copy.path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 0);
+    }
+
+    /// A row whose Primary is current is settled by its window's one image
+    /// read, without a read of its own, only while every file it names is
+    /// there: one with a missing file is refreshed, which drops it
+    /// (`ValidateImages`).
+    #[tokio::test]
+    async fn a_current_row_with_a_missing_file_is_still_validated() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let album = fx
+            .seed(BaseItemKind::PhotoAlbum, "Iceland", None, None)
+            .await;
+        let photo_path = media.join("aurora.png");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([7, 7, 7]))
+            .save(&photo_path)
+            .expect("png");
+        let photo = Uuid::new_v4();
+        fx.persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(photo),
+                type_: stored_type_name(BaseItemKind::Photo).unwrap().to_owned(),
+                name: Some("aurora".to_owned()),
+                parent_id: Some(guid_to_db(album)),
+                path: Some(photo_path.to_string_lossy().into_owned()),
+                ..Default::default()
+            }])
+            .await
+            .expect("photo");
+        fx.persistence
+            .set_ancestors(photo, &[album])
+            .await
+            .expect("ancestors");
+        let photo_image = image_info(ImageType::Primary, &photo_path.to_string_lossy(), None);
+        seed_images(&fx.db, photo, std::slice::from_ref(&photo_image)).await;
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 1);
+        let primary = fx.primary_of(album).await.expect("album primary");
+
+        let gone = media.join("gone-backdrop.png");
+        seed_images(
+            &fx.db,
+            album,
+            &[
+                primary.clone(),
+                image_info(ImageType::Backdrop, &gone.to_string_lossy(), None),
+            ],
+        )
+        .await;
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 0);
+        assert_eq!(
+            fx.items.get_image_infos(album).await.unwrap(),
+            vec![primary]
+        );
+    }
+
     /// The album's photo is copied off the runtime worker, so a copy from a
     /// slow mount never holds it: on a runtime with one worker, a task still
     /// runs while the copy waits on its destination (a FIFO the test reads the
@@ -2291,6 +2501,15 @@ mod tests {
             plan.starts_with("SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
             "{plan}"
         );
+    }
+
+    /// The pass draws a music album's copy of its track's cover before the
+    /// collages that sample album covers.
+    #[test]
+    fn a_music_album_is_drawn_before_the_collages_that_sample_it() {
+        let at = |kind| PASS_KINDS.iter().position(|&k| k == kind).unwrap();
+        assert!(at(BaseItemKind::MusicAlbum) < at(BaseItemKind::MusicGenre));
+        assert!(at(BaseItemKind::MusicAlbum) < at(BaseItemKind::Playlist));
     }
 
     /// gl-1482: the closing pass lists a kind's ids, not its rows, and reads

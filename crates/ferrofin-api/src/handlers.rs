@@ -981,7 +981,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// TheMovieDb's movie, series, season and episode providers write onto an item
 /// from TMDb's answer. `guide-programme-items` is what the guide refresh
 /// stores on each programme item and its external ids, which every programme
-/// operation reads.
+/// operation reads. `music-artwork` is what a library scan stores as a music
+/// album's and a track's Primary, which the item and image operations serve.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -1006,6 +1007,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "metadata-refresh",
     "metadata-providers",
     "guide-programme-items",
+    "music-artwork",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -2564,6 +2566,72 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              ported.",
         ],
     },
+    VerifiedSubsystem {
+        key: "music-artwork",
+        upstream_file: "MediaBrowser.Providers/MediaInfo/AudioImageProvider.cs",
+        upstream_method: "GetImage",
+        ferrofin: "What a library scan stores as a track's and a music album's Primary \
+                   (docs/MUSIC_ARTWORK.md). A track or an audiobook: ferrofin-core \
+                   library_scan.rs \
+                   embedded_primary → extract_embedded_cover (GetImage: no EmbeddedImage \
+                   stream, no image; audio_cover_stream picks the stream whose comment names \
+                   the front cover, then a cover, then the first; one extraction per \
+                   album_cover_key, the plan's album with GetAudioImagePath's Album tag and \
+                   first album artist (none when either is blank, nor for an audiobook), \
+                   copied into each such track's own art folder as GetAudioImagePath shares \
+                   it, and ItemImageProvider.RefreshFromProvider \
+                   saves it as the track's own image), with the stored pictures \
+                   (StoredItemLinks.embedded_images, item_persistence_service.rs \
+                   scan_stored_links; GetMediaStreams) when the pass probes nothing. An album: \
+                   collect_artwork's local discovery (LocalImageProvider, which supports no \
+                   song) and kept rows (ValidateImages), then dynamic_images.rs \
+                   DynamicImageKind::MusicAlbum (MusicAlbumImageProvider: the first child \
+                   that is no folder with a Primary, CreateSingleImage into the album's own \
+                   folder whatever SaveLocalMetadata says, HasChangedByDate false, FetchAsync \
+                   never replacing an image outside it), drawn by the closing dynamic image \
+                   pass, whose windows read their rows' images in one statement; the next \
+                   scan lists the copy in the album's art folder, and ferrofin-providers \
+                   image_save.rs save_all publishes beside the media only an image the pass \
+                   acquired, never one the item stores with the same file and time, as \
+                   ImageSaver writes only what SaveImage is given. A row naming \
+                   an earlier build's shared album-covers copy is not kept by validation, \
+                   except on a locked item (see the divergences), so the next scan gives any \
+                   other item the image above. Compared with \
+                   AudioImageProvider.cs (GetImage, GetAudioImagePath, Supports), \
+                   Emby.Server.Implementations/Images/MusicAlbumImageProvider.cs, \
+                   BaseFolderImageProvider.cs (GetItemsWithImages, HasChangedByDate), \
+                   BaseDynamicImageProvider.cs (FetchAsync, FetchToFileInternal, HasChanged, \
+                   CreateSingleImage), MediaBrowser.LocalMetadata/Images/LocalImageProvider.cs \
+                   (Supports, GetImages), MediaBrowser.Providers/Manager/ItemImageProvider.cs \
+                   (RefreshFromProvider) and MetadataService.cs (RefreshMetadata's order), and \
+                   live against Jellyfin 12.4 on the same music folder: an album with a \
+                   folder.jpg and one without, each with a track that embeds a picture and \
+                   one that does not.",
+        date: "2026-11-20",
+        divergences: &[
+            "A track's cover and an album's copy are stored in the item's own {ID} art \
+             folder as primary.<ext>, where upstream saves them as poster.jpg and \
+             folder.<ext> in library/{xx}/{idN}, so a returned Jellyfin counts an album's \
+             copy as the user's and never redraws it. Fix path: gl-1575.",
+            "A locked album or track keeps a row naming an earlier build's shared \
+             album-covers copy, as its lock keeps the stored row (and refuses an album's \
+             copy), \
+             so a returned Jellyfin keeps naming that file for it; upstream never stores \
+             such a row. Whether a lock should keep it is the owner's question, raised \
+             with gl-692.",
+            "Tracks share one extraction within one scan, keyed by their album's id, Album \
+             tag and first album artist; GetAudioImagePath keys a cache file by the last \
+             two only, and it outlives the scan, so two albums sharing both share one \
+             picture there (a Jellyfin bug not ported), and a track added to an album in \
+             a later scan gets the cached picture there and its own here.",
+            "An album's copy is drawn in the scan's closing passes, after the music pass \
+             downloads TheAudioDB's and fanart.tv's images, where upstream's custom \
+             provider runs before its remote image providers: an image full refresh below \
+             a full metadata refresh keeps a downloaded Primary where upstream keeps the \
+             copy, and Replace all images keeps the copy where upstream keeps the \
+             download. Fix path: gl-1909.",
+        ],
+    },
 ];
 
 /// One contract operation whose Ferrofin implementation was compared against
@@ -3445,11 +3513,11 @@ pub const VERIFIED: &[Verified] = &[
             "A Chapter image's file is not deleted: chapter images are not image rows, so the \
              delete finds nothing and answers 204, where GetImageInfo returns the chapter's \
              image and DeleteImageAsync deletes its file. Fix path: gl-1663.",
-            "A file in the shared album-covers directory is kept, as an album and its tracks \
-             name the same file there (docs/MUSIC_ARTWORK.md); DeleteImageAsync deletes any \
-             local file, a track's extracted cover that the album's other tracks share \
-             (AudioImageProvider.GetAudioImagePath) included, which leaves them naming a \
-             missing file. Whether tracks keep the album's cover is gl-692.",
+            "A file in the album-covers directory is kept: earlier builds stored there one \
+             copy of an album's cover that the album and every one of its tracks named, and \
+             rows a library scan has not yet replaced may still name it (docs/MUSIC_ARTWORK.md); \
+             DeleteImageAsync deletes any local file. No build writes there any more (gl-692, \
+             gl-1633).",
             "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &["images"],

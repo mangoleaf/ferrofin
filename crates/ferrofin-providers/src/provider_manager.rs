@@ -8,10 +8,26 @@
 //! remote images ("Choose Image"), the external-id descriptor set, and the
 //! external-URL ("Links") table.
 
-/// Immutable album covers shared by multiple item image records. These assets
-/// are retained when references are removed, so concurrent scans/readers cannot
-/// lose a file while adopting it. Per-item uploads live outside this directory.
+/// The folder (under the item-art root) where earlier builds stored every
+/// album's cover as an immutable copy that the album and each of its tracks
+/// named. No build writes there any more: a library scan replaces each row
+/// still naming one with the image upstream gives the item. Its files are
+/// kept when a row is removed, as an album's rows not yet scanned again may
+/// still name the same file.
 pub const SHARED_ALBUM_ARTWORK_DIR: &str = "album-covers";
+
+/// Whether `path` is one of the shared album covers in
+/// [`SHARED_ALBUM_ARTWORK_DIR`] (`…/album-covers/{album}/{file}`), told by
+/// that layout rather than today's metadata root, which may have moved since
+/// the row was stored.
+#[must_use]
+pub fn is_shared_album_artwork(path: &str) -> bool {
+    std::path::Path::new(path)
+        .parent()
+        .and_then(std::path::Path::parent)
+        .and_then(std::path::Path::file_name)
+        .is_some_and(|name| name == SHARED_ALBUM_ARTWORK_DIR)
+}
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::{HashMap, HashSet};
@@ -5424,14 +5440,7 @@ impl ProviderManager for LocalProviderManager {
             if !ItemImageInfo::is_local_path(&path) {
                 continue;
             }
-            // Shared files can belong to a previous metadata root. Their
-            // persisted layout, not today's root, identifies shared ownership.
-            if std::path::Path::new(&path)
-                .parent()
-                .and_then(std::path::Path::parent)
-                .and_then(std::path::Path::file_name)
-                .is_some_and(|name| name == SHARED_ALBUM_ARTWORK_DIR)
-            {
+            if is_shared_album_artwork(&path) {
                 continue;
             }
             if live_tv && !self.in_metadata_directory(&path).await {
@@ -5776,6 +5785,20 @@ mod tests {
     use std::time::Duration;
 
     use super::{LocalProviderManager, RemoteSearchProvider, parse_ymd, wants_fetch};
+
+    // An earlier build's shared album cover, told by its layout under any
+    // metadata root: `…/album-covers/{album}/{file}`, nothing shallower or
+    // deeper.
+    #[rstest::rstest]
+    #[case("/data/metadata/library/album-covers/0A1B/0123abcd.jpg", true)]
+    #[case("/moved/elsewhere/album-covers/0A1B/0123abcd.jpg", true)]
+    #[case("/data/metadata/library/album-covers/0123abcd.jpg", false)]
+    #[case("/data/metadata/library/album-covers/0A1B/x/0123abcd.jpg", false)]
+    #[case("/data/metadata/library/0A1B/primary.jpg", false)]
+    #[case("/media/Album/folder.jpg", false)]
+    fn a_shared_album_cover_is_told_by_its_layout(#[case] path: &str, #[case] shared: bool) {
+        assert_eq!(super::is_shared_album_artwork(path), shared);
+    }
     use ferrofin_model::entities::MetadataField;
     use ferrofin_traits::persistence::OwnerExtrasRefresh;
     use ferrofin_traits::providers::{MetadataRefreshMode as Mode, MetadataRefreshOptions as Opts};
