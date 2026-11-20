@@ -4,7 +4,8 @@
 //! C# used ICU4N + the `Diacritics.Extensions` library. Here diacritic removal
 //! is done via Unicode NFD decomposition + stripping of combining marks, plus a
 //! small explicit map for non-decomposable ligatures (e.g. `œ` → `oe`). This
-//! matches the ported test oracle exactly.
+//! matches the ported test oracle exactly. Transliteration runs ICU4X's CLDR
+//! transforms (see [`transliterated`]).
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, OnceLock};
@@ -20,13 +21,13 @@ static NOT_LETTER_DIGIT_SPACE: LazyLock<Regex> =
 /// C# `@"\s+"` in `GetCleanValue` — a run of whitespace to collapse.
 static WHITESPACE_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("valid regex"));
 
-/// Environment variable name that (in upstream Jellyfin) overrides the ICU
-/// transliterator rule id. Surfaced here as a config value for parity.
+/// Environment variable name that, in upstream Jellyfin, replaces the ICU
+/// transliterator rule id. Ferrofin does not read it yet: [`transliterated`]
+/// always runs [`DEFAULT_TRANSLITERATOR_ID`] (gl-327).
 pub const TRANSLITERATOR_ID_ENV: &str = "JELLYFIN_TRANSLITERATOR_ID";
 
-/// Default ICU transliterator rule id used when the environment override is
-/// unset. Retained as a documented config constant even though the Rust port
-/// approximates transliteration with ASCII folding.
+/// Upstream's default ICU transliterator rule id, the rule [`transliterated`]
+/// runs.
 pub const DEFAULT_TRANSLITERATOR_ID: &str =
     "Any-Latin; Latin-Ascii; Lower; NFD; [:Nonspacing Mark:] Remove; [:Punctuation:] Remove;";
 
@@ -203,13 +204,15 @@ pub fn right_part(haystack: &str, needle: char) -> &str {
     }
 }
 
-/// Returns a transliterated string which only contains ASCII characters.
-///
-/// The ICU rule-driven transliteration has no direct Rust analog; this
-/// approximates it with diacritic folding, matching the documented intent.
+/// Port of `StringExtensions.Transliterated()`: `text` through ICU's
+/// [`DEFAULT_TRANSLITERATOR_ID`] rule, run on ICU4X's CLDR transforms. Every
+/// script ICU's `Any-Latin` romanises is romanised (`東京` → `dong jing`),
+/// then the text is folded to ASCII, lower-cased, and stripped of nonspacing
+/// marks and punctuation. Thai, which ICU4X has no transform for, keeps its
+/// letters.
 #[must_use]
 pub fn transliterated(text: &str) -> String {
-    remove_diacritics(text)
+    crate::transliteration::transliterate(text)
 }
 
 /// Ensures all strings are non-null and trimmed of leading and trailing blanks.
@@ -638,9 +641,10 @@ mod tests {
     // get_clean_value and its regex helpers).
 
     #[rstest]
-    #[case("Béla Tarr", "Bela Tarr")] // diacritic folding, same oracle as remove_diacritics
-    #[case("Indiana Jones", "Indiana Jones")] // identity
-    fn transliterated_folds_diacritics(#[case] input: &str, #[case] expected: &str) {
+    #[case("Béla Tarr", "bela tarr")] // folded and lower-cased
+    #[case("Indiana Jones: Raiders", "indiana jones raiders")] // punctuation removed
+    #[case("東京", "dong jing")] // romanised
+    fn transliterated_runs_the_icu_rule(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(expected, transliterated(input));
     }
 

@@ -77,13 +77,8 @@ async fn a_first_sign_in_creates_an_account_with_the_password_refusing_provider_
 async fn a_linked_identity_signs_in_to_its_account_whatever_its_name() {
     let harness = Harness::new().await;
     let local = linked_local(&harness, "linked-local", &harness.fake.issuer()).await;
-    let reply = harness.finish().await;
-    assert_eq!(reply.status, 200, "{reply:?}");
-    assert!(
-        reply.html.contains("<strong>linked-local</strong>"),
-        "{}",
-        reply.html
-    );
+    let session = harness.session("linked-device").await.expect("signed in");
+    assert_eq!(session.user.name.as_deref(), Some("linked-local"));
     assert_eq!(user(&harness, USERNAME).await, None, "no account was made");
     assert_eq!(
         user(&harness, "linked-local")
@@ -289,6 +284,8 @@ fn over(harness: &mut Harness, store: LateLinks) {
         Arc::clone(&harness.sso.plugins),
         Arc::clone(&harness.users) as Arc<dyn UserManager>,
         Arc::new(store),
+        Arc::clone(&harness.sso.sessions),
+        Arc::clone(&harness.sso.activity),
         Some(PUBLIC_URL.to_owned()),
     );
 }

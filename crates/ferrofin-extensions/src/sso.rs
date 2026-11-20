@@ -25,7 +25,15 @@
 //! - [`accounts`]: the Ferrofin account that identity signs in to, found by
 //!   its link or created, and [`SsoAuthProvider`](accounts::SsoAuthProvider),
 //!   the authentication provider of the accounts it creates, which refuses
-//!   every password.
+//!   every password;
+//! - [`roles`]: a user's roles in the provider's role claim, the required
+//!   role a sign-in is refused without, and role sync, which keeps the
+//!   administrator flag, the libraries and Live TV in step with them;
+//! - [`complete`]: the completion page the callback answers, and the
+//!   exchange of its one-time code for the session, under the account rules
+//!   of a password sign-in;
+//! - [`login_buttons`]: the "Sign in with" buttons jellyfin-web's login page
+//!   shows under its form.
 //!
 //! An identity provider is contacted only when an admin saves a provider or a
 //! user signs in with it (B1).
@@ -36,12 +44,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
+use ferrofin_traits::activity::ActivityManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::ExternalIdentityStore;
 use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
 use ferrofin_traits::security::AuthenticationManager;
-use ferrofin_traits::sso::{OidcCallback, SsoManager, SsoReply};
+use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
+use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, SsoManager, SsoReply};
 use ferrofin_traits::tasks::ScheduledTask;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -49,15 +59,18 @@ use uuid::Uuid;
 use crate::{Extension, ExtensionContext};
 
 pub mod accounts;
+pub mod complete;
 pub mod discovery;
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake_idp;
 pub mod flows;
+pub mod login_buttons;
 pub mod oidc_http;
+pub mod roles;
 pub mod sign_in;
 
 use discovery::MetadataCache;
-use flows::PendingFlows;
+use flows::{ExchangeCodes, PendingFlows};
 use oidc_http::OidcHttpClient;
 
 /// The Single Sign-On plugin's id in `/Plugins`: Ferrofin's own, generated
@@ -81,7 +94,7 @@ pub const MAX_PROVIDER_KEY_LEN: usize = 32;
 /// route and the file on disk can hold one that does not read, or that the
 /// provider routes would refuse, and a save of one provider keeps the others
 /// as they are, members a newer server added included.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SsoConfig {
     /// The server's public URL the callback URLs are built on, base path
@@ -91,6 +104,21 @@ pub struct SsoConfig {
     /// The OIDC providers, each an [`OidcProvider`] document.
     #[serde(deserialize_with = "crate::ldap_auth::null_as_empty")]
     pub providers: Vec<serde_json::Value>,
+    /// Shows a sign-in button per provider on jellyfin-web's login page
+    /// ([`SsoManager::login_buttons`]); on by default (D7), a stored `null`
+    /// included.
+    #[serde(deserialize_with = "null_as_on")]
+    pub show_login_button: bool,
+}
+
+impl Default for SsoConfig {
+    fn default() -> Self {
+        Self {
+            public_url: String::new(),
+            providers: Vec::new(),
+            show_login_button: true,
+        }
+    }
 }
 
 impl SsoConfig {
@@ -128,6 +156,12 @@ impl SsoConfig {
             })
             .collect()
     }
+}
+
+/// Reads a switch that is on by default: a JSON `null` is on, as an absent
+/// member is.
+fn null_as_on<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(true))
 }
 
 /// The provider members a stored document must not keep: a client secret
@@ -190,6 +224,9 @@ pub fn validate_provider(provider: &OidcProvider) -> Result<(), String> {
         ("client id", &provider.client_id),
         ("scopes", &provider.scopes),
         ("username claim", &provider.username_claim),
+        ("role claim", &provider.role_claim),
+        ("required role", &provider.required_role),
+        ("administrator role", &provider.admin_role),
     ] {
         if value.chars().any(char::is_control) || value.trim() != value.as_str() {
             return Err(format!(
@@ -214,7 +251,10 @@ pub fn validate_provider(provider: &OidcProvider) -> Result<(), String> {
     if provider.username_claim.trim().is_empty() {
         return Err("the username claim is required".to_owned());
     }
-    Ok(())
+    if roles::reads_roles(provider) && provider.role_claim.is_empty() {
+        return Err("the role claim is required for a required role or role sync".to_owned());
+    }
+    roles::validate_mappings(provider)
 }
 
 /// Checks an issuer as OpenID Connect Core 1.0 defines one: a URL with a
@@ -282,14 +322,20 @@ async fn plugin_enabled(plugins: &dyn PluginManager) -> Result<bool, ServiceErro
 }
 
 /// The Single Sign-On plugin's service: reads and saves its configuration and
-/// private data through the plugin manager, and finds or creates the account
-/// a sign-in ends at. Shared by the `/sso` routes through [`SsoManager`].
+/// private data through the plugin manager, finds or creates the account a
+/// sign-in ends at, and opens its session. Shared by the `/sso` routes
+/// through [`SsoManager`].
 pub struct SsoService {
     plugins: Arc<dyn PluginManager>,
-    /// The accounts a sign-in finds or creates.
+    /// The accounts a sign-in finds or creates, and their sign-in rules.
     users: Arc<dyn UserManager>,
     /// The links from an identity to its account.
     identities: Arc<dyn ExternalIdentityStore>,
+    /// Opens a signed-in account's session and mints its token.
+    sessions: Arc<dyn SessionManager>,
+    /// The dashboard's activity log, for a refused sign-in of a known
+    /// account.
+    activity: Arc<dyn ActivityManager>,
     /// Held while an account is created and linked, so two first sign-ins of
     /// one identity end at one account.
     provisioning: tokio::sync::Mutex<()>,
@@ -305,30 +351,39 @@ pub struct SsoService {
     metadata: MetadataCache,
     /// The sign-ins started and not yet called back.
     flows: PendingFlows,
+    /// The sign-ins called back whose completion page has not yet swapped
+    /// its exchange code.
+    exchanges: ExchangeCodes,
 }
 
 impl SsoService {
     /// A service over the plugin manager (the enabled flag, the configuration
-    /// and the private data), the accounts and their identity links, and the
-    /// server's published URL, which the callback URLs fall back to. Never
-    /// the request's `Host` header.
+    /// and the private data), the accounts and their identity links, the
+    /// sessions a sign-in opens, the activity log, and the server's published
+    /// URL, which the callback URLs fall back to. Never the request's `Host`
+    /// header.
     #[must_use]
     pub fn new(
         plugins: Arc<dyn PluginManager>,
         users: Arc<dyn UserManager>,
         identities: Arc<dyn ExternalIdentityStore>,
+        sessions: Arc<dyn SessionManager>,
+        activity: Arc<dyn ActivityManager>,
         published_url: Option<String>,
     ) -> Self {
         Self {
             plugins,
             users,
             identities,
+            sessions,
+            activity,
             provisioning: tokio::sync::Mutex::new(()),
             published_url,
             saving: tokio::sync::Mutex::new(()),
             http: OidcHttpClient::new(),
             metadata: MetadataCache::default(),
             flows: PendingFlows::default(),
+            exchanges: ExchangeCodes::default(),
         }
     }
 
@@ -471,9 +526,13 @@ impl SsoManager for SsoService {
             &mut provider.client_id,
             &mut provider.scopes,
             &mut provider.username_claim,
+            &mut provider.role_claim,
+            &mut provider.required_role,
+            &mut provider.admin_role,
         ] {
             *value = value.trim().to_owned();
         }
+        roles::trim_mappings(&mut provider);
         validate_provider(&provider).map_err(ServiceError::invalid_input)?;
         // An empty or blank secret field on the page means "keep".
         let secret = provider
@@ -610,6 +669,20 @@ impl SsoManager for SsoService {
         callback: OidcCallback,
     ) -> Result<SsoReply, ServiceError> {
         self.finish_sign_in(key, callback).await
+    }
+
+    async fn exchange_oidc_sign_in(
+        &self,
+        code: Secret,
+        flow_cookie: Option<Secret>,
+        request: AuthenticationRequest,
+    ) -> Result<OidcExchangeReply, ServiceError> {
+        self.exchange_sign_in(&code, flow_cookie.as_ref(), request)
+            .await
+    }
+
+    async fn login_buttons(&self) -> Result<Option<String>, ServiceError> {
+        self.login_button_forms().await
     }
 }
 
