@@ -1,17 +1,22 @@
 """api.Server.settle against a stub whose scheduled tasks run for a while: it waits for two idle polls in a row,
-and gives up with a reason once its time is out."""
+and gives up with a reason once its time is out. api.Server.refresh_playlists against the fake server: it waits until
+each playlist's DateLastRefreshed moved, and gives up with a reason once its time is out."""
 
+from contextlib import closing
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 sys.path.append(str(Path(__file__).resolve().parent))
 import api  # noqa: E402
-from fake_server import copy, server  # noqa: E402
+from fake_server import REFRESH_SECONDS, SHARED, Stub, copy, server  # noqa: E402
 
 
 class Tasks:
@@ -51,6 +56,53 @@ class Settle(unittest.TestCase):
         with self.assertRaisesRegex(api.CheckError, "a scheduled task was still running after 0 s"):
             self.server(tasks).settle(timeout=0.05, interval=0.01)
         self.assertGreater(tasks.polls, 1)   # it waited, not gave up at the first look
+
+
+class RefreshPlaylists(unittest.TestCase):
+    def server(self, stub, data):
+        httpd = server(stub)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return api.Server(f"http://127.0.0.1:{httpd.server_port}", data)
+
+    def copy(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        return copy(tmp / "copy")
+
+    def test_each_playlist_is_refreshed_in_full_and_waited_for(self):
+        data = self.copy()
+        stub = Stub(db=api.database(data))
+        started = time.monotonic()
+        self.server(stub, data).refresh_playlists(api.database(data), timeout=10, interval=0.01)
+        self.assertIn(("POST", f"/Items/{SHARED}/Refresh"), stub.calls)
+        self.assertGreaterEqual(time.monotonic() - started, REFRESH_SECONDS)   # the queued refresh was waited for
+
+    def test_a_refresh_that_never_lands_is_a_reason(self):
+        data = self.copy()
+        with self.assertRaisesRegex(api.CheckError, "1 of 1 playlists were not refreshed after 0 s"):
+            self.server(Stub(), data).refresh_playlists(api.database(data), timeout=0.05, interval=0.01)
+
+    def test_a_refresh_of_another_mode_is_never_waited_out(self):
+        data = self.copy()
+        server = self.server(Stub(db=api.database(data)), data)
+        original = api.Server.request
+
+        def default_mode(self, path, method="GET", **options):
+            return original(self, path.replace("FullRefresh", "Default"), method, **options)
+
+        with mock.patch.object(api.Server, "request", default_mode):
+            with self.assertRaisesRegex(api.CheckError, "were not refreshed"):
+                server.refresh_playlists(api.database(data), timeout=REFRESH_SECONDS * 3, interval=0.01)
+
+    def test_a_copy_without_playlists_is_a_reason_not_a_pass(self):
+        data = self.copy()
+        with closing(sqlite3.connect(api.database(data))) as db:
+            db.execute("DELETE FROM BaseItems WHERE Type = ?", (api.PLAYLIST,))
+            db.commit()
+        with self.assertRaisesRegex(api.CheckError, "holds no playlist to refresh"):
+            self.server(Stub(), data).refresh_playlists(api.database(data), timeout=1, interval=0.01)
 
 
 class Send(unittest.TestCase):

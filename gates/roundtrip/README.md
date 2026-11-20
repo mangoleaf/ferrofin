@@ -61,7 +61,7 @@ Settings (environment), each a whole number of seconds:
 | Setting | Default | What |
 |---|---|---|
 | `ROUNDTRIP_READY_TIMEOUT` | 300 | how long a server may take to answer after its start |
-| `ROUNDTRIP_SCAN_TIMEOUT` | 600 | how long a library scan, the export, Jellyfin's startup tasks, Jellyfin's answers or its probes may take (the adoption gate's scan timeout); five times that bounds the whole usage stage (two scans, each followed by a settle, and the probes) |
+| `ROUNDTRIP_SCAN_TIMEOUT` | 600 | how long a library scan, the export, Jellyfin's startup tasks, its playlists' refresh, Jellyfin's answers or its probes may take (the adoption gate's scan timeout); five times that bounds the whole usage stage (two scans, each followed by a settle, and the probes) |
 | `ROUNDTRIP_STOP_TIMEOUT` | 60 | how long a server is given to stop after TERM before docker kills it |
 | `ROUNDTRIP_DOCKER_TIMEOUT` | 120 | how long any other docker call may take (a stop gets `ROUNDTRIP_STOP_TIMEOUT` more) |
 
@@ -81,6 +81,7 @@ Settings (environment), each a whole number of seconds:
 | | every migration it began finished | a `Perform migration` with no `was successfully applied`, named with its SQLite error ([`checks_boot.py`](checks_boot.py)); a log with no entry at all fails too |
 | | it ran the code migrations it runs on the source, and no schema migration | it applied a schema migration, which the exported history should record; or the code migrations it ran differ from those its own first start on the route's source ran, which `build-fixtures.sh` logged (`<fixture>.server.log` of the route's fourth field in `routes.sh`), so the fixtures must have been built with the Jellyfin image the gate runs. A history that records too much shows here: the code migrations it left out do not run |
 | | no ERR or FTL outside the allowlist | an error entry other than the blocked plugin repository, up to the probes; an error a probe causes is judged by the answers instead |
+| | every playlist's full metadata refresh completes | a playlist's `DateLastRefreshed` in its database has not moved within `ROUNDTRIP_SCAN_TIMEOUT` of `POST /Items/{id}/Refresh?metadataRefreshMode=FullRefresh` (jellyfin-web's "Refresh metadata", replacing nothing, for the metadata only), sent for every playlist its database holds ([`api.py`](api.py) `refresh-playlists`); or its database holds no playlist (the check would refresh nothing); or a refresh request is refused or unanswered. A full refresh runs every metadata reader whatever the file's time, so a stale `playlist.xml` in the export would merge its shares back (`PlaylistMetadataService.MergeData`), which the answers then show |
 | | answers equal Ferrofin's before the stop | `answers.txt` differs from `oracle.txt` through `adoption_normalise`, which leaves out ids, image sizes and the probes that differ by design; or the `userdata` lines differ with their item ids kept; or no answers came within `ROUNDTRIP_SCAN_TIMEOUT` |
 | | it serves every image, trickplay tile, subtitle and attachment its database lists | one of the files its database lists is not answered with 200: each item's each image type, each chapter image, each profile image, the first tile of each trickplay width, each external text subtitle and each attachment; or a file the database Ferrofin stopped with lists is no longer listed for an item or user Jellyfin still holds (a row Jellyfin dropped because the file was missing; an item it removed whole is judged by the answers and the library check instead); or neither database lists a file at all while Jellyfin's has an image table ([`probes.py`](probes.py), which writes `probes.txt`) |
 | | its library scan completes | `POST /Library/Refresh` does not end `Completed` |
@@ -173,6 +174,12 @@ members <Playlist|BoxSet> <name> = <item names>                their items: a pl
                                                                 by name
 image <Playlist|BoxSet> <name> <image types>                   which images they have (not their sizes: an
                                                                 upload is stored 0x0 until gl-1054 is fixed)
+shares <owner> <playlist> = <user>:<can edit 0|1>,…            synthetic-adult's playlists (answers.SHARE_OWNER,
+                                                                through its own web session in the copy), each with
+                                                                the accounts it is shared with, "-" for none,
+                                                                "error=<status>" when refused (one it sees but does
+                                                                not own); "shares <owner> no session" when the copy
+                                                                has no web session of the owner's
 item <name> lock=<0|1> fields=<locked fields> overview=<n>     the probed account's movies, by name
 ```
 
@@ -199,6 +206,10 @@ times `ROUNDTRIP_SCAN_TIMEOUT`. The actions, each checked in the answers it lead
 - rename the playlist, edit and lock a movie's metadata, give the collection a primary image;
 - delete the second playlist and collection: the copy's media is mounted read-only, so the items the
   stage deletes are these, whose files live in the data directory;
+- remove every share of the playlist synthetic-adult shared in Jellyfin (the fixtures' `Synthetic mixed
+  order`, shared with synthetic-child), as its owner: its `playlist.xml` still lists the share (the stage
+  fails when it does not, as the scenario would test nothing), and the export must not carry the file to
+  Jellyfin (gl-1903);
 - scan the library again, then capture.
 
 A new action keeps this command line and these line kinds, and adds the probe that shows it to
@@ -216,7 +227,7 @@ One file per stage and per check family, so later work adds files instead of gro
 | [`stage_jellyfin.sh`](stage_jellyfin.sh) | the Jellyfin stage |
 | [`routes.sh`](routes.sh) | the routes |
 | [`lib.sh`](lib.sh) | run ids, names, containers, ports and the comparison |
-| [`api.py`](api.py) | the HTTP client, the library scan and the settle |
+| [`api.py`](api.py) | the HTTP client, the library scan, the settle and the playlists' refresh |
 | [`usage.py`](usage.py) | the usage stage |
 | [`answers.py`](answers.py) | the answers both servers give |
 | [`checks_boot.py`](checks_boot.py) | Jellyfin's log |
@@ -241,12 +252,14 @@ The gate reuses the adoption gate's parts: its fixtures, `smoke.sh`, `lib.sh` (`
     during the export;
   - a route whose first-start log is missing;
   - a Jellyfin whose setup server answers first;
-  - a Jellyfin whose copy lost a write (the comparison fails), one that never answers (given up at
-    the deadline) and one that exits (named with its status);
+  - a Jellyfin whose copy lost a write (the comparison fails), one whose playlist refresh shares a
+    playlist again (the comparison fails on its `shares` line), one that never answers (given up at the
+    deadline) and one that exits (named with its status);
   - a Ferrofin that exits at once, and one that does not exit 0 on TERM;
   - a run stopped mid-stage (it removes its containers and its tag);
   - the refusals, and two runs at the same time sharing nothing, run directories included.
 - Canned Jellyfin logs exercise `checks_boot.py`.
 - Databases shaped as Jellyfin's tables exercise `checks_paths.py` and what `probes.py` probes.
-- The same fake server, in process, exercises `usage.py` and `answers.py` (a lost write included) and
-  `api.py`'s settle.
+- The same fake server, in process, exercises `usage.py` and `answers.py` (a lost write included, a copy
+  with no shared playlist or no stale `playlist.xml`, an owner with no session) and `api.py`'s settle and
+  playlist refresh (waited for, never landing, another mode, no playlist at all).

@@ -28,6 +28,11 @@ The lines (README.md, "The usage-stage contract"):
     members <Playlist|BoxSet> <name> = <item names>               their items: a playlist's in its order, a
                                                                    collection's by name
     image <Playlist|BoxSet> <name> <image types>                  which images they have
+    shares <owner> <playlist> = <user>:<can edit 0|1>,…           SHARE_OWNER's playlists, each with the accounts
+                                                                   it is shared with ("-": none, "error=<status>":
+                                                                   refused), as the owner asks; "shares <owner> no
+                                                                   session" when the copy has no web session of the
+                                                                   owner's
     item <name> lock=<0|1> fields=<locked fields> overview=<n>    the smoke user's movies, by name
     config <document> <setting>=<value> …                         server settings a dashboard shows, per document
 The smoke probes run as ADOPTION_USER when it is set (run.sh sets the fixture's oracle user), as smoke.sh
@@ -42,6 +47,7 @@ import sqlite3
 import subprocess
 import sys
 import urllib.parse
+import uuid
 
 import api
 
@@ -53,6 +59,9 @@ GATE_USERS = {"roundtrip-user": "roundtrip-password-1", "roundtrip-passwordless"
 #: What a login sends besides the password: not "Jellyfin Web", so smoke.sh never picks the session it makes.
 DEVICE_ID = "roundtrip-{name}"
 LOGIN_AUTH = f'MediaBrowser Client="roundtrip", Device="roundtrip", DeviceId="{DEVICE_ID}", Version="1"'
+#: The account whose playlist the fixtures share (gates/adoption/synthetic_fixture.py seed: Synthetic mixed order,
+#: shared with synthetic-child), probed through its own web session in the copy.
+SHARE_OWNER = "synthetic-adult"
 USER_DATA_FILTERS = ("IsPlayed", "IsFavorite", "IsResumable")
 # Not Dislikes: it is "not liked", a mixed listing of nearly everything, where upstream shows other users'
 # private playlists and Ferrofin does not (an accepted divergence).
@@ -69,12 +78,13 @@ CONFIGURATION = {
 }
 
 
-def smoke_credentials(data_dir):
+def smoke_credentials(data_dir, account=None):
     """(name, token, device id, id) of the account smoke.sh probes as: ADOPTION_USER, else its default choice
-    (adoption_smoke_credentials in gates/adoption/lib.sh, asked rather than copied)."""
+    (adoption_smoke_credentials in gates/adoption/lib.sh, asked rather than copied); or of `account`, from its
+    own web session in the copy."""
     result = subprocess.run(
         ["bash", "-c", '. "$1"; adoption_smoke_credentials "$2" "$3"', "-", str(ADOPTION / "lib.sh"),
-         str(api.database(data_dir)), os.environ.get("ADOPTION_USER", "")],
+         str(api.database(data_dir)), account or os.environ.get("ADOPTION_USER", "")],
         capture_output=True, text=True, check=False)
     fields = result.stdout.split()
     if result.returncode != 0 or len(fields) != 4:
@@ -88,9 +98,9 @@ def smoke_user(data_dir):
     return name, key
 
 
-def smoke_auth(data_dir):
-    """The Authorization header of that account's own web session, as smoke.sh sends it."""
-    _, token, device, _ = smoke_credentials(data_dir)
+def smoke_auth(data_dir, account=None):
+    """The Authorization header of that account's (or `account`'s) own web session, as smoke.sh sends it."""
+    _, token, device, _ = smoke_credentials(data_dir, account)
     return f'MediaBrowser Token="{token}", Client="Jellyfin Web", Device="Chrome", DeviceId="{device}", Version="10.11.8"'
 
 
@@ -102,9 +112,9 @@ def smoke_lines(base_url, data_dir):
     return result.stdout.splitlines()
 
 
-def items(server, query):
-    """(status, the Items of one /Items-shaped answer)."""
-    status, body = server.send("GET", query)
+def items(server, query, auth=None):
+    """(status, the Items of one /Items-shaped answer), as the API key or as `auth`."""
+    status, body = server.send("GET", query, auth=auth)
     return status, (body.get("Items") or []) if isinstance(body, dict) else []
 
 
@@ -279,13 +289,47 @@ def collection_lines(server, user_id):
     return out
 
 
+def share_lines(server, data_dir):
+    """SHARE_OWNER's playlists, each with the accounts it is shared with, as the owner asks (upstream answers the
+    owner only); one line when the copy has no web session of the owner's."""
+    try:
+        _, _, _, owner = smoke_credentials(data_dir, SHARE_OWNER)
+    except api.CheckError:
+        return [f"shares {SHARE_OWNER} no session"]
+    auth = smoke_auth(data_dir, SHARE_OWNER)
+    query = urllib.parse.urlencode({"userId": owner, "Recursive": "true", "IncludeItemTypes": "Playlist"})
+    status, found = items(server, "/Items?" + query, auth)
+    if status != 200:
+        return [f"shares {SHARE_OWNER} /Items {status}"]
+    _, users = accounts(server)
+    names = {uuid_hex(user.get("Id")): user.get("Name") for user in users}
+    out = []
+    for playlist in found:
+        status, shares = server.send("GET", f"/Playlists/{playlist.get('Id')}/Users", auth=auth)
+        if status != 200 or not isinstance(shares, list):
+            listed = f"error={status}"   # a playlist the owner sees but does not own: upstream answers 403
+        else:
+            listed = ",".join(sorted(f"{names.get(uuid_hex(share.get('UserId')), share.get('UserId'))}:"
+                                     f"{flag(share.get('CanEdit'))}" for share in shares)) or "-"
+        out.append(f"shares {SHARE_OWNER} {playlist.get('Name')} = {listed}")
+    return sorted(out)
+
+
+def uuid_hex(value):
+    """A user id as 32 hex digits, however a server spells it; a value that is no id as it is."""
+    try:
+        return uuid.UUID(str(value)).hex
+    except ValueError:
+        return value
+
+
 def capture(base_url, data_dir):
     """Every answer, in file order."""
     server = api.Server(base_url, data_dir)
     _, user_id = smoke_user(data_dir)
     return (smoke_lines(base_url, data_dir) + user_data_lines(server) + user_plays_lines(server)
             + account_lines(server) + login_lines(server) + preference_lines(server) + server_lines(server)
-            + collection_lines(server, user_id) + movie_lines(server, user_id))
+            + collection_lines(server, user_id) + share_lines(server, data_dir) + movie_lines(server, user_id))
 
 
 def write(path, lines):

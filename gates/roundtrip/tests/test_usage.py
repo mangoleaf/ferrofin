@@ -2,10 +2,11 @@
 reach the server, the closing scan is waited for, the oracle holds every kind of answer the contract names,
 and a failed action is named. smoke.sh runs for real against the stub (curl, jq and sqlite3)."""
 
-from contextlib import redirect_stderr
+from contextlib import closing, redirect_stderr
 import io
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -16,7 +17,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 sys.path.append(str(Path(__file__).resolve().parent))
 import usage  # noqa: E402
-from fake_server import MOVIES, Stub, copy, server  # noqa: E402
+from fake_server import CHILD, MOVIES, SHARED, SHARED_NAME, Stub, copy, server  # noqa: E402
 
 # The stub numbers what the stage creates from 100: the playlist, the one to delete, the collection, the one to delete.
 PLAYLIST, DOOMED_PLAYLIST, COLLECTION, DOOMED_COLLECTION = (f"{n:032x}" for n in range(100, 104))
@@ -72,8 +73,13 @@ class UsageStage(unittest.TestCase):
                        "members Playlist Round trip playlist renamed = Movie 3,Movie 2",
                        "collection BoxSet 2 Round trip collection", "members BoxSet Round trip collection = Movie 4,Movie 5",
                        "image BoxSet Round trip collection Primary", "image Playlist Round trip playlist renamed -",
-                       "item Round trip edited movie lock=1 fields=Name,Overview overview=37"):
+                       "item Round trip edited movie lock=1 fields=Name,Overview overview=37",
+                       f"shares synthetic-adult {SHARED_NAME} = -",
+                       "shares synthetic-adult Round trip playlist renamed = error=403"):
             self.assertIn(wanted, lines)
+        # the share was removed as the playlist's owner, through its own web session
+        self.assertIn(("DELETE", f"/Playlists/{SHARED}/Users/{CHILD}"), stub.calls)
+        self.assertEqual(stub.shares, [])
         self.assertTrue(any(line.startswith("user roundtrip-passwordless admin=0 disabled=0 hidden=1 folders=1 ")
                             and line.endswith(" sessions=2 audio=deu subs=Always autoplay=0") for line in lines))
         self.assertTrue(any(line.startswith("prefs synthetic-admin DateCreated Descending ")
@@ -119,7 +125,7 @@ class UsageStage(unittest.TestCase):
                                       f"synthetic-admin {MOVIES[0]} with fav=1)")
 
     def test_each_lost_write_fails_the_stage_naming_its_action(self):
-        restricted = f"{1:032x}"   # the stub numbers accounts in creation order: roundtrip-passwordless first
+        restricted = f"{3:032x}"   # the stub numbers accounts in creation order after its own three
         for drop, action in (
                 (f"/UserPlayedItems/{MOVIES[1]}", "mark Movie 2 played"),
                 (f"/UserItems/{MOVIES[4]}/UserData", "set a resume position on Movie 5"),
@@ -141,7 +147,8 @@ class UsageStage(unittest.TestCase):
                 (f"/Items/{COLLECTION}/Images", "give the collection a primary image"),
                 (f"/Items/{MOVIES[5]}", "edit and lock Movie 6"),
                 (f"/Items/{DOOMED_PLAYLIST}", "delete the playlist Round trip deleted playlist"),
-                (f"/Items/{DOOMED_COLLECTION}", "delete the collection Round trip deleted collection")):
+                (f"/Items/{DOOMED_COLLECTION}", "delete the collection Round trip deleted collection"),
+                (f"DELETE /Playlists/{SHARED}/Users", f"unshare {SHARED_NAME}")):
             with self.subTest(drop=drop):
                 status, err = self.run_stage(Stub(drop=drop))
                 self.assertEqual(status, 1)
@@ -182,6 +189,28 @@ class UsageStage(unittest.TestCase):
         # the in-process server prints the dropped connection's traceback first; the stage's line is last
         self.assertTrue(err.strip().splitlines()[-1].startswith("usage: create an API key: POST /Auth/Keys: no answer"), err)
         self.assertEqual((self.tmp / "oracle.txt.actions").read_text().splitlines()[-1], "create an API key  no answer")
+
+    def test_a_copy_without_a_shared_playlist_or_its_stale_file_is_named(self):
+        stub = Stub()
+        stub.shares = []
+        self.assertEqual(self.run_stage(stub), (1, "usage: unshare a playlist: synthetic-adult has shared none\n"))
+        (self.data / "data" / "playlists" / SHARED_NAME / "playlist.xml").unlink()
+        status, err = self.run_stage(Stub())
+        self.assertEqual(status, 1)
+        self.assertTrue(err.startswith(f"usage: unshare {SHARED_NAME}: the copy's playlist.xml does not list its "
+                                       "shares"), err)
+
+    def test_the_share_lines_say_when_the_owner_has_no_session(self):
+        httpd = server(Stub())
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        api_server = usage.api.Server(f"http://127.0.0.1:{httpd.server_port}", self.data)
+        self.assertEqual(usage.answers.share_lines(api_server, self.data), [f"shares synthetic-adult {SHARED_NAME} = synthetic-child:0"])
+        with closing(sqlite3.connect(self.data / "data" / "jellyfin.db")) as db:
+            db.execute("DELETE FROM Devices WHERE AccessToken = 'adulttoken'")
+            db.commit()
+        self.assertEqual(usage.answers.share_lines(api_server, self.data), ["shares synthetic-adult no session"])
 
     def test_a_created_item_without_an_id_is_named(self):
         class NoId(Stub):
