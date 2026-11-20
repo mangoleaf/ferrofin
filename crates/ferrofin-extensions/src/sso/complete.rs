@@ -17,7 +17,9 @@
 //!    which applies device access and the session limit and logs the success
 //!    (`AuthenticationSucceeded`). A refusal of a known account writes an
 //!    `AuthenticationFailed` activity entry; any other refusal is one log
-//!    line. Nothing here touches the account's failed-login counter.
+//!    line. Nothing here touches the account's failed-login counter. A
+//!    Quick Connect confirmation ([`quick_connect`](super::quick_connect))
+//!    is refused: it opens no session.
 //!
 //! Neither the code nor the token is ever logged (B15).
 
@@ -40,7 +42,7 @@ use uuid::Uuid;
 
 use super::SsoService;
 use super::accounts::PROVIDER_ID;
-use super::flows::{EXCHANGE_CODE_LIFETIME, PendingExchange};
+use super::flows::{EXCHANGE_CODE_LIFETIME, FlowPurpose, PendingExchange};
 use super::sign_in::{
     VerifiedIdentity, cleared_flow_cookie, escape_html, flow_cookie, log_refusal, page,
     sign_in_provider,
@@ -91,7 +93,7 @@ pub(super) fn completion_page(code: &str, cookie: &Secret, public_url: Option<&s
 
 /// A refusal of an exchange for a reason no account rule names: logged once,
 /// with the provider when it is known, and the page's [`FAILED`].
-fn refused(provider: Option<&str>, reason: &'static str) -> OidcExchangeRefusal {
+pub(super) fn refused(provider: Option<&str>, reason: &'static str) -> OidcExchangeRefusal {
     if let Some(key) = provider {
         log_refusal(key, reason);
     } else {
@@ -104,13 +106,14 @@ fn refused(provider: Option<&str>, reason: &'static str) -> OidcExchangeRefusal 
 }
 
 impl SsoService {
-    /// Keeps the sign-in of `user` by `identity` for the exchange under a new
+    /// Keeps the sign-in of `user` by `identity` for `purpose` under a new
     /// code, bound to the flow `cookie`, and answers the code.
     pub(super) fn issue_exchange_code(
         &self,
         user: &UserEntity,
         identity: VerifiedIdentity,
         cookie: &Secret,
+        purpose: FlowPurpose,
     ) -> Result<String, ServiceError> {
         let user_id =
             Uuid::parse_str(&user.id).map_err(|error| ServiceError::backend(error.to_string()))?;
@@ -121,6 +124,7 @@ impl SsoService {
                 binding_hash: Sha256::digest(cookie.expose().as_bytes()).into(),
                 user_id,
                 identity,
+                purpose,
                 created: std::time::Instant::now(),
             },
         );
@@ -137,6 +141,11 @@ impl SsoService {
         self.ensure_enabled().await?;
         let config = self.config().await?;
         let outcome = match self.redeem(code, flow_cookie) {
+            // A Quick Connect confirmation opens no browser session.
+            Ok(pending) if pending.purpose != FlowPurpose::SignIn => Err(refused(
+                Some(&pending.identity.provider_key),
+                "wrong_purpose",
+            )),
             Ok(pending) => match sign_in_provider(&config, &pending.identity.provider_key) {
                 Ok(provider) => self.open_session(&provider, pending, request).await?,
                 // Disabled or removed since the callback.
@@ -156,7 +165,7 @@ impl SsoService {
     /// Takes the exchange `code` names, once, while it is younger than
     /// [`EXCHANGE_CODE_LIFETIME`] and `flow_cookie` is the one it is bound
     /// to; else the reason it is refused.
-    fn redeem(
+    pub(super) fn redeem(
         &self,
         code: &Secret,
         flow_cookie: Option<&Secret>,
@@ -224,7 +233,10 @@ impl SsoService {
             .ensure_sign_in_allowed(&user, &remote_endpoint)
             .await
         {
-            return self.account_refused(&user, &remote_endpoint, error).await;
+            return self
+                .account_refused(&user, &remote_endpoint, error)
+                .await
+                .map(Err);
         }
         request.user_id = Some(pending.user_id);
         request.username = None;
@@ -236,9 +248,10 @@ impl SsoService {
             }
             // A device the account may not use, or its session limit: logged
             // by the session manager.
-            Err(error @ ServiceError::Forbidden(_)) => {
-                self.account_refused(&user, &remote_endpoint, error).await
-            }
+            Err(error @ ServiceError::Forbidden(_)) => self
+                .account_refused(&user, &remote_endpoint, error)
+                .await
+                .map(Err),
             // The page always sends its device.
             Err(ServiceError::InvalidInput(_)) => Ok(Err(refused(Some(key), "no_device"))),
             // Deleted since the callback.
@@ -251,12 +264,12 @@ impl SsoService {
     /// [`ServiceError::Forbidden`]; any other is passed on): an
     /// `AuthenticationFailed` activity entry as a refused password sign-in
     /// writes, and the rule's message for the page.
-    async fn account_refused(
+    pub(super) async fn account_refused(
         &self,
         user: &UserEntity,
         remote_endpoint: &str,
         error: ServiceError,
-    ) -> Result<Result<AuthenticationResultData, OidcExchangeRefusal>, ServiceError> {
+    ) -> Result<OidcExchangeRefusal, ServiceError> {
         let ServiceError::Forbidden(message) = error else {
             return Err(error);
         };
@@ -272,10 +285,10 @@ impl SsoService {
         if let Err(error) = self.activity.create_entry(entry).await {
             tracing::warn!(%error, activity_type = "AuthenticationFailed", "could not write the activity entry");
         }
-        Ok(Err(OidcExchangeRefusal {
+        Ok(OidcExchangeRefusal {
             status: 403,
             message,
-        }))
+        })
     }
 }
 

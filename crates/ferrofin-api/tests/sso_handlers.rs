@@ -2,7 +2,8 @@
 //! the provider settings, `GET /sso/admin/oidc/providers` and
 //! `PUT`/`DELETE /sso/admin/oidc/providers/{provider}`, and the sign-in,
 //! `GET /sso/oidc/{provider}/start`, `GET /sso/oidc/{provider}/callback` and
-//! `POST /sso/oidc/exchange`.
+//! `POST /sso/oidc/exchange`, and Quick Connect approval, `GET` and
+//! `POST /sso/quickconnect` and the start's `quickConnect`.
 //!
 //! Each test drives a route through the real router against a [`FakeSso`]
 //! manager, asserting the status, the body and whether the manager was
@@ -40,6 +41,9 @@ const SECRET: &str = "route-client-secret-31";
 /// Where [`FakeSso`] sends a started sign-in.
 const AUTHORIZE: &str = "https://id.example.org/authorize?state=s1";
 
+/// What a confirmation posted: its confirmation, flow cookie and caller.
+type Confirmed = (Option<Secret>, Option<Secret>, IpAddr);
+
 /// An [`SsoManager`] fake: enabled or not, refusing a save with `refusal`
 /// when set, answering a discovery test with `discovery_error` when set, and
 /// keeping what it was given.
@@ -55,6 +59,8 @@ struct FakeSso {
     started: Mutex<Vec<(String, IpAddr)>>,
     finished: Mutex<Vec<(String, OidcCallback)>>,
     exchanged: Mutex<Vec<(Secret, Option<Secret>, AuthenticationRequest)>>,
+    quick_connect_started: Mutex<Vec<(String, IpAddr, String)>>,
+    confirmed: Mutex<Vec<Confirmed>>,
     /// Each link call: its name and the account it named.
     links: Mutex<Vec<(String, Uuid)>>,
 }
@@ -91,6 +97,17 @@ impl FakeSso {
         self.exchanged.lock().expect("exchanged").clone()
     }
 
+    fn quick_connect_started(&self) -> Vec<(String, IpAddr, String)> {
+        self.quick_connect_started
+            .lock()
+            .expect("quick connect started")
+            .clone()
+    }
+
+    fn confirmed(&self) -> Vec<Confirmed> {
+        self.confirmed.lock().expect("confirmed").clone()
+    }
+
     /// Whether any route reached the manager past its enabled check.
     fn untouched(&self) -> bool {
         self.saved().is_empty()
@@ -100,6 +117,8 @@ impl FakeSso {
             && self.started().is_empty()
             && self.finished().is_empty()
             && self.exchanged().is_empty()
+            && self.quick_connect_started().is_empty()
+            && self.confirmed().is_empty()
             && self.link_calls().is_empty()
     }
 
@@ -301,6 +320,60 @@ impl SsoManager for FakeSso {
         Ok(None)
     }
 
+    async fn quick_connect_page(&self) -> Result<SsoReply, ServiceError> {
+        self.ensure_enabled().await?;
+        Ok(SsoReply {
+            status: 200,
+            location: None,
+            html: QUICK_CONNECT_PAGE.to_owned(),
+            set_cookies: Vec::new(),
+            content_security_policy: Some("form-action 'self' https:".to_owned()),
+        })
+    }
+
+    async fn start_oidc_quick_connect(
+        &self,
+        key: &str,
+        client: IpAddr,
+        code: &str,
+    ) -> Result<SsoReply, ServiceError> {
+        self.ensure_enabled().await?;
+        if key != "pocket" {
+            return Err(ServiceError::not_found(format!("OIDC provider {key}")));
+        }
+        self.quick_connect_started
+            .lock()
+            .expect("quick connect started")
+            .push((key.to_owned(), client, code.to_owned()));
+        Ok(SsoReply {
+            status: 302,
+            location: Some(AUTHORIZE.to_owned()),
+            html: String::new(),
+            set_cookies: vec![format!("{OIDC_FLOW_COOKIE}=b2; Path=/sso; HttpOnly")],
+            content_security_policy: None,
+        })
+    }
+
+    async fn confirm_oidc_quick_connect(
+        &self,
+        confirmation: Option<Secret>,
+        flow_cookie: Option<Secret>,
+        client: IpAddr,
+    ) -> Result<SsoReply, ServiceError> {
+        self.ensure_enabled().await?;
+        self.confirmed
+            .lock()
+            .expect("confirmed")
+            .push((confirmation, flow_cookie, client));
+        Ok(SsoReply {
+            status: 200,
+            location: None,
+            html: "<p>Your app is signed in.</p>".to_owned(),
+            set_cookies: vec![format!("{OIDC_FLOW_COOKIE}=; Path=/sso; Max-Age=0")],
+            content_security_policy: Some("default-src 'none'".to_owned()),
+        })
+    }
+
     async fn oidc_link_page(&self) -> Result<SsoReply, ServiceError> {
         self.ensure_enabled().await?;
         Ok(SsoReply {
@@ -386,6 +459,9 @@ const ALICE: Uuid = Uuid::from_u128(0xA11CE);
 
 /// The plain user [`as_user`] signs in as (`test_support::sample_user`).
 const SIGNED_IN: Uuid = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+
+/// The code-entry page [`FakeSso`] answers.
+const QUICK_CONNECT_PAGE: &str = "<form method=\"get\"><input name=\"quickConnect\"></form>";
 
 /// The session [`FakeSso`] answers the exchange code `good` with.
 fn signed_in() -> AuthenticationResultData {
@@ -729,6 +805,8 @@ async fn every_sso_plugin_route_is_registered() {
             ("get", "/sso/oidc/{provider}/start"),
             ("get", "/sso/oidc/{provider}/callback"),
             ("post", "/sso/oidc/exchange"),
+            ("get", "/sso/quickconnect"),
+            ("post", "/sso/quickconnect"),
             ("get", "/sso/link"),
             ("get", "/sso/links"),
             ("delete", "/sso/links/{provider}"),
@@ -752,8 +830,10 @@ async fn every_sso_plugin_route_is_registered() {
         }
         let body = match (method, path.as_str()) {
             ("put", _) => PAGE_BODY,
-            ("post", "/sso/oidc/exchange") => r#"{"Code":"good"}"#,
+            ("post", "/sso/quickconnect") => "confirmation=c1",
             ("post", "/sso/admin/links") => ADD_BODY,
+            ("post", "/sso/oidc/pocket/link") => "",
+            ("post", _) => r#"{"Code":"good"}"#,
             _ => "",
         };
         // The user's link routes need a user, and the admin's an admin.
@@ -1082,6 +1162,115 @@ async fn a_page_runs_only_what_its_policy_names_and_is_never_sniffed() {
         header(&start, "content-security-policy"),
         Vec::<&str>::new()
     );
+}
+
+/// B13's routes: the code-entry page as the plugin answers it, the start's
+/// `quickConnect` to the Quick Connect start (never the sign-in's), and the
+/// confirmation's form, cookie and caller to the plugin.
+#[tokio::test]
+async fn the_quick_connect_routes_hand_the_code_the_confirmation_and_the_cookie_to_the_plugin() {
+    let fake = FakeSso::new(true);
+    let page = respond(
+        fake_state().with_sso(fake.clone()),
+        request("GET", "/sso/quickconnect", "", false),
+    )
+    .await;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert_eq!(
+        header(&page, "content-security-policy"),
+        ["form-action 'self' https:"]
+    );
+    assert_eq!(header(&page, "x-content-type-options"), ["nosniff"]);
+    assert_eq!(header(&page, "cache-control"), ["no-store"]);
+    let body = axum::body::to_bytes(page.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], QUICK_CONNECT_PAGE.as_bytes());
+
+    let start = respond(
+        fake_state().with_sso(fake.clone()),
+        request(
+            "GET",
+            "/sso/oidc/pocket/start?quickConnect=123456",
+            "",
+            false,
+        ),
+    )
+    .await;
+    assert_eq!(start.status(), StatusCode::FOUND);
+    assert_eq!(
+        header(&start, "set-cookie"),
+        ["ferrofin_sso_flow=b2; Path=/sso; HttpOnly"]
+    );
+    assert_eq!(
+        fake.quick_connect_started(),
+        [(
+            "pocket".to_owned(),
+            IpAddr::from([127, 0, 0, 1]),
+            "123456".to_owned()
+        )]
+    );
+    assert!(fake.started().is_empty(), "no plain sign-in");
+
+    let confirm = Request::builder()
+        .method("POST")
+        .uri("/sso/quickconnect")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("cookie", "theme=dark; ferrofin_sso_flow=b2")
+        .body(Body::from("other=1&confirmation=c%2B1"))
+        .expect("request");
+    let confirmed = respond(fake_state().with_sso(fake.clone()), confirm).await;
+    assert_eq!(confirmed.status(), StatusCode::OK);
+    assert_eq!(
+        header(&confirmed, "set-cookie"),
+        ["ferrofin_sso_flow=; Path=/sso; Max-Age=0"]
+    );
+    assert_eq!(header(&confirmed, "referrer-policy"), ["no-referrer"]);
+    let (confirmation, cookie, client) = fake.confirmed().remove(0);
+    assert_eq!(confirmation.as_ref().map(Secret::expose), Some("c+1"));
+    assert_eq!(cookie.as_ref().map(Secret::expose), Some("b2"));
+    assert_eq!(client, IpAddr::from([127, 0, 0, 1]));
+
+    // A form without the confirmation still reaches the plugin, which
+    // refuses it.
+    let bare = Request::builder()
+        .method("POST")
+        .uri("/sso/quickconnect")
+        .body(Body::empty())
+        .expect("request");
+    respond(fake_state().with_sso(fake.clone()), bare).await;
+    let (confirmation, cookie, _) = fake.confirmed().remove(1);
+    assert!(confirmation.is_none() && cookie.is_none());
+}
+
+/// B1 for the Quick Connect routes: no such route while disabled or without
+/// the extension.
+#[tokio::test]
+async fn the_quick_connect_routes_answer_not_found_while_disabled() {
+    for (method, path, body) in [
+        ("GET", "/sso/quickconnect", ""),
+        ("POST", "/sso/quickconnect", "confirmation=c1"),
+        ("GET", "/sso/oidc/pocket/start?quickConnect=123456", ""),
+    ] {
+        let fake = FakeSso::new(false);
+        let (status, _) = send(
+            fake_state().with_sso(fake.clone()),
+            request(method, path, body, false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+        assert!(fake.untouched(), "{method} {path}");
+        let (status, _) = send(
+            authed_state_with_plugins(Arc::new(DisabledPluginManager)),
+            request(method, path, body, true),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "no extension: {method} {path}"
+        );
+    }
 }
 
 /// What the settings page posts to link `ALICE` by hand.

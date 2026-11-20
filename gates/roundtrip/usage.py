@@ -24,7 +24,8 @@ collection queued is no scheduled task, and one that saves an item after a chang
 change (or bring a deleted item back). Then
   6. the playlist is renamed, a movie's metadata edited and locked, and the collection given a primary image;
   7. the second playlist and collection are deleted. The copy's media is read-only, so the items the stage
-     deletes are these, whose files live in the data directory.
+     deletes are these, whose files live in the data directory;
+  8. every share of the playlist answers.SHARE_OWNER shared in Jellyfin is removed, as its owner.
 Then the library is scanned and left to settle again, and the answers (answers.py) are written to FILE: the
 oracle Jellyfin's answers are compared with after the return. Each action must show in them (a write the
 server accepted and lost fails here, not as two equal answers later), and a deleted item must answer 404.
@@ -36,11 +37,14 @@ the actions change.
 import argparse
 import base64
 import os
+from pathlib import Path
+import re
 import signal
 import sqlite3
 import struct
 import sys
 import urllib.parse
+import uuid
 import zlib
 
 import answers
@@ -136,6 +140,43 @@ def shown(action, wanted, found):
 def after_the_prefix(lines, prefix):
     """The rest of the first line starting with prefix, or None."""
     return next((line[len(prefix):] for line in lines if line.startswith(prefix)), None)
+
+
+def stale(data_dir, name, shares):
+    """Refuses a copy whose playlist.xml for the playlist `name` does not list every one of `shares`."""
+    file = Path(data_dir) / "data" / "playlists" / name / "playlist.xml"
+    try:
+        listed = {uuid.UUID(key).hex for key in re.findall(r"<UserId>([^<]+)</UserId>", file.read_text("utf-8-sig"))}
+    except (OSError, ValueError):
+        listed = set()
+    if any(uuid.UUID(str(share["UserId"])).hex not in listed for share in shares):
+        raise UsageError(f"unshare {name}: the copy's playlist.xml does not list its shares, so there is no stale "
+                         "file for the export to leave out")
+
+
+def unshare(server, data_dir):
+    """Removes every share of the first playlist, by name, that answers.SHARE_OWNER has shared, as the owner (upstream
+    lets only the owner or an editor do it), and returns its name. A playlist Jellyfin shared keeps the shares in its
+    playlist.xml, which Jellyfin's metadata refresh merges back: a share removed in Ferrofin must stay removed. The
+    copy's playlist.xml must list every share first, or the scenario has no stale file to test."""
+    owner = answers.smoke_credentials(data_dir, answers.SHARE_OWNER)[3]
+    auth = answers.smoke_auth(data_dir, answers.SHARE_OWNER)
+    found = (act(server, f"list {answers.SHARE_OWNER}'s playlists", "GET", "/Items" + query(
+        userId=owner, Recursive="true", IncludeItemTypes="Playlist"), auth=auth) or {}).get("Items") or []
+    for playlist in sorted(found, key=lambda p: p.get("Name") or ""):
+        status, shares = server.send("GET", f"/Playlists/{playlist['Id']}/Users", auth=auth)
+        if status == 403:
+            continue   # a playlist the owner sees but does not own, which upstream answers 403
+        if status != 200 or not isinstance(shares, list):
+            raise UsageError(f"read the shares of {playlist['Name']}: HTTP {status}")
+        if shares:
+            stale(data_dir, playlist["Name"], shares)
+        for share in shares:
+            act(server, f"unshare {playlist['Name']}", "DELETE",
+                f"/Playlists/{playlist['Id']}/Users/{share['UserId']}", auth=auth)
+        if shares:
+            return playlist["Name"]
+    raise UsageError(f"unshare a playlist: {answers.SHARE_OWNER} has shared none")
 
 
 def run(base_url, data_dir, oracle_out, timeout):
@@ -237,7 +278,7 @@ def run(base_url, data_dir, oracle_out, timeout):
         name=removed[0], refreshLibrary="true"))
     refresh(server, timeout, "refresh the library")
 
-    # 6. and 7., once the refreshes the changes above queued have run
+    # 6., 7. and 8., once the refreshes the changes above queued have run
     act(server, "rename the playlist", "POST", f"/Playlists/{playlist}", {"Name": RENAMED}, auth=owner)
     edited = every[5]
     item = act(server, f"read {edited['Name']}", "GET", f"/Items/{edited['Id']}" + query(userId=user)) or {}
@@ -248,6 +289,7 @@ def run(base_url, data_dir, oracle_out, timeout):
         base64.b64encode(png(120, 180, (255, 165, 0))), content_type="image/png")
     act(server, f"delete the playlist {DOOMED_PLAYLIST}", "DELETE", f"/Items/{doomed_playlist}")
     act(server, f"delete the collection {DOOMED_COLLECTION}", "DELETE", f"/Items/{doomed_collection}")
+    unshared = unshare(server, data_dir)
     refresh(server, timeout, "refresh the library again")
 
     lines = answers.capture(base_url, data_dir)
@@ -299,6 +341,8 @@ def run(base_url, data_dir, oracle_out, timeout):
              gone[doomed_playlist] == 404 and not any(line.endswith(f" {DOOMED_PLAYLIST}") for line in lines)),
             (f"delete the collection {DOOMED_COLLECTION}", "GET /Items/<its id> 404 and no line for it",
              gone[doomed_collection] == 404 and not any(line.endswith(f" {DOOMED_COLLECTION}") for line in lines)),
+            (f"unshare {unshared}", f"shares {answers.SHARE_OWNER} {unshared} = -",
+             f"shares {answers.SHARE_OWNER} {unshared} = -" in lines),
             *((f"create the user {n}", f"login {n} 200 token=yes", f"login {n} 200 token=yes" in lines)
               for n in sorted(answers.GATE_USERS))):
         shown(action, wanted, found)

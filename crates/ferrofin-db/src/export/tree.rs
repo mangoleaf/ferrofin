@@ -6,7 +6,9 @@
 //! a link, so nothing written into the output (by the export, or later by
 //! Jellyfin) can reach the source through one. A directory reached twice, by
 //! a link loop or by two links to one directory, is refused. A directory the
-//! export leaves out ([`Skip::leaving_out`]) is neither read nor digested.
+//! export leaves out ([`Skip::leaving_out`]) is neither read nor digested; a
+//! file it leaves out (the database's, and with [`Skip::with_containers`] a
+//! playlist's or box set's metadata file, `super::containers`) is digested.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -15,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
+use super::containers::{self, ContainerFile};
 use super::failed;
 use crate::{DbError, Result};
 
@@ -62,6 +65,9 @@ pub(super) struct Copied {
     pub(super) bytes: u64,
     /// (copy, source) of every directory written, for [`finish`].
     pub(super) dirs: Vec<(PathBuf, PathBuf)>,
+    /// The playlists' and box sets' metadata files found, relative to the
+    /// root, with what was done with each ([`Skip::with_containers`]).
+    pub(super) containers: Vec<(PathBuf, ContainerFile)>,
 }
 
 /// The files [`copy`] digests but does not copy, matched by path and, for a
@@ -77,6 +83,9 @@ pub(super) struct Skip {
     paths: HashSet<PathBuf>,
     /// Directories left out, relative to the root.
     dirs: HashSet<PathBuf>,
+    /// Whether the root is the data directory, whose playlists' and box sets'
+    /// metadata files are classified and the stale ones left out.
+    containers: bool,
 }
 
 impl Skip {
@@ -100,6 +109,14 @@ impl Skip {
     /// listed, read, digested nor copied.
     pub(super) fn leaving_out(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
         self.dirs.extend(dirs);
+        self
+    }
+
+    /// Also leaves out the playlists' and box sets' metadata files the data
+    /// directory holds in Jellyfin's own folders ([`containers::classify`]),
+    /// digested all the same, and records each such file found.
+    pub(super) fn with_containers(mut self) -> Self {
+        self.containers = true;
         self
     }
 
@@ -164,6 +181,7 @@ pub(super) fn walk_all(
         all.files += one.files;
         all.bytes += one.bytes;
         all.dirs.extend(one.dirs);
+        all.containers.extend(one.containers);
         all.digest.0.extend(
             one.digest
                 .0
@@ -251,7 +269,16 @@ fn walk(root: &Path, out: Option<&Path>, skip: &Skip) -> Result<Copied> {
                 Entry::Dir
             }
             Kind::File => {
-                let to = if to.is_some() && skip.holds(&from)? {
+                let container = if skip.containers {
+                    containers::classify(&path)
+                } else {
+                    None
+                };
+                if let Some(container) = container {
+                    copied.containers.push((path.clone(), container));
+                }
+                let left_out = container == Some(ContainerFile::LeftOut);
+                let to = if to.is_some() && (left_out || skip.holds(&from)?) {
                     None
                 } else {
                     to
@@ -402,7 +429,7 @@ fn refused(path: &Path, why: &str) -> DbError {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{Skip, copy, digest, digest_files, finish, walk_all};
+    use super::{ContainerFile, Skip, copy, digest, digest_files, finish, walk_all};
 
     fn write(root: &Path, path: &str, bytes: &[u8]) {
         let path = root.join(path);
@@ -476,6 +503,48 @@ mod tests {
             copied.digest.changes(&after),
             [meta.join("library/poster.jpg").display().to_string()]
         );
+    }
+
+    /// With the containers on, a playlist's `playlist.xml` is left out, its
+    /// folder copied, and the file digested all the same, so a change to it
+    /// is seen; a `collection.xml` only it makes a box set is copied. Both
+    /// are recorded. Without them, both are copied.
+    #[test]
+    fn container_files_are_left_out_but_digested() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, out, plain) = (
+            dir.path().join("source"),
+            dir.path().join("out"),
+            dir.path().join("plain"),
+        );
+        write(&source, "data/playlists/Mix/playlist.xml", b"stale");
+        write(&source, "data/collections/Odd/collection.xml", b"kept");
+        let skip = Skip::default().with_containers();
+
+        let copied = copy(&source, &out, &skip).unwrap();
+
+        assert!(!out.join("data/playlists/Mix/playlist.xml").exists());
+        assert!(out.join("data/playlists/Mix").is_dir());
+        assert_eq!(
+            std::fs::read(out.join("data/collections/Odd/collection.xml")).unwrap(),
+            b"kept"
+        );
+        assert_eq!(
+            copied.containers,
+            [
+                ("data/collections/Odd/collection.xml", ContainerFile::Kept),
+                ("data/playlists/Mix/playlist.xml", ContainerFile::LeftOut),
+            ]
+            .map(|(path, what)| (PathBuf::from(path), what))
+        );
+        write(&source, "data/playlists/Mix/playlist.xml", b"changed");
+        assert_eq!(
+            copied.digest.changes(&digest(&source, &skip).unwrap()),
+            ["data/playlists/Mix/playlist.xml"]
+        );
+        let copied = copy(&source, &plain, &Skip::default()).unwrap();
+        assert!(plain.join("data/playlists/Mix/playlist.xml").is_file());
+        assert_eq!(copied.containers, []);
     }
 
     #[test]

@@ -745,6 +745,25 @@ impl SsoManager for LoginButtons {
             .map(|buttons| buttons.map(str::to_owned))
             .map_err(|()| ServiceError::backend("the plugin configuration does not read"))
     }
+    async fn quick_connect_page(&self) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn start_oidc_quick_connect(
+        &self,
+        _key: &str,
+        _client: std::net::IpAddr,
+        _code: &str,
+    ) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn confirm_oidc_quick_connect(
+        &self,
+        _confirmation: Option<Secret>,
+        _flow_cookie: Option<Secret>,
+        _client: std::net::IpAddr,
+    ) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
     async fn oidc_link_page(&self) -> Result<SsoReply, ServiceError> {
         Err(unused())
     }

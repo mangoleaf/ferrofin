@@ -65,7 +65,7 @@ pub(in crate::sso) struct Harness {
 
 /// A sign-in started: where the browser was sent, and its flow cookie.
 pub(in crate::sso) struct Started {
-    location: String,
+    pub(in crate::sso) location: String,
     pub(in crate::sso) cookie: String,
 }
 
@@ -255,11 +255,17 @@ impl Harness {
     }
 
     pub(in crate::sso) async fn start(&self) -> Started {
-        let reply = self
-            .sso
-            .start_oidc_sign_in("fake", CLIENT)
-            .await
-            .expect("starts");
+        Self::started(
+            self.sso
+                .start_oidc_sign_in("fake", CLIENT)
+                .await
+                .expect("starts"),
+        )
+    }
+
+    /// What the browser keeps of a start's `reply`: where it is sent, and
+    /// its flow cookie.
+    pub(in crate::sso) fn started(reply: SsoReply) -> Started {
         assert_eq!(reply.status, 302, "{reply:?}");
         let cookie = reply.set_cookies[0]
             .strip_prefix("ferrofin_sso_flow=")

@@ -186,7 +186,9 @@ pub trait SsoManager: Send + Sync {
     /// carries a one-time exchange code for that account, bound to the
     /// [`OIDC_FLOW_COOKIE`], which it keeps for the exchange, and its script
     /// swaps the code at [`exchange_oidc_sign_in`](Self::exchange_oidc_sign_in)
-    /// and opens jellyfin-web signed in. With no account, a `403` page says
+    /// and opens jellyfin-web signed in. A sign-in started with
+    /// [`start_oidc_quick_connect`](Self::start_oidc_quick_connect) answers
+    /// its confirmation page instead. With no account, a `403` page says
     /// what to ask an administrator; a failed check is the refusal page; both
     /// clear the cookie. Either way the pending sign-in is used up. A link
     /// flow's callback ends on its own page instead
@@ -214,7 +216,7 @@ pub trait SsoManager: Send + Sync {
     /// refusal of a known account writes an `AuthenticationFailed` activity
     /// entry; nothing touches the account's failed-login counter. The code
     /// is used up by any attempt that reaches it, and every reply clears the
-    /// cookie.
+    /// cookie. A Quick Connect confirmation is refused: it opens no session.
     ///
     /// [`ServiceError::NotFound`] while the plugin is disabled, and an error
     /// when the accounts or the sessions cannot be read or written.
@@ -236,6 +238,62 @@ pub trait SsoManager: Send + Sync {
     /// is then served as stored (B1). Never [`ServiceError::NotFound`] for a
     /// disabled plugin; an error only when its configuration cannot be read.
     async fn login_buttons(&self) -> Result<Option<String>, ServiceError>;
+
+    /// The Quick Connect code-entry page (B13): a form for the code a native
+    /// app shows, with a button for each provider that can sign users in,
+    /// each starting
+    /// [`start_oidc_quick_connect`](Self::start_oidc_quick_connect) with the
+    /// code. While Quick Connect is turned off, a `403` page saying so.
+    ///
+    /// [`ServiceError::NotFound`] while the plugin is disabled, without Quick
+    /// Connect approval, and while no provider can sign users in.
+    async fn quick_connect_page(&self) -> Result<SsoReply, ServiceError>;
+
+    /// Starts a sign-in at the provider `key` whose verified identity approves
+    /// the Quick Connect `code`, as
+    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in) starts one. Its
+    /// callback, at [`finish_oidc_sign_in`](Self::finish_oidc_sign_in), is
+    /// checked and finds or creates the account as a sign-in's does, then
+    /// answers a confirmation page instead of the completion page: it names
+    /// the code and the account, and holds a one-time confirmation bound to
+    /// the [`OIDC_FLOW_COOKIE`], which it keeps as long, for
+    /// [`confirm_oidc_quick_connect`](Self::confirm_oidc_quick_connect).
+    /// Nothing is approved before that. A `code` that is not six digits is a
+    /// `400` page, and Quick Connect turned off a `403` one, both before the
+    /// identity provider is contacted.
+    ///
+    /// [`ServiceError::NotFound`] as for `start_oidc_sign_in`, and without
+    /// Quick Connect approval.
+    async fn start_oidc_quick_connect(
+        &self,
+        key: &str,
+        client: IpAddr,
+        code: &str,
+    ) -> Result<SsoReply, ServiceError>;
+
+    /// Approves the Quick Connect code of a confirmation page's
+    /// `confirmation`, once: `flow_cookie` must be the [`OIDC_FLOW_COOKIE`] it
+    /// is bound to, and it at most a minute old. The account must pass the
+    /// sign-in rules of a password sign-in (disabled, remote access from the
+    /// approving browser at `client`, parental schedule); then
+    /// `QuickConnect::authorize_request` signs the app's device in, which
+    /// applies device access and the session limit. No browser session is
+    /// opened. Every answer is a page and clears the cookie: the app signed
+    /// in, or why not (`400` for a confirmation or cookie that does not check
+    /// out, and for a code that is unknown, expired or approved already;
+    /// `403` for Quick Connect turned off, and for an account a sign-in rule
+    /// refuses, which writes an `AuthenticationFailed` activity entry). The
+    /// confirmation is used up by any attempt that reaches it.
+    ///
+    /// [`ServiceError::NotFound`] while the plugin is disabled or without
+    /// Quick Connect approval, and an error when the accounts or the sessions
+    /// cannot be read or written.
+    async fn confirm_oidc_quick_connect(
+        &self,
+        confirmation: Option<Secret>,
+        flow_cookie: Option<Secret>,
+        client: IpAddr,
+    ) -> Result<SsoReply, ServiceError>;
 
     // Linking an account and an identity (B12). Linking never changes the
     // account's authentication provider or password (D5).

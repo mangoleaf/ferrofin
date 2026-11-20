@@ -15,6 +15,9 @@
 //!   completion page;
 //! - `POST /sso/oidc/exchange` — the completion page's script swaps its
 //!   one-time code for the session there, for anyone;
+//! - `GET /sso/quickconnect` and `POST /sso/quickconnect` — a native app's
+//!   Quick Connect code entered, approved through a sign-in started with
+//!   `?quickConnect=CODE`, and confirmed, for anyone;
 //! - the account-link routes, in [`links`].
 //!
 //! Not Jellyfin contract operations, so they are listed in
@@ -234,13 +237,19 @@ fn flow_cookie(headers: &HeaderMap) -> Option<Secret> {
 
 /// `GET /sso/oidc/{provider}/start` — sends the browser to the provider's
 /// sign-in page, binding the attempt to it with the [`OIDC_FLOW_COOKIE`].
-/// Anonymous: this is how a user signs in.
+/// Anonymous: this is how a user signs in. With `quickConnect`, the sign-in
+/// approves that Quick Connect code once the browser confirms it.
 #[utoipa::path(
     get,
     path = "/sso/oidc/{provider}/start",
-    params(("provider" = String, Path, description = "The provider's key")),
+    params(
+        ("provider" = String, Path, description = "The provider's key"),
+        ("quickConnect" = Option<String>, Query, description = "The Quick Connect code the sign-in approves, once confirmed")
+    ),
     responses(
         (status = 302, description = "To the identity provider, with the flow cookie set"),
+        (status = 400, description = "The quickConnect value is not a Quick Connect code: a page saying so"),
+        (status = 403, description = "With quickConnect, Quick Connect is turned off: a page saying so"),
         (status = 502, description = "The identity provider could not be reached: a page saying so"),
         (status = 503, description = "No public URL is set to build the callback URL on: a page naming the setting"),
         (status = 404, description = "No such enabled provider, or the Single Sign-On plugin is disabled or not available")
@@ -255,17 +264,28 @@ async fn start_oidc_sign_in(
     let sso = enabled_service(&state).await?;
     let provider = sign_in_provider(provider)?;
     let client = state.client_address(&parts);
-    browser_reply(sso.start_oidc_sign_in(&provider, client).await?)
+    let quick_connect = form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
+        .find(|(name, _)| name == "quickConnect")
+        .map(|(_, code)| code.into_owned());
+    browser_reply(match quick_connect {
+        Some(code) => {
+            sso.start_oidc_quick_connect(&provider, client, &code)
+                .await?
+        }
+        None => sso.start_oidc_sign_in(&provider, client).await?,
+    })
 }
 
 /// `GET /sso/oidc/{provider}/callback` — where the identity provider sends
 /// the browser back. A response that passes every check, for an account found
 /// by its link or created, ends on the completion page, which keeps the flow
-/// cookie for [`exchange_oidc_sign_in`]; with no account, on a page saying
-/// what to ask an administrator; any other on the refusal page. Both clear the
-/// flow cookie. A link flow's callback ends on its own page: the account
-/// linked, or refused because another account has the identity
-/// ([`links`]).
+/// cookie for [`exchange_oidc_sign_in`] (a sign-in started with
+/// `quickConnect`: on the confirmation page, which keeps it for
+/// [`confirm_quick_connect`]); with no account, on a page saying what to ask
+/// an administrator; any other on the refusal page. Both clear the flow
+/// cookie. A link flow's callback ends on its own page: the account linked,
+/// or refused (a missing required role, or another account has the
+/// identity; [`links`]).
 #[utoipa::path(
     get,
     path = "/sso/oidc/{provider}/callback",
@@ -277,7 +297,7 @@ async fn start_oidc_sign_in(
         ("error" = Option<String>, Query, description = "Why the identity provider refused")
     ),
     responses(
-        (status = 200, description = "The completion page, which signs the verified identity's account in"),
+        (status = 200, description = "The completion page, which signs the verified identity's account in; for a sign-in started with quickConnect, the confirmation page, which asks before approving the code"),
         (status = 400, description = "Refused: the sign-in failed a check"),
         (status = 403, description = "Refused: no account is linked to the identity and none can be created; the page says what to ask an administrator"),
         (status = 409, description = "A link flow refused: another account is linked to the identity"),
@@ -338,7 +358,7 @@ async fn finish_oidc_sign_in(
     request_body = OidcExchangeRequest,
     responses(
         (status = 200, description = "Signed in (AuthenticationResult)"),
-        (status = 400, description = "Refused: the code is unknown, used, expired or not this browser's, its identity is no longer linked to the account, or the body does not bind"),
+        (status = 400, description = "Refused: the code is unknown, used, expired, not this browser's or a Quick Connect confirmation, its identity is no longer linked to the account, or the body does not bind"),
         (status = 403, description = "Refused: the account is disabled, outside its schedule or remote access, on a device it may not use, or at its session limit"),
         (status = 404, description = "The Single Sign-On plugin is disabled or not available")
     ),
@@ -384,6 +404,57 @@ async fn exchange_oidc_sign_in(
     Ok(response)
 }
 
+/// `GET /sso/quickconnect` — the page where a native app's Quick Connect code
+/// is entered, with a button for each provider that can sign users in, each
+/// starting a sign-in that approves it once confirmed. Anonymous: whoever
+/// signs in approves the code as themselves.
+#[utoipa::path(
+    get,
+    path = "/sso/quickconnect",
+    responses(
+        (status = 200, description = "The code-entry page"),
+        (status = 403, description = "Quick Connect is turned off: a page saying so"),
+        (status = 404, description = "No provider can sign users in, or the Single Sign-On plugin is disabled or not available")
+    ),
+    tag = "ferrofin"
+)]
+async fn quick_connect_page(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let sso = enabled_service(&state).await?;
+    browser_reply(sso.quick_connect_page().await?)
+}
+
+/// `POST /sso/quickconnect` — the confirmation page's form: approves its
+/// Quick Connect code, once, with the flow cookie its `confirmation` is bound
+/// to, as the account the sign-in found, from the caller's address. Answers a
+/// page either way, and clears the flow cookie.
+#[utoipa::path(
+    post,
+    path = "/sso/quickconnect",
+    request_body(content = String, content_type = "application/x-www-form-urlencoded", description = "confirmation=…, from the confirmation page"),
+    responses(
+        (status = 200, description = "The app is signed in: a page saying so"),
+        (status = 400, description = "Refused: the confirmation is unknown, used, expired or not this browser's, or the code is unknown, expired or approved already"),
+        (status = 403, description = "Refused: Quick Connect is turned off, or a sign-in rule refuses the account"),
+        (status = 404, description = "The Single Sign-On plugin is disabled or not available")
+    ),
+    tag = "ferrofin"
+)]
+async fn confirm_quick_connect(
+    State(state): State<AppState>,
+    parts: Parts,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let sso = enabled_service(&state).await?;
+    let confirmation = form_urlencoded::parse(&body)
+        .find(|(name, _)| name == "confirmation")
+        .map(|(_, value)| Secret::new(value.into_owned()));
+    let client = state.client_address(&parts);
+    browser_reply(
+        sso.confirm_oidc_quick_connect(confirmation, flow_cookie(&parts.headers), client)
+            .await?,
+    )
+}
+
 /// Registers this controller's routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
@@ -395,6 +466,10 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/sso/oidc/{provider}/start", get(start_oidc_sign_in))
         .route("/sso/oidc/{provider}/callback", get(finish_oidc_sign_in))
         .route("/sso/oidc/exchange", post(exchange_oidc_sign_in))
+        .route(
+            "/sso/quickconnect",
+            get(quick_connect_page).post(confirm_quick_connect),
+        )
         .merge(links::register(Router::new()))
 }
 

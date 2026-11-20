@@ -3390,17 +3390,20 @@ pub async fn build_app_state(
     // to a request's Host header. It finds or creates the account a sign-in
     // ends at through the extensions' user manager and identity links, opens
     // its session through the session manager, and writes a refused one to
-    // the activity log. Both exist only long after the extension context, so
-    // they come from the state, not from it.
-    let sso: Arc<dyn ferrofin_traits::sso::SsoManager> =
-        Arc::new(ferrofin_extensions::sso::SsoService::new(
+    // the activity log; a native app's Quick Connect code it approves through
+    // the Quick Connect manager. These exist only long after the extension
+    // context, so they come from the state, not from it.
+    let sso: Arc<dyn ferrofin_traits::sso::SsoManager> = Arc::new(
+        ferrofin_extensions::sso::SsoService::new(
             Arc::clone(&plugins),
             Arc::clone(&extension_cx.users),
             Arc::clone(&extension_cx.external_identities),
             Arc::clone(&state.sessions),
             Arc::clone(&state.activity),
             config.published_url.clone(),
-        ));
+        )
+        .with_quick_connect(Arc::clone(&state.quick_connect)),
+    );
     // The backup engine behind `/Backup*`: archives come from and go back to
     // the live application paths, and each manifest records this release.
     let backup_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =

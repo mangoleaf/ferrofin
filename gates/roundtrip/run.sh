@@ -5,7 +5,7 @@
 # pristine synthetic fixture (gates/adoption/build-fixtures.sh), each stage records each of its checks:
 #   Ferrofin   IMAGE (default ferrofin:bench) adopts the copy and scans it, the usage stage runs (usage.py:
 #              watch state, accounts, a device, an API key, display preferences, playlists, collections,
-#              libraries, a metadata edit, an image and deletes; README.md) and captures
+#              libraries, a metadata edit, an image, deletes and a removed share; README.md) and captures
 #              Ferrofin's answers (answers.py) once its closing library scan has completed, and Ferrofin
 #              is stopped. Checks: ready; boot log (generation, migrations, no ERROR); the scan completes;
 #              the usage stage; a clean stop.
@@ -18,7 +18,8 @@
 #              began finished (a failure names the migration and its SQLite error); it ran the code
 #              migrations its own first start on the route's source ran (routes.sh) and no schema
 #              migration; no ERR or FTL entry outside checks_boot.py's allowlist up to that
-#              point; its answers equal Ferrofin's (adoption_normalise: ids, image sizes and the probes
+#              point; a full metadata refresh of every playlist completes (api.py refresh-playlists),
+#              then its answers equal Ferrofin's (adoption_normalise: ids, image sizes and the probes
 #              that differ by design left out), so everything answers.py captures came back: users and
 #              their logins, watch state, devices, API keys, settings, playlists and collections, and
 #              more; it serves every image, chapter and profile image, trickplay tile, external subtitle
@@ -40,10 +41,10 @@
 # network share (refused). DIR defaults to the one build-fixtures.sh builds under $FERROFIN_GATES_DIR; the
 # work directory to $FERROFIN_GATES_DIR/runs/roundtrip-<id>, never reused.
 # Settings (environment): ROUNDTRIP_READY_TIMEOUT, the seconds a server may take to answer after its
-# start (default 300); ROUNDTRIP_SCAN_TIMEOUT, the seconds a library scan, a settle or the export may take
-# (default 600, as the adoption gate's); ROUNDTRIP_STOP_TIMEOUT, the seconds a TERM is given before docker
-# kills the server (default 60); ROUNDTRIP_DOCKER_TIMEOUT, the seconds any other docker call may take
-# (default 120).
+# start (default 300); ROUNDTRIP_SCAN_TIMEOUT, the seconds a library scan, a settle, the export or the
+# playlists' refresh may take (default 600, as the adoption gate's); ROUNDTRIP_STOP_TIMEOUT, the seconds a
+# TERM is given before docker kills the server (default 60); ROUNDTRIP_DOCKER_TIMEOUT, the seconds any other
+# docker call may take (default 120).
 set -uo pipefail
 CALLER=$PWD
 SELF=$(cd "$(dirname "$0")" && pwd)/${0##*/}

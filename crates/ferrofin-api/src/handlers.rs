@@ -791,6 +791,8 @@ pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
     ("get", "/sso/oidc/{provider}/start", "sso"),
     ("get", "/sso/oidc/{provider}/callback", "sso"),
     ("post", "/sso/oidc/exchange", "sso"),
+    ("get", "/sso/quickconnect", "sso"),
+    ("post", "/sso/quickconnect", "sso"),
     ("get", "/sso/link", "sso"),
     ("get", "/sso/links", "sso"),
     ("delete", "/sso/links/{provider}", "sso"),

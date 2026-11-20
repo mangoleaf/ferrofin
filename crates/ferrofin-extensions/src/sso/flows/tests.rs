@@ -38,6 +38,7 @@ fn exchange(age: Duration) -> PendingExchange {
             username: None,
             claims: serde_json::Map::new(),
         },
+        purpose: FlowPurpose::SignIn,
         created: Instant::now()
             .checked_sub(age)
             .expect("the clock reaches back"),
