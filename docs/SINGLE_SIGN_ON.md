@@ -210,9 +210,11 @@ Administrators see every link under **Linked accounts** on the settings page. Th
 any link, or link an account by hand with the identity's subject: the `sub` claim of its ID
 tokens, which Keycloak's admin console shows as the user's ID.
 
-Removing a link signs out every session of the account. An account Single Sign-On created whose
-last link is removed cannot sign in at all, until an administrator links it again or gives it
-another authentication provider. Deleting a user removes their links.
+Removing a link signs out every session of the account, and ends every attempt to link a sign-in
+that the account started and has not finished at the identity provider (a sign-out by another
+route, such as Dashboard → Devices or a password change, does not end one). An account Single
+Sign-On created whose last link is removed cannot sign in at all, until an administrator links it
+again or gives it another authentication provider. Deleting a user removes their links.
 
 ## Native apps: Quick Connect
 

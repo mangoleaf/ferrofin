@@ -112,6 +112,15 @@ impl PendingFlows {
             .remove(state)
     }
 
+    /// Drops every pending link flow of the account `user_id`, so none links
+    /// once a removal has signed the account out ([`links`](super::links)).
+    pub fn drop_link_flows_of(&self, user_id: Uuid) {
+        self.flows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, flow| flow.purpose != FlowPurpose::Link(user_id));
+    }
+
     /// How many flows are pending.
     #[must_use]
     pub fn len(&self) -> usize {

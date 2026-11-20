@@ -20,7 +20,8 @@
 //!   (the store's rule).
 //! - Linking never changes the account's authentication provider or its
 //!   password (D5).
-//! - Removing a link signs every session of its account out. An account whose
+//! - Removing a link signs every session of its account out, and ends every
+//!   link flow the account started and has not called back. An account whose
 //!   provider is Single Sign-On's cannot sign in without a link, which both
 //!   pages say before the removal.
 //!
@@ -429,7 +430,17 @@ impl SsoService {
         // already minted is signed out here. A failed
         // sign-out is an error for a removal that stands; the dashboard's
         // Devices page signs the sessions out too.
-        self.sessions.revoke_user_tokens(user_id, "").await?;
+        let revoked = self.sessions.revoke_user_tokens(user_id, "").await;
+        // After the sign-out, so no session of the account is left to start
+        // another: a link flow started from one would otherwise link
+        // whoever signs in at its callback.
+        // shortcut: a callback whose flow was already taken still links, the
+        // drop reaches this process's flows only (another pod's live out their
+        // lifetime), and a sign-out by another route (the Devices page, a
+        // password change) ends no link flow; bind a link flow to its session
+        // if that matters.
+        self.flows.drop_link_flows_of(user_id);
+        revoked?;
         tracing::info!(user_id = %user_id, "OIDC identity unlinked and the account's sessions signed out");
         Ok(())
     }
