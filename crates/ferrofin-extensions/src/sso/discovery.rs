@@ -2,9 +2,9 @@
 //! it names, fetched through [`OidcHttpClient`] and checked by
 //! `openidconnect` (the document must name the configured issuer exactly),
 //! summarised for the settings page ([`summary`]) and kept for sign-in in a
-//! [`MetadataCache`]. A save's test fills the cache ([`MetadataCache::refresh`]);
-//! its readers ([`MetadataCache::get`], [`MetadataCache::get_or_refresh`]) are
-//! for the sign-in phases.
+//! [`MetadataCache`]. A save's test fills the cache ([`MetadataCache::refresh`]),
+//! and sign-in reads it ([`MetadataCache::get_or_refresh`]), fetching it again
+//! for an ID token signed with a key it lacks.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -34,6 +34,10 @@ pub struct DiscoveryExtras {
     /// The PKCE methods the provider lists (RFC 8414), when it lists any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_challenge_methods_supported: Option<Vec<String>>,
+    /// Whether the provider sends `iss` with its authorization responses
+    /// (RFC 9207), which a callback must then carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_response_iss_parameter_supported: Option<bool>,
 }
 
 impl AdditionalProviderMetadata for DiscoveryExtras {}

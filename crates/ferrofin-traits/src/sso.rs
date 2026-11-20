@@ -6,10 +6,79 @@
 //! plugin is grouped there; `ferrofin-api` handlers reach it only through this
 //! object-safe trait.
 
+use std::net::IpAddr;
+
 use async_trait::async_trait;
+use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
 
 use crate::error::ServiceError;
+
+/// The cookie that binds a pending OIDC sign-in to the browser that started
+/// it: [`SsoManager::start_oidc_sign_in`] sets it, and the callback route
+/// reads it back into [`OidcCallback::flow_cookie`].
+pub const OIDC_FLOW_COOKIE: &str = "ferrofin_sso_flow";
+
+/// What a browser-facing Single Sign-On route answers: a redirect when
+/// [`location`](Self::location) is set, else an HTML page, with the cookies
+/// to set either way. `Debug` leaves the cookies and the redirect's query
+/// (its `state` and nonce) out.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SsoReply {
+    /// The status code: `302` for a redirect.
+    pub status: u16,
+    /// Where a redirect sends the browser.
+    pub location: Option<String>,
+    /// The page; empty for a redirect.
+    pub html: String,
+    /// Each `Set-Cookie` header value, in order.
+    pub set_cookies: Vec<String>,
+}
+
+impl std::fmt::Debug for SsoReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SsoReply")
+            .field("status", &self.status)
+            .field(
+                "location",
+                &self.location.as_deref().and_then(|l| l.split('?').next()),
+            )
+            .field("html", &self.html)
+            .field("set_cookies", &self.set_cookies.len())
+            .finish()
+    }
+}
+
+/// What the identity provider's redirect brought back to
+/// `GET /sso/oidc/{provider}/callback`: its query parameters, and the
+/// browser's [`OIDC_FLOW_COOKIE`]. A callback that repeats any of these
+/// parameters is read as having none of them. `Debug` says only which are
+/// present.
+#[derive(Clone, Default)]
+pub struct OidcCallback {
+    /// `state`: names the pending sign-in.
+    pub state: Option<String>,
+    /// `code`: the authorization code to exchange.
+    pub code: Option<Secret>,
+    /// `iss`: the issuer that answered (RFC 9207).
+    pub iss: Option<String>,
+    /// `error`: the identity provider refused or failed the sign-in.
+    pub error: Option<String>,
+    /// The value of the browser's [`OIDC_FLOW_COOKIE`].
+    pub flow_cookie: Option<Secret>,
+}
+
+impl std::fmt::Debug for OidcCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcCallback")
+            .field("state", &self.state.is_some())
+            .field("code", &self.code.is_some())
+            .field("iss", &self.iss.is_some())
+            .field("error", &self.error.is_some())
+            .field("flow_cookie", &self.flow_cookie.is_some())
+            .finish()
+    }
+}
 
 /// The Single Sign-On plugin's operations.
 ///
@@ -68,6 +137,30 @@ pub trait SsoManager: Send + Sync {
         &self,
         provider: &OidcProvider,
     ) -> Result<OidcDiscovery, ServiceError>;
+
+    /// Starts a sign-in at the provider `key` for the browser at `client`:
+    /// a redirect to its authorization endpoint (the code flow with PKCE
+    /// `S256`, a `state` and a nonce) that sets the [`OIDC_FLOW_COOKIE`].
+    /// When no callback URL can be built, a page naming the public URL
+    /// setting; when the provider cannot be reached, the refusal page.
+    ///
+    /// [`ServiceError::NotFound`] while the plugin is disabled, and for a
+    /// provider that is unknown, disabled or refused.
+    async fn start_oidc_sign_in(&self, key: &str, client: IpAddr)
+    -> Result<SsoReply, ServiceError>;
+
+    /// Finishes the sign-in `callback` names, at the provider `key`: the page
+    /// naming the verified identity when every check passes, else the
+    /// refusal page. Either way the pending sign-in is used up and the
+    /// [`OIDC_FLOW_COOKIE`] cleared.
+    ///
+    /// [`ServiceError::NotFound`] as for
+    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in).
+    async fn finish_oidc_sign_in(
+        &self,
+        key: &str,
+        callback: OidcCallback,
+    ) -> Result<SsoReply, ServiceError>;
 }
 
 fn _assert_object_safe_sso_manager(_: &dyn SsoManager) {}

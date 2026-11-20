@@ -1,7 +1,6 @@
 //! The HTTP client every call to an OpenID Connect identity provider goes
 //! through: `openidconnect`'s [`AsyncHttpClient`] over a reqwest client built
-//! for it. Discovery and its key set use it now; the code exchange and
-//! userinfo of the next phases are to use it too.
+//! for it: discovery and its key set, the code exchange and userinfo.
 //!
 //! - **No redirect is followed.** A `3xx` answer is an error: the URLs come
 //!   from the admin's issuer and the document it serves, and a redirect would

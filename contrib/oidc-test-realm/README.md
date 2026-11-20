@@ -83,6 +83,10 @@ Then replace the published values, in the realm `ferrofin-test`:
    the key set below `{issuer}/protocol/openid-connect/`, and how many signing keys were read.
    Saved with a wrong issuer (`…/realms/ferrofin-missing`), the row says why the test failed, and
    the provider is still saved.
+5. Open `http://127.0.0.1:8096/sso/oidc/keycloak/start` in a browser and sign in as a realm user.
+   The page you land on names the identity Keycloak vouched for; no Ferrofin account is linked to
+   it or signed in yet. Loading that page's URL again is refused, and so is finishing in another
+   browser a sign-in started in this one.
 
 ## The live test
 
@@ -113,4 +117,9 @@ cargo test -p ferrofin-extensions --test oidc_keycloak -- --include-ignored --no
 
 It saves the realm's client as a provider and checks that discovery finds the realm's endpoints
 and keys, and that it fails cleanly, with the provider still saved, for a realm that does not exist
-and for the issuer written with a trailing `/`. The users and groups are for the sign-in checks.
+and for the issuer written with a trailing `/`. Then it signs the member user in: it starts a
+sign-in, fills in Keycloak's own login form, and checks that the callback Keycloak sends the
+browser back to reaches the verified identity, that the same callback is refused a second time,
+and that a callback without the flow cookie (another browser) is refused. It builds callback URLs
+on `http://127.0.0.1:8096`, which the realm's redirect URIs accept; nothing needs to listen there.
+The other users and the groups are for the later sign-in checks.

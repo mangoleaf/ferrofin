@@ -18,10 +18,13 @@
 //! - [`oidc_http`]: the HTTP client every call to an identity provider goes
 //!   through, with the D19 limits;
 //! - [`discovery`]: a provider's discovery document and key set, and their
-//!   cache.
+//!   cache;
+//! - [`sign_in`]: a sign-in at a provider, from `/sso/oidc/{provider}/start`
+//!   to the [`VerifiedIdentity`](sign_in::VerifiedIdentity) its callback ends
+//!   with, through the pending flows of [`flows`].
 //!
-//! An identity provider is contacted only when an admin saves a provider
-//! (B1): sign-in is not built yet.
+//! An identity provider is contacted only when an admin saves a provider or a
+//! user signs in with it (B1).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -31,7 +34,7 @@ use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
-use ferrofin_traits::sso::SsoManager;
+use ferrofin_traits::sso::{OidcCallback, SsoManager, SsoReply};
 use ferrofin_traits::tasks::ScheduledTask;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -41,9 +44,12 @@ use crate::{Extension, ExtensionContext};
 pub mod discovery;
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake_idp;
+pub mod flows;
 pub mod oidc_http;
+pub mod sign_in;
 
 use discovery::MetadataCache;
+use flows::PendingFlows;
 use oidc_http::OidcHttpClient;
 
 /// The Single Sign-On plugin's id in `/Plugins`: Ferrofin's own, generated
@@ -274,6 +280,8 @@ pub struct SsoService {
     http: OidcHttpClient,
     /// Each provider's discovery document and key set, for sign-in.
     metadata: MetadataCache,
+    /// The sign-ins started and not yet called back.
+    flows: PendingFlows,
 }
 
 impl SsoService {
@@ -288,6 +296,7 @@ impl SsoService {
             saving: tokio::sync::Mutex::new(()),
             http: OidcHttpClient::new(),
             metadata: MetadataCache::default(),
+            flows: PendingFlows::default(),
         }
     }
 
@@ -552,6 +561,22 @@ impl SsoManager for SsoService {
                 Ok(failed(failure.message))
             }
         }
+    }
+
+    async fn start_oidc_sign_in(
+        &self,
+        key: &str,
+        client: std::net::IpAddr,
+    ) -> Result<SsoReply, ServiceError> {
+        self.start_sign_in(key, client).await
+    }
+
+    async fn finish_oidc_sign_in(
+        &self,
+        key: &str,
+        callback: OidcCallback,
+    ) -> Result<SsoReply, ServiceError> {
+        self.finish_sign_in(key, callback).await
     }
 }
 
