@@ -101,12 +101,14 @@ impl ScanTrigger {
     }
 
     /// The scan trigger of a scheduled-task run started by `trigger` (the
-    /// task registry's `api` / `schedule` / `startup`). Anything else — a
-    /// run with no recorded trigger — is the task's own schedule.
+    /// task registry's `api` / `schedule` / `startup`, or `library_change`
+    /// for a "Scan Media Library" run a library change queued, which is a
+    /// request over the API). Anything else — a run with no recorded
+    /// trigger — is the task's own schedule.
     #[must_use]
     pub fn from_task_trigger(trigger: &str) -> Self {
         match trigger {
-            "api" => Self::Api,
+            "api" | "library_change" => Self::Api,
             "startup" => Self::Startup,
             _ => Self::Schedule,
         }
@@ -1281,15 +1283,18 @@ pub trait LibraryManager: Send + Sync {
         Ok(map)
     }
 
-    /// Queues a full library scan.
+    /// Queues the scan of every library a library change ends with
+    /// (`ILibraryManager.QueueLibraryScan`). The real manager runs it as a
+    /// run of the "Scan Media Library" task, queued behind a running one
+    /// (see [`run_requested_library_scans`](Self::run_requested_library_scans)).
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
 
-    /// Queues a scan restricted to one library. `library_id` is the library's
-    /// CollectionFolder id — what jellyfin-web's per-library "Scan Library"
-    /// button refreshes via `POST /Items/{id}/Refresh`. Defaults to the full
+    /// Queues a scan restricted to one library, for a library change that
+    /// touches that library alone (it was added or renamed). `library_id` is the
+    /// library's CollectionFolder id. Defaults to the full
     /// [`queue_library_scan`](Self::queue_library_scan) so existing
     /// implementations need no change; the real manager narrows the filesystem
-    /// walk to that library's folders.
+    /// walk to that library's folders and runs it as the full one runs.
     async fn queue_library_scan_scoped(&self, _library_id: Uuid) -> Result<(), ServiceError> {
         self.queue_library_scan().await
     }
@@ -1489,6 +1494,31 @@ pub trait LibraryManager: Send + Sync {
     ) -> Result<bool, ServiceError> {
         let _ = (trigger, progress);
         self.queue_library_scan().await.map(|()| true)
+    }
+
+    /// Runs the scans library changes asked for
+    /// ([`queue_library_scan`](Self::queue_library_scan),
+    /// [`queue_library_scan_scoped`](Self::queue_library_scan_scoped)) that
+    /// no "Scan Media Library" run has started on, one after another, and
+    /// returns only when they have FINISHED: that task's run for a library
+    /// change, as upstream's `QueueLibraryScan` queues
+    /// `RefreshMediaLibraryTask`. An added or renamed library's scan keeps
+    /// its scope, that library alone, where upstream's task scans every
+    /// library. Each scan takes an equal share of `progress`. Nothing is left to scan when a
+    /// [`run_library_scan`](Self::run_library_scan) started after the changes.
+    ///
+    /// Returns as [`run_library_scan`](Self::run_library_scan) does.
+    /// Defaults to a scan of every library; the real manager overrides it.
+    ///
+    /// # Errors
+    ///
+    /// A scan failed (or panicked), so the task records `Failed`: the first
+    /// failure, once the other libraries' scans have run.
+    async fn run_requested_library_scans(
+        &self,
+        progress: Option<ScanProgressSink>,
+    ) -> Result<bool, ServiceError> {
+        self.run_library_scan(ScanTrigger::Api, progress).await
     }
 
     /// Whether a full library validation is running: upstream's

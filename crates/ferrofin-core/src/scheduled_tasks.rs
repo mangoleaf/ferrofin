@@ -987,15 +987,21 @@ impl FerrofinTaskManager {
     }
 
     /// `TaskManager.ExecuteQueuedTasks`, run where a run completes: takes every
-    /// remembered request, keeps the first for each task, and starts those
-    /// tasks that are idle. It runs in the completing worker's context, so a
+    /// remembered request, keeps the first for each task (a later request
+    /// from another trigger takes a library change's place), and starts
+    /// those tasks that are idle. It runs in the completing worker's context, so a
     /// started run inherits that worker's culture scope like upstream's.
     fn drain_busy_queue(&self) {
         let mut queue = lock(&self.busy_queue);
         let mut requests: Vec<QueuedRun> = Vec::new();
         while let Some(request) = queue.pop_front() {
-            if requests.iter().all(|(key, ..)| *key != request.0) {
-                requests.push(request);
+            match requests.iter_mut().find(|(key, ..)| *key == request.0) {
+                None => requests.push(request),
+                // A library change's run scans only what library changes
+                // asked for, so it never stands in for another trigger's run,
+                // which scans every library and takes those changes with it.
+                Some(kept) if kept.1 == LIBRARY_CHANGE_TRIGGER => *kept = request,
+                Some(_) => {}
             }
         }
         for (key, trigger, max_runtime_ticks) in requests {
@@ -1050,8 +1056,20 @@ impl FerrofinTaskManager {
         self.queue_with_trigger(key, "api", None)
     }
 
+    /// `LibraryManager.QueueLibraryScan`: queues the "Scan Media Library"
+    /// task for a library change, which starts it now or, while it runs,
+    /// once that run ends. The run scans what the library changes asked for
+    /// ([`RefreshLibraryTask`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`queue`](Self::queue), except that a running task queues the run.
+    pub(crate) fn queue_library_change(&self) -> Result<(), ServiceError> {
+        self.queue_scheduled(RefreshLibraryTask::KEY, LIBRARY_CHANGE_TRIGGER, None)
+    }
+
     /// [`queue`](Self::queue) with an explicit `trigger` tag recorded on the
-    /// run's root span (`api` / `schedule` / `startup`).
+    /// run's root span (`api` / `schedule` / `startup` / `library_change`).
     ///
     /// The run gets its **own** root span (never parented under a request — a
     /// background unit of work per RULES_LOGGING); `.instrument()` makes the
@@ -1739,17 +1757,26 @@ fn wall_clock_occurrence<Tz: TimeZone>(tz: &Tz, naive: NaiveDateTime) -> DateTim
     }
 }
 
+/// The trigger tag of a "Scan Media Library" run a library change queued
+/// ([`FerrofinTaskManager::queue_library_change`]).
+pub(crate) const LIBRARY_CHANGE_TRIGGER: &str = "library_change";
+
 /// The "Scan Media Library" task — port of `RefreshMediaLibraryTask`.
 ///
-/// Its [`execute`](ScheduledTask::execute) runs the same library scan as
-/// `POST /Library/Refresh` (`LibraryManager::queue_library_scan`). The `Key` is
-/// Jellyfin's well-known `"RefreshLibrary"`, so jellyfin-web's dashboard "Scan
-/// all libraries" button (which starts the task by that key) drives it.
+/// Its [`execute`](ScheduledTask::execute) scans every library, as
+/// `POST /Library/Refresh` does through it, except in a run a library change
+/// queued (`LibraryManager::queue_library_scan` and `_scoped`), which scans
+/// what the changes asked for. The `Key` is Jellyfin's well-known
+/// `"RefreshLibrary"`, so jellyfin-web's dashboard "Scan all libraries"
+/// button (which starts the task by that key) drives it.
 pub struct RefreshLibraryTask {
     library: Arc<dyn ferrofin_traits::library::LibraryManager>,
 }
 
 impl RefreshLibraryTask {
+    /// The task's key, Jellyfin's `RefreshLibrary`.
+    pub const KEY: &str = "RefreshLibrary";
+
     /// Builds the task over the library-manager seam it scans through.
     #[must_use]
     pub fn new(library: Arc<dyn ferrofin_traits::library::LibraryManager>) -> Self {
@@ -1762,7 +1789,7 @@ impl RefreshLibraryTask {
 #[async_trait]
 impl ScheduledTask for RefreshLibraryTask {
     fn key(&self) -> &str {
-        "RefreshLibrary"
+        Self::KEY
     }
     fn name(&self) -> &str {
         "TaskRefreshLibrary"
@@ -1800,17 +1827,24 @@ impl ScheduledTask for RefreshLibraryTask {
         // progress, until the scan's first report.
         progress.report(0.0);
         let sink = progress.clone();
-        let trigger = ferrofin_traits::library::ScanTrigger::from_task_trigger(progress.trigger());
+        let report: ferrofin_traits::library::ScanProgressSink =
+            Arc::new(move |percent| sink.report(percent));
+        // A library change's run scans what the changes asked for: one new
+        // library alone, or every library.
+        let scan = if progress.trigger() == LIBRARY_CHANGE_TRIGGER {
+            self.library.run_requested_library_scans(Some(report))
+        } else {
+            let trigger =
+                ferrofin_traits::library::ScanTrigger::from_task_trigger(progress.trigger());
+            self.library.run_library_scan(trigger, Some(report))
+        };
         // A stop withdraws the run's wait, and a scan nobody else waits for
         // stops at its next item. The run ends before that item does, which
         // upstream's waits for (fix path: gl-1709); the scan queue starts the
         // next scan after it.
         let finished = progress
             .cancel_token()
-            .unless_cancelled(
-                self.library
-                    .run_library_scan(trigger, Some(Arc::new(move |percent| sink.report(percent)))),
-            )
+            .unless_cancelled(scan)
             .await
             .transpose()?;
         // Stopped by the task's own stop, by the library manager's own
@@ -2089,6 +2123,10 @@ mod tests {
         }
         assert_eq!(*seen.lock().unwrap(), vec!["", "api"]);
         assert_eq!(ScanTrigger::from_task_trigger("api"), ScanTrigger::Api);
+        assert_eq!(
+            ScanTrigger::from_task_trigger(crate::scheduled_tasks::LIBRARY_CHANGE_TRIGGER),
+            ScanTrigger::Api
+        );
         assert_eq!(
             ScanTrigger::from_task_trigger("startup"),
             ScanTrigger::Startup

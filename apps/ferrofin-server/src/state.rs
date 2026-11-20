@@ -2591,7 +2591,12 @@ pub async fn build_app_state(
             .await,
         ));
     }
-    let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
+    let task_registry = Arc::new(task_manager.clone());
+    // A library change's scan (a library added or removed, the first
+    // collection's library, the seeded libraries) is a "Scan Media Library"
+    // run, as upstream's `QueueLibraryScan` queues it.
+    library_impl.attach_refresh_task(&task_registry);
+    let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = task_registry;
     // Every item delete and scan removal removes the deleted rows' extracted
     // data (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the
     // library manager and the scanner are built before the chapter and
