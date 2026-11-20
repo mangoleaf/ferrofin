@@ -112,7 +112,7 @@ mod tests {
     fn a_total_order_gives_what_the_standard_stable_sort_gives() {
         let mut rng = StdRng::seed_from_u64(905);
         for len in 0..200 {
-            let items: Vec<(u8, usize)> = (0..len).map(|i| (rng.random_range(0..8), i)).collect();
+            let items: Vec<(u8, usize)> = Vec::from_fn(len, |i| (rng.random_range(0..8), i));
             let mut ours = items.clone();
             let mut std_sorted = items;
             stable_sort_by(&mut ours, |a, b| a.0.cmp(&b.0));
@@ -240,15 +240,13 @@ mod tests {
     fn a_comparer_that_is_no_order_at_all_gets_the_previous_sorts_order() {
         let mut rng = StdRng::seed_from_u64(1051);
         for len in lengths() {
-            let items: Vec<(usize, String)> =
-                (0..len).map(|id| (id, format!("item {id}"))).collect();
-            let verdicts: Vec<Ordering> = (0..len * len)
-                .map(|_| match rng.random_range(0..3) {
+            let items: Vec<(usize, String)> = Vec::from_fn(len, |id| (id, format!("item {id}")));
+            let verdicts: Vec<Ordering> =
+                Vec::from_fn(len * len, |_| match rng.random_range(0..3) {
                     0 => Ordering::Less,
                     1 => Ordering::Equal,
                     _ => Ordering::Greater,
-                })
-                .collect();
+                });
             assert_same_as_reference(&items, |a, b| verdicts[a.0 * len + b.0]);
         }
     }
@@ -259,12 +257,10 @@ mod tests {
     fn undated_rows_and_ties_get_the_previous_sorts_order() {
         let mut rng = StdRng::seed_from_u64(1051);
         for len in lengths() {
-            let items: Vec<(Option<u8>, String)> = (0..len)
-                .map(|id| {
-                    let day = rng.random_range(0..12);
-                    ((day < 10).then_some(day), format!("item {id}"))
-                })
-                .collect();
+            let items: Vec<(Option<u8>, String)> = Vec::from_fn(len, |id| {
+                let day = rng.random_range(0..12);
+                ((day < 10).then_some(day), format!("item {id}"))
+            });
             assert_same_as_reference(&items, |a, b| match (a.0, b.0) {
                 (Some(a), Some(b)) => a.cmp(&b),
                 _ => Ordering::Equal,

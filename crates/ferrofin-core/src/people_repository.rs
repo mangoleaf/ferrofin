@@ -5363,7 +5363,7 @@ mod tests {
     #[tokio::test]
     async fn a_large_cast_is_written_whole_and_in_order() {
         let (db, item, repo) = people_lab(true).await;
-        let names: Vec<String> = (0..300).map(|i| format!("Cast Member {i:03}")).collect();
+        let names: Vec<String> = Vec::from_fn(300, |i| format!("Cast Member {i:03}"));
         let cast: Vec<PeopleEntity> = names.iter().map(|n| person(n, "Actor")).collect();
         let written = repo.update_people(item, &cast).await.expect("update");
         let credits: Vec<(String, i64)> = sqlx::query_as(

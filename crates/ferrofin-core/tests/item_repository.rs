@@ -930,7 +930,7 @@ async fn named_item_id_lookup_seeks_the_type_clean_name_index() {
     for n in (0..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
         let filter = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Studio],
-            names: (0..n).map(|i| format!("Studio {i}")).collect(),
+            names: Vec::from_fn(n, |i| format!("Studio {i}")),
             ..Default::default()
         };
         let mut builder = build_query(&filter, QueryShape::IdAndCleanName);

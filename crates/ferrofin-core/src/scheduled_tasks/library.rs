@@ -5132,7 +5132,7 @@ mod tests {
 
     #[tokio::test]
     async fn chapter_images_page_past_the_first_page() {
-        let files: Vec<String> = (0..past_one_page()).map(|n| format!("{n}.mkv")).collect();
+        let files: Vec<String> = Vec::from_fn(past_one_page(), |n| format!("{n}.mkv"));
         let names: Vec<&str> = files.iter().map(String::as_str).collect();
         let (media, _movie, chapters, streams, task) = chapter_task_parts(false, &names).await;
         task.execute(&TaskProgress::default()).await.expect("run");

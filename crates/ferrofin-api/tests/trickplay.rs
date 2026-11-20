@@ -448,9 +448,7 @@ async fn trickplay_tile_serves_file_then_404() {
 async fn trickplay_tile_has_no_range_support() {
     let mut path = std::env::temp_dir();
     path.push(format!("ferrofin-tile-{}.jpg", Uuid::new_v4()));
-    let tile: Vec<u8> = (0..512u16)
-        .map(|b| u8::try_from(b % 251).unwrap())
-        .collect();
+    let tile: Vec<u8> = Vec::from_fn(512, |b| u8::try_from(b % 251).unwrap());
     std::fs::write(&path, &tile).expect("write tile");
 
     let app = state(

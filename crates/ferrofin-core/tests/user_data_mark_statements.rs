@@ -147,7 +147,7 @@ async fn a_series_mark_reads_its_episodes_together() {
     let user = Uuid::new_v4();
     seed_user(&db, user).await;
     let (series, season) = (Uuid::new_v4(), Uuid::new_v4());
-    let episodes: Vec<Uuid> = (0..EPISODES).map(|_| Uuid::new_v4()).collect();
+    let episodes: Vec<Uuid> = Vec::from_fn(EPISODES, |_| Uuid::new_v4());
     seed_show(&db, series, season, &episodes).await;
 
     let counts: Arc<dyn ItemCountService> = Arc::new(FerrofinItemCountService::new(db.clone()));

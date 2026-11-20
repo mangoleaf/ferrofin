@@ -600,8 +600,10 @@ async fn copy_to_temp_file(
 ) {
     // Whatever ends this task — the tuner hanging up, a write failure, an
     // abort — the buffer is gone afterwards, so the stream stops being
-    // joinable at the same moment.
-    let _sharing = SharingGuard(alive);
+    // joinable at the same moment: the guard clears the "still sharing" flag.
+    // An abort skips everything after the await it lands on; the guard still
+    // runs.
+    let _sharing = std::mem::DropGuard::new(alive, |alive| alive.store(false, Ordering::SeqCst));
     let mut first_byte = Some(first_byte);
     let mut file = match tokio::fs::File::create(&temp_path).await {
         Ok(file) => file,
@@ -652,16 +654,6 @@ async fn copy_to_temp_file(
     // The tuner hung up on its own: the buffer is dead, so it goes (C#
     // `StartStreaming`'s `DeleteTempFiles` on the way out).
     let _ = tokio::fs::remove_file(&temp_path).await;
-}
-
-/// Clears the "still sharing" flag when the copy task ends, however it ends —
-/// including an abort, which skips everything after the await it lands on.
-struct SharingGuard(Arc<AtomicBool>);
-
-impl Drop for SharingGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
 }
 
 #[cfg(test)]

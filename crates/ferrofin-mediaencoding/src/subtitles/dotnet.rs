@@ -545,9 +545,7 @@ pub fn format_double_custom(value: f64, min_fraction: usize, max_fraction: usize
     // Lay the digits out around the decimal point.
     let (mut int_digits, mut frac_digits): (Vec<u8>, Vec<u8>) = if exponent >= 0 {
         let int_len = usize::try_from(exponent + 1).unwrap_or(0);
-        let int: Vec<u8> = (0..int_len)
-            .map(|i| digits.get(i).copied().unwrap_or(0))
-            .collect();
+        let int: Vec<u8> = Vec::from_fn(int_len, |i| digits.get(i).copied().unwrap_or(0));
         (int, digits.iter().skip(int_len).copied().collect())
     } else {
         let lead = usize::try_from(-exponent - 1).unwrap_or(0);

@@ -403,15 +403,13 @@ pub async fn redirect_to_https(
             [(header::LOCATION, location.clone())],
         )
             .into_response();
-        async move { Ok::<_, std::convert::Infallible>(response) }
+        async move { Ok::<_, !>(response) }
     });
     let config = redirect.config.as_ref();
     let cors = tower::service_fn(move |request: Request| {
         let answer = answer.clone();
         async move {
-            Ok::<_, std::convert::Infallible>(
-                ferrofin_api::cors::with_configured_cors(config, request, answer).await,
-            )
+            Ok::<_, !>(ferrofin_api::cors::with_configured_cors(config, request, answer).await)
         }
     });
     let network = redirect.network.as_deref();

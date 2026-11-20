@@ -3353,7 +3353,7 @@ async fn play_instant_mix_becomes_play_now_over_the_mix() {
     let db = test_db().await;
     let bus: Arc<dyn ferrofin_traits::session_bus::SessionMessageBus> =
         Arc::new(crate::FerrofinSessionMessageBus::new());
-    let mix: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+    let mix: Vec<Uuid> = Vec::from_fn(3, |_| Uuid::new_v4());
     let mgr = Arc::new(
         manager(&db)
             .as_ref()

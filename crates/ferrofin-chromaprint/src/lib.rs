@@ -439,7 +439,7 @@ mod tests {
         for _ in 0..20 {
             let (ranges, _) = search_inverted_index(&lhs, &rhs, &cfg);
             let starts: Vec<f64> = ranges.iter().map(|r| r.start).collect();
-            let expected: Vec<f64> = (0..8).map(|k| point_time(k * 40)).collect();
+            let expected: Vec<f64> = Vec::from_fn(8, |k| point_time(k * 40));
             assert_eq!(starts, expected);
         }
     }

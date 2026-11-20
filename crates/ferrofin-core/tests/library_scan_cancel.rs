@@ -287,15 +287,6 @@ impl TrickplayManager for CancelInTrickplay {
     }
 }
 
-/// Counts once when dropped.
-struct DropCount<'a>(&'a tokio::sync::watch::Sender<usize>);
-
-impl Drop for DropCount<'_> {
-    fn drop(&mut self) {
-        self.0.send_modify(|n| *n += 1);
-    }
-}
-
 /// What a [`DetachedTrickplay`] refresh found as it started: the item,
 /// whether it came by id (not handed the row), and the item's stored
 /// `DateModified` and stream count.
@@ -323,7 +314,10 @@ impl DetachedTrickplay {
     }
 
     async fn held(&self, item_id: uuid::Uuid, by_id: bool) -> Result<(), ServiceError> {
-        let _dropped = DropCount(&self.dropped);
+        // Counts once when dropped.
+        let _dropped = std::mem::DropGuard::new(&self.dropped, |dropped| {
+            dropped.send_modify(|n| *n += 1);
+        });
         let db = self.db.get().expect("wired").clone();
         let row = FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
             .retrieve_item(item_id)

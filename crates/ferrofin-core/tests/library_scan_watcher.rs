@@ -860,13 +860,11 @@ async fn a_thousand_new_files_are_one_scan_of_their_series_only() {
     let fx = tv(tmp.path()).await;
     let series = fx.media.join("Show");
     let season = series.join("Season 9");
-    let files: Vec<PathBuf> = (0..1_000)
-        .map(|n| {
-            let name = format!("Show S09E{n:04}.mkv");
-            touch(&season, &name);
-            season.join(name)
-        })
-        .collect();
+    let files: Vec<PathBuf> = Vec::from_fn(1_000, |n| {
+        let name = format!("Show S09E{n:04}.mkv");
+        touch(&season, &name);
+        season.join(name)
+    });
     let reported: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
     let outcome = fx.report(&reported).await;
     assert_eq!(

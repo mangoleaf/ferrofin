@@ -2047,7 +2047,7 @@ mod tests {
     ) {
         // Truncation is the point: varied bytes from the index.
         #[allow(clippy::cast_possible_truncation)]
-        let line: Vec<u8> = (0..len * 4).map(|i| (i * 97 % 256) as u8).collect();
+        let line: Vec<u8> = Vec::from_fn(len * 4, |i| (i * 97 % 256) as u8);
         let mut raw = line.clone();
         let mut sums = vec![[0; 4]; len];
         blur_line(&mut raw, &mut sums, 0, 4, len, radii);
@@ -2060,13 +2060,11 @@ mod tests {
                 signal[i + pad] = i128::from(line[i * 4 + c]);
             }
             for r in radii {
-                signal = (0..signal.len())
-                    .map(|x| {
-                        signal[x.saturating_sub(r)..=(x + r).min(signal.len() - 1)]
-                            .iter()
-                            .sum()
-                    })
-                    .collect();
+                signal = Vec::from_fn(signal.len(), |x| {
+                    signal[x.saturating_sub(r)..=(x + r).min(signal.len() - 1)]
+                        .iter()
+                        .sum()
+                });
             }
             for i in 0..len {
                 let expected = (signal[i + pad] + window / 2) / window;
@@ -2974,12 +2972,10 @@ mod tests {
             // SOF0 (baseline), SOF1 (extended sequential), SOF2 (progressive).
             if (0xC0..=0xC2).contains(&marker) {
                 let count = usize::from(bytes[i + 9]);
-                return (0..count)
-                    .map(|k| {
-                        let sampling = bytes[i + 11 + 3 * k];
-                        (sampling >> 4, sampling & 0x0F)
-                    })
-                    .collect();
+                return Vec::from_fn(count, |k| {
+                    let sampling = bytes[i + 11 + 3 * k];
+                    (sampling >> 4, sampling & 0x0F)
+                });
             }
             i += 2 + length;
         }
@@ -3191,9 +3187,8 @@ mod tests {
     async fn trickplay_grid_pack() {
         let dir = TempDir::new().expect("tempdir");
         // 3 tiles of 320x180 packed into a 2x2 grid.
-        let inputs: Vec<String> = (0..3)
-            .map(|i| fixture(&dir, &format!("t{i}.png"), 320, 180))
-            .collect();
+        let inputs: Vec<String> =
+            Vec::from_fn(3, |i| fixture(&dir, &format!("t{i}.png"), 320, 180));
         let output = out_path(&dir, "tile.jpg");
         let enc = ImageCrateEncoder::new();
 
@@ -3326,9 +3321,8 @@ mod tests {
     #[tokio::test]
     async fn trickplay_over_full_grid_is_invalid() {
         let dir = TempDir::new().expect("tempdir");
-        let inputs: Vec<String> = (0..5)
-            .map(|i| fixture(&dir, &format!("o{i}.png"), 100, 100))
-            .collect();
+        let inputs: Vec<String> =
+            Vec::from_fn(5, |i| fixture(&dir, &format!("o{i}.png"), 100, 100));
         let enc = ImageCrateEncoder::new();
         let options = ImageCollageOptions {
             input_paths: inputs,
@@ -3385,9 +3379,8 @@ mod tests {
     #[tokio::test]
     async fn square_collage_writes_output() {
         let dir = TempDir::new().expect("tempdir");
-        let inputs: Vec<String> = (0..4)
-            .map(|i| fixture(&dir, &format!("c{i}.png"), 200, 200))
-            .collect();
+        let inputs: Vec<String> =
+            Vec::from_fn(4, |i| fixture(&dir, &format!("c{i}.png"), 200, 200));
         let output = out_path(&dir, "collage.png");
         let enc = ImageCrateEncoder::new();
 
@@ -3505,9 +3498,8 @@ mod tests {
     #[tokio::test]
     async fn a_square_collage_of_two_images_fills_every_cell() {
         let dir = TempDir::new().expect("tempdir");
-        let inputs: Vec<String> = (0..2)
-            .map(|i| fixture(&dir, &format!("c{i}.png"), 200, 200))
-            .collect();
+        let inputs: Vec<String> =
+            Vec::from_fn(2, |i| fixture(&dir, &format!("c{i}.png"), 200, 200));
         let output = out_path(&dir, "collage.png");
         let options = ImageCollageOptions {
             input_paths: inputs,
@@ -3669,9 +3661,8 @@ mod tests {
 
         let dir = TempDir::new().expect("tempdir");
         let img = fixture(&dir, "work.png", 100, 100);
-        let collage_inputs: Vec<String> = (0..4)
-            .map(|i| fixture(&dir, &format!("w{i}.png"), 200, 200))
-            .collect();
+        let collage_inputs: Vec<String> =
+            Vec::from_fn(4, |i| fixture(&dir, &format!("w{i}.png"), 200, 200));
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

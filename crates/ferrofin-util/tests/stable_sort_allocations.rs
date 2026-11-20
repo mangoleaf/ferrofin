@@ -75,9 +75,9 @@ fn sort_counting(mut items: Vec<(u32, usize)>) -> (Vec<(u32, usize)>, usize) {
 
 /// Items in descending key order with runs of ties, so every merge compares.
 fn descending_with_ties(len: usize) -> Vec<(u32, usize)> {
-    (0..len)
-        .map(|position| (u32::try_from((len - position) / 3).expect("key"), position))
-        .collect()
+    Vec::from_fn(len, |position| {
+        (u32::try_from((len - position) / 3).expect("key"), position)
+    })
 }
 
 /// Sorting two items and sorting thousands make the same two allocations (the

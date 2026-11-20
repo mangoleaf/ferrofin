@@ -10955,12 +10955,10 @@ mod tests {
         url: &str,
         count: usize,
     ) -> Vec<Result<String, ServiceError>> {
-        let requests: Vec<_> = (0..count)
-            .map(|_| {
-                let (mgr, url) = (mgr.clone(), url.to_owned());
-                tokio::spawn(async move { mgr.cached_remote_image(&url).await })
-            })
-            .collect();
+        let requests: Vec<_> = Vec::from_fn(count, |_| {
+            let (mgr, url) = (mgr.clone(), url.to_owned());
+            tokio::spawn(async move { mgr.cached_remote_image(&url).await })
+        });
         let mut answers = Vec::new();
         for request in requests {
             answers.push(request.await.expect("request"));

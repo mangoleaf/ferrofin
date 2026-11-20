@@ -1101,9 +1101,9 @@ mod tests {
         let names: Vec<String> = {
             let file = std::fs::File::open(&archive).unwrap();
             let mut zip = zip::ZipArchive::new(file).unwrap();
-            (0..zip.len())
-                .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
-                .collect()
+            Vec::from_fn(zip.len(), |i| {
+                zip.by_index(i).unwrap().name().unwrap().into_owned()
+            })
         };
         assert!(
             names.contains(&"config/system.json".to_owned()),
@@ -1938,13 +1938,11 @@ mod tests {
         let roots = small_roots(&tmp.path().join("pd"));
         let backups = tmp.path().join("backups");
         let now = "2024-05-06T07:08:09Z".parse().unwrap();
-        let written: Vec<String> = (0..3)
-            .map(|_| {
-                let manifest =
-                    super::write_backup(&backups, &roots, no_database(), now, None, TEST_VERSION);
-                manifest.unwrap().path
-            })
-            .collect();
+        let written: Vec<String> = Vec::from_fn(3, |_| {
+            let manifest =
+                super::write_backup(&backups, &roots, no_database(), now, None, TEST_VERSION);
+            manifest.unwrap().path
+        });
         assert_eq!(
             file_names(&backups),
             [

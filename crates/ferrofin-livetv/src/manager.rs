@@ -10540,7 +10540,7 @@ mod tests {
             .await
             .expect("lineup");
         let names: Vec<String> = lineup.into_iter().map(|row| row.name).collect();
-        assert_eq!(names, (0..count).map(name).collect::<Vec<_>>());
+        assert_eq!(names, Vec::from_fn(count, name));
 
         let programs = crate::guide_repository::all_program_ids(&mgr.db)
             .await

@@ -42254,9 +42254,8 @@ mod tests {
             .with_item_data_cleanup(cleanup);
 
         // More rows than one batch reads.
-        let many: Vec<uuid::Uuid> = (0..=ferrofin_db::BATCH_BIND_CHUNK)
-            .map(|_| uuid::Uuid::new_v4())
-            .collect();
+        let many: Vec<uuid::Uuid> =
+            Vec::from_fn(ferrofin_db::BATCH_BIND_CHUNK + 1, |_| uuid::Uuid::new_v4());
         for id in &many {
             crate::test_support::seed_item(&db, *id, BaseItemKind::Movie).await;
         }

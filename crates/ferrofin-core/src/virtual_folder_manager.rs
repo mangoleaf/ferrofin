@@ -4915,7 +4915,7 @@ mod tests {
         let options_before = std::fs::read(folder.join(OPTIONS_FILE)).unwrap();
         for blank in ["", "  "] {
             let mut new_opts = opts_with_paths(&[m1.clone(), m2.clone(), blank.to_owned()]);
-            new_opts.enable_realtime_monitor = !new_opts.enable_realtime_monitor;
+            new_opts.enable_realtime_monitor.toggle();
             let error = mgr
                 .update_library_options("Lib", &new_opts)
                 .await

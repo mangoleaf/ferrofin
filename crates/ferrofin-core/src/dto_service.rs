@@ -12388,9 +12388,7 @@ mod tests {
             .map(|(name, _)| (*name, *name))
             .collect();
         stored.extend([("actor", "Unknown"), ("Colorer", "Unknown")]);
-        let names: Vec<String> = (0..stored.len())
-            .map(|order| format!("Person {order}"))
-            .collect();
+        let names: Vec<String> = Vec::from_fn(stored.len(), |order| format!("Person {order}"));
         let library = Arc::new(FakeLibrary {
             people: (0_i64..)
                 .zip(&stored)

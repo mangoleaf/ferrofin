@@ -160,7 +160,7 @@ mod tests {
     /// makes it a random sort at all.
     #[test]
     fn successive_draws_differ_and_span_the_i64_range() {
-        let draws: Vec<i64> = (0..1000).map(|_| next_random()).collect();
+        let draws: Vec<i64> = Vec::from_fn(1000, |_| next_random());
         let distinct: std::collections::HashSet<i64> = draws.iter().copied().collect();
         assert_eq!(distinct.len(), draws.len(), "draws repeated");
         assert!(
