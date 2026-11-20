@@ -44,10 +44,8 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::configuration::LibraryOptionsResultDto;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
-use ferrofin_model::dto::SortOrder;
 use ferrofin_model::entities::ExtraType;
 use ferrofin_model::entities_media::MetadataProvider;
-use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::querying::{AllThemeMediaResult, QueryResult, ThemeMediaResult};
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use uuid::Uuid;
@@ -56,8 +54,8 @@ use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::resolve_user_opt;
-use crate::handlers::query_parse::parse_csv_enums_lenient;
-use crate::handlers::streaming::serve_static_file;
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_order_by};
+use crate::handlers::streaming::{physical_file_path, serve_physical_file};
 use crate::state::AppState;
 
 /// Query parameters shared by the theme-media routes.
@@ -82,20 +80,6 @@ struct ThemeMediaQuery {
     /// Optional. Comma-delimited sort orders (paired with `sort_by`).
     #[serde(default)]
     sort_order: Option<String>,
-}
-
-/// Builds the `order_by` list from the raw `sortBy` / `sortOrder` query values.
-///
-/// Ports `RequestHelpers.GetOrderBy`: each sort key is paired with the sort
-/// order at the same index, falling back to [`SortOrder::Ascending`] when fewer
-/// orders than keys are supplied. An unrecognized token is a `400`.
-fn parse_order_by(sort_by: Option<&str>, sort_order: Option<&str>) -> Vec<(ItemSortBy, SortOrder)> {
-    let keys: Vec<ItemSortBy> = parse_csv_enums_lenient(sort_by);
-    let orders: Vec<SortOrder> = parse_csv_enums_lenient(sort_order);
-    keys.into_iter()
-        .enumerate()
-        .map(|(i, key)| (key, orders.get(i).copied().unwrap_or(SortOrder::Ascending)))
-        .collect()
 }
 
 /// Resolves the theme-media owner for `item_id`, projecting its extras of
@@ -402,9 +386,10 @@ async fn get_item_collections(
 
 /// `GET /Items/{itemId}/File` — the original file of an item.
 ///
-/// Port of `LibraryController.GetFile`: resolves the item (`404` when absent),
-/// then serves its on-disk `Path` with HTTP `Range`/`HEAD` support (Jellyfin's
-/// `PhysicalFile`). The symlink-resolution nicety is left to the file server.
+/// Port of `LibraryController.GetFile`: resolves the item (`404` when absent,
+/// `400` when it has no path), then serves its on-disk `Path`, a link's final
+/// target, with HTTP `Range`/`HEAD` support, typed by `MimeTypes.GetMimeType`
+/// (Jellyfin's `PhysicalFile`).
 #[utoipa::path(
     get,
     path = "/Items/{itemId}/File",
@@ -426,11 +411,12 @@ async fn get_file(
         .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
+    // An empty path is MimeTypes.GetMimeType's ArgumentException, a 400.
     let path = item
         .path
         .filter(|p| !p.is_empty())
-        .ok_or_else(|| ApiError::NotFound(format!("item {item_id} has no file")))?;
-    serve_static_file(&path, request).await
+        .ok_or_else(|| ApiError::BadRequest(format!("item {item_id} has no file")))?;
+    serve_physical_file(&physical_file_path(path).await?, request).await
 }
 
 /// The scheduled task `POST /Library/Refresh` starts, keyed exactly as Jellyfin
@@ -479,14 +465,10 @@ async fn refresh_library(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
 ) -> axum::http::StatusCode {
-    // `CancelIfRunningAndQueue`: cancel first so a scan already in flight is
-    // restarted rather than rejected. Cancelling an idle task is a no-op on
-    // both servers, so this is safe on the common path.
+    // `CancelIfRunningAndQueue`: a scan already in flight is cancelled and
+    // the new one starts when it has ended, rather than being rejected.
     let task_id = ferrofin_traits::tasks::task_id_for_key(REFRESH_LIBRARY_TASK_KEY);
-    if let Err(err) = state.tasks.cancel_task(&task_id).await {
-        tracing::error!(%err, "Error refreshing library");
-    }
-    if let Err(err) = state.tasks.start_task(&task_id).await {
+    if let Err(err) = state.tasks.cancel_if_running_and_queue(&task_id).await {
         tracing::error!(%err, "Error refreshing library");
     }
     axum::http::StatusCode::NO_CONTENT
@@ -496,8 +478,8 @@ async fn refresh_library(
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaFoldersQuery {
-    /// Optional. Filter by folders marked hidden. Ferrofin models no per-folder
-    /// hidden flag, so `true` matches nothing and `false`/absent matches all.
+    /// Optional. Filter by folders marked hidden (`BaseItem.IsHidden`), which
+    /// only the playlists folder is.
     #[serde(default)]
     is_hidden: Option<bool>,
 }
@@ -568,9 +550,9 @@ fn representative_item_types(
 /// compiled-in provider registry (via the
 /// [`ProviderManager`](ferrofin_traits::providers::ProviderManager)) into the
 /// available metadata/image/subtitle/lyric/segment providers, grouped by the
-/// representative item types of `libraryContentType`. A provider is listed iff
-/// its code is in the build (e.g. Open Subtitles only with the `opensubtitles`
-/// feature).
+/// representative item types of `libraryContentType`: the subtitle and lyric
+/// fetchers only when one of those types is theirs (Open Subtitles for movies
+/// and episodes, LrcLib for audio and audiobooks).
 #[utoipa::path(
     get,
     path = "/Libraries/AvailableOptions",
@@ -616,15 +598,15 @@ async fn get_available_options(
 
 /// `GET /Library/MediaFolders` — the server's media (collection) folders.
 ///
-/// Port of `LibraryController.GetMediaFolders`: the user-root collection folders,
-/// less the libraries whose options disable them, name-sorted, projected to
-/// [`BaseItemDto`] as a [`QueryResult`](ferrofin_model::querying::QueryResult).
+/// Port of `LibraryController.GetMediaFolders`: the user-root collection folders
+/// and the playlists folder, less the libraries whose options disable them,
+/// name-sorted, projected to [`BaseItemDto`] as a
+/// [`QueryResult`](ferrofin_model::querying::QueryResult).
 ///
 /// Upstream reads no user here: the folders are the same for every caller, an
-/// API key with no user included, and carry no user data. Ferrofin does not
-/// model a per-folder hidden flag, so no folder is hidden: an `isHidden=true`
-/// filter returns nothing, and
-/// `false`/absent returns them all (a faithful projection of "nothing hidden").
+/// API key with no user included, and carry no user data. `isHidden` compares
+/// `BaseItem.IsHidden`, which only `PlaylistsFolder` overrides (to `true`), so
+/// `true` keeps the playlists folder, `false` the libraries, and no value both.
 #[utoipa::path(
     get,
     path = "/Library/MediaFolders",
@@ -638,19 +620,25 @@ async fn get_media_folders(
     Query(query): Query<MediaFoldersQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     // The media folders are the user-root children — the collection folders plus
-    // the auto-provisioned Playlists folder — returned name-sorted by the view seam
-    // (C# GetUserRootFolder().Children).
-    let folders = if query.is_hidden == Some(true) {
-        // No folder carries a hidden flag, so none match `isHidden=true`.
-        Vec::new()
-    } else {
-        // Upstream reads no user here (`LibraryController.GetMediaFolders`),
-        // so an API key with none is served like an administrator.
-        state.user_views.get_media_folders().await?
-    };
+    // the auto-provisioned Playlists folder — returned sorted by the view seam
+    // (C# GetUserRootFolder().Children.Concat(RootFolder.VirtualChildren)).
+    //
+    // Upstream reads no user here (`LibraryController.GetMediaFolders`),
+    // so an API key with none is served like an administrator.
+    let mut folders = state.user_views.get_media_folders().await?;
+    if let Some(hidden) = query.is_hidden {
+        // `PlaylistsFolder.IsHidden => true` is the only override of
+        // `BaseItem.IsHidden => false`; both stored spellings are that folder.
+        folders.retain(|folder| {
+            matches!(
+                BaseItemKind::from_stored_type_name(&folder.type_),
+                Some(BaseItemKind::PlaylistsFolder | BaseItemKind::ManualPlaylistsFolder)
+            ) == hidden
+        });
+    }
     let options = DtoOptions::default();
     // NO user, matching C# `GetMediaFolders`:
-    //   var dtoOptions = new DtoOptions().AddClientFields(User);
+    //   var dtoOptions = new DtoOptions();
     //   var resultArray = _dtoService.GetBaseItemDtos(items, dtoOptions);
     //
     // `IDtoService.GetBaseItemDtos(items, options, User? user = null, ...)` —

@@ -3,8 +3,8 @@
 //! [`PlayAccess`] is the canonical home for the enum that [`crate::dto`]
 //! previously stubbed as a forward reference. `UserViewQuery` carries a
 //! server-side `User` entity, so it has no type here: the `UserViewManager`
-//! seam in `ferrofin-traits` takes a user id and the `IncludeHidden` flag
-//! instead.
+//! seam takes a user id and `ferrofin_traits::options::UserViewQuery`, the
+//! query's other members, instead.
 
 use serde::Serialize;
 use utoipa::ToSchema;

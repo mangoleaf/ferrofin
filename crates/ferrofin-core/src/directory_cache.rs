@@ -350,7 +350,6 @@ fn image_metadata(entry: &FileSystemEntryInfo) -> FileSystemMetadata {
         name: entry.name.clone(),
         extension,
         length,
-        last_write_time_utc: None,
         is_directory,
     }
 }

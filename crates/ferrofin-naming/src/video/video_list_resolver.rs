@@ -3,13 +3,13 @@
 use std::sync::OnceLock;
 
 use ferrofin_model::data::CollectionType;
+use ferrofin_util::numeric_collation::invariant_numeric_cmp;
 use regex::Regex;
 
 use crate::common::NamingOptions;
 use crate::io::FileSystemMetadata;
 use crate::path;
 use crate::tv::EpisodePathParser;
-use crate::video::numeric_ordering::numeric_ordinal_cmp;
 use crate::video::{VideoFileInfo, VideoInfo, clean_string_parser, stack_resolver, video_resolver};
 
 fn resolution_regex() -> &'static Regex {
@@ -305,10 +305,10 @@ fn organize_alternate_versions(
 
         // Matched: order by resolution value desc, then filename asc.
         matched.sort_by(|a, b| {
-            numeric_ordinal_cmp(&b.1, &a.1).then_with(|| numeric_ordinal_cmp(&a.0, &b.0))
+            invariant_numeric_cmp(&b.1, &a.1).then_with(|| invariant_numeric_cmp(&a.0, &b.0))
         });
         // Unmatched: order by filename asc.
-        unmatched.sort_by(|a, b| numeric_ordinal_cmp(&a.0, &b.0));
+        unmatched.sort_by(|a, b| invariant_numeric_cmp(&a.0, &b.0));
 
         // Matched are prepended (InsertRange(0)), unmatched appended.
         videos = matched

@@ -76,7 +76,9 @@ pub async fn library_manager_mid_scan(
 }
 
 /// The concrete manager [`library_manager_over`] hands out.
-fn concrete_library_manager_over(db: Database) -> crate::library_manager::FerrofinLibraryManager {
+pub(crate) fn concrete_library_manager_over(
+    db: Database,
+) -> crate::library_manager::FerrofinLibraryManager {
     use crate::item_count_service::FerrofinItemCountService;
     use crate::people_repository::FerrofinPeopleRepository;
 
@@ -654,7 +656,19 @@ pub async fn seed_item_value(
     value_type: ferrofin_db::enums::ItemValueType,
     value: &str,
 ) {
-    let mut values: Vec<(i32, String)> = sqlx::query_as(
+    let mut values = item_values(db, item_id).await;
+    values.push((i32::from(value_type), value.to_owned()));
+
+    persistence_over(db)
+        .save_item_values(item_id, &values)
+        .await
+        .expect("save item values");
+}
+
+/// The `(type, value)` pairs an item's `ItemValuesMap` rows link it to, of
+/// every type.
+pub async fn item_values(db: &Database, item_id: Uuid) -> Vec<(i32, String)> {
+    sqlx::query_as(
         r#"SELECT iv."Type", iv."Value"
            FROM "ItemValuesMap" m
            JOIN "ItemValues" iv ON iv."ItemValueId" = m."ItemValueId"
@@ -663,13 +677,7 @@ pub async fn seed_item_value(
     .bind(guid_to_db(item_id))
     .fetch_all(db.pool())
     .await
-    .expect("read existing item values");
-    values.push((i32::from(value_type), value.to_owned()));
-
-    persistence_over(db)
-        .save_item_values(item_id, &values)
-        .await
-        .expect("save item values");
+    .expect("read existing item values")
 }
 
 /// An [`ItemImageInfo`] for a fixture image: only the type, path and blurhash
@@ -1046,4 +1054,18 @@ pub fn rooted_library_manager(
     )
     .with_dashboard_configuration(configuration)
     .with_visibility(visibility)
+}
+
+/// The by-name identity the tests use, rooted at `/config` as a stock Jellyfin
+/// is (gl-1597).
+pub fn by_name_identity() -> crate::item_type_lookup::ByNameIdentity {
+    crate::item_type_lookup::ByNameIdentity::new(
+        &crate::item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        },
+        "/config/metadata/Genre",
+        "/config/metadata/MusicGenre",
+        "/config/metadata/Studio",
+    )
+    .expect("a Jellyfin-mode identity")
 }

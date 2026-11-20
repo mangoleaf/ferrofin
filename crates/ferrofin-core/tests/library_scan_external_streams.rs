@@ -61,7 +61,7 @@ impl ProbeByExtension {
     }
 
     fn probed(&self) -> Vec<(String, bool)> {
-        self.probed.lock().map(|p| p.clone()).unwrap_or_default()
+        self.probed.lock().map_or_default(|p| p.clone())
     }
 
     /// The file names probed since the last call, sorted.
@@ -69,8 +69,7 @@ impl ProbeByExtension {
         let mut names: Vec<String> = self
             .probed
             .lock()
-            .map(|mut p| std::mem::take(&mut *p))
-            .unwrap_or_default()
+            .map_or_default(|mut p| std::mem::take(&mut *p))
             .into_iter()
             .map(|(path, _)| {
                 Path::new(&path)
@@ -306,7 +305,7 @@ async fn scan_indexes_sidecar_subtitles_as_external_streams_and_rescans_idempote
     let movie = movie_id(&h.db).await;
     let rows = streams_of(&h.streams, movie).await;
 
-    // Externals first (subtitles, in directory order), then the file's own
+    // Externals first (subtitles, sorted by path), then the file's own
     // streams, all renumbered from 0.
     assert_eq!(rows.len(), 4, "{rows:?}");
     let indices: Vec<i64> = rows.iter().map(|r| r.stream_index).collect();
@@ -318,6 +317,7 @@ async fn scan_indexes_sidecar_subtitles_as_external_streams_and_rescans_idempote
         .iter()
         .find(|r| file_name(r) == "Heat (1995).eng.forced.srt")
         .expect("the forced English sidecar is indexed");
+    assert_eq!(eng.stream_index, 0, "sorted ahead of the French sidecar");
     assert!(eng.is_external);
     assert_eq!(eng.language.as_deref(), Some("eng"));
     assert!(eng.is_forced, "`.forced` in the name sets IsForced");
@@ -334,6 +334,7 @@ async fn scan_indexes_sidecar_subtitles_as_external_streams_and_rescans_idempote
         .iter()
         .find(|r| file_name(r) == "Heat (1995).fra.srt")
         .expect("the French sidecar is indexed");
+    assert_eq!(fra.stream_index, 1);
     assert!(fra.is_external);
     assert_eq!(fra.language.as_deref(), Some("fra"));
     assert!(!fra.is_forced);

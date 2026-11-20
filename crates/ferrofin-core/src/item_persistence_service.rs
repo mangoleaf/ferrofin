@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
-use sqlx::{QueryBuilder, Sqlite};
+use sqlx::Sqlite;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -33,12 +33,14 @@ use std::collections::{HashMap, HashSet};
 
 /// Compare the values the image save actually persists, including the database's
 /// 100 ns timestamp precision. A provider returning identical artwork is a no-op.
+/// The row's path is compared expanded ([`same_image_path`]).
 fn image_row_matches(
     row: &ferrofin_db::entities::base_items::BaseItemImageInfoEntity,
     image: &ItemImageInfo,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> bool {
     row.image_type == image_type_to_disc(image.image_type)
-        && row.path == image.path
+        && same_image_path(row, image, virtual_paths)
         && row.width == i64::from(image.width)
         && row.height == i64::from(image.height)
         && row.blurhash.as_deref() == image.blur_hash.as_deref().map(str::as_bytes)
@@ -46,17 +48,17 @@ fn image_row_matches(
             == Some(datetime_to_db(image.date_modified).as_str())
 }
 
-/// One `BaseItemImageInfos` row as the scan's change detection reads it:
-/// `ItemId`, `ImageType`, `Path`, `Width`, `Height`, `Blurhash`, `DateModified`.
-type ScanImageRow = (
-    String,
-    i32,
-    String,
-    i64,
-    i64,
-    Option<Vec<u8>>,
-    Option<chrono::DateTime<chrono::Utc>>,
-);
+/// Whether `row` names `image`'s file: its path as stored, or expanded as
+/// every read expands it, is the one saved. An adopted row's `%MetadataPath%`
+/// form is so updated in place and keeps that form, as a save keeps an item's
+/// (`stored_virtual_path`).
+fn same_image_path(
+    row: &ferrofin_db::entities::base_items::BaseItemImageInfoEntity,
+    image: &ItemImageInfo,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
+) -> bool {
+    row.path == image.path || virtual_paths.expand_cow(&row.path) == image.path
+}
 
 use ferrofin_model::data::BaseItemKind;
 
@@ -232,9 +234,10 @@ fn item_value_ids_sql(count: usize) -> String {
 /// A real 10.11.8 leaves the column NULL for exactly ONE kind —
 /// `LiveTvProgram` — and the column is what `GetItemValues` groups on.
 ///
-/// The existence guard is by **type and name**, not by id (`OR IGNORE` keys on
-/// the PRIMARY KEY, which is the `ItemValueId` — a fresh guid every first
-/// write). A `MusicArtist` the scanner resolved from an artist DIRECTORY
+/// The existence guard is by **type and name**, and by id: a genre, music genre
+/// or studio's id derives from its name's path, so a row stored under it with
+/// another clean name (one an older version spelled differently) must not fail
+/// the insert. A `MusicArtist` the scanner resolved from an artist DIRECTORY
 /// already carries that `CleanName` under its path-derived id, and
 /// `item_repository::push_by_name_join` joins `agg.cval = bi."CleanName"`, so a
 /// second row here would list every artist TWICE on /Artists. An adopted
@@ -247,17 +250,22 @@ fn item_value_ids_sql(count: usize) -> String {
 /// a `MusicArtist` is `IsAccessedByName` (`MusicArtist.cs:30-33`,
 /// `IsFolder => !IsAccessedByName`).
 fn by_name_insert_sql(count: usize) -> String {
+    // `DateCreated` is `CreateItemByName`'s (`LibraryManager.cs:1374-1381`).
+    // Its `DateModified` is not stored: the validator's refresh of the new row
+    // restats its path, a directory, which has none (D2), and the post-scan
+    // pass that ports that refresh stamps the rest.
     format!(
         r#"INSERT INTO "BaseItems"
            ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","UnratedType",
-            "IsFolder","IsInMixedFolder",
+            "DateCreated","IsFolder","IsInMixedFolder",
             "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem",{columns})
            SELECT v.column1, v.column2, v.column3, v.column4, v.column5, v.column6, v.column7,
-                  0, 0, 0, 0, 0, 0, 0, {values}
+                  v.column8, 0, 0, 0, 0, 0, 0, 0, {values}
            FROM (VALUES {rows}) AS v
            WHERE NOT EXISTS (
                SELECT 1 FROM "BaseItems" b
-               WHERE b."Type" = v.column2 AND b."CleanName" = v.column4)"#,
+               WHERE b."Type" = v.column2 AND b."CleanName" = v.column4)
+             AND NOT EXISTS (SELECT 1 FROM "BaseItems" b WHERE b."Id" = v.column1)"#,
         columns = unset_columns!(),
         values = unset_values!(),
         rows = ferrofin_db::values_rows(count, BY_NAME_INSERT_BINDS)
@@ -265,7 +273,7 @@ fn by_name_insert_sql(count: usize) -> String {
 }
 
 /// The values each row of [`by_name_insert_sql`] binds.
-const BY_NAME_INSERT_BINDS: usize = 7;
+const BY_NAME_INSERT_BINDS: usize = 8;
 
 /// The `ItemValueId` of each of `values` (`(Type, Value, CleanValue)`, distinct
 /// by type and value), keyed by type and value, creating the rows not stored
@@ -322,6 +330,7 @@ async fn write_item_values(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     item_id: Uuid,
     values: &[(i32, String)],
+    identity: Option<&crate::item_type_lookup::ByNameIdentity>,
 ) -> Result<(), ServiceError> {
     let id = guid_to_db(item_id);
     // Whether this item's genres are *music* genres, which get their own
@@ -356,13 +365,15 @@ async fn write_item_values(
             .get(&(*type_, (*value).to_owned()))
             .ok_or_else(|| db_err(sqlx::Error::RowNotFound))?;
         links.push(value_id);
-        // Materialize the browsable by-name item (genre/studio) sharing the
-        // ItemValueId as its id, so the Genres/Studios tabs list it, the
-        // /Genres/{name} lookup resolves it, and a `GenreIds=<id>` filter
-        // (which resolves the id → BaseItems.CleanName) matches. Faithful to
-        // Jellyfin, where genres/studios are BaseItems; here their id is the
-        // shared value id, and the DTO's genre/studio links find the row by
-        // type and name (`item_repository::by_name_ids_by_clean_name`).
+        // Materialize the browsable by-name item (genre/studio), so the
+        // Genres/Studios tabs list it, the /Genres/{name} lookup resolves it,
+        // and a `GenreIds=<id>` filter (which resolves the id →
+        // BaseItems.CleanName) matches. Faithful to Jellyfin, where
+        // genres/studios are BaseItems with the id `GetItemByNameId<T>` derives
+        // from their path (`identity`, gl-1597); a by-name artist, and a row
+        // when no identity is wired, borrows the shared value id. The DTO's
+        // genre/studio links find the row by type and name
+        // (`item_repository::by_name_ids_by_clean_name`), whatever its id.
         // A music item's genre materializes ONLY as a `MusicGenre` row.
         // Upstream keeps the two disjoint — `LibraryManager.GetMusicGenre`
         // for audio, `GetGenre` otherwise — so a real 10.11.8 library has
@@ -371,25 +382,29 @@ async fn write_item_values(
         // phantom entry on the Genres tab.
         let row = if owner_is_music && *type_ == i32::from(ferrofin_db::enums::ItemValueType::Genre)
         {
-            music_genre_row(value, clean)
+            music_genre_row(value, clean, identity)
         } else {
             by_name_type_name(*type_).map(|type_name| {
+                let row_id = by_name_kind(*type_)
+                    .and_then(|kind| identity.and_then(|ids| ids.id(kind, value)))
+                    .map_or_else(|| value_id.clone(), guid_to_db);
+                let key = by_name_kind(*type_).map(|kind| {
+                    crate::kinds::presentation_unique_key(
+                        kind,
+                        Uuid::parse_str(&row_id).unwrap_or_default(),
+                        Some(value),
+                        None,
+                        None,
+                        None,
+                    )
+                });
                 (
-                    value_id.clone(),
+                    row_id,
                     type_name,
                     *value,
                     clean.as_str(),
                     ferrofin_util::sort_name::create_sort_name(value),
-                    by_name_kind(*type_).map(|kind| {
-                        crate::kinds::presentation_unique_key(
-                            kind,
-                            Uuid::parse_str(value_id).unwrap_or_default(),
-                            Some(value),
-                            None,
-                            None,
-                            None,
-                        )
-                    }),
+                    key,
                 )
             })
         };
@@ -412,6 +427,7 @@ async fn write_item_values(
         }
         query.execute(&mut **tx).await.map_err(db_err)?;
     }
+    let now = datetime_to_db(chrono::Utc::now());
     for chunk in ferrofin_db::power_of_two_chunks(
         &by_name,
         ferrofin_db::BATCH_BIND_CHUNK / BY_NAME_INSERT_BINDS,
@@ -427,7 +443,8 @@ async fn write_item_values(
                 .bind(*clean)
                 .bind(sort_name)
                 .bind(key)
-                .bind(unrated_type_name(kind));
+                .bind(unrated_type_name(kind))
+                .bind(&now);
         }
         query.execute(&mut **tx).await.map_err(db_err)?;
     }
@@ -441,19 +458,23 @@ async fn write_item_values(
 /// Jellyfin keeps `Genre` and `MusicGenre` as two separate items over the one
 /// `ItemValueType`, and `GetMusicGenres` selects on the row type alone
 /// (`BaseItemRepository.cs:221`), so without this row `/MusicGenres` is empty.
-/// Ferrofin's other by-name rows borrow the `ItemValueId` as their id, which
-/// this one cannot — that id already belongs to the `Genre` row for the same
-/// value — so it takes a derived id instead, the way Jellyfin derives every
-/// by-name id.
+/// Its id is the one Jellyfin derives from its path (`identity`, gl-1597);
+/// with no identity wired, one derived from the bare name.
 ///
 /// The existence check is by **type and name**, not by id: an adopted database
 /// already has Jellyfin's `MusicGenre` rows under Jellyfin's ids, and a scan
 /// must not lay a second row beside each of them. Its `PresentationUniqueKey`
 /// is the `{Type}-{Name}` key the other by-name rows take: a real 10.11.8
 /// scanner row reads back as `MusicGenre-Ambient`.
-fn music_genre_row<'a>(value: &'a str, clean: &'a str) -> Option<ByNameRow<'a>> {
+fn music_genre_row<'a>(
+    value: &'a str,
+    clean: &'a str,
+    identity: Option<&crate::item_type_lookup::ByNameIdentity>,
+) -> Option<ByNameRow<'a>> {
     let type_name = stored_type_name(BaseItemKind::MusicGenre)?;
-    let id = crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, value)?;
+    let id = identity
+        .and_then(|ids| ids.id(BaseItemKind::MusicGenre, value))
+        .or_else(|| crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, value))?;
     Some((
         guid_to_db(id),
         type_name,
@@ -537,13 +558,15 @@ pub(crate) async fn insert_named_item_in(
         // `CleanName` is what `searchTerm` and the search hints match
         // (`BaseItemMapper.cs:279` derives it on every save); without it a
         // new box set or playlist is never found by name.
-        // The dates are `Folder.AddChild`'s: `DateCreated`/`DateModified`
-        // from the folder `CreatePlaylist`/`CreateCollectionAsync` just made
-        // (this instant), else `DateTime.UtcNow`. `DateLastSaved` is stamped
-        // on create too, by the first save after it (`UpdateItemsAsync`: the
-        // playlist's `ForceSave` refresh, the box set's member add or queued
-        // refresh). Undated, the row sorted anywhere by date added and never
-        // matched `minDateLastSaved`.
+        // The dates are `Folder.AddChild`'s: `DateCreated` from the folder
+        // `CreatePlaylist`/`CreateCollectionAsync` just made (this instant),
+        // else `DateTime.UtcNow`. `DateLastSaved` is stamped on create too, by
+        // the first save after it (`UpdateItemsAsync`: the playlist's
+        // `ForceSave` refresh, the box set's member add or queued refresh).
+        // That save restats the item's path (`MetadataService.cs:244-249`), a
+        // folder's directory, which has no `DateModified` (D2), so a folder's
+        // is NULL, not `AddChild`'s (gl-1586). Undated, the row sorted
+        // anywhere by date added and never matched `minDateLastSaved`.
         concat!(
             r#"INSERT INTO "BaseItems"
            ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
@@ -552,7 +575,8 @@ pub(crate) async fn insert_named_item_in(
             "DateCreated", "DateModified", "DateLastSaved", "UnratedType", "#,
             unset_columns!(),
             r#")
-           VALUES (?1, ?2, ?3, 0, ?10, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9, ?9, ?9, ?11, "#,
+           VALUES (?1, ?2, ?3, 0, ?10, 0, 0, 0, 0, ?4, ?5, ?7, ?6, ?6, ?8, ?9,
+                   CASE WHEN ?3 THEN NULL ELSE ?9 END, ?9, ?11, "#,
             unset_values!(),
             ")"
         ),
@@ -648,6 +672,28 @@ pub(crate) async fn set_item_path_in(
         .bind(path)
         .execute(&mut *conn)
         .await?;
+    Ok(())
+}
+
+/// Stores `ids` as item `id`'s provider ids (`TrySetProviderId` for each),
+/// on a connection the caller holds.
+pub(crate) async fn set_provider_ids_in(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    ids: &[(String, String)],
+) -> Result<(), ServiceError> {
+    for (provider, value) in ids {
+        sqlx::query(
+            r#"INSERT OR REPLACE INTO "BaseItemProviders"
+               ("ItemId", "ProviderId", "ProviderValue") VALUES (?1, ?2, ?3)"#,
+        )
+        .bind(guid_to_db(id))
+        .bind(provider)
+        .bind(value)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    }
     Ok(())
 }
 
@@ -1079,6 +1125,46 @@ pub(crate) async fn adopt_orphans(
     Ok(())
 }
 
+/// Adds the ancestors missing from the Playlists folder `folder` and from every
+/// playlist directly under it: each row's `ParentId` chain up to the root, as
+/// upstream's save of any item writes `GetAncestorIds()`
+/// (`ItemPersistenceService.cs:321-323`). Earlier builds wrote neither the
+/// folder's (the root) nor an API-made playlist's (the folder and the root).
+///
+/// Run on every boot, not once: a playlist the previous version makes during a
+/// rolling update has none either. Only missing rows are added
+/// (`INSERT OR IGNORE`, with links to rows that do not exist skipped), so a
+/// second run adds nothing. Playlists a library scan found sit under their
+/// library folders, not here, and keep the ancestors the scan gave them.
+pub(crate) async fn add_playlist_ancestors(
+    db: &Database,
+    folder: Uuid,
+) -> Result<u64, ServiceError> {
+    let Some(playlist) = stored_type_name(BaseItemKind::Playlist) else {
+        return Ok(0);
+    };
+    let added = sqlx::query(
+        r#"WITH RECURSIVE "chain"("ItemId", "ParentItemId") AS (
+               SELECT "Id", "ParentId" FROM "BaseItems"
+                WHERE ("Id" = ?1 OR ("ParentId" = ?1 AND "Type" = ?2))
+                  AND "ParentId" IS NOT NULL
+               UNION
+               SELECT c."ItemId", p."ParentId" FROM "chain" c
+                 JOIN "BaseItems" p ON p."Id" = c."ParentItemId"
+                WHERE p."ParentId" IS NOT NULL)
+           INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId")
+           SELECT "ItemId", "ParentItemId" FROM "chain"
+            WHERE "ParentItemId" IN (SELECT "Id" FROM "BaseItems")"#,
+    )
+    .bind(guid_to_db(folder))
+    .bind(playlist)
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    Ok(added)
+}
+
 /// The concrete item-persistence service.
 #[derive(Clone)]
 pub struct FerrofinItemPersistenceService {
@@ -1103,6 +1189,18 @@ pub struct FerrofinItemPersistenceService {
     /// `%MetadataPath%`/`%AppDataPath%` path on a save
     /// ([`FerrofinItemPersistenceService::with_virtual_paths`]).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    /// How by-name `Genre`, `MusicGenre` and `Studio` rows take their ids
+    /// ([`FerrofinItemPersistenceService::with_by_name_identity`]).
+    by_name_identity: Option<crate::item_type_lookup::ByNameIdentity>,
+    /// The playlist manager's entry-edit lock
+    /// ([`Self::playlist_entry_edits`]), held by the writers of a playlist's
+    /// entries outside it: the scan's playlist sync, an item deletion and a
+    /// re-key ([`ItemPersistenceService::rekey_items`]), and the
+    /// linked-children service's reroute. One landing between an edit's read
+    /// and its rewrite would lose the scan's members or the reroute, or fail
+    /// the rewrite on a deleted or folded member. Taken before the writer, as
+    /// the manager takes it.
+    playlist_entry_edits: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinItemPersistenceService {
@@ -1125,7 +1223,32 @@ impl FerrofinItemPersistenceService {
             changed: std::sync::OnceLock::new(),
             localization: std::sync::OnceLock::new(),
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+            by_name_identity: None,
+            playlist_entry_edits: Arc::default(),
         }
+    }
+
+    /// Installs how by-name `Genre`, `MusicGenre` and `Studio` rows take their
+    /// ids: Jellyfin's, derived from the kind and the name's metadata path
+    /// (gl-1597). Called once by the composition root; with none (no call, or
+    /// a pre-parity database's [`None`]) a genre or studio row borrows its
+    /// `ItemValues` id and a music genre's derives from the bare name.
+    #[must_use]
+    pub fn with_by_name_identity(
+        mut self,
+        identity: Option<crate::item_type_lookup::ByNameIdentity>,
+    ) -> Self {
+        self.by_name_identity = identity;
+        self
+    }
+
+    /// The lock the playlist manager holds across an entry edit's read and
+    /// rewrite, which this service's playlist sync, deletion and re-key also
+    /// take. The composition root hands it to the playlist manager and the
+    /// linked-children service.
+    #[must_use]
+    pub fn playlist_entry_edits(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.playlist_entry_edits)
     }
 
     /// Installs the server's [`VirtualPathExpander`], so a save keeps the
@@ -1887,10 +2010,10 @@ impl FerrofinItemPersistenceService {
     /// its permissions, in the same writer transaction
     /// ([`crate::item_data::sync_saved_playlist_in`]): the
     /// row the caller saves was read earlier, and its copy of those keys must
-    /// not undo a share change committed since, which the next boot's
-    /// re-import from `Data` would make real. A scan's save of a playlist
-    /// without a `FerrofinPlaylists` row first imports one from the `Data` it
-    /// wrote ([`crate::item_data::import_playlist_meta_if_missing_in`]).
+    /// not undo, in `Data`, a share change committed since (`Data` stays an
+    /// exact copy of the tables, [`crate::item_data`]). A scan's save of a
+    /// playlist without a `FerrofinPlaylists` row first imports one from the
+    /// `Data` it wrote ([`crate::item_data::import_playlist_meta_if_missing_in`]).
     ///
     /// The `Path` is written through `ReverseVirtualPath`, as upstream's
     /// mapper writes every saved path (`BaseItemMapper.Map` →
@@ -2324,6 +2447,7 @@ pub(crate) async fn remove_person_items(
     db: &Database,
     ids: &[Uuid],
 ) -> Result<usize, ServiceError> {
+    // A service of its own, so not the playlist edits' lock: a person is never a playlist entry.
     Ok(FerrofinItemPersistenceService::new(db.clone())
         .delete_items(ids)
         .await?
@@ -2483,6 +2607,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         if given.is_empty() {
             return Ok(Vec::new());
         }
+        let _edits = self.playlist_entry_edits.lock().await;
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         // Two BaseItems references have no `ON DELETE CASCADE`: an extra's
         // `OwnerId`, and `LinkedChildren` (the item as a playlist or
@@ -2495,6 +2620,17 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .map_err(db_err)?;
         let closure: Vec<String> = deletion_closure_rows(&mut tx, &given).await?;
         detach_user_data(&mut tx, &closure).await?;
+        // The persons the closure credits, read before the delete cascades
+        // their credit rows away (upstream `:147`); those left with no credit
+        // go after it (`:154`).
+        let credited: Vec<String> = sqlx::query_scalar(CLOSURE_CREDITS_SQL)
+            .bind(
+                serde_json::to_string(&closure)
+                    .map_err(|e| ServiceError::Backend(e.to_string()))?,
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_err)?;
         // A playlist or collection that loses a member needs no `Data`
         // re-sync: 12.0 keeps membership out of `Data` (`[JsonIgnore]`), and
         // the playlist keys it does hold are not changed by a delete.
@@ -2534,6 +2670,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+        crate::people_repository::delete_credits_without_mapping(&mut tx, &credited).await?;
         tx.commit().await.map_err(db_err)?;
         note_written(&self.db, &closure, false);
         Ok(closure
@@ -2592,8 +2729,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             self.upsert_item(item, UPSERT_SQL, false).await?;
         }
         // `ItemUpdated`. An item the caller also reported as ADDED is folded back
-        // out of the updated bucket by the notifier, so the library manager's
-        // `create_items` hook still wins for a creation.
+        // out of the updated bucket by the notifier, so a creation's
+        // `report_item_added` still wins.
         if let Some(changed) = self.changed.get() {
             changed.record_updated(items);
         }
@@ -2785,6 +2922,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 }
                 None => None,
             };
+            let _edits = self.playlist_entry_edits.lock().await;
             let mut tx = self.db.writer().begin().await.map_err(db_err)?;
             // `PlaylistResolver` creates `new Playlist { OpenAccess = true }`:
             // `OwnerUserId` is `Guid.Empty` — a user no caller is, so nobody
@@ -2822,6 +2960,39 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             tx.commit().await.map_err(db_err)?;
         }
         Ok(())
+    }
+
+    async fn merge_box_set_members(
+        &self,
+        box_set: Uuid,
+        members: &[PlaylistMember],
+    ) -> Result<bool, ServiceError> {
+        // Resolved on a reader, before the writer is taken, as a playlist's
+        // entries are. `ItemPersistenceService` keeps one entry per child of
+        // any container but a playlist.
+        let mut ids: Vec<Uuid> = Vec::with_capacity(members.len());
+        {
+            let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+            for member in members {
+                if let Some(id) = resolve_playlist_member(&mut conn, member, &self.virtual_paths)
+                    .await
+                    .map_err(db_err)?
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            }
+        }
+        // The stored members stay: a file naming none adds nothing.
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let written = write_scanned_members(&mut tx, &guid_to_db(box_set), ids, false)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(written.is_some())
     }
 
     async fn provider_ids_for_items(
@@ -3015,7 +3186,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         values: &[(i32, String)],
     ) -> Result<(), ServiceError> {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        write_item_values(&mut tx, item_id, values).await?;
+        write_item_values(&mut tx, item_id, values, self.by_name_identity.as_ref()).await?;
         tx.commit().await.map_err(db_err)
     }
 
@@ -3025,7 +3196,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     ) -> Result<(), ServiceError> {
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         for (item_id, values) in items {
-            write_item_values(&mut tx, *item_id, values).await?;
+            write_item_values(&mut tx, *item_id, values, self.by_name_identity.as_ref()).await?;
         }
         tx.commit().await.map_err(db_err)
     }
@@ -3058,11 +3229,21 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         }
         // Mint the id the SCANNER would mint for this name, not a fresh one, so
         // that a later scan of content carrying this value converges on THIS
-        // row instead of inserting a second one beside it: the `ItemValues` id
-        // for the value-backed kinds (what `save_item_values` uses), the
-        // derived id for `MusicGenre` (what `music_genre_row` uses).
-        let id = match by_name_value_type(kind) {
-            Some(value_type) => {
+        // row instead of inserting a second one beside it: Jellyfin's
+        // path-derived id where the identity covers the kind (gl-1597), else
+        // the `ItemValues` id for the value-backed kinds (what
+        // `save_item_values` uses) and the name-derived id for `MusicGenre`
+        // (what `music_genre_row` uses).
+        // With the derived id, no `ItemValues` row is made for a genre or
+        // studio, as upstream's `GetGenre` makes none: a row no item tags is
+        // dead, and the next validation's dead by-name sweep removes it.
+        let derived = self
+            .by_name_identity
+            .as_ref()
+            .and_then(|ids| ids.id(kind, name));
+        let id = match (derived, by_name_value_type(kind)) {
+            (Some(id), _) => Some(id),
+            (None, Some(value_type)) => {
                 let fresh = guid_to_db(Uuid::new_v4());
                 sqlx::query(
                     r#"INSERT OR IGNORE INTO "ItemValues" ("ItemValueId","CleanValue","Type","Value")
@@ -3085,10 +3266,10 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 .map_err(db_err)?;
                 Uuid::parse_str(&value_id).ok()
             }
-            None if kind == BaseItemKind::MusicGenre => {
+            (None, None) if kind == BaseItemKind::MusicGenre => {
                 crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, name)
             }
-            None => None,
+            (None, None) => None,
         };
         let Some(id) = id else {
             tx.rollback().await.map_err(db_err)?;
@@ -3126,7 +3307,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             None,
         ))
         .bind(self.virtual_paths.reverse(path))
-        .bind(chrono::Utc::now())
+        .bind(datetime_to_db(chrono::Utc::now()))
         .bind(unrated_type_name(kind))
         .execute(&mut *tx)
         .await
@@ -3178,6 +3359,17 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(exists.is_some())
     }
 
+    async fn item_path(&self, id: Uuid) -> Result<Option<Option<String>>, ServiceError> {
+        let stored: Option<Option<String>> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        // Read expanded, as `set_item_path` stores it reversed (gl-1581).
+        Ok(stored.map(|path| self.virtual_paths.expand_opt(path.as_deref())))
+    }
+
     async fn set_ancestors(
         &self,
         item_id: Uuid,
@@ -3218,24 +3410,6 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         tx.commit().await.map_err(db_err)
     }
 
-    async fn save_images(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {
-        // The image rows live in BaseItemImageInfos and are written through
-        // `save_item_images`/`set_item_image*`; without the domain item's
-        // ImageInfos list on the entity there is nothing to persist here beyond
-        // confirming the item exists, and nothing calls this. TODO(gl-211): open
-        // work item: remove it from the trait.
-        let exists: Option<i64> =
-            sqlx::query_scalar(r#"SELECT 1 FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&item.id)
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        if exists.is_none() {
-            return Err(ServiceError::not_found(format!("item {}", item.id)));
-        }
-        Ok(())
-    }
-
     async fn save_item_images(
         &self,
         item_id: Uuid,
@@ -3249,7 +3423,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_err)?;
-        write_item_images(&mut tx, item_id, images).await?;
+        write_item_images(&mut tx, item_id, images, &self.virtual_paths).await?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
     }
@@ -3298,7 +3472,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                 .await
                 .map_err(db_err)?;
             for (item_id, images) in chunk {
-                write_item_images(&mut tx, *item_id, images).await?;
+                write_item_images(&mut tx, *item_id, images, &self.virtual_paths).await?;
             }
             tx.commit().await.map_err(db_err)?;
         }
@@ -3317,38 +3491,30 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         // shape every other batched id lookup here uses.
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
-            let sql = format!(
-                r#"SELECT "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified"
-                   FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})"#
-            );
-            let mut query = sqlx::query_as::<_, ScanImageRow>(sqlx::AssertSqlSafe(sql));
+            let mut query =
+                sqlx::query_as::<_, ferrofin_db::entities::base_items::BaseItemImageInfoEntity>(
+                    sqlx::AssertSqlSafe(crate::item_repository::images_of_items_sql(&placeholders)),
+                );
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
-            out.extend(rows.into_iter().filter_map(
-                |(item_id, image_type, path, width, height, blurhash, date_modified)| {
-                    Some(StoredImageMetadata {
-                        item_id: Uuid::parse_str(&item_id).ok()?,
-                        image_type: crate::item_repository::image_type_from_disc(image_type),
-                        path,
-                        width: i32::try_from(width).unwrap_or(0),
-                        height: i32::try_from(height).unwrap_or(0),
-                        // Stored as a UTF-8 byte blob; an empty or non-UTF-8 blob
-                        // reads back as "no blurhash", which forces a recompute.
-                        blur_hash: blurhash
-                            .filter(|b| !b.is_empty())
-                            .and_then(|b| String::from_utf8(b).ok()),
-                        // A row with no stored mtime can never match the file's,
-                        // so it falls through to a recompute — the same outcome
-                        // C# reaches for a `default(DateTime)` image.
-                        date_modified: date_modified.unwrap_or_else(|| {
-                            chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-                                .unwrap_or_else(chrono::Utc::now)
-                        }),
-                    })
-                },
-            ));
+            // An empty or non-UTF-8 blurhash reads back as none, and a row with
+            // no stored mtime as the epoch, which no file's matches: both fall
+            // through to a recompute, as C# does for a `default(DateTime)` image.
+            out.extend(rows.into_iter().filter_map(|row| {
+                let item_id = Uuid::parse_str(&row.item_id).ok()?;
+                let image = crate::item_repository::image_info_from_row(row, &self.virtual_paths);
+                Some(StoredImageMetadata {
+                    item_id,
+                    image_type: image.image_type,
+                    path: image.path,
+                    width: image.width,
+                    height: image.height,
+                    blur_hash: image.blur_hash,
+                    date_modified: image.date_modified,
+                })
+            }));
         }
         Ok(out)
     }
@@ -3362,31 +3528,20 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let key = |id: &str| Uuid::parse_str(id).ok();
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
-            let images = format!(
-                r#"SELECT "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified"
-                   FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})
-                   ORDER BY "ItemId", "ImageType", rowid"#
-            );
-            let mut query = sqlx::query_as::<_, ScanImageRow>(sqlx::AssertSqlSafe(images.as_str()));
+            let mut query =
+                sqlx::query_as::<_, ferrofin_db::entities::base_items::BaseItemImageInfoEntity>(
+                    sqlx::AssertSqlSafe(crate::item_repository::images_of_items_sql(&placeholders)),
+                );
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
             for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
-                let Some(id) = key(&row.0) else { continue };
-                out.entry(id).or_default().images.push(ItemImageInfo {
-                    path: row.2,
-                    image_type: crate::item_repository::image_type_from_disc(row.1),
-                    date_modified: row.6.unwrap_or_else(|| {
-                        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-                            .unwrap_or_else(chrono::Utc::now)
-                    }),
-                    width: i32::try_from(row.3).unwrap_or(0),
-                    height: i32::try_from(row.4).unwrap_or(0),
-                    blur_hash: row
-                        .5
-                        .filter(|b| !b.is_empty())
-                        .and_then(|b| String::from_utf8(b).ok()),
-                });
+                let Some(id) = key(&row.item_id) else {
+                    continue;
+                };
+                out.entry(id).or_default().images.push(
+                    crate::item_repository::image_info_from_row(row, &self.virtual_paths),
+                );
             }
             let ancestors = format!(
                 r#"SELECT "ItemId", "ParentItemId" FROM "AncestorIds"
@@ -3681,13 +3836,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     locations: crate::item_data::parse_data(data.as_deref())
                         .get("PhysicalLocationsList")
                         .and_then(serde_json::Value::as_array)
-                        .map(|list| {
+                        .map_or_default(|list| {
                             list.iter()
                                 .filter_map(serde_json::Value::as_str)
                                 .map(str::to_owned)
                                 .collect()
-                        })
-                        .unwrap_or_default(),
+                        }),
                     scanned_by,
                 })
             })
@@ -3890,6 +4044,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn rekey_items(&self, moves: &[ItemRekey]) -> Result<Vec<ItemRekey>, ServiceError> {
+        let _edits = self.playlist_entry_edits.lock().await;
         rekey_rows(&self.db, moves, RekeyKind::Changed).await
     }
 
@@ -4574,10 +4729,15 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn update_inherited_values(&self) -> Result<(), ServiceError> {
-        // A no-op that nothing calls. Upstream's `UpdateInheritedValues` deletes
-        // the `ItemValuesMap` rows of type `InheritedTags`, which Ferrofin never
-        // writes (an adopted database may hold some). TODO(gl-211): open work
-        // item: port it and call it after the post-scan tasks, or remove it.
+        // `ItemPersistenceService.cs:161-170`: one statement, so no transaction.
+        sqlx::query(
+            r#"DELETE FROM "ItemValuesMap" WHERE "ItemValueId" IN
+               (SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = ?1)"#,
+        )
+        .bind(i32::from(ferrofin_db::enums::ItemValueType::InheritedTags))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 }
@@ -4615,7 +4775,15 @@ pub(crate) async fn rekey_rows_at(
     if moves.is_empty() {
         return Ok(Vec::new());
     }
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reserve the writer before reading the schema: a deferred transaction
+    // fails at its first write when another process commits in between, and a
+    // boot repair runs this beside the previous version (CONTRIBUTING.md,
+    // "Migrations and one-shot repairs").
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     // Every reference moves inside the one transaction; the foreign
     // keys are checked once, at its end, against the moved rows.
     sqlx::query("PRAGMA defer_foreign_keys = ON")
@@ -6211,105 +6379,6 @@ pub async fn backfill_missing_sort_names(db: &Database) -> Result<usize, Service
     Ok(rows.len())
 }
 
-/// Fills in `BaseItems."PresentationUniqueKey"` for the by-name rows written
-/// before the write path derived it — run once at startup, cheap thereafter.
-///
-/// Why this exists at all: the by-name inserts are
-/// `INSERT ... WHERE NOT EXISTS` / `INSERT OR IGNORE`, so writing the column in
-/// the insert (as `music_genre_row` and `insert_named_item` now do) is INERT on
-/// every database that already holds the row. On this campaign's own lab that
-/// was every scanner-created music genre: `MusicGenre|Ambient`, `Jazz` and
-/// `Rock` still read back `PresentationUniqueKey NULL` after the fix shipped.
-/// The column is what `GetItemValues` GROUPs on, and SQLite groups all NULLs
-/// together, so a set of unkeyed by-name rows collapses to ONE representative
-/// — the whole tab silently loses names.
-///
-/// Upstream needs no such pass because it recomputes the key on every
-/// `SaveItems`: `MetadataService.BeforeSaveInternal`
-/// (`MediaBrowser.Providers/Manager/MetadataService.cs:332-338`, identical on
-/// v10.11.8 and master) assigns `item.CreatePresentationUniqueKey()` whenever
-/// it differs. A Jellyfin by-name row is unkeyed only until its first metadata
-/// refresh runs — `CreateItemByName` calls `CreateItem` and queues no refresh
-/// itself — which is why a live 10.11.8 shows a MIXTURE of keyed and unkeyed
-/// by-name rows. So the value written here is exactly the value Jellyfin's own
-/// next refresh of that row would write, which is what makes the pass safe on
-/// an adopted database: it moves a row forward to Jellyfin's settled state,
-/// never to a value Jellyfin would not produce.
-///
-/// Scoped to the four by-name kinds whose key is a pure function of the name
-/// (`Genre-…`, `MusicGenre-…`, `Studio-…`, `Artist-…` — see
-/// [`crate::kinds::presentation_unique_key`]). `Person` is deliberately absent:
-/// [`crate::people_repository::FerrofinPeopleRepository::repair_person_items`]
-/// already repairs that kind, together with the `Path` column and the metadata
-/// directory that only it knows how to build. Every other kind derives its key
-/// from an id or a parent chain, where NULL is not the same kind of damage and
-/// a blanket rewrite would be a guess.
-///
-/// Only NULL/empty keys are touched, so an already-keyed row — the whole of an
-/// adopted, refreshed Jellyfin database — is left byte-identical. Returns the
-/// number of rows repaired.
-///
-/// # Errors
-/// Returns [`ServiceError`] if the read or the write fails.
-pub async fn backfill_missing_presentation_keys(db: &Database) -> Result<usize, ServiceError> {
-    let kinds = [
-        BaseItemKind::Genre,
-        BaseItemKind::MusicGenre,
-        BaseItemKind::Studio,
-        BaseItemKind::MusicArtist,
-    ];
-    let type_names: Vec<&'static str> =
-        kinds.iter().copied().filter_map(stored_type_name).collect();
-    if type_names.is_empty() {
-        return Ok(0);
-    }
-    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-        r#"SELECT "Id", "Name", "Type" FROM "BaseItems"
-           WHERE coalesce("PresentationUniqueKey", '') = ''
-             AND "Name" IS NOT NULL AND "Name" <> '' AND "Type" IN ("#,
-    );
-    let mut sep = qb.separated(", ");
-    for t in &type_names {
-        sep.push_bind(*t);
-    }
-    qb.push(")");
-    let rows: Vec<(String, String, String)> = qb
-        .build_query_as()
-        .fetch_all(db.pool())
-        .await
-        .map_err(db_err)?;
-
-    let mut pending: Vec<(String, String)> = Vec::new();
-    for (id, name, type_name) in &rows {
-        let Some((kind, uuid)) =
-            crate::item_type_lookup::kind_from_type_name(type_name).zip(Uuid::parse_str(id).ok())
-        else {
-            continue;
-        };
-        pending.push((
-            id.clone(),
-            crate::kinds::presentation_unique_key(kind, uuid, Some(name), None, None, None),
-        ));
-    }
-    if pending.is_empty() {
-        return Ok(0);
-    }
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
-    for (id, key) in &pending {
-        sqlx::query(
-            r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?2
-               WHERE "Id" = ?1 AND coalesce("PresentationUniqueKey", '') = ''"#,
-        )
-        .bind(id)
-        .bind(key)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-    }
-    tx.commit().await.map_err(db_err)?;
-    Ok(pending.len())
-}
-
 /// The library-side inputs of a series' presentation key — what C#
 /// `Series.CreatePresentationUniqueKey` reads off `LibraryManager` — resolved
 /// by [`series_key_scope`].
@@ -6354,8 +6423,7 @@ pub fn series_key_scope(
     let owning = ferrofin_model::entities_media::owning_library(folders, top_parent_id, path);
     let options = owning.and_then(|f| f.library_options.as_ref());
     let mut collection_folder_ids: Vec<Uuid> = path
-        .map(|path| ferrofin_model::entities_media::libraries_holding(folders, path))
-        .unwrap_or_default()
+        .map_or_default(|path| ferrofin_model::entities_media::libraries_holding(folders, path))
         .into_iter()
         .filter_map(folder_id)
         .collect();
@@ -6884,6 +6952,12 @@ pub(crate) const PRUNE_ORPHAN_ITEM_VALUES_SQL: &str = r#"DELETE FROM "ItemValues
    WHERE NOT EXISTS (SELECT 1 FROM "ItemValuesMap" AS m
                       WHERE m."ItemValueId" = "ItemValues"."ItemValueId")"#;
 
+/// The distinct persons credited on a deletion closure (`?1`, a JSON array
+/// of ids), each item's credits sought by its id; `EXPLAIN QUERY PLAN` pinned
+/// by `the_closure_credits_read_seeks_each_items_credits`.
+const CLOSURE_CREDITS_SQL: &str = r#"SELECT DISTINCT "PeopleId" FROM "PeopleBaseItemMap"
+   WHERE "ItemId" IN (SELECT value FROM json_each(?1))"#;
+
 /// The ids of the `item_type` rows never refreshed (`DateLastRefreshed`
 /// unset), in id order — `PeopleValidator`'s new person items.
 ///
@@ -7059,11 +7133,13 @@ async fn provider_id_sets(
 }
 
 /// Replaces `item_id`'s image rows with `images` inside `tx`, keeping
-/// identical rows (see [`ItemPersistenceService::save_item_images`]).
+/// identical rows and matching each by its path expanded ([`same_image_path`];
+/// see [`ItemPersistenceService::save_item_images`]).
 async fn write_item_images(
     tx: &mut sqlx::SqliteConnection,
     item_id: Uuid,
     images: &[ItemImageInfo],
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<(), ServiceError> {
     use ferrofin_db::entities::base_items::BaseItemImageInfoEntity;
     let item = guid_to_db(item_id);
@@ -7079,7 +7155,10 @@ async fn write_item_images(
     // so duplicate paths do not hide additions or removals.
     let mut changed = Vec::new();
     for image in images {
-        if let Some(index) = stored.iter().position(|row| image_row_matches(row, image)) {
+        if let Some(index) = stored
+            .iter()
+            .position(|row| image_row_matches(row, image, virtual_paths))
+        {
             stored.swap_remove(index);
         } else {
             changed.push(image);
@@ -7097,7 +7176,8 @@ async fn write_item_images(
         let id = stored
             .iter()
             .position(|row| {
-                row.image_type == image_type_to_disc(image.image_type) && row.path == image.path
+                row.image_type == image_type_to_disc(image.image_type)
+                    && same_image_path(row, image, virtual_paths)
             })
             .map_or_else(
                 || guid_to_db(Uuid::new_v4()),
@@ -7877,6 +7957,7 @@ mod tests {
 
     /// The inserts that bypass the upsert write the same values as it (gl-1580).
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn inserts_beside_the_upsert_store_the_mappers_defaults() {
         use crate::item_persistence_service::null_mapper_columns;
         let db = test_db().await;
@@ -7972,6 +8053,19 @@ mod tests {
                 "{writer}"
             );
         }
+        // The scan's genre has `CreateItemByName`'s `DateCreated` and, its path being a
+        // directory, no `DateModified`; its first refresh stamps the rest (gl-1586).
+        let row: ferrofin_db::entities::base_items::BaseItemEntity =
+            crate::test_support::fetch_item(&db, genre).await;
+        assert!(row.date_created.is_some(), "DateCreated");
+        assert_eq!(
+            (
+                row.date_modified,
+                row.date_last_saved,
+                row.date_last_refreshed
+            ),
+            (None, None, None)
+        );
     }
 
     /// A row Ferrofin wrote before the defaults (NULL) and one that holds them compare as the
@@ -8811,17 +8905,31 @@ mod tests {
     // Saving an item must stamp the derived `CleanName` (C# `SaveItem` computes
     // `GetCleanValue(item.Name)` at write time). No scan path pre-computes it,
     // and the `searchTerm` filter queries `CleanName` — a NULL there makes the
-    // item invisible to search (the web search page returned nothing).
+    // item invisible to search (the web search page returned nothing). The
+    // titles after `Amélie` are upstream `SearchPunctuationTests.cs` (PR
+    // 14879), which saves a `Series` through `BaseItemRepository.Map`.
+    #[rstest::rstest]
+    #[case("Amélie", "amelie")]
+    #[case("Mr. Robot", "mr robot")]
+    #[case("Spider-Man: Homecoming", "spider man homecoming")]
+    #[case("Beyoncé — Live!", "beyonce live")]
+    #[case("Hello, World!", "hello world")]
+    #[case("(The) Good, the Bad & the Ugly", "the good the bad the ugly")]
+    #[case("Wall-E", "wall e")]
+    #[case("No. 1: The Beginning", "no 1 the beginning")]
+    #[case("Café-au-lait", "cafe au lait")]
+    #[case("Face/Off", "face off")]
+    #[case("V/H/S", "v h s")]
     #[tokio::test]
-    async fn save_items_stamps_derived_clean_name() {
+    async fn save_items_stamps_derived_clean_name(#[case] name: &str, #[case] expected: &str) {
         let db = test_db().await;
         let id = Uuid::new_v4();
         let svc = FerrofinItemPersistenceService::new(db.clone());
 
         let item = ferrofin_db::entities::base_items::BaseItemEntity {
             id: ferrofin_db::store::guid_to_db(id),
-            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
-            name: Some("Amélie".to_owned()),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".to_owned(),
+            name: Some(name.to_owned()),
             ..ferrofin_db::entities::base_items::BaseItemEntity::default()
         };
         svc.save_items(std::slice::from_ref(&item))
@@ -8834,7 +8942,7 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .expect("query");
-        assert_eq!(clean.as_deref(), Some("amelie"));
+        assert_eq!(clean.as_deref(), Some(expected));
     }
 
     /// gl-1581: the scan's path reads — the by-path lookup (`FindByPath`),
@@ -9022,6 +9130,80 @@ mod tests {
         assert_eq!(stored_path(adopted.id.clone()).await, adopted.path);
     }
 
+    /// The scan's image reads expand an adopted row's `%MetadataPath%` image
+    /// path, as every other read does (`BaseItemMapper.MapImageFromEntity`'s
+    /// `ExpandVirtualPath`), so change detection compares the path the scan
+    /// finds with the one the row names.
+    #[tokio::test]
+    async fn the_scan_image_reads_expand_an_adopted_image_path() {
+        let db = test_db().await;
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc = FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths)),
+        );
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        super::seed_primary_image(
+            &db,
+            Uuid::new_v4(),
+            item,
+            "%MetadataPath%/library/ab/poster.jpg",
+        )
+        .await;
+        let expanded = format!("{metadata}/library/ab/poster.jpg");
+
+        let links = svc
+            .scan_stored_links(&[item])
+            .await
+            .expect("read")
+            .expect("supported");
+        assert_eq!(links[&item].images[0].path, expanded);
+        let stored = svc.image_metadata_for_items(&[item]).await.expect("read");
+        assert_eq!(stored[0].path, expanded);
+    }
+
+    /// A save that names an adopted row's file by its expanded path, as every
+    /// read hands it out, updates that row in place: its id, and so its place
+    /// among the item's backdrops, and its `%MetadataPath%` form are kept.
+    #[tokio::test]
+    async fn an_image_save_updates_an_adopted_row_in_place() {
+        let db = test_db().await;
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc = FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths)),
+        );
+        let (item, row) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let token = "%MetadataPath%/library/ab/poster.jpg";
+        super::seed_primary_image(&db, row, item, token).await;
+
+        let remeasured = ferrofin_traits::options::ItemImageInfo {
+            path: format!("{metadata}/library/ab/poster.jpg"),
+            image_type: ferrofin_model::entities::ImageType::Primary,
+            date_modified: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("date"),
+            width: 10,
+            height: 20,
+            blur_hash: Some("hash".to_owned()),
+        };
+        svc.save_item_images(item, std::slice::from_ref(&remeasured))
+            .await
+            .expect("save");
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            r#"SELECT "Id", "Path", "Width" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .expect("rows");
+        assert_eq!(rows, vec![(guid_to_db(row), token.to_owned(), 10)]);
+    }
+
     /// Saves `entity` and returns the `SortName` the write path persisted.
     async fn persisted_sort_name(
         db: &ferrofin_db::Database,
@@ -9127,92 +9309,6 @@ mod tests {
 
         assert_eq!(
             super::backfill_missing_sort_names(&db)
-                .await
-                .expect("second run"),
-            0,
-            "the pass is a no-op once repaired"
-        );
-    }
-
-    /// The by-name key backfill: an unkeyed scanner-created row gets the key
-    /// upstream's next metadata refresh would give it, an already-keyed row is
-    /// left byte-identical, and a kind whose key is not name-derived is not
-    /// touched at all.
-    ///
-    /// This is the half the batch's first cut was missing: writing the key in
-    /// the `music_genre_row` insert's `WHERE NOT EXISTS` is INERT on every
-    /// database that already holds the row, and the campaign's own lab proved
-    /// it — `MusicGenre|Ambient`/`Jazz`/`Rock` still read back NULL after the
-    /// "fix" shipped.
-    #[tokio::test]
-    async fn backfill_missing_presentation_keys_repairs_only_unkeyed_by_name_rows() {
-        async fn key(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
-            sqlx::query_scalar(r#"SELECT "PresentationUniqueKey" FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(ferrofin_db::store::guid_to_db(id))
-                .fetch_one(db.pool())
-                .await
-                .expect("query")
-        }
-        let db = test_db().await;
-        let unkeyed = Uuid::from_u128(0xB201);
-        let keyed = Uuid::from_u128(0xB202);
-        let artist = Uuid::from_u128(0xB203);
-        let movie = Uuid::from_u128(0xB204);
-        crate::test_support::seed_named_item(&db, unkeyed, BaseItemKind::MusicGenre, "Ambient")
-            .await;
-        crate::test_support::seed_named_item(&db, keyed, BaseItemKind::Genre, "Action").await;
-        crate::test_support::seed_named_item(&db, artist, BaseItemKind::MusicArtist, "Bjork").await;
-        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Heat").await;
-        // The unkeyed shapes are BOTH real: Ferrofin's inserts left NULL, and
-        // Jellyfin's lazily-created rows can carry ''.
-        sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#)
-            .bind(ferrofin_db::store::guid_to_db(unkeyed))
-            .execute(db.writer())
-            .await
-            .expect("null key");
-        sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = '' WHERE "Id" = ?1"#)
-            .bind(ferrofin_db::store::guid_to_db(artist))
-            .execute(db.writer())
-            .await
-            .expect("empty key");
-        sqlx::query(
-            r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = 'Genre-Action' WHERE "Id" = ?1"#,
-        )
-        .bind(ferrofin_db::store::guid_to_db(keyed))
-        .execute(db.writer())
-        .await
-        .expect("already keyed");
-        sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = NULL WHERE "Id" = ?1"#)
-            .bind(ferrofin_db::store::guid_to_db(movie))
-            .execute(db.writer())
-            .await
-            .expect("null movie key");
-
-        assert_eq!(
-            super::backfill_missing_presentation_keys(&db)
-                .await
-                .expect("backfill"),
-            2,
-            "only the two unkeyed BY-NAME rows"
-        );
-        assert_eq!(
-            key(&db, unkeyed).await.as_deref(),
-            Some("MusicGenre-Ambient")
-        );
-        // `MusicArtist` is spelled `Artist-` in the key (MusicArtist.cs:152).
-        assert_eq!(key(&db, artist).await.as_deref(), Some("Artist-Bjork"));
-        assert_eq!(
-            key(&db, keyed).await.as_deref(),
-            Some("Genre-Action"),
-            "an adopted, refreshed Jellyfin row comes through byte-identical"
-        );
-        assert_eq!(
-            key(&db, movie).await,
-            None,
-            "a Movie's key is derived from its id/primary version, not its name — not this pass's"
-        );
-        assert_eq!(
-            super::backfill_missing_presentation_keys(&db)
                 .await
                 .expect("second run"),
             0,
@@ -9460,8 +9556,9 @@ mod tests {
     }
 
     // Saving a movie's genre/studio values must also materialize the browsable
-    // by-name BaseItems row (sharing the ItemValueId as its id) so the
-    // Genres/Studios tabs list it and a `GenreIds=<id>` filter resolves.
+    // by-name BaseItems row (with no identity wired, sharing the ItemValueId
+    // as its id) so the Genres/Studios tabs list it and a `GenreIds=<id>`
+    // filter resolves.
     #[tokio::test]
     async fn save_item_values_materializes_by_name_items() {
         let db = test_db().await;
@@ -9820,6 +9917,107 @@ mod tests {
             assert_eq!(value, expected);
             assert_eq!(row_id.as_ref(), Some(value_id), "{value}: its by-name row");
         }
+    }
+
+    /// The id of the by-name row of `type_suffix` named `name`.
+    async fn by_name_row_id(
+        db: &ferrofin_db::Database,
+        type_suffix: &str,
+        name: &str,
+    ) -> Option<String> {
+        sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Type" LIKE '%.' || ?1 AND "Name" = ?2"#,
+        )
+        .bind(type_suffix)
+        .bind(name)
+        .fetch_optional(db.pool())
+        .await
+        .expect("row")
+    }
+
+    /// gl-1597: with the identity wired, a scanned genre, studio and music
+    /// genre take the ids Jellyfin derives from their paths, not the shared
+    /// `ItemValues` id or one derived from the bare name; the on-demand
+    /// creator mints the same, so a later scan finds its row.
+    #[tokio::test]
+    async fn by_name_rows_take_the_ids_jellyfin_derives() {
+        let db = test_db().await;
+        let (movie, song) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        seed_item(&db, song, BaseItemKind::Audio).await;
+        let identity = crate::test_support::by_name_identity();
+        let svc = FerrofinItemPersistenceService::new(db.clone())
+            .with_by_name_identity(Some(identity.clone()));
+        svc.save_item_values(
+            movie,
+            &[(2, "Adventure".to_owned()), (3, "Pixar".to_owned())],
+        )
+        .await
+        .expect("movie values");
+        svc.save_item_values(song, &[(2, "Ambient".to_owned())])
+            .await
+            .expect("song values");
+        let derived = |kind, name| identity.id(kind, name).map(guid_to_db);
+        assert_eq!(
+            by_name_row_id(&db, "Genre", "Adventure").await,
+            Some("51CEC964-5B89-6084-D12B-259ACD05CCB1".to_owned())
+        );
+        // Jellyfin 12.4's ids for the same names.
+        assert_eq!(
+            by_name_row_id(&db, "Studio", "Pixar").await.as_deref(),
+            Some("A1384420-050B-89EA-581E-04C0DD9A83A8")
+        );
+        assert_eq!(
+            by_name_row_id(&db, "MusicGenre", "Ambient")
+                .await
+                .as_deref(),
+            Some("7566EE57-563D-F93E-E76C-CE4F2C4349A7")
+        );
+        let created = svc
+            .ensure_by_name_item(
+                BaseItemKind::Genre,
+                "Comedy",
+                "/config/metadata/Genre/Comedy",
+            )
+            .await
+            .expect("ensure")
+            .map(guid_to_db);
+        assert_eq!(created, derived(BaseItemKind::Genre, "Comedy"));
+        svc.save_item_values(movie, &[(2, "Comedy".to_owned())])
+            .await
+            .expect("rescan");
+        let rows: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE '%.Genre' AND "Name" = 'Comedy'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(rows, 1, "the scan converges on the row the lookup created");
+    }
+
+    /// gl-1597: a by-name row whose derived id is already stored under another
+    /// clean name (one an older version spelled differently) leaves the
+    /// insert alone instead of failing the whole save on the primary key.
+    #[tokio::test]
+    async fn a_by_name_insert_skips_an_id_already_stored() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let identity = crate::test_support::by_name_identity();
+        let taken = identity
+            .id(BaseItemKind::Genre, "Adventure")
+            .expect("derived");
+        crate::test_support::seed_named_item(&db, taken, BaseItemKind::Genre, "Other").await;
+        let svc =
+            FerrofinItemPersistenceService::new(db.clone()).with_by_name_identity(Some(identity));
+        svc.save_item_values(movie, &[(2, "Adventure".to_owned())])
+            .await
+            .expect("the save goes through");
+        assert_eq!(by_name_row_id(&db, "Genre", "Adventure").await, None);
+        assert_eq!(
+            by_name_row_id(&db, "Genre", "Other").await,
+            Some(guid_to_db(taken))
+        );
     }
 
     /// The value-id read seeks `IX_ItemValues_Type_Value` for its pairs, and
@@ -12739,6 +12937,76 @@ mod tests {
         assert_eq!(left, 0);
     }
 
+    /// `ItemPersistencePeopleCleanupTests.DeleteItem_RemovesUnusedPeopleForItemsDescendantsAndExtras`
+    /// (v12.4): the person rows only the closure credited (the item, its child
+    /// and the child's extra) go with it. A person another item still credits
+    /// stays, and so does an unrelated one with no credit, which only the
+    /// "Refresh People" task sweeps.
+    #[tokio::test]
+    async fn delete_items_removes_the_person_rows_only_the_closure_credited() {
+        use crate::people_repository::{seed_credit, seed_people_row};
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+        let (parent, child, extra, survivor, shared, orphan) =
+            (ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
+        seed_item(&db, parent, BaseItemKind::Folder).await;
+        for (id, parent_id, owner) in [
+            (child, Some(parent), None),
+            (extra, None, Some(child)),
+            (survivor, None, None),
+        ] {
+            seed_item(&db, id, BaseItemKind::Book).await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.parent_id = parent_id.map(guid_to_db);
+            row.owner_id = owner.map(guid_to_db);
+            crate::test_support::save_item(&db, &row).await;
+        }
+        for (item, name) in [
+            (parent, "Parent credit"),
+            (child, "Child credit"),
+            (extra, "Extra credit"),
+        ] {
+            seed_credit(&db, item, Uuid::new_v4(), name).await;
+        }
+        seed_credit(&db, child, shared, "Shared person").await;
+        sqlx::query(
+            r#"INSERT INTO "PeopleBaseItemMap" ("ItemId", "PeopleId", "Role") VALUES (?1, ?2, '')"#,
+        )
+        .bind(guid_to_db(survivor))
+        .bind(guid_to_db(shared))
+        .execute(db.writer())
+        .await
+        .expect("shared credit");
+        seed_people_row(&db, orphan, "Unrelated orphan", "Actor").await;
+
+        svc.delete_items(&[parent]).await.expect("delete");
+
+        let items: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN (?1, ?2, ?3, ?4)"#)
+                .bind(guid_to_db(parent))
+                .bind(guid_to_db(child))
+                .bind(guid_to_db(extra))
+                .bind(guid_to_db(survivor))
+                .fetch_all(db.pool())
+                .await
+                .expect("items");
+        assert_eq!(items, [guid_to_db(survivor)]);
+        let maps: Vec<String> = sqlx::query_scalar(r#"SELECT "ItemId" FROM "PeopleBaseItemMap""#)
+            .fetch_all(db.pool())
+            .await
+            .expect("maps");
+        assert_eq!(maps, [guid_to_db(survivor)]);
+        let mut people: Vec<String> = sqlx::query_scalar(r#"SELECT "Id" FROM "Peoples""#)
+            .fetch_all(db.pool())
+            .await
+            .expect("people");
+        people.sort();
+        let mut expected = vec![guid_to_db(shared), guid_to_db(orphan)];
+        expected.sort();
+        assert_eq!(people, expected);
+    }
+
     /// The rating-level repair (Jellyfin `MigrateRatingLevels`):
     /// every row's inherited rating columns are recomputed from its OWN
     /// `OfficialRating` through `GetRatingScore` — a bare age, a US table
@@ -13729,6 +13997,23 @@ mod tests {
         assert!(
             !plan.iter().any(|s| s.starts_with("SCAN m")),
             "never a scan of the maps, got: {plan:?}"
+        );
+    }
+
+    /// The credits read before a deletion seeks each closure item's credit
+    /// rows by `ItemId`, never a scan of every credit in the library.
+    #[tokio::test]
+    async fn the_closure_credits_read_seeks_each_items_credits() {
+        let db = test_db().await;
+        let plan = query_plan(&db, super::CLOSURE_CREDITS_SQL, 1).await;
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH PeopleBaseItemMap") && s.contains("(ItemId=?)")),
+            "the credits sought by ItemId, got: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|s| s.starts_with("SCAN PeopleBaseItemMap")),
+            "never a scan of the credits, got: {plan:?}"
         );
     }
 

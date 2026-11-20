@@ -47,11 +47,18 @@
 //!   `413` the condition is, never the binder's 400 claiming the body is
 //!   required.
 //!
-//! What is deliberately NOT reproduced is the `errors` dictionary's contents:
-//! its keys and messages carry .NET type names (`Jellyfin.Data.Enums.ItemSortBy`)
-//! and its `traceId` is a per-request ASP.NET activity id. The status, the
-//! content type and the document's shape are the contract; the diagnostic text
-//! is Ferrofin's own, and no parity probe compares it.
+//! * **The body parameter is named.** Beside the complaint, ASP.NET files an
+//!   entry under the action's C# `[FromBody]` parameter name
+//!   (`"forgotPasswordRequest": ["The forgotPasswordRequest field is
+//!   required."]`), and none for a nullable one. The names come from the
+//!   generated per-route table `query/body.json`, looked up by the matched
+//!   route.
+//!
+//! What is deliberately NOT reproduced is the complaint's text, which carries
+//! .NET type names (`Jellyfin.Data.Enums.ItemSortBy`), and the document's
+//! `traceId`, a per-request ASP.NET activity id. The status, the content type,
+//! the document's shape and the parameter's entry are the contract; the
+//! complaint is Ferrofin's own diagnostic.
 
 pub use crate::query::{Query, QueryParameters, QueryRejection};
 
@@ -61,10 +68,11 @@ use std::marker::PhantomData;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{
-    DefaultBodyLimit, FromRequest, FromRequestParts, OptionalFromRequest, RawPathParams, Request,
+    DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, OptionalFromRequest,
+    RawPathParams, Request,
 };
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -100,9 +108,6 @@ const PAYLOAD_TOO_LARGE_TYPE: &str = "https://tools.ietf.org/html/rfc9110#sectio
 /// The `title` of a validation failure, verbatim from ASP.NET.
 const VALIDATION_TITLE: &str = "One or more validation errors occurred.";
 
-/// ASP.NET always names the bound parameter alongside the specific complaint;
-/// every measured rejection carried this entry.
-const BODY_REQUIRED: &str = "The body field is required.";
 /// The message ASP.NET uses for an absent (or JSON `null`) body.
 const NON_EMPTY_REQUIRED: &str = "A non-empty request body is required.";
 
@@ -152,23 +157,16 @@ impl ProblemDetails {
 
     /// A 400 naming one failing member: `key` is the `errors` dictionary key
     /// (`""` for the body as a whole, `$…` for a JSON path) and `message` the
-    /// complaint.
+    /// complaint. The body extractors add the parameter's own entry
+    /// (`naming`).
     #[must_use]
     pub fn validation(key: &str, message: impl Into<String>) -> Self {
-        let mut errors = BTreeMap::new();
-        errors.insert(key.to_owned(), vec![message.into()]);
-        errors.insert("body".to_owned(), vec![BODY_REQUIRED.to_owned()]);
-        Self {
-            type_: VALIDATION_TYPE,
-            title: VALIDATION_TITLE,
-            status: StatusCode::BAD_REQUEST.as_u16(),
-            errors: Some(errors),
-        }
+        Self::member_validation(key, message)
     }
 
     /// A 400 naming one member of a body that bound but failed a validation
     /// attribute (`[StringLength]`, …): ASP.NET keys it by the member name
-    /// alone, with no `body` entry, because the parameter itself bound.
+    /// alone, with no parameter entry, because the parameter itself bound.
     #[must_use]
     pub fn member_validation(member: &str, message: impl Into<String>) -> Self {
         let mut errors = BTreeMap::new();
@@ -215,11 +213,43 @@ impl ProblemDetails {
         )
     }
 
-    /// The rejection for an absent, blank or `null` body.
+    /// The rejection for an absent, empty or `null` body.
     #[must_use]
     fn empty_body() -> Self {
         Self::validation("", NON_EMPTY_REQUIRED)
     }
+
+    /// Adds the entry ASP.NET files under the body parameter that did not
+    /// bind ([`body_parameter`]): nothing on a 413 or a 415, which carry no
+    /// `errors`, or when the route names no parameter.
+    #[must_use]
+    fn naming(mut self, parameter: Option<(&str, &str)>) -> Self {
+        if let (Some(errors), Some((name, message))) = (self.errors.as_mut(), parameter) {
+            errors.insert(name.to_owned(), vec![message.to_owned()]);
+        }
+        self
+    }
+}
+
+/// The `(key, message)` ASP.NET files under the action's `[FromBody]`
+/// parameter when its body fails to bind, from the request's method and matched
+/// route: `("forgotPasswordRequest", "The forgotPasswordRequest field is
+/// required.")`. `None` when ASP.NET files no entry, and for a route neither
+/// Jellyfin nor a ported plugin serves, rather than a name it does not have.
+pub(crate) fn body_parameter(
+    method: &Method,
+    route: Option<&MatchedPath>,
+) -> Option<(&'static str, &'static str)> {
+    crate::query::body_parameter(method, route?.as_str())
+}
+
+/// The request's method and matched route, kept so a rejection can look up
+/// its [`body_parameter`] without a lookup on every request that binds.
+fn route_of(req: &Request) -> (Method, Option<MatchedPath>) {
+    (
+        req.method().clone(),
+        req.extensions().get::<MatchedPath>().cloned(),
+    )
 }
 
 /// A C# `[Required] public required string` body member as bound, before the
@@ -243,15 +273,25 @@ impl<'de> serde::Deserialize<'de> for RequiredString {
 
 impl RequiredString {
     /// The value as sent, untrimmed, or the 400 ASP.NET answers instead.
-    /// `type_name` is the DTO's full C# name and `member` the member's.
+    /// `type_name` is the DTO's full C# name, `member` the member's, and
+    /// `parameter` yields the request's [`body_parameter`], asked only when
+    /// the member was left out.
     ///
     /// - Left out: System.Text.Json refuses the body
-    ///   ([`ProblemDetails::missing_required_member`]).
+    ///   ([`ProblemDetails::missing_required_member`]), so the parameter is
+    ///   named too.
     /// - `null`, empty or whitespace (`string.IsNullOrWhiteSpace`): `[Required]`
     ///   refuses it, keyed by the member alone.
-    pub(crate) fn require(self, type_name: &str, member: &str) -> Result<String, ProblemDetails> {
+    pub(crate) fn require(
+        self,
+        type_name: &str,
+        member: &str,
+        parameter: impl FnOnce() -> Option<(&'static str, &'static str)>,
+    ) -> Result<String, ProblemDetails> {
         match self {
-            Self::Missing => Err(ProblemDetails::missing_required_member(type_name, member)),
+            Self::Missing => {
+                Err(ProblemDetails::missing_required_member(type_name, member).naming(parameter()))
+            }
             Self::Sent(value) => value
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
@@ -329,15 +369,17 @@ impl TopLevel {
 }
 
 /// Parses `bytes` into a [`Doc`], or `None` when the body says "nothing was
-/// supplied" — blank, or the literal `null`.
+/// supplied" — empty, or the literal `null`.
 ///
 /// Measured against 10.11.8: an optional body (`[FromBody] X? dto`) binds all
 /// three of an absent body, an empty body and `null` to null and serves the
 /// request 200; a REQUIRED one answers all three
 /// "A non-empty request body is required.". So the two cases differ only in
-/// what they do with this `None`.
+/// what they do with this `None`. A blank body is not empty: the formatter
+/// reads it and System.Text.Json refuses it, keyed `$`, on either kind
+/// (measured on Jellyfin 12.4.0).
 fn parse_doc(bytes: &[u8]) -> Result<Option<Doc>, ProblemDetails> {
-    if bytes.iter().all(u8::is_ascii_whitespace) {
+    if bytes.is_empty() {
         return Ok(None);
     }
     let doc: Doc = serde_json::from_slice(bytes)
@@ -383,7 +425,7 @@ fn bind<T: DeserializeOwned>(bytes: &[u8], want: TopLevel) -> Result<T, ProblemD
 /// number spelling. Named-configuration handlers bind its raw text separately
 /// with JsonDefaults options after resolving the configuration's type.
 fn bind_document<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ProblemDetails> {
-    if bytes.iter().all(u8::is_ascii_whitespace) {
+    if bytes.is_empty() {
         return Err(ProblemDetails::empty_body());
     }
     let raw: &serde_json::value::RawValue = serde_json::from_slice(bytes)
@@ -472,7 +514,12 @@ where
     type Rejection = ProblemDetails;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        bind(&read_required(req, state).await?, TopLevel::Object).map(Self)
+        let (method, route) = route_of(&req);
+        read_required(req, state)
+            .await
+            .and_then(|bytes| bind(&bytes, TopLevel::Object))
+            .map(Self)
+            .map_err(|problem| problem.naming(body_parameter(&method, route.as_ref())))
     }
 }
 
@@ -503,6 +550,11 @@ where
     /// is what axum's `Option<Json<T>>` did with a missing content type only,
     /// while a malformed one became a 422; neither matched.
     ///
+    /// A blank body is present too. Measured on Jellyfin 12.4.0, `"   "` is a
+    /// 400 keyed `$` with a JSON content type (`PlaybackInfo`,
+    /// `POST /Playlists`, `POST /Library/VirtualFolders`), and a 415 with
+    /// `text/plain` (`POST /Playlists`).
+    ///
     /// "A member the DTO cannot take" is the extractor's half of the rule and
     /// is only as strict as the DTO: this binder refuses what `T`'s
     /// `Deserialize` refuses, so a field whose own deserializer is lenient
@@ -510,16 +562,24 @@ where
     /// fields used to swallow `{"MaxStreamingBitrate":"nope"}` into `None`
     /// (Ferrofin 200 / Jellyfin 400) until `handlers::item_update::opt_i32` was
     /// made to fail the way `Deserialize<int>` throws.
+    ///
+    /// A route whose upstream parameter is `[Required]` with
+    /// `EmptyBodyBehavior.Allow` still names it when a body fails to bind.
     async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
-        let (json_content_type, bytes) = read_optional(req, state).await?;
-        if bytes.iter().all(u8::is_ascii_whitespace) {
+        let (method, route) = route_of(&req);
+        let name =
+            |problem: ProblemDetails| problem.naming(body_parameter(&method, route.as_ref()));
+        let (json_content_type, bytes) = read_optional(req, state).await.map_err(name)?;
+        if bytes.is_empty() {
             return Ok(None);
         }
         if !json_content_type {
             return Err(ProblemDetails::unsupported_media_type());
         }
-        match parse_doc(&bytes)? {
-            Some(doc) => bind_doc(doc, TopLevel::Object).map(|v| Some(Self(v))),
+        match parse_doc(&bytes).map_err(name)? {
+            Some(doc) => bind_doc(doc, TopLevel::Object)
+                .map(|v| Some(Self(v)))
+                .map_err(name),
             None => Ok(None),
         }
     }
@@ -542,7 +602,12 @@ where
     type Rejection = ProblemDetails;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        bind(&read_required(req, state).await?, TopLevel::Array).map(Self)
+        let (method, route) = route_of(&req);
+        read_required(req, state)
+            .await
+            .and_then(|bytes| bind(&bytes, TopLevel::Array))
+            .map(Self)
+            .map_err(|problem| problem.naming(body_parameter(&method, route.as_ref())))
     }
 }
 
@@ -566,7 +631,12 @@ where
     type Rejection = ProblemDetails;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        bind_document(&read_required(req, state).await?).map(Self)
+        let (method, route) = route_of(&req);
+        read_required(req, state)
+            .await
+            .and_then(|bytes| bind_document(&bytes))
+            .map(Self)
+            .map_err(|problem| problem.naming(body_parameter(&method, route.as_ref())))
     }
 }
 
@@ -574,9 +644,14 @@ where
 /// [`RequiredRouteString`]. Each such parameter gets a marker type that
 /// implements this.
 pub trait RouteParameter {
-    /// The parameter's name in the route template (`{lyricId}` is
-    /// `"lyricId"`), which is also the key ASP.NET files its error under.
+    /// The parameter's name in Jellyfin's route template (`{lyricId}` is
+    /// `"lyricId"`), which is the key ASP.NET files its error under.
     const NAME: &'static str;
+    /// The name Ferrofin's route template gives the segment. The router names
+    /// every parameter at one position after the first name the contract uses
+    /// there ([`routes::normalize_contract_path`](crate::routes::normalize_contract_path)),
+    /// so `/Artists/{name}` is registered as `/Artists/{itemId}`.
+    const ROUTE_NAME: &'static str = Self::NAME;
 }
 
 /// A `[FromRoute, Required] string` route parameter, bound the way ASP.NET
@@ -606,25 +681,126 @@ where
         let params = RawPathParams::from_request_parts(parts, state)
             .await
             .map_err(IntoResponse::into_response)?;
-        let Some((_, value)) = params.iter().find(|(name, _)| *name == P::NAME) else {
+        let Some((_, value)) = params.iter().find(|(name, _)| *name == P::ROUTE_NAME) else {
             // The handler names a parameter its route does not have. That is
             // a bug in the route table, not a bad request.
-            tracing::error!(parameter = P::NAME, "route has no such parameter");
+            tracing::error!(parameter = P::ROUTE_NAME, "route has no such parameter");
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Extension(crate::error::FailureLogged),
             )
                 .into_response());
         };
-        if value.trim().is_empty() {
-            return Err(ProblemDetails::member_validation(
-                P::NAME,
-                format!("The {} field is required.", P::NAME),
-            )
-            .into_response());
+        if let Some(rejection) = blank_route_values([(P::NAME, value)]) {
+            return Err(rejection);
         }
         Ok(Self(value.to_owned(), PhantomData))
     }
+}
+
+/// [`RequiredRouteString`]'s rule for route values a handler reads itself:
+/// a part of one captured segment (`Stream.{routeFormat}`,
+/// `{segmentId}.{segmentContainer}`), or a value taken by position because the
+/// route repeats a parameter name. The `400` names every blank
+/// `(name, value)`, as the model-state filter reports every failing parameter
+/// in one body; `None` when each value has text. Values bound by different
+/// extractors still answer first-wins (gl-1672).
+pub(crate) fn blank_route_values<'a>(
+    values: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Option<Response> {
+    validation_failure(
+        values
+            .into_iter()
+            .filter_map(|(name, value)| blank_complaint(name, value)),
+    )
+}
+
+/// `[Required]`'s `(name, complaint)` about a blank route value, for a
+/// handler that files it beside other complaints; `None` when it has text.
+pub(crate) fn blank_complaint(name: &str, value: &str) -> Option<(String, String)> {
+    value
+        .trim()
+        .is_empty()
+        .then(|| (name.to_owned(), format!("The {name} field is required.")))
+}
+
+/// The model-state `400` naming every `(name, complaint)` in one body, as the
+/// filter reports every failing parameter; `None` when there are none.
+pub(crate) fn validation_failure(
+    complaints: impl IntoIterator<Item = (String, String)>,
+) -> Option<Response> {
+    ProblemDetails::members_validation(complaints).map(IntoResponse::into_response)
+}
+
+/// A `[RegularExpression]` pattern the stream routes bind a parameter with.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StreamPattern {
+    /// `EncodingHelper.ContainerValidationRegexStr`, on the containers and codecs.
+    Container,
+    /// `EncodingHelper.LevelValidationRegexStr`, on `level`.
+    Level,
+}
+
+impl StreamPattern {
+    /// The pattern, verbatim as upstream declares it and ASP.NET quotes it.
+    const fn regex(self) -> &'static str {
+        match self {
+            Self::Container => r"^[a-zA-Z0-9\-\._,|]{0,40}$",
+            Self::Level => r"-?[0-9]+(?:\.[0-9]+)?",
+        }
+    }
+
+    /// Whether the pattern matches all of `value`: `RegularExpressionAttribute`
+    /// takes only a match that starts at 0 and spans the whole value, so the
+    /// unanchored level pattern is anchored too.
+    fn matches(self, value: &str) -> bool {
+        match self {
+            Self::Container => ferrofin_model::media_info::is_valid_stream_identifier(value),
+            Self::Level => {
+                let digits =
+                    |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+                let unsigned = value.strip_prefix('-').unwrap_or(value);
+                match unsigned.split_once('.') {
+                    Some((whole, fraction)) => digits(whole) && digits(fraction),
+                    None => digits(unsigned),
+                }
+            }
+        }
+    }
+}
+
+/// The `(name, complaint)` the model-state filter files, after authorization
+/// and before the action, about a parameter bound with a `[RegularExpression]`
+/// ([`StreamPattern`]) whose value fails it, keyed by the parameter's declared
+/// name whatever case the query spelled it in ([`validation_failure`] answers
+/// with them). An absent or empty value passes, as the attribute passes one,
+/// and so does a blank query value, which the binder made `null`.
+pub(crate) fn pattern_complaint(
+    name: &str,
+    value: Option<&str>,
+    pattern: StreamPattern,
+) -> Option<(String, String)> {
+    value
+        .filter(|value| !value.is_empty() && !pattern.matches(value))
+        .map(|_| {
+            (
+                name.to_owned(),
+                format!(
+                    "The field {name} must match the regular expression '{}'.",
+                    pattern.regex()
+                ),
+            )
+        })
+}
+
+/// The complaint about a `[FromRoute, Required][RegularExpression(
+/// ContainerValidationRegexStr)] string container` (`stream.{container}`,
+/// `{segmentId}.{container}`): a blank one is [`blank_complaint`]'s alone, as
+/// the binder reads it as `null` and the pattern passes a `null`, and one
+/// outside the pattern is [`pattern_complaint`]'s; `None` when it binds.
+pub(crate) fn route_container_complaint(container: &str) -> Option<(String, String)> {
+    blank_complaint("container", container)
+        .or_else(|| pattern_complaint("container", Some(container), StreamPattern::Container))
 }
 
 /// A route or query `Guid`, bound the way ASP.NET binds one. Extract it as
@@ -751,9 +927,9 @@ mod tests {
 
     #[test]
     fn an_optional_body_is_absent_for_nothing_and_still_strict_for_something() {
-        // Measured on Jellyfin 10.11.8, POST /Items/{id}/PlaybackInfo: all three
-        // of these are served 200 with a null DTO.
-        for body in [b"".as_slice(), b"   ", b"null"] {
+        // Measured on Jellyfin 10.11.8, POST /Items/{id}/PlaybackInfo: both of
+        // these are served 200 with a null DTO.
+        for body in [b"".as_slice(), b"null"] {
             assert!(
                 parse_doc(body).expect("not a syntax error").is_none(),
                 "an optional body treats {body:?} as absent"
@@ -766,13 +942,33 @@ mod tests {
 
     #[test]
     fn an_empty_or_null_body_is_the_non_empty_complaint() {
-        for body in [b"".as_slice(), b"   ", b"null"] {
+        for body in [b"".as_slice(), b"null"] {
             let rejected = bind::<Dto>(body, TopLevel::Object).expect_err("rejected");
             assert_eq!(rejected.status, 400);
             assert_eq!(
                 rejected.errors.as_ref().and_then(|e| e.get("")),
                 Some(&vec![NON_EMPTY_REQUIRED.to_owned()])
             );
+        }
+    }
+
+    /// A blank body is read, and has no JSON token: System.Text.Json's
+    /// syntax error, keyed `$`, on a required and an optional body alike
+    /// (measured on Jellyfin 12.4.0).
+    #[test]
+    fn a_blank_body_is_a_syntax_error_not_an_absent_body() {
+        for body in [b"   ".as_slice(), b"\n", b"\t \r\n"] {
+            for rejected in [
+                parse_doc(body).expect_err("blank is no JSON"),
+                bind::<Dto>(body, TopLevel::Object).expect_err("blank is no JSON"),
+                bind_document::<serde_json::Value>(body).expect_err("blank is no JSON"),
+            ] {
+                assert!(
+                    rejected.errors.as_ref().is_some_and(|e| e.keys().eq(["$"])),
+                    "{body:?}: {:?}",
+                    rejected.errors
+                );
+            }
         }
     }
 
@@ -787,13 +983,6 @@ mod tests {
                 .is_some_and(|e| e.keys().any(|k| k.starts_with("$.Names"))),
             "the failing member is keyed by its path, not by the DTO's type name: {:?}",
             rejected.errors
-        );
-        // Every ASP.NET rejection also names the bound parameter.
-        assert!(
-            rejected
-                .errors
-                .as_ref()
-                .is_some_and(|e| e.contains_key("body"))
         );
     }
 
@@ -924,6 +1113,42 @@ mod tests {
                 "errors": { "name": ["The name field is required."] },
             })
         );
+    }
+
+    /// Each value as stock Jellyfin 12.4 judged it on `master.m3u8` (`true`:
+    /// the action ran; `false`: the pattern's `400`).
+    #[rstest::rstest]
+    #[case::level_decimal(StreamPattern::Level, "4.1", true)]
+    #[case::level_negative(StreamPattern::Level, "-41", true)]
+    #[case::level_word(StreamPattern::Level, "abc", false)]
+    #[case::level_exponent(StreamPattern::Level, "1e1", false)]
+    #[case::level_leading_space(StreamPattern::Level, " 41", false)]
+    #[case::level_trailing_dot(StreamPattern::Level, "41.", false)]
+    #[case::level_two_dots(StreamPattern::Level, "4.1.2", false)]
+    #[case::level_line_break(StreamPattern::Level, "41\n", false)]
+    #[case::container_forty(StreamPattern::Container, &"a".repeat(40), true)]
+    #[case::container_forty_one(StreamPattern::Container, &"a".repeat(41), false)]
+    #[case::container_line_break(StreamPattern::Container, "ts\n", false)]
+    #[case::container_leading_space(StreamPattern::Container, " mp4", false)]
+    fn a_pattern_matches_the_whole_value(
+        #[case] pattern: StreamPattern,
+        #[case] value: &str,
+        #[case] matches: bool,
+    ) {
+        assert_eq!(pattern.matches(value), matches, "{value:?}");
+        assert_eq!(
+            pattern_complaint("v", Some(value), pattern).is_none(),
+            matches,
+            "{value:?}"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_value_passes_every_pattern() {
+        for pattern in [StreamPattern::Container, StreamPattern::Level] {
+            assert!(pattern_complaint("v", None, pattern).is_none());
+            assert!(pattern_complaint("v", Some(""), pattern).is_none());
+        }
     }
 
     #[tokio::test]

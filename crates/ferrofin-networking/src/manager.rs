@@ -1,16 +1,17 @@
 //! Port of `Jellyfin.Networking.Manager.NetworkManager` — the bind-address /
 //! published-URL resolver.
 //!
-//! Live managers refresh operating-system interfaces at boot, configuration saves,
-//! peer URL resolution and OS network changes ([`NetworkManager::on_network_change`],
-//! driven by [`crate::network_change`]). Mock and provided snapshots remain
-//! deterministic.
+//! Live managers read operating-system interfaces at boot, configuration saves
+//! and OS network changes ([`NetworkManager::on_network_change`], driven by
+//! [`crate::network_change`]); a request reads that snapshot, as upstream's
+//! `GetBindAddress` does. Mock and provided snapshots remain deterministic.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use ferrofin_model::net::{AddressFamily, IpData, IpNetwork, PublishedServerUriOverride};
+use ferrofin_util::source_url::redact_urls_in;
 
 use crate::config_keys;
 use crate::known_proxies::KnownProxies;
@@ -68,7 +69,10 @@ impl StartupConfig {
 /// `host:port` (the scheme's default port when it names none), once per
 /// override ignoring case, never its user info, query or fragment. Bare host
 /// or IP overrides are exempt, since the base URL is appended when the API URL
-/// is built from them; an empty `base_url` leaves nothing to compare.
+/// is built from them; an empty `base_url` leaves nothing to compare. The
+/// base matches in either spelling (`/my jellyfin`, `/my%20jellyfin`), where
+/// upstream compares the decoded path with the saved spelling: Jellyfin bug
+/// not ported (gl-1821).
 #[must_use]
 pub fn published_urls_missing_base_url<'a>(
     overrides: impl IntoIterator<Item = &'a str>,
@@ -78,6 +82,8 @@ pub fn published_urls_missing_base_url<'a>(
     if base_url.is_empty() {
         return hosts;
     }
+    // Either spelling of the base (`/my jellyfin`, `/my%20jellyfin`) matches.
+    let base_url = percent_encoding::percent_decode_str(base_url).decode_utf8_lossy();
     let mut seen = std::collections::HashSet::new();
     for uri in overrides {
         let lowered = uri.to_ascii_lowercase();
@@ -109,7 +115,7 @@ pub fn published_urls_missing_base_url<'a>(
             .len()
             .checked_sub(base_url.len())
             .and_then(|at| path.get(at..))
-            .is_some_and(|tail| tail.eq_ignore_ascii_case(base_url))
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(&base_url))
         {
             continue;
         }
@@ -239,24 +245,35 @@ impl NetworkManager {
         )
     }
 
-    /// Constructs a manager that enumerates live OS interfaces.
+    /// Constructs a manager that enumerates live OS interfaces and reports the
+    /// settings it ignores to `logger`.
     #[must_use]
-    pub fn live(config: NetworkConfiguration) -> Self {
-        Self::live_with_enumerator(config, Arc::new(crate::interfaces::enumerate))
+    pub fn live(config: NetworkConfiguration, logger: Arc<dyn Logger>) -> Self {
+        Self::live_with_enumerator(config, Arc::new(crate::interfaces::enumerate), logger)
     }
 
     /// Constructs a live manager that reads its interfaces from `enumerator`
     /// instead of the operating system, every time [`Self::live`] would
-    /// enumerate them: at construction, [`Self::refresh_interfaces`],
-    /// [`Self::update_settings`] and [`Self::on_network_change`].
+    /// enumerate them: at construction, [`Self::update_settings`] and
+    /// [`Self::on_network_change`].
+    ///
+    /// The settings it ignores go to `logger` at construction, at each
+    /// [`Self::update_settings`] and after a network change (as
+    /// [`Self::on_network_change`] describes). The network information goes
+    /// to it at construction and at each [`Self::update_settings`].
     #[must_use]
     pub fn live_with_enumerator(
         config: NetworkConfiguration,
         enumerator: InterfaceEnumerator,
+        logger: Arc<dyn Logger>,
     ) -> Self {
         let mut manager = Self::with_defaults(config, "");
         manager.interface_source = InterfaceSource::Live(enumerator);
-        manager.refresh_interfaces();
+        // Only the parse that sees the interfaces reports, or an override
+        // naming one would be reported as unparsable.
+        manager.logger = logger;
+        let config = manager.config.clone();
+        manager.update_settings(&config);
         manager
     }
 
@@ -301,14 +318,6 @@ impl NetworkManager {
         self.update_settings(&config);
     }
 
-    /// Refreshes live interfaces and dependent settings; injected snapshots stay fixed.
-    pub fn refresh_interfaces(&mut self) {
-        if matches!(self.interface_source, InterfaceSource::Live(_)) {
-            let config = self.config.clone();
-            self.update_settings(&config);
-        }
-    }
-
     /// Re-reads the interfaces after the operating system reported a network
     /// change (`NetworkManager.OnNetworkChange`, after its 2-second wait,
     /// which [`crate::network_change::monitor`] owns).
@@ -318,7 +327,10 @@ impl NetworkManager {
     /// filter, `KnownProxies` and the published-server overrides are left as
     /// they are, except when IPv6 is enabled but the operating system has no
     /// IPv6 (`Socket.OSSupportsIPv6`), where upstream runs the whole
-    /// `UpdateSettings`. The network information is then logged at debug
+    /// `UpdateSettings` (which also reports the network information, as
+    /// [`Self::update_settings`] does). Either way, as upstream's
+    /// `InitializeLan` does, the LAN entries it ignores are reported again.
+    /// The network information is then logged at debug
     /// (`PrintNetworkInformation`). Mock and provided snapshots stay fixed.
     pub fn on_network_change(&mut self) {
         self.on_network_change_with(os_supports_ipv6);
@@ -350,33 +362,69 @@ impl NetworkManager {
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
+        let info = self.network_information();
+        tracing::debug!(
+            lan_subnets = ?info.lan_subnets,
+            lan_exclusions = ?info.lan_exclusions,
+            used_lan_subnets = ?info.used_lan_subnets,
+            interface_addresses = ?info.interface_addresses,
+            bind_addresses = ?info.bind_addresses,
+            remote_ip_filter = info.remote_ip_filter,
+            filtered_subnets = ?info.filtered_subnets,
+            "network information after a network change"
+        );
+    }
+
+    /// `PrintNetworkInformation(config, false)`, which ends `UpdateSettings`:
+    /// upstream's seven Information lines, through the manager's logger, so a
+    /// quiet manager stays quiet.
+    fn report_network_information(&self) {
+        let info = self.network_information();
+        for line in [
+            format!("Defined LAN subnets: {:?}", info.lan_subnets),
+            format!("Defined LAN exclusions: {:?}", info.lan_exclusions),
+            format!("Used LAN subnets: {:?}", info.used_lan_subnets),
+            format!(
+                "Filtered interface addresses: {:?}",
+                info.interface_addresses
+            ),
+            format!("Bind Addresses {:?}", info.bind_addresses),
+            format!("Remote IP filter is {}", info.remote_ip_filter),
+            format!("Filtered subnets: {:?}", info.filtered_subnets),
+        ] {
+            self.logger.info(&line);
+        }
+    }
+
+    /// What `PrintNetworkInformation` prints, addresses IPv4 first.
+    fn network_information(&self) -> NetworkInformation {
         let ipv4_first = |addresses: &mut Vec<IpAddr>| addresses.sort_by_key(|a| !a.is_ipv4());
-        let mut interfaces: Vec<IpAddr> = self.interfaces.iter().map(|x| x.address).collect();
-        ipv4_first(&mut interfaces);
-        let mut bind: Vec<IpAddr> = self
+        let mut interface_addresses: Vec<IpAddr> =
+            self.interfaces.iter().map(|x| x.address).collect();
+        ipv4_first(&mut interface_addresses);
+        let mut bind_addresses: Vec<IpAddr> = self
             .get_all_bind_interfaces(false)
             .iter()
             .map(|x| x.address)
             .collect();
-        ipv4_first(&mut bind);
-        tracing::debug!(
-            lan_subnets = ?cidrs(&self.lan_subnets),
-            lan_exclusions = ?cidrs(&self.excluded_subnets),
-            used_lan_subnets = ?cidrs(
+        ipv4_first(&mut bind_addresses);
+        NetworkInformation {
+            lan_subnets: cidrs(&self.lan_subnets),
+            lan_exclusions: cidrs(&self.excluded_subnets),
+            used_lan_subnets: cidrs(
                 self.lan_subnets
                     .iter()
-                    .filter(|s| !self.excluded_subnets.contains(s))
+                    .filter(|s| !self.excluded_subnets.contains(s)),
             ),
-            interface_addresses = ?interfaces,
-            bind_addresses = ?bind,
-            remote_ip_filter = if self.config.is_remote_ip_filter_blacklist {
+            interface_addresses,
+            bind_addresses,
+            remote_ip_filter: if self.config.is_remote_ip_filter_blacklist {
                 "Blocklist"
             } else {
                 "Allowlist"
             },
-            filtered_subnets = ?cidrs(&self.remote_address_filter),
-            "network information after a network change"
-        );
+            filtered_subnets: cidrs(&self.remote_address_filter),
+        }
     }
 
     /// The network configuration the manager was last given
@@ -442,7 +490,9 @@ impl NetworkManager {
     /// (`NetworkManager.UpdateSettings`).
     ///
     /// `KnownProxies` is parsed again only when its entries or the address
-    /// families changed, so an interface refresh resolves no host name.
+    /// families changed, so a reload that changes neither resolves no host
+    /// name. It ends with the network information at Information
+    /// (`PrintNetworkInformation(config, false)`), through the logger.
     pub fn update_settings(&mut self, config: &NetworkConfiguration) {
         self.config = config.clone();
 
@@ -484,6 +534,7 @@ impl NetworkManager {
         self.initialize_known_proxies(config);
         self.enforce_bind_settings(config);
         self.initialize_overrides(config);
+        self.report_network_information();
     }
 
     /// Initializes the internal LAN cache (`InitializeLan`).
@@ -656,8 +707,8 @@ impl NetworkManager {
     }
 
     /// The address of the client that actually made the request, given the
-    /// transport `peer` and the `X-Forwarded-For` chain (left to right, as
-    /// sent).
+    /// transport `peer` and the `X-Forwarded-For` chain nearest hop first (the
+    /// entries from the right).
     ///
     /// Port of what ASP.NET's `ForwardedHeadersMiddleware` does with the options
     /// C# `ConfigureForwardHeaders` builds:
@@ -674,17 +725,25 @@ impl NetworkManager {
     /// `ForwardLimit` is null upstream once any proxy is configured, so the
     /// whole chain is walkable. `ApplyForwarders` also stops at the first entry
     /// from the right that does not parse; the caller passes the chain already
-    /// ended there (`ferrofin-api`'s `forwarded_for`).
+    /// ended there (`ferrofin-api`'s `forwarded_for`). A hop is taken from the
+    /// chain only once the address before it is trusted, so a lazy chain is
+    /// read no further than the walk goes, and not at all for a peer that is
+    /// not a known proxy.
     #[must_use]
-    pub fn client_address(&self, peer: IpAddr, forwarded_for: &[IpAddr]) -> IpAddr {
+    pub fn client_address(
+        &self,
+        peer: IpAddr,
+        forwarded_for: impl IntoIterator<Item = IpAddr>,
+    ) -> IpAddr {
         if !self.known_proxies.forwarding_enabled() {
             return peer;
         }
+        let mut chain = forwarded_for.into_iter();
         let mut current = peer;
-        let mut remaining = forwarded_for.len();
-        while remaining > 0 && self.is_known_proxy(current) {
-            remaining -= 1;
-            current = forwarded_for[remaining];
+        while self.is_known_proxy(current)
+            && let Some(next) = chain.next()
+        {
+            current = next;
         }
         current
     }
@@ -711,7 +770,7 @@ impl NetworkManager {
 
         // Everything else is a single-IP subnet.
         for ip in remote_ip_filter.iter().filter(|x| !x.contains('/')) {
-            if let Ok(ipp) = ip.parse::<IpAddr>() {
+            if let Some(ipp) = net_utils::try_parse_ip_address(ip) {
                 let prefix = match ipp {
                     IpAddr::V4(_) => net_constants::MINIMUM_IPV4_PREFIX_SIZE,
                     IpAddr::V6(_) => net_constants::MINIMUM_IPV6_PREFIX_SIZE,
@@ -750,8 +809,10 @@ impl NetworkManager {
         for entry in &config.published_server_uri_by_subnet {
             let parts: Vec<&str> = entry.split('=').collect();
             if parts.len() != 2 {
-                self.logger
-                    .warn(&format!("Unable to parse bind override: {entry}"));
+                self.logger.error(&format!(
+                    "Unable to parse bind override: {}",
+                    redact_urls_in(entry)
+                ));
                 return;
             }
 
@@ -816,8 +877,10 @@ impl NetworkManager {
                     ));
                 }
             } else {
-                self.logger
-                    .warn(&format!("Unable to parse bind override: {entry}"));
+                self.logger.error(&format!(
+                    "Unable to parse bind override: {}",
+                    redact_urls_in(entry)
+                ));
             }
         }
 
@@ -1298,6 +1361,17 @@ fn dedup(addresses: &mut Vec<IpAddr>) {
             true
         }
     });
+}
+
+/// The values `PrintNetworkInformation` logs.
+struct NetworkInformation {
+    lan_subnets: Vec<String>,
+    lan_exclusions: Vec<String>,
+    used_lan_subnets: Vec<String>,
+    interface_addresses: Vec<IpAddr>,
+    bind_addresses: Vec<IpAddr>,
+    remote_ip_filter: &'static str,
+    filtered_subnets: Vec<String>,
 }
 
 /// Subnets as upstream prints them: `BaseAddress/PrefixLength`.

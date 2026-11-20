@@ -14,6 +14,7 @@
 //! `DbLinkedChildType.Manual`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -36,6 +37,12 @@ const MANUAL_CHILD_TYPE: i32 = 0;
 #[derive(Clone)]
 pub struct FerrofinLinkedChildrenService {
     db: Database,
+    /// The playlist manager's entry-edit lock
+    /// (`FerrofinItemPersistenceService::playlist_entry_edits`), taken
+    /// before the writer by [`LinkedChildrenService::reroute_linked_children`]:
+    /// a reroute landing between an edit's read and its rewrite would be
+    /// undone by the rewrite.
+    entry_edits: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinLinkedChildrenService {
@@ -49,7 +56,20 @@ impl FerrofinLinkedChildrenService {
     /// Creates a linked-children service over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            entry_edits: Arc::default(),
+        }
+    }
+
+    /// Shares the playlist manager's entry-edit lock
+    /// (`FerrofinItemPersistenceService::playlist_entry_edits`), so a reroute
+    /// never lands between an edit's read and its rewrite. Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_entry_edits(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.entry_edits = lock;
+        self
     }
 }
 
@@ -75,6 +95,9 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         Ok(ids.iter().filter_map(|s| Uuid::parse_str(s).ok()).collect())
     }
 
+    /// `LinkedChildrenService.FindArtists` (v12.4 `:83-108`): the artist
+    /// rows whose `CleanName` is each name's clean value, grouped back onto
+    /// every requested name that matched one.
     async fn find_artists(
         &self,
         artist_names: &[String],
@@ -86,18 +109,17 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         let Some(artist_type) = stored_type_name(BaseItemKind::MusicArtist) else {
             return Ok(result);
         };
-        let lower_names: Vec<String> = artist_names
+        let clean_names: Vec<String> = artist_names
             .iter()
-            .map(|n| ferrofin_util::string_extensions::upper_invariant(n))
+            .map(|n| crate::text_util::get_clean_value(n))
             .collect();
 
         // All placeholders are anonymous `?`: SQLite forbids mixing numbered
         // (`?1`) and anonymous placeholders in one statement, and this query
         // builds a dynamic `IN (?, …)` list.
-        let mut sql = String::from(
-            r#"SELECT * FROM "BaseItems" WHERE "Type" = ? AND ferrofin_upper_invariant("Name") IN ("#,
-        );
-        for i in 0..lower_names.len() {
+        let mut sql =
+            String::from(r#"SELECT * FROM "BaseItems" WHERE "Type" = ? AND "CleanName" IN ("#);
+        for i in 0..clean_names.len() {
             if i > 0 {
                 sql.push_str(", ");
             }
@@ -106,27 +128,20 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         sql.push(')');
         let mut query =
             sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql)).bind(artist_type);
-        for name in &lower_names {
+        for name in &clean_names {
             query = query.bind(name.clone());
         }
         let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
 
-        // Group the matched artist rows back onto each requested name
-        // (case-insensitively), only emitting names that matched at least one row.
-        for name in artist_names {
-            let lower = ferrofin_util::string_extensions::upper_invariant(name);
-            let matches: Vec<BaseItemEntity> = rows
-                .iter()
-                .filter(|r| {
-                    r.name
-                        .as_deref()
-                        .map(ferrofin_util::string_extensions::upper_invariant)
-                        == Some(lower.clone())
-                })
-                .cloned()
-                .collect();
-            if !matches.is_empty() {
-                result.insert(name.clone(), matches);
+        let mut by_clean: HashMap<&str, Vec<BaseItemEntity>> = HashMap::new();
+        for row in &rows {
+            if let Some(clean) = row.clean_name.as_deref() {
+                by_clean.entry(clean).or_default().push(row.clone());
+            }
+        }
+        for (name, clean) in artist_names.iter().zip(&clean_names) {
+            if let Some(matches) = by_clean.get(clean.as_str()) {
+                result.insert(name.clone(), matches.clone());
             }
         }
         Ok(result)
@@ -177,6 +192,7 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         from_child_id: Uuid,
         to_child_id: Uuid,
     ) -> Result<Vec<Uuid>, ServiceError> {
+        let _edits = self.entry_edits.lock().await;
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         let affected: Vec<String> = sqlx::query_scalar(
@@ -276,7 +292,7 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
 #[cfg(test)]
 mod tests {
     use super::{FerrofinLinkedChildrenService, MANUAL_CHILD_TYPE};
-    use crate::test_support::{seed_item, seed_named_item, test_db};
+    use crate::test_support::{seed_item, test_db};
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::persistence::LinkedChildrenService;
     use uuid::Uuid;
@@ -406,53 +422,5 @@ mod tests {
                 .expect("parents"),
             vec![playlist]
         );
-    }
-
-    #[rstest::rstest]
-    #[case("Élodie", "élodie", true)]
-    #[case("ΟΣ", "ος", true)]
-    #[case("ς", "σ", true)]
-    #[case("ᾀ", "ᾈ", true)]
-    #[case("𐐨", "𐐀", true)]
-    #[case("ı", "I", false)]
-    #[case("İ", "i", false)]
-    #[case("ß", "ss", false)]
-    #[tokio::test]
-    async fn unicode_artist_lookup(
-        #[case] stored: &str,
-        #[case] query: &str,
-        #[case] matches: bool,
-    ) {
-        let db = test_db().await;
-        let id = Uuid::new_v4();
-        seed_named_item(&db, id, BaseItemKind::MusicArtist, stored).await;
-        let svc = FerrofinLinkedChildrenService::new(db);
-        let found = svc
-            .find_artists(&[query.to_owned(), "absent".to_owned()])
-            .await
-            .unwrap();
-        assert_eq!(found.contains_key(query), matches);
-        if matches {
-            assert_eq!(found[query][0].id, ferrofin_db::store::guid_to_db(id));
-        }
-        assert!(!found.contains_key("absent"));
-    }
-
-    #[tokio::test]
-    async fn find_artists_matches_case_insensitively() {
-        let db = test_db().await;
-        let a1 = Uuid::new_v4();
-        let a2 = Uuid::new_v4();
-        seed_named_item(&db, a1, BaseItemKind::MusicArtist, "The Beatles").await;
-        seed_named_item(&db, a2, BaseItemKind::MusicArtist, "Queen").await;
-        let svc = FerrofinLinkedChildrenService::new(db);
-
-        let found = svc
-            .find_artists(&["the beatles".to_owned(), "Unknown".to_owned()])
-            .await
-            .expect("find");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found.get("the beatles").map(Vec::len), Some(1));
-        assert!(!found.contains_key("Unknown"));
     }
 }

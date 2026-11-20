@@ -25,8 +25,8 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::by_name::{additional_dto_options, project_item_rows, resolve_parent};
-use crate::handlers::items::{parse_order_by, resolve_user_or_api_key};
-use crate::handlers::query_parse::parse_csv_enums_lenient;
+use crate::handlers::items::resolve_user_or_api_key;
+use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_order_by};
 use crate::state::AppState;
 
 /// The query parameters honoured by `GET /Years`.
@@ -117,8 +117,18 @@ async fn get_years(
     //
     // A `parentId` naming no item, the zero id included, is `GetParentItem`'s
     // `ArgumentException`: a 400.
-    resolve_parent(&state, &auth, query.parent_id, user.as_deref()).await?;
+    let parent = resolve_parent(&state, &auth, query.parent_id, user.as_deref()).await?;
+    let parent_kind = parent
+        .as_ref()
+        .and_then(|row| BaseItemKind::from_stored_type_name(&row.type_));
+    // A parent that is not a folder (`!parentItem.IsFolder`, the stored
+    // `IsFolder`) is the only item: `new[] { parentItem }.Where(Filter)`
+    // (v12.4 `YearsController.cs:111-128`), so the answer is its own year,
+    // if the type and media-type filters keep it, whether or not it is an
+    // alternate version or an owned item.
+    let only_item = parent.as_ref().is_some_and(|row| !row.is_folder);
     let parent_id = match query.parent_id {
+        Some(_) if only_item => Uuid::nil(),
         Some(parent) => parent,
         None if !recursive => state
             .library
@@ -137,18 +147,23 @@ async fn get_years(
     // The user row moves into the query and is borrowed back out for the DTO
     // projection below — it is the auth context's shared row
     // (`resolve_user_or_api_key`), and the query holds the same handle.
-    let internal = ferrofin_traits::options::InternalItemsQuery {
+    let mut internal = ferrofin_traits::options::InternalItemsQuery {
         user,
         start_index: query.start_index,
         limit: query.limit,
         recursive,
         parent_id,
+        item_ids: query.parent_id.filter(|_| only_item).into_iter().collect(),
+        include_owned_items: only_item,
         include_item_types,
         exclude_item_types,
         media_types,
         order_by: parse_order_by(query.sort_by.as_deref(), query.sort_order.as_deref()),
         ..ferrofin_traits::options::InternalItemsQuery::default()
     };
+    if let Some(kind @ (BaseItemKind::Playlist | BaseItemKind::BoxSet)) = parent_kind {
+        linked_container_children(kind, &mut internal);
+    }
     let result = state.library.get_years(&internal).await?;
     let options = additional_dto_options(
         query.fields.as_deref(),
@@ -159,6 +174,43 @@ async fn get_years(
     );
     let projected = project_item_rows(&state, result, &options, internal.user.as_deref()).await?;
     Ok(Json(projected))
+}
+
+/// The children `GetYears` walks under a playlist or a box set, whose
+/// members are linked entries (v12.4 `YearsController.cs:112-123`).
+///
+/// With no user, a recursive walk takes every linked entry and what is under
+/// it, which the query already does, and a non-recursive one takes
+/// `Children`: a playlist never has any (`Playlist.LoadChildren`,
+/// `Playlist.cs:131`), and a box set only when it is a legacy one, whose
+/// children have it as their `ParentId` (`BoxSet.LoadChildren`,
+/// `BoxSet.cs:96-104`). The query reads the rows with that `ParentId` and
+/// does not test `IsLegacyBoxSet`, so it lists them too for a box set that
+/// has such rows and linked members, which upstream counts as not legacy.
+/// Only an adopted Jellyfin database holds one: Ferrofin's scanner makes
+/// none (gl-1712).
+///
+/// With a user, a playlist's `GetRecursiveChildren(user, …)` and
+/// `GetChildren(user, true)` both reach `Playlist.GetPlayableItems`
+/// (`Playlist.cs:142-171`): its linked entries, never recursing, less every
+/// folder entry. A box set takes no arm here then.
+///
+/// `GET /Items?parentId=<playlist>` reaches neither override: its
+/// `Folder.GetItemsInternal` calls the `GetChildren` overload with a count,
+/// which `Playlist` does not override, so its folder entries are listed
+/// there, as in Ferrofin.
+fn linked_container_children(
+    kind: BaseItemKind,
+    query: &mut ferrofin_traits::options::InternalItemsQuery,
+) {
+    if query.user.is_some() {
+        if kind == BaseItemKind::Playlist {
+            query.recursive = false;
+            query.is_folder = Some(false);
+        }
+    } else if !query.recursive {
+        query.physical_children_only = true;
+    }
 }
 
 /// The query parameters for `GET /Years/{year}`.

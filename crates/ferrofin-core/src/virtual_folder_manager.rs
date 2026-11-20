@@ -49,6 +49,7 @@ use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 
 use crate::item_type_lookup;
+use crate::library_monitor::trim_separators;
 use crate::user_root_folder::UserRootFolderStore;
 
 /// The shortcut-file extension Jellyfin uses (`MbLinkShortcutHandler.Extension`).
@@ -62,6 +63,31 @@ const OPTIONS_FILE: &str = "options.json";
 /// [`OPTIONS_FILE`] yet, and converted — see
 /// [`FerrofinVirtualFolderManager::load_options`].
 const JELLYFIN_OPTIONS_FILE: &str = "options.xml";
+
+/// The [`OPTIONS_FILE`]s and [`JELLYFIN_OPTIONS_FILE`]s whose failure has been
+/// logged at error and that have not loaded since, so a listing repeated on
+/// every dashboard load names a damaged file once. A file that loads again is
+/// forgotten, so a later failure is logged anew, and so is an XML that is gone
+/// or that an [`OPTIONS_FILE`] beside it, usable or not, has taken over from.
+static UNUSABLE_OPTIONS: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Records that `path` failed to load: `true` the first time since it last
+/// loaded, when the failure is logged at error rather than debug.
+fn first_options_failure(path: &Path) -> bool {
+    UNUSABLE_OPTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf())
+}
+
+/// Forgets a file that loaded, so its next failure is logged at error again.
+fn forget_options_failure(path: &Path) {
+    UNUSABLE_OPTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path);
+}
 
 /// Whether `path` is a shortcut: its .NET extension (`Path.GetExtension`,
 /// which counts a leading dot — `.mblink` is one) is `.mblink`, compared
@@ -531,8 +557,7 @@ impl FerrofinVirtualFolderManager {
                 .await?;
         let file_name = |path: &Path| {
             path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
+                .map_or_default(|n| n.to_string_lossy().into_owned())
         };
         let (Some(old_id), Some(new_id)) = (
             stored
@@ -870,8 +895,7 @@ impl FerrofinVirtualFolderManager {
         let stored_ids = data
             .get("PhysicalFolderIds")
             .and_then(serde_json::Value::as_array)
-            .map(|values| as_ids(values))
-            .unwrap_or_default();
+            .map_or_default(|values| as_ids(values));
         !stored_paths
             .iter()
             .map(String::as_str)
@@ -897,8 +921,7 @@ impl FerrofinVirtualFolderManager {
         };
         let name = folder_path
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|name| name.to_string_lossy().into_owned());
         row.sort_name = Some(ferrofin_util::sort_name::create_sort_name(&name));
         row.name = Some(name);
         row.path = Some(folder_path.to_string_lossy().into_owned());
@@ -1178,29 +1201,25 @@ impl FerrofinVirtualFolderManager {
     /// first time, at debug while it stays unusable, since the dashboard's
     /// listing reads it on every load.
     async fn stored_options(folder_path: &Path) -> Option<LibraryOptions> {
-        /// The `options.json` files last found unusable.
-        static UNUSABLE: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
-            std::sync::Mutex::new(std::collections::BTreeSet::new());
         let path = folder_path.join(OPTIONS_FILE);
-        let error = match tokio::fs::read(&path).await {
+        let read = tokio::fs::read(&path).await;
+        if matches!(&read, Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+            return None;
+        }
+        // An options.json, usable or not, wins over the XML, so a damage the
+        // XML had is moot.
+        forget_options_failure(&folder_path.join(JELLYFIN_OPTIONS_FILE));
+        let error = match read {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(options) => {
-                    UNUSABLE
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&path);
+                    forget_options_failure(&path);
                     return Some(options);
                 }
                 Err(error) => error.to_string(),
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
             Err(error) => error.to_string(),
         };
-        let first = UNUSABLE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(path.clone());
-        if first {
+        if first_options_failure(&path) {
             tracing::error!(
                 path = %path.display(),
                 error,
@@ -1218,7 +1237,8 @@ impl FerrofinVirtualFolderManager {
     }
 
     /// Reads options for access checks without writing an adoption sidecar or
-    /// provisioning library rows. Missing/unusable options use upstream defaults.
+    /// provisioning library rows. Missing/unusable options use upstream defaults,
+    /// reported once as the listing reports them ([`Self::adopt_jellyfin_options`]).
     /// `PathInfos` are expanded through `paths`, as [`Self::load_options`] does.
     pub(crate) async fn read_options(
         folder_path: &Path,
@@ -1226,18 +1246,10 @@ impl FerrofinVirtualFolderManager {
     ) -> LibraryOptions {
         let mut options = if let Some(options) = Self::stored_options(folder_path).await {
             options
-        } else if let Ok(xml) =
-            tokio::fs::read_to_string(folder_path.join(JELLYFIN_OPTIONS_FILE)).await
-        {
-            crate::config_import::import_over(
-                &LibraryOptions::default(),
-                &xml,
-                "LibraryOptions",
-                &[],
-            )
-            .unwrap_or_default()
         } else {
-            LibraryOptions::default()
+            Self::adopt_jellyfin_options(folder_path, paths, false)
+                .await
+                .unwrap_or_default()
         };
         expand_path_infos(&mut options, paths);
         options
@@ -1246,32 +1258,52 @@ impl FerrofinVirtualFolderManager {
     /// Imports a Jellyfin `options.xml` beside a missing `options.json` and,
     /// when `persist`, persists the result as `options.json`, its `PathInfos`
     /// expanded through `paths` first so the persisted file holds real paths.
-    /// `None` when there is no XML; the default (and a warning) when the XML
-    /// cannot be read or converted, so one damaged file never blocks listing
-    /// the library.
+    /// `None` when there is no XML; the default when it cannot be read or
+    /// converted, so one damaged file never blocks listing the library. That
+    /// failure is logged as `LoadLibraryOptions` logs "Error loading library
+    /// options": at error the first time, at debug while it stays so, since the
+    /// dashboard's listing reads it on every load.
     async fn adopt_jellyfin_options(
         folder_path: &Path,
         paths: &crate::virtual_paths::VirtualPathExpander,
         persist: bool,
     ) -> Option<LibraryOptions> {
         let xml_path = folder_path.join(JELLYFIN_OPTIONS_FILE);
-        let xml = tokio::fs::read_to_string(&xml_path).await.ok()?;
-        let imported = match crate::config_import::import_over(
-            &LibraryOptions::default(),
-            &xml,
-            "LibraryOptions",
-            &[],
-        ) {
+        let converted = match tokio::fs::read_to_string(&xml_path).await {
+            Ok(xml) => crate::config_import::import_over(
+                &LibraryOptions::default(),
+                &xml,
+                "LibraryOptions",
+                &[],
+            )
+            .map_err(|error| error.to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                forget_options_failure(&xml_path);
+                return None;
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        let imported = match converted {
             Ok(mut options) => {
+                forget_options_failure(&xml_path);
                 expand_path_infos(&mut options, paths);
                 options
             }
-            Err(err) => {
-                tracing::warn!(
-                    path = %xml_path.display(),
-                    error = %err,
-                    "could not adopt the jellyfin library options; using defaults"
-                );
+            Err(error) => {
+                // Nothing is persisted, so every listing imports it again.
+                if first_options_failure(&xml_path) {
+                    tracing::error!(
+                        path = %xml_path.display(),
+                        error,
+                        "could not adopt the jellyfin library options; using defaults"
+                    );
+                } else {
+                    tracing::debug!(
+                        path = %xml_path.display(),
+                        error,
+                        "jellyfin library options still unusable; using defaults"
+                    );
+                }
                 return Some(LibraryOptions::default());
             }
         };
@@ -1465,20 +1497,20 @@ impl FerrofinVirtualFolderManager {
             .map_err(|e| Self::io_err("write shortcut", &e))
     }
 
-    /// Deletes the `.mblink` shortcut in `folder_path` that resolves to `target`,
-    /// if one exists (C# `RemoveMediaPath` shortcut cleanup). Returns whether a
-    /// shortcut was removed.
+    /// Deletes every `.mblink` shortcut in `folder_path` that resolves to
+    /// `target` (C# `RemoveMediaPath` shortcut cleanup). Returns whether a
+    /// shortcut was removed. `target` and each shortcut's target are compared
+    /// past their trailing separators, as [`remove_media_path`](VirtualFolderManager::remove_media_path)
+    /// compares the `PathInfos` entries, and every match goes, as every
+    /// matching entry does, so no shortcut outlives its entry; upstream
+    /// compares the raw `target` and deletes the first match (gl-1871).
     async fn delete_shortcut_for(
         &self,
         folder_path: &Path,
         target: &str,
     ) -> Result<bool, ServiceError> {
-        // A filesystem root must retain its separator to match the shortcut.
-        let target = if Path::new(target).has_root() && Path::new(target).parent().is_none() {
-            target
-        } else {
-            target.trim_end_matches(['/', '\\'])
-        };
+        let target = trim_separators(target);
+        let mut removed = false;
         let mut dir = tokio::fs::read_dir(folder_path)
             .await
             .map_err(|e| Self::io_err("read folder", &e))?;
@@ -1492,23 +1524,30 @@ impl FerrofinVirtualFolderManager {
                 continue;
             }
             // Upstream's `FirstOrDefault` over `ResolveShortcut` throws on an
-            // unreadable shortcut met before the match.
-            let found = Self::resolve_shortcut(&path)
-                .await
-                .map_err(|e| Self::io_err(&format!("read shortcut {}", path.display()), &e))?;
+            // unreadable shortcut met before the match, and reads none after it.
+            let found = match Self::resolve_shortcut(&path).await {
+                Ok(found) => found,
+                Err(_) if removed => continue,
+                Err(e) => {
+                    return Err(Self::io_err(
+                        &format!("read shortcut {}", path.display()),
+                        &e,
+                    ));
+                }
+            };
             if found.is_some_and(|found| {
                 ferrofin_util::string_extensions::equals_ordinal_ignore_case(
-                    &self.virtual_paths.expand(&found),
+                    trim_separators(&self.virtual_paths.expand(&found)),
                     target,
                 )
             }) {
                 tokio::fs::remove_file(&path)
                     .await
                     .map_err(|e| Self::io_err("delete shortcut", &e))?;
-                return Ok(true);
+                removed = true;
             }
         }
-        Ok(false)
+        Ok(removed)
     }
 
     /// Errors when `name` does not resolve to an existing directory directly
@@ -2051,7 +2090,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         self.delete_shortcut_for(&folder_path, path).await?;
 
         let mut options = self.load_options(&folder_path).await;
-        options.path_infos.retain(|i| i.path != path);
+        options
+            .path_infos
+            .retain(|i| trim_separators(&i.path) != trim_separators(path));
         Self::save_options(&folder_path, &options).await?;
         self.record_changed_locations(&folder_path).await;
         Ok(())
@@ -2066,15 +2107,26 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         let _snapshot = self.invalidate_on_drop();
         let folder_path = self.require_folder(virtual_folder_name).await?;
         let existing = self.load_options(&folder_path).await;
+        let new_paths = || {
+            options
+                .path_infos
+                .iter()
+                .filter(|p| !existing.path_infos.iter().any(|i| i.path == p.path))
+        };
+
+        // Upstream's CreateShortcut throws on an empty target and
+        // RemoveContentTypeOverrides on a blank path, so the options are never
+        // saved; refusing before the loop also keeps the earlier new paths'
+        // shortcuts unwritten.
+        if new_paths().any(|p| p.path.trim().is_empty()) {
+            return Err(ServiceError::invalid_input("path must not be empty"));
+        }
 
         // Create a shortcut for any newly-referenced media path (C# loops the
         // request's PathInfos and `CreateShortcut`s the ones not already present).
-        for path_info in &options.path_infos {
-            let already = existing.path_infos.iter().any(|i| i.path == path_info.path);
-            if !already {
-                self.create_shortcut(&folder_path, path_info).await?;
-                self.remove_content_type_overrides(&path_info.path).await?;
-            }
+        for path_info in new_paths() {
+            self.create_shortcut(&folder_path, path_info).await?;
+            self.remove_content_type_overrides(&path_info.path).await?;
         }
 
         Self::save_options(&folder_path, options).await?;
@@ -2845,7 +2897,8 @@ mod tests {
     /// Every shortcut Jellyfin reads is a location: a dotfile `.mblink`
     /// (what a path entered with a trailing slash names) and any case of
     /// the extension count, and a target written with `ReverseVirtualPath`
-    /// is expanded; removing the path finds the shortcut the same way.
+    /// is expanded; removing the path, in any case, finds the shortcut the
+    /// same way.
     #[tokio::test]
     async fn jellyfin_shortcuts_resolve_as_jellyfin_reads_them() {
         let (tmp, mgr) = manager();
@@ -2881,7 +2934,7 @@ mod tests {
         want.sort();
         assert_eq!(folders[0].locations, want);
 
-        mgr.remove_media_path("Educational", &format!("{data}/Collections/"))
+        mgr.remove_media_path("Educational", &format!("{data}/Collections"))
             .await
             .expect("remove");
         assert!(!folder.join("collections.mblink").exists());
@@ -3112,6 +3165,114 @@ mod tests {
             "unreadable XML falls back to defaults"
         );
         assert!(!folder.join(super::OPTIONS_FILE).exists());
+    }
+
+    /// gl-1510: a damaged `options.xml` with no `options.json` is imported
+    /// again on every listing and by the access checks' reader. It is logged at
+    /// error once and then at debug, as `LoadLibraryOptions` logs "Error loading
+    /// library options", and is forgotten once an `options.json` takes over,
+    /// even a torn one, so the damage is logged at error again when that file
+    /// goes away.
+    #[tokio::test]
+    async fn a_damaged_options_xml_is_logged_once_until_an_options_json_takes_over() {
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("Damaged");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(
+            folder.join(super::JELLYFIN_OPTIONS_FILE),
+            "<NotLibraryOptions/>",
+        )
+        .expect("xml");
+        let json_path = folder.join(super::OPTIONS_FILE);
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let count = |level: &str| {
+            logs.text()
+                .lines()
+                .filter(|line| line.contains(level) && line.contains("Damaged/options.xml"))
+                .count()
+        };
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            );
+            for _ in 0..3 {
+                let folders = mgr.get_virtual_folders().await.expect("list");
+                assert_eq!(folders[0].library_options, Some(LibraryOptions::default()));
+            }
+            assert_eq!(
+                FerrofinVirtualFolderManager::read_options(&folder, &mgr.virtual_paths).await,
+                LibraryOptions::default(),
+                "the access checks read the same defaults"
+            );
+            assert!(!json_path.exists(), "nothing persisted");
+            assert_eq!(count(" ERROR "), 1, "{}", logs.text());
+            assert_eq!(count(" DEBUG "), 3, "{}", logs.text());
+
+            std::fs::write(&json_path, br#"{"EnableRealtimeMonitor":tr"#).expect("torn json");
+            mgr.get_virtual_folders().await.expect("list");
+            std::fs::remove_file(&json_path).expect("remove json");
+            mgr.get_virtual_folders().await.expect("list");
+        }
+        assert_eq!(count(" ERROR "), 2, "{}", logs.text());
+        assert_eq!(count(" DEBUG "), 3, "{}", logs.text());
+    }
+
+    /// gl-1510: an `options.xml` that cannot be read (here a directory, which
+    /// fails as an unreadable file would, even for root) is reported like one
+    /// that does not convert, and one that converts again or goes away is
+    /// forgotten, so a later damage is logged at error anew. Listed during a
+    /// structure change, so the converted options are not persisted and the
+    /// XML is read each time.
+    #[tokio::test]
+    async fn an_options_xml_that_converts_again_is_forgotten() {
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("Flaky");
+        let xml_path = folder.join(super::JELLYFIN_OPTIONS_FILE);
+        std::fs::create_dir_all(&xml_path).expect("unreadable xml");
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let count = |level: &str| {
+            logs.text()
+                .lines()
+                .filter(|line| line.contains(level) && line.contains("Flaky/options.xml"))
+                .count()
+        };
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            );
+            let change = mgr.structure_change.write().await;
+            for _ in 0..2 {
+                let folders = mgr.get_virtual_folders().await.expect("list");
+                assert_eq!(folders[0].library_options, Some(LibraryOptions::default()));
+            }
+            std::fs::remove_dir(&xml_path).expect("remove");
+            std::fs::write(&xml_path, JELLYFIN_OPTIONS_XML).expect("xml");
+            let folders = mgr.get_virtual_folders().await.expect("list");
+            assert_ne!(folders[0].library_options, Some(LibraryOptions::default()));
+            std::fs::write(&xml_path, "<NotLibraryOptions/>").expect("damaged xml");
+            mgr.get_virtual_folders().await.expect("list");
+            std::fs::remove_file(&xml_path).expect("remove xml");
+            mgr.get_virtual_folders().await.expect("list");
+            std::fs::write(&xml_path, "<NotLibraryOptions/>").expect("damaged xml");
+            mgr.get_virtual_folders().await.expect("list");
+            drop(change);
+        }
+        assert!(
+            !folder.join(super::OPTIONS_FILE).exists(),
+            "nothing persisted"
+        );
+        assert_eq!(count(" ERROR "), 3, "{}", logs.text());
+        assert_eq!(count(" DEBUG "), 1, "{}", logs.text());
     }
 
     /// gl-271: an `options.json` that does not parse (a save torn by a crash)
@@ -3451,12 +3612,6 @@ mod tests {
             Ok(self.saved.lock().expect("saved").contains(&id))
         }
         async fn set_ancestors(&self, _: uuid::Uuid, _: &[uuid::Uuid]) -> Result<(), ServiceError> {
-            self.write()
-        }
-        async fn save_images(
-            &self,
-            _: &ferrofin_db::entities::base_items::BaseItemEntity,
-        ) -> Result<(), ServiceError> {
             self.write()
         }
         async fn reattach_user_data(
@@ -4281,9 +4436,21 @@ mod tests {
 
     #[tokio::test]
     async fn add_rejects_missing_media_path_and_empty_name() {
-        let (_tmp, mgr) = manager();
+        let (tmp, mgr) = manager();
         let bad = opts_with_paths(&["/does/not/exist".to_owned()]);
         assert!(mgr.add_virtual_folder("X", None, &bad).await.is_err());
+        // A blank `paths` piece binds as "" (`CommaDelimitedCollectionModelBinder`),
+        // and upstream's `Directory.Exists("")` refuses it.
+        let blank = opts_with_paths(&[media_dir(&tmp, "real"), String::new()]);
+        assert!(matches!(
+            mgr.add_virtual_folder("Y", None, &blank).await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+        assert_eq!(
+            mgr.get_virtual_folders().await.unwrap().len(),
+            0,
+            "no library"
+        );
         assert!(
             mgr.add_virtual_folder("   ", None, &LibraryOptions::default())
                 .await
@@ -4505,6 +4672,79 @@ mod tests {
         assert!(locations.is_empty(), "{locations:?}");
     }
 
+    /// The shortcut and the `PathInfos` entry are matched with their trailing
+    /// separators trimmed, so the request removes both: a folder added with
+    /// a trailing slash and removed with that stored path (what jellyfin-web
+    /// sends, gl-1871), and either side spelled with or without one
+    /// (gl-1205). Upstream compares the raw path with both, which keeps the
+    /// shortcut of a folder stored with a slash.
+    #[rstest::rstest]
+    #[case::stored_with_a_slash("/", "/")]
+    #[case::requested_without("/", "")]
+    #[case::requested_with("", "/")]
+    #[case::requested_with_two("", "//")]
+    #[tokio::test]
+    async fn remove_media_path_matches_past_trailing_separators(
+        #[case] stored: &str,
+        #[case] requested: &str,
+    ) {
+        let (tmp, mgr) = manager();
+        let m1 = media_dir(&tmp, "one");
+        let m2 = media_dir(&tmp, "two");
+        mgr.add_virtual_folder(
+            "Lib",
+            None,
+            &opts_with_paths(&[format!("{m1}{stored}"), m2.clone()]),
+        )
+        .await
+        .unwrap();
+        mgr.remove_media_path("Lib", &format!("{m1}{requested}"))
+            .await
+            .unwrap();
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(folder.locations, std::slice::from_ref(&m2));
+        let paths: Vec<String> = folder
+            .library_options
+            .unwrap()
+            .path_infos
+            .into_iter()
+            .map(|info| info.path)
+            .collect();
+        assert_eq!(paths, [m2]);
+    }
+
+    /// A folder added twice has two shortcuts and two `PathInfos` entries;
+    /// removing it drops both entries, so both shortcuts go too, or the
+    /// folder would stay scanned with no entry left to remove. Upstream
+    /// deletes the first shortcut only.
+    #[rstest::rstest]
+    #[case::twice_as_typed("")]
+    #[case::again_with_a_slash("/")]
+    #[tokio::test]
+    async fn remove_media_path_deletes_every_matching_shortcut(#[case] again: &str) {
+        let (tmp, mgr) = manager();
+        let m1 = media_dir(&tmp, "one");
+        let m2 = media_dir(&tmp, "two");
+        mgr.add_virtual_folder(
+            "Lib",
+            None,
+            &opts_with_paths(&[m1.clone(), format!("{m1}{again}"), m2.clone()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mgr.get_virtual_folders().await.unwrap()[0].locations.len(),
+            3
+        );
+        mgr.remove_media_path("Lib", &m1).await.unwrap();
+        let folder = mgr.get_virtual_folders().await.unwrap().remove(0);
+        assert_eq!(folder.locations, std::slice::from_ref(&m2));
+        assert_eq!(
+            folder.library_options.unwrap().path_infos,
+            [MediaPathInfo { path: m2 }]
+        );
+    }
+
     /// A case-only rename that differs in a non-ASCII letter is case-only as
     /// C#'s `OrdinalIgnoreCase` sees it, so a case-insensitive filesystem,
     /// where the target spelling already exists, is not a conflict. (On a
@@ -4655,6 +4895,62 @@ mod tests {
         expected.sort();
         assert_eq!(locs, expected);
         assert!(folder.library_options.unwrap().enable_realtime_monitor);
+    }
+
+    /// A new path that is empty or blank is refused, and nothing is written:
+    /// upstream's `CreateShortcut` throws on an empty target and
+    /// `RemoveContentTypeOverrides` on a blank path, so its options are never
+    /// saved (gl-1206). A blank path the stored options already hold is skipped
+    /// as upstream skips it, so such a library can still be saved.
+    #[tokio::test]
+    async fn update_library_options_refuses_a_blank_new_path_and_writes_nothing() {
+        let (tmp, mgr) = manager();
+        let m1 = media_dir(&tmp, "one");
+        let m2 = media_dir(&tmp, "two");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&m1)))
+            .await
+            .unwrap();
+        let folder = tmp.path().join("default").join("Lib");
+        let before = mgr.get_virtual_folders().await.unwrap();
+        let options_before = std::fs::read(folder.join(OPTIONS_FILE)).unwrap();
+        for blank in ["", "  "] {
+            let mut new_opts = opts_with_paths(&[m1.clone(), m2.clone(), blank.to_owned()]);
+            new_opts.enable_realtime_monitor = !new_opts.enable_realtime_monitor;
+            let error = mgr
+                .update_library_options("Lib", &new_opts)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ServiceError::InvalidInput(_)),
+                "{blank:?}: {error:?}"
+            );
+            assert_eq!(
+                mgr.get_virtual_folders().await.unwrap(),
+                before,
+                "{blank:?}"
+            );
+            assert_eq!(
+                std::fs::read(folder.join(OPTIONS_FILE)).unwrap(),
+                options_before,
+                "{blank:?}"
+            );
+            let mut files: Vec<_> = std::fs::read_dir(&folder)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            files.sort();
+            assert_eq!(files, ["one.mblink", OPTIONS_FILE], "{blank:?}");
+        }
+
+        // A blank path already stored is not new, so it neither fails nor gets a shortcut.
+        let stored = opts_with_paths(&[m1.clone(), String::new()]);
+        std::fs::write(
+            folder.join(OPTIONS_FILE),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        mgr.update_library_options("Lib", &stored).await.unwrap();
+        assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 2);
     }
 
     #[tokio::test]

@@ -65,8 +65,7 @@ impl MediaEncoder for Tagged {
     ) -> Result<MediaInfo, ServiceError> {
         let name = Path::new(request.media_source.path.as_deref().unwrap_or_default())
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|name| name.to_string_lossy().into_owned());
         let tags = self.tags.lock().unwrap().get(&name).cloned();
         Ok(MediaInfo {
             media_source: self.get_media_info(request).await?,

@@ -288,8 +288,7 @@ impl FerrofinSearchManager {
         for hint in hints.iter_mut() {
             let parents = rows
                 .get(&hint.id)
-                .map(|row| parent_chain(row, &ancestors))
-                .unwrap_or_default();
+                .map_or_default(|row| parent_chain(row, &ancestors));
             fill_artwork(
                 processor,
                 self.metadata_root.as_ref(),
@@ -639,14 +638,12 @@ fn first_multi(stored: Option<&str>) -> Option<String> {
 /// Splits a stored pipe-delimited multi-value column (`artists`, …) into a list,
 /// dropping empties. Jellyfin stores these joined by `|`.
 fn split_multi(stored: Option<&str>) -> Vec<String> {
-    stored
-        .map(|s| {
-            s.split('|')
-                .filter(|p| !p.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    stored.map_or_default(|s| {
+        s.split('|')
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 #[async_trait]

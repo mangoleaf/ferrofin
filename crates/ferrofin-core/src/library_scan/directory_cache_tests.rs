@@ -274,13 +274,13 @@ fn the_sidecar_check_asks_a_listed_folders_existence_of_its_listing() {
         metadata_dir: Some(tmp.path().join("metadata").into()),
         dirs: Some(Arc::clone(&dirs)),
     };
+    let row = BaseItemEntity {
+        path: Some(video.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
     let item = Planned {
         id: uuid::Uuid::new_v4(),
-        entity: BaseItemEntity {
-            path: Some(video.to_string_lossy().into_owned()),
-            ..Default::default()
-        }
-        .into(),
+        entity: row.clone().into(),
         ancestors: Vec::new(),
         generated_names: Vec::new(),
     };
@@ -293,7 +293,7 @@ fn the_sidecar_check_asks_a_listed_folders_existence_of_its_listing() {
     // The plan pass lists the folder.
     dirs.relist(&dir).unwrap();
 
-    assert!(!sidecars_changed(&seam, &item, Some(&links)));
+    assert!(!sidecars_changed(&seam, &item, &row, Some(&links)));
     assert_eq!((stats(), listings()), (0, 1), "answered from the listing");
     // Only the spelling listed: another is the filesystem's to answer (a
     // case-insensitive mount says yes to it itself).
@@ -305,13 +305,19 @@ fn the_sidecar_check_asks_a_listed_folders_existence_of_its_listing() {
     let commentary = folder.join("Heat (1995).commentary.mka");
     std::fs::write(&commentary, b"1").unwrap();
     dirs.invalidate(&commentary.to_string_lossy());
-    assert!(sidecars_changed(&seam, &item, Some(&links)), "the new one");
+    assert!(
+        sidecars_changed(&seam, &item, &row, Some(&links)),
+        "the new one"
+    );
     assert_eq!((stats(), listings()), (2, 2));
 
     // A folder removed, once forgotten, is gone: no listing says it is there.
     std::fs::remove_dir_all(&folder).unwrap();
     dirs.invalidate(&dir);
     let links = StoredItemLinks::default();
-    assert!(!sidecars_changed(&seam, &item, Some(&links)), "none left");
+    assert!(
+        !sidecars_changed(&seam, &item, &row, Some(&links)),
+        "none left"
+    );
     assert_eq!((stats(), listings()), (4, 2), "both searches asked");
 }

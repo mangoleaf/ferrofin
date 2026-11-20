@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "SQLite persistence for Ferrofin (port of Jellyfin.Database) — entities, migration, DTO conversions."
+description = "SQLite persistence for Ferrofin (port of Jellyfin.Database) — entities, migrations, the database handle."
 
 [lints]
 workspace = true
@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 ferrofin-model.workspace = true
 ferrofin-util.workspace = true
+# Reading `BaseItems.Data`, the JSON payload of each item (`item_data`).
+serde_json.workspace = true
 sqlx = { workspace = true, features = ["migrate"] }
 libsqlite3-sys.workspace = true
 thiserror.workspace = true

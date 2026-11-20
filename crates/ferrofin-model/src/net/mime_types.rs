@@ -1,19 +1,25 @@
 //! Port of `MediaBrowser.Model.Net.MimeTypes`.
 //!
-//! The C# original delegates most lookups to an external `MimeTypes` NuGet
-//! table and overrides/augments it with two small dictionaries. Here the full
-//! extension↔mime tables are inlined (the union of the upstream override tables
-//! and the base table entries exercised by the ported oracle, plus every
-//! `image/*` entry of the base table in both directions), preserving the same
-//! lookup order:
+//! The C# original delegates most lookups to the `MimeTypes` NuGet package
+//! (2.5.2, pinned in upstream's `Directory.Packages.props`) and overrides or
+//! augments its table with two small dictionaries. Here the package's whole
+//! extension → mime table is inlined verbatim (`base_type_map`), beside the
+//! upstream override table (`MIME_TYPE_LOOKUP`). The mime → extension table
+//! (`mime_to_extension`) is the union of the upstream override table and the
+//! package entries `ToExtension` gives for the types the ported oracle
+//! exercises, plus every `image/*` type of the package (`ToExtension`'s callers
+//! here are the image paths). The lookup order is upstream's:
 //!
-//! `GetMimeType`: override table → base table → generic `video/<ext>` for known
-//! video extensions → default.
+//! `GetMimeType`: override table → package table → generic `video/<ext>` for
+//! known video extensions → default.
 //!
-//! `ToExtension`: strip any `;charset=…` suffix → override table → base table.
+//! `ToExtension`: strip any `;charset=…` suffix → override table → package
+//! table.
 //!
 //! Lookups are case-insensitive on the extension/mime key (matching the C#
 //! `StringComparer.OrdinalIgnoreCase`).
+
+mod base_type_map;
 
 use ferrofin_util::string_extensions::left_part;
 
@@ -28,194 +34,40 @@ const VIDEO_FILE_EXTENSIONS: &[&str] = &[
     ".ogv", ".rec", ".ts", ".rmvb", ".vob", ".webm", ".wmv", ".wtv",
 ];
 
-/// Extension → MIME type table (override table ∪ base table). Keys are lowercase
-/// with a leading dot.
-// A data table, one entry per line, so its length is the table's.
-#[allow(clippy::type_complexity, clippy::too_many_lines)]
-fn extension_to_mime() -> &'static [(&'static str, &'static str)] {
-    &[
-        // Type application
-        (".7z", "application/x-7z-compressed"),
-        (".azw", "application/vnd.amazon.ebook"),
-        (".azw3", "application/vnd.amazon.ebook"),
-        (".cb7", "application/x-cb7"),
-        (".cba", "application/x-cba"),
-        (".cbr", "application/vnd.comicbook-rar"),
-        (".cbt", "application/x-cbt"),
-        (".cbz", "application/vnd.comicbook+zip"),
-        (".dll", "application/octet-stream"),
-        (".eot", "application/vnd.ms-fontobject"),
-        (".epub", "application/epub+zip"),
-        (".json", "application/json"),
-        (".mobi", "application/x-mobipocket-ebook"),
-        (".opf", "application/oebps-package+xml"),
-        (".pdf", "application/pdf"),
-        (".rar", "application/vnd.rar"),
-        (".srt", "application/x-subrip"),
-        (".ttml", "application/ttml+xml"),
-        (".wasm", "application/wasm"),
-        (".xml", "application/xml"),
-        (".zip", "application/zip"),
-        // Type image: every extension the `MimeTypes` 2.5.2 base table maps to an
-        // `image/*` type, plus the override `.tbn`, so files stored under the
-        // extensions `to_extension` hands out are typed as upstream types them.
-        (".3ds", "image/x-3ds"),
-        (".apng", "image/apng"),
-        (".avci", "image/avci"),
-        (".avcs", "image/avcs"),
-        (".avif", "image/avif"),
-        (".azv", "image/vnd.airzip.accelerator.azv"),
-        (".b16", "image/vnd.pco.b16"),
-        (".bmp", "image/bmp"),
-        (".btf", "image/prs.btif"),
-        (".btif", "image/prs.btif"),
-        (".cgm", "image/cgm"),
-        (".cmx", "image/x-cmx"),
-        (".dds", "image/vnd.ms-dds"),
-        (".dib", "image/bmp"),
-        (".djv", "image/vnd.djvu"),
-        (".djvu", "image/vnd.djvu"),
-        (".dpx", "image/dpx"),
-        (".drle", "image/dicom-rle"),
-        (".dwg", "image/vnd.dwg"),
-        (".dxf", "image/vnd.dxf"),
-        (".emf", "image/emf"),
-        (".exr", "image/aces"),
-        (".fbs", "image/vnd.fastbidsheet"),
-        (".fh", "image/x-freehand"),
-        (".fh4", "image/x-freehand"),
-        (".fh5", "image/x-freehand"),
-        (".fh7", "image/x-freehand"),
-        (".fhc", "image/x-freehand"),
-        (".fits", "image/fits"),
-        (".fpx", "image/vnd.fpx"),
-        (".fst", "image/vnd.fst"),
-        (".g3", "image/g3fax"),
-        (".gif", "image/gif"),
-        (".heic", "image/heic"),
-        (".heics", "image/heic-sequence"),
-        (".heif", "image/heif"),
-        (".heifs", "image/heif-sequence"),
-        (".hej2", "image/hej2k"),
-        (".hsj2", "image/hsj2"),
-        (".ico", "image/vnd.microsoft.icon"),
-        (".ief", "image/ief"),
-        (".jhc", "image/jphc"),
-        (".jls", "image/jls"),
-        (".jng", "image/x-jng"),
-        (".jp2", "image/jp2"),
-        (".jpe", "image/jpeg"),
-        (".jpeg", "image/jpeg"),
-        (".jpf", "image/jpx"),
-        (".jpg", "image/jpeg"),
-        (".jpg2", "image/jp2"),
-        (".jpgm", "image/jpm"),
-        (".jph", "image/jph"),
-        (".jpm", "image/jpm"),
-        (".jpx", "image/jpx"),
-        (".jxr", "image/jxr"),
-        (".jxra", "image/jxra"),
-        (".jxrs", "image/jxrs"),
-        (".jxs", "image/jxs"),
-        (".jxsc", "image/jxsc"),
-        (".jxsi", "image/jxsi"),
-        (".jxss", "image/jxss"),
-        (".ktx", "image/ktx"),
-        (".ktx2", "image/ktx2"),
-        (".mdi", "image/vnd.ms-modi"),
-        (".mmr", "image/vnd.fujixerox.edmics-mmr"),
-        (".npx", "image/vnd.net-fpx"),
-        (".pbm", "image/x-portable-bitmap"),
-        (".pct", "image/x-pict"),
-        (".pcx", "image/vnd.zbrush.pcx"),
-        (".pgm", "image/x-portable-graymap"),
-        (".pic", "image/x-pict"),
-        (".png", "image/png"),
-        (".pnm", "image/x-portable-anymap"),
-        (".ppm", "image/x-portable-pixmap"),
-        (".psd", "image/vnd.adobe.photoshop"),
-        (".pti", "image/prs.pti"),
-        (".ras", "image/x-cmu-raster"),
-        (".rgb", "image/x-rgb"),
-        (".rlc", "image/vnd.fujixerox.edmics-rlc"),
-        (".sgi", "image/sgi"),
-        (".sid", "image/x-mrsid-image"),
-        (".svg", "image/svg+xml"),
-        (".svgz", "image/svg+xml"),
-        (".t38", "image/t38"),
-        (".tap", "image/vnd.tencent.tap"),
-        (".tbn", "image/jpeg"),
-        (".tfx", "image/tiff-fx"),
-        (".tga", "image/x-tga"),
-        (".tif", "image/tiff"),
-        (".tiff", "image/tiff"),
-        (".uvg", "image/vnd.dece.graphic"),
-        (".uvi", "image/vnd.dece.graphic"),
-        (".uvvg", "image/vnd.dece.graphic"),
-        (".uvvi", "image/vnd.dece.graphic"),
-        (".vtf", "image/vnd.valve.source.texture"),
-        (".wbmp", "image/vnd.wap.wbmp"),
-        (".wdp", "image/vnd.ms-photo"),
-        (".webp", "image/webp"),
-        (".wmf", "image/wmf"),
-        (".xbm", "image/x-xbitmap"),
-        (".xif", "image/vnd.xiff"),
-        (".xpm", "image/x-xpixmap"),
-        (".xwd", "image/x-xwindowdump"),
-        // Type font
-        (".ttf", "font/ttf"),
-        (".woff", "font/woff"),
-        (".woff2", "font/woff2"),
-        // Type text
-        (".ass", "text/x-ssa"),
-        (".ssa", "text/x-ssa"),
-        (".css", "text/css"),
-        (".csv", "text/csv"),
-        (".edl", "text/plain"),
-        (".html", "text/html; charset=UTF-8"),
-        (".htm", "text/html; charset=UTF-8"),
-        (".log", "text/plain"),
-        (".txt", "text/plain"),
-        (".vtt", "text/vtt"),
-        // Type video
-        (".3gp", "video/3gpp"),
-        (".3g2", "video/3gpp2"),
-        (".asf", "video/x-ms-asf"),
-        (".avi", "video/x-msvideo"),
-        (".flv", "video/x-flv"),
-        (".mp4", "video/mp4"),
-        (".m4v", "video/x-m4v"),
-        (".mpegts", "video/mp2t"),
-        (".mpg", "video/mpeg"),
-        (".mkv", "video/x-matroska"),
-        (".mov", "video/quicktime"),
-        (".ogv", "video/ogg"),
-        (".ts", "video/mp2t"),
-        (".webm", "video/webm"),
-        (".wmv", "video/x-ms-wmv"),
-        // Type audio
-        (".aac", "audio/aac"),
-        (".ac3", "audio/ac3"),
-        (".ape", "audio/x-ape"),
-        (".dsf", "audio/dsf"),
-        (".dsp", "audio/dsp"),
-        (".flac", "audio/flac"),
-        (".m4a", "audio/mp4"),
-        (".m4b", "audio/mp4"),
-        (".mid", "audio/midi"),
-        (".midi", "audio/midi"),
-        (".mp3", "audio/mpeg"),
-        (".oga", "audio/ogg"),
-        (".ogg", "audio/ogg"),
-        (".opus", "audio/ogg"),
-        (".vorbis", "audio/vorbis"),
-        (".wav", "audio/wav"),
-        (".webma", "audio/webm"),
-        (".wma", "audio/x-ms-wma"),
-        (".wv", "audio/x-wavpack"),
-        (".xsp", "audio/xsp"),
-    ]
-}
+/// Upstream's `_mimeTypeLookup`: extensions the package's table lacks, and
+/// types that override it. Keys are lowercase with a leading dot.
+const MIME_TYPE_LOOKUP: &[(&str, &str)] = &[
+    // Type application
+    (".azw3", "application/vnd.amazon.ebook"),
+    (".cb7", "application/x-cb7"),
+    (".cba", "application/x-cba"),
+    (".cbr", "application/vnd.comicbook-rar"),
+    (".cbt", "application/x-cbt"),
+    (".cbz", "application/vnd.comicbook+zip"),
+    // Type image
+    (".tbn", "image/jpeg"),
+    // Type text
+    (".ass", "text/x-ssa"),
+    (".ssa", "text/x-ssa"),
+    (".edl", "text/plain"),
+    (".html", "text/html; charset=UTF-8"),
+    (".htm", "text/html; charset=UTF-8"),
+    // Type video
+    (".mpegts", "video/mp2t"),
+    // Type audio
+    (".aac", "audio/aac"),
+    (".ac3", "audio/ac3"),
+    (".ape", "audio/x-ape"),
+    (".dsf", "audio/dsf"),
+    (".dsp", "audio/dsp"),
+    (".flac", "audio/flac"),
+    (".m4b", "audio/mp4"),
+    (".mp3", "audio/mpeg"),
+    (".vorbis", "audio/vorbis"),
+    (".webma", "audio/webm"),
+    (".wv", "audio/x-wavpack"),
+    (".xsp", "audio/xsp"),
+];
 
 /// MIME type → extension table (override table ∪ base table). Keys are lowercase.
 // A data table, one entry per line, so its length is the table's.
@@ -417,12 +269,12 @@ pub fn get_mime_type_or<'a>(filename: &str, default_value: Option<&'a str>) -> O
 
     let ext = extension_of(filename);
 
-    if let Some(result) = lookup(extension_to_mime(), ext) {
+    if let Some(result) = lookup(MIME_TYPE_LOOKUP, ext).or_else(|| base_mime_type(ext)) {
         return Some(result);
     }
 
     // Catch-all for video types that don't require specific mime types. Only
-    // reachable for a known video extension not already in the table above.
+    // reachable for a known video extension neither table above names.
     if !ext.is_empty()
         && VIDEO_FILE_EXTENSIONS
             .iter()
@@ -434,6 +286,17 @@ pub fn get_mime_type_or<'a>(filename: &str, default_value: Option<&'a str>) -> O
     default_value
 }
 
+/// `Model.MimeTypes.TryGetMimeType`: the package's table, keyed by the
+/// extension without its dot. Its keys are lowercase and sorted, so a binary
+/// search over the lowercased extension is its case-insensitive lookup.
+fn base_mime_type(ext: &str) -> Option<&'static str> {
+    let key = ext.strip_prefix('.')?;
+    base_type_map::TYPE_MAP
+        .binary_search_by(|(k, _)| k.bytes().cmp(key.bytes().map(|b| b.to_ascii_lowercase())))
+        .ok()
+        .map(|i| base_type_map::TYPE_MAP[i].1)
+}
+
 /// Gets the MIME type for `filename`, or [`DEFAULT_MIME_TYPE`] when none is
 /// found. Mirrors the single-argument `MimeTypes.GetMimeType(path)`.
 #[must_use]
@@ -443,24 +306,16 @@ pub fn get_mime_type(filename: &str) -> &'static str {
 
 /// Returns the generic `video/<ext-without-dot>` MIME type for a known video
 /// extension, mirroring the C# `string.Concat("video/", ext.AsSpan(1))`
-/// catch-all. The set of extensions is fixed ([`VIDEO_FILE_EXTENSIONS`]), so
-/// each maps to a `'static` string.
+/// catch-all, for the [`VIDEO_FILE_EXTENSIONS`] neither table names (the
+/// others never reach it), so each maps to a `'static` string.
 fn generic_video_mime(ext: &str) -> &'static str {
     const GENERIC: &[(&str, &str)] = &[
         (".divx", "video/divx"),
         (".dvr-ms", "video/dvr-ms"),
-        (".f4v", "video/f4v"),
-        (".img", "video/img"),
-        (".iso", "video/iso"),
         (".m2t", "video/m2t"),
         (".m2ts", "video/m2ts"),
-        (".m2v", "video/m2v"),
-        (".mk3d", "video/mk3d"),
-        (".mts", "video/mts"),
         (".ogm", "video/ogm"),
         (".rec", "video/rec"),
-        (".rmvb", "video/rmvb"),
-        (".vob", "video/vob"),
         (".wtv", "video/wtv"),
     ];
     GENERIC
@@ -589,6 +444,35 @@ mod tests {
     #[case(".wma", "audio/x-ms-wma")]
     #[case(".wv", "audio/x-wavpack")]
     #[case(".xsp", "audio/xsp")]
+    // The `MimeTypes` 2.5.2 package's table, which `GetMimeType` asks after the
+    // override table: its rows, case-insensitively.
+    #[case(".aif", "audio/x-aiff")]
+    #[case(".aifc", "audio/x-aiff")]
+    #[case(".aiff", "audio/x-aiff")]
+    #[case(".AIFF", "audio/x-aiff")]
+    #[case(".amr", "audio/amr")]
+    #[case(".au", "audio/basic")]
+    #[case(".dts", "audio/vnd.dts")]
+    #[case(".m3u8", "application/vnd.apple.mpegurl")]
+    #[case(".m4p", "application/mp4")]
+    #[case(".mka", "audio/x-matroska")]
+    #[case(".mp2", "audio/mpeg")]
+    #[case(".mpc", "application/vnd.mophun.certificate")]
+    #[case(".otf", "font/otf")]
+    #[case(".pfb", "application/x-font-type1")]
+    #[case(".ra", "audio/x-realaudio")]
+    #[case(".spx", "audio/ogg")]
+    #[case(".ttc", "font/collection")]
+    #[case(".weba", "audio/webm")]
+    // A video extension the package names wins over the generic `video/<ext>`.
+    #[case(".f4v", "video/x-f4v")]
+    #[case(".iso", "application/octet-stream")]
+    #[case(".m2v", "video/mpeg")]
+    #[case(".mk3d", "video/x-matroska")]
+    #[case(".mpeg", "video/mpeg")]
+    #[case(".mts", "model/vnd.mts")]
+    #[case(".rmvb", "application/vnd.rn-realmedia-vbr")]
+    #[case(".vob", "video/x-ms-vob")]
     fn get_mime_type_valid_returns_correct_result(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(Some(expected), get_mime_type_or(input, None));
     }
@@ -685,16 +569,45 @@ mod tests {
         assert_eq!(get_mime_type_or("", Some("x/y")), Some("x/y"));
         assert_eq!(get_mime_type(""), DEFAULT_MIME_TYPE);
 
-        // Unknown extension → default.
+        // Unknown extension → default; the package has no `.eac3` row either.
         assert_eq!(get_mime_type("file.unknownext"), DEFAULT_MIME_TYPE);
         assert_eq!(get_mime_type_or("file.unknownext", None), None);
+        assert_eq!(get_mime_type_or("track.eac3", None), None);
+        assert_eq!(get_mime_type_or("file.", None), None);
 
-        // A known video extension that is not in the primary table falls back to
-        // the generic `video/<ext>` mapping.
+        // The package's table is keyed on the file name's extension.
+        assert_eq!(get_mime_type("/music/a.b/Song.AIFF"), "audio/x-aiff");
+
+        // A known video extension in neither table falls back to the generic
+        // `video/<ext>` mapping.
         assert_eq!(get_mime_type("clip.divx"), "video/divx");
-        assert_eq!(get_mime_type("disk.iso"), "video/iso");
-        // A video extension without a dedicated generic entry → video/mp4.
-        assert_eq!(get_mime_type("movie.rmvb"), "video/rmvb");
+        assert_eq!(get_mime_type("show.m2ts"), "video/m2ts");
+    }
+
+    /// Every video extension neither table names has its generic
+    /// `video/<ext>` entry.
+    #[test]
+    fn generic_video_fallback_covers_every_unlisted_video_extension() {
+        for ext in VIDEO_FILE_EXTENSIONS {
+            if lookup(MIME_TYPE_LOOKUP, ext).is_none() && base_mime_type(ext).is_none() {
+                assert_eq!(generic_video_mime(ext), format!("video/{}", &ext[1..]));
+            }
+        }
+    }
+
+    /// The binary search in `base_mime_type` needs the package's keys
+    /// lowercase and strictly ascending.
+    #[test]
+    fn base_table_keys_are_lowercase_and_sorted() {
+        let table = base_type_map::TYPE_MAP;
+        // The package's own row count (`new Dictionary<string, string>(1180, …)`).
+        assert_eq!(table.len(), 1180);
+        assert!(table.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(
+            table
+                .iter()
+                .all(|(k, _)| !k.bytes().any(|b| b.is_ascii_uppercase()))
+        );
     }
 
     /// Every extension `to_extension` hands out for an image type is typed as an

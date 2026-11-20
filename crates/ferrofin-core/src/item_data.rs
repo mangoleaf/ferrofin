@@ -1,6 +1,6 @@
-//! `BaseItems.Data` JSON — Jellyfin's serialized-item payload, the **source of
-//! truth** for a playlist's ownership and shares. Membership lives in the
-//! `LinkedChildren` table since 12.0 (`Folder.LinkedChildren` is
+//! `BaseItems.Data` JSON — Jellyfin's serialized-item payload, where a
+//! Jellyfin database keeps a playlist's ownership and shares. Membership lives
+//! in the `LinkedChildren` table since 12.0 (`Folder.LinkedChildren` is
 //! `[JsonIgnore]`); a 10.11 `Data` copy of it is imported once, on adoption.
 //!
 //! Jellyfin serializes the whole runtime item object into the `Data` column
@@ -18,12 +18,17 @@
 //!    {"Path":"/media/…/M.mkv","Type":"Manual"}], …}
 //! ```
 //!
-//! Ferrofin's query paths keep using the `FerrofinPlaylists` /
-//! `FerrofinPlaylistShares` tables as a **derived cache**; every ownership or
-//! share mutation writes through to `Data` via `sync_container_data_in`, a
-//! whole-row save of a playlist the cache holds rewrites those keys from it in
-//! the save's transaction, and [`reconcile_playlist_permissions`] rebuilds the
-//! cache from `Data` at startup.
+//! Once a playlist has a `FerrofinPlaylists` row, the `FerrofinPlaylists` /
+//! `FerrofinPlaylistShares` tables are the **source of truth** for its
+//! permissions, and `Data` is a write-through copy: every ownership or share
+//! mutation writes through to `Data` via `sync_container_data_in` in the
+//! mutation's transaction, and a whole-row save of a playlist the tables hold
+//! rewrites those keys from them in the save's transaction. The copy is kept
+//! exact because an earlier Ferrofin re-imports it over the tables on every
+//! boot (a downgrade), and because a playlist without its row is imported from
+//! it: [`reconcile_playlist_permissions`] imports, at startup, only the
+//! playlists that have no row yet (an adopted database, or a scan that stopped
+//! before writing the row).
 //!
 //! Writes are **read-modify-write** over the raw JSON object: keys Ferrofin does
 //! not model (`DisplayOrder`, `DateLastSaved`, `IsHD`, …) are preserved
@@ -39,6 +44,11 @@ use uuid::Uuid;
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
+
+// The readers live in `ferrofin-db`, so the crates beside core share them.
+pub use ferrofin_db::item_data::{
+    VideoFormat, parse_data, read_data_f64, read_data_i32, read_data_string, video_format,
+};
 
 /// One entry of the `LinkedChildren` array (C# `LinkedChild`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -88,26 +98,14 @@ pub fn json_guid(id: Uuid) -> String {
     id.simple().to_string()
 }
 
-/// Parses a `Data` column value into its JSON object, tolerating `NULL`,
-/// empty, and malformed payloads (each yields an empty object).
-#[must_use]
-pub fn parse_data(data: Option<&str>) -> Map<String, Value> {
-    data.and_then(|d| serde_json::from_str::<Value>(d).ok())
-        .and_then(|v| match v {
-            Value::Object(map) => Some(map),
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
-/// The `CollectionType` a row's `Data` stores, lower-cased: how a library's
-/// type (`CollectionFolder.CollectionType`) is read case-insensitively.
-/// `mixed` comes back as stored; callers that read it as no type filter it.
+/// A library's type (`CollectionFolder.CollectionType`) from its row's `Data`,
+/// bound as Jellyfin binds it ([`CollectionType::from_item_data`]), by its C#
+/// `ToString()` name. A mixed library (`mixed`, no member) has none.
+///
+/// [`CollectionType::from_item_data`]: ferrofin_model::data::CollectionType::from_item_data
 pub(crate) fn stored_collection_type(data: Option<&str>) -> Option<String> {
-    parse_data(data)
-        .get("CollectionType")
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase)
+    ferrofin_model::data::CollectionType::from_item_data(data, "CollectionType")
+        .map(|kind| kind.json_name().into_owned())
 }
 
 /// A library row's `PhysicalLocationsList` from its `Data`, as stored: a virtual-path token stays
@@ -119,14 +117,13 @@ pub(crate) fn stored_physical_locations(data: Option<&str>) -> Vec<String> {
     parse_data(data)
         .get("PhysicalLocationsList")
         .and_then(Value::as_array)
-        .map(|locations| {
+        .map_or_default(|locations| {
             locations
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -163,7 +160,7 @@ pub fn read_remote_trailers(data: Option<&str>) -> Vec<(Option<String>, String)>
     parse_data(data)
         .get("RemoteTrailers")
         .and_then(Value::as_array)
-        .map(|entries| {
+        .map_or_default(|entries| {
             entries
                 .iter()
                 .filter_map(|e| {
@@ -177,7 +174,6 @@ pub fn read_remote_trailers(data: Option<&str>) -> Vec<(Option<String>, String)>
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// Merges `trailers` into a `Data` column value's `RemoteTrailers` array,
@@ -453,20 +449,6 @@ pub fn merge_data_fields(data: Option<&str>, fields: &[(&str, Option<Value>)]) -
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
-/// A video's format as its `Data` stores it: `Video.VideoType` (the
-/// `VideoFile` default when the blob names none), `IsoType` and
-/// `Video3DFormat`, each serialized by name (`BaseItemMapper` keeps them in
-/// the blob, not in a column).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VideoFormat {
-    /// `Video.VideoType`.
-    pub video_type: ferrofin_model::entities::VideoType,
-    /// `Video.IsoType`, for a disc image.
-    pub iso_type: Option<ferrofin_model::entities::IsoType>,
-    /// `Video.Video3DFormat`, for a 3D video.
-    pub video3d_format: Option<ferrofin_model::entities::Video3DFormat>,
-}
-
 /// `BaseItem.Container`: the container a probe stored in `data`
 /// (`FFProbeVideoInfo`/`AudioFileProber`), if any. The text is read first: a
 /// blob with no `"Container"` key is not parsed.
@@ -474,33 +456,6 @@ pub struct VideoFormat {
 pub fn stored_container(data: Option<&str>) -> Option<String> {
     let text = data.filter(|text| text.contains("\"Container\""))?;
     read_data_string(&parse_data(Some(text)), "Container").filter(|c| !c.is_empty())
-}
-
-/// The [`VideoFormat`] `data` stores. The text is read first: a blob naming
-/// no disc, image or 3D format — nearly every video's — is not parsed.
-#[must_use]
-pub fn video_format(data: Option<&str>) -> VideoFormat {
-    let plain = VideoFormat {
-        video_type: ferrofin_model::entities::VideoType::VideoFile,
-        iso_type: None,
-        video3d_format: None,
-    };
-    let Some(text) = data.filter(|t| {
-        ["Video3DFormat", "\"BluRay\"", "\"Dvd\"", "\"Iso\""]
-            .iter()
-            .any(|needle| t.contains(needle))
-    }) else {
-        return plain;
-    };
-    let data = parse_data(Some(text));
-    let field = |key: &str| data.get(key).cloned().filter(|v| !v.is_null());
-    VideoFormat {
-        video_type: field("VideoType")
-            .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or(plain.video_type),
-        iso_type: field("IsoType").and_then(|v| serde_json::from_value(v).ok()),
-        video3d_format: field("Video3DFormat").and_then(|v| serde_json::from_value(v).ok()),
-    }
 }
 
 /// A video's `IHasAspectRatio.AspectRatio` and `ISupportsPlaceHolders.
@@ -598,24 +553,6 @@ pub fn date_modified_follows_save(
     path_is_directory(item) || item.path.as_deref().is_none_or(str::is_empty)
 }
 
-/// Reads one `Data` field as a string.
-#[must_use]
-pub fn read_data_string(data: &Map<String, Value>, key: &str) -> Option<String> {
-    data.get(key)?.as_str().map(str::to_owned)
-}
-
-/// Reads one `Data` field as an `f64` (accepting the JSON number form).
-#[must_use]
-pub fn read_data_f64(data: &Map<String, Value>, key: &str) -> Option<f64> {
-    data.get(key)?.as_f64()
-}
-
-/// Reads one `Data` field as an `i32`.
-#[must_use]
-pub fn read_data_i32(data: &Map<String, Value>, key: &str) -> Option<i32> {
-    i32::try_from(data.get(key)?.as_i64()?).ok()
-}
-
 /// Whether the parsed `Data` object carries a `LinkedChildren` key at all —
 /// the presence signal that Jellyfin (or a prior Ferrofin sync) owns this blob.
 #[cfg(test)]
@@ -665,8 +602,8 @@ pub async fn sync_container_data(db: &Database, container: Uuid) -> Result<(), S
 /// a table change and its `Data` sync commit together and each sync reflects
 /// the tables at its own point in the writer's order: a sync that read before a
 /// share change committed cannot write its older `Shares` after that change's
-/// own sync, where the next boot's [`reconcile_playlist_permissions`] would
-/// bring a revoked share back.
+/// own sync, where it would leave `Data` disagreeing with the tables (see the
+/// module doc for why the copy must stay exact).
 pub(crate) async fn sync_container_data_in(
     conn: &mut sqlx::SqliteConnection,
     container: Uuid,
@@ -720,13 +657,13 @@ pub(crate) async fn sync_saved_playlist_in(
     conn: &mut sqlx::SqliteConnection,
     playlist: Uuid,
 ) -> Result<(), ServiceError> {
-    let cached: Option<i64> =
+    let has_row: Option<i64> =
         sqlx::query_scalar(r#"SELECT 1 FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#)
             .bind(guid_to_db(playlist))
             .fetch_optional(&mut *conn)
             .await
             .map_err(db_err)?;
-    if cached.is_none() {
+    if has_row.is_none() {
         return Ok(());
     }
     sync_container_data_in(conn, playlist).await
@@ -861,7 +798,7 @@ pub(crate) async fn playlist_permissions_in(
 
 /// Makes `heir` the owner of `playlist` and drops `heir`'s share, with the
 /// `Data` sync, on a connection the caller holds (normally a writer
-/// transaction, so the next boot's re-import keeps the change): C#
+/// transaction, so the change and its `Data` copy commit together): C#
 /// `RemovePlaylistsAsync`'s `OwnerUserId = rankedShares[0].UserId` and
 /// `Shares = rankedShares.Skip(1)`.
 ///
@@ -925,7 +862,7 @@ pub(crate) async fn hand_playlist_to_in(
 ///
 /// The share order is the rows' `rowid` order. Every writer inserts in the
 /// order upstream's `Shares` list holds (a create or an update in the
-/// request's order, the boot re-import in `Data`'s, a hand-over editors
+/// request's order, the boot import in `Data`'s, a hand-over editors
 /// first), and every reader and the `Data` sync read in it. A whole list is
 /// written with [`add_listed_shares_in`].
 ///
@@ -959,7 +896,7 @@ pub(crate) async fn share_playlist_in(
     Ok(())
 }
 
-/// Writes the share list a create, an update or the boot re-import gives
+/// Writes the share list a create, an update or the boot import gives
 /// `playlist` (C# `Shares = request.Users`, or `Data`'s `Shares`), in its
 /// order, after the caller cleared the old rows.
 ///
@@ -993,8 +930,8 @@ pub(crate) async fn add_listed_shares_in(
     Ok(())
 }
 
-/// Folds a playlist's owner / open-access / shares cache rows into its parsed
-/// `Data` object (the `OwnerUserId` / `OpenAccess` / `Shares` keys).
+/// Folds a playlist's owner / open-access / shares permission rows into its
+/// parsed `Data` object (the `OwnerUserId` / `OpenAccess` / `Shares` keys).
 async fn sync_playlist_meta(
     conn: &mut sqlx::SqliteConnection,
     container_db: &str,
@@ -1038,43 +975,63 @@ async fn sync_playlist_meta(
     Ok(())
 }
 
-/// Imports every playlist's owner / open-access / shares from its `Data` JSON
-/// into the Ferrofin permission tables — run on every boot, before the first
-/// request is served: a playlist without a `FerrofinPlaylists` row is treated
-/// as owner-accessible by every caller. 12.0 still serialises these keys, so
-/// the JSON is current on both adoption paths; a row Ferrofin wrote agrees
-/// with its own tables. Membership is deliberately NOT imported here (the JSON
-/// copy is frozen on a 12.0 database) — that is the one-shot
-/// [`crate::adoption_repairs::import_membership_once`].
+/// Imports the owner / open-access / shares of each playlist that has no
+/// `FerrofinPlaylists` row yet from its `Data` JSON into the Ferrofin
+/// permission tables — run on every boot, before the first request is served:
+/// a playlist without its row is treated as owner-accessible by every caller.
+/// That is every playlist of a newly adopted database (12.0 still serialises
+/// these keys) and one a scan saved but stopped before writing its row. A
+/// playlist with a row is left alone: the tables are the source of truth once
+/// imported, so a `Data` that fell behind them brings nothing back. One whose
+/// `Data` names none of the keys is skipped and keeps no row. Membership is
+/// deliberately NOT imported here (the JSON copy is frozen on a 12.0 database)
+/// — that is the one-shot [`crate::adoption_repairs::import_membership_once`].
 ///
-/// Returns the number of playlists reconciled.
+/// Returns the number of playlists imported.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
 pub async fn reconcile_playlist_permissions(db: &Database) -> Result<usize, ServiceError> {
     let [playlist_type, _] = container_type_names();
-    let rows: Vec<(String, Option<String>)> =
-        sqlx::query_as(r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Type" = ?1"#)
-            .bind(playlist_type)
-            .fetch_all(db.pool())
-            .await
-            .map_err(db_err)?;
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        r#"SELECT bi."Id", bi."Data" FROM "BaseItems" bi
+           WHERE bi."Type" = ?1
+             AND NOT EXISTS (SELECT 1 FROM "FerrofinPlaylists" p WHERE p."PlaylistId" = bi."Id")"#,
+    )
+    .bind(playlist_type)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
     let mut imported = 0usize;
     for (id, data) in rows {
         let map = parse_data(data.as_deref());
-        if !["OwnerUserId", "OpenAccess", "Shares"]
-            .iter()
-            .any(|k| map.contains_key(*k))
-        {
+        let keys = ["OwnerUserId", "OpenAccess", "Shares"];
+        let present = keys.iter().filter(|k| map.contains_key(**k)).count();
+        if present == 0 {
             continue;
         }
-        let mut tx = db.writer().begin().await.map_err(db_err)?;
-        import_playlist_meta(&mut tx, &id, &map).await?;
+        let Ok(playlist) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        if present < keys.len() {
+            tracing::debug!(
+                item_id = %playlist,
+                "playlist Data lacks some permission keys; importing their defaults"
+            );
+        }
+        // The import re-checks for the row and reads before it writes: take the
+        // write lock first, as the previous version may still be writing.
+        let mut tx = db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
+        import_playlist_meta_if_missing_in(&mut tx, playlist).await?;
         tx.commit().await.map_err(db_err)?;
         imported += 1;
     }
     if imported > 0 {
-        tracing::debug!(imported, "reconciled playlist permissions from Data JSON");
+        tracing::debug!(imported, "imported playlist permissions from Data JSON");
     }
     Ok(imported)
 }
@@ -1331,15 +1288,25 @@ pub(crate) async fn seed_playlist_owner(db: &Database, playlist: Uuid, owner: Uu
     .expect("seed playlist owner");
 }
 
-/// Test-only: drops `playlist`'s share rows (not its `Data`), so a test can
-/// prove the boot re-import brings them back from `Data`.
+/// Test-only: drops `playlist`'s permission row and share rows (not its
+/// `Data`), as for a playlist no boot has imported yet, then runs the boot
+/// import, so the tables hold what `Data` alone gives them: a test proves
+/// `Data` is an exact copy of the tables, or that the import reads it right.
 #[cfg(test)]
-pub(crate) async fn clear_playlist_shares(db: &Database, playlist: Uuid) {
-    sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
+pub(crate) async fn reimport_from_data(db: &Database, playlist: Uuid) {
+    for table in ["FerrofinPlaylistShares", "FerrofinPlaylists"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            r#"DELETE FROM "{table}" WHERE "PlaylistId" = ?1"#
+        )))
         .bind(guid_to_db(playlist))
         .execute(db.writer())
         .await
-        .expect("clear playlist shares");
+        .expect("forget playlist permissions");
+    }
+    let imported = reconcile_playlist_permissions(db)
+        .await
+        .expect("boot import");
+    assert_eq!(imported, 1, "`Data` names none of the permission keys");
 }
 
 /// Test-only: makes every write of `item`'s `Data` abort (a `BEFORE UPDATE OF
@@ -1355,6 +1322,15 @@ pub(crate) async fn fail_data_writes_of(db: &Database, item: Uuid) {
     .execute(db.writer())
     .await
     .expect("trigger");
+}
+
+/// Test-only: lifts [`fail_data_writes_of`]'s failure.
+#[cfg(test)]
+pub(crate) async fn allow_data_writes(db: &Database) {
+    sqlx::query(r#"DROP TRIGGER "TestFailDataWrite""#)
+        .execute(db.writer())
+        .await
+        .expect("drop trigger");
 }
 
 #[cfg(test)]
@@ -1382,6 +1358,23 @@ mod tests {
         #[case] expected: &[&str],
     ) {
         assert_eq!(stored_physical_locations(data), expected);
+    }
+
+    /// A library's type reads by Jellyfin's binding and comes back by name: a
+    /// number or a padded name classifies, an unknown name or `mixed` is none.
+    #[rstest::rstest]
+    #[case(Some(r#"{"CollectionType":"Movies"}"#), Some("movies"))]
+    #[case(Some(r#"{"CollectionType":" boxsets "}"#), Some("boxsets"))]
+    #[case(Some(r#"{"CollectionType":11}"#), Some("playlists"))]
+    #[case(Some(r#"{"CollectionType":"mixed"}"#), None)]
+    #[case(Some(r#"{"CollectionType":"nonsense"}"#), None)]
+    #[case(Some(r#"{"ViewType":"movies"}"#), None)]
+    #[case(None, None)]
+    fn stored_collection_type_binds_as_jellyfin(
+        #[case] data: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(stored_collection_type(data).as_deref(), expected);
     }
 
     /// `Video.UpdateFromResolvedItem` (`Video.cs:500-526`) over the `Data`
@@ -1619,8 +1612,8 @@ mod tests {
 
     /// An entry edit's `Data` sync that starts while a share revoke holds the
     /// writer must not write the pre-revoke `Shares` after the revoke's own
-    /// sync: the next boot rebuilds the shares from `Data` and would give the
-    /// access back.
+    /// sync: `Data` would then disagree with the tables, and an earlier
+    /// Ferrofin's boot (a downgrade) rebuilds the shares from it.
     #[tokio::test]
     async fn a_sync_waiting_on_a_revoke_does_not_bring_the_share_back() {
         // File-backed: an in-memory database shares one connection between the
@@ -1668,9 +1661,7 @@ mod tests {
         drop(revoke);
         edit_sync.await.expect("join").expect("edit sync");
 
-        reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot reconcile");
+        reimport_from_data(&db, playlist).await;
         let shares: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#,
         )
@@ -1678,7 +1669,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .expect("count");
-        assert_eq!(shares, 0, "the revoked share came back on boot");
+        assert_eq!(shares, 0, "`Data` still names the revoked share");
     }
 
     #[tokio::test]
@@ -1755,11 +1746,11 @@ mod tests {
             .await
             .expect("import meta");
         tx.commit().await.expect("commit");
-        // The every-boot permission pass is a no-op on top of it.
+        // The every-boot permission pass leaves an imported playlist alone.
         let reconciled = reconcile_playlist_permissions(&db)
             .await
             .expect("reconcile");
-        assert_eq!(reconciled, 1);
+        assert_eq!(reconciled, 0);
 
         let edges: Vec<(String, i64)> = sqlx::query_as(
             r#"SELECT "ChildId", "SortOrder" FROM "LinkedChildren"
@@ -1791,6 +1782,86 @@ mod tests {
         .await
         .expect("share");
         assert_eq!(share, (guid_to_db(owner), true));
+    }
+
+    /// Once a playlist has its permission row the tables win: a boot leaves a
+    /// revoked share revoked and a private playlist private whatever a stale
+    /// `Data` says. A playlist with no row (adopted, or saved by a scan that
+    /// stopped before its row) is still imported from `Data`, and one whose
+    /// `Data` names no permission key still gets no row.
+    #[tokio::test]
+    async fn boot_imports_only_playlists_without_a_permission_row() {
+        let db = test_db().await;
+        let (imported, missing, keyless) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (owner, bob) = (Uuid::new_v4(), Uuid::new_v4());
+        let stale = serde_json::json!({
+            "OwnerUserId": json_guid(owner),
+            "OpenAccess": true,
+            "Shares": [{"UserId": json_guid(bob), "CanEdit": true}],
+        })
+        .to_string();
+        for playlist in [imported, missing] {
+            crate::test_support::seed_item_with_data(
+                &db,
+                playlist,
+                BaseItemKind::Playlist,
+                "P",
+                &stale,
+            )
+            .await;
+        }
+        crate::test_support::seed_item_with_data(
+            &db,
+            keyless,
+            BaseItemKind::Playlist,
+            "Keyless",
+            r#"{"PlaylistMediaType":"Audio"}"#,
+        )
+        .await;
+        // The tables hold `imported` private and unshared: a revoke whose
+        // `Data` sync was lost.
+        seed_playlist_owner(&db, imported, owner).await;
+
+        let reconciled = reconcile_playlist_permissions(&db)
+            .await
+            .expect("reconcile");
+        let meta = |playlist: Uuid| {
+            let db = db.clone();
+            async move {
+                let row: Option<(Option<String>, bool)> = sqlx::query_as(
+                    r#"SELECT "OwnerUserId", "OpenAccess" FROM "FerrofinPlaylists"
+                       WHERE "PlaylistId" = ?1"#,
+                )
+                .bind(guid_to_db(playlist))
+                .fetch_optional(db.pool())
+                .await
+                .expect("meta");
+                let shares: Vec<(String, bool)> = sqlx::query_as(
+                    r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
+                       WHERE "PlaylistId" = ?1"#,
+                )
+                .bind(guid_to_db(playlist))
+                .fetch_all(db.pool())
+                .await
+                .expect("shares");
+                (row, shares)
+            }
+        };
+        assert_eq!(
+            meta(imported).await,
+            (Some((Some(guid_to_db(owner)), false)), Vec::new()),
+            "the tables win: no share and no open access come back"
+        );
+        assert_eq!(
+            meta(missing).await,
+            (
+                Some((Some(guid_to_db(owner)), true)),
+                vec![(guid_to_db(bob), true)]
+            ),
+            "a playlist without a row is imported from `Data`"
+        );
+        assert_eq!(meta(keyless).await, (None, Vec::new()));
+        assert_eq!(reconciled, 1, "only the playlist without a row is imported");
     }
 
     #[tokio::test]

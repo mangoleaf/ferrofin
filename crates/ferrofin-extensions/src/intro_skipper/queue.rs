@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::SortOrder;
-use ferrofin_model::entities_media::VirtualFolderInfo;
+use ferrofin_model::entities_media::{VirtualFolderInfo, airs_numbers};
 use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::LibraryManager;
@@ -282,18 +282,8 @@ fn duration(item: &BaseItemEntity) -> f64 {
 /// `Episode.AiredSeasonNumber`: `AirsAfterSeasonNumber ?? AirsBeforeSeasonNumber
 /// ?? ParentIndexNumber` (the airs-numbers live in the item's `Data` blob).
 fn aired_season_number(item: &BaseItemEntity) -> Option<i64> {
-    let blob = item
-        .data
-        .as_deref()
-        .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok());
-    let number = |key: &str| {
-        blob.as_ref()
-            .and_then(|b| b.get(key))
-            .and_then(serde_json::Value::as_i64)
-    };
-    number("AirsAfterSeasonNumber")
-        .or_else(|| number("AirsBeforeSeasonNumber"))
-        .or(item.parent_index_number)
+    let [before_season, after_season, _] = airs_numbers(item.data.as_deref());
+    after_season.or(before_season).or(item.parent_index_number)
 }
 
 /// The queue under construction, with the anime lookups it caches per series.

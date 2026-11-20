@@ -27,10 +27,9 @@ use ferrofin_model::configuration::{
     MetadataOptions, MetadataPluginSummary, ServerConfiguration, UserConfiguration,
 };
 use ferrofin_model::data::CollectionType;
-use ferrofin_model::devices::DeviceInfo;
 use ferrofin_model::dto::{
-    BaseItemDto, ClientCapabilitiesDto, DeviceInfoDto, ItemCounts, MediaSourceInfo, NameIdPair,
-    SessionInfoDto, UpdateUserItemDataDto, UserDto, UserItemDataDto,
+    BaseItemDto, DeviceInfoDto, ItemCounts, MediaSourceInfo, NameIdPair, SessionInfoDto,
+    UpdateUserItemDataDto, UserDto, UserItemDataDto,
 };
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -266,8 +265,7 @@ pub fn elevated_fake_state() -> AppState {
 }
 
 /// [`elevated_fake_state`] over the given library and system managers, for an
-/// admin-only handler whose behaviour depends on them (the backup create's
-/// scan and free-space guards).
+/// admin-only handler whose behaviour depends on them.
 #[must_use]
 pub fn elevated_state_with(
     library: Arc<dyn LibraryManager>,
@@ -499,6 +497,43 @@ impl AuthService for ApiKeyAuthService {
     }
 }
 
+/// A fake [`AuthService`] and [`AuthorizationContext`] that answers every
+/// request with the same [`AuthorizationInfo`], whatever its credentials say.
+#[derive(Clone)]
+pub struct FixedAuth(pub AuthorizationInfo);
+
+impl FixedAuth {
+    /// Signed in as `user`, with no cached policy and no API key.
+    #[must_use]
+    pub fn signed_in(user: UserEntity) -> Self {
+        Self(AuthorizationInfo {
+            user: Some(Arc::new(user)),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        })
+    }
+}
+
+#[async_trait]
+impl AuthService for FixedAuth {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for FixedAuth {
+    async fn get_authorization_info(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(self.0.clone())
+    }
+}
+
 /// Implements [`LibraryManager`] for a library fake: the methods given, then
 /// every other required one, which INFRA-level tests never reach.
 macro_rules! fake_library_manager {
@@ -536,13 +571,6 @@ macro_rules! fake_library_manager {
                 _query: &InternalItemsQuery,
                 _collection_type: CollectionType,
             ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-                unimplemented!("fake")
-            }
-            async fn create_items(
-                &self,
-                _items: &[BaseItemEntity],
-                _parent_id: Option<Uuid>,
-            ) -> Result<(), ServiceError> {
                 unimplemented!("fake")
             }
             async fn update_items(
@@ -657,20 +685,6 @@ fake_library_manager!(FakeLibrary {
     }
 });
 
-/// [`FakeLibrary`] in the middle of a full library validation
-/// ([`LibraryManager::is_scan_running`]), for the work that refuses or stands
-/// down while a library scan runs.
-pub struct ScanningLibrary;
-
-fake_library_manager!(ScanningLibrary {
-    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    fn is_scan_running(&self) -> bool {
-        true
-    }
-});
-
 /// [`FakeLibrary`] that counts the library scans queued through it, scoped
 /// or not, for the routes whose requested refresh is under test.
 #[derive(Default)]
@@ -731,40 +745,10 @@ impl ferrofin_traits::media_encoding::EncoderSupport for CommonEncoders {
 /// indistinguishable from a denial.
 #[must_use]
 pub fn sample_user() -> UserEntity {
-    UserEntity {
-        id: "11111111-1111-1111-1111-111111111111".to_owned(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
-        password: None,
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "bench".to_owned(),
-        normalized_username: "BENCH".to_owned(),
-    }
+    fake_user_entity(
+        Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+        "bench",
+    )
 }
 
 /// An [`AuthService`] that authenticates as [`sample_user`], so a
@@ -808,9 +792,6 @@ impl UserManager for PolicyUsers {
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         FakeUsers.get_users().await
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        FakeUsers.get_user_ids().await
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
         FakeUsers.initialize().await
@@ -902,9 +883,6 @@ pub struct FakeUsers;
 #[async_trait]
 impl UserManager for FakeUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!("fake")
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -1061,9 +1039,6 @@ pub struct FakeAdminUsers;
 #[async_trait]
 impl UserManager for FakeAdminUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!("fake")
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -1306,13 +1281,6 @@ impl SessionManager for FakeSessions {
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
-    async fn update_device_name(
-        &self,
-        _session_id: &str,
-        _reported_device_name: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn on_playback_start(&self, _info: &PlaybackStartInfo) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
@@ -1383,14 +1351,6 @@ impl SessionManager for FakeSessions {
         // delivery is covered by ferrofin-core's tests.
         Ok(())
     }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _device_id: &str,
-        _message_type: SessionMessageType,
-        _data: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
@@ -1420,6 +1380,7 @@ impl SessionManager for FakeSessions {
         _request: &AuthenticationRequest,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: UserDto::default(),
             session: SessionInfoDto::default(),
             access_token: FAKE_ACCESS_TOKEN.into(),
         })
@@ -1429,6 +1390,7 @@ impl SessionManager for FakeSessions {
         _request: &AuthenticationRequest,
     ) -> Result<AuthenticationResultData, ServiceError> {
         Ok(AuthenticationResultData {
+            user: UserDto::default(),
             session: SessionInfoDto::default(),
             access_token: FAKE_ACCESS_TOKEN.into(),
         })
@@ -1493,8 +1455,7 @@ impl SessionManager for FakeSessions {
 /// A fake [`SystemManager`]. The info getters return a default value so the
 /// now-real `/System/Info` and `/System/Info/Public` handlers resolve (the
 /// contract probe expects them to route, not `404`); `restart` accepts the
-/// request (the backup-restore handler schedules a restart, and its test
-/// asserts the on-disk marker instead); shutdown/storage stay `unimplemented!`.
+/// request; shutdown/storage stay `unimplemented!`.
 /// `snapshot_database` writes a stand-in database file, and `free_space_of`
 /// reports a disk that never fills.
 pub struct FakeSystem;
@@ -1574,20 +1535,6 @@ impl ServerApplicationHost for FakeAppHost {
     ) -> Result<String, ServiceError> {
         self.get_smart_api_url(&RequestContext::default()).await
     }
-    async fn get_local_api_url(
-        &self,
-        _hostname: &str,
-        _scheme: Option<&str>,
-        _port: Option<u16>,
-    ) -> Result<String, ServiceError> {
-        unimplemented!("fake")
-    }
-    fn expand_virtual_path(&self, path: &str) -> String {
-        path.to_owned()
-    }
-    fn reverse_virtual_path(&self, path: &str) -> String {
-        path.to_owned()
-    }
 }
 
 /// A fake [`ServerApplicationPaths`]; every accessor returns an empty path.
@@ -1625,8 +1572,8 @@ impl ServerApplicationPaths for FakePaths {
         String::new()
     }
     fn program_data_path(&self) -> String {
-        // A process-unique temp root so path-backed handlers (e.g. Backup) have a
-        // real, writable directory to operate in during tests.
+        // A process-unique temp root so path-backed handlers have a real,
+        // writable directory to operate in during tests.
         std::env::temp_dir()
             .join(format!("ferrofin-api-test-data-{}", std::process::id()))
             .to_string_lossy()
@@ -1774,14 +1721,6 @@ impl MusicManager for FakeMusic {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_instant_mix_from_artist(
-        &self,
-        _artist_id: Uuid,
-        _user_id: Option<Uuid>,
-        _dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn get_instant_mix_from_genres(
         &self,
         _genres: &[String],
@@ -1844,12 +1783,6 @@ pub struct FakeDto;
 
 #[async_trait]
 impl DtoService for FakeDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -1867,15 +1800,6 @@ impl DtoService for FakeDto {
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
         unimplemented!("fake")
     }
     async fn can_delete(
@@ -1931,13 +1855,6 @@ impl PlaylistManager for FakePlaylists {
     ) -> Result<ferrofin_traits::collections::PlaylistAccess, ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_playlist_for_user(
-        &self,
-        _playlist_id: Uuid,
-        _user_id: Uuid,
-    ) -> Result<BaseItemEntity, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn create_playlist(
         &self,
         _request: &PlaylistCreationRequest,
@@ -1947,14 +1864,11 @@ impl PlaylistManager for FakePlaylists {
     async fn update_playlist(&self, _request: &PlaylistUpdateRequest) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn get_playlist_items(
         &self,
         _playlist_id: Uuid,
         _user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<ferrofin_traits::persistence::PlaylistMembers, ServiceError> {
         unimplemented!("fake")
     }
     async fn get_playlist_item_ids(&self, _playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
@@ -2049,6 +1963,14 @@ impl CollectionManager for FakeCollections {
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
+
+    async fn resolve_box_set_folders(
+        &self,
+        _location: &str,
+        _folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        unimplemented!("fake")
+    }
 }
 
 /// A fake [`SubtitleManager`]; every method is unused by INFRA-level tests.
@@ -2080,6 +2002,9 @@ impl SubtitleManager for FakeSubtitles {
         unimplemented!("fake")
     }
     async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn drop_missing_subtitle_rows(&self, _item_id: Uuid) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
     async fn get_supported_providers(
@@ -2259,12 +2184,6 @@ impl DeviceManager for FakeDevices {
     ) -> Result<QueryResult<DeviceEntity>, ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_device_infos(
-        &self,
-        _query: &DeviceQuery,
-    ) -> Result<QueryResult<DeviceInfo>, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn get_devices_for_user(
         &self,
         _user_id: Option<Uuid>,
@@ -2295,12 +2214,6 @@ impl DeviceManager for FakeDevices {
         &self,
         _device_id: &str,
     ) -> Result<Option<DeviceOptionsEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn to_client_capabilities_dto(
-        &self,
-        _capabilities: &ClientCapabilities,
-    ) -> Result<ClientCapabilitiesDto, ServiceError> {
         unimplemented!("fake")
     }
 }
@@ -2411,13 +2324,6 @@ impl DisplayPreferencesManager for FakeDisplayPreferences {
     ) -> Result<ItemDisplayPreferencesEntity, ServiceError> {
         unimplemented!("fake")
     }
-    async fn list_item_display_preferences(
-        &self,
-        _user_id: Uuid,
-        _client: &str,
-    ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn list_custom_item_display_preferences(
         &self,
         _user_id: Uuid,
@@ -2526,6 +2432,9 @@ pub struct RecordingTasks {
     pub started: std::sync::Mutex<Vec<String>>,
     /// Task ids passed to [`TaskManager::cancel_task`], in call order.
     pub cancelled: std::sync::Mutex<Vec<String>>,
+    /// Task ids passed to [`TaskManager::cancel_if_running_and_queue`], in
+    /// call order.
+    pub requeued: std::sync::Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -2547,6 +2456,13 @@ impl TaskManager for RecordingTasks {
         self.cancelled
             .lock()
             .expect("cancelled lock")
+            .push(task_id.to_owned());
+        Ok(())
+    }
+    async fn cancel_if_running_and_queue(&self, task_id: &str) -> Result<(), ServiceError> {
+        self.requeued
+            .lock()
+            .expect("requeued lock")
             .push(task_id.to_owned());
         Ok(())
     }
@@ -2856,7 +2772,8 @@ pub fn elevated_state_with_virtual_folders(vf: Arc<dyn VirtualFolderManager>) ->
 }
 
 /// A [`FakeConfig`] whose startup wizard is complete, so the
-/// `FirstTimeSetupOr*` extractors take their post-setup branch.
+/// `FirstTimeSetupOr*` extractors take their post-setup branch. Client log
+/// uploads are allowed, as in a stock install.
 pub struct SetupCompleteConfig;
 
 #[async_trait]
@@ -2867,6 +2784,7 @@ impl ServerConfigurationManager for SetupCompleteConfig {
     async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
         Ok(Arc::new(ServerConfiguration {
             is_startup_wizard_completed: true,
+            allow_client_log_upload: true,
             ..ServerConfiguration::default()
         }))
     }
@@ -2890,6 +2808,27 @@ impl ServerConfigurationManager for SetupCompleteConfig {
 #[must_use]
 pub fn setup_complete_state(auth: Arc<dyn AuthService>) -> AppState {
     fake_state_with(auth, Arc::new(SetupCompleteConfig))
+}
+
+/// [`setup_complete_state`] whose request context resolves through `context`
+/// (the identity a route reading the request's [`AuthorizationInfo`] sees)
+/// over the given user manager, so a handler that re-reads the caller's policy
+/// ([`PolicyUsers`]) sees the one `auth` carries.
+#[must_use]
+pub fn setup_complete_state_as(
+    context: Arc<dyn AuthorizationContext>,
+    auth: Arc<dyn AuthService>,
+    users: Arc<dyn UserManager>,
+) -> AppState {
+    fake_state_over(
+        users,
+        context,
+        auth,
+        Arc::new(SetupCompleteConfig),
+        Arc::new(FakeSessions),
+        Arc::new(FakeActivity),
+        Arc::new(FakeTasks),
+    )
 }
 
 /// [`fake_state`] with the given auth service and configuration manager.
@@ -2928,9 +2867,29 @@ pub fn fake_state_with_streams(
     activity: Arc<dyn ActivityManager>,
     tasks: Arc<dyn TaskManager>,
 ) -> AppState {
+    fake_state_over(
+        Arc::new(FakeUsers),
+        Arc::new(FakeAuthContext),
+        auth,
+        config,
+        sessions,
+        activity,
+        tasks,
+    )
+}
+
+fn fake_state_over(
+    users: Arc<dyn UserManager>,
+    context: Arc<dyn AuthorizationContext>,
+    auth: Arc<dyn AuthService>,
+    config: Arc<dyn ServerConfigurationManager>,
+    sessions: Arc<dyn SessionManager>,
+    activity: Arc<dyn ActivityManager>,
+    tasks: Arc<dyn TaskManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
-        Arc::new(FakeUsers),
+        users,
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
@@ -2943,7 +2902,7 @@ pub fn fake_state_with_streams(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
-        Arc::new(FakeAuthContext),
+        context,
         auth,
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
@@ -2968,8 +2927,8 @@ pub fn fake_state_with_streams(
 /// for the `/Plugins/*`, `/Packages/*` and `/Repositories` handler tests.
 ///
 /// Every other manager is the [`fake_state`] double; authentication succeeds
-/// as an **API key** ([`ApiKeyAuthService`]) so both the plain-auth reads and
-/// the admin-gated mutators reach their handler.
+/// as an **API key** ([`ApiKeyAuthService`]) so every admin-gated route reaches
+/// its handler.
 #[must_use]
 pub fn authed_state_with_plugins(
     plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,

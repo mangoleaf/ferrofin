@@ -548,7 +548,7 @@ fn verified_rows_are_real_operations_and_print_the_parity_line() {
         let e = per.entry(tag).or_insert((0, 0));
         e.1 += 1;
         total += 1;
-        if verified.contains(&(method.clone(), norm)) {
+        if verified.contains(&(method, norm)) {
             e.0 += 1;
         }
     }
@@ -615,8 +615,7 @@ fn verified_rows_name_existing_upstream_code() {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
     if !head.starts_with(UPSTREAM_COMMIT) {
         eprintln!(
             "SKIP: FERROFIN_UPSTREAM_DIR {} is at {head:?}, not UPSTREAM_COMMIT \
