@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """The stored paths of a round trip's export, and its libraries once Jellyfin has scanned it (stdlib only).
 
-    checks_paths.py stored --db FILE --out DIR --media DIR [--source DIR]...
+    checks_paths.py stored --db FILE --out DIR --media DIR [--source DIR]... [--ran DIR COPY]... [--before FILE]
         on the exported database, before Jellyfin boots on it: every path it stores under Jellyfin's
         directories resolves in the export, where DIR (--out) is Jellyfin's /config, a token path through the
         directory Jellyfin expands it to, a media path under the media mount (--media is /media), and no path
-        lies under a directory of the source (each --source: where the server ran, as its rows named it)
+        lies under a directory of the source (each --source, and both of each --ran: where the server ran, as
+        its rows named it, and the copy that holds it; the first --ran its data directory, a second its
+        configuration directory). With --before, the database the export read (it needs --ran), a path the
+        same column of the source stored without a file where it placed one (a person whose folder Jellyfin
+        never made, a file gone from the media) is not the export's to resolve; an absolute path outside the
+        source's directories and the media always is
     checks_paths.py libraries --before FILE --after FILE
         every library folder row of the database Ferrofin stopped with (--before) is in Jellyfin's once its
         scan ran (--after), with the same DateCreated: Jellyfin deletes a library whose stored folder it cannot
@@ -51,22 +56,50 @@ def rows(db, query):
             raise
 
 
-def place(path, out, media):
-    """Where `path`, as Jellyfin reads it in its docker image, is in the export: a Path; OUTSIDE for an absolute
-    path elsewhere, which Jellyfin's container never has (whatever the host holds there); or None when it names no
-    file at all (a URL, a relative name: nothing to check)."""
+def place(path, roots, media):
+    """Where `path` is on the host: a Path; OUTSIDE for an absolute path elsewhere, which the server's container
+    never has (whatever the host holds there); or None when it names no file at all (a URL, a relative name:
+    nothing to check). `roots` is [(a directory the server saw, where it is on the host)], the tokens expanding
+    under the first: [(/config, the export)] for Jellyfin's docker image."""
     for token, under in TOKENS.items():
         if path == token or path.startswith(token + "/"):
-            return Path(out, under, path[len(token):].lstrip("/"))
-    for root, there in ((CONFIG, out), (MEDIA, media)):
-        if path == root or path.startswith(root + "/"):
+            return Path(roots[0][1], under, path[len(token):].lstrip("/"))
+    for root, there in (*roots, (MEDIA, media)):
+        if path == root or path.startswith(root.rstrip("/") + "/"):
             return Path(there, path[len(root):].lstrip("/"))
     return OUTSIDE if path.startswith("/") else None
 
 
-def stored(db, out, media, sources):
+def fileless(before, table, column, media, ran):
+    """The paths `table`.`column` of the source's database stored that it placed in its directories (`ran`,
+    [(directory, copy)]) or the media and that named no file there. A path it could not place is not one: the
+    source held no file there only where there is a there."""
+    out = set()
+    for (value,) in rows(before, f'SELECT "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL'):
+        where = place(value, ran, media)
+        if where is not None and where is not OUTSIDE and not where.exists():
+            out.add(value)
+    return out
+
+
+def source_forms(value, ran):
+    """`value` as the source may have stored it: as it is, or before the export moved its directory onto
+    Jellyfin's, the first of `ran` (the data directory) onto /config, a second (the configuration) onto
+    /config/config."""
+    forms = {value}
+    for (directory, _), target in zip(ran, (CONFIG, CONFIG + "/config")):
+        if value.startswith(target + "/"):
+            forms.add(directory.rstrip("/") + value[len(target):])
+    return forms
+
+
+def stored(db, out, media, sources, before=None, ran=()):
     """The problems of `stored` mode. A database with Jellyfin's items table and not one path in it checks
-    nothing, which is a problem, not a pass."""
+    nothing, which is a problem, not a pass. With `before`, the source's database, a path missing from the export
+    that the same column of the source stored, in one of its `source_forms`, without a file (`fileless`) is left
+    out."""
+    if before and not ran:
+        raise ValueError("the source's database needs the directories that place its paths (ran)")
     problems = []
     if has_table(db, "BaseItems") and not rows(db, 'SELECT 1 FROM "BaseItems" WHERE "Path" IS NOT NULL LIMIT 1'):
         problems.append("BaseItems.Path: no stored path to check")
@@ -79,9 +112,12 @@ def stored(db, out, media, sources):
                             + ", ".join(under[:EXAMPLES]))
         missing = []
         for value in values:
-            where = place(value, out, media)
+            where = place(value, [(CONFIG, out)], media)
             if where is OUTSIDE or (where is not None and not where.exists()):
                 missing.append(value)
+        if missing and before:
+            without_file = fileless(before, table, column, media, ran)
+            missing = [value for value in missing if not source_forms(value, ran) & without_file]
         if missing:
             problems.append(f"{table}.{column}: {len(missing)} of {len(values)} path(s) not in the export, first: "
                             + ", ".join(missing[:EXAMPLES]))
@@ -128,13 +164,19 @@ def main(argv=None):
     paths.add_argument("--out", required=True)
     paths.add_argument("--media", required=True)
     paths.add_argument("--source", action="append", default=[])
+    paths.add_argument("--before")
+    paths.add_argument("--ran", nargs=2, action="append", default=[], metavar=("DIR", "COPY"))
     folders = modes.add_parser("libraries")
     folders.add_argument("--before", required=True)
     folders.add_argument("--after", required=True)
     args = parser.parse_args(argv)
+    if args.mode == "stored" and args.before and not args.ran:
+        parser.error("--before needs --ran: the directories that place the source's paths")
     try:
         if args.mode == "stored":
-            problems = stored(args.db, args.out, args.media, [s for s in args.source if s.rstrip("/") != CONFIG])
+            sources = args.source + [directory for pair in args.ran for directory in pair]
+            problems = stored(args.db, args.out, args.media, [s for s in sources if s.rstrip("/") != CONFIG],
+                              args.before, [tuple(pair) for pair in args.ran])
         else:
             problems = libraries(args.before, args.after)
     except (OSError, sqlite3.Error) as error:

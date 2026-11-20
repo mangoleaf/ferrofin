@@ -28,8 +28,10 @@ export_stage() {
   rt_remove "$cid"
   mark Export "the export completes"
   if [ "${#why[@]}" = 0 ]; then
+    # where the server ran and the copy that holds it: no exported path may lie under either, and a path the
+    # source already stored without a file there is not the export's to resolve
     check reasons python3 "$HERE/checks_paths.py" stored --db "$dst/jellyfin/data/jellyfin.db" --out "$dst/jellyfin" \
-      --media "$FIXTURES/media" --source "$ran_at" --source "$dst/ferrofin"
+      --media "$FIXTURES/media" --before "$dst/ferrofin/data/jellyfin.db" --ran "$ran_at" "$dst/ferrofin"
     mark Export "every stored path is in the export, none under the directory Ferrofin ran at"
   fi
   [ "${#why[@]}" = 0 ]
