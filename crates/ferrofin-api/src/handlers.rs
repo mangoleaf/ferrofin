@@ -3702,7 +3702,8 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/users.rs authenticate_by_name, authenticate, login_failure, \
                authentication_result → ferrofin-core session_manager.rs authenticate_internal \
                (AuthenticateNewSessionInternal), admit_session → user_manager.rs \
-               authenticate_user (UserManager.AuthenticateUser), authentication_providers_for \
+               authenticate_user (UserManager.AuthenticateUser) with ensure_sign_in_allowed \
+               (its disabled, remote and schedule checks), authentication_providers_for \
                (GetAuthenticationProviders(User)), authenticate_with_providers \
                (AuthenticateLocalUser) and apply_external_administrator; a 401 or 403 \
                answers as ExceptionMiddleware does \
