@@ -666,6 +666,10 @@ mod tests {
             "Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin"
         );
         assert!(!providers[0].is_enabled().await.expect("enabled"));
+        assert!(
+            providers[0].counts_failed_passwords(),
+            "a refused password counts toward lockout, as upstream's"
+        );
         register_auth_providers(std::slice::from_ref(&ldap), &cx, users.as_ref());
         let listed: Vec<Option<String>> = cx
             .users

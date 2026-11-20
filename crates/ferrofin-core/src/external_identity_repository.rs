@@ -144,13 +144,16 @@ impl ExternalIdentityStore for FerrofinExternalIdentityStore {
         }
         // Upstream's `AddUser`: "Ensure we do not have more than one entry for a
         // given user" — `RemoveUser(userGuid)`, then `RemoveUser(ldapUid)`. The
-        // map was LDAP's own, so here both are scoped to the provider.
+        // map was LDAP's own, so here both are scoped to the provider, and the
+        // user's is scoped to the issuer too: LDAP's is always empty, and an
+        // OIDC user keeps their link at another identity provider.
         sqlx::query(
             r#"DELETE FROM "FerrofinExternalIdentities"
-               WHERE "UserId" = ?1 AND "ProviderId" = ?2"#,
+               WHERE "UserId" = ?1 AND "ProviderId" = ?2 AND "Issuer" = ?3"#,
         )
         .bind(&user)
         .bind(identity.provider_id)
+        .bind(identity.issuer)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -366,6 +369,47 @@ mod tests {
         assert_eq!(links[0].avatar_hash.as_deref(), Some("hash"));
         // Another provider's link of the same user stays.
         assert!(store.find(oidc).await.expect("find oidc").is_some());
+    }
+
+    /// OIDC: a user linked at one identity provider keeps that link when
+    /// linked at a second, and a relink at the first replaces only its own.
+    #[tokio::test]
+    async fn a_user_keeps_one_link_per_provider_and_issuer() {
+        let (store, _users, ids) = fixture(&["alice"]).await;
+        let at = |issuer, subject| ExternalIdentityKey {
+            provider_id: OIDC,
+            issuer,
+            subject,
+        };
+        store
+            .link(ids[0], at("https://one.example", "sub-1"), None)
+            .await
+            .expect("first issuer");
+        store
+            .link(ids[0], at("https://two.example", "sub-2"), None)
+            .await
+            .expect("second issuer");
+        assert!(
+            store
+                .find(at("https://one.example", "sub-1"))
+                .await
+                .expect("find")
+                .is_some(),
+            "the first issuer's link stays"
+        );
+        store
+            .link(ids[0], at("https://one.example", "sub-3"), None)
+            .await
+            .expect("relink at the first issuer");
+        let mut subjects: Vec<String> = store
+            .list(OIDC)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|l| l.subject)
+            .collect();
+        subjects.sort();
+        assert_eq!(subjects, ["sub-2", "sub-3"]);
     }
 
     #[tokio::test]

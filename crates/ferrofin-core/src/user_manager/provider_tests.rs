@@ -1101,3 +1101,92 @@ async fn the_default_external_user_creation_saves_the_setup() {
     assert!(!policy.enable_all_folders);
     assert_eq!(policy.enabled_folders, [folder]);
 }
+
+/// A provider that refuses every password and says its refusals never count,
+/// as Single Sign-On's does (D20).
+struct NoPasswords {
+    enabled: bool,
+}
+
+#[async_trait]
+impl AuthenticationManager for NoPasswords {
+    fn name(&self) -> &'static str {
+        "Tests.NoPasswords"
+    }
+    async fn is_enabled(&self) -> Result<bool, ServiceError> {
+        Ok(self.enabled)
+    }
+    async fn authenticate(
+        &self,
+        _username: &str,
+        _password: &str,
+        _resolved_user: Option<&UserEntity>,
+    ) -> Result<ProviderAuthenticationResult, ServiceError> {
+        Err(ServiceError::unauthorized("no password signs in"))
+    }
+    async fn change_password(
+        &self,
+        _user: &UserEntity,
+        _new_password: &str,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::Forbidden("no password".to_owned()))
+    }
+    fn new_user_policy(&self) -> Option<UserPolicy> {
+        None
+    }
+    fn counts_failed_passwords(&self) -> bool {
+        false
+    }
+}
+
+/// D20: a password refused for an account whose provider never counts its
+/// refusals is the usual failure, and leaves the account's counter and
+/// enabled flag alone, whether that provider is enabled or not (the invalid
+/// provider then refuses in its place). An account of any other provider is
+/// counted and locked out as before.
+#[rstest::rstest]
+#[case::enabled("Tests.NoPasswords", true, false)]
+#[case::disabled("tests.nopasswords", false, false)]
+#[case::default_provider(DEFAULT_AUTH_PROVIDER_ID, true, true)]
+#[case::missing_provider("missing", true, true)]
+#[tokio::test]
+async fn a_provider_whose_refusals_never_count_leaves_the_lockout_alone(
+    #[case] saved: &str,
+    #[case] enabled: bool,
+    #[case] counted: bool,
+) {
+    let db = crate::test_support::test_db().await;
+    let mgr = FerrofinUserManager::with_providers(db, vec![Arc::new(NoPasswords { enabled })]);
+    let user = mgr.create_user("no-password").await.unwrap();
+    let uid = Uuid::parse_str(&user.id).unwrap();
+    mgr.update_policy(
+        uid,
+        &UserPolicy {
+            authentication_provider_id: saved.to_owned(),
+            login_attempts_before_lockout: 2,
+            ..UserPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Two failures: the second reaches the lockout, when they count.
+    for password in ["guess", "again"] {
+        let refused = mgr
+            .authenticate_user("no-password", password, "127.0.0.1", true)
+            .await;
+        assert!(matches!(refused, Ok(None)), "{saved}: {refused:?}");
+    }
+    let user = mgr.get_user_by_id(uid).await.unwrap().unwrap();
+    assert_eq!(
+        user.invalid_login_attempt_count,
+        if counted { 2 } else { 0 },
+        "{saved}"
+    );
+    assert_eq!(
+        has_permission(mgr.db.pool(), &user.id, PermissionKind::IsDisabled)
+            .await
+            .unwrap(),
+        counted,
+        "{saved}: locked out only when counted"
+    );
+}

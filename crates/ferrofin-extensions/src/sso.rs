@@ -21,7 +21,11 @@
 //!   cache;
 //! - [`sign_in`]: a sign-in at a provider, from `/sso/oidc/{provider}/start`
 //!   to the [`VerifiedIdentity`](sign_in::VerifiedIdentity) its callback ends
-//!   with, through the pending flows of [`flows`].
+//!   with, through the pending flows of [`flows`];
+//! - [`accounts`]: the Ferrofin account that identity signs in to, found by
+//!   its link or created, and [`SsoAuthProvider`](accounts::SsoAuthProvider),
+//!   the authentication provider of the accounts it creates, which refuses
+//!   every password.
 //!
 //! An identity provider is contacted only when an admin saves a provider or a
 //! user signs in with it (B1).
@@ -33,7 +37,10 @@ use async_trait::async_trait;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::external_identities::ExternalIdentityStore;
+use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
+use ferrofin_traits::security::AuthenticationManager;
 use ferrofin_traits::sso::{OidcCallback, SsoManager, SsoReply};
 use ferrofin_traits::tasks::ScheduledTask;
 use serde::{Deserialize, Serialize};
@@ -41,6 +48,7 @@ use uuid::Uuid;
 
 use crate::{Extension, ExtensionContext};
 
+pub mod accounts;
 pub mod discovery;
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake_idp;
@@ -265,11 +273,26 @@ fn public_base(text: &str) -> Option<String> {
     usable.then(|| url.as_str().trim_end_matches('/').to_owned())
 }
 
+/// Whether the Single Sign-On plugin is enabled.
+async fn plugin_enabled(plugins: &dyn PluginManager) -> Result<bool, ServiceError> {
+    Ok(plugins
+        .get_plugin(EXTENSION_ID)
+        .await?
+        .is_some_and(|plugin| plugin.enabled))
+}
+
 /// The Single Sign-On plugin's service: reads and saves its configuration and
-/// private data through the plugin manager. Shared by the `/sso` routes
-/// through [`SsoManager`].
+/// private data through the plugin manager, and finds or creates the account
+/// a sign-in ends at. Shared by the `/sso` routes through [`SsoManager`].
 pub struct SsoService {
     plugins: Arc<dyn PluginManager>,
+    /// The accounts a sign-in finds or creates.
+    users: Arc<dyn UserManager>,
+    /// The links from an identity to its account.
+    identities: Arc<dyn ExternalIdentityStore>,
+    /// Held while an account is created and linked, so two first sign-ins of
+    /// one identity end at one account.
+    provisioning: tokio::sync::Mutex<()>,
     /// The server's published URL (`--published-url`,
     /// `FERROFIN_PUBLISHED_URL`), the public URL when the plugin sets none.
     published_url: Option<String>,
@@ -286,12 +309,21 @@ pub struct SsoService {
 
 impl SsoService {
     /// A service over the plugin manager (the enabled flag, the configuration
-    /// and the private data) and the server's published URL, which the
-    /// callback URLs fall back to. Never the request's `Host` header.
+    /// and the private data), the accounts and their identity links, and the
+    /// server's published URL, which the callback URLs fall back to. Never
+    /// the request's `Host` header.
     #[must_use]
-    pub fn new(plugins: Arc<dyn PluginManager>, published_url: Option<String>) -> Self {
+    pub fn new(
+        plugins: Arc<dyn PluginManager>,
+        users: Arc<dyn UserManager>,
+        identities: Arc<dyn ExternalIdentityStore>,
+        published_url: Option<String>,
+    ) -> Self {
         Self {
             plugins,
+            users,
+            identities,
+            provisioning: tokio::sync::Mutex::new(()),
             published_url,
             saving: tokio::sync::Mutex::new(()),
             http: OidcHttpClient::new(),
@@ -390,11 +422,12 @@ impl SsoService {
 #[async_trait]
 impl SsoManager for SsoService {
     async fn ensure_enabled(&self) -> Result<(), ServiceError> {
-        match self.plugins.get_plugin(EXTENSION_ID).await? {
-            Some(plugin) if plugin.enabled => Ok(()),
-            _ => Err(ServiceError::not_found(
+        if plugin_enabled(self.plugins.as_ref()).await? {
+            Ok(())
+        } else {
+            Err(ServiceError::not_found(
                 "the Single Sign-On plugin is disabled",
-            )),
+            ))
         }
     }
 
@@ -622,6 +655,14 @@ impl Extension for SsoExtension {
             .to_vec(),
             enable_in_main_menu: false,
         }]
+    }
+
+    /// The provider of the accounts sign-in creates, which refuses every
+    /// password and is listed while the plugin is enabled.
+    fn auth_providers(&self, cx: &ExtensionContext) -> Vec<Arc<dyn AuthenticationManager>> {
+        vec![Arc::new(accounts::SsoAuthProvider::new(Arc::clone(
+            &cx.plugins,
+        )))]
     }
 
     fn tasks(&self, _cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {

@@ -172,6 +172,17 @@
                             autocomplete="off" spellcheck="false" />
                         <div class="fieldDescription">The claim a user's Ferrofin name is taken from.</div>
                     </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoCreateUsers" />
+                            <span>Create accounts at first sign-in</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            A user no account is linked to gets one, named by the username claim, that only
+                            signs in through this provider. Off, such a user is refused. A name an account already
+                            has is always refused.
+                        </div>
+                    </div>
                     <div class="ssoNotice ssoEditorError hide" role="alert"></div>
                     <div class="ssoButtons">
                         <button is="emby-button" type="submit" class="raised button-submit">
@@ -376,6 +387,7 @@
                         : 'Required.';
                     field(page, 'ssoScopes').value = info ? info.Scopes : DEFAULT_SCOPES;
                     field(page, 'ssoUsernameClaim').value = info ? info.UsernameClaim : DEFAULT_USERNAME_CLAIM;
+                    field(page, 'ssoCreateUsers').checked = info ? !!info.CreateUsers : true;
                     showError(field(page, 'ssoEditorError'), '');
                     field(page, 'ssoEditor').classList.remove('hide');
                     field(page, 'ssoAdd').classList.add('hide');
@@ -398,7 +410,8 @@
                         AllowHttpIssuer: field(page, 'ssoAllowHttp').checked,
                         ClientId: field(page, 'ssoClientId').value.trim(),
                         Scopes: field(page, 'ssoScopes').value.trim(),
-                        UsernameClaim: field(page, 'ssoUsernameClaim').value.trim()
+                        UsernameClaim: field(page, 'ssoUsernameClaim').value.trim(),
+                        CreateUsers: field(page, 'ssoCreateUsers').checked
                     };
                     var secret = field(page, 'ssoClientSecret').value;
                     if (secret) {

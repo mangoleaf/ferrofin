@@ -79,7 +79,9 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
   user's administrator flag in its result rather than saving the user's policy itself
   (which would wait forever on the login lock it is called under). The user manager applies
   it through `UserManager::apply_external_administrator`, which sign-in paths outside the
-  password flow call too, and never demotes the last administrator.
+  password flow call too, and never demotes the last administrator. A provider that refuses
+  every password (Single Sign-On's) answers `false` from `counts_failed_passwords`, so a
+  refused password never counts toward its accounts' lockout.
 - **Password-reset providers join the same way.** `register_auth_providers` also hands the
   user manager every extension's `password_reset_providers`. A forgotten-password request
   goes to the enabled provider a user's `PasswordResetProviderId` names, and to the
