@@ -449,7 +449,7 @@ async fn encode_subtitle_response(
         // re-encodes the text without a preamble. Its WebVTT writer emits no BOM, but a
         // `.vtt` file served verbatim can carry one, and it does not survive this path.
         let text = String::from_utf8_lossy(&bytes);
-        let text = text.strip_prefix('\u{feff}').unwrap_or(&text).replace(
+        let text = text.trim_prefix('\u{feff}').replace(
             "WEBVTT",
             "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000",
         );

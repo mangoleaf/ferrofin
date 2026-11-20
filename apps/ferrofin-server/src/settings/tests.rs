@@ -485,7 +485,7 @@ fn a_rows_description_leaves_its_unit_to_the_unit() {
         let description = spec.description.to_lowercase();
         let states_it = description
             .split(|c: char| !c.is_alphanumeric())
-            .any(|word| word.strip_suffix('s').unwrap_or(word) == stated);
+            .any(|word| word.trim_suffix('s') == stated);
         assert!(!states_it, "{}: {}", spec.key, spec.description);
     }
 }

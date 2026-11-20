@@ -63,10 +63,7 @@ async fn provider(
         }
         _ => {}
     }
-    let image_path = uri
-        .path()
-        .strip_prefix("/original")
-        .unwrap_or_else(|| uri.path());
+    let image_path = uri.path().trim_prefix("/original");
     if matches!(
         image_path,
         "/large.png"

@@ -81,7 +81,7 @@ where
     if let Some(hex) = hex {
         // Convert.ToInt32(base16) permits one plus before an optional 0x, and
         // interprets the full unsigned bit pattern as a signed 32-bit value.
-        let digits = hex.strip_prefix('+').unwrap_or(hex);
+        let digits = hex.trim_prefix('+');
         let digits = digits
             .strip_prefix("0x")
             .or_else(|| digits.strip_prefix("0X"))

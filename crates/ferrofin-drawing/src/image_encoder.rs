@@ -1050,7 +1050,7 @@ fn blur_line(
 /// anything else, where `SKColor.Parse` throws.
 fn parse_sk_color(text: &str) -> Option<image::Rgba<u8>> {
     let hex = text.trim();
-    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    let hex = hex.trim_prefix('#');
     if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }

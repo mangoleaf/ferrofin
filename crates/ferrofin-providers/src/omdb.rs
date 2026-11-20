@@ -658,7 +658,7 @@ fn split_credits(credits: &str) -> Vec<&str> {
 /// Whether a credit is only a generational suffix (`Jr`, `III.`, …) — port
 /// of `OmdbProvider.IsNameSuffix`.
 fn is_name_suffix(value: &str) -> bool {
-    let suffix = value.strip_suffix('.').unwrap_or(value);
+    let suffix = value.trim_suffix('.');
     NAME_SUFFIXES
         .iter()
         .any(|s| equals_ordinal_ignore_case(s, suffix))

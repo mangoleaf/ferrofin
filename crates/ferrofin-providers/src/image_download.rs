@@ -1080,7 +1080,7 @@ fn is_svg(head: &[u8]) -> bool {
             .map_or(&[], |at| &text[at + end.len()..])
     }
 
-    let mut rest = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    let mut rest = head.trim_prefix(b"\xEF\xBB\xBF");
     loop {
         rest = rest.trim_ascii_start();
         if rest.starts_with(b"<?") {

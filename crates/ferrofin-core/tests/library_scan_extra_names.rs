@@ -100,7 +100,7 @@ impl MovieLibrary {
         let root = format!("{}/", self.media.to_string_lossy());
         rows.into_iter()
             .map(|(path, name)| {
-                let file = path.strip_prefix(&root).unwrap_or(&path).to_owned();
+                let file = path.trim_prefix(&root).to_owned();
                 (file, name.unwrap_or_default())
             })
             .collect()
