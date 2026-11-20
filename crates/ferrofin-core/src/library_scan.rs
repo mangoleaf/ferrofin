@@ -4452,7 +4452,8 @@ pub struct LibraryScanner {
     /// image rows store, for the local image validation's existence check and
     /// the image measuring: the stored rows reach the scan expanded already
     /// when its persistence service has the server's paths, so this matters
-    /// for one that has not. Identity until
+    /// for one that has not. Its `reverse` also gives the stored form of a
+    /// re-keyed item's folders ([`Self::move_item_folders`]). Identity until
     /// [`with_virtual_paths`](Self::with_virtual_paths).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
     /// The `AggregateFolder` (`CreateRootFolder()`), which each library
@@ -4998,7 +4999,8 @@ impl LibraryScanner {
     }
 
     /// Installs the server's [`VirtualPathExpander`], so the local image
-    /// validation finds an adopted row's `%MetadataPath%` image on disk.
+    /// validation finds an adopted row's `%MetadataPath%` image on disk, and a
+    /// re-key moves the paths stored in the form saves store them in.
     ///
     /// [`VirtualPathExpander`]: crate::virtual_paths::VirtualPathExpander
     #[must_use]
@@ -6476,7 +6478,7 @@ impl LibraryScanner {
     }
 
     /// [`item_folders::move_item_folders`] under this scanner's art root and
-    /// path manager.
+    /// path manager, with its virtual-path expander for the stored forms.
     fn move_item_folders(
         &self,
         ids: (Uuid, Uuid),
@@ -6485,6 +6487,7 @@ impl LibraryScanner {
     ) -> (MovedFolders, Vec<(String, String)>) {
         let metadata_dir = self.metadata_dir.as_ref().map(DirectoryPath::resolve);
         item_folders::move_item_folders(
+            &self.virtual_paths,
             metadata_dir.as_deref(),
             self.path_manager.as_deref(),
             ids,
