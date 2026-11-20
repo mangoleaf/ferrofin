@@ -123,6 +123,7 @@ removed() { [ ! -f "$TMP/state/removed" ] || grep "^${1:-}" "$TMP/state/removed"
 
 @test "start failed: Jellyfin's critical start line matches, an ordinary error does not" {
   grep -qE -- "$RT_JELLYFIN_START_FAILED" <<<'[16:44:10] [FTL] [7] Main: Error while starting server'
+  grep -qE -- "$RT_JELLYFIN_START_FAILED" <<<'[16:44:10.252] [FTL] [7] Main: Error while starting server'
   run ! grep -qE -- "$RT_JELLYFIN_START_FAILED" <<<'[16:44:10] [ERR] [7] Main: Error while starting server'
   run ! grep -qE -- "$RT_JELLYFIN_START_FAILED" <<<'[16:44:10] [FTL] [7] InternalDatabaseMigration: Error: SQLite Error 1'
 }
