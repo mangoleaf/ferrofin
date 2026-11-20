@@ -1088,6 +1088,7 @@ impl FerrofinTaskManager {
         let key_owned = key.to_owned();
         let start = Utc::now();
         let span = tracing::info_span!(
+            parent: None,
             "scheduled_task",
             task = %key_owned,
             trigger,
@@ -2921,7 +2922,9 @@ mod tests {
             fail: false,
             hidden: false,
         }));
-        mgr.queue("counting").expect("queued");
+        // Queued from inside a request (`POST /ScheduledTasks/Running/{id}`,
+        // a library change), the run is still a trace of its own.
+        tracing::info_span!("request").in_scope(|| mgr.queue("counting").expect("queued"));
 
         // Drive the spawned run to completion so its span closes and exports.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2947,6 +2950,11 @@ mod tests {
         assert_eq!(attrs.get("task").map(String::as_str), Some("counting"));
         assert_eq!(attrs.get("trigger").map(String::as_str), Some("api"));
         assert_eq!(attrs.get("outcome").map(String::as_str), Some("completed"));
+        assert_eq!(
+            span.parent_span_id,
+            opentelemetry::trace::SpanId::INVALID,
+            "a root span, never the request's child"
+        );
     }
 
     /// `ScheduledTaskWorker.Cancel` only asks: the task reads `Cancelling`
