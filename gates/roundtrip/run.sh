@@ -10,7 +10,9 @@
 #              is stopped. Checks: ready; boot log (generation, migrations, no ERROR); the scan completes;
 #              the usage stage; a clean stop.
 #   Export     `ferrofin-server export-jellyfin` from IMAGE, in a container of its own, writes what
-#              Ferrofin left into the copy Jellyfin boots on (stage_export.sh). Check: it completes.
+#              Ferrofin left into the copy Jellyfin boots on (stage_export.sh). Checks: it completes; every
+#              path the exported database stores resolves in it, in the layout of Jellyfin's image, and
+#              none lies under the directory Ferrofin ran at (checks_paths.py stored).
 #   Jellyfin   the Jellyfin release UPSTREAM_TAG names (jellyfin/jellyfin:<minor>, or --jellyfin-image)
 #              boots on the export. Checks: ready within ROUNDTRIP_READY_TIMEOUT; every migration it
 #              began finished (a failure names the migration and its SQLite error); it ran the code
@@ -19,8 +21,11 @@
 #              point; its answers equal Ferrofin's (adoption_normalise: ids, image sizes and the probes
 #              that differ by design left out), so everything answers.py captures came back: users and
 #              their logins, watch state, devices, API keys, settings, playlists and collections, and
-#              more; integrity_check and foreign_key_check
-#              clean once it has stopped.
+#              more; it serves every image, chapter and profile image, trickplay tile, external subtitle
+#              and attachment its database lists (probes.py, which writes probes.txt); its library scan
+#              completes; integrity_check and foreign_key_check clean once it has stopped; and every
+#              library folder row Ferrofin stopped with is still there after that scan, with its
+#              DateCreated (checks_paths.py libraries).
 # The errors check reads the log up to the probes: an error a probe causes is judged by the answers.
 # One PASS/FAIL line per route; the exit status is 1 if any failed, 2 if the run was refused. Every
 # check's verdict goes to WORK/results.jsonl as it runs, and WORK/report.html is built from it however
@@ -82,6 +87,9 @@ rt_valid_run_id "$RUN_ID" || die "--run-id must be lower-case letters, digits, d
 if [ -n "$ONLY" ]; then
   printf '%s\n' "${ROUNDTRIP_ROUTES[@]}" | cut -d'|' -f1 | grep -qxF -- "$ONLY" || die "no route $ONLY in routes.sh"
 fi
+for spec in "${ROUNDTRIP_ROUTES[@]}"; do   # the fifth field: where Ferrofin runs, an absolute directory
+  [[ "$(cut -d'|' -f5 <<<"$spec")" == /?* ]] || die "route ${spec%%|*} in routes.sh names no absolute data directory for Ferrofin"
+done
 [ -n "$FIXTURES" ] || FIXTURES=$(adoption_fixtures_dir roundtrip) || exit 2
 [ -d "$FIXTURES/media" ] || die "$FIXTURES has no media/: run gates/adoption/build-fixtures.sh first"
 if [ -z "$WORK" ]; then WORK=$(gates_dir roundtrip "runs/roundtrip-$RUN_ID") || exit 2; fi
@@ -148,7 +156,7 @@ reasons() { local out; out=$("$@" 2>&1) || printf '%s\n' "${out:-$1 failed}"; }
 MEDIA=(-v "$FIXTURES/media:/media:ro")
 failed=0
 for spec in "${ROUNDTRIP_ROUTES[@]}"; do
-  IFS='|' read -r route fixture generation first_start <<<"$spec"
+  IFS='|' read -r route fixture generation first_start ran_at <<<"$spec"
   [ -z "$ONLY" ] || [ "$ONLY" = "$route" ] || continue
   dst=$WORK/$route
   for needed in "$fixture" "$first_start.server.log"; do

@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use ferrofin_db::DbError;
 use ferrofin_db::export::{
-    DatabaseEdits, DroppedObjects, DroppedTable, EXPORTED_DATABASE, HistoryRewrite, export_data_dir,
+    DOCKER, DatabaseEdits, DroppedObjects, DroppedTable, EXPORTED_DATABASE, HistoryRewrite,
+    LeftOut, PathRewrite, SourceDirs, export_data_dir,
 };
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
@@ -129,9 +130,14 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
     let out = scratch.path().join("out");
     let before = files(&source);
 
-    let summary = export_data_dir(&source, &source.join(EXPORTED_DATABASE), &out)
-        .await
-        .unwrap();
+    let summary = export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        &out,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         files(&source),
@@ -169,8 +175,10 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
                 }],
                 indexes: Vec::new(),
             },
+            paths: PathRewrite::default(),
         }
     );
+    assert_eq!(summary.left_out.len(), 0);
     assert_eq!(exported_names(&out).await, ["one", "two", "three"]);
 }
 
@@ -181,8 +189,12 @@ async fn two_exports_of_one_source_hold_the_same_database() {
     let database = source.join(EXPORTED_DATABASE);
     let (first, second) = (scratch.path().join("first"), scratch.path().join("second"));
 
-    export_data_dir(&source, &database, &first).await.unwrap();
-    export_data_dir(&source, &database, &second).await.unwrap();
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &first)
+        .await
+        .unwrap();
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &second)
+        .await
+        .unwrap();
 
     assert_eq!(files(&first), files(&second));
 }
@@ -202,9 +214,14 @@ async fn a_native_database_is_exported_in_place_of_a_leftover_jellyfin_one() {
     .unwrap();
     let out = scratch.path().join("out");
 
-    export_data_dir(&source, &source.join("ferrofin.db"), &out)
-        .await
-        .unwrap();
+    export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join("ferrofin.db"),
+        &out,
+    )
+    .await
+    .unwrap();
 
     let copied = files(&out);
     assert!(!copied.contains_key(Path::new("ferrofin.db")));
@@ -220,9 +237,14 @@ async fn a_source_that_changes_during_the_export_fails_it() {
     // after the export finds the output's files there.
     let out = source.join("export");
 
-    let error = export_data_dir(&source, &source.join(EXPORTED_DATABASE), &out)
-        .await
-        .unwrap_err();
+    let error = export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        &out,
+    )
+    .await
+    .unwrap_err();
 
     let DbError::ExportSourceChanged { changed } = error else {
         panic!("expected the source to be reported changed, got {error}");
@@ -248,9 +270,14 @@ async fn a_linked_data_directory_is_copied_and_its_target_left_alone() {
     // same directory, and the snapshot would be written through it.
     let out = scratch.path().join("out");
 
-    export_data_dir(&source, &source.join(EXPORTED_DATABASE), &out)
-        .await
-        .unwrap();
+    export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        &out,
+    )
+    .await
+    .unwrap();
 
     let data = std::fs::symlink_metadata(out.join("data")).unwrap();
     assert!(data.is_dir(), "a real directory, not a link");
@@ -275,9 +302,14 @@ async fn a_linked_database_is_read_where_sqlite_keeps_its_log() {
     let before = files(&real);
     let out = scratch.path().join("out");
 
-    export_data_dir(&source, &source.join("ferrofin.db"), &out)
-        .await
-        .unwrap();
+    export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join("ferrofin.db"),
+        &out,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(files(&real), before);
     assert!(!out.join("ferrofin.db").exists());
@@ -294,7 +326,9 @@ async fn a_missing_or_foreign_database_is_refused_before_anything_is_written() {
     let out = scratch.path().join("out");
 
     for database in [source.join("missing.db"), source.join("ferrofin.db")] {
-        let error = export_data_dir(&source, &database, &out).await.unwrap_err();
+        let error = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+            .await
+            .unwrap_err();
         assert!(matches!(error, DbError::Export { .. }), "{error}");
         assert!(!out.exists(), "nothing written for {}", database.display());
     }
@@ -310,7 +344,9 @@ async fn the_snapshot_keeps_the_database_files_permissions() {
     std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
     let out = scratch.path().join("out");
 
-    export_data_dir(&source, &database, &out).await.unwrap();
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+        .await
+        .unwrap();
 
     let snapshot = std::fs::metadata(out.join(EXPORTED_DATABASE)).unwrap();
     assert_eq!(snapshot.permissions().mode() & 0o777, 0o600);
@@ -328,7 +364,9 @@ async fn a_read_only_database_is_exported_with_its_mode() {
     }
     let out = scratch.path().join("out");
 
-    export_data_dir(&source, &database, &out).await.unwrap();
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+        .await
+        .unwrap();
 
     let snapshot = std::fs::metadata(out.join(EXPORTED_DATABASE)).unwrap();
     assert_eq!(snapshot.permissions().mode() & 0o777, 0o400);
@@ -344,9 +382,14 @@ async fn a_database_linked_to_a_file_inside_the_source_is_not_copied_raw() {
     std::os::unix::fs::symlink("store/real.db", source.join("ferrofin.db")).unwrap();
     let out = scratch.path().join("out");
 
-    export_data_dir(&source, &source.join("ferrofin.db"), &out)
-        .await
-        .unwrap();
+    export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join("ferrofin.db"),
+        &out,
+    )
+    .await
+    .unwrap();
 
     let copied = files(&out);
     assert_eq!(
@@ -372,7 +415,13 @@ async fn the_database_directory_keeps_its_mode_and_time_after_the_snapshot() {
     std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o555)).unwrap();
     let out = scratch.path().join("out");
 
-    let exported = export_data_dir(&source, &source.join(EXPORTED_DATABASE), &out).await;
+    let exported = export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        &out,
+    )
+    .await;
 
     let copy = std::fs::metadata(out.join("data"));
     // Writable again, so the temporary directory can be removed.
@@ -383,6 +432,163 @@ async fn the_database_directory_keeps_its_mode_and_time_after_the_snapshot() {
     let copy = copy.unwrap();
     assert_eq!(copy.permissions().mode() & 0o777, 0o555);
     assert_eq!(copy.modified().unwrap(), old);
+}
+
+/// A server that ran at `/data`, its metadata directory outside the data
+/// directory and its cache inside it, exports in the layout of Jellyfin's
+/// docker image (gl-1557): its metadata directory becomes the output's
+/// `metadata`, the cache and the data directory's own stale `metadata` are
+/// left out, every stored path under a directory of the source is rewritten
+/// onto `/config`, and every one of those resolves in the output.
+#[tokio::test]
+async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it() {
+    let scratch = tempfile::tempdir().unwrap();
+    let meta = scratch.path().join("meta");
+    let image = format!("{}/library/ab/poster.jpg", meta.display());
+    let statements = [
+        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
+        r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT)"#.to_owned(),
+        r#"CREATE TABLE "BaseItemImageInfos" ("Path" TEXT NOT NULL)"#.to_owned(),
+        r#"CREATE TABLE "ImageInfos" ("Path" TEXT)"#.to_owned(),
+        r#"INSERT INTO "BaseItems" VALUES
+           ('MediaBrowser.Controller.Entities.AggregateFolder', '/data/root'),
+           ('MediaBrowser.Controller.Entities.UserRootFolder', '/data/root/default'),
+           ('MediaBrowser.Controller.Entities.CollectionFolder', '/data/root/default/Movies'),
+           ('MediaBrowser.Controller.Entities.Person', '%MetadataPath%/People/A/Actor'),
+           ('MediaBrowser.Controller.Entities.Movies.Movie', '/media/movies/a.mkv')"#
+            .to_owned(),
+        format!(r#"INSERT INTO "BaseItemImageInfos" VALUES ('{image}')"#),
+        r#"INSERT INTO "ImageInfos" VALUES ('/data/config/users/a/profile.png')"#.to_owned(),
+    ];
+    let source = source_with_database(
+        scratch.path(),
+        &statements.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    for (root, file) in [
+        (&source, "root/default/Movies/movies.mblink"),
+        (&source, "config/users/a/profile.png"),
+        (&source, "cache/images/resized.jpg"),
+        (&source, "metadata/stale.jpg"),
+        (&meta, "library/ab/poster.jpg"),
+        (&meta, "People/A/Actor/folder.jpg"),
+    ] {
+        let file = root.join(file);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, b"bytes").unwrap();
+    }
+    let dirs = SourceDirs {
+        metadata: meta.clone(),
+        not_needed: vec![source.join("cache"), source.join("log")],
+        ..SourceDirs::new(&source)
+    };
+    let (out, before) = (scratch.path().join("out"), files(&source));
+
+    let summary = export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out)
+        .await
+        .unwrap();
+
+    assert_eq!(files(&source), before, "the source is left as it was");
+    let copied = files(&out);
+    for kept in [
+        "root/default/Movies/movies.mblink",
+        "config/users/a/profile.png",
+        "metadata/library/ab/poster.jpg",
+        "metadata/People/A/Actor/folder.jpg",
+    ] {
+        assert!(copied.contains_key(Path::new(kept)), "{kept}");
+    }
+    assert!(
+        !copied
+            .keys()
+            .any(|path| path.starts_with("cache") || path.ends_with("stale.jpg"))
+    );
+    assert_eq!(
+        summary.left_out,
+        [
+            (PathBuf::from("metadata"), LeftOut::NotUsed),
+            (PathBuf::from("cache"), LeftOut::NotNeeded)
+        ]
+    );
+    assert_eq!(summary.edits.paths.stored, ["/data"]);
+    assert_eq!(summary.edits.paths.ran_at.as_deref(), Some("/data"));
+    assert_eq!(summary.edits.paths.rows, 5);
+    let stored = exported_paths(&out).await;
+    assert!(stored.contains(&"/config/metadata/library/ab/poster.jpg".to_owned()));
+    for path in &stored {
+        let source_dirs = [source.as_path(), meta.as_path(), Path::new("/data")];
+        assert!(
+            !source_dirs
+                .iter()
+                .any(|dir| Path::new(path).starts_with(dir)),
+            "{path}"
+        );
+        let Some(inside) = path.strip_prefix("/config/") else {
+            assert!(
+                path.starts_with("%MetadataPath%/") || path.starts_with("/media/"),
+                "{path}"
+            );
+            continue;
+        };
+        assert!(out.join(inside).exists(), "{path} resolves in the output");
+    }
+}
+
+/// Every path the exported database under `out` stores in `BaseItems`,
+/// `BaseItemImageInfos` and `ImageInfos`.
+async fn exported_paths(out: &Path) -> Vec<String> {
+    let mut conn = SqliteConnectOptions::new()
+        .filename(out.join(EXPORTED_DATABASE))
+        .read_only(true)
+        .connect()
+        .await
+        .unwrap();
+    let stored = sqlx::query_scalar(
+        r#"SELECT "Path" FROM "BaseItems" WHERE "Path" IS NOT NULL
+           UNION ALL SELECT "Path" FROM "BaseItemImageInfos"
+           UNION ALL SELECT "Path" FROM "ImageInfos""#,
+    )
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    sqlx::Connection::close(conn).await.unwrap();
+    stored
+}
+
+/// A configuration directory kept outside the data directory is copied to
+/// the output's `config`, without a `migrations.xml` Jellyfin would read again,
+/// and the data directory's own `config` is left out (gl-1557).
+#[tokio::test]
+async fn a_configuration_directory_kept_elsewhere_is_copied_without_its_migration_list() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source(scratch.path()).await;
+    let etc = scratch.path().join("etc");
+    std::fs::create_dir_all(etc.join("users/a")).unwrap();
+    std::fs::write(etc.join("system.json"), b"{\"ServerName\": \"elsewhere\"}").unwrap();
+    std::fs::write(etc.join("users/a/profile.png"), b"png").unwrap();
+    std::fs::write(etc.join("migrations.xml"), b"<MigrationOptions />").unwrap();
+    let dirs = SourceDirs {
+        config: etc.clone(),
+        ..SourceDirs::new(&source)
+    };
+    let out = scratch.path().join("out");
+
+    let summary = export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out)
+        .await
+        .unwrap();
+
+    let copied = files(&out);
+    assert_eq!(
+        copied[Path::new("config/system.json")],
+        b"{\"ServerName\": \"elsewhere\"}"
+    );
+    assert_eq!(copied[Path::new("config/users/a/profile.png")], b"png");
+    assert!(!copied.contains_key(Path::new("config/migrations.xml")));
+    assert_eq!(
+        summary.left_out,
+        [(PathBuf::from("config"), LeftOut::NotUsed)]
+    );
+    assert!(etc.join("migrations.xml").exists(), "the source keeps it");
 }
 
 /// A database with `statements` run on it, at `data/jellyfin.db` of a new
@@ -411,7 +617,13 @@ async fn source_with_database(scratch: &Path, statements: &[&str]) -> PathBuf {
 /// it found it.
 async fn refusal(source: &Path, out: &Path) -> String {
     let before = files(source);
-    let result = export_data_dir(source, &source.join(EXPORTED_DATABASE), out).await;
+    let result = export_data_dir(
+        &SourceDirs::new(source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        out,
+    )
+    .await;
     assert_eq!(files(source), before, "the source is left as it was");
     match result {
         Err(ferrofin_db::DbError::ExportRefused { reason }) => reason,

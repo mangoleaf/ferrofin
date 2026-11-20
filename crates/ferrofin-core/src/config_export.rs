@@ -162,6 +162,41 @@ pub fn export_configuration(config_dir: &Path) -> Result<ConfigExport, ServiceEr
     Ok(export)
 }
 
+/// The metadata directory the server of the Ferrofin data directory
+/// `program_data_dir` (with its config directory `config_dir`) uses, as it
+/// names it: its settings' `MetadataPath`, else `{program data}/metadata`.
+///
+/// # Errors
+///
+/// Returns [`ServiceError::Backend`] when `system.json` is missing or does not
+/// parse.
+pub fn metadata_dir(program_data_dir: &Path, config_dir: &Path) -> Result<PathBuf, ServiceError> {
+    Ok(PathBuf::from(
+        application_paths(program_data_dir, config_dir)?.internal_metadata_path(),
+    ))
+}
+
+/// The server's directories as it derives them from `program_data_dir` and
+/// `config_dir`, its metadata directory as `system.json` names it. Only the
+/// data, metadata and library directories are read; the log, cache and web
+/// directories are there because the constructor takes them.
+fn application_paths(
+    program_data_dir: &Path,
+    config_dir: &Path,
+) -> Result<FerrofinServerApplicationPaths, ServiceError> {
+    let paths = FerrofinServerApplicationPaths::new(
+        program_data_dir,
+        program_data_dir.join("log"),
+        config_dir,
+        program_data_dir.join("cache"),
+        program_data_dir.join("web"),
+    );
+    // `%MetadataPath%` stands for the configured metadata directory, as the
+    // server's load sets it.
+    paths.set_internal_metadata_path(Some(&system::read(config_dir)?.metadata_path));
+    Ok(paths)
+}
+
 /// Exports the options of every library of the Ferrofin data directory
 /// `program_data_dir`, whose config directory is `config_dir`, as the
 /// `root/default/<library>/options.xml` Jellyfin reads. Nothing in it is
@@ -176,11 +211,11 @@ pub fn export_configuration(config_dir: &Path) -> Result<ConfigExport, ServiceEr
 /// directory becomes `%AppDataPath%/…` or `%MetadataPath%/…` (the Collections
 /// library's own folder is one), so it follows Jellyfin's directories.
 ///
-/// `program_data_dir` must be the path the server ran with (its `--data-dir`),
-/// as Jellyfin's own `ReverseVirtualPath` uses its running paths: Ferrofin
-/// stores media paths resolved, so a data directory read from another mount
-/// point leaves the Collections folder as an absolute path Jellyfin may not
-/// have.
+/// `ran_at` is the data directory as the server named it, which its stored
+/// paths name, as Jellyfin's own `ReverseVirtualPath` uses its running paths:
+/// Ferrofin stores media paths resolved, so a data directory read from another
+/// mount point than the one it ran at (a container's `/data`, exported from
+/// the host) is reversed from where it ran, not from where it is read.
 ///
 /// # Errors
 ///
@@ -191,20 +226,10 @@ pub fn export_configuration(config_dir: &Path) -> Result<ConfigExport, ServiceEr
 pub async fn export_library_options(
     program_data_dir: &Path,
     config_dir: &Path,
+    ran_at: &Path,
 ) -> Result<ConfigExport, ServiceError> {
-    // Only the data, metadata and library directories are read; the log,
-    // cache and web directories are there because the constructor takes them.
-    let paths = FerrofinServerApplicationPaths::new(
-        program_data_dir,
-        program_data_dir.join("log"),
-        config_dir,
-        program_data_dir.join("cache"),
-        program_data_dir.join("web"),
-    );
-    // `%MetadataPath%` stands for the configured metadata directory, as the
-    // server's load sets it.
-    paths.set_internal_metadata_path(Some(&system::read(config_dir)?.metadata_path));
-    let root = PathBuf::from(paths.default_user_views_path());
+    let paths = application_paths(ran_at, config_dir)?;
+    let root = program_data_dir.join("root").join("default");
     let expander = VirtualPathExpander::from_paths(Arc::new(paths));
     let list_error =
         |e: std::io::Error| ServiceError::Backend(format!("list {}: {e}", root.display()));
@@ -884,7 +909,7 @@ mod tests {
     }
 
     async fn export_libraries(dir: &tempfile::TempDir) -> ConfigExport {
-        export_library_options(dir.path(), &dir.path().join("config"))
+        export_library_options(dir.path(), &dir.path().join("config"), dir.path())
             .await
             .expect("exports")
     }
@@ -1100,6 +1125,46 @@ mod tests {
         );
     }
 
+    /// A server that ran at another path than the one the export reads it at
+    /// (a container's `/data`) stored its media paths under that path: they are
+    /// reversed from where it ran (gl-1557), and its metadata directory is the
+    /// one its settings name, else the default under where it ran.
+    #[tokio::test]
+    async fn media_paths_are_reversed_from_where_the_server_ran() {
+        let dir = data_dir(&[]);
+        write_library(
+            &dir,
+            "Collections",
+            &with_paths(&["/data/data/collections"]),
+        );
+        let config = dir.path().join("config");
+
+        let export = export_library_options(dir.path(), &config, Path::new("/data"))
+            .await
+            .expect("exports");
+
+        let xml = file(&export, "root/default/Collections/options.xml");
+        assert!(
+            xml.contains("<Path>%AppDataPath%/collections</Path>"),
+            "{xml}"
+        );
+        assert_eq!(
+            metadata_dir(Path::new("/data"), &config).expect("read"),
+            Path::new("/data/metadata")
+        );
+        let mut system = crate::configuration_manager::default_server_configuration();
+        system.metadata_path = "/srv/metadata".to_owned();
+        std::fs::write(
+            config.join("system.json"),
+            serde_json::to_vec(&system).expect("serialize"),
+        )
+        .expect("write system.json");
+        assert_eq!(
+            metadata_dir(dir.path(), &config).expect("read"),
+            Path::new("/srv/metadata")
+        );
+    }
+
     /// A library adopted from Jellyfin whose `options.xml` Ferrofin never
     /// converted is exported from that XML, as the server reads it, and
     /// nothing is written into the source.
@@ -1221,7 +1286,7 @@ mod tests {
             ..LibraryOptions::default()
         };
         let dir = data_dir(&[("Films", &options)]);
-        let error = export_library_options(dir.path(), &dir.path().join("config"))
+        let error = export_library_options(dir.path(), &dir.path().join("config"), dir.path())
             .await
             .expect_err("refused");
         let error = error.to_string();
