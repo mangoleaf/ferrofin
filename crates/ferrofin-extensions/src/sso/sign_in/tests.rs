@@ -245,7 +245,7 @@ impl Harness {
         }
     }
 
-    async fn provider(&self, key: &str) -> OidcProvider {
+    pub(in crate::sso) async fn provider(&self, key: &str) -> OidcProvider {
         sign_in_provider(&self.sso.config().await.expect("config"), key).expect("a provider")
     }
 

@@ -183,6 +183,46 @@
                             has is always refused.
                         </div>
                     </div>
+                    <h4>Roles</h4>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoRoleClaim" label="Role claim"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">
+                            The claim a user's roles or groups are read from, in the ID token or the userinfo
+                            answer: a list of names, or one name. A nested claim, such as Keycloak's
+                            realm_access.roles, is not read: map the roles or groups to a top-level claim at the
+                            provider. Some providers send it only for a scope that asks for it, such as groups: add
+                            that scope above. A user whose sign-in carries no such claim has no role.
+                        </div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoRequiredRole" label="Required role"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">
+                            A user without this role is refused, and no account is created for them. Empty lets
+                            every user of the provider sign in. Names are compared exactly.
+                        </div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoRoleSync" />
+                            <span>Sync rights from roles</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            At each sign-in, a user's administrator flag follows the administrator role below.
+                            Roles are read only at sign-in, so a change at the provider reaches a user at their
+                            next sign-in. Off, a sign-in never changes a user's rights.
+                        </div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoAdminRole" label="Administrator role"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">
+                            With role sync on, a user with this role is made an administrator, and a user without
+                            it loses the flag, except the last administrator, who keeps it. Empty never changes
+                            the flag.
+                        </div>
+                    </div>
                     <div class="ssoNotice ssoEditorError hide" role="alert"></div>
                     <div class="ssoButtons">
                         <button is="emby-button" type="submit" class="raised button-submit">
@@ -203,6 +243,7 @@
                 // The defaults a new provider starts with, as the server's.
                 var DEFAULT_SCOPES = 'openid profile';
                 var DEFAULT_USERNAME_CLAIM = 'preferred_username';
+                var DEFAULT_ROLE_CLAIM = 'groups';
                 // jellyfin-web renders a confirm message as HTML and its title
                 // as text, so the provider's name goes in the title only.
                 var DELETE_MESSAGE = 'Its users can no longer sign in with it, and its client secret is deleted too.';
@@ -388,6 +429,10 @@
                     field(page, 'ssoScopes').value = info ? info.Scopes : DEFAULT_SCOPES;
                     field(page, 'ssoUsernameClaim').value = info ? info.UsernameClaim : DEFAULT_USERNAME_CLAIM;
                     field(page, 'ssoCreateUsers').checked = info ? !!info.CreateUsers : true;
+                    field(page, 'ssoRoleClaim').value = info ? info.RoleClaim : DEFAULT_ROLE_CLAIM;
+                    field(page, 'ssoRequiredRole').value = info ? info.RequiredRole : '';
+                    field(page, 'ssoRoleSync').checked = info ? !!info.RoleSync : false;
+                    field(page, 'ssoAdminRole').value = info ? info.AdminRole : '';
                     showError(field(page, 'ssoEditorError'), '');
                     field(page, 'ssoEditor').classList.remove('hide');
                     field(page, 'ssoAdd').classList.add('hide');
@@ -411,7 +456,11 @@
                         ClientId: field(page, 'ssoClientId').value.trim(),
                         Scopes: field(page, 'ssoScopes').value.trim(),
                         UsernameClaim: field(page, 'ssoUsernameClaim').value.trim(),
-                        CreateUsers: field(page, 'ssoCreateUsers').checked
+                        CreateUsers: field(page, 'ssoCreateUsers').checked,
+                        RoleClaim: field(page, 'ssoRoleClaim').value.trim(),
+                        RequiredRole: field(page, 'ssoRequiredRole').value.trim(),
+                        RoleSync: field(page, 'ssoRoleSync').checked,
+                        AdminRole: field(page, 'ssoAdminRole').value.trim()
                     };
                     var secret = field(page, 'ssoClientSecret').value;
                     if (secret) {
