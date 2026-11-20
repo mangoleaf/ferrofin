@@ -27,13 +27,15 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::ServerConfiguration;
 use ferrofin_model::secret::Secret;
-use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
+use ferrofin_model::sso::{
+    OidcAdminLink, OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList, OidcUserLinks,
+};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::session::AuthenticationRequest;
-use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, SsoManager, SsoReply};
+use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, OidcLinkAt, SsoManager, SsoReply};
 use ferrofin_traits::system::ServerApplicationPaths;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -760,6 +762,38 @@ impl SsoManager for LoginButtons {
         _flow_cookie: Option<Secret>,
         _client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn oidc_link_page(&self) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn oidc_links(&self, _user_id: Uuid) -> Result<OidcUserLinks, ServiceError> {
+        Err(unused())
+    }
+    async fn start_oidc_link(
+        &self,
+        _key: &str,
+        _user_id: Uuid,
+        _client: std::net::IpAddr,
+    ) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn all_oidc_links(&self) -> Result<Vec<OidcAdminLink>, ServiceError> {
+        Err(unused())
+    }
+    async fn add_oidc_link(
+        &self,
+        _user_id: Uuid,
+        _key: &str,
+        _subject: &str,
+    ) -> Result<OidcAdminLink, ServiceError> {
+        Err(unused())
+    }
+    async fn remove_oidc_link(
+        &self,
+        _user_id: Uuid,
+        _at: OidcLinkAt<'_>,
+    ) -> Result<(), ServiceError> {
         Err(unused())
     }
 }

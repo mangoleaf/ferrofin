@@ -258,7 +258,7 @@
                         <input is="emby-input" type="text" class="ssoRequiredRole" label="Required role"
                             autocomplete="off" spellcheck="false" />
                         <div class="fieldDescription">
-                            A user without this role is refused, and no account is created for them. Empty lets
+                            A user without this role is refused, and no account is created or linked for them. Empty lets
                             every user of the provider sign in. Names are compared exactly.
                         </div>
                     </div>
@@ -316,6 +316,45 @@
                         </button>
                     </div>
                 </form>
+
+                <!--
+                    Linked accounts: every link between an account and an identity, from the
+                    admin-only `GET /sso/admin/links`; `POST` adds one by hand, `DELETE` removes one
+                    and signs its account out. Self-contained: its script is the second one below.
+                -->
+                <div class="verticalSection ssoLinks">
+                    <h3 class="sectionTitle">Linked accounts</h3>
+                    <p class="fieldDescription">
+                        A linked identity at a provider signs in to its Ferrofin account. Users link their own
+                        account on the page <code class="ssoLinkPage"></code>. Removing a link signs out every
+                        session of its account. An account that signs in through Single Sign-On only cannot sign
+                        in at all without a link, until it is linked again or given another authentication
+                        provider on its profile page.
+                    </p>
+                    <div class="ssoNotice ssoLinksError hide" role="alert"></div>
+                    <div class="ssoLinkList"></div>
+                    <form class="ssoLinkForm" novalidate>
+                        <h4 class="ssoProviderTitle">Link an account by hand</h4>
+                        <div class="selectContainer">
+                            <select is="emby-select" class="ssoLinkUser" label="Account"></select>
+                        </div>
+                        <div class="selectContainer">
+                            <select is="emby-select" class="ssoLinkProvider" label="Provider"></select>
+                        </div>
+                        <div class="inputContainer">
+                            <input is="emby-input" type="text" class="ssoLinkSubject" label="Subject"
+                                autocomplete="off" spellcheck="false" maxlength="255" />
+                            <div class="fieldDescription">
+                                The identity's subject at the provider: the sub claim of its ID tokens, which the
+                                provider's admin console shows as the user's id. It replaces the account's link at
+                                that provider, if it has one. An identity another account has is refused.
+                            </div>
+                        </div>
+                        <button is="emby-button" type="submit" class="raised button-submit">
+                            <span>Link</span>
+                        </button>
+                    </form>
+                </div>
             </div>
         </div>
         <script type="text/javascript">
@@ -868,6 +907,190 @@
                     if (page.getAttribute('data-sso-bound') !== 'true') {
                         bind(page);
                     }
+                });
+            }());
+        </script>
+        <script type="text/javascript">
+            // Linked accounts (the section above): lists every link, removes one, adds one.
+            (function () {
+                'use strict';
+
+                // Dashboard.confirm renders its message as HTML and its title as text: names go in
+                // the title only.
+                var REMOVE_MESSAGE = 'Every session of the account is signed out.';
+                var LAST_LINK_MESSAGE = 'Every session of the account is signed out. It signs in through '
+                    + 'Single Sign-On only and has no other link, so it cannot sign in at all until it is linked '
+                    + 'again or given another authentication provider on its profile page.';
+
+                function element(tag, className, text) {
+                    var node = document.createElement(tag);
+                    if (className) {
+                        node.className = className;
+                    }
+                    if (text !== undefined && text !== null) {
+                        node.textContent = String(text);
+                    }
+                    return node;
+                }
+
+                function field(page, name) {
+                    return page.querySelector('.' + name);
+                }
+
+                function showError(page, text) {
+                    var node = field(page, 'ssoLinksError');
+                    node.textContent = text;
+                    node.classList.toggle('hide', !text);
+                }
+
+                /** The server's reason for a refused request, when it gives one. */
+                function failed(page, failure, verb) {
+                    var prefix = 'Could not ' + verb;
+                    if (!failure || typeof failure.json !== 'function') {
+                        showError(page, prefix + '.');
+                        return Promise.resolve();
+                    }
+                    return failure.json().then(function (body) {
+                        showError(page, body && body.error && failure.status < 500
+                            ? prefix + ': ' + String(body.error).replace(/^invalid input: /, '') + '.'
+                            : prefix + ' (HTTP ' + failure.status + ').');
+                    }, function () {
+                        showError(page, prefix + ' (HTTP ' + failure.status + ').');
+                    });
+                }
+
+                function options(select, entries) {
+                    var kept = select.value;
+                    while (select.firstChild) {
+                        select.removeChild(select.firstChild);
+                    }
+                    entries.forEach(function (entry) {
+                        var option = element('option', null, entry[1]);
+                        option.value = entry[0];
+                        select.appendChild(option);
+                    });
+                    if (kept) {
+                        select.value = kept;
+                    }
+                }
+
+                function render(page, links) {
+                    var list = field(page, 'ssoLinkList');
+                    while (list.firstChild) {
+                        list.removeChild(list.firstChild);
+                    }
+                    if (links.length === 0) {
+                        list.appendChild(element('p', 'fieldDescription', 'No account is linked yet.'));
+                    }
+                    links.forEach(function (link) {
+                        var row = element('div', 'ssoProvider');
+                        row.appendChild(element('h4', 'ssoProviderTitle', link.UserName + ' at '
+                            + (link.ProviderName || link.Issuer)));
+                        row.appendChild(element('p', 'fieldDescription', 'Issuer: ' + link.Issuer));
+                        row.appendChild(element('p', 'fieldDescription', 'Subject: ' + link.Subject));
+                        row.appendChild(element('p', 'fieldDescription', 'Linked on '
+                            + new Date(link.DateCreated).toLocaleString()
+                            + (link.SingleSignOnAccount ? '. The account signs in through Single Sign-On only.' : '.')));
+                        var remove = element('button', 'raised');
+                        remove.type = 'button';
+                        remove.setAttribute('is', 'emby-button');
+                        remove.appendChild(element('span', null, 'Remove'));
+                        remove.addEventListener('click', function () {
+                            var last = link.SingleSignOnAccount && !links.some(function (other) {
+                                return other !== link && other.UserId === link.UserId;
+                            });
+                            removeLink(page, link, last);
+                        });
+                        var buttons = element('div', 'ssoButtons');
+                        buttons.appendChild(remove);
+                        row.appendChild(buttons);
+                        list.appendChild(row);
+                    });
+                }
+
+                function load(page) {
+                    field(page, 'ssoLinkPage').textContent = ApiClient.getUrl('sso/link');
+                    return Promise.all([
+                        ApiClient.fetch({ url: ApiClient.getUrl('sso/admin/links'), type: 'GET', dataType: 'json' }),
+                        ApiClient.fetch({ url: ApiClient.getUrl('sso/admin/oidc/providers'), type: 'GET', dataType: 'json' }),
+                        ApiClient.getUsers()
+                    ]).then(function (answers) {
+                        showError(page, '');
+                        render(page, answers[0]);
+                        options(field(page, 'ssoLinkProvider'), (answers[1].Providers || []).filter(function (info) {
+                            return !info.ValidationError;
+                        }).map(function (info) {
+                            return [info.Key, info.Name || info.Key];
+                        }));
+                        options(field(page, 'ssoLinkUser'), answers[2].map(function (user) {
+                            return [user.Id, user.Name];
+                        }));
+                    }, function (failure) {
+                        return failed(page, failure, 'load the linked accounts');
+                    });
+                }
+
+                function removeLink(page, link, last) {
+                    Dashboard.confirm(last ? LAST_LINK_MESSAGE : REMOVE_MESSAGE,
+                        'Remove the link of ' + link.UserName + ' at ' + (link.ProviderName || link.Issuer) + '?',
+                        function (confirmed) {
+                            if (!confirmed) {
+                                return;
+                            }
+                            Dashboard.showLoadingMsg();
+                            // By its issuer, which names a link whose provider is gone too.
+                            ApiClient.fetch({
+                                url: ApiClient.getUrl('sso/admin/links', { userId: link.UserId, issuer: link.Issuer }),
+                                type: 'DELETE'
+                            }).then(function () {
+                                return load(page);
+                            }, function (failure) {
+                                return failed(page, failure, 'remove the link');
+                            }).finally(function () {
+                                Dashboard.hideLoadingMsg();
+                            });
+                        });
+                }
+
+                function addLink(page) {
+                    var subject = field(page, 'ssoLinkSubject').value;
+                    if (!subject.trim()) {
+                        showError(page, 'Fill in the subject.');
+                        return;
+                    }
+                    Dashboard.showLoadingMsg();
+                    ApiClient.fetch({
+                        url: ApiClient.getUrl('sso/admin/links'),
+                        type: 'POST',
+                        data: JSON.stringify({
+                            UserId: field(page, 'ssoLinkUser').value,
+                            Provider: field(page, 'ssoLinkProvider').value,
+                            Subject: subject
+                        }),
+                        contentType: 'application/json',
+                        dataType: 'json'
+                    }).then(function () {
+                        field(page, 'ssoLinkSubject').value = '';
+                        return load(page);
+                    }, function (failure) {
+                        return failed(page, failure, 'link the account');
+                    }).finally(function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                document.querySelectorAll('.ssoSettingsPage').forEach(function (page) {
+                    if (page.getAttribute('data-sso-links-bound') === 'true') {
+                        return;
+                    }
+                    page.setAttribute('data-sso-links-bound', 'true');
+                    page.addEventListener('pageshow', function () {
+                        load(page);
+                    });
+                    field(page, 'ssoLinkForm').addEventListener('submit', function (event) {
+                        event.preventDefault();
+                        addLink(page);
+                    });
                 });
             }());
         </script>

@@ -793,6 +793,13 @@ pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
     ("post", "/sso/oidc/exchange", "sso"),
     ("get", "/sso/quickconnect", "sso"),
     ("post", "/sso/quickconnect", "sso"),
+    ("get", "/sso/link", "sso"),
+    ("get", "/sso/links", "sso"),
+    ("delete", "/sso/links/{provider}", "sso"),
+    ("post", "/sso/oidc/{provider}/link", "sso"),
+    ("get", "/sso/admin/links", "sso"),
+    ("post", "/sso/admin/links", "sso"),
+    ("delete", "/sso/admin/links", "sso"),
 ];
 
 /// Every path a handler registers that is neither a contract route nor in

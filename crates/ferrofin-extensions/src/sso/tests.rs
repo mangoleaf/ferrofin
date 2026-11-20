@@ -171,7 +171,19 @@ fn the_settings_page_reads_the_admin_routes_and_holds_no_setting() {
         ),
         "{html}"
     );
-    assert_eq!(html.matches("Dashboard.confirm(").count(), 2, "{html}");
+    for (at, call) in html.match_indices("Dashboard.confirm(") {
+        let rest = &html[at + call.len()..];
+        let message = &rest[..rest.find(',').unwrap_or(rest.len())];
+        assert!(
+            [
+                "DELETE_MESSAGE",
+                "NO_ACCESS_MESSAGE",
+                "last ? LAST_LINK_MESSAGE : REMOVE_MESSAGE"
+            ]
+            .contains(&message),
+            "a confirm message that is not a constant: {message}"
+        );
+    }
     assert!(!html.contains("Dashboard.alert("), "{html}");
     // Every string from a response is set as text, never parsed as HTML.
     for sink in [
