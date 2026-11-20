@@ -8981,8 +8981,13 @@ impl LibraryScanner {
                 .repoint_series_children(item.id, &key)
                 .await?;
         }
-        self.persist_provider_ids_and_values(item.id, &entity, &settled_ids)
-            .await?;
+        self.persist_provider_ids_and_values(
+            item.id,
+            &entity,
+            &settled_ids,
+            matches!(stored, Stored::Existing(_)),
+        )
+        .await?;
         self.persistence.reattach_user_data(&entity).await?;
         if ancestors_changed {
             self.persistence
@@ -9347,14 +9352,23 @@ impl LibraryScanner {
     /// Persists the item's external provider ids (the remote match's
     /// Tmdb/Imdb/Tvdb plus the embedded MusicBrainz tag ids — they key the
     /// id-dependent providers and make re-scans stable; best-effort, a
-    /// write failure is logged, not fatal) and mirrors genres/studios/tags
-    /// into ItemValues so the genre/studio/tag *filters* (More Like This,
-    /// genre browse) match. `settled` is [`settle_provider_ids`]'s answer.
+    /// write failure is logged, not fatal) and mirrors the artists, album
+    /// artists, genres, studios and tags into ItemValues so the *filters*
+    /// (More Like This, genre browse) match. `settled` is [`settle_provider_ids`]'s answer.
+    ///
+    /// An item left with no values loses its links, as every upstream save
+    /// rewrites them (`ItemPersistenceService.cs:364-422`, gl-1636), when
+    /// `stored_read`: the scan read the item's stored row. A new item has no
+    /// links to drop. A row the scan could not read (only a scanner without
+    /// an item repository has one) keeps them: the scan cannot tell whether
+    /// it is locked, and the save keeps a locked row's Artists, AlbumArtists,
+    /// Genres, Studios and Tags it was not given.
     async fn persist_provider_ids_and_values(
         &self,
         item_id: Uuid,
         entity: &BaseItemEntity,
         settled: &SettledProviderIds,
+        stored_read: bool,
     ) -> Result<(), ServiceError> {
         if settled.drops_stored {
             // A recorded id is gone: the set is rewritten whole. It is
@@ -9377,7 +9391,7 @@ impl LibraryScanner {
             }
         }
         let item_values = item_values_of(entity);
-        if !item_values.is_empty() {
+        if stored_read || !item_values.is_empty() {
             self.persistence
                 .save_item_values(item_id, &item_values)
                 .await?;
