@@ -114,7 +114,7 @@ impl Format {
 /// `ReadLine` loop.
 fn read_all_lines(data: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(data);
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let text = text.trim_prefix('\u{feff}');
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines: Vec<String> = normalized.split('\n').map(str::to_owned).collect();
     if lines.last().is_some_and(String::is_empty) {

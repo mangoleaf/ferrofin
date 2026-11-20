@@ -1344,7 +1344,7 @@ fn guid_x(text: &[char]) -> Option<uuid::Uuid> {
 /// digits (none reads as zero). `None` for any other character, or for more
 /// than eight significant digits (its `overflow`).
 fn guid_hex(s: &[char]) -> Option<u32> {
-    let s = s.strip_prefix(&['+']).unwrap_or(s);
+    let s = s.trim_prefix(&['+']);
     let s = match s {
         ['0', 'x' | 'X', rest @ ..] => rest,
         _ => s,

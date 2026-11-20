@@ -91,11 +91,7 @@ fn sql_stays_behind_the_repository_boundary() {
 
     let mut violations = Vec::new();
     for path in files {
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = path.trim_prefix(&root).to_string_lossy().replace('\\', "/");
         if is_exempt(&rel) {
             continue;
         }

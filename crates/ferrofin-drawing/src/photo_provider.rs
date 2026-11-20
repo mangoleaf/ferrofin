@@ -943,7 +943,7 @@ fn user_comment(bytes: &[u8]) -> String {
     }
     // Any other code (JIS among them) is read as text, the code included,
     // except a corrupt `Unicode` one.
-    up_to_nul(bytes.strip_prefix(b"Unicode\0").unwrap_or(bytes))
+    up_to_nul(bytes.trim_prefix(b"Unicode\0"))
 }
 
 /// Decodes UTF-16 text, honouring a leading byte-order mark and defaulting to

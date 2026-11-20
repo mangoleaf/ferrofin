@@ -76,7 +76,7 @@ impl FakeSd {
 
 /// The API path of `url`, query dropped.
 fn route_path(url: &str) -> &str {
-    let rest = url.strip_prefix(API_URL).unwrap_or(url);
+    let rest = url.trim_prefix(API_URL);
     rest.split('?').next().unwrap_or(rest)
 }
 

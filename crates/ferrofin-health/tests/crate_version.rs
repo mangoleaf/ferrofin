@@ -58,11 +58,7 @@ fn crate_version_uses_stay_on_the_allowlist() {
 
     let mut violations = Vec::new();
     for path in &files {
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = path.trim_prefix(&root).to_string_lossy().replace('\\', "/");
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{rel}: {e}"));
         let count = text.matches(NEEDLE).count();
         let allowed = ALLOWED
