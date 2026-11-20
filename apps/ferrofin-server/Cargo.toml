@@ -85,6 +85,8 @@ tempfile.workspace = true
 rstest.workspace = true
 # restart integration test: drives the real `run()` over loopback HTTP.
 reqwest.workspace = true
+# oidc_keycloak: the form it signs in with at Keycloak's login page.
+form_urlencoded.workspace = true
 # HTTPS tests: a self-signed certificate, written as the PKCS#12 Jellyfin reads.
 rcgen.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

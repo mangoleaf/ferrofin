@@ -25,7 +25,10 @@
 //! - [`accounts`]: the Ferrofin account that identity signs in to, found by
 //!   its link or created, and [`SsoAuthProvider`](accounts::SsoAuthProvider),
 //!   the authentication provider of the accounts it creates, which refuses
-//!   every password.
+//!   every password;
+//! - [`complete`]: the completion page the callback answers, and the
+//!   exchange of its one-time code for the session, under the account rules
+//!   of a password sign-in.
 //!
 //! An identity provider is contacted only when an admin saves a provider or a
 //! user signs in with it (B1).
@@ -36,12 +39,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
+use ferrofin_traits::activity::ActivityManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::ExternalIdentityStore;
 use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
 use ferrofin_traits::security::AuthenticationManager;
-use ferrofin_traits::sso::{OidcCallback, SsoManager, SsoReply};
+use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
+use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, SsoManager, SsoReply};
 use ferrofin_traits::tasks::ScheduledTask;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -49,6 +54,7 @@ use uuid::Uuid;
 use crate::{Extension, ExtensionContext};
 
 pub mod accounts;
+pub mod complete;
 pub mod discovery;
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake_idp;
@@ -57,7 +63,7 @@ pub mod oidc_http;
 pub mod sign_in;
 
 use discovery::MetadataCache;
-use flows::PendingFlows;
+use flows::{ExchangeCodes, PendingFlows};
 use oidc_http::OidcHttpClient;
 
 /// The Single Sign-On plugin's id in `/Plugins`: Ferrofin's own, generated
@@ -282,14 +288,20 @@ async fn plugin_enabled(plugins: &dyn PluginManager) -> Result<bool, ServiceErro
 }
 
 /// The Single Sign-On plugin's service: reads and saves its configuration and
-/// private data through the plugin manager, and finds or creates the account
-/// a sign-in ends at. Shared by the `/sso` routes through [`SsoManager`].
+/// private data through the plugin manager, finds or creates the account a
+/// sign-in ends at, and opens its session. Shared by the `/sso` routes
+/// through [`SsoManager`].
 pub struct SsoService {
     plugins: Arc<dyn PluginManager>,
-    /// The accounts a sign-in finds or creates.
+    /// The accounts a sign-in finds or creates, and their sign-in rules.
     users: Arc<dyn UserManager>,
     /// The links from an identity to its account.
     identities: Arc<dyn ExternalIdentityStore>,
+    /// Opens a signed-in account's session and mints its token.
+    sessions: Arc<dyn SessionManager>,
+    /// The dashboard's activity log, for a refused sign-in of a known
+    /// account.
+    activity: Arc<dyn ActivityManager>,
     /// Held while an account is created and linked, so two first sign-ins of
     /// one identity end at one account.
     provisioning: tokio::sync::Mutex<()>,
@@ -305,30 +317,39 @@ pub struct SsoService {
     metadata: MetadataCache,
     /// The sign-ins started and not yet called back.
     flows: PendingFlows,
+    /// The sign-ins called back whose completion page has not yet swapped
+    /// its exchange code.
+    exchanges: ExchangeCodes,
 }
 
 impl SsoService {
     /// A service over the plugin manager (the enabled flag, the configuration
-    /// and the private data), the accounts and their identity links, and the
-    /// server's published URL, which the callback URLs fall back to. Never
-    /// the request's `Host` header.
+    /// and the private data), the accounts and their identity links, the
+    /// sessions a sign-in opens, the activity log, and the server's published
+    /// URL, which the callback URLs fall back to. Never the request's `Host`
+    /// header.
     #[must_use]
     pub fn new(
         plugins: Arc<dyn PluginManager>,
         users: Arc<dyn UserManager>,
         identities: Arc<dyn ExternalIdentityStore>,
+        sessions: Arc<dyn SessionManager>,
+        activity: Arc<dyn ActivityManager>,
         published_url: Option<String>,
     ) -> Self {
         Self {
             plugins,
             users,
             identities,
+            sessions,
+            activity,
             provisioning: tokio::sync::Mutex::new(()),
             published_url,
             saving: tokio::sync::Mutex::new(()),
             http: OidcHttpClient::new(),
             metadata: MetadataCache::default(),
             flows: PendingFlows::default(),
+            exchanges: ExchangeCodes::default(),
         }
     }
 
@@ -610,6 +631,16 @@ impl SsoManager for SsoService {
         callback: OidcCallback,
     ) -> Result<SsoReply, ServiceError> {
         self.finish_sign_in(key, callback).await
+    }
+
+    async fn exchange_oidc_sign_in(
+        &self,
+        code: Secret,
+        flow_cookie: Option<Secret>,
+        request: AuthenticationRequest,
+    ) -> Result<OidcExchangeReply, ServiceError> {
+        self.exchange_sign_in(&code, flow_cookie.as_ref(), request)
+            .await
     }
 }
 

@@ -1847,6 +1847,7 @@ dependencies = [
  "ferrofin-util",
  "ferrofin-wasm",
  "flate2",
+ "form_urlencoded",
  "futures-util",
  "http-body",
  "image",

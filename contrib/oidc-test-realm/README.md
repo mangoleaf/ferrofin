@@ -1,7 +1,7 @@
 # OIDC test realm
 
 A Keycloak realm to try Ferrofin's Single Sign-On plugin against, by hand from jellyfin-web and in
-the `#[ignore]`d live test (`crates/ferrofin-extensions/tests/oidc_keycloak.rs`). It is test data
+the `#[ignore]`d live test (`apps/ferrofin-server/tests/oidc_keycloak.rs`). It is test data
 only. `ferrofin-test-realm.json` is a realm import file: load it into a Keycloak container you
 start for the purpose, or into a Keycloak you already run.
 
@@ -84,17 +84,22 @@ Then replace the published values, in the realm `ferrofin-test`:
    Saved with a wrong issuer (`…/realms/ferrofin-missing`), the row says why the test failed, and
    the provider is still saved.
 5. Open `http://127.0.0.1:8096/sso/oidc/keycloak/start` in a browser and sign in as a realm user.
-   The page you land on names the Ferrofin account that sign-in created and linked; nobody is
-   signed in to it yet. Dashboard → Users lists it with Single Sign-On as its provider, and no
-   password signs in to it, not even an empty one. Loading that page's URL again is refused, and
-   so is finishing in another browser a sign-in started in this one.
-6. With the provider's "Create accounts at first sign-in" off, a realm user with no account is
+   You land on jellyfin-web's home screen, signed in to the Ferrofin account that sign-in created
+   and linked; the address bar never shows a token. Dashboard → Users lists the account with
+   Single Sign-On as its provider, and no password signs in to it, not even an empty one.
+   Dashboard → Devices lists the browser once, and the activity log has the sign-in. Loading the
+   callback's URL again is refused, and so is finishing in another browser a sign-in started in
+   this one.
+6. Disable the account (or turn off its remote access and come from another address, give it a
+   parental schedule, limit its devices or sessions) and sign in again: the page says why, no
+   session opens, and the activity log has the failed sign-in.
+7. With the provider's "Create accounts at first sign-in" off, a realm user with no account is
    refused, and no account appears. A local account named like a realm user makes that user's
    sign-in refused, and the local account is left as it was.
 
 ## The live test
 
-`crates/ferrofin-extensions/tests/oidc_keycloak.rs` reads the realm's values from the environment
+`apps/ferrofin-server/tests/oidc_keycloak.rs` reads the realm's values from the environment
 and returns early with a message while any is unset. Keep them in a file outside the repository,
 readable by you only, such as `~/.config/ferrofin/oidc-test.env`:
 
@@ -116,16 +121,19 @@ FERROFIN_OIDC_TEST_GUEST_PASSWORD=oidc-guest-password
 
 ```sh
 set -a; . ~/.config/ferrofin/oidc-test.env; set +a
-cargo test -p ferrofin-extensions --test oidc_keycloak -- --include-ignored --nocapture
+cargo test -p ferrofin-server --test oidc_keycloak -- --include-ignored --nocapture
 ```
 
-It saves the realm's client as a provider and checks that discovery finds the realm's endpoints
-and keys, and that it fails cleanly, with the provider still saved, for a realm that does not exist
-and for the issuer written with a trailing `/`. Then it signs the member user in: it starts a
-sign-in, fills in Keycloak's own login form, and checks that the callback Keycloak sends the
-browser back to creates and links the member's account under the Single Sign-On provider, that no
-password (the realm's, or an empty one) signs in to that account or counts toward its lockout, that
-the same callback is refused a second time, that a callback without the flow cookie (another
-browser) is refused, and that a second sign-in finds the same account. It builds callback URLs
-on `http://127.0.0.1:8096`, which the realm's redirect URIs accept; nothing needs to listen there.
+It runs on the server the composition root wires, through its router. It saves the realm's client
+as a provider and checks that discovery finds the realm's endpoints and keys, and that it fails
+cleanly, with the provider still saved, for a realm that does not exist and for the issuer written
+with a trailing `/`. Then it signs the member user in: it starts a sign-in, fills in Keycloak's own
+login form, hands the callback Keycloak sends the browser back to to the router, and swaps the
+completion page's code for a session at `POST /sso/oidc/exchange`. It checks that the session's
+token opens `GET /Users/Me` as the member, that the account was created and linked under the
+Single Sign-On provider, that no password (the realm's, or an empty one) signs in to that account
+or counts toward its lockout, that the same callback and the same code are each refused a second
+time, that a callback without the flow cookie (another browser) is refused, and that a second
+sign-in finds the same account. It builds callback URLs on `http://127.0.0.1:8096`, which the
+realm's redirect URIs accept; nothing needs to listen there.
 The other users and the groups are for the later sign-in checks.

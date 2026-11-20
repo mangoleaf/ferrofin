@@ -1,5 +1,6 @@
 //! The Single Sign-On plugin's wire types: the OIDC providers its settings
-//! page lists and saves through `/sso/admin/oidc/providers`.
+//! page lists and saves through `/sso/admin/oidc/providers`, and what a
+//! completion page posts to `/sso/oidc/exchange`.
 //!
 //! Ferrofin's own, not Jellyfin contract types and not the community SSO-Auth
 //! plugin's: the routes are the plugin's own (D2). Their JSON is PascalCase,
@@ -153,6 +154,18 @@ pub struct OidcProviderList {
     /// is usable or empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub public_url_error: Option<String>,
+}
+
+/// What the completion page posts to `POST /sso/oidc/exchange`: the one-time
+/// exchange code it carries. The device the session is for comes from the
+/// request's `Authorization` header, as for `POST /Users/AuthenticateByName`.
+/// `Debug` leaves the code out.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct OidcExchangeRequest {
+    /// The exchange code; a missing one is refused as an unknown one.
+    #[schema(value_type = String)]
+    pub code: Secret,
 }
 
 #[cfg(test)]
