@@ -45412,7 +45412,7 @@ mod tests {
         rows.into_iter()
             .map(|row| {
                 let path = row.path.unwrap_or_default();
-                let rel = path.strip_prefix(root).unwrap_or(&path).to_owned();
+                let rel = path.trim_prefix(root).to_owned();
                 (rel, row.name, row.extra_type, row.parent_id)
             })
             .collect()

@@ -1270,7 +1270,7 @@ fn parses_as_invariant_double(s: &str) -> bool {
         .chain(fraction.chars())
         .any(|c| c.is_ascii_digit());
     let exponent_ok = exponent.is_none_or(|e| {
-        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        let e = e.trim_prefix(['+', '-']);
         !e.is_empty() && digits(e)
     });
     integer_ok && digits(fraction) && has_digit && exponent_ok

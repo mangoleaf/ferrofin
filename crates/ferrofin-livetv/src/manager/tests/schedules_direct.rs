@@ -86,7 +86,7 @@ impl Upstream {
 }
 
 fn sd_path(url: &str) -> &str {
-    let rest = url.strip_prefix(API_URL).unwrap_or(url);
+    let rest = url.trim_prefix(API_URL);
     rest.split('?').next().unwrap_or(rest)
 }
 

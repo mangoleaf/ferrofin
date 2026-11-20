@@ -155,7 +155,7 @@ fn normalize_system_version(value: &str) -> Option<String> {
         // which tolerates surrounding whitespace and a leading sign, then rejects
         // a negative value.
         let trimmed = part.trim();
-        let unsigned = trimmed.strip_prefix('+').unwrap_or(trimmed);
+        let unsigned = trimmed.trim_prefix('+');
         out.push(
             unsigned
                 .parse::<i32>()

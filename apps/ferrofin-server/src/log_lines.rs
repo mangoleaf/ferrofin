@@ -65,7 +65,7 @@ impl<W: io::Write> io::Write for RecordLinesWriter<W> {
 /// `event` with every carriage return written as `\r` and every line feed
 /// but a final one followed by [`CONTINUATION`].
 fn neutralize(event: &[u8]) -> Cow<'_, [u8]> {
-    let body = event.strip_suffix(b"\n").unwrap_or(event);
+    let body = event.trim_suffix(b"\n");
     if !body.iter().any(|&b| b == b'\n' || b == b'\r') {
         return Cow::Borrowed(event);
     }

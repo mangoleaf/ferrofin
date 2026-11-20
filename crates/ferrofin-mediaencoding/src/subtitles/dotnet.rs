@@ -266,7 +266,7 @@ fn int_from_string(text: &str) -> Result<i32, Throws> {
 ///
 /// Returns [`Throws`] for anything else.
 pub fn convert_to_int32_hex(value: &str) -> Result<i32, Throws> {
-    let unsigned = value.strip_prefix('+').unwrap_or(value);
+    let unsigned = value.trim_prefix('+');
     let digits = unsigned
         .strip_prefix("0x")
         .or_else(|| unsigned.strip_prefix("0X"))

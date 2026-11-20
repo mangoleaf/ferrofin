@@ -15665,10 +15665,7 @@ mod tests {
                 .split(',')
                 .map(|name| {
                     let name = name.trim();
-                    name.strip_prefix(prefix)
-                        .unwrap_or(name)
-                        .trim_matches('"')
-                        .to_owned()
+                    name.trim_prefix(prefix).trim_matches('"').to_owned()
                 })
                 .collect()
         };
