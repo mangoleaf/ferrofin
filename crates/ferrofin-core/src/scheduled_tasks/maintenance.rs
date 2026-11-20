@@ -11,8 +11,11 @@
 //! - [`OptimizeDatabaseTask`] — `OptimizeDatabaseTask` (`OptimizeDatabaseTask`)
 //! - [`CleanupUserDataTask`] — `CleanupUserDataTask` (`CleanupUserDataTask`)
 //!
-//! The C# `IProgress<double>` maps to [`TaskProgress`]; `CancellationToken`s are
-//! dropped (a queued run is cancelled by aborting its tokio task).
+//! The C# `IProgress<double>` and `CancellationToken` both map to
+//! [`TaskProgress`]: the file sweeps check
+//! [`TaskProgress::stop_requested`] before each file, as upstream's
+//! `ThrowIfCancellationRequested` does, since a sweep on the blocking pool
+//! outlives a dropped body.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,25 +37,10 @@ use uuid::Uuid;
 use crate::db_error::db_err;
 use crate::translate_query::PLACEHOLDER_ID;
 
-use super::{ScheduledTask, TaskProgress};
-
-/// 100-nanosecond ticks per second (the `TaskTriggerInfo` time unit).
-const TICKS_PER_SECOND: i64 = 10_000_000;
-
-/// Ticks per hour, for trigger intervals.
-const TICKS_PER_HOUR: i64 = 3600 * TICKS_PER_SECOND;
+use super::{ScheduledTask, TaskProgress, interval_hours};
 
 /// The upstream Maintenance category's localization key.
 const MAINTENANCE: &str = "TasksMaintenanceCategory";
-
-/// An interval trigger firing every `hours` hours.
-fn interval_hours(hours: i64) -> TaskTriggerInfo {
-    TaskTriggerInfo {
-        type_: TaskTriggerInfoType::IntervalTrigger,
-        interval_ticks: Some(hours * TICKS_PER_HOUR),
-        ..TaskTriggerInfo::default()
-    }
-}
 
 /// A startup trigger.
 fn startup() -> TaskTriggerInfo {
@@ -122,6 +110,7 @@ pub fn delete_encoded_media_cache(paths: &dyn ServerApplicationPaths) -> u64 {
 /// empty subdirectories (the root is kept). Returns how many files were
 /// deleted. Per-file failures are logged and skipped (the C# helper's
 /// swallow-and-log behavior). `keep` filters which file names are eligible.
+/// A stop request ends the sweep before its next file, the pruning skipped.
 fn delete_files_older_than(
     dir: &Path,
     cutoff: SystemTime,
@@ -130,6 +119,9 @@ fn delete_files_older_than(
     progress_span: f64,
     keep: &dyn Fn(&Path) -> bool,
 ) -> u64 {
+    if progress.stop_requested() {
+        return 0;
+    }
     let candidates = files_under(dir, &|f| {
         !keep(f)
             && std::fs::metadata(f)
@@ -139,6 +131,9 @@ fn delete_files_older_than(
     let total = candidates.len();
     let mut deleted = 0u64;
     for (index, file) in candidates.iter().enumerate() {
+        if progress.stop_requested() {
+            return deleted;
+        }
         match std::fs::remove_file(file) {
             Ok(()) => deleted += 1,
             Err(e) => tracing::warn!(path = %file.display(), error = %e, "failed to delete file"),
@@ -327,20 +322,23 @@ impl ScheduledTask for DeleteCacheFileTask {
 /// Port of `DeleteLogFileTask`.
 pub struct DeleteLogFileTask {
     config: Arc<dyn ServerConfigurationManager>,
-    /// The retention formatted into the description, read at boot (the C#
-    /// formats `TaskCleanLogsDescription` with the live value on every read;
-    /// the sync accessor cannot read the async configuration seam).
-    retention_days: i32,
+    /// Reads the live retention the description is formatted with, as the C#
+    /// formats `TaskCleanLogsDescription` with `LogFileRetentionDays` on every
+    /// read (the async configuration seam has no synchronous read).
+    retention_days: Box<dyn Fn() -> i32 + Send + Sync>,
 }
 
 impl DeleteLogFileTask {
-    /// Builds the task over the config seam; `retention_days` (the boot-time
-    /// `log_file_retention_days`) is formatted into the description.
+    /// Builds the task over the config seam; `retention_days` reads the live
+    /// `log_file_retention_days` formatted into the description.
     #[must_use]
-    pub fn new(config: Arc<dyn ServerConfigurationManager>, retention_days: i32) -> Self {
+    pub fn new(
+        config: Arc<dyn ServerConfigurationManager>,
+        retention_days: impl Fn() -> i32 + Send + Sync + 'static,
+    ) -> Self {
         Self {
             config,
-            retention_days,
+            retention_days: Box::new(retention_days),
         }
     }
 }
@@ -364,7 +362,7 @@ impl ScheduledTask for DeleteLogFileTask {
         "TaskCleanLogsDescription"
     }
     fn description_argument(&self) -> Option<String> {
-        Some(self.retention_days.to_string())
+        Some((self.retention_days)().to_string())
     }
     fn category(&self) -> &str {
         MAINTENANCE
@@ -475,11 +473,38 @@ impl ScheduledTask for DeleteTranscodeFileTask {
 
 /// "Optimize database" — compacts the database and truncates free space. Port
 /// of `OptimizeDatabaseTask` + the SQLite provider's `RunScheduledOptimisation`
-/// (`PRAGMA optimize`, `VACUUM`, WAL checkpoint truncation).
+/// (WAL checkpoint truncation, `VACUUM`, truncation again). Before the
+/// vacuum the task also prunes Ferrofin's own `FerrofinPlaybackSessions` rows
+/// (no upstream equivalent) older than `ActivityLogRetentionDays`.
+///
+/// Upstream sets `temp_store=1` around its vacuum to undo its connections'
+/// in-memory default. Ferrofin's bundled SQLite keeps temporary files on disk
+/// already, so its vacuum copy goes to SQLite's temporary directory as
+/// upstream's does (pinned by `ferrofin-db`'s `temp_store_stays_on_disk`).
+///
+/// Accepted divergence (owner decision, 2026-11-11): Jellyfin 12.x's
+/// `OptimizeAsync` also runs a full `ANALYZE` (under `analysis_limit=0`, once
+/// the library holds items), as its `RefreshDatabaseStatisticsPostScanTask`
+/// does after every library scan, and Ferrofin deliberately does neither. Its
+/// plan pins and `EXPLAIN QUERY PLAN` tests assume the planner has no
+/// statistics (`sqlite_stat1` never exists). `PRAGMA optimize` is not run
+/// either: it analyses every populated, indexed table that has none.
+/// Statistics an earlier version left behind are dropped at boot
+/// (`ferrofin-db`'s `Database::connect_tuned`).
+///
+/// Accepted divergence (owner decision, 2026-11-19): upstream's
+/// `ExecuteAsync` catches whatever `RunScheduledOptimisation` throws and only
+/// logs it, so a failed vacuum or checkpoint ends its run `Completed`.
+/// Ferrofin returns the error, so the run is recorded `Failed` with its
+/// message and a `TaskFailed` activity entry, as every release up to v1.5.1
+/// did: the dashboard's "(Failed)" and Alerts entry are an administrator's
+/// only sign that the database is not being compacted (a full disk, the
+/// write lock held past the busy timeout). No client acts on the status.
 pub struct OptimizeDatabaseTask {
     db: Database,
     sessions: Arc<dyn SessionManager>,
     library: Arc<dyn LibraryManager>,
+    config: Arc<dyn ServerConfigurationManager>,
 }
 
 impl OptimizeDatabaseTask {
@@ -487,18 +512,21 @@ impl OptimizeDatabaseTask {
     /// snapshot holds its maintenance turn), the session manager (the
     /// vacuum is skipped while anything is playing — `VACUUM` and the
     /// truncating checkpoint take exclusive locks that fail live requests; a
-    /// real mid-playback black-screen traced to exactly this window) and the
-    /// library manager (skipped, as upstream, while a library scan runs).
+    /// real mid-playback black-screen traced to exactly this window), the
+    /// library manager (skipped, as upstream, while a library scan runs) and
+    /// the config (the playback-metrics retention window).
     #[must_use]
     pub fn new(
         db: Database,
         sessions: Arc<dyn SessionManager>,
         library: Arc<dyn LibraryManager>,
+        config: Arc<dyn ServerConfigurationManager>,
     ) -> Self {
         Self {
             db,
             sessions,
             library,
+            config,
         }
     }
 }
@@ -555,14 +583,42 @@ impl ScheduledTask for OptimizeDatabaseTask {
             tracing::info!("skipping database optimization: a database snapshot is running");
             return Ok(());
         };
-        tracing::info!("optimizing and vacuuming the database");
-        for (statement, pct) in [("PRAGMA optimize", 25.0), ("VACUUM", 75.0)] {
-            sqlx::query(statement)
-                .execute(self.db.writer())
-                .await
-                .map_err(db_err)?;
-            progress.report(pct);
+        // Playback-decision rows hold per-user, per-device history: they expire
+        // with the activity log (unset keeps both), before the vacuum reclaims
+        // their pages. Clean Activity Log has no default trigger; this task does.
+        // A window reaching past chrono's earliest date keeps every row too.
+        let retention = self
+            .config
+            .configuration()
+            .await?
+            .activity_log_retention_days;
+        if let Some((days, cutoff)) = retention.filter(|d| *d >= 0).and_then(|days| {
+            Utc::now()
+                .checked_sub_signed(chrono::Duration::days(i64::from(days)))
+                .map(|cutoff| (days, cutoff))
+        }) {
+            // Ferrofin's own side job: a failure must not cost the optimize.
+            match crate::playback_sessions_repository::prune(&self.db, cutoff).await {
+                Ok(removed) => tracing::info!(removed, days, "pruned playback-decision metrics"),
+                Err(err) => tracing::warn!(
+                    %err,
+                    "could not prune playback-decision metrics; optimizing anyway"
+                ),
+            }
         }
+        tracing::info!("optimizing and vacuuming the database");
+        // Unlike upstream's `ExecuteAsync`, a failure below is returned, so
+        // the run is recorded `Failed`: see the type's doc.
+        // `OptimizeAsync` empties the log before the vacuum, which then
+        // writes its copy of the database into it.
+        self.db.truncate_wal().await.map_err(ServiceError::from)?;
+        // Unlike upstream, no `ANALYZE`, and no `PRAGMA optimize` either:
+        // see the type's doc.
+        sqlx::query("VACUUM")
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        progress.report(75.0);
         // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
         // checkpoints: the vacuum's commit has just started one, which the
         // truncation would otherwise answer busy against.
@@ -728,6 +784,7 @@ mod tests {
     use ferrofin_traits::error::ServiceError;
 
     use super::*;
+    use crate::playback_sessions_repository::test_rows;
     use crate::scheduled_tasks::TaskProgress;
     use crate::test_support::test_db;
     use ferrofin_db::entities::security::DeviceEntity;
@@ -745,6 +802,25 @@ mod tests {
     /// unreachable (the tasks only consult the guard).
     struct FakePlaybackSessions(bool);
 
+    /// A stop request ends a sweep before its next file, the empty-folder
+    /// pruning included, as upstream's `ThrowIfCancellationRequested` before
+    /// each delete does: a sweep on the blocking pool outlives its dropped body.
+    #[test]
+    fn a_sweep_stops_before_its_next_file_once_asked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("old.tmp"), b"x").expect("write");
+        std::fs::create_dir(dir.path().join("empty")).expect("mkdir");
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        let everything = SystemTime::now() + std::time::Duration::from_secs(3600);
+        let deleted =
+            delete_files_older_than(dir.path(), everything, &progress, 0.0, 100.0, &|_| false);
+        assert_eq!(deleted, 0);
+        assert!(dir.path().join("old.tmp").exists());
+        assert!(dir.path().join("empty").exists(), "nothing pruned either");
+        assert!(progress.was_stopped(), "the run is recorded Cancelled");
+    }
+
     #[allow(unused_variables)] // stub bodies are unreachable!(), params deliberately unused
     #[async_trait]
     impl ferrofin_traits::session::SessionManager for FakePlaybackSessions {
@@ -760,13 +836,6 @@ mod tests {
             remote_endpoint: &str,
             user: Option<&UserEntity>,
         ) -> Result<SessionInfoDto, ServiceError> {
-            unreachable!("not used by maintenance tasks")
-        }
-        async fn update_device_name(
-            &self,
-            session_id: &str,
-            reported_device_name: &str,
-        ) -> Result<(), ServiceError> {
             unreachable!("not used by maintenance tasks")
         }
         async fn on_playback_start(&self, info: &PlaybackStartInfo) -> Result<(), ServiceError> {
@@ -827,14 +896,6 @@ mod tests {
         async fn send_message_to_user_sessions(
             &self,
             user_ids: &[Uuid],
-            message_type: SessionMessageType,
-            data: &str,
-        ) -> Result<(), ServiceError> {
-            unreachable!("not used by maintenance tasks")
-        }
-        async fn send_message_to_user_device_sessions(
-            &self,
-            device_id: &str,
             message_type: SessionMessageType,
             data: &str,
         ) -> Result<(), ServiceError> {
@@ -939,6 +1000,19 @@ mod tests {
 
     fn playing_sessions() -> Arc<dyn ferrofin_traits::session::SessionManager> {
         Arc::new(FakePlaybackSessions(true))
+    }
+
+    /// Seeds a playback-decision row a year old, past any test's retention.
+    async fn seed_old_session(db: &Database) {
+        test_rows::insert(db, "old", Utc::now() - chrono::Duration::days(365)).await;
+    }
+
+    /// A config whose `ActivityLogRetentionDays` is `days`; the database
+    /// task never touches its paths.
+    fn retention_days(days: Option<i32>) -> Arc<dyn ServerConfigurationManager> {
+        Arc::new(FakeConfig::over(std::path::Path::new("unused"), |c| {
+            c.activity_log_retention_days = days;
+        }))
     }
 
     // -- fakes ------------------------------------------------------------
@@ -1159,7 +1233,7 @@ mod tests {
         backdate(&managed, 40);
         let fresh = touch(&logs, "ferrofin-today.log");
 
-        let task = Arc::new(DeleteLogFileTask::new(config, 3));
+        let task = Arc::new(DeleteLogFileTask::new(config, || 3));
         assert_eq!(task.key(), "CleanLogFiles");
         // `string.Format(GetLocalizedString("TaskCleanLogsDescription"), days)`.
         let registry = crate::scheduled_tasks::FerrofinTaskManager::new();
@@ -1249,24 +1323,51 @@ mod tests {
             db.clone(),
             idle_sessions(),
             crate::test_support::library_manager_over(db),
+            retention_days(Some(30)),
         );
         assert_eq!(task.key(), "OptimizeDatabaseTask");
         assert_eq!(
             task.default_triggers()[0].interval_ticks,
-            Some(6 * TICKS_PER_HOUR)
+            Some(216_000_000_000)
         );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("run");
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
     }
 
+    /// Ferrofin's plan pins assume the planner has no statistics, so the
+    /// run takes none, over populated, indexed tables (Jellyfin 12.x runs a
+    /// full `ANALYZE` here).
+    #[tokio::test]
+    async fn optimize_database_leaves_no_planner_statistics() {
+        let db = test_db().await;
+        // The placeholder `BaseItems` row is there too.
+        seed_old_session(&db).await;
+        test_rows::insert(&db, "recent", Utc::now()).await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(Some(30)),
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+        assert_eq!(
+            test_rows::remaining(&db).await,
+            ["recent"],
+            "the run went through"
+        );
+        assert_eq!(test_rows::stat_tables(&db).await, Vec::<String>::new());
+    }
+
     #[tokio::test]
     async fn optimize_database_skips_while_playback_is_active() {
         let db = test_db().await;
+        seed_old_session(&db).await;
         let task = OptimizeDatabaseTask::new(
             db.clone(),
             playing_sessions(),
-            crate::test_support::library_manager_over(db),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(Some(30)),
         );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
@@ -1274,6 +1375,7 @@ mod tests {
             progress.current().abs() < f64::EPSILON,
             "guarded run must not have executed the vacuum steps"
         );
+        assert_eq!(test_rows::remaining(&db).await, ["old"], "nor the prune");
     }
 
     /// `OptimizeDatabaseTask.ExecuteAsync` returns at once while a library
@@ -1283,10 +1385,12 @@ mod tests {
     #[tokio::test]
     async fn optimize_database_skips_while_a_library_scan_runs() {
         let db = test_db().await;
+        seed_old_session(&db).await;
         let task = OptimizeDatabaseTask::new(
             db.clone(),
             idle_sessions(),
-            crate::test_support::library_manager_mid_scan(db).await,
+            crate::test_support::library_manager_mid_scan(db.clone()).await,
+            retention_days(Some(30)),
         );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
@@ -1294,6 +1398,7 @@ mod tests {
             progress.current().abs() < f64::EPSILON,
             "a run during a library scan must not have executed the vacuum steps"
         );
+        assert_eq!(test_rows::remaining(&db).await, ["old"], "nor the prune");
     }
 
     /// While a backup snapshot holds the database's maintenance turn, the
@@ -1306,7 +1411,9 @@ mod tests {
             db.clone(),
             idle_sessions(),
             crate::test_support::library_manager_over(db.clone()),
+            retention_days(Some(30)),
         );
+        seed_old_session(&db).await;
         let snapshot = db.try_maintenance_turn().expect("free");
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
@@ -1314,9 +1421,146 @@ mod tests {
             progress.current().abs() < f64::EPSILON,
             "a run during a snapshot must not have executed the vacuum steps"
         );
+        assert_eq!(test_rows::remaining(&db).await, ["old"], "nor the prune");
         drop(snapshot);
         task.execute(&progress).await.expect("run");
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+        assert_eq!(test_rows::remaining(&db).await, Vec::<String>::new());
+    }
+
+    /// A failed prune is Ferrofin's own side job: it is logged, and the
+    /// upstream optimize steps still run to the end.
+    #[tokio::test]
+    async fn optimize_database_runs_on_when_the_prune_fails() {
+        let db = test_db().await;
+        test_rows::drop_table(&db).await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db),
+            retention_days(Some(30)),
+        );
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("run");
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+    }
+
+    /// A failed vacuum is returned, so the runner records the run `Failed`
+    /// (accepted divergence: upstream's `ExecuteAsync` catches it and ends
+    /// `Completed`; see the type's doc). The runner logs it, the task does
+    /// not. `OptimizeAsync` empties the write-ahead log before the vacuum.
+    /// The vacuum fails here and the trailing truncation never runs, so an
+    /// empty log can only come from the leading one.
+    #[tokio::test]
+    async fn optimize_database_fails_when_the_vacuum_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("jellyfin.db");
+        let db = Database::connect(&format!("sqlite://{}?mode=rwc", file.display()))
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrate");
+        test_rows::insert(&db, "recent", Utc::now()).await;
+        let wal = dir.path().join("jellyfin.db-wal");
+        assert!(
+            std::fs::metadata(&wal).expect("wal").len() > 0,
+            "the log holds the last write"
+        );
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(None),
+        );
+        // On the one writer connection: the checkpoints still run, the vacuum
+        // cannot write.
+        test_rows::query_only_writer(&db).await;
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let progress = TaskProgress::default();
+        let error = task
+            .execute(&progress)
+            .await
+            .expect_err("a failed vacuum fails the run");
+        assert!(error.to_string().contains("readonly"), "{error}");
+        assert_eq!(progress.reported(), None, "the vacuum did not go through");
+        assert_eq!(
+            std::fs::metadata(&wal).expect("wal").len(),
+            0,
+            "the log was emptied before the vacuum"
+        );
+        assert!(
+            !logs.text().contains("ERROR"),
+            "the runner logs the failure, the task does not: {}",
+            logs.text()
+        );
+    }
+
+    /// A failed checkpoint fails the run as a failed vacuum does.
+    #[tokio::test]
+    async fn optimize_database_fails_when_the_checkpoint_fails() {
+        let db = test_db().await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(None),
+        );
+        db.writer().close().await;
+        let progress = TaskProgress::default();
+        task.execute(&progress)
+            .await
+            .expect_err("a failed checkpoint fails the run");
+        assert_eq!(progress.reported(), None, "no step went through");
+    }
+
+    /// Ferrofin's playback-decision rows expire with the activity log: the
+    /// optimize run drops those decided before `ActivityLogRetentionDays`,
+    /// and `null` keeps every row, as it keeps the log.
+    #[tokio::test]
+    async fn optimize_database_prunes_playback_sessions_past_activity_log_retention() {
+        let db = test_db().await;
+        test_rows::insert(&db, "old", Utc::now() - chrono::Duration::days(11)).await;
+        test_rows::insert(&db, "recent", Utc::now() - chrono::Duration::days(9)).await;
+        let task = |days| {
+            OptimizeDatabaseTask::new(
+                db.clone(),
+                idle_sessions(),
+                crate::test_support::library_manager_over(db.clone()),
+                retention_days(days),
+            )
+        };
+
+        task(None)
+            .execute(&TaskProgress::default())
+            .await
+            .expect("run");
+        assert_eq!(test_rows::remaining(&db).await, ["old", "recent"]);
+
+        // A window past chrono's earliest date keeps every row, and the
+        // optimize still runs to the end.
+        let progress = TaskProgress::default();
+        task(Some(i32::MAX)).execute(&progress).await.expect("run");
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+        assert_eq!(test_rows::remaining(&db).await, ["old", "recent"]);
+
+        // A negative window keeps every row, as unset does; its cutoff would
+        // otherwise lie in the future and take them all.
+        task(Some(-1))
+            .execute(&TaskProgress::default())
+            .await
+            .expect("run");
+        assert_eq!(test_rows::remaining(&db).await, ["old", "recent"]);
+
+        task(Some(10))
+            .execute(&TaskProgress::default())
+            .await
+            .expect("run");
+        assert_eq!(test_rows::remaining(&db).await, ["recent"]);
     }
 
     #[tokio::test]

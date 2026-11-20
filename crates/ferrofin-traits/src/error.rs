@@ -132,6 +132,32 @@ impl ServiceError {
     pub fn backend_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::BackendSource(Box::new(source))
     }
+
+    /// The error's text without the kind prefix [`Display`](std::fmt::Display)
+    /// adds (`"not found: "`, …): what C# shows as `Exception.Message`.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotFound(message)
+            | Self::Unauthorized(message)
+            | Self::Forbidden(message)
+            | Self::InvalidInput(message)
+            | Self::Conflict(message)
+            | Self::Unavailable(message)
+            | Self::Busy { message, .. }
+            | Self::Backend(message) => message.clone(),
+            Self::Db(error) => error.to_string(),
+            Self::BackendSource(source) => source.to_string(),
+        }
+    }
+}
+
+/// A Jellyfin XML configuration that could not be imported is a
+/// [`ServiceError::Backend`] with the importer's message.
+impl From<ferrofin_common::config_import::ConfigImportError> for ServiceError {
+    fn from(err: ferrofin_common::config_import::ConfigImportError) -> Self {
+        Self::Backend(err.to_string())
+    }
 }
 
 /// Wraps a `sqlx` error as a [`ServiceError::Db`], keeping it as the source.
@@ -184,6 +210,16 @@ mod tests {
             "not found: item 42"
         );
         assert_eq!(ServiceError::backend("io").to_string(), "backend error: io");
+    }
+
+    #[test]
+    fn message_drops_the_kind_prefix() {
+        assert_eq!(ServiceError::not_found("item 42").message(), "item 42");
+        assert_eq!(ServiceError::busy("queue full", 5).message(), "queue full");
+        assert_eq!(
+            ServiceError::backend_source(std::io::Error::other("disk gone")).message(),
+            "disk gone"
+        );
     }
 
     #[test]

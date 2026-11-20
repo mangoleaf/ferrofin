@@ -2,7 +2,8 @@
 //! file carries labelled embedded pictures and an attached logo gets a Primary,
 //! a Backdrop and a Logo from them, an unchanged rescan extracts nothing more,
 //! and the library's "Embedded Image Extractor" checkbox and per-type limits
-//! gate it. The ffprobe/ffmpeg seam is a fake that records each extraction.
+//! gate it. The ffprobe/ffmpeg seam is a fake that records each extraction,
+//! with the image stream it is handed (an attachment is handed none).
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -25,11 +26,16 @@ use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamRepository};
 
+/// One extraction: the stream index, the format, and the index and
+/// interlacing of the image stream handed over with it.
+type Extraction = (i32, ImageFormat, Option<(i32, bool)>);
+
 /// A probe that reports a video with two embedded pictures and an attached
-/// logo, and an extractor that writes `IMG-<index>` and records its calls.
+/// logo (also exposed as a picture stream, as ffmpeg does an attached
+/// picture), and an extractor that writes `IMG-<index>` and records its calls.
 struct Pictures {
     scratch: std::path::PathBuf,
-    extractions: Mutex<Vec<(i32, ImageFormat)>>,
+    extractions: Mutex<Vec<Extraction>>,
 }
 
 #[async_trait]
@@ -47,11 +53,13 @@ impl MediaEncoder for Pictures {
         &self,
         _request: &MediaInfoRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
-        let picture = |index, comment: &str, codec: &str| MediaStream {
+        let picture = |index, comment: Option<&str>, codec: &str| MediaStream {
             index,
             stream_type: MediaStreamType::EmbeddedImage,
             codec: Some(codec.to_owned()),
-            comment: Some(comment.to_owned()),
+            comment: comment.map(str::to_owned),
+            // Each picture reads as interlaced, so a stream handed over shows.
+            is_interlaced: true,
             ..MediaStream::default()
         };
         Ok(MediaSourceInfo {
@@ -65,8 +73,9 @@ impl MediaEncoder for Pictures {
                     height: Some(1080),
                     ..MediaStream::default()
                 },
-                picture(2, "Cover", "mjpeg"),
-                picture(3, "Backdrop art", "png"),
+                picture(2, Some("Cover"), "mjpeg"),
+                picture(3, Some("Backdrop art"), "png"),
+                picture(4, None, "png"),
             ],
             media_attachments: vec![MediaAttachment {
                 index: 4,
@@ -96,6 +105,7 @@ impl MediaEncoder for Pictures {
         _input_file: &str,
         _container: &str,
         _media_source: &MediaSourceInfo,
+        image_stream: Option<&MediaStream>,
         stream_index: i32,
         format: ImageFormat,
     ) -> Result<String, ServiceError> {
@@ -104,7 +114,11 @@ impl MediaEncoder for Pictures {
             .scratch
             .join(format!("extract-{}{}", calls.len(), format.extension()));
         std::fs::write(&path, format!("IMG-{stream_index}")).unwrap();
-        calls.push((stream_index, format));
+        calls.push((
+            stream_index,
+            format,
+            image_stream.map(|stream| (stream.index, stream.is_interlaced)),
+        ));
         Ok(path.to_string_lossy().into_owned())
     }
     fn get_input_argument(&self, input_file: &str, _: &MediaSourceInfo) -> String {
@@ -214,7 +228,9 @@ async fn a_video_gets_primary_backdrop_and_logo_from_its_embedded_pictures() {
     h.scanner.scan_all().await.unwrap();
     // Primary: the first picture labelled like a poster ("Cover", mjpeg → jpg);
     // Backdrop: the stream commented "Backdrop art" (png); Logo: no stream
-    // matches, so the attachment whose name contains "logo" (png).
+    // matches, so the attachment whose name contains "logo" (png). A picked
+    // stream is handed over as the extraction's video stream; the attachment
+    // goes with none, though a picture stream shares its index.
     let stored = images(&h).await;
     assert_eq!(
         stored,
@@ -230,9 +246,9 @@ async fn a_video_gets_primary_backdrop_and_logo_from_its_embedded_pictures() {
     assert_eq!(
         calls,
         [
-            (2, ImageFormat::Jpg),
-            (3, ImageFormat::Png),
-            (4, ImageFormat::Png)
+            (2, ImageFormat::Jpg, Some((2, true))),
+            (3, ImageFormat::Png, Some((3, true))),
+            (4, ImageFormat::Png, None)
         ]
     );
     drop(calls);

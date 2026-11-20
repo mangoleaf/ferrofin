@@ -19,6 +19,7 @@ fn state(collaborators: Arc<std::sync::OnceLock<Collaborators>>) -> HostState {
         plugin_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff99".to_owned(),
         config_json: r#"{"k":"v"}"#.to_owned(),
         segment_policy_skipped: false,
+        user_data_writes: 0,
         limits: wasmtime::StoreLimitsBuilder::new().build(),
         memory_limit_bytes: 1024 * 1024,
         http: Arc::new(
@@ -392,6 +393,38 @@ async fn state_and_next_up_flow_through_the_host_trait() {
             .expect("next-up through the trait");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "Big Buck Bunny");
+
+        // gl-275: each user-data write is debug; the call's one info line
+        // names the plugin and counts them.
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        for _ in 0..2 {
+            s.set_user_data(
+                "00000000-0000-0000-0000-000000000001".into(),
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01".into(),
+                types::UserDataUpdate {
+                    played: Some(true),
+                    favorite: None,
+                    playback_position_ticks: None,
+                },
+            )
+            .expect("write");
+        }
+        s.log_user_data_writes();
+        // The count started again: nothing more to say.
+        s.log_user_data_writes();
+        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(text.contains("wasm plugin wrote user data"), "{text}");
+        assert!(text.contains("host-impl-test"), "{text}");
+        assert!(text.contains("writes=2"), "{text}");
     })
     .await
     .unwrap();

@@ -129,7 +129,22 @@ pub async fn consolidate_localized_user_views(
         if stale.is_empty() {
             continue;
         }
-        dropped += consolidate(&mut tx, &view_type, &path, canonical, &candidates, &stale).await?;
+        // The id comes from the resolved path; the row stores it as upstream's
+        // save does, through `ReverseVirtualPath` (`%MetadataPath%/views/…`).
+        let stored_path = Path::new(
+            crate::app_paths::FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH,
+        )
+        .join("views")
+        .join(&folder);
+        dropped += consolidate(
+            &mut tx,
+            &view_type,
+            &stored_path,
+            canonical,
+            &candidates,
+            &stale,
+        )
+        .await?;
     }
     sqlx::query(
         r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')
@@ -168,39 +183,15 @@ async fn typed_views(
     Ok(groups)
 }
 
-/// The `ViewType` a stored view carries, as the `CollectionType` member name
-/// — read from the `Data` JSON the way the DTO projection reads it. Jellyfin
-/// serializes the enum by name (`JsonStringEnumConverter`); the numeric form
-/// is accepted too, mapped over the public discriminants, so a blob written
-/// by a converter-less serializer still classifies.
+/// The `ViewType` a stored view carries (`UserView.ViewType`), bound from the
+/// `Data` JSON as Jellyfin binds it ([`CollectionType::from_item_data`], the
+/// reading the DTO projection shares), by its C# `ToString()` name: the
+/// lowercase member name, or the number for a value no member names.
+///
+/// [`CollectionType::from_item_data`]: ferrofin_model::data::CollectionType::from_item_data
 pub(crate) fn view_type_of(data: Option<&str>) -> Option<String> {
-    /// `Jellyfin.Data.Enums.CollectionType`, discriminants 0–12 in order.
-    const PUBLIC_NAMES: [&str; 13] = [
-        "unknown",
-        "movies",
-        "tvshows",
-        "music",
-        "musicvideos",
-        "trailers",
-        "homevideos",
-        "boxsets",
-        "books",
-        "photos",
-        "livetv",
-        "playlists",
-        "folders",
-    ];
-    let blob: serde_json::Value = serde_json::from_str(data?).ok()?;
-    match blob.get("ViewType")? {
-        serde_json::Value::String(name) if !name.trim().is_empty() => {
-            Some(name.trim().to_ascii_lowercase())
-        }
-        serde_json::Value::Number(disc) => {
-            let index = usize::try_from(disc.as_i64()?).ok()?;
-            PUBLIC_NAMES.get(index).map(|name| (*name).to_owned())
-        }
-        _ => None,
-    }
+    ferrofin_model::data::CollectionType::from_item_data(data, "ViewType")
+        .map(|kind| kind.json_name().into_owned())
 }
 
 /// `Path.GetFileName(path.TrimEnd(DirectorySeparatorChar))` after either
@@ -402,14 +393,18 @@ async fn create_canonical_copy(
     let presentation_key = Uuid::parse_str(canonical_db)
         .map(|id| id.as_simple().to_string())
         .map_err(|e| ServiceError::backend(format!("canonical view id: {e}")))?;
-    sqlx::query(
+    sqlx::query(concat!(
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "Name", "SortName", "ForcedSortName", "Path",
             "DateCreated", "DateModified", "Data", "TopParentId",
             "PresentationUniqueKey", "IsFolder", "IsInMixedFolder", "IsLocked",
-            "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem")
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0)"#,
-    )
+            "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem", "UnratedType", "#,
+        crate::item_persistence_service::unset_columns!(),
+        r#")
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0, ?12, "#,
+        crate::item_persistence_service::unset_values!(),
+        ")"
+    ))
     .bind(canonical_db)
     .bind(&source.type_)
     .bind(&source.name)
@@ -421,6 +416,9 @@ async fn create_canonical_copy(
     .bind(&source.data)
     .bind(&source.top_parent_id)
     .bind(&presentation_key)
+    .bind(crate::item_persistence_service::unrated_type_name(
+        crate::item_type_lookup::kind_from_type_name(&source.type_).unwrap_or(BaseItemKind::Folder),
+    ))
     .execute(&mut **tx)
     .await
     .map_err(db_err)?;
@@ -870,12 +868,18 @@ mod tests {
             .expect("canonical view");
         assert_eq!(view.name.as_deref(), Some("TV en direct"));
         assert_eq!(view.forced_sort_name.as_deref(), Some("TV en direct"));
-        assert_eq!(view.path.as_deref(), Some(view_path));
+        // the id from the resolved path, the row as upstream stores it (gl-1581)
+        assert_eq!(view.path.as_deref(), Some("%MetadataPath%/views/livetv"));
         assert_eq!(view.date_created, Some(at(2024, 3, 1)));
         assert_eq!(view.data.as_deref(), Some(r#"{"ViewType":"livetv"}"#));
         assert_eq!(
             view.top_parent_id.as_deref(),
             Some(guid_to_db(canonical).as_str())
+        );
+        // Upstream's values where the view has none (gl-1580).
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, canonical).await,
+            Vec::<&str>::new()
         );
         assert!(
             fetch_item_opt(&db, stale_id).await.is_none(),
@@ -1238,6 +1242,9 @@ mod tests {
     #[case(Some(r#"{"ViewType":"livetv"}"#), Some("livetv"))]
     #[case(Some(r#"{"ViewType":"LiveTv"}"#), Some("livetv"))]
     #[case(Some(r#"{"ViewType":10}"#), Some("livetv"))]
+    #[case(Some(r#"{"ViewType":110}"#), Some("movieresume"))]
+    #[case(Some(r#"{"ViewType":99}"#), Some("99"))]
+    #[case(Some(r#"{"ViewType":"nonsense"}"#), None)]
     #[case(Some(r#"{"ViewType":""}"#), None)]
     #[case(Some(r#"{"ViewType":null}"#), None)]
     #[case(Some(r#"{"DisplayParentId":"x"}"#), None)]

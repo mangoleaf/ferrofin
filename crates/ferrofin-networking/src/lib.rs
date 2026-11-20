@@ -17,7 +17,7 @@
 //! - [`config_keys`] — the startup key inlined from
 //!   `MediaBrowser.Controller.Extensions.ConfigurationExtensions`.
 //! - [`logger`] — a minimal `ILogger` seam so the ported warning-substring
-//!   tests stay deterministic without pulling in `tracing`.
+//!   tests stay deterministic; [`TracingLogger`] writes to the server log.
 //!
 //! The [`ferrofin_model::net`] value types (`IpData`, `IpNetwork`,
 //! `AddressFamily`, `PublishedServerUriOverride`) are reused, not redefined.
@@ -39,9 +39,11 @@ pub mod network_configuration;
 pub mod remote_access_policy_result;
 
 pub use known_proxies::KnownProxies;
-pub use logger::{Logger, NullLogger};
+pub use logger::{Logger, NullLogger, TracingLogger};
 pub use manager::{
     HostLookup, InterfaceEnumerator, NetworkManager, StartupConfig, published_urls_missing_base_url,
 };
-pub use network_configuration::{NetworkConfiguration, normalize_base_url};
+pub use network_configuration::{
+    NetworkConfiguration, base_url_prefix_len, escape_base_url, normalize_base_url,
+};
 pub use remote_access_policy_result::RemoteAccessPolicyResult;

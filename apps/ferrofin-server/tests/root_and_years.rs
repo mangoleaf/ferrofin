@@ -291,9 +291,12 @@ async fn items_root_ancestors_and_years_over_real_http() {
             id.eq_ignore_ascii_case(&expected.to_string()),
             "Year {name} has the path-derived id ({id} vs {expected})"
         );
+        // this bare repository reads the row as stored: tokenised, as
+        // upstream's save writes it (gl-1581); the id is still the one the
+        // resolved path derives
         assert_eq!(
             path.as_deref(),
-            Some(format!("{}/{name}", paths.year_path()).as_str())
+            Some(format!("%MetadataPath%/Year/{name}").as_str())
         );
     }
 

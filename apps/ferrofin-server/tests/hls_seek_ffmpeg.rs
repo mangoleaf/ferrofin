@@ -8,7 +8,7 @@
 //! Needs `ffmpeg` 5.0 or later (with libx264) and `ffprobe` on `PATH`:
 //!
 //! ```bash
-//! FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server --test hls_seek_ffmpeg
+//! cargo test -p ferrofin-server --test hls_seek_ffmpeg -- --include-ignored
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -34,26 +34,21 @@ fn tool(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// The real ffmpeg and ffprobe, or `None` (saying why) when this run skips:
-/// `FERROFIN_FFMPEG_TESTS` unset, a tool missing, no libx264, or an ffmpeg
-/// older than 5.0 (its `noise` filter has no `drop`, so nothing is trimmed).
+/// The real ffmpeg and ffprobe, or `None` (saying why) when this run skips
+/// because the ffmpeg is older than 5.0 (its `noise` filter has no `drop`, so
+/// nothing is trimmed). The tests are `#[ignore]`d, so a run that asks for
+/// them fails when a tool or libx264 is missing.
 fn tools() -> Option<(PathBuf, PathBuf)> {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipping: set FERROFIN_FFMPEG_TESTS=1 to run");
-        return None;
-    }
-    let (Some(ffmpeg), Some(ffprobe)) = (tool("ffmpeg"), tool("ffprobe")) else {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return None;
-    };
+    let ffmpeg = tool("ffmpeg").expect("ffmpeg not found on PATH");
+    let ffprobe = tool("ffprobe").expect("ffprobe not found on PATH");
     let encoders = Command::new(&ffmpeg)
         .args(["-hide_banner", "-encoders"])
         .output()
         .unwrap();
-    if !String::from_utf8_lossy(&encoders.stdout).contains("libx264") {
-        eprintln!("skipping: this ffmpeg has no libx264 to transcode to");
-        return None;
-    }
+    assert!(
+        String::from_utf8_lossy(&encoders.stdout).contains("libx264"),
+        "this ffmpeg has no libx264 to transcode to"
+    );
     let noise = Command::new(&ffmpeg)
         .args(["-hide_banner", "-h", "bsf=noise"])
         .output()
@@ -261,6 +256,7 @@ async fn serve_movies(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_seeked_segment_with_copied_audio_starts_both_streams_at_the_seek() {
     let Some((ffmpeg, ffprobe)) = tools() else {
         return;
@@ -342,6 +338,7 @@ async fn a_seeked_segment_with_copied_audio_starts_both_streams_at_the_seek() {
 /// them again, and only upstream's flag is ported (owner decision on
 /// gl-1244). They are not compared here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_seek_restarted_fmp4_segment_keeps_the_continuous_jobs_timestamps() {
     /// The segment the seek restarts at: 18 s into the movie.
     const SEEK: u32 = 3;

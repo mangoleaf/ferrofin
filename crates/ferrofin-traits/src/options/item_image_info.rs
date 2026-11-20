@@ -70,9 +70,30 @@ impl ItemImageInfo {
     }
 }
 
+/// The image file's mtime as UTC, falling back to [`Utc::now`] when the stat
+/// fails. Port of Jellyfin's `IFileSystem.GetLastWriteTimeUtc`, which stamps
+/// `ItemImageInfo.DateModified`.
+///
+/// This MUST be the file's mtime, not the scan time: `date_modified` feeds both
+/// the client-facing `ImageTags` (`md5(path + ticks)`) and the resized-image
+/// cache key. A rescan of an unchanged file has to reproduce the same timestamp,
+/// or every scan changes every poster URL (busting the clients' year-long
+/// immutable image caches) and invalidates the entire server-side resize cache.
+///
+/// The one spelling of that rule for every crate that stamps an image row
+/// (providers, drawing, core), so their values compare like with like. Some
+/// other file dates keep their own value when the mtime cannot be read: the
+/// epoch for chapter images and directory listings, none for a view folder.
+#[must_use]
+pub fn file_date_modified(path: &Path) -> DateTime<Utc> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
+}
+
 /// Whether a Live TV channel's or programme's image `path` is in the internal
-/// metadata directory `metadata_root`, the only place its file may be read from
-/// or deleted.
+/// metadata directory `metadata_root`, the only place its file may be read
+/// from, deleted or exchanged with another.
 ///
 /// Those rows hold what a tuner or a guide supplied, which is kept only as a URL
 /// (`ferrofin_livetv::projection::is_artwork_url`), but a row saved before that

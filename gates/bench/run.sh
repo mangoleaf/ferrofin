@@ -30,6 +30,8 @@ CALLER=$PWD
 cd "$(dirname "$0")/../.."
 # shellcheck source=gates/lib.sh
 source gates/lib.sh
+# shellcheck source=gates/isolation.sh
+source gates/isolation.sh   # the readiness wait and the isolation steps, shared with gates/parity/run.sh (gl-754)
 gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/lib.sh, gl-968)
 
 # ── tunables (§2) ──────────────────────────────────────────────────────────
@@ -230,66 +232,22 @@ jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$RUN_N
     window_s:$window, mem_sample_ms:$sample_ms, oracle:$oracle, date: (now|todate)}' > "$OUT/run.json"
 
 api() { curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" -H "$AUTH" "$URL$1"; }
-wait_ready() {
-  local deadline=$((SECONDS + READY_TIMEOUT_S))
-  while (( SECONDS < deadline )); do
-    curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" "$URL/System/Info/Public" 2>/dev/null | jq -e '.Version | strings | length > 0' >/dev/null 2>&1 && return 0
-    sleep 1
-  done
-  FAIL_REASON="readiness timed out"; return 1
-}
+api_post() { curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" -X POST -H "$AUTH" -H 'Content-Type: application/json' --data "${2:-}" "$URL$1" >/dev/null; }
 # shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
-drain() {
-  verify_isolation || return 1
-  local deadline=$((SECONDS + DRAIN_TIMEOUT_S)) busy
-  while (( SECONDS < deadline )); do
-    busy=$(api "/ScheduledTasks" | jq -er 'if type != "array" then error("invalid tasks") else [.[] | select(.State != "Idle") | .Name] | join(",") end') || { FAIL_REASON="cannot read scheduled tasks"; return 1; }
-    if [ -z "$busy" ]; then sleep "$SETTLE_S"; return 0; fi
-    echo "  drain: waiting for [$busy]"; sleep 1
-  done
-  FAIL_REASON="scheduled tasks did not drain before deadline"; return 1
+drain() {   # still isolated, every task idle, then the settle
+  isolation_verify "$ALL_PLUGINS" || return 1
+  isolation_tasks_idle || return 1
+  sleep "$SETTLE_S"
 }
 # shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 count() { api "$1" | jq -r 'if type=="array" then length else (.TotalRecordCount // (.Items|length)) end'; }
 disable_plugins() {  # installed Jellyfin plugins / all Ferrofin plugins off; no WASM
-  local wasm; wasm=$(find "$1" -name '*.wasm' 2>/dev/null | head -1)
-  [ -z "$wasm" ] || die "$NAME: a WASM plugin is present in the config copy ($wasm) — the benchmark measures core Ferrofin only"
-  api "/Plugins" > "$D/plugins-before.json" || die "$NAME: cannot enumerate plugins"
-  jq -e 'type == "array"' "$D/plugins-before.json" >/dev/null || die "invalid plugins response"
-  local id ver
-  while read -r id ver; do
-    curl -sf --max-time "$HTTP_TIMEOUT_S" -X POST -H "$AUTH" "$URL/Plugins/$id/$ver/Disable" >/dev/null || die "$NAME: could not disable plugin $id $ver"
-  done < <(jq -r --arg server "$NAME" '.[] | select($server == "ferrofin" or .CanUninstall != false) | "\(.Id) \(.Version)"' "$D/plugins-before.json")
+  isolation_no_wasm "$1" || die "$NAME: $FAIL_REASON — the benchmark measures core Ferrofin only"
+  isolation_disable_plugins "$ALL_PLUGINS" || die "$NAME: $FAIL_REASON"
   api "/Plugins" > "$D/plugins.json"
-  local on; on=$(jq -r --arg server "$NAME" '[.[] | select(.Status != "Disabled" and ($server == "ferrofin" or .CanUninstall != false)) | .Name] | join(", ")' "$D/plugins.json")
+  local on; on=$(jq -r --argjson all "$ALL_PLUGINS" '[.[] | select(.Status != "Disabled" and ($all == 1 or .CanUninstall != false)) | .Name] | join(", ")' "$D/plugins.json")
   [ -z "$on" ] || die "$NAME: plugins still enabled after disabling: $on"
   echo "  plugins: $(jq -r 'map(.Name) | join(", ")' "$D/plugins.json") — plugin policy applied for $NAME"
-}
-# Persist empty schedules before the provisioning restart, including startup triggers.
-# This also suppresses automatic metadata/image/plugin maintenance during measurements.
-disable_schedules() {
-  api "/ScheduledTasks" > "$D/tasks-before.json" || return 1
-  jq -e 'type == "array" and length > 0' "$D/tasks-before.json" >/dev/null || return 1
-  local id
-  while read -r id; do
-    curl -sf --max-time "$HTTP_TIMEOUT_S" -X POST -H "$AUTH" -H 'Content-Type: application/json' \
-      --data '[]' "$URL/ScheduledTasks/$id/Triggers" >/dev/null || return 1
-  done < <(jq -r '.[].Id' "$D/tasks-before.json")
-}
-verify_isolation() {
-  # each check fails when either its request or its condition does
-  if ! { api "/Plugins" > "$D/plugins.json" &&
-         jq -e --arg server "$NAME" 'type == "array" and all(.[]; .Status == "Disabled" or ($server != "ferrofin" and .CanUninstall == false))' "$D/plugins.json" >/dev/null; }; then
-    FAIL_REASON="plugins not disabled"; return 1
-  fi
-  if ! { api "/ScheduledTasks" > "$D/tasks.json" &&
-         jq -e 'type == "array" and length > 0 and all(.[]; .Triggers == [])' "$D/tasks.json" >/dev/null; }; then
-    FAIL_REASON="automatic task triggers remain enabled"; return 1
-  fi
-  if ! { api "/Library/VirtualFolders" > "$D/libraries.json" &&
-         jq -e 'type == "array" and length > 0 and all(.[]; .LibraryOptions | .EnableRealtimeMonitor == false and .AutomaticRefreshIntervalDays == 0 and (.TypeOptions | length > 0 and all(.[]; .MetadataFetchers == [] and .ImageFetchers == [])))' "$D/libraries.json" >/dev/null; }; then
-    FAIL_REASON="library monitoring/automatic refresh/fetchers not disabled"; return 1
-  fi
 }
 # A client gets its own process group, so interruption/timeout also stops descendants.
 client() {
@@ -528,6 +486,7 @@ phase_ttfs() {
 run_server() {
   set -e
   NAME=$1; URL=http://127.0.0.1:$(port_of "$1"); D=$OUT/$1; CONTAINER=bench-$1
+  ALL_PLUGINS=0; [ "$1" != ferrofin ] || ALL_PLUGINS=1   # every Ferrofin plugin off; Jellyfin's in-tree ones cannot be
   local cfg=$D/config cache=$D/cache
   echo "== $1 ($(image_of "$1")) → $D"
   [ -e "$cfg" ] && die "$cfg exists — a run dir is never reused"
@@ -555,21 +514,7 @@ run_server() {
     cp "$TESTDATA/jellyfin/preparation.json" "$D/preparation.json"
   fi
   cp -r --reflink=auto "$source" "$cfg"; mkdir -p "$cache"
-  # Change only the disposable copy, before either server starts its filesystem watcher.
-  python3 - "$cfg" <<'PY_ISOLATION'
-import pathlib, sys, xml.etree.ElementTree as ET
-files = list(pathlib.Path(sys.argv[1]).glob("root/default/*/options.xml"))
-if not files:
-    raise SystemExit("no library options found in benchmark config")
-for path in files:
-    tree = ET.parse(path)
-    root = tree.getroot()
-    node = root.find("EnableRealtimeMonitor")
-    if node is None:
-        node = ET.SubElement(root, "EnableRealtimeMonitor")
-    node.text = "false"
-    tree.write(path, encoding="utf-8", xml_declaration=True)
-PY_ISOLATION
+  isolation_realtime_monitor_off "$cfg" || die "$NAME: $FAIL_REASON"
   local env=(); [ "$1" = ferrofin ] && env=(-e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache)
   # the server log is the one diagnostic a failed phase needs: always captured, on any exit
   timeout --kill-after=2 "$READY_TIMEOUT_S" docker run -d --cidfile "$D/container.cid" --name "$CONTAINER" --user "$(id -u):$(id -g)" --cpuset-cpus "$SERVER_CPUS" \
@@ -584,12 +529,14 @@ PY_ISOLATION
     python3 gates/bench/oracle.py matches "$expected_version" || die "the Jellyfin image is not the oracle release"
   fi
   disable_plugins "$cfg"
-  disable_schedules || die "$NAME: could not disable automatic tasks"
+  # Empty schedules persist across the provisioning restart, startup triggers included; this also suppresses
+  # automatic metadata/image/plugin maintenance during measurements.
+  isolation_disable_triggers || die "$NAME: could not disable automatic tasks: $FAIL_REASON"
   # Jellyfin unloads disabled plugin assemblies only on restart. Do this outside timing.
   docker_cmd stop --time "$CLEANUP_TIMEOUT_S" "$CONTAINER" >/dev/null
   docker_cmd start "$CONTAINER" >/dev/null
   wait_ready || die "$NAME: isolation restart failed"
-  verify_isolation || die "$NAME: $FAIL_REASON"
+  isolation_verify "$ALL_PLUGINS" || die "$NAME: $FAIL_REASON"
   # Jellyfin boots the config its preparation scanned under 12.x; give Ferrofin the
   # equivalent one full scan of its adopted copy, then a fresh process, as Jellyfin's scan
   # ran in its preparation: no scan heap is left in the memory numbers.
@@ -599,7 +546,7 @@ PY_ISOLATION
     docker_cmd stop --time "$CLEANUP_TIMEOUT_S" "$CONTAINER" >/dev/null
     docker_cmd start "$CONTAINER" >/dev/null
     wait_ready || die "$NAME: post-scan restart failed"
-    verify_isolation || die "$NAME: $FAIL_REASON"
+    isolation_verify "$ALL_PLUGINS" || die "$NAME: $FAIL_REASON"
   fi
   state startup completed; CURRENT_PHASE=""
   phase startup-drain drain || exit 1

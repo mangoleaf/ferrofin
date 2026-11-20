@@ -18,8 +18,9 @@ use rstest::rstest;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 use super::{
-    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, merge_data, merge_people,
-    merge_provider_ids, merge_refresh, pass_credits, set_provider_ids, settle_sort_name,
+    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, language_subtag,
+    matches_preferred_language, merge_data, merge_people, merge_provider_ids, merge_refresh,
+    pass_credits, set_provider_ids, settle_sort_name,
 };
 
 /// The stored `Type` name for `kind`.
@@ -133,6 +134,19 @@ fn merged_equals_new(
     let locked: Vec<MetadataField> = lock.into_iter().collect();
     merge_data(&source, &mut target, &locked, replace, false);
     field.get(&target.item).as_deref() == new
+}
+
+/// `MatchesPreferredLanguage`: the language subtags compare, and an unknown
+/// language on either side matches.
+#[test]
+fn languages_match_on_their_subtag() {
+    assert_eq!(language_subtag("ES-es"), "es");
+    assert!(matches_preferred_language(Some("es"), "es-ES"));
+    assert!(matches_preferred_language(Some("EN-us"), "en"));
+    assert!(!matches_preferred_language(Some("en"), "de"));
+    assert!(matches_preferred_language(None, "de"));
+    assert!(matches_preferred_language(Some(""), "de"));
+    assert!(matches_preferred_language(Some("en"), ""));
 }
 
 /// `MergeBaseItemData_StringField_ReplacesAppropriately` (on a `Series`, so
@@ -278,6 +292,14 @@ fn string_array_fill_unions(#[case] field: Field) {
     let mut target = MetadataResult::of(target);
     merge_data(&MetadataResult::of(source), &mut target, &[], false, false);
     assert_eq!(field.get(&target.item).as_deref(), Some("A|B"));
+    // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+    let mut source = item(BaseItemKind::Audio);
+    field.set(&mut source, Some("Croſs"));
+    let mut target = item(BaseItemKind::Audio);
+    field.set(&mut target, Some("Cross"));
+    let mut target = MetadataResult::of(target);
+    merge_data(&MetadataResult::of(source), &mut target, &[], false, false);
+    assert_eq!(field.get(&target.item).as_deref(), Some("Cross|Croſs"));
 }
 
 /// Genres are not a union field upstream: a fill merge keeps the target.
@@ -1394,6 +1416,21 @@ fn kind_specific_rules() {
     assert_eq!(book.item.series_name.as_deref(), Some("Discworld"));
 }
 
+/// Upstream's `MergeData_MissingProviderSeasonKeepsExistingSeason`
+/// (`EpisodeMetadataServiceTests.cs`, from jellyfin/jellyfin PR 16702): a
+/// settings-carrying merge from an answer with no season keeps the episode's
+/// season (`EpisodeMetadataService.MergeData` takes only an explicit one).
+#[test]
+fn merge_data_missing_provider_season_keeps_existing_season() {
+    let source = MetadataResult::of(item(BaseItemKind::Episode));
+    let mut target = MetadataResult::of(BaseItemEntity {
+        parent_index_number: Some(1),
+        ..item(BaseItemKind::Episode)
+    });
+    merge_data(&source, &mut target, &[], false, true);
+    assert_eq!(target.item.parent_index_number, Some(1));
+}
+
 /// The dashboard's three refresh choices, as `RefreshWithProviders`
 /// (`MetadataService.cs:895-918`) makes its two `MergeData` calls for each:
 /// the stored values first fill the provider result (skipped under
@@ -1999,4 +2036,34 @@ fn rating_to_items_takes_the_least_restrictive_member(
         super::rating_to_items(current, members.iter().copied(), test_score),
         expected
     );
+}
+
+/// `UpdateGenres`/`UpdateStudios` compare the lists sorted and ignoring
+/// case, so a reordering or a case change is no edit; a date, year or rating
+/// change is one, and the runtime (`MetadataImport`) is not compared.
+#[rstest]
+#[case::same(|_: &mut BaseItemEntity| {}, false)]
+#[case::reordered_genres(|row: &mut BaseItemEntity| row.genres = Some("drama|ACTION".into()), false)]
+#[case::runtime(|row: &mut BaseItemEntity| row.run_time_ticks = Some(9), false)]
+#[case::genre_added(|row: &mut BaseItemEntity| row.genres = Some("Action|Drama|War".into()), true)]
+#[case::studio(|row: &mut BaseItemEntity| row.studios = None, true)]
+#[case::year(|row: &mut BaseItemEntity| row.production_year = Some(1999), true)]
+#[case::premiere_date(|row: &mut BaseItemEntity| row.premiere_date = Some(Utc.with_ymd_and_hms(2001, 5, 4, 0, 0, 0).unwrap()), true)]
+#[case::rating(|row: &mut BaseItemEntity| row.official_rating = Some("PG".into()), true)]
+#[case::rating_case(|row: &mut BaseItemEntity| row.official_rating = Some("pg-13".into()), false)]
+#[case::rating_cleared(|row: &mut BaseItemEntity| row.official_rating = None, true)]
+fn members_edited_follows_upstreams_metadata_edit_comparisons(
+    #[case] change: fn(&mut BaseItemEntity),
+    #[case] edited: bool,
+) {
+    let before = BaseItemEntity {
+        genres: Some("Action|Drama".into()),
+        studios: Some("Acme".into()),
+        production_year: Some(2001),
+        official_rating: Some("PG-13".into()),
+        ..BaseItemEntity::default()
+    };
+    let mut after = before.clone();
+    change(&mut after);
+    assert_eq!(super::members_edited(&before, &after), edited);
 }

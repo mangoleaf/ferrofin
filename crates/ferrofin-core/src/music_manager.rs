@@ -53,15 +53,12 @@ impl std::fmt::Debug for FerrofinMusicManager {
 
 /// The display genres of a row (its `Genres` column, pipe-split).
 fn row_genres(row: &BaseItemEntity) -> Vec<String> {
-    row.genres
-        .as_deref()
-        .map(|g| {
-            g.split('|')
-                .filter(|p| !p.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    row.genres.as_deref().map_or_default(|g| {
+        g.split('|')
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 /// C# `Jellyfin.Extensions.DistinctNames` — distinct, case-insensitive, first
@@ -72,7 +69,9 @@ fn distinct_names(names: Vec<String>) -> Vec<String> {
         .into_iter()
         .filter(|n| {
             let key = ferrofin_util::string_extensions::remove_diacritics(n);
-            seen.insert(ferrofin_util::string_extensions::upper_invariant(&key))
+            seen.insert(ferrofin_util::string_extensions::ordinal_ignore_case_key(
+                &key,
+            ))
         })
         .collect()
 }
@@ -270,17 +269,6 @@ impl MusicManager for FerrofinMusicManager {
         }
     }
 
-    async fn get_instant_mix_from_artist(
-        &self,
-        artist_id: Uuid,
-        user_id: Option<Uuid>,
-        dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // `GetInstantMixFromArtist` is the MusicArtist arm of the dispatch.
-        self.get_instant_mix_from_item(artist_id, user_id, dto_options)
-            .await
-    }
-
     async fn get_instant_mix_from_genres(
         &self,
         genres: &[String],
@@ -306,6 +294,7 @@ mod tests {
     #[case("é", "E", true)]
     #[case("𐐨", "𐐀", true)]
     #[case("ı", "I", false)]
+    #[case("ſ", "s", false)]
     fn unicode_distinct_names(#[case] first: &str, #[case] second: &str, #[case] equal: bool) {
         let expected = if equal {
             vec![first]

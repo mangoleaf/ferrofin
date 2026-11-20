@@ -20,6 +20,7 @@ use ferrofin_model::dlna::{EncodingContext, SubtitleDeliveryMethod};
 use ferrofin_model::drawing::ImageDimensions;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities_media::MediaStream;
+use ferrofin_model::session::TranscodeReasons;
 use ferrofin_traits::media_encoding::TranscodingJobType;
 
 /// The character(s) profile/range/rotation option lists are split on.
@@ -59,6 +60,14 @@ pub trait EncoderCapabilities: Send + Sync {
     /// `IMediaEncoder.IsVaapiDeviceInteliHD`; `false` (the default) when
     /// nothing was probed.
     fn is_vaapi_device_intel_ihd(&self) -> bool {
+        false
+    }
+
+    /// Whether the VAAPI device runs Intel's legacy i965 driver, whose VBR can
+    /// pixelate, so upstream encodes CBR on it. Port of
+    /// `IMediaEncoder.IsVaapiDeviceInteli965`; `false` (the default) when
+    /// nothing was probed.
+    fn is_vaapi_device_intel_i965(&self) -> bool {
         false
     }
 
@@ -161,6 +170,9 @@ pub struct BaseEncodingJobOptions {
     pub cpu_core_limit: Option<i32>,
     /// The live-stream id, if this is a live source (`LiveStreamId`).
     pub live_stream_id: Option<String>,
+    /// The media source id as the request sent it (`MediaSourceId`), before
+    /// it is resolved; `None` when the request named none.
+    pub media_source_id: Option<String>,
     /// Whether MPEG-TS M2TS mode is enabled (`EnableMpegtsM2TsMode`).
     pub enable_mpegts_m2ts_mode: bool,
     /// The encoding context (`Context`).
@@ -212,6 +224,7 @@ impl Default for BaseEncodingJobOptions {
             require_non_anamorphic: false,
             cpu_core_limit: None,
             live_stream_id: None,
+            media_source_id: None,
             enable_mpegts_m2ts_mode: false,
             stream_options: Vec::new(),
             always_burn_in_subtitle_when_transcoding: false,
@@ -308,8 +321,6 @@ pub struct EncodingJobInfo {
     pub output_audio_channels: Option<i32>,
     /// The output container (`OutputContainer`).
     pub output_container: Option<String>,
-    /// The output video sync mode (`OutputVideoSync`).
-    pub output_video_sync: Option<String>,
     /// The output file path (`OutputFilePath`).
     pub output_file_path: String,
     /// The input container (`InputContainer`).
@@ -354,6 +365,11 @@ pub struct EncodingJobInfo {
     pub play_session_id: Option<String>,
     /// The device id this job streams to (`Request.DeviceId`).
     pub device_id: Option<String>,
+    /// Why this job transcodes (`TranscodeReasons`): the request's
+    /// `TranscodeReasons` ([`parse_transcode_reasons`](ferrofin_model::session::parse_transcode_reasons))
+    /// plus what the copy decision adds (`AddTranscodeReason`). The session's
+    /// `TranscodingInfo` reports it.
+    pub transcode_reasons: TranscodeReasons,
 }
 
 impl EncodingJobInfo {
@@ -728,12 +744,12 @@ mod derived_state_tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: String::new(),
             input_container: None,
             is_input_video: true,
             subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: Some(1),
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),

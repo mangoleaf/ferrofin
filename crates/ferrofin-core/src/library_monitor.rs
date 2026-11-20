@@ -454,7 +454,7 @@ impl FerrofinLibraryMonitor {
             // `LibraryMonitor.Start` / `ContainsParentFolder`: a recursive
             // parent watch already covers its children and shared roots.
             // Compare directory boundaries, using .NET ordinal casing.
-            let key = ferrofin_util::string_extensions::upper_invariant(
+            let key = ferrofin_util::string_extensions::ordinal_ignore_case_key(
                 root.trim_end_matches(std::path::MAIN_SEPARATOR),
             );
             if watched_roots.iter().any(|parent| {
@@ -643,26 +643,6 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
         self.restart_wake.notify_one();
     }
 
-    async fn report_file_system_change_beginning(&self, path: &str) -> Result<(), ServiceError> {
-        if path.is_empty() {
-            return Err(ServiceError::invalid_input("path can't be empty"));
-        }
-        SelfWriteGuard::begin(self, path);
-        Ok(())
-    }
-
-    async fn report_file_system_change_complete(
-        &self,
-        path: &str,
-        refresh_path: bool,
-    ) -> Result<(), ServiceError> {
-        if path.is_empty() {
-            return Err(ServiceError::invalid_input("path can't be empty"));
-        }
-        SelfWriteGuard::complete(self, path, refresh_path);
-        Ok(())
-    }
-
     async fn report_file_system_changed(&self, path: &str) -> Result<(), ServiceError> {
         self.report_change(path, ScanTrigger::Watcher).await
     }
@@ -741,10 +721,16 @@ fn contains_sub_path(parent: &str, path: &str) -> bool {
             || path[parent.len()..].starts_with(std::path::is_separator))
 }
 
-/// `Path.TrimEndingDirectorySeparator`: a root stays as it is.
-fn trim_separators(path: &str) -> &str {
+/// `path` without its trailing separators, all of them (`/a//` is `/a`;
+/// `Path.TrimEndingDirectorySeparator` trims one); a path of separators only
+/// is the root, one separator.
+pub(crate) fn trim_separators(path: &str) -> &str {
     let trimmed = path.trim_end_matches(std::path::is_separator);
-    if trimmed.is_empty() { path } else { trimmed }
+    if trimmed.is_empty() {
+        path.get(..1).unwrap_or(path)
+    } else {
+        trimmed
+    }
 }
 
 impl FerrofinLibraryMonitor {
@@ -1201,18 +1187,12 @@ mod tests {
         let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![]);
         let dir = "/media/movies/Solaris";
 
-        monitor
-            .report_file_system_change_beginning(dir)
-            .await
-            .expect("begin");
+        SelfWriteGuard::begin(&monitor, dir);
         assert!(monitor.is_path_suppressed(dir));
         // A change under the suppressed directory is ignored.
         assert!(monitor.is_path_suppressed(&format!("{dir}/poster.jpg")));
 
-        monitor
-            .report_file_system_change_complete(dir, false)
-            .await
-            .expect("complete");
+        SelfWriteGuard::complete(&monitor, dir, false);
         assert!(
             monitor.is_path_suppressed(dir),
             "still, while events settle"
@@ -1602,6 +1582,18 @@ mod tests {
         );
     }
 
+    /// Every trailing separator goes; a path of separators only is the root.
+    #[rstest::rstest]
+    #[case::bare("/m/tv", "/m/tv")]
+    #[case::one("/m/tv/", "/m/tv")]
+    #[case::two("/m/tv//", "/m/tv")]
+    #[case::root("/", "/")]
+    #[case::root_twice("//", "/")]
+    #[case::empty("", "")]
+    fn trim_separators_keeps_the_root(#[case] path: &str, #[case] trimmed: &str) {
+        assert_eq!(trim_separators(path), trimmed);
+    }
+
     /// `CreateRefresher`'s grouping: a path joins a settle group whose path
     /// is equal to it, contains it, is contained by it, or is its sibling;
     /// anything else settles on its own.
@@ -1694,14 +1686,8 @@ mod tests {
         let scans = || library.scans.load(std::sync::atomic::Ordering::SeqCst);
         let dir = "/media/movies/Solaris";
         let file = format!("{dir}/Solaris.en.srt");
-        monitor
-            .report_file_system_change_beginning(&file)
-            .await
-            .expect("begin");
-        monitor
-            .report_file_system_change_complete(&file, false)
-            .await
-            .expect("complete");
+        SelfWriteGuard::begin(&monitor, &file);
+        SelfWriteGuard::complete(&monitor, &file, false);
         for path in [file.clone(), dir.to_owned(), format!("{dir}/")] {
             monitor
                 .report_file_system_changed(&path)
@@ -1776,10 +1762,7 @@ mod tests {
         let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
             .with_refresh_target(library.clone());
         let dir = "/media/movies/Solaris";
-        monitor
-            .report_file_system_change_beginning(dir)
-            .await
-            .expect("begin");
+        SelfWriteGuard::begin(&monitor, dir);
         // A change under a server-write-suppressed dir must not trigger a rescan.
         monitor
             .report_file_system_changed(&format!("{dir}/poster.jpg"))

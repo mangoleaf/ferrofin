@@ -144,9 +144,10 @@ upstream's `ProviderManager.IsSaverEnabledForItem` makes it; the script prints i
 library's metadata savers chosen (the dashboard saves a list, empty unless "Nfo" is ticked),
 the save writes it when "Nfo" is among them. With none chosen (as `run.sh`'s libraries), it
 never does when the server disables the Nfo saver for the item's type, and otherwise does
-when the library saves metadata into media folders or the saver's file already exists. An
-episode's saver file is the episode's own NFO, which the script made, so a TV library made
-like `run.sh`'s rewrites it; a movie's is `movie.nfo`, which nothing made (once written, the
+when the library saves metadata into media folders. Upstream also rewrites a saver's file
+that already exists, such as an episode's own NFO, which the script made; Ferrofin never
+writes into a media folder the library did not open to it, so a library made like `run.sh`'s
+rewrites nothing. A movie's saver file is `movie.nfo`, which nothing made (once written, the
 scan reads it before the movie's own NFO). A rewritten NFO also changes rows 9 and 10: "Replace all
 metadata" runs no local reader for an item a saver will rewrite, so with the fetchers off the
 overview and the rating come back empty there, which both rows accept.
@@ -194,9 +195,10 @@ scans do. They cover:
   refresh before the rows, is not counted), a stray episode request in row 1 and in a later
   row, a scratch series that matched a real show (the run stops after row 1), and one with
   only the series fetchers ticked (on, not off);
-- row 8 under each NFO saver choice: none chosen in a TV library (the edit rewrote the
-  episode's NFO, so a refilled rating fails), chosen without "Nfo" (the rating must be
-  refilled), the server disabling Nfo for episodes, and a movies library with "Nfo" ticked;
+- row 8 under each NFO saver choice: none chosen in a TV library that saves into its media
+  folders (the edit rewrote the episode's NFO, so a refilled rating fails), none chosen with
+  the media folders closed and chosen without "Nfo" (the rating must be refilled), the server
+  disabling Nfo for episodes, and a movies library with "Nfo" ticked;
 - options with leading zeros;
 - SIGINT mid-run (exit 130), and a second SIGINT during the cleanup.
 

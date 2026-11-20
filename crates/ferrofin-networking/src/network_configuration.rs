@@ -19,18 +19,25 @@
 //! access policy and peer-aware address advertisement. It applies configured LAN
 //! subnets, trusted proxies, remote-IP filters, interface selection and published
 //! subnet URL overrides. Saving the named network configuration updates this
-//! manager; live interfaces refresh at boot, on save and before peer URL resolution.
+//! manager; live interfaces are read at boot, on save and after an operating-system
+//! network change (with `DetectNetworkChange` on, the default), and a peer URL is
+//! resolved from that snapshot.
 //!
 //! `AutoDiscovery` is captured at the start of each server lifetime and controls
-//! the UDP 7359 listener. Changing it requires a restart. HTTP listener ports, the
-//! advertised global URL and the mounted base URL come from the server's bootstrap
-//! configuration (CLI/environment/config.toml), not this DTO's corresponding fields.
-//! In particular, use `FERROFIN_BASE_URL` or bootstrap `base_url` for the mounted
-//! prefix; saving `BaseUrl` here does not remount routes. Bootstrap settings require
-//! a process restart to reload. `EnableHttps`, `RequireHttps` and the certificate
-//! fields do apply: at startup the server listens with HTTPS on its bootstrap HTTPS
-//! port when HTTPS is enabled and the certificate loads, and a new certificate path
-//! flags a restart. `EnablePublishedServerUriByRequest` is read live.
+//! the UDP 7359 listener. Changing it requires a restart. `BaseUrl` is read the same
+//! way: the server mounts, redirects to and advertises it for the whole lifetime,
+//! below `FERROFIN_BASE_URL` and above bootstrap `base_url`, and saving a different
+//! one flags a restart. `InternalHttpPort` and `InternalHttpsPort` are too: the server
+//! listens on and advertises them below `--port`/`FERROFIN_PORT` (HTTPS:
+//! `FERROFIN_HTTPS_PORT`) and above bootstrap `port`/`https_port`. A port at its
+//! default leaves the bootstrap one, and so do equal ports (`ApplicationHost.Init`
+//! resets them to the defaults); saving a different port flags a restart. The
+//! advertised global URL comes from the server's bootstrap configuration
+//! (CLI/environment/config.toml), not this DTO's corresponding fields. `EnableHttps`,
+//! `RequireHttps` and the certificate fields do apply: at startup the server listens
+//! with HTTPS on its HTTPS port when HTTPS is enabled and the certificate loads, and a
+//! new certificate path flags a restart. `EnablePublishedServerUriByRequest` is read
+//! live.
 //!
 //! `EnableUPnP` is a different case, and not a Ferrofin gap: upstream marks it
 //! `[Obsolete("No longer supported")]`
@@ -40,6 +47,7 @@
 //! contract and the dashboard expect the key; ignoring it is exact parity, so
 //! there is nothing here to warn about.
 
+use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
 use serde::{Deserialize, Serialize};
 
 /// The default value for the internal/public HTTP port.
@@ -236,4 +244,79 @@ pub fn normalize_base_url(value: &str) -> String {
     }
     normalized.truncate(normalized.trim_end_matches('/').len());
     normalized
+}
+
+/// What `UriBuilder.Path` escapes, plus `\`, but `%`, which [`escape_base_url`]
+/// decides.
+const URL_PATH: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// A normalized base URL as the path of a URL, escaped as `UriBuilder.Path`
+/// escapes it (Jellyfin 12.4's discovery `Address`, probed live): `/my
+/// jellyfin` is `/my%20jellyfin`, `/médias` is `/m%C3%A9dias`, an escape it
+/// already holds is kept, and a `%` that starts none is `%25`. A `\` is `%5C`,
+/// where `UriBuilder` writes a `/` that the mount would not answer.
+#[must_use]
+pub fn escape_base_url(base: &str) -> String {
+    let mut chunks = base.split('%');
+    let mut escaped: String = chunks
+        .next()
+        .map_or_default(|chunk| percent_encode(chunk.as_bytes(), URL_PATH).collect());
+    for chunk in chunks {
+        let escape = chunk
+            .as_bytes()
+            .get(..2)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit));
+        escaped.push_str(if escape { "%" } else { "%25" });
+        escaped.extend(percent_encode(chunk.as_bytes(), URL_PATH));
+    }
+    escaped
+}
+
+/// How much of the raw `path` the base URL takes: the length of its prefix
+/// that decodes to what `base` decodes to, ASCII case ignored, or `None`. So a
+/// base written `/my jellyfin` or `/my%20jellyfin` matches `/my%20jellyfin/…`
+/// alike, where ASP.NET compares one spelling with the other.
+///
+/// The match is a byte prefix, not a path segment: `/jellyfin` takes the first
+/// nine bytes of `/jellyfin2/…`, so a caller checks that the rest starts with
+/// `/`. `%2F` is compared as written on both sides (it is not a `/`), and an
+/// empty `base` is `Some(0)`.
+#[must_use]
+pub fn base_url_prefix_len(path: &str, base: &str) -> Option<usize> {
+    let (path, base) = (path.as_bytes(), base.as_bytes());
+    let (mut at, mut matched) = (0, 0);
+    while matched < base.len() {
+        let (want, used) = decoded_byte(base, matched)?;
+        let (byte, len) = decoded_byte(path, at)?;
+        if !byte.eq_ignore_ascii_case(&want) {
+            return None;
+        }
+        (at, matched) = (at + len, matched + used);
+    }
+    Some(at)
+}
+
+/// The byte at `raw[at]`, a `%XX` escape decoded, and how many raw bytes it
+/// took. `%2F` is compared as written, as Kestrel leaves it: it is not a `/`.
+fn decoded_byte(raw: &[u8], at: usize) -> Option<(u8, usize)> {
+    let hex = |i: usize| raw.get(at + i).and_then(|&d| char::from(d).to_digit(16));
+    let escaped = hex(1)
+        .zip(hex(2))
+        .and_then(|(hi, lo)| u8::try_from((hi << 4) | lo).ok());
+    match (*raw.get(at)?, escaped) {
+        (b'%', Some(byte)) if byte != b'/' => Some((byte, 3)),
+        (byte, _) => Some((byte, 1)),
+    }
 }

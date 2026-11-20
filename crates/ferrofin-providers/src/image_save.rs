@@ -4,6 +4,8 @@ mod policy;
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::configuration::{ImageSavingConvention, XbmcMetadataOptions};
+use ferrofin_model::entities::CollectionTypeOptions;
+use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{SelfWrite, SelfWriteGuard, VirtualFolderManager};
@@ -38,6 +40,43 @@ impl SavedImage {
     }
 }
 
+/// An item whose artwork [`ImageFileSaver`] publishes beside it
+/// ([`ImageFileSaver::beside_art`]), for "Replace all images".
+#[derive(Debug)]
+pub struct BesideArt {
+    item: BaseItemEntity,
+    series: Option<BaseItemEntity>,
+    /// The owning library's images are its media: a home-video (and photo)
+    /// library with photos enabled, `PhotoResolver`'s.
+    photos: bool,
+}
+
+impl BesideArt {
+    /// Whether `RemoveImages` takes `image` although it is outside the item's
+    /// metadata folders. Upstream takes it wherever it is stored; Ferrofin
+    /// takes a file only where the saver writes the item's art and would
+    /// delete a replaced one (its destinations' folder, never the item's own
+    /// file or a shared album cover), so nothing else in a media folder is
+    /// touched. In a home-video (and photo) library no file goes: an image
+    /// beside the item there can be one of its photos (`jacket.jpg` is an
+    /// album's Primary and a photo alike). A remote image (`!IsLocalFile`)
+    /// goes, with no file to delete.
+    #[must_use]
+    pub fn removes(&self, image: &ItemImageInfo) -> bool {
+        if !image.is_local_file() {
+            return true;
+        }
+        let path = Path::new(&image.path);
+        !self.photos
+            && path.is_absolute()
+            && policy::eligible(&self.item, self.series.as_ref(), image.image_type)
+            && policy::art_folder(&self.item, self.series.as_ref())
+                .is_some_and(|folder| path.starts_with(folder))
+            && Some(path) != self.item.path.as_deref().map(Path::new)
+            && !shared(path)
+    }
+}
+
 struct Selection<'a> {
     index: usize,
     current: &'a [ItemImageInfo],
@@ -48,6 +87,27 @@ struct Settings {
     series: Option<BaseItemEntity>,
     convention: ImageSavingConvention,
     extra_thumbs: bool,
+}
+
+/// Whether `path` lies in one of the server's own directories rather than in
+/// a media library: the data directory (a playlist in `{data}/playlists`, a
+/// box set in `{data}/collections`), the internal metadata directory (a
+/// genre's `{metadata}/Genre/<name>`, a person's `{metadata}/People/…`) or the
+/// libraries' root folder (a library's own `root/default/<name>`). The check
+/// is lexical, so a path it cannot match falls back to the library's setting.
+/// It decides where the always-true `IsSaveLocalMetadataEnabled` overrides
+/// hold (owner decision 2026-10-17).
+pub(crate) fn in_server_directories(
+    paths: &dyn ferrofin_traits::system::ServerApplicationPaths,
+    path: &Path,
+) -> bool {
+    [
+        paths.data_path(),
+        paths.internal_metadata_path(),
+        paths.root_folder_path(),
+    ]
+    .iter()
+    .any(|root| !root.is_empty() && path.starts_with(root))
 }
 
 /// Publishes acquired artwork beside media when the owning library requests it.
@@ -180,42 +240,95 @@ impl ImageFileSaver {
         failure.map_or(Ok(()), Err)
     }
 
-    /// Whether the item's own path lies in one of the server's own
-    /// directories rather than in a media library: the data directory (a
-    /// playlist in `{data}/playlists`, a box set in `{data}/collections`), the
-    /// internal metadata directory (a genre's `{metadata}/Genre/<name>`, a
-    /// person's `{metadata}/People/…`) or the libraries' root folder (a
-    /// library's own `root/default/<name>`). The check is lexical, so a path
-    /// it cannot match falls back to the library's setting.
+    /// [`in_server_directories`] for the item's own path.
     fn in_server_directories(&self, item: &BaseItemEntity) -> bool {
-        let Some(path) = item.path.as_deref().map(Path::new) else {
-            return false;
-        };
-        let paths = self.configuration.application_paths();
-        [
-            paths.data_path(),
-            paths.internal_metadata_path(),
-            paths.root_folder_path(),
-        ]
-        .iter()
-        .any(|root| !root.is_empty() && path.starts_with(root))
+        item.path.as_deref().is_some_and(|path| {
+            in_server_directories(
+                self.configuration.application_paths().as_ref(),
+                Path::new(path),
+            )
+        })
     }
 
-    async fn settings(&self, item: &BaseItemEntity) -> Result<Option<Settings>, ServiceError> {
-        let series = if policy::short_kind(item) == "Season" {
-            let id = item
-                .series_id
+    /// `IsSaveLocalMetadataEnabled()` for `ItemImageProvider.RemoveImages`
+    /// (`ItemImageProvider.cs:83-95`), by the rule [`save`](Self::save)
+    /// publishes by: `Some` when the item's artwork is saved beside it, and
+    /// then "Replace all images" removes the art saved there too
+    /// ([`BesideArt::removes`]); `None` when it stays in the metadata folder.
+    ///
+    /// # Errors
+    /// Returns a repository failure reading a season's series or the
+    /// libraries.
+    pub async fn beside_art(
+        &self,
+        item: &BaseItemEntity,
+    ) -> Result<Option<BesideArt>, ServiceError> {
+        let series = self.season_series(item).await?;
+        if !self.saves_beside(item, series.as_ref()).await? {
+            return Ok(None);
+        }
+        let photos = self
+            .library(item, series.as_ref())
+            .await?
+            .is_some_and(|folder| {
+                folder.collection_type == Some(CollectionTypeOptions::homevideos)
+                    && folder
+                        .library_options
+                        .as_ref()
+                        .is_none_or(|options| options.enable_photos)
+            });
+        Ok(Some(BesideArt {
+            item: item.clone(),
+            series,
+            photos,
+        }))
+    }
+
+    /// The item's library, from the libraries' snapshot, as upstream's
+    /// `GetLibraryOptions(item)` reads them from memory: the dashboard's full
+    /// listing re-heals and re-reads every library, once per saved item.
+    async fn library(
+        &self,
+        item: &BaseItemEntity,
+        series: Option<&BaseItemEntity>,
+    ) -> Result<Option<VirtualFolderInfo>, ServiceError> {
+        let folders = self.folders.library_folders().await?;
+        Ok(ferrofin_model::entities_media::owning_library(
+            &folders,
+            item.top_parent_id.as_deref(),
+            item.path
                 .as_deref()
-                .or(item.parent_id.as_deref())
-                .and_then(|id| Uuid::parse_str(id).ok());
-            if let Some(id) = id {
-                self.items.retrieve_item(id).await?
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+                .or_else(|| series.and_then(|series| series.path.as_deref())),
+        )
+        .cloned())
+    }
+
+    /// A season's series, whose folder its art is saved in.
+    async fn season_series(
+        &self,
+        item: &BaseItemEntity,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if policy::short_kind(item) != "Season" {
+            return Ok(None);
+        }
+        let id = item
+            .series_id
+            .as_deref()
+            .or(item.parent_id.as_deref())
+            .and_then(|id| Uuid::parse_str(id).ok());
+        match id {
+            Some(id) => self.items.retrieve_item(id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Ferrofin's `IsSaveLocalMetadataEnabled()`: whether the item's artwork
+    /// is published beside it.
+    async fn saves_beside(
+        &self,
+        item: &BaseItemEntity,
+        series: Option<&BaseItemEntity>,
+    ) -> Result<bool, ServiceError> {
         // `IsSaveLocalMetadataEnabled`: these kinds override it to true
         // (`Genre.cs:55`, `MusicGenre.cs:63`, `Playlist.cs:126`, `Person.cs:89`,
         // `Studio.cs:62`, `Year.cs:54`, `BoxSet.cs:112`, `MusicArtist.cs:106`
@@ -228,7 +341,7 @@ impl ImageFileSaver {
         // media folders", so nothing is written into a media folder the
         // library did not open to it. `UserView` and `BasePluginFolder` are
         // not given the override here (see gl-598).
-        if !(matches!(
+        if matches!(
             policy::short_kind(item),
             "Genre"
                 | "MusicGenre"
@@ -239,23 +352,21 @@ impl ImageFileSaver {
                 | "BoxSet"
                 | "MusicArtist"
                 | "CollectionFolder"
-        ) && self.in_server_directories(item))
+        ) && self.in_server_directories(item)
         {
-            // The libraries' snapshot, as upstream's `GetLibraryOptions(item)`
-            // reads them from memory: the dashboard's full listing re-heals
-            // and re-reads every library, once per saved item.
-            let folders = self.folders.library_folders().await?;
-            let options = ferrofin_model::entities_media::owning_library(
-                &folders,
-                item.top_parent_id.as_deref(),
-                item.path
-                    .as_deref()
-                    .or_else(|| series.as_ref().and_then(|series| series.path.as_deref())),
-            )
-            .and_then(|folder| folder.library_options.as_ref());
-            if !options.is_some_and(|options| options.save_local_metadata) {
-                return Ok(None);
-            }
+            return Ok(true);
+        }
+        Ok(self
+            .library(item, series)
+            .await?
+            .and_then(|folder| folder.library_options)
+            .is_some_and(|options| options.save_local_metadata))
+    }
+
+    async fn settings(&self, item: &BaseItemEntity) -> Result<Option<Settings>, ServiceError> {
+        let series = self.season_series(item).await?;
+        if !self.saves_beside(item, series.as_ref()).await? {
+            return Ok(None);
         }
         let configuration = self.configuration.configuration().await?;
         let path = PathBuf::from(
@@ -450,6 +561,7 @@ fn remove_previous(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrofin_model::entities::ImageType::{Backdrop, Primary};
     /// A [`SelfWriteGuard`] recording each call, in order.
     #[derive(Default)]
     struct Recording(std::sync::Mutex<Vec<String>>);
@@ -594,5 +706,260 @@ mod tests {
         for output in outputs {
             assert_eq!(std::fs::read(output).unwrap(), b"shared");
         }
+    }
+
+    /// A `kind` row at `path` (a folder when `is_folder`).
+    fn row(kind: &str, path: &str, is_folder: bool) -> BaseItemEntity {
+        BaseItemEntity {
+            type_: format!("MediaBrowser.Controller.Entities.{kind}"),
+            path: Some(path.into()),
+            is_folder,
+            ..Default::default()
+        }
+    }
+
+    /// An image row of `image_type` at `path`.
+    fn image(image_type: ferrofin_model::entities::ImageType, path: &str) -> ItemImageInfo {
+        ItemImageInfo {
+            path: path.into(),
+            image_type,
+            date_modified: chrono::DateTime::UNIX_EPOCH,
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        }
+    }
+
+    /// gl-1741: with the item's art saved beside it, "Replace all images"
+    /// takes an image from where the saver writes the item's art — its
+    /// folder, a season's series folder — and a remote one; never the item's
+    /// own file, a shared album cover, a file elsewhere, a relative path, or
+    /// an image of a kind or type the saver never publishes beside the media.
+    #[rstest::rstest]
+    #[case::beside_a_box_set(
+        "BoxSet",
+        "/data/collections/Mix [boxset]",
+        true,
+        Primary,
+        "/data/collections/Mix [boxset]/folder.png",
+        true
+    )]
+    #[case::beside_a_genre(
+        "Genre",
+        "/metadata/Genre/Crime",
+        false,
+        Primary,
+        "/metadata/Genre/Crime/folder.png",
+        true
+    )]
+    #[case::beside_a_movie(
+        "Movie",
+        "/media/Heat/Heat.mkv",
+        false,
+        Primary,
+        "/media/Heat/poster.jpg",
+        true
+    )]
+    #[case::in_extrafanart(
+        "Movie",
+        "/media/Heat/Heat.mkv",
+        false,
+        Backdrop,
+        "/media/Heat/extrafanart/fanart1.jpg",
+        true
+    )]
+    #[case::remote(
+        "Movie",
+        "/media/Heat/Heat.mkv",
+        false,
+        Primary,
+        "https://image.tmdb.org/t/p/original/a.jpg",
+        true
+    )]
+    #[case::beside_an_episode(
+        "Episode",
+        "/tv/Show/Season 1/e1.mkv",
+        false,
+        Primary,
+        "/tv/Show/Season 1/e1-thumb.jpg",
+        true
+    )]
+    #[case::another_movies_folder(
+        "Movie",
+        "/media/Heat/Heat.mkv",
+        false,
+        Primary,
+        "/media/Ronin/poster.jpg",
+        false
+    )]
+    #[case::a_folder_named_alike(
+        "Movie",
+        "/media/Heat/Heat.mkv",
+        false,
+        Primary,
+        "/media/Heat2/poster.jpg",
+        false
+    )]
+    #[case::the_items_own_file(
+        "Movie",
+        "/media/Heat/Heat.mkv",
+        false,
+        Primary,
+        "/media/Heat/Heat.mkv",
+        false
+    )]
+    #[case::a_shared_album_cover(
+        "MusicAlbum",
+        "/media/Album",
+        true,
+        Primary,
+        "/media/Album/album-covers/a/b.jpg",
+        false
+    )]
+    #[case::relative("Movie", "/media/Heat/Heat.mkv", false, Primary, "poster.jpg", false)]
+    #[case::a_track(
+        "Audio",
+        "/media/Album/01.flac",
+        false,
+        Primary,
+        "/media/Album/cover.jpg",
+        false
+    )]
+    #[case::a_photo(
+        "Photo",
+        "/media/Trip/a.jpg",
+        false,
+        Primary,
+        "/media/Trip/folder.jpg",
+        false
+    )]
+    #[case::an_episode_backdrop(
+        "Episode",
+        "/tv/Show/Season 1/e1.mkv",
+        false,
+        Backdrop,
+        "/tv/Show/Season 1/e1-fanart.jpg",
+        false
+    )]
+    fn beside_art_is_taken_only_where_the_saver_writes(
+        #[case] kind: &str,
+        #[case] path: &str,
+        #[case] is_folder: bool,
+        #[case] image_type: ferrofin_model::entities::ImageType,
+        #[case] image_path: &str,
+        #[case] removes: bool,
+    ) {
+        let beside = BesideArt {
+            item: row(kind, path, is_folder),
+            series: None,
+            photos: false,
+        };
+        assert_eq!(beside.removes(&image(image_type, image_path)), removes);
+    }
+
+    /// gl-1741: a season's art is saved in its series' folder
+    /// (`seasonNN-poster`), so it is taken from there, and not from another
+    /// series.
+    #[test]
+    fn a_seasons_beside_art_is_its_series_folders() {
+        let beside = BesideArt {
+            item: BaseItemEntity {
+                index_number: Some(1),
+                ..row("Season", "/tv/Show/Season 1", true)
+            },
+            series: Some(row("Series", "/tv/Show", true)),
+            photos: false,
+        };
+        assert!(beside.removes(&image(Primary, "/tv/Show/season01-poster.jpg")));
+        assert!(!beside.removes(&image(Primary, "/tv/Other/season01-poster.jpg")));
+    }
+
+    /// gl-1741: in a home-video (and photo) library an image beside an album
+    /// can be one of its photos, so no local file is taken there; a remote
+    /// row still is.
+    #[test]
+    fn nothing_beside_an_item_in_a_photo_library_is_taken() {
+        let beside = BesideArt {
+            item: row("PhotoAlbum", "/photos/Trip", true),
+            series: None,
+            photos: true,
+        };
+        assert!(!beside.removes(&image(Primary, "/photos/Trip/jacket.jpg")));
+        assert!(!beside.removes(&image(Backdrop, "/photos/Trip/backdrop.jpg")));
+        assert!(beside.removes(&image(Primary, "https://img/trip.jpg")));
+    }
+
+    /// gl-1741, through `remove_images`: with the art saved beside a movie,
+    /// its first Primary and its backdrops there go, files and rows, and a
+    /// remote image's row; a second Primary, a screenshot, an image in
+    /// another folder, the movie and a file it does not list stay. Without
+    /// (the library does not save artwork into its media folders) the media
+    /// folder is left as it is.
+    #[rstest::rstest]
+    #[case::saved_beside(true)]
+    #[case::not_saved_beside(false)]
+    fn removing_the_images_saved_beside_a_movie(#[case] saved_beside: bool) {
+        use ferrofin_model::entities::ImageType::{Screenshot, Thumb};
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("media/Heat");
+        let other = tmp.path().join("media/Ronin");
+        std::fs::create_dir_all(movie.join("extrafanart")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let file = |path: &Path| {
+            std::fs::write(path, b"x").unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let mkv = file(&movie.join("Heat.mkv"));
+        let unlisted = file(&movie.join("notes.jpg"));
+        let poster = image(Primary, &file(&movie.join("poster.jpg")));
+        let second = image(Primary, &file(&movie.join("poster1.jpg")));
+        let fanart = image(Backdrop, &file(&movie.join("fanart.jpg")));
+        let extra = image(Backdrop, &file(&movie.join("extrafanart/fanart1.jpg")));
+        let screenshot = image(Screenshot, &file(&movie.join("screenshot.jpg")));
+        let elsewhere = image(Thumb, &file(&other.join("landscape.jpg")));
+        let remote = image(
+            ferrofin_model::entities::ImageType::Logo,
+            "https://img/logo.png",
+        );
+        let all = [
+            &poster,
+            &second,
+            &fanart,
+            &extra,
+            &screenshot,
+            &elsewhere,
+            &remote,
+        ];
+        let mut images: Vec<ItemImageInfo> = all.iter().map(|i| (*i).clone()).collect();
+        let beside = saved_beside.then(|| BesideArt {
+            item: row("Movie", &mkv, false),
+            series: None,
+            photos: false,
+        });
+        let metadata = [tmp.path().join("metadata/library/x")];
+
+        let removed =
+            crate::local_images::remove_images(&mut images, &metadata, "x", beside.as_ref());
+
+        assert_eq!(removed, saved_beside);
+        let kept: Vec<&ItemImageInfo> = if saved_beside {
+            vec![&second, &screenshot, &elsewhere]
+        } else {
+            all.to_vec()
+        };
+        assert_eq!(images.iter().collect::<Vec<_>>(), kept);
+        for image in [&poster, &second, &fanart, &extra, &screenshot, &elsewhere] {
+            assert_eq!(
+                Path::new(&image.path).exists(),
+                kept.contains(&image),
+                "{}",
+                image.path
+            );
+        }
+        assert!(Path::new(&mkv).exists(), "the movie stays");
+        assert!(
+            Path::new(&unlisted).exists(),
+            "a file the movie does not list stays"
+        );
     }
 }

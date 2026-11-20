@@ -1,5 +1,5 @@
-//! The NFO sidecars a DVR recording gets when its capture starts — port of
-//! `RecordingsMetadataManager` (`src/Jellyfin.LiveTv/Recordings/`).
+//! The NFO and image sidecars a DVR recording gets when its capture starts —
+//! port of `RecordingsMetadataManager` (`src/Jellyfin.LiveTv/Recordings/`).
 //!
 //! The programme facts come from the timer's [`TimerRecordingInfo`], which
 //! the guide row filled when the timer fired (upstream's programme lookup by
@@ -9,10 +9,12 @@
 //! never written here.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use ferrofin_model::entities::ImageType;
+use ferrofin_traits::options::ItemImageInfo;
 
 use crate::dvr::TimerRecordingInfo;
 
@@ -107,6 +109,74 @@ async fn create_new(path: &Path, body: &str) -> std::io::Result<()> {
     };
     file.write_all(body.as_bytes()).await?;
     file.flush().await
+}
+
+/// `SaveRecordingImages`' choice, run with "Save EPG images"
+/// (`LiveTvOptions.SaveRecordingImages`): the programme's images to copy
+/// beside `recording`, in its order, each with the path it is saved at before
+/// its extension. A series episode gets its Thumb, else its Primary, as
+/// `{recording}-thumb`; anything else its Primary (`poster`), else its Thumb,
+/// then its Backdrop (`fanart`), its Thumb (`landscape`) and its Logo
+/// (`logo`). The name follows the image chosen, so a Thumb standing in for a
+/// Primary is a `landscape`, and upstream copies it twice.
+#[must_use]
+pub fn recording_images<'a>(
+    recording: &Path,
+    is_series: bool,
+    images: &'a [ItemImageInfo],
+) -> Vec<(&'a ItemImageInfo, PathBuf)> {
+    let first = |image_type| images.iter().find(|i| i.image_type == image_type);
+    let chosen = if is_series {
+        vec![first(ImageType::Thumb).or_else(|| first(ImageType::Primary))]
+    } else {
+        vec![
+            first(ImageType::Primary).or_else(|| first(ImageType::Thumb)),
+            first(ImageType::Backdrop),
+            first(ImageType::Thumb),
+            first(ImageType::Logo),
+        ]
+    };
+    let stem = recording.file_stem().unwrap_or_default().to_string_lossy();
+    chosen
+        .into_iter()
+        .flatten()
+        .filter_map(|image| {
+            let name = match image.image_type {
+                ImageType::Primary | ImageType::Thumb if is_series => format!("{stem}-thumb"),
+                ImageType::Primary => "poster".to_owned(),
+                ImageType::Thumb => "landscape".to_owned(),
+                ImageType::Backdrop => "fanart".to_owned(),
+                ImageType::Logo => "logo".to_owned(),
+                _ => return None,
+            };
+            Some((image, recording.with_file_name(name)))
+        })
+        .collect()
+}
+
+/// `SaveRecordingImage`'s copy: the local image `local` copied to `name` with
+/// `local`'s extension, replacing a file there (`File.Copy(.., true)`).
+///
+/// Upstream sets the extension with `Path.ChangeExtension`, which cuts the
+/// name at its last dot, so an episode `Dr. Who S01E01` saved its thumb as
+/// `Dr.jpg`; the extension is appended here.
+///
+/// # Errors
+///
+/// The I/O error that stopped the copy. The caller logs it and goes on to the
+/// next image, as upstream's catch does.
+pub async fn copy_recording_image(local: &Path, name: &Path) -> std::io::Result<PathBuf> {
+    let mut target = name.as_os_str().to_owned();
+    if let Some(extension) = local.extension() {
+        target.push(".");
+        target.push(extension);
+    }
+    let target = PathBuf::from(target);
+    if let Some(folder) = target.parent() {
+        tokio::fs::create_dir_all(folder).await?;
+    }
+    tokio::fs::copy(local, &target).await?;
+    Ok(target)
 }
 
 /// `SaveSeriesNfoAsync`: the series folder's `tvshow.nfo`, from the timer.
@@ -431,5 +501,75 @@ mod tests {
             .await
             .expect("saved");
         assert_eq!(tokio::fs::read_to_string(&nfo).await.expect("nfo"), "mine");
+    }
+
+    /// `SaveRecordingImages`' choice, each image named by its own type: a
+    /// series episode's Thumb, else its Primary; anything else's Primary,
+    /// else its Thumb, then its Backdrop, Thumb and Logo.
+    #[rstest::rstest]
+    #[case::series_thumb_first(true, &[ImageType::Primary, ImageType::Thumb], &[(ImageType::Thumb, "Show S01E02-thumb")])]
+    #[case::series_primary(true, &[ImageType::Backdrop, ImageType::Primary], &[(ImageType::Primary, "Show S01E02-thumb")])]
+    #[case::series_nothing_else(true, &[ImageType::Backdrop, ImageType::Logo], &[])]
+    #[case::all_four(
+        false,
+        &[ImageType::Logo, ImageType::Thumb, ImageType::Backdrop, ImageType::Primary],
+        &[(ImageType::Primary, "poster"), (ImageType::Backdrop, "fanart"), (ImageType::Thumb, "landscape"), (ImageType::Logo, "logo")]
+    )]
+    #[case::thumb_for_primary(false, &[ImageType::Thumb], &[(ImageType::Thumb, "landscape"), (ImageType::Thumb, "landscape")])]
+    #[case::no_images(false, &[], &[])]
+    fn recording_images_follow_upstreams_choice(
+        #[case] is_series: bool,
+        #[case] types: &[ImageType],
+        #[case] expected: &[(ImageType, &str)],
+    ) {
+        let folder = Path::new("/recordings/Show");
+        let images: Vec<ItemImageInfo> = types
+            .iter()
+            .map(|&image_type| ItemImageInfo {
+                image_type,
+                path: format!("http://img/{image_type:?}"),
+                ..ItemImageInfo::default()
+            })
+            .collect();
+        let chosen: Vec<(ImageType, PathBuf)> =
+            recording_images(&folder.join("Show S01E02.ts"), is_series, &images)
+                .into_iter()
+                .map(|(image, name)| (image.image_type, name))
+                .collect();
+        let expected: Vec<(ImageType, PathBuf)> = expected
+            .iter()
+            .map(|&(image_type, name)| (image_type, folder.join(name)))
+            .collect();
+        assert_eq!(chosen, expected);
+    }
+
+    /// `File.Copy(.., true)` with the image's extension: a file already there
+    /// is replaced, and an image without an extension gives a name without one.
+    #[tokio::test]
+    async fn an_image_is_copied_with_its_extension_over_one_there() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let local = dir.path().join("image.png");
+        tokio::fs::write(&local, "new").await.expect("image");
+        let folder = dir.path().join("Film");
+        tokio::fs::create_dir_all(&folder).await.expect("folder");
+        tokio::fs::write(folder.join("poster.png"), "old")
+            .await
+            .expect("old");
+
+        let saved = copy_recording_image(&local, &folder.join("poster"))
+            .await
+            .expect("copied");
+        assert_eq!(saved, folder.join("poster.png"));
+        assert_eq!(
+            tokio::fs::read_to_string(&saved).await.expect("read"),
+            "new"
+        );
+
+        let bare = dir.path().join("image");
+        tokio::fs::write(&bare, "bare").await.expect("image");
+        let saved = copy_recording_image(&bare, &dir.path().join("New").join("logo"))
+            .await
+            .expect("copied");
+        assert_eq!(saved, dir.path().join("New").join("logo"));
     }
 }

@@ -69,7 +69,16 @@ pub fn by_name_presentation_key(stored_type: &str, name: &str) -> Option<String>
 /// every other kind: SQLite cannot express `RemoveDiacritics` (it is a Unicode
 /// NFD fold plus a ligature map, `ferrofin_util::string_extensions`), so the
 /// five kinds whose key is derived from their NAME are repaired here, where the
-/// real function is in reach, instead of being guessed in SQL.
+/// real function is in reach, instead of being guessed in SQL. It is the only
+/// boot pass that keys these rows; the later boot repairs (the person repair
+/// included) leave their key alone.
+///
+/// Upstream needs no such pass: `MetadataService.BeforeSaveInternal` (v12.4
+/// `MediaBrowser.Providers/Manager/MetadataService.cs:366-371`) reassigns
+/// `CreatePresentationUniqueKey()` on every metadata refresh, so a Jellyfin
+/// by-name row is keyless only until its first refresh. The value written here
+/// is the one that refresh would write, and only NULL or `''` keys are touched,
+/// so an adopted, refreshed row is left byte-identical.
 ///
 /// **Why any of this is load-bearing.** The recursive user universe is queried
 /// with a bare `GROUP BY "PresentationUniqueKey"` — upstream's own
@@ -268,11 +277,38 @@ mod tests {
             "The Nine O'Clock News",
         )
         .await;
+        // Jellyfin's lazily-created by-name rows can carry '' rather than NULL.
+        let studio = "AAAAAAAA-0000-0000-0000-000000000005";
+        keyless_row(
+            &db,
+            studio,
+            "MediaBrowser.Controller.Entities.Studio",
+            "A24",
+        )
+        .await;
+        let nameless = "AAAAAAAA-0000-0000-0000-000000000006";
+        keyless_row(&db, nameless, "MediaBrowser.Controller.Entities.Studio", "").await;
+        let keyed = "AAAAAAAA-0000-0000-0000-000000000007";
+        keyless_row(
+            &db,
+            keyed,
+            "MediaBrowser.Controller.Entities.Genre",
+            "Action",
+        )
+        .await;
+        for (id, key) in [(studio, ""), (nameless, ""), (keyed, "Genre-Hand Written")] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?1 WHERE "Id" = ?2"#)
+                .bind(key)
+                .bind(id)
+                .execute(db.writer())
+                .await
+                .expect("set key");
+        }
 
         let repaired = backfill_by_name_presentation_keys(db.writer())
             .await
             .expect("backfill");
-        assert_eq!(3, repaired, "only the by-name rows are repaired");
+        assert_eq!(5, repaired, "only the keyless by-name rows are repaired");
         assert_eq!(
             Some("Person-Bela Tarr".to_owned()),
             key_of(&db, person).await
@@ -285,6 +321,17 @@ mod tests {
             Some("Artist-Sigur Ros".to_owned()),
             key_of(&db, artist).await
         );
+        assert_eq!(Some("Studio-A24".to_owned()), key_of(&db, studio).await);
+        // A nameless row takes `CreatePresentationUniqueKey()`'s own-id default.
+        assert_eq!(
+            Some("aaaaaaaa000000000000000000000006".to_owned()),
+            key_of(&db, nameless).await
+        );
+        // An already-keyed row (an adopted, refreshed Jellyfin row) is untouched.
+        assert_eq!(
+            Some("Genre-Hand Written".to_owned()),
+            key_of(&db, keyed).await
+        );
         // An airing stays keyless: upstream never writes one, and the NULL
         // group collapsing the guide into a single `Program` row is the
         // behaviour a recursive page depends on.
@@ -296,6 +343,30 @@ mod tests {
             backfill_by_name_presentation_keys(db.writer())
                 .await
                 .expect("second pass")
+        );
+    }
+
+    /// The boot wiring: `Database::run_migrations` is what runs the pass, and
+    /// no later boot repair keys a by-name row, so dropping the call from it
+    /// would bring the NULL-group item loss back with every other test green.
+    #[tokio::test]
+    async fn run_migrations_keys_a_keyless_by_name_row() {
+        let db = crate::Database::connect_in_memory().await.expect("db");
+        db.run_migrations().await.expect("migrate");
+        let person = "AAAAAAAA-0000-0000-0000-00000000000C";
+        keyless_row(
+            &db,
+            person,
+            "MediaBrowser.Controller.Entities.Person",
+            "Alice Parity",
+        )
+        .await;
+        // The in-memory database's second run is a no-op for the chain, as a
+        // file-backed database's boot is, and still ends with the pass.
+        db.run_migrations().await.expect("boot");
+        assert_eq!(
+            Some("Person-Alice Parity".to_owned()),
+            key_of(&db, person).await
         );
     }
 

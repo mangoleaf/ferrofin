@@ -21,9 +21,12 @@ keeps its relative position:
   JELLYFIN/root/default/        -> DATA_DIR/root/default/   (library definitions)
   JELLYFIN/metadata/            -> DATA_DIR/metadata/       (images)
   JELLYFIN_CONFIG/              -> CONFIG_DIR/              (XML configuration)
-  JELLYFIN/plugins/configurations/LDAP-Auth.xml
+  JELLYFIN/plugins/configurations/LDAP-Auth.xml, Jellyfin.Plugin.{Tmdb,Omdb,
+    MusicBrainz,AudioDb,StudioImages}.xml
                                 -> DATA_DIR/plugins/configurations/
-                                   (LDAP-Auth's settings, imported on the first start)
+                                   (the settings of LDAP-Auth and of the metadata
+                                   plugins Jellyfin builds in, imported on the
+                                   first start)
 
 The rest of Jellyfin's data/ holds caches Ferrofin rebuilds or does not read, and
 the rest of its plugins/ (.NET plugins) and "Subtitle Edit/" cannot run in
@@ -130,15 +133,20 @@ fi
 if [[ -d "$source_config" ]]; then
     copy "$source_config" "$destination_config"
 fi
-# The one plugin file Ferrofin reads: Ferrofin's LDAP-Auth imports it once. It
-# holds the directory's bind password, so only the service user may read it.
-ldap_auth_xml=$source_data/plugins/configurations/LDAP-Auth.xml
-if [[ -f "$ldap_auth_xml" ]]; then
-    mkdir -p "$destination/plugins/configurations"
-    rsync -a --ignore-existing --chown=ferrofin:ferrofin --chmod=F600 "$ldap_auth_xml" "$destination/plugins/configurations/"
-    # Ferrofin installs WASM plugins into DATA_DIR/plugins, so the service user owns it.
-    chown ferrofin:ferrofin "$destination/plugins" "$destination/plugins/configurations"
-    echo "Copied $ldap_auth_xml -> $destination/plugins/configurations/"
-fi
+# The plugin files Ferrofin reads, each imported once on the first start:
+# LDAP-Auth's, and those of the metadata plugins Jellyfin builds in. LDAP-Auth's
+# holds the directory's bind password and TMDb's may hold an API key, so only the
+# service user may read them.
+for plugin_xml in LDAP-Auth.xml Jellyfin.Plugin.Tmdb.xml Jellyfin.Plugin.Omdb.xml \
+        Jellyfin.Plugin.MusicBrainz.xml Jellyfin.Plugin.AudioDb.xml Jellyfin.Plugin.StudioImages.xml; do
+    source_xml=$source_data/plugins/configurations/$plugin_xml
+    if [[ -f "$source_xml" ]]; then
+        mkdir -p "$destination/plugins/configurations"
+        rsync -a --ignore-existing --chown=ferrofin:ferrofin --chmod=F600 "$source_xml" "$destination/plugins/configurations/"
+        # Ferrofin installs WASM plugins into DATA_DIR/plugins, so the service user owns it.
+        chown ferrofin:ferrofin "$destination/plugins" "$destination/plugins/configurations"
+        echo "Copied $source_xml -> $destination/plugins/configurations/"
+    fi
+done
 
 chown ferrofin:ferrofin "$destination" "$destination/data" "$destination/root"

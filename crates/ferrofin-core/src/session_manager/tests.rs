@@ -81,12 +81,6 @@ struct UnusedDtoService;
 
 #[async_trait]
 impl DtoService for UnusedDtoService {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unreachable!("dto service is not exercised by these tests")
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -112,15 +106,6 @@ impl DtoService for UnusedDtoService {
                 ..BaseItemDto::default()
             })
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unreachable!("dto service is not exercised by these tests")
     }
 }
 
@@ -237,6 +222,32 @@ async fn log_session_activity_creates_and_reuses_a_session() {
         .unwrap();
     assert_eq!(first.id, again.id);
     assert_eq!(again.application_version.as_deref(), Some("1.1"));
+}
+
+/// `_activeConnections` is an `OrdinalIgnoreCase` dictionary: the same
+/// client and device in another case, outside ASCII too, are the same
+/// session, which keeps the id its first casing gave it.
+#[tokio::test]
+async fn the_session_pool_ignores_the_case_of_the_client_and_device() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+
+    let first = mgr
+        .log_session_activity("Web", "1.0", "dév-1", "Chrome", "e", Some(&user))
+        .await
+        .unwrap();
+    let again = mgr
+        .log_session_activity("WEB", "1.0", "DÉV-1", "Chrome", "e", Some(&user))
+        .await
+        .unwrap();
+    assert_eq!(first.id, again.id);
+    // The device filter ignores case the same way (`GetSessions`).
+    let listed = mgr
+        .get_sessions(Uuid::nil(), Some("dÉv-1"), None, None, true)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
 }
 
 /// The session id is Jellyfin's byte for byte: `GetSessionKey` is
@@ -812,6 +823,10 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
         !result.access_token.expose().is_empty(),
         "authenticate_new_session returns a non-empty token"
     );
+    // `User` is the signed-in user's DTO, carrying this login's stamp.
+    assert_eq!(result.user.id, user_id);
+    assert_eq!(result.user.name.as_deref(), Some("bob"));
+    assert!(result.user.last_login_date.is_some());
 
     let persisted: String =
         sqlx::query_scalar(r#"SELECT "AccessToken" FROM "Devices" WHERE "DeviceId" = ?1"#)
@@ -1110,6 +1125,37 @@ async fn an_admin_push_reaches_the_sessions_holding_an_administrator() {
     );
     assert_eq!(socket.sent_count(), 1, "an additional administrator counts");
     assert!(viewer_pushes.lock().unwrap().is_empty());
+}
+
+/// `RecordingNotifier.SendMessage` sends to the users `HasPermission` says
+/// hold `EnableLiveTvAccess` (gl-1746): the permission itself, so an
+/// administrator without it gets nothing and a user with it gets the push.
+#[tokio::test]
+async fn a_permission_push_reaches_only_the_users_holding_it() {
+    let db = test_db().await;
+    db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+    let (mgr, bus) = cast_manager(&db);
+    let admin = seed_named_user(&db, Uuid::new_v4(), "admin").await;
+    let viewer = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let (_, admin_pushes) = cast_target(&mgr, bus.as_ref(), &admin, "admin").await;
+    let (_, viewer_pushes) = cast_target(&mgr, bus.as_ref(), &viewer, "viewer").await;
+    for (user, kind, value) in [
+        (&admin, PermissionKind::IsAdministrator, true),
+        (&admin, PermissionKind::EnableLiveTvAccess, false),
+        (&viewer, PermissionKind::EnableLiveTvAccess, true),
+    ] {
+        set_permission(&db, &user.id, kind, value).await.unwrap();
+    }
+
+    mgr.send_message_to_sessions_with_permission(
+        PermissionKind::EnableLiveTvAccess,
+        SessionMessageType::TimerCreated,
+        "{}",
+    )
+    .await
+    .unwrap();
+    assert!(admin_pushes.lock().unwrap().is_empty());
+    assert_eq!(viewer_pushes.lock().unwrap().len(), 1);
 }
 
 /// A scan pushes RefreshProgress once a second per library (gl-1312): the push
@@ -2286,6 +2332,91 @@ async fn start_and_progress_for_an_item_the_library_does_not_have_save_nothing()
     );
 }
 
+/// A report's own `Item` changes what the session shows, not what is saved: a
+/// library item reported with one still saves the user's start and progress
+/// (C# `if (libraryItem is not null)`), whether the progress carries the
+/// `Item` again or not, and one the library does not have saves nothing
+/// (gl-1062).
+#[tokio::test]
+async fn a_library_item_reported_with_its_own_item_still_saves_progress() {
+    use ferrofin_model::session::{PlaybackProgressInfo, PlaybackStartInfo};
+    use ferrofin_traits::library::UserDataManager as _;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "viewer").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-own-item", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let item = Uuid::new_v4();
+    crate::test_support::seed_named_item(&db, item, BaseItemKind::Movie, "Film").await;
+    // An hour long, so ten and twenty minutes in are resume points.
+    let library = library_manager(&db);
+    let mut row = library.get_item_by_id(item).await.unwrap().expect("row");
+    row.run_time_ticks = Some(36_000_000_000);
+    library.update_items(&[row], None).await.unwrap();
+    let report = |position_ticks, with_item: bool| PlaybackProgressInfo {
+        session_id: session.id.clone(),
+        item_id: item,
+        position_ticks: Some(position_ticks),
+        item: with_item.then(|| BaseItemDto {
+            id: item,
+            name: Some("Client Title".to_owned()),
+            ..BaseItemDto::default()
+        }),
+        ..PlaybackStartInfo::default()
+    };
+    let user_data = FerrofinUserDataManager::new(
+        db.clone(),
+        Arc::new(FixedConfig {
+            config: default_server_configuration(),
+        }),
+    );
+
+    mgr.on_playback_start(&report(0, true)).await.unwrap();
+    for (position_ticks, with_item) in [(6_000_000_000, true), (12_000_000_000, false)] {
+        mgr.on_playback_progress(&report(position_ticks, with_item), false)
+            .await
+            .unwrap();
+        let data = user_data
+            .get_user_data_dto(item, user_id)
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(
+            (data.play_count, data.playback_position_ticks),
+            (1, position_ticks)
+        );
+    }
+
+    // An `Item` reported for an id the library does not have saves nothing.
+    let unknown = Uuid::new_v4();
+    let unknown_report = PlaybackProgressInfo {
+        item_id: unknown,
+        ..report(6_000_000_000, true)
+    };
+    mgr.on_playback_start(&unknown_report).await.unwrap();
+    mgr.on_playback_progress(&unknown_report, false)
+        .await
+        .unwrap();
+    let data = user_data
+        .get_user_data_dto(unknown, user_id)
+        .await
+        .unwrap()
+        .expect("the empty row");
+    assert_eq!(
+        (
+            data.play_count,
+            data.playback_position_ticks,
+            data.last_played_date
+        ),
+        (0, 0, None),
+        "nothing was saved"
+    );
+}
+
 /// C# `OnPlaybackStopped` refuses a negative position (stalled clients report
 /// one): it releases the live stream first, so no tuner leaks, then throws
 /// before anything is saved. The resume point the last progress report left
@@ -2658,14 +2789,6 @@ impl ferrofin_traits::library::MusicManager for CannedMix {
                 ..BaseItemEntity::default()
             })
             .collect())
-    }
-    async fn get_instant_mix_from_artist(
-        &self,
-        _artist_id: Uuid,
-        _user_id: Option<Uuid>,
-        _dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(Vec::new())
     }
     async fn get_instant_mix_from_genres(
         &self,
@@ -4375,12 +4498,6 @@ impl RecordingDtoService {
 
 #[async_trait]
 impl DtoService for RecordingDtoService {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unreachable!("not reached from a NowPlayingItem build")
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -4414,15 +4531,6 @@ impl DtoService for RecordingDtoService {
                 ..BaseItemDto::default()
             })
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unreachable!("not reached from a NowPlayingItem build")
     }
 }
 

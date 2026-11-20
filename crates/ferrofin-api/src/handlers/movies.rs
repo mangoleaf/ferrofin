@@ -5,6 +5,8 @@
 //! through the
 //! [`SimilarItemsManager`](ferrofin_traits::library::SimilarItemsManager) seam.
 
+use std::collections::HashSet;
+
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -86,7 +88,7 @@ async fn get_movie_recommendations(
         ..DtoOptions::default()
     };
 
-    let recommendations = state
+    let mut recommendations = state
         .similar_items
         .get_movie_recommendations(
             user_uuid,
@@ -96,6 +98,31 @@ async fn get_movie_recommendations(
             &options,
         )
         .await?;
+
+    // C# projects each category with `GetBaseItemDtos(r.Items, dtoOptions,
+    // user)`, whose `IsVisible` pass drops the rows the user may not see. Run
+    // that pass once over every category's distinct rows, before the single
+    // projection below splits its output by position; a category it empties
+    // stays in the list with no items, as upstream's does.
+    if let Some(user) = user.as_deref() {
+        let mut seen = HashSet::new();
+        let distinct: Vec<_> = recommendations
+            .iter()
+            .flat_map(|rec| rec.items.iter())
+            .filter(|item| seen.insert(item.id.as_str()))
+            .cloned()
+            .collect();
+        let visible: HashSet<String> = state
+            .library
+            .filter_visible_items(distinct, user)
+            .await?
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        for rec in &mut recommendations {
+            rec.items.retain(|item| visible.contains(&item.id));
+        }
+    }
 
     // Project every category's items in one pass (one page prefetch instead of
     // one per category), then reassemble per category by position — order and
