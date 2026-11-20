@@ -360,6 +360,11 @@ fn srt_lines(text: &str) -> Subtitle {
     subtitle
 }
 
+/// [`srt_lines`]'s `Errors`.
+fn srt_errors(text: &str) -> String {
+    srt::load(&mut Subtitle::new(), &split_to_lines(text)).1
+}
+
 fn texts(subtitle: &Subtitle) -> Vec<&str> {
     subtitle
         .paragraphs
@@ -507,13 +512,10 @@ fn srt_missing_line_numbers_and_an_empty_cue() {
 }
 
 // SubtitleFormatsTest.TestBadFileWithMissingNewLineAndBadNumbers.
-// TODO(gl-1218): add its four `Errors.Contains("Line N: ")` asserts once the
-// loader returns libse's messages; it returns only the count so far.
 #[test]
 fn srt_missing_blank_lines_and_numbers_that_do_not_follow() {
-    let parsed = srt_lines(
-        "\n00:21:29,998 --> 00:21:32,960\nLONDYN 8 maja 1945.\n\nJeszcze 13 lat temu,\n\n-Kwadrans po 12... Mamo.\n67\n\n00:21:58,986 --> 00:22:01,947\nGŁÓWNY\n012 235 4526\nmodel 5732.\n93\n00:22:03,991 --> 00:22:05,784\n- Za wasz\n- Za wasz\n115\n00:22:18,931 --> 00:22:20,674\n- How do you do, Mr. Van Cleve?\n- How do you do, Mr. Van Cleve?\n\n124\n\n00:22:21,175 --> 00:22:23,121\n10:15 PM.\nThat's it, you're staying in bed.\n\n312\n00:24:21,175 --> 00:24:23,121\nREŻYSERIA\n611\n00:27:21,175 --> 00:27:23,121\nZA ŁATWO, PRAGNIE MŁODOŚCI",
-    );
+    let text = "\n00:21:29,998 --> 00:21:32,960\nLONDYN 8 maja 1945.\n\nJeszcze 13 lat temu,\n\n-Kwadrans po 12... Mamo.\n67\n\n00:21:58,986 --> 00:22:01,947\nGŁÓWNY\n012 235 4526\nmodel 5732.\n93\n00:22:03,991 --> 00:22:05,784\n- Za wasz\n- Za wasz\n115\n00:22:18,931 --> 00:22:20,674\n- How do you do, Mr. Van Cleve?\n- How do you do, Mr. Van Cleve?\n\n124\n\n00:22:21,175 --> 00:22:23,121\n10:15 PM.\nThat's it, you're staying in bed.\n\n312\n00:24:21,175 --> 00:24:23,121\nREŻYSERIA\n611\n00:27:21,175 --> 00:27:23,121\nZA ŁATWO, PRAGNIE MŁODOŚCI";
+    let parsed = srt_lines(text);
     assert_eq!(
         texts(&parsed),
         [
@@ -538,6 +540,10 @@ fn srt_missing_blank_lines_and_numbers_that_do_not_follow() {
         (6, "00:27:21,175", "00:27:23,121"),
     ] {
         assert_eq!(times[i], (start.to_owned(), end.to_owned()), "cue {i}");
+    }
+    let errors = srt_errors(text);
+    for line in ["Line 8: ", "Line 14: ", "Line 18: ", "Line 32: "] {
+        assert!(errors.contains(line), "{line} in {errors}");
     }
 }
 
@@ -659,17 +665,144 @@ fn srt_numbered_cues_keep_their_numbers() {
 /// still load. White-space-only lines before it end the cue, so it is read where
 /// a number is expected.
 #[rstest]
-#[case::joins_the_previous_cue("2", ["one\nstray", "two"], 0)]
-#[case::is_an_error_when_the_next_number_does_not_follow("3", ["one", "two"], 1)]
+#[case::joins_the_previous_cue("2", ["one\nstray", "two"], 0, "")]
+#[case::is_an_error_when_the_next_number_does_not_follow(
+    "3",
+    ["one", "two"],
+    1,
+    "Line 7 - expected subtitle number: stray\n"
+)]
 fn srt_a_stray_line_between_cues(
     #[case] next_number: &str,
     #[case] expected: [&str; 2],
     #[case] errors: i32,
+    #[case] messages: &str,
 ) {
     let text = format!(
         "1\n00:00:01,000 --> 00:00:02,000\none\n\n \n \nstray\n\n{next_number}\n00:00:03,000 --> 00:00:04,000\ntwo\n"
     );
     let mut subtitle = Subtitle::new();
-    assert_eq!(srt::load(&mut subtitle, &split_to_lines(&text)), errors);
+    assert_eq!(
+        srt::load(&mut subtitle, &split_to_lines(&text)),
+        (errors, messages.to_owned())
+    );
     assert_eq!(texts(&subtitle), expected);
+}
+
+/// The timing line `ReadLine` expects is read with `validate`: a field out of range
+/// is reported with the repaired line but not counted, and the cue still loads; a
+/// line that is no time code is reported and counted, and the text after it is then
+/// read where a cue number is expected, another counted error.
+#[rstest]
+#[case::a_fraction_over_999(
+    "00:00:01,000 -> 00:00:02,1000",
+    0,
+    "Line 2 - error reading time code: 00:00:01,000 --> 00:00:02,1000\n"
+)]
+#[case::minutes_over_99(
+    "00:100:01,000 --> 00:00:02,000",
+    0,
+    "Line 2 - error reading time code: 00:100:01,000 --> 00:00:02,000\n"
+)]
+#[case::no_time_code(
+    "soon",
+    2,
+    "Line 2 - error reading time code: soon\nLine 3 - expected subtitle number: text\n"
+)]
+fn srt_a_timing_line_libse_reports(
+    #[case] timing: &str,
+    #[case] errors: i32,
+    #[case] messages: &str,
+) {
+    let text = format!("1\n{timing}\ntext\n");
+    assert_eq!(
+        srt::load(&mut Subtitle::new(), &split_to_lines(&text)),
+        (errors, messages.to_owned())
+    );
+}
+
+/// libse stops collecting messages once they reach 2000 UTF-16 units; the count
+/// goes on. Each emoji is two units, four bytes and one `char`: a cap counted in
+/// bytes or in `char`s stops at another message than libse's.
+#[test]
+fn srt_messages_stop_at_2000_units_but_the_count_does_not() {
+    let text = "1\nnot a time code \u{1f600}\u{1f600}\n\n".repeat(200);
+    let (errors, messages) = srt::load(&mut Subtitle::new(), &split_to_lines(&text));
+    assert_eq!(errors, 200);
+    let length = messages.encode_utf16().count();
+    let last = messages.lines().last().unwrap().encode_utf16().count() + 1;
+    assert!(length >= 2000 && length - last < 2000, "{length}");
+}
+
+// ---- the parse log carries libse's `Errors` (gl-1218) ----
+
+/// The text logged through it while its subscriber is the default.
+#[derive(Clone, Default)]
+struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+/// The events section both SubStation loaders read: one good event, then one
+/// whose start is no time code (line 4).
+const SSA_WITH_A_BAD_EVENT: &str = "[Events]\nFormat: Layer, Start, End, Text\nDialogue: 0,0:00:01.00,0:00:02.00,one\nDialogue: 0,notatime,0:00:03.50,x\n";
+
+/// A format that loads with errors logs libse's messages beside the count, as
+/// upstream's `SubtitleEditParser.Parse` logs `Errors` (`TryGetErrors`), so the
+/// log names the line. At debug: it repeats on every request for the same file.
+#[rstest]
+#[case::subrip(
+    "srt",
+    "1\nnot a time code\n\n2\n00:00:03,000 --> 00:00:04,000\ntwo\n",
+    "Line 2 - error reading time code: not a time code"
+)]
+#[case::ssa(
+    "ssa",
+    SSA_WITH_A_BAD_EVENT,
+    "Line 4 - error reading time code: Dialogue: 0,notatime,0:00:03.50,x"
+)]
+#[case::ass(
+    "ass",
+    SSA_WITH_A_BAD_EVENT,
+    "Line 4 - error reading time code: Dialogue: 0,notatime,0:00:03.50,x"
+)]
+fn a_load_with_errors_logs_libses_messages(
+    #[case] extension: &str,
+    #[case] data: &str,
+    #[case] message: &str,
+) {
+    let logs = Logs::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish(),
+    );
+    SubtitleEditParser::new()
+        .parse(data.as_bytes(), extension)
+        .unwrap();
+
+    let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+    let event = text
+        .lines()
+        .find(|line| line.contains("errors encountered while parsing a subtitle"))
+        .unwrap_or_else(|| panic!("no error event in {text}"));
+    assert!(event.contains(" DEBUG "), "{event}");
+    assert!(event.contains("errors=1"), "{event}");
+    assert!(event.contains(message), "{event}");
 }

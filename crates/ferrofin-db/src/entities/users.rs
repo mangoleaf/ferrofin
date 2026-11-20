@@ -4,11 +4,11 @@
 //!
 //! Each struct mirrors one table one-to-one: field names and order match the
 //! columns in `migrations/0001_initial.sql`. Enum-valued columns are stored as
-//! `INTEGER` discriminants and are kept as [`i32`] here; the conversion layer
-//! maps them onto the [`crate::enums`] / `ferrofin-model` enum types. `RowVersion`
+//! `INTEGER` discriminants and are kept as [`i32`] here; callers
+//! map them onto the [`crate::enums`] / `ferrofin-model` enum types. `RowVersion`
 //! optimistic-concurrency tokens are stored as `INTEGER` and kept as [`i64`].
 //! `Guid` columns are `TEXT` and kept as [`String`] (the hyphenated stored
-//! form; the conversion layer parses them into `Uuid`).
+//! form; callers parse them into `Uuid`).
 
 use chrono::{DateTime, Utc};
 

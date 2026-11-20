@@ -9,10 +9,9 @@
 //! - The in-memory `SessionInfo` domain object is **not** ported; session reads
 //!   surface as the [`SessionInfoDto`] wire DTO. The `AuthenticateNewSession` /
 //!   `AuthenticateDirect` methods return an [`AuthenticationResultData`] — the
-//!   session DTO plus the minted access token — mirroring Jellyfin's
-//!   `AuthenticationResult` carrying its `AccessToken`. The full
-//!   `{ UserDto, SessionInfoDto, AccessToken, ServerId }` wire envelope is
-//!   assembled at the API layer from this data. The `ToSessionInfoDto` /
+//!   authenticated user's DTO, the session DTO and the minted access token —
+//!   mirroring Jellyfin's `AuthenticationResult`. The API layer adds `ServerId`
+//!   to make the wire envelope. The `ToSessionInfoDto` /
 //!   `OnSessionControllerConnected` mapping helpers that take the un-ported
 //!   `SessionInfo` are dropped.
 //! - The .NET `event`s `SessionInfoWebSocketListener` subscribes to
@@ -33,7 +32,7 @@
 use async_trait::async_trait;
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::dto::SessionInfoDto;
+use ferrofin_model::dto::{SessionInfoDto, UserDto};
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::{
     ClientCapabilities, GeneralCommand, MessageCommand, PlayMethod, PlayRequest,
@@ -44,16 +43,19 @@ use uuid::Uuid;
 
 use crate::error::ServiceError;
 
-/// The outcome of authenticating and opening a session: the session DTO plus
-/// the freshly minted access token the client must present on subsequent
-/// requests.
+/// The outcome of authenticating and opening a session: the user it
+/// authenticated, the session DTO and the freshly minted access token the
+/// client must present on subsequent requests.
 ///
-/// Port shape of the token-carrying half of Jellyfin's `AuthenticationResult`
-/// (`SessionManager.AuthenticateNewSession` returns the result *with* its
-/// `AccessToken`). The full `{ UserDto, SessionInfoDto, AccessToken, ServerId }`
-/// envelope is assembled at the API layer from this data.
+/// Port of Jellyfin's `AuthenticationResult` as
+/// `SessionManager.AuthenticateNewSessionInternal` builds it. The API layer
+/// adds `ServerId` (the session's) to make the wire envelope.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuthenticationResultData {
+    /// The authenticated user (C# `User = _userManager.GetUserDto(user, …)`),
+    /// built from the user this sign-in authenticated, not reloaded after it.
+    pub user: UserDto,
+
     /// The opened session.
     pub session: SessionInfoDto,
 
@@ -158,7 +160,7 @@ impl From<&SessionInfoDto> for SessionSummary {
 ///
 /// Port of `ISessionManager` (the object-safe, domain-`SessionInfo`-free
 /// subset). Reads return [`SessionInfoDto`]; the authenticate methods return an
-/// [`AuthenticationResultData`] (session DTO + minted access token).
+/// [`AuthenticationResultData`] (user DTO, session DTO and minted access token).
 #[async_trait]
 pub trait SessionManager: Send + Sync {
     /// Records session activity for a client, returning the session DTO.
@@ -206,12 +208,17 @@ pub trait SessionManager: Send + Sync {
             .id)
     }
 
-    /// Updates the reported device name of a session.
-    async fn update_device_name(
-        &self,
-        session_id: &str,
-        reported_device_name: &str,
-    ) -> Result<(), ServiceError>;
+    /// Applies a device's newly saved custom name to its live sessions (C#
+    /// `SessionManager.OnDeviceManagerDeviceOptionsUpdated`, raised by
+    /// `DeviceManager.UpdateDeviceOptions`). A non-blank `custom_name` becomes
+    /// each session's device name and marks it custom; a blank one only clears
+    /// the mark, so the next reported name replaces the old one.
+    ///
+    /// The default does nothing, so test fakes without sessions need no
+    /// change; the concrete session manager overrides it.
+    async fn on_device_options_updated(&self, device_id: &str, custom_name: Option<&str>) {
+        let _ = (device_id, custom_name);
+    }
 
     /// Reports that playback started for an item.
     async fn on_playback_start(&self, info: &PlaybackStartInfo) -> Result<(), ServiceError>;
@@ -280,6 +287,23 @@ pub trait SessionManager: Send + Sync {
         data: &str,
     ) -> Result<(), ServiceError>;
 
+    /// Sends a pre-serialized JSON message to the sessions of every user who
+    /// holds `permission`, read as upstream's `User.HasPermission` reads it:
+    /// the permission itself, so an administrator without it gets nothing
+    /// (`RecordingNotifier.SendMessage` with `EnableLiveTvAccess`).
+    ///
+    /// Defaulted to a no-op so lightweight test doubles need not implement
+    /// delivery; the concrete session manager overrides it.
+    async fn send_message_to_sessions_with_permission(
+        &self,
+        permission: ferrofin_db::enums::PermissionKind,
+        message_type: SessionMessageType,
+        data: &str,
+    ) -> Result<(), ServiceError> {
+        let _ = (permission, message_type, data);
+        Ok(())
+    }
+
     /// Sends a pre-serialized JSON message to all sessions of the given users.
     async fn send_message_to_user_sessions(
         &self,
@@ -308,14 +332,6 @@ pub trait SessionManager: Send + Sync {
         let _ = (message_type, data);
         Ok(())
     }
-
-    /// Sends a pre-serialized JSON message to all sessions of a specific device.
-    async fn send_message_to_user_device_sessions(
-        &self,
-        device_id: &str,
-        message_type: SessionMessageType,
-        data: &str,
-    ) -> Result<(), ServiceError>;
 
     /// Broadcasts a "restart required" notification to all sessions.
     async fn send_restart_required_notification(&self) -> Result<(), ServiceError>;
@@ -357,9 +373,9 @@ pub trait SessionManager: Send + Sync {
 
     /// Authenticates a request and opens a new session.
     ///
-    /// Returns the opened session together with the minted access token (see
-    /// [`AuthenticationResultData`]) so the API layer can echo the token in the
-    /// `AuthenticationResult` body.
+    /// Returns the authenticated user, the opened session and the minted access
+    /// token (see [`AuthenticationResultData`]) so the API layer can answer them
+    /// in the `AuthenticationResult` body.
     async fn authenticate_new_session(
         &self,
         request: &AuthenticationRequest,
@@ -368,8 +384,8 @@ pub trait SessionManager: Send + Sync {
     /// Authenticates directly (bypassing the interactive flow), opening a
     /// session.
     ///
-    /// Returns the opened session together with the minted access token (see
-    /// [`AuthenticationResultData`]).
+    /// Returns the authenticated user, the opened session and the minted access
+    /// token (see [`AuthenticationResultData`]).
     async fn authenticate_direct(
         &self,
         request: &AuthenticationRequest,
@@ -419,6 +435,29 @@ pub trait SessionManager: Send + Sync {
             .get_sessions(Uuid::nil(), None, None, None, true)
             .await?;
         Ok(sessions.iter().map(SessionSummary::from).collect())
+    }
+
+    /// The id of the library item the session `session_id` plays (C#
+    /// `SessionInfo.FullNowPlayingItem`), which SyncPlay seeds a new group
+    /// from: the item a playback report's `ItemId` names, `None` when it plays
+    /// nothing or the library does not have the item. It can differ from the
+    /// `NowPlayingItem` the session shows, which may be a client's own `Item`.
+    ///
+    /// The default reads the shown item's id from the elevated
+    /// [`Self::get_sessions`] view, so test fakes need no change. The concrete
+    /// manager overrides it to read the library item.
+    async fn now_playing_library_item_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Uuid>, ServiceError> {
+        let sessions = self
+            .get_sessions(Uuid::nil(), None, None, None, true)
+            .await?;
+        Ok(sessions
+            .into_iter()
+            .find(|s| s.id.as_deref() == Some(session_id))
+            .and_then(|s| s.now_playing_item)
+            .map(|item| item.id))
     }
 
     /// Resolves a session from its access token, returning the session DTO.

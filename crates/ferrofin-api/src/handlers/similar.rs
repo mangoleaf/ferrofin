@@ -11,7 +11,7 @@
 //! before any provider runs — builds `DtoOptions` from `fields`, asks the
 //! similar-items manager for the ranked rows, and returns a
 //! `QueryResult<BaseItemDto>` with `startIndex = 0` and `totalRecordCount` equal
-//! to the number of rows. The transform is identical for every alias — only the
+//! to the number of rows before the projection's `IsVisible` pass. The transform is identical for every alias — only the
 //! route path differs — so one handler backs all six.
 
 use axum::extract::{Path, State};
@@ -87,7 +87,9 @@ async fn resolve_similar_seed(state: &AppState, item_id: Uuid) -> Result<Option<
 /// && item is not MusicArtist)) return new QueryResult()` guard — and otherwise
 /// runs the providers with the user's access, the per-kind played filter and
 /// `excludeArtistIds` (honoured by the music providers only, as in C#).
-/// Returns the ranked rows projected to [`BaseItemDto`] with `startIndex = 0`.
+/// Returns the ranked rows projected to [`BaseItemDto`] with `startIndex = 0`;
+/// the projection runs `IsVisible` for the user (`GetBaseItemDtos(itemsResult,
+/// dtoOptions, user)`), and `TotalRecordCount` is the count before that pass.
 async fn similar_items(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,
@@ -130,7 +132,7 @@ async fn similar_items(
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
     let dtos = state
         .dto
-        .get_base_item_dtos(&items, &options, user.as_deref(), None, true)
+        .get_base_item_dtos(&items, &options, user.as_deref(), None, false)
         .await?;
     Ok(Json(QueryResult::new(Some(0), Some(total), dtos)))
 }

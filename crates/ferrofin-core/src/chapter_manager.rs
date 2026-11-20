@@ -12,13 +12,17 @@
 //!
 //! Chapter-image reconciliation and extraction are shared by scans and the
 //! scheduled task through [`crate::chapter_image_extractor::ChapterImageExtractor`].
-//! Image cache tags are computed by the DTO layer.
+//! Image cache tags are computed by the DTO layer. A deletion (a changed
+//! file's prune) drops the save of a task refresh that began before it
+//! ([`ChapterManager::save_refreshed_chapters`]), which upstream's
+//! `RefreshChapterImages` saves whatever happened meanwhile.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::ChapterEntity;
 use ferrofin_model::entities_media::ChapterInfo;
+use ferrofin_util::change_watch::{ChangeWatch, Watch};
 use uuid::Uuid;
 
 use ferrofin_traits::chapters::ChapterManager;
@@ -34,6 +38,8 @@ use crate::kinds::{is_audio, is_video};
 pub struct FerrofinChapterManager {
     repository: Arc<dyn ChapterRepository>,
     library_manager: Arc<dyn LibraryManager>,
+    /// The items a chapter-image refresh is running for, shared by the clones.
+    refreshes: Arc<ChangeWatch<Uuid>>,
 }
 
 impl std::fmt::Debug for FerrofinChapterManager {
@@ -53,6 +59,7 @@ impl FerrofinChapterManager {
         Self {
             repository,
             library_manager,
+            refreshes: Arc::default(),
         }
     }
 
@@ -77,7 +84,10 @@ impl FerrofinChapterManager {
             start_position_ticks: entity.start_position_ticks,
             name: entity.name,
             image_path: entity.image_path,
-            image_date_modified: entity.image_date_modified.unwrap_or_default(),
+            // `GetValueOrDefault()` upstream: a NULL date reads as `MinValue`.
+            image_date_modified: entity
+                .image_date_modified
+                .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
             image_tag: None,
         }
     }
@@ -140,7 +150,29 @@ impl ChapterManager for FerrofinChapterManager {
     }
 
     async fn delete_chapter_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
-        self.repository.delete_chapters(item_id).await
+        self.refreshes
+            .change(&item_id, self.repository.delete_chapters(item_id))
+            .await
+    }
+
+    async fn watch_chapter_data(&self, item_id: Uuid) -> Watch<Uuid> {
+        self.refreshes.watch(item_id).await
+    }
+
+    async fn save_refreshed_chapters(
+        &self,
+        watch: Watch<Uuid>,
+        chapters: &[ChapterInfo],
+    ) -> Result<bool, ServiceError> {
+        let item_id = *watch.key();
+        match self
+            .refreshes
+            .commit(watch, self.save_chapters(item_id, chapters))
+            .await
+        {
+            Some(saved) => saved.map(|()| true),
+            None => Ok(false),
+        }
     }
 }
 
@@ -191,6 +223,36 @@ mod tests {
         mgr.delete_chapter_data(item).await.expect("delete");
         let chapters = mgr.get_chapters(item).await.expect("get");
         assert!(chapters.is_empty(), "{chapters:?}");
+    }
+
+    /// gl-1590: an imageless chapter is stored and read back dated .NET's
+    /// `DateTime.MinValue`, as Jellyfin stores `0001-01-01` and serves it; a
+    /// NULL date reads as `MinValue` too (`GetValueOrDefault()`).
+    #[tokio::test]
+    async fn an_imageless_chapter_is_dated_min_value() {
+        use ferrofin_traits::persistence::ChapterRepository as _;
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = Arc::new(FerrofinChapterRepository::new(db.clone()));
+        let mgr = FerrofinChapterManager::new(repo.clone(), library_manager_over(db.clone()));
+        let min = ferrofin_model::json::datetime::dotnet_min();
+
+        mgr.save_chapters(item, &[chapter("Intro", 0)])
+            .await
+            .expect("save");
+        let stored = repo.get_chapters(item).await.expect("rows");
+        assert_eq!(stored[0].image_date_modified, Some(min));
+        let read = mgr.get_chapters(item).await.expect("get");
+        assert_eq!(read[0].image_date_modified, min);
+
+        let mut undated = stored[0].clone();
+        undated.image_date_modified = None;
+        repo.save_chapters(item, &[undated])
+            .await
+            .expect("save NULL");
+        let read = mgr.get_chapters(item).await.expect("get");
+        assert_eq!(read[0].image_date_modified, min);
     }
 
     #[tokio::test]

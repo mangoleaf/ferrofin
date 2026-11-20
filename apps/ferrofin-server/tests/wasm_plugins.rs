@@ -501,6 +501,26 @@ async fn repository_install_stages_plugin_and_flags_restart() {
         info["HasPendingRestart"], true,
         "restart-required surfaces in SystemInfo: {info}"
     );
+    // …and lists the installation (`InstallationManager.CompletedInstallations`,
+    // gl-1776), as `GetCompatibleVersions` built it.
+    let completed = info["CompletedInstallations"].as_array().expect("an array");
+    assert_eq!(completed.len(), 1, "{info}");
+    let installation = &completed[0];
+    // Jellyfin's `JsonGuidConverter` writes a GUID without dashes.
+    let guid = PLUGIN_ID.replace('-', "");
+    assert_eq!(installation["Guid"], guid);
+    assert_eq!(installation["Name"], "HelloFixture");
+    assert_eq!(installation["Version"], "1.2.3");
+    assert_eq!(
+        installation["SourceUrl"],
+        format!("{repo_base}/plugin.wasm")
+    );
+    assert_eq!(installation["Checksum"], md5);
+    assert_eq!(installation["PackageInfo"]["guid"], guid);
+    assert_eq!(
+        installation["PackageInfo"]["versions"][0]["version"],
+        "1.2.3"
+    );
 
     drop(Arc::new(temp));
 }

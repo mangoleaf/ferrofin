@@ -20,14 +20,17 @@ use std::time::Duration;
 use crate::rate_limit::RateLimiter;
 use serde::Deserialize;
 
-/// The default MusicBrainz web-service base.
-pub const DEFAULT_BASE_URL: &str = "https://musicbrainz.org";
+/// The default MusicBrainz web-service base (`PluginConfiguration.DefaultServer`).
+pub const DEFAULT_BASE_URL: &str = crate::plugin_config::MUSICBRAINZ_DEFAULT_SERVER;
+
 /// The minimum interval between requests to the official server (MB policy),
-/// and the `RateLimit` default the settings page ships
+/// which is the `RateLimit` default the settings page ships
 /// (`PluginConfiguration.DefaultRateLimit`). The plugin's setter refuses to go
 /// below it while musicbrainz.org itself is selected — see
 /// [`MusicBrainzConfig::normalized`](crate::plugin_config::MusicBrainzConfig::normalized).
-const MIN_INTERVAL: Duration = Duration::from_secs(1);
+fn min_interval() -> Duration {
+    Duration::from_secs_f64(crate::plugin_config::MUSICBRAINZ_DEFAULT_RATE_LIMIT)
+}
 
 /// A resolved album identity: the release id and/or its release-group id.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -463,7 +466,7 @@ impl MusicBrainzClient {
     pub fn new(base_url: &str, version: &str) -> Self {
         let base = base_url.trim_end_matches('/');
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             configured_base_url: (!base.is_empty()).then(|| base.to_owned()),
             plugin: crate::plugin_config::ConfigSource::new(),
             // MB requires contact info; the project URL satisfies the policy.
@@ -505,16 +508,16 @@ impl MusicBrainzClient {
     ///
     /// A negative or non-finite value (only reachable by hand-editing
     /// `config.json` — the settings page writes a number input) would panic
-    /// `Duration::from_secs_f64`, so it falls back to [`MIN_INTERVAL`], the
+    /// `Duration::from_secs_f64`, so it falls back to [`min_interval`], the
     /// published MusicBrainz policy floor. Falling back to *zero* there would
     /// turn a typo into an unthrottled crawl of a public service.
     fn interval(rate_limit: f64) -> Duration {
         if rate_limit > 0.0 {
             Duration::try_from_secs_f64(rate_limit)
-                .unwrap_or(MIN_INTERVAL)
+                .unwrap_or_else(|_| min_interval())
                 .min(Duration::from_secs(u64::from(u32::MAX)))
         } else {
-            MIN_INTERVAL
+            min_interval()
         }
     }
 
@@ -525,7 +528,7 @@ impl MusicBrainzClient {
                 .is_some_and(|host| host == "musicbrainz.org" || host.ends_with(".musicbrainz.org"))
         });
         if official {
-            interval.max(MIN_INTERVAL)
+            interval.max(min_interval())
         } else {
             interval
         }
@@ -633,28 +636,37 @@ impl MusicBrainzClient {
 
     /// Looks up a release group's releases (`inc=releases`) and resolves each
     /// through [`lookup_release`](Self::lookup_release) — port of the
-    /// `MusicBrainzAlbumProvider.GetReleaseGroupResultAsync` walk. Empty when
-    /// the group is unknown.
-    pub async fn release_group_releases(&self, release_group_id: &str) -> Vec<ReleaseHit> {
-        let Some(release_group_id) = lookup_id(release_group_id, "release group") else {
-            return Vec::new();
-        };
-        let Some(group): Option<ReleaseGroupLookup> = self
+    /// `MusicBrainzAlbumProvider.GetReleaseGroupResultAsync` walk. `None`
+    /// when the id is malformed or the group lookup fails
+    /// (`LookupReleaseGroupOrNullAsync`), so a caller can tell an unknown
+    /// group from one with no releases.
+    ///
+    /// A release that answers 404 is skipped. One that fails any other way
+    /// ends the walk with the releases before it: upstream's lookup throws
+    /// mid-enumeration, and `GetRemoteSearchResults` keeps what it already
+    /// added. Each release lookup counts its failures in a scope of its own,
+    /// so they do not reach the caller's [`count_request_failures`] scope,
+    /// which sees only the group lookup's.
+    ///
+    /// [`count_request_failures`]: crate::rate_limit::count_request_failures
+    pub async fn release_group_releases(&self, release_group_id: &str) -> Option<Vec<ReleaseHit>> {
+        let release_group_id = lookup_id(release_group_id, "release group")?;
+        let group: ReleaseGroupLookup = self
             .get(
                 &format!("/ws/2/release-group/{release_group_id}"),
                 &[("inc", "releases".to_owned())],
             )
-            .await
-        else {
-            return Vec::new();
-        };
+            .await?;
         let mut hits = Vec::with_capacity(group.releases.len());
         for release in group.releases {
-            if let Some(hit) = self.lookup_release(&release.id).await {
-                hits.push(hit);
+            let (hit, failures) =
+                crate::rate_limit::count_request_failures(self.lookup_release(&release.id)).await;
+            if failures > 0 {
+                break;
             }
+            hits.extend(hit);
         }
-        hits
+        Some(hits)
     }
 
     /// Runs a raw lucene artist search (`/ws/2/artist?query=`) and returns
@@ -768,18 +780,17 @@ impl MusicBrainzClient {
             (None, None) => return None,
         };
         let voted = |of_group: Option<&Vec<VotedWire>>, of_release: Option<&Vec<VotedWire>>| {
-            of_group
-                .or(of_release)
-                .map(|v| by_votes(v))
-                .unwrap_or_default()
+            of_group.or(of_release).map_or_default(|v| by_votes(v))
         };
-        // `.Distinct(StringComparer.OrdinalIgnoreCase)`: folded as .NET's
-        // invariant upper case, non-ASCII letters included.
+        // `.Distinct(StringComparer.OrdinalIgnoreCase)`: non-ASCII letters
+        // folded too, the long `ſ` kept apart from `s`.
         let mut studios: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for label in release.iter().flat_map(|r| &r.label_info) {
             if let Some(name) = non_empty(label.label.as_ref().and_then(|l| l.name.clone()))
-                && seen.insert(ferrofin_util::string_extensions::upper_invariant(&name))
+                && seen.insert(ferrofin_util::string_extensions::ordinal_ignore_case_key(
+                    &name,
+                ))
             {
                 studios.push(name);
             }
@@ -839,8 +850,8 @@ impl MusicBrainzClient {
             // : artist.Area!.Name`.
             location: non_empty(artist.area.and_then(|a| a.name))
                 .or_else(|| non_empty(artist.country)),
-            genres: artist.genres.as_deref().map(by_votes).unwrap_or_default(),
-            tags: artist.tags.as_deref().map(by_votes).unwrap_or_default(),
+            genres: artist.genres.as_deref().map_or_default(by_votes),
+            tags: artist.tags.as_deref().map_or_default(by_votes),
         })
     }
 
@@ -998,14 +1009,19 @@ mod tests {
 
     #[test]
     fn official_host_interval_floor() {
-        assert_eq!(MusicBrainzClient::interval(f64::MAX), MIN_INTERVAL);
-        assert_eq!(MusicBrainzClient::interval(f64::NAN), MIN_INTERVAL);
+        // musicbrainz.org's published limit: one request per second.
+        assert_eq!(min_interval(), Duration::from_secs(1));
+        assert_eq!(MusicBrainzClient::interval(f64::MAX), min_interval());
+        assert_eq!(MusicBrainzClient::interval(f64::NAN), min_interval());
         for url in [
             "https://musicbrainz.org",
             "http://MUSICBRAINZ.ORG:80/",
             "https://www.musicbrainz.org",
         ] {
-            assert_eq!(MusicBrainzClient::request_interval(url, 0.01), MIN_INTERVAL);
+            assert_eq!(
+                MusicBrainzClient::request_interval(url, 0.01),
+                min_interval()
+            );
         }
         assert_eq!(
             MusicBrainzClient::request_interval("http://localhost", 0.1),
@@ -1153,7 +1169,7 @@ mod tests {
         assert!(c.first_release_of("").await.is_none());
         let release_group_releases = c.release_group_releases("rg").await;
         assert!(
-            release_group_releases.is_empty(),
+            release_group_releases.is_none(),
             "{release_group_releases:?}"
         );
     }
@@ -1182,7 +1198,8 @@ mod tests {
                                      {"name":"Beethoven","artist":{"id":"b","name":"Ludwig van Beethoven"}},
                                      {"name":"Printed","artist":{"id":"c","name":" "}}],
                     "label-info":[{"label":{"name":"Columbia"}},{"label":{"name":"columbia"}},{"label":null},
-                                  {"label":{"name":"Éditions"}},{"label":{"name":"éditions"}}],
+                                  {"label":{"name":"Éditions"}},{"label":{"name":"éditions"}},
+                                  {"label":{"name":"Gloſs"}},{"label":{"name":"Gloss"}}],
                     "genres":[{"name":"release genre","count":50}],
                     "tags":[{"name":"release tag","count":50}]}"#
                     .to_owned(),
@@ -1231,8 +1248,8 @@ mod tests {
         assert_eq!(details.tags, ["trumpet"]);
         assert_eq!(
             details.studios,
-            ["Columbia", "Éditions"],
-            "distinct ignoring case, non-ASCII too"
+            ["Columbia", "Éditions", "Gloſs", "Gloss"],
+            "distinct ignoring case, non-ASCII too, the long s kept apart from s"
         );
 
         // No group: the release's own genres, tags, date and credits.

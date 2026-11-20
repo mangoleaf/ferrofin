@@ -14,7 +14,8 @@
 //! `IMediaSegmentManager.DeleteSegmentsAsync` →
 //! [`MediaSegmentManager::delete_segments`],
 //! `ITrickplayManager.DeleteTrickplayDataAsync` →
-//! [`TrickplayManager::delete_trickplay_data`], and
+//! [`TrickplayManager::prune_trickplay_data`] (the rows and the tile folders,
+//! which a refresh of the item in flight removes again once done), and
 //! `IChapterManager.DeleteChapterDataAsync` →
 //! [`ChapterManager::delete_chapter_data`].
 //!
@@ -167,13 +168,15 @@ impl ExternalDataManager for FerrofinExternalDataManager {
         media: MediaLocation<'_>,
     ) -> Result<(), ServiceError> {
         // Filesystem first, then the four DB-side deletions (C# ordering).
+        // Trickplay's goes with its folders again, and a refresh of the item
+        // in flight removes what it saves (gl-1694).
         self.delete_files(item_id, media).await;
         self.keyframe_repository
             .delete_keyframe_data(item_id)
             .await?;
         self.media_segment_manager.delete_segments(item_id).await?;
         self.trickplay_manager
-            .delete_trickplay_data(item_id)
+            .prune_trickplay_data(item_id, media)
             .await?;
         self.chapter_manager.delete_chapter_data(item_id).await?;
         Ok(())
@@ -257,6 +260,8 @@ mod tests {
         keyframe: Mutex<Vec<Uuid>>,
         segments: Mutex<Vec<Uuid>>,
         trickplay: Mutex<Vec<Uuid>>,
+        /// Each `prune_trickplay_data` call's item and media path.
+        trickplay_prunes: Mutex<Vec<(Uuid, String)>>,
         chapters: Mutex<Vec<Uuid>>,
     }
 
@@ -360,6 +365,17 @@ mod tests {
             self.trickplay.lock().unwrap().push(item_id);
             Ok(())
         }
+        async fn prune_trickplay_data(
+            &self,
+            item_id: Uuid,
+            media: MediaLocation<'_>,
+        ) -> Result<(), ServiceError> {
+            self.trickplay_prunes
+                .lock()
+                .unwrap()
+                .push((item_id, media.path.to_owned()));
+            Ok(())
+        }
         async fn get_hls_playlist(
             &self,
             _item_id: Uuid,
@@ -436,7 +452,12 @@ mod tests {
         // Every DB-side deletion fired once for the item.
         assert_eq!(*deletes.keyframe.lock().unwrap(), vec![item]);
         assert_eq!(*deletes.segments.lock().unwrap(), vec![item]);
-        assert_eq!(*deletes.trickplay.lock().unwrap(), vec![item]);
+        // Trickplay's through the prune that also covers a refresh in flight.
+        assert_eq!(
+            *deletes.trickplay_prunes.lock().unwrap(),
+            vec![(item, "/media/x.mkv".to_owned())]
+        );
+        assert!(deletes.trickplay.lock().unwrap().is_empty());
         assert_eq!(*deletes.chapters.lock().unwrap(), vec![item]);
     }
 

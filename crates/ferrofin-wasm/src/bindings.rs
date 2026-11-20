@@ -56,9 +56,8 @@ pub struct HostState {
     /// The shared blocking HTTP client behind `http-fetch` (per host, with
     /// the call timeout baked in at construction).
     pub http: std::sync::Arc<crate::capabilities::GuestHttp>,
-    /// The per-call timeout, needed when `http-fetch` builds a one-off
-    /// DNS-pinned client (the shared client's timeout is not readable). A
-    /// fetch gets the smaller of it and the time left in the call
+    /// The per-call timeout (the shared clients' is not readable). A fetch
+    /// gets the smaller of it and the time left in the call
     /// ([`fetch_timeout`]).
     pub http_timeout: std::time::Duration,
     /// The operator-configured total state cap, in bytes
@@ -85,6 +84,9 @@ pub struct HostState {
     pub collaborators: std::sync::Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
     /// True when this guest call attempted a write suppressed by live segment policy.
     pub segment_policy_skipped: bool,
+    /// The `set-user-data` writes this guest call made, which
+    /// [`HostState::log_user_data_writes`] logs once it returns.
+    pub user_data_writes: usize,
     /// When the current guest call's time budget runs out, armed with the
     /// epoch deadline (`InstanceSpec::arm_deadline`). Epoch checks only run
     /// in wasm code, so WASI clock waits ([`DeadlineClocks`]) and the bounded
@@ -97,6 +99,21 @@ pub struct HostState {
 }
 
 impl HostState {
+    /// Logs at info how many user-data writes the guest call that just
+    /// returned made, naming the plugin, and starts the count again. Each
+    /// write is logged at debug, as a sync plugin may write one per item in
+    /// the library (LOGGING.md rule 1).
+    pub fn log_user_data_writes(&mut self) {
+        let writes = std::mem::take(&mut self.user_data_writes);
+        if writes > 0 {
+            tracing::info!(
+                plugin = self.plugin_name,
+                writes,
+                "wasm plugin wrote user data"
+            );
+        }
+    }
+
     /// The locked-down WASI context every plugin store gets: nothing
     /// attached, nothing inherited.
     ///
@@ -330,7 +347,9 @@ impl host::Host for HostState {
             .collaborators
             .get()
             .ok_or("set-user-data is not available during plugin load")?;
-        crate::capabilities::set_user_data(cx, &self.plugin_name, &user_id, &item_id, &update)
+        crate::capabilities::set_user_data(cx, &self.plugin_name, &user_id, &item_id, &update)?;
+        self.user_data_writes += 1;
+        Ok(())
     }
 
     fn write_lyrics(

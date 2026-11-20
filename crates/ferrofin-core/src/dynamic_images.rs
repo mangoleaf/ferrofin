@@ -70,7 +70,10 @@
 //! refresh, a changed folder, an overdue interval), then goes over every
 //! other supported row, each gated by the rule above
 //! ([`DynamicImageProviders::refresh_all_between`], which serves the scan's
-//! item-refresh lane between two rows).
+//! item-refresh lane between two rows). The two root folders are refreshed
+//! instead at the validation's opening, before any library is walked, as
+//! upstream's `ValidateTopLibraryFolders` refreshes them
+//! ([`DynamicImageProviders::refresh_roots_between`]).
 //!
 //! An item refresh runs the provider too, as upstream's `MetadataService`
 //! runs a custom provider: not with metadata mode `None`, forced when the
@@ -86,7 +89,7 @@
 //!   refreshed ([`DynamicImageProviders::refresh_rows_between`]).
 //! - A library's or the root's refresh validates whole libraries the same
 //!   way, and also redraws the library tiles; the root's reaches the user
-//!   root's image too ([`DynamicImageProviders::refresh_user_root_between`]).
+//!   root's image too ([`DynamicImageProviders::refresh_roots_between`]).
 //!   The walk plans neither, so each is forced as its own refresh plan says
 //!   (`unwalked_refresh_plan`):
 //!   by the refresh's options, or by its own first or overdue refresh.
@@ -103,8 +106,8 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::BaseItemEntity;
-use ferrofin_db::store::{datetime_to_db, guid_to_db};
-use ferrofin_model::data::BaseItemKind;
+use ferrofin_db::store::datetime_to_db;
+use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::SortOrder;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::live_tv::ItemSortBy;
@@ -118,6 +121,7 @@ use ferrofin_traits::providers::{GeneratedImageProvider, ItemUpdateType, Metadat
 use uuid::Uuid;
 
 use crate::item_type_lookup::kind_from_type_name;
+use crate::library_scan::off_runtime;
 use crate::refresh_plan::{PassOutcome, RefreshRequest};
 
 /// Edge length of the square collage every provider here draws — upstream's
@@ -288,17 +292,31 @@ impl DynamicImageProviders {
         }
     }
 
-    /// [`refresh_all_between`](Self::refresh_all_between) with nothing left
-    /// out and no pause between rows.
+    /// A library validation's two dynamic image passes with nothing left out
+    /// and no pause between rows: the root folders at its opening
+    /// ([`refresh_roots_between`](Self::refresh_roots_between), default
+    /// options), then [`refresh_all_between`](Self::refresh_all_between).
     ///
     /// # Errors
     ///
-    /// As [`refresh_all_between`](Self::refresh_all_between).
+    /// As those two.
     #[cfg(test)]
     pub async fn refresh_all(&self) -> Result<DynamicImageReport, ServiceError> {
         let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
-        self.refresh_all_between(&std::collections::HashSet::new(), &nothing)
-            .await
+        let roots = self
+            .refresh_roots_between(
+                &[BaseItemKind::AggregateFolder, BaseItemKind::UserRootFolder],
+                &MetadataRefreshOptions::default(),
+                &nothing,
+            )
+            .await?;
+        let rest = self
+            .refresh_all_between(&std::collections::HashSet::new(), &nothing)
+            .await?;
+        Ok(DynamicImageReport {
+            examined: roots.examined + rest.examined,
+            generated: roots.generated + rest.generated,
+        })
     }
 
     /// The scan-time pass: evaluates every supported row and (re)generates
@@ -312,19 +330,13 @@ impl DynamicImageProviders {
     /// skipped — one unreadable poster must not lose every other collage.
     ///
     /// `Genre` and `MusicGenre` are separate rows, as upstream keeps them: a
-    /// scan writes a `Genre` row for a non-music item's genre (its id is the
-    /// `ItemValueId`) and a `MusicGenre` row for a music item's (a derived id),
-    /// so a name used by both a movie and an album has two rows and two
-    /// Primaries. An adopted database's rows keep Jellyfin's ids.
+    /// scan writes a `Genre` row for a non-music item's genre and a `MusicGenre`
+    /// row for a music item's, each under the id Jellyfin derives from its path
+    /// (gl-1597), so a name used by both a movie and an album has two rows and
+    /// two Primaries. An adopted database's rows keep Jellyfin's ids.
     ///
-    /// TODO(parity, open work item — NOT an accepted divergence; gl-950): the
-    /// user root is drawn here behind its gate, where upstream's
-    /// `ValidateTopLibraryFolders` refreshes it on every library validation;
-    /// the scan records only that refresh's first stamp
-    /// (`LibraryScanner::stamp_first_refreshes`, gl-1586). Un-defer path: refresh it through
-    /// [`refresh_user_root_between`](Self::refresh_user_root_between) with
-    /// library validation's default options before this pass, and take it
-    /// out of the list below.
+    /// The two root folders are not here: library validation refreshes them
+    /// at its opening ([`refresh_roots_between`](Self::refresh_roots_between)).
     ///
     /// # Errors
     ///
@@ -342,13 +354,8 @@ impl DynamicImageProviders {
                     BaseItemKind::MusicGenre,
                     BaseItemKind::Playlist,
                     BaseItemKind::PhotoAlbum,
-                    // `FolderImageProvider`. The library tiles this copies from
-                    // are drawn by `refresh_library_images`, which runs BEFORE
-                    // this pass (library_scan.rs), so the root's source is
-                    // already on disk.
+                    // `FolderImageProvider`.
                     BaseItemKind::Folder,
-                    BaseItemKind::UserRootFolder,
-                    BaseItemKind::AggregateFolder,
                 ],
                 done,
                 between,
@@ -362,13 +369,18 @@ impl DynamicImageProviders {
         Ok(report)
     }
 
-    /// The user root's Primary, which a refresh of the root reaches besides
-    /// the libraries it validates (`UserRootFolder` is the root clients
-    /// refresh, and its children are the libraries): forced when the root's
-    /// refresh plan runs every provider (`runAllProviders`: the `options`, or
-    /// the root's own first refresh at `Default` or above), else gated, and
-    /// its `DateLastRefreshed` stamped as the save rule says. Awaits
-    /// `between` before the row.
+    /// The Primaries of the root folders of `kinds`, in that order, each
+    /// forced when its refresh plan runs every provider (`runAllProviders`:
+    /// the `options`, or the row's own first refresh at `Default` or above),
+    /// else gated, and its `DateLastRefreshed` stamped as the save rule says.
+    /// Awaits `between` before each row.
+    ///
+    /// A refresh of the root reaches the user root's image (`UserRootFolder`
+    /// is the root clients refresh, and its children are the libraries). Library
+    /// validation opens with both, the `AggregateFolder` and then the user
+    /// root, with default options whatever the scan's
+    /// (`ValidateTopLibraryFolders`: `RootFolder.RefreshMetadata`, then
+    /// `GetUserRootFolder().RefreshMetadata()`).
     ///
     /// TODO(parity, open work item — NOT an accepted divergence; gl-595): an
     /// `AggregateFolder` refresh reaches its own image and every playlist's
@@ -378,12 +390,20 @@ impl DynamicImageProviders {
     /// root in the scan request and draw the `AggregateFolder`, the user root
     /// and the playlists for the aggregate's refresh.
     ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-1847):
+    /// every root's plan is taken with `locations_changed` false, where
+    /// upstream's `AggregateFolder.RequiresRefresh` also fires when its
+    /// physical locations (every library's) differ from the stored list. Fix
+    /// path: record the aggregate's `PhysicalLocationsList` as upstream does
+    /// and pass the comparison for the `AggregateFolder` row.
+    ///
     /// # Errors
     ///
-    /// Only when the user root's row cannot be read or its refresh date
-    /// cannot be stamped; a failure drawing its image is logged.
-    pub async fn refresh_user_root_between<'b>(
+    /// Only when a root's row cannot be read or the refresh dates cannot be
+    /// stamped; a failure drawing an image is logged.
+    pub async fn refresh_roots_between<'b>(
         &self,
+        kinds: &[BaseItemKind],
         options: &MetadataRefreshOptions,
         between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
     ) -> Result<DynamicImageReport, ServiceError> {
@@ -395,17 +415,14 @@ impl DynamicImageProviders {
             options,
             force_save: false,
         };
-        let rows = self
-            .items
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::UserRootFolder],
-                ..InternalItemsQuery::default()
-            })
-            .await?;
+        let mut rows = Vec::new();
+        for &kind in kinds {
+            rows.extend(self.items.get_item_list(&kind_query(kind)).await?);
+        }
         let mut refreshed = Vec::new();
         for row in rows {
             between().await;
-            // No library: `GetLibraryOptions` gives the root the defaults.
+            // No library: `GetLibraryOptions` gives a root the defaults.
             let plan = crate::library_scan::unwalked_refresh_plan(Some(&row), options, None, false);
             let pass = self
                 .refresh_tallied(&row, plan.run_all_providers, &mut report)
@@ -615,7 +632,7 @@ impl DynamicImageProviders {
             return Ok(ItemUpdateType::None);
         }
 
-        std::fs::create_dir_all(&item_dir).map_err(|e| {
+        off_runtime(|| std::fs::create_dir_all(&item_dir)).map_err(|e| {
             ServiceError::backend(format!(
                 "failed to create the item art dir {}: {e}",
                 item_dir.display()
@@ -625,7 +642,8 @@ impl DynamicImageProviders {
             kind,
             DynamicImageKind::PhotoAlbum | DynamicImageKind::Folder
         ) {
-            copy_single_image(&item_dir, &sources[0])?
+            // One closure: the stale Primaries go before the copy lands.
+            off_runtime(|| copy_single_image(&item_dir, &sources[0]))?
         } else {
             let output = item_dir.join(format!("{PRIMARY_STEM}.png"));
             let options = ImageCollageOptions {
@@ -634,7 +652,7 @@ impl DynamicImageProviders {
                 width: SQUARE_COLLAGE_SIZE,
                 height: SQUARE_COLLAGE_SIZE,
             };
-            remove_other_primaries(&item_dir, &output);
+            off_runtime(|| remove_other_primaries(&item_dir, &output));
             self.processor
                 .create_image_collage(&options, item.name.as_deref())
                 .await?;
@@ -647,12 +665,18 @@ impl DynamicImageProviders {
         let mut info = ItemImageInfo {
             path: output.to_string_lossy().into_owned(),
             image_type: ImageType::Primary,
-            date_modified: file_date_modified(&output),
+            date_modified: off_runtime(|| file_date_modified(&output)),
             width: 0,
             height: 0,
             blur_hash: None,
         };
-        fill_image_metadata(self.processor.as_ref(), &mut info).await;
+        fill_image_metadata(
+            self.processor.as_ref(),
+            item_id,
+            &output.to_string_lossy(),
+            &mut info,
+        )
+        .await;
         images.retain(|i| i.image_type != ImageType::Primary);
         images.insert(0, info);
         self.persistence.save_item_images(item_id, &images).await?;
@@ -668,7 +692,10 @@ impl DynamicImageProviders {
     /// no `ParentId` (the two roots) is answered without a query.
     async fn folder_supported(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
         let kind = kind_from_type_name(&item.type_);
-        let collection_type = row_collection_type(item);
+        // The `IHasCollectionType` value `BaseItem.IsTopParent` tests for `livetv`.
+        let collection_type = kind
+            .and_then(|kind| crate::dto_service::collection_type_of(item, kind))
+            .map(CollectionType::json_name);
         if let Some(kind) = kind
             && crate::kinds::is_top_parent(kind, None, collection_type.as_deref())
         {
@@ -911,7 +938,7 @@ impl DynamicImageProviders {
     }
 }
 
-/// Every row of `kind`, for the closing pass.
+/// Every row of `kind`, for a dynamic image pass.
 fn kind_query(kind: BaseItemKind) -> InternalItemsQuery {
     InternalItemsQuery {
         include_item_types: vec![kind],
@@ -941,16 +968,49 @@ fn folder_sources_query(folder_id: Uuid) -> InternalItemsQuery {
 
 /// Dimensions + blurhash for a written image file, the way the scanner records
 /// every other image (so the DTO carries `Width`/`Height`/`ImageBlurHashes`):
-/// what `LibraryManager.UpdateImagesAsync` fills for a saved image.
-/// Best-effort: a decode failure leaves the size the caller set, and no hash.
-pub(crate) async fn fill_image_metadata(processor: &dyn ImageProcessor, image: &mut ItemImageInfo) {
-    let Ok(dims) = processor.get_image_dimensions(&image.path).await else {
-        return;
+/// what `LibraryManager.UpdateImagesAsync` fills for a saved image. `path` is
+/// the file to read: `image.path` itself, or its expansion when the row stores
+/// a virtual path.
+///
+/// Best-effort: an error reading the size leaves the size the caller set,
+/// and an error computing the blurhash leaves no hash. Each failure is logged
+/// with the item, the image type and the path, the events `UpdateImagesAsync`
+/// and its encoder log, at levels set by LOGGING.md rule 1: a missing file, an
+/// error reading the size and a failed blurhash at `warn!` (upstream: Warning,
+/// Error, Error), a file measured 0x0 at `debug!` (upstream: Debug when empty
+/// or unsupported, Warning when undecodable, which this encoder cannot tell
+/// apart).
+pub(crate) async fn fill_image_metadata(
+    processor: &dyn ImageProcessor,
+    item_id: Uuid,
+    path: &str,
+    image: &mut ItemImageInfo,
+) {
+    let image_type = image.image_type;
+    let dims = match processor.get_image_dimensions(path).await {
+        Ok(dims) => dims,
+        Err(ServiceError::NotFound(_)) => {
+            tracing::warn!(item_id = %item_id, ?image_type, path = %path, "image not found");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, item_id = %item_id, ?image_type, path = %path, "cannot get image dimensions");
+            return;
+        }
     };
+    if dims.width <= 0 || dims.height <= 0 {
+        // The encoder answers an empty, unsupported or undecodable file 0x0,
+        // and cannot say which: debug, as an SVG logo (no decoder, gl-802) is
+        // one per movie, measured again on every scan.
+        tracing::debug!(item_id = %item_id, ?image_type, path = %path, "unable to determine image dimensions");
+    }
     image.width = dims.width;
     image.height = dims.height;
-    if let Ok(hash) = processor.get_image_blur_hash_sized(&image.path, dims).await {
-        image.blur_hash = Some(hash);
+    match processor.get_image_blur_hash_sized(path, dims).await {
+        Ok(hash) => image.blur_hash = Some(hash),
+        Err(error) => {
+            tracing::warn!(%error, item_id = %item_id, ?image_type, path = %path, "cannot compute blurhash");
+        }
     }
 }
 
@@ -962,7 +1022,7 @@ pub(crate) async fn fill_image_metadata(processor: &dyn ImageProcessor, image: &
 /// stored value was truncated to it on the way in, so a raw nanosecond `mtime`
 /// would never compare equal and every scan would redraw every collage.
 fn has_changed_by_date(image: &ItemImageInfo) -> bool {
-    let Ok(meta) = std::fs::metadata(&image.path) else {
+    let Ok(meta) = off_runtime(|| std::fs::metadata(&image.path)) else {
         return true;
     };
     let Ok(modified) = meta.modified() else {
@@ -971,36 +1031,9 @@ fn has_changed_by_date(image: &ItemImageInfo) -> bool {
     datetime_to_db(DateTime::<Utc>::from(modified)) != datetime_to_db(image.date_modified)
 }
 
-/// An item's own art folders under the metadata `root`: Ferrofin's
-/// `{root}/{ID}` ([`own_art_dir`]), the [`legacy_art_dir`] older scans wrote
-/// some art to, and the `{root}/{xx}/{id:N}` folder Jellyfin's
-/// `BaseItem.GetInternalMetadataPath` uses (`BaseItem.cs:927-937`), which an
-/// adopted database's images keep.
-#[must_use]
-pub(crate) fn internal_metadata_dirs(root: &Path, item_id: Uuid) -> [PathBuf; 3] {
-    let simple = item_id.simple().to_string();
-    [
-        own_art_dir(root, item_id),
-        legacy_art_dir(root, item_id),
-        root.join(&simple[..2]).join(&simple),
-    ]
-}
-
-/// The folder Ferrofin draws an item's art into: `{root}/{ID}`.
-#[must_use]
-pub(crate) fn own_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
-    root.join(guid_to_db(item_id))
-}
-
-/// `{root}/{id}`, the item's id lower-cased: where older scans wrote music,
-/// person, studio and embedded-cover art, beside [`own_art_dir`]. Nothing is
-/// written there any more. It is read and cleaned so that art already there
-/// is found, pruned and removed with the item, and its stored paths keep
-/// working.
-#[must_use]
-pub(crate) fn legacy_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
-    root.join(item_id.hyphenated().to_string())
-}
+pub(crate) use ferrofin_providers::local_images::{
+    internal_metadata_dirs, legacy_art_dir, own_art_dir,
+};
 
 /// Whether `image` is the item's own (`BaseDynamicImageProvider.FetchAsync` /
 /// `HasChanged`): a local file inside one of its
@@ -1016,8 +1049,13 @@ pub(crate) fn is_own_image(root: &Path, item_id: Uuid, image: &ItemImageInfo) ->
 /// `ImageService.ValidateImages`: drops the local images whose file is gone,
 /// returning whether any was.
 pub(crate) fn drop_missing_images(images: &mut Vec<ItemImageInfo>) -> bool {
+    if !images.iter().any(ItemImageInfo::is_local_file) {
+        return false;
+    }
     let before = images.len();
-    images.retain(|image| !image.is_local_file() || Path::new(&image.path).is_file());
+    off_runtime(|| {
+        images.retain(|image| !image.is_local_file() || Path::new(&image.path).is_file());
+    });
     images.len() != before
 }
 
@@ -1059,18 +1097,6 @@ fn remove_other_primaries(item_dir: &Path, keep: &Path) {
     }
 }
 
-/// The row's `CollectionType`, read out of the serialized `Data` blob (where
-/// `ItemRepository` keeps it) — the `IHasCollectionType` value
-/// `BaseItem.IsTopParent` tests for `livetv`.
-fn row_collection_type(item: &BaseItemEntity) -> Option<String> {
-    let data = item.data.as_deref()?;
-    let value: serde_json::Value = serde_json::from_str(data).ok()?;
-    value
-        .get("CollectionType")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,6 +1105,7 @@ mod tests {
     use crate::test_support::{image_info, item_repository_over, seed_images, test_db};
     use ferrofin_db::Database;
     use ferrofin_db::enums::ItemValueType;
+    use ferrofin_db::store::guid_to_db;
     use ferrofin_drawing::image_encoder::ImageCrateEncoder;
     use ferrofin_drawing::processor::ImageProcessor as DrawingProcessor;
     use ferrofin_traits::persistence::LinkedChildrenService;
@@ -1661,6 +1688,30 @@ mod tests {
         assert_eq!((decoded.width(), decoded.height()), (600, 600));
     }
 
+    /// `IsTopParent`'s `livetv` test reads `IHasCollectionType.CollectionType`,
+    /// never a stray `CollectionType` member on a plain folder, which is no
+    /// `IHasCollectionType`. [`DynamicImageKind::for_entity`] routes only the
+    /// plain folder kinds here; the user-view case pins the kind-aware read
+    /// (its bound `ViewType`, a number included) for a kind it may add.
+    #[tokio::test]
+    async fn the_live_tv_top_parent_test_reads_the_collection_type_of_the_kind() {
+        let fx = fixture().await;
+        let row = |kind: BaseItemKind, data: &str| BaseItemEntity {
+            type_: stored_type_name(kind).expect("type name").to_owned(),
+            data: Some(data.to_owned()),
+            ..Default::default()
+        };
+        let folder = row(BaseItemKind::Folder, r#"{"CollectionType":"livetv"}"#);
+        assert!(
+            fx.providers
+                .folder_supported(&folder)
+                .await
+                .expect("folder")
+        );
+        let live_tv = row(BaseItemKind::UserView, r#"{"ViewType":10}"#);
+        assert!(!fx.providers.folder_supported(&live_tv).await.expect("view"));
+    }
+
     /// `FolderImageProvider` (`FolderImageProvider.cs` +
     /// `BaseFolderImageProvider.cs`): the `UserRootFolder` copies its first
     /// descendant's Primary verbatim — this is `CreateSingleImage`
@@ -1739,7 +1790,12 @@ mod tests {
             .set_ancestors(library, &[user_root])
             .await
             .expect("ancestors");
-        fx.providers.refresh_all().await.expect("pass");
+        // A copy drawn behind the gate, recording no refresh.
+        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
+        fx.providers
+            .refresh_rows_between(&[(user_root, false)], &nothing)
+            .await
+            .expect("pass");
         let copy = || async {
             std::fs::read(fx.primary_of(user_root).await.expect("primary").path).expect("read")
         };
@@ -1751,12 +1807,11 @@ mod tests {
             image_refresh_mode: MetadataRefreshMode::FullRefresh,
             ..MetadataRefreshOptions::default()
         };
-        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
         let never_refreshed =
             std::fs::read(write_png(&media, "library-tile.png", [6, 6, 6])).expect("tile");
         assert_ne!(first, never_refreshed);
         fx.providers
-            .refresh_user_root_between(&default, &nothing)
+            .refresh_roots_between(&[BaseItemKind::UserRootFolder], &default, &nothing)
             .await
             .expect("first refresh");
         assert_eq!(
@@ -1768,7 +1823,7 @@ mod tests {
         let recoloured =
             std::fs::read(write_png(&media, "library-tile.png", [9, 9, 9])).expect("tile");
         fx.providers
-            .refresh_user_root_between(&default, &nothing)
+            .refresh_roots_between(&[BaseItemKind::UserRootFolder], &default, &nothing)
             .await
             .expect("gated");
         assert_eq!(
@@ -1777,7 +1832,7 @@ mod tests {
             "a refreshed root's current copy is behind its gate"
         );
         fx.providers
-            .refresh_user_root_between(&full, &nothing)
+            .refresh_roots_between(&[BaseItemKind::UserRootFolder], &full, &nothing)
             .await
             .expect("forced");
         assert_eq!(copy().await, recoloured, "a forced refresh recopies");
@@ -1795,10 +1850,81 @@ mod tests {
             .expect("lock");
         write_png(&media, "library-tile.png", [200, 200, 200]);
         fx.providers
-            .refresh_user_root_between(&full, &nothing)
+            .refresh_roots_between(&[BaseItemKind::UserRootFolder], &full, &nothing)
             .await
             .expect("forced");
         assert_eq!(copy().await, recoloured, "a locked root is left alone");
+    }
+
+    /// gl-950: library validation opens with the `AggregateFolder`'s refresh
+    /// too (`RootFolder.RefreshMetadata`): a never-refreshed aggregate runs
+    /// every provider, recopying its first descendant's Primary past the date
+    /// gate, and is stamped; its next refresh is behind the gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn library_validation_refreshes_the_aggregate_root_too() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let tile = write_png(&media, "library-tile.png", [3, 4, 5]);
+        let aggregate = fx
+            .seed(BaseItemKind::AggregateFolder, "root", None, None)
+            .await;
+        let library = fx
+            .seed(BaseItemKind::CollectionFolder, "Movies", None, Some(&tile))
+            .await;
+        fx.persistence
+            .set_parent_id(library, aggregate)
+            .await
+            .expect("parent");
+        fx.persistence
+            .set_ancestors(library, &[aggregate])
+            .await
+            .expect("ancestors");
+        // A copy drawn behind the gate, recording no refresh.
+        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
+        fx.providers
+            .refresh_rows_between(&[(aggregate, false)], &nothing)
+            .await
+            .expect("pass");
+        let copy = || async {
+            std::fs::read(fx.primary_of(aggregate).await.expect("primary").path).expect("read")
+        };
+        let recoloured =
+            std::fs::read(write_png(&media, "library-tile.png", [6, 6, 6])).expect("tile");
+        assert_ne!(copy().await, recoloured);
+
+        let roots = [BaseItemKind::AggregateFolder, BaseItemKind::UserRootFolder];
+        let default = MetadataRefreshOptions::default();
+        fx.providers
+            .refresh_roots_between(&roots, &default, &nothing)
+            .await
+            .expect("first refresh");
+        assert_eq!(
+            copy().await,
+            recoloured,
+            "a never-refreshed aggregate's first refresh runs every provider"
+        );
+        let stamped = || async {
+            fx.items
+                .retrieve_item(aggregate)
+                .await
+                .expect("read")
+                .expect("row")
+                .date_last_refreshed
+        };
+        let first = stamped().await;
+        assert!(first.is_some(), "the aggregate's refresh is recorded");
+
+        write_png(&media, "library-tile.png", [9, 9, 9]);
+        fx.providers
+            .refresh_roots_between(&roots, &default, &nothing)
+            .await
+            .expect("gated");
+        assert_eq!(
+            copy().await,
+            recoloured,
+            "a refreshed aggregate's current copy is behind its gate"
+        );
+        assert_eq!(stamped().await, first, "nothing changed, nothing saved");
     }
 
     /// A Live TV item's row is a source only from the internal metadata
@@ -1902,6 +2028,95 @@ mod tests {
             "the sort-name-first photo is the one copied"
         );
         assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 0);
+    }
+
+    /// The album's photo is copied off the runtime worker, so a copy from a
+    /// slow mount never holds it: on a runtime with one worker, a task still
+    /// runs while the copy waits on its destination (a FIFO the test reads the
+    /// photo out of, too small to hold it; `std::fs::copy` refuses a FIFO as
+    /// its source).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_photo_copy_leaves_the_runtime_worker_free() {
+        use std::io::Read as _;
+        use std::time::Duration;
+
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let album = fx
+            .seed(BaseItemKind::PhotoAlbum, "Iceland", None, None)
+            .await;
+        let photo = media.join("aurora.jpg");
+        // Larger than a pipe's buffer, so the copy waits for the reader.
+        std::fs::write(&photo, vec![7_u8; 1 << 20]).expect("photo");
+        let id = Uuid::new_v4();
+        fx.persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(id),
+                type_: stored_type_name(BaseItemKind::Photo).unwrap().to_owned(),
+                name: Some("aurora".to_owned()),
+                parent_id: Some(guid_to_db(album)),
+                path: Some(photo.to_string_lossy().into_owned()),
+                ..Default::default()
+            }])
+            .await
+            .expect("photo");
+        fx.persistence
+            .set_ancestors(id, &[album])
+            .await
+            .expect("ancestors");
+        seed_images(
+            &fx.db,
+            id,
+            &[image_info(
+                ImageType::Primary,
+                &photo.to_string_lossy(),
+                None,
+            )],
+        )
+        .await;
+        let art = own_art_dir(&fx.tmp.path().join("metadata").join("library"), album);
+        std::fs::create_dir_all(&art).expect("art dir");
+        // Nothing reads it back: the image probe answers 0x0 for a zero-length
+        // file (the FIFO) without opening it, which would block forever.
+        let output = art.join("primary.jpg");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&output)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "mkfifo {}", output.display());
+
+        let copying = Arc::new(tokio::sync::Notify::new());
+        let (ran, waited) = std::sync::mpsc::channel();
+        let task = {
+            let copying = Arc::clone(&copying);
+            tokio::spawn(async move {
+                copying.notified().await;
+                ran.send(()).ok();
+            })
+        };
+        let reader = std::thread::spawn(move || {
+            // Opening the read end waits for the copy to open the write end.
+            let mut fifo = std::fs::File::open(&output).expect("fifo");
+            copying.notify_one();
+            let starved = waited.recv_timeout(Duration::from_secs(2)).is_err();
+            let mut copied = Vec::new();
+            fifo.read_to_end(&mut copied).expect("read the copy");
+            (starved, copied)
+        });
+        // On the worker: the test's own future runs on the thread that started it.
+        let report = tokio::spawn(async move { fx.providers.refresh_all().await })
+            .await
+            .expect("the pass finished")
+            .expect("pass");
+
+        assert_eq!(report.generated, 1);
+        let (starved, copied) = reader.join().expect("reader");
+        assert_eq!(copied, std::fs::read(&photo).expect("photo"));
+        assert!(!starved, "the copy held the only worker");
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("the task never ran")
+            .expect("the task ran");
     }
 
     /// `ArtistImageProvider` yields no sources upstream, so an artist row is
@@ -2092,6 +2307,80 @@ mod tests {
             let ids = explain(&db, build_query(&kind_query(kind), QueryShape::IdsOnly)).await;
             let rows = explain(&db, build_query(&kind_query(kind), QueryShape::FullRows)).await;
             assert_eq!(ids, rows, "{kind:?}");
+        }
+    }
+
+    /// An image whose file is gone is logged as not found (`warn!`), one that
+    /// cannot be decoded as unmeasurable (`debug!`), and a truncated one whose
+    /// header still gives its size as having no blurhash (`warn!`), each with
+    /// the item, the image type and the path (gl-384,
+    /// `LibraryManager.UpdateImagesAsync`); none gets a hash.
+    #[tokio::test]
+    async fn an_unreadable_image_is_logged_with_its_item_type_and_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let processor =
+            DrawingProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache"));
+        let item = Uuid::new_v4();
+        let missing = tmp.path().join("gone.png").to_string_lossy().into_owned();
+        let garbage = tmp.path().join("garbage.png");
+        std::fs::write(&garbage, b"not an image").expect("write");
+        let garbage = garbage.to_string_lossy().into_owned();
+        let truncated = write_png(tmp.path(), "truncated.png", [200, 20, 20]);
+        let bytes = std::fs::read(&truncated).expect("read");
+        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).expect("truncate");
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        for (path, image_type, size, level, message) in [
+            (
+                &missing,
+                ImageType::Backdrop,
+                (0, 0),
+                "WARN",
+                "image not found",
+            ),
+            (
+                &garbage,
+                ImageType::Logo,
+                (0, 0),
+                "DEBUG",
+                "unable to determine image dimensions",
+            ),
+            (
+                &truncated,
+                ImageType::Primary,
+                (24, 36),
+                "WARN",
+                "cannot compute blurhash",
+            ),
+        ] {
+            let mut info = image_info(image_type, path, None);
+            fill_image_metadata(&processor, item, path, &mut info).await;
+            assert_eq!((info.width, info.height), size, "{path}");
+            assert!(
+                info.blur_hash.as_deref().is_none_or(str::is_empty),
+                "{path}"
+            );
+
+            let text = logs.text();
+            let line = text
+                .lines()
+                .find(|line| line.contains(message))
+                .unwrap_or_else(|| panic!("no {message:?} line: {text}"));
+            for expected in [
+                level.to_owned(),
+                format!("item_id={item}"),
+                format!("image_type={image_type:?}"),
+                format!("path={path}"),
+            ] {
+                assert!(line.contains(&expected), "{expected} missing: {line}");
+            }
         }
     }
 }

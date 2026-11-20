@@ -11,7 +11,7 @@
 //! `AuthenticationManager` over `dbContext.ApiKeys` (distinct from device-session
 //! tokens issued by the session manager).
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Json, Router};
@@ -20,7 +20,7 @@ use ferrofin_model::security::AuthenticationInfo;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{Query, RequiredRouteString, RouteParameter};
 use crate::state::AppState;
 
 /// Query parameters for `POST /Auth/Keys` — the app name for the new key.
@@ -74,6 +74,13 @@ async fn create_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `{key}`, the `[FromRoute, Required] string` of `RevokeKey`.
+struct Key;
+
+impl RouteParameter for Key {
+    const NAME: &'static str = "key";
+}
+
 /// `DELETE /Auth/Keys/{key}` — revoke an API key by its access token.
 ///
 /// Port of `ApiKeyController.RevokeKey`: deletes the key with the given token
@@ -88,7 +95,7 @@ async fn create_key(
 async fn revoke_key(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(key): Path<String>,
+    RequiredRouteString(key, _): RequiredRouteString<Key>,
 ) -> Result<StatusCode, ApiError> {
     state.api_keys.delete_api_key(&key).await?;
     Ok(StatusCode::NO_CONTENT)

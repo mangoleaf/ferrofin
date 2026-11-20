@@ -23,7 +23,8 @@ use crate::encoding_helper::hw::{BsfOption, FilterOption};
 
 /// The minimum recommended ffmpeg version (`4.4`).
 ///
-/// When changing this, also change `FFMPEG_MINIMUM_LIBRARY_VERSIONS`.
+/// When changing this, also change `FFMPEG_MINIMUM_LIBRARY_VERSIONS` and the
+/// last row of `FFMPEG_RELEASE_LIBAVUTIL_VERSIONS`.
 pub const MIN_VERSION: FfmpegVersion = FfmpegVersion::new(4, 4);
 
 /// The maximum recommended ffmpeg version (unbounded — C# `MaxVersion` is `null`).
@@ -69,6 +70,27 @@ static FFMPEG_MINIMUM_LIBRARY_VERSIONS: LazyLock<HashMap<&'static str, FfmpegVer
             ("libswresample", FfmpegVersion::new(3, 9)),
         ])
     });
+
+/// Each ffmpeg release from 4.4 on and the libavutil version it ships, newest
+/// first (`libavutil/version.h` at each release tag).
+///
+/// A Ferrofin addition: it reads a build whose banner names no release (a git
+/// build's `ffmpeg version N-…`) as the newest release its libavutil has
+/// reached, where upstream reads every such build as [`MIN_VERSION`] (gl-1796).
+/// shortcut: a build newer than the first row reads as that row's release;
+/// add each new release here.
+const FFMPEG_RELEASE_LIBAVUTIL_VERSIONS: [(FfmpegVersion, FfmpegVersion); 10] = [
+    (FfmpegVersion::new(9, 0), FfmpegVersion::new(61, 1)),
+    (FfmpegVersion::new(8, 1), FfmpegVersion::new(60, 26)),
+    (FfmpegVersion::new(8, 0), FfmpegVersion::new(60, 8)),
+    (FfmpegVersion::new(7, 1), FfmpegVersion::new(59, 39)),
+    (FfmpegVersion::new(7, 0), FfmpegVersion::new(59, 8)),
+    (FfmpegVersion::new(6, 1), FfmpegVersion::new(58, 29)),
+    (FfmpegVersion::new(6, 0), FfmpegVersion::new(58, 2)),
+    (FfmpegVersion::new(5, 1), FfmpegVersion::new(57, 28)),
+    (FfmpegVersion::new(5, 0), FfmpegVersion::new(57, 17)),
+    (FfmpegVersion::new(4, 4), FfmpegVersion::new(56, 70)),
+];
 
 /// The decoders Jellyfin enumerates. Port of C# `_requiredDecoders`.
 ///
@@ -343,8 +365,9 @@ impl EncoderValidator {
     /// For pre-built binaries the version is at the very start of the output and
     /// is parsed directly. Otherwise the library versions are matched against
     /// `FFMPEG_MINIMUM_LIBRARY_VERSIONS`; if every required library is present
-    /// and at least its minimum, [`MIN_VERSION`] is returned, else `None`.
-    /// Mirrors C# `GetFFmpegVersionInternal`.
+    /// and at least its minimum, the release its libavutil names is returned
+    /// (`FFMPEG_RELEASE_LIBAVUTIL_VERSIONS`), else `None`. Mirrors C#
+    /// `GetFFmpegVersionInternal`, which returns [`MIN_VERSION`] there instead.
     #[must_use]
     pub fn get_ffmpeg_version_internal(&self, output: &str) -> Option<FfmpegVersion> {
         // For pre-built binaries the FFmpeg version should be mentioned at the very start of the output
@@ -365,11 +388,16 @@ impl EncoderValidator {
             }
         }
 
-        if all_versions_validated {
-            Some(MIN_VERSION)
-        } else {
-            None
+        if !all_versions_validated {
+            return None;
         }
+        let libavutil = *version_map.get("libavutil")?;
+        Some(
+            FFMPEG_RELEASE_LIBAVUTIL_VERSIONS
+                .iter()
+                .find(|(_, shipped)| libavutil >= *shipped)
+                .map_or(MIN_VERSION, |(release, _)| *release),
+        )
     }
 
     /// Parses captured `ffmpeg -filters` output into the available filter names.
@@ -557,9 +585,10 @@ mod tests {
     #[case(d::FFMPEG_V44_OUTPUT, Some(FfmpegVersion::new(4, 4)))]
     #[case(d::FFMPEG_V432_OUTPUT, Some(FfmpegVersion::with_build(4, 3, 2)))]
     #[case(d::FFMPEG_GIT_UNKNOWN_OUTPUT2, Some(FfmpegVersion::new(4, 4)))]
+    // Upstream reads this one as 4.4 (gl-1796): its libavutil 60.26 is 8.1's.
     #[case(
         d::FFMPEG_GIT_WITHOUT_LIBPOSTPROC_OUTPUT,
-        Some(FfmpegVersion::new(4, 4))
+        Some(FfmpegVersion::new(8, 1))
     )]
     #[case(d::FFMPEG_GIT_UNKNOWN_OUTPUT, None)]
     fn get_ffmpeg_version_test(
@@ -569,6 +598,70 @@ mod tests {
         assert_eq!(
             version,
             validator().get_ffmpeg_version_internal(version_output)
+        );
+    }
+
+    /// A release's own libraries under a git build's banner read as that
+    /// release (gl-1796), so the version gates do not all take their oldest
+    /// branch: on 4.4 `-vsync`, which ffmpeg 9 no longer has.
+    #[rstest]
+    #[case(d::FFMPEG_V701_OUTPUT, FfmpegVersion::new(7, 0))]
+    #[case(d::FFMPEG_V611_OUTPUT, FfmpegVersion::new(6, 1))]
+    #[case(d::FFMPEG_V60_OUTPUT, FfmpegVersion::new(6, 0))]
+    #[case(d::FFMPEG_V512_OUTPUT, FfmpegVersion::new(5, 1))]
+    #[case(d::FFMPEG_V44_OUTPUT, FfmpegVersion::new(4, 4))]
+    fn a_git_build_reads_as_the_release_its_libraries_ship(
+        #[case] release_output: &str,
+        #[case] version: FfmpegVersion,
+    ) {
+        let (_, libraries) = release_output.split_once('\n').expect("a banner line");
+        let git_build = format!("ffmpeg version N-122128-gdeadbeef\n{libraries}");
+        assert_eq!(
+            Some(version),
+            validator().get_ffmpeg_version_internal(&git_build)
+        );
+    }
+
+    /// Between releases a git build reads as the newest one its libavutil has
+    /// reached, and past the table as the table's newest.
+    #[rstest]
+    #[case(62, 0, FfmpegVersion::new(9, 0))]
+    #[case(61, 1, FfmpegVersion::new(9, 0))]
+    #[case(60, 8, FfmpegVersion::new(8, 0))]
+    #[case(59, 39, FfmpegVersion::new(7, 1))]
+    #[case(59, 38, FfmpegVersion::new(7, 0))]
+    #[case(57, 17, FfmpegVersion::new(5, 0))]
+    #[case(57, 16, FfmpegVersion::new(4, 4))]
+    fn a_git_build_reads_as_the_newest_release_its_libavutil_reached(
+        #[case] major: i32,
+        #[case] minor: i32,
+        #[case] version: FfmpegVersion,
+    ) {
+        // 4.4's other libraries, which every case passes the minimums with.
+        let others: Vec<&str> = d::FFMPEG_V44_OUTPUT
+            .lines()
+            .filter(|line| line.starts_with("lib") && !line.starts_with("libavutil"))
+            .collect();
+        let git_build = format!(
+            "ffmpeg version N-122128-gdeadbeef\nlibavutil      {major}.{minor:>3}.100\n{}",
+            others.join("\n")
+        );
+        assert_eq!(
+            Some(version),
+            validator().get_ffmpeg_version_internal(&git_build)
+        );
+    }
+
+    /// `find` needs the table newest first, and its last row is the minimum.
+    #[test]
+    fn the_release_table_runs_newest_first_down_to_the_minimum() {
+        for pair in FFMPEG_RELEASE_LIBAVUTIL_VERSIONS.windows(2) {
+            assert!(pair[0].0 > pair[1].0 && pair[0].1 > pair[1].1, "{pair:?}");
+        }
+        let last = FFMPEG_RELEASE_LIBAVUTIL_VERSIONS.last().unwrap();
+        assert_eq!(
+            *last,
+            (MIN_VERSION, FFMPEG_MINIMUM_LIBRARY_VERSIONS["libavutil"])
         );
     }
 

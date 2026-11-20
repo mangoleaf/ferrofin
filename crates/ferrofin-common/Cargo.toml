@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Common infra for Ferrofin (port of MediaBrowser.Common): config, app-paths, crypto."
+description = "Common infra for Ferrofin (port of MediaBrowser.Common): config, crypto."
 
 [lints]
 workspace = true
@@ -17,6 +17,13 @@ pbkdf2.workspace = true
 rand.workspace = true
 sha2.workspace = true
 sha1.workspace = true
+# `config_import`: Jellyfin's XML configuration over a serialized default.
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
+# `config_import`'s tests read real configuration types.
+ferrofin-model.workspace = true

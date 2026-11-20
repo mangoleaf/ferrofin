@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate crates/ferrofin-api/src/query/{non_nullable,required}.json.
+"""Generate crates/ferrofin-api/src/query/{non_nullable,required,body}.json.
 
 For every upstream API action, list the query parameters that refuse an empty
 value: a NON-nullable value type (`bool enableTotalRecordCount = true`, `int
@@ -15,6 +15,22 @@ signatures are the source.
 non-nullable `string` without a default (MVC's implicit `[Required]` under
 nullable reference types). Absent, `CheckModel` answers "The X field is
 required." (400); an absent non-nullable value type binds its default.
+
+`body.json` names each action's `[FromBody]` parameter. When its body fails to
+bind, ASP.NET files a second entry beside the complaint, keyed by the C#
+parameter name: "The X field is required." for a required parameter
+(`[Required]`, or a non-nullable type, MVC's implicit `[Required]`), "A value
+for the 'X' parameter or property was not provided." for `[BindRequired]`
+(measured on Jellyfin 12.4). The value is `[name, message]`, or `[]` when
+ASP.NET files no entry: a nullable (`X?`) parameter, a non-nullable-looking one
+in a project without `<Nullable>enable</Nullable>` (not implicitly required),
+or any on a controller without `[ApiController]`, whose invalid model reaches
+the action instead of a 400.
+
+The body table also covers the plugins Ferrofin ports, read from each plugin's
+checkout beside the Jellyfin one at the revision ported (the
+`crates/ferrofin-extensions/build.rs` pins; OpenSubtitles is plugin v25). Only
+their body rows are written: the query tables are Jellyfin's alone.
 
 Routes come from each action's own attributes — the controller's `[Route]`
 plus every `[HttpGet|Head|Post|Put|Delete|Patch("…")]`, aliases (`Name = …`)
@@ -36,7 +52,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "crates/ferrofin-api/src/query/non_nullable.json"
 OUT_REQUIRED = ROOT / "crates/ferrofin-api/src/query/required.json"
-TAGS = ["v10.11.8", "v12.1"]  # later wins
+OUT_BODY = ROOT / "crates/ferrofin-api/src/query/body.json"
+TAGS = ["v10.11.8", "v12.1", "v12.4"]  # later wins
+BUILD_RS = (ROOT / "crates/ferrofin-extensions/build.rs").read_text()
+
+
+def pin(name):
+    return re.search(rf'{name}_REV: &str = "(\w+)"', BUILD_RS).group(1)
+
+
+# (checkout beside the Jellyfin one, revision, controllers, project file).
+PLUGINS = [
+    ("intro-skipper", pin("INTRO_SKIPPER"), "IntroSkipper/Controllers", "IntroSkipper/IntroSkipper.csproj"),
+    ("jellyfin-plugin-file-transformation", pin("FILE_TRANSFORMATION"),
+     "src/Jellyfin.Plugin.FileTransformation/Controller",
+     "src/Jellyfin.Plugin.FileTransformation/Jellyfin.Plugin.FileTransformation.csproj"),
+    ("jellyfin-plugin-ldapauth", pin("LDAP_AUTH"), "LDAP-Auth/Api", "LDAP-Auth/LDAP-Auth.csproj"),
+    ("jellyfin-plugin-opensubtitles", "v25", "Jellyfin.Plugin.OpenSubtitles/API",
+     "Jellyfin.Plugin.OpenSubtitles/Jellyfin.Plugin.OpenSubtitles.csproj"),
+]
 VALUE_TYPES = {
     "bool", "byte", "sbyte", "short", "ushort", "int", "uint", "long", "ulong",
     "float", "double", "decimal", "Guid", "DateTime", "DateTimeOffset", "TimeSpan",
@@ -105,6 +139,25 @@ def non_nullable(params, enums):
     return names, present
 
 
+def body_parameter(params, nullable, api_controller):
+    """`[name, message]` for the `[FromBody]` parameter, `[]` when ASP.NET
+    files no entry for it, `None` when the action binds no body."""
+    for param in split_params(params):
+        param = " ".join(param.split())
+        lead = re.match(r"\s*((?:\[[^\]]*\]\s*)*)", param).group(1)
+        if "FromBody" not in lead:
+            continue
+        ty, name = param[len(lead):].split("=")[0].split()[-2:]
+        if not api_controller:
+            return []
+        if re.search(r"\bBindRequired\b", lead):
+            return [name, f"A value for the '{name}' parameter or property was not provided."]
+        if re.search(r"\bRequired\b", lead) or (nullable and not ty.endswith("?")):
+            return [name, f"The {name} field is required."]
+        return []
+    return None
+
+
 def join_route(prefix, template):
     if template is None or template == "":
         path = prefix
@@ -115,20 +168,23 @@ def join_route(prefix, template):
     return "/" + path.strip("/")
 
 
-def actions(repo, tag, enums):
+def actions(repo, tag, enums, controllers="Jellyfin.Api/Controllers", nullable=True):
     """(METHOD, path) -> non-nullable query names, for every controller action."""
     table = {}
-    files = git(repo, "ls-tree", "-r", "--name-only", tag, "--", "Jellyfin.Api/Controllers").split()
+    files = git(repo, "ls-tree", "-r", "--name-only", tag, "--", controllers).split()
     for path in files:
         if not path.endswith(".cs"):
             continue
         text = git(repo, "show", f"{tag}:{path}")
         # A controller without its own `[Route]` inherits
-        # `BaseJellyfinApiController`'s `[Route("[controller]")]`.
-        class_match = re.search(r"public\s+(?:sealed\s+|abstract\s+)*class\s+(\w+?)(?:Controller)?\b", text)
+        # `BaseJellyfinApiController`'s `[Route("[controller]")]` and
+        # `[ApiController]`; a plugin's `ControllerBase` carries neither.
+        jellyfin = re.search(r":\s*BaseJellyfinApiController\b", text) is not None
+        api_controller = jellyfin or "[ApiController]" in text
+        class_match = re.search(r"public\s+(?:sealed\s+|abstract\s+|partial\s+)*class\s+(\w+?)(?:Controller)?\b", text)
         controller = class_match.group(1) if class_match else ""
-        prefix_match = re.search(r'\[Route\("([^"]*)"\)\]\s*(?:\[[^\]]*\]\s*)*public\s+(?:sealed\s+|abstract\s+)*class', text)
-        prefix = prefix_match.group(1) if prefix_match else "[controller]"
+        prefix_match = re.search(r'\[Route\("([^"]*)"\)\]\s*(?:\[[^\]]*\]\s*)*public\s+(?:sealed\s+|abstract\s+|partial\s+)*class', text)
+        prefix = prefix_match.group(1) if prefix_match else "[controller]" if jellyfin else ""
         prefix = prefix.replace("[controller]", controller).strip("/")
         for match in re.finditer(r"public\s+[^\n(;=]*?\s(\w+)\(", text):
             start = match.end()
@@ -153,7 +209,8 @@ def actions(repo, tag, enums):
             routes = [(m.group(1).upper(), join_route(prefix, m.group(2))) for m in HTTP.finditer(" ".join(attrs))]
             if not routes:
                 continue
-            names = non_nullable(text[start:i - 1], enums)
+            params = text[start:i - 1]
+            names = (*non_nullable(params, enums), body_parameter(params, nullable, api_controller))
             for route in routes:
                 table[route] = names
     return table
@@ -166,18 +223,34 @@ def main():
         merged.update(actions(repo, tag, enum_names(repo, tag)))
     table = {f"{m} {p}": sorted(set(n[0]), key=str.lower) for (m, p), n in merged.items() if n[0]}
     required = {f"{m} {p}": sorted(set(n[1]), key=str.lower) for (m, p), n in merged.items() if n[1]}
+    body = {f"{m} {p}": n[2] for (m, p), n in merged.items() if n[2] is not None}
     # The server matches routes by shape (parameters erased, literals
     # case-folded); two routes of one shape must agree.
     shapes = {}
     for (m, p), n in merged.items():
         shape = (m, "/".join("{}" if "{" in s else s.lower() for s in p.split("/")))
-        if shape in shapes and (sorted(shapes[shape][0]), sorted(shapes[shape][1])) != (sorted(n[0]), sorted(n[1])):
+        if shape in shapes and (sorted(shapes[shape][0]), sorted(shapes[shape][1]), shapes[shape][2]) != (sorted(n[0]), sorted(n[1]), n[2]):
             sys.exit(f"routes collide on shape {shape}: {shapes[shape]} vs {n}")
         shapes[shape] = n
+    for name, rev, controllers, project in PLUGINS:
+        plugin = str(Path(repo).parent / name)
+        git(plugin, "cat-file", "-e", f"{rev}:{project}")  # a wrong path must not read as "not nullable"
+        nullable = subprocess.run(
+            ["git", "-C", plugin, "grep", "-q", "<Nullable>enable</Nullable>", rev, "--", project,
+             "Directory.Build.props"]).returncode == 0
+        for (m, p), n in actions(plugin, rev, set(), controllers, nullable).items():
+            shape = (m, "/".join("{}" if "{" in s else s.lower() for s in p.split("/")))
+            if shape in shapes:
+                sys.exit(f"{name} route {m} {p} collides on shape {shape}")
+            shapes[shape] = n
+            if n[2] is not None:
+                body[f"{m} {p}"] = n[2]
     OUT.write_text(json.dumps(dict(sorted(table.items())), indent=1) + "\n")
     OUT_REQUIRED.write_text(json.dumps(dict(sorted(required.items())), indent=1) + "\n")
+    OUT_BODY.write_text(json.dumps(dict(sorted(body.items())), indent=1) + "\n")
     print(f"{len(table)} routes, {sum(map(len, table.values()))} parameters -> {OUT.relative_to(ROOT)}")
     print(f"{len(required)} routes, {sum(map(len, required.values()))} parameters -> {OUT_REQUIRED.relative_to(ROOT)}")
+    print(f"{len(body)} routes, {sum(map(bool, body.values()))} required -> {OUT_BODY.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

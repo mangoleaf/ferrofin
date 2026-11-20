@@ -550,6 +550,7 @@ impl FerrofinUserManager {
             LazyLock::new(|| {
                 ferrofin_networking::NetworkManager::live(
                     ferrofin_networking::NetworkConfiguration::default(),
+                    Arc::new(ferrofin_networking::TracingLogger),
                 )
             });
         match &self.network {
@@ -1098,6 +1099,15 @@ fn require_valid_username(name: &str) -> Result<(), ServiceError> {
     }
 }
 
+impl ferrofin_traits::security::AuthProviderRegistry for FerrofinUserManager {
+    fn set_extension_providers(&self, providers: Vec<Arc<dyn AuthenticationManager>>) {
+        FerrofinUserManager::set_extension_providers(self, providers);
+    }
+    fn set_extension_reset_providers(&self, providers: Vec<Arc<dyn PasswordResetManager>>) {
+        FerrofinUserManager::set_extension_reset_providers(self, providers);
+    }
+}
+
 #[async_trait]
 impl UserManager for FerrofinUserManager {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
@@ -1105,18 +1115,6 @@ impl UserManager for FerrofinUserManager {
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)
-    }
-
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        let ids: Vec<String> =
-            sqlx::query_scalar(r#"SELECT "Id" FROM "Users" ORDER BY "Username""#)
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        Ok(ids
-            .into_iter()
-            .filter_map(|id| Uuid::parse_str(&id).ok())
-            .collect())
     }
 
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -1840,8 +1838,7 @@ impl UserManager for FerrofinUserManager {
             .get_user_dto(user, None)
             .await?
             .configuration
-            .map(|c| c.latest_items_excludes)
-            .unwrap_or_default())
+            .map_or_default(|c| c.latest_items_excludes))
     }
 
     async fn update_configuration(

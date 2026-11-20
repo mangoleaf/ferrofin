@@ -169,13 +169,6 @@ impl LibraryManager for OneMovieLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("stub")
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("stub")
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -361,9 +354,6 @@ impl ferrofin_traits::library::UserManager for StubUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
         unimplemented!("stub")
     }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!("stub")
-    }
     async fn initialize(&self) -> Result<(), ServiceError> {
         unimplemented!("stub")
     }
@@ -444,7 +434,8 @@ impl ferrofin_traits::library::UserManager for StubUsers {
     }
 }
 
-/// Panic-on-call stub — only the methods a test exercises matter.
+/// Panic-on-call stub — only the methods a test exercises matter. A save
+/// succeeds and keeps nothing.
 pub struct StubUserData;
 
 #[async_trait::async_trait]
@@ -455,7 +446,7 @@ impl ferrofin_traits::library::UserDataManager for StubUserData {
         _item_id: Uuid,
         _user_data: &UpdateUserItemDataDto,
     ) -> Result<(), ServiceError> {
-        unimplemented!("stub")
+        Ok(())
     }
     async fn get_user_data_dto(
         &self,
@@ -845,6 +836,9 @@ impl ferrofin_traits::subtitles::SubtitleManager for StubSubtitles {
     async fn delete_subtitles(&self, _item_id: Uuid, _index: i32) -> Result<(), ServiceError> {
         unimplemented!("stub")
     }
+    async fn drop_missing_subtitle_rows(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
     async fn get_supported_providers(
         &self,
         _item_id: Uuid,
@@ -912,6 +906,14 @@ impl ferrofin_traits::collections::CollectionManager for StubCollections {
         &self,
         _create_if_needed: bool,
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        unimplemented!("stub")
+    }
+
+    async fn resolve_box_set_folders(
+        &self,
+        _location: &str,
+        _folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
         unimplemented!("stub")
     }
 }

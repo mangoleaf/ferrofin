@@ -59,16 +59,19 @@ use ferrofin_traits::library::{
     LibraryManager, SelfWrite, SelfWriteGuard, UserManager, VirtualFolderManager,
 };
 use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, LinkedChildrenService};
+use ferrofin_traits::persistence::{
+    ItemPersistenceService, ItemRepository, LinkedChildrenService, PlaylistMembers,
+};
 use ferrofin_traits::providers::{
-    MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
+    ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
 use ferrofin_traits::system::ServerApplicationPaths;
+use tracing::Instrument;
 
 use crate::collections_library::{CollectionsFolder, CollectionsLibrary};
 use crate::db_error::db_err;
 use crate::item_data;
-use crate::item_type_lookup::{kind_from_type_name, stored_type_name};
+use crate::item_type_lookup::kind_from_type_name;
 
 /// The manual [`LinkedChildType`](ferrofin_db::enums::LinkedChildType) discriminant
 /// (`0`) used to record a box-set/playlist member.
@@ -86,6 +89,71 @@ enum Rerate {
     /// change (`MetadataService.UpdateOfficialRating`, `:623-635`): a locked
     /// item keeps its rating, and a failure is logged, never the request's.
     Refresh,
+}
+
+/// Queues the scan `AddVirtualFolder(…, true)` ends with, for the new
+/// Collections library. A scan that cannot be queued does not fail the
+/// create: the next one reaches the library.
+async fn queue_collections_scan(library_manager: &dyn LibraryManager) {
+    if let Err(err) = library_manager.queue_library_scan().await {
+        tracing::warn!(%err, "could not queue a scan of the new collections library");
+    }
+}
+
+/// The new Collections library's scan, which the create that made the
+/// library owes whatever follows (upstream queues it in `AddVirtualFolder`'s
+/// `finally`). [`queue`](Self::queue) runs it; dropped unrun (the create
+/// failed or was cancelled, or the refresh before it panicked) it is queued
+/// in the background (gl-1622).
+struct ScanOwed(Option<Arc<dyn LibraryManager>>);
+
+impl ScanOwed {
+    /// Queues the scan now.
+    async fn queue(mut self) {
+        if let Some(manager) = self.0.take() {
+            queue_collections_scan(manager.as_ref()).await;
+        }
+    }
+}
+
+impl Drop for ScanOwed {
+    fn drop(&mut self) {
+        if let Some(manager) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            drop(runtime.spawn(in_background(
+                async move { queue_collections_scan(manager.as_ref()).await },
+                tracing::info_span!(parent: None, "collections_scan", trigger = "api"),
+            )));
+        }
+    }
+}
+
+/// `work`, as a background task outliving the request runs: under the
+/// request's culture (the refresh queue's worker captures it the same way)
+/// and in `span`, a root span tagged with its trigger (LOGGING.md, rule 4).
+fn in_background(
+    work: impl std::future::Future<Output = ()>,
+    span: tracing::Span,
+) -> impl std::future::Future<Output = ()> {
+    ferrofin_util::current_culture::scope(ferrofin_util::current_culture::capture(), work)
+        .instrument(span)
+}
+
+/// The first collection's box-set refresh (`refresh_full_item`, what the
+/// refresh queue's worker runs for a queued one), then `scan`, which queues
+/// the new library's scan: whatever the refresh's outcome, the scan follows
+/// it (gl-1622).
+async fn refresh_then_scan(
+    providers: Arc<dyn ProviderManager>,
+    id: Uuid,
+    options: MetadataRefreshOptions,
+    scan: impl std::future::Future<Output = ()>,
+) {
+    if let Err(err) = providers.refresh_full_item(id, &options).await {
+        tracing::warn!(item_id = %id, %err, "the first collection's refresh failed");
+    }
+    scan.await;
 }
 
 /// `_providerManager.QueueRefresh(id, options, RefreshPriority.High)`, which
@@ -213,7 +281,7 @@ fn folder_items_query(
     }
     if kind == BaseItemKind::Series {
         query.series_presentation_unique_key =
-            Some(crate::library_manager::episode_presentation_key(folder));
+            Some(ferrofin_db::entities::base_items::presentation_key(folder).to_owned());
         query.include_item_types = vec![BaseItemKind::Episode, BaseItemKind::Season];
         query.order_by = vec![(ItemSortBy::SortName, SortOrder::Ascending)];
         query.is_virtual_item = Some(false);
@@ -227,8 +295,9 @@ fn folder_items_query(
 /// Upstream's `GetUserById(Guid.Empty)` throw (`UserManager.cs:123-128`, a
 /// 400 through `ExceptionMiddleware`): `CreatePlaylist` and every
 /// `GetPlaylists`/`GetPlaylistForUser` lookup make it, so an API key that
-/// names no user gets neither an unowned playlist nor a look at one.
-fn require_user(user_id: Uuid) -> Result<(), ServiceError> {
+/// names no user gets neither an unowned playlist nor a look at one. SyncPlay's
+/// `JoinGroup`/`ListGroups`/`GetGroup` make it for an API key's session too.
+pub(crate) fn require_user(user_id: Uuid) -> Result<(), ServiceError> {
     if user_id.is_nil() {
         return Err(ServiceError::invalid_input("Guid can't be empty"));
     }
@@ -401,7 +470,7 @@ pub(crate) async fn new_playlist_folder_and_id(
 ///
 /// # Errors
 /// The I/O error that kept the folder from being made, or a failed lookup.
-async fn new_box_set_folder_and_id(
+pub(crate) async fn new_box_set_folder_and_id(
     db: &Database,
     mode: &crate::item_type_lookup::IdDerivation,
     collections: &str,
@@ -478,7 +547,9 @@ pub struct FerrofinCollectionManager {
     /// ([`update_rating_to_items`]). `None` in unit tests: the rating stays.
     visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
     /// Queues the box set's refresh after a membership change
-    /// ([`queue_refresh`]). `None` in unit tests: nothing is queued.
+    /// ([`queue_refresh`]); the first collection's runs at once, ahead of its
+    /// library's scan ([`refresh_then_scan`]). `None` in unit tests: nothing
+    /// is queued.
     providers: Option<Arc<dyn ProviderManager>>,
     /// Brackets the folder a new box set is made in, as `CollectionManager.CreateCollectionAsync` does
     /// (`ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
@@ -495,6 +566,12 @@ pub struct FerrofinCollectionManager {
     /// One provision at a time: two first creates at once would otherwise each
     /// add a library (`Collections`, `Collections2`).
     provisioning: Arc<tokio::sync::Mutex<()>>,
+    /// Held while a create claims a box set folder until its row is stored,
+    /// and while a scan stores the box sets of the folders it found
+    /// ([`CollectionManager::resolve_box_set_folders`]): the scan would
+    /// otherwise store a row for a folder a create just made, and the
+    /// create's own row would then fail.
+    box_set_folders: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -525,6 +602,7 @@ impl FerrofinCollectionManager {
             virtual_folders: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             provisioning: Arc::default(),
+            box_set_folders: Arc::default(),
         }
     }
 
@@ -578,14 +656,17 @@ impl FerrofinCollectionManager {
     /// the library it belongs to, making both when there is no folder, and
     /// adopting any orphan box sets a previous version left behind.
     ///
-    /// `AddVirtualFolder(…, true)` ends with a background library scan, which is
-    /// queued here; a scan that cannot be queued does not fail the create, the
-    /// next one reaches the library.
+    /// `AddVirtualFolder(…, true)` ends with a background library scan. The
+    /// third value holds that scan when this call made the folder (empty
+    /// otherwise), owed from the moment the folder exists: the caller queues
+    /// it at once or, for a first collection, after its box set's refresh,
+    /// and an error or cancel anywhere after still queues it.
     async fn ensure_collections_folder(
         &self,
-    ) -> Result<(CollectionsLibrary, Option<CollectionsFolder>), ServiceError> {
+    ) -> Result<(CollectionsLibrary, Option<CollectionsFolder>, ScanOwed), ServiceError> {
         let library = self.collections_library().await?;
         let mut folder = library.find().await?;
+        let mut owed = ScanOwed(None);
         if folder.is_none() {
             let _one_at_a_time = self.provisioning.lock().await;
             folder = library.find().await?;
@@ -596,9 +677,7 @@ impl FerrofinCollectionManager {
                         .await?;
                 }
                 folder = library.ensure_folder().await?;
-                if let Err(err) = self.library_manager.queue_library_scan().await {
-                    tracing::warn!(%err, "could not queue a scan of the new collections library");
-                }
+                owed = ScanOwed(Some(Arc::clone(&self.library_manager)));
             }
         }
         if let Some(folder) = &folder {
@@ -609,7 +688,35 @@ impl FerrofinCollectionManager {
             )
             .await?;
         }
-        Ok((library, folder))
+        Ok((library, folder, owed))
+    }
+
+    /// The new box set's refresh, `options`: queued, as upstream queues it.
+    /// The first collection also made the Collections library, whose scan
+    /// would otherwise give the box set its first refresh in Default mode,
+    /// which replaces the name the user typed with TMDb's (gl-1622). So its
+    /// own refresh runs first and the scan is queued after it, the order
+    /// upstream's slower background scan almost always ends up in: its
+    /// `FullRefresh` (with items) keeps the typed name, and the scan then
+    /// finds the box set refreshed.
+    async fn refresh_new_box_set(
+        &self,
+        id: Uuid,
+        options: MetadataRefreshOptions,
+        owed: ScanOwed,
+    ) -> Result<(), ServiceError> {
+        if owed.0.is_none() {
+            return queue_refresh(self.providers.as_deref(), id, options).await;
+        }
+        let Some(providers) = self.providers.clone() else {
+            owed.queue().await;
+            return Ok(());
+        };
+        drop(tokio::spawn(in_background(
+            refresh_then_scan(providers, id, options, owed.queue()),
+            tracing::info_span!(parent: None, "collection_refresh", item_id = %id, trigger = "api"),
+        )));
+        Ok(())
     }
 
     /// The name a new Collections library takes:
@@ -633,7 +740,8 @@ impl FerrofinCollectionManager {
     }
 
     /// Queues a box set's provider refresh after it is created or its members
-    /// change, as `CollectionManager` does. Called once by the composition
+    /// change, as `CollectionManager` does (the first collection's runs at
+    /// once, ahead of its library's scan). Called once by the composition
     /// root.
     #[must_use]
     pub fn with_providers(mut self, providers: Arc<dyn ProviderManager>) -> Self {
@@ -664,6 +772,21 @@ impl FerrofinCollectionManager {
             how,
         )
         .await
+    }
+
+    /// `collection.UpdateToRepositoryAsync(ItemUpdateType.MetadataEdit)`,
+    /// which every membership change makes: the metadata savers run (the box
+    /// set's `collection.xml` lists its members) and the save is announced.
+    /// Nothing without a provider manager (unit tests).
+    async fn save_membership(&self, collection_id: Uuid) -> Result<(), ServiceError> {
+        match self.providers.as_deref() {
+            Some(providers) => {
+                providers
+                    .update_to_repository(collection_id, ItemUpdateType::MetadataEdit)
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 
     /// `AddToCollectionAsync`'s check, made for every id before any is linked:
@@ -699,7 +822,10 @@ impl CollectionManager for FerrofinCollectionManager {
         &self,
         options: &CollectionCreationOptions,
     ) -> Result<BaseItemEntity, ServiceError> {
-        let (library, parent) = self.ensure_collections_folder().await?;
+        // `owed` holds the new library's scan when this create made it: an
+        // error below still queues it (the guard's drop), and the refresh
+        // takes it over.
+        let (library, parent, owed) = self.ensure_collections_folder().await?;
         let (mode, _) = container_identity(&self.db, &self.paths).await?;
         // `Path.Combine(parentFolder.Path, folderName)`: `{data}/collections`,
         // or the library location above it that `FindFolders` found.
@@ -720,6 +846,7 @@ impl CollectionManager for FerrofinCollectionManager {
             _ => Vec::new(),
         };
         let parent = parent.map(|folder| folder.id);
+        let claim = self.box_set_folders.lock().await;
         let (path, id) =
             new_box_set_folder_and_id(&self.db, &mode, &collections, &options.name).await?;
         // `ReportFileSystemChangeBeginning(path)` around the whole create.
@@ -758,6 +885,7 @@ impl CollectionManager for FerrofinCollectionManager {
             }
             return Err(err);
         }
+        drop(claim);
         let row = self
             .library_manager
             .get_item_by_id(id)
@@ -772,25 +900,22 @@ impl CollectionManager for FerrofinCollectionManager {
         }
         if options.item_id_list.is_empty() {
             // `CreateCollectionAsync` with no items: a default refresh.
-            queue_refresh(
-                self.providers.as_deref(),
-                id,
-                MetadataRefreshOptions::default(),
-            )
-            .await?;
+            self.refresh_new_box_set(id, MetadataRefreshOptions::default(), owed)
+                .await?;
             return Ok(row);
         }
         self.update_rating_to_items(id, Rerate::Direct).await?;
+        self.save_membership(id).await?;
         // `AddToCollectionAsync` with the `FullRefresh` options create passes
         // ("the initial adding of items is going to create a local metadata
         // file"), which it then marks `ForceSave`.
-        queue_refresh(
-            self.providers.as_deref(),
+        self.refresh_new_box_set(
             id,
             MetadataRefreshOptions {
                 metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
                 ..force_save_refresh()
             },
+            owed,
         )
         .await?;
         Ok(self
@@ -816,11 +941,12 @@ impl CollectionManager for FerrofinCollectionManager {
                 .upsert_linked_child(collection_id, *item_id, LINKED_CHILD_MANUAL)
                 .await?;
         }
-        // `AddToCollectionAsync` re-rates and queues its refresh only when an
-        // item was new.
+        // `AddToCollectionAsync` re-rates, saves and queues its refresh only
+        // when an item was new.
         if item_ids.iter().any(|id| !current.contains(id)) {
             self.update_rating_to_items(collection_id, Rerate::Direct)
                 .await?;
+            self.save_membership(collection_id).await?;
             queue_refresh(
                 self.providers.as_deref(),
                 collection_id,
@@ -850,7 +976,9 @@ impl CollectionManager for FerrofinCollectionManager {
         }
         self.update_rating_to_items(collection_id, Rerate::Refresh)
             .await?;
-        // `RemoveFromCollectionAsync` queues its refresh whatever it removed.
+        // `RemoveFromCollectionAsync` saves and queues its refresh whatever it
+        // removed.
+        self.save_membership(collection_id).await?;
         queue_refresh(
             self.providers.as_deref(),
             collection_id,
@@ -977,7 +1105,9 @@ impl CollectionManager for FerrofinCollectionManager {
         // :88-118): the folder by its path, and the library and folder made
         // only when the caller asked for them.
         let folder = if create_if_needed {
-            self.ensure_collections_folder().await?.1
+            let (_, folder, owed) = self.ensure_collections_folder().await?;
+            owed.queue().await;
+            folder
         } else {
             self.collections_library().await?.find().await?
         };
@@ -985,6 +1115,109 @@ impl CollectionManager for FerrofinCollectionManager {
             return Ok(None);
         };
         crate::item_persistence_service::container_row(&self.db, folder.id).await
+    }
+
+    async fn resolve_box_set_folders(
+        &self,
+        location: &str,
+        folders: &[String],
+    ) -> Result<Option<Vec<Uuid>>, ServiceError> {
+        // The folder box sets are made in, found as `create_collection`
+        // finds it but never provisioned: a scan resolves only that one,
+        // under the `Folder` `AddChild` gives a new box set as its parent.
+        let library = self.collections_library().await?;
+        let Some(folder) = library.find().await? else {
+            return Ok(None);
+        };
+        if folder.legacy
+            || !ferrofin_model::content_type_overrides::paths_equal(
+                &folder.path,
+                &self.virtual_paths.expand(location),
+            )
+        {
+            return Ok(None);
+        }
+        let (mode, _) = container_identity(&self.db, &self.paths).await?;
+        let owner = match &self.virtual_folders {
+            Some(virtual_folders) => library.library_at(virtual_folders.as_ref()).await?,
+            None => None,
+        };
+        let ancestors = library.ancestors(&folder, owner.as_ref());
+        let _claim = self.box_set_folders.lock().await;
+        let mut added = Vec::new();
+        for path in folders {
+            let Some(name) = crate::library_scan::box_set_name(path) else {
+                continue;
+            };
+            // Stored as `AddChild`'s save stores it (`ReverseVirtualPath`).
+            let stored = self.virtual_paths.reverse(path);
+            let Some(id) =
+                crate::item_type_lookup::derive_item_id_with(&mode, BaseItemKind::BoxSet, path)
+            else {
+                continue;
+            };
+            let held = async {
+                let at_path = crate::library_structure_repository::folder_at(
+                    &self.db,
+                    BaseItemKind::BoxSet,
+                    path,
+                    &stored,
+                )
+                .await?;
+                Ok::<_, ServiceError>(
+                    at_path.is_some()
+                        || crate::item_persistence_service::row_exists(&self.db, id).await?,
+                )
+            }
+            .await;
+            match held {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(err) => {
+                    tracing::warn!(%err, path = %path, "could not look for the box set of a folder");
+                    continue;
+                }
+            }
+            // `BoxSetResolver.SetProviderIdFromPath`: the `tmdbid` its name carries.
+            let provider_ids = crate::resolvers::path_provider_ids(&BaseItemEntity {
+                type_: crate::item_type_lookup::stored_type_name(BaseItemKind::BoxSet)
+                    .unwrap_or_default()
+                    .to_owned(),
+                path: Some(path.clone()),
+                ..BaseItemEntity::default()
+            });
+            let written = async {
+                let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+                crate::item_persistence_service::insert_named_item_in(
+                    &mut tx,
+                    id,
+                    BaseItemKind::BoxSet,
+                    &name,
+                    true,
+                    Some(folder.id),
+                    false,
+                )
+                .await?;
+                crate::item_persistence_service::set_item_path_in(&mut tx, id, &stored)
+                    .await
+                    .map_err(db_err)?;
+                crate::library_structure_repository::add_ancestors_in(&mut tx, id, &ancestors)
+                    .await?;
+                crate::item_persistence_service::set_provider_ids_in(&mut tx, id, &provider_ids)
+                    .await?;
+                tx.commit().await.map_err(db_err)
+            }
+            .await;
+            // One folder that cannot be stored does not keep the others, or
+            // the ones already stored, from the scan.
+            match written {
+                Ok(()) => added.push(id),
+                Err(err) => {
+                    tracing::warn!(%err, path = %path, "could not store the box set of a folder");
+                }
+            }
+        }
+        Ok(Some(added))
     }
 }
 
@@ -1011,7 +1244,9 @@ pub struct FerrofinPlaylistManager {
     /// do not take it (`update_playlist` writes its shares under the guard):
     /// the re-rate after an edit saves only its rating columns, never
     /// `Data`, and every `Data` sync reads and writes in one writer
-    /// transaction, so neither can put an older `Shares` back.
+    /// transaction, so neither can put an older `Shares` back. The scan's
+    /// playlist sync, item deletion, a re-key and a linked-children reroute
+    /// take it too ([`Self::with_entry_edits`]).
     // ponytail: one lock for every playlist; key it by playlist if edits ever contend.
     entry_edits: Arc<tokio::sync::Mutex<()>>,
     /// Queues the playlist's refresh after its entries change
@@ -1068,6 +1303,18 @@ impl FerrofinPlaylistManager {
         virtual_paths: crate::virtual_paths::VirtualPathExpander,
     ) -> Self {
         self.virtual_paths = virtual_paths;
+        self
+    }
+
+    /// Shares the entry-edit lock with the persistence service's playlist
+    /// sync, deletion and re-key and the linked-children service's reroute
+    /// (`FerrofinItemPersistenceService::playlist_entry_edits`), so none of
+    /// them writes a playlist's entries between an edit's read and its
+    /// rewrite.
+    /// Called once by the composition root.
+    #[must_use]
+    pub fn with_entry_edits(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.entry_edits = lock;
         self
     }
 
@@ -1247,8 +1494,9 @@ impl FerrofinPlaylistManager {
     /// `CreatePlaylist`'s media type when the request names none
     /// (`PlaylistManager.cs:90-127`): the first requested item that answers
     /// decides — its own media type, `Audio` for an artist, album or music
-    /// genre, `Video` for a genre, a folder's first playable member's — and
-    /// `Audio` when none does. An id naming no item before that is upstream's
+    /// genre, `Video` for a genre, a folder's first playable member's in tree
+    /// order ([`Self::first_member_media_type`]) — and `Audio` when none
+    /// does. An id naming no item before that is upstream's
     /// `ArgumentException`, thrown before anything is created.
     async fn infer_media_type(&self, ids: &[Uuid]) -> Result<MediaType, ServiceError> {
         for id in ids {
@@ -1269,24 +1517,24 @@ impl FerrofinPlaylistManager {
                         | BaseItemKind::MusicGenre,
                     ) => MediaType::Audio,
                     Some(BaseItemKind::Genre) => MediaType::Video,
-                    // `GetRecursiveChildren(i => !i.IsFolder &&
-                    // i.SupportsAddingToPlaylist)`, with no user, missing
-                    // episodes included. Those members are all audio or
-                    // video, so the folder query finds them; it reads them in
-                    // name order where upstream walks the tree, which only
-                    // differs for a folder holding both.
                     Some(kind) if crate::kinds::is_folder(kind) => {
-                        let mut query = folder_items_query(*id, kind, &item, None);
-                        query.is_virtual_item = None;
-                        query.limit = Some(1);
-                        self.library_manager
-                            .query_items(&query)
-                            .await?
-                            .items
-                            .first()
-                            .map_or(MediaType::Unknown, |member| {
-                                crate::dto_service::parse_media_type(member.media_type.as_deref())
-                            })
+                        // Boxed: the walk's state would push the boot repair's
+                        // future (`saved_container_plan`) past clippy's size limit.
+                        match Box::pin(self.first_member_media_type(*id, kind)).await? {
+                            // A folder whose walk finds nothing playable still
+                            // answers, as before the walk: a box set of series
+                            // or video folders (upstream never looks inside a
+                            // linked folder), a season whose episodes are
+                            // stored under the series (its `Children` are
+                            // empty). Upstream moves on to the next id, and
+                            // types the playlist `Audio` when none answers,
+                            // whatever its entries. Jellyfin bug not ported.
+                            MediaType::Unknown => {
+                                self.first_listed_member_media_type(*id, kind, &item)
+                                    .await?
+                            }
+                            known => known,
+                        }
                     }
                     _ => MediaType::Unknown,
                 },
@@ -1297,6 +1545,107 @@ impl FerrofinPlaylistManager {
             }
         }
         Ok(MediaType::Audio)
+    }
+
+    /// A folder's media type for [`Self::infer_media_type`]: upstream's
+    /// `folder.GetRecursiveChildren(i => !i.IsFolder &&
+    /// i.SupportsAddingToPlaylist).Select(i => i.MediaType).FirstOrDefault(i =>
+    /// i != MediaType.Unknown)` (`PlaylistManager.cs:109-114`), with no user
+    /// and missing episodes included. `AddChildrenToList` (`Folder.cs:1654-1683`)
+    /// walks each level's `Children` (the physical children, in sort-name
+    /// order), descending into each subfolder where it is met, then the
+    /// folder's own linked children in their stored order, which it never
+    /// descends into. The first playable member with a media type decides;
+    /// `Unknown` when none does.
+    async fn first_member_media_type(
+        &self,
+        folder: Uuid,
+        kind: BaseItemKind,
+    ) -> Result<MediaType, ServiceError> {
+        let media_type = |row: &BaseItemEntity| {
+            let playable = !row.is_folder
+                && kind_from_type_name(&row.type_)
+                    .is_some_and(crate::kinds::supports_adding_to_playlist);
+            if playable {
+                crate::dto_service::parse_media_type(row.media_type.as_deref())
+            } else {
+                MediaType::Unknown
+            }
+        };
+        let children = |id: Uuid, kind: Option<BaseItemKind>| {
+            let query = InternalItemsQuery {
+                parent_id: id,
+                parent_type: kind,
+                group_by_presentation_unique_key: false,
+                ..InternalItemsQuery::default()
+            };
+            async move {
+                // No user: `Children` alone, without the linked ones.
+                let rows = self.items.get_folder_children(&query).await?;
+                Ok::<_, ServiceError>(rows.into_iter().map(|child| child.item))
+            }
+        };
+        // A `ParentId` cycle in a damaged database ends the walk, not the server.
+        let mut visited = std::collections::HashSet::from([folder]);
+        let mut levels = vec![children(folder, Some(kind)).await?];
+        while let Some(level) = levels.last_mut() {
+            let Some(child) = level.next() else {
+                levels.pop();
+                continue;
+            };
+            let found = media_type(&child);
+            if found != MediaType::Unknown {
+                return Ok(found);
+            }
+            if child.is_folder
+                && let Ok(id) = Uuid::parse_str(&child.id)
+                && visited.insert(id)
+            {
+                levels.push(children(id, kind_from_type_name(&child.type_)).await?);
+            }
+        }
+        let linked: Vec<Uuid> = read_entries(self.db.pool(), &guid_to_db(folder))
+            .await?
+            .iter()
+            .filter_map(|(child, _)| Uuid::parse_str(child).ok())
+            .collect();
+        let rows: std::collections::HashMap<Uuid, BaseItemEntity> = self
+            .items
+            .retrieve_items(&linked)
+            .await?
+            .into_iter()
+            .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+            .collect();
+        Ok(linked
+            .iter()
+            .filter_map(|id| rows.get(id))
+            .map(media_type)
+            .find(|found| *found != MediaType::Unknown)
+            .unwrap_or(MediaType::Unknown))
+    }
+
+    /// The media type of the first member of `folder`'s flat recursive member
+    /// listing ([`folder_items_query`], read without a user, missing episodes
+    /// included): what a create inferred from a folder before
+    /// [`Self::first_member_media_type`], kept where the walk finds nothing.
+    async fn first_listed_member_media_type(
+        &self,
+        id: Uuid,
+        kind: BaseItemKind,
+        folder: &BaseItemEntity,
+    ) -> Result<MediaType, ServiceError> {
+        let mut query = folder_items_query(id, kind, folder, None);
+        query.is_virtual_item = None;
+        query.limit = Some(1);
+        Ok(self
+            .library_manager
+            .query_items(&query)
+            .await?
+            .items
+            .first()
+            .map_or(MediaType::Unknown, |member| {
+                crate::dto_service::parse_media_type(member.media_type.as_deref())
+            }))
     }
 
     /// The rest of `Playlist.IsVisible` after [`decide_access`]'s owner/share
@@ -1429,17 +1778,6 @@ impl PlaylistManager for FerrofinPlaylistManager {
         self.access(playlist_id, user_id).await
     }
 
-    async fn get_playlist_for_user(
-        &self,
-        playlist_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<BaseItemEntity, ServiceError> {
-        // Visibility gate first: invisible reads as missing (the C#
-        // `GetPlaylistForUser` returns null for both).
-        self.access(playlist_id, user_id).await?;
-        self.require_playlist(playlist_id).await
-    }
-
     async fn create_playlist(
         &self,
         request: &PlaylistCreationRequest,
@@ -1494,6 +1832,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
             crate::item_persistence_service::set_item_path_in(&mut tx, id, &stored)
                 .await
                 .map_err(db_err)?;
+            // `AddChild`'s save writes `GetAncestorIds()`: the Playlists folder
+            // and the root (`ItemPersistenceService.cs:321-323`).
+            crate::library_structure_repository::add_parent_chain_in(&mut tx, id, parent).await?;
             // The ownership meta row (C# `OwnerUserId`/`OpenAccess`).
             sqlx::query(
                 r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
@@ -1524,8 +1865,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 (!entries.is_empty()).then(chrono::Utc::now),
             )
             .await?;
-            // Write the owner, open access and shares into BaseItems.Data, which
-            // 12.0 still serialises and each boot re-imports.
+            // Write the owner, open access and shares through to BaseItems.Data,
+            // which 12.0 still serialises (the item_data module doc says why).
             item_data::sync_container_data_in(&mut tx, id).await?;
             // `Playlist.PlaylistMediaType`, which Jellyfin reads back from `Data`.
             item_data::set_data_key_in(&mut tx, id, "PlaylistMediaType", media_type).await?;
@@ -1588,8 +1929,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // C# `UpdatePlaylist` saves the name, shares and open access together
         // (the last `UpdatePlaylistInternal`). Every change here commits with
         // the `Data` sync in one writer transaction, so a failed update
-        // applies none of them: a share or open-access change committed
-        // without its sync would be undone by the next boot's re-import. A
+        // applies none of them: a share or open-access change never commits
+        // without its sync, so `Data` stays an exact copy of the tables. A
         // playlist no boot has imported yet is imported first, so its
         // open-access and share changes land on its own rows.
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
@@ -1656,53 +1997,17 @@ impl PlaylistManager for FerrofinPlaylistManager {
         Ok(())
     }
 
-    async fn get_playlists(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        require_user(user_id)?;
-        let type_name = stored_type_name(BaseItemKind::Playlist)
-            .ok_or_else(|| ServiceError::backend("no stored type name for Playlist"))?;
-        // Visibility predicate (C# `Playlist.IsVisible`): legacy/unowned rows,
-        // open-access, owned by the caller, or shared with the caller.
-        let rows = sqlx::query_as::<_, BaseItemEntity>(
-            r#"SELECT bi.* FROM "BaseItems" bi
-               LEFT JOIN "FerrofinPlaylists" p ON p."PlaylistId" = bi."Id"
-               WHERE bi."Type" = ?1 AND (
-                   p."PlaylistId" IS NULL
-                   OR p."OwnerUserId" IS NULL
-                   OR p."OpenAccess" = 1
-                   OR p."OwnerUserId" = ?2
-                   OR EXISTS (SELECT 1 FROM "FerrofinPlaylistShares" s
-                              WHERE s."PlaylistId" = bi."Id" AND s."UserId" = ?2))
-               ORDER BY bi."Name""#,
-        )
-        .bind(type_name)
-        .bind(guid_to_db(user_id))
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        let Some((visibility, user)) = self.visibility_user(user_id).await? else {
-            return Ok(rows);
-        };
-        // `GetPlaylists(userId)`: `.Where(p => p.IsVisible(user))`, whose
-        // parental and file-playlist halves SQL cannot answer.
-        let allowed = visibility.playlist_policy(&rows, &user).await?;
-        Ok(rows
-            .into_iter()
-            .zip(allowed)
-            .filter_map(|(row, allowed)| allowed.then_some(row))
-            .collect())
-    }
-
     async fn get_playlist_items(
         &self,
         playlist_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    ) -> Result<PlaylistMembers, ServiceError> {
         require_user(user_id)?;
-        // One round-trip through the repository seam: the member rows already
-        // in link order (the same ordering `get_linked_children_ids` applies),
-        // each carrying the caller's access columns, so the visibility gate
-        // costs no extra query. The C# `Forbid()` branch is unreachable here
-        // because visible ⇔ permitted-to-read.
+        // One round-trip through the repository seam: each distinct member
+        // row once, the entries in link order (the same ordering
+        // `get_linked_children_ids` applies), and the caller's access columns,
+        // so the visibility gate costs no extra query. The C# `Forbid()`
+        // branch is unreachable here because visible ⇔ permitted-to-read.
         let page = self
             .items
             .get_playlist_items_with_access(playlist_id, user_id, LINKED_CHILD_MANUAL)
@@ -1712,7 +2017,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
             // "missing/invisible playlist", so resolve access on its own. Only
             // empty playlists pay for this second query.
             self.access(playlist_id, user_id).await?;
-            return Ok(Vec::new());
+            return Ok(PlaylistMembers::default());
         };
         // Every row repeats the same access columns; the first decides.
         if decide_access(
@@ -1729,7 +2034,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // them all as `ItemIds`, and the items endpoint drops the ones the
         // caller may not see itself, as `PlaylistsController` does.
         self.require_visible(playlist_id, user_id).await?;
-        Ok(page.items)
+        Ok(page.members)
     }
 
     async fn get_playlist_item_ids(&self, playlist_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
@@ -1748,8 +2053,11 @@ impl PlaylistManager for FerrofinPlaylistManager {
         &self,
         request: &PlaylistUserUpdateRequest,
     ) -> Result<(), ServiceError> {
-        // The share row, committed with its `Data` sync: each boot rebuilds
-        // the shares from `Data`.
+        // `GetPlaylistForUser(request.Id, userId)` looks the target user up
+        // first, and `GetUserById(Guid.Empty)` throws.
+        require_user(request.user_id)?;
+        // The share row, committed with its `Data` sync, so `Data` stays an
+        // exact copy of the tables.
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         item_data::import_playlist_meta_if_missing_in(&mut tx, request.id).await?;
         item_data::share_playlist_in(
@@ -1910,14 +2218,16 @@ impl PlaylistManager for FerrofinPlaylistManager {
         let pid = guid_to_db(playlist);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
 
-        // `entry_id` arrives dashless (`Guid('N')`); `ChildId` is stored in the
-        // canonical dashed uppercase form. Normalise before locating the entry
-        // position (see `remove_item_from_playlist`). With duplicates legal,
-        // the FIRST occurrence moves (C# `MoveItemAsync`: `FirstOrDefault`).
-        let Ok(child_id) = Uuid::parse_str(entry_id) else {
-            return Ok(()); // not a GUID — nothing to move
+        // C# `MoveItemAsync` compares `entry_id` as a string with each entry's
+        // `ItemId.ToString("N")`, ignoring case, so only the 32-digit spelling
+        // names an entry: a hyphenated, braced or urn id moves nothing.
+        // `ChildId` is stored in the canonical dashed uppercase form, so the
+        // id is normalised to it before locating the entry. With duplicates
+        // legal, the FIRST occurrence moves (`FirstOrDefault`).
+        let Ok(child_id) = entry_id.parse::<uuid::fmt::Simple>() else {
+            return Ok(()); // no entry has that id — nothing to move
         };
-        let needle = guid_to_db(child_id);
+        let needle = guid_to_db(child_id.into_uuid());
         let Some(pos) = entries.iter().position(|(c, _)| *c == needle) else {
             return Ok(()); // entry not in the playlist — nothing to move
         };
@@ -1963,9 +2273,17 @@ impl PlaylistManager for FerrofinPlaylistManager {
         let mut first_error = None;
         for playlist in item_data::playlists_owned_by(&self.db, user_id).await? {
             let outcome = async {
-                // A hand-over commits with its `Data` sync, as every boot
-                // re-imports the owner and the shares from `Data`.
-                let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+                // A hand-over commits with its `Data` sync, so `Data` stays an
+                // exact copy of the owner and the shares. It reads before it
+                // writes, so it takes the lock first: the boot repair of
+                // orphaned playlists runs it while the previous version can
+                // still be writing.
+                let mut tx = self
+                    .db
+                    .writer()
+                    .begin_with("BEGIN IMMEDIATE")
+                    .await
+                    .map_err(db_err)?;
                 item_data::import_playlist_meta_if_missing_in(&mut tx, playlist).await?;
                 let Some(permissions) =
                     item_data::playlist_permissions_in(&mut tx, playlist).await?
@@ -2023,13 +2341,15 @@ mod playlist_announcements_tests;
 #[cfg(test)]
 mod remove_playlists_tests;
 
+mod saved_containers;
+
 /// One playlist entry: `(ChildId, ChildType)` as stored.
 type Entry = (String, i64);
 
 /// A playlist's entries in stored order. Entries are positions, not a set:
 /// the same item may appear more than once (12.0's `(ParentId, SortOrder)` key).
-async fn read_entries(
-    pool: &sqlx::SqlitePool,
+async fn read_entries<'e>(
+    executor: impl sqlx::SqliteExecutor<'e>,
     playlist_id: &str,
 ) -> Result<Vec<Entry>, ServiceError> {
     sqlx::query_as(
@@ -2037,7 +2357,7 @@ async fn read_entries(
            WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
     )
     .bind(playlist_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
     .map_err(db_err)
 }
@@ -3323,11 +3643,10 @@ mod tests {
             .expect("create");
         let playlist_id = Uuid::parse_str(&created.id).expect("uuid");
 
-        let row = mgr
-            .get_playlist_for_user(playlist_id, owner)
+        mgr.get_playlist_access(playlist_id, owner)
             .await
-            .expect("get");
-        assert_eq!(row.name.as_deref(), Some("Roadtrip"));
+            .expect("the owner sees it");
+        assert_eq!(name_of(&db, playlist_id).await, "Roadtrip");
 
         mgr.update_playlist(&PlaylistUpdateRequest {
             id: playlist_id,
@@ -3336,20 +3655,15 @@ mod tests {
         })
         .await
         .expect("update");
-        let row = mgr
-            .get_playlist_for_user(playlist_id, owner)
-            .await
-            .expect("get2");
-        assert_eq!(row.name.as_deref(), Some("Roadtrip 2"));
-
-        let all = mgr.get_playlists(owner).await.expect("list");
-        assert_eq!(all.len(), 1);
+        assert_eq!(name_of(&db, playlist_id).await, "Roadtrip 2");
 
         // Removing the sole member leaves the playlist row intact.
         mgr.remove_item_from_playlist(&created.id, &[track.to_string()])
             .await
             .expect("remove");
-        assert_eq!(mgr.get_playlists(owner).await.expect("list2").len(), 1);
+        mgr.get_playlist_access(playlist_id, owner)
+            .await
+            .expect("still there");
     }
 
     #[tokio::test]
@@ -3377,7 +3691,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items");
+            .expect("items")
+            .into_entry_rows();
         assert_eq!(items.len(), 2);
         let ids: Vec<Uuid> = items
             .iter()
@@ -3416,6 +3731,7 @@ mod tests {
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -3424,6 +3740,20 @@ mod tests {
             mgr.get_playlist_item_ids(playlist_id).await.expect("ids"),
             ids
         );
+
+        // The repeated member's row is read once (gl-1523).
+        let page = item_repository_over(db.clone())
+            .get_playlist_items_with_access(playlist_id, owner, super::LINKED_CHILD_MANUAL)
+            .await
+            .expect("read");
+        let rows: Vec<Uuid> = page
+            .members
+            .items
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        assert_eq!(rows, vec![c, a, b]);
+        assert_eq!(page.members.entries, vec![0, 1, 2, 1]);
     }
 
     #[tokio::test]
@@ -3453,7 +3783,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items");
+            .expect("items")
+            .into_entry_rows();
         assert_eq!(items.len(), 1);
         let dashless = Uuid::parse_str(&items[0].id)
             .expect("uuid")
@@ -3467,7 +3798,8 @@ mod tests {
         let after = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items after");
+            .expect("items after")
+            .into_entry_rows();
         assert!(
             after.is_empty(),
             "removing by dashless PlaylistItemId should empty the playlist"
@@ -3502,6 +3834,7 @@ mod tests {
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -3521,6 +3854,7 @@ mod tests {
             &mgr.get_playlist_items(playlist_id, owner)
                 .await
                 .expect("items2")
+                .into_entry_rows()
                 .last()
                 .expect("non-empty")
                 .id,
@@ -3560,6 +3894,7 @@ mod tests {
             mgr.get_playlist_items(playlist_id, owner)
                 .await
                 .expect("items")
+                .into_entry_rows()
                 .iter()
                 .filter_map(|i| Uuid::parse_str(&i.id).ok())
                 .collect::<Vec<Uuid>>()
@@ -3616,6 +3951,7 @@ mod tests {
                 mgr.get_playlist_items(playlist_id, user)
                     .await
                     .expect("items")
+                    .into_entry_rows()
                     .iter()
                     .filter_map(|i| Uuid::parse_str(&i.id).ok())
                     .collect::<Vec<Uuid>>()
@@ -3624,7 +3960,7 @@ mod tests {
         assert_eq!(read(owner).await, vec![c, b, a], "link order, not id order");
 
         // Move the middle entry to the end: [C, A, B].
-        mgr.move_item(&created.id, &b.to_string(), 2, owner)
+        mgr.move_item(&created.id, &b.simple().to_string(), 2, owner)
             .await
             .expect("move");
         assert_eq!(
@@ -3659,7 +3995,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(playlist_id, owner)
             .await
-            .expect("items");
+            .expect("items")
+            .into_entry_rows();
         assert_eq!(items.len(), 1);
         assert_eq!(
             items[0].id,
@@ -3700,6 +4037,7 @@ mod tests {
             mgr.get_playlist_items(playlist_id, alice)
                 .await
                 .expect("owner reads")
+                .into_entry_rows()
                 .len(),
             1
         );
@@ -3746,6 +4084,7 @@ mod tests {
             .get_playlist_items(shared, bob)
             .await
             .expect("share grants read")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -3769,6 +4108,7 @@ mod tests {
             mgr.get_playlist_items(public, Uuid::new_v4())
                 .await
                 .expect("open access grants read")
+                .entries
                 .len(),
             1
         );
@@ -3797,7 +4137,8 @@ mod tests {
         let playlist_items = mgr
             .get_playlist_items(playlist_id, alice)
             .await
-            .expect("owner reads an empty playlist");
+            .expect("owner reads an empty playlist")
+            .into_entry_rows();
         assert!(playlist_items.is_empty(), "{playlist_items:?}");
         let ids = mgr.get_playlist_item_ids(playlist_id).await.expect("ids");
         assert!(ids.is_empty(), "{ids:?}");
@@ -3825,7 +4166,8 @@ mod tests {
         let items = mgr
             .get_playlist_items(legacy, Uuid::new_v4())
             .await
-            .expect("legacy playlists stay readable");
+            .expect("legacy playlists stay readable")
+            .into_entry_rows();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, ferrofin_db::store::guid_to_db(track));
     }
@@ -3866,6 +4208,7 @@ mod tests {
             .get_playlist_items(playlist_id, owner)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect();
@@ -3895,7 +4238,7 @@ mod tests {
         let db = test_db().await;
         let (mgr, _root) = playlist_manager(&db).await;
         let err = mgr
-            .get_playlist_for_user(Uuid::new_v4(), Uuid::new_v4())
+            .get_playlist_access(Uuid::new_v4(), Uuid::new_v4())
             .await
             .expect_err("missing");
         assert!(matches!(
@@ -3955,6 +4298,44 @@ mod tests {
             .unwrap();
         let playlist_shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
         assert!(playlist_shares.is_empty(), "{playlist_shares:?}");
+    }
+
+    /// A share for the nil user is refused before anything is written:
+    /// upstream's `AddUserToShares` looks the playlist up for the target user,
+    /// and `GetUserById(Guid.Empty)` throws `ArgumentException` (a 400).
+    #[tokio::test]
+    async fn a_share_for_the_nil_user_is_refused() {
+        use ferrofin_model::playlists::PlaylistUserUpdateRequest;
+
+        let db = test_db().await;
+        let (mgr, _root) = playlist_manager(&db).await;
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Nil".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        let refused = mgr
+            .add_user_to_shares(&PlaylistUserUpdateRequest {
+                id: playlist_id,
+                user_id: Uuid::nil(),
+                can_edit: Some(true),
+            })
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(ferrofin_traits::error::ServiceError::InvalidInput(_))
+            ),
+            "{refused:?}"
+        );
+        let shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
+        assert!(shares.is_empty(), "{shares:?}");
     }
 
     /// Shares keep the order they were given, as upstream's `Shares` list
@@ -4045,8 +4426,8 @@ mod tests {
     }
 
     /// A re-rate saves only the rating: a share revoked between the re-rate's
-    /// read and its save stays revoked in `Data`, so the boot re-import of the
-    /// shares from `Data` does not bring it back.
+    /// read and its save stays revoked, in the tables and in `Data`, and a
+    /// restart does not bring it back.
     #[tokio::test]
     async fn a_rerate_keeps_a_share_change_made_since_its_read() {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -4079,9 +4460,7 @@ mod tests {
 
         let stored = crate::test_support::fetch_item(&db, playlist_id).await;
         assert_eq!(stored.official_rating.as_deref(), Some("PG"));
-        crate::item_data::reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        crate::item_data::reimport_from_data(&db, playlist_id).await;
         assert!(
             mgr.get_playlist_shares(playlist_id)
                 .await
@@ -4092,8 +4471,8 @@ mod tests {
     }
 
     /// A whole-row save (the metadata editor's `POST /Items/{id}`) built from a
-    /// row read before a share revoke keeps the revoke in `Data`, so the boot
-    /// re-import of the shares from `Data` does not bring it back.
+    /// row read before a share revoke keeps the revoke, in the tables and in
+    /// `Data`, and a restart does not bring it back.
     #[tokio::test]
     async fn a_whole_row_save_keeps_a_share_change_made_since_its_read() {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -4126,9 +4505,7 @@ mod tests {
 
         let stored = crate::test_support::fetch_item(&db, playlist_id).await;
         assert_eq!(stored.overview.as_deref(), Some("Edited"));
-        crate::item_data::reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        crate::item_data::reimport_from_data(&db, playlist_id).await;
         assert!(
             mgr.get_playlist_shares(playlist_id)
                 .await
@@ -4169,9 +4546,7 @@ mod tests {
 
         let stored = crate::test_support::fetch_item(&db, playlist_id).await;
         assert_eq!(stored.overview.as_deref(), Some("Edited"));
-        crate::item_data::reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        crate::item_data::reimport_from_data(&db, playlist_id).await;
         assert!(
             mgr.get_playlist_shares(playlist_id)
                 .await
@@ -4183,7 +4558,7 @@ mod tests {
 
     /// An update that fails part-way applies none of its changes: its share
     /// and open-access writes never commit without their `Data` sync, so the
-    /// tables and the boot re-import from `Data` agree.
+    /// tables and `Data` agree, before and after a restart.
     #[tokio::test]
     async fn a_failed_update_applies_none_of_its_changes() {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -4229,9 +4604,7 @@ mod tests {
                 mgr.get_playlist_access(playlist_id, carol).await.is_ok(),
                 "the playlist stays public {moment}"
             );
-            crate::item_data::reconcile_playlist_permissions(&db)
-                .await
-                .expect("boot re-import");
+            crate::item_data::reimport_from_data(&db, playlist_id).await;
         }
         let stored = crate::test_support::fetch_item(&db, playlist_id).await;
         assert_eq!(stored.name.as_deref(), Some("Shared"));
@@ -4369,14 +4742,39 @@ mod tests {
             mgr.get_playlist_access(playlist_id, carol).await,
             Err(ferrofin_traits::error::ServiceError::NotFound(_))
         ));
-        assert!(matches!(
-            mgr.get_playlist_for_user(playlist_id, carol).await,
-            Err(ferrofin_traits::error::ServiceError::NotFound(_))
-        ));
+    }
+
+    /// A new playlist's ancestors are the Playlists folder and the root, as
+    /// `AddChild`'s save writes `GetAncestorIds()` upstream.
+    #[tokio::test]
+    async fn create_playlist_writes_its_ancestors() {
+        let db = test_db().await;
+        let (mgr, _root) = playlist_manager(&db).await;
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let playlist = Uuid::parse_str(&created.id).expect("uuid");
+        let row = crate::test_support::fetch_item(&db, playlist).await;
+        let folder = row.parent_id.expect("under the Playlists folder");
+        let root = crate::test_support::fetch_item(&db, Uuid::parse_str(&folder).expect("uuid"))
+            .await
+            .parent_id
+            .expect("the folder is under the root");
+        let mut chain = vec![folder, root];
+        chain.sort();
+        assert_eq!(
+            crate::library_structure_repository::ancestors_of(&db, playlist).await,
+            chain
+        );
     }
 
     /// No user, no playlist: upstream's `GetUserById(Guid.Empty)` throws in
-    /// `CreatePlaylist` and in every `GetPlaylists`/`GetPlaylistForUser`.
+    /// `CreatePlaylist` and in every `GetPlaylistForUser` gate.
     #[tokio::test]
     async fn a_nil_user_is_refused() {
         use ferrofin_traits::error::ServiceError;
@@ -4397,8 +4795,17 @@ mod tests {
             .await
             .map(drop),
         );
+        let playlists = || async {
+            library_manager_over(db.clone())
+                .get_item_ids(&ferrofin_traits::options::InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Playlist],
+                    ..ferrofin_traits::options::InternalItemsQuery::default()
+                })
+                .await
+                .expect("read")
+        };
         assert!(
-            mgr.get_playlists(Uuid::new_v4()).await.unwrap().is_empty(),
+            playlists().await.is_empty(),
             "no unowned playlist was written"
         );
         // A member, so the items read takes its joined path, not the
@@ -4417,14 +4824,13 @@ mod tests {
             .id,
         )
         .expect("uuid");
-        invalid(mgr.get_playlist_access(owned, Uuid::nil()).await.map(drop));
-        invalid(
-            mgr.get_playlist_for_user(owned, Uuid::nil())
-                .await
-                .map(drop),
+        assert_eq!(
+            playlists().await,
+            [owned],
+            "the read sees a written playlist"
         );
+        invalid(mgr.get_playlist_access(owned, Uuid::nil()).await.map(drop));
         invalid(mgr.get_playlist_items(owned, Uuid::nil()).await.map(drop));
-        invalid(mgr.get_playlists(Uuid::nil()).await.map(drop));
     }
 
     #[tokio::test]
@@ -4471,11 +4877,10 @@ mod tests {
             .expect("legacy rows stay visible");
         assert_eq!(access.level, PlaylistAccessLevel::Owner);
         assert!(!access.open_access);
-        assert_eq!(mgr.get_playlists(Uuid::new_v4()).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn get_playlists_filters_by_visibility() {
+    async fn playlist_access_follows_ownership_and_shares() {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
 
         let db = test_db().await;
@@ -4500,21 +4905,20 @@ mod tests {
             .await
             .expect("p2")
             .id;
-        mgr.create_playlist(&create("Carol's", carol, Vec::new()))
+        let p3 = mgr
+            .create_playlist(&create("Carol's", carol, Vec::new()))
             .await
-            .expect("p3");
+            .expect("p3")
+            .id;
 
-        let p1 = Uuid::parse_str(&p1).expect("uuid");
-        let p2 = Uuid::parse_str(&p2).expect("uuid");
-        let visible: Vec<Uuid> = mgr
-            .get_playlists(alice)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter_map(|r| Uuid::parse_str(&r.id).ok())
-            .collect();
-        assert_eq!(visible.len(), 2, "alice sees her own + bob's shared");
-        assert!(visible.contains(&p1) && visible.contains(&p2));
+        // Alice sees her own and Bob's shared playlist, not Carol's.
+        for (playlist, visible) in [(p1, true), (p2, true), (p3, false)] {
+            let playlist = Uuid::parse_str(&playlist).expect("uuid");
+            assert_eq!(
+                mgr.get_playlist_access(playlist, alice).await.is_ok(),
+                visible
+            );
+        }
     }
 
     #[tokio::test]
@@ -4580,7 +4984,7 @@ mod tests {
     /// A `Users` entry without a user id binds as the empty GUID (upstream's
     /// `PlaylistUserPermissions` constructor default), and upstream stores and
     /// lists that share as given. It is kept here too: listed, written into
-    /// `Data`, and brought back by the boot re-import.
+    /// `Data`, and brought back from `Data` alone by the boot import.
     #[tokio::test]
     async fn an_empty_guid_share_is_stored_listed_and_survives_a_restart() {
         use ferrofin_model::entities_media::PlaylistUserPermissions;
@@ -4614,13 +5018,8 @@ mod tests {
             serde_json::json!([{"UserId": "00000000000000000000000000000000", "CanEdit": true}])
         );
 
-        // Only `Data` holds the share now: the re-import must bring it back.
-        crate::item_data::clear_playlist_shares(&db, playlist_id).await;
-        let playlist_shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
-        assert!(playlist_shares.is_empty(), "{playlist_shares:?}");
-        crate::item_data::reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        // The boot import must bring it back from `Data` alone.
+        crate::item_data::reimport_from_data(&db, playlist_id).await;
         assert_eq!(
             mgr.get_playlist_shares(playlist_id).await.unwrap(),
             expected
@@ -4631,7 +5030,7 @@ mod tests {
     /// when either entry can (`Shares.Any(s => s.CanEdit && …)`). With one share
     /// row per user, the user keeps one share at their first entry's place that
     /// can edit when any entry can: on create, on update, and when the boot
-    /// re-import reads such a list from `Data` (as a Jellyfin database can hold).
+    /// import reads such a list from `Data` (as a Jellyfin database can hold).
     #[tokio::test]
     async fn a_user_listed_twice_keeps_one_share_that_can_edit_if_any_entry_can() {
         use ferrofin_model::entities_media::PlaylistUserPermissions as Share;
@@ -4678,7 +5077,8 @@ mod tests {
             collapsed
         );
 
-        // A `Data` list naming carol twice, read back by the boot re-import.
+        // A `Data` list naming bob twice, read back by the boot import of a
+        // playlist without its permission rows.
         let shares = serde_json::json!([
             {"UserId": bob.simple().to_string(), "CanEdit": false},
             {"UserId": carol.simple().to_string(), "CanEdit": false},
@@ -4689,9 +5089,7 @@ mod tests {
             .await
             .expect("write Data");
         drop(conn);
-        crate::item_data::reconcile_playlist_permissions(&db)
-            .await
-            .expect("boot re-import");
+        crate::item_data::reimport_from_data(&db, playlist_id).await;
         assert_eq!(
             mgr.get_playlist_shares(playlist_id).await.unwrap(),
             vec![Share::new(bob, true), Share::new(carol, false)]
@@ -4848,6 +5246,7 @@ mod tests {
         mgr.get_playlist_items(playlist_id, reader)
             .await
             .expect("items")
+            .into_entry_rows()
             .iter()
             .filter_map(|i| Uuid::parse_str(&i.id).ok())
             .collect()
@@ -4899,10 +5298,6 @@ mod tests {
             mgr.get_playlist_access(playlist_id, stranger).await,
             Err(ferrofin_traits::error::ServiceError::NotFound(_))
         ));
-        assert!(matches!(
-            mgr.get_playlist_for_user(playlist_id, stranger).await,
-            Err(ferrofin_traits::error::ServiceError::NotFound(_))
-        ));
     }
 
     #[tokio::test]
@@ -4943,7 +5338,6 @@ mod tests {
         reason = "one owner, one limited user and their playlists through every access path"
     )]
     async fn a_parental_limit_hides_playlists_and_members_beyond_it() {
-        use ferrofin_db::entities::base_items::BaseItemEntity;
         use ferrofin_model::entities_media::PlaylistUserPermissions;
         use ferrofin_model::playlists::PlaylistCreationResult;
         use ferrofin_traits::error::ServiceError;
@@ -5012,23 +5406,19 @@ mod tests {
             "no limit"
         );
         assert!(mgr.get_playlist_access(empty, kid).await.is_ok(), "empty");
-        let listed = |rows: Vec<BaseItemEntity>| {
-            let mut ids: Vec<Uuid> = rows
-                .into_iter()
-                .filter_map(|r| Uuid::parse_str(&r.id).ok())
-                .collect();
-            ids.sort();
-            ids
-        };
-        let mut expected = vec![mixed, empty];
-        expected.sort();
-        assert_eq!(listed(mgr.get_playlists(kid).await.expect("kid")), expected);
-        assert_eq!(mgr.get_playlists(owner).await.expect("owner").len(), 3);
+        assert!(
+            mgr.get_playlist_access(mixed, kid).await.is_ok(),
+            "a member within the limit"
+        );
+        for playlist in [mixed, empty] {
+            assert!(mgr.get_playlist_access(playlist, owner).await.is_ok());
+        }
 
         let members: Vec<Uuid> = mgr
             .get_playlist_items(mixed, kid)
             .await
             .expect("items")
+            .into_entry_rows()
             .into_iter()
             .filter_map(|r| Uuid::parse_str(&r.id).ok())
             .collect();
@@ -5135,6 +5525,108 @@ mod tests {
         assert_eq!(rows(&db, playlist).await.len(), 9);
     }
 
+    /// The scan's playlist sync and an item deletion wait while an entry edit
+    /// holds the lock, so neither lands between its read and its rewrite: the
+    /// rewrite would drop the scan's members, or re-insert a deleted member
+    /// and fail on its foreign key (gl-357).
+    #[tokio::test]
+    async fn playlist_sync_and_deletion_wait_for_an_entry_edit() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist, _, _root) = seeded_playlist(&db, &[a, b]).await;
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let mgr = mgr.with_entry_edits(persistence.playlist_entry_edits());
+        let edit = mgr.entry_edits.lock().await;
+        let scanned = [ferrofin_traits::persistence::ScannedPlaylist {
+            id: playlist,
+            members: Some(vec![ferrofin_traits::persistence::PlaylistMember {
+                item_id: Some(b),
+                ..Default::default()
+            }]),
+            from_file: false,
+            replace: true,
+        }];
+        let sync = persistence.sync_scanned_playlists(&scanned);
+        let gone = [a];
+        let delete = persistence.delete_items(&gone);
+        tokio::pin!(sync, delete);
+        let wait = std::time::Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(wait, &mut sync).await.is_err(),
+            "the playlist sync wrote during an entry edit"
+        );
+        assert!(
+            tokio::time::timeout(wait, &mut delete).await.is_err(),
+            "the deletion wrote during an entry edit"
+        );
+        drop(edit);
+        // Both polled: the lock goes to whichever queued first.
+        let (synced, deleted) = tokio::join!(&mut sync, &mut delete);
+        synced.expect("sync");
+        assert_eq!(deleted.expect("delete"), vec![a]);
+        assert_eq!(rows(&db, playlist).await, vec![b]);
+    }
+
+    /// Re-keying an item and rerouting a version's links wait while an entry
+    /// edit holds the lock: the rewrite would put the old `ChildId` back,
+    /// failing its foreign key on a folded row or undoing the reroute
+    /// (gl-1764).
+    #[tokio::test]
+    async fn rekey_and_reroute_wait_for_an_entry_edit() {
+        use ferrofin_traits::persistence::{
+            ItemPersistenceService as _, LinkedChildrenService as _,
+        };
+        let db = test_db().await;
+        let (a, b, primary, new_id) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let (mgr, playlist, _, _root) = seeded_playlist(&db, &[a, b]).await;
+        seed_item(&db, primary, BaseItemKind::Audio).await;
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let links = FerrofinLinkedChildrenService::new(db.clone())
+            .with_entry_edits(persistence.playlist_entry_edits());
+        let mgr = mgr.with_entry_edits(persistence.playlist_entry_edits());
+        let edit = mgr.entry_edits.lock().await;
+        let moves = [ferrofin_traits::persistence::ItemRekey {
+            from: b,
+            to: new_id,
+            type_name: crate::item_type_lookup::stored_type_name(BaseItemKind::Audio)
+                .expect("type")
+                .to_owned(),
+            dirs: Vec::new(),
+            merged: Vec::new(),
+            extra: false,
+        }];
+        let rekey = persistence.rekey_items(&moves);
+        let reroute = links.reroute_linked_children(a, primary);
+        tokio::pin!(rekey, reroute);
+        let wait = std::time::Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(wait, &mut rekey).await.is_err(),
+            "the re-key wrote during an entry edit"
+        );
+        assert!(
+            tokio::time::timeout(wait, &mut reroute).await.is_err(),
+            "the reroute wrote during an entry edit"
+        );
+        drop(edit);
+        // Bounded: nextest has no slow-timeout, so a leaked guard would hang.
+        let (rekeyed, rerouted) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(&mut rekey, &mut reroute)
+        })
+        .await
+        .expect("the re-key and the reroute finish once the edit ends");
+        assert_eq!(rekeyed.expect("rekey").len(), 1);
+        assert_eq!(rerouted.expect("reroute"), vec![playlist]);
+        assert_eq!(rows(&db, playlist).await, vec![primary, new_id]);
+    }
+
     /// C# `RemoveItemFromPlaylistAsync`: every occurrence of the item goes.
     #[tokio::test]
     async fn remove_item_from_playlist_removes_every_occurrence() {
@@ -5167,6 +5659,31 @@ mod tests {
         .await
         .expect("move");
         assert_eq!(rows(&db, playlist).await, vec![b, a, a]);
+    }
+
+    /// C# `MoveItemAsync` finds the entry by comparing `entryId` with each
+    /// `ItemId.ToString("N")`, ignoring case: the 32-digit spelling moves in
+    /// either case, and any other GUID spelling names no entry, so nothing
+    /// moves.
+    #[rstest::rstest]
+    #[case::n_form(|id: Uuid| id.simple().to_string(), true)]
+    #[case::n_form_upper_case(|id: Uuid| id.simple().to_string().to_uppercase(), true)]
+    #[case::d_form(|id: Uuid| id.hyphenated().to_string(), false)]
+    #[case::braced(|id: Uuid| id.braced().to_string(), false)]
+    #[case::urn(|id: Uuid| id.urn().to_string(), false)]
+    #[tokio::test]
+    async fn move_item_matches_the_entry_id_as_its_n_form(
+        #[case] spell: fn(Uuid) -> String,
+        #[case] moves: bool,
+    ) {
+        let db = test_db().await;
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist, _, _root) = seeded_playlist(&db, &[a, b]).await;
+        mgr.move_item(&playlist.to_string(), &spell(a), 1, Uuid::nil())
+            .await
+            .expect("move");
+        let expected = if moves { vec![b, a] } else { vec![a, b] };
+        assert_eq!(rows(&db, playlist).await, expected);
     }
 
     /// C# `UpdatePlaylist` with `Ids` replaces the entries rather than adding.
@@ -5239,7 +5756,6 @@ mod tests {
             );
         };
         not_found(mgr.get_playlist_access(movie, caller).await.map(drop));
-        not_found(mgr.get_playlist_for_user(movie, caller).await.map(drop));
         not_found(mgr.get_playlist_items(movie, caller).await.map(drop));
         // A box set's manual member reaches the members-present branch.
         let box_set = Uuid::new_v4();
@@ -5401,12 +5917,17 @@ mod tests {
     type RefreshLog =
         std::sync::Mutex<Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshOptions)>>;
 
-    /// A [`ProviderManager`] recording `queue_refresh` and
-    /// `refresh_single_item` calls; nothing else on these paths reaches it.
+    /// A [`ProviderManager`] recording `queue_refresh`, `refresh_single_item`,
+    /// `refresh_full_item` and `save_metadata` calls; nothing else on these
+    /// paths reaches it.
     #[derive(Default)]
     struct QueuedRefreshes {
         queued: RefreshLog,
         awaited: RefreshLog,
+        full: RefreshLog,
+        /// `refresh_full_item` fails (after recording) when set.
+        fail_full: std::sync::atomic::AtomicBool,
+        saved: std::sync::Mutex<Vec<(Uuid, ferrofin_traits::providers::ItemUpdateType)>>,
     }
 
     /// A log's `(item, mode, force_save)` triples, emptied.
@@ -5423,6 +5944,11 @@ mod tests {
         /// The queued refreshes, emptied.
         fn take(&self) -> Vec<(Uuid, ferrofin_traits::providers::MetadataRefreshMode, bool)> {
             drain(&self.queued)
+        }
+
+        /// The metadata saves (`UpdateToRepositoryAsync`), emptied.
+        fn take_saved(&self) -> Vec<(Uuid, ferrofin_traits::providers::ItemUpdateType)> {
+            std::mem::take(&mut *self.saved.lock().unwrap())
         }
 
         /// The awaited (`refresh_single_item`) refreshes, emptied.
@@ -5447,10 +5973,16 @@ mod tests {
         }
         async fn refresh_full_item(
             &self,
-            _item_id: Uuid,
-            _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+            item_id: Uuid,
+            options: &ferrofin_traits::providers::MetadataRefreshOptions,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
-            unreachable!("not on these paths")
+            self.full.lock().unwrap().push((item_id, options.clone()));
+            if self.fail_full.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ferrofin_traits::error::ServiceError::backend(
+                    "TMDb is down",
+                ));
+            }
+            Ok(())
         }
         async fn refresh_single_item(
             &self,
@@ -5504,10 +6036,11 @@ mod tests {
         }
         async fn save_metadata(
             &self,
-            _item_id: Uuid,
-            _update_type: ferrofin_traits::providers::ItemUpdateType,
+            item_id: Uuid,
+            update_type: ferrofin_traits::providers::ItemUpdateType,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
-            unreachable!("not on these paths")
+            self.saved.lock().unwrap().push((item_id, update_type));
+            Ok(())
         }
         async fn get_external_id_infos(
             &self,
@@ -5542,11 +6075,177 @@ mod tests {
         }
     }
 
+    /// The first collection makes the Collections library, whose scan would
+    /// give the new box set its first refresh in Default mode, replacing the
+    /// typed name with TMDb's: its own refresh runs instead of being queued,
+    /// and the scan is queued after it. Later collections queue theirs
+    /// (gl-1622).
+    #[tokio::test]
+    async fn the_first_collection_is_refreshed_before_its_library_is_scanned() {
+        use ferrofin_traits::providers::MetadataRefreshMode::FullRefresh;
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let queued = Arc::new(QueuedRefreshes::default());
+        let mgr = collection_manager_over(&db).with_providers(Arc::clone(&queued) as Arc<_>);
+        let create = |name: &str| CollectionCreationOptions {
+            name: name.to_owned(),
+            item_id_list: vec![movie],
+            ..CollectionCreationOptions::default()
+        };
+
+        let first = mgr
+            .create_collection(&create("First"))
+            .await
+            .expect("first");
+        let first = Uuid::parse_str(&first.id).expect("uuid");
+        assert_eq!(queued.take(), Vec::new(), "the first is not queued");
+        let mut ran = Vec::new();
+        for _ in 0..200 {
+            ran = drain(&queued.full);
+            if !ran.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            ran,
+            vec![(first, FullRefresh, true)],
+            "it runs, with create's options"
+        );
+
+        let second = mgr
+            .create_collection(&create("Second"))
+            .await
+            .expect("second");
+        let second = Uuid::parse_str(&second.id).expect("uuid");
+        assert_eq!(queued.take(), vec![(second, FullRefresh, true)]);
+        assert_eq!(drain(&queued.full), Vec::new());
+    }
+
+    /// A scan stand-in recording, for each scan, how many box-set refreshes
+    /// had run when it started.
+    struct ScanAfter {
+        refreshes: Arc<QueuedRefreshes>,
+        seen: std::sync::Mutex<Vec<usize>>,
+        ran: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::library_manager::ScanRunner for ScanAfter {
+        async fn run(
+            &self,
+            _scope: &ferrofin_traits::library::ScanTarget,
+            _run: crate::library_scan::ScanRun<'_>,
+        ) -> Result<crate::library_scan::ScanOutcome, ferrofin_traits::error::ServiceError>
+        {
+            let refreshed = self.refreshes.full.lock().unwrap().len();
+            self.seen.lock().unwrap().push(refreshed);
+            self.ran.notify_one();
+            Ok(crate::library_scan::ScanOutcome::default())
+        }
+    }
+
+    /// A collection manager whose library manager runs [`ScanAfter`].
+    async fn scanning_collection_manager() -> (FerrofinCollectionManager, Arc<ScanAfter>, Uuid) {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let refreshes = Arc::new(QueuedRefreshes::default());
+        let scans = Arc::new(ScanAfter {
+            refreshes: Arc::clone(&refreshes),
+            seen: std::sync::Mutex::new(Vec::new()),
+            ran: tokio::sync::Notify::new(),
+        });
+        let library = crate::test_support::concrete_library_manager_over(db.clone())
+            .with_scan_runner(Arc::clone(&scans) as Arc<_>);
+        let mgr = FerrofinCollectionManager::new(
+            db.clone(),
+            Arc::new(library),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            test_paths(),
+        )
+        .with_providers(refreshes as Arc<_>);
+        (mgr, scans, movie)
+    }
+
+    /// The new library's scan is owed whatever follows its creation: after
+    /// the first box set's refresh, after a create refused once the library
+    /// was made (an unknown item), and at once for the folder alone (gl-1622).
+    #[tokio::test]
+    async fn the_new_librarys_scan_is_queued_whatever_follows() {
+        let wait = |scans: Arc<ScanAfter>| async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), scans.ran.notified())
+                .await
+                .expect("the library is scanned");
+            // Long enough for a second scan, were one queued, to start.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            scans.seen.lock().unwrap().clone()
+        };
+
+        let (mgr, scans, movie) = scanning_collection_manager().await;
+        mgr.create_collection(&CollectionCreationOptions {
+            name: "First".to_owned(),
+            item_id_list: vec![movie],
+            ..CollectionCreationOptions::default()
+        })
+        .await
+        .expect("create");
+        assert_eq!(wait(scans).await, vec![1], "scanned after the refresh");
+
+        let (mgr, scans, _) = scanning_collection_manager().await;
+        mgr.create_collection(&CollectionCreationOptions {
+            name: "Refused".to_owned(),
+            item_id_list: vec![Uuid::new_v4()],
+            ..CollectionCreationOptions::default()
+        })
+        .await
+        .expect_err("an unknown item");
+        assert_eq!(wait(scans).await, vec![0], "scanned all the same");
+
+        let (mgr, scans, _) = scanning_collection_manager().await;
+        mgr.get_collections_folder(true).await.expect("folder");
+        assert_eq!(wait(scans).await, vec![0], "scanned at once");
+    }
+
+    /// The spawned refresh comes before the scan, which follows a failed
+    /// refresh too.
+    #[tokio::test]
+    async fn the_new_librarys_scan_follows_the_box_sets_refresh() {
+        let providers = Arc::new(QueuedRefreshes::default());
+        providers
+            .fail_full
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let refreshed = Arc::clone(&providers);
+        let scanned = std::sync::atomic::AtomicBool::new(false);
+        super::refresh_then_scan(
+            providers as Arc<_>,
+            Uuid::new_v4(),
+            ferrofin_traits::providers::MetadataRefreshOptions::default(),
+            async {
+                assert_eq!(
+                    refreshed.full.lock().unwrap().len(),
+                    1,
+                    "refreshed before the scan"
+                );
+                scanned.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(
+            scanned.load(std::sync::atomic::Ordering::SeqCst),
+            "a failed refresh still lets the scan run"
+        );
+    }
+
     /// `CollectionManager` queues a High-priority refresh on every create and
     /// membership change: a default one for an empty create, `FullRefresh`
     /// (+`ForceSave`) for a create with items, `ForceSave` for an add that
     /// brings a new item and for every remove. An add of members already
-    /// there queues nothing.
+    /// there queues nothing. Each change that queues a `ForceSave` refresh
+    /// first saves the box set as a metadata edit
+    /// (`UpdateToRepositoryAsync(MetadataEdit)`), which writes its
+    /// `collection.xml`; an empty create saves nothing.
     #[tokio::test]
     async fn collection_changes_queue_the_box_set_refresh() {
         use ferrofin_traits::providers::MetadataRefreshMode::{Default, FullRefresh};
@@ -5556,6 +6255,8 @@ mod tests {
         seed_item(&db, movie_b, BaseItemKind::Movie).await;
         let queued = Arc::new(QueuedRefreshes::default());
         let mgr = collection_manager_over(&db).with_providers(Arc::clone(&queued) as Arc<_>);
+        // The Collections library exists: no create below is the first.
+        mgr.get_collections_folder(true).await.expect("folder");
 
         let empty = mgr
             .create_collection(&CollectionCreationOptions {
@@ -5566,6 +6267,8 @@ mod tests {
             .expect("create empty");
         let empty = Uuid::parse_str(&empty.id).expect("uuid");
         assert_eq!(queued.take(), vec![(empty, Default, false)]);
+        assert_eq!(queued.take_saved(), Vec::new());
+        let edit = ferrofin_traits::providers::ItemUpdateType::MetadataEdit;
 
         let full = mgr
             .create_collection(&CollectionCreationOptions {
@@ -5577,17 +6280,25 @@ mod tests {
             .expect("create with items");
         let full = Uuid::parse_str(&full.id).expect("uuid");
         assert_eq!(queued.take(), vec![(full, FullRefresh, true)]);
+        assert_eq!(queued.take_saved(), vec![(full, edit)]);
 
         mgr.add_to_collection(full, &[movie_a])
             .await
             .expect("re-add");
         assert_eq!(queued.take(), Vec::new(), "nothing new, nothing queued");
+        assert_eq!(
+            queued.take_saved(),
+            Vec::new(),
+            "nothing new, nothing saved"
+        );
         mgr.add_to_collection(full, &[movie_b]).await.expect("add");
         assert_eq!(queued.take(), vec![(full, Default, true)]);
+        assert_eq!(queued.take_saved(), vec![(full, edit)]);
         mgr.remove_from_collection(full, &[movie_a])
             .await
             .expect("remove");
         assert_eq!(queued.take(), vec![(full, Default, true)]);
+        assert_eq!(queued.take_saved(), vec![(full, edit)]);
         mgr.remove_from_collection(full, &[movie_a])
             .await
             .expect("remove a non-member");
@@ -5596,6 +6307,60 @@ mod tests {
             vec![(full, Default, true)],
             "a remove queues its refresh whatever it removed"
         );
+        assert_eq!(queued.take_saved(), vec![(full, edit)], "and saves");
+    }
+
+    /// `BoxSetMetadataService.MergeData` for a box set outside the data
+    /// directory: its file's members come first, the stored ones not among
+    /// them after; a path naming no item is dropped, and a file naming no
+    /// member, or only stored ones, writes nothing.
+    #[tokio::test]
+    async fn a_box_sets_file_members_come_before_its_stored_ones() {
+        use ferrofin_traits::persistence::{ItemPersistenceService as _, PlaylistMember};
+        let db = test_db().await;
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b, c] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        let created = collection_manager_over(&db)
+            .create_collection(&CollectionCreationOptions {
+                name: "Set".to_owned(),
+                item_id_list: vec![a, b],
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("create");
+        let set = Uuid::parse_str(&created.id).expect("uuid");
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let member = |id| PlaylistMember {
+            item_id: Some(id),
+            ..Default::default()
+        };
+        let gone = PlaylistMember {
+            path: Some("/nowhere/Gone.mkv".to_owned()),
+            ..Default::default()
+        };
+        assert!(
+            !persistence
+                .merge_box_set_members(set, &[])
+                .await
+                .expect("none")
+        );
+        assert!(
+            persistence
+                .merge_box_set_members(set, &[member(c), gone, member(b), member(c)])
+                .await
+                .expect("merge")
+        );
+        assert_eq!(rows(&db, set).await, vec![c, b, a]);
+        assert!(
+            !persistence
+                .merge_box_set_members(set, &[member(c)])
+                .await
+                .expect("again")
+        );
+        assert_eq!(rows(&db, set).await, vec![c, b, a]);
     }
 
     /// `PlaylistManager.AddToPlaylistInternal` (reached from create, update

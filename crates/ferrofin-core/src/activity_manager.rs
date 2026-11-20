@@ -249,7 +249,7 @@ impl ActivityManager for FerrofinActivityManager {
     async fn clean(&self, before: chrono::DateTime<Utc>) -> Result<u64, ServiceError> {
         // Port of `ActivityManager.CleanAsync`: bulk-delete entries older than
         // the cutoff. `DateCreated` is stored as canonical
-        // `YYYY-MM-DD HH:MM:SS.fffffff` text, which orders lexicographically for
+        // `yyyy-MM-dd HH:mm:ss.FFFFFFF` text, which orders lexicographically for
         // UTC timestamps, so a text comparison is exact.
         let result = sqlx::query(r#"DELETE FROM "ActivityLogs" WHERE "DateCreated" < ?1"#)
             .bind(datetime_to_db(before))

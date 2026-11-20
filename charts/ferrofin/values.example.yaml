@@ -177,6 +177,10 @@ ferrofin:
     # MaxCachedRecords) or after this many idle seconds (default 300).
     # FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS: "100000"
     # FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS: "300"
+    # A comic book's runtime is its page count, read from its archive's directory;
+    # an archive with more entries than this is not counted (1000-10000000,
+    # default 100000).
+    # FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES: "100000"
     # Seconds a resolved access token, and a user's permissions with the libraries'
     # rows and options and whether a Live TV tuner exists, are served from memory
     # (5-300, default 30 each). Changes made through the server apply at once; these
@@ -217,6 +221,13 @@ ferrofin:
     # thumbnails and embedded pictures: keyframes only, no 24-frame sampling
     # (default "false", Jellyfin's FFmpeg:imgExtractPerfTradeoff).
     # FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF: "true"
+    # How long and how much of an input ffmpeg analyses to find its streams,
+    # before every probe and transcode (defaults "200M" microseconds and "1G"
+    # bytes, Jellyfin's FFmpeg:analyzeduration and FFmpeg:probesize; 1M-600M
+    # and 1M-4G). Lower values start remote (.strm) sources sooner and can
+    # miss late streams.
+    # FERROFIN_FFMPEG_ANALYZE_DURATION: "8M"
+    # FERROFIN_FFMPEG_PROBE_SIZE: "32M"
     # How long TheTVDB lookups (episode ids, a series' season list) are reused,
     # in whole hours (default 1, the TVDB plugin's CacheDurationInHours).
     # FERROFIN_TVDB_CACHE_HOURS: "1"
@@ -236,8 +247,9 @@ ferrofin:
     # FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB: "512"
     # FERROFIN_IMAGE_RESIZE_BUDGET_MB: "2048"
 
-    # The largest remote image downloaded, and how long a URL that gave no image
-    # (a channel logo that is gone, say) is left alone before it is tried again.
+    # The largest remote image downloaded (and the largest metadata provider
+    # answer), and how long a URL that gave no image (a channel logo that is
+    # gone, say) is left alone before it is tried again.
     # FERROFIN_IMAGE_DOWNLOAD_MAX_MB: "64"
     # FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS: "3600"
     # Image downloads refuse private/LAN addresses, a Live TV tuner's host

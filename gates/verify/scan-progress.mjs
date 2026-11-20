@@ -126,7 +126,8 @@ try {
     if (!measure) {
         await until(() => refreshFrames(frames).length >= 3, 'start and repeated zero ticks');
         assert.equal(taskFrames(frames)[0].State, 'Running');
-        assert.equal(taskFrames(frames)[0].CurrentProgressPercentage, 0);
+        // The start frame is captured before the run's first report, as Jellyfin's null CurrentProgress.
+        assert.equal(taskFrames(frames)[0].CurrentProgressPercentage, undefined);
         for (const frame of refreshFrames(frames)) {
             assert.equal(frame.Data.Progress, '0.00');
             assert.equal(frame.Data.RefreshStatus, 'Active');
@@ -137,7 +138,8 @@ try {
         assert.equal(live.RefreshProgress, 0);
         const reconnect = await connect(true);
         assert.equal(taskFrames(reconnect.frames)[0].State, 'Running');
-        assert.equal(taskFrames(reconnect.frames)[0].CurrentProgressPercentage, 0);
+        // The run has reported by now: 0 at its start, then the scan's progress before the held probe.
+        assert.equal(typeof taskFrames(reconnect.frames)[0].CurrentProgressPercentage, 'number');
         reconnect.socket.close();
     }
     await release();
@@ -163,7 +165,8 @@ try {
     await settled();
     if (!measure) {
         await until(() => taskFrames(frames).some(t => t.State === 'Running') && taskFrames(frames).at(-1)?.State === 'Idle', 'short unchanged scan lifecycle');
-        assert.equal(taskFrames(frames)[0].CurrentProgressPercentage, 0);
+        assert.equal(taskFrames(frames)[0].State, 'Running');
+        assert.equal(taskFrames(frames)[0].CurrentProgressPercentage, undefined);
     }
     const unchanged = { ms: performance.now() - rescanStart, events: refreshFrames(frames).length };
     if (!measure) {

@@ -969,3 +969,45 @@ fn test_multi_version_episode_by_date_same_day() {
         other.alternate_versions
     );
 }
+
+/// Jellyfin 12's `_numericOrdinalComparer` is invariant-culture collation with
+/// numeric ordering, not code-point order (gl-510). With no file named after
+/// the folder, `theatrical` sorts before `Unrated` and is the primary; and
+/// among equal resolutions `1080p hdr` comes before `1080p Remux`.
+#[test]
+fn alternate_versions_order_by_invariant_culture_with_numeric_ordering() {
+    let paths = |v: &VideoInfo| -> Vec<String> {
+        std::iter::once(v)
+            .chain(&v.alternate_versions)
+            .map(|v| primary_path(v).to_owned())
+            .collect()
+    };
+
+    let result = resolve(&[
+        "/movies/Movie (2020)/Movie (2020) - Unrated.mkv",
+        "/movies/Movie (2020)/Movie (2020) - theatrical.mkv",
+    ]);
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        paths(&result[0]),
+        [
+            "/movies/Movie (2020)/Movie (2020) - theatrical.mkv",
+            "/movies/Movie (2020)/Movie (2020) - Unrated.mkv",
+        ]
+    );
+
+    let result = resolve(&[
+        "/movies/Movie (2020)/Movie (2020) - 1080p Remux.mkv",
+        "/movies/Movie (2020)/Movie (2020) - 1080p hdr.mkv",
+        "/movies/Movie (2020)/Movie (2020) - 2160p.mkv",
+    ]);
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        paths(&result[0]),
+        [
+            "/movies/Movie (2020)/Movie (2020) - 2160p.mkv",
+            "/movies/Movie (2020)/Movie (2020) - 1080p hdr.mkv",
+            "/movies/Movie (2020)/Movie (2020) - 1080p Remux.mkv",
+        ]
+    );
+}

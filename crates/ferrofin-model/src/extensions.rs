@@ -6,8 +6,6 @@
 
 use ferrofin_util::split_string_extensions::span_split;
 
-use crate::providers::RemoteImageInfo;
-
 /// Splits a comma-delimited input string, discarding empty entries.
 ///
 /// Mirrors `ContainerHelper.Split` (`String.Split(',',
@@ -131,65 +129,64 @@ pub fn first_to_upper(str: &str) -> String {
     result
 }
 
-/// Orders remote image infos by requested language descending, then `en`, then
-/// no language, over other non-matches.
+/// Orders remote images by requested language descending, then `en`, then no
+/// language, over other non-matches: Jellyfin 12's
+/// `EnumerableExtensions.OrderByLanguageDescending`.
 ///
-/// Mirrors `EnumerableExtensions.OrderByLanguageDescending`. Within a language
-/// priority tier, images are ordered by community rating (rounded to one
-/// decimal) descending, then vote count descending. A blank
-/// `requested_language` defaults to `en`.
+/// Within a language tier, images order by community rating rounded to one
+/// decimal descending, then vote count descending. A blank
+/// `requested_language` defaults to `en`. `fields` reads one image's
+/// (language, community rating, vote count), so the same ladder sorts the
+/// `RemoteImages` listing and the provider-side candidates of an automatic pick.
 ///
 /// The sort is stable (matching LINQ `OrderByDescending`/`ThenByDescending`),
 /// so items comparing equal keep their original order.
-#[must_use]
-pub fn order_by_language_descending(
-    remote_image_infos: impl IntoIterator<Item = RemoteImageInfo>,
+pub fn order_by_language_descending<T>(
+    images: &mut [T],
     requested_language: &str,
-) -> Vec<RemoteImageInfo> {
+    fields: impl Fn(&T) -> (Option<&str>, Option<f64>, Option<i32>),
+) {
     let requested_language = if requested_language.trim().is_empty() {
         // Default to English if no requested language is specified.
         "en"
     } else {
         requested_language
     };
-
-    let language_priority = |info: &RemoteImageInfo| -> i32 {
-        // Image priority ordering:
-        //  - Images that match the requested language
-        //  - Images in English
-        //  - Images with no language
-        //  - Images that don't match the requested language
-        match info.language.as_deref() {
-            Some(lang) if lang.eq_ignore_ascii_case(requested_language) => 4,
-            Some(lang) if lang.eq_ignore_ascii_case("en") => 3,
-            None | Some("") => 2,
-            Some(_) => 0,
-        }
+    let key = |image: &T| {
+        let (language, rating, votes) = fields(image);
+        (
+            language_rank(language, requested_language),
+            // C# `Math.Round(x, 1)`: banker's rounding, .NET's default midpoint mode.
+            (rating.unwrap_or(0.0) * 10.0).round_ties_even() / 10.0,
+            votes.unwrap_or(0),
+        )
     };
-
-    // Rounded community rating as an ordered integer key (one decimal place),
-    // mirroring `Math.Round(x, 1)`.
-    let rounded_rating = |info: &RemoteImageInfo| -> i64 {
-        // Community ratings are small (0..=10); the rounded ×10 value fits i64.
-        #[allow(clippy::cast_possible_truncation)]
-        let scaled = (info.community_rating.unwrap_or(0.0) * 10.0).round() as i64;
-        scaled
-    };
-
-    let mut result: Vec<RemoteImageInfo> = remote_image_infos.into_iter().collect();
-    // Sort descending on the composite key; `sort_by` is stable, matching LINQ.
-    result.sort_by(|a, b| {
-        language_priority(b)
-            .cmp(&language_priority(a))
-            .then_with(|| rounded_rating(b).cmp(&rounded_rating(a)))
-            .then_with(|| b.vote_count.unwrap_or(0).cmp(&a.vote_count.unwrap_or(0)))
+    images.sort_by(|a, b| {
+        let (a, b) = (key(a), key(b));
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.total_cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
     });
-    result
+}
+
+/// `OrderByLanguageDescending`'s rank for one image language tag: requested
+/// (4) > English (3) > no language (2) > anything else (0).
+///
+/// The no-language test is C# `IsNullOrEmpty`, not `IsNullOrWhiteSpace`, so a
+/// `" "` tag ranks 0.
+fn language_rank(language: Option<&str>, requested_language: &str) -> u8 {
+    match language {
+        Some(lang) if lang.eq_ignore_ascii_case(requested_language) => 4,
+        Some(lang) if lang.eq_ignore_ascii_case("en") => 3,
+        None | Some("") => 2,
+        Some(_) => 0,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::RemoteImageInfo;
     use rstest::rstest;
 
     // ----- ContainerHelper (ported from Dlna/ContainerHelperTests.cs) -----
@@ -283,6 +280,57 @@ mod tests {
         }
     }
 
+    fn ordered(mut images: Vec<RemoteImageInfo>, requested: &str) -> Vec<RemoteImageInfo> {
+        order_by_language_descending(&mut images, requested, |image| {
+            (
+                image.language.as_deref(),
+                image.community_rating,
+                image.vote_count,
+            )
+        });
+        images
+    }
+
+    /// The ladder's edges: `OrdinalIgnoreCase`, and a whitespace-only tag is
+    /// not "no language" (`IsNullOrEmpty`, not `IsNullOrWhiteSpace`), so it
+    /// falls to 0.
+    #[test]
+    fn language_rank_matches_the_csharp_ladder() {
+        assert_eq!(language_rank(Some("fr"), "fr"), 4);
+        assert_eq!(language_rank(Some("FR"), "fr"), 4, "OrdinalIgnoreCase");
+        assert_eq!(language_rank(Some("en"), "fr"), 3);
+        assert_eq!(language_rank(Some("EN"), "fr"), 3, "OrdinalIgnoreCase");
+        assert_eq!(language_rank(None, "fr"), 2);
+        assert_eq!(language_rank(Some(""), "fr"), 2);
+        assert_eq!(language_rank(Some("de"), "fr"), 0);
+        assert_eq!(
+            language_rank(Some(" "), "fr"),
+            0,
+            "IsNullOrEmpty, not WhiteSpace"
+        );
+        // With "en" requested, English takes the top rank; untagged stays 2.
+        assert_eq!(language_rank(Some("en"), "en"), 4);
+        assert_eq!(language_rank(None, "en"), 2);
+    }
+
+    /// `Math.Round(rating, 1)` is banker's rounding, and ties on the rounded
+    /// rating fall to the vote count.
+    #[test]
+    fn order_by_language_descending_rounds_ratings_like_dotnet() {
+        let images = vec![
+            img(Some("fr"), 5.0, 2),
+            img(Some("fr"), 5.04, 50),
+            img(Some("fr"), 5.2, 1),
+            img(Some("fr"), 0.25, 1),
+            img(Some("fr"), 0.2, 9),
+        ];
+        let result = ordered(images, "fr");
+        let votes: Vec<_> = result.iter().map(|i| i.vote_count.unwrap()).collect();
+        // 5.2 > 5.04 ≈ 5.0 (votes break the tie); 0.25 rounds to even, 0.2, so
+        // it ties 0.2 and loses on votes (away-from-zero would make it 0.3).
+        assert_eq!(votes, [1, 50, 2, 9, 1]);
+    }
+
     #[test]
     fn order_by_language_descending_preferred_language_first() {
         let images = vec![
@@ -291,7 +339,7 @@ mod tests {
             img(None, 7.0, 50),
             img(Some("fr"), 8.0, 150),
         ];
-        let result = order_by_language_descending(images, "de");
+        let result = ordered(images, "de");
         assert_eq!(Some("de"), result[0].language.as_deref());
         assert_eq!(Some("en"), result[1].language.as_deref());
         assert_eq!(None, result[2].language.as_deref());
@@ -301,7 +349,7 @@ mod tests {
     #[test]
     fn order_by_language_descending_english_before_no_language() {
         let images = vec![img(None, 9.0, 500), img(Some("en"), 3.0, 10)];
-        let result = order_by_language_descending(images, "de");
+        let result = ordered(images, "de");
         // English should come before no-language, even with lower rating.
         assert_eq!(Some("en"), result[0].language.as_deref());
         assert_eq!(None, result[1].language.as_deref());
@@ -314,16 +362,20 @@ mod tests {
             img(Some("de"), 9.0, 50),
             img(Some("de"), 9.0, 200),
         ];
-        let result = order_by_language_descending(images, "de");
+        let result = ordered(images, "de");
         assert_eq!(Some(200), result[0].vote_count);
         assert_eq!(Some(50), result[1].vote_count);
         assert_eq!(Some(100), result[2].vote_count);
     }
 
-    #[test]
-    fn order_by_language_descending_null_requested_language_defaults_to_english() {
+    #[rstest]
+    #[case("")]
+    #[case("   ")]
+    fn order_by_language_descending_null_requested_language_defaults_to_english(
+        #[case] requested: &str,
+    ) {
         let images = vec![img(Some("fr"), 9.0, 500), img(Some("en"), 5.0, 10)];
-        let result = order_by_language_descending(images, "");
+        let result = ordered(images, requested);
         // With null/blank requested language, English becomes preferred (score 4).
         assert_eq!(Some("en"), result[0].language.as_deref());
         assert_eq!(Some("fr"), result[1].language.as_deref());
@@ -336,7 +388,7 @@ mod tests {
             img(Some("en"), 3.0, 10),
             img(Some("fr"), 8.0, 300),
         ];
-        let result = order_by_language_descending(images, "en");
+        let result = ordered(images, "en");
         assert_eq!(Some("en"), result[0].language.as_deref());
         assert_eq!(None, result[1].language.as_deref());
         assert_eq!(Some("fr"), result[2].language.as_deref());
@@ -350,7 +402,7 @@ mod tests {
             img(Some("en"), 7.0, 300),
             img(Some("de"), 6.0, 200),
         ];
-        let result = order_by_language_descending(images, "de");
+        let result = ordered(images, "de");
         // Expected order: de (requested) > en > no-language > fr (other).
         assert_eq!(Some("de"), result[0].language.as_deref());
         assert_eq!(Some("en"), result[1].language.as_deref());

@@ -141,8 +141,7 @@ impl DisplayPreferencesManager for FerrofinDisplayPreferencesManager {
         // v12.2 looks the row up by the item and, on a miss, stores the
         // defaults under that item (`new ItemDisplayPreferences(userId,
         // itemId, client)`, jellyfin/jellyfin#18259). An empty-GUID row an
-        // older build stored is left alone: no item reads it, and
-        // `list_item_display_preferences` leaves it out.
+        // older build stored is left alone: no item reads it.
         let select = r#"SELECT * FROM "ItemDisplayPreferences"
                WHERE "UserId" = ?1 AND "ItemId" = ?2 AND "Client" = ?3
                ORDER BY "Id" LIMIT 1"#;
@@ -189,25 +188,6 @@ impl DisplayPreferencesManager for FerrofinDisplayPreferencesManager {
             .fetch_one(self.db.pool())
             .await
             .map_err(db_err)
-    }
-
-    async fn list_item_display_preferences(
-        &self,
-        user_id: Uuid,
-        client: &str,
-    ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError> {
-        // Excludes the empty-item-id rows older builds stored (C#
-        // `!prefs.ItemId.Equals(default)`).
-        sqlx::query_as::<_, ItemDisplayPreferencesEntity>(
-            r#"SELECT * FROM "ItemDisplayPreferences"
-               WHERE "UserId" = ?1 AND "Client" = ?2 AND "ItemId" <> ?3"#,
-        )
-        .bind(guid_to_db(user_id))
-        .bind(client)
-        .bind(guid_to_db(Uuid::nil()))
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)
     }
 
     async fn list_custom_item_display_preferences(
@@ -466,7 +446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn item_prefs_are_created_under_the_item_and_listed() {
+    async fn item_prefs_are_created_under_the_item_and_read_back() {
         let db = test_db().await;
         let user = Uuid::new_v4();
         seed_user(&db, user).await;
@@ -479,11 +459,11 @@ mod tests {
             .expect("get item prefs");
         assert_eq!(created.item_id, guid_to_db(item));
 
-        let listed = mgr
-            .list_item_display_preferences(user, "web")
+        let reread = mgr
+            .get_item_display_preferences(user, item, "web")
             .await
-            .expect("list");
-        assert_eq!(listed, [created]);
+            .expect("reread");
+        assert_eq!(reread, created);
     }
 
     #[tokio::test]

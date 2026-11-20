@@ -16,7 +16,8 @@ use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeCollections, FakeConfig, FakeMediaSegments, FakeMusic, FakePlaylists,
     FakeProviders, FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSubtitles,
-    FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, minimal_base_item,
+    FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FixedAuth,
+    fake_user_entity, minimal_base_item,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -27,10 +28,7 @@ use ferrofin_model::media_info::{LiveStreamRequest, MediaProtocol};
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserManager};
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
-use ferrofin_traits::options::{
-    AuthorizationInfo, DeleteOptions, InternalItemsQuery, InternalPeopleQuery,
-};
+use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use ferrofin_traits::persistence::ItemWithCounts;
 use ferrofin_traits::stubs::LyricManager;
 use tower::ServiceExt;
@@ -46,74 +44,38 @@ const MOVIE_ID: Uuid = Uuid::from_u128(0x00A1_0002);
 const STOPPED_ID: Uuid = Uuid::from_u128(0x00A1_0003);
 /// [`STOPPED_ID`]'s file.
 const STOPPED_TRACK: &str = "/music/Artist/Album/Stopped.flac";
+/// Library tracks a single test each writes lyrics for, so a test's refresh
+/// check reads only its own track's refreshes.
+const TRACKS: [(Uuid, &str); 4] = [
+    (
+        Uuid::from_u128(0x00A1_0004),
+        "/music/Artist/Album/Upload Hangup.flac",
+    ),
+    (
+        Uuid::from_u128(0x00A1_0005),
+        "/music/Artist/Album/Delete Hangup.flac",
+    ),
+    (
+        Uuid::from_u128(0x00A1_0006),
+        "/music/Artist/Album/Download Hangup.flac",
+    ),
+    (
+        Uuid::from_u128(0x00A1_0007),
+        "/music/Artist/Album/Nothing Saved.flac",
+    ),
+];
 
 /// A minimal authenticated user for the stubs.
 fn user() -> UserEntity {
     UserEntity {
-        id: USER_ID.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "alice".to_owned(),
-        normalized_username: "ALICE".to_owned(),
+        ..fake_user_entity(USER_ID, "alice")
     }
 }
 
-/// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+/// An `AuthService`/`AuthorizationContext` that authenticates as [`USER_ID`].
+fn ok_auth() -> FixedAuth {
+    FixedAuth::signed_in(user())
 }
 
 /// A [`UserManager`] resolving the fixed authenticated user. The flags are the
@@ -142,9 +104,6 @@ impl UserManager for OkUsers {
         })
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -299,9 +258,13 @@ impl MediaSourceManager for StreamSources {
 /// A [`LibraryManager`] that resolves [`ITEM_ID`] and 404s everything else.
 struct StreamLibrary;
 
-/// The refreshes [`StreamLibrary`] ran to completion for a caller that
-/// awaited them (`run_refresh_scan`), as debug-printed targets.
+/// The refreshes [`StreamLibrary`] ran for a caller that awaited them
+/// (`refresh_item_metadata`), as the items' paths.
 static AWAITED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The refreshes [`StreamLibrary`] queued (`queue_item_refresh`), as the
+/// items' paths.
+static QUEUED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 #[async_trait]
 impl LibraryManager for StreamLibrary {
@@ -333,7 +296,14 @@ impl LibraryManager for StreamLibrary {
                 ..minimal_base_item(STOPPED_ID, "Stopped", "Audio")
             }));
         }
-        // A library track: the refresh a lyric write queues is its path's scan.
+        if let Some((_, path)) = TRACKS.iter().find(|(track, _)| *track == id) {
+            return Ok(Some(BaseItemEntity {
+                path: Some((*path).to_owned()),
+                top_parent_id: Some(Uuid::from_u128(0x11b).to_string()),
+                ..minimal_base_item(id, "Track", "Audio")
+            }));
+        }
+        // A library track: the refresh a lyric delete awaits is of its file.
         Ok((id == ITEM_ID).then(|| BaseItemEntity {
             path: Some("/music/Artist/Album/A Song.flac".to_owned()),
             top_parent_id: Some(Uuid::from_u128(0x11b).to_string()),
@@ -341,22 +311,26 @@ impl LibraryManager for StreamLibrary {
         }))
     }
 
-    async fn queue_refresh_scan(
+    async fn queue_item_refresh(
         &self,
-        _target: ferrofin_traits::library::ScanTarget,
+        item: &BaseItemEntity,
         _options: &ferrofin_traits::providers::MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
+        QUEUED_REFRESHES
+            .lock()
+            .unwrap()
+            .push(item.path.clone().unwrap_or_default());
         Ok(())
     }
-    async fn run_refresh_scan(
+    async fn refresh_item_metadata(
         &self,
-        target: ferrofin_traits::library::ScanTarget,
+        item: &BaseItemEntity,
         _options: &ferrofin_traits::providers::MetadataRefreshOptions,
     ) -> Result<bool, ServiceError> {
-        let target = format!("{target:?}");
+        let path = item.path.clone().unwrap_or_default();
         // The shutdown stopping a refresh before it finished.
-        let finished = !target.contains(STOPPED_TRACK);
-        AWAITED_REFRESHES.lock().unwrap().push(target);
+        let finished = path != STOPPED_TRACK;
+        AWAITED_REFRESHES.lock().unwrap().push(path);
         Ok(finished)
     }
     async fn query_items(
@@ -379,13 +353,6 @@ impl LibraryManager for StreamLibrary {
         _q: &InternalItemsQuery,
         _c: ferrofin_model::data::CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
         unimplemented!()
     }
     async fn update_items(
@@ -523,6 +490,64 @@ impl LyricManager for CannedLyrics {
     }
 }
 
+/// A [`LyricManager`] whose upload, delete and download each signal they have
+/// started, then wait to be released before they finish and record it.
+#[derive(Default)]
+struct GatedLyrics {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    /// The writes that finished.
+    finished: Mutex<Vec<&'static str>>,
+}
+
+impl GatedLyrics {
+    async fn write(&self, name: &'static str) {
+        self.started.notify_one();
+        self.release.notified().await;
+        self.finished.lock().unwrap().push(name);
+    }
+}
+
+#[async_trait]
+impl LyricManager for GatedLyrics {
+    async fn get_lyrics(&self, _item_id: Uuid) -> Result<Option<LyricDto>, ServiceError> {
+        Ok(None)
+    }
+    async fn search_lyrics(&self, _item_id: Uuid) -> Result<Vec<RemoteLyricInfoDto>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn download_lyrics(
+        &self,
+        _item_id: Uuid,
+        _lyric_id: &str,
+    ) -> Result<Option<LyricDto>, ServiceError> {
+        self.write("download").await;
+        Ok(Some(LyricDto::default()))
+    }
+    async fn get_remote_lyrics(&self, _lyric_id: &str) -> Result<Option<LyricDto>, ServiceError> {
+        Ok(None)
+    }
+    async fn save_lyric(
+        &self,
+        _item_id: Uuid,
+        _format: &str,
+        _lyrics: &[u8],
+    ) -> Result<Option<LyricDto>, ServiceError> {
+        self.write("upload").await;
+        Ok(Some(LyricDto::default()))
+    }
+    async fn delete_lyrics(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+        self.write("delete").await;
+        Ok(())
+    }
+    async fn get_supported_providers(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::providers::LyricProviderInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+}
+
 /// Builds an [`AppState`] serving `path` for streams and using `lyrics` for the
 /// Lyrics routes; every other manager is a shared panic fake.
 fn state(path: &str, lyrics: Arc<dyn LyricManager>) -> AppState {
@@ -549,8 +574,8 @@ fn state_as(path: &str, lyrics: Arc<dyn LyricManager>, admin: bool, lyric: bool)
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(ferrofin_api::test_support::FakeDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
+        Arc::new(ok_auth()),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -728,6 +753,33 @@ async fn lyrics_routes_404_on_a_non_audio_item() {
 }
 
 #[tokio::test]
+async fn lyrics_routes_400_on_a_nil_item_id() {
+    // `GetItemById<Audio>(Guid.Empty, …)` reaches `GetItemById(Guid)`, which
+    // throws `ArgumentException("Guid can't be empty")`: a 400, not a 404.
+    let deleted = Arc::new(Mutex::new(false));
+    let canned = || CannedLyrics {
+        stored: Some(LyricDto::default()),
+        remote: Some(("abc_1".to_owned(), LyricDto::default())),
+        deleted: deleted.clone(),
+        saved: Arc::default(),
+    };
+    let nil = Uuid::nil();
+    for (method, path) in [
+        ("GET", format!("/Audio/{nil}/Lyrics")),
+        ("POST", format!("/Audio/{nil}/Lyrics?fileName=x.lrc")),
+        ("DELETE", format!("/Audio/{nil}/Lyrics")),
+        ("GET", format!("/Audio/{nil}/RemoteSearch/Lyrics")),
+        ("POST", format!("/Audio/{nil}/RemoteSearch/Lyrics/abc_1")),
+    ] {
+        let (_dir, path_media) = temp_media();
+        let app = state(&path_media, Arc::new(canned()));
+        let (status, _) = call(app, method, &path).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}");
+    }
+    assert!(!*deleted.lock().unwrap());
+}
+
+#[tokio::test]
 async fn lyric_writes_need_the_lyric_management_permission() {
     // Port of `[Authorize(Policy = Policies.LyricManagement)]` — the
     // `UserPermissionRequirement(PermissionKind.EnableLyricManagement)` five of
@@ -852,6 +904,88 @@ async fn lyrics_delete_with_a_stopped_refresh_is_503() {
     let (status, _) = call(app, "DELETE", &format!("/Audio/{STOPPED_ID}/Lyrics")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(*deleted.lock().unwrap());
+}
+
+/// A client that hangs up during a lyric upload, delete or download does not
+/// stop it: upstream's `LyricsController` passes `CancellationToken.None` or no
+/// token and never reads `RequestAborted`, so the file is saved or deleted and
+/// the track's refresh runs (queued after an upload or a download, awaited by
+/// the delete) (gl-1645).
+#[rstest::rstest]
+#[case::upload(TRACKS[0], "POST", "Lyrics?fileName=s.lrc", "upload", &QUEUED_REFRESHES)]
+#[case::delete(TRACKS[1], "DELETE", "Lyrics", "delete", &AWAITED_REFRESHES)]
+#[case::download(
+    TRACKS[2],
+    "POST",
+    "RemoteSearch/Lyrics/abc_1",
+    "download",
+    &QUEUED_REFRESHES
+)]
+#[tokio::test]
+async fn a_lyric_write_finishes_after_the_client_hangs_up(
+    #[case] track: (Uuid, &str),
+    #[case] method: &str,
+    #[case] route: &str,
+    #[case] write: &str,
+    #[case] refreshes: &'static Mutex<Vec<String>>,
+) {
+    let (track_id, track) = track;
+    let lyrics = Arc::new(GatedLyrics::default());
+    let app = state("/unused", Arc::clone(&lyrics) as Arc<dyn LyricManager>);
+    let request = Request::builder()
+        .method(method)
+        .uri(format!("/Audio/{track_id}/{route}"))
+        .header("Authorization", "Bearer token")
+        .header("Content-Type", "text/plain")
+        .body(Body::from("[00:01.00]hi"))
+        .expect("request");
+    let pending = tokio::spawn(create_router(app).oneshot(request));
+    lyrics.started.notified().await;
+    pending.abort();
+    assert!(
+        pending.await.is_err_and(|e| e.is_cancelled()),
+        "the request was dropped"
+    );
+    lyrics.release.notify_one();
+    let refreshed = || refreshes.lock().unwrap().iter().any(|path| path == track);
+    for _ in 0..200 {
+        if refreshed() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(*lyrics.finished.lock().unwrap(), [write]);
+    assert!(refreshed(), "the track's refresh ran");
+}
+
+/// A save or a download that yields no lyric answers as upstream does, `400`
+/// or `404`, and queues no refresh: `UploadLyrics` and `DownloadRemoteLyrics`
+/// return before their `QueueRefresh`.
+#[tokio::test]
+async fn a_lyric_write_that_yields_nothing_queues_no_refresh() {
+    let (track_id, track) = TRACKS[3];
+    let nothing = || {
+        Arc::new(CannedLyrics {
+            stored: None,
+            remote: None,
+            deleted: Arc::default(),
+            saved: Arc::default(),
+        })
+    };
+    let uri = format!("/Audio/{track_id}/Lyrics?fileName=s.lrc");
+    let upload = post_body(state("/unused", nothing()), &uri, b"[00:01.00]hi".to_vec()).await;
+    assert_eq!(upload, StatusCode::BAD_REQUEST);
+    let uri = format!("/Audio/{track_id}/RemoteSearch/Lyrics/abc_1");
+    let (download, _) = call(state("/unused", nothing()), "POST", &uri).await;
+    assert_eq!(download, StatusCode::NOT_FOUND);
+    assert!(
+        !QUEUED_REFRESHES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|queued| queued == track),
+        "nothing was queued"
+    );
 }
 
 /// Sends an authenticated `POST` whose body is `body`.

@@ -26,10 +26,13 @@ use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{EncoderPreset, MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
+use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_model::session::TranscodeReasons;
 use ferrofin_traits::media_encoding::TranscodingJobType;
+use ferrofin_util::invariant_float;
 
 use crate::encoder::FfmpegVersion;
+use crate::encoder::media_encoder::InputAnalysis;
 
 use super::bitstream;
 use super::transcode_state::{BaseEncodingJobOptions, EncoderCapabilities, EncodingJobInfo};
@@ -44,6 +47,69 @@ use super::transcode_state::{BaseEncodingJobOptions, EncoderCapabilities, Encodi
 /// against the same pattern before it reaches an ffmpeg command line.
 pub(crate) fn is_valid_container(value: &str) -> bool {
     ferrofin_model::media_info::is_valid_stream_identifier(value)
+}
+
+/// The containers [`input_format`] forces no format for: upstream's "need to
+/// find out the ffmpeg names" list, `m4v` (reported failures), `strm` and
+/// `iso` (no ffmpeg format).
+const NO_INPUT_FORMAT: [&str; 16] = [
+    "m2ts", "wmv", "mts", "vob", "mpg", "mpeg", "rec", "dvr-ms", "ogm", "divx", "tp", "rmvb",
+    "rtp", "m4v", "strm", "iso",
+];
+
+/// The ffmpeg input format (`-f`) to force for an item's container, or `None`
+/// to let ffmpeg probe it.
+///
+/// Port of `EncodingHelper.GetInputFormat`: `None` for an empty container or
+/// one failing the validation pattern; `mkv` renamed `matroska` wherever it
+/// appears (`mkv,webm` is `matroska,webm`); `ts` is `mpegts`; `None` for
+/// [`NO_INPUT_FORMAT`]; any other container unchanged, since ffmpeg finds a
+/// demuxer by its whole comma-separated name too (`mov,mp4,m4a,3gp,3g2,mj2`).
+#[must_use]
+pub fn input_format(container: &str) -> Option<String> {
+    if container.is_empty() || !is_valid_container(container) {
+        return None;
+    }
+    let container =
+        ferrofin_util::string_extensions::replace_ignore_ascii_case(container, "mkv", "matroska");
+    if container.eq_ignore_ascii_case("ts") {
+        return Some("mpegts".to_owned());
+    }
+    (!NO_INPUT_FORMAT
+        .iter()
+        .any(|skipped| container.eq_ignore_ascii_case(skipped)))
+    .then_some(container)
+}
+
+/// Whether an HLS `segmentContainer` asks for fMP4 segments: `mp4` in any
+/// case, surrounding whitespace ignored. Every site that turns the container
+/// into a segment file extension, an `-hls_segment_type` or an fMP4 decision
+/// reads this one rule, so the segments ffmpeg is told to write are the ones
+/// the playlist, the stream manager and the transcode manager look for.
+#[must_use]
+pub fn is_mp4_segment_container(segment_container: &str) -> bool {
+    segment_container.trim().eq_ignore_ascii_case("mp4")
+}
+
+/// The extension of the HLS segment files for `segment_container`: `.mp4`
+/// for fMP4 ([`is_mp4_segment_container`]), else `.ts`.
+///
+/// ACCEPTED DIVERGENCE, deliberately: upstream's `GetSegmentFileExtension`
+/// (`EncodingHelper.cs:1625`) is `"." + segmentContainer`, the client's raw
+/// string. ffmpeg only ever writes mpegts or fMP4 segments
+/// (`DynamicHlsController` maps any other container to mpegts), so echoing
+/// `segmentContainer=TS` or an unknown container would have the segment routes
+/// look for `out0.TS` while ffmpeg wrote `out0.ts`: a permanent miss on a
+/// case-sensitive filesystem, which a client sees as a dead transcode. The
+/// playlist's segment URIs keep upstream's echo; the routes ignore that
+/// extension.
+#[must_use]
+pub fn segment_file_extension(segment_container: &str) -> &'static str {
+    if is_mp4_segment_container(segment_container) {
+        ".mp4"
+    } else {
+        ".ts"
+    }
 }
 
 /// Infers an audio codec from the actual URL suffix.
@@ -276,13 +342,19 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// Port of `GetVideoBitrateParam`: the `libx264`/`libx265` (`-maxrate`/
     /// `-bufsize`) and `libsvtav1` (`-b:v`/`-bufsize`) arms, plus the generic
     /// fallback every encoder with no arm of its own takes — NVENC among them —
-    /// and the QSV arm. `-mbbrc` is not here: v12.2 moved it into
-    /// `GetEncoderParam`. The VAAPI encoders take the generic fallback, without
-    /// upstream's `-rc_mode VBR` (`CBR` on i965); TODO(parity, gl-1516): open
-    /// work item: port that arm. AMF and VideoToolbox are not supported.
+    /// and the QSV and VAAPI arms. `-mbbrc` is not here: v12.2 moved it into
+    /// `GetEncoderParam`. AMF and VideoToolbox are not supported. The VAAPI
+    /// arm reads the driver from `capabilities`, which must be the planner's
+    /// per-job probe (see [`Self::video_quality_param_with`]): this helper's
+    /// own capabilities never carry the driver, so they always read as VBR.
     /// Returns empty when no output bitrate is set.
     #[must_use]
-    pub fn video_bitrate_param(&self, state: &EncodingJobInfo, video_codec: &str) -> String {
+    pub fn video_bitrate_param(
+        &self,
+        capabilities: &C,
+        state: &EncodingJobInfo,
+        video_codec: &str,
+    ) -> String {
         let Some(mut bitrate) = state.output_video_bitrate else {
             return String::new();
         };
@@ -313,7 +385,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
                 .is_some_and(|c| c.eq_ignore_ascii_case("h264"))
                 && state
                     .requested_level("h264")
-                    .and_then(|l| l.parse::<f64>().ok())
+                    .and_then(|l| invariant_float::parse::<f64>(&l))
                     .is_some_and(|l| l < 51.0)
             {
                 1
@@ -330,6 +402,18 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             return format!(
                 " -b:v {bitrate} -maxrate {maxrate} \
                  -rc_init_occupancy {init_occupancy} -bufsize {bufsize}"
+            );
+        }
+
+        if eq_any(video_codec, &["h264_vaapi", "hevc_vaapi", "av1_vaapi"]) {
+            // VBR in the i965 driver may result in pixelated output.
+            let rc_mode = if capabilities.is_vaapi_device_intel_i965() {
+                "CBR"
+            } else {
+                "VBR"
+            };
+            return format!(
+                " -rc_mode {rc_mode} -b:v {bitrate} -maxrate {bitrate} -bufsize {bufsize}"
             );
         }
 
@@ -474,7 +558,8 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// [`Self::video_quality_param`] against `capabilities` instead of the
     /// ones this helper was built with.
     ///
-    /// `GetEncoderParam`'s VAAPI arm keys on `IsVaapiDeviceInteliHD`, and the
+    /// `GetEncoderParam`'s VAAPI arm keys on `IsVaapiDeviceInteliHD` and
+    /// `GetVideoBitrateParam`'s on `IsVaapiDeviceInteli965`, and the
     /// driver behind the configured render node is only known once the
     /// planner has probed it for the job. The boot capabilities never carry
     /// it, so the planner passes its per-job probe here.
@@ -498,7 +583,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             is_libx265,
             capabilities.is_vaapi_device_intel_ihd(),
         ));
-        param.push_str(&self.video_bitrate_param(state, video_encoder));
+        param.push_str(&self.video_bitrate_param(capabilities, state, video_encoder));
 
         if let Some(framerate) = self.framerate_param(state) {
             let _ = write!(param, " -r {framerate}");
@@ -577,6 +662,10 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     /// to a client that did not list `DOVI` needs its RPU stripped (see
     /// `range_type_copy_ok`).
     #[must_use]
+    #[allow(
+        clippy::needless_bool,
+        reason = "the last of a chain of `return false` guards ported from CanStreamCopyVideo; folding only that one into the return hides the chain"
+    )]
     pub fn can_stream_copy_video(
         &self,
         state: &EncodingJobInfo,
@@ -678,7 +767,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
 
         if let Some(request_level) = state
             .requested_level(codec)
-            .and_then(|l| l.parse::<f64>().ok())
+            .and_then(|l| invariant_float::parse::<f64>(&l))
             && video_stream.level.is_some_and(|l| l > request_level)
         {
             return false;
@@ -1125,7 +1214,10 @@ fn preset_name(preset: EncoderPreset) -> std::borrow::Cow<'static, str> {
 /// requested level through the same clamp before formatting the `CODECS` entry.
 #[must_use]
 pub fn normalize_transcoding_level(state: &EncodingJobInfo, level: Option<&str>) -> Option<String> {
-    let request_level = level?.parse::<f64>().ok()?;
+    // `double.TryParse(level, CultureInfo.InvariantCulture, …)` takes trailing
+    // NULs, which .NET's argv then cuts off; a NUL in an argument fails the spawn.
+    let level = level.map(|l| l.trim_end_matches('\0'));
+    let request_level = invariant_float::parse::<f64>(level?)?;
     let codec = state.actual_output_video_codec().unwrap_or_default();
 
     if codec.eq_ignore_ascii_case("av1") {
@@ -1178,7 +1270,7 @@ pub fn normalize_subtitle_embed(
 /// `GetProgressiveVideoFullCommandLine` appends it after the audio arguments.
 ///
 /// The stream routes reject a `subtitleCodec` outside the container pattern
-/// before a job exists (`validate_stream_request`, upstream's
+/// before a job exists (`stream_pattern_failures` in the API crate, upstream's
 /// `[RegularExpression(ContainerValidationRegexStr)]`). Because the value is
 /// written into the command line, a name outside that pattern is also treated
 /// as no name here, so a caller that skipped the route check cannot add
@@ -1676,10 +1768,11 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// `fast_seek` is the media file's own `-ss` value, if it seeks: the inputs
 /// are seeked alike, so the tracks stay in step with the video, except the
 /// bitmap sidecars the divergences below read from their start. A subtitle
-/// input reads with the media file's `-analyzeduration` and `-probesize`, and
-/// a burned-in graphical one with its canvas size. A VobSub `.sub` is read
-/// through its `.idx` when one lies beside it, since the `.idx` names the
-/// `.sub` and carries the palette and timing.
+/// input reads with the media file's `-analyzeduration` and `-probesize`
+/// (`input_analysis`: the configured `FFmpeg:analyzeduration` and
+/// `FFmpeg:probesize`), and a burned-in graphical one with its canvas size. A
+/// VobSub `.sub` is read through its `.idx` when one lies beside it, since the
+/// `.idx` names the `.sub` and carries the palette and timing.
 ///
 /// Divergence: each external input is also synced to the media file's clock
 /// (`-isync 0`, from ffmpeg 5.1, `ffmpeg_version`). Without `-copyts` ffmpeg
@@ -1715,7 +1808,8 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 ///
 /// Third divergence (gl-929): an ffmpeg older than 5.1 has no `-isync`, and
 /// one whose version cannot be read counts as the oldest supported, as for
-/// every version gate (static and git builds print `ffmpeg version N-…`).
+/// every version gate (a git build's `ffmpeg version N-…` is read from its
+/// libraries instead).
 /// Upstream's unsynced form, which Ferrofin kept there until then, moved a
 /// bitmap sidecar earlier by its first cue's time and seeked it that much too
 /// far: embedded, its cues came 3.5 s early; burned into a segment seeked to
@@ -1750,11 +1844,18 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// server cut to the start instead
 /// ([`EncodingJobInfo::trimmed_subtitle_path`]), neither seeked nor synced,
 /// since its cues already start at the start.
+///
+/// Fifth divergence (gl-1722): a sidecar whose path is a URL (`://`) is read
+/// from the URL, the way upstream's `GetExternalSubtitleInputArgument` and the
+/// media file's input write it. Upstream's muxing writes `-i file:"<path>"`
+/// whatever the path, so ffmpeg looks for a local file named after the URL
+/// and the stream fails: a Jellyfin bug, deliberately not ported.
 #[must_use]
 pub fn external_stream_input_arguments(
     state: &EncodingJobInfo,
     fast_seek: Option<&str>,
     ffmpeg_version: Option<FfmpegVersion>,
+    input_analysis: &InputAnalysis,
 ) -> Vec<String> {
     let mut args = Vec::new();
     let can_sync = ffmpeg_version.is_some_and(|version| version >= MIN_FFMPEG_INPUT_SYNC);
@@ -1793,15 +1894,7 @@ pub fn external_stream_input_arguments(
                 path = idx.to_string_lossy().into_owned();
             }
         }
-        args.extend([
-            "-analyzeduration".to_owned(),
-            crate::encoder::media_encoder::analyze_duration_value(
-                state.media_source.analyze_duration_ms,
-                crate::encoder::media_encoder::DEFAULT_ANALYZE_DURATION,
-            ),
-            "-probesize".to_owned(),
-            crate::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
-        ]);
+        args.extend(input_analysis.input_args(state.media_source.analyze_duration_ms));
         let bitmap = !sub.is_text_subtitle_stream();
         let burned_in = should_encode_subtitle(state) && bitmap;
         // A bitmap sidecar is read from its start, embedded or burned in, on
@@ -1826,7 +1919,11 @@ pub fn external_stream_input_arguments(
         } else if trimmed.is_none() {
             sync(&mut args);
         }
-        args.extend(["-i".to_owned(), format!("file:{path}")]);
+        // Written as the media file's input is: a URL bare, a file `file:`.
+        let input = crate::encoder::get_input_argument("file", &path, MediaProtocol::File);
+        args.push("-i".to_owned());
+        // `quote` always balances; the fallback is one token, which cannot add an option.
+        args.extend(crate::encoder::split_args(&input).unwrap_or_else(|_| vec![input]));
     }
     if let Some(audio) = state
         .audio_stream
@@ -1957,7 +2054,7 @@ fn range_type_copy_ok<C: EncoderCapabilities>(
         return false;
     }
 
-    if has(&video_range_type_name(range)) {
+    if has(&range.json_name()) {
         return true;
     }
 
@@ -1990,12 +2087,6 @@ fn range_type_copy_ok<C: EncoderCapabilities>(
             bitstream::HdrMetadataRemoval::RemoveDovi,
             Some(video_stream),
         ) && bitstream::video_bit_stream_filters_apply(state))
-}
-
-/// The PascalCase wire name of a video range type. Port of
-/// `VideoRangeType.ToString()`.
-fn video_range_type_name(range_type: VideoRangeType) -> String {
-    range_type.json_name().into_owned()
 }
 
 /// The codec/parameter incompatibilities that prevent an audio copy. Port of
@@ -2136,6 +2227,12 @@ mod tests {
         EncodingHelper::with_processor_count(FakeCapabilities { available }, 8)
     }
 
+    /// `video_bitrate_param` against capabilities that probed no VAAPI driver.
+    fn bitrate_param(state: &EncodingJobInfo, video_codec: &str) -> String {
+        let helper = helper(vec![]);
+        helper.video_bitrate_param(helper.capabilities(), state, video_codec)
+    }
+
     fn video_stream(codec: &str, index: i32) -> MediaStream {
         MediaStream {
             codec: Some(codec.to_owned()),
@@ -2178,12 +2275,12 @@ mod tests {
             output_audio_bitrate: None,
             output_audio_channels: None,
             output_container: None,
-            output_video_sync: None,
             output_file_path: "/tmp/out.mp4".to_owned(),
             input_container: None,
             is_input_video: true,
             subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
             trimmed_subtitle_path: None,
+            transcode_reasons: ferrofin_model::session::TranscodeReasons::empty(),
             run_time_ticks: Some(1),
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Progressive,
             supported_video_codecs: Vec::new(),
@@ -2457,7 +2554,7 @@ mod tests {
         let mut state = job(&[video_stream("h264", 0)]);
         state.output_video_bitrate = Some(3_000_000);
         assert_eq!(
-            helper(vec![]).video_bitrate_param(&state, "libx264"),
+            bitrate_param(&state, "libx264"),
             " -maxrate 3000000 -bufsize 6000000"
         );
     }
@@ -2467,7 +2564,7 @@ mod tests {
         let mut state = job(&[video_stream("h264", 0)]);
         state.output_video_bitrate = Some(2_000_000);
         assert_eq!(
-            helper(vec![]).video_bitrate_param(&state, "libsvtav1"),
+            bitrate_param(&state, "libsvtav1"),
             " -b:v 2000000 -bufsize 4000000"
         );
     }
@@ -2475,7 +2572,12 @@ mod tests {
     #[test]
     fn video_bitrate_param_none_is_empty() {
         let state = job(&[video_stream("h264", 0)]);
-        assert_eq!(helper(vec![]).video_bitrate_param(&state, "libx264"), "");
+        assert_eq!(bitrate_param(&state, "libx264"), "");
+        assert_eq!(
+            bitrate_param(&state, "h264_vaapi"),
+            "",
+            "no -rc_mode either"
+        );
     }
 
     // ----- video_bitrate_param_value / scale_bitrate -------------------------
@@ -2664,9 +2766,38 @@ mod tests {
         state.output_video_bitrate = Some(3_000_000);
         state.base_request.level = level.map(str::to_owned);
         assert_eq!(
-            helper(vec![]).video_bitrate_param(&state, encoder),
+            bitrate_param(&state, encoder),
             expected,
             "{encoder}/{codec}/{level:?}"
+        );
+    }
+
+    /// v12.4 `GetVideoBitrateParam`'s VAAPI arm: VBR, except CBR on the Intel
+    /// i965 driver ("VBR in i965 driver may result in pixelated output"). An
+    /// AMD device, an iHD one and an unprobed one all take VBR.
+    #[rstest]
+    #[case::ihd("h264_vaapi", (false, true, false), "VBR")]
+    #[case::ihd_hevc("hevc_vaapi", (false, true, false), "VBR")]
+    #[case::ihd_av1("av1_vaapi", (false, true, false), "VBR")]
+    #[case::amd("hevc_vaapi", (true, false, false), "VBR")]
+    #[case::unprobed("h264_vaapi", (false, false, false), "VBR")]
+    #[case::i965("h264_vaapi", (false, false, true), "CBR")]
+    #[case::i965_hevc("hevc_vaapi", (false, false, true), "CBR")]
+    #[case::i965_av1("av1_vaapi", (false, false, true), "CBR")]
+    fn video_bitrate_param_vaapi_sets_the_rate_control_mode(
+        #[case] encoder: &str,
+        #[case] (amd, intel_ihd, intel_i965): (bool, bool, bool),
+        #[case] rc_mode: &str,
+    ) {
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .vaapi_driver(amd, intel_ihd, intel_i965)
+            .build();
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_bitrate = Some(3_000_000);
+        assert_eq!(
+            EncodingHelper::with_processor_count(caps.clone(), 8)
+                .video_bitrate_param(&caps, &state, encoder),
+            format!(" -rc_mode {rc_mode} -b:v 3000000 -maxrate 3000000 -bufsize 6000000"),
         );
     }
 
@@ -2680,26 +2811,14 @@ mod tests {
         let mut state = job(&[video_stream("h264", 0)]);
         state.output_video_codec = Some("h264".to_owned());
         state.output_video_bitrate = Some(500_000);
-        assert!(
-            helper(vec![])
-                .video_bitrate_param(&state, "h264_qsv")
-                .contains(" -b:v 500000"),
-        );
+        assert!(bitrate_param(&state, "h264_qsv").contains(" -b:v 500000"));
 
         // Below 1000 bps it does fire...
         state.output_video_bitrate = Some(800);
-        assert!(
-            helper(vec![])
-                .video_bitrate_param(&state, "h264_qsv")
-                .contains(" -b:v 1000"),
-        );
+        assert!(bitrate_param(&state, "h264_qsv").contains(" -b:v 1000"));
         // ...and only for h264_qsv.
         state.output_video_codec = Some("hevc".to_owned());
-        assert!(
-            helper(vec![])
-                .video_bitrate_param(&state, "hevc_qsv")
-                .contains(" -b:v 800"),
-        );
+        assert!(bitrate_param(&state, "hevc_qsv").contains(" -b:v 800"));
     }
 
     /// A helper over the real capability probe, reporting `version` (`None`:
@@ -2932,12 +3051,12 @@ mod tests {
         let mut state = job(&[video_stream("h264", 0)]);
         state.output_video_bitrate = Some(3_000_000);
         assert_eq!(
-            helper(vec![]).video_bitrate_param(&state, "h264_nvenc"),
+            bitrate_param(&state, "h264_nvenc"),
             " -b:v 3000000 -maxrate 3000000 -bufsize 6000000"
         );
         // ...where libx264 only caps.
         assert_eq!(
-            helper(vec![]).video_bitrate_param(&state, "libx264"),
+            bitrate_param(&state, "libx264"),
             " -maxrate 3000000 -bufsize 6000000"
         );
     }
@@ -3071,6 +3190,20 @@ mod tests {
         assert!(!param.contains(" -level "), "{param}");
     }
 
+    /// `NormalizeTranscodingLevel` reads the requested level with
+    /// `double.TryParse(…, CultureInfo.InvariantCulture, …)`: Rust's `inf` is
+    /// no level there (null, so no `-level`), where it was clamped to 15.
+    #[test]
+    fn video_quality_param_omits_a_level_double_parse_refuses() {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("av1".to_owned());
+        state.base_request.level = Some("inf".to_owned());
+        let opts = default_encoding_options(0);
+        let param =
+            helper(vec![]).video_quality_param(&state, "libsvtav1", &opts, EncoderPreset::veryfast);
+        assert!(!param.contains(" -level "), "{param}");
+    }
+
     #[test]
     fn video_quality_param_passes_the_level_through_for_libx264() {
         // Only AV1 is remapped; H.264's level is already the number ffmpeg
@@ -3082,6 +3215,14 @@ mod tests {
         let param =
             helper(vec![]).video_quality_param(&state, "libx264", &opts, EncoderPreset::veryfast);
         assert!(param.contains(" -level 41"), "{param}");
+        // `double.TryParse` reads `41\0` as 41; the NUL never reaches ffmpeg.
+        state.base_request.level = Some("41\0".to_owned());
+        let param =
+            helper(vec![]).video_quality_param(&state, "libx264", &opts, EncoderPreset::veryfast);
+        assert!(
+            param.contains(" -level 41") && !param.contains('\0'),
+            "{param:?}"
+        );
 
         let mut state = job(&[video_stream("hevc", 0)]);
         state.output_video_codec = Some("hevc".to_owned());
@@ -3626,7 +3767,7 @@ mod tests {
         assert_eq!(video_sync_option("0", v(7, 0)), " -fps_mode passthrough");
         assert_eq!(video_sync_option("0", v(5, 1)), " -fps_mode passthrough");
         assert_eq!(video_sync_option("0", v(5, 0)), " -vsync 0");
-        // Unprobed: the option every supported build still understands.
+        // Unprobed counts as the oldest, as upstream's null version does.
         assert_eq!(video_sync_option("0", None), " -vsync 0");
         // The rest of the table.
         assert_eq!(video_sync_option("-1", v(7, 0)), " -fps_mode auto");
@@ -3638,6 +3779,45 @@ mod tests {
         assert_eq!(video_sync_option("", v(7, 0)), "");
         // Below the gate the number is passed through unexamined.
         assert_eq!(video_sync_option("9", v(4, 4)), " -vsync 9");
+    }
+
+    /// `GetInputFormat`, case by case: the probe's normalised containers
+    /// (`mkv`, `mkv,webm`, `ts`, `mpeg`, mp4's full ffmpeg name) among them.
+    #[rstest]
+    #[case::empty("", None)]
+    #[case::fails_validation("mkv webm", None)]
+    #[case::too_long(&"a".repeat(41), None)]
+    #[case::mkv("mkv", Some("matroska"))]
+    #[case::mkv_any_case("MKV", Some("matroska"))]
+    #[case::mkv_in_a_list("mkv,webm", Some("matroska,webm"))]
+    #[case::ts("ts", Some("mpegts"))]
+    #[case::ts_any_case("TS", Some("mpegts"))]
+    #[case::m2ts("m2ts", None)]
+    #[case::wmv("wmv", None)]
+    #[case::mts("mts", None)]
+    #[case::vob("vob", None)]
+    #[case::mpg("mpg", None)]
+    #[case::mpeg("mpeg", None)]
+    #[case::mpeg_any_case("MPEG", None)]
+    #[case::rec("rec", None)]
+    #[case::dvr_ms("dvr-ms", None)]
+    #[case::ogm("ogm", None)]
+    #[case::divx("divx", None)]
+    #[case::tp("tp", None)]
+    #[case::rmvb("rmvb", None)]
+    #[case::rtp("rtp", None)]
+    #[case::m4v("m4v", None)]
+    #[case::strm("strm", None)]
+    #[case::iso("iso", None)]
+    #[case::passed_through("avi", Some("avi"))]
+    #[case::passed_through_unchanged("AVI", Some("AVI"))]
+    #[case::mpegts_itself("mpegts", Some("mpegts"))]
+    #[case::mp4_family("mov,mp4,m4a,3gp,3g2,mj2", Some("mov,mp4,m4a,3gp,3g2,mj2"))]
+    fn the_input_format_follows_get_input_format(
+        #[case] container: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(input_format(container).as_deref(), expected);
     }
 
     const FORCED_3S: &str = " -force_key_frames:0 expr:gte(t,n_forced*3)";
@@ -3821,6 +4001,23 @@ mod tests {
     #[case("", "aac")]
     fn infer_audio_codec_maps_containers(#[case] container: &str, #[case] expected: &str) {
         assert_eq!(infer_audio_codec(container), expected);
+    }
+
+    #[rstest]
+    #[case("mp4", ".mp4")]
+    #[case("MP4", ".mp4")]
+    #[case(" mp4 ", ".mp4")]
+    #[case("ts", ".ts")]
+    #[case("TS", ".ts")]
+    #[case("webm", ".ts")]
+    #[case("", ".ts")]
+    #[case("   ", ".ts")]
+    fn segment_containers_map_to_the_files_ffmpeg_writes(
+        #[case] container: &str,
+        #[case] extension: &str,
+    ) {
+        assert_eq!(segment_file_extension(container), extension);
+        assert_eq!(is_mp4_segment_container(container), extension == ".mp4");
     }
 
     fn subtitle(codec: Option<&str>) -> MediaStream {

@@ -257,6 +257,38 @@ async fn addresses_published_by_request_take_the_requests_scheme() {
     server.shut_down(&token).await;
 }
 
+/// gl-1791: `ListenWithHttps` reads the saved `EnableHttps`, so a save that
+/// turns HTTPS off advertises the HTTP address at once, while HTTPS still
+/// answers until the restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_that_turns_https_off_advertises_http_at_once() {
+    let server = boot_https_server_with(serde_json::json!({"RequireHttps": false})).await;
+    let token = server.sign_in().await;
+    let local_address = |info: serde_json::Value| info["LocalAddress"].clone();
+    assert_eq!(
+        local_address(server.get_json("/System/Info/Public", &token).await),
+        server.https_base.as_str()
+    );
+
+    let mut network = server
+        .get_json("/System/Configuration/network", &token)
+        .await;
+    network["EnableHttps"] = false.into();
+    assert_eq!(
+        server.save_network(&network, &token).await,
+        reqwest::StatusCode::NO_CONTENT
+    );
+    for path in ["/System/Info/Public", "/System/Info"] {
+        assert_eq!(
+            local_address(server.get_json(path, &token).await),
+            server.base.as_str(),
+            "{path}"
+        );
+    }
+
+    server.shut_down(&token).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_certificate_path_needs_a_restart_or_is_answered_404() {
     let server = boot_https_server().await;

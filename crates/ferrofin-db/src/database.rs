@@ -209,6 +209,21 @@ impl Database {
             adopt_jellyfin_database(&mut conn, path).await?;
             let snapshot = backup_before_migrations(&mut conn, path).await?;
             MIGRATOR.run(&mut conn).await?;
+            // Every boot, and never fatal (a failure warns and the next boot
+            // tries again): see `drop_planner_statistics`.
+            match drop_planner_statistics(&mut conn).await {
+                Ok(true) => tracing::info!(
+                    "dropped the planner statistics (sqlite_stat1, sqlite_stat4) an ANALYZE \
+                     left: an earlier version's Optimize Database task, a manual one, or the \
+                     Jellyfin this database came from"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "could not drop the planner statistics; queries may not follow their \
+                     pinned plans until a later boot drops them"
+                ),
+            }
             log_dangling_row_cleanup(&mut conn).await?;
             crate::normalized_usernames::repair(&mut conn).await?;
             foreign_key_check(&mut conn).await?;
@@ -1106,7 +1121,7 @@ impl Database {
 
     /// Folds the whole write-ahead log back into the database file and empties
     /// it (`PRAGMA wal_checkpoint(TRUNCATE)`), as the optimization task does
-    /// after its vacuum.
+    /// before and after its vacuum.
     ///
     /// It takes its turn with the checkpoint task, so it waits for a
     /// checkpoint the writer's commits started, however long that takes,
@@ -2219,6 +2234,29 @@ async fn log_dangling_row_cleanup(conn: &mut sqlx::SqliteConnection) -> Result<(
     Ok(())
 }
 
+/// Drops the planner statistics `ANALYZE` writes, `sqlite_stat1` and
+/// `sqlite_stat4`, and says whether there were any. Ferrofin's plan pins and
+/// `EXPLAIN QUERY PLAN` tests assume the planner has none. `0033` dropped
+/// `sqlite_stat1` once, but the Optimize Database task's `PRAGMA optimize`
+/// recreated both on every server that ran long enough, and a manual
+/// `ANALYZE` would too, so this runs on every boot rather than as a
+/// migration. Beside a previous version still running, a statistics table its
+/// task writes after this ran stays until the next boot.
+async fn drop_planner_statistics(conn: &mut sqlx::SqliteConnection) -> Result<bool> {
+    let present: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+         AND name IN ('sqlite_stat1', 'sqlite_stat4')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if present > 0 {
+        sqlx::raw_sql("DROP TABLE IF EXISTS sqlite_stat1; DROP TABLE IF EXISTS sqlite_stat4;")
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(present > 0)
+}
+
 /// How many prepared statements each pooled connection keeps when the
 /// composition root does not say (`db_statement_cache`; owner decisions,
 /// gl-1071 and gl-1243). sqlx's own default is 100, which evicted statements
@@ -2435,6 +2473,29 @@ mod tests {
             memory.snapshot_once("db.pre-rehome").await.expect("memory"),
             None
         );
+    }
+
+    /// Temporary storage stays on disk: the bundled SQLite's compile-time
+    /// default, which no connection overrides, so the Optimize Database task's
+    /// vacuum writes its copy of the database to a file, as Jellyfin's does
+    /// under its `temp_store=1`.
+    #[tokio::test]
+    async fn temp_store_stays_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let db = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        for (name, pool) in [("writer", db.writer()), ("readers", db.pool())] {
+            let (on_disk, temp_store): (bool, i64) = sqlx::query_as(
+                "SELECT sqlite_compileoption_used('TEMP_STORE=1'), temp_store FROM pragma_temp_store",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("compile options");
+            assert!(on_disk, "built with SQLITE_TEMP_STORE=1");
+            assert_eq!(temp_store, 0, "the {name} pool overrides the default");
+        }
     }
 
     /// An existing repair snapshot is kept as an earlier boot left it, and
@@ -3845,6 +3906,31 @@ mod tests {
             > 0
     }
 
+    /// Statistics an earlier `OptimizeDatabaseTask` (`PRAGMA optimize`) or a
+    /// hand-run `ANALYZE` left behind are dropped on the next boot, `stat4`
+    /// with `stat1`, and a boot with none to drop opens as before.
+    #[tokio::test]
+    async fn every_boot_drops_the_planner_statistics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite://{}", dir.path().join("ferrofin.db").display());
+        let db = Database::connect(&url).await.expect("connect");
+        // The placeholder `BaseItems` row gives `ANALYZE` an indexed table to sample.
+        sqlx::query("ANALYZE")
+            .execute(db.writer())
+            .await
+            .expect("analyze");
+        assert!(table_exists(&db, "sqlite_stat1").await);
+        assert!(table_exists(&db, "sqlite_stat4").await);
+        db.close().await;
+
+        for _ in 0..2 {
+            let db = Database::connect(&url).await.expect("reopen");
+            assert!(!table_exists(&db, "sqlite_stat1").await);
+            assert!(!table_exists(&db, "sqlite_stat4").await);
+            db.close().await;
+        }
+    }
+
     #[test]
     fn the_convergence_migration_is_never_baselined() {
         for generation in &JELLYFIN_GENERATIONS {
@@ -4905,8 +4991,9 @@ mod tests {
                 membership_import_done: false
             })
         );
-        // 0033's hygiene ran on this path too.
+        // 0033's hygiene ran on this path too, and the boot drops stat4.
         assert!(!table_exists(&db, "sqlite_stat1").await);
+        assert!(!table_exists(&db, "sqlite_stat4").await);
         let ef_rows: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#)
             .fetch_one(db.pool())
             .await

@@ -4,7 +4,8 @@
 //! The plugin's `MapEpisodeToResult` maps only the episode's record
 //! (`TvdbEpisodeProvider.cs:225,272-308`, jellyfin-plugin-tvdb `5c4592f`), and
 //! neither `EpisodeMetadataService` nor `MetadataService` adds the series'
-//! people to an episode.
+//! people to an episode. Each answer's credits go through `AddPerson`, and
+//! an episode's are typed as the plugin's episode loop types them.
 //!
 //! Boots the real server ([`ferrofin_server::run`]) over a one-episode library
 //! whose only metadata fetcher is TheTVDB, answered by an in-process stand-in
@@ -32,14 +33,17 @@ async fn the_tvdb(uri: Uri) -> Json<Value> {
         "/login" => json!({"data":{"token":"fixture"}}),
         "/series/5/extended" => json!({"data":{"id":5,"name":"Cast Show","characters":[
             {"personName":"Series Regular","name":"Lead","peopleType":"Actor"},
-            {"personName":"Second Regular","name":"Sidekick","peopleType":"Actor"}
+            {"personName":"Second Regular","name":"Sidekick","peopleType":"Actor"},
+            {"personName":"Series Director","name":"Showrunner","peopleType":"director"}
         ]}}),
         "/series/5/episodes/official" => {
             json!({"data":{"episodes":[{"id":51,"seasonNumber":1,"number":1}]}})
         }
         "/episodes/51/extended" => json!({"data":{"id":51,"name":"Pilot","characters":[
-            {"personName":"Episode Guest","name":"Villain","peopleType":"Guest Star"},
-            {"personName":"Episode Director","peopleType":"Director"}
+            {"personName":"Episode Guest","name":"Villain","peopleType":"Actor"},
+            {"personName":"Episode Guest","name":"Villain","peopleType":"guest star"},
+            {"personName":"Episode Director","name":"Ignored","peopleType":"DIRECTOR"},
+            {"personName":"Episode Producer","name":"Ignored","peopleType":"Producer"}
         ]}}),
         _ => json!({"data":{}}),
     })
@@ -230,14 +234,20 @@ async fn a_scanned_tvdb_episode_lists_only_its_own_characters() {
         [
             credit("Series Regular", Some("Lead"), "Actor"),
             credit("Second Regular", Some("Sidekick"), "Actor"),
+            // TVDB's type kept, case-insensitively (the plugin types it Actor).
+            credit("Series Director", Some("Showrunner"), "Director"),
         ]
     );
     assert_eq!(
         api.await_credits("Episode").await,
         [
+            // `AddPerson` merges the actor credit into the guest star's.
             credit("Episode Guest", Some("Villain"), "GuestStar"),
-            // `UpdatePeople` stores a missing role as "".
+            // No role for a director, and `UpdatePeople` stores a missing
+            // role as "".
             credit("Episode Director", Some(""), "Director"),
+            // A type `MapEpisodeToResult` does not name is `Unknown`.
+            credit("Episode Producer", Some(""), "Unknown"),
         ]
     );
 

@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{DynamicHlsPlaylistGenerator, EncodingOptionsProvider, HlsStreamManagerImpl};
 use ferrofin_mediaencoding::attachments::{AttachmentIo, MediaSourceResolver};
+use ferrofin_mediaencoding::encoder::media_encoder::InputAnalysis;
 use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
     subtitle_extraction_timeout,
@@ -43,6 +44,7 @@ use ferrofin_traits::media_encoding::{
 };
 use ferrofin_traits::persistence::KeyframeRepository;
 use ferrofin_traits::system::PathManager;
+use ferrofin_util::source_url::{is_remote_url, redact_url, redact_urls_in};
 use uuid::Uuid;
 
 use crate::bootstrap::FfmpegPaths;
@@ -73,6 +75,9 @@ pub struct MediaEncodingExtras {
     /// The caps on concurrent re-encoding jobs; see
     /// [`crate::config::Config::max_transcodes`].
     pub transcode_limits: TranscodeLimits,
+    /// The `-analyzeduration` / `-probesize` transcode inputs read with; see
+    /// [`crate::config::Config::ffmpeg_probe_size`].
+    pub input_analysis: InputAnalysis,
 }
 
 /// The playlist generator's encoding options: the live configuration, as
@@ -98,11 +103,9 @@ fn playlist_generator(
     encoder: &Arc<dyn MediaEncoder>,
     keyframes: Option<Arc<dyn KeyframeRepository>>,
 ) -> Arc<DynamicHlsPlaylistGenerator<GeneratorEncodingOptions>> {
-    let extractors = keyframes
-        .map(|repository| {
-            ferrofin_core::keyframe_extractors::keyframe_extractors(repository, Arc::clone(encoder))
-        })
-        .unwrap_or_default();
+    let extractors = keyframes.map_or_default(|repository| {
+        ferrofin_core::keyframe_extractors::keyframe_extractors(repository, Arc::clone(encoder))
+    });
     Arc::new(DynamicHlsPlaylistGenerator::new(
         GeneratorEncodingOptions {
             config: Arc::clone(config),
@@ -356,7 +359,8 @@ pub fn build_media_encoding(
         Arc::clone(&paths),
         Arc::clone(&subtitles),
     )
-    .with_attachments(Arc::clone(&attachments), path_manager);
+    .with_attachments(Arc::clone(&attachments), path_manager)
+    .with_input_analysis(extras.input_analysis);
     let planner = match library {
         Some(library) => planner.with_library(library),
         None => planner,
@@ -435,7 +439,8 @@ async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// Mirrors [`FfmpegAttachmentIo`]: cache paths come from the [`PathManager`],
 /// file/HTTP reads use `tokio::fs`/`reqwest`, and extraction runs the injected
 /// ffmpeg binary through `tokio::process`, bounded by the persisted
-/// `SubtitleExtractionTimeoutMinutes` read from `config` on every run.
+/// `SubtitleExtractionTimeoutMinutes` read from `config` on every run, and
+/// hands back the end of what ffmpeg wrote to stderr.
 struct FfmpegSubtitleIo {
     path_manager: Arc<dyn PathManager>,
     ffmpeg_path: String,
@@ -455,12 +460,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
-        let lower = path.trim_start().to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") {
-            MediaProtocol::Http
-        } else {
-            MediaProtocol::File
-        }
+        ferrofin_model::media_info::path_protocol(path)
     }
 
     fn subtitle_cache_path(
@@ -473,7 +473,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
             .subtitle_path(media_source_id, subtitle_stream_index, output_extension)
     }
 
-    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String> {
+    async fn extract(&self, args: &str, output_paths: &[String]) -> Result<String, String> {
         // ffmpeg won't create missing output directories; the per-source subtitle
         // cache folder may not exist yet on first extraction, so ensure each
         // output's parent exists (C# creates it before spawning ffmpeg).
@@ -497,14 +497,18 @@ impl SubtitleIo for FfmpegSubtitleIo {
             ));
         };
         let parts = ferrofin_mediaencoding::encoder::split_args(args)?;
-        let child = tokio::process::Command::new(&self.ffmpeg_path)
+        // Upstream's `-nostdin`, and stderr drained while ffmpeg runs, so a full
+        // pipe cannot stall it (jellyfin#17297); what it wrote explains a failure.
+        let mut child = tokio::process::Command::new(&self.ffmpeg_path)
+            .arg("-nostdin")
             .args(&parts)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawn ffmpeg {}: {e}", self.ffmpeg_path))?;
+        let stderr = child.stderr.take();
         // From here until ffmpeg exits on its own, any way out — the timeout
         // below, or the request future being dropped (a client disconnecting
         // mid-seek) — kills ffmpeg and deletes its outputs.
@@ -513,31 +517,113 @@ impl SubtitleIo for FfmpegSubtitleIo {
             output_paths,
             finished: false,
         };
-        let Ok(waited) = tokio::time::timeout(timeout, running.child.wait()).await else {
+        let mut tail = Vec::new();
+        let waited = tokio::time::timeout(timeout, async {
+            tokio::join!(running.child.wait(), read_stderr_tail(stderr, &mut tail)).0
+        })
+        .await;
+        let stderr = stderr_text(&tail, &parts);
+        let failed = |message: String| {
+            if stderr.is_empty() {
+                message
+            } else {
+                format!("{message}: {stderr}")
+            }
+        };
+        let Ok(waited) = waited else {
             tracing::warn!(
                 timeout_minutes = minutes,
                 "ffmpeg subtitle extraction timed out; killing it and deleting its outputs"
             );
-            return Err(format!(
+            return Err(failed(format!(
                 "ffmpeg subtitle extraction timed out after {minutes} minute(s)"
-            ));
+            )));
         };
         let status = waited.map_err(|e| format!("wait for ffmpeg {}: {e}", self.ffmpeg_path))?;
         running.finished = true;
         if !status.success() {
-            return Err(format!(
+            return Err(failed(format!(
                 "ffmpeg subtitle extraction exited with {}",
                 status.code().unwrap_or(-1)
-            ));
+            )));
         }
         // The extraction is only useful if every requested output was written.
         for path in output_paths {
             if !std::path::Path::new(path).is_file() {
-                return Err(format!("ffmpeg did not produce {path}"));
+                return Err(failed(format!("ffmpeg did not produce {path}")));
             }
         }
-        Ok(())
+        Ok(stderr)
     }
+}
+
+/// How much of ffmpeg's stderr an extraction keeps: its end, where ffmpeg names
+/// the cause after the banner and stream list it starts with. Upstream keeps
+/// all of it; this is the transcode manager's stderr window
+/// (`STDERR_TAIL_BYTES`), and a candidate setting.
+const EXTRACTION_STDERR_BYTES: usize = 16 * 1024;
+
+/// Reads ffmpeg's stderr `pipe` to its end into `tail`, keeping its last
+/// [`EXTRACTION_STDERR_BYTES`].
+async fn read_stderr_tail(pipe: Option<tokio::process::ChildStderr>, tail: &mut Vec<u8>) {
+    use tokio::io::AsyncReadExt as _;
+
+    let Some(mut pipe) = pipe else {
+        return;
+    };
+    let mut chunk = [0; 4096];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) => return,
+            Ok(read) => {
+                tail.extend_from_slice(&chunk[..read]);
+                tail.drain(..tail.len().saturating_sub(EXTRACTION_STDERR_BYTES));
+            }
+            Err(error) => {
+                tracing::debug!(%error, "reading ffmpeg's stderr failed; keeping what was read");
+                return;
+            }
+        }
+    }
+}
+
+/// ffmpeg's stderr `tail` as an error or a log line may quote it.
+///
+/// A full window may open mid-line, even mid-URL, so its text up to the first
+/// line break goes, or up to the first space when nothing follows that break.
+/// A line ffmpeg rewrote with `\r` (its progress statistics) shows its last
+/// state, as a terminal would, and blank lines go. Each URL (a `.strm` source's
+/// can carry an account) is cut to its scheme and host (`LOGGING.md`, rule 5):
+/// first each remote URL among ffmpeg's `arguments`, which ffmpeg prints
+/// unquoted where a space in it would end the URL [`redact_urls_in`] finds,
+/// then any other, line by line as [`redact_urls_in`] reads stderr.
+fn stderr_text(tail: &[u8], arguments: &[String]) -> String {
+    let text = String::from_utf8_lossy(tail);
+    let mut text = text.as_ref();
+    if tail.len() >= EXTRACTION_STDERR_BYTES {
+        let start = text
+            .find(['\n', '\r'])
+            .map(|at| at + 1)
+            .filter(|&at| !text[at..].trim().is_empty())
+            .or_else(|| {
+                text.find(|c: char| c.is_ascii_whitespace())
+                    .map(|at| at + 1)
+            })
+            .unwrap_or(text.len());
+        text = &text[start..];
+    }
+    let lines: Vec<_> = text
+        .lines()
+        .filter_map(|line| line.rsplit('\r').find(|state| !state.trim().is_empty()))
+        .map(|line| {
+            let mut line = line.trim_end().to_owned();
+            for url in arguments.iter().filter(|argument| is_remote_url(argument)) {
+                line = line.replace(url.as_str(), &redact_url(url));
+            }
+            redact_urls_in(&line).into_owned()
+        })
+        .collect();
+    lines.join("\n")
 }
 
 /// A subtitle or attachment extraction ffmpeg that has not exited on its own
@@ -548,7 +634,10 @@ impl SubtitleIo for FfmpegSubtitleIo {
 /// exit code `-1`) and deletes every output it was writing
 /// (`ExtractSubtitlesForFile`, `AttachmentExtractor`'s failure path). Here both
 /// cases are a drop before `finished` is set — the timeout returns early, and a
-/// cancelled request drops the future awaiting it. Without the deletion, a file
+/// cancelled request drops the future awaiting it. An attachment extraction
+/// runs on a task its request only awaits (upstream's token there is one
+/// nothing cancels), so for it only the host's teardown does (a shutdown or a
+/// restart, `AttachmentExtractor::shutdown`). Without the deletion, a file
 /// cut off mid-write would stay in the cache and be served on every later
 /// request, because extraction skips any output that already exists.
 struct RunningExtraction<'a> {
@@ -748,9 +837,11 @@ impl AttachmentIo for FfmpegAttachmentIo {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("spawn ffmpeg {ffmpeg_path}: {e}"))?;
-        // Until ffmpeg exits on its own, a cancelled request (its future
-        // dropped) kills it and deletes `outputs`. Upstream has no timeout
-        // here, only the cancellation (owner decision 2026-10-25).
+        // Until ffmpeg exits on its own, dropping this future kills it and
+        // deletes `outputs`. The extractor awaits it on a task of its own, so
+        // only the host's teardown (a shutdown or a restart) does that, never a
+        // request that stops waiting. No timeout, as upstream (owner decision
+        // 2026-10-25).
         let mut running = RunningExtraction {
             child,
             output_paths: outputs,
@@ -783,6 +874,21 @@ mod tests {
         .expect_err("nothing listens there");
 
         assert_eq!(error, "GET http://127.0.0.1:0: error sending request");
+    }
+
+    /// A subtitle URL on another scheme is read over HTTP, as upstream reads
+    /// it, and fails there without naming its account or path either.
+    #[tokio::test]
+    async fn a_subtitle_url_on_another_scheme_names_only_the_host() {
+        let error = http_get_bytes("smb://acct-user:info-secret@nas/path-secret/en.srt")
+            .await
+            .expect_err("no smb client");
+
+        assert!(error.starts_with("GET smb://nas"), "{error}");
+        assert!(
+            !error.contains("secret") && !error.contains("acct"),
+            "{error}"
+        );
     }
 
     /// A fake [`MediaSourceManager`] returning fixed sources + attachments.
@@ -1065,6 +1171,7 @@ mod tests {
                 sessions: None,
                 keyframes: None,
                 transcode_limits: TranscodeLimits::default(),
+                input_analysis: InputAnalysis::default(),
             },
         );
     }
@@ -1111,6 +1218,7 @@ mod tests {
                 sessions: None,
                 keyframes: None,
                 transcode_limits: TranscodeLimits::default(),
+                input_analysis: InputAnalysis::default(),
             },
         );
         assert!(!job.join("0123abcd0.mp4").exists());
@@ -1433,6 +1541,7 @@ mod tests {
                 sessions: None,
                 keyframes: None,
                 transcode_limits: TranscodeLimits::default(),
+                input_analysis: InputAnalysis::default(),
             },
         );
 
@@ -1736,6 +1845,20 @@ mod tests {
         }
     }
 
+    /// The real subtitle I/O reads a path over the protocol
+    /// `GetPathProtocol` gives it: a non-HTTP URL is no local file.
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case("/media/Movie.en.srt", MediaProtocol::File)]
+    #[case("https://subs.example/a.srt", MediaProtocol::Http)]
+    #[case("ftp://subs.example/a.srt", MediaProtocol::Ftp)]
+    #[case("smb://nas/share/a.srt", MediaProtocol::Http)]
+    fn subtitle_paths_take_upstreams_protocol(#[case] path: &str, #[case] expected: MediaProtocol) {
+        let tmp = tempfile::tempdir().unwrap();
+        let io = subtitle_io(tmp.path(), "ffmpeg".to_owned(), 1);
+        assert_eq!(io.path_protocol(path), expected);
+    }
+
     /// A sidecar gone from disk keeps its I/O kind through the real read, so the
     /// encoder answers the `404` upstream's `FileNotFoundException` is, not a 500.
     #[cfg(unix)]
@@ -1878,24 +2001,132 @@ mod tests {
         );
     }
 
-    /// Within the configured timeout the extraction completes normally.
+    /// Within the configured timeout the extraction completes normally, and
+    /// hands back what ffmpeg wrote to stderr for a caller that finds an
+    /// output empty.
     #[cfg(unix)]
     #[tokio::test]
     async fn subtitle_extraction_within_the_timeout_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let ffmpeg = fake_ffmpeg(
             tmp.path(),
-            "for arg; do out=\"$arg\"; done; printf 1 > \"$out\"",
+            "for arg; do out=\"$arg\"; done; printf 1 > \"$out\"; printf 'size=1\\rsize=2\\r\\nmuxing overhead \\n' >&2",
         );
         let output = tmp.path().join("0.srt").to_string_lossy().into_owned();
         let io = subtitle_io(tmp.path(), ffmpeg, 1);
-        io.extract(
-            &format!("-y -i in.mkv \"{output}\""),
-            std::slice::from_ref(&output),
-        )
-        .await
-        .unwrap();
+        let stderr = io
+            .extract(
+                &format!("-y -i in.mkv \"{output}\""),
+                std::slice::from_ref(&output),
+            )
+            .await
+            .unwrap();
         assert!(std::path::Path::new(&output).is_file());
+        assert_eq!(stderr, "size=2\nmuxing overhead");
+    }
+
+    /// A failed extraction's error ends with what ffmpeg wrote to stderr, as
+    /// upstream logs `{FfmpegOutput}` (`ExtractSubtitlesForFile`): the end of a
+    /// long one only, a URL's account taken out, and read while ffmpeg runs, since
+    /// more than a pipe holds would otherwise stall ffmpeg until the timeout.
+    /// ffmpeg gets upstream's `-nostdin` first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_extraction_ends_with_the_tail_of_ffmpegs_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            "[ \"$1\" = -nostdin ] || exit 3\n\
+             echo 'ffmpeg version banner' >&2\n\
+             head -c 200000 /dev/zero | tr '\\0' x >&2\n\
+             echo >&2\n\
+             echo 'http://user:secret@host.example/a.mkv: Invalid data found' >&2\n\
+             exit 1",
+        );
+        let output = tmp.path().join("0.srt").to_string_lossy().into_owned();
+        let error = subtitle_io(tmp.path(), ffmpeg, 1)
+            .extract(
+                &format!("-y -i in.mkv \"{output}\""),
+                std::slice::from_ref(&output),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "ffmpeg subtitle extraction exited with 1: http://host.example: Invalid data found"
+        );
+    }
+
+    /// A run that exits 0 without writing an output fails with what ffmpeg
+    /// wrote to stderr too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_output_ends_with_ffmpegs_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(tmp.path(), "echo 'Output file is empty' >&2");
+        let output = tmp.path().join("0.srt").to_string_lossy().into_owned();
+        let error = subtitle_io(tmp.path(), ffmpeg, 1)
+            .extract(
+                &format!("-y -i in.mkv \"{output}\""),
+                std::slice::from_ref(&output),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            format!("ffmpeg did not produce {output}: Output file is empty")
+        );
+    }
+
+    /// What an error quotes of ffmpeg's stderr, from the window
+    /// [`read_stderr_tail`] keeps of it: a full window loses its text up to the
+    /// first line break (or the first space, when nothing follows the break),
+    /// part of a line or of a URL; a line rewritten with `\r` shows its last
+    /// state; blank lines go; a URL keeps its scheme and host.
+    #[rstest::rstest]
+    #[case::short(
+        b"  Stream #0:0\r\n\nError opening input\n".to_vec(),
+        "  Stream #0:0\nError opening input"
+    )]
+    #[case::progress_then_error(
+        b"size=1\rsize=2\r[srt] Invalid data\nConversion failed!\n".to_vec(),
+        "[srt] Invalid data\nConversion failed!"
+    )]
+    #[case::progress_only(b"size=1\rsize=2\r".to_vec(), "size=2")]
+    #[case::progress_fills_the_window([b"size=1\r".repeat(3_000), b"fatal\n".to_vec()].concat(), "fatal")]
+    #[case::one_long_line_ends_in_a_word([b"x".repeat(20_000), b" fatal\n".to_vec()].concat(), "fatal")]
+    #[case::one_long_word(b"x".repeat(20_000), "")]
+    #[case::url_in_the_window(
+        b"[in#0] http://user:secret@h/a.mkv: Invalid data\n".to_vec(),
+        "[in#0] http://h: Invalid data"
+    )]
+    fn stderr_text_quotes_the_end_of_the_window(#[case] stderr: Vec<u8>, #[case] shown: &str) {
+        let window = &stderr[stderr.len().saturating_sub(EXTRACTION_STDERR_BYTES)..];
+        assert_eq!(stderr_text(window, &[]), shown);
+    }
+
+    /// A window that opens inside a URL drops that part of the line.
+    #[test]
+    fn stderr_text_drops_a_url_the_window_cut() {
+        let mut window = b"ser:secret@h/a.mkv: open failed\nnext\n".to_vec();
+        window.resize(EXTRACTION_STDERR_BYTES, b' ');
+        assert_eq!(stderr_text(&window, &[]), "next");
+        let mut window = b"ser:secret@h/a.mkv: open failed".to_vec();
+        window.resize(EXTRACTION_STDERR_BYTES, b' ');
+        assert_eq!(stderr_text(&window, &[]), "open failed");
+    }
+
+    /// A remote input among ffmpeg's arguments is cut to its scheme and host
+    /// wherever ffmpeg prints it, a space in its path included.
+    #[test]
+    fn stderr_text_redacts_an_input_url_with_a_space() {
+        let url = "http://user:secret@h/a b.mkv?token=x";
+        let arguments = ["-y".to_owned(), "-i".to_owned(), url.to_owned()];
+        let stderr = format!("{url}: Server returned 403 Forbidden\n");
+        assert_eq!(
+            stderr_text(stderr.as_bytes(), &arguments),
+            "http://h: Server returned 403 Forbidden"
+        );
     }
 
     /// A negative timeout, or one past the longest .NET timer delay, is refused
@@ -2002,10 +2233,11 @@ mod tests {
         assert!(killed, "ffmpeg {pid} kept running after the cancellation");
     }
 
-    /// Dropping the request future mid-dump (a client giving up on a font)
-    /// kills ffmpeg and deletes the attachment it was writing, as upstream's
-    /// cancellation does (`Kill(true)`, then the failure path's delete), so a
-    /// truncated font is never served from the attachment cache.
+    /// Dropping the dump mid-run (the host's teardown stopping the
+    /// extraction's task) kills ffmpeg and deletes the attachment it was
+    /// writing, as upstream's cancellation branch would (`Kill(true)`, then the
+    /// failure path's delete), so a truncated font is never served from the
+    /// attachment cache.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_cancelled_attachment_extraction_kills_ffmpeg_and_deletes_its_output() {
@@ -2048,7 +2280,7 @@ mod tests {
             .to_owned();
         assert!(std::path::Path::new(&output).is_file());
 
-        // The request is cancelled.
+        // The extraction's task is dropped.
         drop(dump);
 
         assert!(!std::path::Path::new(&output).exists());

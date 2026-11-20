@@ -628,6 +628,48 @@ pub trait LibraryManager: Send + Sync {
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError>;
 
+    /// `UserView.GetItemsInternal` → `UserViewBuilder.GetUserItems`
+    /// (`UserView.cs:96-109`) for a browse whose parent is the user view
+    /// `view`: rewrites `query` as the view's builder runs it, and returns the
+    /// kind the browse reports as its parent ([`InternalItemsQuery::parent_type`])
+    /// and whether Folder's display policy applies
+    /// ([`InternalItemsQuery::apply_folder_display_options`]). The folder a
+    /// view shows is its `DisplayParentId`, else its `ParentId`. By `ViewType`:
+    ///
+    /// - a direct builder (`GetMovieMovies`, `GetTvSeries`, `GetBooks`, and
+    ///   the other builders that select items without Folder's policy) sets
+    ///   its own kinds and recursion, if it has any, and reports the view
+    ///   itself, with no Folder policy;
+    /// - a `movies` or `tvshows` view browsed recursively runs Folder's
+    ///   recursive query, with the view's default kinds when the request
+    ///   names none, and reports the kind of the folder it shows (the view's
+    ///   own when there is none), with Folder policy. Browsed without
+    ///   `recursive` it is left as asked and reports itself, with no Folder
+    ///   policy;
+    /// - any other view reports the kind of the folder it shows, with Folder
+    ///   policy unless that folder is a channel or in one. A non-recursive
+    ///   browse, and any browse of a Season, moves `query` onto that folder
+    ///   (`parent_id` and `parent_row`, clearing `user_root_children`); a
+    ///   recursive one stays on the view.
+    ///   With no such folder, or one that is gone, the view is left as asked
+    ///   and reports itself, with no Folder policy.
+    ///
+    /// The caller has checked that the user may open `view`. `GET /Items`
+    /// runs this before the controller's own rewrites (the container re-root,
+    /// the playlists and library defaults), which read what it leaves.
+    ///
+    /// Managers must supply the builders; the default fails closed.
+    async fn apply_user_view_builder(
+        &self,
+        query: &mut InternalItemsQuery,
+        view: &BaseItemEntity,
+    ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
+        let _ = (query, view);
+        Err(ServiceError::backend(
+            "user view browsing is not configured",
+        ))
+    }
+
     /// Returns just the ids of the items matching the query.
     async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError>;
 
@@ -658,13 +700,6 @@ pub trait LibraryManager: Send + Sync {
         collection_type: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
-    /// Persists (inserts or updates) the given item rows under a parent.
-    async fn create_items(
-        &self,
-        items: &[BaseItemEntity],
-        parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError>;
-
     /// Updates the given item rows under a parent.
     async fn update_items(
         &self,
@@ -676,10 +711,12 @@ pub trait LibraryManager: Send + Sync {
     /// `provider_ids`.
     ///
     /// The write behind C# `ItemUpdateController.UpdateItem`'s
-    /// `item.ProviderIds = request.ProviderIds` (v10.11.8
-    /// `Jellyfin.Api/Controllers/ItemUpdateController.cs:402-410`): an
-    /// **assignment**, so a key the request omits is removed, not merged. The
-    /// caller strips empty values first, exactly as the C# does.
+    /// `item.SetProviderIds(request.ProviderIds)` (v12.4
+    /// `Jellyfin.Api/Controllers/ItemUpdateController.cs:435-438`): an
+    /// **assignment**, so a key the request omits is removed, not merged. Each
+    /// pair goes through `TrySetProviderId`: trimmed, dropped when blank, when
+    /// its name holds `=` or when the id cannot belong to its provider, and a
+    /// known provider's name stored in its canonical spelling.
     ///
     /// External ids live in their own table, not on [`BaseItemEntity`], so they
     /// cannot ride along with [`update_items`](Self::update_items) — hence a
@@ -987,11 +1024,14 @@ pub trait LibraryManager: Send + Sync {
     /// upstream. `GetPerson` is the exception — a plain lookup on both trees
     /// (`LibraryManager.cs:958-968` on v10.11.8, `:1195-1205` on master) — so
     /// `Person` is not in the provisioned set. Use [`Self::find_named_item`]
-    /// where the lookup must not write.
+    /// (or [`Self::get_named_item_ids`] for many names) where the lookup must
+    /// not write.
     ///
     /// Matching is by cleaned name (Jellyfin's item-by-name id is derived from
     /// the name), delegating to [`Self::get_item_list`] filtered to `kind`; the
-    /// first match wins, mirroring C# `FirstOrDefault`.
+    /// first match wins, mirroring C# `FirstOrDefault`. The concrete manager
+    /// reads a `Person` by the id its name derives instead, as `GetPerson`
+    /// does, so spellings sharing a clean name are each their own person.
     async fn get_named_item(
         &self,
         kind: BaseItemKind,
@@ -1056,7 +1096,9 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// The default loops [`Self::get_named_item`]; the concrete manager overrides
     /// it with a single `CleanName IN (…)` query — resolving a whole page of
-    /// people/years in one round-trip instead of N.
+    /// by-name items in one round-trip instead of N — and a page of people with the
+    /// people repository's `GetPerson` reads by id
+    /// ([`PeopleRepository::find_person_item_ids`](crate::persistence::PeopleRepository::find_person_item_ids)).
     async fn get_named_items(
         &self,
         kind: BaseItemKind,
@@ -1069,26 +1111,33 @@ pub trait LibraryManager: Send + Sync {
         Ok(out)
     }
 
-    /// Id-only form of [`Self::get_named_items`]: resolves each of `names` to
-    /// the id of its by-name item row of `kind`, one slot per input name in
-    /// order (`None` where no row resolves).
+    /// Id-only batch form of [`Self::find_named_item`]: resolves each of
+    /// `names` to the id of its existing by-name item row of `kind`, one slot
+    /// per input name in order (`None` where no row resolves).
+    ///
+    /// It **never creates a row**: a name nothing matches stays `None`, where
+    /// [`Self::get_named_items`] materializes the kinds Jellyfin creates by
+    /// name. An implementation must keep it that way, because read paths rely
+    /// on it (the DTO prefetch, and the `GET` name filters that resolve names
+    /// to ids). For a row that exists it answers the id
+    /// [`Self::get_named_items`] would.
     ///
     /// The DTO prefetch resolves a whole page's cast through this and reads
-    /// nothing but the id, so the concrete manager overrides it with a
-    /// two-column projection rather than materializing a full item row per
-    /// credited name. The default delegates to [`Self::get_named_items`], so
-    /// every implementation gets it for free with identical results.
+    /// nothing but the id, so the concrete manager overrides it with one
+    /// two-column `CleanName IN (…)` query rather than a full item row per
+    /// name, and for a `Person` with the people repository's id-only
+    /// `GetPerson` reads. The default loops [`Self::find_named_item`].
     async fn get_named_item_ids(
         &self,
         kind: BaseItemKind,
         names: &[String],
     ) -> Result<Vec<Option<Uuid>>, ServiceError> {
-        Ok(self
-            .get_named_items(kind, names)
-            .await?
-            .into_iter()
-            .map(|row| row.and_then(|r| Uuid::parse_str(&r.id).ok()))
-            .collect())
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let row = self.find_named_item(kind, name).await?;
+            out.push(row.and_then(|r| Uuid::parse_str(&r.id).ok()));
+        }
+        Ok(out)
     }
 
     /// Gets the library's production years, resolved to their by-name `Year`
@@ -1239,18 +1288,6 @@ pub trait LibraryManager: Send + Sync {
     /// Queues a full library scan.
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
 
-    /// Queues a full library scan, tagging the run's root span, its log lines
-    /// and its metrics with why it was triggered ([`ScanTrigger`]). Defaults
-    /// to the plain [`queue_library_scan`](Self::queue_library_scan) so
-    /// existing implementations need no change; the real manager overrides it
-    /// to record the `trigger`.
-    async fn queue_library_scan_with_trigger(
-        &self,
-        _trigger: ScanTrigger,
-    ) -> Result<(), ServiceError> {
-        self.queue_library_scan().await
-    }
-
     /// Queues a scan restricted to one library. `library_id` is the library's
     /// CollectionFolder id — what jellyfin-web's per-library "Scan Library"
     /// button refreshes via `POST /Items/{id}/Refresh`. Defaults to the full
@@ -1322,6 +1359,102 @@ pub trait LibraryManager: Send + Sync {
         let _ = (target, options);
         Err(ServiceError::backend(
             "run_refresh_scan needs a library scanner, which this library manager has none of",
+        ))
+    }
+
+    /// Queues `item`'s refresh with `options` and returns without waiting:
+    /// `ProviderManager.QueueRefresh(item.Id, options, RefreshPriority.High)`,
+    /// then the queue's `RefreshItem` or `RefreshArtist`
+    /// (`ProviderManager.cs:1209-1290`). What the refresh covers:
+    ///
+    /// - a library (`CollectionFolder`) scans that library
+    ///   (`RefreshCollectionFolderChildren`), the root or the aggregate
+    ///   folder every library;
+    /// - any other folder with a path validates its own subtree, the folder
+    ///   included (`ValidateChildren`), and a file item refreshes itself
+    ///   (`RefreshSingleItem`) through the scan of its own path — both
+    ///   through [`queue_refresh_scan`](Self::queue_refresh_scan);
+    /// - a music artist validates the children of the artist folders above
+    ///   the albums credited to it, then refreshes itself (`RefreshArtist`);
+    /// - an item with no file and no physical children (a box set, a
+    ///   playlist, a view, a virtual season, a person, a genre, a studio, a
+    ///   channel, an item outside every library) refreshes through the
+    ///   provider manager's queue at high priority.
+    ///
+    /// The default refuses: a manager without a scanner and a provider
+    /// manager cannot run the refresh, and a silent no-op would look like
+    /// one that ran.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] from a manager without them, or whatever
+    /// reading the artist's albums or queueing the refresh surfaces.
+    async fn queue_item_refresh(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        let _ = (item, options);
+        Err(ServiceError::backend(
+            "queue_item_refresh needs a library scanner and a provider manager, which this library manager has none of",
+        ))
+    }
+
+    /// Runs `item`'s own metadata refresh with `options` and returns once it
+    /// has run: `item.RefreshMetadata(options, CancellationToken.None)`,
+    /// which a caller awaits rather than queues. An item with a path of its
+    /// own in a library refreshes through the scan of that path in the scan queue's
+    /// priority lane ([`run_refresh_scan`](Self::run_refresh_scan)); any
+    /// other item is queued through the provider manager at high priority,
+    /// and this returns once it is queued. A folder's children are not
+    /// validated. Returns `Ok(false)` when the refresh was stopped before it
+    /// finished (the server is shutting down).
+    ///
+    /// The default refuses, as [`queue_item_refresh`](Self::queue_item_refresh)'s does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] from a manager without a scanner and a
+    /// provider manager, or the refresh failed.
+    async fn refresh_item_metadata(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item, options);
+        Err(ServiceError::backend(
+            "refresh_item_metadata needs a library scanner and a provider manager, which this library manager has none of",
+        ))
+    }
+
+    /// Runs Identify's refresh of `item` with `options` (which carry the
+    /// chosen search result) and returns once it has run:
+    /// `ProviderManager.RefreshFullItem`, `RefreshItem` without the queue.
+    /// The item and, for a folder, its subtree refresh as
+    /// [`queue_item_refresh`](Self::queue_item_refresh) says, through
+    /// [`run_refresh_scan`](Self::run_refresh_scan) in the scan queue's
+    /// priority lane; an artist known only by name refreshes only itself
+    /// there, through the scanner; an item with no file of its own through
+    /// [`ProviderManager::refresh_full_item`](crate::providers::ProviderManager::refresh_full_item).
+    /// Returns `Ok(false)` when the refresh was stopped before it finished.
+    ///
+    /// The default refuses, as [`queue_item_refresh`](Self::queue_item_refresh)'s does.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Conflict`] when the item's path lies under no library
+    /// location, or when it is a file- or folder-backed item that belongs to
+    /// no library: the scan cannot reach it, so it is not refreshed.
+    /// [`ServiceError::Backend`] from a manager without a scanner and a
+    /// provider manager, or the refresh failed.
+    async fn refresh_full_item(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item, options);
+        Err(ServiceError::backend(
+            "refresh_full_item needs a library scanner and a provider manager, which this library manager has none of",
         ))
     }
 
@@ -1561,9 +1694,6 @@ pub trait UserManager: Send + Sync {
     /// Gets all user rows.
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError>;
 
-    /// Gets the ids of all users.
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError>;
-
     /// Ensures at least one user exists (first-run bootstrap).
     async fn initialize(&self) -> Result<(), ServiceError>;
 
@@ -1766,8 +1896,7 @@ pub trait UserManager: Send + Sync {
             .get_user_dto(user, None)
             .await?
             .configuration
-            .map(|c| c.latest_items_excludes)
-            .unwrap_or_default())
+            .map_or_default(|c| c.latest_items_excludes))
     }
 
     /// The cache tag of `user`'s profile image (C#
@@ -2407,16 +2536,19 @@ pub trait UserViewManager: Send + Sync {
     /// Gets the top-level views for a user.
     async fn get_user_views(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
-    /// Gets the top-level views including any the user hid from their home
-    /// screen. Used by profile settings so hidden views can be re-enabled.
-    /// Managers that do not implement hidden-view filtering can use the
-    /// ordinary view list for both requests.
-    async fn get_user_views_with_hidden(
+    /// Gets the top-level views `query` asks for: port of
+    /// `UserViewManager.GetUserViews(UserViewQuery)`. `include_hidden` keeps
+    /// the views the user hid from their home screen (profile settings use it
+    /// so hidden views can be re-enabled), `include_external_content` the
+    /// Live TV view, and `preset_views` lists a library of a named type as its
+    /// shadow view. Managers that implement none of them can use the ordinary
+    /// view list for every request.
+    async fn get_user_views_with_query(
         &self,
         user_id: Uuid,
-        include_hidden: bool,
+        query: &crate::options::UserViewQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let _ = include_hidden;
+        let _ = query;
         self.get_user_views(user_id).await
     }
 
@@ -2426,8 +2558,9 @@ pub trait UserViewManager: Send + Sync {
     /// [`get_user_root_children`](Self::get_user_root_children) instead.
     ///
     /// Port of `LibraryController.GetMediaFolders`, which returns
-    /// `GetUserRootFolder().Children` sorted by `SortName`, less the libraries
-    /// whose options disable them. Unlike
+    /// `GetUserRootFolder().Children` and the playlists folder sorted by
+    /// `SortName` in the request culture, less the libraries whose options
+    /// disable them. Unlike
     /// [`get_user_views`](Self::get_user_views) (the library collection folders
     /// only), this also includes the playlists folder
     /// ([`BaseItemKind`]`::PlaylistsFolder`, `ManualPlaylistsFolder` to
@@ -2755,6 +2888,21 @@ pub trait MediaSourceManager: Send + Sync {
         chosen.ok_or_else(|| ServiceError::NotFound(format!("no media source for item {item_id}")))
     }
 
+    /// The container ffmpeg is told `source` holds: upstream's
+    /// `EncodingJobInfo.InputContainer`, copied from `MediaSourceInfo.Container`,
+    /// which upstream fills with the item's probed container
+    /// (`BaseItem.Container`), the path's extension only when none was stored
+    /// (`BaseItem.GetVersionInfo`). Ferrofin's sources report the extension,
+    /// so a transcode asks here. This default answers the source's own
+    /// container. Fix path: gl-1877; once a source reports the probed
+    /// container, every implementation answers the source's own.
+    async fn input_container(
+        &self,
+        source: &MediaSourceInfo,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(source.container.clone())
+    }
+
     /// The media source a playback report names: the open live stream
     /// `live_stream_id` names when it is non-empty, else the source of `item`
     /// (a row the caller has read) whose id is `media_source_id`, or `None`
@@ -2835,14 +2983,6 @@ pub trait MusicManager: Send + Sync {
         dto_options: &DtoOptions,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
-    /// Builds an instant mix seeded by an artist item.
-    async fn get_instant_mix_from_artist(
-        &self,
-        artist_id: Uuid,
-        user_id: Option<Uuid>,
-        dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
-
     /// Builds an instant mix seeded by genre names.
     async fn get_instant_mix_from_genres(
         &self,
@@ -2879,16 +3019,6 @@ pub trait LibraryMonitor: Send + Sync {
     /// restart at a time, each reading the structure when it runs, so the
     /// watches end up matching the latest one.
     fn restart(&self);
-
-    /// Signals that a change at `path` is beginning (suppress self-triggering).
-    async fn report_file_system_change_beginning(&self, path: &str) -> Result<(), ServiceError>;
-
-    /// Signals that a change at `path` is complete, optionally refreshing it.
-    async fn report_file_system_change_complete(
-        &self,
-        path: &str,
-        refresh_path: bool,
-    ) -> Result<(), ServiceError>;
 
     /// Signals that `path` changed on disk, as the filesystem watcher saw it
     /// (a refresh it starts is labelled [`ScanTrigger::Watcher`]).
@@ -2940,6 +3070,22 @@ pub trait RecordingLibrary: Send + Sync {
     /// `RecordingsManager.TriggerRefresh(path)`: queues the refresh of the item
     /// nearest `path`, which also drops the item of a file that has gone.
     async fn refresh_path(&self, path: &str) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.FindByPath(path, isFolder)`: the id of the item at
+    /// exactly `path` (stored as it is, or in its `%AppDataPath%` form), a
+    /// folder or not as `is_folder` says, the newest `DateCreated` first.
+    async fn find_by_path(&self, path: &str, is_folder: bool)
+    -> Result<Option<Uuid>, ServiceError>;
+
+    /// The files below the folder `folder_id`, with their paths, newest
+    /// `DateCreated` first: what `RecordingsManager.EnforceKeepUpTo` asks of a
+    /// series folder (`GetItemList` with `Recursive`, `IsFolder = false` and
+    /// `IsVirtualItem = false`, then `IsFileProtocol`).
+    async fn files_under(&self, folder_id: Uuid) -> Result<Vec<(Uuid, String)>, ServiceError>;
+
+    /// `ILibraryManager.DeleteItem(item, new DeleteOptions { DeleteFileLocation
+    /// = true }, true)`: the item goes, with its files.
+    async fn delete_item(&self, id: Uuid) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_recording_library(_: &dyn RecordingLibrary) {}
@@ -3213,7 +3359,9 @@ pub trait VirtualFolderManager: Send + Sync {
     /// (`CollectionFolder.UpdateLibraryOptions`): looks the library up by its
     /// item id, creates a shortcut for any newly-referenced media path, then
     /// persists the supplied [`LibraryOptions`] to `options.xml`. A library id
-    /// that resolves to no folder is a [`ServiceError::NotFound`].
+    /// that resolves to no folder is a [`ServiceError::NotFound`]; a new media
+    /// path that is empty or blank is a [`ServiceError::InvalidInput`], and
+    /// nothing is written.
     ///
     /// The lookup is by name here: at this filesystem seam the DB item-id of a
     /// collection folder is not modeled, so the caller resolves the id to the

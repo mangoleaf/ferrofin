@@ -58,11 +58,13 @@ pub trait SourceFetcher: Send + Sync {
 
     /// Opens an XMLTV listings document and answers its bytes as they arrive,
     /// decompressed when the source is gzipped. Port of `GetXml`'s download
-    /// and `UnzipIfNeededAndCopy` (v12.2 XmlTvListingsProvider.cs:100-123,
+    /// and `UnzipIfNeededAndCopy` (v12.4 XmlTvListingsProvider.cs:100-123,
     /// 175-202), which stream the response or the file into the cache; a
     /// source is gzipped when the URL after redirects, or the path, with any
-    /// query stripped ends in `.gz` or `.gzip`. A failure status is an error
-    /// (`EnsureSuccessStatusCode`).
+    /// query stripped ends in `.gz` or `.gzip`, and, for a URL, the body
+    /// still starts with gzip's magic number: the client has already decoded
+    /// one sent with `Content-Encoding: gzip`, which upstream then fails to
+    /// gunzip. A failure status is an error (`EnsureSuccessStatusCode`).
     ///
     /// The default is [`open`](Self::open) with that status check, so a
     /// text-only fake keeps working; the real fetcher decompresses.
@@ -600,6 +602,57 @@ fn is_gzip_name(name: &str) -> bool {
         })
 }
 
+/// The two bytes a gzip member starts with (RFC 1952's ID1 and ID2).
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+
+/// `body` gunzipped when it starts with [`GZIP_MAGIC`], else as it is.
+async fn gunzip_if_gzipped(
+    body: Box<dyn BodyChunks>,
+    name: String,
+) -> Result<Box<dyn BodyChunks>, ServiceError> {
+    let mut head = Vec::new();
+    let mut rest = Some(body);
+    while head.len() < GZIP_MAGIC.len()
+        && let Some(body) = rest.as_mut()
+    {
+        match body.next_chunk().await? {
+            Some(chunk) => head.extend(chunk),
+            None => rest = None,
+        }
+    }
+    let gzipped = head.starts_with(&GZIP_MAGIC);
+    let body = Box::new(Prefixed {
+        head: Some(head),
+        rest,
+    });
+    Ok(if gzipped {
+        Box::new(GunzipBody::new(body, name))
+    } else {
+        body
+    })
+}
+
+/// A body whose first bytes were read ahead: those, then the rest.
+struct Prefixed {
+    /// The bytes read ahead; `None` once handed out.
+    head: Option<Vec<u8>>,
+    /// The body after them; `None` when it ended while they were read.
+    rest: Option<Box<dyn BodyChunks>>,
+}
+
+#[async_trait]
+impl BodyChunks for Prefixed {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ServiceError> {
+        if let Some(head) = self.head.take().filter(|head| !head.is_empty()) {
+            return Ok(Some(head));
+        }
+        match self.rest.as_mut() {
+            Some(rest) => rest.next_chunk().await,
+            None => Ok(None),
+        }
+    }
+}
+
 /// How much compressed input [`GunzipBody`] hands its decoder at once. Deflate
 /// expands at most about 1032 to 1, so the text one call answers stays near a
 /// megabyte however the transport chunks the body.
@@ -736,11 +789,17 @@ impl SourceFetcher for ReqwestFetcher {
         } else {
             (url.to_owned(), self.open(url, None).await?.body)
         };
-        Ok(if is_gzip_name(&name) {
-            Box::new(GunzipBody::new(body, redact_url(&name)))
+        if !is_gzip_name(&name) {
+            return Ok(body);
+        }
+        let name = redact_url(&name);
+        if is_http(url) {
+            // The client has already decoded a body sent with
+            // `Content-Encoding: gzip`, so over HTTP the bytes decide.
+            gunzip_if_gzipped(body, name).await
         } else {
-            body
-        })
+            Ok(Box::new(GunzipBody::new(body, name)))
+        }
     }
 
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, ServiceError> {
@@ -1308,6 +1367,57 @@ mod tests {
             .await
             .expect("fetch");
         assert_eq!(text, "<tv><channel id=\"a\"/></tv>");
+    }
+
+    /// A gzipped guide is gunzipped once whatever its server says: a `.gz` URL
+    /// sent with `Content-Encoding: gzip` arrives already decoded by the client,
+    /// one sent without it arrives gzipped, and a plain URL sent compressed
+    /// arrives decoded.
+    #[rstest::rstest]
+    #[case("/guide.xml.gz", "Content-Encoding: gzip\r\n")]
+    #[case("/guide.xml.gz", "")]
+    #[case("/guide.xml", "Content-Encoding: gzip\r\n")]
+    #[tokio::test]
+    async fn a_guide_is_gunzipped_once_whatever_its_encoding(
+        #[case] path: &str,
+        #[case] encoding: &str,
+    ) {
+        let body = gzipped("<tv><channel id=\"a\"/></tv>");
+        let mut ok = format!(
+            "HTTP/1.1 200 OK\r\n{encoding}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        ok.extend_from_slice(&body);
+        let base = serve_sequence(vec![ok]);
+        let text = listings_text(&ReqwestFetcher::new(), &format!("{base}{path}"))
+            .await
+            .expect("fetch");
+        assert_eq!(text, "<tv><channel id=\"a\"/></tv>");
+    }
+
+    /// The magic number is read across pieces too short to hold it, and the
+    /// bytes read for it are kept, a body shorter than it included.
+    #[rstest::rstest]
+    #[case(gzipped("<tv/>"), b"<tv/>")]
+    #[case(b"<tv/>".to_vec(), b"<tv/>")]
+    #[case(b"<".to_vec(), b"<")]
+    #[case(Vec::new(), b"")]
+    #[tokio::test]
+    async fn a_body_arriving_a_byte_at_a_time_is_sniffed_whole(
+        #[case] bytes: Vec<u8>,
+        #[case] expected: &[u8],
+    ) {
+        let pieces = bytes.chunks(1).map(<[u8]>::to_vec).collect();
+        let mut body =
+            super::gunzip_if_gzipped(Box::new(GzPieces(pieces)), "guide.xml.gz".to_owned())
+                .await
+                .expect("sniff");
+        let mut text = Vec::new();
+        while let Some(chunk) = body.next_chunk().await.expect("read") {
+            text.extend(chunk);
+        }
+        assert_eq!(text, expected);
     }
 
     #[tokio::test]

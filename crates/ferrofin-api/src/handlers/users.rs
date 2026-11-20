@@ -22,9 +22,9 @@
 //! Port notes:
 //! - `AuthenticateNewSession` returns an [`AuthenticationResult`] in C#; the
 //!   ported `SessionManager::authenticate_new_session` returns an
-//!   [`AuthenticationResultData`] (session DTO + minted access token), which the
-//!   handler assembles into the wire [`AuthenticationResult`] — the client gets a
-//!   real `AccessToken` to present on subsequent requests.
+//!   [`AuthenticationResultData`] (the authenticated user's DTO, the session DTO
+//!   and the minted access token), which the handler answers as the wire
+//!   [`AuthenticationResult`] with the session's `ServerId`.
 //! - The `[Authorize]` attributes are extractors: `Policy = RequiresElevation` is
 //!   [`RequireAdmin`], `Policy = IgnoreParentalControl` is
 //!   [`RequireAuthIgnoringSchedule`], and a plain `[Authorize]` is
@@ -62,7 +62,7 @@ use crate::auth::{
     is_administrator_identity,
 };
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, JsonBody, ProblemDetails, Query, RequiredString};
+use crate::extract::{DotnetGuid, JsonBody, ProblemDetails, Query, RequiredString, body_parameter};
 use crate::handlers::items::user_uuid;
 use crate::panic_boundary::ERROR_BODY;
 use crate::state::AppState;
@@ -371,7 +371,7 @@ async fn authenticate(
     // handler instead put it before the (spawned) SessionStarted row and showed
     // the dashboard's login pair backwards. The consumer lives beside the
     // SessionStarted one in the composition root.
-    Ok(Json(authentication_result(state, result).await).into_response())
+    Ok(Json(authentication_result(result)).into_response())
 }
 
 /// `POST /Users/AuthenticateWithQuickConnect` — finish a Quick Connect login.
@@ -398,7 +398,7 @@ async fn authenticate_with_quick_connect(
                 .into_response(),
         );
     };
-    let result = match state
+    let mut result = match state
         .quick_connect
         .get_authorized_request(secret.expose())
         .await
@@ -406,37 +406,46 @@ async fn authenticate_with_quick_connect(
         Ok(result) => result,
         Err(e) => return login_failure(e),
     };
-    Ok(Json(authentication_result(&state, result).await).into_response())
+    // Upstream answers the `User` it snapshotted when the code was authorized,
+    // up to 10 minutes stale; Ferrofin builds it now (Jellyfin bug not ported),
+    // and answers the snapshot, as upstream does, only when it cannot.
+    if let Some(user) = quick_connect_user(&state, result.session.user_id).await {
+        result.user = user;
+    }
+    Ok(Json(authentication_result(result)).into_response())
 }
 
-/// Assembles the [`AuthenticationResult`] wire body from an authenticated
-/// session and its minted access token.
-///
-/// The token is echoed back to the client as `AccessToken` so subsequent
-/// requests can authenticate.
-async fn authentication_result(
-    state: &AppState,
-    result: AuthenticationResultData,
-) -> AuthenticationResult {
+/// The Quick Connect exchange's `User`: the session's user as they are now,
+/// built as `GET /Users/Me` builds it. `None` for a user deleted since the
+/// code was authorized, or whose DTO cannot be read.
+async fn quick_connect_user(state: &AppState, user_id: Uuid) -> Option<UserDto> {
+    let built = match load_user(state, user_id).await {
+        Ok(entity) => state
+            .users
+            .get_user_dto(&entity, None)
+            .await
+            .map_err(ApiError::from),
+        Err(error) => Err(error),
+    };
+    match built {
+        Ok(user) => Some(user),
+        Err(ApiError::NotFound(_)) => None,
+        Err(error) => {
+            tracing::warn!(%user_id, %error, "quick connect answered the authorize-time user");
+            None
+        }
+    }
+}
+
+/// Assembles the [`AuthenticationResult`] wire body: the authenticated user,
+/// the session, the minted access token the client presents on later
+/// requests, and the session's `ServerId`.
+fn authentication_result(result: AuthenticationResultData) -> AuthenticationResult {
     let AuthenticationResultData {
+        user,
         session,
         access_token,
     } = result;
-    // Build the full User DTO exactly as `GET /Users/Me` does — real policy,
-    // configuration, and `ServerId`. jellyfin-web caches `result.User` from login
-    // and drives the whole UI off it, so a bare id/name DTO with a default
-    // (all-false) policy and null `ServerId` locks the client out of its own
-    // libraries/dashboard and throws `getApiClient(null)`. Fall back to the bare
-    // DTO only if the row somehow can't be reloaded post-auth.
-    let user = match load_user(state, session.user_id).await {
-        Ok(entity) => state.users.get_user_dto(&entity, None).await.ok(),
-        Err(_) => None,
-    }
-    .unwrap_or_else(|| UserDto {
-        id: session.user_id,
-        name: session.user_name.clone(),
-        ..UserDto::default()
-    });
     let server_id = session.server_id.clone();
     AuthenticationResult {
         user: Some(user),
@@ -995,6 +1004,7 @@ async fn forgot_password(
     let entered_username = match body.entered_username.require(
         "Jellyfin.Api.Models.UserDtos.ForgotPasswordDto",
         "EnteredUsername",
+        || body_parameter(&parts.method, parts.extensions.get()),
     ) {
         Ok(name) => name,
         Err(problem) => return Ok(problem.into_response()),
@@ -1039,12 +1049,14 @@ async fn forgot_password(
 )]
 async fn forgot_password_pin(
     State(state): State<AppState>,
+    parts: Parts,
     JsonBody(body): JsonBody<ForgotPasswordPinDto>,
 ) -> Result<Response, ApiError> {
-    let pin = match body
-        .pin
-        .require("Jellyfin.Api.Models.UserDtos.ForgotPasswordPinDto", "Pin")
-    {
+    let pin = match body.pin.require(
+        "Jellyfin.Api.Models.UserDtos.ForgotPasswordPinDto",
+        "Pin",
+        || body_parameter(&parts.method, parts.extensions.get()),
+    ) {
         Ok(pin) => pin,
         Err(problem) => return Ok(problem.into_response()),
     };

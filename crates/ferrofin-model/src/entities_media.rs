@@ -143,7 +143,7 @@ impl MetadataProvider {
 }
 
 /// Class `ChapterInfo`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ChapterInfo {
     /// The start position ticks.
@@ -154,13 +154,29 @@ pub struct ChapterInfo {
     /// The image path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
-    /// The image date modified.
+    /// The image date modified: .NET's `DateTime.MinValue` until an image is
+    /// extracted, as upstream's unassigned `DateTime` is.
     #[schema(value_type = String, format = "date-time")]
     #[serde(with = "crate::json::datetime")]
     pub image_date_modified: chrono::DateTime<chrono::Utc>,
     /// The image tag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_tag: Option<String>,
+}
+
+impl Default for ChapterInfo {
+    /// A chapter with no image: its date is .NET's `DateTime.MinValue`
+    /// (`0001-01-01`), not chrono's epoch, as Jellyfin stores and serves it
+    /// (gl-1590).
+    fn default() -> Self {
+        Self {
+            start_position_ticks: 0,
+            name: None,
+            image_path: None,
+            image_date_modified: crate::json::datetime::dotnet_min(),
+            image_tag: None,
+        }
+    }
 }
 
 /// Class `MediaAttachment`.
@@ -366,6 +382,31 @@ pub struct VirtualFolderInfo {
 }
 
 impl VirtualFolderInfo {
+    /// The [`CollectionType`](crate::data::CollectionType) of each library in
+    /// `folders`, keyed by its folder item id; a library whose item id does
+    /// not parse is left out. A `mixed` library has no single type and maps to
+    /// `None`, which is still an entry: C# treats an unset `CollectionType` as
+    /// grouping-eligible.
+    #[must_use]
+    pub fn collection_types_by_id(
+        folders: &[Self],
+    ) -> HashMap<Uuid, Option<crate::data::CollectionType>> {
+        folders
+            .iter()
+            .filter_map(|vf| {
+                let id = vf
+                    .item_id
+                    .as_deref()
+                    .and_then(|s| Uuid::parse_str(s).ok())?;
+                Some((
+                    id,
+                    vf.collection_type
+                        .and_then(CollectionTypeOptions::collection_type),
+                ))
+            })
+            .collect()
+    }
+
     /// Whether one of this library's locations holds `path` — the location
     /// itself or anything under it, compared as upstream compares physical
     /// locations (`OrdinalIgnoreCase`).
@@ -1497,8 +1538,232 @@ impl AiredEpisodeOrder {
     }
 }
 
+/// The `AirsBeforeSeasonNumber`, `AirsAfterSeasonNumber` and
+/// `AirsBeforeEpisodeNumber` members of an episode's `Data` blob, in that
+/// order: what parsing the blob as a `serde_json::Value` and reading each
+/// member with `as_i64` gives (see `AiredPosition`), and all three `None`
+/// when the blob is missing or no JSON object. The one reading of those
+/// members behind the API's and core's aired episode order
+/// (`AiredEpisodeOrderComparer`, `FilterEpisodesBySeason`, next up).
+#[must_use]
+pub fn airs_numbers(data: Option<&str>) -> [Option<i64>; 3] {
+    let position = data
+        .and_then(|data| serde_json::from_str::<AiredPosition>(data).ok())
+        .unwrap_or_default();
+    [
+        position.before_season,
+        position.after_season,
+        position.before_episode,
+    ]
+}
+
+/// The aired-position members of an episode's `Data` blob, read without
+/// building the blob's `serde_json::Value` tree (gl-1003).
+///
+/// Each is what parsing the blob as a `Value` and reading the member with
+/// `as_i64` gives: the member's last occurrence, when it is an integer in
+/// `i64` range (a string, a float, a larger number or `null` is `None`), and
+/// `None` for all three when the blob is not a JSON object. Every other member
+/// is parsed as a value too rather than skipped, so a blob the `Value` parse
+/// rejects (a number out of range, nesting past the depth limit) is rejected
+/// here as well, and gives `None` for all three. A derived `Deserialize`
+/// would skip the other members with `IgnoredAny`, which `serde_json` skips
+/// without those checks, and would reject a repeated member where `Value`
+/// keeps the last. The one blob read differently names an object's first
+/// member `$serde_json::private::RawValue`, a token `serde_json` reserves for
+/// its own raw values, which no stored item carries.
+#[derive(Default)]
+struct AiredPosition {
+    before_season: Option<i64>,
+    after_season: Option<i64>,
+    before_episode: Option<i64>,
+}
+
+/// A member name of an episode's `Data` blob, as [`AiredPosition`] reads it.
+enum AiredMember {
+    BeforeSeason,
+    AfterSeason,
+    BeforeEpisode,
+    Other,
+}
+
+/// A member value as `serde_json::Value::as_i64` reads it.
+struct AiredNumber(Option<i64>);
+
+/// A member value parsed as a `serde_json::Value` would be, then dropped.
+struct AnyValue;
+
+impl<'de> serde::Deserialize<'de> for AiredPosition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Members;
+        impl<'de> serde::de::Visitor<'de> for Members {
+            type Value = AiredPosition;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an episode's Data object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<AiredPosition, A::Error> {
+                let mut position = AiredPosition::default();
+                while let Some(member) = map.next_key()? {
+                    let slot = match member {
+                        AiredMember::BeforeSeason => &mut position.before_season,
+                        AiredMember::AfterSeason => &mut position.after_season,
+                        AiredMember::BeforeEpisode => &mut position.before_episode,
+                        AiredMember::Other => {
+                            map.next_value::<AnyValue>()?;
+                            continue;
+                        }
+                    };
+                    *slot = map.next_value::<AiredNumber>()?.0;
+                }
+                Ok(position)
+            }
+        }
+        deserializer.deserialize_map(Members)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AiredMember {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Name;
+        impl serde::de::Visitor<'_> for Name {
+            type Value = AiredMember;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a member name")
+            }
+            fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<AiredMember, E> {
+                Ok(match name {
+                    "AirsBeforeSeasonNumber" => AiredMember::BeforeSeason,
+                    "AirsAfterSeasonNumber" => AiredMember::AfterSeason,
+                    "AirsBeforeEpisodeNumber" => AiredMember::BeforeEpisode,
+                    _ => AiredMember::Other,
+                })
+            }
+        }
+        deserializer.deserialize_str(Name)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AiredNumber {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Number;
+        impl<'de> serde::de::Visitor<'de> for Number {
+            type Value = AiredNumber;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+            fn visit_i64<E>(self, value: i64) -> Result<AiredNumber, E> {
+                Ok(AiredNumber(Some(value)))
+            }
+            fn visit_u64<E>(self, value: u64) -> Result<AiredNumber, E> {
+                Ok(AiredNumber(i64::try_from(value).ok()))
+            }
+            fn visit_f64<E>(self, _value: f64) -> Result<AiredNumber, E> {
+                Ok(AiredNumber(None))
+            }
+            fn visit_bool<E>(self, _value: bool) -> Result<AiredNumber, E> {
+                Ok(AiredNumber(None))
+            }
+            fn visit_str<E>(self, _value: &str) -> Result<AiredNumber, E> {
+                Ok(AiredNumber(None))
+            }
+            fn visit_unit<E>(self) -> Result<AiredNumber, E> {
+                Ok(AiredNumber(None))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<AiredNumber, A::Error> {
+                serde::de::Visitor::visit_seq(AnyValue, seq).map(|AnyValue| AiredNumber(None))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<AiredNumber, A::Error> {
+                serde::de::Visitor::visit_map(AnyValue, map).map(|AnyValue| AiredNumber(None))
+            }
+        }
+        deserializer.deserialize_any(Number)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AnyValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(AnyValue)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for AnyValue {
+    type Value = AnyValue;
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+    fn visit_bool<E>(self, _value: bool) -> Result<AnyValue, E> {
+        Ok(AnyValue)
+    }
+    fn visit_i64<E>(self, _value: i64) -> Result<AnyValue, E> {
+        Ok(AnyValue)
+    }
+    fn visit_u64<E>(self, _value: u64) -> Result<AnyValue, E> {
+        Ok(AnyValue)
+    }
+    fn visit_f64<E>(self, _value: f64) -> Result<AnyValue, E> {
+        Ok(AnyValue)
+    }
+    fn visit_str<E>(self, _value: &str) -> Result<AnyValue, E> {
+        Ok(AnyValue)
+    }
+    fn visit_unit<E>(self) -> Result<AnyValue, E> {
+        Ok(AnyValue)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<AnyValue, A::Error> {
+        while seq.next_element::<AnyValue>()?.is_some() {}
+        Ok(AnyValue)
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<AnyValue, A::Error> {
+        while map.next_entry::<AnyValue, AnyValue>()?.is_some() {}
+        Ok(AnyValue)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Each library's type by its folder id: a mixed library is an entry with
+    /// no type, and one whose id does not parse is left out.
+    #[test]
+    fn collection_types_are_keyed_by_the_library_folder_id() {
+        use crate::data::CollectionType;
+        use crate::entities::CollectionTypeOptions;
+        let library = |id: Option<&str>, kind| super::VirtualFolderInfo {
+            item_id: id.map(str::to_owned),
+            collection_type: kind,
+            ..Default::default()
+        };
+        let tv = uuid::Uuid::from_u128(1);
+        let mixed = uuid::Uuid::from_u128(2);
+        let unset = uuid::Uuid::from_u128(3);
+        let found = super::VirtualFolderInfo::collection_types_by_id(&[
+            library(
+                Some(&tv.simple().to_string()),
+                Some(CollectionTypeOptions::tvshows),
+            ),
+            library(Some(&mixed.to_string()), Some(CollectionTypeOptions::mixed)),
+            library(Some(&unset.to_string()), None),
+            library(Some("not an id"), Some(CollectionTypeOptions::movies)),
+            library(None, Some(CollectionTypeOptions::music)),
+        ]);
+        assert_eq!(
+            found,
+            std::collections::HashMap::from([
+                (tv, Some(CollectionType::tvshows)),
+                (mixed, None),
+                (unset, None),
+            ])
+        );
+    }
 
     #[test]
     fn the_library_owning_an_item_is_found_by_its_collection_folder_or_location() {
@@ -1618,6 +1883,14 @@ mod tests {
         assert_eq!(MetadataProvider::Custom as i32, 0);
         assert_eq!(MetadataProvider::Imdb as i32, 2);
         assert_eq!(MetadataProvider::MusicBrainzRecording as i32, 20);
+    }
+
+    /// gl-1590: an imageless chapter's date is .NET's `DateTime.MinValue`, as
+    /// a stock Jellyfin 12.4 serves it, not chrono's 1970 epoch.
+    #[test]
+    fn a_chapter_without_an_image_is_dated_dotnet_min_value() {
+        let json = serde_json::to_value(ChapterInfo::default()).unwrap();
+        assert_eq!(json["ImageDateModified"], "0001-01-01T00:00:00.0000000Z");
     }
 
     #[test]
@@ -2456,7 +2729,7 @@ mod tests {
 
 #[cfg(test)]
 mod aired_episode_order_tests {
-    use super::AiredEpisodeOrder;
+    use super::{AiredEpisodeOrder, airs_numbers};
     use rstest::rstest;
     use std::cmp::Ordering;
     fn ts(value: &str) -> chrono::DateTime<chrono::Utc> {
@@ -2585,5 +2858,103 @@ mod aired_episode_order_tests {
     ) {
         assert_eq!(x.compare(&y), expected);
         assert_eq!(y.compare(&x), expected.reverse());
+    }
+
+    /// The three members as the episode lists read them before gl-1003: the whole
+    /// blob parsed into a `serde_json::Value`, each member read with `as_i64`.
+    fn read_through_value(data: &str) -> [Option<i64>; 3] {
+        let value = serde_json::from_str::<serde_json::Value>(data).ok();
+        let number = |key| {
+            value
+                .as_ref()
+                .and_then(|value| value.get(key))
+                .and_then(serde_json::Value::as_i64)
+        };
+        [
+            number("AirsBeforeSeasonNumber"),
+            number("AirsAfterSeasonNumber"),
+            number("AirsBeforeEpisodeNumber"),
+        ]
+    }
+
+    /// The typed read gives what the `Value` read gave for every shape of
+    /// blob: members of every JSON type, out-of-range and negative numbers,
+    /// duplicated and escaped member names, blobs that are no object or no
+    /// JSON, and blobs the `Value` parse rejects in a member it never read.
+    #[rstest]
+    #[case::empty_object("{}")]
+    #[case::all_three(
+        r#"{"AirsBeforeSeasonNumber":2,"AirsAfterSeasonNumber":1,"AirsBeforeEpisodeNumber":3}"#
+    )]
+    #[case::among_others(
+        r#"{"Overview":"x","AirsBeforeSeasonNumber":1,"Tags":["a"],"Images":[{"W":1}]}"#
+    )]
+    #[case::negative(
+        r#"{"AirsAfterSeasonNumber":-1,"AirsBeforeSeasonNumber":-9223372036854775808}"#
+    )]
+    #[case::largest(r#"{"AirsBeforeSeasonNumber":9223372036854775807}"#)]
+    #[case::too_large(r#"{"AirsBeforeSeasonNumber":9223372036854775808}"#)]
+    #[case::beyond_u64(r#"{"AirsBeforeSeasonNumber":18446744073709551616}"#)]
+    #[case::below_i64(r#"{"AirsBeforeSeasonNumber":-9223372036854775809}"#)]
+    #[case::negative_zero(r#"{"AirsBeforeSeasonNumber":-0}"#)]
+    #[case::float(r#"{"AirsBeforeSeasonNumber":1.0}"#)]
+    #[case::exponent(r#"{"AirsBeforeSeasonNumber":1e2}"#)]
+    #[case::string(r#"{"AirsBeforeSeasonNumber":"1"}"#)]
+    #[case::boolean(r#"{"AirsBeforeSeasonNumber":true}"#)]
+    #[case::null(r#"{"AirsBeforeSeasonNumber":null,"AirsAfterSeasonNumber":2}"#)]
+    #[case::array(r#"{"AirsBeforeSeasonNumber":[1],"AirsAfterSeasonNumber":2}"#)]
+    #[case::object(r#"{"AirsBeforeSeasonNumber":{"Value":1},"AirsAfterSeasonNumber":2}"#)]
+    #[case::duplicate_last_wins(r#"{"AirsBeforeSeasonNumber":5,"AirsBeforeSeasonNumber":2}"#)]
+    #[case::duplicate_last_not_a_number(
+        r#"{"AirsBeforeSeasonNumber":5,"AirsBeforeSeasonNumber":"2"}"#
+    )]
+    #[case::escaped_name(r#"{"Airs\u0042eforeSeasonNumber":4}"#)]
+    #[case::other_case(r#"{"airsBeforeSeasonNumber":4}"#)]
+    #[case::escaped_strings(r#"{"Overview":"caf\u00e9 \"x\"","AirsBeforeEpisodeNumber":1}"#)]
+    #[case::whitespace(" {\n \"AirsBeforeSeasonNumber\" : 3 \t} \n")]
+    #[case::not_json("broken")]
+    #[case::blank("")]
+    #[case::trailing(r#"{"AirsBeforeSeasonNumber":1} x"#)]
+    #[case::two_values(r#"{"AirsBeforeSeasonNumber":1}{}"#)]
+    #[case::truncated(r#"{"AirsBeforeSeasonNumber":1"#)]
+    #[case::array_blob(r#"[{"AirsBeforeSeasonNumber":1}]"#)]
+    #[case::string_blob(r#""AirsBeforeSeasonNumber""#)]
+    #[case::number_blob("1")]
+    #[case::null_blob("null")]
+    #[case::other_out_of_range(r#"{"Rating":1e400,"AirsBeforeSeasonNumber":1}"#)]
+    #[case::other_bad_escape(r#"{"Overview":"\x","AirsBeforeSeasonNumber":1}"#)]
+    #[case::other_lone_surrogate(r#"{"Overview":"\ud800","AirsBeforeSeasonNumber":1}"#)]
+    #[case::other_bad_literal(r#"{"Overview":nul,"AirsBeforeSeasonNumber":1}"#)]
+    fn the_typed_read_matches_the_value_read(#[case] data: &str) {
+        assert_eq!(airs_numbers(Some(data)), read_through_value(data), "{data}");
+    }
+
+    /// Nesting past `serde_json`'s depth limit, in another member or in one
+    /// of the three, fails both, and just inside it passes both.
+    #[rstest]
+    #[case(100)]
+    #[case(127)]
+    #[case(128)]
+    #[case(200)]
+    fn nesting_fails_the_typed_read_where_it_fails_the_value_read(
+        #[case] depth: usize,
+        #[values("Nested", "AirsBeforeSeasonNumber")] member: &str,
+    ) {
+        let data = format!(
+            r#"{{"{member}":{}{},"AirsAfterSeasonNumber":1}}"#,
+            "[".repeat(depth),
+            "]".repeat(depth)
+        );
+        assert_eq!(
+            airs_numbers(Some(&data)),
+            read_through_value(&data),
+            "{member} at depth {depth}"
+        );
+    }
+
+    /// No blob reads as no numbers.
+    #[test]
+    fn a_missing_blob_has_no_airs_numbers() {
+        assert_eq!(airs_numbers(None), [None; 3]);
     }
 }

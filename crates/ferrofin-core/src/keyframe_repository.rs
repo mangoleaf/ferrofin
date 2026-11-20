@@ -8,11 +8,18 @@
 //! `MediaEncoding.Keyframes.KeyframeData` DTO is a DTO-layer concern; the trait
 //! works directly on [`KeyframeDataEntity`] rows, so no mapping is done here (the
 //! `KeyframeTicks` JSON stays as its raw string).
+//!
+//! A deletion (a changed file's prune) drops the result of an extraction that
+//! began before it ([`KeyframeRepository::save_extracted_keyframe_data`]), which
+//! upstream's `CacheDecorator` saves whatever happened meanwhile.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::KeyframeDataEntity;
 use ferrofin_db::store::guid_to_db;
+use ferrofin_util::change_watch::{ChangeWatch, Watch};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -24,6 +31,8 @@ use crate::db_error::db_err;
 #[derive(Clone)]
 pub struct FerrofinKeyframeRepository {
     db: Database,
+    /// The items an extraction is running for, shared by the clones.
+    extractions: Arc<ChangeWatch<Uuid>>,
 }
 
 impl std::fmt::Debug for FerrofinKeyframeRepository {
@@ -37,7 +46,10 @@ impl FerrofinKeyframeRepository {
     /// Creates a keyframe repository over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            extractions: Arc::default(),
+        }
     }
 }
 
@@ -83,12 +95,34 @@ impl KeyframeRepository for FerrofinKeyframeRepository {
     }
 
     async fn delete_keyframe_data(&self, item_id: Uuid) -> Result<(), ServiceError> {
-        sqlx::query(r#"DELETE FROM "KeyframeData" WHERE "ItemId" = ?1"#)
+        let delete = sqlx::query(r#"DELETE FROM "KeyframeData" WHERE "ItemId" = ?1"#)
             .bind(guid_to_db(item_id))
-            .execute(self.db.writer())
+            .execute(self.db.writer());
+        self.extractions
+            .change(&item_id, delete)
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn watch_keyframe_data(&self, item_id: Uuid) -> Watch<Uuid> {
+        self.extractions.watch(item_id).await
+    }
+
+    async fn save_extracted_keyframe_data(
+        &self,
+        watch: Watch<Uuid>,
+        data: &KeyframeDataEntity,
+    ) -> Result<bool, ServiceError> {
+        let item_id = *watch.key();
+        match self
+            .extractions
+            .commit(watch, self.save_keyframe_data(item_id, data))
+            .await
+        {
+            Some(saved) => saved.map(|()| true),
+            None => Ok(false),
+        }
     }
 }
 

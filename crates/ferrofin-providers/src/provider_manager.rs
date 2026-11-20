@@ -22,15 +22,16 @@ use chrono::Utc;
 use ferrofin_model::configuration::{MetadataOptions, MetadataPluginSummary};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::{ImageType, MetadataField};
+use ferrofin_model::extensions::order_by_language_descending;
 use ferrofin_model::net::mime_types;
 use ferrofin_model::providers::{
     ExternalIdInfo, ImageProviderInfo, RemoteImageInfo, RemoteImageQuery, RemoteSearchResult,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
-use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_traits::options::{ItemImageInfo, file_date_modified};
 use ferrofin_traits::persistence::{
-    ItemPersistenceService, ItemRepository, ItemTypeLookup, OwnerExtrasRefresh,
+    ItemPersistenceService, ItemRepository, ItemTypeLookup, OwnerExtrasRefresh, PlaylistMember,
 };
 use ferrofin_traits::providers::{
     GeneratedImageProvider, ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions,
@@ -44,8 +45,8 @@ use crate::library_options::{
     channel_fetcher_override, fetcher_names, image_fetcher_enabled, metadata_fetcher_enabled,
 };
 use crate::refresh_plan::{
-    FileFacts, ImageFetch, PassOutcome, ProbeKind, RefreshRequest, StoredState, decide_save,
-    plan_item_refresh,
+    FileFacts, ImageFetch, ItemRefreshPlan, LocalMetadataFile, LocalMetadataFormat, PassOutcome,
+    ProbeKind, RefreshRequest, StoredState, decide_save, plan_item_refresh,
 };
 use crate::tmdb::{TmdbClient, TmdbDetails, TmdbImage, TmdbKind};
 use ferrofin_db::entities::base_items::{BaseItemEntity, item_values_of};
@@ -138,12 +139,19 @@ impl RemoteSearchProvider for TmdbSearchProvider {
         // the two providers: `TmdbMovieProvider.cs:96-101`/`:106-111` pass
         // `TmdbUtils.GetImageLanguagesParam(...)` (so TMDB's `/find` sees
         // `language=en,null`), while `TmdbSeriesProvider.cs:73` passes the bare
-        // `MetadataLanguage`. Upstream's asymmetry, ported as-is.
+        // `MetadataLanguage`. Upstream's asymmetry, ported as-is, and so is
+        // `FindByExternalIdAsync`'s own `NormalizeLanguage` over the whole
+        // string, which upper-cases what follows a region's hyphen
+        // (`pt-BR,null,en` → `pt-BR,NULL,EN`).
+        let country = search_info.metadata_country_code.as_deref();
         let find_language = match self.kind {
-            TmdbKind::Movie => Some(crate::tmdb::image_languages_param(
-                search_info.metadata_language.as_deref(),
-                search_info.metadata_country_code.as_deref(),
-            )),
+            TmdbKind::Movie => crate::tmdb::normalize_language(
+                Some(&crate::tmdb::image_languages_param(
+                    search_info.metadata_language.as_deref(),
+                    country,
+                )),
+                country,
+            ),
             TmdbKind::Series => language.map(ToOwned::to_owned),
         };
         for (key, source) in [("Imdb", "imdb_id"), ("Tvdb", "tvdb_id")] {
@@ -160,7 +168,7 @@ impl RemoteSearchProvider for TmdbSearchProvider {
             return Ok(hits
                 .into_iter()
                 .map(|hit| {
-                    let mut result = self.hit_result(hit);
+                    let mut result = Self::hit_result(hit);
                     // `TmdbSeriesProvider` stamps the id it searched by back
                     // onto each row; `TmdbMovieProvider` does not.
                     if self.kind == TmdbKind::Series {
@@ -186,22 +194,20 @@ impl RemoteSearchProvider for TmdbSearchProvider {
             TmdbKind::Series => None,
         };
         let hits = self.tmdb.search(self.kind, name, year, language).await;
-        Ok(hits.into_iter().map(|hit| self.hit_result(hit)).collect())
+        Ok(hits.into_iter().map(Self::hit_result).collect())
     }
 }
 
 impl TmdbSearchProvider {
     /// One `/search/*` or `/find/*` row as an Identify candidate — the C#
     /// name-search loop for movies, `MapSearchTvToRemoteSearchResult` for
-    /// series. The series mapper sets `PremiereDate` and never `ProductionYear`;
-    /// the movie one sets both, from the same release date.
-    fn hit_result(&self, hit: crate::tmdb::TmdbSearchHit) -> RemoteSearchResult {
+    /// series. Both set `PremiereDate` and `ProductionYear` from the same date:
+    /// the release date for a movie, the first air date for a series
+    /// (jellyfin/jellyfin#16144).
+    fn hit_result(hit: crate::tmdb::TmdbSearchHit) -> RemoteSearchResult {
         RemoteSearchResult {
             name: hit.name,
-            production_year: match self.kind {
-                TmdbKind::Movie => hit.year,
-                TmdbKind::Series => None,
-            },
+            production_year: hit.year,
             premiere_date: hit.premiere_date.as_deref().and_then(parse_ymd),
             image_url: hit.poster_url,
             overview: hit.overview,
@@ -216,8 +222,8 @@ impl TmdbSearchProvider {
 
     /// The single candidate a `Tmdb` id resolves to — the C# `GetMovieAsync`
     /// branch / `MapTvShowToRemoteSearchResult`. Both carry the IMDb id when
-    /// TMDB knows it; the series mapper adds the TVDB id too, and neither
-    /// series mapper sets `ProductionYear`.
+    /// TMDB knows it; the series mapper adds the TVDB id too. Both set
+    /// `ProductionYear` from the release / first air date.
     fn pinned_result(&self, tmdb_id: i64, details: TmdbDetails) -> RemoteSearchResult {
         let mut provider_ids = HashMap::from([("Tmdb".to_owned(), tmdb_id.to_string())]);
         // `TrySetProviderId` — only when TMDB actually has the id.
@@ -231,10 +237,7 @@ impl TmdbSearchProvider {
         }
         RemoteSearchResult {
             name: details.name,
-            production_year: match self.kind {
-                TmdbKind::Movie => details.production_year,
-                TmdbKind::Series => None,
-            },
+            production_year: details.production_year,
             premiere_date: details.premiere_date.as_deref().and_then(parse_ymd),
             image_url: details.poster_url,
             overview: details.overview,
@@ -435,13 +438,8 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
             };
             return Ok(vec![RemoteSearchResult {
                 name: Some(collection.name),
-                // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick, which
-                // `TmdbClient::collection` pushes first as the Primary image.
-                image_url: collection
-                    .images
-                    .iter()
-                    .find(|image| image.image_type == ImageType::Primary)
-                    .map(|image| image.url.clone()),
+                // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick only.
+                image_url: collection.poster_url,
                 provider_ids: Some(HashMap::from([(
                     "Tmdb".to_owned(),
                     collection.tmdb_id.to_string(),
@@ -559,11 +557,9 @@ impl RemoteSearchProvider for OmdbSearchProvider {
         // that branch is unreachable until both exist.
         let is_episode = self.kind == crate::OmdbKind::Episode;
         let known = crate::OmdbSearchKey {
-            imdb_id: search_info
-                .provider_ids
-                .as_ref()
-                .and_then(|ids| ids.iter().find(|(key, _)| key.eq_ignore_ascii_case("Imdb")))
-                .map(|(_, value)| value.as_str())
+            // A blank id is no id (`string.IsNullOrWhiteSpace(imdbId)`); jellyfin-web
+            // sends "" for every id field left empty.
+            imdb_id: provider_id_of(search_info.provider_ids.as_ref(), "Imdb")
                 .filter(|_| !is_episode),
             season: is_episode
                 .then_some(search_info.parent_index_number)
@@ -669,15 +665,23 @@ fn parse_numeric_provider_id(raw: &str) -> Option<i64> {
     raw.trim().parse::<i64>().ok()
 }
 
+/// `AlbumInfoExtensions.MusicBrainzId` (`AlbumInfoExtensions.cs:87-88`): the
+/// `key` id in `ids` only when it can be one of that provider's
+/// (`IsValidProviderId`), so another service's id under a MusicBrainz key
+/// reads as no id and the caller falls back to the next source.
+fn musicbrainz_id_of<'a>(ids: Option<&'a HashMap<String, String>>, key: &str) -> Option<&'a str> {
+    provider_id_of(ids, key).filter(|id| crate::metadata_merge::is_valid_provider_id(key, id))
+}
+
 /// `AlbumInfoExtensions.GetReleaseId` / `GetReleaseGroupId`: the album's own
 /// `key`, else the first contained song that carries one.
 fn album_id_or_song_id(request: &RemoteSearchRequest, key: &str) -> Option<String> {
-    provider_id_of(request.search_info.provider_ids.as_ref(), key)
+    musicbrainz_id_of(request.search_info.provider_ids.as_ref(), key)
         .or_else(|| {
             request
                 .song_infos
                 .iter()
-                .find_map(|song| provider_id_of(song.base.provider_ids.as_ref(), key))
+                .find_map(|song| musicbrainz_id_of(song.base.provider_ids.as_ref(), key))
         })
         .map(str::to_owned)
 }
@@ -686,14 +690,14 @@ fn album_id_or_song_id(request: &RemoteSearchRequest, key: &str) -> Option<Strin
 /// `MusicBrainzAlbumArtist`, else the artist's `MusicBrainzArtist` (from
 /// `ArtistProviderIds`), else the first song's `MusicBrainzAlbumArtist`.
 fn album_artist_mbid(request: &RemoteSearchRequest) -> Option<String> {
-    provider_id_of(
+    musicbrainz_id_of(
         request.search_info.provider_ids.as_ref(),
         "MusicBrainzAlbumArtist",
     )
-    .or_else(|| provider_id_of(request.artist_provider_ids.as_ref(), "MusicBrainzArtist"))
+    .or_else(|| musicbrainz_id_of(request.artist_provider_ids.as_ref(), "MusicBrainzArtist"))
     .or_else(|| {
         request.song_infos.iter().find_map(|song| {
-            provider_id_of(song.base.provider_ids.as_ref(), "MusicBrainzAlbumArtist")
+            musicbrainz_id_of(song.base.provider_ids.as_ref(), "MusicBrainzAlbumArtist")
         })
     })
     .map(str::to_owned)
@@ -714,16 +718,31 @@ fn album_artist_name(request: &RemoteSearchRequest) -> Option<&str> {
 /// `AlbumInfoExtensions.GetMusicBrainzArtistId(ArtistInfo)`: the artist's own
 /// `MusicBrainzArtist`, else the first song's `MusicBrainzAlbumArtist`.
 fn artist_mbid(request: &RemoteSearchRequest) -> Option<String> {
-    provider_id_of(
+    musicbrainz_id_of(
         request.search_info.provider_ids.as_ref(),
         "MusicBrainzArtist",
     )
     .or_else(|| {
         request.song_infos.iter().find_map(|song| {
-            provider_id_of(song.base.provider_ids.as_ref(), "MusicBrainzAlbumArtist")
+            musicbrainz_id_of(song.base.provider_ids.as_ref(), "MusicBrainzAlbumArtist")
         })
     })
     .map(str::to_owned)
+}
+
+/// A MusicBrainz request of the "Identify" flow, failing the provider when
+/// it fails, as the C# `HttpError` does (`MusicBrainzQueryExtensions.cs`).
+/// A by-id lookup MusicBrainz answers with a 404 (or never sends, for a
+/// malformed id) is no failure but `None` (`NotFoundAsNullAsync`), and the
+/// search goes on to its next step. `what` names the request in the error.
+async fn or_failed<T>(
+    what: &str,
+    request: impl std::future::Future<Output = T>,
+) -> Result<T, ServiceError> {
+    match crate::rate_limit::count_request_failures(request).await {
+        (output, 0) => Ok(output),
+        _ => Err(ServiceError::backend(format!("MusicBrainz {what} failed"))),
+    }
 }
 
 /// Maps one MusicBrainz release hit into the "Identify" result shape — port of
@@ -811,7 +830,7 @@ impl RemoteSearchProvider for MusicBrainzAlbumSearchProvider {
     }
 
     /// `MusicBrainzAlbumProvider.Order => 0`
-    /// (`MusicBrainz/MusicBrainzAlbumProvider.cs:46`) — it wants to be first.
+    /// (`MusicBrainz/MusicBrainzAlbumProvider.cs:41`) — it wants to be first.
     fn default_order(&self) -> i32 {
         0
     }
@@ -820,25 +839,28 @@ impl RemoteSearchProvider for MusicBrainzAlbumSearchProvider {
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        // A release id on the item resolves it exactly (`LookupReleaseAsync`).
-        if let Some(release_id) = album_id_or_song_id(request, "MusicBrainzAlbum") {
-            return Ok(self
-                .musicbrainz
-                .lookup_release(&release_id)
-                .await
-                .map(release_search_result)
-                .into_iter()
-                .collect());
+        // A release id on the item resolves it exactly
+        // (`LookupReleaseOrNullAsync`); one MusicBrainz does not know (404)
+        // or that is malformed falls through to the release group.
+        if let Some(release_id) = album_id_or_song_id(request, "MusicBrainzAlbum")
+            && let Some(hit) = or_failed(
+                "release lookup",
+                self.musicbrainz.lookup_release(&release_id),
+            )
+            .await?
+        {
+            return Ok(vec![release_search_result(hit)]);
         }
-        // A release-group id expands to every release in the group.
-        if let Some(group_id) = album_id_or_song_id(request, "MusicBrainzReleaseGroup") {
-            return Ok(self
-                .musicbrainz
-                .release_group_releases(&group_id)
-                .await
-                .into_iter()
-                .map(release_search_result)
-                .collect());
+        // A release group MusicBrainz knows expands to every release in it,
+        // even none; an unknown one falls through to the name search.
+        if let Some(group_id) = album_id_or_song_id(request, "MusicBrainzReleaseGroup")
+            && let Some(releases) = or_failed(
+                "release group lookup",
+                Box::pin(self.musicbrainz.release_group_releases(&group_id)),
+            )
+            .await?
+        {
+            return Ok(releases.into_iter().map(release_search_result).collect());
         }
         let name = request.search_info.name.as_deref().unwrap_or_default();
         let query = if let Some(arid) = album_artist_mbid(request) {
@@ -852,20 +874,20 @@ impl RemoteSearchProvider for MusicBrainzAlbumSearchProvider {
             let artist = album_artist_name(request).unwrap_or_default();
             format!("\"{query_name}\" AND artist:\"{artist}\"")
         };
-        Ok(self
-            .musicbrainz
-            .find_releases(&query)
-            .await
-            .into_iter()
-            .map(release_search_result)
-            .collect())
+        Ok(
+            or_failed("release search", self.musicbrainz.find_releases(&query))
+                .await?
+                .into_iter()
+                .map(release_search_result)
+                .collect(),
+        )
     }
 }
 
 /// A [`RemoteSearchProvider`] over MusicBrainz artists — the "Identify" flow
 /// for a `MusicArtist`. Port of `MusicBrainzArtistProvider.GetSearchResults`:
-/// a known artist id resolves exactly, else a phrase search by name, retried
-/// through `artistaccent:` when the name carries diacritics.
+/// a known artist id resolves exactly, else a phrase search by a non-blank
+/// name, retried through `artistaccent:` when the name carries diacritics.
 pub struct MusicBrainzArtistSearchProvider {
     musicbrainz: Arc<crate::musicbrainz::MusicBrainzClient>,
 }
@@ -889,38 +911,38 @@ impl RemoteSearchProvider for MusicBrainzArtistSearchProvider {
         item_kind == BaseItemKind::MusicArtist
     }
 
-    /// `MusicBrainzArtistProvider` implements `IRemoteMetadataProvider` and
-    /// `IDisposable` but **not** `IHasOrder`
-    /// (`MusicBrainz/MusicBrainzArtistProvider.cs:25`) — unlike its album
-    /// sibling, which declares 0. Upstream's default 50.
+    /// `MusicBrainzArtistProvider.Order => 0`
+    /// (`MusicBrainz/MusicBrainzArtistProvider.cs:41`, `IHasOrder` since
+    /// v12.0) — first, like its album sibling.
     fn default_order(&self) -> i32 {
-        50
+        0
     }
 
     async fn get_search_results(
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        if let Some(artist_id) = artist_mbid(request) {
-            return Ok(self
-                .musicbrainz
-                .lookup_artist(&artist_id)
-                .await
-                .map(artist_search_result)
-                .into_iter()
-                .collect());
+        // `LookupArtistOrNullAsync`: an id MusicBrainz does not know (404)
+        // falls through to the name search.
+        if let Some(artist_id) = artist_mbid(request)
+            && let Some(hit) =
+                or_failed("artist lookup", self.musicbrainz.lookup_artist(&artist_id)).await?
+        {
+            return Ok(vec![artist_search_result(hit)]);
         }
         let name = request.search_info.name.as_deref().unwrap_or_default();
-        let hits = self.musicbrainz.find_artists(&format!("\"{name}\"")).await;
+        if name.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let phrase = format!("\"{name}\"");
+        let hits = or_failed("artist search", self.musicbrainz.find_artists(&phrase)).await?;
         if !hits.is_empty() {
             return Ok(hits.into_iter().map(artist_search_result).collect());
         }
         if ferrofin_util::string_extensions::has_diacritics(name) {
             // Retry through the accent-preserving field.
-            let hits = self
-                .musicbrainz
-                .find_artists(&format!("artistaccent:\"{name}\""))
-                .await;
+            let accent = format!("artistaccent:\"{name}\"");
+            let hits = or_failed("artist search", self.musicbrainz.find_artists(&accent)).await?;
             return Ok(hits.into_iter().map(artist_search_result).collect());
         }
         Ok(Vec::new())
@@ -928,11 +950,13 @@ impl RemoteSearchProvider for MusicBrainzArtistSearchProvider {
 }
 
 /// The TheAudioDb face of the "Identify" flow for a `MusicAlbum` /
-/// `MusicArtist`. Port of `AudioDbAlbumProvider.GetSearchResults` /
-/// `AudioDbArtistProvider.GetSearchResults`, which both return an empty set —
-/// TheAudioDb has no name search, it is keyed by MusicBrainz id and only
-/// contributes during the metadata fetch. Registered so the provider is
-/// selectable by name exactly as it is in Jellyfin.
+/// `MusicArtist`. Port of `AudioDbAlbumProvider.GetSearchResults`, which
+/// returns an empty set: TheAudioDb contributes to an album only during the
+/// metadata fetch. Registered so the provider is selectable by name exactly
+/// as it is in Jellyfin. TODO(gl-497): v12.4's
+/// `AudioDbArtistProvider.GetSearchResults` searches, by the artist's
+/// `AudioDbArtist` id, else its MusicBrainz id, else its name; the artist
+/// half still returns nothing.
 pub struct AudioDbSearchProvider {
     supported: BaseItemKind,
 }
@@ -956,11 +980,11 @@ impl RemoteSearchProvider for AudioDbSearchProvider {
         item_kind == self.supported
     }
 
-    /// `AudioDbArtistProvider.Order => 1` (`AudioDb/AudioDbArtistProvider.cs:52`)
-    /// and `AudioDbAlbumProvider.Order => 1` (`AudioDb/AudioDbAlbumProvider.cs:53`)
+    /// `AudioDbArtistProvider.Order => 1` (`AudioDb/AudioDbArtistProvider.cs:55`)
+    /// and `AudioDbAlbumProvider.Order => 1` (`AudioDb/AudioDbAlbumProvider.cs:54`)
     /// — both kinds this instance can be built for declare 1, which puts
-    /// TheAudioDb after MusicBrainz's album provider (0) and before an
-    /// unranked one (50).
+    /// TheAudioDb after the MusicBrainz providers (0) and before an unranked
+    /// one (50).
     fn default_order(&self) -> i32 {
         1
     }
@@ -1125,7 +1149,13 @@ pub trait RemoteSearchProvider: Send + Sync {
 pub struct LocalProviderManager {
     /// Refreshes waiting for the serial worker (`ProviderManager._refreshQueue`).
     refresh_queue: Arc<std::sync::Mutex<RefreshQueue>>,
+    /// Per-item locks on a row's read-modify-write, shared by every clone
+    /// ([`ProviderManager::lock_item_metadata`]).
+    item_metadata_locks: Arc<ferrofin_util::keyed_locks::KeyedLocks>,
     nfo_saver: Option<Arc<crate::nfo_save::NfoSaver>>,
+    /// A box set's `collection.xml` saver (`BoxSetXmlSaver`); with it the
+    /// box set's refresh reads the file too (`BoxSetXmlProvider`).
+    box_set_xml: Option<Arc<crate::box_set_xml::BoxSetXmlSaver>>,
     image_saver: Option<Arc<crate::image_save::ImageFileSaver>>,
     external_id_infos: Vec<ExternalIdInfo>,
     /// Runtime-registered named metadata providers (WASM plugins) as
@@ -1214,7 +1244,14 @@ pub struct LocalProviderManager {
     /// `POST /System/Configuration` applies without a restart. Absent → an
     /// empty global array, i.e. no server-wide ranking.
     metadata_options: Option<Arc<dyn Fn() -> Vec<MetadataOptions> + Send + Sync>>,
+    /// `GetRebasedPath` of a by-name Genre, MusicGenre, Person, Studio or
+    /// Year at a path (`None` for any other kind). Absent → no by-name item
+    /// is ever rebased by a refresh.
+    by_name_rebase: Option<ByNameRebase>,
 }
+
+/// [`LocalProviderManager::with_by_name_rebase`]'s reader, stored.
+type ByNameRebase = Arc<dyn Fn(BaseItemKind, &str) -> Option<String> + Send + Sync>;
 
 /// What every [`ProviderManager::cached_remote_image`] shares, so that one
 /// image URL costs one download however many ask, and one that gave no image
@@ -1288,6 +1325,7 @@ impl std::fmt::Debug for LocalProviderManager {
                     .lock()
                     .map_or(0, |queue| queue.items.len()),
             )
+            .field("locked_items", &self.item_metadata_locks.len())
             .field("external_id_infos", &self.external_id_infos)
             .field("has_virtual_folders", &self.virtual_folders.is_some())
             .field(
@@ -1303,9 +1341,11 @@ impl std::fmt::Debug for LocalProviderManager {
                 &self.remote_search_providers.len(),
             )
             .field("has_nfo_saver", &self.nfo_saver.is_some())
+            .field("has_box_set_xml", &self.box_set_xml.is_some())
             .field("has_image_saver", &self.image_saver.is_some())
             .field("has_image_store", &self.image_store.is_some())
             .field("metadata_dir", &self.metadata_dir)
+            .field("has_by_name_rebase", &self.by_name_rebase.is_some())
             .field("remote_image_cache", &self.remote_image_cache)
             .field("remote_image_requests", &self.remote_image_requests)
             .field("has_tmdb", &self.tmdb.is_some())
@@ -1346,6 +1386,14 @@ impl LocalProviderManager {
         self
     }
 
+    /// Attaches the box set `collection.xml` saver, which also makes a box
+    /// set's refresh read the file ([`crate::box_set_xml`]).
+    #[must_use]
+    pub fn with_box_set_xml(mut self, saver: Arc<crate::box_set_xml::BoxSetXmlSaver>) -> Self {
+        self.box_set_xml = Some(saver);
+        self
+    }
+
     /// Attaches the providers that draw an item's Primary from other items'
     /// artwork (upstream's `BaseDynamicImageProvider` family), so a refresh of
     /// a genre, music genre or playlist redraws its collage.
@@ -1376,7 +1424,9 @@ impl LocalProviderManager {
     pub fn new(external_id_infos: Vec<ExternalIdInfo>) -> Self {
         Self {
             refresh_queue: Arc::default(),
+            item_metadata_locks: Arc::default(),
             nfo_saver: None,
+            box_set_xml: None,
             image_saver: None,
             external_id_infos,
             dynamic_fetchers: Vec::new(),
@@ -1403,6 +1453,7 @@ impl LocalProviderManager {
             server_metadata_language: None,
             server_metadata_country: None,
             metadata_options: None,
+            by_name_rebase: None,
         }
     }
 
@@ -1434,6 +1485,28 @@ impl LocalProviderManager {
     ) -> Self {
         self.server_metadata_country = Some(server_country);
         self
+    }
+
+    /// Wires the by-name `GetRebasedPath` the single-item refresh asks
+    /// (`Genre`/`MusicGenre`/`Person`/`Studio`/`Year` `RequiresRefresh` and
+    /// `BeforeMetadataRefresh`): a by-name item whose `Path` is not the
+    /// rebased one is refreshed and saved there.
+    #[must_use]
+    pub fn with_by_name_rebase(
+        mut self,
+        rebase: impl Fn(BaseItemKind, &str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.by_name_rebase = Some(Arc::new(rebase));
+        self
+    }
+
+    /// The path a by-name `stored` item moves to (`GetRebasedPath`) when it
+    /// differs from its `Path` (ordinal); [`None`] while it is in place, for
+    /// a row with no path, a kind with no such arm, or with no reader wired.
+    fn rebased_by_name_path(&self, stored: &BaseItemEntity) -> Option<String> {
+        let path = stored.path.as_deref()?;
+        let kind = BaseItemKind::from_stored_type_name(&stored.type_)?;
+        (self.by_name_rebase.as_ref()?)(kind, path).filter(|rebased| rebased != path)
     }
 
     /// `ServerConfiguration.PreferredMetadataLanguage`, or the C# default
@@ -2010,6 +2083,69 @@ impl LocalProviderManager {
         Ok(Some(ids))
     }
 
+    /// `RefreshWithProviders`' local metadata provider for a box set,
+    /// `BoxSetXmlProvider`: its `collection.xml` ([`crate::box_set_xml`]),
+    /// read when the plan runs the local readers — never when identifying,
+    /// nor under "Replace all metadata" while a metadata saver is enabled for
+    /// the item (`isSavingMetadata`, `MetadataService.cs:803`). Its provider
+    /// id elements are the box set's external ids
+    /// (`GetExternalIdInfos(item)`).
+    async fn read_local_xml(
+        &self,
+        stored: &BaseItemEntity,
+        file: Option<&crate::box_set_xml::LocalXmlFile>,
+        plan: &ItemRefreshPlan,
+        options: &MetadataRefreshOptions,
+    ) -> Option<crate::local_xml::LocalContainerXml> {
+        let (saver, file) = (self.box_set_xml.as_ref()?, file?);
+        if !plan.local_metadata || options.search_result.is_some() {
+            return None;
+        }
+        if options.replace_all_metadata {
+            // `IsSaverEnabledForItem` logs a failure and counts the saver
+            // as disabled.
+            match saver
+                .is_enabled_for(stored, ItemUpdateType::MetadataEdit)
+                .await
+            {
+                Ok(true) => return None,
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(item_id = %stored.id, %err, "could not tell whether the box set's collection.xml is saved");
+                }
+            }
+        }
+        let keys: Vec<String> = crate::external_ids::external_id_infos(BaseItemKind::BoxSet)
+            .into_iter()
+            .chain(self.external_id_infos.iter().cloned())
+            .filter_map(|info| info.key)
+            .collect();
+        crate::box_set_xml::read(&file.path, &keys).await
+    }
+
+    /// `ProviderManager.SaveMetadataAsync` with the NFO saver. A failure is
+    /// logged, never returned: the metadata is already committed.
+    async fn save_nfo(&self, item_id: Uuid, update: ItemUpdateType) {
+        if let Some(saver) = &self.nfo_saver
+            && let Err(error) = saver.save(item_id, update).await
+        {
+            tracing::warn!(%item_id, %error, "NFO metadata saver failed");
+        }
+    }
+
+    /// `ProviderManager.SaveMetadataAsync` with the `collection.xml` saver:
+    /// whether it wrote the file. A failure is logged, never returned: the
+    /// metadata is already committed.
+    async fn save_box_set_xml(&self, item_id: Uuid, update: ItemUpdateType) -> bool {
+        let Some(saver) = &self.box_set_xml else {
+            return false;
+        };
+        saver.save(item_id, update).await.unwrap_or_else(|error| {
+            tracing::warn!(%item_id, %error, "collection.xml metadata saver failed");
+            false
+        })
+    }
+
     /// The item's locked metadata fields. Without a store nothing is
     /// persisted, so nothing is locked; a failed read locks every field
     /// rather than let a refresh overwrite one the user locked.
@@ -2288,7 +2424,7 @@ impl LocalProviderManager {
                 self.tmdb_episode(
                     series_id_of("Tmdb"),
                     season_number,
-                    episode_number,
+                    (episode_number, crate::episode::lookup_range_end(row)),
                     tmdb_language.as_deref(),
                 )
                 .await
@@ -2358,13 +2494,10 @@ impl LocalProviderManager {
         let record = omdb
             .episode(series, season_number, episode_number, own_imdb)
             .await?;
-        let subtag = language
-            .split_once('-')
-            .map_or(language, |(subtag, _)| subtag);
         let mut answer = crate::episode::omdb_answer(
             &record,
             crate::episode::OmdbGates {
-                english: subtag.eq_ignore_ascii_case("en"),
+                english: crate::metadata_merge::language_subtag(language) == "en",
                 us: country.eq_ignore_ascii_case("US"),
                 cast_and_crew: omdb.cast_and_crew().await,
             },
@@ -2417,27 +2550,26 @@ impl LocalProviderManager {
     }
 
     /// `TmdbEpisodeProvider`'s answer: the episode's entry in the series'
-    /// season response and its own request, by the series' `Tmdb` id only.
+    /// season response — for a multi-episode one (`episode_end`), every entry
+    /// up to its end, joined ([`crate::episode::tmdb_episode_in_range`]) — and
+    /// the first one's own request, by the series' `Tmdb` id only.
     async fn tmdb_episode(
         &self,
         series_tmdb_id: Option<i64>,
         season_number: i32,
-        episode_number: i32,
+        (episode_number, episode_end): (i32, Option<i32>),
         language: Option<&str>,
     ) -> Option<crate::episode::EpisodeAnswer> {
         let (client, series) = self.tmdb.as_ref().zip(series_tmdb_id)?;
         let season = client
             .season_details_for_language(series, season_number, language)
             .await?;
-        let entry = season
-            .episodes
-            .iter()
-            .find(|entry| entry.episode_number == episode_number)?;
+        let entry = crate::episode::tmdb_episode_in_range(&season, episode_number, episode_end)?;
         let extras = client
-            .episode_extras_for_language(series, season_number, episode_number, language)
+            .episode_extras_for_language(series, season_number, entry.episode_number, language)
             .await;
         Some(crate::episode::tmdb_answer(
-            entry,
+            &entry,
             extras.as_ref(),
             season_number,
             episode_number,
@@ -2480,9 +2612,7 @@ impl LocalProviderManager {
     async fn stored_images(&self, item_id: Uuid) -> Option<Vec<ItemImageInfo>> {
         let store = self.image_store.as_ref()?;
         match store.scan_stored_links(&[item_id]).await {
-            Ok(Some(mut links)) => {
-                Some(links.remove(&item_id).map(|l| l.images).unwrap_or_default())
-            }
+            Ok(Some(mut links)) => Some(links.remove(&item_id).map_or_default(|l| l.images)),
             Ok(None) => None,
             Err(err) => {
                 tracing::warn!(%item_id, %err, "could not read the item's images");
@@ -2523,6 +2653,12 @@ impl LocalProviderManager {
         options: &MetadataRefreshOptions,
     ) -> Result<ItemUpdateType, ServiceError> {
         use crate::metadata_merge::{MetadataResult, RefreshAnswers, RefreshMerge};
+        // Held from the id write and the load below to the last save, so an
+        // edit made meanwhile waits and then applies to the saved row. It
+        // spans the remote fetches too, so the edit waits for them, minutes at
+        // worst under `rate_limit.rs`'s timeouts and retries; gl-1504 has the
+        // re-read-under-the-lock shape that would end that wait.
+        let _metadata = self.lock_item_metadata(item_id).await;
         // "Identify → Apply": the chosen result's ids become the item's, and
         // they are persisted BEFORE anything else — including every gate and
         // early return below. C# does this in the CONTROLLER, outside the
@@ -2556,6 +2692,13 @@ impl LocalProviderManager {
         let Some(stored) = items.retrieve_item(item_id).await? else {
             return Err(ServiceError::not_found(format!("item {item_id}")));
         };
+        // `if (refreshOptions.RemoveOldMetadata &&
+        // refreshOptions.ReplaceAllImages) ImageProvider.RemoveImages(item)`
+        // (`MetadataService.cs:112-118`): before every provider, whatever the
+        // lock or the modes.
+        let removed_images = options.remove_old_metadata
+            && options.replace_all_images
+            && self.remove_own_images(item_id, &stored).await?;
         // The item's `LockedFields`: the merge leaves them as stored.
         let locked_fields = self.stored_locked_fields(item_id).await;
         let stored_ids = if options.search_result.is_some() {
@@ -2601,6 +2744,23 @@ impl LocalProviderManager {
             options,
             force_save: options.force_save,
         };
+        // A by-name item off its rebased path is required to refresh
+        // (`Genre.RequiresRefresh` and its kin, `MetadataService.cs:99-110`).
+        let rebased = self.rebased_by_name_path(&stored);
+        // A box set's local metadata provider, `BoxSetXmlProvider`: its
+        // `collection.xml`, which its change monitor watches.
+        let xml_file = match &self.box_set_xml {
+            Some(_) => crate::box_set_xml::local_file(&stored).await,
+            None => None,
+        };
+        let file = FileFacts {
+            local_metadata: xml_file.as_ref().map(|file| LocalMetadataFile {
+                mtime: file.mtime,
+                format: LocalMetadataFormat::Xml,
+            }),
+            path_rebased: rebased.is_some(),
+            ..NO_FILE
+        };
         let plan = plan_item_refresh(
             Some(&StoredState {
                 date_last_refreshed: stored.date_last_refreshed,
@@ -2611,7 +2771,7 @@ impl LocalProviderManager {
                 is_virtual_item: stored.is_virtual_item,
                 is_locked: stored.is_locked,
             }),
-            &NO_FILE,
+            &file,
             &request,
             library.as_ref(),
             Utc::now(),
@@ -2621,8 +2781,17 @@ impl LocalProviderManager {
         // `CanRefreshImages`): the owning library's fetcher checkboxes and the
         // item's `IsLocked` flag.
         let gated = self.gated_options(&stored, options).await;
+        let local = self
+            .read_local_xml(&stored, xml_file.as_ref(), &plan, options)
+            .await;
+        // `isLocalLocked`: a file that locks the item runs no remote provider.
+        let local_locked = local
+            .as_ref()
+            .is_some_and(|local| local.item.item.is_locked);
         let fetch = Fetch {
-            metadata: plan.remote_metadata && wants_fetch(gated.metadata_refresh_mode),
+            metadata: plan.remote_metadata
+                && wants_fetch(gated.metadata_refresh_mode)
+                && !local_locked,
             images: !local_images_failed
                 && plan.remote_images != ImageFetch::None
                 && wants_fetch(gated.image_refresh_mode),
@@ -2638,6 +2807,20 @@ impl LocalProviderManager {
         } else {
             None
         };
+        // `ApplySearchResult` (`MetadataService.cs:272-293`) clears an
+        // identified season's or episode's own ids whenever the item has a
+        // provider (`providers.Count > 0`): the lookup's `ProviderIds` are the
+        // item's (`GetItemLookupInfo`), so it keeps only the ids they return.
+        // An episode always has one, its forced `ProbeProvider` and
+        // `TrickplayProvider`, whatever the lock and the checkboxes; a
+        // path-less season has only remote ones, and with none of them
+        // nothing clears the chosen ids stored above.
+        let own_ids_cleared = options.search_result.is_some()
+            && match BaseItemKind::from_stored_type_name(&stored.type_) {
+                Some(BaseItemKind::Episode) => true,
+                Some(BaseItemKind::Season) => fetch.metadata,
+                _ => false,
+            };
         // The fetch, with its provider failures counted: a provider that
         // failed keeps the refresh from being stamped, one that found nothing
         // does not (owner decision D1, `RefreshResult.Failures`).
@@ -2743,6 +2926,9 @@ impl LocalProviderManager {
             _ => None,
         };
         let mut base = stored.clone();
+        // Whether the members changed a value `UpdateMetadataFromChildren`
+        // reports as `MetadataEdit` (the date, year, genres, studios, rating).
+        let mut members_edited = false;
         // `BeforeSave` → `UpdateMetadataFromChildren` (`MetadataService.cs:
         // 404-483`): past the `isFullRefresh` gate a box set or playlist takes
         // its runtime, genres, studios, date and rating from its members
@@ -2766,6 +2952,7 @@ impl LocalProviderManager {
                 )
                 .map(str::to_owned);
             }
+            members_edited = crate::metadata_merge::members_edited(&stored, &base);
         }
         // `BoxSetMetadataService.BeforeSaveInternal`: on every refresh, past
         // any gate or lock, a box set's `LibraryFolderIds` — the libraries
@@ -2783,18 +2970,34 @@ impl LocalProviderManager {
         // country (`MetadataService.cs:790-795`) — merges onto the stored row
         // when a provider answered (`UpdateType > None`).
         let current = MetadataResult {
-            provider_ids: stored_ids.clone(),
+            provider_ids: if own_ids_cleared {
+                Vec::new()
+            } else {
+                stored_ids.clone()
+            },
+            locked_fields: locked_fields.clone(),
             ..MetadataResult::of(base)
         };
+        let downloaded = fetched.item.is_some();
+        // `hasRemoteMetadata`: with only the local file answering and a
+        // remote provider failing, "Replace all metadata" keeps the stored
+        // values (`MetadataService.cs:898-902`).
         let merge = RefreshMerge::of(
             options,
             RefreshAnswers {
                 any: true,
                 failed: failures > 0,
-                remote: true,
-                local_locked: false,
+                remote: downloaded,
+                local_locked,
             },
         );
+        // The file's links, kept for after the save: they count only for a
+        // box set outside the data directory (`BoxSetMetadataService.MergeData`).
+        let mut local = local;
+        let local_members = local
+            .as_mut()
+            .map(|local| std::mem::take(&mut local.children));
+        let local_people = local.as_mut().and_then(|local| local.item.people.take());
         // The credits the answers carried, as the scan folds them
         // ([`pass_credits`](crate::metadata_merge::pass_credits)): `None`
         // keeps the stored ones. A locked item and a `Cast` lock keep them
@@ -2802,10 +3005,39 @@ impl LocalProviderManager {
         let credits = if stored.is_locked || locked_fields.contains(&MetadataField::Cast) {
             None
         } else {
-            crate::metadata_merge::pass_credits(None, &fetched.credits, merge.keep_existing)
+            crate::metadata_merge::pass_credits(local_people, &fetched.credits, merge.keep_existing)
         };
-        let merged = match fetched.item {
-            Some(mut item) if !stored.is_locked => {
+        let merged = match (local, fetched.item) {
+            // `RefreshWithProviders` with a local result: `temp` starts with
+            // the item's path, ids, `ParentIndexNumber` and preferred
+            // language and country (`MetadataService.cs:790-795`), takes the
+            // file's values (`MergeData(localItem, temp, [], false, true)`,
+            // `:850`), then the remote answer fills what the file left empty
+            // (`MergeData(result, temp, [], false, false)`, `:1003`).
+            (Some(local), remote) if !stored.is_locked => {
+                let mut temp = MetadataResult::of(BaseItemEntity {
+                    id: stored.id.clone(),
+                    type_: stored.type_.clone(),
+                    path: stored.path.clone(),
+                    parent_index_number: stored.parent_index_number,
+                    preferred_metadata_language: stored.preferred_metadata_language.clone(),
+                    preferred_metadata_country_code: stored.preferred_metadata_country_code.clone(),
+                    ..BaseItemEntity::default()
+                });
+                let mut local = local.item;
+                local.item.type_.clone_from(&stored.type_);
+                crate::metadata_merge::merge_data(&local, &mut temp, &[], false, true);
+                if let Some(mut item) = remote {
+                    item.type_.clone_from(&stored.type_);
+                    let answer = MetadataResult {
+                        provider_ids: fetched.provider_ids,
+                        ..MetadataResult::of(item)
+                    };
+                    crate::metadata_merge::merge_data(&answer, &mut temp, &[], false, false);
+                }
+                crate::metadata_merge::merge_refresh(&current, temp, &locked_fields, merge)
+            }
+            (_, Some(mut item)) if !stored.is_locked => {
                 item.id.clone_from(&stored.id);
                 item.type_.clone_from(&stored.type_);
                 item.path.clone_from(&stored.path);
@@ -2825,6 +3057,16 @@ impl LocalProviderManager {
             _ => current,
         };
         let mut row = merged.item;
+        // `BeforeMetadataRefresh` (`MetadataService.cs:162-169`): the moved
+        // by-name item takes its rebased path in every mode but `None` (a moved
+        // path makes the refresh required), whatever the lock, before the
+        // images and the save use the path.
+        if options.metadata_refresh_mode != MetadataRefreshMode::None
+            && let Some(rebased) = rebased
+        {
+            tracing::debug!(%item_id, path = %rebased, "the item's path has changed; moving it");
+            row.path = Some(rebased);
+        }
         // `OnMetadataChanged` (`BaseItem.cs:2968-3000`): every refresh, of any
         // kind and whatever the lock, re-derives the stored parental score
         // (and the `UnratedType` its kind blocks under) from the row it saves,
@@ -2871,6 +3113,10 @@ impl LocalProviderManager {
                     &row,
                     &merged.provider_ids,
                     plan.remote_images,
+                    options
+                        .search_result
+                        .as_ref()
+                        .and_then(|r| r.search_provider_name.as_deref()),
                 ),
             ))
             .await;
@@ -2887,15 +3133,25 @@ impl LocalProviderManager {
         // rule, decided as the library scan decides them.
         let metadata_changed = row != stored;
         let ids_changed = merged.provider_ids != stored_ids;
+        // A local file unions its `LockedFields` into the item's
+        // (`MergeBaseItemData`, `:1372-1379`).
+        let locks_changed = merged.locked_fields != locked_fields;
+        // A local reader that answered is `MetadataImport`, which upstream
+        // saves whatever it changed (`updateType > None`): the save's stamp
+        // settles the file's change monitor.
+        let read_local = local_members.is_some();
         let decision = decide_save(
             plan,
             &request,
             PassOutcome {
                 changed: metadata_changed
                     || ids_changed
+                    || locks_changed
+                    || read_local
                     || image_saved
                     || generated
-                    || local_images,
+                    || local_images
+                    || removed_images,
                 failed: failures > 0,
             },
         );
@@ -2919,6 +3175,38 @@ impl LocalProviderManager {
                 store
                     .replace_provider_ids(item_id, &merged.provider_ids)
                     .await?;
+            }
+            if locks_changed {
+                let added: Vec<i32> = merged
+                    .locked_fields
+                    .iter()
+                    .filter(|field| !locked_fields.contains(field))
+                    .map(|field| field.json_value())
+                    .collect();
+                store.add_locked_fields(item_id, &added).await?;
+            }
+            // `BoxSetMetadataService.MergeData`: the file's members join the
+            // links of a box set outside the data directory; in it, the
+            // `LinkedChildren` table is the source of truth (v12.4).
+            if let (Some(members), Some(saver)) = (&local_members, &self.box_set_xml)
+                && row.path.as_deref().is_some_and(|path| {
+                    crate::box_set_xml::takes_members_from_file(
+                        &saver.data_path(),
+                        std::path::Path::new(path),
+                    )
+                })
+            {
+                let members: Vec<PlaylistMember> = members
+                    .iter()
+                    .map(|child| PlaylistMember {
+                        item_id: child
+                            .item_id
+                            .as_deref()
+                            .and_then(|id| Uuid::parse_str(id).ok()),
+                        path: child.path.clone(),
+                    })
+                    .collect();
+                store.merge_box_set_members(item_id, &members).await?;
             }
             // The refresh of a video copies its title metadata to its parts
             // (`BaseItem.RefreshMetadataForOwnedItem`) and its save gives its
@@ -2967,16 +3255,27 @@ impl LocalProviderManager {
         {
             tracing::warn!(%item_id, %err, "could not copy the item's metadata to its extras");
         }
-        // What changed: the row's metadata beats an image save, which beats
-        // nothing — the closest single value to the C# `ItemUpdateType` flags.
-        let update = if metadata_changed
-            || ids_changed
-            || request.force_save
-            || request.options.replace_all_metadata
-        {
+        // What changed, as the closest single value to the C#
+        // `ItemUpdateType` flags the savers are gated on: `MetadataEdit` when
+        // the members changed the date, genres, studios or rating
+        // (`UpdatePremiereDate` and its siblings, `MetadataService.cs:543-635`),
+        // `MetadataDownload` when a remote provider answered, changed or not
+        // (`ExecuteRemoteProviders`), or the options force it (`ForceSave`,
+        // `ReplaceAllMetadata`, `:258-262`), else an image save, else
+        // `MetadataImport` for what the local file or the rest of
+        // `BeforeSave` (the runtime, the library folders, the rating score,
+        // the sort name) changed. The savers write nothing back from an
+        // import, so a file the user edited stays as they wrote it.
+        let forced = request.force_save || request.options.replace_all_metadata;
+        let metadata = metadata_changed || ids_changed || locks_changed;
+        let update = if members_edited {
+            ItemUpdateType::MetadataEdit
+        } else if forced || downloaded {
             ItemUpdateType::MetadataDownload
-        } else if image_saved || generated || local_images {
+        } else if image_saved || generated || local_images || removed_images {
             ItemUpdateType::ImageUpdate
+        } else if metadata || read_local {
+            ItemUpdateType::MetadataImport
         } else {
             ItemUpdateType::None
         };
@@ -2984,6 +3283,38 @@ impl LocalProviderManager {
             self.save_metadata(item_id, update).await?;
         }
         Ok(update)
+    }
+
+    /// [`remove_images`](crate::local_images::remove_images) over the item's
+    /// stored images in its own metadata folders, and beside it when its art
+    /// is saved there, the rows it removed saved at once so the providers
+    /// after it see them gone. Returns whether any image was removed.
+    async fn remove_own_images(
+        &self,
+        item_id: Uuid,
+        row: &BaseItemEntity,
+    ) -> Result<bool, ServiceError> {
+        let (Some(store), Some(root)) = (&self.image_store, &self.metadata_dir) else {
+            return Ok(false);
+        };
+        let Some(mut images) = self.stored_images(item_id).await.filter(|i| !i.is_empty()) else {
+            return Ok(false);
+        };
+        let folders = crate::local_images::internal_metadata_dirs(&root.resolve(), item_id);
+        let beside = match &self.image_saver {
+            Some(saver) => saver.beside_art(row).await?,
+            None => None,
+        };
+        if !crate::local_images::remove_images(
+            &mut images,
+            &folders,
+            &item_id.to_string(),
+            beside.as_ref(),
+        ) {
+            return Ok(false);
+        }
+        store.save_item_images(item_id, &images).await?;
+        Ok(true)
     }
 
     /// `ImageProvider.ValidateImages` for a season with no folder of its own:
@@ -3048,13 +3379,15 @@ impl LocalProviderManager {
         Ok(true)
     }
 
-    /// Remote and dynamic image providers share one ordered acquisition pass.
+    /// Remote and dynamic image providers share one ordered acquisition pass,
+    /// an Identify's chosen provider (`identified_by`) first.
     async fn refresh_ordered_images(
         &self,
         item_id: Uuid,
         row: &BaseItemEntity,
         ids: &[(String, String)],
         fetch: ImageFetch,
+        identified_by: Option<&str>,
     ) -> Result<bool, ServiceError> {
         let kind = short_kind(row);
         let library = self.library_options_for(row).await;
@@ -3086,14 +3419,12 @@ impl LocalProviderManager {
             })
         });
         sources.sort_by_key(|(name, _)| {
-            (
-                crate::library_options::image_fetcher_rank(
-                    library.as_ref(),
-                    global.as_ref(),
-                    kind,
-                    name,
-                ),
-                crate::library_options::default_image_order(kind, name),
+            crate::library_options::image_provider_order(
+                library.as_ref(),
+                global.as_ref(),
+                kind,
+                name,
+                identified_by,
             )
         });
         let lookup = ferrofin_traits::providers::DynamicMetadataLookup {
@@ -3151,7 +3482,7 @@ impl LocalProviderManager {
             }
         }
         if saved {
-            self.persist_acquired_images(item_id, &mut images, &stored, fetch)
+            self.persist_acquired_images(item_id, row, &mut images, &stored, fetch)
                 .await?;
         }
         Ok(saved)
@@ -3160,6 +3491,7 @@ impl LocalProviderManager {
     async fn persist_acquired_images(
         &self,
         item_id: Uuid,
+        row: &BaseItemEntity,
         images: &mut Vec<ItemImageInfo>,
         stored: &[ItemImageInfo],
         fetch: ImageFetch,
@@ -3175,9 +3507,12 @@ impl LocalProviderManager {
             );
         }
         let published = if let (Some(saver), Some(items)) = (&self.image_saver, &self.items)
-            && let Some(row) = items.retrieve_item(item_id).await?
+            && let Some(mut owner) = items.retrieve_item(item_id).await?
         {
-            saver.save_all(&row, images, stored).await
+            // At the path this refresh gives the item: `BeforeMetadataRefresh`
+            // may have moved a by-name item, and its art goes beside it there.
+            owner.path.clone_from(&row.path);
+            saver.save_all(&owner, images, stored).await
         } else {
             Ok(())
         };
@@ -3363,7 +3698,7 @@ impl LocalProviderManager {
         let dest = item_dir.join(format!("{stem}.{ext}"));
         let content: Vec<u8> = content.into();
         // `atomic_write` fsyncs: keep the disk work off the async workers.
-        let (dest, modified) = tokio::task::spawn_blocking(move || {
+        let (dest, date_modified) = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&item_dir).map_err(|e| {
                 ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
             })?;
@@ -3374,14 +3709,13 @@ impl LocalProviderManager {
                     let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
                 }
             }
-            let modified = std::fs::metadata(&dest).and_then(|info| info.modified());
+            // `SetImagePath(…, FileInfo)`: the file's own modification time, so
+            // the dynamic image providers' date gate sees an upload as current.
+            let modified = file_date_modified(&dest);
             Ok::<_, ServiceError>((dest, modified))
         })
         .await
         .map_err(|error| ServiceError::backend(error.to_string()))??;
-        // `SetImagePath(…, FileInfo)`: the file's own modification time, so
-        // the dynamic image providers' date gate sees an upload as current.
-        let date_modified = modified.map_or_else(|_| Utc::now(), chrono::DateTime::from);
         Ok(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type,
@@ -3538,6 +3872,7 @@ const NO_FILE: FileFacts = FileFacts {
     is_shortcut: false,
     is_file_protocol: false,
     is_placeholder: false,
+    is_photo: false,
     path_rebased: false,
     locations_changed: false,
 };
@@ -3986,6 +4321,7 @@ impl LocalProviderManager {
                 .map(|img| RemoteImageInfo {
                     provider_name: Some(source.name().to_owned()),
                     url: Some(img.url),
+                    thumbnail_url: img.thumbnail_url,
                     width: img.width,
                     height: img.height,
                     community_rating: img.community_rating,
@@ -4010,7 +4346,7 @@ impl LocalProviderManager {
                     })
                 });
             }
-            order_by_language_descending(&mut block, &preferred);
+            order_by_language_descending(&mut block, &preferred, ranking_fields);
             results.extend(block);
         }
         Ok(results)
@@ -4066,8 +4402,7 @@ impl LocalProviderManager {
                 Some(id) => client
                     .series_details(id, "usa")
                     .await
-                    .map(|details| details.images)
-                    .unwrap_or_default(),
+                    .map_or_default(|details| details.images),
                 None => Vec::new(),
             }
         } else {
@@ -4111,8 +4446,7 @@ impl LocalProviderManager {
                 details
                     .and_then(|details| details.image_url)
                     .filter(|url| !url.is_empty())
-                    .map(|url| vec![plain_image(ImageType::Primary, url)])
-                    .unwrap_or_default()
+                    .map_or_default(|url| vec![plain_image(ImageType::Primary, url)])
             }
         };
         for image in &mut images {
@@ -4357,20 +4691,16 @@ impl LocalProviderManager {
         let id = |key: &str| provider_id_of_pairs(ids, key);
         match source {
             RemoteImageSource::AudioDbArtist => match (&self.audiodb, id("MusicBrainzArtist")) {
-                (Some(audiodb), Some(artist)) => audiodb
-                    .artist(artist)
-                    .await
-                    .map(|a| a.images)
-                    .unwrap_or_default(),
+                (Some(audiodb), Some(artist)) => {
+                    audiodb.artist(artist).await.map_or_default(|a| a.images)
+                }
                 _ => Vec::new(),
             },
             RemoteImageSource::AudioDbAlbum => {
                 match (&self.audiodb, id("MusicBrainzReleaseGroup")) {
-                    (Some(audiodb), Some(group)) => audiodb
-                        .album(group)
-                        .await
-                        .map(|a| a.images)
-                        .unwrap_or_default(),
+                    (Some(audiodb), Some(group)) => {
+                        audiodb.album(group).await.map_or_default(|a| a.images)
+                    }
                     _ => Vec::new(),
                 }
             }
@@ -4379,16 +4709,14 @@ impl LocalProviderManager {
                     .item(imdb)
                     .await
                     .and_then(|item| item.poster)
-                    .map(|url| vec![plain_image(ImageType::Primary, url)])
-                    .unwrap_or_default(),
+                    .map_or_default(|url| vec![plain_image(ImageType::Primary, url)]),
                 _ => Vec::new(),
             },
             _ => match (&self.studios, entity_name(entity)) {
                 (Some(studios), Some(name)) => studios
                     .thumb_url(name)
                     .await
-                    .map(|url| vec![plain_image(ImageType::Thumb, url)])
-                    .unwrap_or_default(),
+                    .map_or_default(|url| vec![plain_image(ImageType::Thumb, url)]),
                 _ => Vec::new(),
             },
         }
@@ -4407,6 +4735,7 @@ fn entity_name(entity: &BaseItemEntity) -> Option<&str> {
 /// A type + URL image with no size/rating/language metadata.
 fn plain_image(image_type: ImageType, url: String) -> TmdbImage {
     TmdbImage {
+        thumbnail_url: None,
         image_type,
         url,
         width: None,
@@ -4426,54 +4755,14 @@ fn provider_id_of_pairs<'a>(ids: &'a [(String, String)], key: &str) -> Option<&'
         .filter(|v| !v.is_empty())
 }
 
-/// The C# `OrderByLanguageDescending` rank for one image's language tag
-/// (`MediaBrowser.Model/Extensions/EnumerableExtensions.cs`, v10.11.8).
-///
-/// The ladder is **preferred (4) > no language (3) > English (2) > anything
-/// else (0)** — an untagged image outranks an English one, which is easy to get
-/// backwards. `requested` has already been defaulted to `"en"` by the caller,
-/// per the same file's opening guard.
-///
-/// The no-language test is C# `IsNullOrEmpty`, NOT `IsNullOrWhiteSpace`: a tag
-/// of `" "` is not "no language" here and falls to 0.
-fn language_rank(language: Option<&str>, requested: &str) -> u8 {
-    match language {
-        Some(l) if l.eq_ignore_ascii_case(requested) => 4,
-        // C# `IsNullOrEmpty` — an absent tag and an empty one are both
-        // "no language"; note a WHITESPACE tag is not, and falls to 0.
-        None | Some("") => 3,
-        Some(l) if l.eq_ignore_ascii_case("en") => 2,
-        _ => 0,
-    }
-}
-
-/// C# `Math.Round(value ?? 0, 1)` — banker's rounding, which is .NET's default
-/// midpoint mode and what `round_ties_even` gives.
-fn rounded_rating(rating: Option<f64>) -> f64 {
-    (rating.unwrap_or(0.0) * 10.0).round_ties_even() / 10.0
-}
-
-/// Ports `IEnumerable<RemoteImageInfo>.OrderByLanguageDescending(requested)`:
-/// language rank, then rounded community rating, then vote count — all
-/// descending.
-///
-/// `sort_by` is STABLE, matching LINQ's `OrderByDescending`/`ThenByDescending`,
-/// so images that tie on all three keep the provider's own order.
-fn order_by_language_descending(images: &mut [RemoteImageInfo], requested: &str) {
-    // "Default to English if no requested language is specified."
-    let requested = if requested.trim().is_empty() {
-        "en"
-    } else {
-        requested
-    };
-    images.sort_by(|a, b| {
-        language_rank(b.language.as_deref(), requested)
-            .cmp(&language_rank(a.language.as_deref(), requested))
-            .then_with(|| {
-                rounded_rating(b.community_rating).total_cmp(&rounded_rating(a.community_rating))
-            })
-            .then_with(|| b.vote_count.unwrap_or(0).cmp(&a.vote_count.unwrap_or(0)))
-    });
+/// What `OrderByLanguageDescending` ranks a remote image by: its language,
+/// community rating and vote count.
+fn ranking_fields(image: &RemoteImageInfo) -> (Option<&str>, Option<f64>, Option<i32>) {
+    (
+        image.language.as_deref(),
+        image.community_rating,
+        image.vote_count,
+    )
 }
 
 /// `TmdbUtils.AdjustImageLanguage`: expose regional requested tags when the
@@ -4493,22 +4782,6 @@ fn adjust_tmdb_image_language(language: Option<String>, requested: &str) -> Opti
     } else {
         Some(language)
     }
-}
-
-pub(crate) fn order_tmdb_images(images: &mut [TmdbImage], requested: &str) {
-    let requested = if requested.trim().is_empty() {
-        "en"
-    } else {
-        requested
-    };
-    images.sort_by(|a, b| {
-        language_rank(b.language.as_deref(), requested)
-            .cmp(&language_rank(a.language.as_deref(), requested))
-            .then_with(|| {
-                rounded_rating(b.community_rating).total_cmp(&rounded_rating(a.community_rating))
-            })
-            .then_with(|| b.vote_count.unwrap_or(0).cmp(&a.vote_count.unwrap_or(0)))
-    });
 }
 
 /// The TMDB id an item's external ids pin it to: its own `Tmdb` id, else an
@@ -4633,8 +4906,10 @@ fn wants_fetch(mode: MetadataRefreshMode) -> bool {
     )
 }
 
-/// Parses a TMDB `YYYY-MM-DD` date into a UTC midnight timestamp.
-pub(crate) fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
+/// Parses a TMDB `YYYY-MM-DD` date into a UTC midnight timestamp — the one
+/// parse both refresh engines store a provider's date-only value with.
+#[must_use]
+pub fn parse_ymd(s: &str) -> Option<chrono::DateTime<Utc>> {
     let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
     Some(chrono::DateTime::from_naive_utc_and_offset(
         date.and_hms_opt(0, 0, 0)?,
@@ -4793,16 +5068,38 @@ impl RefreshQueue {
     }
 }
 
-/// Stands the worker down if it unwinds, so a panicking refresh cannot leave
-/// the queue claimed forever.
-struct WorkerGuard(Arc<std::sync::Mutex<RefreshQueue>>);
+/// A worker's claim on the queue. Dropping it while the worker still holds the
+/// claim (a panicking refresh, an aborted task) stands the worker down, so the
+/// queue is never left claimed forever. Once [`Self::next_refresh`] has stood
+/// the worker down the guard holds nothing, so dropping it cannot clear the
+/// claim of a worker a later request started.
+struct WorkerGuard(Option<Arc<std::sync::Mutex<RefreshQueue>>>);
+
+impl WorkerGuard {
+    /// The next refresh, or `None` once the queue ran dry and the worker stood
+    /// down ([`RefreshQueue::pop_or_stand_down`]).
+    fn next_refresh(&mut self) -> Option<(Uuid, MetadataRefreshOptions)> {
+        let next = self
+            .0
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_or_stand_down();
+        if next.is_none() {
+            self.0 = None;
+        }
+        next
+    }
+}
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .processing = false;
+        if let Some(queue) = self.0.take() {
+            queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .processing = false;
+        }
     }
 }
 
@@ -4811,21 +5108,12 @@ impl LocalProviderManager {
     /// priority first, until the queue is empty. A failed refresh is logged and
     /// the queue keeps draining.
     async fn drain_refresh_queue(&self) {
-        let guard = WorkerGuard(Arc::clone(&self.refresh_queue));
-        loop {
-            let next = self
-                .refresh_queue
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pop_or_stand_down();
-            let Some((item_id, options)) = next else {
-                break;
-            };
+        let mut worker = WorkerGuard(Some(Arc::clone(&self.refresh_queue)));
+        while let Some((item_id, options)) = worker.next_refresh() {
             if let Err(err) = self.refresh_full_item(item_id, &options).await {
                 tracing::warn!(%item_id, %err, "queued metadata refresh failed");
             }
         }
-        drop(guard);
     }
 }
 
@@ -4965,6 +5253,20 @@ impl ProviderManager for LocalProviderManager {
         // runs and reports what changed. Ferrofin's refresh never recurses
         // into children, so this is the full refresh with its verdict kept.
         Box::pin(self.refresh_item(item_id, options)).await
+    }
+
+    async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.item_metadata_locks
+            .get(&item_id.to_string())
+            .lock_owned()
+            .await
+    }
+
+    async fn is_processing_refresh_queue(&self) -> bool {
+        self.refresh_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .processing
     }
 
     async fn save_image_from_url(
@@ -5193,10 +5495,16 @@ impl ProviderManager for LocalProviderManager {
     ) -> Result<(), ServiceError> {
         // ProviderManager.SaveMetadataAsync logs saver failures; metadata has
         // already been committed and an unwritable sidecar must not undo it.
-        if let Some(saver) = &self.nfo_saver
-            && let Err(error) = saver.save(item_id, update_type).await
+        self.save_nfo(item_id, update_type).await;
+        // "Modify again, so saved value is after write time of externally
+        // saved metadata" (`LibraryManager.UpdateItemsAsync`): the XML
+        // reader's change monitor has no tolerance, so the server's own write
+        // must not read as a change.
+        if self.save_box_set_xml(item_id, update_type).await
+            && let Some(store) = &self.image_store
+            && let Err(error) = store.touch_item_updated(item_id).await
         {
-            tracing::warn!(%item_id, %error, "NFO metadata saver failed");
+            tracing::warn!(%item_id, %error, "could not stamp the box set's save time after writing its collection.xml");
         }
         Ok(())
     }
@@ -5208,8 +5516,9 @@ impl ProviderManager for LocalProviderManager {
     ) -> Result<(), ServiceError> {
         // `LibraryManager.UpdateItemsAsync` runs the savers, then the save
         // re-stamps `DateLastSaved` "after write time of externally saved
-        // metadata" and `ItemUpdated` fires.
-        self.save_metadata(item_id, update_type).await?;
+        // metadata" and `ItemUpdated` fires, once.
+        self.save_nfo(item_id, update_type).await;
+        self.save_box_set_xml(item_id, update_type).await;
         if let Some(store) = &self.image_store {
             store.touch_item_updated(item_id).await?;
             // A video's save gives its local versions its images and
@@ -5261,14 +5570,15 @@ impl ProviderManager for LocalProviderManager {
         //
         // The reference item decides the gate: `ItemId` set → the real row and
         // ITS library's `LibraryOptions` (its "Metadata downloaders"
-        // checkboxes decide which fetchers may run, and its `IsLocked` flag can
-        // shut them all out); `ItemId` empty → the C# builds a dummy
-        // `new TItemType()` under a fresh `new LibraryOptions()`, where every
-        // type entry is absent and therefore every fetcher enabled, so an
-        // unattached search stays unfiltered. `typeOptions` is keyed on
-        // `item.GetType().Name`, i.e. the REFERENCE item's type — which for the
-        // dummy is the searched-for kind, whose `BaseItemKind` name is the same
-        // PascalCase string the checkbox list stores.
+        // checkboxes decide which fetchers may run, and its `IsLocked` flag or
+        // its `ExtraType` can shut them all out); `ItemId` empty → the C#
+        // builds a dummy `new TItemType()` under a fresh `new
+        // LibraryOptions()`, where every type entry is absent and therefore
+        // every fetcher enabled, so an unattached search stays unfiltered.
+        // `typeOptions` is keyed on `item.GetType().Name`, i.e. the REFERENCE
+        // item's type — which for the dummy is the searched-for kind, whose
+        // `BaseItemKind` name is the same PascalCase string the checkbox list
+        // stores.
         let reference = match (&self.items, request.item_id) {
             (Some(items), id) if !id.is_nil() => items.retrieve_item(id).await?,
             _ => None,
@@ -5282,14 +5592,18 @@ impl ProviderManager for LocalProviderManager {
             None => format!("{:?}", request.item_kind),
         };
         // `CanRefreshMetadata` (`ProviderManager.cs:571`): `includeDisabled`
-        // short-circuits to true before the locked and fetcher tests, and a
-        // LOCKED reference item drops every non-local provider outright.
+        // short-circuits to true before the locked, extra and fetcher tests; a
+        // LOCKED reference item drops every non-local provider outright, and
+        // so does an extra (`ExtraType` set, `:602-605`), which has no identity
+        // of its own online — every search provider is a remote one.
         let locked = reference.as_ref().is_some_and(|e| e.is_locked);
+        let extra = reference.as_ref().is_some_and(|e| e.extra_type.is_some());
         let global = self.global_metadata_options_for(&kind);
         let channel = reference.as_ref().and_then(channel_gate);
         let can_refresh = |name: &str| {
             request.include_disabled_providers
                 || (!locked
+                    && !extra
                     && channel.unwrap_or_else(|| {
                         metadata_fetcher_enabled(library.as_ref(), global.as_ref(), &kind, name)
                     }))
@@ -5332,8 +5646,7 @@ impl ProviderManager for LocalProviderManager {
             .unwrap_or_else(|| {
                 global
                     .as_ref()
-                    .map(|o| o.metadata_fetcher_order.clone())
-                    .unwrap_or_default()
+                    .map_or_default(|o| o.metadata_fetcher_order.clone())
             });
         providers.sort_by_key(|p| {
             let ranked = crate::library_options::configured_order(&order, p.name());
@@ -5413,8 +5726,7 @@ impl ProviderManager for LocalProviderManager {
         let global = self
             .metadata_options
             .as_ref()
-            .map(|options| options())
-            .unwrap_or_default();
+            .map_or_default(|options| options());
         Ok(crate::library_options::library_options_info(
             item_types,
             is_new_library,
@@ -5463,10 +5775,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{
-        LocalProviderManager, RemoteImageInfo, RemoteSearchProvider, language_rank,
-        order_by_language_descending, parse_ymd, wants_fetch,
-    };
+    use super::{LocalProviderManager, RemoteSearchProvider, parse_ymd, wants_fetch};
     use ferrofin_model::entities::MetadataField;
     use ferrofin_traits::persistence::OwnerExtrasRefresh;
     use ferrofin_traits::providers::{MetadataRefreshMode as Mode, MetadataRefreshOptions as Opts};
@@ -5738,40 +6047,432 @@ mod tests {
         );
     }
 
+    /// `AlbumInfoExtensionsTests.ExampleMbid` / `SongMbid`.
+    const EXAMPLE_MBID: &str = "59b5a40b-e2fd-3f18-a218-e8c9aae12ab5";
+    const SONG_MBID: &str = "6c301dbd-6ccb-3403-a6c4-6a22240a0297";
+
+    /// A song lookup carrying `ids`.
+    fn song_with(ids: &[(&str, &str)]) -> ferrofin_model::providers::SongInfo {
+        ferrofin_model::providers::SongInfo {
+            base: ItemLookupInfo {
+                provider_ids: Some(
+                    ids.iter()
+                        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                        .collect(),
+                ),
+                ..ItemLookupInfo::default()
+            },
+            ..ferrofin_model::providers::SongInfo::default()
+        }
+    }
+
     #[test]
     fn album_artist_mbid_follows_the_c_sharp_precedence() {
         use super::album_artist_mbid;
+        const ARTIST: &str = "c0000000-0000-4000-8000-0000000000a1";
         // Own `MusicBrainzAlbumArtist` wins.
         let mut request = id_request(
             BaseItemKind::MusicAlbum,
-            &[("MusicBrainzAlbumArtist", "own")],
+            &[("MusicBrainzAlbumArtist", EXAMPLE_MBID)],
         );
         request.artist_provider_ids = Some(HashMap::from([(
             "MusicBrainzArtist".to_owned(),
-            "artist".to_owned(),
+            ARTIST.to_owned(),
         )]));
-        assert_eq!(album_artist_mbid(&request).as_deref(), Some("own"));
+        assert_eq!(album_artist_mbid(&request).as_deref(), Some(EXAMPLE_MBID));
         // Then the artist's own id.
         request.search_info.provider_ids = None;
-        assert_eq!(album_artist_mbid(&request).as_deref(), Some("artist"));
+        assert_eq!(album_artist_mbid(&request).as_deref(), Some(ARTIST));
         // Then the first song's album-artist id; blanks are absent.
         request.artist_provider_ids = Some(HashMap::from([(
             "MusicBrainzArtist".to_owned(),
             "  ".to_owned(),
         )]));
-        request.song_infos = vec![ferrofin_model::providers::SongInfo {
-            base: ItemLookupInfo {
-                provider_ids: Some(HashMap::from([(
-                    "MusicBrainzAlbumArtist".to_owned(),
-                    "song".to_owned(),
-                )])),
-                ..ItemLookupInfo::default()
-            },
-            ..ferrofin_model::providers::SongInfo::default()
-        }];
-        assert_eq!(album_artist_mbid(&request).as_deref(), Some("song"));
+        request.song_infos = vec![song_with(&[("MusicBrainzAlbumArtist", SONG_MBID)])];
+        assert_eq!(album_artist_mbid(&request).as_deref(), Some(SONG_MBID));
         request.song_infos.clear();
         assert!(album_artist_mbid(&request).is_none());
+    }
+
+    /// `AlbumInfoExtensionsTests.GetReleaseId_OnlyReturnsMbids`: another
+    /// provider's id under a MusicBrainz key reads as no id.
+    #[rstest::rstest]
+    #[case(EXAMPLE_MBID, Some(EXAMPLE_MBID))]
+    #[case("111239", None)]
+    #[case("", None)]
+    fn the_release_id_is_only_an_mbid(#[case] id: &str, #[case] expected: Option<&str>) {
+        let request = id_request(BaseItemKind::MusicAlbum, &[("MusicBrainzAlbum", id)]);
+        assert_eq!(
+            super::album_id_or_song_id(&request, "MusicBrainzAlbum").as_deref(),
+            expected
+        );
+    }
+
+    /// `AlbumInfoExtensionsTests.GetReleaseId_ForeignId_FallsBackToSongs`.
+    #[test]
+    fn a_foreign_release_id_falls_back_to_the_songs() {
+        let mut request = id_request(BaseItemKind::MusicAlbum, &[("MusicBrainzAlbum", "111239")]);
+        request.song_infos = vec![song_with(&[("MusicBrainzAlbum", SONG_MBID)])];
+        assert_eq!(
+            super::album_id_or_song_id(&request, "MusicBrainzAlbum").as_deref(),
+            Some(SONG_MBID)
+        );
+    }
+
+    /// `AlbumInfoExtensionsTests.GetMusicBrainzArtistId_ForeignId_FallsBackToArtistIds`.
+    #[test]
+    fn a_foreign_album_artist_id_falls_back_to_the_artist_ids() {
+        let mut request = id_request(
+            BaseItemKind::MusicAlbum,
+            &[("MusicBrainzAlbumArtist", "111239")],
+        );
+        request.artist_provider_ids = Some(HashMap::from([(
+            "MusicBrainzArtist".to_owned(),
+            EXAMPLE_MBID.to_owned(),
+        )]));
+        assert_eq!(
+            super::album_artist_mbid(&request).as_deref(),
+            Some(EXAMPLE_MBID)
+        );
+    }
+
+    /// `AlbumInfoExtensionsTests.GetMusicBrainzArtistId_ArtistInfo_OnlyReturnsMbids`.
+    #[rstest::rstest]
+    #[case(EXAMPLE_MBID, Some(EXAMPLE_MBID))]
+    #[case("111239", None)]
+    fn the_artist_id_is_only_an_mbid(#[case] id: &str, #[case] expected: Option<&str>) {
+        let request = id_request(BaseItemKind::MusicArtist, &[("MusicBrainzArtist", id)]);
+        assert_eq!(super::artist_mbid(&request).as_deref(), expected);
+    }
+
+    /// `GetMusicBrainzArtistId(ArtistInfo)`: a foreign artist id falls back
+    /// to the first song's `MusicBrainzAlbumArtist`.
+    #[test]
+    fn a_foreign_artist_id_falls_back_to_the_songs() {
+        let mut request = id_request(
+            BaseItemKind::MusicArtist,
+            &[("MusicBrainzArtist", "111239")],
+        );
+        request.song_infos = vec![song_with(&[("MusicBrainzAlbumArtist", SONG_MBID)])];
+        assert_eq!(super::artist_mbid(&request).as_deref(), Some(SONG_MBID));
+    }
+
+    /// A mock MusicBrainz that answers `routes` and 404 to anything else, the
+    /// way it answers an id it merged away or deleted.
+    async fn musicbrainz_404_over(
+        routes: Vec<(&'static str, &'static str)>,
+    ) -> (
+        crate::mock_http::MockServer,
+        Arc<crate::musicbrainz::MusicBrainzClient>,
+    ) {
+        let server = crate::mock_http::MockServer::start_typed(
+            routes
+                .into_iter()
+                .map(|(path, body)| (path, "application/json", body.as_bytes().to_vec()))
+                .collect(),
+        )
+        .await;
+        let client = Arc::new(crate::musicbrainz::MusicBrainzClient::new(
+            &server.base_url,
+            "test",
+        ));
+        (server, client)
+    }
+
+    /// The names of `results`, in order.
+    fn result_names(results: &[RemoteSearchResult]) -> Vec<&str> {
+        results.iter().filter_map(|r| r.name.as_deref()).collect()
+    }
+
+    /// `LookupReleaseOrNullAsync` (gl-499): a release id MusicBrainz no
+    /// longer knows falls through to the release group.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_falls_through_an_unknown_release_to_its_group() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (_server, mb) = musicbrainz_404_over(vec![
+            (
+                "/ws/2/release-group/c0000000-0000-4000-8000-000000000007",
+                r#"{"releases":[{"id":"c0000000-0000-4000-8000-00000000000a"}]}"#,
+            ),
+            (
+                "/ws/2/release/c0000000-0000-4000-8000-00000000000a",
+                r#"{"id":"c0000000-0000-4000-8000-00000000000a","title":"From the group"}"#,
+            ),
+        ])
+        .await;
+        let provider = MusicBrainzAlbumSearchProvider::new(mb);
+        let results = provider
+            .get_search_results(&id_request(
+                BaseItemKind::MusicAlbum,
+                &[
+                    ("MusicBrainzAlbum", "c0000000-0000-4000-8000-000000000404"),
+                    (
+                        "MusicBrainzReleaseGroup",
+                        "c0000000-0000-4000-8000-000000000007",
+                    ),
+                ],
+            ))
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["From the group"]);
+    }
+
+    /// `LookupReleaseGroupOrNullAsync` (gl-499): with neither id known to
+    /// MusicBrainz, the name/artist search still runs.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_falls_through_unknown_ids_to_the_name_search() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (_server, mb) = musicbrainz_404_over(vec![("/ws/2/release?", MB_RELEASE_HIT)]).await;
+        let provider = MusicBrainzAlbumSearchProvider::new(mb);
+        let mut request = id_request(
+            BaseItemKind::MusicAlbum,
+            &[
+                ("MusicBrainzAlbum", "c0000000-0000-4000-8000-000000000404"),
+                (
+                    "MusicBrainzReleaseGroup",
+                    "c0000000-0000-4000-8000-000000000405",
+                ),
+            ],
+        );
+        request.search_info.name = Some("Kind of Blue".to_owned());
+        let results = provider
+            .get_search_results(&request)
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["Kind of Blue"]);
+    }
+
+    /// `AlbumInfoExtensions.MusicBrainzId` + `ParseMusicBrainzId` (gl-499): a
+    /// malformed release id is no id, and a malformed album-artist id is no
+    /// `arid:` term — the search goes by the artist's name instead.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_ignores_malformed_ids() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (server, mb) =
+            musicbrainz_over(vec![("/ws/2/release?", MB_RELEASE_HIT.to_owned())]).await;
+        let provider = MusicBrainzAlbumSearchProvider::new(mb);
+        let mut request = id_request(
+            BaseItemKind::MusicAlbum,
+            &[
+                ("MusicBrainzAlbum", "111239"),
+                ("MusicBrainzAlbumArtist", "111239"),
+            ],
+        );
+        request.search_info.name = Some("Kind of Blue".to_owned());
+        request.album_artists = vec!["Miles Davis".to_owned()];
+        let results = provider
+            .get_search_results(&request)
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["Kind of Blue"]);
+        assert_eq!(
+            server.query_values("/ws/2/release", "query"),
+            [r#""Kind of Blue" AND artist:"Miles Davis""#]
+        );
+    }
+
+    /// `GetSearchResults`: a valid album-artist MBID narrows the name search
+    /// by `arid:`.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_narrows_by_a_valid_album_artist_mbid() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (server, mb) =
+            musicbrainz_over(vec![("/ws/2/release?", MB_RELEASE_HIT.to_owned())]).await;
+        let mut request = id_request(
+            BaseItemKind::MusicAlbum,
+            &[("MusicBrainzAlbumArtist", EXAMPLE_MBID)],
+        );
+        request.search_info.name = Some("Kind of Blue".to_owned());
+        let results = MusicBrainzAlbumSearchProvider::new(mb)
+            .get_search_results(&request)
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["Kind of Blue"]);
+        assert_eq!(
+            server.query_values("/ws/2/release", "query"),
+            [format!(r#""Kind of Blue" AND arid:{EXAMPLE_MBID}"#)]
+        );
+    }
+
+    /// `GetSearchResults` returns a release group's releases whenever the
+    /// group exists, so a group with none ends the search empty.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_stops_at_an_existing_empty_group() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (server, mb) = musicbrainz_over(vec![
+            ("/ws/2/release-group/", r#"{"releases":[]}"#.to_owned()),
+            ("/ws/2/release?", MB_RELEASE_HIT.to_owned()),
+        ])
+        .await;
+        let provider = MusicBrainzAlbumSearchProvider::new(mb);
+        let mut request = id_request(
+            BaseItemKind::MusicAlbum,
+            &[(
+                "MusicBrainzReleaseGroup",
+                "c0000000-0000-4000-8000-000000000007",
+            )],
+        );
+        request.search_info.name = Some("Kind of Blue".to_owned());
+        let results = provider
+            .get_search_results(&request)
+            .await
+            .expect("results");
+        assert!(results.is_empty(), "{results:?}");
+        let searches = server.query_values("/ws/2/release", "query");
+        assert!(searches.is_empty(), "{searches:?}");
+    }
+
+    /// `GetReleaseGroupResultAsync`: a release in the group that answers 404
+    /// is skipped and the walk goes on.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_skips_a_group_release_that_is_gone() {
+        use super::MusicBrainzAlbumSearchProvider;
+        let (_server, mb) = musicbrainz_404_over(vec![
+            (
+                "/ws/2/release-group/c0000000-0000-4000-8000-000000000007",
+                r#"{"releases":[{"id":"c0000000-0000-4000-8000-00000000000a"},{"id":"c0000000-0000-4000-8000-000000000404"},{"id":"c0000000-0000-4000-8000-00000000000b"}]}"#,
+            ),
+            (
+                "/ws/2/release/c0000000-0000-4000-8000-00000000000a",
+                r#"{"id":"c0000000-0000-4000-8000-00000000000a","title":"A"}"#,
+            ),
+            (
+                "/ws/2/release/c0000000-0000-4000-8000-00000000000b",
+                r#"{"id":"c0000000-0000-4000-8000-00000000000b","title":"B"}"#,
+            ),
+        ])
+        .await;
+        let results = MusicBrainzAlbumSearchProvider::new(mb)
+            .get_search_results(&id_request(
+                BaseItemKind::MusicAlbum,
+                &[(
+                    "MusicBrainzReleaseGroup",
+                    "c0000000-0000-4000-8000-000000000007",
+                )],
+            ))
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["A", "B"]);
+    }
+
+    /// A group release whose lookup fails other than with a 404 ends the
+    /// walk with the releases before it: upstream's exception stops the
+    /// enumeration, and `GetRemoteSearchResults` keeps what it added.
+    #[tokio::test]
+    async fn musicbrainz_album_identify_keeps_the_group_releases_before_a_failed_one() {
+        use super::MusicBrainzAlbumSearchProvider;
+        use crate::mock_http::MockServer;
+        let json = "Content-Type: application/json\r\n";
+        let server = MockServer::start_raw(vec![
+            MockServer::raw_ok(
+                json,
+                br#"{"releases":[{"id":"c0000000-0000-4000-8000-00000000000a"},{"id":"c0000000-0000-4000-8000-00000000000b"},{"id":"c0000000-0000-4000-8000-00000000000c"}]}"#,
+            ),
+            MockServer::raw_ok(
+                json,
+                br#"{"id":"c0000000-0000-4000-8000-00000000000a","title":"A"}"#,
+            ),
+            MockServer::raw_status("400 Bad Request"),
+        ])
+        .await;
+        let mb = Arc::new(crate::musicbrainz::MusicBrainzClient::new(
+            &server.base_url,
+            "test",
+        ));
+        let results = MusicBrainzAlbumSearchProvider::new(mb)
+            .get_search_results(&id_request(
+                BaseItemKind::MusicAlbum,
+                &[(
+                    "MusicBrainzReleaseGroup",
+                    "c0000000-0000-4000-8000-000000000007",
+                )],
+            ))
+            .await
+            .expect("results");
+        assert_eq!(result_names(&results), ["A"]);
+        assert_eq!(server.requests(), 3);
+    }
+
+    /// `LookupArtistOrNullAsync` (gl-499): an artist id MusicBrainz no
+    /// longer knows falls through to the name search.
+    #[tokio::test]
+    async fn musicbrainz_artist_identify_falls_through_an_unknown_id_to_the_name_search() {
+        use super::MusicBrainzArtistSearchProvider;
+        let (_server, mb) = musicbrainz_404_over(vec![(
+            "/ws/2/artist?",
+            r#"{"artists":[{"id":"c0000000-0000-4000-8000-00000000000c","name":"Miles Davis"}]}"#,
+        )])
+        .await;
+        let provider = MusicBrainzArtistSearchProvider::new(mb);
+        for id in ["c0000000-0000-4000-8000-000000000406", "not-an-mbid"] {
+            let mut request = id_request(BaseItemKind::MusicArtist, &[("MusicBrainzArtist", id)]);
+            request.search_info.name = Some("Miles Davis".to_owned());
+            let results = provider
+                .get_search_results(&request)
+                .await
+                .expect("results");
+            assert_eq!(result_names(&results), ["Miles Davis"], "id {id}");
+        }
+    }
+
+    /// `NotFoundAsNullAsync` maps only a lookup's 404 to null: any other
+    /// failed lookup, and a failed name search (`Find*WithRetryAsync`), fails
+    /// the provider (its `HttpError`) and asks nothing more, not even the
+    /// `artistaccent:` retry. A `Tmdb` key leaves no MBID, so the name
+    /// search is the first request.
+    #[rstest::rstest]
+    #[case(BaseItemKind::MusicAlbum, "MusicBrainzAlbum")]
+    #[case(BaseItemKind::MusicAlbum, "MusicBrainzReleaseGroup")]
+    #[case(BaseItemKind::MusicAlbum, "Tmdb")]
+    #[case(BaseItemKind::MusicArtist, "MusicBrainzArtist")]
+    #[case(BaseItemKind::MusicArtist, "Tmdb")]
+    #[tokio::test]
+    async fn musicbrainz_identify_fails_on_a_request_error_other_than_a_lookup_404(
+        #[case] kind: BaseItemKind,
+        #[case] key: &str,
+    ) {
+        use super::{MusicBrainzAlbumSearchProvider, MusicBrainzArtistSearchProvider};
+        let server = crate::mock_http::MockServer::start_raw(vec![
+            crate::mock_http::MockServer::raw_status("400 Bad Request"),
+        ])
+        .await;
+        let mb = Arc::new(crate::musicbrainz::MusicBrainzClient::new(
+            &server.base_url,
+            "test",
+        ));
+        let mut request = id_request(kind, &[(key, EXAMPLE_MBID)]);
+        request.search_info.name = Some("Björk".to_owned());
+        let result = if kind == BaseItemKind::MusicAlbum {
+            MusicBrainzAlbumSearchProvider::new(mb)
+                .get_search_results(&request)
+                .await
+        } else {
+            MusicBrainzArtistSearchProvider::new(mb)
+                .get_search_results(&request)
+                .await
+        };
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(server.requests(), 1);
+    }
+
+    /// `if (string.IsNullOrWhiteSpace(searchInfo.Name)) return [];`.
+    #[tokio::test]
+    async fn musicbrainz_artist_identify_does_not_search_a_blank_name() {
+        use super::MusicBrainzArtistSearchProvider;
+        let (server, mb) = musicbrainz_over(vec![(
+            "/ws/2/artist?",
+            r#"{"artists":[{"id":"c0000000-0000-4000-8000-00000000000c","name":"Anyone"}]}"#
+                .to_owned(),
+        )])
+        .await;
+        let provider = MusicBrainzArtistSearchProvider::new(mb);
+        let results = provider
+            .get_search_results(&named_request(BaseItemKind::MusicArtist, "  "))
+            .await
+            .expect("results");
+        assert!(results.is_empty(), "{results:?}");
+        let searches = server.query_values("/ws/2/artist", "query");
+        assert!(searches.is_empty(), "{searches:?}");
     }
 
     #[tokio::test]
@@ -6009,6 +6710,88 @@ mod tests {
         assert!(results[0].premiere_date.is_some());
     }
 
+    /// TMDb's empty overview or biography is kept, so the result answers
+    /// `"Overview": ""` as upstream's does (`Overview = movie.Overview`,
+    /// `movieResult.Overview`, `series.Overview`, `personResult.Biography`).
+    #[tokio::test]
+    async fn tmdb_identify_keeps_an_empty_overview() {
+        use super::{TmdbKind, TmdbPersonSearchProvider, TmdbSearchProvider};
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/search/movie",
+                r#"{"results":[{"id":603,"title":"The Matrix","overview":""}]}"#.to_owned(),
+            ),
+            (
+                "/search/tv",
+                r#"{"results":[{"id":1396,"name":"Breaking Bad","overview":""}]}"#.to_owned(),
+            ),
+            (
+                "/find/tt0133093",
+                r#"{"movie_results":[{"id":603,"title":"The Matrix","overview":""}],
+                    "tv_results":[{"id":1396,"name":"Breaking Bad","overview":""}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/movie/603",
+                r#"{"id":603,"title":"The Matrix","overview":""}"#.to_owned(),
+            ),
+            (
+                "/tv/1396",
+                r#"{"id":1396,"name":"Breaking Bad","overview":""}"#.to_owned(),
+            ),
+            (
+                "/person/31",
+                r#"{"id":31,"name":"Tom Hanks","biography":""}"#.to_owned(),
+            ),
+            ("/movie/604", r#"{"id":604,"title":"No Plot"}"#.to_owned()),
+            ("/person/32", r#"{"id":32,"name":"No Bio"}"#.to_owned()),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let movie = TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Movie);
+        let series = TmdbSearchProvider::new(tmdb.clone(), TmdbKind::Series);
+        let person = TmdbPersonSearchProvider::new(tmdb);
+        let cases: [(&dyn super::RemoteSearchProvider, RemoteSearchRequest); 7] = [
+            (&movie, named_request(BaseItemKind::Movie, "The Matrix")),
+            (&movie, id_request(BaseItemKind::Movie, &[("Tmdb", "603")])),
+            (
+                &movie,
+                id_request(BaseItemKind::Movie, &[("Imdb", "tt0133093")]),
+            ),
+            (&series, named_request(BaseItemKind::Series, "Breaking Bad")),
+            (
+                &series,
+                id_request(BaseItemKind::Series, &[("Tmdb", "1396")]),
+            ),
+            (
+                &series,
+                id_request(BaseItemKind::Series, &[("Imdb", "tt0133093")]),
+            ),
+            (&person, id_request(BaseItemKind::Person, &[("Tmdb", "31")])),
+        ];
+        for (provider, req) in cases {
+            let results = provider.get_search_results(&req).await.expect("results");
+            let label = (req.item_kind, &req.search_info.provider_ids);
+            assert_eq!(results.len(), 1, "{label:?}");
+            assert_eq!(results[0].overview.as_deref(), Some(""), "{label:?}");
+            let json = serde_json::to_value(&results[0]).expect("json");
+            assert_eq!(json["Overview"], "", "{label:?}");
+        }
+
+        // No overview at all stays out of the result.
+        let none: [(&dyn super::RemoteSearchProvider, RemoteSearchRequest); 2] = [
+            (&movie, id_request(BaseItemKind::Movie, &[("Tmdb", "604")])),
+            (&person, id_request(BaseItemKind::Person, &[("Tmdb", "32")])),
+        ];
+        for (provider, req) in none {
+            let results = provider.get_search_results(&req).await.expect("results");
+            assert_eq!(results.len(), 1, "{:?}", req.item_kind);
+            assert_eq!(results[0].overview, None, "{:?}", req.item_kind);
+            let json = serde_json::to_value(&results[0]).expect("json");
+            assert!(json.get("Overview").is_none(), "{json}");
+        }
+    }
+
     /// A provider id with surrounding whitespace must still pin the title.
     ///
     /// `int.Parse(id, CultureInfo.InvariantCulture)` and
@@ -6112,7 +6895,8 @@ mod tests {
             (
                 // The bare `fr` — the series arm only.
                 "language=fr",
-                r#"{"movie_results":[],"tv_results":[{"id":1396,"name":"Breaking Bad"}]}"#
+                r#"{"movie_results":[],"tv_results":[{"id":1396,"name":"Breaking Bad",
+                    "first_air_date":"2008-01-20"}]}"#
                     .to_owned(),
             ),
             (
@@ -6146,6 +6930,8 @@ mod tests {
             .expect("results");
         assert_eq!(results.len(), 1, "series /find must send the bare language");
         assert_eq!(results[0].name.as_deref(), Some("Breaking Bad"));
+        // `MapSearchTvToRemoteSearchResult`: the year of the first air date.
+        assert_eq!(results[0].production_year, Some(2008));
     }
 
     #[tokio::test]
@@ -6153,9 +6939,11 @@ mod tests {
         use super::{TmdbKind, TmdbSearchProvider};
 
         let body = r#"{"movie_results":[{"id":603,"title":"Resolved movie"}]}"#;
+        // `FindByExternalIdAsync` runs `NormalizeLanguage` over the whole
+        // list, which upper-cases everything after a region's hyphen.
         let server = crate::mock_http::MockServer::start(vec![
-            ("language=pt-BR%2Cnull%2Cen", body.to_owned()),
-            ("language=es-AR%2Cnull%2Cen", body.to_owned()),
+            ("language=pt-BR%2CNULL%2CEN", body.to_owned()),
+            ("language=es-AR%2CNULL%2CEN", body.to_owned()),
             ("language=null%2Cen", body.to_owned()),
         ])
         .await;
@@ -6210,7 +6998,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tmdb_series_identify_sets_premiere_date_and_drops_the_year_filter() {
+    async fn tmdb_series_identify_sets_first_air_year_and_drops_the_year_filter() {
         use super::{TmdbKind, TmdbSearchProvider};
         // `first_air_date_year` first: `TmdbSeriesProvider` leaves
         // `SearchSeriesAsync`'s year at 0, so forwarding one is the bug this
@@ -6243,7 +7031,8 @@ mod tests {
         let provider = TmdbSearchProvider::new(tmdb, TmdbKind::Series);
 
         // A wrong `Year` must not narrow the search, and the series mapper
-        // emits `PremiereDate` — never `ProductionYear`.
+        // emits `PremiereDate` and `ProductionYear` from the first air date
+        // (jellyfin/jellyfin#16144).
         let mut req = named_request(BaseItemKind::Series, "Breaking Bad");
         req.search_info.year = Some(2019);
         let results = provider.get_search_results(&req).await.expect("results");
@@ -6256,7 +7045,7 @@ mod tests {
             results[0].premiere_date.map(|d| d.to_rfc3339()).as_deref(),
             Some("2008-01-20T00:00:00+00:00")
         );
-        assert_eq!(results[0].production_year, None);
+        assert_eq!(results[0].production_year, Some(2008));
 
         // The metadata language reaches TMDB.
         let mut req = named_request(BaseItemKind::Series, "Breaking Bad");
@@ -6274,7 +7063,7 @@ mod tests {
         assert_eq!(ids["Tmdb"], "1396");
         assert_eq!(ids["Imdb"], "tt0903747");
         assert_eq!(ids["Tvdb"], "81189");
-        assert_eq!(results[0].production_year, None);
+        assert_eq!(results[0].production_year, Some(2008));
         assert!(results[0].premiere_date.is_some());
     }
 
@@ -6333,6 +7122,17 @@ mod tests {
         // `ResultToMetadataResult` echoes the caller's index numbers.
         assert_eq!(results[0].index_number, Some(3));
         assert_eq!(results[0].parent_index_number, Some(7));
+
+        // jellyfin-web sends every id field it shows, a blank one as "": a
+        // blank id is no id (`string.IsNullOrWhiteSpace(imdbId)`), so the
+        // name is still parsed.
+        let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
+        req.search_info.provider_ids = Some(HashMap::from([("Imdb".to_owned(), " ".to_owned())]));
+        assert_eq!(
+            provider.get_search_results(&req).await.expect("ok").len(),
+            1,
+            "a blank Imdb id must not skip ParseName"
+        );
 
         // An explicit `Year` wins over the one in the title (C# `year ??=`).
         let mut req = named_request(BaseItemKind::Trailer, "Inception (2010)");
@@ -7634,6 +8434,14 @@ mod tests {
     /// `(ItemValueType discriminant, value)` index.
     type RecordedItemValues = Vec<(Uuid, Vec<(i32, String)>)>;
 
+    /// Where [`RecordingStore::save_items`] parks a refresh: it signals
+    /// `reached` and waits for a `release` permit, so a test can act while the
+    /// refresh is between its load and its save.
+    struct SaveHold {
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
     /// An [`ItemPersistenceService`] fake recording the writes a refresh makes
     /// (replaced id sets, upserted ids, saved rows) over a seeded id store.
     #[derive(Default)]
@@ -7653,6 +8461,8 @@ mod tests {
         removed_paths: std::sync::Mutex<Vec<String>>,
         /// The items whose save time it was asked to stamp.
         touched: std::sync::Mutex<Vec<Uuid>>,
+        /// When set, `save_items` parks until the test releases it.
+        hold_save: Option<Arc<SaveHold>>,
         /// Each `copy_metadata_to_owned_videos` call: owners, versions, parts.
         copied: std::sync::Mutex<Vec<(Vec<Uuid>, bool, bool)>>,
         /// Each refresh `copy_owner_metadata_to_extras` was asked for.
@@ -7735,6 +8545,15 @@ mod tests {
             unimplemented!()
         }
         async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
+            if let Some(hold) = &self.hold_save {
+                hold.reached.notify_one();
+                drop(
+                    hold.release
+                        .acquire()
+                        .await
+                        .expect("the semaphore stays open"),
+                );
+            }
             self.saved.lock().expect("lock").extend_from_slice(items);
             Ok(())
         }
@@ -7778,9 +8597,6 @@ mod tests {
             _item_id: Uuid,
             _ancestor_ids: &[Uuid],
         ) -> Result<(), ServiceError> {
-            unimplemented!()
-        }
-        async fn save_images(&self, _item: &BaseItemEntity) -> Result<(), ServiceError> {
             unimplemented!()
         }
         async fn locked_fields_for_items(
@@ -8423,75 +9239,26 @@ mod tests {
         (item_id, wire(mgr))
     }
 
-    /// `OrderByLanguageDescending`'s ladder, straight from
-    /// `MediaBrowser.Model/Extensions/EnumerableExtensions.cs` (v10.11.8).
-    /// The trap: an UNTAGGED image (3) outranks an English one (2), and a
-    /// whitespace-only tag is not "no language" — `IsNullOrEmpty`, not
-    /// `IsNullOrWhiteSpace` — so it falls to 0.
+    /// The automatic TMDb pick ranks like `GetImages`: requested, then English
+    /// (even rated lower), then untagged, then other languages.
     #[test]
-    fn language_rank_matches_the_csharp_ladder() {
-        assert_eq!(language_rank(Some("fr"), "fr"), 4);
-        assert_eq!(language_rank(Some("FR"), "fr"), 4, "OrdinalIgnoreCase");
-        assert_eq!(language_rank(None, "fr"), 3);
-        assert_eq!(language_rank(Some(""), "fr"), 3);
-        assert_eq!(language_rank(Some("en"), "fr"), 2);
-        assert_eq!(language_rank(Some("de"), "fr"), 0);
-        assert_eq!(
-            language_rank(Some(" "), "fr"),
-            0,
-            "IsNullOrEmpty, not WhiteSpace"
-        );
-        // With "en" requested, English takes the top rank and untagged drops to 3.
-        assert_eq!(language_rank(Some("en"), "en"), 4);
-        assert_eq!(language_rank(None, "en"), 3);
-    }
-
-    /// The full `OrderByDescending(rank).ThenByDescending(Math.Round(rating,
-    /// 1)).ThenByDescending(voteCount)` chain, plus the "default to English
-    /// when nothing is requested" guard.
-    #[test]
-    fn images_order_by_language_then_rating_then_votes() {
-        let img = |lang: Option<&str>, rating: Option<f64>, votes: Option<i32>, url: &str| {
-            RemoteImageInfo {
-                url: Some(url.to_owned()),
-                language: lang.map(str::to_owned),
-                community_rating: rating,
-                vote_count: votes,
-                ..RemoteImageInfo::default()
-            }
+    fn tmdb_download_images_rank_english_above_untagged() {
+        let image = |url: &str, language: Option<&str>, rating: f64| crate::tmdb::TmdbImage {
+            community_rating: Some(rating),
+            language: language.map(str::to_owned),
+            ..super::plain_image(ImageType::Primary, url.to_owned())
         };
-        let mut images = vec![
-            img(Some("de"), Some(9.0), Some(999), "other"),
-            img(Some("en"), Some(1.0), Some(1), "english"),
-            img(None, Some(1.0), Some(1), "untagged"),
-            img(Some("fr"), Some(5.0), Some(2), "fr-low-votes"),
-            img(Some("fr"), Some(5.04), Some(50), "fr-rounds-equal"),
-            img(Some("fr"), Some(5.2), Some(1), "fr-top"),
+        let images = vec![
+            image("fr", Some("fr"), 9.0),
+            image("untagged", None, 8.0),
+            image("en", Some("en"), 1.0),
+            image("de", Some("de"), 0.5),
         ];
-        order_by_language_descending(&mut images, "fr");
-        let urls: Vec<&str> = images.iter().filter_map(|i| i.url.as_deref()).collect();
-        assert_eq!(
-            urls,
-            [
-                // rank 4, by rating: 5.2 > 5.0
-                "fr-top",
-                // 5.04 rounds to 5.0, tying "fr-low-votes" — votes break it
-                "fr-rounds-equal",
-                "fr-low-votes",
-                // rank 3 (untagged) before rank 2 (English) before rank 0
-                "untagged",
-                "english",
-                "other",
-            ]
-        );
-
-        // "Default to English if no requested language is specified."
-        let mut blank = vec![
-            img(Some("de"), None, None, "de"),
-            img(Some("en"), None, None, "en"),
-        ];
-        order_by_language_descending(&mut blank, "   ");
-        assert_eq!(blank[0].url.as_deref(), Some("en"));
+        let urls: Vec<String> = crate::tmdb::ordered_download_images(images, "de")
+            .into_iter()
+            .map(|image| image.url)
+            .collect();
+        assert_eq!(urls, ["de", "en", "untagged", "fr"]);
     }
 
     const TMDB_MIXED_LANGUAGE_IMAGES: &str = r#"{"posters":[
@@ -8531,7 +9298,7 @@ mod tests {
                 "https://image.tmdb.org/t/p/original/en.jpg",
                 "https://image.tmdb.org/t/p/original/none.jpg",
             ],
-            "de and sv are filtered out; en (rank 4) precedes untagged (rank 3)"
+            "de and sv are filtered out; en (rank 4) precedes untagged (rank 2)"
         );
 
         // `IncludeAllLanguages` keeps everything — still ordered.
@@ -9072,7 +9839,7 @@ mod tests {
             [
                 // Within each provider the block is `OrderByLanguageDescending`,
                 // so the two `en`-tagged images (rank 4) come before the two
-                // untagged ones (rank 3) — NOT the raw poster/backdrop/logo
+                // untagged ones (rank 2) — NOT the raw poster/backdrop/logo
                 // order TMDB returned. All four tie on rating and votes, and
                 // the sort is stable, so each rank keeps TMDB's own sequence.
                 (
@@ -9361,6 +10128,61 @@ mod tests {
         assert_eq!(next_seen(&mut rx).await, ids[1]);
     }
 
+    /// A request that arrives after a worker stood down, but before that
+    /// worker's guard is dropped, starts a new worker. Dropping the old guard
+    /// must leave the new worker's claim alone, or a third request starts a
+    /// second worker beside it.
+    #[test]
+    fn a_stood_down_worker_leaves_the_next_workers_claim_alone() {
+        let queue = claimed_queue();
+        let mut worker = super::WorkerGuard(Some(Arc::clone(&queue)));
+        assert!(worker.next_refresh().is_none());
+        assert!(
+            !queue.lock().unwrap().processing,
+            "stood down under the lock"
+        );
+        let started = {
+            let mut queue = queue.lock().unwrap();
+            queue.push(
+                Uuid::from_u128(31),
+                MetadataRefreshOptions::default(),
+                RefreshPriority::Low,
+            );
+            !std::mem::replace(&mut queue.processing, true)
+        };
+        assert!(started, "the request starts a new worker");
+        drop(worker);
+        assert!(
+            queue.lock().unwrap().processing,
+            "the new worker's claim survives the old guard"
+        );
+    }
+
+    /// A worker dropped mid-drain (a panicking refresh, an aborted task) still
+    /// holds the claim, and dropping its guard releases it.
+    #[test]
+    fn a_worker_dropped_mid_drain_releases_its_claim() {
+        let queue = claimed_queue();
+        queue.lock().unwrap().push(
+            Uuid::from_u128(32),
+            MetadataRefreshOptions::default(),
+            RefreshPriority::Low,
+        );
+        let mut worker = super::WorkerGuard(Some(Arc::clone(&queue)));
+        assert!(worker.next_refresh().is_some());
+        assert!(queue.lock().unwrap().processing, "still draining");
+        drop(worker);
+        assert!(!queue.lock().unwrap().processing, "the claim is released");
+    }
+
+    /// A queue a worker has claimed, as `queue_refresh` leaves it.
+    fn claimed_queue() -> Arc<std::sync::Mutex<super::RefreshQueue>> {
+        Arc::new(std::sync::Mutex::new(super::RefreshQueue {
+            processing: true,
+            ..super::RefreshQueue::default()
+        }))
+    }
+
     /// The worker, and so every refresh it runs, carries the culture of the
     /// request that started it — and a failing refresh does not stop it.
     #[tokio::test]
@@ -9614,6 +10436,13 @@ mod tests {
                     "poster_path":"/lotr.jpg"}"#
                     .to_owned(),
             ),
+            // No poster of TMDB's own pick, only alternatives.
+            (
+                "/collection/120",
+                r#"{"id":120,"name":"Untitled Collection",
+                    "images":{"posters":[{"file_path":"/alt.jpg"}],"backdrops":[]}}"#
+                    .to_owned(),
+            ),
             // TMDB has no collection 999999 — the mock stands in for that with
             // a body the client cannot read, so `collection()` yields `None`.
             ("/collection/999999", "<not json>".to_owned()),
@@ -9641,6 +10470,15 @@ mod tests {
             Some("https://image.tmdb.org/t/p/original/lotr.jpg")
         );
         assert!(results[0].overview.is_none());
+
+        // The image is `GetPosterUrl(collection.PosterPath)` alone: with no
+        // poster_path there is none, whatever alternatives the images list.
+        let results = provider
+            .get_search_results(&id_request(BaseItemKind::BoxSet, &[("Tmdb", "120")]))
+            .await
+            .expect("results");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].image_url, None);
 
         // An id TMDB does not answer for returns nothing — C# returns
         // `Enumerable.Empty` rather than falling back to the name search, which
@@ -9942,6 +10780,52 @@ mod tests {
         // …unless the caller explicitly asked for disabled providers.
         req.include_disabled_providers = true;
         assert_eq!(mgr.remote_search(&req).await.expect("search").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_search_refuses_an_extra() {
+        // v12.4 `CanRefreshMetadata`: an extra (`ExtraType` set) has no identity
+        // of its own online, so every remote provider is dropped for it.
+        let search = |extra_type: Option<i32>, include_disabled: bool| async move {
+            let library_id = Uuid::new_v4();
+            let item_id = Uuid::new_v4();
+            let mut trailer = row("Trailer", "Making Of");
+            trailer.id = item_id.to_string();
+            trailer.top_parent_id = Some(library_id.to_string());
+            trailer.owner_id = Some(Uuid::new_v4().to_string());
+            trailer.extra_type = extra_type;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let items = Arc::new(FakeItems {
+                rows: HashMap::from([(item_id, trailer)]),
+                seen: tx,
+            });
+            let libraries = Arc::new(FakeLibraries {
+                item_id: library_id,
+                options: ferrofin_model::configuration::LibraryOptions::default(),
+            });
+            let provider: Arc<dyn RemoteSearchProvider> = Arc::new(FakeProvider {
+                name: "The Open Movie Database".to_owned(),
+                kind: BaseItemKind::Trailer,
+                results: vec![result_with(
+                    "The Open Movie Database",
+                    &[("Imdb", "tt1")],
+                    None,
+                )],
+                fail: false,
+            });
+            let mgr = gated_manager(vec![provider], items, libraries);
+            let mut req = request(BaseItemKind::Trailer);
+            req.item_id = item_id;
+            req.include_disabled_providers = include_disabled;
+            mgr.remote_search(&req).await.expect("search").len()
+        };
+        // `ExtraType.Trailer` is 2.
+        assert_eq!(search(Some(2), false).await, 0);
+        // The same row as a plain item is searched…
+        assert_eq!(search(None, false).await, 1);
+        // …and `includeDisabled` is tested before the extra, as upstream
+        // orders it.
+        assert_eq!(search(Some(2), true).await, 1);
     }
 
     #[tokio::test]
@@ -11436,6 +12320,128 @@ mod tests {
             .expect("saved")
     }
 
+    /// A box set refreshed recently enough that no remote provider runs,
+    /// under a manager whose store parks every refresh in its save.
+    fn held_box_set() -> (
+        Uuid,
+        LocalProviderManager,
+        Arc<RecordingStore>,
+        Arc<SaveHold>,
+    ) {
+        let item_id = Uuid::new_v4();
+        let mut stored = row("Movies.BoxSet", "Saga");
+        stored.id = item_id.to_string();
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let hold = Arc::new(SaveHold {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let store = Arc::new(RecordingStore {
+            hold_save: Some(Arc::clone(&hold)),
+            ..RecordingStore::default()
+        });
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_linked_children(Arc::new(Members(Vec::new())));
+        (item_id, mgr, store, hold)
+    }
+
+    /// A refresh that always saves.
+    fn force_save() -> MetadataRefreshOptions {
+        MetadataRefreshOptions {
+            force_save: true,
+            ..MetadataRefreshOptions::default()
+        }
+    }
+
+    /// A refresh holds the item's metadata lock from its load to its save, so
+    /// an edit waits for it and lands on the saved row instead of under it
+    /// (gl-1852: a box set's edited Overview was lost to the refresh a
+    /// membership change had queued).
+    #[tokio::test]
+    async fn an_edit_waits_for_the_refresh_of_its_item_to_save() {
+        let (item_id, mgr, store, hold) = held_box_set();
+        let options = force_save();
+        let refresh = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.refresh_full_item(item_id, &options).await }
+        });
+        // The refresh has loaded the row and is saving it (a refresh that
+        // never got there fails here rather than hanging).
+        tokio::time::timeout(std::time::Duration::from_secs(5), hold.reached.notified())
+            .await
+            .expect("the refresh reached its save");
+        let edit = tokio::spawn({
+            let mgr = mgr.clone();
+            let store = Arc::clone(&store);
+            async move {
+                let _metadata = mgr.lock_item_metadata(item_id).await;
+                store.saved.lock().expect("lock").len()
+            }
+        });
+        // Enough turns for the edit to take an uncontended lock.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        hold.release.add_permits(1);
+        let done = std::time::Duration::from_secs(5);
+        tokio::time::timeout(done, refresh)
+            .await
+            .expect("the refresh finished once released")
+            .expect("join")
+            .expect("refresh succeeds");
+        let saved_before_the_edit = tokio::time::timeout(done, edit)
+            .await
+            .expect("the edit got the lock once the refresh was done")
+            .expect("join");
+        assert!(
+            saved_before_the_edit > 0,
+            "the edit took the lock while the refresh was still saving"
+        );
+    }
+
+    /// `is_processing_refresh_queue` (`_isProcessingRefreshQueue`) reads true
+    /// while the worker runs a refresh it has already taken off the queue,
+    /// which `get_refresh_queue` no longer lists, and false once it is done.
+    #[tokio::test]
+    async fn the_queue_reads_as_processing_until_its_running_refresh_is_done() {
+        let (item_id, mgr, _store, hold) = held_box_set();
+        assert!(
+            !mgr.is_processing_refresh_queue().await,
+            "nothing queued yet"
+        );
+        mgr.queue_refresh(item_id, &force_save(), RefreshPriority::High)
+            .await
+            .expect("queued");
+        tokio::time::timeout(std::time::Duration::from_secs(5), hold.reached.notified())
+            .await
+            .expect("the worker reached the refresh's save");
+        assert!(
+            mgr.get_refresh_queue().await.expect("queue").is_empty(),
+            "the running refresh has left the queue"
+        );
+        assert!(
+            mgr.is_processing_refresh_queue().await,
+            "the worker is still running it"
+        );
+        hold.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while mgr.is_processing_refresh_queue().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the worker stood down once the refresh was done");
+    }
+
     /// A member row of `type_` with the given genres, studios and runtime.
     fn member(
         type_: &str,
@@ -11827,6 +12833,148 @@ mod tests {
         }
     }
 
+    /// gl-1209: a by-name genre (and its kin) off its rebased path is required
+    /// to refresh (`Genre.RequiresRefresh`) and is saved at the rebased path
+    /// (`BeforeMetadataRefresh`) in every mode but `None`, locked or not. One
+    /// already in place, refreshed just now, saves nothing.
+    #[rstest::rstest]
+    #[case::default(
+        MetadataRefreshMode::Default,
+        "/old/Genre/Crime",
+        false,
+        Some("/new/Genre/Crime")
+    )]
+    #[case::validation_only(
+        MetadataRefreshMode::ValidationOnly,
+        "/old/Genre/Crime",
+        false,
+        Some("/new/Genre/Crime")
+    )]
+    #[case::locked(
+        MetadataRefreshMode::Default,
+        "/old/Genre/Crime",
+        true,
+        Some("/new/Genre/Crime")
+    )]
+    #[case::mode_none(MetadataRefreshMode::None, "/old/Genre/Crime", false, None)]
+    #[case::in_place(MetadataRefreshMode::Default, "/new/Genre/Crime", false, None)]
+    #[tokio::test]
+    async fn a_moved_by_name_item_is_saved_at_its_rebased_path(
+        #[case] mode: MetadataRefreshMode,
+        #[case] stored_path: &str,
+        #[case] is_locked: bool,
+        #[case] moved_to: Option<&str>,
+    ) {
+        let item_id = Uuid::new_v4();
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.path = Some(stored_path.to_owned());
+        stored.is_locked = is_locked;
+        // Refreshed just now: only a moved path asks for this refresh.
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_by_name_rebase(|kind, path: &str| {
+                (kind == BaseItemKind::Genre)
+                    .then(|| format!("/new/Genre/{}", path.rsplit('/').next().unwrap_or(path)))
+            });
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: mode,
+            ..MetadataRefreshOptions::default()
+        };
+        mgr.refresh_single_item(item_id, &options)
+            .await
+            .expect("refresh succeeds");
+        let saved: Vec<String> = store
+            .saved
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|row| row.path.clone())
+            .collect();
+        match moved_to {
+            Some(path) => assert_eq!(saved.last().map(String::as_str), Some(path), "{saved:?}"),
+            None => assert!(saved.iter().all(|path| path == stored_path), "{saved:?}"),
+        }
+    }
+
+    /// gl-1209: the moved path makes the refresh required
+    /// (`Person.RequiresRefresh`), so a person refreshed just now still asks
+    /// its remote provider in the default mode, as a first refresh would. In
+    /// place, or with no path, it asks nothing.
+    #[rstest::rstest]
+    #[case::moved(Some("/old/People/B/Brad Pitt"), true)]
+    #[case::in_place(Some("/new/People/B/Brad Pitt"), false)]
+    #[case::no_path(None, false)]
+    #[tokio::test]
+    async fn a_moved_person_is_required_to_refresh(
+        #[case] stored_path: Option<&str>,
+        #[case] asks_tmdb: bool,
+    ) {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/search/person",
+                r#"{"results":[{"id":287,"name":"Brad Pitt","profile_path":"/bp.jpg"}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/person/287",
+                r#"{"id":287,"name":"Brad Pitt","biography":"An actor.","images":{"profiles":[]}}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let store = Arc::new(RecordingStore::default());
+        let item_id = Uuid::new_v4();
+        let mut person = row("Person", "Brad Pitt");
+        person.id = item_id.to_string();
+        person.sort_name = Some("Brad Pitt".to_owned());
+        person.path = stored_path.map(str::to_owned);
+        person.date_last_refreshed = Some(chrono::Utc::now());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                tmdb,
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, person)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_by_name_rebase(|kind, path: &str| {
+                (kind == BaseItemKind::Person)
+                    .then(|| format!("/new/People/B/{}", path.rsplit('/').next().unwrap_or(path)))
+            });
+        mgr.refresh_single_item(item_id, &MetadataRefreshOptions::default())
+            .await
+            .expect("refresh");
+        assert_eq!(
+            !server
+                .query_values("/person/287", "append_to_response")
+                .is_empty(),
+            asks_tmdb,
+            "TMDB asked for the person"
+        );
+        if asks_tmdb {
+            let saved = store.saved.lock().expect("lock");
+            assert_eq!(
+                saved.last().and_then(|row| row.path.as_deref()),
+                Some("/new/People/B/Brad Pitt")
+            );
+        }
+    }
+
     /// A draw that fails is a provider failure (`RunCustomProvider`): the
     /// refresh goes on, but `DateLastRefreshed` is not stamped, as it is when
     /// the draw succeeds.
@@ -11873,6 +13021,110 @@ mod tests {
             .last()
             .is_some_and(|row| row.date_last_refreshed.is_some_and(|at| at > before));
         assert_eq!(restamped, stamped);
+    }
+
+    /// gl-592: "Replace all metadata" with "Replace existing images" removes
+    /// the item's images in its own metadata folders before any provider runs
+    /// (`MetadataService.cs:112-118`, `ItemImageProvider.RemoveImages`): the
+    /// first image of each singular type and every backdrop, in Ferrofin's
+    /// and Jellyfin's layout, whatever the lock. A second Primary, a
+    /// screenshot and an image stored elsewhere stay; either option alone
+    /// removes nothing.
+    #[rstest::rstest]
+    #[case::replace_all(true, true, false, true)]
+    #[case::locked(true, true, true, true)]
+    #[case::metadata_only(true, false, false, false)]
+    #[case::images_only(false, true, false, false)]
+    #[tokio::test]
+    async fn replacing_all_metadata_and_images_removes_the_items_own_images(
+        #[case] remove_old_metadata: bool,
+        #[case] replace_all_images: bool,
+        #[case] is_locked: bool,
+        #[case] removed: bool,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let item_id = Uuid::new_v4();
+        let [ours, _, jellyfins] = crate::local_images::internal_metadata_dirs(tmp.path(), item_id);
+        let elsewhere = tmp.path().join("Genre").join("Crime");
+        let image = |dir: &std::path::Path, name: &str, image_type| {
+            std::fs::create_dir_all(dir).expect("dir");
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").expect("write");
+            ItemImageInfo {
+                path: path.to_string_lossy().into_owned(),
+                image_type,
+                date_modified: chrono::Utc::now(),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            }
+        };
+        let poster = image(&jellyfins, "poster.jpg", ImageType::Primary);
+        let second = image(&ours, "primary1.jpg", ImageType::Primary);
+        let backdrop = image(&ours, "backdrop.jpg", ImageType::Backdrop);
+        let screenshot = image(&ours, "screenshot.jpg", ImageType::Screenshot);
+        let logo = image(&elsewhere, "logo.png", ImageType::Logo);
+        let all = [&poster, &second, &backdrop, &screenshot, &logo];
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.is_locked = is_locked;
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        // Settled as the refresh settles it, so only the images change.
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        store
+            .images
+            .lock()
+            .expect("lock")
+            .extend(all.iter().map(|image| (item_id, (*image).clone())));
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, tmp.path().to_path_buf());
+        let options = Opts {
+            remove_old_metadata,
+            replace_all_images,
+            ..Opts::default()
+        };
+        let update = mgr
+            .refresh_single_item(item_id, &options)
+            .await
+            .expect("refresh");
+        // The removal is the refresh's only change: an image update, saved.
+        let (expected_update, saves) = if removed {
+            (ItemUpdateType::ImageUpdate, true)
+        } else {
+            (ItemUpdateType::None, false)
+        };
+        assert_eq!(update, expected_update);
+        assert_eq!(!store.saved.lock().expect("lock").is_empty(), saves);
+        let kept: Vec<ItemImageInfo> = store
+            .images
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, image)| image.clone())
+            .collect();
+        let expected: Vec<ItemImageInfo> = if removed {
+            vec![second.clone(), screenshot.clone(), logo.clone()]
+        } else {
+            all.iter().map(|image| (*image).clone()).collect()
+        };
+        assert_eq!(kept, expected);
+        for image in all {
+            assert_eq!(
+                std::path::Path::new(&image.path).exists(),
+                expected.contains(image),
+                "{}",
+                image.path
+            );
+        }
     }
 
     /// A season with no folder of its own (a virtual season) refreshes here,
@@ -12038,13 +13290,6 @@ mod tests {
             &self,
             _filter: &ferrofin_traits::options::InternalPeopleQuery,
         ) -> Result<Vec<String>, ServiceError> {
-            unimplemented!()
-        }
-        async fn get_people_names_by_items(
-            &self,
-            _item_ids: &[Uuid],
-            _person_types: &[String],
-        ) -> Result<HashMap<Uuid, Vec<String>>, ServiceError> {
             unimplemented!()
         }
     }
@@ -12572,7 +13817,9 @@ mod tests {
     /// request (its external ids and one guest star).
     const TMDB_EPISODE_SEASON: &str = r#"{"id": 3624, "episodes": [
         {"id": 9002, "episode_number": 2, "name": "TMDB Episode",
-         "overview": "TMDB synopsis.", "air_date": "2011-04-24", "vote_average": 8.5}]}"#;
+         "overview": "TMDB synopsis.", "air_date": "2011-04-24", "vote_average": 8.5},
+        {"id": 9003, "episode_number": 3, "name": "TMDB Third",
+         "overview": "Third synopsis.", "air_date": "2011-05-01", "vote_average": 7.0}]}"#;
     const TMDB_EPISODE: &str = r#"{"external_ids": {"imdb_id": "tt0002002", "tvdb_id": 5002},
         "credits": {"cast": [], "guest_stars": [{"id": 31, "name": "Guest Star",
         "character": "Visitor", "order": 0}], "crew": []}, "videos": {"results": []}}"#;
@@ -12920,6 +14167,167 @@ mod tests {
         );
     }
 
+    /// A multi-episode file (`IndexNumberEnd`) takes TheMovieDb's entries for
+    /// every episode in its range: the first one's date, rating and ids, and
+    /// the names and overviews joined with ` / ` (`TmdbEpisodeProvider.cs:
+    /// 106-158`); only the first episode's own request is made.
+    #[tokio::test]
+    async fn a_multi_episode_takes_every_tmdb_episode_in_its_range() {
+        let (base, log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tmdb", "1399")],
+            episode_fetchers(&[crate::library_options::fetcher_names::TMDB]),
+            |row| {
+                remote(row);
+                row.data = Some(r#"{"IndexNumberEnd":3}"#.to_owned());
+            },
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let row = episode.saved().expect("a full refresh saves");
+        assert_eq!(row.name.as_deref(), Some("TMDB Episode / TMDB Third"));
+        assert_eq!(
+            row.overview.as_deref(),
+            Some("TMDB synopsis. / Third synopsis.")
+        );
+        assert_eq!(
+            row.premiere_date
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .as_deref(),
+            Some("2011-04-24")
+        );
+        let replaced = episode.store.replaced.lock().expect("lock").clone();
+        let (_, ids) = replaced.last().expect("the ids are written");
+        assert!(
+            ids.iter()
+                .any(|(k, v)| (k.as_str(), v.as_str()) == ("Tmdb", "9002")),
+            "{ids:?}"
+        );
+        let asked = log.lock().expect("log").clone();
+        assert!(
+            asked
+                .iter()
+                .any(|l| l.contains("/tmdb/tv/1399/season/1/episode/2")),
+            "{asked:?}"
+        );
+        assert!(!asked.iter().any(|l| l.contains("/episode/3")), "{asked:?}");
+    }
+
+    /// A series' Identify result: its TheMovieDb id and an id no season or
+    /// episode provider answers with.
+    const CHOSEN: &[(&str, &str)] = &[("Tmdb", "1399"), ("Zap2It", "SH0001")];
+
+    /// The options "Identify → Apply" refreshes with for a series' result
+    /// `ids`: a season or an episode supports no Identify, so a result is
+    /// always its series' (`ApplySearchResult`).
+    fn identify_series(ids: &[(&str, &str)]) -> MetadataRefreshOptions {
+        MetadataRefreshOptions {
+            search_result: Some(RemoteSearchResult {
+                name: Some("Show".to_owned()),
+                provider_ids: Some(
+                    ids.iter()
+                        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                        .collect(),
+                ),
+                search_provider_name: Some(crate::library_options::fetcher_names::TMDB.to_owned()),
+                ..RemoteSearchResult::default()
+            }),
+            remove_old_metadata: true,
+            ..full_metadata_refresh()
+        }
+    }
+
+    /// `ids` as owned pairs, sorted.
+    fn sorted_ids(ids: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut ids: Vec<(String, String)> = ids
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A stored season or episode, as it was.
+    fn as_stored(_: &mut BaseItemEntity) {}
+
+    /// A locked one.
+    fn locked(row: &mut BaseItemEntity) {
+        row.is_locked = true;
+    }
+
+    /// One without a number, which resolves to no provider target.
+    fn unnumbered(row: &mut BaseItemEntity) {
+        row.index_number = None;
+    }
+
+    /// Identify on a season or an episode the provider manager refreshes (a
+    /// path-less season; here a remote-path episode, which the rule does not
+    /// tell from a path-less one): `ApplySearchResult` hands the chosen
+    /// result's ids to the lookup as its series'
+    /// (`SeriesProviderIds`) and clears the lookup's own `ProviderIds`, which
+    /// are the item's (`GetItemLookupInfo` shares the dictionary the
+    /// controller's `SetProviderIds` just replaced), whenever the item has a
+    /// provider. So it keeps only the ids its providers return, none when
+    /// they fail or cannot look it up: never the series' ids from the result.
+    /// An episode always has a provider (the forced `ProbeProvider` and
+    /// `TrickplayProvider`), locked or with every fetcher unticked. A
+    /// path-less season has only remote ones: locked or with none ticked,
+    /// nothing clears the chosen ids.
+    #[rstest::rstest]
+    #[case::season_providers_run("TV.Season", &[crate::library_options::fetcher_names::TMDB], as_stored, false, &[("Tmdb", "3624"), ("Tvdb", "364731")])]
+    #[case::season_providers_fail("TV.Season", &[crate::library_options::fetcher_names::TMDB], as_stored, true, &[])]
+    #[case::season_without_a_number("TV.Season", &[crate::library_options::fetcher_names::TMDB], unnumbered, false, &[])]
+    #[case::season_no_provider("TV.Season", &[], as_stored, false, CHOSEN)]
+    #[case::season_locked("TV.Season", &[crate::library_options::fetcher_names::TMDB], locked, false, CHOSEN)]
+    #[case::episode_providers_run("TV.Episode", &[crate::library_options::fetcher_names::TMDB], as_stored, false, &[("Imdb", "tt0002002"), ("Tmdb", "9002"), ("Tvdb", "5002")])]
+    #[case::episode_providers_fail("TV.Episode", &[crate::library_options::fetcher_names::TMDB], as_stored, true, &[])]
+    #[case::episode_no_provider("TV.Episode", &[], as_stored, false, &[])]
+    #[case::episode_locked("TV.Episode", &[crate::library_options::fetcher_names::TMDB], locked, false, &[])]
+    #[tokio::test]
+    async fn identifying_a_virtual_season_or_episode_keeps_only_its_providers_ids(
+        #[case] kind: &str,
+        #[case] fetchers: &[&str],
+        #[case] edit: fn(&mut BaseItemEntity),
+        #[case] fail: bool,
+        #[case] expected: &[(&str, &str)],
+    ) {
+        let (item_id, store, mgr, log) = if kind == "TV.Season" {
+            let (base, log) = spawn_season_providers(fail);
+            let season = VirtualSeason::new(&base, &[], season_fetchers(fetchers), edit);
+            (season.season_id, season.store, season.mgr, log)
+        } else {
+            let (base, log) = spawn_episode_providers(fail);
+            let episode = VirtualEpisode::new(&base, &[], episode_fetchers(fetchers), |row| {
+                remote(row);
+                edit(row);
+            });
+            (episode.episode_id, episode.store, episode.mgr, log)
+        };
+        mgr.refresh_full_item(item_id, &identify_series(CHOSEN))
+            .await
+            .expect("apply");
+        let mut ids = store
+            .stored_ids
+            .lock()
+            .expect("lock")
+            .get(&item_id)
+            .cloned()
+            .expect("ids");
+        ids.sort();
+        assert_eq!(ids, sorted_ids(expected));
+        if !fail && expected.iter().any(|&(key, _)| key == "Tvdb") {
+            let asked = log.lock().expect("log").clone();
+            assert!(
+                asked.iter().any(|l| l.contains("/tmdb/tv/1399/season/1")),
+                "the series is resolved by the chosen ids: {asked:?}"
+            );
+        }
+    }
+
     /// The episode's own credits: TheMovieDb's guest star and TheTVDB's guest are
     /// both written (each provider answers with its own list), and a `Cast`
     /// lock keeps the stored ones.
@@ -13174,21 +14582,27 @@ mod tests {
                 .collect())
         }
     }
+    /// `identified_by` is an Identify → Apply's `SearchProviderName`: that
+    /// provider runs first (`GetNonLocalImageProviders`).
     #[rstest::rstest]
-    #[case::none(&[], &[], None)]
-    #[case::plugin_only(&["ArtworkPlugin"], &[], Some("plugin"))]
-    #[case::plugin_first(&["ArtworkPlugin", "TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], Some("plugin"))]
-    #[case::plugin_last(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], Some("tmdb"))]
-    #[case::plugin_default(&["ArtworkPlugin", "TheMovieDb"], &[], Some("tmdb"))]
-    #[case::fanart_only(&["FanArt"], &[], Some("fanart"))]
-    #[case::tmdb_only(&["TheMovieDb"], &[], Some("tmdb"))]
-    #[case::fanart_first(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], Some("fanart"))]
-    #[case::tmdb_first(&["FanArt", "TheMovieDb"], &["TheMovieDb", "FanArt"], Some("tmdb"))]
-    #[case::default_order(&["FanArt", "TheMovieDb"], &[], Some("tmdb"))]
+    #[case::none(&[], &[], None, None)]
+    #[case::plugin_only(&["ArtworkPlugin"], &[], None, Some("plugin"))]
+    #[case::plugin_first(&["ArtworkPlugin", "TheMovieDb"], &["ArtworkPlugin", "TheMovieDb"], None, Some("plugin"))]
+    #[case::plugin_last(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], None, Some("tmdb"))]
+    #[case::plugin_default(&["ArtworkPlugin", "TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::fanart_only(&["FanArt"], &[], None, Some("fanart"))]
+    #[case::tmdb_only(&["TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::fanart_first(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], None, Some("fanart"))]
+    #[case::tmdb_first(&["FanArt", "TheMovieDb"], &["TheMovieDb", "FanArt"], None, Some("tmdb"))]
+    #[case::default_order(&["FanArt", "TheMovieDb"], &[], None, Some("tmdb"))]
+    #[case::identified_tmdb(&["FanArt", "TheMovieDb"], &["FanArt", "TheMovieDb"], Some("themoviedb"), Some("tmdb"))]
+    #[case::identified_plugin(&["ArtworkPlugin", "TheMovieDb"], &["TheMovieDb", "ArtworkPlugin"], Some("ArtworkPlugin"), Some("plugin"))]
+    #[case::identified_disabled(&["FanArt"], &[], Some("TheMovieDb"), Some("fanart"))]
     #[tokio::test]
     async fn pathless_refresh_obeys_image_selection_and_order(
         #[case] enabled: &[&str],
         #[case] order: &[&str],
+        #[case] identified_by: Option<&str>,
         #[case] expected: Option<&str>,
     ) {
         use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
@@ -13257,6 +14671,11 @@ mod tests {
                 metadata_refresh_mode: MetadataRefreshMode::None,
                 image_refresh_mode: MetadataRefreshMode::FullRefresh,
                 replace_all_images: true,
+                search_result: identified_by.map(|name| RemoteSearchResult {
+                    provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "603".to_owned())])),
+                    search_provider_name: Some(name.to_owned()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )
@@ -13389,13 +14808,19 @@ mod tests {
                 .collect();
             assert_eq!(bytes, [b"GIF89afirst".to_vec(), b"GIF89asecond".to_vec()]);
             assert!(
-                !mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::MissingOnly)
-                    .await
-                    .unwrap()
+                !mgr.refresh_ordered_images(
+                    item_id,
+                    &movie,
+                    &ids,
+                    super::ImageFetch::MissingOnly,
+                    None
+                )
+                .await
+                .unwrap()
             );
             assert_eq!(*store.images.lock().unwrap(), first);
             assert!(
-                mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::All)
+                mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::All, None)
                     .await
                     .unwrap()
             );
@@ -13554,6 +14979,75 @@ mod tests {
             assert_eq!(images[0].url.as_deref(), Some(url));
             assert_eq!(images[0].language.as_deref(), language);
         }
+    }
+
+    /// TheTVDB's series artwork carries TheTVDB's score as its
+    /// `CommunityRating` and keeps a missing dimension unknown, as v1.5.1 did
+    /// (accepted divergence from jellyfin-plugin-tvdb's `CreateRemoteImageInfo`,
+    /// see `tvdb::ArtworkWire::into_series_image`). `OrderByLanguageDescending`
+    /// breaks a same-language tie by rating, so the higher-scored poster comes
+    /// first although TheTVDB lists it second.
+    #[tokio::test]
+    async fn tvdb_series_images_carry_the_score_and_sort_by_it() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            ("/series/5/extended", r#"{"data":{"id":5,"artworks":[{"type":2,"image":"low.jpg","language":"eng","score":1,"width":680,"height":1000},{"type":2,"image":"high.jpg","language":"eng","score":9}]}}"#.to_owned()),
+        ]).await;
+        let series_id = Uuid::new_v4();
+        let library_id = Uuid::new_v4();
+        let mut series = row("TV.Series", "Show");
+        series.id = series_id.to_string();
+        series.top_parent_id = Some(library_id.to_string());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        store
+            .stored_ids
+            .lock()
+            .unwrap()
+            .insert(series_id, vec![("Tvdb".to_owned(), "5".to_owned())]);
+        let mut mgr = LocalProviderManager::default()
+            .with_tvdb(Arc::new(
+                crate::tvdb::TvdbClient::new().with_base_url(&server.base_url),
+            ))
+            .with_image_store(store, std::env::temp_dir())
+            .with_localization(Arc::new(EnglishAndFrench))
+            .with_virtual_folders(Arc::new(FakeLibraries {
+                item_id: library_id,
+                options: ferrofin_model::configuration::LibraryOptions {
+                    type_options: vec![ferrofin_model::configuration::TypeOptions {
+                        type_: Some("Series".to_owned()),
+                        image_fetchers: vec!["TheTVDB".to_owned()],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            }));
+        mgr.items = Some(Arc::new(FakeItems {
+            rows: HashMap::from([(series_id, series)]),
+            seen: tx,
+        }));
+        let images = mgr
+            .get_available_remote_images(series_id, &RemoteImageQuery::default())
+            .await
+            .unwrap();
+        let candidates: Vec<_> = images
+            .iter()
+            .map(|image| {
+                (
+                    image.url.as_deref(),
+                    image.community_rating,
+                    image.width,
+                    image.height,
+                )
+            })
+            .collect();
+        assert_eq!(
+            candidates,
+            [
+                (Some("high.jpg"), Some(9.0), None, None),
+                (Some("low.jpg"), Some(1.0), Some(680), Some(1000)),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -13774,7 +15268,9 @@ mod tests {
                             "/fr.jpg"
                         })
                 );
-                assert_eq!(images[1].language, None, "xx is untagged");
+                // Jellyfin 12's ladder: English (3) before untagged (2).
+                assert_eq!(images[1].language.as_deref(), Some("en"));
+                assert_eq!(images[2].language, None, "xx is untagged");
                 if language == "fr-CA" {
                     assert_eq!(images[0].width, Some(1600));
                     assert_eq!(images[0].height, Some(2400));

@@ -32,6 +32,7 @@ use ferrofin_model::configuration::LibraryOptions;
 use uuid::Uuid;
 
 use crate::error::ServiceError;
+use crate::system::MediaLocation;
 
 /// A Generate Trickplay Images pass that checks the images already on disk,
 /// because the trickplay widths or chroma changed since the last pass that
@@ -69,8 +70,10 @@ pub trait TrickplayManager: Send + Sync {
         library_options: &LibraryOptions,
     ) -> Result<(), ServiceError>;
 
-    /// Refreshes from the scan's current row before its final save.
-    /// `Some(streams)` is a completed fresh probe, including an empty result;
+    /// Refreshes from the caller's row: the scan's current row before its
+    /// final save, or a Generate Trickplay Images page's row.
+    /// `Some(streams)` is the item's streams the caller holds (a completed
+    /// fresh probe, or the page's stored streams), including an empty result;
     /// `None` uses persisted streams when the probe did not supply new context.
     /// The default preserves identity-only implementations of the seam.
     async fn refresh_trickplay_for_media(
@@ -116,6 +119,24 @@ pub trait TrickplayManager: Send + Sync {
             .map(|()| true)
     }
 
+    /// [`Self::check_trickplay_data`] over the caller's row and stored
+    /// streams, as [`Self::refresh_trickplay_for_media`] is to
+    /// [`Self::refresh_trickplay_data`]: Generate Trickplay Images hands each
+    /// video its page's row and streams. The default preserves identity-only
+    /// implementations of the seam.
+    async fn check_trickplay_for_media(
+        &self,
+        item_id: Uuid,
+        entity: &ferrofin_db::entities::base_items::BaseItemEntity,
+        streams: &[ferrofin_db::entities::base_items::MediaStreamInfoEntity],
+        check: &TrickplayCheck,
+        library_options: &LibraryOptions,
+    ) -> Result<bool, ServiceError> {
+        let _ = (entity, streams);
+        self.check_trickplay_data(item_id, check, library_options)
+            .await
+    }
+
     /// Records `check`'s settings as those of the last finished pass, once it
     /// has checked every item. The default records nothing.
     async fn finish_trickplay_pass(&self, check: &TrickplayCheck) -> Result<(), ServiceError> {
@@ -142,6 +163,19 @@ pub trait TrickplayManager: Send + Sync {
 
     /// Deletes all trickplay data for an item.
     async fn delete_trickplay_data(&self, item_id: Uuid) -> Result<(), ServiceError>;
+
+    /// A changed file's prune of the item's trickplay: its tile folders for
+    /// `media` and its rows. A refresh or move of the item already running,
+    /// working from the old file, removes what it saved once done, so its set
+    /// does not outlive the prune. The default deletes the rows only; an
+    /// implementation that refreshes trickplay overrides it.
+    async fn prune_trickplay_data(
+        &self,
+        item_id: Uuid,
+        _media: MediaLocation<'_>,
+    ) -> Result<(), ServiceError> {
+        self.delete_trickplay_data(item_id).await
+    }
 
     /// Batch form of [`Self::get_trickplay_resolutions`], keyed by item; an
     /// item with no trickplay rows is left out. A media source's id is the id

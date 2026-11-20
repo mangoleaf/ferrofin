@@ -36,14 +36,6 @@ use crate::options::DtoOptions;
 /// play-state, and produce the presentation DTO the API serializes.
 #[async_trait]
 pub trait DtoService: Send + Sync {
-    /// Gets the primary-image aspect ratio for an item, or `None` when it has
-    /// no primary image. Port of `GetPrimaryImageAspectRatio(BaseItem)`; the
-    /// domain item becomes an [`item_id`](Uuid).
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError>;
-
     /// Projects a single item row into a [`BaseItemDto`].
     ///
     /// Port of `GetBaseItemDto(BaseItem, DtoOptions, User?, BaseItem? owner)`:
@@ -90,19 +82,6 @@ pub trait DtoService: Send + Sync {
         self.get_base_item_dtos(items, options, user, None, true)
             .await
     }
-
-    /// Projects an item-by-name row (a genre/studio/person/…) into a
-    /// [`BaseItemDto`], counting the items tagged with it.
-    ///
-    /// Port of `GetItemByNameDto(BaseItem, DtoOptions, List<BaseItem>?
-    /// taggedItems, User?)`; the tagged items are passed as their id list.
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        options: &DtoOptions,
-        tagged_item_ids: Option<&[Uuid]>,
-        user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError>;
 
     /// Whether the item itself supports downloading (`BaseItem.CanDownload()`),
     /// before the user's permission is applied. Must agree with a userless DTO.

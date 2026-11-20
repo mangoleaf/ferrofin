@@ -67,11 +67,9 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{SelfWrite, SelfWriteGuard, VirtualFolderManager};
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::stubs::{LyricManager, LyricProvider};
+use ferrofin_util::ticks::TICKS_PER_MS;
 
 use crate::item_type_lookup::kind_from_type_name;
-
-/// The number of ffmpeg ticks (100 ns) per millisecond.
-const TICKS_PER_MS: i64 = 10_000;
 
 /// The lyric manager: reads/writes `.lrc`/`.elrc`/`.txt` sidecars for an item
 /// (media folder and/or internal metadata folder, see the module docs), and
@@ -2033,13 +2031,11 @@ mod tests {
             .parent()
             .expect("folder")
             .to_path_buf();
-        let mut written: Vec<String> = std::fs::read_dir(&folder)
-            .map(|entries| {
-                entries
-                    .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut written: Vec<String> = std::fs::read_dir(&folder).map_or_default(|entries| {
+            entries
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect()
+        });
         written.sort();
         let expected: Vec<String> = saved_as
             .map(|ext| format!("song.{ext}"))

@@ -29,6 +29,11 @@ ignore = [
     # only an administrator's backup or the operator fills. Remove this once a sqlx release
     # allows libsqlite3-sys 0.39 and the workspace moves to it.
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys: fixed in 0.39, which sqlx 0.9 cannot take; no untrusted -wal is opened" },
+    # chrono handles the workspace's dates (13 crates, and sqlx through its `chrono`
+    # feature). RustSec marks every version unmaintained and no fixed release exists. That is
+    # no known vulnerability, so this exception is temporary: gl-1860 moves the workspace off
+    # chrono and removes it before v1.6.0.
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, no fixed release; replaced before v1.6.0 (gl-1860)" },
 ]
 
 [licenses]
