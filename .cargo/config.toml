@@ -1,0 +1,9 @@
+# Cargo's dependency cooldown (Cargo 1.100): `cargo update`, and resolving a newly added
+# dependency, never pick a crate version published less than 7 days ago, so a compromised
+# release has a week to be found and yanked before it can reach Ferrofin. Cargo reads this file
+# for every command under the repository root, the WASM guest (examples/wasm-hello/) included.
+# `--locked` builds resolve nothing, and `cargo install` ignores it. CONTRIBUTING.md
+# ("Dependency cooldown") has the override. Keep anything else out of this file: it merges with
+# each contributor's own ~/.cargo/config.toml.
+[registry]
+global-min-publish-age = "7 days"
