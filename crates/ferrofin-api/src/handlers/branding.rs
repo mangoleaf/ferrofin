@@ -41,6 +41,9 @@ use crate::state::AppState;
 ///
 /// Port of `BrandingController.GetBrandingOptions`: projects the stored
 /// `BrandingOptions` into the API DTO (dropping `SplashscreenLocation`).
+/// While the Single Sign-On plugin has sign-in buttons to show, they follow
+/// the stored disclaimer ([`with_login_buttons`]); otherwise the answer is
+/// the stored configuration, as upstream's.
 #[utoipa::path(
     get,
     path = "/Branding/Configuration",
@@ -51,11 +54,86 @@ async fn get_branding_options(
     State(state): State<AppState>,
 ) -> Result<Json<BrandingOptionsDto>, ApiError> {
     let branding = state.config.get_branding().await?;
+    let login_disclaimer = match login_buttons(&state).await {
+        Some(buttons) => Some(with_login_buttons(
+            branding.login_disclaimer.as_deref(),
+            &buttons,
+        )),
+        None => branding.login_disclaimer,
+    };
     Ok(Json(BrandingOptionsDto {
-        login_disclaimer: branding.login_disclaimer,
+        login_disclaimer,
         custom_css: branding.custom_css,
         splashscreen_enabled: branding.splashscreen_enabled,
     }))
+}
+
+/// Opens the Single Sign-On plugin's sign-in buttons in a served login
+/// disclaimer. DOMPurify drops both markers from the login page.
+const LOGIN_BUTTONS_BEGIN: &str = "<!-- ferrofin:sso-login-buttons -->";
+/// Closes what [`LOGIN_BUTTONS_BEGIN`] opens.
+const LOGIN_BUTTONS_END: &str = "<!-- /ferrofin:sso-login-buttons -->";
+
+/// The Single Sign-On plugin's sign-in buttons
+/// ([`SsoManager::login_buttons`](ferrofin_traits::sso::SsoManager::login_buttons)),
+/// when it has any. A plugin configuration that does not read leaves them
+/// out, so the login page still gets its branding. That is logged at `debug`
+/// only: this anonymous route is asked on every login page, and the plugin's
+/// settings page shows the admin the same failure.
+async fn login_buttons(state: &AppState) -> Option<String> {
+    match state.sso.as_ref()?.login_buttons().await {
+        Ok(buttons) => buttons,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "the login page's Single Sign-On buttons are left out: its configuration could \
+                 not be read"
+            );
+            None
+        }
+    }
+}
+
+/// The served login disclaimer: the stored one, a blank line, so jellyfin-web's
+/// markdown renderer reads what follows as an HTML block, then `buttons`
+/// between the marker comments, which [`strip_login_buttons`] finds again
+/// when the dashboard saves this text back (D7: the stored branding is never
+/// changed).
+fn with_login_buttons(stored: Option<&str>, buttons: &str) -> String {
+    format!(
+        "{}\n\n{LOGIN_BUTTONS_BEGIN}{buttons}{LOGIN_BUTTONS_END}",
+        stored.unwrap_or_default()
+    )
+}
+
+/// Removes every block of sign-in buttons [`with_login_buttons`] served from
+/// a disclaimer about to be saved, with the blank line before it, in `\n`
+/// line breaks (as jellyfin-web 12.4 sends them) or `\r\n` (as a form
+/// submitted natively sends a textarea's). jellyfin-web's branding page
+/// loads `GET /Branding/Configuration` into its editor and saves it back, and
+/// the buttons must be neither stored nor served twice. A block runs from a
+/// closing marker back to the nearest opening one; a marker without its pair
+/// is left as it is.
+pub(crate) fn strip_login_buttons(disclaimer: &mut Option<String>) {
+    let Some(text) = disclaimer else {
+        return;
+    };
+    let mut from = 0;
+    while let Some(found) = text[from..].find(LOGIN_BUTTONS_END) {
+        let close = from + found;
+        let Some(open) = text[from..close].rfind(LOGIN_BUTTONS_BEGIN) else {
+            from = close + LOGIN_BUTTONS_END.len();
+            continue;
+        };
+        let open = from + open;
+        let before = &text[..open];
+        let start = ["\r\n\r\n", "\n\n"]
+            .into_iter()
+            .find_map(|blank| before.strip_suffix(blank))
+            .map_or(open, str::len);
+        text.replace_range(start..close + LOGIN_BUTTONS_END.len(), "");
+        from = start;
+    }
 }
 
 /// `GET /Branding/Css` (and `/Branding/Css.css`) — the configured custom CSS.

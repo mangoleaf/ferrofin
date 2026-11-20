@@ -10,7 +10,7 @@ const SECRET: &str = "pocket-client-secret-7f3a";
 
 /// The service over a plugin manager holding only this extension, enabled
 /// unless `enabled` is false, and the manager and its directory.
-async fn service(
+pub(super) async fn service(
     enabled: bool,
     published_url: Option<&str>,
 ) -> (SsoService, Arc<FerrofinPluginManager>, tempfile::TempDir) {
@@ -97,7 +97,7 @@ fn the_plugin_is_single_sign_on_under_a_ferrofin_guid_and_off_by_default() {
         serde_json::from_slice(&SsoExtension.default_config()).expect("JSON");
     assert_eq!(
         config,
-        serde_json::json!({"PublicUrl": "", "Providers": []})
+        serde_json::json!({"PublicUrl": "", "Providers": [], "ShowLoginButton": true})
     );
     let cx_free = SsoExtension.config_pages();
     assert_eq!(cx_free.len(), 1);

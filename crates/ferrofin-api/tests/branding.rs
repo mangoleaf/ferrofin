@@ -26,10 +26,14 @@ use ferrofin_api::test_support::{
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::secret::Secret;
+use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
+use ferrofin_traits::session::AuthenticationRequest;
+use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, SsoManager, SsoReply};
 use ferrofin_traits::system::ServerApplicationPaths;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -657,4 +661,224 @@ async fn a_tagged_splashscreen_is_immutable_cacheable() {
     );
     assert_eq!(tagged["etag"], "\"abc\"");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- the Single Sign-On plugin's sign-in buttons ------------------------------
+
+/// The marker comments around the buttons appended to the login disclaimer.
+const BUTTONS_BEGIN: &str = "<!-- ferrofin:sso-login-buttons -->";
+const BUTTONS_END: &str = "<!-- /ferrofin:sso-login-buttons -->";
+
+/// An [`SsoManager`] that answers [`SsoManager::login_buttons`] with its
+/// value, or an error for `Err`, and nothing else.
+struct LoginButtons(Result<Option<&'static str>, ()>);
+
+fn unused() -> ServiceError {
+    ServiceError::backend("not used by the branding routes")
+}
+
+#[async_trait]
+impl SsoManager for LoginButtons {
+    async fn ensure_enabled(&self) -> Result<(), ServiceError> {
+        Err(unused())
+    }
+    async fn oidc_providers(&self) -> Result<OidcProviderList, ServiceError> {
+        Err(unused())
+    }
+    async fn save_oidc_provider(
+        &self,
+        _key: &str,
+        _provider: OidcProvider,
+    ) -> Result<OidcProviderInfo, ServiceError> {
+        Err(unused())
+    }
+    async fn delete_oidc_provider(&self, _key: &str) -> Result<(), ServiceError> {
+        Err(unused())
+    }
+    async fn test_oidc_provider(
+        &self,
+        _provider: &OidcProvider,
+    ) -> Result<OidcDiscovery, ServiceError> {
+        Err(unused())
+    }
+    async fn start_oidc_sign_in(
+        &self,
+        _key: &str,
+        _client: std::net::IpAddr,
+    ) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn finish_oidc_sign_in(
+        &self,
+        _key: &str,
+        _callback: OidcCallback,
+    ) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn exchange_oidc_sign_in(
+        &self,
+        _code: Secret,
+        _flow_cookie: Option<Secret>,
+        _request: AuthenticationRequest,
+    ) -> Result<OidcExchangeReply, ServiceError> {
+        Err(unused())
+    }
+    async fn login_buttons(&self) -> Result<Option<String>, ServiceError> {
+        self.0
+            .map(|buttons| buttons.map(str::to_owned))
+            .map_err(|()| ServiceError::backend("the plugin configuration does not read"))
+    }
+}
+
+/// `GET /Branding/Configuration` as the login page asks it, anonymously, from
+/// a server with `sso` wired: the body's bytes.
+async fn branding_with(config: Arc<StubConfig>, sso: Option<LoginButtons>) -> Vec<u8> {
+    let mut state = state_as(config, &Caller::Anonymous);
+    if let Some(sso) = sso {
+        state = state.with_sso(Arc::new(sso));
+    }
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/Branding/Configuration")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body")
+        .to_vec()
+}
+
+fn stored_branding(login_disclaimer: Option<&str>) -> BrandingOptions {
+    BrandingOptions {
+        login_disclaimer: login_disclaimer.map(str::to_owned),
+        custom_css: Some("body{color:red}".to_owned()),
+        splashscreen_enabled: true,
+        splashscreen_location: Some("/keep.png".to_owned()),
+    }
+}
+
+/// B3: the stored disclaimer, a blank line (so markdown reads what follows
+/// as an HTML block), then the plugin's forms between the markers; the
+/// other members as stored.
+#[tokio::test]
+async fn the_sign_in_buttons_follow_the_stored_disclaimer_after_a_blank_line() {
+    let forms = "<form action=\"https://media.example.org/sso/oidc/kc/start\"></form>";
+    for (stored, served) in [
+        (Some("Welcome"), "Welcome\n\n"),
+        (Some(""), "\n\n"),
+        (None, "\n\n"),
+    ] {
+        let config = make_config(stored_branding(stored), "/tmp");
+        let body = json(&branding_with(config, Some(LoginButtons(Ok(Some(forms))))).await);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "LoginDisclaimer": format!("{served}{BUTTONS_BEGIN}{forms}{BUTTONS_END}"),
+                "CustomCss": "body{color:red}",
+                "SplashscreenEnabled": true,
+            }),
+            "{stored:?}"
+        );
+    }
+}
+
+/// B1: with no buttons to show (the plugin disabled, no provider, the switch
+/// off, no public URL), with a plugin whose configuration does not read, and
+/// on a server without the plugin, the response is the stored configuration
+/// byte for byte.
+#[tokio::test]
+async fn without_buttons_the_branding_is_the_stored_one_byte_for_byte() {
+    for stored in [Some("Welcome"), None] {
+        let config = make_config(stored_branding(stored), "/tmp");
+        let without = branding_with(config.clone(), None).await;
+        let expected = match stored {
+            Some(text) => format!(
+                r#"{{"LoginDisclaimer":"{text}","CustomCss":"body{{color:red}}","SplashscreenEnabled":true}}"#
+            ),
+            None => r#"{"CustomCss":"body{color:red}","SplashscreenEnabled":true}"#.to_owned(),
+        };
+        assert_eq!(String::from_utf8_lossy(&without), expected);
+        for sso in [LoginButtons(Ok(None)), LoginButtons(Err(()))] {
+            assert_eq!(
+                branding_with(config.clone(), Some(sso)).await,
+                without,
+                "{stored:?}"
+            );
+        }
+    }
+}
+
+/// The dashboard's branding page saves the disclaimer it was served, in `\n`
+/// line breaks (or `\r\n`, as a form submitted natively sends them), through
+/// either branding save: the buttons and the blank line before them are
+/// dropped, so the stored text is the admin's, and a second save adds
+/// nothing.
+#[tokio::test]
+async fn a_saved_disclaimer_never_keeps_the_sign_in_buttons() {
+    let block = format!("{BUTTONS_BEGIN}<form><button>Sign in with A</button></form>{BUTTONS_END}");
+    for route in [
+        "/System/Configuration/Branding",
+        "/System/Configuration/branding",
+    ] {
+        for (saved, stored) in [
+            (format!("Welcome\n\n{block}"), "Welcome"),
+            (
+                format!("Line 1\r\nLine 2\r\n\r\n{block}"),
+                "Line 1\r\nLine 2",
+            ),
+            (format!("\n\n{block}"), ""),
+            // Text the admin added after the block stays; so does a block
+            // served twice by an earlier save.
+            (format!("Welcome\n\n{block}\n\nBye"), "Welcome\n\nBye"),
+            (format!("Welcome\n\n{block}\n\n{block}"), "Welcome"),
+            // Without both markers, nothing is the plugin's.
+            (
+                format!("Welcome\n\n{BUTTONS_BEGIN}<form>"),
+                "Welcome\n\n<!-- ferrofin:sso-login-buttons --><form>",
+            ),
+            (
+                format!("x{BUTTONS_END}y"),
+                "x<!-- /ferrofin:sso-login-buttons -->y",
+            ),
+            (
+                format!("x{BUTTONS_END}y\n\n{block}"),
+                "x<!-- /ferrofin:sso-login-buttons -->y",
+            ),
+            ("Welcome\n\n".to_owned(), "Welcome\n\n"),
+        ] {
+            let config = make_config(stored_branding(Some("old")), "/tmp");
+            // Then the page is served the stored text with the buttons
+            // again, and saves that.
+            for body in [saved.clone(), format!("{stored}\n\n{block}")] {
+                let (status, _) = send(
+                    config.clone(),
+                    "POST",
+                    route,
+                    Some((
+                        "application/json",
+                        &serde_json::json!({
+                            "LoginDisclaimer": body,
+                            "CustomCss": "body{color:red}",
+                            "SplashscreenEnabled": true,
+                        })
+                        .to_string(),
+                    )),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NO_CONTENT, "{route}");
+                let branding = config.branding.lock().expect("lock").clone();
+                assert_eq!(
+                    branding.login_disclaimer.as_deref(),
+                    Some(stored),
+                    "{route} {body:?}"
+                );
+                assert_eq!(branding.custom_css.as_deref(), Some("body{color:red}"));
+            }
+        }
+    }
 }

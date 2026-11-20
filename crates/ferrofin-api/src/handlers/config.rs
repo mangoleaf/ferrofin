@@ -33,6 +33,7 @@ use serde_json::Value;
 use crate::auth::{RequireAdminWithDefault, RequireAuth, is_administrator_identity};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, JsonValueBody, RequiredRouteString, RouteParameter};
+use crate::handlers::branding::strip_login_buttons;
 use crate::state::AppState;
 
 /// The on-disk file backing a persisted named configuration, or `None` when
@@ -115,7 +116,9 @@ async fn get_default_metadata_options(_auth: RequireAdminWithDefault) -> Json<Me
 ///
 /// Port of `ConfigurationController.UpdateBrandingConfiguration`: reads the
 /// current branding to preserve `SplashscreenLocation`, overlays the DTO's three
-/// editable fields, and persists.
+/// editable fields, and persists. The Single Sign-On sign-in buttons
+/// `GET /Branding/Configuration` served are dropped from the disclaimer
+/// first ([`strip_login_buttons`]).
 #[utoipa::path(
     post,
     path = "/System/Configuration/Branding",
@@ -130,6 +133,7 @@ async fn update_branding_configuration(
 ) -> Result<StatusCode, ApiError> {
     let mut current = state.config.get_branding().await?;
     current.login_disclaimer = dto.login_disclaimer;
+    strip_login_buttons(&mut current.login_disclaimer);
     current.custom_css = dto.custom_css;
     current.splashscreen_enabled = dto.splashscreen_enabled;
     state.config.update_branding(&current).await?;
@@ -425,8 +429,10 @@ async fn update_named_configuration(
 ) -> Result<StatusCode, ApiError> {
     let body = normalize_named_configuration(&key, raw.get())?;
     if key.eq_ignore_ascii_case("branding") {
-        let branding: BrandingOptions =
+        let mut branding: BrandingOptions =
             serde_json::from_value(body).map_err(|error| configuration_error(&error))?;
+        // jellyfin-web's branding page saves here what it was served.
+        strip_login_buttons(&mut branding.login_disclaimer);
         state.config.update_branding(&branding).await?;
         run_committed_checks(&state, &key)?;
         return Ok(StatusCode::NO_CONTENT);

@@ -218,6 +218,18 @@ pub trait SsoManager: Send + Sync {
         flow_cookie: Option<Secret>,
         request: AuthenticationRequest,
     ) -> Result<OidcExchangeReply, ServiceError>;
+
+    /// The sign-in buttons `GET /Branding/Configuration` appends to the login
+    /// disclaimer, for jellyfin-web's login page to show under its form (D7):
+    /// one `<form>` per provider that can sign users in, in the
+    /// configuration's order, each a "Sign in with {name}" button that opens
+    /// `{public URL}/sso/oidc/{provider}/start` in the same tab.
+    ///
+    /// `None` while the plugin is disabled, its `ShowLoginButton` is off, no
+    /// public URL is usable, or no provider can sign users in: the branding
+    /// is then served as stored (B1). Never [`ServiceError::NotFound`] for a
+    /// disabled plugin; an error only when its configuration cannot be read.
+    async fn login_buttons(&self) -> Result<Option<String>, ServiceError>;
 }
 
 fn _assert_object_safe_sso_manager(_: &dyn SsoManager) {}
