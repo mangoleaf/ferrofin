@@ -63,8 +63,16 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
     let target = ferrofin_db::export::refuse_unsafe(source, &config.database_path(), out)
         .await
         .with_context(nothing_written)?;
+    // Where the server would listen and mount: the Networking page's saved
+    // port and base URL outrank `config.toml`'s, and a flag or variable
+    // outranks both.
+    let saved =
+        crate::state::load_network_configuration(&crate::bootstrap::application_paths(config))
+            .await;
+    let port = crate::listen::ports(config, &saved).0;
+    let base_url = crate::base_url::resolve(&config.base_url, config.base_url_from_env, &saved);
     let probed = config.clone();
-    tokio::task::spawn_blocking(move || refuse_running_server(&probed))
+    tokio::task::spawn_blocking(move || refuse_running_server(&probed, port, &base_url))
         .await
         .context("the check for a running server did not finish")
         .and_then(|refused| refused)
@@ -252,14 +260,18 @@ fn make_writable(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Refuses an export while this data directory's server answers on the port
-/// it is configured for: `GET {base_url}/System/Info/Public` there returns the
-/// id in `{config}/system_id`. Another server on that port (a Jellyfin the
-/// operator started already, say) is not this one, and is no reason to
-/// refuse. The database lock check finds a server on this data directory
-/// however it is reached; this one also finds it when the database is on a
-/// filesystem that does not share locks.
-fn refuse_running_server(config: &Config) -> anyhow::Result<()> {
+/// Refuses an export while this data directory's server answers on `port`,
+/// the one it would listen on ([`crate::listen::ports`]): `GET
+/// {base_url}/System/Info/Public` there, under the base URL it would mount
+/// ([`crate::base_url::resolve`]), returns the id in `{config}/system_id`.
+/// Another server on that port (a Jellyfin the operator started already, say)
+/// is not this one, and is no reason to refuse. The database lock check finds
+/// a server on this data directory however it is reached; this one also finds
+/// it when the database is on a filesystem that does not share locks, if it
+/// answers plain HTTP on `config.bind_addr` (localhost when unspecified): a
+/// server that only redirects to HTTPS, or listens on other addresses only,
+/// is left to the lock check.
+fn refuse_running_server(config: &Config, port: u16, base_url: &str) -> anyhow::Result<()> {
     use std::io::{Read as _, Write as _};
 
     let Ok(id) = std::fs::read_to_string(config.config_dir.join("system_id")) else {
@@ -271,14 +283,16 @@ fn refuse_running_server(config: &Config) -> anyhow::Result<()> {
         std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::Ipv6Addr::LOCALHOST.into(),
         ip => ip,
     };
-    let address = std::net::SocketAddr::new(host, config.port);
+    let address = std::net::SocketAddr::new(host, port);
     // A refused, failed or unanswered connection is no server at all.
     let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, PROBE_TIMEOUT) else {
         return Ok(());
     };
+    // `resolve` normalizes (a leading `/`, no trailing one, or empty) but does
+    // not escape: `my jellyfin` would make an invalid request line.
     let request = format!(
         "GET {}/System/Info/Public HTTP/1.0\r\nHost: localhost\r\n\r\n",
-        config.base_url.trim_end_matches('/')
+        ferrofin_networking::escape_base_url(base_url)
     );
     let sent = stream
         .set_write_timeout(Some(PROBE_TIMEOUT))

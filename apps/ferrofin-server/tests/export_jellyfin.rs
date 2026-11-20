@@ -165,24 +165,25 @@ fn free_port() -> u16 {
 
 /// [`export`] with the server configured on `127.0.0.1:port`.
 fn export_on(source: &Path, out: &Path, port: u16) -> Output {
-    command(source, out, port)
+    command(source, out, Some(port))
         .output()
         .expect("run ferrofin-server export-jellyfin")
 }
 
-/// The command [`export_on`] runs, for a test to add to.
-fn command(source: &Path, out: &Path, port: u16) -> Command {
+/// The command [`export_on`] runs, for a test to add to; without a `port`,
+/// the server's own settings pick it.
+fn command(source: &Path, out: &Path, port: Option<u16>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ferrofin-server"));
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("FERROFIN_") {
             command.env_remove(key);
         }
     }
+    command.arg("--bind").arg("127.0.0.1");
+    if let Some(port) = port {
+        command.arg("--port").arg(port.to_string());
+    }
     command
-        .arg("--bind")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(port.to_string())
         .arg("export-jellyfin")
         .arg("--data-dir")
         .arg(source)
@@ -421,7 +422,7 @@ async fn export_jellyfin_writes_the_output_however_it_is_spelled() {
     exported(&empty, export(&source, &scratch.path().join("empty/")));
     let here = scratch.path().join("here");
     std::fs::create_dir(&here).unwrap();
-    let run = command(&source, Path::new("."), free_port())
+    let run = command(&source, Path::new("."), Some(free_port()))
         .current_dir(&here)
         .output()
         .unwrap();
@@ -567,7 +568,7 @@ async fn export_jellyfin_refuses_while_this_directorys_server_answers() {
             .path()
             .join(format!("out-{refuse}-{}", base_url.len()));
         let run = || {
-            command(&source, &out, port)
+            command(&source, &out, Some(port))
                 .env("FERROFIN_BASE_URL", base_url)
                 .output()
                 .unwrap()
@@ -588,6 +589,33 @@ async fn export_jellyfin_refuses_while_this_directorys_server_answers() {
             "{base_url}: the export probed the port"
         );
     }
+}
+
+/// With no flag or variable setting them, the probe looks where the server
+/// would listen and mount: the port and base URL saved on the Networking page,
+/// the base URL escaped as the server mounts it.
+#[tokio::test]
+async fn export_jellyfin_probes_the_networking_pages_port_and_base_url() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source(scratch.path()).await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::fs::write(
+        source.join("config/users/named/network.json"),
+        format!(r#"{{"InternalHttpPort": {port}, "BaseUrl": "saved dir/"}}"#),
+    )
+    .unwrap();
+    let server = answer(
+        listener,
+        "/saved%20dir/System/Info/Public",
+        format!(r#"{{"Id":"{SERVER_ID}","ServerName":"x"}}"#),
+    );
+    let out = scratch.path().join("out");
+    let stderr = refused(&source, &out, || {
+        command(&source, &out, None).output().unwrap()
+    });
+    assert!(stderr.contains("server is running"), "{stderr}");
+    assert!(server.join().unwrap(), "the export probed the saved port");
 }
 
 /// A source larger than the free space on the output's filesystem is refused
