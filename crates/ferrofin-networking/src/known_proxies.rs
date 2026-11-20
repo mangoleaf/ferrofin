@@ -4,7 +4,7 @@
 //!
 //! A host-name entry is resolved (`NetworkUtils.TryParseHost`), which can block
 //! on DNS. [`KnownProxies`] keeps the inputs it was parsed from, so the manager
-//! re-resolves only when those change, never on an interface refresh; a caller
+//! re-resolves only when those change, never on a reload that keeps them; a caller
 //! holding the manager behind a lock resolves outside it with
 //! [`KnownProxies::resolve`] and hands the result over.
 
@@ -52,7 +52,7 @@ impl KnownProxies {
             ..Self::default()
         };
         for entry in &config.known_proxies {
-            if let Ok(address) = entry.trim().parse::<IpAddr>() {
+            if let Some(address) = net_utils::try_parse_ip_address(entry.trim()) {
                 proxies.add_ip_address(address, single_host_prefix(address));
             } else if let Some(subnet) =
                 net_utils::try_parse_to_subnet(entry, false).map(|data| data.subnet)

@@ -1,11 +1,12 @@
 //! Path spelling, end to end: Jellyfin's routes are case-insensitive (ASP.NET)
 //! and axum's are not, so the server re-cases a path before routing it. Over real
-//! HTTP, every contract route answers the same however it is spelled, and a
+//! HTTP, every route answers the same however it is spelled, and a
 //! `/web/*` asset, whose case is the file's, is left alone.
 
 use std::time::Duration;
 
 use ferrofin_api::VENDORED_ROUTES;
+use ferrofin_api::handlers::UNLISTED_ROUTES;
 use ferrofin_server::config::Config;
 use reqwest::StatusCode;
 
@@ -62,10 +63,12 @@ async fn a_route_answers_the_same_in_any_spelling_and_an_asset_keeps_its_case() 
     // GET is what can be repeated without changing what the next spelling sees.
     // Sent anonymously, so most answer 401 in every spelling, which still tells
     // a route that was found from a spelling that fell through to a 404.
-    for (_, path) in VENDORED_ROUTES
+    // The routes outside the contract too, upstream's obsolete ones among them.
+    let gets = VENDORED_ROUTES
         .iter()
         .filter(|(method, _)| *method == "get")
-    {
+        .map(|(_, path)| *path);
+    for path in gets.chain(UNLISTED_ROUTES.iter().copied()) {
         let path = filled(path);
         let canonical = status(path.clone()).await;
         for spelling in [

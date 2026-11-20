@@ -384,10 +384,14 @@ async fn a_logo_that_is_no_url_leaves_no_row_and_takes_the_stored_one(
     )
     .await;
     lab.mgr.refresh_guide().await.expect("first refresh");
-    let channels =
-        crate::guide_repository::channel_rows(&lab.mgr.db, &LiveTvChannelQuery::default(), None)
-            .await
-            .expect("channels");
+    let channels = crate::guide_repository::channel_rows(
+        &lab.mgr.db,
+        &LiveTvChannelQuery::default(),
+        None,
+        false,
+    )
+    .await
+    .expect("channels");
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0].image_url.as_deref(), Some(logo));
     let channel = Uuid::parse_str(&channels[0].id).expect("guid");
@@ -505,5 +509,174 @@ async fn a_poster_two_channels_share_is_pre_cached_once() {
     assert_eq!(
         *art.cached.lock().expect("cache log"),
         ["http://img/series.png"]
+    );
+}
+
+/// gl-1591, gl-1503: `RefreshChannelsInternal` stores, on each channel item,
+/// what its airings add up to (`GuideManager.cs:275-316`):
+/// - `IsMovie` and `IsSeries`;
+/// - a "Kids" tag (indexed, so `tags=Kids` finds the channel);
+/// - and, from `GetChannel`, the `ExternalServiceId` provider row.
+///
+/// A second refresh of the same guide writes no channel item.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "three refreshes of one lineup, each checked against the last"
+)]
+async fn a_guide_refresh_stores_its_channels_aggregates_and_service_id() {
+    use ferrofin_model::data::BaseItemKind;
+    let day = guide_day(0);
+    let xml = format!(
+        "<tv>\
+         <channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+         <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>\
+         <programme start=\"{day}060000 +0000\" stop=\"{day}070000 +0000\" channel=\"one.tv\">\
+         <title>Cartoon Hour</title><category>Kids</category>\
+         <episode-num system=\"xmltv_ns\">0.1.</episode-num></programme>\
+         <programme start=\"{day}060000 +0000\" stop=\"{day}080000 +0000\" channel=\"two.tv\">\
+         <title>A Feature</title><category>Movie</category></programme>\
+         </tv>"
+    );
+    let lab = item_lab_reading_through(M3U, Some(xml), |inner| inner).await;
+    lab.mgr.refresh_guide().await.expect("refresh");
+
+    let channels = |tags: Vec<String>| {
+        let items = Arc::clone(&lab.items);
+        async move {
+            items
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::LiveTvChannel],
+                    tags,
+                    ..InternalItemsQuery::default()
+                })
+                .await
+                .expect("channel items")
+                .into_iter()
+                .map(|row| (row.name.clone().unwrap_or_default(), row))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        }
+    };
+    let all = channels(Vec::new()).await;
+    let (one, two) = (&all["Channel One"], &all["Channel Two"]);
+    assert!(one.is_series && !one.is_movie, "{one:?}");
+    assert_eq!(one.tags.as_deref(), Some("Kids"));
+    assert!(two.is_movie && !two.is_series, "{two:?}");
+    assert_eq!(two.tags, None, "no kids airing, no tag");
+    assert_eq!(
+        channels(vec!["Kids".to_owned()])
+            .await
+            .into_keys()
+            .collect::<Vec<_>>(),
+        ["Channel One"],
+        "the tag is indexed"
+    );
+    let ids: Vec<Uuid> = [one, two]
+        .iter()
+        .map(|row| Uuid::parse_str(&row.id).expect("guid"))
+        .collect();
+    let providers = lab
+        .persistence
+        .provider_ids_for_items(&ids)
+        .await
+        .expect("provider ids");
+    for id in &ids {
+        assert_eq!(
+            providers[id],
+            [("ExternalServiceId".to_owned(), "Emby".to_owned())],
+            "{id}"
+        );
+    }
+
+    // Channel two as Jellyfin stores an item without tags (`Tags = ''`): no
+    // tag value to index, so an unchanged guide writes none for it either.
+    let mut untagged = two.clone();
+    untagged.tags = Some(String::new());
+    lab.persistence
+        .save_items(&[untagged])
+        .await
+        .expect("an adopted, untagged channel");
+    let all = channels(Vec::new()).await;
+    let db = &lab.mgr.db;
+    crate::guide_repository::test_support::count_program_writes(db)
+        .await
+        .expect("count writes");
+
+    lab.mgr.refresh_guide().await.expect("second refresh");
+    assert_eq!(
+        crate::guide_repository::test_support::take_program_writes(db)
+            .await
+            .expect("writes"),
+        (0, 0),
+        "an unchanged guide writes no programme and no tag value"
+    );
+    let again = channels(Vec::new()).await;
+    for name in ["Channel One", "Channel Two"] {
+        assert_eq!(
+            again[name].date_last_saved, all[name].date_last_saved,
+            "{name}: an unchanged guide does not write the channel again"
+        );
+    }
+
+    // A provider row naming another service is put right; another key stays.
+    let two_id = ids[1];
+    lab.persistence
+        .save_provider_id(two_id, "ExternalServiceId", "Other")
+        .await
+        .expect("a stale service");
+    lab.persistence
+        .save_provider_id(two_id, "Custom", "kept")
+        .await
+        .expect("an editor's id");
+    // The next guide: channel one airs only a sub-titled episode (no episode
+    // number, so the listing's IsSeries is false) and channel two nothing.
+    let xml = format!(
+        "<tv>\
+         <channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+         <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>\
+         <programme start=\"{day}090000 +0000\" stop=\"{day}100000 +0000\" channel=\"one.tv\">\
+         <title>Talk</title><sub-title>Guests</sub-title></programme>\
+         </tv>"
+    );
+    lab.sources
+        .0
+        .lock()
+        .expect("sources")
+        .insert("http://guide/xmltv.xml".to_owned(), xml);
+    let providers = lab.mgr.get_listing_providers().await.expect("providers");
+    let provider = providers[0].id.as_deref().expect("provider id");
+    tokio::fs::remove_file(lab.mgr.xmltv.cache_file_for_test(provider))
+        .await
+        .expect("drop the cached guide");
+    lab.mgr.refresh_guide().await.expect("third refresh");
+    let last = channels(Vec::new()).await;
+    let (one, two) = (&last["Channel One"], &last["Channel Two"]);
+    assert!(
+        !one.is_series,
+        "a sub-title alone is no series for the channel"
+    );
+    assert_eq!(
+        one.tags.as_deref(),
+        Some("Kids"),
+        "the Kids tag is never removed"
+    );
+    assert!(
+        !two.is_movie,
+        "a channel whose airings left the guide is reset"
+    );
+    let mut provider_ids = lab
+        .persistence
+        .provider_ids_for_items(&[two_id])
+        .await
+        .expect("provider ids")
+        .remove(&two_id)
+        .expect("rows");
+    provider_ids.sort();
+    assert_eq!(
+        provider_ids,
+        [
+            ("Custom".to_owned(), "kept".to_owned()),
+            ("ExternalServiceId".to_owned(), "Emby".to_owned()),
+        ]
     );
 }

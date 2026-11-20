@@ -75,7 +75,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::VirtualFolderInfo;
@@ -87,7 +86,9 @@ use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::merge_versions::{MergeProgress, MergeVersionsManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
+use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
+use ferrofin_util::ticks::TICKS_PER_DAY;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -167,9 +168,6 @@ impl Extension for MergeVersionsExtension {
     }
 }
 
-/// One day as scheduler ticks (100 ns) — the upstream tasks' default interval.
-const DAY_TICKS: i64 = 24 * 3600 * 10_000_000;
-
 /// The merge tasks' shared default trigger: every 24 hours, as upstream.
 ///
 /// There used to be a `StartupTrigger` here as well, justified by "the interval
@@ -192,7 +190,7 @@ const DAY_TICKS: i64 = 24 * 3600 * 10_000_000;
 fn default_triggers() -> Vec<TaskTriggerInfo> {
     vec![TaskTriggerInfo {
         type_: TaskTriggerInfoType::IntervalTrigger,
-        interval_ticks: Some(DAY_TICKS),
+        interval_ticks: Some(TICKS_PER_DAY),
         ..TaskTriggerInfo::default()
     }]
 }
@@ -512,9 +510,7 @@ impl MergeVersionsService {
         let primary = items
             .iter()
             .find(|i| i.primary_version_id.is_none() && owns_alternates(i))
-            .unwrap_or_else(|| {
-                &items[ferrofin_core::video_versions::preferred_primary_version(&items)]
-            });
+            .unwrap_or_else(|| &items[ferrofin_db::item_data::preferred_primary_version(&items)]);
         let primary_id = primary.id.clone();
 
         // Targeted single-column writes: the group rows were loaded to decide
@@ -539,7 +535,9 @@ impl MergeVersionsService {
                     .await?;
             }
         }
-        tracing::info!(
+        // One per group, and the episode merge passes merged groups again on
+        // every run: the scan's line counts them at info (LOGGING.md rule 1).
+        tracing::debug!(
             merged = group.len() - 1,
             primary = %primary_id,
             "merge versions: merged alternate versions into primary"
@@ -719,6 +717,11 @@ impl MergeVersionsManager for MergeVersionsService {
             .filter(|(_, (ids, any_unmerged))| ids.len() > 1 && *any_unmerged)
             .map(|((library, _), (ids, _))| (library, ids))
             .collect();
+        tracing::info!(
+            movies = movies.len(),
+            duplicate_groups = duplicates.len(),
+            "merge versions: movie scan"
+        );
 
         for (index, (library, ids)) in duplicates.iter().enumerate() {
             report(progress, percent(index, duplicates.len()));
@@ -899,12 +902,11 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
     if let (Some(parent), Some(index)) = (ep.parent_index_number, ep.index_number) {
         // `IndexNumberEnd` lives in the `Data` blob; a null renders as
         // nothing, as in the C# interpolation.
-        let end = ferrofin_core::item_data::read_data_i32(
-            &ferrofin_core::item_data::parse_data(ep.data.as_deref()),
+        let end = ferrofin_db::item_data::read_data_i32(
+            &ferrofin_db::item_data::parse_data(ep.data.as_deref()),
             "IndexNumberEnd",
         )
-        .map(|end| end.to_string())
-        .unwrap_or_default();
+        .map_or_default(|end| end.to_string());
         return format!("{series}|number:{parent}:{index}:{end}");
     }
     // The title fallback also carries the file name's version key — a second
@@ -934,9 +936,7 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
         "{series}|title:{}:{}:{}",
         ep.season_name.as_deref().unwrap_or_default(),
         ep.name.as_deref().unwrap_or_default(),
-        ep.production_year
-            .map(|y| y.to_string())
-            .unwrap_or_default()
+        ep.production_year.map_or_default(|y| y.to_string())
     );
     let Some(path) = ep.path.as_deref() else {
         return key;
@@ -1006,7 +1006,7 @@ mod tests {
         FerrofinLibraryManager, FerrofinPeopleRepository,
     };
     use ferrofin_db::Database;
-    use ferrofin_db::store::guid_to_db;
+    use ferrofin_db::store::{guid_to_db, opt_guid_to_db};
     use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
     use ferrofin_traits::plugins::PluginImage;
 
@@ -1226,22 +1226,17 @@ mod tests {
         )
     }
 
-    /// An id whose hex has no letters, so the lowercase text [`seed`] stores
-    /// and the uppercase form the by-id reads bind are the same.
-    fn plain_id(n: usize) -> Uuid {
-        Uuid::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).expect("id")
-    }
-
     fn stored_type(kind: BaseItemKind) -> &'static str {
         ferrofin_core::item_type_lookup::stored_type_name(kind).expect("stored type name")
     }
 
     /// Persists a minimal item row of the given kind (via the real persistence
-    /// service — no raw SQL outside the repository boundary).
+    /// service — no raw SQL outside the repository boundary), its id in the
+    /// production `guid_to_db` casing that the by-id reads bind.
     async fn seed(db: &Database, id: Uuid, kind: BaseItemKind, path: Option<&str>, width: i64) {
         FerrofinItemPersistenceService::new(db.clone())
             .save_items(&[BaseItemEntity {
-                id: id.to_string(),
+                id: guid_to_db(id),
                 type_: stored_type(kind).to_owned(),
                 path: path.map(str::to_owned),
                 width: Some(width),
@@ -1555,13 +1550,27 @@ mod tests {
 
     // ---- service over a real database --------------------------------------
 
+    /// An in-memory sink for a scoped `fmt` subscriber.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn merge_movies_groups_by_tmdb() {
         let db = test_db().await;
-        let a = Uuid::from_u128(0x401);
-        let b = Uuid::from_u128(0x402);
-        let lonely = Uuid::from_u128(0x403);
-        let no_id = Uuid::from_u128(0x404);
+        let a = Uuid::from_u128(0x4a1);
+        let b = Uuid::from_u128(0x4b2);
+        let lonely = Uuid::from_u128(0x4c3);
+        let no_id = Uuid::from_u128(0x4d4);
         seed(&db, a, BaseItemKind::Movie, None, 1920).await;
         seed(&db, b, BaseItemKind::Movie, None, 640).await;
         seed(&db, lonely, BaseItemKind::Movie, None, 640).await;
@@ -1571,13 +1580,31 @@ mod tests {
         set_provider_id(&db, lonely, "Tmdb", "604").await;
         let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
 
-        svc.merge_movies(None).await.expect("merge movies");
+        // gl-275: the run's info lines are its own, never one per group.
+        let logs = Logs::default();
+        {
+            let writer = logs.clone();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .finish(),
+            );
+            svc.merge_movies(None).await.expect("merge movies");
+        }
+        let text = String::from_utf8_lossy(&logs.0.lock().expect("logs")).into_owned();
+        assert!(!text.contains("merged alternate versions"), "{text}");
+        assert!(
+            text.contains("merge versions: movie scan movies=4 duplicate_groups=1"),
+            "{text}"
+        );
 
         // a (widest) is the primary; b links to it; the rest are untouched.
         assert_eq!(primary_of(&db, &svc, a).await, None);
         assert_eq!(
             primary_of(&db, &svc, b).await.as_deref(),
-            Some(a.to_string().as_str())
+            Some(guid_to_db(a).as_str())
         );
         assert_eq!(primary_of(&db, &svc, lonely).await, None);
         assert_eq!(primary_of(&db, &svc, no_id).await, None);
@@ -1626,9 +1653,9 @@ mod tests {
     #[tokio::test]
     async fn merge_movies_demotes_3d_and_disc_copies_below_a_plain_file() {
         let db = test_db().await;
-        let three_d = Uuid::from_u128(0x411);
-        let disc = Uuid::from_u128(0x412);
-        let plain = Uuid::from_u128(0x413);
+        let three_d = Uuid::from_u128(0x41a);
+        let disc = Uuid::from_u128(0x41b);
+        let plain = Uuid::from_u128(0x41c);
         for (id, width, data) in [
             (three_d, 3840, r#"{"Video3DFormat":"HalfSideBySide"}"#),
             (disc, 1920, r#"{"VideoType":"BluRay"}"#),
@@ -1636,7 +1663,7 @@ mod tests {
         ] {
             FerrofinItemPersistenceService::new(db.clone())
                 .save_items(&[BaseItemEntity {
-                    id: id.to_string(),
+                    id: guid_to_db(id),
                     type_: stored_type(BaseItemKind::Movie).to_owned(),
                     width: Some(width),
                     data: Some(data.to_owned()),
@@ -1654,15 +1681,13 @@ mod tests {
         for id in [three_d, disc] {
             assert_eq!(
                 primary_of(&db, &svc, id).await.as_deref(),
-                Some(plain.to_string().as_str()),
+                Some(guid_to_db(plain).as_str()),
                 "the wider 3D or disc copy is an alternate of the plain file"
             );
         }
     }
 
-    /// Seeds a movie owned by `library` (`TopParentId`). Unlike [`seed`],
-    /// this writes ids in the production `guid_to_db` casing, so the
-    /// library-scoping comparisons are exercised on realistic strings.
+    /// Seeds a movie owned by `library` (`TopParentId`).
     async fn seed_in_library(
         db: &Database,
         id: Uuid,
@@ -1868,7 +1893,7 @@ mod tests {
         assert_eq!(primary_of(&db, &svc, loose_a).await, None);
         assert_eq!(
             primary_of(&db, &svc, loose_b).await.as_deref(),
-            Some(loose_a.to_string().as_str())
+            Some(guid_to_db(loose_a).as_str())
         );
     }
 
@@ -1891,7 +1916,7 @@ mod tests {
             .expect("pre-merge");
         assert_eq!(
             primary_of(&db, &svc, alt).await.as_deref(),
-            Some(primary.to_string().as_str())
+            Some(guid_to_db(primary).as_str())
         );
 
         svc.merge_movies(None).await.expect("merge movies");
@@ -1902,7 +1927,7 @@ mod tests {
         for id in [alt, wider] {
             assert_eq!(
                 primary_of(&db, &svc, id).await.as_deref(),
-                Some(primary.to_string().as_str()),
+                Some(guid_to_db(primary).as_str()),
                 "{id}"
             );
         }
@@ -1916,22 +1941,22 @@ mod tests {
     #[tokio::test]
     async fn merge_movies_leaves_owned_versions_alone() {
         let db = test_db().await;
-        let primary = Uuid::from_u128(0x441);
-        let local = Uuid::from_u128(0x442);
-        let copy = Uuid::from_u128(0x443);
-        let lonely = Uuid::from_u128(0x444);
-        let lonely_local = Uuid::from_u128(0x445);
+        let primary = Uuid::from_u128(0x44a);
+        let local = Uuid::from_u128(0x44b);
+        let copy = Uuid::from_u128(0x44c);
+        let lonely = Uuid::from_u128(0x44d);
+        let lonely_local = Uuid::from_u128(0x44e);
         seed(&db, primary, BaseItemKind::Movie, None, 1920).await;
         seed(&db, copy, BaseItemKind::Movie, None, 2560).await;
         seed(&db, lonely, BaseItemKind::Movie, None, 1920).await;
         for (id, owner) in [(local, primary), (lonely_local, lonely)] {
             FerrofinItemPersistenceService::new(db.clone())
                 .save_items(&[BaseItemEntity {
-                    id: id.to_string(),
+                    id: guid_to_db(id),
                     type_: stored_type(BaseItemKind::Movie).to_owned(),
                     width: Some(3840),
-                    owner_id: Some(owner.to_string()),
-                    primary_version_id: Some(owner.to_string()),
+                    owner_id: Some(guid_to_db(owner)),
+                    primary_version_id: Some(guid_to_db(owner)),
                     ..BaseItemEntity::default()
                 }])
                 .await
@@ -1972,19 +1997,19 @@ mod tests {
     async fn expand_group_walks_through_an_owned_version() {
         let db = test_db().await;
         let (head, local, copy) = (
-            Uuid::from_u128(0x451),
-            Uuid::from_u128(0x452),
-            Uuid::from_u128(0x453),
+            Uuid::from_u128(0x45a),
+            Uuid::from_u128(0x45b),
+            Uuid::from_u128(0x45c),
         );
         seed(&db, head, BaseItemKind::Episode, None, 1920).await;
         for (id, owner, primary) in [(local, Some(head), head), (copy, None, local)] {
             FerrofinItemPersistenceService::new(db.clone())
                 .save_items(&[BaseItemEntity {
-                    id: id.to_string(),
+                    id: guid_to_db(id),
                     type_: stored_type(BaseItemKind::Episode).to_owned(),
                     width: Some(1280),
-                    owner_id: owner.map(|o| o.to_string()),
-                    primary_version_id: Some(primary.to_string()),
+                    owner_id: opt_guid_to_db(owner),
+                    primary_version_id: Some(guid_to_db(primary)),
                     ..BaseItemEntity::default()
                 }])
                 .await
@@ -2037,7 +2062,7 @@ mod tests {
             }
         }
         assert_eq!(primaries.len(), 1, "exactly one primary after regroup");
-        let top = primaries[0].to_string();
+        let top = guid_to_db(primaries[0]);
         for id in [a1, a2, b1, b2] {
             if id != primaries[0] {
                 assert_eq!(
@@ -2077,8 +2102,13 @@ mod tests {
         let db = test_db().await;
         // More rows than a page, in pairs.
         let rows = crate::library_pages::PAGE + 38;
-        let pairs = rows / 2;
-        let pair = |n: usize| (plain_id(500_000 + 2 * n), plain_id(500_001 + 2 * n));
+        let pairs = u128::try_from(rows / 2).expect("pairs");
+        let pair = |n: u128| {
+            (
+                Uuid::from_u128(0xa_0000 + 2 * n),
+                Uuid::from_u128(0xa_0001 + 2 * n),
+            )
+        };
         for n in 0..pairs {
             let (wide, narrow) = pair(n);
             seed(&db, wide, BaseItemKind::Movie, None, 1920).await;
@@ -2095,7 +2125,7 @@ mod tests {
             assert_eq!(primary_of(&db, &svc, wide).await, None);
             assert_eq!(
                 primary_of(&db, &svc, narrow).await.as_deref(),
-                Some(wide.to_string().as_str())
+                Some(guid_to_db(wide).as_str())
             );
         }
 
@@ -2112,8 +2142,13 @@ mod tests {
         let db = test_db().await;
         // More rows than a page, in pairs.
         let rows = crate::library_pages::PAGE + 38;
-        let pairs = rows / 2;
-        let pair = |n: usize| (plain_id(600_000 + 2 * n), plain_id(600_001 + 2 * n));
+        let pairs = u128::try_from(rows / 2).expect("pairs");
+        let pair = |n: u128| {
+            (
+                Uuid::from_u128(0xb_0000 + 2 * n),
+                Uuid::from_u128(0xb_0001 + 2 * n),
+            )
+        };
         for n in 0..pairs {
             let (wide, narrow) = pair(n);
             let number = i64::try_from(n).expect("n") + 1;
@@ -2139,7 +2174,7 @@ mod tests {
             assert_eq!(primary_of(&db, &svc, wide).await, None);
             assert_eq!(
                 primary_of(&db, &svc, narrow).await.as_deref(),
-                Some(wide.to_string().as_str())
+                Some(guid_to_db(wide).as_str())
             );
         }
 
@@ -2181,7 +2216,7 @@ mod tests {
 
         assert_eq!(
             primary_of(&db, &svc, b).await.as_deref(),
-            Some(a.to_string().as_str())
+            Some(guid_to_db(a).as_str())
         );
         assert_eq!(primary_of(&db, &svc, other).await, None);
     }
@@ -2300,7 +2335,7 @@ mod tests {
         }
         assert_eq!(
             primary_of(&db, &svc, copy_b).await,
-            Some(copy_a.to_string()),
+            Some(guid_to_db(copy_a)),
             "two copies of one airing are one episode"
         );
         assert_eq!(primary_of(&db, &svc, copy_a).await, None);
@@ -2347,7 +2382,7 @@ mod tests {
         }
         assert_eq!(
             primary_of(&db, &svc, copy_b).await,
-            Some(copy_a.to_string()),
+            Some(guid_to_db(copy_a)),
             "two copies of one file name are one episode"
         );
         assert_eq!(primary_of(&db, &svc, copy_a).await, None);
@@ -2403,7 +2438,7 @@ mod tests {
         // Hot series: hot2 stays (or is re-linked) under hot1.
         assert_eq!(
             primary_of(&db, &svc, hot2).await,
-            Some(hot1.to_string()),
+            Some(guid_to_db(hot1)),
             "same-series link survives"
         );
         assert_eq!(primary_of(&db, &svc, hot1).await, None);
@@ -2411,7 +2446,7 @@ mod tests {
         // the widest (cold1) is primary, cold2 its alternate.
         assert_eq!(
             primary_of(&db, &svc, cold2).await,
-            Some(cold1.to_string()),
+            Some(guid_to_db(cold1)),
             "cold pair regroups within its own series"
         );
         assert_eq!(primary_of(&db, &svc, cold1).await, None);
@@ -2592,6 +2627,7 @@ mod tests {
             remote_images: Arc::new(
                 crate::ldap_auth::provider::profile_image::FakeImages::default(),
             ),
+            media_segment_scan: Arc::new(crate::tests::NoScan),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);
@@ -2600,7 +2636,7 @@ mod tests {
         for task in &tasks {
             assert_eq!(task.category(), "Merge Versions");
             let triggers = task.default_triggers();
-            assert_eq!(triggers[0].interval_ticks, Some(DAY_TICKS));
+            assert_eq!(triggers[0].interval_ticks, Some(TICKS_PER_DAY));
             // Daily and ONLY daily, as upstream. A `StartupTrigger` used to sit
             // beside it, compensating for an interval clock that restarted on
             // every boot; the scheduler anchors on the last completion now, so

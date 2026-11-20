@@ -39,12 +39,12 @@ use ferrofin_model::intro_skipper::{AnalysisMode, AnalyzerAction};
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{self as intro_store, StoredSegment};
-use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_util::ticks::TICKS_PER_SECOND_F64;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::{RequireAdmin, RequireAuth};
+use crate::auth::{RequireAdmin, RequireAdminWithDefault, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::state::AppState;
@@ -53,8 +53,6 @@ use crate::state::AppState;
 /// `ferrofin-extensions` — the upstream plugin's GUID, which the plugin's own
 /// dashboard app and client integrations hardcode).
 const INTRO_SKIPPER_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
-/// One second expressed in the 100-nanosecond ticks used by segment storage.
-const TICKS_PER_SECOND: f64 = 10_000_000.0;
 
 /// The skip-button CSS `@import` the plugin injects into server branding.
 const IMPORT_STRING: &str = r#"@import url("https://cdn.jsdelivr.net/gh/intro-skipper/intro-skipper-css@main/skip-button.min.css");"#;
@@ -79,7 +77,7 @@ fn is_episode_or_movie(item: &BaseItemEntity) -> bool {
 
 #[allow(clippy::cast_precision_loss)]
 fn ticks_to_secs(ticks: i64) -> f64 {
-    ticks as f64 / TICKS_PER_SECOND
+    ticks as f64 / TICKS_PER_SECOND_F64
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +259,11 @@ async fn timestamps_for(state: &AppState, item_id: Uuid) -> Result<TimeStamps, A
 // ---------------------------------------------------------------------------
 // SkipIntro controller
 // ---------------------------------------------------------------------------
+//
+// `SkipIntroController` is `[Authorize]` and its three writes add
+// `RequiresElevation`, so they need both: the administrator role and the
+// default policy's remote-access check, which bare elevation (the other four
+// controllers) skips.
 
 /// `POST /Episode/{Id}/Timestamps` — replace an episode/movie's user timestamps.
 ///
@@ -269,7 +272,7 @@ async fn timestamps_for(state: &AppState, item_id: Uuid) -> Result<TimeStamps, A
 /// item is not an Episode or Movie.
 async fn update_timestamps(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdminWithDefault(_auth): RequireAdminWithDefault,
     Path(DotnetGuid(id)): Path<DotnetGuid>,
     JsonBody(timestamps): JsonBody<TimeStamps>,
 ) -> Result<StatusCode, ApiError> {
@@ -356,7 +359,7 @@ async fn get_skippable_segments(
 /// Credits only, as upstream).
 async fn erase_timestamps(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdminWithDefault(_auth): RequireAdminWithDefault,
     Query(query): Query<EraseQuery>,
 ) -> Result<StatusCode, ApiError> {
     let mode = query.mode.unwrap_or(AnalysisMode::Introduction);
@@ -397,7 +400,7 @@ async fn erase_timestamps(
 /// prune of invalid segments. Not published, as upstream does not refresh.
 async fn rebuild_database(
     State(state): State<AppState>,
-    RequireAdmin(_auth): RequireAdmin,
+    RequireAdminWithDefault(_auth): RequireAdminWithDefault,
 ) -> Result<StatusCode, ApiError> {
     let pruned = state.intro_skipper.prune_invalid().await?;
     tracing::info!(pruned, "intro skipper: database rebuilt");
@@ -422,7 +425,8 @@ async fn segment_editor_metadata(
 /// as user-provided in the plugin's tier (`UpdateTimestampAsync`), then
 /// `MediaSegmentEditorService.CreateOrReplaceSegmentAsync` writes it under the
 /// plugin's provider id — replacing the item's other segments of that type
-/// (any provider), or, for a Commercial, skipping an identical one. The
+/// (any provider), or, for a Commercial, skipping an identical one; an item
+/// that is not a video or audio keeps the tier row and publishes nothing. The
 /// `providerId` query is `[Required]` (400 when absent) but not used for the
 /// write.
 async fn create_segment(
@@ -455,65 +459,17 @@ async fn create_segment(
             config_hash: String::new(),
         })
         .await?;
-    publish_edit(state.media_segments.as_ref(), item_id, &segment).await?;
+    state
+        .intro_skipper_analysis
+        .create_or_replace_segment(&MediaSegmentDto {
+            id: Uuid::nil(),
+            item_id,
+            type_: segment.type_,
+            start_ticks: segment.start_ticks,
+            end_ticks: segment.end_ticks,
+        })
+        .await?;
     Ok(StatusCode::OK)
-}
-
-/// `MediaSegmentEditorService._itemLocks`: one lock per edited item, kept for
-/// the process's lifetime.
-// ponytail: never evicted, as upstream ("re-add eviction if touched item count
-// becomes measurable") — one small entry per item ever edited by hand.
-fn item_lock(item_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    type Locks = std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>;
-    static LOCKS: std::sync::LazyLock<std::sync::Mutex<Locks>> =
-        std::sync::LazyLock::new(Default::default);
-    let mut locks = LOCKS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::sync::Arc::clone(locks.entry(item_id).or_default())
-}
-
-/// `MediaSegmentEditorService.CreateOrReplaceSegmentAsync`, under the item's
-/// lock so two simultaneous edits publish one segment: a Commercial identical
-/// to one already published is skipped; any other type replaces the item's
-/// segments of that type (any provider); then the edit is published under the
-/// plugin's provider id.
-async fn publish_edit(
-    segments: &dyn MediaSegmentManager,
-    item_id: Uuid,
-    segment: &SegmentInput,
-) -> Result<(), ApiError> {
-    let lock = item_lock(item_id);
-    let _held = lock.lock().await;
-    let existing = segments
-        .get_segments(item_id, Some(&[segment.type_]), false)
-        .await?;
-    if segment.type_ == MediaSegmentType::Commercial {
-        if existing
-            .iter()
-            .any(|e| e.start_ticks == segment.start_ticks && e.end_ticks == segment.end_ticks)
-        {
-            return Ok(());
-        }
-    } else {
-        for e in existing {
-            // Upstream logs a failed delete and carries on with the others.
-            if let Err(err) = segments.delete_segment(e.id).await {
-                tracing::warn!(%err, segment_id = %e.id, "intro skipper: could not delete a replaced segment");
-            }
-        }
-    }
-    let dto = MediaSegmentDto {
-        id: Uuid::nil(),
-        item_id,
-        type_: segment.type_,
-        start_ticks: segment.start_ticks,
-        end_ticks: segment.end_ticks,
-    };
-    segments
-        .create_segment(&dto, &intro_store::provider_id())
-        .await?;
-    Ok(())
 }
 
 /// Query for `DELETE /MediaSegmentsApi/{segmentId}` (both `[Required]`).
@@ -811,51 +767,9 @@ async fn support_bundle(
          * Runs on: {os}\n\
          {analysis}",
         ferrofin = ferrofin_health::RELEASE_VERSION,
-        os = operating_system(),
+        os = state.intro_skipper_analysis.operating_system(),
         analysis = state.intro_skipper_analysis.support_bundle().await,
     )
-}
-
-/// .NET's `RuntimeInformation.OSDescription` on Linux: the kernel's
-/// `uname -srv`.
-fn os_description() -> String {
-    let read = |name: &str| {
-        std::fs::read_to_string(format!("/proc/sys/kernel/{name}"))
-            .map(|value| value.trim().to_owned())
-            .unwrap_or_default()
-    };
-    format!(
-        "{} {} {}",
-        read("ostype"),
-        read("osrelease"),
-        read("version")
-    )
-    .trim()
-    .to_owned()
-}
-
-/// `Helper.OperatingSystem.DetermineOperatingSystem`.
-fn operating_system() -> String {
-    match std::env::consts::OS {
-        "windows" => "Windows".to_owned(),
-        "macos" => "macOS".to_owned(),
-        "linux" => {
-            let docker = ["/.dockerenv", "/run/.containerenv"]
-                .iter()
-                .any(|marker| std::path::Path::new(marker).exists());
-            if !docker {
-                return os_description();
-            }
-            if std::env::var_os("ATTACHED_DEVICES_PERMS").is_some() {
-                "LinuxServer.io image (Docker)".to_owned()
-            } else if std::env::var_os("WEBUI_PORTS").is_some() {
-                "hotio image (Docker)".to_owned()
-            } else {
-                "Linux (Docker)".to_owned()
-            }
-        }
-        _ => "Unknown".to_owned(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1512,105 +1426,5 @@ mod numeric_contract_tests {
             ),
             2
         );
-    }
-}
-
-#[cfg(test)]
-mod edit_lock_tests {
-    use super::{SegmentInput, publish_edit};
-    use async_trait::async_trait;
-    use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
-    use ferrofin_traits::error::ServiceError;
-    use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProviderInfo};
-    use std::sync::{Arc, Mutex};
-    use uuid::Uuid;
-
-    /// Segments in memory; each read yields after taking its snapshot, as a
-    /// real store awaits there, so a concurrent edit reads the same snapshot.
-    #[derive(Default)]
-    struct YieldingSegments(Mutex<Vec<MediaSegmentDto>>);
-
-    #[async_trait]
-    impl MediaSegmentManager for YieldingSegments {
-        async fn is_type_supported(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
-            Ok(true)
-        }
-        async fn create_segment(
-            &self,
-            segment: &MediaSegmentDto,
-            _provider: &str,
-        ) -> Result<MediaSegmentDto, ServiceError> {
-            let mut rows = self.0.lock().expect("lock");
-            let created = MediaSegmentDto {
-                id: Uuid::from_u128(rows.len() as u128 + 1),
-                ..segment.clone()
-            };
-            rows.push(created.clone());
-            Ok(created)
-        }
-        async fn delete_segment(&self, segment_id: Uuid) -> Result<(), ServiceError> {
-            self.0.lock().expect("lock").retain(|s| s.id != segment_id);
-            Ok(())
-        }
-        async fn delete_segments(&self, _item_id: Uuid) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn delete_provider_segments(
-            &self,
-            _item_id: Uuid,
-            _provider_id: &str,
-            _type_filter: Option<MediaSegmentType>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn get_segments(
-            &self,
-            item_id: Uuid,
-            types: Option<&[MediaSegmentType]>,
-            _by_provider: bool,
-        ) -> Result<Vec<MediaSegmentDto>, ServiceError> {
-            let found = self
-                .0
-                .lock()
-                .expect("lock")
-                .iter()
-                .filter(|s| s.item_id == item_id && types.is_none_or(|t| t.contains(&s.type_)))
-                .cloned()
-                .collect();
-            tokio::task::yield_now().await;
-            Ok(found)
-        }
-        async fn has_segments(&self, _item_id: Uuid) -> Result<bool, ServiceError> {
-            Ok(false)
-        }
-        async fn get_supported_providers(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<Vec<MediaSegmentProviderInfo>, ServiceError> {
-            Ok(Vec::new())
-        }
-    }
-
-    /// `MediaSegmentEditorService`'s per-item lock: two simultaneous edits of
-    /// one item's Intro publish one segment, the later one.
-    #[tokio::test]
-    async fn simultaneous_edits_of_an_item_publish_one_segment() {
-        let segments = Arc::new(YieldingSegments::default());
-        let item = Uuid::from_u128(0x5d);
-        let edit = |end_ticks| SegmentInput {
-            type_: MediaSegmentType::Intro,
-            start_ticks: 0,
-            end_ticks,
-        };
-        let (first, second) = (edit(10), edit(20));
-        let (a, b) = tokio::join!(
-            publish_edit(segments.as_ref(), item, &first),
-            publish_edit(segments.as_ref(), item, &second),
-        );
-        a.expect("first");
-        b.expect("second");
-        let rows = segments.0.lock().expect("lock").clone();
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(rows[0].end_ticks, 20);
     }
 }

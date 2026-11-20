@@ -37,7 +37,7 @@ Consequences you must respect:
 
 ## Workspace layout
 
-Rust workspace, edition 2024, toolchain pinned to **1.99.1** (stable). Library crates in
+Rust workspace, edition 2024, toolchain pinned to **1.100.0** (stable). Library crates in
 `crates/`, the server binary in `apps/`.
 
 ```
@@ -261,14 +261,24 @@ cargo llvm-cov nextest -p <crate> --fail-under-lines 80 --summary-only
 ### ffmpeg integration tests
 The real `tokio::process` ffmpeg spawn (transcode) can't be unit-tested and is excluded from
 the coverage gate — it lives behind a seam trait with a fake for unit tests. The real
-integration tests are gated behind an env var and skip if ffmpeg is absent:
+integration tests are `#[ignore]`d, so every default run lists them as skipped. Run them with
+`--include-ignored` (nextest: `--run-ignored all`); asked for, they fail when ffmpeg, ffprobe or
+libx264 is missing:
 
 ```bash
-FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg
-FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-hls          --test hls_stream_manager_ffmpeg
-FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test no_repeat_extraction_ffmpeg
-FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test subtitle_streams_ffmpeg
+cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg   -- --include-ignored
+cargo test -p ferrofin-hls          --test hls_stream_manager_ffmpeg   -- --include-ignored
+cargo test -p ferrofin-server       --test no_repeat_extraction_ffmpeg -- --include-ignored
+cargo test -p ferrofin-server       --test subtitle_streams_ffmpeg     -- --include-ignored
+# all of them: every *_ffmpeg test binary and the inline real_ffmpeg_* tests
+cargo nextest run --workspace --run-ignored only -E 'binary(/_ffmpeg$/) | test(/real_ffmpeg/)'
 ```
+
+A test that needs more than that returns early with a message when the host lacks it: an ffmpeg
+new enough (`hls_seek_ffmpeg` 5.0; `subtitle_streams_ffmpeg` and the BT.709 chapter-image and
+several trickplay cases 5.1), one whose version reads (several trickplay tests), jellyfin-ffmpeg's
+`tonemapx`, or a VAAPI render node. The chapter-image test fails on an unreadable version
+instead: it hands the version to the encoder.
 
 `no_repeat_extraction_ffmpeg` checks that chapter images, trickplay and Intro Skipper
 analysis are never redone for an unchanged file: library scans, the three scheduled tasks,
@@ -283,10 +293,10 @@ the right time; and it burns an ASS track in with the fonts its file ships, whic
 extracted into the cache whatever their `filename` tags say.
 
 Both of these need an ffmpeg with libx264, and `subtitle_streams_ffmpeg` also needs ffmpeg
-5.1 or later. CI does not run them (CI never sets `FERROFIN_FFMPEG_TESTS`): run them by hand
-for changes to those paths.
+5.1 or later. CI does not run them (no CI job runs ignored tests): run them by hand for
+changes to those paths.
 
-The image limits have the same kind of gate. `image_limits_cgroup` boots the real binary in a
+The image-limit tests are `#[ignore]`d too. `image_limits_cgroup` boots the real binary in a
 `systemd-run --user --scope` with a hard memory cap and swap off, and checks that each limit holds
 there: the pixel limit, the resize budget, the memory limit on a Photo item, the budget shared
 by concurrent resizes, a blur's compositing under the budget, and remote images past the download
@@ -295,10 +305,10 @@ and CI does not run it: run it by hand for changes to `ferrofin-drawing/src/limi
 `ferrofin-providers/src/image_download.rs`:
 
 ```bash
-FERROFIN_CGROUP_TESTS=1 cargo test -p ferrofin-server --test image_limits_cgroup
+cargo test -p ferrofin-server --test image_limits_cgroup -- --include-ignored
 ```
 
-The LDAP-Auth extension's directory client has one too. `ldap_directory` starts two OpenLDAP
+So is the LDAP-Auth extension's directory client test. `ldap_directory` starts two OpenLDAP
 containers (built from `alpine:3.22` on the first run, certificates generated per run) and runs
 the settings page's connection test over plain LDAP, LDAPS and StartTLS: a custom root CA, a
 client certificate, skip-verify, a certificate for the wrong name refused, a wrong bind
@@ -307,13 +317,14 @@ modify, the password-modify operation and the root DSE. It needs `docker`, and C
 it: run it by hand for changes to `crates/ferrofin-extensions/src/ldap_auth/`:
 
 ```bash
-FERROFIN_LDAP_TESTS=1 cargo test -p ferrofin-extensions --test ldap_directory -- --nocapture
+cargo test -p ferrofin-extensions --test ldap_directory -- --include-ignored --nocapture
 ```
 
-Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
+The end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
-toolchain stays server-only). It skips with a message when the target is absent; CI always
-runs it:
+toolchain stays server-only). It has an environment-variable gate instead of `#[ignore]`,
+because CI's ordinary test run sets the variable and must run it. Without the variable, or
+when the target is absent, it returns early with a message and counts as passed:
 
 ```bash
 FERROFIN_WASM_GUEST_TESTS=1 cargo test -p ferrofin-wasm --test wasm_hello_guest
@@ -481,17 +492,25 @@ The real remaining gaps are **by design**, not un-ported routes:
   `github.com/mangoleaf/ferrofin-plugin-template`, never from the example.
 - **DLNA server discovery (SSDP)** — Ferrofin has the profile/StreamBuilder logic but no
   SSDP broadcast/discovery.
-- **No artwork is written into a media library without the library's opt-in** — an owner
-  decision (2026-10-17). Upstream's `IsSaveLocalMetadataEnabled()` overrides (Genre,
-  MusicGenre, Playlist, Person, Studio, Year, BoxSet, …) save artwork "beside the item"
-  whatever the library says. Ferrofin ports them (Genre, MusicGenre, Playlist, Person,
-  Studio, Year, BoxSet, a by-name MusicArtist and a library's CollectionFolder; not yet
-  UserView) only while the item's own path is in its data or metadata directory or the
-  libraries' root folder (a genre's `{metadata}/Genre/<name>`, a playlist in
-  `{data}/playlists`, a library's `root/default/<name>`). An item inside a media library
-  (an `.m3u` playlist file, a playlist or box-set folder) follows the library's "Save artwork
-  into media folders" (`SaveLocalMetadata`), so with it off the media folders stay
-  untouched and need no write permission.
+- **No artwork or metadata file is written into a media library without the library's
+  opt-in** — owner decisions (2026-10-17; metadata files 2026-11-19). Upstream's
+  `IsSaveLocalMetadataEnabled()` overrides (Genre, MusicGenre, Playlist, Person, Studio,
+  Year, BoxSet, …) save artwork "beside the item" whatever the library says. Ferrofin ports
+  them (Genre, MusicGenre, Playlist, Person, Studio, Year, BoxSet, a by-name MusicArtist
+  and a library's CollectionFolder; not yet UserView) only while the item's own path is in
+  its data or metadata directory or the libraries' root folder (a genre's
+  `{metadata}/Genre/<name>`, a playlist in `{data}/playlists`, a library's
+  `root/default/<name>`). An item inside a media library (an `.m3u` playlist file, a
+  playlist or box-set folder) follows the library's "Save artwork into media folders"
+  (`SaveLocalMetadata`), so with it off the media folders stay untouched and need no write
+  permission. The metadata savers follow the same rule: in a library without a saver list
+  (`MetadataSavers` null) and with `SaveLocalMetadata` off, no edit or member change writes
+  an `.nfo` or a box set's `collection.xml` into its media folders, not even over a file
+  already there (a library with a saver list writes what the list names). In a library
+  without a saver list, upstream's `ProviderManager.IsSaverEnabledForItem` rewrites a
+  saver's existing file on an edit, and `BoxSet.IsSaveLocalMetadataEnabled()` always writes
+  `collection.xml`; here a file left in place can be read again at a refresh until the
+  library names the saver or turns saving on.
 - **Hardware transcoding is NVENC, VAAPI and QSV only.** AMF (AMD on Windows),
   VideoToolbox (macOS), RKMPP (Rockchip) and V4L2M2M are **not supported** — an owner
   decision (2026-08-26), not an un-ported route: their filter chains cannot be verified

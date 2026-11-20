@@ -1,0 +1,2 @@
+# Byte-exact: every offset in these files counts bytes, so no line-end conversion.
+*.pdf binary

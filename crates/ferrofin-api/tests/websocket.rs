@@ -290,9 +290,6 @@ impl SessionManager for StreamingSessions {
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
-    async fn update_device_name(&self, _session_id: &str, _name: &str) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
     async fn on_playback_start(&self, _info: &PlaybackStartInfo) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
@@ -351,14 +348,6 @@ impl SessionManager for StreamingSessions {
     async fn send_message_to_user_sessions(
         &self,
         _user_ids: &[Uuid],
-        _message_type: SessionMessageType,
-        _data: &str,
-    ) -> Result<(), ServiceError> {
-        unimplemented!("fake")
-    }
-    async fn send_message_to_user_device_sessions(
-        &self,
-        _device_id: &str,
         _message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {

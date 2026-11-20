@@ -4,15 +4,18 @@
 //!
 //! Port rules applied throughout:
 //! - Persisted devices are the [`DeviceEntity`] / [`DeviceOptionsEntity`]
-//!   `ferrofin-db` rows; API-facing reads surface the [`DeviceInfoDto`] /
-//!   [`DeviceInfo`] wire DTOs. The C# `GetDeviceOptions` returns a
+//!   `ferrofin-db` rows; API-facing reads surface the [`DeviceInfoDto`] wire
+//!   DTO. The C# `GetDeviceOptions` returns a
 //!   `DeviceOptionsDto`; here it returns the [`DeviceOptionsEntity`] row, and
 //!   the API layer maps it to `ferrofin_model::dto::DeviceOptionsDto`.
 //! - The `CanAccessDevice(User, …)` domain-`User` argument becomes a
 //!   [`UserEntity`] row; identity arguments become [`uuid::Uuid`].
 //! - `Jellyfin.Data.Queries.DeviceQuery` is ported as [`DeviceQuery`] (a small
 //!   service param, not a wire DTO).
-//! - The `DeviceOptionsUpdated` event is dropped (event wiring is `ferrofin-core`).
+//! - The `DeviceOptionsUpdated` event is not raised. Its one subscriber (C#
+//!   `SessionManager.OnDeviceManagerDeviceOptionsUpdated`) is
+//!   `SessionManager::on_device_options_updated`, which `POST /Devices/Options`
+//!   calls after the save.
 //! - `Task<T>` → `async fn -> Result<T, ServiceError>`; the synchronous C#
 //!   methods stay `async fn` for a uniform, fallible surface.
 //!
@@ -21,8 +24,7 @@
 use async_trait::async_trait;
 use ferrofin_db::entities::security::{DeviceEntity, DeviceOptionsEntity};
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::devices::DeviceInfo;
-use ferrofin_model::dto::{ClientCapabilitiesDto, DeviceInfoDto};
+use ferrofin_model::dto::DeviceInfoDto;
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::session::ClientCapabilities;
 use uuid::Uuid;
@@ -79,12 +81,6 @@ pub trait DeviceManager: Send + Sync {
         query: &DeviceQuery,
     ) -> Result<QueryResult<DeviceEntity>, ServiceError>;
 
-    /// Queries device info (capability-enriched) records.
-    async fn get_device_infos(
-        &self,
-        query: &DeviceQuery,
-    ) -> Result<QueryResult<DeviceInfo>, ServiceError>;
-
     /// Gets the device info DTOs visible to a user (or all when `None`).
     async fn get_devices_for_user(
         &self,
@@ -133,12 +129,6 @@ pub trait DeviceManager: Send + Sync {
         &self,
         device_id: &str,
     ) -> Result<Option<DeviceOptionsEntity>, ServiceError>;
-
-    /// Maps recorded capabilities to their client-facing DTO.
-    async fn to_client_capabilities_dto(
-        &self,
-        capabilities: &ClientCapabilities,
-    ) -> Result<ClientCapabilitiesDto, ServiceError>;
 }
 
 fn _assert_object_safe_device_manager(_: &dyn DeviceManager) {}

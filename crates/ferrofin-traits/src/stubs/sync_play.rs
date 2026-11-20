@@ -25,10 +25,11 @@ use crate::error::ServiceError;
 pub struct SyncPlaySession {
     /// The session's id (group membership key).
     pub session_id: String,
-    /// The authenticated user's id.
+    /// The authenticated user's id; nil for an API key's session.
     pub user_id: Uuid,
-    /// The authenticated user's display name (shown in `Participants`).
-    pub user_name: String,
+    /// The authenticated user's display name (shown in `Participants`); `None`
+    /// for an API key's session, whose C# `SessionInfo.UserName` is null.
+    pub user_name: Option<String>,
 }
 
 /// What a session is playing when it creates a group — the `SessionInfo`
@@ -170,7 +171,8 @@ pub trait SyncPlayManager: Send + Sync {
         now_playing: Option<&SyncPlayNowPlaying>,
     ) -> Result<GroupInfoDto, ServiceError>;
 
-    /// Adds the session to an existing group.
+    /// Adds the session to an existing group. A session with no user (an API
+    /// key's) is `InvalidInput("Guid can't be empty")`, as upstream's user lookup.
     async fn join_group(
         &self,
         session: &SyncPlaySession,
@@ -180,13 +182,15 @@ pub trait SyncPlayManager: Send + Sync {
     /// Removes the session from its current group (idempotent).
     async fn leave_group(&self, session: &SyncPlaySession) -> Result<(), ServiceError>;
 
-    /// Lists the groups visible to the session.
+    /// Lists the groups visible to the session; `InvalidInput` for a session
+    /// with no user, as [`join_group`](SyncPlayManager::join_group).
     async fn list_groups(
         &self,
         session: &SyncPlaySession,
     ) -> Result<Vec<GroupInfoDto>, ServiceError>;
 
-    /// Returns info for a single group, or `NotFound`.
+    /// Returns info for a single group, or `NotFound`; `InvalidInput` for a
+    /// session with no user, as [`join_group`](SyncPlayManager::join_group).
     async fn get_group(
         &self,
         session: &SyncPlaySession,

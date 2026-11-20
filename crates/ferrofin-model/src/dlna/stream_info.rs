@@ -257,7 +257,7 @@ impl StreamInfo {
         if let Some(codec) = target.first()
             && !codec.is_empty()
             && let Some(value) = self.get_option(Some(codec), "rangetype")
-            && let Some(rt) = super::condition_processor::parse_video_range_type_pub(value)
+            && let Some(rt) = super::condition_processor::parse_video_range_type(value)
         {
             return rt;
         }
@@ -410,7 +410,9 @@ impl StreamInfo {
     /// Gets the target video level for a codec.
     #[must_use]
     pub fn get_target_video_level(&self, codec: Option<&str>) -> Option<f64> {
-        self.get_option(codec, "level").and_then(|v| v.parse().ok())
+        // `double.TryParse(value, CultureInfo.InvariantCulture, …)`.
+        self.get_option(codec, "level")
+            .and_then(ferrofin_util::invariant_float::parse)
     }
 
     /// Gets the target reference frames for a codec.
@@ -819,10 +821,11 @@ impl StreamInfo {
             ));
             info.is_external_url = false;
 
-            let is_absolute_http = stream
-                .path
-                .as_deref()
-                .is_some_and(|p| p.starts_with("http://") || p.starts_with("https://"));
+            // Upstream's `Uri.TryCreate(path, UriKind.Absolute)`: surrounding
+            // white space ignored, the scheme in any case, a host required.
+            let is_absolute_http = stream.path.as_deref().is_some_and(|p| {
+                url::Url::parse(p).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+            });
 
             if stream.is_external
                 && stream.supports_external_stream
@@ -871,6 +874,11 @@ fn bool_lower(v: bool) -> String {
 /// values exercised here (whole numbers without a trailing `.0`).
 #[allow(clippy::float_cmp, clippy::cast_possible_truncation)]
 fn format_float(v: f32) -> String {
+    if v.is_infinite() {
+        // `float.ToString(CultureInfo.InvariantCulture)`: the query binder
+        // reads `Infinity` back, and refuses Rust's `inf` as upstream does.
+        return if v > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
     if v.fract() == 0.0 {
         format!("{}", v as i64)
     } else {

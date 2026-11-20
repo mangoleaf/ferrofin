@@ -17,9 +17,9 @@ use ferrofin_traits::options::InternalItemsQuery;
 use uuid::Uuid;
 
 /// Rows read per page: the library tasks' page
-/// ([`ferrofin_core::scheduled_tasks::library::PAGE_SIZE`]).
+/// ([`ferrofin_traits::tasks::PAGE_SIZE`]).
 #[allow(clippy::cast_sign_loss)] // a positive constant
-pub(crate) const PAGE: usize = ferrofin_core::scheduled_tasks::library::PAGE_SIZE as usize;
+pub(crate) const PAGE: usize = ferrofin_traits::tasks::PAGE_SIZE as usize;
 
 /// The rows of `ids`, one page of a `get_item_ids(query)` snapshot, that still
 /// match `query`, in `ids`' order. A row deleted or changed since the snapshot
@@ -82,10 +82,10 @@ pub(crate) mod tests {
     /// than one page of rows from a single list read. The walks do slow work
     /// per item, so one that reads the whole library at once holds every row
     /// throughout; over this fake it fails instead. Every other method,
-    /// defaulted ones included, forwards to the real repository: a method
-    /// added to [`ItemRepository`] must be forwarded here too, or tests over
-    /// this fake run its default body instead of the real one. The ids of
-    /// the rows its list reads return are logged, in order.
+    /// defaulted ones included, forwards to the real repository, so tests
+    /// over this fake run the real body, never a trait default;
+    /// `missing_trait_methods` fails clippy when a method is left out. The
+    /// ids of the rows its list reads return are logged, in order.
     pub(crate) struct OnePageAtATime(
         pub(crate) Arc<dyn ItemRepository>,
         pub(crate) std::sync::Mutex<Vec<String>>,
@@ -112,6 +112,7 @@ pub(crate) mod tests {
     }
 
     #[async_trait]
+    #[deny(clippy::missing_trait_methods)]
     impl ItemRepository for OnePageAtATime {
         async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             self.0.retrieve_item(id).await
@@ -148,6 +149,12 @@ pub(crate) mod tests {
             filter: &InternalItemsQuery,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             self.one_page(self.0.get_item_list(filter).await?)
+        }
+        async fn get_episode_order_rows(
+            &self,
+            filter: &InternalItemsQuery,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            self.one_page(self.0.get_episode_order_rows(filter).await?)
         }
         async fn get_latest_item_list(
             &self,

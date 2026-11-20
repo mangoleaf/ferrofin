@@ -13,29 +13,29 @@
 //! is a match rather than a trait — see the `ferrofin-traits` port note on
 //! strategy interfaces becoming match-on-kind logic.
 //!
-//! **The oracle is Jellyfin 10.11.8** — the version the vendored contract is
-//! pinned to — not whatever the upstream checkout happens to be at. That
-//! distinction is load-bearing here: `TmdbSeasonExternalId` and
-//! `TmdbEpisodeExternalId` do not exist in 10.11.8 (they post-date it), and a
-//! port aimed at `master` grows id fields upstream does not serve.
+//! **The oracle is the Jellyfin release `UPSTREAM_TAG` names** (v12.4), like
+//! every other behaviour: the route set is pinned to the 10.11.8 contract, but
+//! what a route answers follows the release. A port aimed at `master` would
+//! grow id fields no release serves.
 //!
-//! Ported providers, the complete 10.11.8 `IExternalId` set (19 classes,
-//! `git grep -l ": IExternalId" v10.11.8`):
+//! Ported providers, the complete v12.4 `IExternalId` set (25 classes,
+//! `git grep -l ": IExternalId" v12.4`):
 //! `Movies/Imdb{,Person}ExternalId`, `TV/Zap2ItExternalId`,
-//! `Plugins/Tmdb/{BoxSets,Movies,People,TV}/Tmdb*ExternalId`,
-//! `Plugins/MusicBrainz/*` (7), `Plugins/AudioDb/*` (4), `Music/ImvdbId`.
+//! `Plugins/Tmdb/{BoxSets,Movies,People,TV}/Tmdb*ExternalId` (the TV ones for
+//! series, seasons and episodes), `Plugins/MusicBrainz/*` (7),
+//! `Plugins/AudioDb/*` (4), `Music/ImvdbId` and
+//! `Books/{ComicVine,ComicVinePerson,GoogleBooks,ISBN}ExternalId`.
 //!
-//! Two deliberate Ferrofin additions, both backed by code that reads the id:
+//! One deliberate Ferrofin addition, backed by code that reads the id:
 //! `jellyfin-plugin-tvdb`'s `TvdbSeriesExternalId` (TVDB ships compiled into
-//! Ferrofin) and `Books/{ComicVine,GoogleBooks,Isbn}` (Ferrofin has a books
-//! provider, and [`external_urls`] renders all three as "Links").
+//! Ferrofin).
 //!
 //! ORDER IS PART OF THE CONTRACT. `ProviderManager.AddParts` stores
 //! `externalIds.OrderBy(i => i.ProviderName)`, and LINQ `OrderBy` is a STABLE
 //! sort, so entries sharing a provider name come back in the order the
 //! assembly exported them (`GetExports<IExternalId>()` — reflection order, not
 //! anything derivable from the source). This table therefore encodes that
-//! sequence, with the live 10.11.8 response as the oracle, and
+//! sequence, with the live v12.4 response as the oracle, and
 //! [`external_id_infos`] re-sorts with an equally stable `sort_by`.
 
 use std::collections::HashMap;
@@ -369,6 +369,18 @@ const EXTERNAL_IDS: &[ExternalIdDescriptor] = {
         ExternalIdDescriptor {
             name: "TheMovieDb",
             key: "Tmdb",
+            media_type: Some(ExternalIdMediaType::Season),
+            kinds: &[K::Season],
+        },
+        ExternalIdDescriptor {
+            name: "TheMovieDb",
+            key: "Tmdb",
+            media_type: Some(ExternalIdMediaType::Episode),
+            kinds: &[K::Episode],
+        },
+        ExternalIdDescriptor {
+            name: "TheMovieDb",
+            key: "Tmdb",
             media_type: Some(ExternalIdMediaType::Person),
             kinds: &[K::Person],
         },
@@ -380,7 +392,7 @@ const EXTERNAL_IDS: &[ExternalIdDescriptor] = {
             kinds: &[K::Movie, K::MusicVideo, K::Trailer],
         },
         // jellyfin-plugin-tvdb Providers/ExternalId/TvdbSeriesExternalId — the
-        // ONE id field Ferrofin adds beyond 10.11.8's lineup, and the only TVDB
+        // ONE id field Ferrofin adds beyond v12.4's lineup, and the only TVDB
         // id anything here can actually consume: `resolve_tmdb_id` resolves a
         // series through TMDB's `/find?external_source=tvdb_id`
         // (provider_manager.rs, gated on `TmdbKind::Series`) and fanart.tv looks
@@ -780,7 +792,7 @@ mod tests {
         // A movie offers NO TVDB field: nothing in Ferrofin can consume a
         // per-movie TVDB id (the client has no movie lookup, and
         // `resolve_tmdb_id`'s tvdb branch is gated on `TmdbKind::Series`), and
-        // 10.11.8 has no `Tvdb` IExternalId at all.
+        // v12.4 has no `Tvdb` IExternalId at all.
         assert!(!keys.contains(&"Tvdb".to_owned()));
 
         let book = external_id_infos(BaseItemKind::Book);
@@ -788,9 +800,11 @@ mod tests {
         assert_eq!(book_keys, vec!["ComicVine", "GoogleBooks", "ISBN"]);
     }
 
-    /// The exact ordered field list live Jellyfin 10.11.8 serves for each kind
-    /// the parity fixture can correlate by path. These are measured bytes, not
-    /// a restatement of the table: `ProviderManager`'s `OrderBy(ProviderName)`
+    /// The exact ordered field list live Jellyfin 12.4 serves for each kind
+    /// the parity fixture can correlate by path, re-measured on 2026-11-13
+    /// against the benchmark corpus prepared for the pinned 12.4 image. These
+    /// are measured bytes, not a restatement of the table:
+    /// `ProviderManager`'s `OrderBy(ProviderName)`
     /// is stable, so intra-provider order is part of the response and a set
     /// comparison would not have caught the MusicBrainz block being
     /// transcribed out of order.
@@ -802,14 +816,14 @@ mod tests {
     /// `OrderBy` is stable, so what survives inside one name is the order
     /// `GetExports<IExternalId>()` handed over: .NET reflection/DI discovery
     /// order for that assembly. This vector is therefore pinned
-    /// EMPIRICALLY against a running 10.11.8 server, not derived — the live
-    /// server is the only available oracle. If a future runtime or plugin-load
-    /// change reorders the exports, upstream's own response moves and this
-    /// test is reporting a real contract change; re-measure against a live
-    /// 10.11.8 before editing the expectation, and never reorder the table to
-    /// match a guess.
+    /// EMPIRICALLY against a running Jellyfin server at `UPSTREAM_TAG`, not
+    /// derived — the live server is the only available oracle. If a future
+    /// runtime or plugin-load change reorders the exports, upstream's own
+    /// response moves and this test is reporting a real contract change;
+    /// re-measure against a live server at `UPSTREAM_TAG` before editing the
+    /// expectation, and never reorder the table to match a guess.
     #[test]
-    fn identify_fields_match_the_live_10_11_8_bytes() {
+    fn identify_fields_match_the_live_12_4_bytes() {
         let keys = |kind| -> Vec<String> {
             external_id_infos(kind)
                 .into_iter()
@@ -847,12 +861,11 @@ mod tests {
             keys(BaseItemKind::Movie),
             ["Imdb", "Tmdb", "TmdbCollection"]
         );
-        // A season offers nothing: TMDB keys its season lookups off the SERIES
-        // id plus the season number, so there is no per-season id to hold.
-        assert_eq!(keys(BaseItemKind::Season), Vec::<String>::new());
-        assert_eq!(keys(BaseItemKind::Episode), ["Imdb"]);
-        // Series and Person carry Ferrofin's two accepted additions
-        // (`Tvdb`, `ComicVine`); everything else is the 10.11.8 sequence.
+        // `TmdbSeasonExternalId` / `TmdbEpisodeExternalId` (jellyfin/jellyfin#16472).
+        assert_eq!(keys(BaseItemKind::Season), ["Tmdb"]);
+        assert_eq!(keys(BaseItemKind::Episode), ["Imdb", "Tmdb"]);
+        // Series carries Ferrofin's one addition (`Tvdb`); everything else is
+        // the 12.4 sequence.
         assert_eq!(
             keys(BaseItemKind::Series),
             ["Imdb", "Tmdb", "Tvdb", "Zap2It"]
@@ -869,6 +882,22 @@ mod tests {
             .expect("Tmdb descriptor");
         assert_eq!(tmdb.name.as_deref(), Some("TheMovieDb"));
         assert_eq!(tmdb.type_, Some(ExternalIdMediaType::Movie));
+    }
+
+    #[test]
+    fn the_season_and_episode_descriptors_carry_their_media_types() {
+        for (kind, media_type) in [
+            (BaseItemKind::Season, ExternalIdMediaType::Season),
+            (BaseItemKind::Episode, ExternalIdMediaType::Episode),
+        ] {
+            let infos = external_id_infos(kind);
+            let tmdb = infos
+                .iter()
+                .find(|i| i.key.as_deref() == Some("Tmdb"))
+                .expect("Tmdb descriptor");
+            assert_eq!(tmdb.name.as_deref(), Some("TheMovieDb"));
+            assert_eq!(tmdb.type_, Some(media_type));
+        }
     }
 
     #[test]

@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
 use crate::extract::Query;
+use crate::handlers::query_parse::get_order_by;
 use crate::state::AppState;
 
 /// Query parameters for `GET /System/ActivityLog/Entries`.
@@ -115,9 +116,8 @@ fn parse_enum_array<T: serde::de::DeserializeOwned>(
     )
 }
 
-/// `RequestHelpers.GetOrderBy`: each key takes the order at its index, the
-/// rest the FIRST requested order (ascending when none). Extra orders are
-/// ignored (upstream indexes past its array and fails the request).
+/// Binds `sortBy` / `sortOrder` strictly, then pairs them with
+/// [`get_order_by`] (`RequestHelpers.GetOrderBy`).
 fn build_order_by(
     sort_by: Option<&str>,
     sort_order: Option<&str>,
@@ -134,12 +134,7 @@ fn build_order_by(
             )),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let fallback = orders.first().copied().unwrap_or(SortOrder::Ascending);
-    Ok(keys
-        .into_iter()
-        .enumerate()
-        .map(|(i, key)| (key, orders.get(i).copied().unwrap_or(fallback)))
-        .collect())
+    Ok(get_order_by(keys, &orders))
 }
 
 /// `GET /System/ActivityLog/Entries` — a page of activity-log entries.

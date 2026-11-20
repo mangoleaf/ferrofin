@@ -72,7 +72,7 @@ use crate::config_import;
 /// set the library metadata-options editor lists. Verbatim port of the C#
 /// `ServerConfiguration.MetadataOptions` default array (an empty array here left
 /// the editor with no per-type rows).
-fn default_metadata_options() -> Vec<ferrofin_model::configuration::MetadataOptions> {
+pub(crate) fn default_metadata_options() -> Vec<ferrofin_model::configuration::MetadataOptions> {
     use ferrofin_model::configuration::MetadataOptions;
     let plain = |item_type: &str| MetadataOptions {
         item_type: Some(item_type.to_owned()),
@@ -232,6 +232,9 @@ pub struct FerrofinServerConfigurationManager {
     configuration: Arc<RwLock<Arc<ServerConfiguration>>>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
     listeners: Arc<RwLock<Vec<Arc<ConfigurationListener>>>>,
+    /// Set while the saved network ports differ from the ports this lifetime
+    /// listens on ([`Self::set_ports_changed`]).
+    ports_changed: std::sync::atomic::AtomicBool,
 }
 
 /// A file a warning was logged for, by its modification time (`None` when
@@ -292,33 +295,33 @@ impl std::fmt::Debug for FerrofinServerConfigurationManager {
 
 impl FerrofinServerConfigurationManager {
     /// The on-disk configuration file name (JSON counterpart of C# `system.xml`).
-    const CONFIG_FILE_NAME: &'static str = "system.json";
+    pub(crate) const CONFIG_FILE_NAME: &'static str = "system.json";
 
     /// The subdirectory of the user config dir holding named configs
     /// (`branding`/`encoding`), matching the `/System/Configuration/{key}` API.
-    const NAMED_SUBDIR: &'static str = "named";
+    pub(crate) const NAMED_SUBDIR: &'static str = "named";
 
     /// The on-disk branding configuration file name (Jellyfin's named
     /// `branding` configuration, stored as a sibling JSON document).
-    const BRANDING_FILE_NAME: &'static str = "branding.json";
+    pub(crate) const BRANDING_FILE_NAME: &'static str = "branding.json";
 
     /// The on-disk encoding configuration file name (Jellyfin's named
     /// `encoding` configuration, stored as a sibling JSON document).
-    const ENCODING_FILE_NAME: &'static str = "encoding.json";
+    pub(crate) const ENCODING_FILE_NAME: &'static str = "encoding.json";
 
     /// The on-disk network configuration file name (Jellyfin's named
     /// `network` configuration). This one is not merely served back: the
     /// request path enforces it (`ferrofin_api::ip_access`).
-    const NETWORK_FILE_NAME: &'static str = "network.json";
+    pub(crate) const NETWORK_FILE_NAME: &'static str = "network.json";
 
     /// The on-disk metadata configuration file name (Jellyfin's named
     /// `metadata` configuration, `MetadataConfigurationStore`): the "Date
     /// added behavior for new content" the library scan dates new items by.
-    const METADATA_FILE_NAME: &'static str = "metadata.json";
+    pub(crate) const METADATA_FILE_NAME: &'static str = "metadata.json";
 
     /// The on-disk NFO configuration file name (Jellyfin's named
     /// `xbmcmetadata` configuration, `XbmcMetadataOptions`).
-    const XBMC_METADATA_FILE_NAME: &'static str = "xbmcmetadata.json";
+    pub(crate) const XBMC_METADATA_FILE_NAME: &'static str = "xbmcmetadata.json";
 
     /// The on-disk Live TV configuration file name (Jellyfin's named `livetv`
     /// configuration): its scalar options, the tuners and listing providers
@@ -438,6 +441,7 @@ impl FerrofinServerConfigurationManager {
             configuration: Arc::new(RwLock::new(Arc::new(configuration))),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             listeners: Arc::new(RwLock::new(Vec::new())),
+            ports_changed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -481,6 +485,97 @@ impl FerrofinServerConfigurationManager {
         .map_err(|error| ServiceError::backend(format!("encoding writer: {error}")))??;
         self.named_configuration_updated("encoding", committed);
         Ok(())
+    }
+
+    /// Records whether the saved network configuration's ports differ from
+    /// the ports this lifetime listens on, as the host resolves them: the
+    /// comparison in `ApplicationHost.OnConfigurationUpdated`
+    /// (ApplicationHost.cs:804-818). While they differ, every save of the
+    /// server configuration stores `IsPortAuthorized` false, as upstream's
+    /// handler clears it again after each save; the next startup sets it back
+    /// (`load`, `FindParts`). [`Self::revoke_port_authorization`] clears it
+    /// at once.
+    pub fn set_ports_changed(&self, changed: bool) {
+        self.ports_changed
+            .store(changed, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Clears `IsPortAuthorized` and saves the server configuration while the
+    /// saved ports differ from the ones served ([`Self::set_ports_changed`]),
+    /// as `OnConfigurationUpdated` does when a save changes a port. The
+    /// document is read under the save lock, so a concurrent save is never
+    /// overwritten by an older copy; when the flag is already clear, or the
+    /// ports no longer differ, nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// The configuration could not be saved.
+    pub async fn revoke_port_authorization(&self) -> Result<(), ServiceError> {
+        let save = Arc::clone(&self.write_lock).lock_owned().await;
+        let current = self.snapshot_shared();
+        if !current.is_port_authorized
+            || !self.ports_changed.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        self.commit(save, (*current).clone()).await
+    }
+
+    /// Validates, persists and publishes `configuration` under `save`, the
+    /// held save lock, then notifies the listeners. While the saved ports
+    /// differ from the ones served, `IsPortAuthorized` is stored false
+    /// whatever `configuration` says ([`Self::set_ports_changed`]).
+    async fn commit(
+        &self,
+        save: tokio::sync::OwnedMutexGuard<()>,
+        mut configuration: ServerConfiguration,
+    ) -> Result<(), ServiceError> {
+        if self.ports_changed.load(std::sync::atomic::Ordering::SeqCst) {
+            configuration.is_port_authorized = false;
+        }
+        let old_metadata = self.snapshot_shared().metadata_path.clone();
+        let old_cache = self.snapshot_shared().cache_path.clone();
+        let json = serde_json::to_vec_pretty(&configuration)
+            .map_err(|e| ServiceError::backend(format!("serialize configuration: {e}")))?;
+        let replacement = Arc::new(configuration);
+        let path = self.config_file.clone();
+        let current = Arc::clone(&self.configuration);
+        let paths = Arc::clone(&self.paths);
+        let listeners = Arc::clone(&self.listeners);
+        tokio::task::spawn_blocking(move || {
+            let _save = save;
+            prepare_metadata_path(&paths, &replacement.metadata_path, Some(&old_metadata))?;
+            if let Some(cache) = replacement
+                .cache_path
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+            {
+                let cache_path = PathBuf::from(cache);
+                if old_cache.as_deref() != Some(cache) {
+                    if !cache_path.is_dir() {
+                        return Err(ServiceError::not_found(format!(
+                            "cache path does not exist: {cache}"
+                        )));
+                    }
+                    let probe = cache_path.join(uuid::Uuid::new_v4().to_string());
+                    std::fs::File::create_new(&probe)
+                        .and_then(|_| std::fs::remove_file(&probe))
+                        .map_err(|e| io_err("validate cache directory", &cache_path, &e))?;
+                }
+                FerrofinServerApplicationPaths::prepare_cache_path(&cache_path)
+                    .map_err(|e| io_err("prepare cache directory", &cache_path, &e))?;
+            }
+            ferrofin_util::file_helper::atomic_write(&path, &json)
+                .map_err(|e| io_err("write configuration", &path, &e))?;
+            *current.write().expect("configuration lock poisoned") = Arc::clone(&replacement);
+            publish_key_policies(&replacement);
+            paths.set_cache_path(replacement.cache_path.as_deref());
+            paths.set_internal_metadata_path(Some(&replacement.metadata_path));
+            notify_listeners(&listeners, &ConfigurationUpdate::Server(replacement));
+            Ok(())
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("configuration writer: {e}")))?
     }
 
     /// Subscribes to successful main, branding, and named-store saves.
@@ -745,49 +840,7 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         // Hold the writer through validation, persistence, publication and
         // notification. A cancelled caller must not leave disk ahead of memory.
         let save = Arc::clone(&self.write_lock).lock_owned().await;
-        let old_metadata = self.snapshot_shared().metadata_path.clone();
-        let old_cache = self.snapshot_shared().cache_path.clone();
-        let replacement = Arc::new(configuration.clone());
-        let json = serde_json::to_vec_pretty(configuration)
-            .map_err(|e| ServiceError::backend(format!("serialize configuration: {e}")))?;
-        let path = self.config_file.clone();
-        let current = Arc::clone(&self.configuration);
-        let paths = Arc::clone(&self.paths);
-        let listeners = Arc::clone(&self.listeners);
-        tokio::task::spawn_blocking(move || {
-            let _save = save;
-            prepare_metadata_path(&paths, &replacement.metadata_path, Some(&old_metadata))?;
-            if let Some(cache) = replacement
-                .cache_path
-                .as_deref()
-                .filter(|p| !p.trim().is_empty())
-            {
-                let cache_path = PathBuf::from(cache);
-                if old_cache.as_deref() != Some(cache) {
-                    if !cache_path.is_dir() {
-                        return Err(ServiceError::not_found(format!(
-                            "cache path does not exist: {cache}"
-                        )));
-                    }
-                    let probe = cache_path.join(uuid::Uuid::new_v4().to_string());
-                    std::fs::File::create_new(&probe)
-                        .and_then(|_| std::fs::remove_file(&probe))
-                        .map_err(|e| io_err("validate cache directory", &cache_path, &e))?;
-                }
-                FerrofinServerApplicationPaths::prepare_cache_path(&cache_path)
-                    .map_err(|e| io_err("prepare cache directory", &cache_path, &e))?;
-            }
-            ferrofin_util::file_helper::atomic_write(&path, &json)
-                .map_err(|e| io_err("write configuration", &path, &e))?;
-            *current.write().expect("configuration lock poisoned") = Arc::clone(&replacement);
-            publish_key_policies(&replacement);
-            paths.set_cache_path(replacement.cache_path.as_deref());
-            paths.set_internal_metadata_path(Some(&replacement.metadata_path));
-            notify_listeners(&listeners, &ConfigurationUpdate::Server(replacement));
-            Ok(())
-        })
-        .await
-        .map_err(|e| ServiceError::backend(format!("configuration writer: {e}")))?
+        self.commit(save, configuration.clone()).await
     }
 
     async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
@@ -1298,6 +1351,7 @@ fn import_system_xml(xml: &str) -> Result<ServerConfiguration, ServiceError> {
         "ServerConfiguration",
         config_import::SYSTEM_XML_DENY,
     )
+    .map_err(ServiceError::from)
 }
 
 /// Serializes and writes a configuration to `path` (creating the parent dir).
@@ -1397,6 +1451,57 @@ mod tests {
         let bytes = std::fs::read(&mgr.config_file).expect("read config");
         let persisted: ServerConfiguration = serde_json::from_slice(&bytes).expect("parse config");
         assert!(persisted.is_port_authorized);
+    }
+
+    /// gl-1701: `OnConfigurationUpdated` (ApplicationHost.cs:804-818) clears
+    /// `IsPortAuthorized` and saves when the saved ports differ from the ones
+    /// served, and again after any later save while they still do.
+    #[tokio::test]
+    async fn a_port_change_clears_the_port_authorized_flag_until_the_ports_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        let notified = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&notified);
+        mgr.add_configuration_listener(Arc::new(move |update| {
+            if let ConfigurationUpdate::Server(configuration) = update {
+                seen.lock().unwrap().push(configuration.is_port_authorized);
+            }
+        }));
+        let persisted = || {
+            let bytes = std::fs::read(&mgr.config_file).expect("read config");
+            serde_json::from_slice::<ServerConfiguration>(&bytes)
+                .expect("parse config")
+                .is_port_authorized
+        };
+
+        // Not while the ports match.
+        mgr.revoke_port_authorization().await.expect("no-op");
+        assert!(mgr.snapshot().is_port_authorized);
+
+        mgr.set_ports_changed(true);
+        mgr.revoke_port_authorization().await.expect("revoke");
+        assert!(!mgr.snapshot().is_port_authorized);
+        assert!(!persisted());
+        // Already clear: nothing is saved again.
+        mgr.revoke_port_authorization().await.expect("no-op");
+        assert_eq!(*notified.lock().unwrap(), [false]);
+
+        // A dashboard page loaded before the change saves it back as true.
+        let mut stale = mgr.snapshot();
+        stale.is_port_authorized = true;
+        stale.server_name = "kept".to_owned();
+        mgr.update_configuration(&stale).await.expect("save");
+        assert!(!mgr.snapshot().is_port_authorized);
+        assert_eq!(mgr.snapshot().server_name, "kept");
+        assert!(!persisted());
+
+        // The ports saved back to the ones served: a save keeps what it says.
+        mgr.set_ports_changed(false);
+        mgr.update_configuration(&stale).await.expect("save");
+        assert!(mgr.snapshot().is_port_authorized);
+        assert!(persisted());
     }
 
     #[tokio::test]

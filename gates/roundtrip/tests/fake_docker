@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# A docker for roundtrip.bats: it records every call in $FAKE_STATE/calls and plays each container with
+# fake_server.py on a free loopback port. A Ferrofin container answers as Ferrofin, and logs the boot lines
+# adoption_check_boot_log reads (the generation from the fixture's fake-generation file). A Jellyfin
+# container answers from a copy of what the Ferrofin one left (its state travels in the copy), and prints
+# jellyfin-ok.log, or, on a copy of the 10.11.8 route, jellyfin-start-failed.log and 503 for everything,
+# as Jellyfin's setup server does after a failed start. An image whose name holds "dead" makes containers
+# that exit at once. A tag only exists once `docker tag` made it. A container's id is not its name, and
+# `rm` takes only an id (a name is "No such container"); each removal is logged by name in $FAKE_STATE/removed.
+# Knobs: FAKE_RUN_DELAY (seconds a run takes), FAKE_EXIT_CODE (what a stopped container exited with),
+# FAKE_JELLYFIN=loses (Jellyfin's copy has lost a favorite), =hang (it answers 503 and never logs why) or
+# =exits (it stops with status 3 before it answers).
+set -uo pipefail
+state=${FAKE_STATE:?}
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+echo "$*" >> "$state/calls"
+last=${*: -1}
+alive() { [ -f "$state/$1.pid" ] && kill -0 "$(cat "$state/$1.pid")" 2>/dev/null; }
+case "$1" in
+  image)
+    case "$*" in *missing*) exit 1;; esac
+    case $last in ferrofin-roundtrip:*) [ -f "$state/tag-${last#*:}" ] || exit 1;; esac
+    case "$*" in *'{{.Id}}'*) echo "sha256:fake-${last//[^a-z0-9]/-}";; *revision*) echo 0123abc;; esac
+    exit 0;;
+  tag) echo "$2" > "$state/tag-${3#*:}"; exit 0;;
+  rmi) rm -f "$state/tag-${2#*:}"; exit 0;;
+  run)
+    args=("$@"); image=$last name='' cid='' config=''
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      case ${args[i]} in
+        --name) name=${args[i+1]};;
+        --cidfile) cid=${args[i+1]};;
+        -v) case ${args[i+1]} in *:/config) config=${args[i+1]%:/config};; esac;;
+      esac
+    done
+    if [ -e "$state/$name.name" ]; then echo "Conflict. The container name \"/$name\" is already in use" >&2; exit 125; fi
+    case $image in ferrofin-roundtrip:*) image=$(cat "$state/tag-${image#*:}");; esac
+    sleep "${FAKE_RUN_DELAY:-0}"
+    id=cid-$(printf '%s' "$name" | sha1sum | cut -c1-12)
+    echo "$name" > "$state/$name.name"; echo "$name" > "$state/$id.id"; echo "$id" > "$cid"
+    case $image in *dead*) exit 0;; esac
+    role=ferrofin behaviour=ok log=ok
+    if [ "${name%-jellyfin}" != "$name" ]; then
+      role=jellyfin
+      case $config in */10.11.8/*) behaviour=start-failed log=start-failed;; esac
+      case ${FAKE_JELLYFIN:-} in loses) behaviour=loses;; hang) behaviour=start-failed;; exits) behaviour=exits; echo 3 > "$state/$name.exit";; esac
+    fi
+    echo "$role $log $config" > "$state/$name.role"
+    setsid python3 "$here/fake_server.py" serve "$state/$name.port" "$role" "$config" "$behaviour" >/dev/null 2>&1 &
+    echo $! > "$state/$name.pid"
+    for _ in $(seq 50); do [ -f "$state/$name.port" ] && exit 0; sleep 0.1; done
+    echo "fake docker: the server for $name never listened" >&2; exit 1;;
+  port) [ -f "$state/$2.port" ] || exit 1; echo "127.0.0.1:$(cat "$state/$2.port")"; exit 0;;
+  inspect)
+    case "$*" in
+      *Running*) if alive "$last"; then echo true; else echo false; fi;;
+      *ExitCode*) if [ -f "$state/$last.exit" ]; then cat "$state/$last.exit"; else echo "${FAKE_EXIT_CODE:-0}"; fi;;
+    esac
+    exit 0;;
+  logs)
+    read -r role log config < "$state/$last.role" 2>/dev/null || exit 0
+    if [ "$role" = ferrofin ]; then
+      printf '{"level":"INFO","fields":{"message":"adopted an existing Jellyfin database in place","generation":"%s"}}\n' \
+        "$(cat "$config/fake-generation")"
+      echo '{"level":"INFO","fields":{"message":"database migrations applied","migrations":49,"head":49}}'
+    else
+      cat "$here/jellyfin-$log.log"
+    fi
+    exit 0;;
+  stop) ! alive "$last" || kill "$(cat "$state/$last.pid")"; exit 0;;
+  rm)
+    [ -f "$state/$last.id" ] || { echo "Error response from daemon: No such container: $last" >&2; exit 1; }
+    name=$(cat "$state/$last.id")
+    ! alive "$name" || kill "$(cat "$state/$name.pid")"
+    rm -f "$state/$name".* "$state/$last.id"; echo "$name" >> "$state/removed"; exit 0;;
+esac
+echo "unexpected docker $*" >&2
+exit 99

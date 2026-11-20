@@ -24,7 +24,6 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use ferrofin_chromaprint::AnalysisMode;
-use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::intro_skipper::AnalysisMode as WireMode;
@@ -35,7 +34,8 @@ use ferrofin_traits::intro_skipper::{
 };
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProvider};
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
+use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -47,7 +47,9 @@ mod black_frame;
 mod chapter_analyzer;
 mod config_hash;
 mod credit_scenes;
+mod editor;
 mod engine;
+mod platform;
 mod queue;
 
 use crate::{Extension, ExtensionContext};
@@ -129,10 +131,7 @@ impl Extension for IntroSkipperExtension {
             Arc::clone(&detect) as Arc<dyn ScheduledTask>,
             Arc::new(MediaSegmentScanTask {
                 detect: Arc::clone(&detect),
-                providers: ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
-                    Arc::clone(&cx.library),
-                    Arc::clone(&cx.media_segments),
-                ),
+                providers: Arc::clone(&cx.media_segment_scan),
             }),
             Arc::new(CleanCacheTask { detect }),
         ]
@@ -140,8 +139,7 @@ impl Extension for IntroSkipperExtension {
 
     fn media_segment_providers(&self, cx: &ExtensionContext) -> Vec<Arc<dyn MediaSegmentProvider>> {
         vec![Arc::new(SegmentProvider {
-            plugins: Arc::clone(&cx.plugins),
-            store: Arc::clone(&cx.intro_skipper),
+            detect: detector(cx),
         })]
     }
 }
@@ -151,8 +149,9 @@ impl Extension for IntroSkipperExtension {
 /// ([`intro_store::published`]). The core "Media Segment Scan" runs it over
 /// the library; it analyses nothing.
 struct SegmentProvider {
-    plugins: Arc<dyn PluginManager>,
-    store: Arc<dyn intro_store::IntroSkipperStore>,
+    /// The detection pass; its segment manager holds this provider, a cycle
+    /// that lives as long as the server does.
+    detect: DetectSegmentsTask,
 }
 
 #[async_trait]
@@ -172,6 +171,7 @@ impl MediaSegmentProvider for SegmentProvider {
             return Ok(false);
         }
         Ok(self
+            .detect
             .plugins
             .get_plugin(EXTENSION_ID)
             .await?
@@ -181,8 +181,18 @@ impl MediaSegmentProvider for SegmentProvider {
         &self,
         request: &MediaSegmentGenerationRequest,
     ) -> Result<Vec<MediaSegmentDto>, ServiceError> {
-        let stored = self.store.segments_unless_excluded(request.item_id).await?;
+        let stored = self
+            .detect
+            .actions
+            .segments_unless_excluded(request.item_id)
+            .await?;
         Ok(intro_store::published(request.item_id, &stored))
+    }
+    /// A changed file (the scan's prune): [`DetectSegmentsTask::forget_item`],
+    /// with the plugin enabled or not, or the old analysis would come back
+    /// with it. Upstream's provider has no cleanup and keeps the old analysis.
+    async fn cleanup(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        self.detect.forget_item(item_id).await
     }
 }
 
@@ -206,7 +216,7 @@ fn detector(cx: &ExtensionContext) -> DetectSegmentsTask {
 }
 
 /// The Intro Skipper's analysis runtime for the plugin routes (`ScanSeason`,
-/// `ScanStatus`, `eraseCache`).
+/// `ScanStatus`, `eraseCache`, the segment editor, the support bundle).
 #[must_use]
 pub fn analysis(cx: &ExtensionContext) -> Arc<dyn IntroSkipperAnalysis> {
     Arc::new(detector(cx))
@@ -278,11 +288,8 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
         // the whole queue now, without ffprobe (it moves windows, not counts).
         // The whole build clears the flag, so a failed or dropped one leaves it.
         if self.runtime.counts_stale.load(Ordering::Relaxed) {
-            let config = IntroSkipperConfig {
-                probe_audio_duration: false,
-                ..(*self.load_config().await).clone()
-            };
-            if let Err(err) = self.queue(&config, None).await {
+            let config = self.load_config().await;
+            if let Err(err) = self.queue_unprobed(&config).await {
                 tracing::warn!(%err, "intro skipper: could not count the queue for the support bundle");
             }
         }
@@ -310,11 +317,22 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
         )
     }
 
+    fn operating_system(&self) -> String {
+        platform::operating_system()
+    }
+
+    async fn create_or_replace_segment(
+        &self,
+        segment: &MediaSegmentDto,
+    ) -> Result<(), ServiceError> {
+        editor::create_or_replace_segment(self.media_segments.as_ref(), segment).await
+    }
+
     async fn clear_excluded(&self) -> Result<intro_store::ExcludedClear, ServiceError> {
         let config = self.load_config().await;
         // `GetExcludedInventoryAsync`: the queue with the excluded items in.
         let mut ids: Vec<Uuid> = self
-            .queue(&config, None)
+            .queue_unprobed(&config)
             .await?
             .into_iter()
             .flat_map(|(_, entries)| entries)
@@ -354,12 +372,13 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
 /// The "Media Segment Scan" task (`TaskExtractMediaSegments`), which this
 /// extension registers in place of the core one while it is loaded: the
 /// detection pass first (owner decision D5: the scan keeps running
-/// detection), then the core `MediaSegmentExtractionTask`, which runs every
-/// registered segment provider — this plugin's [`SegmentProvider`], which
-/// publishes what detection stored, and any other — over the library.
+/// detection), then the core task
+/// ([`ExtensionContext::media_segment_scan`]), which runs every registered
+/// segment provider — this plugin's [`SegmentProvider`], which publishes what
+/// detection stored, and any other — over the library.
 struct MediaSegmentScanTask {
     detect: Arc<DetectSegmentsTask>,
-    providers: ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask,
+    providers: Arc<dyn ScheduledTask>,
 }
 
 #[async_trait]
@@ -781,8 +800,9 @@ impl ScheduledTask for DetectSegmentsTask {
         }
         // The automatic analysis gives way, then this waits its turn for the
         // one-pass latch (`ScheduledTaskSemaphore.AcquireAsync`) — a rescan
-        // may hold it. The guard releases it even if the run is aborted
-        // mid-await (the task manager cancels a run by aborting its task).
+        // may hold it. The guard releases it even if the run is dropped
+        // mid-await (the task manager drops a run that does not stop in time,
+        // and aborts one at shutdown).
         self.cancel_automatic().await;
         let _release = self.running.acquire().await?;
         let config = self.load_config().await;
@@ -796,6 +816,21 @@ impl ScheduledTask for DetectSegmentsTask {
 }
 
 impl DetectSegmentsTask {
+    /// The whole [`Self::queue`] for a caller that reads only its ids,
+    /// exclusion flags and seasons: built without `ProbeAudioDuration`, whose
+    /// ffprobe per entry moves only the credits windows. Upstream probes here
+    /// too.
+    async fn queue_unprobed(
+        &self,
+        config: &IntroSkipperConfig,
+    ) -> Result<queue::Queue, ServiceError> {
+        let config = IntroSkipperConfig {
+            probe_audio_duration: false,
+            ..config.clone()
+        };
+        self.queue(&config, None).await
+    }
+
     /// The queue (`QueueManager.GetMediaItems(includeExcluded: true)`): every
     /// entry, excluded ones flagged; with `only`, just those seasons (and
     /// movies), as `AnalyzeItemsAsync(seasonsToAnalyze)` filters it.
@@ -848,7 +883,7 @@ impl DetectSegmentsTask {
                 return;
             }
         };
-        let stored = self.analyze_queue(&queue, config, progress).await;
+        let stored = self.analyze_queue(queue, config, progress).await;
         progress.report(100.0);
         tracing::info!(analyzed = stored, "intro skipper: analysis complete");
     }
@@ -936,7 +971,7 @@ impl DetectSegmentsTask {
         let _release = self.running.acquire().await?;
         let config = self.load_config().await;
         // Excluded items keep their state: only leaving a library is stale.
-        let queue = self.queue(&config, None).await?;
+        let queue = self.queue_unprobed(&config).await?;
         let live: HashSet<Uuid> = queue
             .iter()
             .flat_map(|(_, entries)| entries.iter().map(|e| e.episode_id))
@@ -1060,9 +1095,34 @@ impl DetectSegmentsTask {
         }
         // `AnalyzeItemsAsync(seasonsToAnalyze: [seasonId])`.
         let stored = self
-            .analyze_queue(&[(season_id, entries)], &config, &TaskProgress::default())
+            .analyze_queue(
+                vec![(season_id, entries)],
+                &config,
+                &TaskProgress::default(),
+            )
             .await;
         tracing::info!(%season_id, analyzed = stored, "intro skipper: season rescanned");
+    }
+
+    /// Forgets what was detected in an item's old file, so the next pass
+    /// analyses the new one: its detection caches, then its detected segments
+    /// and its place in the analysed lists; segments a user entered stay.
+    /// Only a changed file's prune runs it (the provider's cleanup), and a
+    /// season's analysis that was working on the item when it ran, once more
+    /// after storing its results ([`Self::forget_changed`]).
+    async fn forget_item(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        // Caches first: if the store write then fails, the old analysis
+        // stands whole, where the other order could analyse the new file
+        // from the old one's prints. A file that cannot be removed is passed
+        // over, as the erase route does.
+        let forget = async {
+            let removed = self.erase_cache_files(Some(&[item_id]), None).await?;
+            self.actions.forget_items(&[item_id]).await?;
+            Ok::<_, ServiceError>(removed)
+        };
+        let removed = self.runtime.analyses.change(&item_id, forget).await?;
+        tracing::debug!(%item_id, cache_files = removed, "intro skipper: a changed file's analysis forgotten");
+        Ok(())
     }
 
     /// Deletes the detection caches (`{item}.{mode tag}.…`: prints, silences,
@@ -2079,9 +2139,11 @@ mod tests {
     fn scan_task(h: &Harness) -> MediaSegmentScanTask {
         MediaSegmentScanTask {
             detect: Arc::new(h.task.clone()),
-            providers: ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
-                Arc::clone(&h.task.library),
-                Arc::clone(&h.segments),
+            providers: Arc::new(
+                ferrofin_core::scheduled_tasks::library::MediaSegmentExtractionTask::new(
+                    Arc::clone(&h.task.library),
+                    Arc::clone(&h.segments),
+                ),
             ),
         }
     }
@@ -2119,21 +2181,18 @@ mod tests {
     fn register_provider(h: &Harness) {
         h.segments
             .register_segment_provider(Arc::new(SegmentProvider {
-                plugins: Arc::clone(&h.task.plugins),
-                store: Arc::clone(&h.task.actions),
+                detect: h.task.clone(),
             }));
     }
 
     /// The cache files a detection run left behind for `id`.
     pub(super) fn cache_files(h: &Harness, id: Uuid) -> Vec<String> {
-        std::fs::read_dir(h.task.cache_dir.resolve())
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
-                    .filter(|name| name.starts_with(&id.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        std::fs::read_dir(h.task.cache_dir.resolve()).map_or_default(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|name| name.starts_with(&id.to_string()))
+                .collect()
+        })
     }
 
     /// `DeleteForItem` / `DeleteByMode`: by item, by mode, or everything —
@@ -2261,12 +2320,12 @@ mod tests {
         let (series, season, specials, other) = (id(0x51), id(0x52), id(0x53), id(0x54));
         let episode =
             |n: u128, path: &str, season_id: Uuid, series_id: Uuid, number: i64| BaseItemEntity {
-                id: id(n).to_string(),
+                id: guid_to_db(id(n)),
                 type_: ty(BaseItemKind::Episode).to_owned(),
                 path: Some(path.to_owned()),
                 run_time_ticks: Some(1_800 * 10_000_000),
-                season_id: Some(season_id.to_string()),
-                series_id: Some(series_id.to_string()),
+                season_id: Some(guid_to_db(season_id)),
+                series_id: Some(guid_to_db(series_id)),
                 series_name: Some(if series_id == other { "Other" } else { "Show" }.to_owned()),
                 parent_index_number: Some(number),
                 ..BaseItemEntity::default()
@@ -2275,7 +2334,7 @@ mod tests {
         special.data = Some(r#"{"AirsBeforeSeasonNumber":1}"#.to_owned());
         let rows = vec![
             BaseItemEntity {
-                id: series.to_string(),
+                id: guid_to_db(series),
                 type_: ty(BaseItemKind::Series).to_owned(),
                 genres: Some("Anime".to_owned()),
                 ..BaseItemEntity::default()
@@ -2286,7 +2345,7 @@ mod tests {
             episode(0x64, "/media/other/s01e01.mkv", id(0x55), other, 1),
             episode(0x65, "/disabled/show/s01e01.mkv", id(0x56), series, 1),
             BaseItemEntity {
-                id: id(0x66).to_string(),
+                id: guid_to_db(id(0x66)),
                 type_: ty(BaseItemKind::Movie).to_owned(),
                 path: Some("/media/movies/film.mkv".to_owned()),
                 name: Some("Film".to_owned()),
@@ -2608,6 +2667,29 @@ mod tests {
             intros_of(&h.segments, EP_A).await.is_empty(),
             "republished as empty"
         );
+    }
+
+    /// Clean cache and Clear excluded read only the queue's ids, exclusion
+    /// flags and seasons, so `ProbeAudioDuration`, which moves only the
+    /// credits windows, runs no ffprobe for them, though a queue for analysis
+    /// still probes.
+    #[tokio::test]
+    async fn clean_cache_and_clear_excluded_run_no_audio_probe() {
+        let h = harness(&TWO_EPISODES, true, r#"{"ProbeAudioDuration":true}"#, true).await;
+        let ffmpeg = Arc::new(crate::ffmpeg::FakeFfmpeg {
+            audio_duration: Some(1_700.0),
+            ..crate::ffmpeg::FakeFfmpeg::default()
+        });
+        let task = DetectSegmentsTask {
+            ffmpeg: Arc::clone(&ffmpeg) as Arc<dyn FfmpegService>,
+            ..h.task.clone()
+        };
+        task.clean_cache().await.expect("clean");
+        task.clear_excluded().await.expect("clear");
+        assert_eq!(ffmpeg.take_probes(), Vec::<String>::new());
+        let config = task.load_config().await;
+        task.queue(&config, None).await.expect("queue");
+        assert_eq!(ffmpeg.take_probes().len(), TWO_EPISODES.len());
     }
 
     /// `VerifyQueueAsync` + the configuration hash: an analysed season is not
@@ -2983,11 +3065,9 @@ mod tests {
         }
     }
 
-    /// `TestBlackFrames.TestEndCreditDetection`: a 5:30 episode whose credits
-    /// go black at 300 s, bisected from 240 s from the end, is found within
-    /// 3 s — against the fake, and (`FERROFIN_FFMPEG_TESTS`) a generated clip.
-    #[tokio::test]
-    async fn end_credit_detection() {
+    /// `TestBlackFrames.TestEndCreditDetection`'s 5:30 episode, whose credits
+    /// go black at 300 s, with the settings it bisects under.
+    async fn end_credit_case() -> (Harness, IntroSkipperConfig, queue::QueuedEpisode) {
         let h = harness(&TWO_EPISODES, true, "{}", false).await;
         let config = IntroSkipperConfig {
             black_frame_minimum_percentage: 85,
@@ -3000,6 +3080,15 @@ mod tests {
             credits_fingerprint_start: 0.0,
             ..queued[0].1[0].clone()
         };
+        (h, config, entry)
+    }
+
+    /// `TestBlackFrames.TestEndCreditDetection`: the credits of
+    /// [`end_credit_case`], bisected from 240 s from the end, are found within
+    /// 3 s, against the fake.
+    #[tokio::test]
+    async fn end_credit_detection() {
+        let (h, config, entry) = end_credit_case().await;
         let fake = with_ffmpeg(
             &h,
             crate::ffmpeg::FakeFfmpeg {
@@ -3014,10 +3103,15 @@ mod tests {
             .expect("bisect")
             .expect("credits");
         assert!((297.0..=303.0).contains(&start), "{start}");
+    }
 
-        if std::env::var_os("FERROFIN_FFMPEG_TESTS").is_none() {
-            return;
-        }
+    /// [`end_credit_detection`] against a generated clip and the real ffmpeg,
+    /// on a harness of its own: the black-frame cache is keyed by episode, not
+    /// path, so after the fake's run every window would be read from it.
+    #[tokio::test]
+    #[ignore = "runs the real ffmpeg; run with --ignored"]
+    async fn real_ffmpeg_end_credit_detection() {
+        let (h, config, entry) = end_credit_case().await;
         let clip = h.cache.path().join("credits.mkv");
         let clip = clip.to_str().expect("utf-8").to_owned();
         let made = crate::ffmpeg::output(
@@ -3065,7 +3159,10 @@ mod tests {
             .await
             .expect("bisect")
             .expect("credits");
-        assert!((297.0..=303.0).contains(&start), "{start}");
+        // The bisection ends on the window at 303 s, the tolerance's edge: its
+        // halvings put that window's start at 303.0000000335, and ffmpeg reports
+        // the first frame at t=0 (the fake's tenths land on 303.0 exactly).
+        assert!((297.0..=303.0 + 1e-6).contains(&start), "{start}");
     }
 
     /// Black frames are cached as ffmpeg reported them; the
@@ -3353,6 +3450,37 @@ mod tests {
         assert_eq!(h.calls.load(Ordering::SeqCst), 0);
         let found = intros_of(&h.segments, EP_A).await;
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// `AnalyzeItemsAsync` analyses only the queue's non-excluded items: an
+    /// excluded episode is never fingerprinted or given a segment. The last
+    /// run excludes nothing, so both episodes are compared and each gets an
+    /// intro.
+    #[tokio::test]
+    async fn excluded_queue_entries_are_not_analysed() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let config = h.task.load_config().await;
+        let queue = h.task.queue(&config, None).await.expect("queue");
+        let excluding = |excluded: &[Uuid]| {
+            let mut queue = queue.clone();
+            for (_, entries) in &mut queue {
+                for entry in entries {
+                    entry.is_excluded = excluded.contains(&entry.episode_id);
+                }
+            }
+            queue
+        };
+        let progress = TaskProgress::default();
+        let run = |queue| h.task.analyze_queue(queue, &config, &progress);
+        assert_eq!(run(excluding(&[EP_A, EP_B])).await, 0);
+        assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+        run(excluding(&[EP_B])).await;
+        let b = h.actions.segments(EP_B).await.expect("tier");
+        assert!(b.is_empty(), "{b:?}");
+        assert!(run(excluding(&[])).await > 0);
+        for id in [EP_A, EP_B] {
+            assert_eq!(intros_of(&h.segments, id).await.len(), 1, "{id}");
+        }
     }
 
     /// The only episode still needing analysis is compared with its analysed
@@ -3849,8 +3977,7 @@ mod tests {
             .await
             .expect("detect");
         let provider = SegmentProvider {
-            plugins: Arc::clone(&h.task.plugins),
-            store: Arc::clone(&h.task.actions),
+            detect: h.task.clone(),
         };
         assert_eq!(provider.name(), "Intro Skipper");
         let episode = h
@@ -3886,10 +4013,132 @@ mod tests {
 
         let disabled = harness(&TWO_EPISODES, false, "{}", true).await;
         let provider = SegmentProvider {
-            plugins: Arc::clone(&disabled.task.plugins),
-            store: Arc::clone(&disabled.task.actions),
+            detect: disabled.task.clone(),
         };
         assert!(!provider.supports(&episode).await.expect("supports"));
+    }
+
+    /// A changed file (the scan's prune, `MediaSegmentManager::delete_segments`
+    /// calling the provider's cleanup): the episode's detected segments, its
+    /// place in the analysed lists and its detection caches go, so the next
+    /// Media Segment Scan analyses the new file rather than republishing the
+    /// old intro. A user-provided segment and the other episode stay.
+    #[tokio::test]
+    async fn a_changed_file_is_analysed_again() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        register_provider(&h);
+        let scan = scan_task(&h);
+        scan.execute(&TaskProgress::default()).await.expect("first");
+        let user = StoredSegment {
+            item_id: EP_A,
+            mode: WireMode::Credits,
+            start: 1700.0,
+            end: 1790.0,
+            is_user_provided: true,
+            config_hash: String::new(),
+        };
+        h.actions
+            .update_timestamp(user.clone())
+            .await
+            .expect("user edit");
+        assert!(intro_state(&h).await.episode_ids.contains(&EP_A));
+        assert_ne!(cache_files(&h, EP_A), Vec::<String>::new());
+        let files_b = || {
+            let mut files = cache_files(&h, EP_B);
+            files.sort();
+            files
+        };
+        let kept_b = (h.actions.segments(EP_B).await.expect("B"), files_b());
+        let calls = h.calls.load(Ordering::SeqCst);
+
+        h.segments.delete_segments(EP_A).await.expect("prune");
+
+        assert_eq!(h.actions.segments(EP_A).await.expect("A"), vec![user]);
+        let state = intro_state(&h).await;
+        assert!(!state.episode_ids.contains(&EP_A), "{state:?}");
+        assert!(state.episode_ids.contains(&EP_B), "{state:?}");
+        assert_eq!(cache_files(&h, EP_A), Vec::<String>::new());
+        assert_eq!(
+            (h.actions.segments(EP_B).await.expect("B"), files_b()),
+            kept_b
+        );
+
+        scan.execute(&TaskProgress::default())
+            .await
+            .expect("second");
+        let again = h.calls.load(Ordering::SeqCst);
+        assert!(again > calls, "the new file is fingerprinted");
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+        scan.execute(&TaskProgress::default()).await.expect("third");
+        assert_eq!(h.calls.load(Ordering::SeqCst), again, "and only once");
+    }
+
+    /// A fingerprinter whose first call notifies the first `Notify` and waits
+    /// for the second.
+    struct HoldFirst {
+        inner: Arc<dyn Fingerprinter>,
+        hold: std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    }
+
+    #[async_trait]
+    impl Fingerprinter for HoldFirst {
+        async fn fingerprint(
+            &self,
+            path: &str,
+            start: f64,
+            end: f64,
+            options: ProcessOptions,
+        ) -> Result<Vec<u32>, String> {
+            let hold = self.hold.lock().expect("hold").take();
+            if let Some((entered, release)) = hold {
+                entered.notify_one();
+                release.notified().await;
+            }
+            self.inner.fingerprint(path, start, end, options).await
+        }
+    }
+
+    /// gl-1694: a changed file's prune while a pass analyses its season (from
+    /// the old file) is applied again once the pass has stored its results:
+    /// the episode leaves the analysed lists with its detected segments,
+    /// published ones and caches, so the next pass analyses the new file.
+    #[tokio::test]
+    async fn a_prune_during_the_analysis_is_applied_again_after_it() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        register_provider(&h);
+        let (entered, release) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let mut held = h.task.clone();
+        held.fingerprinter = Some(Arc::new(HoldFirst {
+            inner: held.fingerprinter.clone().expect("fingerprinter"),
+            hold: std::sync::Mutex::new(Some((Arc::clone(&entered), Arc::clone(&release)))),
+        }));
+        let pass = tokio::spawn(async move { held.execute(&TaskProgress::default()).await });
+        entered.notified().await;
+        h.segments.delete_segments(EP_A).await.expect("prune");
+        release.notify_one();
+        pass.await.unwrap().expect("pass");
+
+        let state = intro_state(&h).await;
+        assert!(!state.episode_ids.contains(&EP_A), "{state:?}");
+        assert!(state.episode_ids.contains(&EP_B), "{state:?}");
+        assert_eq!(h.actions.segments(EP_A).await.expect("A"), vec![]);
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 0);
+        assert_eq!(cache_files(&h, EP_A), Vec::<String>::new());
+        assert_eq!(intros_of(&h.segments, EP_B).await.len(), 1);
+
+        let calls = h.calls.load(Ordering::SeqCst);
+        scan_task(&h)
+            .execute(&TaskProgress::default())
+            .await
+            .expect("next pass");
+        assert!(
+            h.calls.load(Ordering::SeqCst) > calls,
+            "the new file is fingerprinted"
+        );
+        assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
     }
 
     /// `DetectSegmentsTask`'s identity (D6): upstream's key, name and
