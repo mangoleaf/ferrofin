@@ -24,10 +24,11 @@
 //!    `azp` naming the client), `azp`, expiry and nonce;
 //! 8. when the username claim, or the role claim of a provider that reads
 //!    roles, is not in the ID token, the userinfo answer's `sub`, which must
-//!    be the ID token's. Asked only for the `picture` claim of a provider
-//!    that syncs pictures ([`avatar_sync`](super::avatar_sync)), userinfo
-//!    refuses nothing: an answer that fails is not used, and of one that
-//!    passes only the `picture` is taken.
+//!    be the ID token's. Asked only for the `picture` claim, by a sign-in
+//!    (not a link flow) at a provider that syncs pictures
+//!    ([`avatar_sync`](super::avatar_sync)), userinfo refuses nothing: an
+//!    answer that fails is not used, and of one that passes only the
+//!    `picture` is taken.
 //!
 //! `SsoService::sign_in_verified` then refuses an identity without the
 //! provider's required role ([`roles`](super::roles)) before any account is
@@ -559,7 +560,7 @@ impl SsoService {
             {
                 claims.entry(name).or_insert(value);
             }
-        } else if super::avatar_sync::wants_userinfo(provider, &claims) {
+        } else if super::avatar_sync::wants_userinfo(provider, &flow.purpose, &claims) {
             // Asked for the picture only, which never fails a sign-in (B16).
             match self
                 .userinfo(provider, &metadata, tokens.access_token(), &subject)

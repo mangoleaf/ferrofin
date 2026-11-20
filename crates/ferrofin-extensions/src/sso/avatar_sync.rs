@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 use super::SsoService;
 use super::accounts::PROVIDER_ID;
+use super::flows::FlowPurpose;
 use super::sign_in::VerifiedIdentity;
 use crate::profile_images::{quoted, replace_picture};
 
@@ -57,11 +58,18 @@ pub(super) struct AvatarSync {
     storing: Arc<tokio::sync::Mutex<()>>,
 }
 
-/// Whether a sign-in at `provider` whose ID token holds `claims` asks the
-/// userinfo endpoint for the picture: only with picture sync on and the claim
-/// missing from the ID token.
-pub(super) fn wants_userinfo(provider: &OidcProvider, claims: &Map<String, Value>) -> bool {
-    provider.sync_profile_pictures && !claims.contains_key(PICTURE_CLAIM)
+/// Whether a flow for `purpose` at `provider` whose ID token holds `claims`
+/// asks the userinfo endpoint for the picture: only with picture sync on, the
+/// claim missing from the ID token, and a flow that signs the account in (a
+/// link flow starts no sync).
+pub(super) fn wants_userinfo(
+    provider: &OidcProvider,
+    purpose: &FlowPurpose,
+    claims: &Map<String, Value>,
+) -> bool {
+    provider.sync_profile_pictures
+        && !matches!(purpose, FlowPurpose::Link(_))
+        && !claims.contains_key(PICTURE_CLAIM)
 }
 
 impl SsoService {

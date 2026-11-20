@@ -474,3 +474,40 @@ fn a_logged_picture_url_keeps_its_scheme_and_host_only() {
         "a value of 30 characters"
     );
 }
+
+/// A link flow opens no session and starts no picture sync, so it never asks
+/// userinfo for the picture.
+#[tokio::test]
+async fn a_link_flow_never_asks_userinfo_for_the_picture() {
+    use ferrofin_traits::sso::SsoManager as _;
+    let harness = syncing(Arc::new(FakeImages::default())).await;
+    picture_claim(&harness, Value::Null);
+    let user = harness.users.create_user("linker").await.expect("created");
+    let client = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
+    let started = Harness::started(
+        harness
+            .sso
+            .start_oidc_link("fake", Uuid::parse_str(&user.id).expect("an id"), client)
+            .await
+            .expect("starts"),
+    );
+    let callback = harness.callback(&started).await;
+    let page = harness
+        .sso
+        .finish_oidc_sign_in("fake", callback)
+        .await
+        .expect("an answer");
+    assert_eq!(page.status, 200, "{}", page.html);
+    assert_eq!(
+        harness.link().await.user_id,
+        Uuid::parse_str(&user.id).expect("an id"),
+        "linked"
+    );
+    let userinfo_calls = harness
+        .fake
+        .requests()
+        .iter()
+        .filter(|request| request.path == harness.fake.path(USERINFO_PATH))
+        .count();
+    assert_eq!(userinfo_calls, 0);
+}
