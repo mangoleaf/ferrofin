@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The Jellyfin stage of a round-trip route, sourced by run.sh: boot the Jellyfin release under test on what
-# the export wrote, read its log (checks_boot.py), compare its answers with Ferrofin's oracle and check the
-# file once it has stopped. It uses run.sh's state: route, dst, first_start, the settings, FIXTURES, JELLYFIN_ID,
-# MADE, and why[] through check and mark.
+# the export wrote, read its log (checks_boot.py), compare its answers with Ferrofin's oracle, probe the files
+# it serves (probes.py), scan its libraries, and check the file and its library rows (checks_paths.py) once it
+# has stopped. It uses run.sh's state: route, dst, first_start, the settings, FIXTURES, JELLYFIN_ID, MADE, and
+# why[] through check and mark.
 # shellcheck disable=SC2154  # run.sh sets what this reads
 
 # jellyfin_stage: the Jellyfin checks of one route, each recorded.
@@ -46,6 +47,12 @@ jellyfin_stage() {
       python3 "$HERE/answers.py" --base-url "$url" --data-dir "$dst/jellyfin" --out "$dst/answers.txt"
     [ ! -f "$dst/answers.txt" ] || check rt_compare_answers "$dst/oracle.txt" "$dst/answers.txt"
     mark Jellyfin "answers equal Ferrofin's before the stop"
+    check reasons_within "$SCAN_TIMEOUT" "the probes" \
+      python3 "$HERE/probes.py" --base-url "$url" --data-dir "$dst/jellyfin" --before "$dst/ferrofin/data/jellyfin.db" \
+      --out "$dst/probes.txt"
+    mark Jellyfin "it serves every image, trickplay tile, subtitle and attachment its database lists"
+    check reasons python3 "$HERE/api.py" scan --base-url "$url" --data-dir "$dst/jellyfin" --timeout "$SCAN_TIMEOUT"
+    mark Jellyfin "its library scan completes"
   fi
   if [ -s "$cid" ]; then
     rt_stop "$name" "$STOP_TIMEOUT" >/dev/null
@@ -54,4 +61,9 @@ jellyfin_stage() {
   rt_remove "$cid"
   check adoption_check_db "$dst/jellyfin/data/jellyfin.db"
   mark Jellyfin "integrity_check and foreign_key_check"
+  if [ -n "$ready" ]; then
+    check reasons python3 "$HERE/checks_paths.py" libraries --before "$dst/ferrofin/data/jellyfin.db" \
+      --after "$dst/jellyfin/data/jellyfin.db"
+    mark Jellyfin "every library keeps its folder row and DateCreated through its scan"
+  fi
 }
