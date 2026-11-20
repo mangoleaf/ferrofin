@@ -2,8 +2,9 @@
 jellyfin-start-failed.log: lines taken from Jellyfin 12.4's own logs, a clean upgrade boot and the failed start
 on a 10.11.8 database Ferrofin adopted)."""
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 import io
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -66,6 +67,16 @@ class Ran(unittest.TestCase):
             "it began 1 schema migration(s) the history should have recorded: 2026_AddTable",
             "1 code migration(s) ran that it does not run on the source: 2026_Other"])
 
+    def test_a_code_migration_the_source_records_ran_there_only_after_a_revert(self):
+        # Jellyfin 12.4 on 10.11.10: the first schema migration it applies reverts AddNormalizedUsername, whose Down
+        # drops UpdateNormalizedUsername's row, so that routine runs again; on the export nothing reverts.
+        oracle = boot((SCHEMA, "2026_AddLinkedChildrenTable"), (SCHEMA, "2026_AddNormalizedUsername"),
+                      (CODE, "2026_UpdateNormalizedUsername"), (CODE, "2026_Repair"))
+        source = {"2026_AddNormalizedUsername", "2026_UpdateNormalizedUsername"}
+        self.assertEqual(checks_boot.ran(boot((CODE, "2026_Repair")), oracle, source), [])
+        self.assertEqual(checks_boot.ran(boot(), oracle, source),
+                         ["1 code migration(s) it runs on the source did not run: 2026_Repair"])
+
     def test_a_long_list_is_cut_short(self):
         oracle = boot(*((CODE, f"2026_R{n}") for n in range(5)))
         self.assertEqual(checks_boot.ran(boot(), oracle),
@@ -95,17 +106,25 @@ class CommandLine(unittest.TestCase):
             log.flush()
             return checks_boot.main([mode, log.name, *oracle])
 
-    def test_ran_needs_a_readable_oracle_with_entries(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".log") as oracle:
-            oracle.write(boot((CODE, "2026_Fix")))
+    def test_ran_needs_a_readable_oracle_with_entries_and_the_source_s_history(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.NamedTemporaryFile("w", suffix=".log") as oracle:
+            source = Path(tmp) / "jellyfin.db"
+            with closing(sqlite3.connect(source)) as db:
+                db.executescript("CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);"
+                                 "INSERT INTO __EFMigrationsHistory VALUES ('2026_Recorded', '10.11.10.0');")
+            oracle.write(boot((CODE, "2026_Fix"), (CODE, "2026_Recorded")))
             oracle.flush()
-            self.assertEqual(self.run_on("ran", boot((CODE, "2026_Fix")), oracle.name), 0)
-            self.assertEqual(self.run_on("ran", boot(), oracle.name), 1)
-            self.assertEqual(self.run_on("ran", boot(), "/nonexistent/oracle.log"), 2)
+            self.assertEqual(self.run_on("ran", boot((CODE, "2026_Fix")), oracle.name, source), 0)
+            self.assertEqual(self.run_on("ran", boot(), oracle.name, source), 1)
+            self.assertEqual(self.run_on("ran", boot(), "/nonexistent/oracle.log", source), 2)
+            self.assertEqual(self.run_on("ran", boot(), oracle.name, Path(tmp) / "missing.db"), 2)
+            with closing(sqlite3.connect(Path(tmp) / "no-history.db")) as db:
+                db.execute("CREATE TABLE Users (Id TEXT)")
+            self.assertEqual(self.run_on("ran", boot(), oracle.name, Path(tmp) / "no-history.db"), 2)
             with redirect_stderr(io.StringIO()):
-                self.assertEqual(self.run_on("ran", boot()), 2)   # no oracle given
-        with tempfile.NamedTemporaryFile("w", suffix=".log") as empty:
-            self.assertEqual(self.run_on("ran", boot(), empty.name), 2)
+                self.assertEqual(self.run_on("ran", boot(), oracle.name), 2)   # no source given
+            with tempfile.NamedTemporaryFile("w", suffix=".log") as empty:
+                self.assertEqual(self.run_on("ran", boot(), empty.name, source), 2)
 
     def test_exit_status(self):
         self.assertEqual(self.run_on("migrations", CLEAN), 0)

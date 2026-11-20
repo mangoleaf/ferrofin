@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gates/roundtrip/run.sh [--image IMAGE] [--jellyfin-image IMAGE] [--fixtures DIR] [--only ROUTE] [--run-id ID] [--work DIR]
+# gates/roundtrip/run.sh [--image IMAGE] [--jellyfin-image IMAGE] [--fixtures DIR] [--only ROUTE[,ROUTE…]] [--run-id ID] [--work DIR]
 #
 # The way back to Jellyfin, proved on real Jellyfin: for each route in routes.sh, on a FRESH copy of a
 # pristine synthetic fixture (gates/adoption/build-fixtures.sh), each stage records each of its checks:
@@ -85,9 +85,10 @@ done
 for t in docker sqlite3 jq curl python3 timeout; do command -v "$t" >/dev/null || die "$t not installed"; done
 RUN_ID=${RUN_ID:-$(rt_new_run_id)}
 rt_valid_run_id "$RUN_ID" || die "--run-id must be lower-case letters, digits, dots and dashes (at most 48), not '$RUN_ID'"
-if [ -n "$ONLY" ]; then
-  printf '%s\n' "${ROUNDTRIP_ROUTES[@]}" | cut -d'|' -f1 | grep -qxF -- "$ONLY" || die "no route $ONLY in routes.sh"
-fi
+IFS=, read -ra WANTED <<<"$ONLY"
+for want in "${WANTED[@]}"; do
+  printf '%s\n' "${ROUNDTRIP_ROUTES[@]}" | cut -d'|' -f1 | grep -qxF -- "$want" || die "no route $want in routes.sh"
+done
 for spec in "${ROUNDTRIP_ROUTES[@]}"; do   # the fifth field: where Ferrofin runs, an absolute directory
   [[ "$(cut -d'|' -f5 <<<"$spec")" == /?* ]] || die "route ${spec%%|*} in routes.sh names no absolute data directory for Ferrofin"
 done
@@ -158,7 +159,7 @@ MEDIA=(-v "$FIXTURES/media:/media:ro")
 failed=0
 for spec in "${ROUNDTRIP_ROUTES[@]}"; do
   IFS='|' read -r route fixture generation first_start ran_at <<<"$spec"
-  [ -z "$ONLY" ] || [ "$ONLY" = "$route" ] || continue
+  [ -z "$ONLY" ] || [[ ",$ONLY," == *",$route,"* ]] || continue
   dst=$WORK/$route
   for needed in "$fixture" "$first_start.server.log"; do
     [ ! -e "$FIXTURES/$needed" ] || continue

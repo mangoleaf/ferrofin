@@ -355,6 +355,7 @@ def copy(root):
         f"<Item><Shares><Share><UserId>{uuid.UUID(CHILD)}</UserId></Share></Shares></Item>", encoding="utf-8")
     with closing(sqlite3.connect(root / "data" / "jellyfin.db")) as db:
         db.executescript("""
+            CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
             CREATE TABLE ApiKeys (AccessToken TEXT, DateCreated TEXT);
             CREATE TABLE Users (Id TEXT, Username TEXT);
             CREATE TABLE Permissions (UserId TEXT, Kind INTEGER, Value INTEGER);

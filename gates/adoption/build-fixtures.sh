@@ -18,6 +18,9 @@
 #   oracle/smoke-jellyfin-12.4.txt smoke.sh against Jellyfin 12.4 on a throwaway copy of 12.4-from-123
 #   oracle/smoke-jellyfin-12.4-fresh.txt  smoke.sh against Jellyfin 12.4 on a copy of 12.4-fresh
 #   oracle/user.txt                the account every oracle (and run.sh) probes as
+#   oracle/first-start-12.4/<fixture>.server.log   Jellyfin 12.4's first start on a throwaway copy of each
+#                                  older fixture no 12.4 fixture is built from (synthetic.py FIRST_STARTS):
+#                                  the migrations gates/roundtrip/ expects it to run on that fixture's export
 #   jellyfin-12.2-schema.sql       12.2-from-121's .schema without sqlite_stat*/sqlite_sequence,
 #                                  rewritten every run; every other upgrade route of 12.2, 12.3 and
 #                                  12.4 is diffed against it, and the 12.3 and 12.4 fresh installs
@@ -43,7 +46,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=gates/adoption/lib.sh
 . "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}
-while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,40p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
+while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,43p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
 [ -n "$FIXTURES" ] || FIXTURES=$(adoption_fixtures_dir build-fixtures) || exit 2
 gates_require_local "$FIXTURES" || exit 2
 mkdir -p "$FIXTURES"; FIXTURES=$(cd "$FIXTURES" && pwd)
@@ -64,6 +67,7 @@ PY
 )
 for version in $versions; do docker pull -q "jellyfin/jellyfin:$version" >/dev/null; done
 python3 "$HERE/synthetic.py" build --fixtures "$FIXTURES"
+python3 "$HERE/synthetic.py" first-start --fixtures "$FIXTURES"
 MEDIA=(-v "$FIXTURES/media:/media:ro")
 
 # Each fixture must carry exactly its release's EF history ids (the v12.2 C# gives 107 from
