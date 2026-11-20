@@ -4,7 +4,7 @@
 # run.sh's state: route, fixture, generation, dst, the settings, MADE, and why[] through check and mark.
 # shellcheck disable=SC2154  # run.sh sets what this reads
 
-# ferrofin_stage: status 0 when the copy is ready for Jellyfin; 1 (with the reasons in why[]) when not.
+# ferrofin_stage: status 0 when the copy is ready for the export; 1 (with the reasons in why[]) when not.
 ferrofin_stage() {
   local name cid=$dst/ferrofin.cid port url='' failed
   name=$(rt_name "$RUN_ID" "$route" ferrofin)

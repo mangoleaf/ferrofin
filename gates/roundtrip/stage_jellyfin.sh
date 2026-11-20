@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The Jellyfin stage of a round-trip route, sourced by run.sh: boot the Jellyfin release under test on a
-# copy of what Ferrofin left, read its log (checks_boot.py), compare its answers with Ferrofin's oracle
-# and check the file once it has stopped. It uses run.sh's state: route, dst, the settings, JELLYFIN_ID,
+# The Jellyfin stage of a round-trip route, sourced by run.sh: boot the Jellyfin release under test on what
+# the export wrote, read its log (checks_boot.py), compare its answers with Ferrofin's oracle and check the
+# file once it has stopped. It uses run.sh's state: route, dst, first_start, the settings, FIXTURES, JELLYFIN_ID,
 # MADE, and why[] through check and mark.
 # shellcheck disable=SC2154  # run.sh sets what this reads
 
@@ -9,8 +9,8 @@
 jellyfin_stage() {
   local name cid=$dst/jellyfin.cid port url='' ready=1 log
   name=$(rt_name "$RUN_ID" "$route" jellyfin)
-  if ! { cp -a "$dst/ferrofin" "$dst/jellyfin" && mkdir -p "$dst/jellyfin-cache"; }; then
-    why+=("cannot copy Ferrofin's result"); mark Jellyfin ready; return
+  if ! mkdir -p "$dst/jellyfin-cache"; then
+    why+=("cannot create its cache directory"); mark Jellyfin ready; return
   fi
   MADE+=("$cid")
   if port=$(rt_start "$name" "$cid" "$JELLYFIN_ID" -v "$dst/jellyfin:/config" -v "$dst/jellyfin-cache:/cache" \
@@ -35,6 +35,9 @@ jellyfin_stage() {
     rt_docker logs "$name" > "$dst/jellyfin-boot.log" 2>&1
     check reasons python3 "$HERE/checks_boot.py" migrations "$dst/jellyfin-boot.log"
     mark Jellyfin "every migration it began finished"
+    # what Jellyfin's own first start on this route's source ran, as build-fixtures.sh logged it
+    check reasons python3 "$HERE/checks_boot.py" ran "$dst/jellyfin-boot.log" "$FIXTURES/$first_start.server.log"
+    mark Jellyfin "it ran the code migrations it runs on the source, and no schema migration"
     check reasons python3 "$HERE/checks_boot.py" errors "$dst/jellyfin-boot.log"
     mark Jellyfin "no ERR or FTL outside the allowlist"
   fi

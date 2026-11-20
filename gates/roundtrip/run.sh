@@ -9,10 +9,13 @@
 #              Ferrofin's answers (answers.py) once its closing library scan has completed, and Ferrofin
 #              is stopped. Checks: ready; boot log (generation, migrations, no ERROR); the scan completes;
 #              the usage stage; a clean stop.
+#   Export     `ferrofin-server export-jellyfin` from IMAGE, in a container of its own, writes what
+#              Ferrofin left into the copy Jellyfin boots on (stage_export.sh). Check: it completes.
 #   Jellyfin   the Jellyfin release UPSTREAM_TAG names (jellyfin/jellyfin:<minor>, or --jellyfin-image)
-#              boots on a copy of what Ferrofin left, with no export step yet. Checks: ready within
-#              ROUNDTRIP_READY_TIMEOUT; every migration it began finished (a failure names the migration
-#              and its SQLite error); no ERR or FTL entry outside checks_boot.py's allowlist up to that
+#              boots on the export. Checks: ready within ROUNDTRIP_READY_TIMEOUT; every migration it
+#              began finished (a failure names the migration and its SQLite error); it ran the code
+#              migrations its own first start on the route's source ran (routes.sh) and no schema
+#              migration; no ERR or FTL entry outside checks_boot.py's allowlist up to that
 #              point; its answers equal Ferrofin's (adoption_normalise: ids, image sizes and the probes
 #              that differ by design left out), so everything answers.py captures came back: users and
 #              their logins, watch state, devices, API keys, settings, playlists and collections, and
@@ -22,7 +25,7 @@
 # One PASS/FAIL line per route; the exit status is 1 if any failed, 2 if the run was refused. Every
 # check's verdict goes to WORK/results.jsonl as it runs, and WORK/report.html is built from it however
 # the run ends (report.py). A failed route keeps its copies under WORK; a passed one keeps only its logs
-# and answers. The stages are stage_ferrofin.sh and stage_jellyfin.sh.
+# and answers. The stages are stage_ferrofin.sh, stage_export.sh and stage_jellyfin.sh.
 #
 # Several runs can share one host: a run has an id (--run-id, default <time>-<pid>), and its containers
 # (rt-<id>-<route>-<server>), the tag it runs IMAGE as (ferrofin-roundtrip:<id>) and its work directory
@@ -32,9 +35,10 @@
 # network share (refused). DIR defaults to the one build-fixtures.sh builds under $FERROFIN_GATES_DIR; the
 # work directory to $FERROFIN_GATES_DIR/runs/roundtrip-<id>, never reused.
 # Settings (environment): ROUNDTRIP_READY_TIMEOUT, the seconds a server may take to answer after its
-# start (default 300); ROUNDTRIP_SCAN_TIMEOUT, the seconds a library scan or a settle may take (default
-# 600, as the adoption gate's); ROUNDTRIP_STOP_TIMEOUT, the seconds a TERM is given before docker kills
-# the server (default 60); ROUNDTRIP_DOCKER_TIMEOUT, the seconds any other docker call may take (default 120).
+# start (default 300); ROUNDTRIP_SCAN_TIMEOUT, the seconds a library scan, a settle or the export may take
+# (default 600, as the adoption gate's); ROUNDTRIP_STOP_TIMEOUT, the seconds a TERM is given before docker
+# kills the server (default 60); ROUNDTRIP_DOCKER_TIMEOUT, the seconds any other docker call may take
+# (default 120).
 set -uo pipefail
 CALLER=$PWD
 SELF=$(cd "$(dirname "$0")" && pwd)/${0##*/}
@@ -135,6 +139,8 @@ check() { mapfile -t -O "${#why[@]}" why < <("$@"); }
 reasons() { local out; out=$("$@" 2>&1) || printf '%s\n' "${out:-$1 failed}"; }
 # shellcheck source=gates/roundtrip/stage_ferrofin.sh
 . "$HERE/stage_ferrofin.sh"   # ferrofin_stage
+# shellcheck source=gates/roundtrip/stage_export.sh
+. "$HERE/stage_export.sh"     # export_stage
 # shellcheck source=gates/roundtrip/stage_jellyfin.sh
 . "$HERE/stage_jellyfin.sh"   # jellyfin_stage
 
@@ -142,17 +148,18 @@ reasons() { local out; out=$("$@" 2>&1) || printf '%s\n' "${out:-$1 failed}"; }
 MEDIA=(-v "$FIXTURES/media:/media:ro")
 failed=0
 for spec in "${ROUNDTRIP_ROUTES[@]}"; do
-  IFS='|' read -r route fixture generation <<<"$spec"
+  IFS='|' read -r route fixture generation first_start <<<"$spec"
   [ -z "$ONLY" ] || [ "$ONLY" = "$route" ] || continue
   dst=$WORK/$route
-  if [ ! -d "$FIXTURES/$fixture" ]; then
-    printf '%-5s %-14s %s\n' FAIL "$route" "fixture $fixture missing: run gates/adoption/build-fixtures.sh"
-    record_detail row "$WORK" "$route" path "$generation" FAIL "fixture $fixture missing"; failed=1; continue
-  fi
+  for needed in "$fixture" "$first_start.server.log"; do
+    [ ! -e "$FIXTURES/$needed" ] || continue
+    printf '%-5s %-14s %s\n' FAIL "$route" "fixture $needed missing: build the fixtures again into a new directory (gates/adoption/build-fixtures.sh)"
+    record_detail row "$WORK" "$route" path "$generation" FAIL "fixture $needed missing"; failed=1; continue 2
+  done
   mkdir -p "$dst"
   record begin "$WORK" "$route" path "$generation"
   why=(); mark_from=0
-  ferrofin_stage && jellyfin_stage
+  ferrofin_stage && export_stage && jellyfin_stage
   verdict=PASS; [ "${#why[@]}" = 0 ] || { verdict=FAIL; failed=1; }
   detail=$(printf '%s; ' "${why[@]}"); detail=${detail%; }
   printf '%-5s %-14s %s\n' "$verdict" "$route" "$detail"

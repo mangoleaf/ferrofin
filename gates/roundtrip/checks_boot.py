@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Jellyfin's boot on a round-trip copy, read from its console log (stdlib only).
+"""Jellyfin's boot on a round trip's export, read from its console log (stdlib only).
 
     checks_boot.py migrations LOG   a line per migration Jellyfin began and never finished, with the error it
                                     died of (the SQLite error when there is one)
     checks_boot.py errors LOG       ERR and FTL entries outside ALLOWED: how many, and the first few
+    checks_boot.py ran LOG ORACLE   the schema migrations Jellyfin began (the exported history should record
+                                    every one), and the code migrations it ran that differ from those ORACLE, the
+                                    log of its own first start on the route's source, shows it running
 
-Exit status 0 when there is nothing to say, 1 with the reasons on stdout, 2 when the log cannot be read or
+Exit status 0 when there is nothing to say, 1 with the reasons on stdout, 2 when a log cannot be read or
 holds no entry at all (an empty capture, or a format this no longer parses, must never pass).
 The log is the container's output: entries such as `[07:53:39] [INF] [10] Main: Jellyfin version: 12.4.0`,
 a multi-line entry continuing on the lines that do not start one.
@@ -56,6 +59,34 @@ def migrations(log):
     return reasons
 
 
+def performed(log):
+    """(code, schema): the code and the schema (EF) migrations Jellyfin began, in log order."""
+    code, schema = [], []
+    for _, source, first, _ in entries(log):
+        if match := BEGUN.match(first):
+            {"InternalCodeMigration": code, "InternalDatabaseMigration": schema}.get(source, code).append(match[1])
+    return code, schema
+
+
+def ran(log, oracle):
+    code, schema = performed(log)
+    expected = performed(oracle)[0]
+    reasons = []
+    if schema:
+        reasons.append(f"it began {len(schema)} schema migration(s) the history should have recorded: "
+                       f"{shown(schema)}")
+    if missing := [m for m in expected if m not in code]:
+        reasons.append(f"{len(missing)} code migration(s) it runs on the source did not run: {shown(missing)}")
+    if extra := [m for m in code if m not in expected]:
+        reasons.append(f"{len(extra)} code migration(s) ran that it does not run on the source: {shown(extra)}")
+    return reasons
+
+
+def shown(names):
+    more = f"; and {len(names) - MAX_SHOWN} more" if len(names) > MAX_SHOWN else ""
+    return ", ".join(names[:MAX_SHOWN]) + more
+
+
 def errors(log):
     unexpected = [f"[{level}] {source}: {first}" for level, source, first, _ in entries(log)
                   if level in ("ERR", "FTL") and not any(p.match(f"{source}: {first}") for p, _ in ALLOWED)]
@@ -67,19 +98,21 @@ def errors(log):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 2 or argv[0] not in ("migrations", "errors"):
+    if not argv or len(argv) != {"migrations": 2, "errors": 2, "ran": 3}.get(argv[0], 0):
         print(__doc__.split("\n\n")[1], file=sys.stderr)
         return 2
-    try:
-        with open(argv[1], encoding="utf-8", errors="replace") as handle:
-            log = handle.read()
-    except OSError as error:
-        print(f"cannot read the Jellyfin log: {error}")
-        return 2
-    if not entries(log):
-        print(f"no Jellyfin log entry in {argv[1]}")
-        return 2
-    reasons = migrations(log) if argv[0] == "migrations" else errors(log)
+    logs = []
+    for path in argv[1:]:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                logs.append(handle.read())
+        except OSError as error:
+            print(f"cannot read the Jellyfin log: {error}")
+            return 2
+        if not entries(logs[-1]):
+            print(f"no Jellyfin log entry in {path}")
+            return 2
+    reasons = {"migrations": migrations, "errors": errors, "ran": ran}[argv[0]](*logs)
     for reason in reasons:
         print(reason)
     return int(bool(reasons))
