@@ -68,13 +68,32 @@ rt_start() {
   printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
+# rt_run_once <seconds> <name> <cidfile> <image> <docker run arguments…> -- <command arguments…>: run a
+# one-shot container of <image> to its end, in the foreground, as the calling user, its id in <cidfile> (which
+# must not exist) for the run's cleanup should the run stop meanwhile. With no network: what it runs is offline
+# by design (the export's check for a running server then finds none, as for a stopped one). Prints its output;
+# its status is the container's, or 124 when it ran past <seconds>, 137 when the docker client then had to be
+# killed (a container that ignores TERM); the cleanup then removes it.
+rt_run_once() {
+  local seconds=$1 name=$2 cidfile=$3 image=$4 options=(); shift 4
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do options+=("$1"); shift; done
+  [ $# -eq 0 ] || shift
+  ROUNDTRIP_DOCKER_TIMEOUT=$seconds rt_docker run --pull never --cidfile "$cidfile" --name "$name" \
+    --user "$(id -u):$(id -g)" --network none "${options[@]}" "$image" "$@"
+}
+
 # rt_wait_up <name> <port> <seconds> [give-up ERE]: the server answers, or status 1 as soon as its
 # container has exited (a server that refuses its database exits at once), its log matches the give-up
 # pattern (Jellyfin stays up after a failed start, answering 503) or once <seconds> have passed.
+# Ready is both probes: Jellyfin's setup server answers /System/Info/Public while Jellyfin still runs its last
+# migrations and optimises the database, and 503 to everything else, /System/Ping included
+# (Jellyfin.Server/Program.cs, ServerSetupApp/SetupServer.cs); the real server then answers only /System/Ping
+# until its core startup completes (Jellyfin.Api/Middleware/ServerStartupMessageMiddleware.cs). Ferrofin answers both.
 rt_wait_up() {
   local name=$1 port=$2 deadline=$((SECONDS + $3)) give_up=${4:-} log
   while [ "$SECONDS" -lt "$deadline" ]; do
-    curl -sf --max-time 5 "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0
+    curl -sf --max-time 5 "http://127.0.0.1:$port/System/Ping" >/dev/null &&
+      curl -sf --max-time 5 "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0
     [ "$(rt_docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] || return 1
     if [ -n "$give_up" ]; then
       log=$(rt_docker logs "$name" 2>&1)   # whole, not piped: grep -q's early exit would fail the pipe
@@ -112,10 +131,11 @@ rt_not_up() {
   fi
 }
 
-# rt_remove <cidfile>: remove the container docker created with that cidfile, if it did, and the file.
+# rt_remove <cidfile>: remove the container docker created with that cidfile, if it did, with its anonymous
+# volumes (the Ferrofin image declares one at /data, which no stage mounts), and the file.
 rt_remove() {
   [ -s "$1" ] || return 0
-  rt_docker rm -f "$(cat "$1")" >/dev/null 2>&1 && rm -f -- "$1"
+  rt_docker rm -fv "$(cat "$1")" >/dev/null 2>&1 && rm -f -- "$1"
 }
 
 # rt_compare_answers <oracle> <answers>: a reason when Jellyfin's answers differ from Ferrofin's,

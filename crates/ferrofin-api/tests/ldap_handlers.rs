@@ -315,9 +315,11 @@ async fn a_server_without_the_extension_answers_not_found() {
 #[tokio::test]
 async fn every_plugin_route_is_registered() {
     use ferrofin_api::handlers::PLUGIN_ROUTES;
-    // Every row is LDAP-Auth's so far; another plugin's rows need its manager
-    // wired here too.
-    for (method, path, _) in PLUGIN_ROUTES {
+    // LDAP-Auth's rows; Single Sign-On's are checked in `sso_handlers.rs`.
+    for (method, path, _) in PLUGIN_ROUTES
+        .iter()
+        .filter(|(_, _, plugin)| *plugin == "ldap-auth")
+    {
         let request = Request::builder()
             .method(method.to_ascii_uppercase().as_str())
             .uri(*path)

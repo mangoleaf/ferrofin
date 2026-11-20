@@ -308,6 +308,11 @@ pub struct Inner {
     /// Jellyfin server without the plugin's controller).
     pub ldap: Option<Arc<dyn ferrofin_traits::ldap::LdapManager>>,
 
+    /// The Single Sign-On extension's service backing the `/sso` routes.
+    /// `None` until the composition root wires it via [`AppState::with_sso`];
+    /// while unset those routes answer `404`, as a server without the plugin.
+    pub sso: Option<Arc<dyn ferrofin_traits::sso::SsoManager>>,
+
     /// The backup engine behind the `/Backup*` routes. `None` until the
     /// composition root wires it via [`AppState::with_backup`]; while unset
     /// those routes answer `500`.
@@ -480,6 +485,7 @@ impl AppState {
             playback_metrics: None,
             merge_versions: None,
             ldap: None,
+            sso: None,
             backup: None,
             music,
             similar_items,
@@ -1092,6 +1098,23 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_ldap must be called before the state is shared");
         inner.ldap = Some(ldap);
+        self
+    }
+
+    /// Wires the Single Sign-On extension's service behind the `/sso` routes.
+    ///
+    /// [`new`](Self::new) leaves it unset (the routes answer `404`); the
+    /// composition root calls this with the `ferrofin-extensions`
+    /// implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_sso(mut self, sso: Arc<dyn ferrofin_traits::sso::SsoManager>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_sso must be called before the state is shared");
+        inner.sso = Some(sso);
         self
     }
 

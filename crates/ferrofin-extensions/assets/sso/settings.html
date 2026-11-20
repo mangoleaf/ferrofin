@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Single Sign-On</title>
+</head>
+
+<body>
+    <!--
+        The Single Sign-On plugin's page, authored in this repository (not
+        vendored from a Jellyfin plugin). jellyfin-web keeps only the
+        `data-role="page"` element and runs the scripts inside it, so the
+        styles and the script live in it too.
+
+        The page is served anonymously (`GET /web/ConfigurationPage`), so it
+        holds no setting: the providers come from the admin-only
+        `GET /sso/admin/oidc/providers`, and every string from a response is
+        set as text, never parsed as HTML. A provider is saved with
+        `PUT /sso/admin/oidc/providers/{key}`, which then tests the provider's
+        discovery document, and removed with `DELETE`; the provider's row shows
+        what the test found until the page is left. The public URL is saved
+        through the plugin configuration. No route returns
+        a stored client secret, so the secret field always starts empty, and an
+        empty one keeps the stored secret.
+    -->
+    <div data-role="page" class="page type-interior pluginConfigurationPage ssoSettingsPage"
+        data-require="emby-input,emby-button,emby-checkbox">
+        <style>
+            .ssoSettingsPage .ssoNotice {
+                padding: 0.75em 1em;
+                margin: 1em 0;
+                border-radius: 0.3em;
+                background: rgba(200, 60, 60, 0.2);
+            }
+
+            .ssoSettingsPage .ssoProvider {
+                padding: 0.75em 1em;
+                margin: 0 0 0.75em;
+                border-radius: 0.3em;
+                background: rgba(128, 128, 128, 0.12);
+            }
+
+            .ssoSettingsPage .ssoProviderTitle {
+                margin: 0 0 0.3em;
+            }
+
+            .ssoSettingsPage .ssoProvider p {
+                margin: 0.25em 0;
+            }
+
+            .ssoSettingsPage .ssoRefused {
+                color: #e57373;
+            }
+
+            .ssoSettingsPage .ssoCallback code {
+                user-select: all;
+                word-break: break-all;
+            }
+
+            .ssoSettingsPage .ssoHttpWarning {
+                color: #ffb74d;
+            }
+
+            .ssoSettingsPage .ssoFound {
+                color: #81c784;
+            }
+
+            .ssoSettingsPage .ssoDiscovery code {
+                word-break: break-all;
+            }
+
+            .ssoSettingsPage .ssoButtons {
+                display: flex;
+                gap: 0.5em;
+                flex-wrap: wrap;
+                margin-top: 0.5em;
+            }
+        </style>
+        <div data-role="content">
+            <div class="content-primary">
+                <div class="verticalSection">
+                    <div class="sectionTitleContainer">
+                        <h2 class="sectionTitle">Single Sign-On</h2>
+                    </div>
+                    <p class="fieldDescription">
+                        Let users sign in with an OpenID Connect identity provider, such as Authentik,
+                        Authelia, Keycloak or Pocket ID. Changes apply at once.
+                    </p>
+                </div>
+                <div class="ssoNotice ssoError hide" role="alert"></div>
+
+                <form class="ssoPublicUrlForm verticalSection" novalidate>
+                    <h3 class="sectionTitle">Public URL</h3>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="url" class="ssoPublicUrl" label="Public URL"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">
+                            The address users reach this server at, base path included, such as
+                            https://media.example.org. Each provider's callback URL is built on it. When it
+                            is empty, the Published server URL in Ferrofin Settings is used.
+                        </div>
+                        <div class="fieldDescription ssoRefused ssoPublicUrlError hide" role="alert"></div>
+                    </div>
+                    <button is="emby-button" type="submit" class="raised button-submit block">
+                        <span>Save</span>
+                    </button>
+                </form>
+
+                <div class="verticalSection">
+                    <h3 class="sectionTitle">OIDC providers</h3>
+                    <div class="ssoProviders"></div>
+                    <button is="emby-button" type="button" class="raised ssoAdd">
+                        <span>Add provider</span>
+                    </button>
+                </div>
+
+                <form class="ssoEditor verticalSection hide" novalidate>
+                    <h3 class="sectionTitle ssoEditorTitle"></h3>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoKey" label="Key"
+                            autocomplete="off" spellcheck="false" maxlength="32" />
+                        <div class="fieldDescription">
+                            1 to 32 lowercase letters, digits or hyphens, such as "authentik". It is part of the
+                            callback URL, so it cannot be changed once the provider is saved.
+                        </div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoName" label="Name" autocomplete="off" />
+                        <div class="fieldDescription">The name users see on the sign-in button.</div>
+                    </div>
+                    <div class="checkboxContainer">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoEnabled" />
+                            <span>Enabled</span>
+                        </label>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="url" class="ssoIssuer" label="Issuer URL"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">
+                            The provider's issuer, whose discovery document is at
+                            /.well-known/openid-configuration under it, such as
+                            https://auth.example.org/application/o/ferrofin/.
+                        </div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoAllowHttp" />
+                            <span>Allow an http issuer</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription ssoHttpWarning">
+                            Warning: only for an identity provider on a network you trust. Over http, sign-in
+                            codes and tokens travel unencrypted and can be read or changed on the way.
+                        </div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoClientId" label="Client ID"
+                            autocomplete="off" spellcheck="false" />
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="password" class="ssoClientSecret" label="Client secret"
+                            autocomplete="new-password" spellcheck="false" />
+                        <div class="fieldDescription ssoSecretNote"></div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoScopes" label="Scopes"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">Separated by spaces; openid is required.</div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoUsernameClaim" label="Username claim"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">The claim a user's Ferrofin name is taken from.</div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoCreateUsers" />
+                            <span>Create accounts at first sign-in</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            A user no account is linked to gets one, named by the username claim, that only
+                            signs in through this provider. Off, such a user is refused. A name an account already
+                            has is always refused.
+                        </div>
+                    </div>
+                    <div class="ssoNotice ssoEditorError hide" role="alert"></div>
+                    <div class="ssoButtons">
+                        <button is="emby-button" type="submit" class="raised button-submit">
+                            <span>Save provider</span>
+                        </button>
+                        <button is="emby-button" type="button" class="raised button-cancel ssoCancel">
+                            <span>Cancel</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        <script type="text/javascript">
+            (function () {
+                'use strict';
+
+                var PLUGIN_ID = '67a29a1d-e02b-4aaa-bba0-4b2275e765d0';
+                // The defaults a new provider starts with, as the server's.
+                var DEFAULT_SCOPES = 'openid profile';
+                var DEFAULT_USERNAME_CLAIM = 'preferred_username';
+                // jellyfin-web renders a confirm message as HTML and its title
+                // as text, so the provider's name goes in the title only.
+                var DELETE_MESSAGE = 'Its users can no longer sign in with it, and its client secret is deleted too.';
+
+                /** A new `tag` element with `className` and, if given, `text` as its text. */
+                function element(tag, className, text) {
+                    var node = document.createElement(tag);
+                    if (className) {
+                        node.className = className;
+                    }
+                    if (text !== undefined && text !== null) {
+                        node.textContent = String(text);
+                    }
+                    return node;
+                }
+
+                function clear(node) {
+                    while (node.firstChild) {
+                        node.removeChild(node.firstChild);
+                    }
+                }
+
+                function field(page, name) {
+                    return page.querySelector('.' + name);
+                }
+
+                function showError(node, text) {
+                    node.textContent = text;
+                    node.classList.toggle('hide', !text);
+                }
+
+                /** What to show for a refused request: the server's reason, when it gives one. */
+                function failureText(failure, verb) {
+                    var prefix = 'Could not ' + verb;
+                    if (!failure || typeof failure.json !== 'function') {
+                        return Promise.resolve(prefix + '.');
+                    }
+                    var status = ' (HTTP ' + failure.status + ')';
+                    return failure.json().then(function (body) {
+                        if (body && body.error && failure.status < 500) {
+                            return prefix + ': ' + String(body.error).replace(/^invalid input: /, '') + '.';
+                        }
+                        return prefix + status + '.';
+                    }, function () {
+                        return prefix + status + '.';
+                    });
+                }
+
+                /** Whether `text` is an address callback URLs can be built on, as the server judges it. */
+                function usableUrl(text) {
+                    try {
+                        var url = new URL(text);
+                        return (url.protocol === 'https:' || url.protocol === 'http:') && !!url.hostname
+                            && !url.search && !url.hash && !url.username && !url.password;
+                    } catch (e) {
+                        return false;
+                    }
+                }
+
+                function load(page, state) {
+                    Dashboard.showLoadingMsg();
+                    return ApiClient.fetch({
+                        url: ApiClient.getUrl('sso/admin/oidc/providers'),
+                        type: 'GET',
+                        dataType: 'json'
+                    }).then(function (list) {
+                        state.list = list;
+                        showError(field(page, 'ssoError'), '');
+                        render(page, state);
+                    }).catch(function (failure) {
+                        return failureText(failure, 'load the providers').then(function (text) {
+                            showError(field(page, 'ssoError'), text);
+                        });
+                    }).finally(function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                function providerRow(page, state, info) {
+                    var row = element('div', 'ssoProvider');
+                    row.appendChild(element('h4', 'ssoProviderTitle', (info.Name || info.Key) + ' (' + info.Key + ')'));
+                    if (info.ValidationError) {
+                        row.appendChild(element('p', 'ssoRefused', 'Not used: ' + info.ValidationError + '.'));
+                    } else {
+                        row.appendChild(element('p', 'fieldDescription', info.Enabled ? 'Enabled' : 'Disabled'));
+                    }
+                    row.appendChild(element('p', 'fieldDescription', 'Issuer: ' + info.Issuer));
+                    row.appendChild(element('p', 'fieldDescription',
+                        info.HasClientSecret ? 'A client secret is stored.' : 'No client secret is stored.'));
+                    var callback = element('p', 'fieldDescription ssoCallback');
+                    if (info.CallbackUrl) {
+                        callback.appendChild(document.createTextNode('Callback URL to register at the provider: '));
+                        callback.appendChild(element('code', null, info.CallbackUrl));
+                    } else {
+                        callback.textContent = 'Fill in the Public URL above, or set the Published server URL in '
+                            + 'Ferrofin Settings, to get the callback URL to register at the provider.';
+                    }
+                    row.appendChild(callback);
+                    if (state.discovery[info.Key]) {
+                        row.appendChild(discoveryResult(state.discovery[info.Key]));
+                    }
+                    var buttons = element('div', 'ssoButtons');
+                    var edit = element('button', 'raised');
+                    edit.type = 'button';
+                    edit.setAttribute('is', 'emby-button');
+                    edit.appendChild(element('span', null, 'Edit'));
+                    edit.addEventListener('click', function () {
+                        openEditor(page, state, info);
+                    });
+                    var remove = element('button', 'raised');
+                    remove.type = 'button';
+                    remove.setAttribute('is', 'emby-button');
+                    remove.appendChild(element('span', null, 'Delete'));
+                    remove.addEventListener('click', function () {
+                        deleteProvider(page, state, info);
+                    });
+                    buttons.appendChild(edit);
+                    buttons.appendChild(remove);
+                    row.appendChild(buttons);
+                    return row;
+                }
+
+                /** What the discovery test of the last save found, as the provider's row shows it. */
+                function discoveryResult(discovery) {
+                    var block = element('div', 'ssoDiscovery');
+                    if (discovery.Error) {
+                        block.appendChild(element('p', 'ssoRefused',
+                            'Discovery test failed: ' + discovery.Error + '. The provider is saved.'));
+                        return block;
+                    }
+                    block.appendChild(element('p', 'ssoFound', 'Discovery test passed.'));
+                    [
+                        ['Authorization endpoint', discovery.AuthorizationEndpoint],
+                        ['Token endpoint', discovery.TokenEndpoint],
+                        ['Userinfo endpoint', discovery.UserinfoEndpoint],
+                        ['Key set', discovery.JwksUri]
+                    ].forEach(function (endpoint) {
+                        var line = element('p', 'fieldDescription');
+                        line.appendChild(document.createTextNode(endpoint[0] + ': '));
+                        line.appendChild(element('code', null, endpoint[1] || 'none advertised'));
+                        block.appendChild(line);
+                    });
+                    block.appendChild(element('p', 'fieldDescription',
+                        'Signing keys read: ' + (discovery.SigningKeys || 0) + '.'));
+                    (discovery.Warnings || []).forEach(function (warning) {
+                        block.appendChild(element('p', 'ssoHttpWarning', 'Warning: ' + warning + '.'));
+                    });
+                    return block;
+                }
+
+                function render(page, state) {
+                    field(page, 'ssoPublicUrl').value = state.list.PublicUrl || '';
+                    showError(field(page, 'ssoPublicUrlError'), state.list.PublicUrlError
+                        ? 'Not used: ' + state.list.PublicUrlError + '.' : '');
+                    var list = field(page, 'ssoProviders');
+                    clear(list);
+                    var providers = state.list.Providers || [];
+                    if (providers.length === 0) {
+                        list.appendChild(element('p', 'fieldDescription', 'No provider has been added yet.'));
+                    }
+                    providers.forEach(function (info) {
+                        list.appendChild(providerRow(page, state, info));
+                    });
+                }
+
+                /** Opens the editor on `info`, a listed provider, or on a new one. */
+                function openEditor(page, state, info) {
+                    state.editing = info ? info.Key : null;
+                    field(page, 'ssoEditorTitle').textContent = info ? 'Edit ' + (info.Name || info.Key) : 'Add a provider';
+                    var key = field(page, 'ssoKey');
+                    key.value = info ? info.Key : '';
+                    key.disabled = !!info;
+                    field(page, 'ssoName').value = info ? info.Name : '';
+                    field(page, 'ssoEnabled').checked = info ? !!info.Enabled : true;
+                    field(page, 'ssoIssuer').value = info ? info.Issuer : '';
+                    field(page, 'ssoAllowHttp').checked = info ? !!info.AllowHttpIssuer : false;
+                    field(page, 'ssoClientId').value = info ? info.ClientId : '';
+                    // A stored secret is never sent to the page: empty keeps it.
+                    field(page, 'ssoClientSecret').value = '';
+                    field(page, 'ssoSecretNote').textContent = info && info.HasClientSecret
+                        ? 'A client secret is stored. Leave this empty to keep it, or enter a new one to replace it.'
+                        : 'Required.';
+                    field(page, 'ssoScopes').value = info ? info.Scopes : DEFAULT_SCOPES;
+                    field(page, 'ssoUsernameClaim').value = info ? info.UsernameClaim : DEFAULT_USERNAME_CLAIM;
+                    field(page, 'ssoCreateUsers').checked = info ? !!info.CreateUsers : true;
+                    showError(field(page, 'ssoEditorError'), '');
+                    field(page, 'ssoEditor').classList.remove('hide');
+                    field(page, 'ssoAdd').classList.add('hide');
+                    (info ? field(page, 'ssoName') : key).focus();
+                }
+
+                function closeEditor(page, state) {
+                    state.editing = null;
+                    field(page, 'ssoClientSecret').value = '';
+                    field(page, 'ssoEditor').classList.add('hide');
+                    field(page, 'ssoAdd').classList.remove('hide');
+                }
+
+                function saveProvider(page, state) {
+                    var key = state.editing || field(page, 'ssoKey').value.trim();
+                    var body = {
+                        Name: field(page, 'ssoName').value.trim(),
+                        Enabled: field(page, 'ssoEnabled').checked,
+                        Issuer: field(page, 'ssoIssuer').value.trim(),
+                        AllowHttpIssuer: field(page, 'ssoAllowHttp').checked,
+                        ClientId: field(page, 'ssoClientId').value.trim(),
+                        Scopes: field(page, 'ssoScopes').value.trim(),
+                        UsernameClaim: field(page, 'ssoUsernameClaim').value.trim(),
+                        CreateUsers: field(page, 'ssoCreateUsers').checked
+                    };
+                    var secret = field(page, 'ssoClientSecret').value;
+                    if (secret) {
+                        body.ClientSecret = secret;
+                    }
+                    var error = field(page, 'ssoEditorError');
+                    if (!key) {
+                        showError(error, 'Fill in the key.');
+                        return;
+                    }
+                    // A save is create-or-update: adding under a key in use
+                    // would replace that provider.
+                    var taken = !state.editing && (state.list && state.list.Providers || []).some(function (info) {
+                        return info.Key === key;
+                    });
+                    if (taken) {
+                        showError(error, 'A provider with the key ' + key + ' already exists: edit it instead.');
+                        return;
+                    }
+                    Dashboard.showLoadingMsg();
+                    ApiClient.fetch({
+                        url: ApiClient.getUrl('sso/admin/oidc/providers/' + encodeURIComponent(key)),
+                        type: 'PUT',
+                        data: JSON.stringify(body),
+                        contentType: 'application/json',
+                        dataType: 'json'
+                    }).then(function (saved) {
+                        state.discovery[key] = saved && saved.Discovery;
+                        closeEditor(page, state);
+                        Dashboard.processPluginConfigurationUpdateResult();
+                        return load(page, state);
+                    }, function (failure) {
+                        return failureText(failure, 'save the provider').then(function (text) {
+                            showError(error, text);
+                        });
+                    }).finally(function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                function deleteProvider(page, state, info) {
+                    Dashboard.confirm(DELETE_MESSAGE, 'Delete ' + (info.Name || info.Key) + '?', function (confirmed) {
+                        if (!confirmed) {
+                            return;
+                        }
+                        Dashboard.showLoadingMsg();
+                        ApiClient.fetch({
+                            url: ApiClient.getUrl('sso/admin/oidc/providers/' + encodeURIComponent(info.Key)),
+                            type: 'DELETE'
+                        }).then(function () {
+                            delete state.discovery[info.Key];
+                            if (state.editing === info.Key) {
+                                closeEditor(page, state);
+                            }
+                            return load(page, state);
+                        }, function (failure) {
+                            return failureText(failure, 'delete the provider').then(function (text) {
+                                showError(field(page, 'ssoError'), text);
+                            });
+                        }).finally(function () {
+                            Dashboard.hideLoadingMsg();
+                        });
+                    });
+                }
+
+                function savePublicUrl(page, state) {
+                    var value = field(page, 'ssoPublicUrl').value.trim();
+                    var error = field(page, 'ssoError');
+                    if (value && !usableUrl(value)) {
+                        showError(error, 'The public URL must be an http or https address with no query, such as '
+                            + 'https://media.example.org.');
+                        return;
+                    }
+                    Dashboard.showLoadingMsg();
+                    // The whole configuration goes back as read: a provider
+                    // saved from another window in between would be lost, as
+                    // with any plugin page that saves its configuration.
+                    ApiClient.getPluginConfiguration(PLUGIN_ID).then(function (config) {
+                        config.PublicUrl = value;
+                        return ApiClient.updatePluginConfiguration(PLUGIN_ID, config);
+                    }).then(function (result) {
+                        Dashboard.processPluginConfigurationUpdateResult(result);
+                        return load(page, state);
+                    }, function (failure) {
+                        return failureText(failure, 'save the public URL').then(function (text) {
+                            showError(error, text);
+                        });
+                    }).finally(function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                function bind(page) {
+                    var state = { list: null, editing: null, discovery: {} };
+                    page.setAttribute('data-sso-bound', 'true');
+                    page.addEventListener('pageshow', function () {
+                        state.discovery = {};
+                        closeEditor(page, state);
+                        load(page, state);
+                    });
+                    field(page, 'ssoPublicUrlForm').addEventListener('submit', function (event) {
+                        event.preventDefault();
+                        savePublicUrl(page, state);
+                    });
+                    field(page, 'ssoAdd').addEventListener('click', function () {
+                        openEditor(page, state, null);
+                    });
+                    field(page, 'ssoCancel').addEventListener('click', function () {
+                        closeEditor(page, state);
+                    });
+                    field(page, 'ssoEditor').addEventListener('submit', function (event) {
+                        event.preventDefault();
+                        saveProvider(page, state);
+                    });
+                }
+
+                // jellyfin-web keeps earlier views in the document, so this
+                // script binds only the page it was loaded with: the one not
+                // bound yet. `pageshow` fires on each visit and reloads.
+                document.querySelectorAll('.ssoSettingsPage').forEach(function (page) {
+                    if (page.getAttribute('data-sso-bound') !== 'true') {
+                        bind(page);
+                    }
+                });
+            }());
+        </script>
+    </div>
+</body>
+
+</html>

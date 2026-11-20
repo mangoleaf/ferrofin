@@ -29,6 +29,11 @@ HARMONIZED = ("AudioStreamIndex", "IsFavorite", "LastPlayedDate", "Likes", "Play
 # Bound as Rust booleans, so a copied value is stored as 0/1.
 BOOLEANS = ("IsFavorite", "Likes", "Played")
 DATE = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?")
+# The UserData dates migration 0050 rewrites, and the two forms it rewrites (its CASE): a
+# space-separated value whose all-digit fraction ends in a zero, and RFC 3339 at +00:00.
+REWRITTEN = ("LastPlayedDate", "RetentionDate")
+TRAILING_ZERO = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]*0")
+RFC3339_UTC = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})T([0-9]{2}:[0-9]{2}:[0-9]{2})([.0-9]*)\+00:00")
 
 
 def timestamp(value):
@@ -66,6 +71,24 @@ def instant(value):
     zone = "+00:00" if zone in (None, "Z") else zone
     whole = datetime.fromisoformat(f"{day}T{time}{zone}")
     return int(whole.timestamp()) * 1_000_000_000 + int(((fraction or "") + "0" * 9)[:9])
+
+
+def ef_text(value):
+    """A stored date as migration 0050 leaves it, in the text Jellyfin's EF provider writes
+    ('yyyy-MM-dd HH:mm:ss.FFFFFFF'): the fraction's trailing zeros trimmed, then the '.'; an
+    RFC 3339 value at +00:00 with the space and at most seven fraction digits, trimmed the
+    same way. Anything else, every value Jellyfin writes included, is returned unchanged."""
+    if not isinstance(value, str):
+        return value
+    if TRAILING_ZERO.fullmatch(value):
+        return value.rstrip("0").rstrip(".")
+    match = RFC3339_UTC.fullmatch(value)
+    if not match:
+        return value
+    day, time, fraction = match.groups()
+    if not fraction:
+        return f"{day} {time}"
+    return f"{day} {time}.{fraction[1:8]}".rstrip("0").rstrip(".")
 
 
 def tick_text(value):
@@ -122,11 +145,13 @@ def snapshot(db, expected=False):
     """Watch history as stored, or (expected=True, for a pre-adoption baseline) as
     adoption must leave it.
 
-    Two boot-time changes are expected, not losses: the rows of an orphaned item move
-    to the placeholder item with a RetentionDate (migration 0042), and a conflicting
-    group is harmonized once (adoption_repairs.rs). Only the baseline models them: the
-    adopted database is read as stored, so a row that later diverges from its group
-    still fails. A moved row's RetentionDate is the boot time, so for those keys only
+    Three boot-time changes are expected, not losses: migration 0050 rewrites the dates
+    into Jellyfin's text form (ef_text), the rows of an orphaned item move to the
+    placeholder item with a RetentionDate (migration 0042), and a conflicting group is
+    harmonized once (adoption_repairs.rs, after the migrations, so on the rewritten
+    text). Only the baseline models them: the adopted database is read as stored, so a
+    row that later diverges from its group, or a date stored in another form, still
+    fails. A moved row's RetentionDate is the boot time, so for those keys only
     ("moved") compare_db checks that one is set ("detached", the stored rows with the
     date reduced to set/unset); every other row, placeholder rows included, must keep
     its exact values.
@@ -141,6 +166,8 @@ def snapshot(db, expected=False):
         for record in conn.execute('SELECT rowid AS "__rowid", * FROM "UserData" ORDER BY rowid'):
             row = dict(record)
             del row["__rowid"]
+            if expected:
+                row.update({column: ef_text(row[column]) for column in REWRITTEN if column in row})
             item, user = item_id(row.pop("ItemId")), item_id(row.pop("UserId"))
             if item == PLACEHOLDER:
                 detached[(user, row["CustomDataKey"])] = row

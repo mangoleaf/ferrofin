@@ -10,10 +10,15 @@ test_usage.py serves a Stub in process. roundtrip.bats's fake docker starts one 
                                                           listening; the state lives in CONFIG/fake-state.json, so a
                                                           copy of CONFIG answers as its source did. BEHAVIOUR "ok";
                                                           "start-failed": every request 503, as Jellyfin's setup server
-                                                          answers once its start failed; "loses": the copy's first
-                                                          favorite is gone, a return that lost a write; "exits": the
-                                                          server stops (status 3) as soon as its port is written. ROLE
-                                                          names the product.
+                                                          answers once its start failed; "setup": for SETUP_SECONDS,
+                                                          /System/Info/Public 200 and everything else 503, as that
+                                                          server answers while Jellyfin's last migrations run, then
+                                                          for as long /System/Ping 200 and everything else 503, as
+                                                          the real server answers until its core startup completes,
+                                                          then "ok"; "loses": the copy's first favorite is gone, a
+                                                          return that lost a write; "exits": the server stops
+                                                          (status 3) as soon as its port is written. ROLE names the
+                                                          product.
 """
 
 import base64
@@ -26,6 +31,7 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 from urllib.parse import parse_qs, urlsplit
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -34,6 +40,9 @@ import answers  # noqa: E402
 ADMIN = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 MOVIES = [f"{n:032x}" for n in range(1, 8)]   # seven movies; the first one is already played
 STATE = "fake-state.json"
+#: How long a "setup" server answers as Jellyfin's setup server does, and then as its starting real server does:
+#: each longer than the harness's poll interval.
+SETUP_SECONDS = 3
 #: What the stub keeps, and saves to CONFIG/fake-state.json.
 FIELDS = ("refreshes", "users", "data", "collections", "accounts", "prefs", "keys", "devices", "libraries", "items",
           "images", "plays")
@@ -64,6 +73,7 @@ class Stub:
     def __init__(self, fail="", drop="", state=None, product="Jellyfin Server", behaviour="ok"):
         self.fail, self.drop, self.state, self.product, self.behaviour = fail, drop, state, product, behaviour
         self.calls, self.lock = [], threading.Lock()
+        self.setup_until = time.monotonic() + SETUP_SECONDS
         saved = json.loads(state.read_text()) if state and state.exists() else {}
         for field, value in fresh().items():
             setattr(self, field, saved.get(field, value))
@@ -75,6 +85,11 @@ class Stub:
             self.calls.append((method, path))
             if self.behaviour == "start-failed":
                 return 503, None
+            now = time.monotonic()
+            if self.behaviour == "setup" and now < self.setup_until + SETUP_SECONDS:
+                # the setup server, then the real server before its core startup completed
+                if path != ("/System/Info/Public" if now < self.setup_until else "/System/Ping"):
+                    return 503, None
             if self.fail and path.startswith(self.fail):
                 return 500, None
             if method in ("POST", "DELETE") and path.startswith("/Playlists/") and 'Token="apikey"' in auth:
@@ -102,6 +117,8 @@ class Stub:
         parts = path.strip("/").split("/")
         if path == "/System/Info/Public":
             return 200, {"Version": "12.4.0", "ProductName": self.product}
+        if path == "/System/Ping":
+            return 200, self.product
         if path == "/Users":
             return 200, [self.user(key) for key in self.users.values()]
         if parts[0] == "Users" and len(parts) == 2 and parts[1] in self.users.values():

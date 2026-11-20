@@ -44,6 +44,7 @@ pub mod secret;
 pub mod security;
 pub mod server_settings;
 pub mod session;
+pub mod sso;
 pub mod subtitles;
 pub mod sync_play;
 pub mod system;

@@ -16032,6 +16032,82 @@ mod tests {
         );
     }
 
+    /// A stream file in the item's metadata folder follows a re-key in the
+    /// form saves store it: with the metadata directory inside the data
+    /// directory, `reverse` stores it as `%AppDataPath%/…`, as upstream's
+    /// `ReverseVirtualPath` does (the data directory is replaced first).
+    #[tokio::test]
+    async fn a_rekey_moves_a_stream_path_stored_under_the_data_token() {
+        use ferrofin_traits::persistence::ItemRekey;
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().to_string_lossy().into_owned();
+        let app_paths = std::sync::Arc::new(crate::FerrofinServerApplicationPaths::new(
+            &root,
+            format!("{root}/log"),
+            format!("{root}/config"),
+            format!("{root}/cache"),
+            format!("{root}/web"),
+        ));
+        app_paths.set_internal_metadata_path(Some(format!("{root}/data/meta").as_str()));
+        let paths = crate::virtual_paths::VirtualPathExpander::from_paths(app_paths);
+        let art = std::path::PathBuf::from(format!("{root}/data/meta/library"));
+        let (movie, to) = (Uuid::from_u128(0xB1), Uuid::from_u128(0xB2));
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        // Jellyfin's `{xx}/{id:N}` folder, where a subtitle saved for the item lives.
+        let [.., old_folder] = crate::item_folders::item_art_folders(&art, movie);
+        let [.., new_folder] = crate::item_folders::item_art_folders(&art, to);
+        std::fs::create_dir_all(&old_folder).expect("folder");
+        let subtitle =
+            |folder: &std::path::Path| paths.reverse(&folder.join("A.en.srt").to_string_lossy());
+        assert!(subtitle(&old_folder).starts_with("%AppDataPath%/meta/library/"));
+        sqlx::query(
+            r#"INSERT INTO "MediaStreamInfos"
+               ("ItemId", "StreamIndex", "StreamType", "IsDefault", "IsExternal", "IsForced", "Path")
+               VALUES (?1, 2, 2, 0, 1, 0, ?2)"#,
+        )
+        .bind(guid_to_db(movie))
+        .bind(subtitle(&old_folder))
+        .execute(db.writer())
+        .await
+        .expect("stream");
+
+        let (folders, dirs) = crate::item_folders::move_item_folders(
+            &paths,
+            Some(&art),
+            None,
+            (movie, to),
+            "",
+            false,
+        );
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let moves = [ItemRekey {
+            from: movie,
+            to,
+            type_name: crate::item_type_lookup::stored_type_name(BaseItemKind::Video)
+                .expect("type")
+                .to_owned(),
+            dirs,
+            merged: Vec::new(),
+            extra: false,
+        }];
+        assert_eq!(svc.rekey_items(&moves).await.expect("rekey").len(), 1);
+        folders.commit();
+        assert!(new_folder.is_dir(), "the folder moved");
+
+        let stored: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "MediaStreamInfos" WHERE "ItemId" = ?1"#)
+                .bind(guid_to_db(to))
+                .fetch_one(db.pool())
+                .await
+                .expect("stream");
+        assert_eq!(
+            stored,
+            Some(subtitle(&new_folder)),
+            "the stream path follows"
+        );
+    }
+
     /// Upstream's `DeleteItem` (`ItemPersistenceService.cs:51-157`): the
     /// closure — the season, its episode (`ParentId`), the extras they own
     /// (`OwnerId`) wherever those are filed — goes in one transaction, the

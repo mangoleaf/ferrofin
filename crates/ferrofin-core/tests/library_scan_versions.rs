@@ -777,6 +777,7 @@ async fn an_adopted_group_repaired_at_boot_scans_quietly() {
     let rehomed = ferrofin_core::adoption_repairs::rehome_local_versions(
         &f.db,
         &IdDerivation::LegacyLowercase,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
         None,
         None,
         f.store.as_ref(),
@@ -848,6 +849,7 @@ async fn a_version_ferrofin_1_0_split_off_is_reunited_at_boot() {
     ferrofin_core::adoption_repairs::rehome_local_versions(
         &f.db,
         &IdDerivation::LegacyLowercase,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
         None,
         None,
         f.store.as_ref(),
@@ -1009,6 +1011,7 @@ async fn an_adopted_alternate_takes_its_primarys_rating_at_boot() {
     let rehomed = ferrofin_core::adoption_repairs::rehome_local_versions(
         &f.db,
         &IdDerivation::LegacyLowercase,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
         None,
         None,
         f.store.as_ref(),

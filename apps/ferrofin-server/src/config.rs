@@ -127,8 +127,8 @@ pub enum Command {
     /// new directory, with its configuration as the XML Jellyfin reads,
     /// leaving the source untouched.
     // Hidden from `--help` (the man page's synopsis still shows a generic
-    // `[subcommands]`) until Jellyfin can start on what it writes: the export lacks the history rewrite (gl-1549) and the
-    // removal of Ferrofin's own objects (gl-1553); gl-1570 documents it.
+    // `[subcommands]`) until the round trip is proven on every route: the export still lacks the removal of Ferrofin's
+    // own objects (gl-1553) and the remaining source generations (gl-1551, gl-1552); gl-1570 documents it.
     #[command(hide = true)]
     ExportJellyfin(crate::export_cmd::ExportJellyfinArgs),
 }
@@ -672,9 +672,9 @@ pub struct Config {
     pub enable_metrics: Option<bool>,
 
     /// Suppress the compiled-in extensions (intro skipper, file
-    /// transformation, merge versions, LDAP-Auth) — `true` registers none of them but
-    /// the Ferrofin settings extension, the server's own settings page
-    /// (`ferrofin_extensions::registered_extensions`).
+    /// transformation, merge versions, LDAP-Auth, Single Sign-On) — `true`
+    /// registers none of them but the Ferrofin settings extension, the
+    /// server's own settings page (`ferrofin_extensions::registered_extensions`).
     ///
     /// This exists for measurement. A benchmark leg has to compare like with
     /// like, and the Jellyfin leg runs with no plugins installed; leaving

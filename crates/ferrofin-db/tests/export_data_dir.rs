@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ferrofin_db::DbError;
-use ferrofin_db::export::{EXPORTED_DATABASE, export_data_dir};
+use ferrofin_db::export::{
+    DatabaseEdits, DroppedObjects, DroppedTable, EXPORTED_DATABASE, HistoryRewrite, export_data_dir,
+};
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
@@ -118,6 +120,12 @@ async fn exported_names(out: &Path) -> Vec<String> {
 async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
     let scratch = tempfile::tempdir().unwrap();
     let source = source(scratch.path()).await;
+    // Jellyfin's pre-10.11 migration list, which Jellyfin 12.4 would read
+    // again, and the copy Jellyfin 10.11 renamed it to, which it never reads.
+    let listing = b"<MigrationOptions><Applied><ValueTupleOfGuidString><Item1>9b354818-94d5-4b68-ac49-e35cb85f9d84</Item1><Item2>CreateNetworkConfiguration</Item2></ValueTupleOfGuidString></Applied></MigrationOptions>";
+    for name in ["migrations.xml", "migrations.xml.backup"] {
+        std::fs::write(source.join("config").join(name), listing).unwrap();
+    }
     let out = scratch.path().join("out");
     let before = files(&source);
 
@@ -136,6 +144,8 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
         b"jpeg bytes"
     );
     assert_eq!(copied[Path::new("config/system.json")], b"{}");
+    assert!(!copied.contains_key(Path::new("config/migrations.xml")));
+    assert!(copied.contains_key(Path::new("config/migrations.xml.backup")));
     // The database is the snapshot alone: none of the source's companion files.
     assert_eq!(
         copied
@@ -144,8 +154,23 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
             .collect::<Vec<_>>(),
         [Path::new(EXPORTED_DATABASE)]
     );
-    assert_eq!(summary.files, 2);
+    assert_eq!(summary.files, 3);
     assert_eq!(summary.database, out.join(EXPORTED_DATABASE));
+    // A native database has no Jellyfin history to rewrite; Ferrofin's own
+    // table goes.
+    assert_eq!(
+        summary.edits,
+        DatabaseEdits {
+            history: HistoryRewrite::default(),
+            dropped: DroppedObjects {
+                tables: vec![DroppedTable {
+                    name: "_sqlx_migrations".to_owned(),
+                    rows: 0
+                }],
+                indexes: Vec::new(),
+            },
+        }
+    );
     assert_eq!(exported_names(&out).await, ["one", "two", "three"]);
 }
 
