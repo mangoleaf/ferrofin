@@ -1,0 +1,554 @@
+//! The **Single Sign-On** extension: Ferrofin's own sign-in through OpenID
+//! Connect identity providers (the "OIDC sign-in" milestone).
+//!
+//! An internal plugin like LDAP-Auth (D1), under a Ferrofin identity of its
+//! own (D15): it is not a port of the community SSO-Auth plugin and does not
+//! present itself as one, so it has no row in `docs/PLUGINS_UPSTREAM.md`. It
+//! is off by default, and while it is off every `/sso` route answers `404`
+//! (B1).
+//!
+//! What it holds so far:
+//! - [`SsoExtension`]: the `/Plugins` entry, the plugin configuration
+//!   ([`SsoConfig`]) and the settings page, authored in this repository;
+//! - [`SsoService`]: the provider settings behind
+//!   `/sso/admin/oidc/providers` (the [`SsoManager`] trait), which keeps each
+//!   provider's client secret in the plugin's private data, a file no route
+//!   serves, never in its configuration (D16).
+//!
+//! Nothing here contacts an identity provider yet.
+
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use ferrofin_model::secret::Secret;
+use ferrofin_model::sso::{OidcProvider, OidcProviderInfo, OidcProviderList};
+use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
+use ferrofin_traits::sso::SsoManager;
+use ferrofin_traits::tasks::ScheduledTask;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::{Extension, ExtensionContext};
+
+/// The Single Sign-On plugin's id in `/Plugins`: Ferrofin's own, generated
+/// once and fixed for good, so its enabled flag, configuration and private
+/// data survive every upgrade (D15). Never the community SSO-Auth plugin's
+/// `505ce9d1-d916-42fa-86ca-673ef241d7df`.
+pub const EXTENSION_ID: Uuid = Uuid::from_u128(0x67a2_9a1d_e02b_4aaa_bba0_4b22_75e7_65d0);
+
+/// The settings page's name, which jellyfin-web loads it by
+/// (`configurationpage?name=SingleSignOn`).
+pub const SETTINGS_PAGE_NAME: &str = "SingleSignOn";
+
+/// The longest provider key: the milestone's phase 2 fixes it at 32.
+pub const MAX_PROVIDER_KEY_LEN: usize = 32;
+
+/// The plugin configuration, stored as `{plugins}/67a29a1d-…/config.json` and
+/// returned by `GET /Plugins/{id}/Configuration`. It holds no secret.
+///
+/// Each provider is kept as the document stored, and read with
+/// [`checked_providers`](Self::checked_providers): the generic configuration
+/// route and the file on disk can hold one that does not read, or that the
+/// provider routes would refuse, and a save of one provider keeps the others
+/// as they are, members a newer server added included.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SsoConfig {
+    /// The server's public URL the callback URLs are built on, base path
+    /// included; empty uses the server's published URL.
+    #[serde(deserialize_with = "crate::ldap_auth::null_as_empty")]
+    pub public_url: String,
+    /// The OIDC providers, each an [`OidcProvider`] document.
+    #[serde(deserialize_with = "crate::ldap_auth::null_as_empty")]
+    pub providers: Vec<serde_json::Value>,
+}
+
+impl SsoConfig {
+    /// Every stored provider with the reason it is refused, if it is: it does
+    /// not read, it fails [`validate_provider`], or an earlier provider has
+    /// its key. A refused provider is treated as disabled. A secret in the
+    /// configuration is never read (D16).
+    #[must_use]
+    pub fn checked_providers(&self) -> Vec<(OidcProvider, Option<String>)> {
+        let mut keys = HashSet::new();
+        self.providers
+            .iter()
+            .map(|stored| match OidcProvider::deserialize(stored) {
+                Ok(mut provider) => {
+                    provider.client_secret = None;
+                    let repeated = !keys.insert(provider.key.clone());
+                    let refused = validate_provider(&provider).err().or_else(|| {
+                        repeated.then(|| "an earlier provider has the same key".to_owned())
+                    });
+                    (provider, refused)
+                }
+                Err(_) => (
+                    OidcProvider {
+                        key: stored_key(stored).unwrap_or_default().to_owned(),
+                        enabled: false,
+                        ..OidcProvider::default()
+                    },
+                    // Not serde's message, which could quote a stored value.
+                    Some(
+                        "the stored provider does not read: it is not an object, or a member \
+                         has the wrong type"
+                            .to_owned(),
+                    ),
+                ),
+            })
+            .collect()
+    }
+}
+
+/// The provider members a stored document must not keep: a client secret
+/// lives in the private data only (D16), whatever spelling the generic
+/// configuration route stored it under.
+fn scrub_secrets(config: &mut SsoConfig) {
+    for stored in &mut config.providers {
+        if let Some(members) = stored.as_object_mut() {
+            members.retain(|name, _| !name.eq_ignore_ascii_case("ClientSecret"));
+        }
+    }
+}
+
+/// The `Key` of a stored provider document, when it has one.
+fn stored_key(stored: &serde_json::Value) -> Option<&str> {
+    stored.get("Key").and_then(serde_json::Value::as_str)
+}
+
+/// The plugin's private data, kept through
+/// [`PluginManager::set_plugin_private_data`] and never in its configuration:
+/// what no route may return (D16). `Debug` leaves every secret out.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct SsoSecrets {
+    /// Each provider's client secret, by provider key.
+    oidc_client_secrets: BTreeMap<String, Secret>,
+}
+
+/// Checks a provider key: 1 to [`MAX_PROVIDER_KEY_LEN`] lowercase ASCII
+/// letters, digits and `-`, so it can sit in a URL path as it is.
+///
+/// # Errors
+///
+/// The message to show the admin.
+pub fn validate_key(key: &str) -> Result<(), String> {
+    let allowed = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
+    if (1..=MAX_PROVIDER_KEY_LEN).contains(&key.len()) && key.bytes().all(allowed) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the provider key must be 1 to {MAX_PROVIDER_KEY_LEN} lowercase letters, digits or \
+             hyphens"
+        ))
+    }
+}
+
+/// Checks a provider's settings, its key included. No setting skips a check:
+/// `AllowHttpIssuer` only widens the issuer's scheme to `http` (D11).
+///
+/// # Errors
+///
+/// The message to show the admin, naming the first setting refused.
+pub fn validate_provider(provider: &OidcProvider) -> Result<(), String> {
+    validate_key(&provider.key)?;
+    // Each is used as written (the issuer is compared with the token's `iss`),
+    // so a save trims them and a stored one must already be trimmed.
+    for (setting, value) in [
+        ("provider name", &provider.name),
+        ("issuer", &provider.issuer),
+        ("client id", &provider.client_id),
+        ("scopes", &provider.scopes),
+        ("username claim", &provider.username_claim),
+    ] {
+        if value.chars().any(char::is_control) || value.trim() != value.as_str() {
+            return Err(format!(
+                "the {setting} must not hold control characters or start or end with a space"
+            ));
+        }
+    }
+    if provider.name.trim().is_empty() {
+        return Err("the provider name is required".to_owned());
+    }
+    validate_issuer(&provider.issuer, provider.allow_http_issuer)?;
+    if provider.client_id.trim().is_empty() {
+        return Err("the client id is required".to_owned());
+    }
+    if !provider
+        .scopes
+        .split_ascii_whitespace()
+        .any(|s| s == "openid")
+    {
+        return Err("the scopes must include openid".to_owned());
+    }
+    if provider.username_claim.trim().is_empty() {
+        return Err("the username claim is required".to_owned());
+    }
+    Ok(())
+}
+
+/// Checks an issuer as OpenID Connect Core 1.0 defines one: a URL with a
+/// scheme, a host and optionally a port and a path, and no query or
+/// fragment. Its scheme is `https`, or `http` with `allow_http`.
+fn validate_issuer(issuer: &str, allow_http: bool) -> Result<(), String> {
+    let url = url::Url::parse(issuer).map_err(|e| format!("the issuer is not a URL ({e})"))?;
+    match url.scheme() {
+        "https" => {}
+        "http" if allow_http => {}
+        "http" => {
+            return Err(
+                "the issuer must use https; allow an http issuer only for an identity provider \
+                 on a trusted network"
+                    .to_owned(),
+            );
+        }
+        _ => return Err("the issuer must be an https URL".to_owned()),
+    }
+    if url.host().is_none() || !url.username().is_empty() || url.password().is_some() {
+        return Err("the issuer must name a host, and no user name or password".to_owned());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("the issuer must have no query or fragment".to_owned());
+    }
+    // The parser forgives spellings a token's exact `iss` would never match
+    // (`https:host`, a backslash, dot segments, upper case, a default port):
+    // the issuer must be the URL it parses to, but for an empty path's `/`.
+    let parsed = url.as_str();
+    if issuer != parsed && Some(issuer) != parsed.strip_suffix('/') {
+        // The `/` the parser gives an empty path is not the issuer's; any
+        // other trailing `/` is.
+        let suggestion = if url.path() == "/" && !issuer.ends_with('/') {
+            parsed.trim_end_matches('/')
+        } else {
+            parsed
+        };
+        return Err(format!(
+            "the issuer must be written as the identity provider names it, such as {suggestion}"
+        ));
+    }
+    Ok(())
+}
+
+/// `text` as a public URL to build callback URLs on (an `http` or `https` URL
+/// with a host and no user name, query or fragment), without its trailing
+/// `/`; `None` for anything else.
+fn public_base(text: &str) -> Option<String> {
+    let url = url::Url::parse(text.trim()).ok()?;
+    let usable = matches!(url.scheme(), "http" | "https")
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
+    usable.then(|| url.as_str().trim_end_matches('/').to_owned())
+}
+
+/// The Single Sign-On plugin's service: reads and saves its configuration and
+/// private data through the plugin manager. Shared by the `/sso` routes
+/// through [`SsoManager`].
+pub struct SsoService {
+    plugins: Arc<dyn PluginManager>,
+    /// The server's published URL (`--published-url`,
+    /// `FERROFIN_PUBLISHED_URL`), the public URL when the plugin sets none.
+    published_url: Option<String>,
+    /// Serialises the read-modify-write of the configuration and the private
+    /// data, so two saves at once cannot lose each other's providers.
+    saving: tokio::sync::Mutex<()>,
+}
+
+impl SsoService {
+    /// A service over the plugin manager (the enabled flag, the configuration
+    /// and the private data) and the server's published URL, which the
+    /// callback URLs fall back to. Never the request's `Host` header.
+    #[must_use]
+    pub fn new(plugins: Arc<dyn PluginManager>, published_url: Option<String>) -> Self {
+        Self {
+            plugins,
+            published_url,
+            saving: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The plugin's current configuration.
+    ///
+    /// # Errors
+    ///
+    /// When the plugin manager cannot read it, or what it holds is not a
+    /// configuration.
+    pub async fn config(&self) -> Result<SsoConfig, ServiceError> {
+        let bytes = self.plugins.get_plugin_configuration(EXTENSION_ID).await?;
+        serde_json::from_slice(&bytes).map_err(|e| {
+            ServiceError::backend(format!("read the Single Sign-On configuration: {e}"))
+        })
+    }
+
+    /// Saves `config` as the plugin's configuration, without any client
+    /// secret a provider document was given.
+    async fn save_config(&self, config: &SsoConfig) -> Result<(), ServiceError> {
+        let mut config = config.clone();
+        scrub_secrets(&mut config);
+        let bytes = serde_json::to_vec(&config).map_err(|e| {
+            ServiceError::backend(format!("serialize the Single Sign-On configuration: {e}"))
+        })?;
+        self.plugins
+            .set_plugin_configuration(EXTENSION_ID, bytes)
+            .await
+    }
+
+    /// The plugin's private data; empty until a secret is saved.
+    async fn secrets(&self) -> Result<SsoSecrets, ServiceError> {
+        let Some(bytes) = self.plugins.get_plugin_private_data(EXTENSION_ID).await? else {
+            return Ok(SsoSecrets::default());
+        };
+        // The reason names only where the file stops reading: serde's own
+        // message could quote a value.
+        serde_json::from_slice(&bytes).map_err(|e| {
+            ServiceError::backend(format!(
+                "the Single Sign-On private data (private.json beside its configuration) does \
+                 not read (line {}, column {})",
+                e.line(),
+                e.column()
+            ))
+        })
+    }
+
+    /// Saves `secrets` as the plugin's private data.
+    async fn save_secrets(&self, secrets: &SsoSecrets) -> Result<(), ServiceError> {
+        let bytes = serde_json::to_vec(secrets)
+            .map_err(|_| ServiceError::backend("serialize the Single Sign-On private data"))?;
+        self.plugins
+            .set_plugin_private_data(EXTENSION_ID, bytes)
+            .await
+    }
+
+    /// The public URL the callback URLs are built on: the plugin's
+    /// `PublicUrl`, else, while it is empty, the server's published URL when
+    /// that is usable. `Err` says why a `PublicUrl` that is set is refused:
+    /// nothing falls back past it.
+    fn public_url(&self, config: &SsoConfig) -> Result<Option<String>, String> {
+        if config.public_url.trim().is_empty() {
+            return Ok(self.published_url.as_deref().and_then(public_base));
+        }
+        public_base(&config.public_url).map(Some).ok_or_else(|| {
+            "the public URL must be an http or https URL with a host and no user name, query or \
+             fragment"
+                .to_owned()
+        })
+    }
+
+    /// `provider` as the list shows it.
+    fn info(
+        provider: OidcProvider,
+        validation_error: Option<String>,
+        secrets: &SsoSecrets,
+        public_url: Option<&str>,
+    ) -> OidcProviderInfo {
+        OidcProviderInfo {
+            has_client_secret: secrets.oidc_client_secrets.contains_key(&provider.key),
+            // A key that fails validation may not fit in a URL path.
+            callback_url: public_url
+                .filter(|_| validate_key(&provider.key).is_ok())
+                .map(|base| format!("{base}/sso/oidc/{}/callback", provider.key)),
+            provider,
+            validation_error,
+        }
+    }
+}
+
+#[async_trait]
+impl SsoManager for SsoService {
+    async fn ensure_enabled(&self) -> Result<(), ServiceError> {
+        match self.plugins.get_plugin(EXTENSION_ID).await? {
+            Some(plugin) if plugin.enabled => Ok(()),
+            _ => Err(ServiceError::not_found(
+                "the Single Sign-On plugin is disabled",
+            )),
+        }
+    }
+
+    async fn oidc_providers(&self) -> Result<OidcProviderList, ServiceError> {
+        self.ensure_enabled().await?;
+        let config = self.config().await?;
+        let secrets = self.secrets().await?;
+        let (public_url, public_url_error) = match self.public_url(&config) {
+            Ok(url) => (url, None),
+            Err(why) => (None, Some(why)),
+        };
+        Ok(OidcProviderList {
+            providers: config
+                .checked_providers()
+                .into_iter()
+                .map(|(provider, refused)| {
+                    Self::info(provider, refused, &secrets, public_url.as_deref())
+                })
+                .collect(),
+            public_url: config.public_url,
+            public_url_error,
+        })
+    }
+
+    async fn save_oidc_provider(
+        &self,
+        key: &str,
+        mut provider: OidcProvider,
+    ) -> Result<OidcProviderInfo, ServiceError> {
+        self.ensure_enabled().await?;
+        validate_key(key).map_err(ServiceError::invalid_input)?;
+        if !provider.key.is_empty() && provider.key != key {
+            return Err(ServiceError::invalid_input(
+                "a provider's key cannot be changed",
+            ));
+        }
+        provider.key = key.to_owned();
+        for value in [
+            &mut provider.name,
+            &mut provider.issuer,
+            &mut provider.client_id,
+            &mut provider.scopes,
+            &mut provider.username_claim,
+        ] {
+            *value = value.trim().to_owned();
+        }
+        validate_provider(&provider).map_err(ServiceError::invalid_input)?;
+        // An empty or blank secret field on the page means "keep".
+        let secret = provider
+            .client_secret
+            .take()
+            .filter(|secret| !secret.expose().trim().is_empty());
+        if secret.as_ref().is_some_and(|secret| {
+            let secret = secret.expose();
+            secret.chars().any(char::is_control) || secret.trim() != secret
+        }) {
+            return Err(ServiceError::invalid_input(
+                "the client secret must not hold control characters or start or end with a space",
+            ));
+        }
+
+        let _saving = self.saving.lock().await;
+        let mut config = self.config().await?;
+        let mut secrets = self.secrets().await?;
+        // A secret counts only beside its provider: one left behind by a
+        // provider the configuration route removed is not inherited.
+        let stored = config
+            .providers
+            .iter()
+            .any(|stored| stored_key(stored) == Some(key));
+        if secret.is_none() && !(stored && secrets.oidc_client_secrets.contains_key(key)) {
+            return Err(ServiceError::invalid_input(
+                "the provider needs a client secret",
+            ));
+        }
+        let document = serde_json::to_value(&provider)
+            .map_err(|e| ServiceError::backend(format!("serialize the OIDC provider: {e}")))?;
+        // In the place of the first provider with this key, the only one left.
+        let at = config
+            .providers
+            .iter()
+            .position(|stored| stored_key(stored) == Some(key));
+        config
+            .providers
+            .retain(|stored| stored_key(stored) != Some(key));
+        config
+            .providers
+            .insert(at.unwrap_or(config.providers.len()), document);
+        // The provider first, then its secret: a failure between the two
+        // leaves a provider asking for its secret, never a secret without a
+        // provider. Secrets whose provider is gone are dropped on the way.
+        self.save_config(&config).await?;
+        let before = secrets.clone();
+        if let Some(secret) = secret {
+            secrets.oidc_client_secrets.insert(key.to_owned(), secret);
+        }
+        let keys: HashSet<&str> = config.providers.iter().filter_map(stored_key).collect();
+        secrets
+            .oidc_client_secrets
+            .retain(|stored, _| keys.contains(stored.as_str()));
+        if secrets != before {
+            self.save_secrets(&secrets).await?;
+        }
+        tracing::info!(oidc_provider = %key, "OIDC provider saved");
+        let public_url = self.public_url(&config).ok().flatten();
+        Ok(Self::info(provider, None, &secrets, public_url.as_deref()))
+    }
+
+    async fn delete_oidc_provider(&self, key: &str) -> Result<(), ServiceError> {
+        self.ensure_enabled().await?;
+        let _saving = self.saving.lock().await;
+        let mut config = self.config().await?;
+        // Read before anything is written, so private data that does not
+        // read changes nothing.
+        let mut secrets = self.secrets().await?;
+        let before = config.providers.len();
+        config
+            .providers
+            .retain(|stored| stored_key(stored) != Some(key));
+        let removed = config.providers.len() != before;
+        if removed {
+            self.save_config(&config).await?;
+        }
+        // A secret left without its provider goes too.
+        let removed_secret = secrets.oidc_client_secrets.remove(key).is_some();
+        if removed_secret {
+            self.save_secrets(&secrets).await?;
+        }
+        if !removed && !removed_secret {
+            return Err(ServiceError::not_found(format!("OIDC provider {key}")));
+        }
+        tracing::info!(oidc_provider = %key, "OIDC provider removed");
+        Ok(())
+    }
+}
+
+/// The `/Plugins` surface of the Single Sign-On extension.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SsoExtension;
+
+impl Extension for SsoExtension {
+    fn id(&self) -> Uuid {
+        EXTENSION_ID
+    }
+
+    fn descriptor(&self) -> PluginDescriptor {
+        PluginDescriptor {
+            id: EXTENSION_ID,
+            name: "Single Sign-On".to_owned(),
+            // Ferrofin's own, so it carries the server's release, as the
+            // Ferrofin Settings plugin does.
+            version: crate::ferrofin_settings::plugin_version(ferrofin_health::build_version()),
+            description: "Sign users in through OpenID Connect identity providers.".to_owned(),
+            // Off until an administrator enables it (D1).
+            enabled: false,
+            has_image: false,
+            can_uninstall: false,
+            configuration_file_name: None,
+        }
+    }
+
+    fn default_config(&self) -> Vec<u8> {
+        serde_json::to_vec_pretty(&SsoConfig::default()).unwrap_or_else(|_| b"{}".to_vec())
+    }
+
+    fn config_pages(&self) -> Vec<PluginConfigPage> {
+        // Authored in this repository, not vendored, so `build.rs` neither
+        // pins nor copies it. It is served anonymously and holds no setting:
+        // its script reads the admin-only `/sso/admin/oidc/providers`.
+        vec![PluginConfigPage {
+            name: SETTINGS_PAGE_NAME.to_owned(),
+            bytes: include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/assets/sso/settings.html"
+            ))
+            .to_vec(),
+            enable_in_main_menu: false,
+        }]
+    }
+
+    fn tasks(&self, _cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -162,6 +162,7 @@ pub mod search;
 pub mod session;
 pub(crate) mod session_ctx;
 pub mod similar;
+pub mod sso;
 pub mod startup;
 pub(crate) mod streaming;
 pub mod studios;
@@ -771,8 +772,9 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
 /// controller, which the vendored spec does not describe.
 ///
 /// They are in neither [`REAL_ROUTES`] nor [`EXTENSION_ROUTES`] (contract
-/// operations only) and carry no [`VERIFIED`] row; each plugin's comparison
-/// with its upstream is recorded in `docs/PLUGINS_UPSTREAM.md`. Like every
+/// operations only) and carry no [`VERIFIED`] row; each ported plugin's
+/// comparison with its upstream is recorded in `docs/PLUGINS_UPSTREAM.md`, and
+/// Ferrofin's own Single Sign-On plugin has none to compare with. Like every
 /// ASP.NET route they are matched ignoring case
 /// ([`canonicalize_path`](crate::routes::canonicalize_path) reads this list):
 /// a plugin's settings page calls them as it spells them.
@@ -781,6 +783,11 @@ pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
     ("post", "/Ldap/TestServerBind", "ldap-auth"),
     ("post", "/Ldap/TestLdapFilters", "ldap-auth"),
     ("post", "/Ldap/LdapUserSearch", "ldap-auth"),
+    // Single Sign-On plugin (see handlers::sso): Ferrofin's own, with no
+    // upstream to compare with (D15).
+    ("get", "/sso/admin/oidc/providers", "sso"),
+    ("put", "/sso/admin/oidc/providers/{provider}", "sso"),
+    ("delete", "/sso/admin/oidc/providers/{provider}", "sso"),
 ];
 
 /// Every path a handler registers that is neither a contract route nor in
@@ -7268,6 +7275,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // The LDAP-Auth plugin's own controller — not a contract operation, so
     // listed in PLUGIN_ROUTES.
     let router = ldap::register(router);
+    // The Single Sign-On plugin's own routes — not contract operations, so
+    // listed in PLUGIN_ROUTES.
+    let router = sso::register(router);
     // Live TV over the `LiveTvManager`; with nothing configured the reads answer
     // the empty state jellyfin-web shows as "not configured".
     let router = live_tv::register(router);

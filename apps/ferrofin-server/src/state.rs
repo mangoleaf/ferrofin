@@ -3355,6 +3355,14 @@ pub async fn build_app_state(
             Arc::clone(&plugins),
             Arc::new(ferrofin_extensions::ldap_auth::directory::Ldap3Directory::default()),
         ));
+    // The Single Sign-On extension's service behind the `/sso` routes, gated
+    // the same way. Its callback URLs fall back to the published URL, never
+    // to a request's Host header.
+    let sso: Arc<dyn ferrofin_traits::sso::SsoManager> =
+        Arc::new(ferrofin_extensions::sso::SsoService::new(
+            Arc::clone(&plugins),
+            config.published_url.clone(),
+        ));
     // The backup engine behind `/Backup*`: archives come from and go back to
     // the live application paths, and each manifest records this release.
     let backup_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
@@ -3375,6 +3383,7 @@ pub async fn build_app_state(
         .with_file_transformations(Arc::clone(&file_transformations))
         .with_merge_versions(merge_versions)
         .with_ldap(ldap)
+        .with_sso(sso)
         .with_backup(backup)
         .with_playback_metrics(playback_metrics);
 
