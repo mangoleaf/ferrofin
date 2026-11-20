@@ -1,7 +1,8 @@
 //! Handler tests for the Single Sign-On plugin's routes (`handlers::sso`):
 //! the provider settings, `GET /sso/admin/oidc/providers` and
 //! `PUT`/`DELETE /sso/admin/oidc/providers/{provider}`, and the sign-in,
-//! `GET /sso/oidc/{provider}/start` and `GET /sso/oidc/{provider}/callback`.
+//! `GET /sso/oidc/{provider}/start`, `GET /sso/oidc/{provider}/callback` and
+//! `POST /sso/oidc/exchange`.
 //!
 //! Each test drives a route through the real router against a [`FakeSso`]
 //! manager, asserting the status, the body and whether the manager was
@@ -18,11 +19,15 @@ use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     authed_state_with_plugins, fake_state, user_authed_state_with_plugins,
 };
+use ferrofin_model::dto::{SessionInfoDto, UserDto};
 use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::DisabledPluginManager;
-use ferrofin_traits::sso::{OIDC_FLOW_COOKIE, OidcCallback, SsoManager, SsoReply};
+use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
+use ferrofin_traits::sso::{
+    OIDC_FLOW_COOKIE, OidcCallback, OidcExchangeRefusal, OidcExchangeReply, SsoManager, SsoReply,
+};
 use tower::ServiceExt;
 
 const SECRET: &str = "route-client-secret-31";
@@ -44,6 +49,7 @@ struct FakeSso {
     listed: Mutex<usize>,
     started: Mutex<Vec<(String, IpAddr)>>,
     finished: Mutex<Vec<(String, OidcCallback)>>,
+    exchanged: Mutex<Vec<(Secret, Option<Secret>, AuthenticationRequest)>>,
 }
 
 impl FakeSso {
@@ -74,6 +80,10 @@ impl FakeSso {
         self.finished.lock().expect("finished").clone()
     }
 
+    fn exchanged(&self) -> Vec<(Secret, Option<Secret>, AuthenticationRequest)> {
+        self.exchanged.lock().expect("exchanged").clone()
+    }
+
     /// Whether any route reached the manager past its enabled check.
     fn untouched(&self) -> bool {
         self.saved().is_empty()
@@ -82,6 +92,7 @@ impl FakeSso {
             && *self.listed.lock().expect("listed") == 0
             && self.started().is_empty()
             && self.finished().is_empty()
+            && self.exchanged().is_empty()
     }
 }
 
@@ -197,6 +208,7 @@ impl SsoManager for FakeSso {
             location: Some(AUTHORIZE.to_owned()),
             html: String::new(),
             set_cookies: vec![format!("{OIDC_FLOW_COOKIE}=b1; Path=/sso; HttpOnly")],
+            content_security_policy: None,
         })
     }
 
@@ -218,7 +230,53 @@ impl SsoManager for FakeSso {
             location: None,
             html: "<p>Sign-in failed. Try again.</p>".to_owned(),
             set_cookies: vec![format!("{OIDC_FLOW_COOKIE}=; Path=/sso; Max-Age=0")],
+            content_security_policy: Some("default-src 'none'".to_owned()),
         })
+    }
+
+    async fn exchange_oidc_sign_in(
+        &self,
+        code: Secret,
+        flow_cookie: Option<Secret>,
+        request: AuthenticationRequest,
+    ) -> Result<OidcExchangeReply, ServiceError> {
+        self.ensure_enabled().await?;
+        self.exchanged
+            .lock()
+            .expect("exchanged")
+            .push((code.clone(), flow_cookie, request));
+        let outcome = match code.expose() {
+            "good" => Ok(signed_in()),
+            "disabled" => Err(OidcExchangeRefusal {
+                status: 403,
+                message: "The pocket account is currently disabled.".to_owned(),
+            }),
+            _ => Err(OidcExchangeRefusal {
+                status: 400,
+                message: "Sign-in failed. Try again.".to_owned(),
+            }),
+        };
+        Ok(OidcExchangeReply {
+            outcome,
+            set_cookies: vec![format!("{OIDC_FLOW_COOKIE}=; Path=/sso; Max-Age=0")],
+        })
+    }
+}
+
+/// The session [`FakeSso`] answers the exchange code `good` with.
+fn signed_in() -> AuthenticationResultData {
+    AuthenticationResultData {
+        user: UserDto {
+            name: Some("pocket".to_owned()),
+            server_id: Some("server-1".to_owned()),
+            ..UserDto::default()
+        },
+        session: SessionInfoDto {
+            user_name: Some("pocket".to_owned()),
+            server_id: Some("server-1".to_owned()),
+            ..SessionInfoDto::default()
+        },
+        access_token: Secret::new("minted-token-0001"),
     }
 }
 
@@ -546,6 +604,7 @@ async fn every_sso_plugin_route_is_registered() {
             ("delete", "/sso/admin/oidc/providers/{provider}"),
             ("get", "/sso/oidc/{provider}/start"),
             ("get", "/sso/oidc/{provider}/callback"),
+            ("post", "/sso/oidc/exchange"),
         ]
     );
     for (method, path) in rows {
@@ -557,7 +616,11 @@ async fn every_sso_plugin_route_is_registered() {
             "{path}"
         );
         let path = path.replace("{provider}", "pocket");
-        let body = if method == "put" { PAGE_BODY } else { "" };
+        let body = match method {
+            "put" => PAGE_BODY,
+            "post" => r#"{"Code":"good"}"#,
+            _ => "",
+        };
         let (status, _) = send(
             as_admin(FakeSso::new(true)),
             request(&method.to_ascii_uppercase(), &path, body, true),
@@ -741,4 +804,141 @@ async fn sign_in_answers_not_found_while_disabled_or_for_an_unknown_provider() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
         assert!(fake.untouched(), "{path}");
     }
+}
+
+/// A `POST /sso/oidc/exchange` with the completion page's body and `cookie`.
+fn exchange(code: &str, cookie: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/sso/oidc/exchange")
+        .header("content-type", "application/json");
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    builder
+        .body(Body::from(format!(r#"{{"Code":"{code}"}}"#)))
+        .expect("request")
+}
+
+#[tokio::test]
+async fn the_exchange_hands_the_code_cookie_and_caller_to_the_plugin_and_answers_the_session() {
+    let fake = FakeSso::new(true);
+    let response = respond(
+        fake_state().with_sso(fake.clone()),
+        exchange("good", Some("theme=dark; ferrofin_sso_flow=b1")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "set-cookie"),
+        ["ferrofin_sso_flow=; Path=/sso; Max-Age=0"]
+    );
+    assert_eq!(header(&response, "cache-control"), ["no-store"]);
+    assert_eq!(header(&response, "x-content-type-options"), ["nosniff"]);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    // `POST /Users/AuthenticateByName`'s `AuthenticationResult`.
+    let body = json(&body);
+    assert_eq!(body["AccessToken"], "minted-token-0001");
+    assert_eq!(body["ServerId"], "server-1");
+    assert_eq!(body["User"]["Name"], "pocket");
+    assert_eq!(body["SessionInfo"]["UserName"], "pocket");
+
+    let (code, cookie, request) = fake.exchanged().remove(0);
+    assert_eq!(code.expose(), "good");
+    assert_eq!(cookie.as_ref().map(Secret::expose), Some("b1"));
+    // The caller's address, as the password sign-in resolves it; the device
+    // is the auth context's, which a fake state leaves empty.
+    assert_eq!(request.remote_endpoint.as_deref(), Some("127.0.0.1"));
+    assert_eq!(request.user_id, None);
+    assert!(request.password.is_none());
+}
+
+#[tokio::test]
+async fn a_refused_exchange_is_the_plain_sentence_the_page_shows_and_clears_the_cookie() {
+    for (code, status, message) in [
+        (
+            "disabled",
+            StatusCode::FORBIDDEN,
+            "The pocket account is currently disabled.",
+        ),
+        (
+            "used",
+            StatusCode::BAD_REQUEST,
+            "Sign-in failed. Try again.",
+        ),
+    ] {
+        let response = respond(
+            fake_state().with_sso(FakeSso::new(true)),
+            exchange(code, None),
+        )
+        .await;
+        assert_eq!(response.status(), status, "{code}");
+        assert_eq!(
+            header(&response, "content-type"),
+            ["text/plain; charset=utf-8"]
+        );
+        assert_eq!(
+            header(&response, "set-cookie"),
+            ["ferrofin_sso_flow=; Path=/sso; Max-Age=0"]
+        );
+        assert_eq!(header(&response, "cache-control"), ["no-store"]);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], message.as_bytes(), "{code}");
+    }
+}
+
+#[tokio::test]
+async fn the_exchange_answers_not_found_while_disabled_and_refuses_a_body_that_does_not_bind() {
+    let fake = FakeSso::new(false);
+    let (status, _) = send(fake_state().with_sso(fake.clone()), exchange("good", None)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(
+        authed_state_with_plugins(Arc::new(DisabledPluginManager)),
+        exchange("good", None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no extension");
+    assert!(fake.untouched());
+
+    let fake = FakeSso::new(true);
+    let (status, _) = send(
+        fake_state().with_sso(fake.clone()),
+        Request::builder()
+            .method("POST")
+            .uri("/sso/oidc/exchange")
+            .header("content-type", "application/json")
+            .body(Body::from("not json"))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(fake.untouched());
+}
+
+#[tokio::test]
+async fn a_page_runs_only_what_its_policy_names_and_is_never_sniffed() {
+    let callback = Request::builder()
+        .uri("/sso/oidc/pocket/callback?state=s1")
+        .body(Body::empty())
+        .expect("request");
+    let response = respond(fake_state().with_sso(FakeSso::new(true)), callback).await;
+    assert_eq!(
+        header(&response, "content-security-policy"),
+        ["default-src 'none'"]
+    );
+    assert_eq!(header(&response, "x-content-type-options"), ["nosniff"]);
+    // A redirect has no policy of its own.
+    let start = respond(
+        fake_state().with_sso(FakeSso::new(true)),
+        request("GET", "/sso/oidc/pocket/start", "", false),
+    )
+    .await;
+    assert_eq!(
+        header(&start, "content-security-policy"),
+        Vec::<&str>::new()
+    );
 }

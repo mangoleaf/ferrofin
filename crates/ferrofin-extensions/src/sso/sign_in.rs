@@ -4,7 +4,9 @@
 //! `GET /sso/oidc/{provider}/callback` accepts only a response that passes
 //! every check, and hands the [`VerifiedIdentity`] it ends with to
 //! `SsoService::sign_in_verified`, which finds or creates its account
-//! ([`accounts`](super::accounts)).
+//! ([`accounts`](super::accounts)); the callback then answers the completion
+//! page, whose script swaps an exchange code for the session
+//! ([`complete`](super::complete)).
 //!
 //! The callback's checks, in order; the first that fails refuses it:
 //! 1. a pending flow for its `state`, at this provider, not expired, and
@@ -33,7 +35,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -55,6 +57,7 @@ use openidconnect::{
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use super::complete::completion_page;
 use super::discovery::ProviderMetadata;
 use super::flows::{FLOW_LIFETIME, FlowPurpose, PendingFlow};
 use super::{SsoConfig, SsoService};
@@ -145,7 +148,10 @@ impl Refusal {
 
 /// The provider `key` while it can sign users in: stored, accepted by the
 /// checks and enabled. Any other is no such provider.
-fn sign_in_provider(config: &SsoConfig, key: &str) -> Result<OidcProvider, ServiceError> {
+pub(super) fn sign_in_provider(
+    config: &SsoConfig,
+    key: &str,
+) -> Result<OidcProvider, ServiceError> {
     config
         .checked_providers()
         .into_iter()
@@ -155,16 +161,16 @@ fn sign_in_provider(config: &SsoConfig, key: &str) -> Result<OidcProvider, Servi
         .ok_or_else(|| ServiceError::not_found("no such OIDC provider"))
 }
 
-/// The flow cookie's `Set-Cookie` value, carrying `value`, or clearing it with
-/// `None`: scoped to `/sso` below the public URL's path, `HttpOnly`,
-/// `SameSite=Lax` (the callback is a top-level navigation), and `Secure` on an
-/// `https` public URL.
-fn flow_cookie(public_url: &str, value: Option<&str>) -> String {
+/// The flow cookie's `Set-Cookie` value, carrying `value` for `max_age`, or
+/// clearing it with an empty value and no age: scoped to `/sso` below the
+/// public URL's path, `HttpOnly`, `SameSite=Lax` (the callback is a top-level
+/// navigation), and `Secure` on an `https` public URL.
+pub(super) fn flow_cookie(public_url: &str, value: &str, max_age: Duration) -> String {
     let base_path = url::Url::parse(public_url).map_or_else(
         |_| String::new(),
         |url| url.path().trim_end_matches('/').to_owned(),
     );
-    let (value, max_age) = value.map_or(("", 0), |value| (value, FLOW_LIFETIME.as_secs()));
+    let max_age = max_age.as_secs();
     let secure = if public_url.starts_with("https:") {
         "; Secure"
     } else {
@@ -176,8 +182,22 @@ fn flow_cookie(public_url: &str, value: Option<&str>) -> String {
     )
 }
 
+/// The `Set-Cookie` value that clears the flow cookie, when a public URL
+/// names its path.
+pub(super) fn cleared_flow_cookie(public_url: Option<&str>) -> Vec<String> {
+    public_url
+        .map(|url| flow_cookie(url, "", Duration::ZERO))
+        .into_iter()
+        .collect()
+}
+
+/// The `Content-Security-Policy` of a page without a script: it loads
+/// nothing, posts no form, and is never framed.
+const PAGE_POLICY: &str =
+    "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
 /// `text` with the characters HTML gives a meaning escaped.
-fn escape_html(text: &str) -> String {
+pub(super) fn escape_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -193,9 +213,9 @@ fn escape_html(text: &str) -> String {
 }
 
 /// A plain page with `title` and `body` (HTML, already escaped), and a link
-/// back to jellyfin-web. The link is relative, from `/sso/oidc/{key}/…`, so
-/// a server under a base URL keeps it.
-fn page(status: u16, title: &str, body: &str) -> SsoReply {
+/// back to jellyfin-web, under [`PAGE_POLICY`]. The link is relative, from
+/// `/sso/oidc/{key}/…`, so a server under a base URL keeps it.
+pub(super) fn page(status: u16, title: &str, body: &str) -> SsoReply {
     SsoReply {
         status,
         location: None,
@@ -206,6 +226,7 @@ fn page(status: u16, title: &str, body: &str) -> SsoReply {
              <p><a href=\"../../../web/\">Back to Ferrofin</a></p></main></body></html>\n"
         ),
         set_cookies: Vec::new(),
+        content_security_policy: Some(PAGE_POLICY.to_owned()),
     }
 }
 
@@ -219,7 +240,7 @@ fn refusal_page(status: u16) -> SsoReply {
 }
 
 /// Logs `reason` once, at `warn`, with the provider key only.
-fn log_refusal(key: &str, reason: &'static str) {
+pub(super) fn log_refusal(key: &str, reason: &'static str) {
     tracing::warn!(oidc_provider = %key, reason, "OIDC sign-in refused");
 }
 
@@ -369,7 +390,8 @@ impl SsoService {
             status: 302,
             location: Some(location.into()),
             html: String::new(),
-            set_cookies: vec![flow_cookie(&public_url, Some(binding.secret()))],
+            set_cookies: vec![flow_cookie(&public_url, binding.secret(), FLOW_LIFETIME)],
+            content_security_policy: None,
         })
     }
 
@@ -382,51 +404,52 @@ impl SsoService {
         self.ensure_enabled().await?;
         let config = self.config().await?;
         let provider = sign_in_provider(&config, key)?;
+        let public_url = self.public_url(&config).ok().flatten();
+        // What the verified identity is for decides how the flow ends: a
+        // purpose added later (linking, Quick Connect approval) adds its own
+        // arm, ending on its own page with no exchange code.
         let mut reply = match self.verify_callback(&provider, callback).await {
-            Ok((FlowPurpose::SignIn, identity)) => {
+            Ok((FlowPurpose::SignIn, identity, cookie)) => {
                 tracing::info!(oidc_provider = %key, "OIDC sign-in verified");
-                self.sign_in_verified(&provider, &identity).await?
+                match self.sign_in_verified(&provider, identity, &cookie).await? {
+                    // Keeps the cookie, the code's binding: the exchange
+                    // clears it.
+                    Ok(code) => return Ok(completion_page(&code, &cookie, public_url.as_deref())),
+                    Err(refusal) => refusal.refused(key),
+                }
             }
             Err(refusal) => refusal.refused(key),
         };
-        if let Some(public_url) = self.public_url(&config).ok().flatten() {
-            reply.set_cookies.push(flow_cookie(&public_url, None));
-        }
+        reply.set_cookies = cleared_flow_cookie(public_url.as_deref());
         Ok(reply)
     }
 
     /// Hands a verified sign-in to its account, found by its link or created
-    /// ([`account`](Self::account)), and answers the page the browser ends
-    /// on: the account that is ready, or the refusal saying what to ask an
-    /// administrator. Nobody is signed in yet: the milestone's next phase
-    /// (gl-1891) signs in the account `account` answers.
+    /// ([`account`](Self::account)), and keeps it for the exchange under a
+    /// new code bound to the flow `cookie`: `Ok(code)`, or the refusal saying
+    /// what to ask an administrator. A check that must refuse before any
+    /// account exists goes before [`account`](Self::account).
     async fn sign_in_verified(
         &self,
         provider: &OidcProvider,
-        identity: &VerifiedIdentity,
-    ) -> Result<SsoReply, ServiceError> {
-        Ok(match self.account(provider, identity).await? {
-            Ok(user) => page(
-                200,
-                "Account ready",
-                &format!(
-                    "<p>You signed in at {provider}. Your Ferrofin account \
-                     <strong>{username}</strong> is ready.</p>",
-                    provider = escape_html(&provider.name),
-                    username = escape_html(&user.username),
-                ),
-            ),
-            Err(refusal) => refusal.refused(&provider.key),
-        })
+        identity: VerifiedIdentity,
+        cookie: &Secret,
+    ) -> Result<Result<String, Refusal>, ServiceError> {
+        let user = match self.account(provider, &identity).await? {
+            Ok(user) => user,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        Ok(Ok(self.issue_exchange_code(&user, identity, cookie)?))
     }
 
     /// Runs the callback's checks, in the order of the module's list, and
-    /// answers what its verified identity is for.
+    /// answers what its verified identity is for, the identity, and the flow
+    /// cookie that bound it to the browser.
     pub(super) async fn verify_callback(
         &self,
         provider: &OidcProvider,
         callback: OidcCallback,
-    ) -> Result<(FlowPurpose, VerifiedIdentity), Refusal> {
+    ) -> Result<(FlowPurpose, VerifiedIdentity, Secret), Refusal> {
         let flow = callback
             .state
             .as_deref()
@@ -504,6 +527,7 @@ impl SsoService {
                 username,
                 claims,
             },
+            cookie,
         ))
     }
 

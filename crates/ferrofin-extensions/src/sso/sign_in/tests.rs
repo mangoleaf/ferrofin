@@ -7,15 +7,31 @@ use std::net::Ipv4Addr;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use ferrofin_core::FerrofinPluginManager;
-use ferrofin_core::FerrofinUserManager;
+use async_trait::async_trait;
 use ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore;
+use ferrofin_core::{
+    FerrofinActivityManager, FerrofinDeviceManager, FerrofinEventManager, FerrofinItemCountService,
+    FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinLibraryManager,
+    FerrofinPeopleRepository, FerrofinPluginManager, FerrofinSessionManager,
+    FerrofinUserDataManager, FerrofinUserManager, ItemTypeLookup,
+};
+use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
+use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::secret::Secret;
+use ferrofin_traits::activity::ActivityManager;
+use ferrofin_traits::configuration::ServerConfigurationManager;
+use ferrofin_traits::dto::DtoService;
+use ferrofin_traits::events::EventManager;
 use ferrofin_traits::external_identities::ExternalIdentityStore;
 use ferrofin_traits::library::UserManager;
+use ferrofin_traits::options::DtoOptions;
 use ferrofin_traits::plugins::PluginManager;
-use ferrofin_traits::sso::SsoManager;
+use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
+use ferrofin_traits::sso::{OidcExchangeRefusal, OidcExchangeReply, SsoManager};
 use serde_json::json;
+use uuid::Uuid;
 
 use super::*;
 use crate::Extension;
@@ -34,19 +50,131 @@ const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
 
 /// The service with the plugin enabled and the provider `fake` saved at the
 /// fake identity provider, and what they run on: the accounts, with the
-/// Single Sign-On provider registered, and the identity links.
+/// Single Sign-On provider registered, the identity links, the sessions and
+/// their events, and the activity log.
 pub(in crate::sso) struct Harness {
     pub(in crate::sso) sso: SsoService,
     pub(in crate::sso) fake: FakeIdentityProvider,
     pub(in crate::sso) users: Arc<FerrofinUserManager>,
     pub(in crate::sso) identities: Arc<FerrofinExternalIdentityStore>,
+    pub(in crate::sso) sessions: Arc<FerrofinSessionManager>,
+    pub(in crate::sso) events: Arc<FerrofinEventManager>,
+    pub(in crate::sso) activity: Arc<FerrofinActivityManager>,
     _dir: tempfile::TempDir,
 }
 
 /// A sign-in started: where the browser was sent, and its flow cookie.
 pub(in crate::sso) struct Started {
     location: String,
-    cookie: String,
+    pub(in crate::sso) cookie: String,
+}
+
+/// The server configuration the user data manager reads: the defaults.
+struct DefaultConfiguration;
+
+#[async_trait]
+impl ServerConfigurationManager for DefaultConfiguration {
+    fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+        unreachable!("no sign-in reads the application paths")
+    }
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        Ok(Arc::new(ferrofin_core::default_server_configuration()))
+    }
+    async fn update_configuration(&self, _: &ServerConfiguration) -> Result<(), ServiceError> {
+        unreachable!("no sign-in saves the configuration")
+    }
+    async fn get_branding(
+        &self,
+    ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+        unreachable!("no sign-in reads the branding")
+    }
+    async fn update_branding(
+        &self,
+        _: &ferrofin_model::branding::BrandingOptions,
+    ) -> Result<(), ServiceError> {
+        unreachable!("no sign-in saves the branding")
+    }
+}
+
+/// The session manager's item DTOs: a session that signs in plays nothing.
+struct NoItems;
+
+#[async_trait]
+impl DtoService for NoItems {
+    async fn get_base_item_dto(
+        &self,
+        _: &BaseItemEntity,
+        _: &DtoOptions,
+        _: Option<&UserEntity>,
+        _: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        unreachable!("no sign-in builds an item")
+    }
+    async fn get_base_item_dtos(
+        &self,
+        _: &[BaseItemEntity],
+        _: &DtoOptions,
+        _: Option<&UserEntity>,
+        _: Option<Uuid>,
+        _: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        unreachable!("no sign-in builds an item")
+    }
+}
+
+/// The real session manager over `db` and `users`, and its events.
+pub(in crate::sso) fn sessions(
+    db: &ferrofin_db::Database,
+    users: &Arc<FerrofinUserManager>,
+) -> (Arc<FerrofinSessionManager>, Arc<FerrofinEventManager>) {
+    let events = Arc::new(FerrofinEventManager::new());
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ItemTypeLookup::new());
+    let library = Arc::new(FerrofinLibraryManager::new(
+        Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+        Arc::new(FerrofinItemCountService::new(db.clone())),
+        Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+        Arc::new(FerrofinPeopleRepository::new(db.clone())),
+    ));
+    let sessions = Arc::new(FerrofinSessionManager::new(
+        Arc::clone(users) as Arc<dyn UserManager>,
+        Arc::new(FerrofinDeviceManager::new(db.clone())),
+        Arc::new(FerrofinUserDataManager::new(
+            db.clone(),
+            Arc::new(DefaultConfiguration),
+        )),
+        library,
+        Arc::new(NoItems),
+        Arc::clone(&events) as Arc<dyn EventManager>,
+        db.clone(),
+        SERVER_ID,
+    ));
+    (sessions, events)
+}
+
+/// The server id every session carries.
+const SERVER_ID: &str = "sso-test-server";
+
+/// The device a completion page names.
+pub(in crate::sso) fn device(device_id: &str) -> AuthenticationRequest {
+    AuthenticationRequest {
+        app: Some("Jellyfin Web".to_owned()),
+        app_version: Some("12.4.0".to_owned()),
+        device_id: Some(device_id.to_owned()),
+        device_name: Some("Web Browser".to_owned()),
+        remote_endpoint: Some(CLIENT.to_string()),
+        ..AuthenticationRequest::default()
+    }
+}
+
+/// The exchange code a completion page holds.
+pub(in crate::sso) fn exchange_code(html: &str) -> String {
+    html.split_once("data-code=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map_or_else(
+            || panic!("no exchange code in {html}"),
+            |(code, _)| code.to_owned(),
+        )
 }
 
 /// The provider `fake` as saved, `edit`ed.
@@ -91,11 +219,15 @@ impl Harness {
         users.set_extension_providers(vec![Arc::new(SsoAuthProvider::new(
             Arc::clone(&plugins) as Arc<dyn PluginManager>
         ))]);
-        let identities = Arc::new(FerrofinExternalIdentityStore::new(db));
+        let identities = Arc::new(FerrofinExternalIdentityStore::new(db.clone()));
+        let (sessions, events) = sessions(&db, &users);
+        let activity = Arc::new(FerrofinActivityManager::new(db));
         let sso = SsoService::new(
             plugins as Arc<dyn PluginManager>,
             Arc::clone(&users) as Arc<dyn UserManager>,
             Arc::clone(&identities) as Arc<dyn ExternalIdentityStore>,
+            Arc::clone(&sessions) as Arc<dyn SessionManager>,
+            Arc::clone(&activity) as Arc<dyn ActivityManager>,
             published_url.map(str::to_owned),
         );
         sso.save_oidc_provider("fake", fake_provider(&fake, edit))
@@ -106,6 +238,9 @@ impl Harness {
             fake,
             users,
             identities,
+            sessions,
+            events,
+            activity,
             _dir: dir,
         }
     }
@@ -147,16 +282,53 @@ impl Harness {
         self.sso
             .verify_callback(&self.provider("fake").await, callback)
             .await
+            .map(|(purpose, identity, _)| (purpose, identity))
     }
 
     /// A whole sign-in at `fake`, through the callback: the page it ends on.
     pub(in crate::sso) async fn finish(&self) -> SsoReply {
+        self.completed().await.0
+    }
+
+    /// A whole sign-in at `fake`, through the callback: the page it ends on,
+    /// and the browser's flow cookie.
+    pub(in crate::sso) async fn completed(&self) -> (SsoReply, String) {
         let started = self.start().await;
         let callback = self.callback(&started).await;
-        self.sso
+        let reply = self
+            .sso
             .finish_oidc_sign_in("fake", callback)
             .await
+            .expect("an answer");
+        (reply, started.cookie)
+    }
+
+    /// Swaps `code`, with the flow `cookie`, for a session of `request`'s
+    /// device.
+    pub(in crate::sso) async fn exchange(
+        &self,
+        code: &str,
+        cookie: Option<&str>,
+        request: AuthenticationRequest,
+    ) -> OidcExchangeReply {
+        self.sso
+            .exchange_oidc_sign_in(Secret::new(code), cookie.map(Secret::new), request)
+            .await
             .expect("an answer")
+    }
+
+    /// A whole sign-in at `fake`, from its start to the exchange of its
+    /// completion page's code by the device `device_id`: the session, or why
+    /// there is none.
+    pub(in crate::sso) async fn session(
+        &self,
+        device_id: &str,
+    ) -> Result<AuthenticationResultData, OidcExchangeRefusal> {
+        let (page, cookie) = self.completed().await;
+        assert_eq!(page.status, 200, "{}", page.html);
+        self.exchange(&exchange_code(&page.html), Some(&cookie), device(device_id))
+            .await
+            .outcome
     }
 
     /// The reason a whole sign-in is refused.
@@ -279,12 +451,13 @@ async fn a_valid_callback_yields_the_verified_identity() {
     let started = harness.start().await;
     let challenge = query(&started.location)["code_challenge"].clone();
     let callback = harness.callback(&started).await;
-    let (purpose, identity) = harness
+    let (purpose, identity, cookie) = harness
         .sso
         .verify_callback(&harness.provider("fake").await, callback)
         .await
         .expect("verified");
     assert_eq!(purpose, FlowPurpose::SignIn);
+    assert_eq!(cookie.expose(), started.cookie, "the flow's binding");
     assert_eq!(identity.provider_key, "fake");
     assert_eq!(identity.issuer, harness.fake.issuer());
     assert_eq!(identity.subject, SUBJECT);
@@ -333,32 +506,6 @@ async fn a_valid_callback_yields_the_verified_identity() {
 }
 
 #[tokio::test]
-async fn the_callback_page_names_the_account_and_clears_the_cookie() {
-    let harness = Harness::new().await;
-    let reply = harness.finish().await;
-    assert_eq!(reply.status, 200, "{reply:?}");
-    assert_eq!(reply.location, None);
-    assert!(
-        reply
-            .html
-            .contains(&format!("<strong>{USERNAME}</strong> is ready")),
-        "{}",
-        reply.html
-    );
-    assert!(
-        reply.html.contains("Fake &lt;IdP&gt;"),
-        "escaped: {}",
-        reply.html
-    );
-    assert!(!reply.html.contains(SUBJECT), "{}", reply.html);
-    assert!(reply.html.contains(r#"<a href="../../../web/">"#));
-    assert_eq!(
-        reply.set_cookies,
-        ["ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
-    );
-}
-
-#[tokio::test]
 async fn every_refusal_is_one_generic_page_that_clears_the_cookie() {
     let harness = Harness::new().await;
     let started = harness.start().await;
@@ -377,6 +524,12 @@ async fn every_refusal_is_one_generic_page_that_clears_the_cookie() {
         reply.set_cookies,
         ["ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
     );
+    assert_eq!(
+        reply.content_security_policy.as_deref(),
+        Some(PAGE_POLICY),
+        "no script, never framed"
+    );
+    assert!(harness.sso.exchanges.is_empty(), "no exchange code");
 }
 
 #[tokio::test]
@@ -932,7 +1085,8 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
 }
 
 /// B15: the log of a sign-in, at every level and from every crate, holds no
-/// code, token, verifier, nonce, state, cookie, client secret or claim.
+/// code, token, verifier, nonce, state, cookie, client secret or claim, nor
+/// the exchange code or the session's token.
 #[tokio::test]
 async fn the_log_of_a_sign_in_holds_no_secret_and_no_claim() {
     let logs = CapturedLogs::default();
@@ -969,6 +1123,17 @@ async fn the_log_of_a_sign_in_holds_no_secret_and_no_claim() {
             .await
             .expect("an answer");
         assert_eq!(reply.status, if refused { 400 } else { 200 });
+        if !refused {
+            // The completion page's code, swapped for a session: B5's code
+            // and token are never logged either.
+            let code = exchange_code(&reply.html);
+            let session = harness
+                .exchange(&code, Some(&started.cookie), device("log-device"))
+                .await
+                .outcome
+                .expect("a session");
+            secrets.extend([code, session.access_token.expose().to_owned()]);
+        }
     }
     for request in harness.fake.requests() {
         if request.path == harness.fake.path(TOKEN_PATH) {
@@ -980,6 +1145,7 @@ async fn the_log_of_a_sign_in_holds_no_secret_and_no_claim() {
     }
     let text = logs.text();
     assert!(text.contains("OIDC sign-in verified"), "{text}");
+    assert!(text.contains("OIDC sign-in completed"), "{text}");
     assert!(
         text.contains("OIDC sign-in refused") && text.contains("reason=\"id_token_nonce\""),
         "{text}"

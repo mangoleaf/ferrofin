@@ -1,5 +1,6 @@
-//! The Single Sign-On extension against a real identity provider: a Keycloak
-//! holding the test realm of `contrib/oidc-test-realm/`.
+//! The Single Sign-On plugin against a real identity provider: a Keycloak
+//! holding the test realm of `contrib/oidc-test-realm/`, through the server
+//! the composition root wires and its real router.
 //!
 //! `#[ignore]`d, so a default run lists it as skipped; CI does not run it
 //! (D12). It reads the realm's values from the environment and returns early
@@ -7,7 +8,7 @@
 //!
 //! ```bash
 //! set -a; . ~/.config/ferrofin/oidc-test.env; set +a   # or export them by hand
-//! cargo test -p ferrofin-extensions --test oidc_keycloak -- --include-ignored --nocapture
+//! cargo test -p ferrofin-server --test oidc_keycloak -- --include-ignored --nocapture
 //! ```
 //!
 //! - `FERROFIN_OIDC_TEST_ISSUER`: the realm's issuer, such as
@@ -22,19 +23,15 @@
 //! The other test users (`FERROFIN_OIDC_TEST_*_USER` and `…_PASSWORD`, listed
 //! in the realm's README) are for the later sign-in phases.
 
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
+#[path = "support/sso.rs"]
+mod sso;
 
-use ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore;
-use ferrofin_core::{FerrofinPluginManager, FerrofinUserManager};
-use ferrofin_extensions::sso::accounts::{PROVIDER_ID, SsoAuthProvider};
-use ferrofin_extensions::sso::{EXTENSION_ID, SsoExtension, SsoService};
-use ferrofin_extensions::{Extension, registered_plugins};
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use ferrofin_extensions::sso::accounts::PROVIDER_ID;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcDiscovery, OidcProvider};
-use ferrofin_traits::library::UserManager;
-use ferrofin_traits::plugins::PluginManager;
-use ferrofin_traits::sso::{OidcCallback, SsoManager, SsoReply};
+use sso::{SsoServer, exchange_code, header_text, text};
 
 /// The realm's values, or `None` while any is unset or empty.
 struct Realm {
@@ -43,8 +40,12 @@ struct Realm {
     client_secret: String,
 }
 
+/// The environment variable `name`, unless it is unset or empty.
+fn read(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
 fn realm() -> Option<Realm> {
-    let read = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
     Some(Realm {
         issuer: read("FERROFIN_OIDC_TEST_ISSUER")?,
         client_id: read("FERROFIN_OIDC_TEST_CLIENT_ID")?,
@@ -52,45 +53,25 @@ fn realm() -> Option<Realm> {
     })
 }
 
-/// The Single Sign-On service over a real plugin manager in `dir` and a fresh
-/// database's accounts, with the plugin enabled, its provider registered with
-/// the accounts, and the realm's redirect URIs' host as its published URL;
-/// and the accounts.
-async fn service(dir: &tempfile::TempDir) -> (SsoService, Arc<FerrofinUserManager>) {
-    let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(SsoExtension)];
-    let plugins = Arc::new(FerrofinPluginManager::new(
-        registered_plugins(&extensions),
-        dir.path().to_path_buf(),
-    ));
-    plugins.enable_plugin(EXTENSION_ID).await.expect("enable");
-    let db = ferrofin_db::Database::connect_in_memory()
-        .await
-        .expect("connect");
-    db.run_migrations().await.expect("migrations");
-    let users = Arc::new(FerrofinUserManager::new(db.clone()));
-    users.set_extension_providers(vec![Arc::new(SsoAuthProvider::new(
-        Arc::clone(&plugins) as Arc<dyn PluginManager>
-    ))]);
-    let sso = SsoService::new(
-        plugins as Arc<dyn PluginManager>,
-        Arc::clone(&users) as Arc<dyn UserManager>,
-        Arc::new(FerrofinExternalIdentityStore::new(db)),
-        Some(PUBLISHED_URL.to_owned()),
-    );
-    (sso, users)
-}
-
 /// The published URL the callback URL is built on: an address the realm's
 /// redirect URIs (`http://127.0.0.1:*`) accept. Nothing listens there: the
-/// test reads the callback from Keycloak's redirect.
+/// test reads the callback from Keycloak's redirect and hands it to the
+/// router.
 const PUBLISHED_URL: &str = "http://127.0.0.1:8096";
-
-/// Where a browser signing in sits.
-const BROWSER: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// Saves the realm's client as the provider `key` with `issuer`, and returns
 /// what testing it found, as a `PUT` does.
-async fn save_and_test(sso: &SsoService, realm: &Realm, key: &str, issuer: &str) -> OidcDiscovery {
+async fn save_and_test(
+    server: &SsoServer,
+    realm: &Realm,
+    key: &str,
+    issuer: &str,
+) -> OidcDiscovery {
+    let sso = server
+        .state
+        .sso
+        .as_ref()
+        .expect("the Single Sign-On service");
     let saved = sso
         .save_oidc_provider(
             key,
@@ -120,10 +101,10 @@ async fn discovery_finds_the_realm_and_refuses_a_wrong_issuer() {
         );
         return;
     };
-    let dir = tempfile::tempdir().expect("temp dir");
-    let (sso, _users) = service(&dir).await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = sso::server(&temp, PUBLISHED_URL).await;
 
-    let found = save_and_test(&sso, &realm, "keycloak", &realm.issuer).await;
+    let found = save_and_test(&server, &realm, "keycloak", &realm.issuer).await;
     assert_eq!(found.error, None, "{found:?}");
     let endpoint = format!("{}/protocol/openid-connect", realm.issuer);
     assert_eq!(
@@ -145,7 +126,7 @@ async fn discovery_finds_the_realm_and_refuses_a_wrong_issuer() {
 
     // A realm that does not exist: Keycloak answers 404.
     let missing = format!("{}-missing", realm.issuer);
-    let found = save_and_test(&sso, &realm, "missing", &missing).await;
+    let found = save_and_test(&server, &realm, "missing", &missing).await;
     assert!(
         found
             .error
@@ -159,7 +140,7 @@ async fn discovery_finds_the_realm_and_refuses_a_wrong_issuer() {
     // The realm's issuer with a trailing `/`: its document names the issuer
     // without one, and the issuer must match exactly.
     let slashed = format!("{}/", realm.issuer);
-    let found = save_and_test(&sso, &realm, "slashed", &slashed).await;
+    let found = save_and_test(&server, &realm, "slashed", &slashed).await;
     assert!(
         found
             .error
@@ -168,14 +149,6 @@ async fn discovery_finds_the_realm_and_refuses_a_wrong_issuer() {
         "{found:?}"
     );
     println!("issuer with a trailing slash: {:?}", found.error);
-}
-
-/// A browser without a cookie jar: Keycloak's cookies are carried by hand.
-fn browser() -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("a client")
 }
 
 /// The `name=value` of each cookie `answer` sets.
@@ -188,40 +161,39 @@ fn cookies(answer: &reqwest::Response) -> Vec<String> {
         .collect()
 }
 
-/// The value of the flow cookie `reply` sets.
-fn flow_cookie(reply: &SsoReply) -> String {
-    reply.set_cookies[0]
-        .strip_prefix("ferrofin_sso_flow=")
-        .and_then(|rest| rest.split(';').next())
-        .expect("the flow cookie")
-        .to_owned()
+/// The value of attribute `name` in the HTML tag `tag`.
+fn attribute(tag: &str, name: &str) -> Option<String> {
+    let start = tag.find(&format!(" {name}=\""))? + name.len() + 3;
+    let end = tag[start..].find('"')? + start;
+    Some(tag[start..end].replace("&amp;", "&"))
 }
 
 /// Signs `user` in at Keycloak's login form, from the authorization URL
 /// `location` start sent the browser to, and answers the callback URL
-/// Keycloak sends the browser back to.
+/// Keycloak sends the browser back to. A browser without a cookie jar:
+/// Keycloak's cookies are carried by hand.
 async fn log_in(location: &str, user: &str, password: &str) -> String {
-    let browser = browser();
+    let browser = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("a client");
     let page = browser.get(location).send().await.expect("the login page");
     assert_eq!(page.status(), 200, "the login page");
     let jar = cookies(&page).join("; ");
     let html = page.text().await.expect("the login page");
-    let form = regex::Regex::new(r#"<form\b[^>]*\bid="kc-form-login"[^>]*>"#)
-        .expect("a regex")
-        .find(&html)
-        .expect("the login form")
-        .as_str();
-    let action = regex::Regex::new(r#"\baction="([^"]+)""#)
-        .expect("a regex")
-        .captures(form)
-        .expect("the form's action")[1]
-        .replace("&amp;", "&");
+    let form = html
+        .split("<form")
+        .find(|tag| tag.contains("id=\"kc-form-login\""))
+        .and_then(|form| form.split_once('>'))
+        .map(|(tag, _)| tag)
+        .expect("the login form");
+    let action = attribute(form, "action").expect("the form's action");
     let answer = browser
         .post(action)
         .header("cookie", jar)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(
-            url::form_urlencoded::Serializer::new(String::new())
+            form_urlencoded::Serializer::new(String::new())
                 .extend_pairs([
                     ("username", user),
                     ("password", password),
@@ -239,40 +211,58 @@ async fn log_in(location: &str, user: &str, password: &str) -> String {
         .to_owned()
 }
 
-/// The callback `url` and the flow `cookie` make, as the route reads them.
-fn callback(url: &str, cookie: Option<String>) -> OidcCallback {
-    let query: std::collections::HashMap<String, String> = url::Url::parse(url)
-        .expect("a URL")
-        .query_pairs()
-        .into_owned()
-        .collect();
-    OidcCallback {
-        state: query.get("state").cloned(),
-        code: query.get("code").map(Secret::new),
-        iss: query.get("iss").cloned(),
-        error: query.get("error").cloned(),
-        flow_cookie: cookie.map(Secret::new),
-    }
+/// A sign-in by `user` from start to the completion page: the page's
+/// response, its callback path, and the flow cookie's `name=value`.
+async fn completion_page(
+    server: &SsoServer,
+    user: &str,
+    password: &str,
+    cookie: bool,
+) -> (axum::response::Response, String, String) {
+    let start = server.get("/sso/oidc/keycloak/start", None).await;
+    assert_eq!(start.status(), StatusCode::FOUND, "start redirects");
+    let flow = header_text(&start, header::SET_COOKIE)
+        .split(';')
+        .next()
+        .expect("the flow cookie")
+        .to_owned();
+    let back = log_in(&header_text(&start, header::LOCATION), user, password).await;
+    let callback = back
+        .strip_prefix(PUBLISHED_URL)
+        .unwrap_or_else(|| panic!("back to the callback: {back}"))
+        .to_owned();
+    assert!(
+        callback.starts_with("/sso/oidc/keycloak/callback?"),
+        "back to the callback"
+    );
+    let page = server.get(&callback, cookie.then_some(flow.as_str())).await;
+    (page, callback, flow)
 }
 
 /// The account `user` signed in to was created under the provider that
 /// refuses passwords: not even the realm password, nor an empty one, signs in
 /// to it, and the refusals do not count toward its lockout.
-async fn refuses_passwords(users: &FerrofinUserManager, user: &str, password: &str) {
-    let account = users
+async fn refuses_passwords(server: &SsoServer, user: &str, password: &str) {
+    let account = server
+        .state
+        .users
         .get_user_by_name(user)
         .await
         .expect("lookup")
         .expect("the account was created");
     assert_eq!(account.authentication_provider_id, PROVIDER_ID);
     for attempt in ["", password] {
-        let answer = users
+        let answer = server
+            .state
+            .users
             .authenticate_user(user, attempt, "127.0.0.1", true)
             .await
             .expect("an answer");
         assert!(answer.is_none(), "a password is refused");
     }
-    let account = users
+    let account = server
+        .state
+        .users
         .get_user_by_name(user)
         .await
         .expect("lookup")
@@ -280,10 +270,12 @@ async fn refuses_passwords(users: &FerrofinUserManager, user: &str, password: &s
     assert_eq!(account.invalid_login_attempt_count, 0, "not counted");
 }
 
+/// The realm member signs in through Keycloak's login form, lands with a
+/// token that opens an authenticated route, and can sign in only once per
+/// code and only in the browser that started.
 #[tokio::test]
 #[ignore = "needs a Keycloak holding the ferrofin-test realm; run with --ignored"]
-async fn a_realm_user_signs_in_through_the_login_form_and_only_once() {
-    let read = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+async fn a_realm_user_signs_in_through_the_login_form_to_a_session() {
     let (Some(realm), Some(user), Some(password)) = (
         realm(),
         read("FERROFIN_OIDC_TEST_MEMBER_USER"),
@@ -296,81 +288,83 @@ async fn a_realm_user_signs_in_through_the_login_form_and_only_once() {
         );
         return;
     };
-    let dir = tempfile::tempdir().expect("temp dir");
-    let (sso, users) = service(&dir).await;
-    let found = save_and_test(&sso, &realm, "keycloak", &realm.issuer).await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = sso::server(&temp, PUBLISHED_URL).await;
+    let found = save_and_test(&server, &realm, "keycloak", &realm.issuer).await;
     assert_eq!(found.error, None, "{found:?}");
-    let callback_url = format!("{PUBLISHED_URL}/sso/oidc/keycloak/callback?");
 
-    let start = sso
-        .start_oidc_sign_in("keycloak", BROWSER)
-        .await
-        .expect("starts");
-    assert_eq!(start.status, 302, "start redirects");
-    let location = start.location.clone().expect("to Keycloak");
-    let back = log_in(&location, &user, &password).await;
-    assert!(back.starts_with(&callback_url), "back to the callback");
-    let signed_in = callback(&back, Some(flow_cookie(&start)));
+    let (page, callback, flow) = completion_page(&server, &user, &password, true).await;
+    assert_eq!(page.status(), StatusCode::OK, "the callback is accepted");
+    let code = exchange_code(&text(page).await);
+    let exchanged = server
+        .exchange(&code, Some(&flow), "keycloak-live-test", None)
+        .await;
+    assert_eq!(exchanged.status(), StatusCode::OK, "the code is swapped");
+    let result: serde_json::Value =
+        serde_json::from_str(&text(exchanged).await).expect("a JSON body");
+    assert_eq!(result["User"]["Name"], user.as_str());
+    let token = result["AccessToken"].as_str().expect("a token").to_owned();
+
+    // The token opens an authenticated route.
+    let me = server
+        .send(
+            Request::builder()
+                .uri("/Users/Me")
+                .header(
+                    header::AUTHORIZATION,
+                    format!(
+                        r#"MediaBrowser Client="Jellyfin Web", Device="Web Browser", DeviceId="keycloak-live-test", Version="12.4.0", Token="{token}""#
+                    ),
+                )
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+    assert_eq!(me.status(), StatusCode::OK, "GET /Users/Me with the token");
+    let me: serde_json::Value = serde_json::from_str(&text(me).await).expect("a user");
+    assert_eq!(me["Name"], user.as_str());
+    println!("verified: the realm user signed in and the token opens GET /Users/Me");
+
+    refuses_passwords(&server, &user, &password).await;
+
+    // The same callback again, and the same code again, are refused.
+    let again = server.get(&callback, Some(&flow)).await;
     assert_eq!(
-        signed_in.iss.as_deref(),
-        Some(realm.issuer.as_str()),
-        "RFC 9207"
+        again.status(),
+        StatusCode::BAD_REQUEST,
+        "a repeated callback"
     );
-    let page = sso
-        .finish_oidc_sign_in("keycloak", signed_in.clone())
-        .await
-        .expect("an answer");
-    assert_eq!(page.status, 200, "the callback is accepted");
-    assert!(
-        page.html
-            .contains(&format!("<strong>{user}</strong> is ready")),
-        "the page names the account"
+    let replayed = server
+        .exchange(&code, Some(&flow), "keycloak-live-test", None)
+        .await;
+    assert_eq!(
+        replayed.status(),
+        StatusCode::BAD_REQUEST,
+        "a replayed code"
     );
-    refuses_passwords(&users, &user, &password).await;
-    println!("verified: the realm user's account was created and refuses passwords");
-
-    // The same callback again: its flow is used up.
-    let again = sso
-        .finish_oidc_sign_in("keycloak", signed_in)
-        .await
-        .expect("an answer");
-    assert_eq!(again.status, 400, "a repeated callback is refused");
 
     // Started in one browser, finished in another (no flow cookie).
-    let start = sso
-        .start_oidc_sign_in("keycloak", BROWSER)
-        .await
-        .expect("starts");
-    let back = log_in(
-        start.location.as_deref().expect("to Keycloak"),
-        &user,
-        &password,
-    )
-    .await;
-    let elsewhere = sso
-        .finish_oidc_sign_in("keycloak", callback(&back, None))
-        .await
-        .expect("an answer");
-    assert_eq!(elsewhere.status, 400, "another browser is refused");
+    let (elsewhere, _, _) = completion_page(&server, &user, &password, false).await;
+    assert_eq!(
+        elsewhere.status(),
+        StatusCode::BAD_REQUEST,
+        "another browser is refused"
+    );
 
     // A second sign-in finds the same account by its link.
-    let start = sso
-        .start_oidc_sign_in("keycloak", BROWSER)
-        .await
-        .expect("starts");
-    let back = log_in(
-        start.location.as_deref().expect("to Keycloak"),
-        &user,
-        &password,
-    )
-    .await;
-    let page = sso
-        .finish_oidc_sign_in("keycloak", callback(&back, Some(flow_cookie(&start))))
-        .await
-        .expect("an answer");
-    assert_eq!(page.status, 200, "signed in again");
+    let (page, _, flow) = completion_page(&server, &user, &password, true).await;
+    assert_eq!(page.status(), StatusCode::OK, "signed in again");
+    let code = exchange_code(&text(page).await);
+    let second = server
+        .exchange(&code, Some(&flow), "keycloak-live-test-2", None)
+        .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let accounts = server.state.users.get_users().await.expect("users");
     assert_eq!(
-        users.get_users().await.expect("users").len(),
+        accounts
+            .iter()
+            .filter(|account| account.authentication_provider_id == PROVIDER_ID)
+            .count(),
         1,
         "one account"
     );

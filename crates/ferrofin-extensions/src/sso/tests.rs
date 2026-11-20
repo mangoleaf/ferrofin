@@ -27,12 +27,18 @@ async fn service(
         .await
         .expect("connect");
     db.run_migrations().await.expect("migrations");
+    let users = Arc::new(ferrofin_core::FerrofinUserManager::new(db.clone()));
+    let (sessions, _) = sign_in::tests::sessions(&db, &users);
     let sso = SsoService::new(
         Arc::clone(&plugins) as Arc<dyn PluginManager>,
-        Arc::new(ferrofin_core::FerrofinUserManager::new(db.clone())),
+        users,
         Arc::new(
-            ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(db),
+            ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(
+                db.clone(),
+            ),
         ),
+        sessions,
+        Arc::new(ferrofin_core::FerrofinActivityManager::new(db)),
         published_url.map(str::to_owned),
     );
     (sso, plugins, dir)
