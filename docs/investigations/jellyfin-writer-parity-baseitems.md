@@ -114,7 +114,7 @@ The gate's row-level diff (gl-1568) will automate these comparisons.
 |---|---|---|
 | gl-1580 | fix | NULL where Jellyfin writes `''`, `0`, `Unknown`, `Other` or the zero GUID, on every item type; the scan rewriting adopted defaults to NULL; `rekey_container` copying 17 of 72 columns. The cause behind gl-1562 |
 | gl-1581 | fix | `Path` stored resolved where upstream stores `%AppDataPath%`/`%MetadataPath%` (with gl-1209 and gl-1220) |
-| gl-1582 | fix | `SortName` without upstream's ICU transliteration, and digit padding for ASCII digits only |
+| gl-1582 | fixed | `SortName` without upstream's ICU transliteration, and digit padding for ASCII digits only (Thai: gl-1907; pointed Hebrew and Arabic: gl-1908) |
 | gl-1583 | fix | `Year` rows created by every scan |
 | gl-1584 | fix | the user's `Playlists` view row not created by user-scoped queries |
 | gl-1585 | fix | the PLACEHOLDER row's `CleanName` |
@@ -215,7 +215,7 @@ the inherited ratings scored from them.
 | `SeriesPresentationUniqueKey` | Map:366 | upsert, key repairs | E1, E4 equal | match |
 | `ShowId` | Map:387, LiveTvProgram | `program_entity` | static | match |
 | `Size` | Map:305 | upsert | E1 equal | match |
-| `SortName` | Map:285; `ModifySortChunks`: Unicode digit padding, then ICU transliteration (`MediaBrowser.Controller/Entities/BaseItem.cs:1081-1099`); per-kind overrides (Audio, Episode, Season, LiveTvChannel) | `modify_sort_chunks` (`crates/ferrofin-util/src/sort_name.rs:217-236`): ASCII digits, no transliteration; the per-kind sort names come from the scan's derivations | E1, E3, E4: `cafe unicode dong jing` vs `cafe unicode 東京`; episodes, seasons and audio equal | fix: gl-1582 |
+| `SortName` | Map:285; `ModifySortChunks`: Unicode digit padding, then ICU transliteration (`MediaBrowser.Controller/Entities/BaseItem.cs:1081-1099`); per-kind overrides (Audio, Episode, Season, LiveTvChannel) | `modify_sort_chunks` (`crates/ferrofin-util/src/sort_name.rs`): Unicode `Nd` digits, then ICU4X's CLDR transforms behind a ported `Any-Latin` (`transliteration.rs`), since gl-1582; the per-kind sort names come from the scan's derivations | E1, E3, E4 (before gl-1582): `cafe unicode dong jing` vs `cafe unicode 東京`; episodes, seasons and audio equal. After it, 184 of 190 names created on both servers agree; the rest are Thai, Bopomofo, `ꜱ` and pointed Hebrew and Arabic | fixed: gl-1582; Thai: gl-1907; pointed Hebrew and Arabic: gl-1908 |
 | `StartDate` | Map:408, `IHasStartDate` | `program_entity` | static | match |
 | `Studios` | Map:333, joined | NULL when empty | E1: 64 rows `''` vs NULL | fix: gl-1580 (Playlist and BoxSet rows: gl-1562); editor: gl-1588; extras: gl-1595 |
 | `Tagline` | Map:302 | editor, NFO, TMDB | static | match |

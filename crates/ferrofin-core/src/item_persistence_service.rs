@@ -1631,6 +1631,113 @@ impl FerrofinItemPersistenceService {
         Ok(repaired)
     }
 
+    /// One-shot startup pass that moves the sort keys earlier builds stored
+    /// for non-Latin names onto upstream's `ModifySortChunks`, which romanises
+    /// what is still not ASCII after the diacritic fold and pads every Unicode
+    /// digit run: `Café 東京` sorted as `cafe 東京` and now sorts as
+    /// `cafe dong jing`, as on Jellyfin.
+    ///
+    /// A row is rewritten only when its stored `SortName` is the key those
+    /// builds derived from its non-ASCII `ForcedSortName` (when set) or `Name`
+    /// ([`ferrofin_util::sort_name::untransliterated_sort_name`]), and the
+    /// derivation now gives another ([`crate::kinds::fallback_sort_name`]).
+    /// Jellyfin's own keys, a kind's number-ordered key and anything else
+    /// stored are left alone. The write is conditional on the stored key, so
+    /// a row the previous version saves during a rolling update is not
+    /// overwritten; it keeps its old key until its next save.
+    ///
+    /// Completion is recorded in `FerrofinMeta` under
+    /// `transliterated_sort_names_v1`. Returns the number of rows rewritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when a read or a partition's write fails; the
+    /// marker is written only after the last partition, so the pass resumes on
+    /// the next boot.
+    pub async fn repair_transliterated_sort_names(&self) -> Result<u64, ServiceError> {
+        const META_KEY: &str = "transliterated_sort_names_v1";
+        if self.repair_done(META_KEY).await? {
+            return Ok(0);
+        }
+        let mut repaired: u64 = 0;
+        let mut last_id = String::new();
+        loop {
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<(
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+            )> = sqlx::query_as(
+                r#"SELECT "Id", "Type", "Name", "ForcedSortName", "SortName",
+                          "ParentIndexNumber", "IndexNumber"
+                   FROM "BaseItems" WHERE "Id" > ?1 ORDER BY "Id" LIMIT ?2"#,
+            )
+            .bind(&last_id)
+            .bind(REPAIR_PARTITION)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+            let Some((tail, ..)) = rows.last() else {
+                break;
+            };
+            last_id.clone_from(tail);
+            let full_partition = rows.len() == usize::try_from(REPAIR_PARTITION).unwrap_or(0);
+
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            for (id, type_, name, forced_sort_name, sort_name, parent_index_number, index_number) in
+                rows
+            {
+                let source = forced_sort_name
+                    .as_deref()
+                    .filter(|forced| !forced.is_empty())
+                    .or(name.as_deref());
+                // An ASCII name derives the same key before and after.
+                let Some(source) = source.filter(|source| !source.is_ascii()) else {
+                    continue;
+                };
+                let previous = ferrofin_util::sort_name::untransliterated_sort_name(source);
+                if sort_name.as_deref() != Some(previous.as_str()) {
+                    continue;
+                }
+                let row = BaseItemEntity {
+                    type_,
+                    name,
+                    forced_sort_name,
+                    parent_index_number,
+                    index_number,
+                    ..BaseItemEntity::default()
+                };
+                let Some(want) = crate::kinds::fallback_sort_name(&row) else {
+                    continue;
+                };
+                if want == previous {
+                    continue;
+                }
+                tracing::debug!(item_id = %id, old = %previous, new = %want, "sort name transliterated");
+                let written = sqlx::query(
+                    r#"UPDATE "BaseItems" SET "SortName" = ?2 WHERE "Id" = ?1 AND "SortName" = ?3"#,
+                )
+                .bind(&id)
+                .bind(&want)
+                .bind(&previous)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                repaired += written.rows_affected();
+            }
+            tx.commit().await.map_err(db_err)?;
+            if !full_partition {
+                break;
+            }
+        }
+        self.mark_repair_done(META_KEY).await?;
+        Ok(repaired)
+    }
+
     /// One-shot startup pass over the box sets and playlists an older
     /// Ferrofin created through `insert_named_item`, which wrote neither the
     /// dates nor, on a rename, the derived keys.
@@ -12717,6 +12824,104 @@ mod tests {
         assert_eq!(service.repair_forced_sort_names().await.expect("repair"), 0);
         assert_eq!(
             db.meta_get("forced_sort_names_v12")
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    /// gl-1582: the keys earlier builds derived for non-Latin names (nothing
+    /// romanised, ASCII digit runs only) move to upstream's; Jellyfin's keys,
+    /// a person's verbatim name, an episode's numbered key and anything else
+    /// stay; the pass runs once.
+    #[tokio::test]
+    async fn the_transliteration_repair_moves_untransliterated_keys_once() {
+        use BaseItemKind::{Audio, Episode, LiveTvChannel, Movie, Person, Season};
+        // (kind, name, forced sort name, stored key, key after the repair)
+        let rows: [(BaseItemKind, &str, Option<&str>, &str, &str); 12] = [
+            (
+                Movie,
+                "Café Ünïcode 東京",
+                None,
+                "cafe unicode 東京",
+                "cafe unicode dong jing",
+            ),
+            (Movie, "Movie ٣", None, "movie ٣", "movie 0000000003"),
+            (
+                Movie,
+                "Tokyo",
+                Some("東京物語"),
+                "東京物語",
+                "dong jing wu yu",
+            ),
+            // Jellyfin's key, and a key no derivation gave: left alone.
+            (Movie, "北京", None, "bei jing", "bei jing"),
+            (Movie, "北京", None, "custom", "custom"),
+            (Movie, "The Matrix", None, "the matrix", "the matrix"),
+            // A person keeps its name, and a forced sort name, verbatim.
+            (Person, "東京", None, "東京", "東京"),
+            (Person, "Tokyo", Some("東京"), "東京", "東京"),
+            // The kinds with their own `CreateSortName` keep their keys, and
+            // an earlier build's generic key on an episode takes its own.
+            (Episode, "東京", None, "東京", "001 - 0002 - 東京"),
+            (Season, "東京", None, "0002", "0002"),
+            (
+                Audio,
+                "東京",
+                None,
+                "0001 - 0002 - 東京",
+                "0001 - 0002 - 東京",
+            ),
+            (LiveTvChannel, "東京", None, "00002.0-東京", "00002.0-東京"),
+        ];
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let mut ids = Vec::new();
+        for (n, (kind, name, forced, stored, _)) in (0x7A00_u128..).zip(rows) {
+            let id = Uuid::from_u128(n);
+            crate::test_support::seed_named_item(&db, id, kind, name).await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "ForcedSortName" = ?2, "SortName" = ?3,
+                       "ParentIndexNumber" = 1, "IndexNumber" = 2
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(forced)
+            .bind(stored)
+            .execute(db.writer())
+            .await
+            .expect("sort name");
+            ids.push(id);
+        }
+
+        assert_eq!(
+            service
+                .repair_transliterated_sort_names()
+                .await
+                .expect("repair"),
+            4
+        );
+        for (id, (_, name, _, _, expected)) in ids.into_iter().zip(rows) {
+            let stored: Option<String> =
+                sqlx::query_scalar(r#"SELECT "SortName" FROM "BaseItems" WHERE "Id" = ?1"#)
+                    .bind(guid_to_db(id))
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("read back");
+            assert_eq!(stored.as_deref(), Some(expected), "{name}");
+        }
+
+        // Second boot: nothing to do.
+        assert_eq!(
+            service
+                .repair_transliterated_sort_names()
+                .await
+                .expect("repair"),
+            0
+        );
+        assert_eq!(
+            db.meta_get("transliterated_sort_names_v1")
                 .await
                 .expect("meta")
                 .as_deref(),

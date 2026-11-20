@@ -280,6 +280,11 @@ icu_collections = "2.4.0"
 icu_locale_fallback = "2.4.0"
 icu_normalizer = "2.4.0"
 icu_provider = "2.4.0"
+# `Script` of each character: the script runs of upstream's `Any-Latin` sort-name step.
+icu_properties = "2.4.0"
+# CLDR's `<Script>-Latin` and `Latin-ASCII` transforms for the sort name's transliteration
+# (upstream's ICU `Any-Latin; Latin-Ascii; …`). Unstable 0.x: it moves with the ICU4X 2.4 above.
+icu_experimental = "0.7.0"
 zerovec = "0.11.9"
 fancy-regex = "0.20.1"    # for C# regexes that use lookaround
 quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)

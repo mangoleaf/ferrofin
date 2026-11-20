@@ -401,6 +401,11 @@ criteria = "safe-to-deploy"
 version = "0.1.15"
 criteria = "safe-to-deploy"
 
+[[exemptions.fixed_decimal]]
+version = "0.7.3"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 0.7.3; lifted by an imported or Ferrofin audit of 0.7.3"
+
 [[exemptions.flagset]]
 version = "0.4.7"
 criteria = "safe-to-deploy"
@@ -545,9 +550,49 @@ criteria = "safe-to-deploy"
 version = "2.4.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.icu_decimal]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
+[[exemptions.icu_decimal_data]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
+[[exemptions.icu_experimental]]
+version = "0.7.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 0.7.0; lifted by an imported or Ferrofin audit of 0.7.0"
+
+[[exemptions.icu_experimental_data]]
+version = "0.7.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 0.7.0; lifted by an imported or Ferrofin audit of 0.7.0"
+
+[[exemptions.icu_list]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
+[[exemptions.icu_list_data]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
+[[exemptions.icu_locale]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
 [[exemptions.icu_locale_core]]
 version = "2.4.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.icu_locale_data]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
 
 [[exemptions.icu_locale_fallback]]
 version = "2.4.0"
@@ -564,6 +609,21 @@ criteria = "safe-to-deploy"
 [[exemptions.icu_normalizer_data]]
 version = "2.4.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.icu_pattern]]
+version = "0.5.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 0.5.1; lifted by an imported or Ferrofin audit of 0.5.1"
+
+[[exemptions.icu_plurals]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
+[[exemptions.icu_plurals_data]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
 
 [[exemptions.icu_properties]]
 version = "2.4.0"
