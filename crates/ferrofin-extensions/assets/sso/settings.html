@@ -16,8 +16,10 @@
         holds no setting: the providers come from the admin-only
         `GET /sso/admin/oidc/providers`, and every string from a response is
         set as text, never parsed as HTML. A provider is saved with
-        `PUT /sso/admin/oidc/providers/{key}` and removed with `DELETE`; the
-        public URL is saved through the plugin configuration. No route returns
+        `PUT /sso/admin/oidc/providers/{key}`, which then tests the provider's
+        discovery document, and removed with `DELETE`; the provider's row shows
+        what the test found until the page is left. The public URL is saved
+        through the plugin configuration. No route returns
         a stored client secret, so the secret field always starts empty, and an
         empty one keeps the stored secret.
     -->
@@ -57,6 +59,14 @@
 
             .ssoSettingsPage .ssoHttpWarning {
                 color: #ffb74d;
+            }
+
+            .ssoSettingsPage .ssoFound {
+                color: #81c784;
+            }
+
+            .ssoSettingsPage .ssoDiscovery code {
+                word-break: break-all;
             }
 
             .ssoSettingsPage .ssoButtons {
@@ -280,6 +290,9 @@
                             + 'Ferrofin Settings, to get the callback URL to register at the provider.';
                     }
                     row.appendChild(callback);
+                    if (state.discovery[info.Key]) {
+                        row.appendChild(discoveryResult(state.discovery[info.Key]));
+                    }
                     var buttons = element('div', 'ssoButtons');
                     var edit = element('button', 'raised');
                     edit.type = 'button';
@@ -299,6 +312,34 @@
                     buttons.appendChild(remove);
                     row.appendChild(buttons);
                     return row;
+                }
+
+                /** What the discovery test of the last save found, as the provider's row shows it. */
+                function discoveryResult(discovery) {
+                    var block = element('div', 'ssoDiscovery');
+                    if (discovery.Error) {
+                        block.appendChild(element('p', 'ssoRefused',
+                            'Discovery test failed: ' + discovery.Error + '. The provider is saved.'));
+                        return block;
+                    }
+                    block.appendChild(element('p', 'ssoFound', 'Discovery test passed.'));
+                    [
+                        ['Authorization endpoint', discovery.AuthorizationEndpoint],
+                        ['Token endpoint', discovery.TokenEndpoint],
+                        ['Userinfo endpoint', discovery.UserinfoEndpoint],
+                        ['Key set', discovery.JwksUri]
+                    ].forEach(function (endpoint) {
+                        var line = element('p', 'fieldDescription');
+                        line.appendChild(document.createTextNode(endpoint[0] + ': '));
+                        line.appendChild(element('code', null, endpoint[1] || 'none advertised'));
+                        block.appendChild(line);
+                    });
+                    block.appendChild(element('p', 'fieldDescription',
+                        'Signing keys read: ' + (discovery.SigningKeys || 0) + '.'));
+                    (discovery.Warnings || []).forEach(function (warning) {
+                        block.appendChild(element('p', 'ssoHttpWarning', 'Warning: ' + warning + '.'));
+                    });
+                    return block;
                 }
 
                 function render(page, state) {
@@ -384,7 +425,8 @@
                         data: JSON.stringify(body),
                         contentType: 'application/json',
                         dataType: 'json'
-                    }).then(function () {
+                    }).then(function (saved) {
+                        state.discovery[key] = saved && saved.Discovery;
                         closeEditor(page, state);
                         Dashboard.processPluginConfigurationUpdateResult();
                         return load(page, state);
@@ -407,6 +449,7 @@
                             url: ApiClient.getUrl('sso/admin/oidc/providers/' + encodeURIComponent(info.Key)),
                             type: 'DELETE'
                         }).then(function () {
+                            delete state.discovery[info.Key];
                             if (state.editing === info.Key) {
                                 closeEditor(page, state);
                             }
@@ -449,9 +492,10 @@
                 }
 
                 function bind(page) {
-                    var state = { list: null, editing: null };
+                    var state = { list: null, editing: null, discovery: {} };
                     page.setAttribute('data-sso-bound', 'true');
                     page.addEventListener('pageshow', function () {
+                        state.discovery = {};
                         closeEditor(page, state);
                         load(page, state);
                     });

@@ -96,6 +96,41 @@ pub struct OidcProviderInfo {
     /// whatever its `Enabled` says. Absent for a valid provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation_error: Option<String>,
+    /// The discovery test run when the provider was saved: in a `PUT`'s
+    /// answer only, never in the list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<OidcDiscovery>,
+}
+
+/// What testing a provider's discovery found: the endpoints its discovery
+/// document names, or why it could not be used. A failed test is still a
+/// saved provider, so this is part of a `200` answer, never its status.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct OidcDiscovery {
+    /// Why the discovery document or its key set could not be fetched or
+    /// used; absent when the test succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Where users are sent to sign in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_endpoint: Option<String>,
+    /// Where an authorization code is exchanged for tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+    /// Where a user's claims are read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub userinfo_endpoint: Option<String>,
+    /// The key set ID tokens are checked against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwks_uri: Option<String>,
+    /// How many keys of that set Ferrofin can read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signing_keys: Option<usize>,
+    /// What the provider advertises that sign-in cannot use: no `code`
+    /// response type, or PKCE methods without `S256`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// What `GET /sso/admin/oidc/providers` answers.
@@ -142,11 +177,13 @@ mod tests {
             has_client_secret: true,
             callback_url: None,
             validation_error: None,
+            discovery: None,
         })
         .expect("serializes");
         assert_eq!(listed["Key"], "pocket");
         assert_eq!(listed["HasClientSecret"], true);
         assert!(listed.get("ClientSecret").is_none(), "{listed}");
         assert!(listed.get("CallbackUrl").is_none(), "{listed}");
+        assert!(listed.get("Discovery").is_none(), "{listed}");
     }
 }

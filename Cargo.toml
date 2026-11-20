@@ -178,6 +178,11 @@ ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-
 # The system's trusted roots for an LDAP-Auth TLS configuration Ferrofin builds
 # itself (a client certificate, or the default checks): what ldap3 reads too.
 rustls-native-certs = "0.8.5"
+# The Single Sign-On extension's OpenID Connect client. No default features: they
+# bring a second reqwest (0.12) with ring, which deny.toml bans; its HTTP goes
+# through the extension's own adapter over the reqwest above. It needs rsa 0.9
+# (RUSTSEC-2023-0071, ignored in deny.toml with its reason).
+openidconnect = { version = "4.1.0", default-features = false, features = ["timing-resistant-secret-traits"] }
 # A certificate's validity period, for LDAP-Auth's check of a server certificate
 # given as its own root CA (already built for ldap3 and p12-keystore).
 x509-parser = "0.18.1"

@@ -24,8 +24,9 @@ Conventions:
 
 Ferrofin's own extensions have no row, since they port nothing: Ferrofin Settings, and Single
 Sign-On, which is not the community SSO-Auth plugin (its own id and routes). Single Sign-On's
-routes in `handlers::PLUGIN_ROUTES` (`/sso/admin/oidc/providers` and
-`/sso/admin/oidc/providers/{provider}`) have no upstream to compare with.
+routes in `handlers::PLUGIN_ROUTES` (`/sso/admin/oidc/providers`,
+`/sso/admin/oidc/providers/{provider}`, `/sso/oidc/{provider}/start` and
+`/sso/oidc/{provider}/callback`) have no upstream to compare with.
 
 ## Per-plugin notes
 
