@@ -2576,8 +2576,10 @@ impl FerrofinDtoService {
                 )
             });
             // `GetStaticMediaSources(item, true, user)`: the DTO always asks for
-            // path substitution.
+            // path substitution, on the path `BaseItemMapper.Map` expanded
+            // (rows from readers outside the item repository hold it as stored).
             for source in &mut sources {
+                self.virtual_paths.expand_in_place(&mut source.path);
                 crate::media_source_manager::map_source_path(
                     source,
                     &prefetched.path_substitutions,
@@ -5205,7 +5207,9 @@ impl FerrofinDtoService {
             facts.protected = self.protected_paths().await?;
         }
         // `Video.IsActiveRecording`: an in-memory set, and only when the page
-        // holds a video at all.
+        // holds a video at all. Each path also as stored: a row from a reader
+        // outside the item repository keeps a recording under the data
+        // directory as `%AppDataPath%/…`.
         if let Some(live_tv) = self.live_tv.get()
             && items.iter().any(|item| kinds::is_video(row_kind(item)))
         {
@@ -5213,6 +5217,7 @@ impl FerrofinDtoService {
                 .active_recording_paths()
                 .await?
                 .into_iter()
+                .flat_map(|path| [self.virtual_paths.reverse(&path), path])
                 .collect();
         }
         let Some(user) = user else {
@@ -5940,6 +5945,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dto.path.as_deref(), Some("//nas/metadata/Genre/Action"));
+    }
+
+    /// gl-1063: a source's `Path` is the item's, which `BaseItemMapper.Map`
+    /// expands (`ExpandVirtualPath`) before `GetStaticMediaSources` reads it.
+    /// A row a reader outside the item repository hands over (Next Up, similar
+    /// items, a version's primary) with the token is served expanded, then
+    /// substituted.
+    #[tokio::test]
+    async fn media_source_path_is_expanded_before_the_path_substitutions() {
+        let db = test_db().await;
+        let config_dir = tempfile::tempdir().expect("tmp");
+        let root = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(root.path());
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(&*paths);
+        let svc = service(db.clone())
+            .with_configuration(
+                crate::test_support::configuration_with_path_substitution(
+                    config_dir.path(),
+                    &format!("{data}/livetv"),
+                    "//nas/livetv",
+                )
+                .await,
+            )
+            .with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Episode, "News").await;
+        let mut episode = fetch_item(&db, id).await;
+        episode.path = Some("%AppDataPath%/livetv/recordings/News.ts".to_owned());
+        let options = DtoOptions {
+            fields: vec![ItemFields::MediaSources],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&episode, &options, None, None)
+            .await
+            .unwrap();
+        let sources = dto.media_sources.expect("sources requested");
+        assert_eq!(
+            sources[0].path.as_deref(),
+            Some("//nas/livetv/recordings/News.ts")
+        );
     }
 
     /// `Playlist.SupportsPlayedStatus => MediaType == Video` (`Playlist.cs:73`):
