@@ -22,8 +22,13 @@
 //!    advertises and its keys (fetched again once for an unknown key id);
 //! 7. its issuer, audience (the client id; another beside it only with an
 //!    `azp` naming the client), `azp`, expiry and nonce;
-//! 8. when the username claim is not in the ID token, the userinfo answer's
-//!    `sub`, which must be the ID token's.
+//! 8. when the username claim, or the role claim of a provider that reads
+//!    roles, is not in the ID token, the userinfo answer's `sub`, which must
+//!    be the ID token's.
+//!
+//! `SsoService::sign_in_verified` then refuses an identity without the
+//! provider's required role ([`roles`](super::roles)) before any account is
+//! looked up or created.
 //!
 //! A refusal is one page for the browser and one `warn` line naming the
 //! provider and a reason code: never the code, a token, the verifier, the
@@ -61,7 +66,7 @@ use sha2::{Digest, Sha256};
 use super::complete::completion_page;
 use super::discovery::ProviderMetadata;
 use super::flows::{FLOW_LIFETIME, FlowPurpose, PendingFlow};
-use super::{SsoConfig, SsoService};
+use super::{SsoConfig, SsoService, roles};
 
 /// Who signed in, as the identity provider vouched for it: every value here
 /// comes from an ID token whose signature, issuer, audience, `azp`, expiry
@@ -441,6 +446,9 @@ impl SsoService {
         identity: VerifiedIdentity,
         cookie: &Secret,
     ) -> Result<Result<String, Refusal>, ServiceError> {
+        if let Err(refusal) = roles::check_required_role(provider, &identity) {
+            return Ok(Err(refusal));
+        }
         let user = match self.account(provider, &identity).await? {
             Ok(user) => user,
             Err(refusal) => return Ok(Err(refusal)),
@@ -512,7 +520,9 @@ impl SsoService {
             .verify_id_token(provider, Arc::clone(&metadata), id_token, &flow.nonce)
             .await?;
         let mut claims = verified_payload(id_token).ok_or(Refusal::bad("id_token_invalid"))?;
-        if !claims.contains_key(&provider.username_claim) {
+        if !claims.contains_key(&provider.username_claim)
+            || (roles::reads_roles(provider) && !claims.contains_key(&provider.role_claim))
+        {
             for (name, value) in self
                 .userinfo(provider, &metadata, tokens.access_token(), &subject)
                 .await?

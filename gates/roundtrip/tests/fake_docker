@@ -13,8 +13,9 @@
 # Knobs: FAKE_RUN_DELAY (seconds a run takes), FAKE_EXIT_CODE (what a stopped container exited with),
 # FAKE_JELLYFIN=loses (Jellyfin's copy has lost a favorite), =hang (it answers 503 and never logs why),
 # =exits (it stops with status 3 before it answers) or =setup (its setup server answers first);
-# FAKE_EXPORT=fails (the export exits 1), =hangs (it never ends), =history-kept (no fake-ran) or
-# =all-recorded (an empty fake-ran: every id recorded, so Jellyfin runs no migration).
+# FAKE_EXPORT=fails (the export exits 1), =hangs (it never ends), =history-kept (no fake-ran),
+# =all-recorded (an empty fake-ran: every id recorded, so Jellyfin runs no migration) or =stale-paths (the
+# exported database still names the library folder where Ferrofin ran).
 set -uo pipefail
 state=${FAKE_STATE:?}
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -30,15 +31,18 @@ case "$1" in
   tag) echo "$2" > "$state/tag-${3#*:}"; exit 0;;
   rmi) rm -f "$state/tag-${2#*:}"; exit 0;;
   run)
-    args=("$@"); image=$last name='' cid='' config='' mounts=() out=''
+    args=("$@"); image=$last name='' cid='' config='' mounts=() out='' data=/config
     for ((i = 0; i < ${#args[@]}; i++)); do
       case ${args[i]} in
         --name) name=${args[i+1]};;
         --cidfile) cid=${args[i+1]};;
-        -v) mounts+=("${args[i+1]}"); case ${args[i+1]} in *:/config) config=${args[i+1]%:/config};; esac;;
+        -e) case ${args[i+1]} in FERROFIN_DATA_DIR=*) data=${args[i+1]#FERROFIN_DATA_DIR=};; esac;;
+        -v) mounts+=("${args[i+1]}");;
         --out) out=${args[i+1]};;
       esac
     done
+    # the data directory: the mount at FERROFIN_DATA_DIR, Jellyfin's /config by default
+    for mount in "${mounts[@]}"; do case $mount in *:"$data") config=${mount%:"$data"};; esac; done
     if [ -e "$state/$name.name" ]; then echo "Conflict. The container name \"/$name\" is already in use" >&2; exit 125; fi
     case $image in ferrofin-roundtrip:*) image=$(cat "$state/tag-${image#*:}");; esac
     sleep "${FAKE_RUN_DELAY:-0}"
@@ -48,17 +52,19 @@ case "$1" in
       for mount in "${mounts[@]}"; do
         case $out in "${mount#*:}"/*) out=${mount%%:*}${out#"${mount#*:}"};; esac
       done
-      [ "${FAKE_EXPORT:-}" != fails ] || { printf 'Error: failed to export /config\n\nCaused by:\n    the database is damaged\n'; exit 1; }
+      [ "${FAKE_EXPORT:-}" != fails ] || { printf 'Error: failed to export %s\n\nCaused by:\n    the database is damaged\n' "$data"; exit 1; }
       if [ "${FAKE_EXPORT:-}" = hangs ]; then   # a container that ignores TERM, as the export's process 1 does
         trap '' TERM; sleep 120 & echo $! > "$state/$name.pid"; wait; exit 137
       fi
       cp -a "$config" "$out" || exit 1
       case ${FAKE_EXPORT:-} in
+        stale-paths) sqlite3 "$out/data/jellyfin.db" \
+          "CREATE TABLE BaseItems (Path TEXT); INSERT INTO BaseItems VALUES ('$data/root/default/Movies')" || exit 1;;&
         history-kept) ;;
         all-recorded) : > "$out/fake-ran";;
         *) if [ -f "$config/fake-left-to-run" ]; then cp "$config/fake-left-to-run" "$out/fake-ran"; else : > "$out/fake-ran"; fi;;
       esac
-      echo "Exported /config into ${args[*]: -1}"; exit 0
+      echo "Exported $data into ${args[*]: -1}"; exit 0
     fi
     case $image in *dead*) exit 0;; esac
     role=ferrofin behaviour=ok log=ok

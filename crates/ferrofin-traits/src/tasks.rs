@@ -279,7 +279,8 @@ impl TaskProgress {
 
     /// Why this run started: the registry's trigger tag (`api` for the
     /// dashboard or `StartTask`, `schedule` for a configured trigger,
-    /// `startup` for a startup trigger), or `""` when it has none (a test's
+    /// `startup` for a startup trigger, `library_change` for a "Scan Media
+    /// Library" run a library change queued), or `""` when it has none (a test's
     /// foreground `FerrofinTaskManager::run_now`).
     #[must_use]
     pub fn trigger(&self) -> &'static str {

@@ -12,9 +12,9 @@
 //! 3. The exchange ([`SsoService::exchange_sign_in`]) uses the code up, checks
 //!    its age and the cookie, and opens the session in
 //!    [`SsoService::open_session`]: the identity still linked to the
-//!    account, the account rules of a password sign-in, then
-//!    `SessionManager::authenticate_direct`, which applies device access and
-//!    the session limit and logs the success
+//!    account, role sync ([`roles`](super::roles)), then the account rules
+//!    of a password sign-in, then `SessionManager::authenticate_direct`,
+//!    which applies device access and the session limit and logs the success
 //!    (`AuthenticationSucceeded`). A refusal of a known account writes an
 //!    `AuthenticationFailed` activity entry; any other refusal is one log
 //!    line. Nothing here touches the account's failed-login counter.
@@ -213,6 +213,10 @@ impl SsoService {
             return Ok(Err(refused(Some(key), "unlinked")));
         }
         let remote_endpoint = request.remote_endpoint.clone().unwrap_or_default();
+        // Role sync first, as a password sign-in applies its provider's
+        // administrator flag before the account rules.
+        self.sync_roles(provider, &pending.identity, pending.user_id)
+            .await?;
         // Disabled, remote access, parental schedule: `authenticate_direct`
         // leaves them out. The refusal is logged by the user manager.
         if let Err(error) = self

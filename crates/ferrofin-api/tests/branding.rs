@@ -26,10 +26,16 @@ use ferrofin_api::test_support::{
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::secret::Secret;
+use ferrofin_model::sso::{
+    OidcAdminLink, OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList, OidcUserLinks,
+};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
+use ferrofin_traits::session::AuthenticationRequest;
+use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, OidcLinkAt, SsoManager, SsoReply};
 use ferrofin_traits::system::ServerApplicationPaths;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -103,6 +109,16 @@ impl ServerApplicationPaths for TmpPaths {
 struct StubConfig {
     data_path: String,
     branding: Mutex<BrandingOptions>,
+    /// When set, `update_branding` says it has started and waits to be
+    /// released before it records the branding.
+    gate: Option<Arc<SaveGate>>,
+}
+
+/// Holds a branding save between its start and its write.
+#[derive(Default)]
+struct SaveGate {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[async_trait]
@@ -122,6 +138,10 @@ impl ServerConfigurationManager for StubConfig {
         Ok(self.branding.lock().expect("lock").clone())
     }
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
+        if let Some(gate) = &self.gate {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
         *self.branding.lock().expect("lock") = branding.clone();
         Ok(())
     }
@@ -132,6 +152,7 @@ fn make_config(branding: BrandingOptions, data_path: &str) -> Arc<StubConfig> {
     Arc::new(StubConfig {
         data_path: data_path.to_owned(),
         branding: Mutex::new(branding),
+        gate: None,
     })
 }
 
@@ -656,5 +677,354 @@ async fn a_tagged_splashscreen_is_immutable_cacheable() {
         "public, max-age=31536000, immutable"
     );
     assert_eq!(tagged["etag"], "\"abc\"");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- the Single Sign-On plugin's sign-in buttons ------------------------------
+
+/// The marker comments around the buttons appended to the login disclaimer.
+const BUTTONS_BEGIN: &str = "<!-- ferrofin:sso-login-buttons -->";
+const BUTTONS_END: &str = "<!-- /ferrofin:sso-login-buttons -->";
+
+/// An [`SsoManager`] that answers [`SsoManager::login_buttons`] with its
+/// value, or an error for `Err`, and nothing else.
+struct LoginButtons(Result<Option<&'static str>, ()>);
+
+fn unused() -> ServiceError {
+    ServiceError::backend("not used by the branding routes")
+}
+
+#[async_trait]
+impl SsoManager for LoginButtons {
+    async fn ensure_enabled(&self) -> Result<(), ServiceError> {
+        Err(unused())
+    }
+    async fn oidc_providers(&self) -> Result<OidcProviderList, ServiceError> {
+        Err(unused())
+    }
+    async fn save_oidc_provider(
+        &self,
+        _key: &str,
+        _provider: OidcProvider,
+    ) -> Result<OidcProviderInfo, ServiceError> {
+        Err(unused())
+    }
+    async fn delete_oidc_provider(&self, _key: &str) -> Result<(), ServiceError> {
+        Err(unused())
+    }
+    async fn test_oidc_provider(
+        &self,
+        _provider: &OidcProvider,
+    ) -> Result<OidcDiscovery, ServiceError> {
+        Err(unused())
+    }
+    async fn start_oidc_sign_in(
+        &self,
+        _key: &str,
+        _client: std::net::IpAddr,
+    ) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn finish_oidc_sign_in(
+        &self,
+        _key: &str,
+        _callback: OidcCallback,
+    ) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn exchange_oidc_sign_in(
+        &self,
+        _code: Secret,
+        _flow_cookie: Option<Secret>,
+        _request: AuthenticationRequest,
+    ) -> Result<OidcExchangeReply, ServiceError> {
+        Err(unused())
+    }
+    async fn login_buttons(&self) -> Result<Option<String>, ServiceError> {
+        self.0
+            .map(|buttons| buttons.map(str::to_owned))
+            .map_err(|()| ServiceError::backend("the plugin configuration does not read"))
+    }
+    async fn oidc_link_page(&self) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn oidc_links(&self, _user_id: Uuid) -> Result<OidcUserLinks, ServiceError> {
+        Err(unused())
+    }
+    async fn start_oidc_link(
+        &self,
+        _key: &str,
+        _user_id: Uuid,
+        _client: std::net::IpAddr,
+    ) -> Result<SsoReply, ServiceError> {
+        Err(unused())
+    }
+    async fn all_oidc_links(&self) -> Result<Vec<OidcAdminLink>, ServiceError> {
+        Err(unused())
+    }
+    async fn add_oidc_link(
+        &self,
+        _user_id: Uuid,
+        _key: &str,
+        _subject: &str,
+    ) -> Result<OidcAdminLink, ServiceError> {
+        Err(unused())
+    }
+    async fn remove_oidc_link(
+        &self,
+        _user_id: Uuid,
+        _at: OidcLinkAt<'_>,
+    ) -> Result<(), ServiceError> {
+        Err(unused())
+    }
+}
+
+/// `GET /Branding/Configuration` as the login page asks it, anonymously, from
+/// a server with `sso` wired: the body's bytes.
+async fn branding_with(config: Arc<StubConfig>, sso: Option<LoginButtons>) -> Vec<u8> {
+    let mut state = state_as(config, &Caller::Anonymous);
+    if let Some(sso) = sso {
+        state = state.with_sso(Arc::new(sso));
+    }
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/Branding/Configuration")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body")
+        .to_vec()
+}
+
+fn stored_branding(login_disclaimer: Option<&str>) -> BrandingOptions {
+    BrandingOptions {
+        login_disclaimer: login_disclaimer.map(str::to_owned),
+        custom_css: Some("body{color:red}".to_owned()),
+        splashscreen_enabled: true,
+        splashscreen_location: Some("/keep.png".to_owned()),
+    }
+}
+
+/// B3: the stored disclaimer, a blank line (so markdown reads what follows
+/// as an HTML block), then the plugin's forms between the markers; the
+/// other members as stored.
+#[tokio::test]
+async fn the_sign_in_buttons_follow_the_stored_disclaimer_after_a_blank_line() {
+    let forms = "<form action=\"https://media.example.org/sso/oidc/kc/start\"></form>";
+    for (stored, served) in [
+        (Some("Welcome"), "Welcome\n\n"),
+        (Some(""), "\n\n"),
+        (None, "\n\n"),
+    ] {
+        let config = make_config(stored_branding(stored), "/tmp");
+        let body = json(&branding_with(config, Some(LoginButtons(Ok(Some(forms))))).await);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "LoginDisclaimer": format!("{served}{BUTTONS_BEGIN}{forms}{BUTTONS_END}"),
+                "CustomCss": "body{color:red}",
+                "SplashscreenEnabled": true,
+            }),
+            "{stored:?}"
+        );
+    }
+}
+
+/// B1: with no buttons to show (the plugin disabled, no provider, the switch
+/// off, no public URL), with a plugin whose configuration does not read, and
+/// on a server without the plugin, the response is the stored configuration
+/// byte for byte.
+#[tokio::test]
+async fn without_buttons_the_branding_is_the_stored_one_byte_for_byte() {
+    for stored in [Some("Welcome"), None] {
+        let config = make_config(stored_branding(stored), "/tmp");
+        let without = branding_with(config.clone(), None).await;
+        let expected = match stored {
+            Some(text) => format!(
+                r#"{{"LoginDisclaimer":"{text}","CustomCss":"body{{color:red}}","SplashscreenEnabled":true}}"#
+            ),
+            None => r#"{"CustomCss":"body{color:red}","SplashscreenEnabled":true}"#.to_owned(),
+        };
+        assert_eq!(String::from_utf8_lossy(&without), expected);
+        for sso in [LoginButtons(Ok(None)), LoginButtons(Err(()))] {
+            assert_eq!(
+                branding_with(config.clone(), Some(sso)).await,
+                without,
+                "{stored:?}"
+            );
+        }
+    }
+}
+
+/// The dashboard's branding page saves the disclaimer it was served, in `\n`
+/// line breaks (or `\r\n`, as a form submitted natively sends them), through
+/// either branding save: the buttons and the blank line before them are
+/// dropped, so the stored text is the admin's, and a second save adds
+/// nothing.
+#[tokio::test]
+async fn a_saved_disclaimer_never_keeps_the_sign_in_buttons() {
+    let block = format!("{BUTTONS_BEGIN}<form><button>Sign in with A</button></form>{BUTTONS_END}");
+    for route in [
+        "/System/Configuration/Branding",
+        "/System/Configuration/branding",
+    ] {
+        for (saved, stored) in [
+            (format!("Welcome\n\n{block}"), "Welcome"),
+            (
+                format!("Line 1\r\nLine 2\r\n\r\n{block}"),
+                "Line 1\r\nLine 2",
+            ),
+            (format!("\n\n{block}"), ""),
+            // Text the admin added after the block stays; so does a block
+            // served twice by an earlier save.
+            (format!("Welcome\n\n{block}\n\nBye"), "Welcome\n\nBye"),
+            (format!("Welcome\n\n{block}\n\n{block}"), "Welcome"),
+            // Without both markers, nothing is the plugin's.
+            (
+                format!("Welcome\n\n{BUTTONS_BEGIN}<form>"),
+                "Welcome\n\n<!-- ferrofin:sso-login-buttons --><form>",
+            ),
+            (
+                format!("x{BUTTONS_END}y"),
+                "x<!-- /ferrofin:sso-login-buttons -->y",
+            ),
+            (
+                format!("x{BUTTONS_END}y\n\n{block}"),
+                "x<!-- /ferrofin:sso-login-buttons -->y",
+            ),
+            ("Welcome\n\n".to_owned(), "Welcome\n\n"),
+        ] {
+            let config = make_config(stored_branding(Some("old")), "/tmp");
+            // Then the page is served the stored text with the buttons
+            // again, and saves that.
+            for body in [saved.clone(), format!("{stored}\n\n{block}")] {
+                let (status, _) = send(
+                    config.clone(),
+                    "POST",
+                    route,
+                    Some((
+                        "application/json",
+                        &serde_json::json!({
+                            "LoginDisclaimer": body,
+                            "CustomCss": "body{color:red}",
+                            "SplashscreenEnabled": true,
+                        })
+                        .to_string(),
+                    )),
+                )
+                .await;
+                assert_eq!(status, StatusCode::NO_CONTENT, "{route}");
+                let branding = config.branding.lock().expect("lock").clone();
+                assert_eq!(
+                    branding.login_disclaimer.as_deref(),
+                    Some(stored),
+                    "{route} {body:?}"
+                );
+                assert_eq!(branding.custom_css.as_deref(), Some("body{color:red}"));
+            }
+        }
+    }
+}
+
+/// `UpdateBrandingConfiguration` is a synchronous action, so a client that
+/// hangs up once its request is in does not stop the save: through either
+/// branding route, the branding is saved after the request is dropped.
+#[tokio::test]
+async fn a_branding_save_finishes_for_a_client_that_hangs_up() {
+    for route in [
+        "/System/Configuration/Branding",
+        "/System/Configuration/branding",
+    ] {
+        let gate = Arc::new(SaveGate::default());
+        let config = Arc::new(StubConfig {
+            data_path: "/tmp".to_owned(),
+            branding: Mutex::new(stored_branding(Some("old"))),
+            gate: Some(Arc::clone(&gate)),
+        });
+        let request = tokio::spawn(send(
+            config.clone(),
+            "POST",
+            route,
+            Some(("application/json", r#"{"LoginDisclaimer":"New"}"#)),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.started.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{route}: the save never started"));
+        // The client hangs up: the request's future is dropped mid-save.
+        request.abort();
+        assert!(request.await.is_err_and(|e| e.is_cancelled()), "{route}");
+        gate.release.notify_one();
+        let mut saved = None;
+        for _ in 0..200 {
+            saved = config
+                .branding
+                .lock()
+                .expect("lock")
+                .login_disclaimer
+                .clone();
+            if saved.as_deref() == Some("New") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(saved.as_deref(), Some("New"), "{route}");
+    }
+}
+
+/// `DeleteCustomSplashscreen` is a synchronous action and
+/// `UploadCustomSplashscreen` copies with `CancellationToken.None`: a client
+/// that hangs up mid-save leaves neither a deleted file still recorded nor a
+/// written file unrecorded.
+#[tokio::test]
+async fn a_splashscreen_save_finishes_for_a_client_that_hangs_up() {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let existing = dir.join("splashscreen-upload.png");
+    std::fs::write(&existing, b"png-bytes").expect("splash");
+    let existing = existing.to_string_lossy().into_owned();
+    for (method, body, recorded) in [
+        ("DELETE", None, None),
+        ("POST", Some(("image/png", "aGk=")), Some(existing.as_str())),
+    ] {
+        let gate = Arc::new(SaveGate::default());
+        let config = Arc::new(StubConfig {
+            data_path: dir.to_string_lossy().into_owned(),
+            branding: Mutex::new(BrandingOptions {
+                splashscreen_location: Some(existing.clone()),
+                ..default_branding()
+            }),
+            gate: Some(Arc::clone(&gate)),
+        });
+        if method == "POST" {
+            config.branding.lock().expect("lock").splashscreen_location = None;
+        }
+        let request = tokio::spawn(send(config.clone(), method, "/Branding/Splashscreen", body));
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.started.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{method}: the save never started"));
+        request.abort();
+        assert!(request.await.is_err_and(|e| e.is_cancelled()), "{method}");
+        gate.release.notify_one();
+        let mut location = Some(String::new());
+        for _ in 0..200 {
+            location = config
+                .branding
+                .lock()
+                .expect("lock")
+                .splashscreen_location
+                .clone();
+            if location.as_deref() == recorded {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(location.as_deref(), recorded, "{method}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -296,6 +296,11 @@ impl SsoManager for FakeSso {
         })
     }
 
+    /// None: `tests/branding.rs` covers the buttons the branding route reads.
+    async fn login_buttons(&self) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+
     async fn oidc_link_page(&self) -> Result<SsoReply, ServiceError> {
         self.ensure_enabled().await?;
         Ok(SsoReply {

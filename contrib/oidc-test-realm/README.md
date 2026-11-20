@@ -136,4 +136,11 @@ or counts toward its lockout, that the same callback and the same code are each 
 time, that a callback without the flow cookie (another browser) is refused, and that a second
 sign-in finds the same account. It builds callback URLs on `http://127.0.0.1:8096`, which the
 realm's redirect URIs accept; nothing needs to listen there.
-The other users and the groups are for the later sign-in checks.
+A third test checks the roles read from the `groups` claim: with `ferrofin-users` as the
+provider's required role, `oidc-guest` (no group, so no `groups` claim) is refused and no account is
+created for it, while `oidc-member` signs in; with role sync on and `ferrofin-admins` as the
+administrator role, `oidc-admin`'s first session is an administrator's and `oidc-member`'s is not.
+A fourth maps the groups to libraries and Live TV with role sync on: `ferrofin-users` to one
+library, `ferrofin-admins` to every library, Live TV and its recordings. `oidc-member`'s first
+session has only that library, `oidc-admin`'s has every library and both Live TV permissions, and
+`oidc-guest`'s has no library and no Live TV.

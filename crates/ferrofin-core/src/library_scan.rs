@@ -7189,6 +7189,11 @@ impl LibraryScanner {
                 Stored::Existing(row) => released_from(item.id, row, &entity, &version_groups),
                 _ => None,
             };
+            // A local version a boot handed back stands in for the row
+            // upstream's scan creates, whose missing link makes its primary
+            // save and copy to it (`Video.cs:560-575,704-726`), as a version
+            // this walk creates does.
+            let handed_back = stored.row().is_some_and(handed_back_version);
             // A locked item's metadata and cast are user-owned: no NFO or
             // remote provider runs for it (`RefreshWithProviders` returns on
             // `IsLocked`), and its people are left alone. The scan-upsert's
@@ -7268,7 +7273,10 @@ impl LibraryScanner {
                         if let Some(owner) = released_by {
                             released.entry(owner).or_default().push(item.id);
                         }
-                        owners.note_saved(item, is_new || moved_ids.contains(&item.id));
+                        owners.note_saved(
+                            item,
+                            is_new || handed_back || moved_ids.contains(&item.id),
+                        );
                         if item.entity.extra_type.is_some() {
                             owners.note_extra(
                                 item,
@@ -7425,6 +7433,7 @@ impl LibraryScanner {
             }
             // A saved owner copies to its owned videos; so does an owner
             // whose part or local version this walk created or moved (re-keyed),
+            // or whose local version a boot handed back (`handed_back`),
             // though the owner itself was unchanged — upstream's refresh of
             // the owner reports a change when its version links do not match
             // (`Video.cs:560-575`), and its save copies (`Video.cs:704-726`).
@@ -7434,7 +7443,7 @@ impl LibraryScanner {
             // its title metadata to its parts (`Video.RefreshedOwnedItems`,
             // `Video.cs:549-555`); that copy writes only a part that differs.
             if matches!(saved, ItemSaved::Saved) {
-                owners.note_saved(item, is_new || moved_ids.contains(&item.id));
+                owners.note_saved(item, is_new || handed_back || moved_ids.contains(&item.id));
             } else if matches!(saved, ItemSaved::Unchanged)
                 && crate::video_versions::additional_part_count(item.entity.data.as_deref()) > 0
             {
@@ -23726,7 +23735,13 @@ fn is_stacked_part(entity: &BaseItemEntity) -> bool {
 /// `RefreshMetadataForVersions`, `Video.cs:528-700`), and that refresh only
 /// fills an empty `Name` — `copyTitleMetadata` (`BaseItem.cs:2805-2858`)
 /// never copies the name, and an alternate refreshes without it
-/// (`Video.cs:565`) — so its saved name stands.
+/// (`Video.cs:565`) — so its saved name stands. The exception is a local
+/// alternate version a boot handed back to the scan
+/// ([`crate::adoption_repairs::rederive_adopted_versions`]): it stands in for
+/// the row Jellyfin 12.x creates in place of a 10.11 one
+/// (`LibraryManager.ResolveAlternateVersion`, named by the resolver), so
+/// until its first refresh the name 10.11 gave it is a generated one too
+/// ([`adopted_version_name`]).
 fn renamed_extra(
     stored: &BaseItemEntity,
     planned: &Planned,
@@ -23737,12 +23752,17 @@ fn renamed_extra(
         .name
         .as_deref()
         .filter(|name| !name.is_empty())?;
+    let adopted = adopted_version_name(stored);
     let generated = match stored.name.as_deref() {
         // A row with no name has none to keep.
         None | Some("") => true,
-        Some(current) => current != name && planned.generated_names.iter().any(|g| g == current),
+        Some(current) => {
+            current != name
+                && (planned.generated_names.iter().any(|g| g == current)
+                    || adopted.as_deref() == Some(current))
+        }
     };
-    if planned.generated_names.is_empty()
+    if (planned.generated_names.is_empty() && adopted.is_none())
         || locked_fields.contains(&MetadataField::Name)
         || !generated
     {
@@ -23752,6 +23772,29 @@ fn renamed_extra(
     row.name = Some(name.to_owned());
     settle_sort_name(&mut row);
     Some(row)
+}
+
+/// Whether `stored` is a local alternate version not refreshed since a boot
+/// handed it back to be derived afresh
+/// ([`crate::adoption_repairs::rederive_adopted_versions`]): it stands in for
+/// the row upstream's scan creates in place of a 10.11 one.
+fn handed_back_version(stored: &BaseItemEntity) -> bool {
+    stored.owner_id.is_some()
+        && stored.primary_version_id.is_some()
+        && stored.extra_type.is_none()
+        && stored.date_last_refreshed.is_none()
+}
+
+/// The name Jellyfin 10.11 gave a local alternate version, its file's name
+/// (it resolved the file with no parent, so unparsed:
+/// `RefreshMetadataForOwnedVideo`, 10.11.8 `BaseItem.cs:2513-2541`), when
+/// `stored` is a version still to be derived afresh
+/// ([`handed_back_version`]) and not locked.
+fn adopted_version_name(stored: &BaseItemEntity) -> Option<String> {
+    if !handed_back_version(stored) || stored.is_locked {
+        return None;
+    }
+    stored.path.as_deref().map(file_stem)
 }
 
 /// Maps an NFO-parsed [`PersonInfo`](ferrofin_providers::container_types::PersonInfo)
@@ -33336,7 +33379,10 @@ mod tests {
             parent_id: Some("PARENT".into()),
             owner_id: Some("PRIMARY".into()),
             extra_type: (shape == "extra").then_some(2),
-            primary_version_id: (shape == "alternate").then(|| "PRIMARY".into()),
+            primary_version_id: shape.ends_with("alternate").then(|| "PRIMARY".into()),
+            is_locked: shape == "locked alternate",
+            date_last_refreshed: (shape == "refreshed alternate")
+                .then_some(chrono::DateTime::UNIX_EPOCH),
             data: Some(r#"{"VideoType":"VideoFile"}"#.into()),
             ..BaseItemEntity::default()
         }
@@ -33377,9 +33423,12 @@ mod tests {
     /// stored name the scan gave it (`PrepareExtra` / `IsGeneratedExtraName`,
     /// v12.2): a number of its type, the resolver's name for its file, or
     /// the raw file stem Ferrofin stored before it named a movie's extras.
-    /// Any other name — an NFO title, an edit — stands. A stacked part or a
-    /// local alternate keeps its stored name, locked or not. The rename
-    /// lands on the merge's base, so it survives a locked item's save.
+    /// Any other name — an NFO title, an edit — stands. A stacked part keeps
+    /// its stored name, locked or not, and so does a local alternate, unless
+    /// a boot handed it back to be derived afresh (never refreshed since)
+    /// and its name is still its file's, as Jellyfin 10.11 named it, and
+    /// neither it nor its name is locked. The rename lands on the merge's
+    /// base, so it survives a locked item's save.
     #[rstest::rstest]
     #[case::numbered("extra", "Trailer 2", &[], true)]
     #[case::resolver_name("extra", "Heat", &[], true)]
@@ -33391,7 +33440,12 @@ mod tests {
     #[case::other_lock("extra", "Trailer 2", &[ferrofin_model::entities::MetadataField::Overview], true)]
     #[case::part("part", "Trailer 2", &[], false)]
     #[case::alternate("alternate", "Trailer 2", &[], false)]
-    fn only_an_extra_with_a_generated_name_takes_the_planners_name(
+    #[case::adopted_alternate("alternate", "Heat cd2", &[], true)]
+    #[case::adopted_alternate_name_locked("alternate", "Heat cd2", &[ferrofin_model::entities::MetadataField::Name], false)]
+    #[case::locked_adopted_alternate("locked alternate", "Heat cd2", &[], false)]
+    #[case::refreshed_alternate("refreshed alternate", "Heat cd2", &[], false)]
+    #[case::part_named_by_its_file("part", "Heat cd2", &[], false)]
+    fn an_owned_row_takes_the_planners_name_only_where_its_name_was_generated(
         #[case] shape: &str,
         #[case] stored_name: &str,
         #[case] locked_fields: &[ferrofin_model::entities::MetadataField],

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::SqliteConnectOptions;
 
-use super::{DatabaseEdits, blocking, failed, tree, with_suffix};
+use super::{DatabaseEdits, Layout, SourceDirs, blocking, failed, tree, with_suffix};
 use crate::Result;
 use crate::database::{
     abandon_on_error, init_sqlite, publish_snapshot, start_snapshot, vacuum_into,
@@ -37,8 +37,13 @@ use crate::database::{
 /// or [`DbError::Backup`](crate::DbError::Backup) when the snapshot cannot be
 /// taken or published; [`DbError::ExportRefused`](crate::DbError::ExportRefused)
 /// when the staged copy fails its checks. Returns what the export's steps
-/// changed in the copy ([`super::edit_staged`]).
-pub(super) async fn snapshot_database(source: &Path, dest: &Path) -> Result<DatabaseEdits> {
+/// changed in the copy ([`super::edit_staged`], which rewrites the stored
+/// paths from `layout.0` onto `layout.1`).
+pub(super) async fn snapshot_database(
+    source: &Path,
+    dest: &Path,
+    layout: (&SourceDirs, &Layout),
+) -> Result<DatabaseEdits> {
     let staged = with_suffix(dest, ".export-source");
     let leftovers = staged_files(&staged);
     let (from, to, files) = (source.to_owned(), staged.clone(), leftovers.clone());
@@ -66,7 +71,7 @@ pub(super) async fn snapshot_database(source: &Path, dest: &Path) -> Result<Data
     })
     .await;
     let written = match staging {
-        Ok(permissions) => vacuum(&staged, dest, permissions).await,
+        Ok(permissions) => vacuum(&staged, dest, permissions, layout).await,
         Err(error) => Err(error),
     };
     // The staged copy goes whether the snapshot was written or not.
@@ -81,6 +86,7 @@ async fn vacuum(
     from: &Path,
     dest: &Path,
     permissions: std::fs::Permissions,
+    layout: (&SourceDirs, &Layout),
 ) -> Result<DatabaseEdits> {
     init_sqlite();
     let partial = start_snapshot(dest)?;
@@ -100,7 +106,7 @@ async fn vacuum(
             .await
             .map_err(super::refusal::damaged_or)?;
         let history = super::refusal::database(&mut conn).await?;
-        let edits = super::edit_staged(&mut conn, history.as_ref()).await?;
+        let edits = super::edit_staged(&mut conn, history.as_ref(), layout).await?;
         sqlx::query(sqlx::AssertSqlSafe(vacuum_into(&partial)))
             .execute(&mut conn)
             .await

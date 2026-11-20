@@ -210,16 +210,21 @@ EOS
   for route in 10.11.8 12.4-from-123; do
     checks=$(jq -r --arg r "$route" 'select(.event == "check" and .fixture == $r) | "\(.stage)|\(.check)|\(.verdict)"' \
       "$TMP/w/results.jsonl")
-    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 13 ]
+    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 17 ]
     grep -qx "Export|the export completes|PASS" <<<"$checks"
+    grep -qx "Export|every stored path is in the export, none under the directory Ferrofin ran at|PASS" <<<"$checks"
     grep -qx "Jellyfin|answers equal Ferrofin's before the stop|PASS" <<<"$checks"
-    grep -q '^Exported /config into /route/jellyfin$' "$TMP/w/$route/export.log"
+    grep -qx "Jellyfin|every library keeps its folder row and DateCreated through its scan|PASS" <<<"$checks"
   done
+  # the 10.11.8 route's Ferrofin runs at /data, its own image's directory, and the export reads it there
+  grep -q '^Exported /data into /route/jellyfin$' "$TMP/w/10.11.8/export.log"
+  grep -q '^Exported /config into /route/jellyfin$' "$TMP/w/12.4-from-123/export.log"
+  grep -E -- "^run .*--name rt-both-10.11.8-ferrofin .*-e FERROFIN_DATA_DIR=/data .*-v $TMP/w/10.11.8/ferrofin:/data " state/calls
   grep -q '^login roundtrip-user 200 token=yes$' "$TMP/w/12.4-from-123/answers.txt"
   cmp "$TMP/w/12.4-from-123/oracle.txt" "$TMP/w/12.4-from-123/answers.txt" >/dev/null ||
     diff <(adoption_normalise "$TMP/w/12.4-from-123/oracle.txt") <(adoption_normalise "$TMP/w/12.4-from-123/answers.txt")
   # the export ran from the image under test, as the calling user, on the server's data directory at its path
-  grep -E -- "^run --pull never --cidfile $TMP/w/10.11.8/export.cid --name rt-both-10.11.8-export --user $(id -u):$(id -g) --network none -e FERROFIN_DATA_DIR=/config -v $TMP/w/10.11.8/ferrofin:/config -v $TMP/w/10.11.8:/route ferrofin-roundtrip:both export-jellyfin --out /route/jellyfin$" \
+  grep -E -- "^run --pull never --cidfile $TMP/w/10.11.8/export.cid --name rt-both-10.11.8-export --user $(id -u):$(id -g) --network none -e FERROFIN_DATA_DIR=/data -v $TMP/w/10.11.8/ferrofin:/data -v $TMP/w/10.11.8:/route ferrofin-roundtrip:both export-jellyfin --out /route/jellyfin$" \
     state/calls
   grep -c 'InternalCodeMigration: Perform migration' "$TMP/w/10.11.8/jellyfin.log" | grep -qx 2
   # a passing route keeps its logs and answers, not its copies
@@ -261,6 +266,16 @@ EOS
   run ! grep -q -- '--name rt-broken-[^ ]*-jellyfin ' state/calls
   [ "$(started rt-broken-)" = "$(removed rt-broken-)" ]
   grep -q 'Caused by' "$TMP/w/12.4-from-123/export.log"
+}
+
+@test "run.sh: an export that leaves a stored path where Ferrofin ran fails its route, and Jellyfin is never booted" {
+  FAKE_EXPORT=stale-paths run run_gate "$TMP/w" --run-id stale --only 10.11.8
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  10.11.8        BaseItems.Path: 1 path(s) under the source's directory, first: /data/root/default/Movies"* ]]
+  check="every stored path is in the export, none under the directory Ferrofin ran at"
+  [ "$(jq -r --arg c "$check" 'select(.event == "check" and .check == $c) | .verdict' "$TMP/w/results.jsonl")" = FAIL ]
+  run ! grep -q -- '--name rt-stale-[^ ]*-jellyfin ' state/calls
+  [ "$(started rt-stale-)" = "$(removed rt-stale-)" ]
 }
 
 @test "run.sh: an export that never ends is given up at ROUNDTRIP_SCAN_TIMEOUT, and its container is removed" {

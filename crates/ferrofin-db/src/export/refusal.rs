@@ -12,6 +12,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use super::layout::Trees;
 use crate::{DbError, Result};
 
 /// A refusal naming its cause.
@@ -186,24 +187,109 @@ fn held_by_another_process(shm: &Path) -> std::io::Result<bool> {
     Ok(i32::from(lock.l_type) != libc::F_UNLCK)
 }
 
-/// Walks what the copy will read under `source` (links followed, as the copy
-/// follows them), and refuses an output inside a directory the source reaches
+/// The classes the preflight sizes, by their place in the output, in the order
+/// it lists them (the audit of gl-1572): a file goes to the first that holds it.
+const CLASSES: [(&str, &str); 9] = [
+    ("metadata", "artwork and other metadata"),
+    ("data/trickplay", "trickplay"),
+    ("data/subtitles", "subtitle cache"),
+    ("data/attachments", "attachment cache"),
+    ("data/playlists", "playlists"),
+    ("data/collections", "collections"),
+    ("root", "library definitions"),
+    ("config", "configuration"),
+    ("plugins", "plugins"),
+];
+
+/// The class of the chapter images, in the `chapters` folder of an item's
+/// metadata folder: regenerable where the library extracts them.
+const CHAPTERS: &str = "chapter images";
+
+/// The class of the database and the files SQLite keeps beside it.
+const DATABASE: &str = "the database";
+
+/// The class of every other file.
+const OTHER: &str = "everything else";
+
+/// What an export will copy, by class, and the room it has: the preflight
+/// `ferrofin-server export-jellyfin` prints before it copies anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preflight {
+    /// The output, resolved: the path the export renames its partial to.
+    pub target: PathBuf,
+    /// The bytes the copy reads in each class, each class listed (with 0
+    /// when it holds nothing): the output's own places first, then the
+    /// database, then everything else.
+    pub classes: Vec<(&'static str, u64)>,
+    /// The bytes the export needs beside the output: everything it reads, and
+    /// a second copy of the database and its log while the snapshot is taken.
+    pub needed: u64,
+    /// The bytes free there.
+    pub available: u64,
+}
+
+/// Walks what the copy will read in each of `trees` (links followed, as the
+/// copy follows them), and refuses an output inside a directory a tree reaches
 /// through a link (the copy would read what it writes), and an export the
 /// partial's filesystem (the output's parent's) has too little free space for.
 /// The export holds a copy of everything it reads and, while the snapshot is
-/// taken, a second copy of the database and its log beside it.
-pub(super) fn reach(source: &Path, database: &Path, target: &Path) -> Result<()> {
-    let bytes = size(source, target)?;
-    let database_files: u64 = ["", "-wal"]
+/// taken, a second copy of the database and its log beside it: `database` is
+/// its path as given (under the data directory, as the walk finds it) and
+/// `real` its real path. Returns the sizes it found.
+pub(super) fn reach(
+    trees: &Trees,
+    (database, real): (&Path, &Path),
+    target: PathBuf,
+) -> Result<Preflight> {
+    let mut classes: Vec<(&'static str, u64)> = CLASSES
         .iter()
-        .map(|suffix| {
-            std::fs::metadata(super::with_suffix(database, suffix)).map_or(0, |m| m.len())
-        })
+        .map(|(_, class)| (*class, 0))
+        .chain([(CHAPTERS, 0), (DATABASE, 0), (OTHER, 0)])
+        .collect();
+    let source = &trees.copied[0].0;
+    let database_files: Vec<PathBuf> = database
+        .strip_prefix(source)
+        .map_or_else(|_| Vec::new(), super::database_files);
+    for (index, (root, place)) in trees.copied.iter().enumerate() {
+        let (left_out, database_files) = if index == 0 {
+            (trees.left_out_dirs(), &database_files[..])
+        } else {
+            (Vec::new(), &[][..])
+        };
+        size(
+            root,
+            &target,
+            &left_out,
+            &mut |relative: &Path, bytes: u64| {
+                let placed = place.join(relative);
+                let class = if database_files.iter().any(|file| file == relative) {
+                    DATABASE
+                } else if placed.starts_with(CLASSES[0].0)
+                    && placed.parent().is_some_and(|dir| dir.ends_with("chapters"))
+                {
+                    CHAPTERS
+                } else {
+                    CLASSES
+                        .iter()
+                        .find(|(prefix, _)| placed.starts_with(prefix))
+                        .map_or(OTHER, |(_, class)| *class)
+                };
+                if let Some((_, total)) = classes.iter_mut().find(|(name, _)| *name == class) {
+                    *total = total.saturating_add(bytes);
+                }
+            },
+        )?;
+    }
+    let second_copy: u64 = ["", "-wal"]
+        .iter()
+        .map(|suffix| std::fs::metadata(super::with_suffix(real, suffix)).map_or(0, |m| m.len()))
         .sum();
-    let needed = bytes.saturating_add(database_files);
+    let needed = classes
+        .iter()
+        .fold(second_copy, |sum, (_, bytes)| sum.saturating_add(*bytes));
     let mut dir = target
         .parent()
-        .map_or_else(|| target.to_owned(), Path::to_owned);
+        .map_or_else(|| target.clone(), Path::to_owned);
     while !dir.exists() {
         if !dir.pop() {
             break;
@@ -221,6 +307,26 @@ pub(super) fn reach(source: &Path, database: &Path, target: &Path) -> Result<()>
             gib(needed - available)
         )));
     }
+    Ok(Preflight {
+        target,
+        classes,
+        needed,
+        available,
+    })
+}
+
+/// Refuses an output that is `tree` (a directory the export copies besides
+/// the data directory), sits inside it or holds it.
+pub(super) fn apart(tree: &Path, target: &Path) -> Result<()> {
+    let real = std::fs::canonicalize(tree).map_err(super::failed(tree))?;
+    if target.starts_with(&real) || real.starts_with(target) {
+        return Err(refused(format!(
+            "the output {} and the directory {} the export copies are nested; an export never \
+             writes into what it reads",
+            target.display(),
+            tree.display()
+        )));
+    }
     Ok(())
 }
 
@@ -232,14 +338,20 @@ fn gib(bytes: u64) -> String {
     format!("{gib:.1} GiB")
 }
 
-/// The bytes in every file under `root`, links followed, each directory
-/// counted once. Refuses `target` as soon as the walk reaches a directory it
-/// is, or is inside, through a link (`root` itself is [`paths`]' to refuse).
-fn size(root: &Path, target: &Path) -> Result<u64> {
+/// Hands `found` each file under `root` (its path relative to `root`, and its
+/// bytes), links followed, each directory counted once, the directories
+/// `left_out` names (relative to `root`) skipped. Refuses `target` as soon as
+/// the walk reaches a directory it is, or is inside, through a link (`root`
+/// itself is [`paths`]' and [`apart`]'s to refuse).
+fn size(
+    root: &Path,
+    target: &Path,
+    left_out: &[PathBuf],
+    found: &mut dyn FnMut(&Path, u64),
+) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
-    let mut pending = vec![root.to_owned()];
-    let mut total = 0_u64;
-    while let Some(dir) = pending.pop() {
+    let mut pending = vec![(root.to_owned(), PathBuf::new())];
+    while let Some((dir, relative)) = pending.pop() {
         let real = std::fs::canonicalize(&dir).map_err(super::failed(&dir))?;
         if dir != root && target.starts_with(&real) {
             let relation = if target == real { "is" } else { "is inside" };
@@ -255,19 +367,24 @@ fn size(root: &Path, target: &Path) -> Result<u64> {
             continue;
         }
         for entry in std::fs::read_dir(&dir).map_err(super::failed(&dir))? {
-            let path = entry.map_err(super::failed(&dir))?.path();
+            let entry = entry.map_err(super::failed(&dir))?;
+            let child = relative.join(entry.file_name());
+            if left_out.contains(&child) {
+                continue;
+            }
+            let path = entry.path();
             // A broken link is the copy's to refuse; it has no size here.
             let Ok(metadata) = std::fs::metadata(&path) else {
                 continue;
             };
             if metadata.is_dir() {
-                pending.push(path);
+                pending.push((path, child));
             } else {
-                total = total.saturating_add(metadata.len());
+                found(&child, metadata.len());
             }
         }
     }
-    Ok(total)
+    Ok(())
 }
 
 /// The bytes an unprivileged writer can still use on the filesystem holding
@@ -509,7 +626,7 @@ fn checksum(data: &[u8], big_endian: bool, (mut s0, mut s1): (u32, u32)) -> (u32
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use sqlx::ConnectOptions as _;
 
@@ -574,6 +691,28 @@ mod tests {
         assert!(reason(check(&dangling)).contains("does not exist"));
     }
 
+    /// A directory the export copies besides the data directory must not hold
+    /// the output, sit in it or be it; one beside it is fine.
+    #[test]
+    fn an_output_nested_with_another_copied_directory_is_refused() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let meta = scratch.path().join("meta");
+        std::fs::create_dir_all(meta.join("library")).expect("dirs");
+        let real = std::fs::canonicalize(scratch.path()).expect("real");
+        for nested in [
+            real.join("meta"),
+            real.join("meta/library/out"),
+            real.clone(),
+        ] {
+            assert!(
+                reason(apart(&meta, &nested)).contains("are nested"),
+                "{}",
+                nested.display()
+            );
+        }
+        apart(&meta, &real.join("out")).expect("beside it");
+    }
+
     /// A directory on its own filesystem is a mount point; one beside its
     /// parent's files is not.
     #[cfg(target_os = "linux")]
@@ -602,20 +741,50 @@ mod tests {
     }
 
     /// The free-space check counts what the source holds, and the database a
-    /// second time, against what the partial's filesystem has.
+    /// second time, against what the partial's filesystem has; each file is
+    /// counted in its class, and a directory left out is not counted.
     #[test]
     fn the_source_size_is_counted_and_compared() {
         let scratch = tempfile::tempdir().expect("tempdir");
         let source = scratch.path().join("source");
+        let meta = scratch.path().join("meta");
         std::fs::create_dir_all(source.join("a/b")).expect("dirs");
+        std::fs::create_dir_all(source.join("data/trickplay")).expect("dirs");
+        std::fs::create_dir_all(source.join("cache")).expect("dirs");
+        std::fs::create_dir_all(meta.join("library")).expect("dirs");
         std::fs::write(source.join("a/one"), vec![0_u8; 1000]).expect("file");
         std::fs::write(source.join("a/b/two"), vec![0_u8; 24]).expect("file");
-        assert_eq!(
-            size(&source, &scratch.path().join("out")).expect("size"),
-            1024
-        );
+        std::fs::write(source.join("data/trickplay/0.jpg"), vec![0_u8; 7]).expect("file");
+        std::fs::write(source.join("cache/big"), vec![0_u8; 4096]).expect("file");
+        std::fs::write(meta.join("library/poster.jpg"), vec![0_u8; 5]).expect("file");
+        std::fs::create_dir_all(meta.join("library/ab/chapters")).expect("dirs");
+        std::fs::write(meta.join("library/ab/chapters/0_0.jpg"), vec![0_u8; 3]).expect("file");
+        let mut trees = Trees {
+            copied: vec![
+                (source.clone(), PathBuf::new()),
+                (meta, PathBuf::from("metadata")),
+            ],
+            left_out: vec![(PathBuf::from("cache"), super::super::LeftOut::NotNeeded)],
+        };
         let database = source.join("a/one");
-        reach(&source, &database, &scratch.path().join("out")).expect("2 KiB fits");
+        let preflight =
+            reach(&trees, (&database, &database), scratch.path().join("out")).expect("2 KiB fits");
+        let class = |name: &str| {
+            preflight
+                .classes
+                .iter()
+                .find(|(class, _)| *class == name)
+                .map(|(_, bytes)| *bytes)
+        };
+        assert_eq!(class("the database"), Some(1000));
+        assert_eq!(class("trickplay"), Some(7));
+        assert_eq!(class("artwork and other metadata"), Some(5));
+        assert_eq!(class("everything else"), Some(24));
+        assert_eq!(class("plugins"), Some(0));
+        assert_eq!(class("chapter images"), Some(3));
+        assert_eq!(preflight.needed, 1039 + 1000);
+        assert!(preflight.available > 0);
+        trees.copied.truncate(1);
 
         // An output under a directory the source links to is refused, naming
         // the link.
@@ -623,7 +792,7 @@ mod tests {
         std::fs::create_dir(&volume).expect("volume");
         std::os::unix::fs::symlink(&volume, source.join("a/linked")).expect("link");
         let real = std::fs::canonicalize(&volume).expect("real");
-        let message = reason(reach(&source, &database, &real.join("export")));
+        let message = reason(reach(&trees, (&database, &database), real.join("export")));
         assert!(
             message.contains("reaches through") && message.contains("linked"),
             "{message}"
@@ -640,7 +809,11 @@ mod tests {
         if sparse.set_len(free + (1 << 30)).is_err() {
             return;
         }
-        let message = reason(reach(&source, &database, &scratch.path().join("out")));
+        let message = reason(reach(
+            &trees,
+            (&database, &database),
+            scratch.path().join("out"),
+        ));
         assert!(message.contains("short"), "{message}");
         assert!(message.contains("GiB"), "{message}");
     }
