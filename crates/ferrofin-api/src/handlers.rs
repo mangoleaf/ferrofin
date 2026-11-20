@@ -3701,7 +3701,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UploadCustomSplashscreen",
         ferrofin: "handlers/branding.rs upload_splashscreen → handlers/image_upload.rs \
                (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
-               to_extension, decode_base64)",
+               to_extension, decode_base64) → the write and the save on handlers.rs \
+               run_detached's task, so a client that hangs up once the body is in stops \
+               neither, as upstream's CancellationToken.None copy and synchronous save",
         date: "2026-10-28",
         divergences: &[
             "The body is decoded in full before anything is written, and the location is \
@@ -4402,8 +4404,8 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/config.rs update_named_configuration (RequiredRouteString key: \
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
                GetConfigurationType and Deserialize) → for branding, strip_login_buttons, \
-               then ServerConfigurationManager::update_branding and the committed checks; \
-               otherwise save_named_configuration, on \
+               then ServerConfigurationManager::update_branding and the committed checks on \
+               run_detached's task; otherwise save_named_configuration, on \
                handlers.rs run_detached's task so it finishes for a client that hangs up, in \
                the request's span and culture \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
@@ -4486,7 +4488,9 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/config.rs update_branding_configuration (RequireAdminWithDefault: \
                RequiresElevation; JsonBody<BrandingOptionsDto>: [FromBody, Required] through \
                JsonDefaults' converters, member names matched ignoring case, an empty or null \
-               body a 400) → ferrofin-core configuration_manager.rs get_branding \
+               body a 400) → on handlers.rs run_detached's task, so the synchronous action's \
+               save finishes for a client that hangs up, in the request's span and culture: \
+               ferrofin-core configuration_manager.rs get_branding \
                (GetConfiguration(\"branding\"), which keeps SplashscreenLocation) → the DTO's \
                LoginDisclaimer, CustomCss and SplashscreenEnabled over it → handlers/branding.rs \
                strip_login_buttons → update_branding (SaveConfiguration(\"branding\", …): the \

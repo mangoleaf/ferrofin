@@ -301,25 +301,31 @@ async fn upload_splashscreen(
     let bytes = decode_base64(body.trim())
         .ok_or_else(|| ApiError::BadRequest("splashscreen data is not valid base64".to_owned()))?;
 
-    let data_path = state.config.application_paths().data_path();
-    // Jellyfin's data path exists from startup; a fresh Ferrofin data directory
-    // has no such folder until something writes to it.
-    tokio::fs::create_dir_all(&data_path).await.map_err(|e| {
-        ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
-            "create data directory: {e}"
-        )))
-    })?;
-    let file_path = Path::new(&data_path).join(format!("splashscreen-upload{extension}"));
-    tokio::fs::write(&file_path, &bytes).await.map_err(|e| {
-        ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
-            "write splashscreen: {e}"
-        )))
-    })?;
+    // With the whole body in, a client that hangs up stops neither the write
+    // nor the save, as upstream's copy (`CancellationToken.None`) and its
+    // synchronous save run on.
+    crate::handlers::run_detached(async move {
+        let data_path = state.config.application_paths().data_path();
+        // Jellyfin's data path exists from startup; a fresh Ferrofin data
+        // directory has no such folder until something writes to it.
+        tokio::fs::create_dir_all(&data_path).await.map_err(|e| {
+            ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
+                "create data directory: {e}"
+            )))
+        })?;
+        let file_path = Path::new(&data_path).join(format!("splashscreen-upload{extension}"));
+        tokio::fs::write(&file_path, &bytes).await.map_err(|e| {
+            ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
+                "write splashscreen: {e}"
+            )))
+        })?;
 
-    let mut branding = state.config.get_branding().await?;
-    branding.splashscreen_location = Some(file_path.to_string_lossy().into_owned());
-    state.config.update_branding(&branding).await?;
-    crate::handlers::config::run_committed_checks(&state, "branding")?;
+        let mut branding = state.config.get_branding().await?;
+        branding.splashscreen_location = Some(file_path.to_string_lossy().into_owned());
+        state.config.update_branding(&branding).await?;
+        crate::handlers::config::run_committed_checks(&state, "branding")
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -338,20 +344,26 @@ async fn delete_splashscreen(
     State(state): State<AppState>,
     _auth: RequireAdmin,
 ) -> Result<StatusCode, ApiError> {
-    let mut branding = state.config.get_branding().await?;
-    if let Some(loc) = branding.splashscreen_location.clone()
-        && !loc.trim().is_empty()
-        && is_file(Path::new(&loc)).await
-    {
-        tokio::fs::remove_file(&loc).await.map_err(|e| {
-            ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
-                "delete splashscreen: {e}"
-            )))
-        })?;
-        branding.splashscreen_location = None;
-        state.config.update_branding(&branding).await?;
-        crate::handlers::config::run_committed_checks(&state, "branding")?;
-    }
+    // A synchronous action upstream: a client that hangs up cannot leave the
+    // file deleted and its location still recorded.
+    crate::handlers::run_detached(async move {
+        let mut branding = state.config.get_branding().await?;
+        if let Some(loc) = branding.splashscreen_location.clone()
+            && !loc.trim().is_empty()
+            && is_file(Path::new(&loc)).await
+        {
+            tokio::fs::remove_file(&loc).await.map_err(|e| {
+                ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
+                    "delete splashscreen: {e}"
+                )))
+            })?;
+            branding.splashscreen_location = None;
+            state.config.update_branding(&branding).await?;
+            crate::handlers::config::run_committed_checks(&state, "branding")?;
+        }
+        Ok::<_, ApiError>(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

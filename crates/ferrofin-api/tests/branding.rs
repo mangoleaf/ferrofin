@@ -107,6 +107,16 @@ impl ServerApplicationPaths for TmpPaths {
 struct StubConfig {
     data_path: String,
     branding: Mutex<BrandingOptions>,
+    /// When set, `update_branding` says it has started and waits to be
+    /// released before it records the branding.
+    gate: Option<Arc<SaveGate>>,
+}
+
+/// Holds a branding save between its start and its write.
+#[derive(Default)]
+struct SaveGate {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 #[async_trait]
@@ -126,6 +136,10 @@ impl ServerConfigurationManager for StubConfig {
         Ok(self.branding.lock().expect("lock").clone())
     }
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
+        if let Some(gate) = &self.gate {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
         *self.branding.lock().expect("lock") = branding.clone();
         Ok(())
     }
@@ -136,6 +150,7 @@ fn make_config(branding: BrandingOptions, data_path: &str) -> Arc<StubConfig> {
     Arc::new(StubConfig {
         data_path: data_path.to_owned(),
         branding: Mutex::new(branding),
+        gate: None,
     })
 }
 
@@ -881,4 +896,101 @@ async fn a_saved_disclaimer_never_keeps_the_sign_in_buttons() {
             }
         }
     }
+}
+
+/// `UpdateBrandingConfiguration` is a synchronous action, so a client that
+/// hangs up once its request is in does not stop the save: through either
+/// branding route, the branding is saved after the request is dropped.
+#[tokio::test]
+async fn a_branding_save_finishes_for_a_client_that_hangs_up() {
+    for route in [
+        "/System/Configuration/Branding",
+        "/System/Configuration/branding",
+    ] {
+        let gate = Arc::new(SaveGate::default());
+        let config = Arc::new(StubConfig {
+            data_path: "/tmp".to_owned(),
+            branding: Mutex::new(stored_branding(Some("old"))),
+            gate: Some(Arc::clone(&gate)),
+        });
+        let request = tokio::spawn(send(
+            config.clone(),
+            "POST",
+            route,
+            Some(("application/json", r#"{"LoginDisclaimer":"New"}"#)),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.started.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{route}: the save never started"));
+        // The client hangs up: the request's future is dropped mid-save.
+        request.abort();
+        assert!(request.await.is_err_and(|e| e.is_cancelled()), "{route}");
+        gate.release.notify_one();
+        let mut saved = None;
+        for _ in 0..200 {
+            saved = config
+                .branding
+                .lock()
+                .expect("lock")
+                .login_disclaimer
+                .clone();
+            if saved.as_deref() == Some("New") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(saved.as_deref(), Some("New"), "{route}");
+    }
+}
+
+/// `DeleteCustomSplashscreen` is a synchronous action and
+/// `UploadCustomSplashscreen` copies with `CancellationToken.None`: a client
+/// that hangs up mid-save leaves neither a deleted file still recorded nor a
+/// written file unrecorded.
+#[tokio::test]
+async fn a_splashscreen_save_finishes_for_a_client_that_hangs_up() {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let existing = dir.join("splashscreen-upload.png");
+    std::fs::write(&existing, b"png-bytes").expect("splash");
+    let existing = existing.to_string_lossy().into_owned();
+    for (method, body, recorded) in [
+        ("DELETE", None, None),
+        ("POST", Some(("image/png", "aGk=")), Some(existing.as_str())),
+    ] {
+        let gate = Arc::new(SaveGate::default());
+        let config = Arc::new(StubConfig {
+            data_path: dir.to_string_lossy().into_owned(),
+            branding: Mutex::new(BrandingOptions {
+                splashscreen_location: Some(existing.clone()),
+                ..default_branding()
+            }),
+            gate: Some(Arc::clone(&gate)),
+        });
+        if method == "POST" {
+            config.branding.lock().expect("lock").splashscreen_location = None;
+        }
+        let request = tokio::spawn(send(config.clone(), method, "/Branding/Splashscreen", body));
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.started.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{method}: the save never started"));
+        request.abort();
+        assert!(request.await.is_err_and(|e| e.is_cancelled()), "{method}");
+        gate.release.notify_one();
+        let mut location = Some(String::new());
+        for _ in 0..200 {
+            location = config
+                .branding
+                .lock()
+                .expect("lock")
+                .splashscreen_location
+                .clone();
+            if location.as_deref() == recorded {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(location.as_deref(), recorded, "{method}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -116,9 +116,12 @@ async fn get_default_metadata_options(_auth: RequireAdminWithDefault) -> Json<Me
 ///
 /// Port of `ConfigurationController.UpdateBrandingConfiguration`: reads the
 /// current branding to preserve `SplashscreenLocation`, overlays the DTO's three
-/// editable fields, and persists. The Single Sign-On sign-in buttons
-/// `GET /Branding/Configuration` served are dropped from the disclaimer
-/// first ([`strip_login_buttons`]).
+/// editable fields, and persists, on [`run_detached`]'s task, so a client that
+/// hangs up does not stop the synchronous action's save. The Single Sign-On
+/// sign-in buttons `GET /Branding/Configuration` served are dropped from the
+/// disclaimer first ([`strip_login_buttons`]).
+///
+/// [`run_detached`]: crate::handlers::run_detached
 #[utoipa::path(
     post,
     path = "/System/Configuration/Branding",
@@ -131,13 +134,16 @@ async fn update_branding_configuration(
     _auth: RequireAdminWithDefault,
     JsonBody(dto): JsonBody<BrandingOptionsDto>,
 ) -> Result<StatusCode, ApiError> {
-    let mut current = state.config.get_branding().await?;
-    current.login_disclaimer = dto.login_disclaimer;
-    strip_login_buttons(&mut current.login_disclaimer);
-    current.custom_css = dto.custom_css;
-    current.splashscreen_enabled = dto.splashscreen_enabled;
-    state.config.update_branding(&current).await?;
-    run_committed_checks(&state, "branding")?;
+    crate::handlers::run_detached(async move {
+        let mut current = state.config.get_branding().await?;
+        current.login_disclaimer = dto.login_disclaimer;
+        strip_login_buttons(&mut current.login_disclaimer);
+        current.custom_css = dto.custom_css;
+        current.splashscreen_enabled = dto.splashscreen_enabled;
+        state.config.update_branding(&current).await?;
+        run_committed_checks(&state, "branding")
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -433,8 +439,12 @@ async fn update_named_configuration(
             serde_json::from_value(body).map_err(|error| configuration_error(&error))?;
         // jellyfin-web's branding page saves here what it was served.
         strip_login_buttons(&mut branding.login_disclaimer);
-        state.config.update_branding(&branding).await?;
-        run_committed_checks(&state, &key)?;
+        // A synchronous action upstream: a hang-up does not stop the save.
+        crate::handlers::run_detached(async move {
+            state.config.update_branding(&branding).await?;
+            run_committed_checks(&state, &key)
+        })
+        .await?;
         return Ok(StatusCode::NO_CONTENT);
     }
     // Once accepted, finish persistence and the live update even if the HTTP
