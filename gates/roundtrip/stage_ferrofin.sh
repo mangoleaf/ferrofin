@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The Ferrofin stage of a round-trip route, sourced by run.sh: adopt a fresh copy of the fixture, scan it,
 # run the usage stage (usage.py, which captures Ferrofin's answers as the route's oracle) and stop. It uses
-# run.sh's state: route, fixture, generation, dst, the settings, MADE, and why[] through check and mark.
+# run.sh's state: route, fixture, generation, ran_at (the data directory it runs at), dst, the settings,
+# MADE, and why[] through check and mark.
 # shellcheck disable=SC2154  # run.sh sets what this reads
 
 # ferrofin_stage: status 0 when the copy is ready for the export; 1 (with the reasons in why[]) when not.
@@ -12,8 +13,8 @@ ferrofin_stage() {
     why+=("cannot copy $fixture"); mark Ferrofin ready; return 1
   fi
   MADE+=("$cid")
-  if port=$(rt_start "$name" "$cid" "$TAG" -e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache \
-      -v "$dst/ferrofin:/config" -v "$dst/ferrofin-cache:/cache" "${MEDIA[@]}" 2>"$dst/ferrofin-start.err"); then
+  if port=$(rt_start "$name" "$cid" "$TAG" -e FERROFIN_DATA_DIR="$ran_at" -e FERROFIN_CACHE_DIR=/cache \
+      -v "$dst/ferrofin:$ran_at" -v "$dst/ferrofin-cache:/cache" "${MEDIA[@]}" 2>"$dst/ferrofin-start.err"); then
     url=http://127.0.0.1:$port
     rt_wait_up "$name" "$port" "$READY_TIMEOUT" || why+=("$(rt_not_up "$name" "$READY_TIMEOUT")")
   else

@@ -122,12 +122,12 @@ impl DtoService for NoItems {
     }
 }
 
-/// The real session manager over `db` and `users`, and its events.
+/// The real session manager over `db` and `users`, publishing to `events`.
 pub(in crate::sso) fn sessions(
     db: &ferrofin_db::Database,
     users: &Arc<FerrofinUserManager>,
-) -> (Arc<FerrofinSessionManager>, Arc<FerrofinEventManager>) {
-    let events = Arc::new(FerrofinEventManager::new());
+    events: &Arc<FerrofinEventManager>,
+) -> Arc<FerrofinSessionManager> {
     let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
         Arc::new(ItemTypeLookup::new());
     let library = Arc::new(FerrofinLibraryManager::new(
@@ -136,7 +136,7 @@ pub(in crate::sso) fn sessions(
         Arc::new(FerrofinItemPersistenceService::new(db.clone())),
         Arc::new(FerrofinPeopleRepository::new(db.clone())),
     ));
-    let sessions = Arc::new(FerrofinSessionManager::new(
+    Arc::new(FerrofinSessionManager::new(
         Arc::clone(users) as Arc<dyn UserManager>,
         Arc::new(FerrofinDeviceManager::new(db.clone())),
         Arc::new(FerrofinUserDataManager::new(
@@ -145,11 +145,10 @@ pub(in crate::sso) fn sessions(
         )),
         library,
         Arc::new(NoItems),
-        Arc::clone(&events) as Arc<dyn EventManager>,
+        Arc::clone(events) as Arc<dyn EventManager>,
         db.clone(),
         SERVER_ID,
-    ));
-    (sessions, events)
+    ))
 }
 
 /// The server id every session carries.
@@ -215,12 +214,18 @@ impl Harness {
             .await
             .expect("connect");
         db.run_migrations().await.expect("migrations");
-        let users = Arc::new(FerrofinUserManager::new(db.clone()));
+        // The user manager announces its saves where the sessions publish,
+        // as the server wires them.
+        let events = Arc::new(FerrofinEventManager::new());
+        let users = Arc::new(
+            FerrofinUserManager::new(db.clone())
+                .with_events(Arc::clone(&events) as Arc<dyn EventManager>),
+        );
         users.set_extension_providers(vec![Arc::new(SsoAuthProvider::new(
             Arc::clone(&plugins) as Arc<dyn PluginManager>
         ))]);
         let identities = Arc::new(FerrofinExternalIdentityStore::new(db.clone()));
-        let (sessions, events) = sessions(&db, &users);
+        let sessions = sessions(&db, &users, &events);
         let activity = Arc::new(FerrofinActivityManager::new(db));
         let sso = SsoService::new(
             plugins as Arc<dyn PluginManager>,
@@ -245,7 +250,7 @@ impl Harness {
         }
     }
 
-    async fn provider(&self, key: &str) -> OidcProvider {
+    pub(in crate::sso) async fn provider(&self, key: &str) -> OidcProvider {
         sign_in_provider(&self.sso.config().await.expect("config"), key).expect("a provider")
     }
 

@@ -47,7 +47,8 @@ class Server(metadata.Api):
             raise CheckError(f"{method} {path.split('?')[0]}: no answer ({type(error).__name__})") from None
 
     def send(self, method, path, body=None, auth=None, content_type="application/json"):
-        """(status, decoded JSON or None) for one request; never raises for an HTTP status.
+        """(status, decoded JSON or None: None for a body that is not JSON, an image's say) for one request;
+        never raises for an HTTP status.
         auth: the Authorization header to send instead of the API key's. A bytes body is sent as it is,
         with content_type (an image upload); any other body as JSON."""
         data = body if isinstance(body, bytes) else None if body is None else json.dumps(body).encode()
@@ -67,7 +68,7 @@ class Server(metadata.Api):
             raise CheckError(f"{method} {path.split('?')[0]}: no answer ({type(error).__name__})") from None
         try:
             return status, (json.loads(raw) if raw else None)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):   # binary bytes fail decoding before parsing
             return status, None
 
     def settle(self, timeout, interval=2):

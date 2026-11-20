@@ -102,8 +102,10 @@ Four comparisons on the adoption gate's synthetic fixtures (2026-11-10, the imag
   diffed with Jellyfin 12.4's own upgrade of the same database (the `jellyfin-12.4-from-10` fixture).
   - Jellyfin cannot boot on this route until the export rewrites the EF history (gl-1549), so there is no return
     run here.
-  - Everything E1 to E3 found shows here too. This route adds the alternate-version movie's name and bitrate, its
-    streams' values and the `Playlists` view's id (gl-1599).
+  - Everything E1 to E3 found shows here too. This route adds the alternate-version movie's name and bitrate and its
+    streams' values (gl-1599, fixed: the adopted version is probed and named afresh by the first scan, and after it
+    the row equals 12.4's but for its timestamps and `Data`, gl-1563's). The `Playlists` view's id was re-checked
+    and is not a difference: each user's view gets 12.4's id for that user; the audit had matched another user's.
 
 Timestamps that differ only because the runs happened at different times are matches; their text form is gl-1565's.
 The gate's row-level diff (gl-1568) will automate these comparisons.
@@ -114,7 +116,7 @@ The gate's row-level diff (gl-1568) will automate these comparisons.
 |---|---|---|
 | gl-1580 | fix | NULL where Jellyfin writes `''`, `0`, `Unknown`, `Other` or the zero GUID, on every item type; the scan rewriting adopted defaults to NULL; `rekey_container` copying 17 of 72 columns. The cause behind gl-1562 |
 | gl-1581 | fix | `Path` stored resolved where upstream stores `%AppDataPath%`/`%MetadataPath%` (with gl-1209 and gl-1220) |
-| gl-1582 | fix | `SortName` without upstream's ICU transliteration, and digit padding for ASCII digits only |
+| gl-1582 | fixed | `SortName` without upstream's ICU transliteration, and digit padding for ASCII digits only (Thai: gl-1907; pointed Hebrew and Arabic: gl-1908) |
 | gl-1583 | fix | `Year` rows created by every scan |
 | gl-1584 | fix | the user's `Playlists` view row not created by user-scoped queries |
 | gl-1585 | fix | the PLACEHOLDER row's `CleanName` |
@@ -128,7 +130,7 @@ The gate's row-level diff (gl-1568) will automate these comparisons.
 | gl-1593 | fix (verify first) | a path-less season's `IsVirtualItem` |
 | gl-1597 | fix | by-name Genre, Studio and MusicGenre ids not derived as upstream derives them |
 | gl-1598 | fix | the first collection's Collections library gets no library scan |
-| gl-1599 | fix (verify first) | the 10.11.8 route, measured and not yet traced: the alternate-version movie's name and bitrate, its streams' values, the `Playlists` view's id |
+| gl-1599 | fix | the 10.11.8 route: the alternate-version movie's name and bitrate and its streams' values, kept from 10.11 where 12.4 re-creates the row (the `Playlists` view's id: not a difference) |
 | gl-1594 | decision | music artists' `RunTimeTicks`: Ferrofin sums; upstream's refresh order, read from the code, leaves 0 |
 | gl-1595 | decision | extras copy their owner's metadata after the owner's refresh (Ferrofin) or before it (upstream) |
 
@@ -159,7 +161,7 @@ the inherited ratings scored from them.
 | `Artists` | Map:377, `IHasArtist` | upsert | E1 equal | match |
 | `Audio` | Map:324, Live TV `ProgramAudio` | never written for programmes | static | fix: gl-763 |
 | `ChannelId` | Map:309, a `Guid` (zero when unset) | NULL off Live TV; the channel's id on programmes | E1: 65 rows zero GUID vs NULL; E4: the `Playlists` view; programmes static | fix: gl-1580 (Playlist and BoxSet rows: gl-1562) |
-| `CleanName` | Map:279, `GetCleanValue` (`src/Jellyfin.Extensions/StringExtensions.cs:159-176`) | `get_clean_value` (`crates/ferrofin-util/src/string_extensions.rs:266-273`), the same algorithm | E1, E3 equal except the PLACEHOLDER row; E4 the alternate-version movie | fix: gl-1585 (placeholder); fix (verify first): gl-1599 (E4) |
+| `CleanName` | Map:279, `GetCleanValue` (`src/Jellyfin.Extensions/StringExtensions.cs:159-176`) | `get_clean_value` (`crates/ferrofin-util/src/string_extensions.rs:266-273`), the same algorithm | E1, E3 equal except the PLACEHOLDER row; E4 the alternate-version movie | fix: gl-1585 (placeholder); fix: gl-1599 (E4) |
 | `CommunityRating` | Map:274; Live TV programmes from the guide (`src/Jellyfin.LiveTv/Guide/GuideManager.cs:535`) | upsert, NFO, TMDB; never for programmes | E1 equal except the extra (NULL vs 7.5); programmes static | match; extras: gl-1595; Live TV: gl-763 |
 | `CriticRating` | Map:293, `float` widened | editor, NFO, OMDb (f32 widened) | static; copied to extras upstream and here | match; extras: gl-1595 |
 | `CustomRating` | Map:275 | editor, NFO | static; copied to extras | match; extras: gl-1595 |
@@ -190,7 +192,7 @@ the inherited ratings scored from them.
 | `IsVirtualItem` | Map:300; seasons re-derived (`MediaBrowser.Providers/TV/SeasonMetadataService.cs:105-114`) | programmes `true`; seasons never re-derived | static | fix (verify first): gl-1593 |
 | `LUFS` | Map:298; `float.Parse` widened (`Emby.Server.Implementations/ScheduledTasks/Tasks/AudioNormalizationTask.cs:279`) | `parse::<f64>()` (`crates/ferrofin-core/src/scheduled_tasks/library.rs:290`) | static (the fixtures' LUFS scan is off) | fix: gl-1589 |
 | `MediaType` | Map:405, `Unknown` unless overridden | NULL from the non-scan inserts | E1: 21 rows `Unknown` vs NULL; E4: the `Playlists` view | fix: gl-1580 (Playlist and BoxSet rows: gl-1562) |
-| `Name` | Map:278 | upsert | E1, E3 equal; E4: the alternate-version movie (`Twin Horizon` vs `Twin Horizon - 720p`) | match in E1 to E3; fix (verify first): gl-1599 (E4) |
+| `Name` | Map:278 | upsert | E1, E3 equal; E4: the alternate-version movie (`Twin Horizon` vs `Twin Horizon - 720p`) | match in E1 to E3; fix: gl-1599 (E4) |
 | `NormalizationGain` | Map:299, from tags | `crates/ferrofin-core/src/audio_tags.rs:192` (f32 widened) | static | match |
 | `OfficialRating` | Map:280 | upsert | E1 equal except the extra (NULL vs `G`) | match; extras: gl-1595 |
 | `OriginalLanguage` | Map:296 | editor, TMDB | static | match |
@@ -203,7 +205,7 @@ the inherited ratings scored from them.
 | `PreferredMetadataCountryCode` | Map:289 | editor | static | match |
 | `PreferredMetadataLanguage` | Map:288 | editor | static | match |
 | `PremiereDate` | Map:283 | upsert, person enrichment | E1: 14 rows differ in text only | owned: gl-1565; Live TV original air date: gl-763 |
-| `PresentationUniqueKey` | Map:294 | upsert, key repairs | E1, E3 equal; E4: the `Playlists` view | match in E1 to E3; fix (verify first): gl-1599 (E4) |
+| `PresentationUniqueKey` | Map:294 | upsert, key repairs | E1, E3 equal; E4: the `Playlists` view, another user's (re-checked under gl-1599) | match |
 | `PrimaryVersionId` | Map:359, `Video` | upsert, version repairs | E1, E4 equal | match |
 | `ProductionLocations` | Map:332, joined, blanks dropped | NULL when empty; NFO countries dropped | E1: 64 rows `''` vs NULL | fix: gl-1580 (Playlist and BoxSet rows: gl-1562); NFO: gl-1587; editor: gl-1588; extras: gl-1595 |
 | `ProductionYear` | Map:284 | upsert | E1, E4 equal | match |
@@ -215,13 +217,13 @@ the inherited ratings scored from them.
 | `SeriesPresentationUniqueKey` | Map:366 | upsert, key repairs | E1, E4 equal | match |
 | `ShowId` | Map:387, LiveTvProgram | `program_entity` | static | match |
 | `Size` | Map:305 | upsert | E1 equal | match |
-| `SortName` | Map:285; `ModifySortChunks`: Unicode digit padding, then ICU transliteration (`MediaBrowser.Controller/Entities/BaseItem.cs:1081-1099`); per-kind overrides (Audio, Episode, Season, LiveTvChannel) | `modify_sort_chunks` (`crates/ferrofin-util/src/sort_name.rs:217-236`): ASCII digits, no transliteration; the per-kind sort names come from the scan's derivations | E1, E3, E4: `cafe unicode dong jing` vs `cafe unicode 東京`; episodes, seasons and audio equal | fix: gl-1582 |
+| `SortName` | Map:285; `ModifySortChunks`: Unicode digit padding, then ICU transliteration (`MediaBrowser.Controller/Entities/BaseItem.cs:1081-1099`); per-kind overrides (Audio, Episode, Season, LiveTvChannel) | `modify_sort_chunks` (`crates/ferrofin-util/src/sort_name.rs`): Unicode `Nd` digits, then ICU4X's CLDR transforms behind a ported `Any-Latin` (`transliteration.rs`), since gl-1582; the per-kind sort names come from the scan's derivations | E1, E3, E4 (before gl-1582): `cafe unicode dong jing` vs `cafe unicode 東京`; episodes, seasons and audio equal. After it, 184 of 190 names created on both servers agree; the rest are Thai, Bopomofo, `ꜱ` and pointed Hebrew and Arabic | fixed: gl-1582; Thai: gl-1907; pointed Hebrew and Arabic: gl-1908 |
 | `StartDate` | Map:408, `IHasStartDate` | `program_entity` | static | match |
 | `Studios` | Map:333, joined | NULL when empty | E1: 64 rows `''` vs NULL | fix: gl-1580 (Playlist and BoxSet rows: gl-1562); editor: gl-1588; extras: gl-1595 |
 | `Tagline` | Map:302 | editor, NFO, TMDB | static | match |
 | `Tags` | Map:334, joined; channels get `Kids` | NULL when empty; no `Kids` on channels | E1: 64 rows `''` vs NULL | fix: gl-1580 (Playlist and BoxSet rows: gl-1562); channels: gl-1503 |
 | `TopParentId` | `ItemPersistenceService.cs:342` | upsert, structure repairs | E1 equal through the item match | match |
-| `TotalBitrate` | Map:303 | upsert | E1, E3 equal; E4: the alternate-version movie (825 vs 192825, as measured, while its stream `BitRate` is NULL vs 825) | match in E1 to E3; fix (verify first): gl-1599 (E4) |
+| `TotalBitrate` | Map:303 | upsert | E1, E3 equal; E4: the alternate-version movie (825 vs 192825, as measured, while its stream `BitRate` is NULL vs 825) | match in E1 to E3; fix: gl-1599 (E4) |
 | `Type` | Map:262 | upsert | E1 equal on every matched row | match; rows only one side writes: gl-1583, gl-1584 |
 | `UnratedType` | Map:411, `GetBlockUnratedType()` | the scan (`crates/ferrofin-core/src/library_scan.rs:5033`), Live TV (`crates/ferrofin-livetv/src/projection.rs:339,736`) and `update_rating` (`item_persistence_service.rs:3880`); the other inserts NULL | E1: 19 rows `Other` vs NULL; E4: the `Playlists` view | fix: gl-1580 |
 | `Width` | Map:313, `int` (0); 1280 for an HD guide programme | as for `Height` | E1: 47 rows 0 vs NULL | fix: gl-1580 (Playlist and BoxSet rows: gl-1562); Live TV: gl-763 |
@@ -232,7 +234,7 @@ the inherited ratings scored from them.
   Ferrofin also creates one for every distinct year after each scan. Fix: gl-1583.
 - **`UserView` rows.** Upstream creates the user's `Playlists` view row on any user-scoped query without a parent
   (`Emby.Server.Implementations/Library/LibraryManager.cs:2090-2117`). Ferrofin creates it only for `/UserViews`.
-  Fix: gl-1584; its id on the 10.11.8 route is gl-1599's.
+  Fix: gl-1584. Its id on the 10.11.8 route matches 12.4's for the same user (re-checked under gl-1599).
 - **The `Live TV` view.** Ferrofin created it in E3, and that matches upstream: the guide refresh and the Live TV
   routes create it without a tuner on both servers (`src/Jellyfin.LiveTv/Guide/GuideManager.cs:192`, through
   `GetInternalLiveTvFolder`, `src/Jellyfin.LiveTv/LiveTvManager.cs:1271-1275`). The row matches.
@@ -241,8 +243,8 @@ the inherited ratings scored from them.
   - Ferrofin adds a per-task spread of up to 55 minutes to that hour (`crates/ferrofin-core/src/scheduled_tasks.rs:69-98`).
     That is a scheduling difference outside this ledger.
 - **Orphans and alternate versions on the 10.11.8 route.** The two orphaned episodes and the 720p version row are
-  removed or re-keyed by both Jellyfin 12.4's upgrade and Ferrofin's adoption (E4). Match, apart from the movie's
-  name and bitrate (gl-1599).
+  removed or re-keyed by both Jellyfin 12.4's upgrade and Ferrofin's adoption (E4). Match; the movie's name and
+  bitrate were fixed by gl-1599.
 
 ## Child tables
 
@@ -253,15 +255,15 @@ with `Map` at `:194-249`. Ferrofin does the same in `crates/ferrofin-core/src/me
 `stream_dto_to_entity` (`crates/ferrofin-core/src/media_source_manager.rs:1484`).
 
 - **E1:** all 54 rows matched in every column.
-- **E4:** on the alternate-version movie's streams, `BitRate` is NULL vs 825 and `Height`, `Width`, `IsAvc` and
-  `Level` are NULL vs 0 (gl-1599).
+- **E4:** on the alternate-version movie's streams, `BitRate` was NULL vs 825 and `Height`, `Width`, `IsAvc` and
+  `Level` NULL vs 0: 10.11's probe values kept. Fixed by gl-1599, which has the first scan probe the version again.
 - **Not exercised by the fixtures, but mapped one to one in code:** the Dolby Vision fields, `Hdr10PlusPresentFlag`,
   `IsOriginal` and `Comment`. `KeyFrames` is NULL on both.
 
 | Column | Verdict |
 |---|---|
 | `ItemId`, `StreamIndex`, `AspectRatio`, `AverageFrameRate`, `BitDepth`, `BlPresentFlag`, `ChannelLayout`, `Channels`, `Codec`, `CodecTag`, `CodecTimeBase`, `ColorPrimaries`, `ColorSpace`, `ColorTransfer`, `Comment`, `DvBlSignalCompatibilityId`, `DvLevel`, `DvProfile`, `DvVersionMajor`, `DvVersionMinor`, `ElPresentFlag`, `IsAnamorphic`, `IsDefault`, `IsExternal`, `IsForced`, `IsHearingImpaired`, `IsInterlaced`, `KeyFrames`, `Language`, `NalLengthSize`, `PixelFormat`, `Profile`, `RealFrameRate`, `RefFrames`, `Rotation`, `RpuPresentFlag`, `SampleRate`, `StreamType`, `TimeBase`, `Title`, `Hdr10PlusPresentFlag`, `IsOriginal` | match |
-| `BitRate`, `Height`, `Width`, `IsAvc`, `Level` | match in E1; fix (verify first): gl-1599 (E4, the alternate-version movie's streams: `BitRate` NULL vs 825, the others NULL vs 0) |
+| `BitRate`, `Height`, `Width`, `IsAvc`, `Level` | match in E1; fix: gl-1599 (E4, the alternate-version movie's streams: `BitRate` NULL vs 825, the others NULL vs 0) |
 | `Path` | fix: gl-1581. Upstream reverses it (`:209`) and Ferrofin writes it raw. Only stream files under the data or metadata directory are affected. Reads expand it (`RestorePath`) since gl-1581, and gl-1616 rewrites the rows stored before |
 
 ### `Chapters`

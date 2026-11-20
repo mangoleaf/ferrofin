@@ -271,6 +271,36 @@ class TableDigests(unittest.TestCase):
         self.sql("DELETE FROM BaseItems; DELETE FROM MediaStreamInfos")
         self.assertEqual(self.failures(), ["MediaStreamInfos row old/x is gone"])
 
+    def test_a_10_11_local_versions_probe_rows_may_be_rewritten(self):
+        # rederive_adopted_versions: the scan probes a 10.11 local version afresh, as 12.x probes
+        # the row it creates in its place. Only the probe's tables, only that version.
+        video, movie = "MediaBrowser.Controller.Entities.Video", "MediaBrowser.Controller.Entities.Movies.Movie"
+        self.sql("ALTER TABLE BaseItems ADD COLUMN ExtraType INTEGER; ALTER TABLE BaseItems ADD COLUMN Data TEXT; "
+                 "ALTER TABLE BaseItems ADD COLUMN Type TEXT; "
+                 f"INSERT INTO BaseItems VALUES ('{GUID}', '/media/a - 1080p.mkv', NULL, NULL, "
+                 "'{\"LocalAlternateVersions\":[\"/media/a - 720p.mkv\"]}', '" + movie + "'), "
+                 f"('old', '/media/a - 720p.mkv', '{SAME}', NULL, NULL, '{video}'), "
+                 f"('extra', '/media/a-trailer.mkv', '{SAME}', 2, NULL, '{video}'), "
+                 "('home', '/media/h - 1080p.mkv', NULL, NULL, "
+                 "'{\"LocalAlternateVersions\":[\"/media/h - 720p.mkv\"]}', '" + video + "'), "
+                 f"('kept', '/media/h - 720p.mkv', 'home', NULL, NULL, '{video}'); "
+                 "UPDATE MediaStreamInfos SET ItemId = 'old'; UPDATE KeyframeData SET ItemId = 'old'; "
+                 "UPDATE Chapters SET ItemId = 'extra'")
+        self.before = digests.snapshot(self.db)
+        # A home video's version has its owner's type: 12.x keeps it, rows and all.
+        self.assertEqual(self.before["rederived"], ["path:/media/a - 720p.mkv"])
+        self.sql("UPDATE BaseItems SET Id = 'new' WHERE Id = 'old'; "
+                 "UPDATE MediaStreamInfos SET ItemId = 'new', Codec = 'h264'; UPDATE KeyframeData SET ItemId = 'new'")
+        self.assertEqual(self.failures(), [])
+        self.sql("DELETE FROM MediaStreamInfos")
+        self.assertEqual(self.failures(), [])
+        self.sql("UPDATE KeyframeData SET TotalDuration = 'y'; UPDATE Chapters SET Name = 'y'")
+        self.assertEqual(self.failures(), ["Chapters row path:/media/a-trailer.mkv/x changed",
+                                           "KeyframeData row path:/media/a - 720p.mkv changed"])
+        # A 12.x database (12.0 added LinkedChildren) is never probed afresh.
+        self.sql("CREATE TABLE LinkedChildren(ParentId TEXT)")
+        self.assertEqual(digests.snapshot(self.db)["rederived"], [])
+
     def test_a_device_reannouncing_itself_passes(self):
         self.sql("ALTER TABLE Devices ADD COLUMN AppVersion TEXT; ALTER TABLE Devices ADD COLUMN DeviceName TEXT;")
         self.before = digests.snapshot(self.db)

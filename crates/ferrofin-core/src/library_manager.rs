@@ -111,6 +111,14 @@ pub struct FerrofinLibraryManager {
     /// Bumped whenever a queued scan finishes or the claim is released, so
     /// the callers waiting on a queued scan re-check it.
     scan_progress: Arc<tokio::sync::watch::Sender<u64>>,
+    /// The task registry a library change's scan runs through, as the
+    /// "Scan Media Library" task (`QueueLibraryScan`). Weak, since that task
+    /// holds this manager. Unset (unit tests), the scan goes straight to the
+    /// scan queue.
+    refresh_task: Arc<std::sync::OnceLock<std::sync::Weak<crate::FerrofinTaskManager>>>,
+    /// The scans library changes asked for that no "Scan Media Library" run
+    /// has started on yet.
+    requested_scans: Arc<Mutex<Vec<ScanTarget>>>,
     scan_tracker: Option<crate::scan_progress::ScanProgressTracker>,
     /// Chapter rows, for serving chapter thumbnails. Set by the composition
     /// root; `None` (unit tests) means an item has no chapter images. The
@@ -916,6 +924,10 @@ fn lock_queue(queue: &Mutex<ScanQueue>) -> std::sync::MutexGuard<'_, ScanQueue> 
     queue.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn lock_requested(scans: &Mutex<Vec<ScanTarget>>) -> std::sync::MutexGuard<'_, Vec<ScanTarget>> {
+    scans.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// What the manager runs a scan on: the [`LibraryScanner`] in production,
 /// a controllable stand-in in tests.
 ///
@@ -1364,6 +1376,8 @@ impl FerrofinLibraryManager {
             scanner: None,
             scan_queue: Arc::new(Mutex::new(ScanQueue::default())),
             scan_progress: Arc::new(tokio::sync::watch::Sender::new(0)),
+            refresh_task: Arc::new(std::sync::OnceLock::new()),
+            requested_scans: Arc::new(Mutex::new(Vec::new())),
             scan_tracker: None,
             chapters: None,
             linked_children: None,
@@ -1408,6 +1422,14 @@ impl FerrofinLibraryManager {
         collections: &Arc<dyn ferrofin_traits::collections::CollectionManager>,
     ) {
         let _ = self.collections.set(Arc::downgrade(collections));
+    }
+
+    /// Runs every scan a library change queues (`queue_library_scan`,
+    /// `queue_library_scan_scoped`) as a run of the "Scan Media Library"
+    /// task `tasks` holds, as upstream's `QueueLibraryScan` queues
+    /// `RefreshMediaLibraryTask`. Called once by the composition root.
+    pub fn attach_refresh_task(&self, tasks: &Arc<crate::FerrofinTaskManager>) {
+        let _ = self.refresh_task.set(Arc::downgrade(tasks));
     }
 
     async fn folder_display_result(
@@ -3693,15 +3715,12 @@ impl LibraryManager for FerrofinLibraryManager {
     }
 
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
-        self.spawn_scan(ScanRequest::defaults(ScanTrigger::Api, ScanTarget::All));
+        self.queue_library_change_scan(ScanTarget::All);
         Ok(())
     }
 
     async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
-        self.spawn_scan(ScanRequest::defaults(
-            ScanTrigger::Api,
-            ScanTarget::Library(library_id),
-        ));
+        self.queue_library_change_scan(ScanTarget::Library(library_id));
         Ok(())
     }
 
@@ -3794,9 +3813,46 @@ impl LibraryManager for FerrofinLibraryManager {
         trigger: ScanTrigger,
         progress: Option<ScanProgressSink>,
     ) -> Result<bool, ServiceError> {
+        // A scan of every library that starts now covers each library change
+        // asked for before it.
+        lock_requested(&self.requested_scans).clear();
         // The scan runs on the queue's worker; this future only waits for it.
         self.run_scan(ScanRequest::defaults(trigger, ScanTarget::All), progress)
             .await
+    }
+
+    async fn run_requested_library_scans(
+        &self,
+        progress: Option<ScanProgressSink>,
+    ) -> Result<bool, ServiceError> {
+        let mut requested = std::mem::take(&mut *lock_requested(&self.requested_scans));
+        if requested.contains(&ScanTarget::All) {
+            requested = vec![ScanTarget::All];
+        }
+        // Nothing left: a scan of every library started since took them.
+        let count = u32::try_from(requested.len()).unwrap_or(u32::MAX);
+        let mut failed = None;
+        for (index, target) in (0u32..).zip(requested) {
+            // The run's progress is the scans' in turn, each an equal share.
+            let share = progress.clone().map(|sink| -> ScanProgressSink {
+                Arc::new(move |percent| {
+                    sink((f64::from(index) * 100.0 + percent) / f64::from(count));
+                })
+            });
+            // One library's failed scan leaves the others' to run; a stop
+            // ends the run.
+            match self
+                .run_scan(ScanRequest::defaults(ScanTrigger::Api, target), share)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    failed.get_or_insert(error);
+                }
+            }
+        }
+        failed.map_or(Ok(true), Err)
     }
 
     fn is_scan_running(&self) -> bool {
@@ -3929,6 +3985,31 @@ impl FerrofinLibraryManager {
     /// Shared by every queueing entry point.
     fn spawn_scan(&self, request: ScanRequest) {
         self.submit(request, false, None);
+    }
+
+    /// Queues the scan of `target` a library change ends with (upstream's
+    /// `QueueLibraryScan`): a run of the "Scan Media Library" task once the
+    /// composition root attached it, which starts now or, while the task
+    /// runs, once that run ends; straight on the scan queue otherwise. A
+    /// task that will not take it (the server is shutting down, or another
+    /// run claimed it first, which scans the target anyway) leaves it to the
+    /// scan queue.
+    fn queue_library_change_scan(&self, target: ScanTarget) {
+        if let Some(tasks) = self.refresh_task.get().and_then(std::sync::Weak::upgrade) {
+            {
+                let mut requested = lock_requested(&self.requested_scans);
+                if !requested.contains(&target) {
+                    requested.push(target.clone());
+                }
+            }
+            match tasks.queue_library_change() {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::debug!(%error, "the library change scans outside the Scan Media Library task");
+                }
+            }
+        }
+        self.spawn_scan(ScanRequest::defaults(ScanTrigger::Api, target));
     }
 
     /// Queues the scan for `request` and returns only once it has run,
@@ -4328,6 +4409,229 @@ mod tests {
         runner.release(2 * GatedRunner::ITEMS);
         waiter.await.expect("joined");
         assert_eq!(runner.runs().len(), 3, "the queued run scanned");
+        until_idle(&mgr).await;
+    }
+
+    /// A manager whose library changes scan through the "Scan Media
+    /// Library" task of the registry it returns, as the composition root
+    /// wires them.
+    fn with_refresh_task(
+        mgr: FerrofinLibraryManager,
+    ) -> (Arc<FerrofinLibraryManager>, Arc<crate::FerrofinTaskManager>) {
+        let mgr = Arc::new(mgr);
+        let tasks = Arc::new(crate::FerrofinTaskManager::new());
+        tasks.register(Arc::new(crate::RefreshLibraryTask::new(mgr.clone())));
+        mgr.attach_refresh_task(&tasks);
+        (mgr, tasks)
+    }
+
+    /// The "Scan Media Library" task as the dashboard reads it.
+    fn refresh_task_info(tasks: &crate::FerrofinTaskManager) -> ferrofin_model::tasks::TaskInfo {
+        tasks.get("RefreshLibrary").expect("the task is registered")
+    }
+
+    /// Waits (bounded) until the "Scan Media Library" task is idle with
+    /// `runs` recorded runs behind it, and returns the last one's status.
+    async fn until_task_ran(
+        tasks: &crate::FerrofinTaskManager,
+        runner: &GatedRunner,
+        runs: usize,
+    ) -> ferrofin_model::tasks::TaskCompletionStatus {
+        for _ in 0..500 {
+            let info = refresh_task_info(tasks);
+            if info.state == ferrofin_model::tasks::TaskState::Idle
+                && runner.runs().len() == runs
+                && let Some(result) = info.last_execution_result
+            {
+                return result.status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the task never finished its {runs} runs");
+    }
+
+    /// gl-1598: a library change's scan is a run of the "Scan Media Library"
+    /// task, as upstream's `QueueLibraryScan` queues `RefreshMediaLibraryTask`
+    /// (v12.4 `LibraryManager.cs:3292-3295`), so the dashboard shows it
+    /// running with its progress and records its result. A new library's
+    /// scan keeps Ferrofin's scope: that library alone.
+    #[tokio::test]
+    async fn a_library_change_scans_as_the_refresh_library_task() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let (mgr, tasks) = with_refresh_task(manager(&db).with_scan_runner(runner.clone()));
+        let library = Uuid::new_v4();
+
+        mgr.queue_library_scan_scoped(library)
+            .await
+            .expect("queued");
+        runner.started(1).await;
+        let running = refresh_task_info(&tasks);
+        assert_eq!(
+            running.state,
+            ferrofin_model::tasks::TaskState::Running,
+            "the task runs the library's scan"
+        );
+        runner.release(GatedRunner::ITEMS);
+        assert_eq!(
+            until_task_ran(&tasks, &runner, 1).await,
+            ferrofin_model::tasks::TaskCompletionStatus::Completed
+        );
+        assert_eq!(
+            runner.runs(),
+            vec![default_run(ScanTarget::Library(library))]
+        );
+
+        // The first collection's library, the seed's: every library.
+        mgr.queue_library_scan().await.expect("queued");
+        runner.release(GatedRunner::ITEMS);
+        until_task_ran(&tasks, &runner, 2).await;
+        assert_eq!(runner.runs()[1], default_run(ScanTarget::All));
+        until_idle(&mgr).await;
+    }
+
+    /// A library change while the task runs waits for that run and then runs
+    /// its own scan (upstream's `StartScanInBackground` drops it, a Jellyfin
+    /// bug not ported). Changes queued behind one run share the next one.
+    #[tokio::test]
+    async fn library_changes_during_a_run_scan_after_it() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let (mgr, tasks) = with_refresh_task(manager(&db).with_scan_runner(runner.clone()));
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+
+        tasks
+            .queue("RefreshLibrary")
+            .expect("the dashboard starts it");
+        runner.started(1).await;
+        mgr.queue_library_scan_scoped(first).await.expect("queued");
+        mgr.queue_library_scan_scoped(second).await.expect("queued");
+        mgr.queue_library_scan_scoped(first).await.expect("queued");
+        runner.release(GatedRunner::ITEMS);
+        runner.started(2).await;
+        assert_eq!(
+            refresh_task_info(&tasks).state,
+            ferrofin_model::tasks::TaskState::Running,
+            "the task runs the queued libraries' scans too"
+        );
+        runner.release(2 * GatedRunner::ITEMS);
+        until_task_ran(&tasks, &runner, 3).await;
+        assert_eq!(
+            runner.runs(),
+            vec![
+                default_run(ScanTarget::All),
+                default_run(ScanTarget::Library(first)),
+                default_run(ScanTarget::Library(second)),
+            ],
+            "each library once, after the running scan"
+        );
+        until_idle(&mgr).await;
+    }
+
+    /// A library change's run scans each requested library in turn, each
+    /// with an equal share of the run's progress, and every library alone
+    /// when any change asked for that.
+    #[tokio::test]
+    async fn requested_scans_share_the_runs_progress() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink: ScanProgressSink = {
+            let seen = Arc::clone(&seen);
+            Arc::new(move |percent| seen.lock().expect("seen").push(percent))
+        };
+
+        lock_requested(&mgr.requested_scans)
+            .extend([ScanTarget::Library(first), ScanTarget::Library(second)]);
+        runner.release(2 * GatedRunner::ITEMS);
+        assert!(
+            mgr.run_requested_library_scans(Some(sink))
+                .await
+                .expect("scans run")
+        );
+        assert_eq!(*seen.lock().expect("seen"), vec![24.0, 48.0, 74.0, 98.0]);
+
+        lock_requested(&mgr.requested_scans).extend([ScanTarget::Library(first), ScanTarget::All]);
+        runner.release(GatedRunner::ITEMS);
+        assert!(
+            mgr.run_requested_library_scans(None)
+                .await
+                .expect("scan runs")
+        );
+        assert_eq!(
+            runner.runs(),
+            vec![
+                default_run(ScanTarget::Library(first)),
+                default_run(ScanTarget::Library(second)),
+                default_run(ScanTarget::All),
+            ]
+        );
+        until_idle(&mgr).await;
+    }
+
+    /// One library's failed scan leaves the other libraries the same run
+    /// owes their scans, and the run records the failure.
+    #[tokio::test]
+    async fn a_failed_library_scan_leaves_the_others_to_run() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let (mgr, tasks) = with_refresh_task(manager(&db).with_scan_runner(runner.clone()));
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+
+        tasks
+            .queue("RefreshLibrary")
+            .expect("the dashboard starts it");
+        runner.started(1).await;
+        mgr.queue_library_scan_scoped(first).await.expect("queued");
+        mgr.queue_library_scan_scoped(second).await.expect("queued");
+        runner.release(GatedRunner::ITEMS);
+        runner.started(2).await;
+        runner
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runner.release(2 * GatedRunner::ITEMS);
+        assert_eq!(
+            until_task_ran(&tasks, &runner, 3).await,
+            ferrofin_model::tasks::TaskCompletionStatus::Failed
+        );
+        assert_eq!(
+            runner.runs()[2],
+            default_run(ScanTarget::Library(second)),
+            "the second library still scanned"
+        );
+        until_idle(&mgr).await;
+    }
+
+    /// A run another trigger asks for (`POST /Library/Refresh` replacing the
+    /// running scan) scans every library even when a library change queued
+    /// a run first: the two share one run, which keeps the full scan.
+    #[tokio::test]
+    async fn a_full_scan_queued_beside_a_library_change_stays_full() {
+        use ferrofin_traits::tasks::TaskManager as _;
+
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let (mgr, tasks) = with_refresh_task(manager(&db).with_scan_runner(runner.clone()));
+        let id = refresh_task_info(&tasks).id.expect("task id");
+
+        tasks
+            .queue("RefreshLibrary")
+            .expect("the dashboard starts it");
+        runner.started(1).await;
+        mgr.queue_library_scan_scoped(Uuid::new_v4())
+            .await
+            .expect("queued");
+        tasks
+            .cancel_if_running_and_queue(&id)
+            .await
+            .expect("refresh replaces the running scan");
+        runner.release(2 * GatedRunner::ITEMS);
+        until_task_ran(&tasks, &runner, 2).await;
+        let runs = runner.runs();
+        assert!(runs[0].stopped, "the running scan stopped");
+        assert_eq!(runs[1], default_run(ScanTarget::All), "{runs:?}");
         until_idle(&mgr).await;
     }
 

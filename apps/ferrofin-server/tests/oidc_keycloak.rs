@@ -18,10 +18,10 @@
 //!   the realm's confidential client;
 //! - `FERROFIN_OIDC_TEST_MEMBER_USER` and `FERROFIN_OIDC_TEST_MEMBER_PASSWORD`:
 //!   the realm user the sign-in test signs in, through Keycloak's own login
-//!   form.
-//!
-//! The other test users (`FERROFIN_OIDC_TEST_*_USER` and `…_PASSWORD`, listed
-//! in the realm's README) are for the later sign-in phases.
+//!   form;
+//! - the other test users (`FERROFIN_OIDC_TEST_ADMIN_*`, `…_GUEST_*`) and the
+//!   groups (`FERROFIN_OIDC_TEST_ADMIN_GROUP`, `…_MEMBER_GROUP`), listed in
+//!   the realm's README: the role test signs all three users in.
 
 #[path = "support/sso.rs"]
 mod sso;
@@ -30,7 +30,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ferrofin_extensions::sso::accounts::PROVIDER_ID;
 use ferrofin_model::secret::Secret;
-use ferrofin_model::sso::{OidcDiscovery, OidcProvider};
+use ferrofin_model::sso::{OidcDiscovery, OidcFolderRole, OidcProvider};
 use sso::{SsoServer, exchange_code, header_text, text};
 
 /// The realm's values, or `None` while any is unset or empty.
@@ -368,4 +368,188 @@ async fn a_realm_user_signs_in_through_the_login_form_to_a_session() {
         1,
         "one account"
     );
+}
+
+/// The realm user `FERROFIN_OIDC_TEST_{role}_USER` with its password.
+fn realm_user(role: &str) -> Option<(String, String)> {
+    Some((
+        read(&format!("FERROFIN_OIDC_TEST_{role}_USER"))?,
+        read(&format!("FERROFIN_OIDC_TEST_{role}_PASSWORD"))?,
+    ))
+}
+
+/// A whole sign-in by `user` to a session of the device `device_id`: the
+/// `AuthenticationResult`.
+async fn signed_in(
+    server: &SsoServer,
+    (user, password): &(String, String),
+    device_id: &str,
+) -> serde_json::Value {
+    let (page, _, flow) = completion_page(server, user, password, true).await;
+    assert_eq!(page.status(), StatusCode::OK, "{user} is let in");
+    let code = exchange_code(&text(page).await);
+    let exchanged = server.exchange(&code, Some(&flow), device_id, None).await;
+    assert_eq!(exchanged.status(), StatusCode::OK, "{user} gets a session");
+    serde_json::from_str(&text(exchanged).await).expect("a JSON body")
+}
+
+/// B8 and B9 against the realm's groups, read from its top-level `groups`
+/// claim: with the members' group required, the user in no group (whose ID
+/// token has no `groups` claim at all) is refused and no account is made,
+/// and the member signs in. With role sync on and the administrators' group
+/// as the administrator role, the realm's administrator is an administrator
+/// from their first session, and the member is not.
+#[tokio::test]
+#[ignore = "needs a Keycloak holding the ferrofin-test realm; run with --ignored"]
+async fn the_realm_groups_gate_sign_in_and_set_the_administrator_flag() {
+    let (Some(realm), Some(admin), Some(member), Some(guest), Some(admins), Some(members)) = (
+        realm(),
+        realm_user("ADMIN"),
+        realm_user("MEMBER"),
+        realm_user("GUEST"),
+        read("FERROFIN_OIDC_TEST_ADMIN_GROUP"),
+        read("FERROFIN_OIDC_TEST_MEMBER_GROUP"),
+    ) else {
+        println!(
+            "skipped: set FERROFIN_OIDC_TEST_ISSUER, _CLIENT_ID, _CLIENT_SECRET, the _USER and \
+             _PASSWORD of ADMIN, MEMBER and GUEST, _ADMIN_GROUP and _MEMBER_GROUP \
+             (contrib/oidc-test-realm/README.md)"
+        );
+        return;
+    };
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = sso::server(&temp, PUBLISHED_URL).await;
+    let sso = server
+        .state
+        .sso
+        .as_ref()
+        .expect("the Single Sign-On service");
+    let provider = |required_role: &str, role_sync: bool| OidcProvider {
+        name: "Keycloak".to_owned(),
+        issuer: realm.issuer.clone(),
+        allow_http_issuer: realm.issuer.starts_with("http://"),
+        client_id: realm.client_id.clone(),
+        client_secret: Some(Secret::new(realm.client_secret.clone())),
+        required_role: required_role.to_owned(),
+        role_sync,
+        admin_role: admins.clone(),
+        ..OidcProvider::default()
+    };
+
+    sso.save_oidc_provider("keycloak", provider(&members, false))
+        .await
+        .expect("the provider saves");
+    let (page, _, _) = completion_page(&server, &guest.0, &guest.1, true).await;
+    assert_eq!(page.status(), StatusCode::FORBIDDEN, "the guest is refused");
+    assert!(text(page).await.contains("does not have the role"));
+    let users = &server.state.users;
+    assert_eq!(
+        users.get_user_by_name(&guest.0).await.expect("lookup"),
+        None
+    );
+    let result = signed_in(&server, &member, "keycloak-member").await;
+    assert_eq!(result["User"]["Policy"]["IsAdministrator"], false);
+    println!("verified: the required group lets the member in and refuses the guest");
+
+    sso.save_oidc_provider("keycloak", provider("", true))
+        .await
+        .expect("the provider saves");
+    let result = signed_in(&server, &admin, "keycloak-admin").await;
+    assert_eq!(result["User"]["Policy"]["IsAdministrator"], true);
+    let result = signed_in(&server, &member, "keycloak-member").await;
+    assert_eq!(result["User"]["Policy"]["IsAdministrator"], false);
+    println!("verified: role sync makes the realm's administrator one, and not the member");
+}
+
+/// The library the members' group is mapped to below, as
+/// `GET /Library/MediaFolders` writes an id.
+const LIBRARY: &str = "0b8e6c0e3c8d4a5f9e2b1d7c6a5f4e3d";
+
+/// B10 against the realm's groups: with role sync on, the members' group
+/// mapped to one library and the administrators' group to every library and
+/// Live TV, each realm user's first session already has what their groups
+/// give, and the user in no group gets no library and no Live TV. The
+/// library ids need not exist: one no library has grants nothing.
+#[tokio::test]
+#[ignore = "needs a Keycloak holding the ferrofin-test realm; run with --ignored"]
+async fn the_realm_groups_map_libraries_and_live_tv() {
+    let (Some(realm), Some(admin), Some(member), Some(guest), Some(admins), Some(members)) = (
+        realm(),
+        realm_user("ADMIN"),
+        realm_user("MEMBER"),
+        realm_user("GUEST"),
+        read("FERROFIN_OIDC_TEST_ADMIN_GROUP"),
+        read("FERROFIN_OIDC_TEST_MEMBER_GROUP"),
+    ) else {
+        println!(
+            "skipped: set FERROFIN_OIDC_TEST_ISSUER, _CLIENT_ID, _CLIENT_SECRET, the _USER and \
+             _PASSWORD of ADMIN, MEMBER and GUEST, _ADMIN_GROUP and _MEMBER_GROUP \
+             (contrib/oidc-test-realm/README.md)"
+        );
+        return;
+    };
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = sso::server(&temp, PUBLISHED_URL).await;
+    let sso = server
+        .state
+        .sso
+        .as_ref()
+        .expect("the Single Sign-On service");
+    sso.save_oidc_provider(
+        "keycloak",
+        OidcProvider {
+            name: "Keycloak".to_owned(),
+            issuer: realm.issuer.clone(),
+            allow_http_issuer: realm.issuer.starts_with("http://"),
+            client_id: realm.client_id.clone(),
+            client_secret: Some(Secret::new(realm.client_secret.clone())),
+            role_sync: true,
+            all_folders_roles: vec![admins.clone()],
+            folder_roles: vec![OidcFolderRole {
+                role: members,
+                folders: vec![LIBRARY.parse().expect("a GUID")],
+            }],
+            live_tv_roles: vec![admins.clone()],
+            live_tv_management_roles: vec![admins],
+            ..OidcProvider::default()
+        },
+    )
+    .await
+    .expect("the provider saves");
+
+    let access = |result: &serde_json::Value| {
+        let policy = &result["User"]["Policy"];
+        (
+            policy["EnableAllFolders"].clone(),
+            policy["EnabledFolders"].clone(),
+            policy["EnableLiveTvAccess"].clone(),
+            policy["EnableLiveTvManagement"].clone(),
+        )
+    };
+    let none = serde_json::json!([]);
+    let (yes, no) = (serde_json::json!(true), serde_json::json!(false));
+    let result = signed_in(&server, &member, "keycloak-member").await;
+    assert_eq!(
+        access(&result),
+        (
+            no.clone(),
+            serde_json::json!([LIBRARY]),
+            no.clone(),
+            no.clone()
+        ),
+        "the member"
+    );
+    let result = signed_in(&server, &admin, "keycloak-admin").await;
+    assert_eq!(
+        access(&result),
+        (yes.clone(), none.clone(), yes.clone(), yes),
+        "the administrator"
+    );
+    let result = signed_in(&server, &guest, "keycloak-guest").await;
+    assert_eq!(
+        access(&result),
+        (no.clone(), none, no.clone(), no),
+        "the user in no group"
+    );
+    println!("verified: the realm's groups give the libraries and Live TV their mappings name");
 }

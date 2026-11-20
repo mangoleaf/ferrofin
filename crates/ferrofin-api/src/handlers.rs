@@ -3646,6 +3646,29 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "get",
+        path: "/Branding/Configuration",
+        upstream_file: "Jellyfin.Api/Controllers/BrandingController.cs",
+        upstream_method: "GetBrandingOptions",
+        ferrofin: "handlers/branding.rs get_branding_options (anonymous, as the controller has \
+               no [Authorize]; no parameter) → ferrofin-core configuration_manager.rs \
+               get_branding (read_named_kept: GetConfiguration<BrandingOptions>(\"branding\")) → \
+               the BrandingOptionsDto projection, SplashscreenLocation left out, nulls omitted \
+               as JsonDefaults' WhenWritingNull does → login_buttons and with_login_buttons over \
+               SsoManager::login_buttons (ferrofin-extensions sso/login_buttons.rs)",
+        date: "2026-11-20",
+        divergences: &[
+            "While the Single Sign-On plugin (Ferrofin's own: Jellyfin has no sign-in through an \
+         identity provider) is enabled with ShowLoginButton on, a usable public URL and at least \
+         one enabled provider, LoginDisclaimer is the stored text, a blank line, then one \
+         \"Sign in with\" <form> per provider between <!-- ferrofin:sso-login-buttons --> \
+         marker comments, for every client (D7 and D17 of the OIDC sign-in milestone). In \
+         every other case, a plugin configuration that does not read included, the body is \
+         the stored configuration's, unchanged, as upstream's. Deliberate.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
         path: "/Branding/Splashscreen",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "GetSplashscreen",
@@ -3678,7 +3701,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UploadCustomSplashscreen",
         ferrofin: "handlers/branding.rs upload_splashscreen → handlers/image_upload.rs \
                (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
-               to_extension, decode_base64)",
+               to_extension, decode_base64) → the write and the save on handlers.rs \
+               run_detached's task, so a client that hangs up once the body is in stops \
+               neither, as upstream's CancellationToken.None copy and synchronous save",
         date: "2026-10-28",
         divergences: &[
             "The body is decoded in full before anything is written, and the location is \
@@ -4378,7 +4403,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UpdateNamedConfiguration",
         ferrofin: "handlers/config.rs update_named_configuration (RequiredRouteString key: \
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
-               GetConfigurationType and Deserialize) → save_named_configuration, on \
+               GetConfigurationType and Deserialize) → for branding, strip_login_buttons, \
+               then ServerConfigurationManager::update_branding and the committed checks on \
+               run_detached's task; otherwise save_named_configuration, on \
                handlers.rs run_detached's task so it finishes for a client that hangs up, in \
                the request's span and culture \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
@@ -4395,10 +4422,15 @@ pub const VERIFIED: &[Verified] = &[
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
                RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
                and provider saves run too, as upstream's save of livetv does)",
-        date: "2026-11-15",
+        date: "2026-11-20",
         divergences: &[
             "database is refused with a 400: Ferrofin has no other database provider (owner \
          decision 2026-10-23).",
+            "A branding LoginDisclaimer is saved without the Single Sign-On sign-in buttons \
+         GET /Branding/Configuration appends (the block between its \
+         <!-- ferrofin:sso-login-buttons --> markers and the blank line before it), as \
+         POST /System/Configuration/Branding saves it. Ferrofin's own: upstream has no such \
+         block.",
             "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
          the database, so lists in a posted document are stored with it but neither add nor \
          change a tuner or a provider.",
@@ -4445,6 +4477,38 @@ pub const VERIFIED: &[Verified] = &[
          entry whole.",
             "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/System/Configuration/Branding",
+        upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
+        upstream_method: "UpdateBrandingConfiguration",
+        ferrofin: "handlers/config.rs update_branding_configuration (RequireAdminWithDefault: \
+               RequiresElevation; JsonBody<BrandingOptionsDto>: [FromBody, Required] through \
+               JsonDefaults' converters, member names matched ignoring case, an empty or null \
+               body a 400) → on handlers.rs run_detached's task, so the synchronous action's \
+               save finishes for a client that hangs up, in the request's span and culture: \
+               ferrofin-core configuration_manager.rs get_branding \
+               (GetConfiguration(\"branding\"), which keeps SplashscreenLocation) → the DTO's \
+               LoginDisclaimer, CustomCss and SplashscreenEnabled over it → handlers/branding.rs \
+               strip_login_buttons → update_branding (SaveConfiguration(\"branding\", …): the \
+               atomic write, then the listeners) → run_committed_checks. Every spelling of \
+               POST /System/Configuration/branding reaches it, jellyfin-web's \
+               updateNamedConfiguration('branding') included, as ASP.NET prefers this literal \
+               route to Configuration/{key}",
+        date: "2026-11-20",
+        divergences: &[
+            "A LoginDisclaimer holding the Single Sign-On sign-in buttons \
+         GET /Branding/Configuration appends (the block between its \
+         <!-- ferrofin:sso-login-buttons --> markers, and the blank line before it, in \\n \
+         line breaks as jellyfin-web 12.4 sends them, or \\r\\n) is saved without them, so \
+         jellyfin-web's branding page, which saves the text it was served, never stores the \
+         buttons (D7 of the OIDC sign-in milestone). Ferrofin's own: upstream has no such \
+         block.",
+            "The 404 and 500 bodies (a store that cannot be read or written, or a committed \
+         check that fails) are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -4897,8 +4961,9 @@ pub const VERIFIED: &[Verified] = &[
                ensure_collections_folder → collections_library.rs (EnsureLibraryFolder: \
                physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
                LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
-               makes)",
-        date: "2026-11-19",
+               makes, and the new library's scan, AddVirtualFolder's StartScanInBackground, \
+               queue_library_scan's RefreshLibrary task run)",
+        date: "2026-11-20",
         divergences: &[
             "A missing name makes a box set with an empty name, where upstream's \
          GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",
@@ -4920,6 +4985,10 @@ pub const VERIFIED: &[Verified] = &[
          collection name over the typed one of a create with items. The scan this create \
          queues now always follows the refresh; a membership change or an unrelated scan \
          during that refresh can still race it, as upstream (gl-1622).",
+            "The new library's scan is queued behind a running scan, as a RefreshLibrary task \
+         run once the running one ends; upstream's StartScanInBackground drops it when a \
+         scan is running, which misses the new library when that scan listed the libraries \
+         before it. Jellyfin bug not ported.",
             "collection.xml writes <Added> and <PremiereDate> in UTC and reads both <Taglines> \
          and <TagLines>; upstream writes the dates in the server's local time and reads \
          them back as UTC, which shifts them on every round trip on a server outside UTC, \
@@ -4999,13 +5068,14 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "RemoveVirtualFolder",
         ferrofin: "handlers/library_structure.rs remove_virtual_folder → finish_structure_change \
                (after_structure_change: LibraryMonitor::restart, then queue_library_scan when \
-               refreshLibrary) → ferrofin-core virtual_folder_manager.rs remove_virtual_folder \
+               refreshLibrary, a RefreshLibrary task run through FerrofinTaskManager::queue_library_change, \
+               QueueLibraryScan's QueueScheduledTask) → ferrofin-core virtual_folder_manager.rs remove_virtual_folder \
                (LibraryManager.RemoveVirtualFolder: child_path and require_folder for \
                GetChildPath and Directory.Exists, preserve_legacy_children, the CollectionFolder \
                row deleted, remove_dir_all, prune_orphan_collection_folders for \
                ValidateTopLibraryFolders' tail) → library_monitor.rs restart and run \
                (LibraryMonitor.Stop and Start, StartWatchingPath)",
-        date: "2026-11-03",
+        date: "2026-11-20",
         divergences: &[
             "Without refreshLibrary, upstream waits 1000 ms (Task.Delay) inside the request before \
          LibraryMonitor.Start, so its directory watchers miss the removal; Ferrofin answers at \
@@ -5067,13 +5137,13 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/library_structure.rs rename_virtual_folder (the name and newName 400s) \
                → library_id_by_name for the scan's scope → finish_structure_change \
                (after_structure_change: LibraryMonitor::restart, then queue_library_scan_scoped \
-               when refreshLibrary) → ferrofin-core virtual_folder_manager.rs \
-               rename_virtual_folder (child_path for GetChildPath, the 404 and 409 checks, \
+               when refreshLibrary, a RefreshLibrary task run) → ferrofin-core \
+               virtual_folder_manager.rs rename_virtual_folder (child_path for GetChildPath, the 404 and 409 checks, \
                case_hop for the case-only temp hop, the preference remap for \
                ReplaceLibraryIdInUserPreferencesAsync over library_preference_repository.rs, \
                repath_collection_folder and prune_orphan_collection_folders) → \
                library_monitor.rs restart and run (LibraryMonitor.Stop and Start)",
-        date: "2026-11-03",
+        date: "2026-11-20",
         divergences: &[
             "The monitor keeps watching while the folder moves and restarts after; upstream stops \
          it first. The move happens under the libraries root, which is not a library location, \
@@ -5081,9 +5151,10 @@ pub const VERIFIED: &[Verified] = &[
             "Without refreshLibrary the restart runs at once on the monitor's own task; upstream's \
          RefreshAfterRenameAsync waits 1000 ms (Task.Delay) first, which for the reason above \
          has nothing to let settle here.",
-            "With refreshLibrary a scan scoped to the renamed library is queued and the monitor is \
+            "With refreshLibrary a scan scoped to the renamed library runs as a RefreshLibrary task \
+         run, queued behind a running one (owner decision 2026-11-20), and the monitor is \
          restarted; upstream refreshes the library's physical folders directly on a background \
-         task, beside any running scan, and never calls Start, so real-time monitoring stays off \
+         task, outside the task and beside any running scan, and never calls Start, so real-time monitoring stays off \
          until the next full scan. Jellyfin bug not ported (the missing restart).",
             "Without refreshLibrary the old library's row is repathed or deleted and orphan rows \
          pruned at once, and the listing writes the new row; upstream validates the top folders \
@@ -5111,14 +5182,15 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "AddMediaPath",
         ferrofin: "handlers/library_structure.rs add_media_path (the Name and PathInfo/Path 400s, \
                PathInfo preferred over Path) → finish_structure_change (after_structure_change: \
-               LibraryMonitor::restart, then queue_library_scan when refreshLibrary) → \
-               ferrofin-core virtual_folder_manager.rs add_media_path \
+               LibraryMonitor::restart, then queue_library_scan when refreshLibrary, \
+               a RefreshLibrary task run through FerrofinTaskManager::queue_library_change, \
+               QueueLibraryScan's QueueScheduledTask) → ferrofin-core virtual_folder_manager.rs add_media_path \
                (LibraryManager.AddMediaPath and AddMediaPathInternal: the path's existence, \
                require_folder, create_shortcut for CreateShortcut, \
                remove_content_type_overrides, sync_options_to_locations for \
                SyncLibraryOptionsToLocations, save_options, record_changed_locations) → \
                library_monitor.rs restart and run (LibraryMonitor.Stop and Start)",
-        date: "2026-11-03",
+        date: "2026-11-20",
         divergences: &[
             "A request refused for its arguments or for a missing library or path (400, 404) \
          restarts nothing and queues no scan; upstream makes those checks inside its try, so its \
@@ -5162,13 +5234,14 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "RemoveMediaPath",
         ferrofin: "handlers/library_structure.rs remove_media_path (the name and path 400s) → \
                finish_structure_change (after_structure_change: LibraryMonitor::restart, then \
-               queue_library_scan when refreshLibrary) → ferrofin-core virtual_folder_manager.rs \
-               remove_media_path (LibraryManager.RemoveMediaPath: require_folder, \
+               queue_library_scan when refreshLibrary, a RefreshLibrary task run through FerrofinTaskManager::queue_library_change, \
+               QueueLibraryScan's QueueScheduledTask) → \
+               ferrofin-core virtual_folder_manager.rs remove_media_path (LibraryManager.RemoveMediaPath: require_folder, \
                delete_shortcut_for (every match) over resolve_shortcut and the virtual-path \
                expansion, compared with the path ignoring case, the ordinal PathInfos filter, \
                both past trailing separators, save_options, record_changed_locations) → \
                library_monitor.rs restart and run (LibraryMonitor.Stop and Start)",
-        date: "2026-11-17",
+        date: "2026-11-20",
         divergences: &[
             "The path is compared with each shortcut's target and each PathInfos entry past \
          their trailing separators, and every matching shortcut is deleted, as every matching \

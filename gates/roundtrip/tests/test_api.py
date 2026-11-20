@@ -53,5 +53,30 @@ class Settle(unittest.TestCase):
         self.assertGreater(tasks.polls, 1)   # it waited, not gave up at the first look
 
 
+class Send(unittest.TestCase):
+    def test_a_binary_body_is_no_json_but_its_status_counts(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Image(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                body = b"\xff\xd8\xff\xe0 a jpeg"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp)
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Image)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        server = api.Server(f"http://127.0.0.1:{httpd.server_port}", copy(tmp / "copy"))
+        self.assertEqual(server.send("GET", "/Items/x/Images/Primary/0"), (200, None))
+
+
 if __name__ == "__main__":
     unittest.main()

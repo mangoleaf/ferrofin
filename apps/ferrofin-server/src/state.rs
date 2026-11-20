@@ -587,6 +587,20 @@ pub async fn build_app_state(
             tracing::warn!(%err, "forced sort-name repair failed; items with a sort-title override may sort by the 10.11.8 key until the next boot retries it");
         }
     }
+    // One-shot: sort keys earlier builds stored for non-Latin names were not
+    // romanised; move them to upstream's (`ModifySortChunks` → `Transliterated`).
+    match item_persistence_impl
+        .repair_transliterated_sort_names()
+        .await
+    {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(repaired, "romanised the sort names of non-Latin titles");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "sort-name transliteration repair failed; non-Latin titles may sort as written until the next boot retries it");
+        }
+    }
     // One-shot: box sets and playlists an older build created had no dates,
     // and a renamed playlist kept its old name's `CleanName`/`SortName`, so a
     // search for its new name missed it.
@@ -937,10 +951,12 @@ pub async fn build_app_state(
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
     // The one boot repair that re-keys items: a Jellyfin 10.11 local version
     // or stacked part takes the shape 12.x's scanner stores, so the first
-    // scan writes nothing for it. It needs the id derivation, the folders
-    // named after an item and the localization that scores the ratings a
-    // primary copies to its versions, so it runs here rather than with the
-    // others in `open_database`; nothing has scanned yet.
+    // scan moves nothing; then the local versions 12.x re-creates are handed
+    // back to that scan to probe and name afresh. It needs the id
+    // derivation, the folders named after an item and the localization that
+    // scores the ratings a primary copies to its versions, so it runs here
+    // rather than with the others in `open_database`; nothing has scanned
+    // yet.
     let metadata_library_now = metadata_library.resolve();
     ferrofin_core::adoption_repairs::run_rehome_local_versions(
         db,
@@ -2595,7 +2611,12 @@ pub async fn build_app_state(
             .await,
         ));
     }
-    let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
+    let task_registry = Arc::new(task_manager.clone());
+    // A library change's scan (a library added or removed, the first
+    // collection's library, the seeded libraries) is a "Scan Media Library"
+    // run, as upstream's `QueueLibraryScan` queues it.
+    library_impl.attach_refresh_task(&task_registry);
+    let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = task_registry;
     // Every item delete and scan removal removes the deleted rows' extracted
     // data (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the
     // library manager and the scanner are built before the chapter and

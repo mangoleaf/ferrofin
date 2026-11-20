@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 use crate::secret::Secret;
 
@@ -22,14 +23,18 @@ pub const DEFAULT_SCOPES: &str = "openid profile";
 /// The ID token claim a new provider names users by.
 pub const DEFAULT_USERNAME_CLAIM: &str = "preferred_username";
 
+/// The claim a new provider reads users' roles from.
+pub const DEFAULT_ROLE_CLAIM: &str = "groups";
+
 /// One OIDC provider's settings.
 ///
 /// A member a body or a stored provider leaves out takes its default: enabled,
 /// [`DEFAULT_SCOPES`], [`DEFAULT_USERNAME_CLAIM`], an `https` issuer only,
-/// accounts created at a first sign-in, and empty text otherwise. `Debug`
-/// leaves the secret out.
+/// accounts created at a first sign-in, [`DEFAULT_ROLE_CLAIM`], role sync off,
+/// and empty text and lists otherwise. `Debug` leaves the secret out.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
+#[allow(clippy::struct_excessive_bools)] // one field per setting, each its own switch
 pub struct OidcProvider {
     /// The provider's key, the `{provider}` of its sign-in and callback URLs:
     /// 1 to 32 lowercase letters, digits and `-`. It is fixed once the
@@ -65,6 +70,52 @@ pub struct OidcProvider {
     /// account is linked to is refused. A name an account already has is
     /// refused either way: no account is ever taken over by name.
     pub create_users: bool,
+    /// The claim a user's roles are read from: a top-level claim holding an
+    /// array of strings or one string, from the ID token, else from the
+    /// userinfo answer. A nested claim (Keycloak's `realm_access.roles`) is
+    /// not read. Required while a role setting is in use.
+    pub role_claim: String,
+    /// The role a user must have to sign in, compared exactly; empty lets
+    /// every user in. A user without it is refused, and no account is created
+    /// or signed in to for them, whatever [`role_sync`](Self::role_sync) says.
+    pub required_role: String,
+    /// Keeps a user's rights in step with their roles at each sign-in (D6).
+    /// Off, a sign-in never changes a user's policy.
+    pub role_sync: bool,
+    /// With [`role_sync`](Self::role_sync) on, the role that makes a user an
+    /// administrator: a user with it is made one at sign-in, and a user
+    /// without it loses the flag, except the last administrator. Empty never
+    /// changes the flag.
+    pub admin_role: String,
+    /// With [`role_sync`](Self::role_sync) on, the roles that give a user
+    /// every library (`EnableAllFolders`). This list and the three below set
+    /// a user's library and Live TV access at each sign-in: a user with none
+    /// of their roles gets no library and no Live TV.
+    pub all_folders_roles: Vec<String>,
+    /// With [`role_sync`](Self::role_sync) on, the libraries each role gives
+    /// a user: their `EnabledFolders` are the libraries of every entry whose
+    /// role they hold.
+    pub folder_roles: Vec<OidcFolderRole>,
+    /// With [`role_sync`](Self::role_sync) on, the roles that allow Live TV
+    /// (`EnableLiveTvAccess`).
+    pub live_tv_roles: Vec<String>,
+    /// With [`role_sync`](Self::role_sync) on, the roles that allow managing
+    /// Live TV recordings (`EnableLiveTvManagement`).
+    pub live_tv_management_roles: Vec<String>,
+}
+
+/// One entry of [`OidcProvider::folder_roles`]: a role, and the libraries it
+/// gives a user.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct OidcFolderRole {
+    /// The role, compared exactly.
+    pub role: String,
+    /// The libraries' ids, as `GET /Library/MediaFolders` lists them. An id
+    /// no library has any more matches nothing.
+    #[schema(value_type = Vec<String>, format = "uuid")]
+    #[serde(with = "crate::json::guid::vec")]
+    pub folders: Vec<Uuid>,
 }
 
 impl Default for OidcProvider {
@@ -80,6 +131,14 @@ impl Default for OidcProvider {
             username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
             allow_http_issuer: false,
             create_users: true,
+            role_claim: DEFAULT_ROLE_CLAIM.to_owned(),
+            required_role: String::new(),
+            role_sync: false,
+            admin_role: String::new(),
+            all_folders_roles: Vec::new(),
+            folder_roles: Vec::new(),
+            live_tv_roles: Vec::new(),
+            live_tv_management_roles: Vec::new(),
         }
     }
 }
@@ -183,6 +242,14 @@ mod tests {
         assert!(provider.enabled);
         assert!(!provider.allow_http_issuer);
         assert!(provider.create_users, "D4: on by default");
+        assert_eq!(provider.role_claim, DEFAULT_ROLE_CLAIM);
+        assert_eq!(provider.required_role, "");
+        assert!(!provider.role_sync, "D6: off by default");
+        assert_eq!(provider.admin_role, "");
+        assert_eq!(provider.all_folders_roles, Vec::<String>::new());
+        assert_eq!(provider.folder_roles, Vec::<OidcFolderRole>::new());
+        assert_eq!(provider.live_tv_roles, Vec::<String>::new());
+        assert_eq!(provider.live_tv_management_roles, Vec::<String>::new());
         assert_eq!(
             provider.client_secret.as_ref().map(Secret::expose),
             Some("s3cr3t-value")
@@ -206,5 +273,37 @@ mod tests {
         assert!(listed.get("ClientSecret").is_none(), "{listed}");
         assert!(listed.get("CallbackUrl").is_none(), "{listed}");
         assert!(listed.get("Discovery").is_none(), "{listed}");
+    }
+
+    /// The access mappings read any GUID spelling and write each library id
+    /// as `GET /Library/MediaFolders` does.
+    #[test]
+    fn the_access_mappings_read_and_write_library_ids_as_the_dashboard_does() {
+        let provider: OidcProvider = serde_json::from_value(serde_json::json!({
+            "AllFoldersRoles": ["admins"],
+            "FolderRoles": [{
+                "Role": "kids",
+                "Folders": ["F2F1A8C2-9B5D-4C67-8E0A-6A1C3E2B7D41", "0b8e6c0e3c8d4a5f9e2b1d7c6a5f4e3d"]
+            }],
+            "LiveTvRoles": ["tv"],
+            "LiveTvManagementRoles": ["dvr"]
+        }))
+        .expect("binds");
+        assert_eq!(provider.all_folders_roles, ["admins"]);
+        assert_eq!(provider.live_tv_roles, ["tv"]);
+        assert_eq!(provider.live_tv_management_roles, ["dvr"]);
+        assert_eq!(provider.folder_roles[0].role, "kids");
+        let written = serde_json::to_value(&provider).expect("serializes");
+        assert_eq!(
+            written["FolderRoles"],
+            serde_json::json!([{
+                "Role": "kids",
+                "Folders": ["f2f1a8c29b5d4c678e0a6a1c3e2b7d41", "0b8e6c0e3c8d4a5f9e2b1d7c6a5f4e3d"]
+            }])
+        );
+        assert_eq!(
+            serde_json::from_value::<OidcProvider>(written).expect("reads back"),
+            provider
+        );
     }
 }

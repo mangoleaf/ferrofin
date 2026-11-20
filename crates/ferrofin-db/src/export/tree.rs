@@ -5,7 +5,8 @@
 //! Symbolic links are followed: the output holds what a link points at, never
 //! a link, so nothing written into the output (by the export, or later by
 //! Jellyfin) can reach the source through one. A directory reached twice, by
-//! a link loop or by two links to one directory, is refused.
+//! a link loop or by two links to one directory, is refused. A directory the
+//! export leaves out ([`Skip::leaving_out`]) is neither read nor digested.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -66,13 +67,16 @@ pub(super) struct Copied {
 /// The files [`copy`] digests but does not copy, matched by path and, for a
 /// file of the same name, by real path: a database file is left out whether
 /// the walk reaches it by the path given or through a linked directory. A
-/// link of another name to it is copied as a file.
+/// link of another name to it is copied as a file. Also the directories every
+/// walk leaves out, by their path relative to the root.
 #[derive(Debug, Default)]
 pub(super) struct Skip {
     /// Their file names: only a file of one of these names is resolved.
     names: HashSet<OsString>,
     /// The paths as given and, for those that exist, their real paths.
     paths: HashSet<PathBuf>,
+    /// Directories left out, relative to the root.
+    dirs: HashSet<PathBuf>,
 }
 
 impl Skip {
@@ -90,6 +94,13 @@ impl Skip {
             skip.paths.insert(file);
         }
         Ok(skip)
+    }
+
+    /// Also leaves out the directories `dirs`, relative to the root: neither
+    /// listed, read, digested nor copied.
+    pub(super) fn leaving_out(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.dirs.extend(dirs);
+        self
     }
 
     /// Whether the file at `path` is one of them.
@@ -119,9 +130,48 @@ enum Kind {
 /// The size of the buffer a file is read through.
 const BUFFER: usize = 1 << 16;
 
-/// Digests every path under `root`.
-pub(super) fn digest(root: &Path) -> Result<TreeDigest> {
-    Ok(walk(root, None, &Skip::default())?.digest)
+/// Digests every path under `root` but the directories `skip` leaves out.
+#[cfg(test)]
+pub(super) fn digest(root: &Path, skip: &Skip) -> Result<TreeDigest> {
+    Ok(walk(root, None, skip)?.digest)
+}
+
+/// Digests (without `out`) or copies (into `out`) each of `trees`, a source
+/// directory with its place under `out`: the first with `first`'s skip, the
+/// rest with `rest`'s. The first's paths are keyed relative to it, the
+/// others' by their full source path, so one digest compares them all.
+pub(super) fn walk_all(
+    trees: &[(PathBuf, PathBuf)],
+    out: Option<&Path>,
+    first: &Skip,
+    rest: &Skip,
+) -> Result<Copied> {
+    let mut all = Copied::default();
+    for (index, (root, place)) in trees.iter().enumerate() {
+        let (skip, key) = if index == 0 {
+            (first, PathBuf::new())
+        } else {
+            (rest, root.clone())
+        };
+        let to = out.map(|out| {
+            if place.as_os_str().is_empty() {
+                out.to_owned()
+            } else {
+                out.join(place)
+            }
+        });
+        let one = walk(root, to.as_deref(), skip)?;
+        all.files += one.files;
+        all.bytes += one.bytes;
+        all.dirs.extend(one.dirs);
+        all.digest.0.extend(
+            one.digest
+                .0
+                .into_iter()
+                .map(|(path, entry)| (key.join(path), entry)),
+        );
+    }
+    Ok(all)
 }
 
 /// Digests each of `files` that exists, keyed by the path as given.
@@ -139,7 +189,7 @@ pub(super) fn digest_files(files: &[PathBuf]) -> Result<TreeDigest> {
 
 /// Copies every path under `root` to the same place under `out`, keeping each
 /// file's permissions and modification time, except the files in `skip`,
-/// which are digested only.
+/// which are digested only, and the directories it leaves out.
 ///
 /// Directories are made private to the owner. [`finish`] gives them their
 /// source's permissions and time once nothing more is written into them, so a
@@ -147,6 +197,7 @@ pub(super) fn digest_files(files: &[PathBuf]) -> Result<TreeDigest> {
 ///
 /// The whole tree is listed before anything is written, so an `out` inside
 /// `root` is never copied into itself (a later digest finds it as added).
+#[cfg(test)]
 pub(super) fn copy(root: &Path, out: &Path, skip: &Skip) -> Result<Copied> {
     walk(root, Some(out), skip)
 }
@@ -181,7 +232,7 @@ pub(super) fn private_dir(dir: &Path) -> std::io::Result<()> {
 
 /// [`digest`], and with `out` [`copy`].
 fn walk(root: &Path, out: Option<&Path>, skip: &Skip) -> Result<Copied> {
-    let listing = list(root)?;
+    let listing = list(root, &skip.dirs)?;
     let mut copied = Copied::default();
     let mut buffer = vec![0_u8; BUFFER];
     if let Some(out) = out {
@@ -219,8 +270,9 @@ fn walk(root: &Path, out: Option<&Path>, skip: &Skip) -> Result<Copied> {
 }
 
 /// Every path under `root`, relative to it, with its kind, links followed, in
-/// path order (a directory before what it holds).
-fn list(root: &Path) -> Result<Vec<(PathBuf, Kind)>> {
+/// path order (a directory before what it holds), but the directories
+/// `left_out` names and what they hold.
+fn list(root: &Path, left_out: &HashSet<PathBuf>) -> Result<Vec<(PathBuf, Kind)>> {
     let mut found = Vec::new();
     // Each directory listed, by where it really is, with the path it was reached by.
     let mut seen = HashMap::new();
@@ -234,6 +286,9 @@ fn list(root: &Path) -> Result<Vec<(PathBuf, Kind)>> {
         for entry in std::fs::read_dir(&at).map_err(failed(&at))? {
             let entry = entry.map_err(failed(&at))?;
             let path = dir.join(entry.file_name());
+            if left_out.contains(&path) {
+                continue;
+            }
             let full = root.join(&path);
             // `metadata` follows a link; a broken one fails here.
             let metadata = match std::fs::metadata(&full) {
@@ -345,9 +400,9 @@ fn refused(path: &Path, why: &str) -> DbError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::{Skip, copy, digest, digest_files, finish};
+    use super::{Skip, copy, digest, digest_files, finish, walk_all};
 
     fn write(root: &Path, path: &str, bytes: &[u8]) {
         let path = root.join(path);
@@ -375,8 +430,51 @@ mod tests {
         // The skipped file is in the digest all the same, so a change to it is seen.
         write(&source, "skipped.db", b"changed!");
         assert_eq!(
-            copied.digest.changes(&digest(&source).unwrap()),
+            copied
+                .digest
+                .changes(&digest(&source, &Skip::default()).unwrap()),
             ["skipped.db"]
+        );
+    }
+
+    /// A directory left out is neither copied nor read: a change inside it is
+    /// not seen. Another tree is copied to its place and keyed by its own path.
+    #[test]
+    fn left_out_directories_are_not_walked_and_other_trees_have_their_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, meta, out) = (
+            dir.path().join("source"),
+            dir.path().join("meta"),
+            dir.path().join("out"),
+        );
+        write(&source, "kept", b"x");
+        write(&source, "cache/big", b"not needed");
+        write(&source, "metadata/stale.jpg", b"not the server's");
+        write(&meta, "library/poster.jpg", b"jpeg");
+        let trees = [
+            (source.clone(), PathBuf::new()),
+            (meta.clone(), PathBuf::from("metadata")),
+        ];
+        let first =
+            Skip::default().leaving_out([PathBuf::from("cache"), PathBuf::from("metadata")]);
+
+        let copied = walk_all(&trees, Some(&out), &first, &Skip::default()).unwrap();
+
+        assert_eq!(std::fs::read(out.join("kept")).unwrap(), b"x");
+        assert_eq!(
+            std::fs::read(out.join("metadata/library/poster.jpg")).unwrap(),
+            b"jpeg"
+        );
+        assert!(!out.join("cache").exists() && !out.join("metadata/stale.jpg").exists());
+        assert_eq!((copied.files, copied.bytes), (2, 5));
+        write(&source, "cache/big", b"changed, unseen");
+        write(&meta, "library/poster.jpg", b"changed");
+        let after = walk_all(&trees, None, &first, &Skip::default())
+            .unwrap()
+            .digest;
+        assert_eq!(
+            copied.digest.changes(&after),
+            [meta.join("library/poster.jpg").display().to_string()]
         );
     }
 
@@ -387,12 +485,12 @@ mod tests {
         write(source, "kept", b"same");
         write(source, "changed", b"before");
         write(source, "removed", b"gone soon");
-        let before = digest(source).unwrap();
+        let before = digest(source, &Skip::default()).unwrap();
 
         write(source, "changed", b"after");
         std::fs::remove_file(source.join("removed")).unwrap();
         write(source, "added/new", b"new");
-        let after = digest(source).unwrap();
+        let after = digest(source, &Skip::default()).unwrap();
 
         assert_eq!(
             before.changes(&after),
@@ -465,7 +563,9 @@ mod tests {
         write(dir.path(), "sub/file", b"x");
         std::os::unix::fs::symlink("..", dir.path().join("sub/up")).unwrap();
 
-        let error = digest(dir.path()).unwrap_err().to_string();
+        let error = digest(dir.path(), &Skip::default())
+            .unwrap_err()
+            .to_string();
 
         assert!(
             error.contains("the same directory as the data directory itself"),
@@ -524,7 +624,9 @@ mod tests {
         ))
         .unwrap();
 
-        let error = digest(dir.path()).unwrap_err().to_string();
+        let error = digest(dir.path(), &Skip::default())
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("not a file or a directory"), "{error}");
         drop(socket);

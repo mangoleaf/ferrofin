@@ -10,7 +10,7 @@ const SECRET: &str = "pocket-client-secret-7f3a";
 
 /// The service over a plugin manager holding only this extension, enabled
 /// unless `enabled` is false, and the manager and its directory.
-async fn service(
+pub(super) async fn service(
     enabled: bool,
     published_url: Option<&str>,
 ) -> (SsoService, Arc<FerrofinPluginManager>, tempfile::TempDir) {
@@ -28,7 +28,11 @@ async fn service(
         .expect("connect");
     db.run_migrations().await.expect("migrations");
     let users = Arc::new(ferrofin_core::FerrofinUserManager::new(db.clone()));
-    let (sessions, _) = sign_in::tests::sessions(&db, &users);
+    let sessions = sign_in::tests::sessions(
+        &db,
+        &users,
+        &Arc::new(ferrofin_core::FerrofinEventManager::new()),
+    );
     let sso = SsoService::new(
         Arc::clone(&plugins) as Arc<dyn PluginManager>,
         users,
@@ -97,7 +101,7 @@ fn the_plugin_is_single_sign_on_under_a_ferrofin_guid_and_off_by_default() {
         serde_json::from_slice(&SsoExtension.default_config()).expect("JSON");
     assert_eq!(
         config,
-        serde_json::json!({"PublicUrl": "", "Providers": []})
+        serde_json::json!({"PublicUrl": "", "Providers": [], "ShowLoginButton": true})
     );
     let cx_free = SsoExtension.config_pages();
     assert_eq!(cx_free.len(), 1);
@@ -161,7 +165,13 @@ fn the_settings_page_reads_the_admin_routes_and_holds_no_setting() {
         html.contains("Dashboard.confirm(DELETE_MESSAGE, 'Delete '"),
         "{html}"
     );
-    assert_eq!(html.matches("Dashboard.confirm(").count(), 1, "{html}");
+    assert!(
+        html.contains(
+            "Dashboard.confirm(NO_ACCESS_MESSAGE, 'Save with no library or Live TV role?'"
+        ),
+        "{html}"
+    );
+    assert_eq!(html.matches("Dashboard.confirm(").count(), 2, "{html}");
     assert!(!html.contains("Dashboard.alert("), "{html}");
     // Every string from a response is set as text, never parsed as HTML.
     for sink in [
