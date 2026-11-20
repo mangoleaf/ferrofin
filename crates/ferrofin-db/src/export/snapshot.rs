@@ -82,14 +82,21 @@ async fn vacuum(from: &Path, dest: &Path, permissions: std::fs::Permissions) -> 
         // snapshot is never readable by more than the source while written;
         // writable by the owner until then, its exact mode once complete.
         tree::create(&partial, &writable(&permissions)).map_err(failed(&partial))?;
+        // The staged copy, never the source, is what the checks may open:
+        // its log first, which opening the copy would fold in (or drop).
+        let log = with_suffix(from, "-wal");
+        blocking(move || super::refusal::wal(&log)).await?;
         let mut conn = SqliteConnectOptions::new()
             .filename(from)
             .create_if_missing(false)
             .connect()
-            .await?;
+            .await
+            .map_err(super::refusal::damaged_or)?;
+        super::refusal::database(&mut conn).await?;
         sqlx::query(sqlx::AssertSqlSafe(vacuum_into(&partial)))
             .execute(&mut conn)
-            .await?;
+            .await
+            .map_err(super::refusal::damaged_or)?;
         sqlx::Connection::close(conn).await?;
         let (partial, dest) = (partial.clone(), dest.to_owned());
         blocking(move || {

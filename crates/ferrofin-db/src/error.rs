@@ -97,6 +97,14 @@ pub enum DbError {
         /// that a link puts outside it.
         changed: Vec<String>,
     },
+
+    /// An export (`ferrofin-server export-jellyfin`) refused to run, because
+    /// completing it would be unsafe or meaningless; the reason names why.
+    #[error("the export is refused: {reason}")]
+    ExportRefused {
+        /// What made the export unsafe or meaningless.
+        reason: String,
+    },
 }
 
 /// Convenient result alias for fallible `ferrofin-db` operations.
