@@ -84,9 +84,13 @@ Then replace the published values, in the realm `ferrofin-test`:
    Saved with a wrong issuer (`…/realms/ferrofin-missing`), the row says why the test failed, and
    the provider is still saved.
 5. Open `http://127.0.0.1:8096/sso/oidc/keycloak/start` in a browser and sign in as a realm user.
-   The page you land on names the identity Keycloak vouched for; no Ferrofin account is linked to
-   it or signed in yet. Loading that page's URL again is refused, and so is finishing in another
-   browser a sign-in started in this one.
+   The page you land on names the Ferrofin account that sign-in created and linked; nobody is
+   signed in to it yet. Dashboard → Users lists it with Single Sign-On as its provider, and no
+   password signs in to it, not even an empty one. Loading that page's URL again is refused, and
+   so is finishing in another browser a sign-in started in this one.
+6. With the provider's "Create accounts at first sign-in" off, a realm user with no account is
+   refused, and no account appears. A local account named like a realm user makes that user's
+   sign-in refused, and the local account is left as it was.
 
 ## The live test
 
@@ -119,7 +123,9 @@ It saves the realm's client as a provider and checks that discovery finds the re
 and keys, and that it fails cleanly, with the provider still saved, for a realm that does not exist
 and for the issuer written with a trailing `/`. Then it signs the member user in: it starts a
 sign-in, fills in Keycloak's own login form, and checks that the callback Keycloak sends the
-browser back to reaches the verified identity, that the same callback is refused a second time,
-and that a callback without the flow cookie (another browser) is refused. It builds callback URLs
+browser back to creates and links the member's account under the Single Sign-On provider, that no
+password (the realm's, or an empty one) signs in to that account or counts toward its lockout, that
+the same callback is refused a second time, that a callback without the flow cookie (another
+browser) is refused, and that a second sign-in finds the same account. It builds callback URLs
 on `http://127.0.0.1:8096`, which the realm's redirect URIs accept; nothing needs to listen there.
 The other users and the groups are for the later sign-in checks.

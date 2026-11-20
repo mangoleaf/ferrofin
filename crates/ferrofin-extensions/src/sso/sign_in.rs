@@ -3,7 +3,8 @@
 //! `state` and a nonce, and binds the attempt to that browser with a cookie;
 //! `GET /sso/oidc/{provider}/callback` accepts only a response that passes
 //! every check, and hands the [`VerifiedIdentity`] it ends with to
-//! `SsoService::sign_in_verified`.
+//! `SsoService::sign_in_verified`, which finds or creates its account
+//! ([`accounts`](super::accounts)).
 //!
 //! The callback's checks, in order; the first that fails refuses it:
 //! 1. a pending flow for its `state`, at this provider, not expired, and
@@ -23,7 +24,8 @@
 //!
 //! A refusal is one page for the browser and one `warn` line naming the
 //! provider and a reason code: never the code, a token, the verifier, the
-//! cookie or a claim (B15).
+//! cookie or a claim (B15). A failed check's page says nothing of why; a
+//! refusal about the account says what to ask an administrator.
 //!
 //! One cookie name serves every flow, so a browser holds one sign-in at a
 //! time: a second start, in another tab or at another provider, replaces the
@@ -87,20 +89,24 @@ impl std::fmt::Debug for VerifiedIdentity {
     }
 }
 
-/// Why a callback is refused: a reason code for the log, and the page's
-/// status.
+/// Why a callback is refused: a reason code for the log, the page's status,
+/// and what the page tells the user to do, if anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Refusal {
     pub(super) reason: &'static str,
     pub(super) status: u16,
+    /// For a refusal the user can act on, what to do; `None` is the page
+    /// that says nothing of why (B15).
+    pub(super) advice: Option<&'static str>,
 }
 
 impl Refusal {
     /// A response that fails a check: `400`.
-    const fn bad(reason: &'static str) -> Self {
+    pub(super) const fn bad(reason: &'static str) -> Self {
         Self {
             reason,
             status: 400,
+            advice: None,
         }
     }
 
@@ -110,6 +116,29 @@ impl Refusal {
         Self {
             reason,
             status: 502,
+            advice: None,
+        }
+    }
+
+    /// No account to sign in to: `403`, with what to ask an administrator.
+    pub(super) const fn account(reason: &'static str, advice: &'static str) -> Self {
+        Self {
+            reason,
+            status: 403,
+            advice: Some(advice),
+        }
+    }
+
+    /// Logs the refusal at `key` ([`log_refusal`]) and answers its page.
+    fn refused(self, key: &str) -> SsoReply {
+        log_refusal(key, self.reason);
+        match self.advice {
+            Some(advice) => page(
+                self.status,
+                "Sign-in refused",
+                &format!("<p>{}</p>", escape_html(advice)),
+            ),
+            None => refusal_page(self.status),
         }
     }
 }
@@ -180,7 +209,7 @@ fn page(status: u16, title: &str, body: &str) -> SsoReply {
     }
 }
 
-/// The one page every refusal shows: it says nothing of why (B15).
+/// The one page every failed check shows: it says nothing of why (B15).
 fn refusal_page(status: u16) -> SsoReply {
     page(
         status,
@@ -356,12 +385,9 @@ impl SsoService {
         let mut reply = match self.verify_callback(&provider, callback).await {
             Ok((FlowPurpose::SignIn, identity)) => {
                 tracing::info!(oidc_provider = %key, "OIDC sign-in verified");
-                self.sign_in_verified(&provider, &identity)
+                self.sign_in_verified(&provider, &identity).await?
             }
-            Err(refusal) => {
-                log_refusal(key, refusal.reason);
-                refusal_page(refusal.status)
-            }
+            Err(refusal) => refusal.refused(key),
         };
         if let Some(public_url) = self.public_url(&config).ok().flatten() {
             reply.set_cookies.push(flow_cookie(&public_url, None));
@@ -369,33 +395,29 @@ impl SsoService {
         Ok(reply)
     }
 
-    /// Hands a verified sign-in to Ferrofin's accounts, and answers the page
-    /// the browser ends on. Nobody is signed in yet: the page names the
-    /// identity, and the account it maps to comes in the milestone's next
-    /// phase (gl-1890).
-    #[expect(
-        clippy::unused_self,
-        reason = "the next phase (gl-1890) finds the account through the service"
-    )]
-    fn sign_in_verified(&self, provider: &OidcProvider, identity: &VerifiedIdentity) -> SsoReply {
-        let name = identity
-            .username
-            .as_deref()
-            .map_or_else(String::new, |username| {
-                format!(" as <strong>{}</strong>", escape_html(username))
-            });
-        page(
-            200,
-            "Signed in at the identity provider",
-            &format!(
-                "<p>You signed in at {provider}{name}: subject <code>{subject}</code> of \
-                 <code>{issuer}</code>.</p>\n<p>No Ferrofin account is linked to this identity \
-                 yet.</p>",
-                provider = escape_html(&provider.name),
-                subject = escape_html(&identity.subject),
-                issuer = escape_html(&identity.issuer),
+    /// Hands a verified sign-in to its account, found by its link or created
+    /// ([`account`](Self::account)), and answers the page the browser ends
+    /// on: the account that is ready, or the refusal saying what to ask an
+    /// administrator. Nobody is signed in yet: the milestone's next phase
+    /// (gl-1891) signs in the account `account` answers.
+    async fn sign_in_verified(
+        &self,
+        provider: &OidcProvider,
+        identity: &VerifiedIdentity,
+    ) -> Result<SsoReply, ServiceError> {
+        Ok(match self.account(provider, identity).await? {
+            Ok(user) => page(
+                200,
+                "Account ready",
+                &format!(
+                    "<p>You signed in at {provider}. Your Ferrofin account \
+                     <strong>{username}</strong> is ready.</p>",
+                    provider = escape_html(&provider.name),
+                    username = escape_html(&user.username),
+                ),
             ),
-        )
+            Err(refusal) => refusal.refused(&provider.key),
+        })
     }
 
     /// Runs the callback's checks, in the order of the module's list, and
@@ -502,6 +524,7 @@ impl SsoService {
             .map_err(|_| Refusal {
                 reason: "private_data",
                 status: 500,
+                advice: None,
             })?
             .oidc_client_secrets
             .get(&provider.key)
@@ -616,5 +639,6 @@ impl SsoService {
     }
 }
 
+// The accounts' tests sign in through its `Harness`.
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

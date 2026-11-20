@@ -325,8 +325,24 @@ impl FerrofinUserManager {
 
     /// Records a failed login: increments the invalid-attempt counter, locks the
     /// account out once the threshold is hit, and logs the security-audit `warn!`
-    /// lines (never the attempted password).
+    /// lines (never the attempted password). An account whose provider never
+    /// counts its refusals ([`AuthenticationManager::counts_failed_passwords`],
+    /// read whether the provider is enabled or not) only gets the `warn!`.
     async fn record_login_failure(&self, user: &UserEntity) -> Result<(), ServiceError> {
+        if self.registered_providers().any(|provider| {
+            !provider.counts_failed_passwords()
+                && provider
+                    .id()
+                    .eq_ignore_ascii_case(&user.authentication_provider_id)
+        }) {
+            tracing::warn!(
+                username = %user.username,
+                user_id = %user.id,
+                reason = "no_password_account",
+                "login failed"
+            );
+            return Ok(());
+        }
         // Count the failure and lock the account out once the threshold is
         // reached (C# increments then disables).
         let attempts = user.invalid_login_attempt_count + 1;

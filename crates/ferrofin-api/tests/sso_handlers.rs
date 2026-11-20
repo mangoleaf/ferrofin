@@ -233,7 +233,8 @@ fn as_user(fake: Arc<FakeSso>) -> AppState {
 /// What the settings page sends for a new provider.
 const PAGE_BODY: &str = r#"{"Name":"Pocket ID","Enabled":true,"Issuer":"https://id.example.org",
     "AllowHttpIssuer":false,"ClientId":"ferrofin","Scopes":"openid profile",
-    "UsernameClaim":"preferred_username","ClientSecret":"route-client-secret-31"}"#;
+    "UsernameClaim":"preferred_username","CreateUsers":true,
+    "ClientSecret":"route-client-secret-31"}"#;
 
 /// Each route, with the body the settings page sends.
 const PAGE_REQUESTS: [(&str, &str, &str); 3] = [

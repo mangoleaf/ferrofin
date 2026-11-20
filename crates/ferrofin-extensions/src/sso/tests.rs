@@ -23,8 +23,16 @@ async fn service(
     if enabled {
         plugins.enable_plugin(EXTENSION_ID).await.expect("enable");
     }
+    let db = ferrofin_db::Database::connect_in_memory()
+        .await
+        .expect("connect");
+    db.run_migrations().await.expect("migrations");
     let sso = SsoService::new(
         Arc::clone(&plugins) as Arc<dyn PluginManager>,
+        Arc::new(ferrofin_core::FerrofinUserManager::new(db.clone())),
+        Arc::new(
+            ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(db),
+        ),
         published_url.map(str::to_owned),
     );
     (sso, plugins, dir)

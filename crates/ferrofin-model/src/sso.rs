@@ -24,8 +24,9 @@ pub const DEFAULT_USERNAME_CLAIM: &str = "preferred_username";
 /// One OIDC provider's settings.
 ///
 /// A member a body or a stored provider leaves out takes its default: enabled,
-/// [`DEFAULT_SCOPES`], [`DEFAULT_USERNAME_CLAIM`], an `https` issuer only, and
-/// empty text otherwise. `Debug` leaves the secret out.
+/// [`DEFAULT_SCOPES`], [`DEFAULT_USERNAME_CLAIM`], an `https` issuer only,
+/// accounts created at a first sign-in, and empty text otherwise. `Debug`
+/// leaves the secret out.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct OidcProvider {
@@ -58,6 +59,11 @@ pub struct OidcProvider {
     /// Accepts an `http` issuer: for an identity provider on a trusted
     /// network only, since its tokens then travel unencrypted (D11).
     pub allow_http_issuer: bool,
+    /// Creates a Ferrofin account, named by the username claim, at an
+    /// identity's first sign-in, and links it (D4). Off, an identity no
+    /// account is linked to is refused. A name an account already has is
+    /// refused either way: no account is ever taken over by name.
+    pub create_users: bool,
 }
 
 impl Default for OidcProvider {
@@ -72,6 +78,7 @@ impl Default for OidcProvider {
             scopes: DEFAULT_SCOPES.to_owned(),
             username_claim: DEFAULT_USERNAME_CLAIM.to_owned(),
             allow_http_issuer: false,
+            create_users: true,
         }
     }
 }
@@ -162,6 +169,7 @@ mod tests {
         assert_eq!(provider.username_claim, DEFAULT_USERNAME_CLAIM);
         assert!(provider.enabled);
         assert!(!provider.allow_http_issuer);
+        assert!(provider.create_users, "D4: on by default");
         assert_eq!(
             provider.client_secret.as_ref().map(Secret::expose),
             Some("s3cr3t-value")

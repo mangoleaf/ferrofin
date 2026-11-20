@@ -25,11 +25,14 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use ferrofin_core::FerrofinPluginManager;
+use ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore;
+use ferrofin_core::{FerrofinPluginManager, FerrofinUserManager};
+use ferrofin_extensions::sso::accounts::{PROVIDER_ID, SsoAuthProvider};
 use ferrofin_extensions::sso::{EXTENSION_ID, SsoExtension, SsoService};
 use ferrofin_extensions::{Extension, registered_plugins};
 use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcDiscovery, OidcProvider};
+use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::PluginManager;
 use ferrofin_traits::sso::{OidcCallback, SsoManager, SsoReply};
 
@@ -49,19 +52,32 @@ fn realm() -> Option<Realm> {
     })
 }
 
-/// The Single Sign-On service over a real plugin manager in `dir`, with the
-/// plugin enabled and the realm's redirect URIs' host as its published URL.
-async fn service(dir: &tempfile::TempDir) -> SsoService {
+/// The Single Sign-On service over a real plugin manager in `dir` and a fresh
+/// database's accounts, with the plugin enabled, its provider registered with
+/// the accounts, and the realm's redirect URIs' host as its published URL;
+/// and the accounts.
+async fn service(dir: &tempfile::TempDir) -> (SsoService, Arc<FerrofinUserManager>) {
     let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(SsoExtension)];
     let plugins = Arc::new(FerrofinPluginManager::new(
         registered_plugins(&extensions),
         dir.path().to_path_buf(),
     ));
     plugins.enable_plugin(EXTENSION_ID).await.expect("enable");
-    SsoService::new(
+    let db = ferrofin_db::Database::connect_in_memory()
+        .await
+        .expect("connect");
+    db.run_migrations().await.expect("migrations");
+    let users = Arc::new(FerrofinUserManager::new(db.clone()));
+    users.set_extension_providers(vec![Arc::new(SsoAuthProvider::new(
+        Arc::clone(&plugins) as Arc<dyn PluginManager>
+    ))]);
+    let sso = SsoService::new(
         plugins as Arc<dyn PluginManager>,
+        Arc::clone(&users) as Arc<dyn UserManager>,
+        Arc::new(FerrofinExternalIdentityStore::new(db)),
         Some(PUBLISHED_URL.to_owned()),
-    )
+    );
+    (sso, users)
 }
 
 /// The published URL the callback URL is built on: an address the realm's
@@ -105,7 +121,7 @@ async fn discovery_finds_the_realm_and_refuses_a_wrong_issuer() {
         return;
     };
     let dir = tempfile::tempdir().expect("temp dir");
-    let sso = service(&dir).await;
+    let (sso, _users) = service(&dir).await;
 
     let found = save_and_test(&sso, &realm, "keycloak", &realm.issuer).await;
     assert_eq!(found.error, None, "{found:?}");
@@ -239,6 +255,31 @@ fn callback(url: &str, cookie: Option<String>) -> OidcCallback {
     }
 }
 
+/// The account `user` signed in to was created under the provider that
+/// refuses passwords: not even the realm password, nor an empty one, signs in
+/// to it, and the refusals do not count toward its lockout.
+async fn refuses_passwords(users: &FerrofinUserManager, user: &str, password: &str) {
+    let account = users
+        .get_user_by_name(user)
+        .await
+        .expect("lookup")
+        .expect("the account was created");
+    assert_eq!(account.authentication_provider_id, PROVIDER_ID);
+    for attempt in ["", password] {
+        let answer = users
+            .authenticate_user(user, attempt, "127.0.0.1", true)
+            .await
+            .expect("an answer");
+        assert!(answer.is_none(), "a password is refused");
+    }
+    let account = users
+        .get_user_by_name(user)
+        .await
+        .expect("lookup")
+        .expect("kept");
+    assert_eq!(account.invalid_login_attempt_count, 0, "not counted");
+}
+
 #[tokio::test]
 #[ignore = "needs a Keycloak holding the ferrofin-test realm; run with --ignored"]
 async fn a_realm_user_signs_in_through_the_login_form_and_only_once() {
@@ -256,7 +297,7 @@ async fn a_realm_user_signs_in_through_the_login_form_and_only_once() {
         return;
     };
     let dir = tempfile::tempdir().expect("temp dir");
-    let sso = service(&dir).await;
+    let (sso, users) = service(&dir).await;
     let found = save_and_test(&sso, &realm, "keycloak", &realm.issuer).await;
     assert_eq!(found.error, None, "{found:?}");
     let callback_url = format!("{PUBLISHED_URL}/sso/oidc/keycloak/callback?");
@@ -279,14 +320,14 @@ async fn a_realm_user_signs_in_through_the_login_form_and_only_once() {
         .finish_oidc_sign_in("keycloak", signed_in.clone())
         .await
         .expect("an answer");
-    // Asserted without quoting the page: it names the realm's host.
     assert_eq!(page.status, 200, "the callback is accepted");
     assert!(
-        page.html.contains(&format!("<strong>{user}</strong>")),
-        "the page names the user"
+        page.html
+            .contains(&format!("<strong>{user}</strong> is ready")),
+        "the page names the account"
     );
-    assert!(page.html.contains(&realm.issuer), "and the issuer");
-    println!("verified: the realm user signed in");
+    refuses_passwords(&users, &user, &password).await;
+    println!("verified: the realm user's account was created and refuses passwords");
 
     // The same callback again: its flow is used up.
     let again = sso
@@ -311,4 +352,26 @@ async fn a_realm_user_signs_in_through_the_login_form_and_only_once() {
         .await
         .expect("an answer");
     assert_eq!(elsewhere.status, 400, "another browser is refused");
+
+    // A second sign-in finds the same account by its link.
+    let start = sso
+        .start_oidc_sign_in("keycloak", BROWSER)
+        .await
+        .expect("starts");
+    let back = log_in(
+        start.location.as_deref().expect("to Keycloak"),
+        &user,
+        &password,
+    )
+    .await;
+    let page = sso
+        .finish_oidc_sign_in("keycloak", callback(&back, Some(flow_cookie(&start))))
+        .await
+        .expect("an answer");
+    assert_eq!(page.status, 200, "signed in again");
+    assert_eq!(
+        users.get_users().await.expect("users").len(),
+        1,
+        "one account"
+    );
 }

@@ -2,19 +2,24 @@
 //! oneshot), as a browser makes it, against the fake identity provider:
 //! `/sso/oidc/{provider}/start`, the provider's authorization endpoint, then
 //! the callback with the flow cookie start set. It reaches the page naming the
-//! verified identity; the same callback again, and one without the cookie,
-//! are refused.
+//! account it created; the same callback again, and one without the cookie,
+//! are refused. That account then refuses every password at
+//! `POST /Users/AuthenticateByName`, and its lockout counter never moves.
+
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::response::Response;
 use ferrofin_db::Database;
 use ferrofin_extensions::sso::EXTENSION_ID;
-use ferrofin_extensions::sso::fake_idp::{FakeIdentityProvider, SUBJECT, USERNAME};
+use ferrofin_extensions::sso::accounts::{PROVIDER_ID, PROVIDER_NAME};
+use ferrofin_extensions::sso::fake_idp::{FakeIdentityProvider, USERNAME};
 use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::OidcProvider;
 use ferrofin_server::config::Config;
 use ferrofin_server::state::build_app_state;
+use ferrofin_traits::library::UserManager;
 use tower::ServiceExt as _;
 
 const PUBLISHED_URL: &str = "https://media.example.org/jf";
@@ -32,12 +37,16 @@ fn header_text(response: &Response, name: header::HeaderName) -> String {
 }
 
 /// The server, wired by the composition root, with the Single Sign-On plugin
-/// enabled and `fake` saved as the provider `fake`: its router,
-/// and the shutdown channel's receiver, held while the router serves.
+/// enabled and `fake` saved as the provider `fake`: its router, its user
+/// manager, and the shutdown channel's receiver, held while the router serves.
 async fn server_with_provider(
     fake: &FakeIdentityProvider,
     temp: &tempfile::TempDir,
-) -> (axum::Router, tokio::sync::oneshot::Receiver<()>) {
+) -> (
+    axum::Router,
+    Arc<dyn UserManager>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
     let config = Config {
         server_name: "sso-sign-in-test".to_owned(),
         published_url: Some(PUBLISHED_URL.to_owned()),
@@ -87,14 +96,14 @@ async fn server_with_provider(
         .await
         .expect("saved");
     let router = ferrofin_api::create_router(wired.state.clone());
-    (router, shutdown_rx)
+    (router, Arc::clone(&wired.state.users), shutdown_rx)
 }
 
 #[tokio::test]
 async fn a_browser_signs_in_through_the_router_once_and_only_with_its_cookie() {
     let fake = FakeIdentityProvider::start().await;
     let temp = tempfile::tempdir().expect("temp dir");
-    let (router, _shutdown) = server_with_provider(&fake, &temp).await;
+    let (router, users, _shutdown) = server_with_provider(&fake, &temp).await;
     let send = |request: Request<Body>| {
         let router = router.clone();
         async move { router.oneshot(request).await.expect("response") }
@@ -135,9 +144,8 @@ async fn a_browser_signs_in_through_the_router_once_and_only_with_its_cookie() {
         "ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure"
     );
     let html = text(page).await;
-    assert!(html.contains(SUBJECT), "{html}");
     assert!(
-        html.contains(&format!("<strong>{USERNAME}</strong>")),
+        html.contains(&format!("<strong>{USERNAME}</strong> is ready")),
         "{html}"
     );
 
@@ -150,4 +158,48 @@ async fn a_browser_signs_in_through_the_router_once_and_only_with_its_cookie() {
     let (callback, _) = sign_in().await;
     let elsewhere = send(get(&callback, None)).await;
     assert_eq!(elsewhere.status(), StatusCode::BAD_REQUEST);
+
+    // The account belongs to the provider that refuses passwords, which the
+    // composition root registered and `GET /Auth/Providers` lists.
+    let account = users
+        .get_user_by_name(USERNAME)
+        .await
+        .expect("lookup")
+        .expect("created");
+    assert_eq!(account.authentication_provider_id, PROVIDER_ID);
+    let listed = users.get_authentication_providers().await.expect("list");
+    assert!(
+        listed
+            .iter()
+            .any(|pair| pair.name.as_deref() == Some(PROVIDER_NAME)),
+        "{listed:?}"
+    );
+
+    // No password signs in to it, not even an empty one, and the refusals
+    // leave its lockout counter alone (D20).
+    for password in ["", "guess"] {
+        let attempt = Request::builder()
+            .method("POST")
+            .uri("/Users/AuthenticateByName")
+            .header(
+                header::AUTHORIZATION,
+                r#"MediaBrowser Client="sso-sign-in-test", Device="fixture", DeviceId="sso-sign-in-test", Version="1""#,
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "Username": USERNAME, "Pw": password }).to_string(),
+            ))
+            .expect("request");
+        assert_eq!(
+            send(attempt).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{password:?}"
+        );
+    }
+    let account = users
+        .get_user_by_name(USERNAME)
+        .await
+        .expect("lookup")
+        .expect("kept");
+    assert_eq!(account.invalid_login_attempt_count, 0);
 }

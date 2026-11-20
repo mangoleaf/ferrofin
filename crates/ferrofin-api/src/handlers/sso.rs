@@ -220,8 +220,9 @@ async fn start_oidc_sign_in(
 
 /// `GET /sso/oidc/{provider}/callback` — where the identity provider sends
 /// the browser back. A response that passes every check ends on a page naming
-/// the verified identity; any other on the refusal page. Either way the flow
-/// cookie is cleared.
+/// the account it signs in to, found by its link or created; with no account,
+/// on a page saying what to ask an administrator; any other on the refusal
+/// page. Either way the flow cookie is cleared.
 #[utoipa::path(
     get,
     path = "/sso/oidc/{provider}/callback",
@@ -233,8 +234,9 @@ async fn start_oidc_sign_in(
         ("error" = Option<String>, Query, description = "Why the identity provider refused")
     ),
     responses(
-        (status = 200, description = "The verified identity"),
+        (status = 200, description = "The account the verified identity signs in to"),
         (status = 400, description = "Refused: the sign-in failed a check"),
+        (status = 403, description = "Refused: no account is linked to the identity and none can be created; the page says what to ask an administrator"),
         (status = 502, description = "Refused: the identity provider could not be reached"),
         (status = 404, description = "No such enabled provider, or the Single Sign-On plugin is disabled or not available")
     ),

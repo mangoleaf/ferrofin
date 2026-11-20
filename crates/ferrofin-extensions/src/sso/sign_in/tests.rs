@@ -8,13 +8,18 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ferrofin_core::FerrofinPluginManager;
+use ferrofin_core::FerrofinUserManager;
+use ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore;
 use ferrofin_model::secret::Secret;
+use ferrofin_traits::external_identities::ExternalIdentityStore;
+use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::PluginManager;
 use ferrofin_traits::sso::SsoManager;
 use serde_json::json;
 
 use super::*;
 use crate::Extension;
+use crate::sso::accounts::SsoAuthProvider;
 use crate::sso::fake_idp::{
     FakeIdentityProvider, FakeResponse, FakeSignature, JWKS_PATH, KEY_ID, SUBJECT, TOKEN_PATH,
     USERNAME,
@@ -23,20 +28,23 @@ use crate::sso::{EXTENSION_ID, SsoExtension};
 
 const SECRET: &str = "fake-client-secret-91c2";
 const CLIENT_ID: &str = "ferrofin";
-const PUBLIC_URL: &str = "https://media.example.org/jf";
+pub(in crate::sso) const PUBLIC_URL: &str = "https://media.example.org/jf";
 const CALLBACK: &str = "https://media.example.org/jf/sso/oidc/fake/callback";
 const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
 
 /// The service with the plugin enabled and the provider `fake` saved at the
-/// fake identity provider, and what they run on.
-struct Harness {
-    sso: SsoService,
-    fake: FakeIdentityProvider,
+/// fake identity provider, and what they run on: the accounts, with the
+/// Single Sign-On provider registered, and the identity links.
+pub(in crate::sso) struct Harness {
+    pub(in crate::sso) sso: SsoService,
+    pub(in crate::sso) fake: FakeIdentityProvider,
+    pub(in crate::sso) users: Arc<FerrofinUserManager>,
+    pub(in crate::sso) identities: Arc<FerrofinExternalIdentityStore>,
     _dir: tempfile::TempDir,
 }
 
 /// A sign-in started: where the browser was sent, and its flow cookie.
-struct Started {
+pub(in crate::sso) struct Started {
     location: String,
     cookie: String,
 }
@@ -59,11 +67,14 @@ fn fake_provider(
 }
 
 impl Harness {
-    async fn new() -> Self {
+    pub(in crate::sso) async fn new() -> Self {
         Self::with(Some(PUBLIC_URL), |_| {}).await
     }
 
-    async fn with(published_url: Option<&str>, edit: impl FnOnce(&mut OidcProvider)) -> Self {
+    pub(in crate::sso) async fn with(
+        published_url: Option<&str>,
+        edit: impl FnOnce(&mut OidcProvider),
+    ) -> Self {
         let fake = FakeIdentityProvider::start().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(SsoExtension)];
@@ -72,8 +83,19 @@ impl Harness {
             dir.path().to_path_buf(),
         ));
         plugins.enable_plugin(EXTENSION_ID).await.expect("enable");
+        let db = ferrofin_db::Database::connect_in_memory()
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrations");
+        let users = Arc::new(FerrofinUserManager::new(db.clone()));
+        users.set_extension_providers(vec![Arc::new(SsoAuthProvider::new(
+            Arc::clone(&plugins) as Arc<dyn PluginManager>
+        ))]);
+        let identities = Arc::new(FerrofinExternalIdentityStore::new(db));
         let sso = SsoService::new(
             plugins as Arc<dyn PluginManager>,
+            Arc::clone(&users) as Arc<dyn UserManager>,
+            Arc::clone(&identities) as Arc<dyn ExternalIdentityStore>,
             published_url.map(str::to_owned),
         );
         sso.save_oidc_provider("fake", fake_provider(&fake, edit))
@@ -82,6 +104,8 @@ impl Harness {
         Self {
             sso,
             fake,
+            users,
+            identities,
             _dir: dir,
         }
     }
@@ -90,7 +114,7 @@ impl Harness {
         sign_in_provider(&self.sso.config().await.expect("config"), key).expect("a provider")
     }
 
-    async fn start(&self) -> Started {
+    pub(in crate::sso) async fn start(&self) -> Started {
         let reply = self
             .sso
             .start_oidc_sign_in("fake", CLIENT)
@@ -110,7 +134,7 @@ impl Harness {
 
     /// Where the fake's authorization endpoint sends the browser back to,
     /// as the callback route reads it, with `started`'s cookie.
-    async fn callback(&self, started: &Started) -> OidcCallback {
+    pub(in crate::sso) async fn callback(&self, started: &Started) -> OidcCallback {
         let url = self.fake.authorize(&started.location).await;
         assert!(url.starts_with(&format!("{CALLBACK}?")), "{url}");
         callback_of(&url, Some(&started.cookie))
@@ -123,6 +147,16 @@ impl Harness {
         self.sso
             .verify_callback(&self.provider("fake").await, callback)
             .await
+    }
+
+    /// A whole sign-in at `fake`, through the callback: the page it ends on.
+    pub(in crate::sso) async fn finish(&self) -> SsoReply {
+        let started = self.start().await;
+        let callback = self.callback(&started).await;
+        self.sso
+            .finish_oidc_sign_in("fake", callback)
+            .await
+            .expect("an answer")
     }
 
     /// The reason a whole sign-in is refused.
@@ -299,25 +333,24 @@ async fn a_valid_callback_yields_the_verified_identity() {
 }
 
 #[tokio::test]
-async fn the_callback_page_names_the_identity_and_clears_the_cookie() {
+async fn the_callback_page_names_the_account_and_clears_the_cookie() {
     let harness = Harness::new().await;
-    let started = harness.start().await;
-    let callback = harness.callback(&started).await;
-    let reply = harness
-        .sso
-        .finish_oidc_sign_in("fake", callback)
-        .await
-        .expect("an answer");
+    let reply = harness.finish().await;
     assert_eq!(reply.status, 200, "{reply:?}");
     assert_eq!(reply.location, None);
-    assert!(reply.html.contains(SUBJECT), "{}", reply.html);
-    assert!(reply.html.contains(&format!("<strong>{USERNAME}</strong>")));
+    assert!(
+        reply
+            .html
+            .contains(&format!("<strong>{USERNAME}</strong> is ready")),
+        "{}",
+        reply.html
+    );
     assert!(
         reply.html.contains("Fake &lt;IdP&gt;"),
         "escaped: {}",
         reply.html
     );
-    assert!(reply.html.contains("No Ferrofin account is linked"));
+    assert!(!reply.html.contains(SUBJECT), "{}", reply.html);
     assert!(reply.html.contains(r#"<a href="../../../web/">"#));
     assert_eq!(
         reply.set_cookies,
@@ -764,7 +797,8 @@ async fn a_failing_userinfo_or_a_lost_client_secret_is_refused() {
         harness.sign_in().await.expect_err("refused"),
         Refusal {
             reason: "private_data",
-            status: 500
+            status: 500,
+            advice: None,
         }
     );
 }

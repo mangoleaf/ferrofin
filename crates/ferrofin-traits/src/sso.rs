@@ -149,13 +149,18 @@ pub trait SsoManager: Send + Sync {
     async fn start_oidc_sign_in(&self, key: &str, client: IpAddr)
     -> Result<SsoReply, ServiceError>;
 
-    /// Finishes the sign-in `callback` names, at the provider `key`: the page
-    /// naming the verified identity when every check passes, else the
-    /// refusal page. Either way the pending sign-in is used up and the
+    /// Finishes the sign-in `callback` names, at the provider `key`. When
+    /// every check passes, the verified identity's account is the one linked
+    /// to its issuer and subject, else one created and linked when the
+    /// provider creates accounts, and the page names it; with no account, a
+    /// `403` page says what to ask an administrator. A failed check is the
+    /// refusal page. With any page, the pending sign-in is used up and the
     /// [`OIDC_FLOW_COOKIE`] cleared.
     ///
     /// [`ServiceError::NotFound`] as for
-    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in).
+    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in), and an error when
+    /// the accounts cannot be read or written, the pending sign-in used up
+    /// all the same.
     async fn finish_oidc_sign_in(
         &self,
         key: &str,

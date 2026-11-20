@@ -3764,6 +3764,14 @@ pub const VERIFIED: &[Verified] = &[
          UserUpdated push, no device check), so an administrator a provider demotes keeps \
          the devices their policy refuses signed in until a later policy save or rename, as \
          upstream does (gl-1191 asks the owner whether to keep that).",
+            "A provider may say a password it refuses never counts toward lockout \
+         (AuthenticationManager::counts_failed_passwords, read for the provider the account \
+         names, enabled or not): such a refusal answers the usual 401 and leaves \
+         InvalidLoginAttemptCount and the enabled flag alone, where upstream's AuthenticateUser \
+         counts every refused password. Only the Single Sign-On extension's provider says so, \
+         since it refuses every password of the accounts it owns; the built-in providers and \
+         LDAP-Auth count as upstream does, and the login backoff still paces the caller. \
+         Owner decision (D20 of the OIDC sign-in milestone, 2026-11-20).",
             "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
          publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
          AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
