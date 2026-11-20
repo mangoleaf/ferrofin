@@ -441,12 +441,19 @@ async fn role_settings_are_trimmed_and_need_a_role_claim_while_in_use() {
     }
 }
 
-/// The settings page reads and sends each role setting.
+/// The settings page reads and sends each role setting, and the picture
+/// sync switch beside them.
 #[test]
 fn the_settings_page_edits_the_role_settings() {
     let page = SsoExtension.config_pages().remove(0).bytes;
     let html = String::from_utf8(page).expect("UTF-8");
-    for member in ["RoleClaim", "RequiredRole", "RoleSync", "AdminRole"] {
+    for member in [
+        "RoleClaim",
+        "RequiredRole",
+        "RoleSync",
+        "AdminRole",
+        "SyncProfilePictures",
+    ] {
         assert_eq!(
             html.matches(&format!("info.{member}")).count(),
             1,

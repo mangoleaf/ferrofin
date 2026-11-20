@@ -17,7 +17,8 @@
 //!   one-time code for the session there, for anyone;
 //! - `GET /sso/quickconnect` and `POST /sso/quickconnect` — a native app's
 //!   Quick Connect code entered, approved through a sign-in started with
-//!   `?quickConnect=CODE`, and confirmed, for anyone.
+//!   `?quickConnect=CODE`, and confirmed, for anyone;
+//! - the account-link routes, in [`links`].
 //!
 //! Not Jellyfin contract operations, so they are listed in
 //! [`PLUGIN_ROUTES`](super::PLUGIN_ROUTES) rather than in `REAL_ROUTES` or
@@ -48,6 +49,8 @@ use crate::auth::RequireAdmin;
 use crate::error::{ApiError, FailureLogged};
 use crate::extract::{JsonBody, ProblemDetails};
 use crate::state::AppState;
+
+pub(crate) mod links;
 
 /// The wired Single Sign-On service while its plugin is enabled, or the `404`
 /// a server without the plugin answers.
@@ -280,7 +283,9 @@ async fn start_oidc_sign_in(
 /// `quickConnect`: on the confirmation page, which keeps it for
 /// [`confirm_quick_connect`]); with no account, on a page saying what to ask
 /// an administrator; any other on the refusal page. Both clear the flow
-/// cookie.
+/// cookie. A link flow's callback ends on its own page: the account linked,
+/// or refused (a missing required role, or another account has the
+/// identity; [`links`]).
 #[utoipa::path(
     get,
     path = "/sso/oidc/{provider}/callback",
@@ -295,6 +300,7 @@ async fn start_oidc_sign_in(
         (status = 200, description = "The completion page, which signs the verified identity's account in; for a sign-in started with quickConnect, the confirmation page, which asks before approving the code"),
         (status = 400, description = "Refused: the sign-in failed a check"),
         (status = 403, description = "Refused: no account is linked to the identity and none can be created; the page says what to ask an administrator"),
+        (status = 409, description = "A link flow refused: another account is linked to the identity"),
         (status = 502, description = "Refused: the identity provider could not be reached"),
         (status = 404, description = "No such enabled provider, or the Single Sign-On plugin is disabled or not available")
     ),
@@ -352,7 +358,7 @@ async fn finish_oidc_sign_in(
     request_body = OidcExchangeRequest,
     responses(
         (status = 200, description = "Signed in (AuthenticationResult)"),
-        (status = 400, description = "Refused: the code is unknown, used, expired, not this browser's or a Quick Connect confirmation, or the body does not bind"),
+        (status = 400, description = "Refused: the code is unknown, used, expired, not this browser's or a Quick Connect confirmation, its identity is no longer linked to the account, or the body does not bind"),
         (status = 403, description = "Refused: the account is disabled, outside its schedule or remote access, on a device it may not use, or at its session limit"),
         (status = 404, description = "The Single Sign-On plugin is disabled or not available")
     ),
@@ -427,7 +433,7 @@ async fn quick_connect_page(State(state): State<AppState>) -> Result<Response, A
     request_body(content = String, content_type = "application/x-www-form-urlencoded", description = "confirmation=…, from the confirmation page"),
     responses(
         (status = 200, description = "The app is signed in: a page saying so"),
-        (status = 400, description = "Refused: the confirmation is unknown, used, expired or not this browser's, or the code is unknown, expired or approved already"),
+        (status = 400, description = "Refused: the confirmation is unknown, used, expired or not this browser's, its identity is no longer linked to the account, or the code is unknown, expired or approved already"),
         (status = 403, description = "Refused: Quick Connect is turned off, or a sign-in rule refuses the account"),
         (status = 404, description = "The Single Sign-On plugin is disabled or not available")
     ),
@@ -464,6 +470,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/sso/quickconnect",
             get(quick_connect_page).post(confirm_quick_connect),
         )
+        .merge(links::register(Router::new()))
 }
 
 #[cfg(test)]

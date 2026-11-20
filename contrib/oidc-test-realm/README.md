@@ -96,6 +96,18 @@ Then replace the published values, in the realm `ferrofin-test`:
 7. With the provider's "Create accounts at first sign-in" off, a realm user with no account is
    refused, and no account appears. A local account named like a realm user makes that user's
    sign-in refused, and the local account is left as it was.
+8. With the provider's "Sync profile pictures" on, a user's picture follows the `picture` claim,
+   which Keycloak's built-in `profile` scope fills from a user attribute named `picture`. Keycloak
+   keeps only the attributes the realm's user profile declares, and this realm declares none
+   beyond the defaults, so give one user a picture for the check: **Realm settings**, **User
+   profile**, **Create attribute** `picture`, viewed and edited by admins only; then that user's
+   **Attributes**, `picture`, the URL of an image. Ferrofin downloads it under its image download
+   limits, so an image on a private address, a loopback one included, also needs that address in
+   the server's `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW`. Sign in, and the account's picture in
+   jellyfin-web is that image. Sign in again and nothing is stored again; change the image at its
+   URL and the next sign-in replaces it. With the image's server stopped, or the address not
+   allowed, the sign-in is as quick as before and the picture stays. Remove the attribute and
+   its declaration when you are done.
 
 ## The live test
 
