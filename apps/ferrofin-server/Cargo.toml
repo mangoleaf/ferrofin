@@ -77,6 +77,9 @@ tracing-opentelemetry.workspace = true
 zip.workspace = true
 # state.rs storage test, planner.rs label test: the virtual-folder fake that counts full listings.
 ferrofin-api = { workspace = true, features = ["test-util"] }
+# sso_settings and sso_sign_in: the fake identity provider a saved provider's
+# discovery, and a sign-in, are tested against.
+ferrofin-extensions = { workspace = true, features = ["test-util"] }
 # manpage test: renders contrib/debian/ferrofin-server.1 from the clap `Cli`.
 clap_mangen.workspace = true
 tempfile.workspace = true

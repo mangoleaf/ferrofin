@@ -22,6 +22,12 @@ Conventions:
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
 | LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | ported |
 
+Ferrofin's own extensions have no row, since they port nothing: Ferrofin Settings, and Single
+Sign-On, which is not the community SSO-Auth plugin (its own id and routes). Single Sign-On's
+routes in `handlers::PLUGIN_ROUTES` (`/sso/admin/oidc/providers`,
+`/sso/admin/oidc/providers/{provider}`, `/sso/oidc/{provider}/start` and
+`/sso/oidc/{provider}/callback`) have no upstream to compare with.
+
 ## Per-plugin notes
 
 ### Intro Skipper

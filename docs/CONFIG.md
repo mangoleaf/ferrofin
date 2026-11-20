@@ -473,7 +473,7 @@ searches a scan or the scheduled task makes.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions, LDAP-Auth): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. The **Ferrofin Settings** plugin stays: it is the server's own settings, with no task or hook. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
+| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions, LDAP-Auth, Single Sign-On): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. The **Ferrofin Settings** plugin stays: it is the server's own settings, with no task or hook. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
 
 ## WASM plugins (Tier 1b)
 

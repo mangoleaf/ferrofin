@@ -945,6 +945,7 @@ pub async fn build_app_state(
     ferrofin_core::adoption_repairs::run_rehome_local_versions(
         db,
         &id_derivation,
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
         item_persistence_service.as_ref(),
@@ -956,6 +957,7 @@ pub async fn build_app_state(
     ferrofin_core::adoption_repairs::run_rekey_virtual_seasons(
         db,
         &id_derivation,
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
     )
@@ -967,6 +969,7 @@ pub async fn build_app_state(
         db,
         &id_derivation,
         &format!("{}/playlists", paths.data_path()),
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
     )
@@ -979,6 +982,7 @@ pub async fn build_app_state(
     ferrofin_core::adoption_repairs::run_rekey_by_name_rows(
         db,
         by_name_identity.as_ref(),
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
     )
@@ -2642,6 +2646,11 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to remove extracted data of items that no longer exist")?;
+    // Once per database (gl-1616): the item and stream paths an earlier
+    // version stored resolved under the data and metadata directories take
+    // the `%AppDataPath%`/`%MetadataPath%` form every save writes. Last of the
+    // repairs, after every one that stores a path, and before a scan.
+    ferrofin_core::adoption_repairs::run_reverse_stored_virtual_paths(db, &virtual_paths).await;
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
@@ -3355,6 +3364,17 @@ pub async fn build_app_state(
             Arc::clone(&plugins),
             Arc::new(ferrofin_extensions::ldap_auth::directory::Ldap3Directory::default()),
         ));
+    // The Single Sign-On extension's service behind the `/sso` routes, gated
+    // the same way. Its callback URLs fall back to the published URL, never
+    // to a request's Host header. It finds or creates the account a sign-in
+    // ends at through the extensions' user manager and identity links.
+    let sso: Arc<dyn ferrofin_traits::sso::SsoManager> =
+        Arc::new(ferrofin_extensions::sso::SsoService::new(
+            Arc::clone(&plugins),
+            Arc::clone(&extension_cx.users),
+            Arc::clone(&extension_cx.external_identities),
+            config.published_url.clone(),
+        ));
     // The backup engine behind `/Backup*`: archives come from and go back to
     // the live application paths, and each manifest records this release.
     let backup_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
@@ -3375,6 +3395,7 @@ pub async fn build_app_state(
         .with_file_transformations(Arc::clone(&file_transformations))
         .with_merge_versions(merge_versions)
         .with_ldap(ldap)
+        .with_sso(sso)
         .with_backup(backup)
         .with_playback_metrics(playback_metrics);
 

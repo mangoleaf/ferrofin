@@ -68,6 +68,7 @@ work across subsystems:
 | `library` | library name/id |
 | `task` | scheduled-task key |
 | `provider` | metadata provider name |
+| `oidc_provider` | Single Sign-On OIDC provider key |
 | `tuner` | Live TV tuner host id |
 | `listings_provider` | Live TV listings provider id |
 | `channel` | Live TV channel name |

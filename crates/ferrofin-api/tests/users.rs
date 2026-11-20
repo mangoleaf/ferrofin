@@ -208,6 +208,13 @@ impl UserManager for MemUsers {
     ) -> Result<Option<UserEntity>, ServiceError> {
         Ok(Some(user_entity(ADMIN_ID, "admin", Some("hash"))))
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
         Ok(Vec::new())
     }
@@ -728,6 +735,13 @@ impl UserManager for OkUsers {
         _remote_endpoint: &str,
         _is_user_session: bool,
     ) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!()
+    }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
         unimplemented!()
     }
     async fn get_authentication_providers(

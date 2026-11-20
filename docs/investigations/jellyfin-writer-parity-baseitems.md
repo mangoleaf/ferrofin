@@ -262,7 +262,7 @@ with `Map` at `:194-249`. Ferrofin does the same in `crates/ferrofin-core/src/me
 |---|---|
 | `ItemId`, `StreamIndex`, `AspectRatio`, `AverageFrameRate`, `BitDepth`, `BlPresentFlag`, `ChannelLayout`, `Channels`, `Codec`, `CodecTag`, `CodecTimeBase`, `ColorPrimaries`, `ColorSpace`, `ColorTransfer`, `Comment`, `DvBlSignalCompatibilityId`, `DvLevel`, `DvProfile`, `DvVersionMajor`, `DvVersionMinor`, `ElPresentFlag`, `IsAnamorphic`, `IsDefault`, `IsExternal`, `IsForced`, `IsHearingImpaired`, `IsInterlaced`, `KeyFrames`, `Language`, `NalLengthSize`, `PixelFormat`, `Profile`, `RealFrameRate`, `RefFrames`, `Rotation`, `RpuPresentFlag`, `SampleRate`, `StreamType`, `TimeBase`, `Title`, `Hdr10PlusPresentFlag`, `IsOriginal` | match |
 | `BitRate`, `Height`, `Width`, `IsAvc`, `Level` | match in E1; fix (verify first): gl-1599 (E4, the alternate-version movie's streams: `BitRate` NULL vs 825, the others NULL vs 0) |
-| `Path` | fix: gl-1581. Upstream reverses it (`:209`) and Ferrofin writes it raw. Only stream files under the data or metadata directory are affected; the read side is gl-1063 |
+| `Path` | fix: gl-1581. Upstream reverses it (`:209`) and Ferrofin writes it raw. Only stream files under the data or metadata directory are affected. Reads expand it (`RestorePath`) since gl-1581, and gl-1616 rewrites the rows stored before |
 
 ### `Chapters`
 

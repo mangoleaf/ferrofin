@@ -20,6 +20,8 @@ struct Wired {
     tasks: usize,
     /// Whether `GET /Ferrofin/Settings`' manager answered.
     settings_answer: bool,
+    /// Whether the Single Sign-On routes answer once an admin enables it.
+    sso_answer: bool,
 }
 
 /// Boots the composition root with the switch in the given position.
@@ -51,10 +53,23 @@ async fn wired(disable_extensions: bool) -> Wired {
     let plugins = wired.state.plugins.list_plugins().await.expect("plugins");
     let tasks = wired.state.tasks.get_tasks().await.expect("tasks").len();
     let settings_answer = wired.state.server_settings.snapshot().await.is_ok();
+    // An unregistered plugin cannot be enabled, and its routes stay 404.
+    let _ = wired
+        .state
+        .plugins
+        .enable_plugin(ferrofin_extensions::sso::EXTENSION_ID)
+        .await;
+    let sso = wired.state.sso.clone().expect("the SSO service is wired");
+    let sso_answer = match sso.ensure_enabled().await {
+        Ok(()) => true,
+        Err(ferrofin_traits::error::ServiceError::NotFound(_)) => false,
+        Err(e) => panic!("{e}"),
+    };
     Wired {
         plugins,
         tasks,
         settings_answer,
+        sso_answer,
     }
 }
 
@@ -82,6 +97,14 @@ async fn disabling_extensions_removes_their_plugins_and_tasks() {
         off_tasks > 0,
         "the server's own scheduled tasks must remain, only the extensions' go"
     );
+
+    // Single Sign-On goes with the other extensions: its routes answer 404
+    // even once enabled.
+    assert!(
+        on.sso_answer,
+        "extensions on: an enabled SSO plugin answers"
+    );
+    assert!(!off.sso_answer, "extensions off: the SSO routes answer 404");
 
     // The Ferrofin settings stay either way (owner decision D4): the server's
     // own settings page, with no task or hook to fire in a measurement.

@@ -162,6 +162,7 @@ pub mod search;
 pub mod session;
 pub(crate) mod session_ctx;
 pub mod similar;
+pub mod sso;
 pub mod startup;
 pub(crate) mod streaming;
 pub mod studios;
@@ -771,8 +772,9 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
 /// controller, which the vendored spec does not describe.
 ///
 /// They are in neither [`REAL_ROUTES`] nor [`EXTENSION_ROUTES`] (contract
-/// operations only) and carry no [`VERIFIED`] row; each plugin's comparison
-/// with its upstream is recorded in `docs/PLUGINS_UPSTREAM.md`. Like every
+/// operations only) and carry no [`VERIFIED`] row; each ported plugin's
+/// comparison with its upstream is recorded in `docs/PLUGINS_UPSTREAM.md`, and
+/// Ferrofin's own Single Sign-On plugin has none to compare with. Like every
 /// ASP.NET route they are matched ignoring case
 /// ([`canonicalize_path`](crate::routes::canonicalize_path) reads this list):
 /// a plugin's settings page calls them as it spells them.
@@ -781,6 +783,13 @@ pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
     ("post", "/Ldap/TestServerBind", "ldap-auth"),
     ("post", "/Ldap/TestLdapFilters", "ldap-auth"),
     ("post", "/Ldap/LdapUserSearch", "ldap-auth"),
+    // Single Sign-On plugin (see handlers::sso): Ferrofin's own, with no
+    // upstream to compare with (D15).
+    ("get", "/sso/admin/oidc/providers", "sso"),
+    ("put", "/sso/admin/oidc/providers/{provider}", "sso"),
+    ("delete", "/sso/admin/oidc/providers/{provider}", "sso"),
+    ("get", "/sso/oidc/{provider}/start", "sso"),
+    ("get", "/sso/oidc/{provider}/callback", "sso"),
 ];
 
 /// Every path a handler registers that is neither a contract route nor in
@@ -3702,7 +3711,8 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/users.rs authenticate_by_name, authenticate, login_failure, \
                authentication_result → ferrofin-core session_manager.rs authenticate_internal \
                (AuthenticateNewSessionInternal), admit_session → user_manager.rs \
-               authenticate_user (UserManager.AuthenticateUser), authentication_providers_for \
+               authenticate_user (UserManager.AuthenticateUser) with ensure_sign_in_allowed \
+               (its disabled, remote and schedule checks), authentication_providers_for \
                (GetAuthenticationProviders(User)), authenticate_with_providers \
                (AuthenticateLocalUser) and apply_external_administrator; a 401 or 403 \
                answers as ExceptionMiddleware does \
@@ -3754,6 +3764,14 @@ pub const VERIFIED: &[Verified] = &[
          UserUpdated push, no device check), so an administrator a provider demotes keeps \
          the devices their policy refuses signed in until a later policy save or rename, as \
          upstream does (gl-1191 asks the owner whether to keep that).",
+            "A provider may say a password it refuses never counts toward lockout \
+         (AuthenticationManager::counts_failed_passwords, read for the provider the account \
+         names, enabled or not): such a refusal answers the usual 401 and leaves \
+         InvalidLoginAttemptCount and the enabled flag alone, where upstream's AuthenticateUser \
+         counts every refused password. Only the Single Sign-On extension's provider says so, \
+         since it refuses every password of the accounts it owns; the built-in providers and \
+         LDAP-Auth count as upstream does, and the login backoff still paces the caller. \
+         Owner decision (D20 of the OIDC sign-in milestone, 2026-11-20).",
             "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
          publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
          AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
@@ -5893,11 +5911,7 @@ pub const VERIFIED: &[Verified] = &[
             "The 400 for an itemId or index the route binder cannot convert (upstream's \
          ValidationProblemDetails), and the 401 and 403 bodies, are Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
-            "A row an adopted database stores with a %AppDataPath% or %MetadataPath% token (a \
-         subtitle Jellyfin saved in its metadata folder) is read unexpanded, so it is the \
-         folder-missing 404 below, where upstream expands it (MediaStreamRepository \
-         RestorePath) and deletes the file. Fix path: gl-1063.",
-            "Every other relative path is the folder-missing 404, without touching the disk, as \
+            "Every relative path is the folder-missing 404, without touching the disk, as \
          the item delete refuses one (item_deletion.rs delete_item_path). Upstream \
          resolves one against its working directory, so a relative row whose folder exists \
          there answers 204 and deletes the file it names beside the server process (gl-1723). \
@@ -7267,6 +7281,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // The LDAP-Auth plugin's own controller — not a contract operation, so
     // listed in PLUGIN_ROUTES.
     let router = ldap::register(router);
+    // The Single Sign-On plugin's own routes — not contract operations, so
+    // listed in PLUGIN_ROUTES.
+    let router = sso::register(router);
     // Live TV over the `LiveTvManager`; with nothing configured the reads answer
     // the empty state jellyfin-web shows as "not configured".
     let router = live_tv::register(router);

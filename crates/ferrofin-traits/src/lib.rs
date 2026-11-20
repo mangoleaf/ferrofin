@@ -50,6 +50,7 @@ pub mod security;
 pub mod server_settings;
 pub mod session;
 pub mod session_bus;
+pub mod sso;
 pub mod stubs;
 pub mod subtitles;
 pub mod system;

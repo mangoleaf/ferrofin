@@ -217,7 +217,7 @@ impl<'de> Deserialize<'de> for ProfileImageFormat {
 /// upstream's C# properties behave for every check that reads them
 /// (`string.IsNullOrEmpty`). A key that is absent keeps the container's
 /// default, upstream's constructor value.
-fn null_as_empty<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn null_as_empty<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de> + Default,

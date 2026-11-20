@@ -588,6 +588,12 @@ impl FerrofinPluginManager {
         self.plugins_dir.join(id.to_string()).join("config.json")
     }
 
+    /// The path to a plugin's private data, beside its config file: no route
+    /// serves it (`PluginManager::get_plugin_private_data`).
+    fn private_data_path(&self, id: Uuid) -> PathBuf {
+        self.plugins_dir.join(id.to_string()).join("private.json")
+    }
+
     /// Writes `bytes` to `path` atomically, creating parents: a uniquely
     /// named, synced temp file renamed over it, so two writers of one path
     /// never share a temp file.
@@ -1325,6 +1331,27 @@ impl PluginManager for FerrofinPluginManager {
                 "plugin configuration must be a JSON object",
             )),
         }
+    }
+
+    async fn get_plugin_private_data(&self, id: Uuid) -> Result<Option<Vec<u8>>, ServiceError> {
+        if self.find(id).is_none() {
+            return Err(ServiceError::not_found(format!("plugin {id}")));
+        }
+        match tokio::fs::read(self.private_data_path(id)).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ServiceError::backend(format!(
+                "read plugin private data: {e}"
+            ))),
+        }
+    }
+
+    async fn set_plugin_private_data(&self, id: Uuid, data: Vec<u8>) -> Result<(), ServiceError> {
+        if self.find(id).is_none() {
+            return Err(ServiceError::not_found(format!("plugin {id}")));
+        }
+        // `atomic_write` writes a private temporary file and renames it over.
+        Self::atomic_write(&self.private_data_path(id), &data)
     }
 
     async fn plugin_image(&self, id: Uuid) -> Result<Option<PluginImage>, ServiceError> {
@@ -2202,6 +2229,69 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// A plugin's private data (the Single Sign-On plugin's client secrets) is
+    /// a private file beside its configuration that the configuration never
+    /// returns, replaced whole.
+    #[tokio::test]
+    async fn private_data_is_a_private_file_the_configuration_never_returns() {
+        let id = Uuid::from_u128(5);
+        let (mgr, dir) = manager(vec![
+            RegisteredPlugin::new(descriptor(id, "Demo", true), None)
+                .with_default_config(br#"{"Providers":[]}"#.to_vec()),
+        ]);
+        assert_eq!(mgr.get_plugin_private_data(id).await.expect("read"), None);
+        mgr.set_plugin_private_data(id, br#"{"Secret":"first-secret"}"#.to_vec())
+            .await
+            .expect("write");
+        mgr.set_plugin_private_data(id, br#"{"Secret":"second-secret"}"#.to_vec())
+            .await
+            .expect("replace");
+        assert_eq!(
+            mgr.get_plugin_private_data(id).await.expect("read"),
+            Some(br#"{"Secret":"second-secret"}"#.to_vec())
+        );
+        let config = mgr.get_plugin_configuration(id).await.expect("cfg");
+        assert!(
+            !String::from_utf8_lossy(&config).contains("secret"),
+            "{config:?}"
+        );
+
+        let file = dir.path().join(id.to_string()).join("private.json");
+        assert_eq!(
+            std::fs::read(&file).expect("the file"),
+            br#"{"Secret":"second-secret"}"#
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&file).expect("mode").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+        // Only the two files: no temporary file is left behind.
+        let mut names: Vec<String> = std::fs::read_dir(file.parent().expect("dir"))
+            .expect("list")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, ["private.json"]);
+
+        let unknown = Uuid::from_u128(6);
+        assert!(matches!(
+            mgr.get_plugin_private_data(unknown).await,
+            Err(ServiceError::NotFound(_))
+        ));
+        assert!(matches!(
+            mgr.set_plugin_private_data(unknown, b"{}".to_vec()).await,
+            Err(ServiceError::NotFound(_))
+        ));
     }
 
     /// The TMDb settings page saves its five image sizes, upstream's `string?`
