@@ -4,9 +4,10 @@
 //! The export copies; it never converts in place. It reads the source data
 //! directory and writes only under the output directory, and it digests the
 //! source before and after to show that it left the source as it found it.
-//! So far it writes a copy of the directory with a consistent snapshot of the
-//! database; Jellyfin can start on the output once the history rewrite and
-//! the removal of Ferrofin's own objects (below) are in place.
+//! It writes a copy of the directory with a consistent snapshot of the
+//! database, whose migration history it rewrites for the Jellyfin release
+//! `UPSTREAM_TAG` names; the removal of Ferrofin's own objects (below) is
+//! still to come.
 //!
 //! Each concern has its own file, so the phases that build the export each
 //! touch their own:
@@ -24,7 +25,14 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+use sqlx::SqliteConnection;
+
 use crate::{DbError, Result};
+
+pub use classify::{
+    CODE_PRODUCT_VERSION, Disposition, JELLYFIN_MIGRATIONS, SCHEMA_PRODUCT_VERSION,
+};
+pub use history::HistoryRewrite;
 
 mod classify;
 mod drop_objects;
@@ -37,6 +45,14 @@ mod tree;
 /// Where an export writes the database, relative to its output directory:
 /// Jellyfin's `{DataPath}/jellyfin.db`.
 pub const EXPORTED_DATABASE: &str = "data/jellyfin.db";
+
+/// Jellyfin's list of the migrations it applied before 10.11, under the
+/// configuration directory of the docker layout. Jellyfin 10.11 moved its
+/// entries into the history table and renamed the file. One still there that
+/// lists any makes Jellyfin 12.4 seed the history from it, and stop when the
+/// history already holds every entry, as an exported one does
+/// (`JellyfinMigrationService.cs`).
+const LEGACY_MIGRATIONS_FILE: &str = "config/migrations.xml";
 
 /// The first bytes of every SQLite database file.
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
@@ -93,6 +109,34 @@ pub struct ExportSummary {
     pub bytes: u64,
     /// Where the database snapshot was written.
     pub database: PathBuf,
+    /// What the export changed in the database it copied.
+    pub edits: DatabaseEdits,
+}
+
+/// What the export changed in its copy of the database, step by step
+/// (`edit_staged`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatabaseEdits {
+    /// The rewrite of `__EFMigrationsHistory`.
+    pub history: HistoryRewrite,
+}
+
+/// The export's changes to its staged copy of the database, in order, on the
+/// one connection the snapshot holds to it: after the checks, which read the
+/// source's Jellyfin `history` ([`refusal::database`]), and before `VACUUM
+/// INTO` writes the snapshot, so the snapshot holds no free pages from them
+/// and two exports of one source stay equal. Each step is a file of its own; a
+/// step added later goes here, with its field in [`DatabaseEdits`].
+async fn edit_staged(
+    conn: &mut SqliteConnection,
+    history: Option<&history::SourceHistory>,
+) -> Result<DatabaseEdits> {
+    let mut tx = sqlx::Connection::begin(conn).await?;
+    let edits = DatabaseEdits {
+        history: history::rewrite(&mut tx, history).await?,
+    };
+    tx.commit().await?;
+    Ok(edits)
 }
 
 /// Copies the stopped data directory `source` into `out`, with a consistent
@@ -107,7 +151,10 @@ pub struct ExportSummary {
 /// source. Left out are the database files: `database`, the file it links to,
 /// the source's own [`EXPORTED_DATABASE`] (a native database's leftover would
 /// otherwise sit under the snapshot), and the `-wal`, `-shm` and `-journal`
-/// files of each. The snapshot holds what they do.
+/// files of each. The snapshot holds what they do. Also left out is a
+/// `config/migrations.xml`, which Jellyfin would read again: from one listing
+/// migrations it writes history rows, or stops its start.
+/// The snapshot's `__EFMigrationsHistory` is rewritten ([`HistoryRewrite`]).
 ///
 /// The source is digested while it is copied and again once the database
 /// snapshot is written, and so are the files SQLite keeps beside the
@@ -142,10 +189,11 @@ pub async fn export_data_dir(source: &Path, database: &Path, out: &Path) -> Resu
         .into_iter()
         .filter(|file| !file.starts_with(&real_source))
         .collect();
-    let skipped = [database, &source.join(EXPORTED_DATABASE), &resolved]
+    let mut skipped = [database, &source.join(EXPORTED_DATABASE), &resolved]
         .into_iter()
         .flat_map(database_files)
         .collect::<Vec<_>>();
+    skipped.push(source.join(LEGACY_MIGRATIONS_FILE));
     let (from, to, files) = (source.to_owned(), out.to_owned(), companions.clone());
     let (companions_before, copied) = blocking(move || {
         let companions = tree::digest_files(&files)?;
@@ -154,7 +202,7 @@ pub async fn export_data_dir(source: &Path, database: &Path, out: &Path) -> Resu
     })
     .await?;
     let exported = out.join(EXPORTED_DATABASE);
-    snapshot::snapshot_database(&resolved, &exported).await?;
+    let edits = snapshot::snapshot_database(&resolved, &exported).await?;
     let (from, mut dirs) = (source.to_owned(), copied.dirs);
     // A source with no `data/` (a native one) has none to take the mode from:
     // the snapshot's directory takes the source's own.
@@ -177,6 +225,7 @@ pub async fn export_data_dir(source: &Path, database: &Path, out: &Path) -> Resu
         files: copied.files,
         bytes: copied.bytes,
         database: exported,
+        edits,
     })
 }
 

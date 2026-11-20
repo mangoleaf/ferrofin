@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::SqliteConnectOptions;
 
-use super::{blocking, failed, tree, with_suffix};
+use super::{DatabaseEdits, blocking, failed, tree, with_suffix};
 use crate::Result;
 use crate::database::{
     abandon_on_error, init_sqlite, publish_snapshot, start_snapshot, vacuum_into,
@@ -35,8 +35,10 @@ use crate::database::{
 /// staged, the directory for `dest` cannot be made or is a symbolic link, or
 /// the staged copy cannot be removed; [`DbError::Sqlx`](crate::DbError::Sqlx)
 /// or [`DbError::Backup`](crate::DbError::Backup) when the snapshot cannot be
-/// taken or published.
-pub(super) async fn snapshot_database(source: &Path, dest: &Path) -> Result<()> {
+/// taken or published; [`DbError::ExportRefused`](crate::DbError::ExportRefused)
+/// when the staged copy fails its checks. Returns what the export's steps
+/// changed in the copy ([`super::edit_staged`]).
+pub(super) async fn snapshot_database(source: &Path, dest: &Path) -> Result<DatabaseEdits> {
     let staged = with_suffix(dest, ".export-source");
     let leftovers = staged_files(&staged);
     let (from, to, files) = (source.to_owned(), staged.clone(), leftovers.clone());
@@ -69,12 +71,17 @@ pub(super) async fn snapshot_database(source: &Path, dest: &Path) -> Result<()> 
     };
     // The staged copy goes whether the snapshot was written or not.
     let removed = blocking(move || remove_all(&leftovers)).await;
-    written.and(removed)
+    written.and_then(|edits| removed.map(|()| edits))
 }
 
 /// `VACUUM INTO` from the database at `from` to `dest`, with `permissions`,
-/// written under a temporary name and renamed into place once complete.
-async fn vacuum(from: &Path, dest: &Path, permissions: std::fs::Permissions) -> Result<()> {
+/// written under a temporary name and renamed into place once complete, after
+/// the checks and the export's steps ran on `from`.
+async fn vacuum(
+    from: &Path,
+    dest: &Path,
+    permissions: std::fs::Permissions,
+) -> Result<DatabaseEdits> {
     init_sqlite();
     let partial = start_snapshot(dest)?;
     let written = async {
@@ -92,7 +99,8 @@ async fn vacuum(from: &Path, dest: &Path, permissions: std::fs::Permissions) -> 
             .connect()
             .await
             .map_err(super::refusal::damaged_or)?;
-        super::refusal::database(&mut conn).await?;
+        let history = super::refusal::database(&mut conn).await?;
+        let edits = super::edit_staged(&mut conn, history.as_ref()).await?;
         sqlx::query(sqlx::AssertSqlSafe(vacuum_into(&partial)))
             .execute(&mut conn)
             .await
@@ -104,7 +112,8 @@ async fn vacuum(from: &Path, dest: &Path, permissions: std::fs::Permissions) -> 
             publish_snapshot(&partial, &dest)?;
             std::fs::set_permissions(&dest, permissions).map_err(failed(&dest))
         })
-        .await
+        .await?;
+        Ok(edits)
     }
     .await;
     abandon_on_error(&partial, written)

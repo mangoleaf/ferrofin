@@ -128,6 +128,21 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
             )));
         }
     };
+    print_report(source, out, &target, &summary, &configuration, replaced);
+    Ok(())
+}
+
+/// Prints what the export of `source` into `out` (resolved to `target`) wrote:
+/// `summary`'s copy and database changes, and `configuration`'s files and the
+/// settings it could not export.
+fn print_report(
+    source: &Path,
+    out: &Path,
+    target: &Path,
+    summary: &ferrofin_db::export::ExportSummary,
+    configuration: &ConfigExport,
+    replaced: bool,
+) {
     println!(
         "Exported {} into {}: the database snapshot at {} and {} other files ({} bytes), then {} configuration files for Jellyfin over them. The source is unchanged.",
         source.display(),
@@ -139,6 +154,14 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
         summary.bytes,
         configuration.files.len()
     );
+    let history = &summary.edits.history;
+    if let Some(generation) = history.generation {
+        println!(
+            "Its Jellyfin migration history (from a database of the Jellyfin {generation} generation): {} recorded that Jellyfin would otherwise apply again, {} code migrations left for Jellyfin to run on its first start.",
+            history.recorded.len(),
+            history.left_to_run.len()
+        );
+    }
     if replaced {
         println!(
             "The export replaced the empty directory {} with a new directory that has the source's permissions; a shell inside it must change into it again to see the files.",
@@ -151,7 +174,6 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
             setting.setting, setting.file, setting.reason
         );
     }
-    Ok(())
 }
 
 /// Sends warnings to stderr. The export runs without the server's logging,
