@@ -29,6 +29,8 @@
 //! - [`roles`]: a user's roles in the provider's role claim, the required
 //!   role a sign-in is refused without, and role sync, which keeps the
 //!   administrator flag, the libraries and Live TV in step with them;
+//! - [`avatar_sync`]: a user's profile picture, kept in step with the
+//!   provider's `picture` claim after each sign-in;
 //! - [`complete`]: the completion page the callback answers, and the
 //!   exchange of its one-time code for the session, under the account rules
 //!   of a password sign-in;
@@ -61,6 +63,7 @@ use uuid::Uuid;
 use crate::{Extension, ExtensionContext};
 
 pub mod accounts;
+pub mod avatar_sync;
 pub mod complete;
 pub mod discovery;
 #[cfg(any(test, feature = "test-util"))]
@@ -350,6 +353,10 @@ pub struct SsoService {
     saving: tokio::sync::Mutex<()>,
     /// The client for every call to an identity provider.
     http: OidcHttpClient,
+    /// Downloads and stores profile pictures ([`avatar_sync`]), once
+    /// [`with_remote_images`](Self::with_remote_images) gives it the server's
+    /// image downloads.
+    avatars: Option<avatar_sync::AvatarSync>,
     /// Each provider's discovery document and key set, for sign-in.
     metadata: MetadataCache,
     /// The sign-ins started and not yet called back.
@@ -387,6 +394,7 @@ impl SsoService {
             published_url,
             saving: tokio::sync::Mutex::new(()),
             http: OidcHttpClient::new(),
+            avatars: None,
             metadata: MetadataCache::default(),
             flows: PendingFlows::default(),
             exchanges: ExchangeCodes::default(),
