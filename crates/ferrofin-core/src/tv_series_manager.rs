@@ -714,6 +714,13 @@ mod tests {
         ) -> Result<Option<UserEntity>, ServiceError> {
             Ok(Some(self.user.clone()))
         }
+        async fn ensure_sign_in_allowed(
+            &self,
+            _user: &UserEntity,
+            _remote_endpoint: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
         async fn get_authentication_providers(
             &self,
         ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {

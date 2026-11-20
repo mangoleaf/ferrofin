@@ -1814,6 +1814,34 @@ pub trait UserManager: Send + Sync {
         is_user_session: bool,
     ) -> Result<Option<UserEntity>, ServiceError>;
 
+    /// Applies the account rules of a sign-in to `user`, whatever proved who
+    /// they are: the account is not disabled, a client outside the local
+    /// network (`remote_endpoint`) needs remote access, and the parental
+    /// schedule allows the sign-in now. These are the checks upstream's
+    /// `UserManager.AuthenticateUser` makes once a provider answered, in its
+    /// order.
+    ///
+    /// [`Self::authenticate_user`] applies them before it counts a wrong
+    /// password, so a disabled account is refused as disabled whatever
+    /// password was sent. A caller that signs a user in without
+    /// `authenticate_user` (the SSO flow) calls this itself before
+    /// `SessionManager::authenticate_direct`, which does not apply the rules:
+    /// Quick Connect signs in through it, and upstream's `AuthenticateDirect`
+    /// applies none. The concrete manager logs each refusal's `login failed`
+    /// warning with the rule's `reason`, so a caller need not log it again.
+    ///
+    /// No default body, so no implementation skips the rules unnoticed.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Forbidden`] with the message of the rule that refused,
+    /// or whatever the reads surface.
+    async fn ensure_sign_in_allowed(
+        &self,
+        user: &UserEntity,
+        remote_endpoint: &str,
+    ) -> Result<(), ServiceError>;
+
     /// Lists the available authentication providers.
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError>;
 
