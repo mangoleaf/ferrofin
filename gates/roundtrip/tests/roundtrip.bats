@@ -215,6 +215,13 @@ EOS
   grep -qx 'rmi ferrofin-roundtrip:both' state/calls
 }
 
+@test "run.sh: a Jellyfin whose setup server answers first is ready only once the real server answers" {
+  # first only /System/Info/Public answers, then only /System/Ping: a request in either phase would get a 503
+  FAKE_JELLYFIN=setup run run_gate "$TMP/w" --only 12.4-from-123
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS  12.4-from-123  "* ]]
+}
+
 @test "run.sh: a Ferrofin that exits at once fails its route, Jellyfin is never booted, and the run removes what it made" {
   run "$ROUNDTRIP/run.sh" --image ferrofin:dead --jellyfin-image jellyfin/jellyfin:test --fixtures "$TMP/fixtures" \
     --work "$TMP/w" --run-id solo --only 10.11.8

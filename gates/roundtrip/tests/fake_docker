@@ -8,8 +8,8 @@
 # that exit at once. A tag only exists once `docker tag` made it. A container's id is not its name, and
 # `rm` takes only an id (a name is "No such container"); each removal is logged by name in $FAKE_STATE/removed.
 # Knobs: FAKE_RUN_DELAY (seconds a run takes), FAKE_EXIT_CODE (what a stopped container exited with),
-# FAKE_JELLYFIN=loses (Jellyfin's copy has lost a favorite), =hang (it answers 503 and never logs why) or
-# =exits (it stops with status 3 before it answers).
+# FAKE_JELLYFIN=loses (Jellyfin's copy has lost a favorite), =hang (it answers 503 and never logs why),
+# =exits (it stops with status 3 before it answers) or =setup (its setup server answers first).
 set -uo pipefail
 state=${FAKE_STATE:?}
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -43,7 +43,10 @@ case "$1" in
     if [ "${name%-jellyfin}" != "$name" ]; then
       role=jellyfin
       case $config in */10.11.8/*) behaviour=start-failed log=start-failed;; esac
-      case ${FAKE_JELLYFIN:-} in loses) behaviour=loses;; hang) behaviour=start-failed;; exits) behaviour=exits; echo 3 > "$state/$name.exit";; esac
+      case ${FAKE_JELLYFIN:-} in
+        loses) behaviour=loses;; hang) behaviour=start-failed;; setup) behaviour=setup;;
+        exits) behaviour=exits; echo 3 > "$state/$name.exit";;
+      esac
     fi
     echo "$role $log $config" > "$state/$name.role"
     setsid python3 "$here/fake_server.py" serve "$state/$name.port" "$role" "$config" "$behaviour" >/dev/null 2>&1 &

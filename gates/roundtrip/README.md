@@ -63,12 +63,12 @@ Settings (environment), each a whole number of seconds:
 
 | Stage | Check | Fails when |
 |---|---|---|
-| Ferrofin | ready | the server never answers `/System/Info/Public` (it exited, named with its status, or the deadline passed) |
+| Ferrofin | ready | the server never answers `/System/Ping` and `/System/Info/Public` (it exited, named with its status, or the deadline passed) |
 | | the library scan completes | `POST /Library/Refresh` does not end `Completed` |
 | | boot log (generation, migrations, no ERROR) | as in the adoption gate (`adoption_check_boot_log`) |
 | | usage stage, then Ferrofin's answers | an action fails (named), an action does not show in the answers, or no answers were written |
 | | clean stop | the server does not exit 0 on TERM (judged only when every check before it passed) |
-| Jellyfin | ready | its start failed (`Main: Error while starting server`; it keeps answering 503, so the wait stops at that line), it exited (named with its status), or it is not ready within `ROUNDTRIP_READY_TIMEOUT` |
+| Jellyfin | ready | its start failed (`Main: Error while starting server`; it keeps answering 503, so the wait stops at that line), it exited (named with its status), or it is not ready within `ROUNDTRIP_READY_TIMEOUT`. Ready is `/System/Ping` and then `/System/Info/Public` answering: Jellyfin's setup server answers `/System/Info/Public` while Jellyfin still runs its last migrations and optimises the database, and 503 to everything else; the real server then answers only `/System/Ping` until its core startup completes |
 | | its startup tasks finish | no scheduled task runs on two polls in a row, within `ROUNDTRIP_SCAN_TIMEOUT` |
 | | every migration it began finished | a `Perform migration` with no `was successfully applied`, named with its SQLite error ([`checks_boot.py`](checks_boot.py)); a log with no entry at all fails too |
 | | no ERR or FTL outside the allowlist | an error entry other than the blocked plugin repository, up to the probes; an error a probe causes is judged by the answers instead |
@@ -203,6 +203,7 @@ The gate reuses the adoption gate's parts: its fixtures, `smoke.sh`, `lib.sh` (`
 - [`tests/fake_docker`](tests/fake_docker) plays each container with
   [`tests/fake_server.py`](tests/fake_server.py), so whole routes run:
   - the 12.4 route passing every check, and the 10.11.8 route failing with the migration named;
+  - a Jellyfin whose setup server answers first;
   - a Jellyfin whose copy lost a write (the comparison fails), one that never answers (given up at
     the deadline) and one that exits (named with its status);
   - a Ferrofin that exits at once, and one that does not exit 0 on TERM;

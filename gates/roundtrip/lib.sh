@@ -71,10 +71,15 @@ rt_start() {
 # rt_wait_up <name> <port> <seconds> [give-up ERE]: the server answers, or status 1 as soon as its
 # container has exited (a server that refuses its database exits at once), its log matches the give-up
 # pattern (Jellyfin stays up after a failed start, answering 503) or once <seconds> have passed.
+# Ready is both probes: Jellyfin's setup server answers /System/Info/Public while Jellyfin still runs its last
+# migrations and optimises the database, and 503 to everything else, /System/Ping included
+# (Jellyfin.Server/Program.cs, ServerSetupApp/SetupServer.cs); the real server then answers only /System/Ping
+# until its core startup completes (Jellyfin.Api/Middleware/ServerStartupMessageMiddleware.cs). Ferrofin answers both.
 rt_wait_up() {
   local name=$1 port=$2 deadline=$((SECONDS + $3)) give_up=${4:-} log
   while [ "$SECONDS" -lt "$deadline" ]; do
-    curl -sf --max-time 5 "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0
+    curl -sf --max-time 5 "http://127.0.0.1:$port/System/Ping" >/dev/null &&
+      curl -sf --max-time 5 "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0
     [ "$(rt_docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] || return 1
     if [ -n "$give_up" ]; then
       log=$(rt_docker logs "$name" 2>&1)   # whole, not piped: grep -q's early exit would fail the pipe
