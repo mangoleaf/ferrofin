@@ -8141,9 +8141,8 @@ fn push_program_tags(qb: &mut QueryBuilder<Sqlite>, query: &InternalItemsQuery, 
         (r#"p."IsKids""#, query.is_kids),
         (r#"p."IsSports""#, query.is_sports),
     ];
-    // Bound like `IsMovie`'s, not literal: SQLite guesses a literal 0 or 1
-    // equality true more often, which walked the start-date index instead
-    // once the table grew 0051's columns.
+    // Bound, not literal: SQLite rates `= 1`/`= 0` likelier true than `= ?`,
+    // which moves the plans the_category_flags_keep_the_guide_plans pins.
     if tags.iter().any(|(_, wanted)| *wanted == Some(true)) {
         push_separator(qb, first);
         qb.push("(");
