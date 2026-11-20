@@ -1075,11 +1075,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              artwork loads; upstream's UpdateImage stores the padded path, which does not. \
              Jellyfin bug not ported.",
             "A programme is saved only when a field GetProgram assigns changed. Upstream skips \
-             only an XMLTV airing whose etag equals the stored one; every other airing (each \
-             Schedules Direct one, whose md5 is compared after its ids were replaced, and an \
-             XMLTV one with no etag) is saved on every refresh, which moves its \
-             DateLastSaved and the DTO Etag derived from it. Fix path: gl-1628 (owner \
-             decision).",
+             only an XMLTV airing whose etag equals the stored one; every other airing is \
+             saved on every refresh, which moves its DateLastSaved and the DTO Etag derived \
+             from it: each Schedules Direct one, because GetProgram overwrites the stored \
+             provider ids before it compares the md5, and an XMLTV one with no etag, which \
+             counts as updated. No known client reads either, and keeping the save to a \
+             changed programme avoids one full-row write per airing per refresh (owner \
+             decision 2026-11-20, gl-1628).",
         ],
     },
     VerifiedSubsystem {
