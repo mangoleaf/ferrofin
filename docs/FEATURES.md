@@ -301,6 +301,9 @@ Wired and working, with a documented limitation or lighter verification:
   with the owner, the members and the shares, on every change to the playlist and every
   refresh that saves it: always for a playlist made in Ferrofin (`{data}/playlists`), and for a
   playlist folder in a media library only when that library opts in, as for a box set below.
+  The first start of a version with this writes the file of every playlist in `{data}/playlists`
+  from the database, so a file Jellyfin wrote before the database was adopted cannot bring back
+  a share, name or lock changed in Ferrofin since.
   A collection made in Ferrofin gets
   Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before 1.4.0 get it, and the
   id it derives, at the first boot of 1.5.2 or later), and its membership lives in the

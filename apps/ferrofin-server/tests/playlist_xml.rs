@@ -10,6 +10,8 @@
 //! - a playlist folder in a media library is read by the scan, and written
 //!   back only once its library saves into its media folders (the owner rule
 //!   on media-library writes).
+//! - the first boot of this version writes the file of every playlist in the
+//!   playlists folder from the database, once.
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -650,3 +652,151 @@ async fn a_playlists_xml_follows_its_changes_and_is_read_back() {
     assert_eq!(member_paths(&text), [beta_path.as_str()]);
 }
 
+/// Boots the app state on `db`, as a start of the server does.
+async fn boot(db: &Database, config: &Config) {
+    let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
+        ffmpeg: "ffmpeg".into(),
+        ffprobe: "ffprobe".into(),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+        chromaprint_muxer: false,
+    };
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+    let wired = build_app_state(db, config, &ffmpeg, None, shutdown_tx)
+        .await
+        .unwrap();
+    drop(wired);
+}
+
+/// The first boot of this version writes the `playlist.xml` of each playlist
+/// in the playlists folder from the database (`save_playlist_xml_once`): a
+/// file Jellyfin last wrote before the database was adopted, with a share
+/// removed since, would otherwise give that share back at the next full
+/// refresh. A playlist folder in a media library is left alone; a file that
+/// cannot be written makes the next boot run the repair again; once it has
+/// run whole, it never runs again.
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one fixture boots three times: a failed write, the retry, the marker"
+)]
+async fn the_first_boot_writes_the_playlists_folders_files_from_the_database() {
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_traits::persistence::ItemPersistenceService as _;
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config::test_stub(temp.path());
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    std::fs::create_dir_all(temp.path().join("config")).unwrap();
+    let db = Database::connect(&config.database_url()).await.unwrap();
+    db.run_migrations().await.unwrap();
+    let playlists = config.data_dir.join("data/playlists");
+    let (playlist, broken, library, owner, kept, removed) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
+    let stale = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Item><LocalTitle>Old Mix</LocalTitle>\
+         <Shares><Share><UserId>{removed}</UserId><CanEdit>true</CanEdit></Share></Shares></Item>"
+    );
+    // In the playlists folder, stored in the `%AppDataPath%` form an adopted
+    // database holds.
+    std::fs::create_dir_all(playlists.join("Old Mix")).unwrap();
+    let xml = playlists.join("Old Mix/playlist.xml");
+    std::fs::write(&xml, &stale).unwrap();
+    // A folder path that is a regular file: its playlist.xml cannot be made.
+    std::fs::write(playlists.join("Broken"), b"").unwrap();
+    // A playlist folder in a media library: never written by the repair.
+    let media = temp.path().join("music/Library Mix [playlist]");
+    std::fs::create_dir_all(&media).unwrap();
+    let media_xml = media.join("playlist.xml");
+    std::fs::write(&media_xml, &stale).unwrap();
+    let row = |id: Uuid, path: String| BaseItemEntity {
+        id: guid_to_db(id),
+        type_: "MediaBrowser.Controller.Playlists.Playlist".into(),
+        name: Some("Old Mix".into()),
+        is_folder: true,
+        media_type: Some("Audio".into()),
+        path: Some(path),
+        data: Some(
+            json!({
+                "OwnerUserId": owner.simple().to_string(),
+                "OpenAccess": false,
+                "Shares": [{"UserId": kept.simple().to_string(), "CanEdit": false}],
+                "PlaylistMediaType": "Audio",
+            })
+            .to_string(),
+        ),
+        ..Default::default()
+    };
+    ferrofin_core::FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[
+            row(playlist, "%AppDataPath%/playlists/Old Mix".to_owned()),
+            row(broken, "%AppDataPath%/playlists/Broken".to_owned()),
+            row(library, media.to_string_lossy().into_owned()),
+        ])
+        .await
+        .unwrap();
+    let marker = || async {
+        sqlx::query_scalar::<_, String>(
+            r#"SELECT "Value" FROM "FerrofinMeta" WHERE "Key" = 'playlist_xml_saved_v1'"#,
+        )
+        .fetch_optional(db.pool())
+        .await
+        .unwrap()
+    };
+
+    // First boot: the playlist's file follows the database; the broken one
+    // leaves the repair owed.
+    boot(&db, &config).await;
+    let text = std::fs::read_to_string(&xml).unwrap();
+    assert!(
+        text.contains(&format!("<OwnerUserId>{}</OwnerUserId>", owner.simple())),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("<UserId>{}</UserId>", kept.hyphenated())),
+        "{text}"
+    );
+    assert!(!text.contains(&removed.hyphenated().to_string()), "{text}");
+    assert!(
+        text.contains("<PlaylistMediaType>Audio</PlaylistMediaType>"),
+        "{text}"
+    );
+    // Stamped after the write, so the file reads as no change.
+    let saved: String =
+        sqlx::query_scalar(r#"SELECT "DateLastSaved" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(playlist))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let saved = chrono::NaiveDateTime::parse_from_str(&saved, "%Y-%m-%d %H:%M:%S%.f")
+        .unwrap()
+        .and_utc();
+    let written =
+        chrono::DateTime::<chrono::Utc>::from(std::fs::metadata(&xml).unwrap().modified().unwrap());
+    assert!(saved >= written, "{saved} < {written}");
+    assert_eq!(std::fs::read_to_string(&media_xml).unwrap(), stale);
+    assert_eq!(
+        marker().await,
+        None,
+        "a failed write leaves the repair owed"
+    );
+
+    // Second boot, the obstacle gone: the repair runs again, whole.
+    std::fs::remove_file(playlists.join("Broken")).unwrap();
+    std::fs::create_dir(playlists.join("Broken")).unwrap();
+    std::fs::remove_file(&xml).unwrap();
+    boot(&db, &config).await;
+    assert!(xml.is_file() && playlists.join("Broken/playlist.xml").is_file());
+    assert_eq!(std::fs::read_to_string(&media_xml).unwrap(), stale);
+    assert_eq!(marker().await.as_deref(), Some("1"));
+
+    // Third boot: done, never again.
+    std::fs::remove_file(&xml).unwrap();
+    boot(&db, &config).await;
+    assert!(!xml.exists(), "the repair runs once");
+}

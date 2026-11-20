@@ -2313,6 +2313,127 @@ pub async fn run_expand_saved_playlist_containers(
     }
 }
 
+/// What [`save_playlist_xml_once`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedPlaylistXml {
+    /// Files written.
+    pub written: usize,
+    /// Playlists whose file could not be written; the repair runs again on
+    /// the next boot.
+    pub pending: usize,
+    /// The first of those failures, for the one warning.
+    pub first_error: Option<String>,
+}
+
+/// Writes the `playlist.xml` of every playlist in the playlists folder once,
+/// from what the database holds (gl-341). No earlier Ferrofin wrote the file:
+/// a playlist Jellyfin made keeps the file Jellyfin last wrote, whatever was
+/// changed here since, and a refresh now reads that file (a full refresh
+/// merges its shares into the stored ones), so a share removed, or a name or
+/// lock changed, since adoption would come back from it. A playlist the saver
+/// does not write (a server-wide disable list) is left alone. When a file
+/// cannot be written, the repair runs again on the next boot, and then writes
+/// every playlist's file again.
+///
+/// During a rolling update the previous version keeps serving after this
+/// ran: a change it makes to a playlist is not in that playlist's file until
+/// the playlist is next changed here, and until then a full refresh of it can
+/// take a share the previous version removed back from the file.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the playlists cannot be listed or the marker
+/// write fails.
+pub async fn save_playlist_xml_once(
+    db: &Database,
+    playlists: &crate::FerrofinPlaylistManager,
+    saver: &ferrofin_providers::container_xml::ContainerXmlSaver,
+    persistence: &dyn ItemPersistenceService,
+) -> Result<SavedPlaylistXml, ServiceError> {
+    const KEY: &str = "playlist_xml_saved_v1";
+    let mut result = SavedPlaylistXml::default();
+    if !once(db, KEY).await? {
+        return Ok(result);
+    }
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as(r#"SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ?1 ORDER BY rowid"#)
+            .bind(stored_type_name(BaseItemKind::Playlist).unwrap_or_default())
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+    for (id, path) in rows {
+        let (Ok(id), Some(path)) = (Uuid::parse_str(&id), path) else {
+            continue;
+        };
+        if !playlists.in_playlists_folder(&path) {
+            continue;
+        }
+        // `MetadataEdit`, as a playlist manager change saves it; the stamp
+        // after the write keeps the file from reading as changed.
+        let outcome = match saver
+            .save(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
+            .await
+        {
+            Ok(true) => persistence.touch_item_updated(id).await.map(|_| true),
+            other => other,
+        };
+        match outcome {
+            Ok(true) => result.written += 1,
+            Ok(false) => {}
+            // One line per playlist would scale with the library: the count
+            // is the caller's warning.
+            Err(err) => {
+                tracing::debug!(
+                    %err,
+                    item_id = %id,
+                    path = %path,
+                    "could not save a playlist's playlist.xml"
+                );
+                result.pending += 1;
+                result
+                    .first_error
+                    .get_or_insert_with(|| format!("{path}: {err}"));
+            }
+        }
+    }
+    if result.pending == 0 {
+        done(db, KEY).await?;
+    }
+    Ok(result)
+}
+
+/// [`save_playlist_xml_once`] and its log line, for the composition root. A
+/// failure is logged, not returned: the repair is not needed to serve, and it
+/// runs again on the next boot.
+pub async fn run_save_playlist_xml_once(
+    db: &Database,
+    playlists: &crate::FerrofinPlaylistManager,
+    saver: &ferrofin_providers::container_xml::ContainerXmlSaver,
+    persistence: &dyn ItemPersistenceService,
+) {
+    match save_playlist_xml_once(db, playlists, saver, persistence).await {
+        Ok(SavedPlaylistXml {
+            written: 0,
+            pending: 0,
+            ..
+        }) => {}
+        Ok(did) if did.pending > 0 => tracing::warn!(
+            written = did.written,
+            pending = did.pending,
+            first_error = did.first_error.as_deref().unwrap_or_default(),
+            "could not save the playlist.xml of some playlists in the playlists folder \
+             (each one's reason is logged at debug); the repair runs again on the next boot"
+        ),
+        Ok(did) => tracing::info!(
+            written = did.written,
+            "wrote the playlist.xml of the playlists in the playlists folder from the database"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not write the playlists' playlist.xml; the repair runs again on the next boot"
+        ),
+    }
+}
+
 /// The extension of the database snapshot
 /// [`merge_legacy_collections_library`] takes
 /// (`jellyfin.db.pre-collections-library`).
