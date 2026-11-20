@@ -9,17 +9,28 @@ stage changes it, and Ferrofin stops. Then `ferrofin-server export-jellyfin` fro
 exports the result, the Jellyfin release that `UPSTREAM_TAG` names boots on the export, and its answers
 are compared with Ferrofin's.
 
-| Route | Source | Ferrofin runs at | Jellyfin on the export |
+| Route | Source (adopted as) | Ferrofin runs at | Jellyfin on the export |
 |---|---|---|---|
-| `10.11.8` | `jellyfin-10.11.8` | `/data` | applies no schema migration (the exported history records the 20 that Ferrofin's own migrations already applied) and runs the 19 code migrations it runs on a 10.11.8 database of its own |
-| `12.4-from-123` | `jellyfin-12.4-from-123` | `/config` | runs no migration: the history is already the 12.2 set, which 12.3 and 12.4 keep |
+| `10.11.8`, `10.11.9` | `jellyfin-10.11.8`, `jellyfin-10.11.9` (10.11.8) | `/data` | applies no schema migration (the exported history records the 20 that Ferrofin's own migrations already applied) and runs the 19 code migrations it runs on a database of that release of its own |
+| `10.11.10`, `10.11.11` | `jellyfin-10.11.10`, `jellyfin-10.11.11` (10.11.11) | `/data` | applies none (the history records 18) and runs 18 code migrations; its own first start there runs `UpdateNormalizedUsername` too, which the source records: there the first schema migration it applies reverts the later ones, and `AddNormalizedUsername`'s `Down` drops that routine's row |
+| `12.0` | `jellyfin-12.0` (12.0.0) | `/data` | applies none (the history records `MakeOwnerIdIndexesPartial`) and runs 5 code migrations |
+| `12.1-from-10`, `12.1-from-12` | `jellyfin-12.1-from-10`, `jellyfin-12.1-from-12` (12.1.0) | `/data` | applies none (the history records `MakeOwnerIdIndexesPartial`) and runs 3 code migrations |
+| `12.2-from-10`, `12.2-from-12`, `12.2-from-121`, `12.3-from-122`, `12.3-from-10` | the fixture of that name (12.2.0) | `/data` | runs no migration: the history is already the 12.2 set, which 12.3 and 12.4 keep |
+| `12.4-from-123` | `jellyfin-12.4-from-123` (12.2.0) | `/config` | runs no migration, as above |
 
-The routes are in [`routes.sh`](routes.sh). The other generations come with their history rule.
-Jellyfin always runs at `/config`, its image's layout. On the `10.11.8` route Ferrofin runs at `/data`, its
-own image's directory, and the export reads it there, so the export must rewrite every stored path from
-`/data` onto `/config`: with source and output both at `/config`, a missed rewrite could not show.
-Without the history rewrite, Jellyfin's start fails on the `10.11.8` route:
-`migration 20260113102337_AddLinkedChildrenTable failed: SQLite Error 1: 'table "LinkedChildren" already exists'`.
+The routes are in [`routes.sh`](routes.sh), one per source generation and upgrade route. TODO, open work:
+routes for the other fixtures. Their history is the set of a route above: `jellyfin-12.4-from-10`, the fresh
+installs, the Debian-layout fixture and `jellyfin-12.4-messy` adopt as 12.2.0, whose history the export keeps as
+it is (the 12.2 to 12.4 routes); `jellyfin-10.11.11-messy` and `jellyfin-10.11.11-scale` are copies of
+`jellyfin-10.11.11` (the `10.11.10` and `10.11.11` routes). `build-fixtures.sh` already logs Jellyfin 12.4's
+first start on the fresh installs of 12.2 and 12.3.
+Jellyfin always runs at `/config`, its image's layout. Ferrofin runs at
+`/data`, its own image's directory, on every route but `12.4-from-123`, and the export reads it there, so the
+export must rewrite every stored path from `/data` onto `/config`: with source and output both at `/config`, a
+missed rewrite could not show. Without the history rewrite, Jellyfin's start fails on the 10.11 routes:
+`migration 20260113102337_AddLinkedChildrenTable failed: SQLite Error 1: 'table "LinkedChildren" already exists'`;
+on the 12.0 and 12.1 routes it applies `20261002210711_MakeOwnerIdIndexesPartial`, which the check below fails;
+the 12.2 and later routes have nothing to rewrite.
 
 ## Running it
 
@@ -28,7 +39,7 @@ export FERROFIN_GATES_DIR=/srv/gates          # the gates' output root (../READM
 gates/adoption/build-fixtures.sh              # the fixtures, once (the adoption gate's own)
 docker build --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t ferrofin:bench .
 docker pull jellyfin/jellyfin:12.4            # the release UPSTREAM_TAG names
-gates/roundtrip/run.sh                        # both routes; --only 10.11.8 for one
+gates/roundtrip/run.sh                        # every route; --only 10.11.8,12.0 for some
 ```
 
 It prints one `PASS`/`FAIL` line per route, and the reasons. It exits 1 if a route failed and 2 if
@@ -50,7 +61,7 @@ events, the adoption report's format). Each route also has a folder with:
 
 Options: `--image IMAGE` (default `ferrofin:bench`), `--jellyfin-image IMAGE` (default
 `jellyfin/jellyfin:<minor of UPSTREAM_TAG>`), `--fixtures DIR` (default the adoption fixtures under the
-output root), `--only ROUTE`, `--run-id ID` and `--work DIR` (the run directory). The gate never builds
+output root), `--only ROUTE[,ROUTE…]`, `--run-id ID` and `--work DIR` (the run directory). The gate never builds
 or pulls an image. It runs Jellyfin by its image id, and the report names both images with their ids, so
 a later `docker pull` of the same tag is never confused with this run's.
 It refuses a fixture or work directory on a network filesystem, and so a real library or a NAS: the
@@ -79,7 +90,7 @@ Settings (environment), each a whole number of seconds:
 | Jellyfin | ready | its start failed (`Main: Error while starting server`; it keeps answering 503, so the wait stops at that line), it exited (named with its status), or it is not ready within `ROUNDTRIP_READY_TIMEOUT`. Ready is `/System/Ping` and then `/System/Info/Public` answering: Jellyfin's setup server answers `/System/Info/Public` while Jellyfin still runs its last migrations and optimises the database, and 503 to everything else; the real server then answers only `/System/Ping` until its core startup completes |
 | | its startup tasks finish | no scheduled task runs on two polls in a row, within `ROUNDTRIP_SCAN_TIMEOUT` |
 | | every migration it began finished | a `Perform migration` with no `was successfully applied`, named with its SQLite error ([`checks_boot.py`](checks_boot.py)); a log with no entry at all fails too |
-| | it ran the code migrations it runs on the source, and no schema migration | it applied a schema migration, which the exported history should record; or the code migrations it ran differ from those its own first start on the route's source ran, which `build-fixtures.sh` logged (`<fixture>.server.log` of the route's fourth field in `routes.sh`), so the fixtures must have been built with the Jellyfin image the gate runs. A history that records too much shows here: the code migrations it left out do not run |
+| | it ran the code migrations it runs on the source, and no schema migration | it applied a schema migration, which the exported history should record; or the code migrations it ran differ from those its own first start on the route's source ran, which `build-fixtures.sh` logged (the route's fourth field in `routes.sh`, `<it>.server.log` under the fixtures: a 12.4 fixture's build on that source, or the first start it gives the source, `oracle/first-start-12.4/<fixture>.server.log`), less those the source's history records (they ran there only after a revert, as on the 10.11.10 route), so the fixtures must have been built with the Jellyfin image the gate runs. A history that records too much shows here: the code migrations it left out do not run |
 | | no ERR or FTL outside the allowlist | an error entry other than the blocked plugin repository, up to the probes; an error a probe causes is judged by the answers instead |
 | | every playlist's full metadata refresh completes | a playlist's `DateLastRefreshed` in its database has not moved within `ROUNDTRIP_SCAN_TIMEOUT` of `POST /Items/{id}/Refresh?metadataRefreshMode=FullRefresh` (jellyfin-web's "Refresh metadata", replacing nothing, for the metadata only), sent for every playlist its database holds ([`api.py`](api.py) `refresh-playlists`); or its database holds no playlist (the check would refresh nothing); or a refresh request is refused or unanswered. A full refresh runs every metadata reader whatever the file's time, so a stale `playlist.xml` in the export would merge its shares back (`PlaylistMetadataService.MergeData`), which the answers then show |
 | | answers equal Ferrofin's before the stop | `answers.txt` differs from `oracle.txt` through `adoption_normalise`, which leaves out ids, image sizes and the probes that differ by design; or the `userdata` lines differ with their item ids kept; or no answers came within `ROUNDTRIP_SCAN_TIMEOUT` |
@@ -93,12 +104,15 @@ fails, the route stops there.
 
 ### Controls
 
-Two runs show that the gate fails on a wrong history. Neither is part of a run; they are done by hand
-when the history rule or the checks above change:
+These runs show that the gate fails on a wrong history or wrong paths. None is part of a run; they are done
+by hand when the history rule or the checks above change:
 
 - **The history left as the source had it:** run the gate with `--image` of a build whose export does not
-  rewrite the history. Jellyfin's start fails on the `10.11.8` route, naming
-  `20260113102337_AddLinkedChildrenTable` (`table "LinkedChildren" already exists`).
+  rewrite the history, or, in a scratch copy of `gates/`, have `export_stage` copy the history of
+  `$dst/ferrofin/data/jellyfin.db` over the export's after the export. Jellyfin's start fails on the four 10.11
+  routes, naming `20260113102337_AddLinkedChildrenTable` (`table "LinkedChildren" already exists`); on the
+  `12.0` and both `12.1` routes it starts, and "it ran the code migrations it runs on the source, and no schema
+  migration" fails, naming `20261002210711_MakeOwnerIdIndexesPartial`; the 12.2 and later routes pass.
 - **Stored paths left as the source had them:** run the gate with `--image` of a build whose export does
   not rewrite the stored paths. On the `10.11.8` route "every stored path is in the export, none under the
   directory Ferrofin ran at" fails, naming `/data/…` paths.
@@ -245,8 +259,8 @@ The gate reuses the adoption gate's parts: its fixtures, `smoke.sh`, `lib.sh` (`
 
 - [`tests/fake_docker`](tests/fake_docker) plays each container with
   [`tests/fake_server.py`](tests/fake_server.py), and the export with a copy, so whole routes run:
-  - both routes passing every check on the export, Jellyfin running on the 10.11.8 route the code
-    migrations the export left to run;
+  - the `10.11.8` and `12.4-from-123` routes (`--only`) passing every check on the export, Jellyfin
+    running on the 10.11.8 route the code migrations the export left to run;
   - an export that leaves the history as it was (the 10.11.8 route fails with the migration named), one
     that records every id (no code migration runs), one that fails, one that never ends and a run stopped
     during the export;
@@ -258,6 +272,9 @@ The gate reuses the adoption gate's parts: its fixtures, `smoke.sh`, `lib.sh` (`
   - a Ferrofin that exits at once, and one that does not exit 0 on TERM;
   - a run stopped mid-stage (it removes its containers and its tag);
   - the refusals, and two runs at the same time sharing nothing, run directories included.
+- [`tests/test_routes.py`](tests/test_routes.py) checks every route of `routes.sh` against the fixtures
+  `build-fixtures.sh` builds: its fixture, the generation Ferrofin adopts it as, and the first-start log it
+  returns to.
 - Canned Jellyfin logs exercise `checks_boot.py`.
 - Databases shaped as Jellyfin's tables exercise `checks_paths.py` and what `probes.py` probes.
 - The same fake server, in process, exercises `usage.py` and `answers.py` (a lost write included, a copy

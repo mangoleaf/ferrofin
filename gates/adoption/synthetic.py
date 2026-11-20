@@ -69,6 +69,12 @@ DEBIAN = {"data": "/var/lib/jellyfin", "config": "/etc/jellyfin", "cache": "/var
 # gates/adoption/run.sh adopts such a fixture into Ferrofin's own directories, as a package
 # migration does, so the boot repair has those paths to point at the copies.
 LAYOUTS = {"jellyfin-12.4-debian": DEBIAN}
+# The release every round trip returns to (gates/roundtrip), and the fixtures first_start gives a first
+# start of that release on a throwaway copy: every older fixture no fixture of that release is built from
+# (the build log of one built from it, 12.4-from-10 on 10.11.8, is that first start already).
+RETURN_RELEASE = "12.4"
+FIRST_STARTS = tuple(name for name, version, _ in VERSIONS if version != RETURN_RELEASE and name not in
+                     {parent for _, release, parent in VERSIONS if release == RETURN_RELEASE})
 
 
 def carries_chain(name):
@@ -228,9 +234,34 @@ def build(root, only, port):
         print(name + " built and validated", flush=True)
 
 
+def first_start(root, port):
+    """Jellyfin RETURN_RELEASE's own first start on a throwaway copy (under work/) of each of FIRST_STARTS,
+    its log kept as oracle/first-start-<release>/<fixture>.server.log: the migrations it ran there are the
+    ones it must run on the round trip's export of that fixture (gates/roundtrip/routes.sh). A log is kept
+    only once the server came up; a failed start leaves its copy and log in work/ and is started again."""
+    out = root / "oracle" / f"first-start-{RETURN_RELEASE}"
+    out.mkdir(parents=True, exist_ok=True)
+    for name in FIRST_STARTS:
+        log = out / (name + ".server.log")
+        if log.exists():
+            continue
+        copy = root / "work" / f"first-start-{name}"
+        cache = copy.with_name(copy.name + "-cache")
+        for left in (copy, cache):   # a failed start's throwaway copy
+            if left.exists():
+                shutil.rmtree(left)
+        shutil.copytree(root / name, copy)
+        with server("jellyfin/jellyfin:" + RETURN_RELEASE, copy, root / "media", "synthetic-first-start", port):
+            pass
+        os.replace(copy.with_name(copy.name + ".server.log"), log)
+        shutil.rmtree(copy)
+        shutil.rmtree(cache)
+        print(f"{log.relative_to(root)}: Jellyfin {RETURN_RELEASE}'s first start on {name}", flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("build", "run", "upgrade"))
+    parser.add_argument("mode", choices=("build", "first-start", "run", "upgrade"))
     parser.add_argument("--fixtures", type=Path,
                         help="default: FERROFIN_ADOPTION_FIXTURES, else the fixtures build-fixtures.sh builds under FERROFIN_GATES_DIR")
     parser.add_argument("--only", choices=[row[0] for row in VERSIONS])
@@ -255,6 +286,8 @@ def main(argv=None):
         subprocess.run(["bash", "-c", '. "$1"; gates_require_local "$2"', "_", lib, str(root)], check=True)
         if args.mode == "build":
             build(root, args.only, args.port)
+        elif args.mode == "first-start":
+            first_start(root, args.port)
         elif args.mode == "upgrade":
             from upgrade import run
             run(root, args.starts, args.image, args.only, args.port)
