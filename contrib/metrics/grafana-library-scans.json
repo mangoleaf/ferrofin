@@ -811,7 +811,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Post-scan pass durations",
-      "description": "Average duration of each closing pass of a library validation (music enrichment, album covers, years, artists, folder aggregates, by-name paths, studio images, library tiles, dynamic images), stacked: the bar is the whole closing phase.",
+      "description": "Average duration of each closing pass of a library validation (music enrichment, album covers, artists, folder aggregates, by-name paths, studio images, library tiles, dynamic images), stacked: the bar is the whole closing phase.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

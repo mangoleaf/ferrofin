@@ -1072,9 +1072,9 @@ async fn a_series_last_media_date_follows_its_episodes_and_sorts_folders() {
 }
 
 /// The library-wide closing passes run on every library validation, each
-/// by its own persisted selection: a `Year` row deleted behind the scan's
-/// back is put back by the next rescan, though that rescan changes nothing
-/// else.
+/// by its own persisted selection: a genre no item names, added behind the
+/// scan's back, is swept by the next rescan, though that rescan changes
+/// nothing else.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_quiet_rescan_still_runs_the_closing_passes() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -1105,38 +1105,35 @@ async fn a_quiet_rescan_still_runs_the_closing_passes() {
         db.clone(),
         Arc::new(ItemTypeLookup::new()),
     ));
-    let years = ferrofin_core::YearStore::new(
-        persistence.clone(),
-        ferrofin_core::item_type_lookup::IdDerivation::Jellyfin {
-            program_data_path: None,
-        },
-        tmp.path().join("metadata/Year"),
-    );
     let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
         .with_items(items)
-        .with_years(years)
         .with_progress_every(0);
     let count = || async {
-        sqlx::query_scalar::<_, i64>(
-            r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE '%Entities.Year'"#,
-        )
-        .fetch_one(db.pool())
-        .await
-        .expect("years")
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Name" = 'Orphan'"#)
+            .fetch_one(db.pool())
+            .await
+            .expect("orphans")
     };
     scanner.scan_all().await.expect("scan");
+    sqlx::query(
+        r#"INSERT INTO "BaseItems"
+           ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
+            "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "CleanName")
+           VALUES ('0D1C0D1C-0000-4000-8000-000000000001',
+                   'MediaBrowser.Controller.Entities.Genre', 1, 0, 0, 0, 0, 0, 0,
+                   'Orphan', 'orphan')"#,
+    )
+    .execute(db.writer())
+    .await
+    .expect("seed dead genre");
     assert_eq!(count().await, 1);
-    sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Type" LIKE '%Entities.Year'"#)
-        .execute(db.writer())
-        .await
-        .expect("delete");
     let quiet = scanner.scan_all().await.expect("rescan");
     assert_eq!(
         quiet.created + quiet.updated + quiet.removed,
         0,
         "{quiet:?}"
     );
-    assert_eq!(count().await, 1, "the missing year is put back");
+    assert_eq!(count().await, 0, "the dead genre is swept");
 }
 
 /// A library scan cancelled once its walk is done — at the 96 % mark,
