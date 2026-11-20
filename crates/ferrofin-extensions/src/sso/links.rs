@@ -13,6 +13,8 @@
 //!   that cookie, links nothing; `SsoService::link_verified` then links the
 //!   verified identity to the flow's account instead of looking one up, and
 //!   answers its own page, with no exchange code and no session.
+//! - An identity without the provider's required role is refused, as at a
+//!   sign-in (B8).
 //! - An identity another account has is refused, and nothing moves. A
 //!   second identity at the same issuer replaces the account's earlier one
 //!   (the store's rule).
@@ -38,6 +40,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::accounts::PROVIDER_ID;
+use super::roles::check_required_role;
 use super::sign_in::{VerifiedIdentity, escape_html, page};
 use super::{SsoConfig, SsoService};
 
@@ -220,9 +223,6 @@ impl SsoService {
         user_id: Uuid,
         identity: VerifiedIdentity,
     ) -> Result<SsoReply, ServiceError> {
-        // TODO(gl-1894): the provider's required role applies to a link as to
-        // a sign-in: once the role check has merged, refuse an identity
-        // without it here, with `sso::roles::check_required_role`.
         let key = provider.key.as_str();
         let refused = |reason: &'static str, status, advice: &str| {
             tracing::warn!(oidc_provider = %key, reason, "OIDC link refused");
@@ -232,6 +232,15 @@ impl SsoService {
                 &format!("<p>{}</p>", escape_html(advice)),
             )
         };
+        // The provider's required role applies to a link as to a sign-in
+        // (B8): an identity without it links nothing and replaces nothing.
+        if let Err(refusal) = check_required_role(provider, &identity) {
+            return Ok(refused(
+                refusal.reason,
+                refusal.status,
+                refusal.advice.unwrap_or("Linking failed. Try again."),
+            ));
+        }
         // The store never finds an empty subject: such a link would sign
         // nobody in.
         if identity.subject.is_empty() {

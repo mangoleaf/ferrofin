@@ -16,7 +16,7 @@ use ferrofin_traits::sso::{OidcCallback, OidcExchangeRefusal, OidcExchangeReply}
 use super::*;
 use crate::sso::EXTENSION_ID;
 use crate::sso::fake_idp::{SUBJECT, USERNAME};
-use crate::sso::sign_in::tests::Harness;
+use crate::sso::sign_in::tests::{Harness, PUBLIC_URL};
 
 const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
 const PASSWORD: &str = "alice-local-password";
@@ -735,4 +735,86 @@ async fn a_removal_during_an_exchange_signs_its_session_out() {
             .is_err(),
         "and signed out by it"
     );
+}
+
+/// B8 applies to a link as to a sign-in: an identity without the provider's
+/// required role is refused, with a page saying so, and nothing is linked or
+/// replaced; with the role it links.
+#[tokio::test]
+async fn an_identity_without_the_required_role_links_nothing() {
+    let harness = Harness::with(Some(PUBLIC_URL), |provider| {
+        "ferrofin-users".clone_into(&mut provider.required_role);
+    })
+    .await;
+    let alice = local(&harness, "alice").await;
+    let roles = |groups: serde_json::Value| {
+        harness.fake.sign_in(|sign_in| {
+            sign_in.claims.insert("groups".to_owned(), groups);
+        });
+    };
+    roles(serde_json::json!(["ferrofin-users"]));
+    assert_eq!(link(&harness, &alice).await.status, 200);
+
+    // The same account, at another subject without the role: refused, and
+    // the earlier link is not replaced.
+    roles(serde_json::json!(["another-group"]));
+    harness
+        .fake
+        .sign_in(|sign_in| sign_in.subject = "alice-second".to_owned());
+    let page = link(&harness, &alice).await;
+    assert_eq!(page.status, 403, "{}", page.html);
+    assert!(page.html.contains("Link refused"), "{}", page.html);
+    assert!(
+        page.html
+            .contains("does not have the role this server requires"),
+        "{}",
+        page.html
+    );
+    assert!(!page.html.contains("ferrofin-users"), "no role on the page");
+    assert_eq!(owner(&harness, "alice-second").await, None);
+    assert_eq!(owner(&harness, SUBJECT).await, Some(id(&alice)));
+}
+
+/// An exchange whose identity was unlinked since its callback is refused
+/// before role sync: the account's rights are left as they were.
+#[tokio::test]
+async fn an_unlinked_exchange_syncs_no_roles() {
+    let harness = Harness::with(Some(PUBLIC_URL), |provider| {
+        provider.role_sync = true;
+        "ferrofin-admins".clone_into(&mut provider.admin_role);
+    })
+    .await;
+    let alice = local(&harness, "alice").await;
+    harness.fake.sign_in(|sign_in| {
+        sign_in
+            .claims
+            .insert("groups".to_owned(), serde_json::json!(["ferrofin-admins"]));
+    });
+    assert_eq!(link(&harness, &alice).await.status, 200);
+    let completed = harness.completed().await;
+    harness
+        .sso
+        .remove_oidc_link(id(&alice), OidcLinkAt::Provider("fake"))
+        .await
+        .expect("removed");
+
+    assert_eq!(
+        swap(&harness, &completed, "browser-late")
+            .await
+            .outcome
+            .map(|session| session.user.name),
+        Err(OidcExchangeRefusal {
+            status: 400,
+            message: "Sign-in failed. Try again.".to_owned()
+        })
+    );
+    let after = reread(&harness, &alice).await;
+    let policy = harness
+        .users
+        .get_user_dto(&after, None)
+        .await
+        .expect("a DTO")
+        .policy
+        .expect("a policy");
+    assert!(!policy.is_administrator, "no role was synced");
 }
