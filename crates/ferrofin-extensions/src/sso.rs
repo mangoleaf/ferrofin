@@ -31,7 +31,9 @@
 //!   administrator flag in step with them;
 //! - [`complete`]: the completion page the callback answers, and the
 //!   exchange of its one-time code for the session, under the account rules
-//!   of a password sign-in.
+//!   of a password sign-in;
+//! - [`login_buttons`]: the "Sign in with" buttons jellyfin-web's login page
+//!   shows under its form.
 //!
 //! An identity provider is contacted only when an admin saves a provider or a
 //! user signs in with it (B1).
@@ -62,6 +64,7 @@ pub mod discovery;
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake_idp;
 pub mod flows;
+pub mod login_buttons;
 pub mod oidc_http;
 pub mod roles;
 pub mod sign_in;
@@ -91,7 +94,7 @@ pub const MAX_PROVIDER_KEY_LEN: usize = 32;
 /// route and the file on disk can hold one that does not read, or that the
 /// provider routes would refuse, and a save of one provider keeps the others
 /// as they are, members a newer server added included.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct SsoConfig {
     /// The server's public URL the callback URLs are built on, base path
@@ -101,6 +104,21 @@ pub struct SsoConfig {
     /// The OIDC providers, each an [`OidcProvider`] document.
     #[serde(deserialize_with = "crate::ldap_auth::null_as_empty")]
     pub providers: Vec<serde_json::Value>,
+    /// Shows a sign-in button per provider on jellyfin-web's login page
+    /// ([`SsoManager::login_buttons`]); on by default (D7), a stored `null`
+    /// included.
+    #[serde(deserialize_with = "null_as_on")]
+    pub show_login_button: bool,
+}
+
+impl Default for SsoConfig {
+    fn default() -> Self {
+        Self {
+            public_url: String::new(),
+            providers: Vec::new(),
+            show_login_button: true,
+        }
+    }
 }
 
 impl SsoConfig {
@@ -138,6 +156,12 @@ impl SsoConfig {
             })
             .collect()
     }
+}
+
+/// Reads a switch that is on by default: a JSON `null` is on, as an absent
+/// member is.
+fn null_as_on<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(true))
 }
 
 /// The provider members a stored document must not keep: a client secret
@@ -654,6 +678,10 @@ impl SsoManager for SsoService {
     ) -> Result<OidcExchangeReply, ServiceError> {
         self.exchange_sign_in(&code, flow_cookie.as_ref(), request)
             .await
+    }
+
+    async fn login_buttons(&self) -> Result<Option<String>, ServiceError> {
+        self.login_button_forms().await
     }
 }
 

@@ -261,6 +261,11 @@ impl SsoManager for FakeSso {
             set_cookies: vec![format!("{OIDC_FLOW_COOKIE}=; Path=/sso; Max-Age=0")],
         })
     }
+
+    /// None: `tests/branding.rs` covers the buttons the branding route reads.
+    async fn login_buttons(&self) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
 }
 
 /// The session [`FakeSso`] answers the exchange code `good` with.

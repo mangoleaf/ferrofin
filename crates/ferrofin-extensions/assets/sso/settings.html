@@ -18,8 +18,9 @@
         set as text, never parsed as HTML. A provider is saved with
         `PUT /sso/admin/oidc/providers/{key}`, which then tests the provider's
         discovery document, and removed with `DELETE`; the provider's row shows
-        what the test found until the page is left. The public URL is saved
-        through the plugin configuration. No route returns
+        what the test found until the page is left. The public URL and the
+        login page's sign-in button switch are saved through the plugin
+        configuration. No route returns
         a stored client secret, so the secret field always starts empty, and an
         empty one keeps the stored secret.
     -->
@@ -100,6 +101,26 @@
                             is empty, the Published server URL in Ferrofin Settings is used.
                         </div>
                         <div class="fieldDescription ssoRefused ssoPublicUrlError hide" role="alert"></div>
+                    </div>
+                    <button is="emby-button" type="submit" class="raised button-submit block">
+                        <span>Save</span>
+                    </button>
+                </form>
+
+                <form class="ssoLoginButtonForm verticalSection" novalidate>
+                    <h3 class="sectionTitle">Login page</h3>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoShowLoginButton" />
+                            <span>Show a sign-in button for each provider</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            Adds "Sign in with" and the provider's name under the web client's login form, for each
+                            enabled provider, once a public URL is known. The button is added to the login
+                            disclaimer the server sends every app, so an app that shows the disclaimer on its own
+                            login screen may show the button's text or markup there. Turn this off to remove it
+                            for every app; the branding you saved is never changed.
+                        </div>
                     </div>
                     <button is="emby-button" type="submit" class="raised button-submit block">
                         <span>Save</span>
@@ -553,9 +574,43 @@
                     });
                 }
 
+                /** The login page's sign-in button switch, kept in the plugin configuration. */
+                function bindLoginButton(page) {
+                    var checkbox = field(page, 'ssoShowLoginButton');
+                    var error = field(page, 'ssoError');
+                    page.addEventListener('pageshow', function () {
+                        ApiClient.getPluginConfiguration(PLUGIN_ID).then(function (config) {
+                            // On unless saved off, as the server reads it.
+                            checkbox.checked = config.ShowLoginButton !== false;
+                        }, function (failure) {
+                            return failureText(failure, 'load the sign-in button setting').then(function (text) {
+                                showError(error, text);
+                            });
+                        });
+                    });
+                    field(page, 'ssoLoginButtonForm').addEventListener('submit', function (event) {
+                        event.preventDefault();
+                        showError(error, '');
+                        Dashboard.showLoadingMsg();
+                        ApiClient.getPluginConfiguration(PLUGIN_ID).then(function (config) {
+                            config.ShowLoginButton = checkbox.checked;
+                            return ApiClient.updatePluginConfiguration(PLUGIN_ID, config);
+                        }).then(function (result) {
+                            Dashboard.processPluginConfigurationUpdateResult(result);
+                        }, function (failure) {
+                            return failureText(failure, 'save the sign-in button setting').then(function (text) {
+                                showError(error, text);
+                            });
+                        }).finally(function () {
+                            Dashboard.hideLoadingMsg();
+                        });
+                    });
+                }
+
                 function bind(page) {
                     var state = { list: null, editing: null, discovery: {} };
                     page.setAttribute('data-sso-bound', 'true');
+                    bindLoginButton(page);
                     page.addEventListener('pageshow', function () {
                         state.discovery = {};
                         closeEditor(page, state);

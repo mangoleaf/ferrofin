@@ -3646,6 +3646,29 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "get",
+        path: "/Branding/Configuration",
+        upstream_file: "Jellyfin.Api/Controllers/BrandingController.cs",
+        upstream_method: "GetBrandingOptions",
+        ferrofin: "handlers/branding.rs get_branding_options (anonymous, as the controller has \
+               no [Authorize]; no parameter) → ferrofin-core configuration_manager.rs \
+               get_branding (read_named_kept: GetConfiguration<BrandingOptions>(\"branding\")) → \
+               the BrandingOptionsDto projection, SplashscreenLocation left out, nulls omitted \
+               as JsonDefaults' WhenWritingNull does → login_buttons and with_login_buttons over \
+               SsoManager::login_buttons (ferrofin-extensions sso/login_buttons.rs)",
+        date: "2026-11-20",
+        divergences: &[
+            "While the Single Sign-On plugin (Ferrofin's own: Jellyfin has no sign-in through an \
+         identity provider) is enabled with ShowLoginButton on, a usable public URL and at least \
+         one enabled provider, LoginDisclaimer is the stored text, a blank line, then one \
+         \"Sign in with\" <form> per provider between <!-- ferrofin:sso-login-buttons --> \
+         marker comments, for every client (D7 and D17 of the OIDC sign-in milestone). In \
+         every other case, a plugin configuration that does not read included, the body is \
+         the stored configuration's, unchanged, as upstream's. Deliberate.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
         path: "/Branding/Splashscreen",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "GetSplashscreen",
@@ -3678,7 +3701,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UploadCustomSplashscreen",
         ferrofin: "handlers/branding.rs upload_splashscreen → handlers/image_upload.rs \
                (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
-               to_extension, decode_base64)",
+               to_extension, decode_base64) → the write and the save on handlers.rs \
+               run_detached's task, so a client that hangs up once the body is in stops \
+               neither, as upstream's CancellationToken.None copy and synchronous save",
         date: "2026-10-28",
         divergences: &[
             "The body is decoded in full before anything is written, and the location is \
@@ -4378,7 +4403,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UpdateNamedConfiguration",
         ferrofin: "handlers/config.rs update_named_configuration (RequiredRouteString key: \
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
-               GetConfigurationType and Deserialize) → save_named_configuration, on \
+               GetConfigurationType and Deserialize) → for branding, strip_login_buttons, \
+               then ServerConfigurationManager::update_branding and the committed checks on \
+               run_detached's task; otherwise save_named_configuration, on \
                handlers.rs run_detached's task so it finishes for a client that hangs up, in \
                the request's span and culture \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
@@ -4395,10 +4422,15 @@ pub const VERIFIED: &[Verified] = &[
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
                RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
                and provider saves run too, as upstream's save of livetv does)",
-        date: "2026-11-15",
+        date: "2026-11-20",
         divergences: &[
             "database is refused with a 400: Ferrofin has no other database provider (owner \
          decision 2026-10-23).",
+            "A branding LoginDisclaimer is saved without the Single Sign-On sign-in buttons \
+         GET /Branding/Configuration appends (the block between its \
+         <!-- ferrofin:sso-login-buttons --> markers and the blank line before it), as \
+         POST /System/Configuration/Branding saves it. Ferrofin's own: upstream has no such \
+         block.",
             "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
          the database, so lists in a posted document are stored with it but neither add nor \
          change a tuner or a provider.",
@@ -4445,6 +4477,38 @@ pub const VERIFIED: &[Verified] = &[
          entry whole.",
             "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/System/Configuration/Branding",
+        upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
+        upstream_method: "UpdateBrandingConfiguration",
+        ferrofin: "handlers/config.rs update_branding_configuration (RequireAdminWithDefault: \
+               RequiresElevation; JsonBody<BrandingOptionsDto>: [FromBody, Required] through \
+               JsonDefaults' converters, member names matched ignoring case, an empty or null \
+               body a 400) → on handlers.rs run_detached's task, so the synchronous action's \
+               save finishes for a client that hangs up, in the request's span and culture: \
+               ferrofin-core configuration_manager.rs get_branding \
+               (GetConfiguration(\"branding\"), which keeps SplashscreenLocation) → the DTO's \
+               LoginDisclaimer, CustomCss and SplashscreenEnabled over it → handlers/branding.rs \
+               strip_login_buttons → update_branding (SaveConfiguration(\"branding\", …): the \
+               atomic write, then the listeners) → run_committed_checks. Every spelling of \
+               POST /System/Configuration/branding reaches it, jellyfin-web's \
+               updateNamedConfiguration('branding') included, as ASP.NET prefers this literal \
+               route to Configuration/{key}",
+        date: "2026-11-20",
+        divergences: &[
+            "A LoginDisclaimer holding the Single Sign-On sign-in buttons \
+         GET /Branding/Configuration appends (the block between its \
+         <!-- ferrofin:sso-login-buttons --> markers, and the blank line before it, in \\n \
+         line breaks as jellyfin-web 12.4 sends them, or \\r\\n) is saved without them, so \
+         jellyfin-web's branding page, which saves the text it was served, never stores the \
+         buttons (D7 of the OIDC sign-in milestone). Ferrofin's own: upstream has no such \
+         block.",
+            "The 404 and 500 bodies (a store that cannot be read or written, or a committed \
+         check that fails) are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
