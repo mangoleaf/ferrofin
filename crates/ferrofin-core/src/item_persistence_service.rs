@@ -4980,7 +4980,9 @@ pub(crate) enum RekeyKind {
     /// Only its id and stored type change, not what it is — a Jellyfin
     /// 10.11 local alternate version stored as a `Video` that 12.x keeps as
     /// its primary's kind: it keeps its refresh stamp and provider ids (the
-    /// same title's), so no scan re-probes or re-matches it.
+    /// same title's), so the move itself has no scan re-probe or re-match it
+    /// (`adoption_repairs::rederive_adopted_versions` then clears an adopted
+    /// local version's stamp).
     Represented,
 }
 
