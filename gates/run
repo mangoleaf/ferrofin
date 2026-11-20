@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gates/run <verify|adoption|parity|bench|all>[,<gate>…] [--image IMAGE] [--previous IMAGE [--release vX.Y.Z]] [--out ROOT] [--dry-run]
+# gates/run <verify|adoption|roundtrip|parity|bench|all>[,<gate>…] [--image IMAGE] [--previous IMAGE [--release vX.Y.Z]] [--out ROOT] [--dry-run]
 #
 # One validation of one commit: a preflight of the host, then each chosen gate against one Ferrofin
 # image, all of it in one session folder under the output root (gates/lib.sh):
@@ -10,7 +10,7 @@
 #     <gate>/  <gate>.log               each gate's own run directory, and what it printed
 #     index.html  report.md             the session's report: every gate's verdict and counts, with
 #                                       links to its own report (gates/report.py), however it ended
-# The gates run in the order verify, adoption, parity, bench; one that fails does not stop the next.
+# The gates run in the order verify, adoption, roundtrip, parity, bench; one that fails does not stop the next.
 # Each gate's own script keeps working on its own.
 #
 #   --image IMAGE     the Ferrofin image under test; default ferrofin:<the commit as git describe names
@@ -34,12 +34,12 @@ set -uo pipefail
 CALLER=$PWD
 SELF=$(cd "$(dirname "$0")" && pwd)/${0##*/}   # for usage, after the cd below
 cd "$(dirname "$0")/.." || exit 2
-# shellcheck source=gates/adoption/lib.sh
-. gates/adoption/lib.sh   # gates/lib.sh, and where the adoption fixtures are
+# shellcheck source=gates/roundtrip/lib.sh
+. gates/roundtrip/lib.sh   # gates/lib.sh, where the adoption fixtures are, and the round trip's Jellyfin image
 gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/lib.sh, gl-968)
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; }
-ORDER=(verify adoption parity bench)
+ORDER=(verify adoption roundtrip parity bench)
 SELECTION=; IMAGE=; PREVIOUS=; RELEASE=; DRY_RUN=false
 while [ $# -gt 0 ]; do
   case $1 in
@@ -100,6 +100,7 @@ if wants adoption; then
   python3 -c 'from PIL import Image' 2>/dev/null || problem "Python Pillow is not installed (adoption needs it)"
   python3 -c 'import icu' 2>/dev/null || problem "Python PyICU (python3-icu) is not installed (adoption needs it)"
 fi
+! wants roundtrip || need roundtrip sqlite3 curl timeout
 ! wants parity || need parity curl timeout taskset
 ! wants bench || need bench k6 taskset curl sha256sum timeout ffprobe
 [ -z "$PREVIOUS" ] || wants bench || problem "--previous is for the bench gate, which is not selected"
@@ -126,8 +127,14 @@ else
   if wants parity || { wants bench && [ -z "$PREVIOUS" ]; }; then   # the Jellyfin both compare against
     image_id "$ORACLE_IMAGE" >/dev/null || problem "the Jellyfin oracle image is missing: docker pull $ORACLE_IMAGE"
   fi
+  if wants roundtrip; then   # the Jellyfin release it returns to, which it never pulls
+    if ! RETURN_IMAGE=$(rt_jellyfin_image crates/ferrofin-api/src/handlers.rs 2>&1); then problem "roundtrip: $RETURN_IMAGE"
+    else image_id "$RETURN_IMAGE" >/dev/null || problem "the Jellyfin image the round trip returns to is missing: docker pull $RETURN_IMAGE"; fi
+  fi
+  # roundtrip has no entry: its containers are named for their run, and its runs share nothing (its README)
   declare -A PREFIX=([verify]=gates-verify [adoption]=adopt- [parity]=parity- [bench]=bench-)
   for gate in "${GATES[@]}"; do
+    [ -n "${PREFIX[$gate]:-}" ] || continue
     [ -z "$(docker ps -aq --filter "name=^${PREFIX[$gate]}")" ] \
       || problem "a ${PREFIX[$gate]}* container is left from another run; it is not this session's to remove"
   done
@@ -137,6 +144,10 @@ if wants adoption; then
     [ -e "$ADOPTION_FIXTURES/$input" ] \
       || { problem "the adoption fixtures are not built in $ADOPTION_FIXTURES (no $input): gates/adoption/build-fixtures.sh"; break; }
   done
+fi
+if wants roundtrip; then   # what gates/roundtrip/run.sh opens first; a route whose fixture is missing fails in the run
+  [ -d "$ADOPTION_FIXTURES/media" ] \
+    || problem "the adoption fixtures the round trip runs on are not built in $ADOPTION_FIXTURES (no media): gates/adoption/build-fixtures.sh"
 fi
 if wants parity || wants bench; then
   [ -f "$TESTDATA/ids.json" ] || problem "the benchmark corpus is not built in $TESTDATA: gates/bench/testdata/build.sh"
@@ -167,6 +178,7 @@ set_command() { # set_command <gate>: CMD, the gate's own command, writing into 
   case $1 in
     verify) CMD=(gates/verify/run.sh --image "$IMAGE" --out "$S/verify");;
     adoption) CMD=(env ADOPTION_WORK_DIR="$S/adoption" gates/adoption/run.sh --fixtures "$ADOPTION_FIXTURES" --image "$IMAGE");;
+    roundtrip) CMD=(gates/roundtrip/run.sh --fixtures "$ADOPTION_FIXTURES" --image "$IMAGE" --work "$S/roundtrip");;
     parity) CMD=(gates/parity/run.sh --oracle "$ORACLE_IMAGE" --ferrofin "$IMAGE" --out "$S/parity"
                  --requests gates/parity/requests/sweep --requests gates/parity/requests/edge);;
     bench) if [ -n "$PREVIOUS" ]; then CMD=(python3 gates/bench/gate.py ab "$PREVIOUS" "$IMAGE" --out "$S/bench"

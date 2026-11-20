@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # The Ferrofin stage of a round-trip route, sourced by run.sh: adopt a fresh copy of the fixture, scan it,
-# run the usage stage (usage.py, which captures Ferrofin's answers as the route's oracle) and stop. It uses
-# run.sh's state: route, fixture, generation, ran_at (the data directory it runs at), dst, the settings,
-# MADE, and why[] through check and mark.
+# run the usage stage (usage.py, which captures Ferrofin's answers as the route's oracle) and stop. The scale
+# route only adopts it, waits for its startup tasks and stops: its 40,000 clones' files are hard links to their
+# templates' (scale.py), so a scan re-identifies and re-extracts every clone, which measures the fixture, not the
+# way back (the adoption gate scans it neither). It uses run.sh's state: route, fixture, generation, kind,
+# config_at and SERVER_DIRS (the directories it runs in), MEDIA, dst, the settings, MADE, and why[] through check
+# and mark.
 # shellcheck disable=SC2154  # run.sh sets what this reads
 
 # ferrofin_stage: status 0 when the copy is ready for the export; 1 (with the reasons in why[]) when not.
@@ -12,9 +15,13 @@ ferrofin_stage() {
   if ! { cp -a "$FIXTURES/$fixture" "$dst/ferrofin" && mkdir -p "$dst/ferrofin-cache"; }; then
     why+=("cannot copy $fixture"); mark Ferrofin ready; return 1
   fi
+  # a configuration directory of its own: the copy's config/ moves there, as a package migration moves it
+  if [ "$config_at" != - ] && ! mv "$dst/ferrofin/config" "$dst/ferrofin-config"; then
+    why+=("$fixture has no config/ to run at $config_at"); mark Ferrofin ready; return 1
+  fi
   MADE+=("$cid")
-  if port=$(rt_start "$name" "$cid" "$TAG" -e FERROFIN_DATA_DIR="$ran_at" -e FERROFIN_CACHE_DIR=/cache \
-      -v "$dst/ferrofin:$ran_at" -v "$dst/ferrofin-cache:/cache" "${MEDIA[@]}" 2>"$dst/ferrofin-start.err"); then
+  if port=$(rt_start "$name" "$cid" "$TAG" "${SERVER_DIRS[@]}" -e FERROFIN_CACHE_DIR=/cache \
+      -v "$dst/ferrofin-cache:/cache" "${MEDIA[@]}" 2>"$dst/ferrofin-start.err"); then
     url=http://127.0.0.1:$port
     rt_wait_up "$name" "$port" "$READY_TIMEOUT" || why+=("$(rt_not_up "$name" "$READY_TIMEOUT")")
   else
@@ -22,7 +29,13 @@ ferrofin_stage() {
   fi
   [ -s "$dst/ferrofin-start.err" ] || rm -f -- "$dst/ferrofin-start.err"
   mark Ferrofin ready
-  if [ "${#why[@]}" = 0 ]; then
+  if [ "${#why[@]}" = 0 ] && [ "$kind" = scale ]; then
+    check reasons python3 "$HERE/api.py" settle --base-url "$url" --data-dir "$dst/ferrofin" --timeout "$SCAN_TIMEOUT"
+    mark Ferrofin "its startup tasks finish"
+    rt_docker logs "$name" > "$dst/ferrofin-boot.log" 2>&1
+    check adoption_check_boot_log "$dst/ferrofin-boot.log" "$generation"
+    mark Ferrofin "boot log (generation, migrations, no ERROR)"
+  elif [ "${#why[@]}" = 0 ]; then
     check reasons python3 "$HERE/api.py" scan --base-url "$url" --data-dir "$dst/ferrofin" --timeout "$SCAN_TIMEOUT"
     mark Ferrofin "the library scan completes"
     rt_docker logs "$name" > "$dst/ferrofin-boot.log" 2>&1
