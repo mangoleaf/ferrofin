@@ -30,7 +30,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ferrofin_extensions::sso::accounts::PROVIDER_ID;
 use ferrofin_model::secret::Secret;
-use ferrofin_model::sso::{OidcDiscovery, OidcProvider};
+use ferrofin_model::sso::{OidcDiscovery, OidcFolderRole, OidcProvider};
 use sso::{SsoServer, exchange_code, header_text, text};
 
 /// The realm's values, or `None` while any is unset or empty.
@@ -459,4 +459,97 @@ async fn the_realm_groups_gate_sign_in_and_set_the_administrator_flag() {
     let result = signed_in(&server, &member, "keycloak-member").await;
     assert_eq!(result["User"]["Policy"]["IsAdministrator"], false);
     println!("verified: role sync makes the realm's administrator one, and not the member");
+}
+
+/// The library the members' group is mapped to below, as
+/// `GET /Library/MediaFolders` writes an id.
+const LIBRARY: &str = "0b8e6c0e3c8d4a5f9e2b1d7c6a5f4e3d";
+
+/// B10 against the realm's groups: with role sync on, the members' group
+/// mapped to one library and the administrators' group to every library and
+/// Live TV, each realm user's first session already has what their groups
+/// give, and the user in no group gets no library and no Live TV. The
+/// library ids need not exist: one no library has grants nothing.
+#[tokio::test]
+#[ignore = "needs a Keycloak holding the ferrofin-test realm; run with --ignored"]
+async fn the_realm_groups_map_libraries_and_live_tv() {
+    let (Some(realm), Some(admin), Some(member), Some(guest), Some(admins), Some(members)) = (
+        realm(),
+        realm_user("ADMIN"),
+        realm_user("MEMBER"),
+        realm_user("GUEST"),
+        read("FERROFIN_OIDC_TEST_ADMIN_GROUP"),
+        read("FERROFIN_OIDC_TEST_MEMBER_GROUP"),
+    ) else {
+        println!(
+            "skipped: set FERROFIN_OIDC_TEST_ISSUER, _CLIENT_ID, _CLIENT_SECRET, the _USER and \
+             _PASSWORD of ADMIN, MEMBER and GUEST, _ADMIN_GROUP and _MEMBER_GROUP \
+             (contrib/oidc-test-realm/README.md)"
+        );
+        return;
+    };
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = sso::server(&temp, PUBLISHED_URL).await;
+    let sso = server
+        .state
+        .sso
+        .as_ref()
+        .expect("the Single Sign-On service");
+    sso.save_oidc_provider(
+        "keycloak",
+        OidcProvider {
+            name: "Keycloak".to_owned(),
+            issuer: realm.issuer.clone(),
+            allow_http_issuer: realm.issuer.starts_with("http://"),
+            client_id: realm.client_id.clone(),
+            client_secret: Some(Secret::new(realm.client_secret.clone())),
+            role_sync: true,
+            all_folders_roles: vec![admins.clone()],
+            folder_roles: vec![OidcFolderRole {
+                role: members,
+                folders: vec![LIBRARY.parse().expect("a GUID")],
+            }],
+            live_tv_roles: vec![admins.clone()],
+            live_tv_management_roles: vec![admins],
+            ..OidcProvider::default()
+        },
+    )
+    .await
+    .expect("the provider saves");
+
+    let access = |result: &serde_json::Value| {
+        let policy = &result["User"]["Policy"];
+        (
+            policy["EnableAllFolders"].clone(),
+            policy["EnabledFolders"].clone(),
+            policy["EnableLiveTvAccess"].clone(),
+            policy["EnableLiveTvManagement"].clone(),
+        )
+    };
+    let none = serde_json::json!([]);
+    let (yes, no) = (serde_json::json!(true), serde_json::json!(false));
+    let result = signed_in(&server, &member, "keycloak-member").await;
+    assert_eq!(
+        access(&result),
+        (
+            no.clone(),
+            serde_json::json!([LIBRARY]),
+            no.clone(),
+            no.clone()
+        ),
+        "the member"
+    );
+    let result = signed_in(&server, &admin, "keycloak-admin").await;
+    assert_eq!(
+        access(&result),
+        (yes.clone(), none.clone(), yes.clone(), yes),
+        "the administrator"
+    );
+    let result = signed_in(&server, &guest, "keycloak-guest").await;
+    assert_eq!(
+        access(&result),
+        (no.clone(), none, no.clone(), no),
+        "the user in no group"
+    );
+    println!("verified: the realm's groups give the libraries and Live TV their mappings name");
 }

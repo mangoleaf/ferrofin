@@ -28,7 +28,11 @@ async fn service(
         .expect("connect");
     db.run_migrations().await.expect("migrations");
     let users = Arc::new(ferrofin_core::FerrofinUserManager::new(db.clone()));
-    let (sessions, _) = sign_in::tests::sessions(&db, &users);
+    let sessions = sign_in::tests::sessions(
+        &db,
+        &users,
+        &Arc::new(ferrofin_core::FerrofinEventManager::new()),
+    );
     let sso = SsoService::new(
         Arc::clone(&plugins) as Arc<dyn PluginManager>,
         users,
@@ -161,7 +165,13 @@ fn the_settings_page_reads_the_admin_routes_and_holds_no_setting() {
         html.contains("Dashboard.confirm(DELETE_MESSAGE, 'Delete '"),
         "{html}"
     );
-    assert_eq!(html.matches("Dashboard.confirm(").count(), 1, "{html}");
+    assert!(
+        html.contains(
+            "Dashboard.confirm(NO_ACCESS_MESSAGE, 'Save with no library or Live TV role?'"
+        ),
+        "{html}"
+    );
+    assert_eq!(html.matches("Dashboard.confirm(").count(), 2, "{html}");
     assert!(!html.contains("Dashboard.alert("), "{html}");
     // Every string from a response is set as text, never parsed as HTML.
     for sink in [

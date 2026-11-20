@@ -28,7 +28,7 @@
 //!   every password;
 //! - [`roles`]: a user's roles in the provider's role claim, the required
 //!   role a sign-in is refused without, and role sync, which keeps the
-//!   administrator flag in step with them;
+//!   administrator flag, the libraries and Live TV in step with them;
 //! - [`complete`]: the completion page the callback answers, and the
 //!   exchange of its one-time code for the session, under the account rules
 //!   of a password sign-in.
@@ -230,7 +230,7 @@ pub fn validate_provider(provider: &OidcProvider) -> Result<(), String> {
     if roles::reads_roles(provider) && provider.role_claim.is_empty() {
         return Err("the role claim is required for a required role or role sync".to_owned());
     }
-    Ok(())
+    roles::validate_mappings(provider)
 }
 
 /// Checks an issuer as OpenID Connect Core 1.0 defines one: a URL with a
@@ -508,6 +508,7 @@ impl SsoManager for SsoService {
         ] {
             *value = value.trim().to_owned();
         }
+        roles::trim_mappings(&mut provider);
         validate_provider(&provider).map_err(ServiceError::invalid_input)?;
         // An empty or blank secret field on the page means "keep".
         let secret = provider

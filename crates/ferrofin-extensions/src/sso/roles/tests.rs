@@ -1,8 +1,12 @@
-//! The required role (B8) and role sync (B9, D6), through the sign-in harness
-//! and the fake identity provider, and the role claim's reading.
+//! The required role (B8) and role sync (B9, B10, D6), through the sign-in
+//! harness and the fake identity provider, and the role claim's reading.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::users::UserPolicy;
+use ferrofin_model::sso::OidcFolderRole;
+use ferrofin_model::users::{AccessSchedule, DynamicDayOfWeek, UserPolicy};
 use ferrofin_traits::external_identities::ExternalIdentityStore as _;
 use ferrofin_traits::library::UserManager as _;
 use ferrofin_traits::session::SessionManager as _;
@@ -458,4 +462,325 @@ fn the_settings_page_edits_the_role_settings() {
         html.contains("var DEFAULT_ROLE_CLAIM = 'groups';"),
         "{html}"
     );
+}
+
+/// The roles the access mappings name besides [`USERS`], and two library
+/// ids. The harness has no library at all, so both are ids no library has:
+/// a sign-in goes on with them, and they grant nothing.
+const ALL: &str = "ferrofin-all";
+const KIDS: &str = "ferrofin-kids";
+const TV: &str = "ferrofin-tv";
+const DVR: &str = "ferrofin-dvr";
+const MOVIES: Uuid = Uuid::from_u128(0x6d6f_7669_6573_0000_0000_0000_0000_0001);
+const SHOWS: Uuid = Uuid::from_u128(0x7368_6f77_7300_0000_0000_0000_0000_0002);
+
+/// Role sync on, with [`ALL`] giving every library, [`USERS`] the movies,
+/// [`KIDS`] the shows and the movies, [`TV`] Live TV and [`DVR`] its
+/// recordings.
+fn map_access(provider: &mut OidcProvider) {
+    provider.role_sync = true;
+    provider.all_folders_roles = vec![ALL.to_owned()];
+    provider.folder_roles = vec![
+        OidcFolderRole {
+            role: USERS.to_owned(),
+            folders: vec![MOVIES],
+        },
+        OidcFolderRole {
+            role: KIDS.to_owned(),
+            folders: vec![SHOWS, MOVIES],
+        },
+    ];
+    provider.live_tv_roles = vec![TV.to_owned()];
+    provider.live_tv_management_roles = vec![DVR.to_owned()];
+}
+
+/// The four members the mappings set: `EnableAllFolders`, `EnabledFolders`,
+/// `EnableLiveTvAccess`, `EnableLiveTvManagement`.
+fn access(policy: &UserPolicy) -> (bool, Vec<Uuid>, bool, bool) {
+    (
+        policy.enable_all_folders,
+        policy.enabled_folders.clone(),
+        policy.enable_live_tv_access,
+        policy.enable_live_tv_management,
+    )
+}
+
+/// Counts the user manager's user-updated announcements, one per policy
+/// save. Each is consumed as the server's push consumes it, by reading the
+/// account back through the manager.
+fn announcements(harness: &Harness) -> Arc<AtomicUsize> {
+    let count = Arc::new(AtomicUsize::new(0));
+    let (reader, seen) = (Arc::clone(&harness.users), Arc::clone(&count));
+    harness.events.subscribe(
+        ferrofin_core::user_updated::USER_UPDATED_EVENT,
+        Arc::new(move |payload: &str| {
+            let id: Uuid = serde_json::from_str(payload).expect("a user id");
+            let (reader, seen) = (Arc::clone(&reader), Arc::clone(&seen));
+            Box::pin(async move {
+                let user = reader.get_user_by_id(id).await?.expect("the user");
+                reader.get_user_dto(&user, None).await?;
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }),
+    );
+    count
+}
+
+/// B10: with role sync on, a user's libraries and both Live TV permissions
+/// are what the mappings give their roles at each sign-in, in the first
+/// session already, and a role taken away takes its access with it. A user
+/// with no mapped role ends with no library and no Live TV. Every mapped id
+/// is one no library has, as after a library is deleted: the sign-in goes
+/// on, and the ids are kept as mapped, where they match nothing.
+#[tokio::test]
+async fn with_role_sync_libraries_and_live_tv_follow_the_mapped_roles() {
+    let harness = Harness::with(Some(PUBLIC_URL), map_access).await;
+    for (held, expected) in [
+        (json!([USERS]), (false, vec![MOVIES], false, false)),
+        (
+            json!([USERS, KIDS, TV]),
+            (false, vec![MOVIES, SHOWS], true, false),
+        ),
+        (json!([ALL, DVR]), (true, vec![], false, true)),
+        (json!(KIDS), (false, vec![SHOWS, MOVIES], false, false)),
+        (json!(["another-group"]), (false, vec![], false, false)),
+        (json!(null), (false, vec![], false, false)),
+    ] {
+        groups(&harness, held.clone());
+        let session = harness.session("member-device").await.expect("signed in");
+        let first = session.user.policy.expect("a policy");
+        assert_eq!(access(&first), expected, "{held}: the session's user");
+        let user = account(&harness).await.expect("the account");
+        assert_eq!(access(&policy(&harness, &user).await), expected, "{held}");
+    }
+}
+
+/// Only the four members change, and a sign-in that changes none of them
+/// saves nothing, so announces nothing; the same libraries in another order
+/// are no change. The announcement's consumer reads the account back, and
+/// the sign-in is not held up by it: nothing on the way holds a lock the
+/// save takes.
+#[tokio::test]
+async fn role_sync_changes_only_the_mapped_members_and_saves_only_a_change() {
+    let harness = Harness::with(Some(PUBLIC_URL), map_access).await;
+    let announced = announcements(&harness);
+    groups(&harness, json!([USERS]));
+    harness.session("member-device").await.expect("signed in");
+    let user = account(&harness).await.expect("the account");
+    assert_eq!(
+        announced.load(Ordering::SeqCst),
+        1,
+        "the new account's defaults narrowed"
+    );
+
+    // Every other kind of member, set by hand as the dashboard does.
+    let mut edited = policy(&harness, &user).await;
+    edited.is_hidden = true;
+    edited.enable_content_deletion = true;
+    edited.enable_all_channels = false;
+    edited.enabled_channels = vec![Uuid::from_u128(0xC1)];
+    edited.blocked_tags = vec!["gore".to_owned()];
+    edited.max_parental_rating = Some(13);
+    edited.remote_client_bitrate_limit = 8_000_000;
+    edited.access_schedules = vec![AccessSchedule {
+        user_id: id_of(&user),
+        day_of_week: DynamicDayOfWeek::Everyday,
+        start_hour: 0.0,
+        end_hour: 24.0,
+        ..AccessSchedule::default()
+    }];
+    harness
+        .users
+        .update_policy(id_of(&user), &edited)
+        .await
+        .expect("saved");
+    let before = policy(&harness, &user).await;
+    assert_eq!(announced.load(Ordering::SeqCst), 2);
+
+    // The same roles: nothing to change, nothing saved.
+    harness.session("member-device").await.expect("signed in");
+    assert_eq!(announced.load(Ordering::SeqCst), 2, "no save");
+    assert_eq!(policy(&harness, &user).await, before);
+
+    // Other roles: those four members change, nothing else.
+    groups(&harness, json!([USERS, KIDS, TV, DVR]));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        harness.session("member-device"),
+    )
+    .await
+    .expect("the sign-in does not wait on its own announcement")
+    .expect("signed in");
+    assert_eq!(announced.load(Ordering::SeqCst), 3);
+    let mut expected = before.clone();
+    expected.enabled_folders = vec![MOVIES, SHOWS];
+    expected.enable_live_tv_access = true;
+    expected.enable_live_tv_management = true;
+    let mut after = policy(&harness, &user).await;
+    // A policy save replaces the access schedules, which renumbers their
+    // rows, as a save from the dashboard does: the schedule is the same.
+    assert_ne!(after.access_schedules[0].id, 0);
+    after.access_schedules[0].id = expected.access_schedules[0].id;
+    assert_eq!(after, expected);
+
+    // The same libraries, stored in another order: no change.
+    let mut reordered = policy(&harness, &user).await;
+    reordered.enabled_folders = vec![SHOWS, MOVIES];
+    harness
+        .users
+        .update_policy(id_of(&user), &reordered)
+        .await
+        .expect("saved");
+    assert_eq!(announced.load(Ordering::SeqCst), 4);
+    harness.session("member-device").await.expect("signed in");
+    assert_eq!(announced.load(Ordering::SeqCst), 4, "no save");
+    assert_eq!(
+        policy(&harness, &user).await.enabled_folders,
+        [SHOWS, MOVIES]
+    );
+}
+
+/// B10, D6: with role sync off the mappings change nothing. A new account
+/// keeps the policy its creation gives it, and an existing account's policy,
+/// set by hand, is byte for byte what it was, with nothing saved.
+#[tokio::test]
+async fn with_role_sync_off_the_mappings_leave_the_policy_alone() {
+    let harness = Harness::with(Some(PUBLIC_URL), |provider| {
+        map_access(provider);
+        provider.role_sync = false;
+    })
+    .await;
+    let announced = announcements(&harness);
+    groups(&harness, json!([USERS]));
+    harness.session("first-device").await.expect("signed in");
+    let user = account(&harness).await.expect("the account");
+    let created = policy(&harness, &user).await;
+    assert_eq!(access(&created), (true, vec![], true, false), "as created");
+    assert_eq!(announced.load(Ordering::SeqCst), 0);
+
+    let mut by_hand = created;
+    by_hand.enable_all_folders = false;
+    by_hand.enabled_folders = vec![SHOWS];
+    by_hand.enable_live_tv_access = false;
+    harness
+        .users
+        .update_policy(id_of(&user), &by_hand)
+        .await
+        .expect("saved");
+    let before = serde_json::to_vec(&policy(&harness, &user).await).expect("serializes");
+    groups(&harness, json!([ALL, KIDS, TV, DVR]));
+    harness.session("first-device").await.expect("signed in");
+    let after = serde_json::to_vec(&policy(&harness, &user).await).expect("serializes");
+    assert_eq!(String::from_utf8(after), String::from_utf8(before));
+    assert_eq!(announced.load(Ordering::SeqCst), 1, "the hand edit only");
+}
+
+/// The access mappings are trimmed on save, an empty role is dropped from a
+/// role list and refused in a library mapping, and the nested lists come
+/// back from the plugin configuration as they were saved, through the
+/// provider routes and the generic configuration route alike.
+#[tokio::test]
+async fn the_access_mappings_are_trimmed_checked_and_kept_on_save() {
+    let harness = Harness::new().await;
+    let saved = harness
+        .sso
+        .save_oidc_provider(
+            "fake",
+            OidcProvider {
+                all_folders_roles: vec![" all ".to_owned(), "  ".to_owned()],
+                folder_roles: vec![OidcFolderRole {
+                    role: " kids ".to_owned(),
+                    folders: vec![SHOWS, MOVIES],
+                }],
+                live_tv_roles: vec!["tv".to_owned(), String::new()],
+                live_tv_management_roles: vec!["\tdvr".to_owned()],
+                ..harness.provider("fake").await
+            },
+        )
+        .await
+        .expect("saved")
+        .provider;
+    assert_eq!(saved.all_folders_roles, ["all"]);
+    assert_eq!(saved.folder_roles[0].role, "kids");
+    assert_eq!(saved.live_tv_roles, ["tv"]);
+    assert_eq!(saved.live_tv_management_roles, ["dvr"]);
+    let stored = harness.provider("fake").await;
+    assert_eq!(stored.all_folders_roles, saved.all_folders_roles);
+    assert_eq!(stored.folder_roles, saved.folder_roles);
+    assert_eq!(stored.live_tv_roles, saved.live_tv_roles);
+    assert_eq!(stored.live_tv_management_roles, ["dvr"]);
+
+    for (folder_role, live_tv_role) in [(" ", "tv"), ("kids\u{7}", "tv"), ("kids", "tv\u{7}")] {
+        let answer = harness
+            .sso
+            .save_oidc_provider(
+                "fake",
+                OidcProvider {
+                    folder_roles: vec![OidcFolderRole {
+                        role: folder_role.to_owned(),
+                        folders: vec![SHOWS],
+                    }],
+                    live_tv_roles: vec![live_tv_role.to_owned()],
+                    ..harness.provider("fake").await
+                },
+            )
+            .await;
+        match answer {
+            Err(ServiceError::InvalidInput(why)) => {
+                assert!(why.contains("library and Live TV mappings"), "{why}");
+            }
+            other => panic!("{folder_role:?} {live_tv_role:?}: {other:?}"),
+        }
+    }
+
+    // The configuration route projects a post onto the defaults, whose
+    // `Providers` list is empty: each provider is kept as posted, its nested
+    // lists included.
+    let mut config = harness.sso.config().await.expect("config");
+    config.providers[0]["FolderRoles"][0]["Folders"]
+        .as_array_mut()
+        .expect("a list")
+        .push(json!("0D0A6E1C-2F3B-4A5C-9D8E-7F6A5B4C3D2E"));
+    harness
+        .sso
+        .plugins
+        .set_plugin_configuration(
+            crate::sso::EXTENSION_ID,
+            serde_json::to_vec(&config).expect("serializes"),
+        )
+        .await
+        .expect("saved");
+    assert_eq!(
+        harness.provider("fake").await.folder_roles[0].folders,
+        [
+            SHOWS,
+            MOVIES,
+            Uuid::from_u128(0x0d0a_6e1c_2f3b_4a5c_9d8e_7f6a_5b4c_3d2e)
+        ]
+    );
+}
+
+/// The settings page reads and sends each access mapping, lists the
+/// libraries from the route the dashboard's user access page reads, and
+/// shows a mapped library that is gone as missing.
+#[test]
+fn the_settings_page_edits_the_access_mappings() {
+    let page = SsoExtension.config_pages().remove(0).bytes;
+    let html = String::from_utf8(page).expect("UTF-8");
+    for member in [
+        "AllFoldersRoles",
+        "FolderRoles",
+        "LiveTvRoles",
+        "LiveTvManagementRoles",
+    ] {
+        assert_eq!(
+            html.matches(&format!("info.{member}")).count(),
+            1,
+            "{member}"
+        );
+        assert_eq!(html.matches(&format!(" {member}: ")).count(), 1, "{member}");
+    }
+    assert!(html.contains("getUrl('Library/MediaFolders', { IsHidden: false })"));
+    assert!(html.contains("Missing library"), "{html}");
 }

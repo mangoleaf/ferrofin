@@ -21,7 +21,9 @@
         what the test found until the page is left. The public URL is saved
         through the plugin configuration. No route returns
         a stored client secret, so the secret field always starts empty, and an
-        empty one keeps the stored secret.
+        empty one keeps the stored secret. The library mappings list the
+        libraries `GET /Library/MediaFolders` names, as the dashboard's user
+        access page does, and keep their ids.
     -->
     <div data-role="page" class="page type-interior pluginConfigurationPage ssoSettingsPage"
         data-require="emby-input,emby-button,emby-checkbox">
@@ -74,6 +76,26 @@
                 gap: 0.5em;
                 flex-wrap: wrap;
                 margin-top: 0.5em;
+            }
+
+            .ssoSettingsPage .ssoRoleList {
+                display: block;
+                margin: 1em 0;
+            }
+
+            .ssoSettingsPage .ssoRoleList textarea {
+                display: block;
+                width: 100%;
+                box-sizing: border-box;
+                margin-top: 0.3em;
+                resize: vertical;
+            }
+
+            .ssoSettingsPage .ssoFolderRole {
+                padding: 0.5em 1em;
+                margin: 0.75em 0;
+                border-radius: 0.3em;
+                background: rgba(128, 128, 128, 0.12);
             }
         </style>
         <div data-role="content">
@@ -209,7 +231,8 @@
                             <span>Sync rights from roles</span>
                         </label>
                         <div class="fieldDescription checkboxFieldDescription">
-                            At each sign-in, a user's administrator flag follows the administrator role below.
+                            At each sign-in, a user's administrator flag, libraries and Live TV follow the roles
+                            below.
                             Roles are read only at sign-in, so a change at the provider reaches a user at their
                             next sign-in. Off, a sign-in never changes a user's rights.
                         </div>
@@ -223,6 +246,29 @@
                             the flag.
                         </div>
                     </div>
+                    <h4>Library and Live TV access</h4>
+                    <p class="fieldDescription">
+                        With role sync on, a user's libraries and Live TV access are set from these roles at each
+                        sign-in, and nothing else of their access changes. A user with none of these roles gets no
+                        library and no Live TV, administrators included. Off, they are not used. One role per line;
+                        names are compared exactly.
+                    </p>
+                    <label class="ssoRoleList">
+                        <span>Roles with every library</span>
+                        <textarea class="emby-textarea ssoAllFoldersRoles" rows="2" spellcheck="false"></textarea>
+                    </label>
+                    <div class="ssoFolderRoles"></div>
+                    <button is="emby-button" type="button" class="raised ssoAddFolderRole">
+                        <span>Add a role with some libraries</span>
+                    </button>
+                    <label class="ssoRoleList">
+                        <span>Roles allowed Live TV</span>
+                        <textarea class="emby-textarea ssoLiveTvRoles" rows="2" spellcheck="false"></textarea>
+                    </label>
+                    <label class="ssoRoleList">
+                        <span>Roles allowed to manage Live TV recordings</span>
+                        <textarea class="emby-textarea ssoLiveTvManagementRoles" rows="2" spellcheck="false"></textarea>
+                    </label>
                     <div class="ssoNotice ssoEditorError hide" role="alert"></div>
                     <div class="ssoButtons">
                         <button is="emby-button" type="submit" class="raised button-submit">
@@ -301,6 +347,140 @@
                     } catch (e) {
                         return false;
                     }
+                }
+
+                var NO_ACCESS_MESSAGE = 'Role sync is on and no role gives a library or Live TV, so every user of '
+                    + 'this provider will have no library and no Live TV after their next sign-in, administrators '
+                    + 'included.';
+
+                /** Whether `body` turns role sync on with no role that gives a library or Live TV. */
+                function withoutAccess(body) {
+                    return body.RoleSync && !body.AllFoldersRoles.length && !body.LiveTvRoles.length
+                        && !body.LiveTvManagementRoles.length && !body.FolderRoles.some(function (mapping) {
+                            return mapping.Folders.length;
+                        });
+                }
+
+                /** A library id as `GET /Library/MediaFolders` writes it, whatever its spelling. */
+                function folderId(id) {
+                    return String(id).replace(/-/g, '').toLowerCase();
+                }
+
+                /** The libraries the dashboard's user access page lists, by id and name; null when they cannot be read. */
+                function loadLibraries() {
+                    return ApiClient.getJSON(ApiClient.getUrl('Library/MediaFolders', { IsHidden: false })).then(function (result) {
+                        return (result && result.Items || []).map(function (item) {
+                            return { Id: folderId(item.Id), Name: item.Name };
+                        });
+                    }, function () {
+                        return null;
+                    });
+                }
+
+                function lines(roles) {
+                    return (roles || []).join('\n');
+                }
+
+                /** The roles a role list's box holds, one per line. */
+                function roleList(page, name) {
+                    return field(page, name).value.split('\n').map(function (role) {
+                        return role.trim();
+                    }).filter(function (role) {
+                        return role;
+                    });
+                }
+
+                /** A library's box in a mapping, named by the library, or as missing when no library has the id. */
+                function folderBox(id, name, checked, missing) {
+                    var container = element('div', 'checkboxContainer');
+                    var label = element('label', missing ? 'ssoRefused' : null);
+                    var box = element('input', 'ssoFolder');
+                    box.type = 'checkbox';
+                    box.setAttribute('is', 'emby-checkbox');
+                    box.setAttribute('data-folder', id);
+                    box.checked = checked;
+                    label.appendChild(box);
+                    label.appendChild(element('span', null, name));
+                    container.appendChild(label);
+                    return container;
+                }
+
+                /** One library mapping: its role, a box for each library, and one for each mapped library that is gone. */
+                function folderRoleRow(libraries, mapping) {
+                    var row = element('div', 'ssoFolderRole');
+                    var roleContainer = element('div', 'inputContainer');
+                    var role = element('input', 'ssoFolderRoleName');
+                    role.type = 'text';
+                    role.setAttribute('is', 'emby-input');
+                    role.setAttribute('label', 'Role');
+                    role.setAttribute('autocomplete', 'off');
+                    role.setAttribute('spellcheck', 'false');
+                    role.value = mapping.Role || '';
+                    roleContainer.appendChild(role);
+                    row.appendChild(roleContainer);
+                    var mapped = (mapping.Folders || []).map(folderId);
+                    var known = (libraries || []).map(function (library) {
+                        return library.Id;
+                    });
+                    (libraries || []).forEach(function (library) {
+                        row.appendChild(folderBox(library.Id, library.Name, mapped.indexOf(library.Id) !== -1, false));
+                    });
+                    mapped.filter(function (id) {
+                        return known.indexOf(id) === -1;
+                    }).forEach(function (id) {
+                        row.appendChild(libraries
+                            ? folderBox(id, 'Missing library ' + id + ': no library has this id any more. Clear the box to remove it.', true, true)
+                            : folderBox(id, 'Library ' + id, true, false));
+                    });
+                    if (!libraries) {
+                        row.appendChild(element('p', 'fieldDescription ssoRefused',
+                            'The libraries could not be loaded: only the ones already mapped are shown.'));
+                    } else if (libraries.length === 0 && mapped.length === 0) {
+                        row.appendChild(element('p', 'fieldDescription', 'The server has no library yet.'));
+                    }
+                    var remove = element('button', 'raised');
+                    remove.type = 'button';
+                    remove.setAttribute('is', 'emby-button');
+                    remove.appendChild(element('span', null, 'Remove this role'));
+                    remove.addEventListener('click', function () {
+                        row.parentNode.removeChild(row);
+                    });
+                    row.appendChild(remove);
+                    return row;
+                }
+
+                /** Shows `mappings` in the editor, once the libraries are read. */
+                function renderFolderRoles(page, state, mappings) {
+                    var list = field(page, 'ssoFolderRoles');
+                    clear(list);
+                    // Only the last editor opened shows its mappings.
+                    var shown = state.folderRolesShown = {};
+                    return state.libraries.then(function (libraries) {
+                        if (state.folderRolesShown !== shown) {
+                            return;
+                        }
+                        (mappings || []).forEach(function (mapping) {
+                            list.appendChild(folderRoleRow(libraries, mapping));
+                        });
+                    });
+                }
+
+                /** The editor's library mappings, without a row left with no role and no library. */
+                function folderRoles(page) {
+                    var rows = field(page, 'ssoFolderRoles').querySelectorAll('.ssoFolderRole');
+                    return Array.prototype.map.call(rows, function (row) {
+                        var boxes = row.querySelectorAll('.ssoFolder');
+                        return {
+                            Role: row.querySelector('.ssoFolderRoleName').value.trim(),
+                            Folders: Array.prototype.filter.call(boxes, function (box) {
+                                return box.checked;
+                            }).map(function (box) {
+                                return box.getAttribute('data-folder');
+                            })
+                        };
+                    }).filter(function (mapping) {
+                        return mapping.Role || mapping.Folders.length;
+                    });
                 }
 
                 function load(page, state) {
@@ -433,6 +613,10 @@
                     field(page, 'ssoRequiredRole').value = info ? info.RequiredRole : '';
                     field(page, 'ssoRoleSync').checked = info ? !!info.RoleSync : false;
                     field(page, 'ssoAdminRole').value = info ? info.AdminRole : '';
+                    field(page, 'ssoAllFoldersRoles').value = lines(info && info.AllFoldersRoles);
+                    state.folderRolesReady = renderFolderRoles(page, state, info && info.FolderRoles);
+                    field(page, 'ssoLiveTvRoles').value = lines(info && info.LiveTvRoles);
+                    field(page, 'ssoLiveTvManagementRoles').value = lines(info && info.LiveTvManagementRoles);
                     showError(field(page, 'ssoEditorError'), '');
                     field(page, 'ssoEditor').classList.remove('hide');
                     field(page, 'ssoAdd').classList.add('hide');
@@ -446,7 +630,8 @@
                     field(page, 'ssoAdd').classList.remove('hide');
                 }
 
-                function saveProvider(page, state) {
+                /** Saves the editor's provider; `noAccessConfirmed` once the admin agreed to role sync with no access role. */
+                function saveProvider(page, state, noAccessConfirmed) {
                     var key = state.editing || field(page, 'ssoKey').value.trim();
                     var body = {
                         Name: field(page, 'ssoName').value.trim(),
@@ -460,7 +645,11 @@
                         RoleClaim: field(page, 'ssoRoleClaim').value.trim(),
                         RequiredRole: field(page, 'ssoRequiredRole').value.trim(),
                         RoleSync: field(page, 'ssoRoleSync').checked,
-                        AdminRole: field(page, 'ssoAdminRole').value.trim()
+                        AdminRole: field(page, 'ssoAdminRole').value.trim(),
+                        AllFoldersRoles: roleList(page, 'ssoAllFoldersRoles'),
+                        FolderRoles: folderRoles(page),
+                        LiveTvRoles: roleList(page, 'ssoLiveTvRoles'),
+                        LiveTvManagementRoles: roleList(page, 'ssoLiveTvManagementRoles')
                     };
                     var secret = field(page, 'ssoClientSecret').value;
                     if (secret) {
@@ -478,6 +667,14 @@
                     });
                     if (taken) {
                         showError(error, 'A provider with the key ' + key + ' already exists: edit it instead.');
+                        return;
+                    }
+                    if (!noAccessConfirmed && withoutAccess(body)) {
+                        Dashboard.confirm(NO_ACCESS_MESSAGE, 'Save with no library or Live TV role?', function (confirmed) {
+                            if (confirmed) {
+                                saveProvider(page, state, true);
+                            }
+                        });
                         return;
                     }
                     Dashboard.showLoadingMsg();
@@ -554,12 +751,23 @@
                 }
 
                 function bind(page) {
-                    var state = { list: null, editing: null, discovery: {} };
+                    var state = {
+                        list: null, editing: null, discovery: {},
+                        libraries: Promise.resolve([]), folderRolesReady: Promise.resolve()
+                    };
                     page.setAttribute('data-sso-bound', 'true');
                     page.addEventListener('pageshow', function () {
                         state.discovery = {};
+                        state.libraries = loadLibraries();
                         closeEditor(page, state);
                         load(page, state);
+                    });
+                    field(page, 'ssoAddFolderRole').addEventListener('click', function () {
+                        state.libraries.then(function (libraries) {
+                            var row = folderRoleRow(libraries, {});
+                            field(page, 'ssoFolderRoles').appendChild(row);
+                            row.querySelector('.ssoFolderRoleName').focus();
+                        });
                     });
                     field(page, 'ssoPublicUrlForm').addEventListener('submit', function (event) {
                         event.preventDefault();
@@ -573,7 +781,10 @@
                     });
                     field(page, 'ssoEditor').addEventListener('submit', function (event) {
                         event.preventDefault();
-                        saveProvider(page, state);
+                        // Not before the library mappings are shown, or none would be sent.
+                        state.folderRolesReady.then(function () {
+                            saveProvider(page, state, false);
+                        });
                     });
                 }
 
