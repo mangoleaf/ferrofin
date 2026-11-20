@@ -39,6 +39,7 @@ pub mod intro_skipper;
 pub mod ldap_auth;
 mod library_pages;
 pub mod merge_versions;
+pub mod sso;
 
 /// The collaborators an extension's tasks are allowed to touch (trait objects
 /// only, so extensions stay decoupled from the concrete managers).
@@ -150,6 +151,7 @@ pub fn builtin_extensions() -> Vec<Arc<dyn Extension>> {
         Arc::new(merge_versions::MergeVersionsExtension),
         Arc::new(ferrofin_settings::FerrofinSettingsExtension),
         Arc::new(ldap_auth::LdapAuthExtension),
+        Arc::new(sso::SsoExtension),
     ]
 }
 
@@ -272,6 +274,35 @@ mod tests {
         }
         async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
             Ok(())
+        }
+    }
+
+    /// An in-memory log sink for a scoped `fmt` subscriber
+    /// (`tracing_subscriber::fmt().with_writer(logs.clone())`).
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        /// Everything logged so far, as text.
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("logs")).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
         }
     }
 
@@ -588,7 +619,7 @@ mod tests {
     #[test]
     fn registered_plugins_carry_each_extensions_seed_config_and_pages() {
         let extensions = builtin_extensions();
-        assert_eq!(extensions.len(), 5);
+        assert_eq!(extensions.len(), 6);
         let plugins = registered_plugins(&extensions);
         assert_eq!(plugins.len(), extensions.len());
         for (plugin, ext) in plugins.iter().zip(&extensions) {
@@ -608,7 +639,7 @@ mod tests {
     fn extension_ids_are_unique() {
         let ids: std::collections::HashSet<Uuid> =
             builtin_extensions().iter().map(|e| e.id()).collect();
-        assert_eq!(ids.len(), 5, "plugin ids double as /Plugins keys");
+        assert_eq!(ids.len(), 6, "plugin ids double as /Plugins keys");
     }
 
     #[tokio::test]
@@ -682,6 +713,28 @@ mod tests {
             ferrofin_model::tasks::TaskTriggerInfoType::IntervalTrigger
         );
         assert_eq!(triggers[0].interval_ticks, Some(24 * 3600 * 10_000_000));
+    }
+
+    #[test]
+    fn single_sign_on_is_listed_under_its_own_guid_off_by_default_with_a_page() {
+        let sso = builtin_extensions()
+            .into_iter()
+            .find(|e| e.descriptor().name == "Single Sign-On")
+            .expect("Single Sign-On is a built-in extension");
+        // D15: a Ferrofin identity, never the community SSO-Auth plugin's.
+        assert_eq!(
+            sso.id(),
+            Uuid::parse_str("67a29a1d-e02b-4aaa-bba0-4b2275e765d0").expect("guid")
+        );
+        assert_ne!(
+            sso.id(),
+            Uuid::parse_str("505ce9d1-d916-42fa-86ca-673ef241d7df").expect("guid")
+        );
+        assert!(
+            !sso.descriptor().enabled,
+            "D1: off until an admin enables it"
+        );
+        assert_eq!(sso.config_pages().len(), 1, "its settings page");
     }
 
     #[tokio::test]

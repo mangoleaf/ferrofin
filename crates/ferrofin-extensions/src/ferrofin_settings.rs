@@ -84,7 +84,7 @@ impl Extension for FerrofinSettingsExtension {
 /// component .NET versions carry, since `/Plugins/{id}/{version}/…` binds the
 /// version as one. A build with no release tag in its history (a bare commit)
 /// reports the crate's version.
-fn plugin_version(build: &str) -> String {
+pub(crate) fn plugin_version(build: &str) -> String {
     let release = build
         .trim_start_matches('v')
         .split(['-', '+'])

@@ -602,8 +602,13 @@ pub(crate) mod tests {
                 }
             }
         }
-        // The plugin routes outside the contract (LDAP-Auth's) all take a body.
-        for (method, path, _) in crate::handlers::PLUGIN_ROUTES {
+        // The ported plugins' routes outside the contract (LDAP-Auth's) all
+        // take a body. Single Sign-On is Ferrofin's own: it has no ASP.NET
+        // binder to copy, so its body files no parameter entry.
+        for (method, path, _) in crate::handlers::PLUGIN_ROUTES
+            .iter()
+            .filter(|(_, _, plugin)| *plugin != "sso")
+        {
             let operation = format!("{} {path}", method.to_ascii_uppercase());
             if !rows.contains(&shape_of(&operation)) {
                 missing.push(operation);

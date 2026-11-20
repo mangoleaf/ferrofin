@@ -672,9 +672,9 @@ pub struct Config {
     pub enable_metrics: Option<bool>,
 
     /// Suppress the compiled-in extensions (intro skipper, file
-    /// transformation, merge versions, LDAP-Auth) — `true` registers none of them but
-    /// the Ferrofin settings extension, the server's own settings page
-    /// (`ferrofin_extensions::registered_extensions`).
+    /// transformation, merge versions, LDAP-Auth, Single Sign-On) — `true`
+    /// registers none of them but the Ferrofin settings extension, the
+    /// server's own settings page (`ferrofin_extensions::registered_extensions`).
     ///
     /// This exists for measurement. A benchmark leg has to compare like with
     /// like, and the Jellyfin leg runs with no plugins installed; leaving

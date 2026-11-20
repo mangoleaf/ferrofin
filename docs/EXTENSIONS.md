@@ -69,8 +69,8 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
 - **Vendored settings pages.** The upstream plugin's HTML settings page is committed into
   `crates/ferrofin-extensions/assets/<name>/` at build time, so normal builds are hermetic
   (no network fetch). Refresh with `FERROFIN_REFRESH_PLUGIN_ASSETS=1 cargo build -p ferrofin-extensions`.
-  The Ferrofin Settings extension's own page is the exception: it is authored here
-  ([below](#the-ferrofin-settings-extension)).
+  Ferrofin's own extensions, Ferrofin Settings ([below](#the-ferrofin-settings-extension)) and
+  Single Sign-On (`assets/sso/settings.html`), are the exception: their pages are authored here.
 - **Authentication providers join sign-in late.** The user manager is built before the
   extensions, so the composition root hands it every extension's `auth_providers` once
   they are wired (`register_auth_providers`). Sign-in consults them after the built-in
@@ -171,9 +171,10 @@ proven against OpenLDAP only: Active Directory has not been tested.
 
 ### The Ferrofin Settings extension
 
-Beside the ports, one extension is Ferrofin's own: **Ferrofin Settings**
-(`crates/ferrofin-extensions/src/ferrofin_settings.rs`). It ports no plugin and has no tasks,
-hooks or providers; it gives the server's own settings (`GET` and `POST /Ferrofin/Settings`, see
+Beside the ports, two extensions are Ferrofin's own: **Single Sign-On**
+(`crates/ferrofin-extensions/src/sso.rs`), off by default, and **Ferrofin Settings**
+(`crates/ferrofin-extensions/src/ferrofin_settings.rs`). This section is about the second, which
+ports no plugin and has no tasks, hooks or providers; it gives the server's own settings (`GET` and `POST /Ferrofin/Settings`, see
 [`CONFIG.md`](CONFIG.md#seeing-what-is-set)) a plugin identity and an enabled flag, so the
 dashboard's Disable toggle turns them off. Its version is the server's release.
 `FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.
