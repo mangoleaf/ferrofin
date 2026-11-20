@@ -31,6 +31,9 @@ setup() {
 }
 
 CODE_MIGRATIONS=(20260113120000_MigrateLinkedChildren 20260915104305_FixNullEncoderPreset)
+# The routes a whole run here runs, the two setup fakes fixtures for: test_routes.py checks the others
+# against the fixtures gates/adoption builds.
+ROUTES=10.11.8,12.4-from-123
 
 teardown() { # no fake server outlives its test
   local pid
@@ -182,6 +185,8 @@ EOS
   [ "$status" -eq 2 ]
   # shellcheck disable=SC2154  # $stderr is set by bats' run --separate-stderr
   [[ "$stderr" == *"no route 9.9 in routes.sh"* ]]
+  run --separate-stderr run_gate "$TMP/w1" --only 10.11.8,9.9
+  [ "$status" -eq 2 ]; [[ "$stderr" == *"no route 9.9 in routes.sh"* ]]
   run --separate-stderr run_gate "$TMP/w2" --run-id 'Bad Id'
   [ "$status" -eq 2 ]; [[ "$stderr" == *"--run-id must be"* ]]
   mkdir "$TMP/w3"
@@ -202,7 +207,7 @@ EOS
 # --- whole runs ------------------------------------------------------------------------------------
 
 @test "run.sh: both routes pass on the export, Jellyfin running on the 10.11.8 route the code migrations it left to run" {
-  run run_gate "$TMP/w" --run-id both
+  run run_gate "$TMP/w" --run-id both --only "$ROUTES"
   [ "$status" -eq 0 ]
   [[ "$output" == *"PASS  10.11.8        "* ]]
   [[ "$output" == *"PASS  12.4-from-123  "* ]]
@@ -341,7 +346,7 @@ EOS
   pids=()
   for side in a b; do
     FERROFIN_GATES_DIR=$TMP/gates FAKE_RUN_DELAY=1 repo/gates/roundtrip/run.sh --image ferrofin:test \
-      --jellyfin-image jellyfin/jellyfin:test --fixtures "$TMP/fixtures" > "$side.out" 2>&1 &
+      --jellyfin-image jellyfin/jellyfin:test --fixtures "$TMP/fixtures" --only "$ROUTES" > "$side.out" 2>&1 &
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do wait "$pid" || true; done

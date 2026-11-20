@@ -1,6 +1,6 @@
 """Regression tests for synthetic coverage and the unchanged-scan write audit."""
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -1063,6 +1063,64 @@ class FreshInstallBuildTest(unittest.TestCase):
         self.assertEqual(ready["fixture"], fresh)  # still a completed, usable fixture
         self.assertEqual(ready["version"], version)
         self.assertEqual(ready.get("layout"), layout)  # what run.sh reads (adoption_fixture_layout)
+
+
+class FirstStartTest(unittest.TestCase):
+    """synthetic.first_start: the round trip's release started once on a throwaway copy of each fixture of
+    FIRST_STARTS, its log kept as the oracle only when the server came up."""
+
+    def setUp(self):
+        import synthetic
+        self.synthetic = synthetic
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.out = self.root / "oracle/first-start-12.4"
+        for name in synthetic.FIRST_STARTS:
+            (self.root / name / "data").mkdir(parents=True)
+            (self.root / name / "data/jellyfin.db").write_text(name)
+
+    def first_start(self, fail=()):
+        """first_start with a fake server that logs as the real one does, also when it never comes up (a
+        fixture in `fail`); the (image, copy, its database) of each start."""
+        started = []
+
+        @contextmanager
+        def server(image, config, media, name, port, ferrofin=False, layout=None):
+            started.append((image, config.name, (config / "data/jellyfin.db").read_text()))
+            (config.parent / (config.name + "-cache")).mkdir()
+            try:
+                if config.name.removeprefix("first-start-") in fail:
+                    raise CheckError("synthetic server did not become ready")
+                yield
+            finally:
+                (config.parent / (config.name + ".server.log")).write_text(f"{image} on {config.name}\n")
+
+        with patch.object(self.synthetic, "server", server):
+            self.synthetic.first_start(self.root, 0)
+        return started
+
+    def test_each_fixture_gets_one_start_on_a_copy_kept_only_as_its_log(self):
+        fixtures = self.synthetic.FIRST_STARTS
+        self.assertEqual(self.first_start(),
+                         [("jellyfin/jellyfin:12.4", f"first-start-{name}", name) for name in fixtures])
+        for name in fixtures:
+            self.assertEqual((self.out / f"{name}.server.log").read_text(),
+                             f"jellyfin/jellyfin:12.4 on first-start-{name}\n")
+            self.assertEqual((self.root / name / "data/jellyfin.db").read_text(), name)   # the fixture untouched
+        self.assertEqual(list((self.root / "work").iterdir()), [])   # no copy, cache or log left behind
+        self.assertEqual(self.first_start(), [])   # a later build starts none again
+
+    def test_a_start_that_fails_keeps_no_log_and_is_made_again(self):
+        first, failing, *rest = self.synthetic.FIRST_STARTS
+        with self.assertRaises(CheckError):
+            self.first_start(fail={failing})
+        self.assertTrue((self.out / f"{first}.server.log").exists())
+        self.assertFalse((self.out / f"{failing}.server.log").exists())
+        self.assertTrue((self.root / "work" / f"first-start-{failing}.server.log").exists())   # to look into
+        self.assertEqual([copy for _, copy, _ in self.first_start()],
+                         [f"first-start-{name}" for name in [failing, *rest]])
+        self.assertTrue((self.out / f"{failing}.server.log").exists())
 
 
 class LayoutTest(unittest.TestCase):
