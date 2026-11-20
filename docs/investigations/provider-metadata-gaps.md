@@ -103,9 +103,9 @@ provider latency. The episode regression separately verifies one detail/credits
 request per changed episode and no request on an unchanged rescan.
 
 ```sh
-FERROFIN_SCAN_BENCH=1 FERROFIN_SCAN_BENCH_MOVIES=300 \
+FERROFIN_SCAN_BENCH_MOVIES=300 \
 FERROFIN_SCAN_BENCH_SERIES=10 FERROFIN_SCAN_BENCH_EPISODES=10 \
-RUSTC_WRAPPER= cargo test -p ferrofin-server --test scan_bench -- --nocapture
+RUSTC_WRAPPER= cargo test -p ferrofin-server --test scan_bench -- --include-ignored --nocapture
 ```
 
 Session artifacts: `/tmp/ferrofin-metadata-bench.log` and

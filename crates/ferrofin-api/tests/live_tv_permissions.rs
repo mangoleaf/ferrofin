@@ -37,7 +37,8 @@ use ferrofin_api::test_support::{authed_fake_state_with_policy, elevated_fake_st
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::live_tv::{
-    GuideInfo, ListingsProviderInfo, LiveTvInfo, SeriesTimerInfoDto, TimerInfoDto, TunerHostInfo,
+    BaseTimerInfoDto, GuideInfo, ListingsProviderInfo, LiveTvInfo, SeriesTimerInfoDto,
+    TimerInfoDto, TunerHostInfo,
 };
 use ferrofin_model::querying::QueryResult;
 use ferrofin_model::users::UserPolicy;
@@ -98,7 +99,7 @@ impl LiveTvManager for CountingLiveTv {
         _provider_id: &str,
         _tuner_channel_id: &str,
         _provider_channel_id: &str,
-    ) -> Result<ferrofin_model::live_tv::TunerChannelMapping, ServiceError> {
+    ) -> Result<Option<ferrofin_model::live_tv::TunerChannelMapping>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
     async fn discover_tuners(
@@ -168,11 +169,15 @@ impl LiveTvManager for CountingLiveTv {
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    async fn get_channel_stream_url(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
-        unimplemented!("not probed by the gate tests")
-    }
+    /// The one timer, `t1`, that the probed `DELETE` cancels.
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
-        unimplemented!("not probed by the gate tests")
+        Ok(vec![TimerInfoDto {
+            base: BaseTimerInfoDto {
+                id: Some("t1".to_owned()),
+                ..BaseTimerInfoDto::default()
+            },
+            ..TimerInfoDto::default()
+        }])
     }
     async fn get_timer(&self, _id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
         unimplemented!("not probed by the gate tests")
@@ -215,9 +220,6 @@ impl LiveTvManager for CountingLiveTv {
         unimplemented!("not probed by the gate tests")
     }
     async fn get_recording(&self, _id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
-        unimplemented!("not probed by the gate tests")
-    }
-    async fn get_recording_path(&self, _id: Uuid) -> Result<Option<String>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
     async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {

@@ -2226,11 +2226,11 @@ async fn a_plugin_is_never_asked_by_an_unchanged_rescan() {
 /// MusicBrainz, TheAudioDB and a plugin ranked first only fill what the NFO
 /// left: the NFO's overview and genres stand over all three; the plugin's
 /// tagline and MusicBrainz's year fill the gaps. "Replace all metadata"
-/// reads neither: an existing NFO enables the Nfo saver at `MetadataEdit`
-/// (`ProviderManager.IsSaverEnabledForItem`, `:880-889`), and upstream skips
-/// the local readers of an item it is saving metadata for under "Replace all
-/// metadata" (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:
-/// 803`), so the providers' values replace the NFO's.
+/// reads neither in a library that names the Nfo saver
+/// (`ProviderManager.IsSaverEnabledForItem`): upstream skips the local
+/// readers of an item it is saving metadata for under "Replace all metadata"
+/// (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:803`), so
+/// the providers' values replace the NFO's.
 #[rstest::rstest]
 #[case::first_scan(false)]
 #[case::replace_all(true)]
@@ -2240,7 +2240,11 @@ async fn the_music_nfo_stands_over_every_remote_provider_except_under_replace_al
 ) {
     let plugin = PluginDb::new();
     let tmp = tempfile::tempdir().expect("tmp");
-    let fx = Fixture::with_plugins(tmp.path(), plugin_ranked(true), plugin.source()).await;
+    let options = LibraryOptions {
+        metadata_savers: Some(vec!["Nfo".into()]),
+        ..plugin_ranked(true)
+    };
+    let fx = Fixture::with_plugins(tmp.path(), options, plugin.source()).await;
     std::fs::write(
         fx.album_dir.join("album.nfo"),
         "<album><title>Kind of Blue</title><plot>NFO album text.</plot>\
@@ -2356,6 +2360,54 @@ async fn an_album_under_an_identified_artist_reads_no_nfo() {
         Some("jazz|modal jazz"),
         "MusicBrainz's"
     );
+}
+
+/// gl-1744: the chosen result the copied options carry also runs its
+/// provider first for the albums below the identified artist ("When
+/// identifying, run the provider the user picked first",
+/// `MetadataService.cs:876-882`, on `options.SearchResult`), not only for the
+/// artist: with the plugin ranked last, an Identify through it makes its
+/// overview and genres win the album's fields over TheAudioDB's and
+/// MusicBrainz's.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_album_under_an_identified_artist_runs_the_chosen_provider_first() {
+    let plugin = PluginDb::new();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::with_plugins(tmp.path(), plugin_ranked(false), plugin.source()).await;
+    fx.scan().await;
+    let album = fx.row(fx.album_id()).await;
+    assert_eq!(
+        album.genres.as_deref(),
+        Some("jazz|modal jazz"),
+        "ranked last"
+    );
+
+    let options = MetadataRefreshOptions {
+        search_result: Some(RemoteSearchResult {
+            name: Some("Miles Davis".to_owned()),
+            search_provider_name: Some(PLUGIN.to_owned()),
+            ..RemoteSearchResult::default()
+        }),
+        ..replace_all()
+    };
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    let cancel = ScanCancel::new();
+    fx.scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![fx.artist_dir.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &cancel).with_passes(ScanPasses::Touched),
+        )
+        .await
+        .expect("identify");
+    let artist = fx.row(fx.artist_id()).await;
+    assert_eq!(artist.genres.as_deref(), Some("Hard bop"), "the artist's");
+    let album = fx.row(fx.album_id()).await;
+    assert_eq!(album.overview.as_deref(), Some("PluginDb album text."));
+    assert_eq!(album.genres.as_deref(), Some("Cool jazz"));
 }
 
 /// A refresh of an album served inside a scan after the walk decided the

@@ -23,32 +23,9 @@ use async_trait::async_trait;
 use tracing::error;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::events::EventManager;
+use ferrofin_traits::events::{EventManager, EventSubscriber};
 
-/// A single in-process event consumer.
-///
-/// Port of `IEventConsumer<T>.OnEvent`. The typed `T eventArgs` becomes the raw
-/// JSON `payload` string the [`EventManager`] trait carries; the consumer
-/// deserializes it by the `event_type` it registered under. Returning
-/// [`ServiceError`] lets [`FerrofinEventManager::publish`] log-and-continue,
-/// matching the C# per-consumer `try/catch`.
-/// The future a consumer returns, awaited in registration order by
-/// [`FerrofinEventManager::publish`].
-pub type EventFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServiceError>> + Send>>;
-
-/// A consumer callback: it inspects the payload synchronously and returns the
-/// work to await. A consumer whose effect must be *ordered* relative to later
-/// publishes (the activity-log writers) puts the work in the future; one whose
-/// effect is a fire-and-forget push (the WebSocket notifiers, which C# also
-/// treats as best-effort sends) may spawn and return a ready future.
-pub type EventConsumer = Arc<dyn Fn(&str) -> EventFuture + Send + Sync + 'static>;
-
-/// A consumer future that is already finished — for a consumer that did all its
-/// work synchronously or spawned it.
-pub fn consumer_done() -> EventFuture {
-    Box::pin(std::future::ready(Ok(())))
-}
+pub use ferrofin_traits::events::{EventConsumer, EventFuture, consumer_done};
 
 /// The concrete in-process event manager.
 ///
@@ -105,6 +82,12 @@ impl FerrofinEventManager {
             .expect("event consumers lock poisoned")
             .get(event_type)
             .map_or(0, Vec::len)
+    }
+}
+
+impl EventSubscriber for FerrofinEventManager {
+    fn subscribe(&self, event_type: &str, consumer: EventConsumer) {
+        Self::subscribe(self, event_type, consumer);
     }
 }
 
@@ -246,6 +229,27 @@ mod tests {
         manager.publish("E", "{}").await.unwrap();
         // Already recorded when publish returned — not eventually.
         assert_eq!(&*order.read().unwrap(), &["first", "second", "third"]);
+    }
+
+    /// Plugin hosts subscribe through the `EventSubscriber` seam, never the
+    /// concrete manager: a consumer added that way runs on publish.
+    #[tokio::test]
+    async fn a_consumer_subscribed_through_the_seam_runs_on_publish() {
+        let manager = FerrofinEventManager::new();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seam: &dyn EventSubscriber = &manager;
+        let counted = Arc::clone(&hits);
+        seam.subscribe(
+            "E",
+            Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                consumer_done()
+            }),
+        );
+
+        manager.publish("E", "{}").await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.consumer_count("E"), 1);
     }
 
     #[tokio::test]

@@ -174,7 +174,7 @@ impl AudioDbClient {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("audiodb"),
             base_url: API_BASE.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
@@ -194,7 +194,7 @@ impl AudioDbClient {
     #[must_use]
     pub fn with_base_url(base_url: &str) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             limiter: RateLimiter::new("audiodb"),
             base_url: base_url.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
@@ -281,6 +281,7 @@ impl AudioDbClient {
 fn push_image(out: &mut Vec<TmdbImage>, url: Option<String>, image_type: ImageType) {
     if let Some(url) = url.filter(|u| !u.trim().is_empty()) {
         out.push(TmdbImage {
+            thumbnail_url: None,
             image_type,
             url,
             width: None,
@@ -336,15 +337,9 @@ fn localized_texts(rest: &BTreeMap<String, Value>, prefix: &str) -> BTreeMap<Str
 /// fallback. Upstream stores `""` in that case; `None` here has the same
 /// effect, because the merge treats both as empty (`IsNullOrEmpty`).
 fn localized(texts: &BTreeMap<String, String>, language: Option<&str>) -> (Option<String>, String) {
-    // `MetadataLanguageUtils.GetLanguageSubtag`.
     let subtag = language
         .filter(|language| !language.is_empty())
-        .map(|language| {
-            language
-                .split_once('-')
-                .map_or(language, |(subtag, _)| subtag)
-                .to_lowercase()
-        });
+        .map(crate::metadata_merge::language_subtag);
     let suffix = match subtag.as_deref() {
         Some("de") => Some("DE"),
         Some("en") => Some("EN"),
@@ -653,5 +648,38 @@ mod quota_tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// gl-76: a provider request names the server and offers compression, as
+    /// upstream's `NamedClient.Default` does, and a compressed answer is
+    /// decoded.
+    #[tokio::test]
+    async fn a_lookup_names_the_server_and_takes_a_compressed_answer() {
+        // `{"ok":true}`, gzipped.
+        const GZIPPED: [u8; 31] = [
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x56, 0xca, 0xcf,
+            0x56, 0xb2, 0x2a, 0x29, 0x2a, 0x4d, 0xad, 0x05, 0x00, 0x90, 0x5f, 0xd4, 0xa7, 0x0b,
+            0x00, 0x00, 0x00,
+        ];
+        let server = MockServer::start_raw(vec![MockServer::raw_ok(
+            "Content-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: 31\r\n",
+            &GZIPPED,
+        )])
+        .await;
+        let client = AudioDbClient::with_base_url(&server.base_url);
+
+        let answer: Option<serde_json::Value> = client.fetch("/artist-mb.php", "id").await;
+
+        assert_eq!(answer, Some(serde_json::json!({"ok": true})));
+        let head = &server.heads()[0];
+        let agent = format!("user-agent: {}\r\n", ferrofin_health::USER_AGENT);
+        assert!(head.contains(&agent.to_ascii_lowercase()), "{head}");
+        let encodings = head
+            .lines()
+            .find_map(|line| line.strip_prefix("accept-encoding: "))
+            .unwrap_or_default();
+        for encoding in ["gzip", "deflate", "br"] {
+            assert!(encodings.contains(encoding), "{head}");
+        }
     }
 }

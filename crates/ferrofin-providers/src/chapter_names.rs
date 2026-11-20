@@ -14,11 +14,10 @@
 //! is the separate ambient-culture divergence tracked by S33/S34.
 
 use ferrofin_model::entities_media::ChapterInfo;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// The largest day count whose ticks fit a signed 64-bit `TimeSpan`.
 const MAX_DAYS: u128 = 10_675_199;
-/// Ticks in one second (`TimeSpan.TicksPerSecond`).
-const TICKS_PER_SECOND: u128 = 10_000_000;
 /// Fraction digits `TimeSpan` keeps (100 ns resolution).
 const FRACTION_DIGITS: usize = 7;
 
@@ -118,8 +117,9 @@ pub fn is_time_span(input: &str) -> bool {
     if days > MAX_DAYS + 1 || hours > 23 || minutes > 59 || seconds > 59 {
         return false;
     }
-    let ticks =
-        (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * TICKS_PER_SECOND + fraction_ticks;
+    let ticks = (((days * 24 + hours) * 60 + minutes) * 60 + seconds)
+        * u128::from(TICKS_PER_SECOND.unsigned_abs())
+        + fraction_ticks;
     let limit = if negative {
         1_u128 << 63
     } else {

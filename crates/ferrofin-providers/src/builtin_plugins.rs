@@ -19,8 +19,8 @@
 //! This module is plain data: the ids, names, descriptions, configuration file
 //! names, default configuration JSON, and the **verbatim** `config.html` bytes
 //! taken from the 10.11.8 tag (both projects are GPL-3.0-only). The composition
-//! root turns each [`BuiltinPlugin`] into a `ferrofin_core::RegisteredPlugin`,
-//! because `RegisteredPlugin` lives above this crate in the dependency graph.
+//! root turns each [`BuiltinPlugin`] into a
+//! `ferrofin_traits::plugins::RegisteredPlugin`.
 //!
 //! **The configurations are live.** The composition root
 //! (`apps/ferrofin-server/src/state.rs`) hands the plugin manager to
@@ -41,6 +41,8 @@
 //! | TMDb | `EnabledMissingEpisodeLibraries` | the libraries those run for (`IsEnabledForLibrary`) |
 //! | TMDb | `UpcomingEpisodeGracePeriodDays` | how long a recently aired placeholder stays while missing episodes are off (`ShouldPrune`) |
 //! | TMDb | `MissingEpisodeRefreshIntervalDays` | the `TmdbRefreshUpcomingEpisodes` task's interval (`TmdbUpcomingEpisodesTask.GetDefaultTriggers`) |
+//! | TMDb | `ExcludeTagsMovies` / `ExcludeTagsSeries` | leave `keywords` out of the movie / series request, so TMDb's keywords never become Tags (`TmdbClientManager.cs:78-81,152-155`) |
+//! | TMDb | `ImportSeasonName` | name a season after TMDb's season name (`TmdbSeasonProvider.cs:76`) |
 //! | OMDb | `CastAndCrew` | whether OMDb's director/writer/actors are imported (`OmdbProvider.cs:417`) |
 //! | MusicBrainz | `Server` | the web-service base URL (`MusicBrainzArtistProvider.ReloadConfig`) |
 //! | MusicBrainz | `RateLimit` | seconds between requests (same) |
@@ -53,28 +55,6 @@
 //! `FERROFIN_STUDIOS_REPO_URL`, `FERROFIN_OMDB_KEY`) still wins over the
 //! dashboard — an explicit env/file setting is the more specific instruction,
 //! and those knobs shipped before these plugins had an identity.
-//!
-//! **Two TMDb settings remain OPEN WORK, because the behaviour they gate has
-//! never been ported at all** — they are not "accepted", and reading the config
-//! for them would be a switch wired to nothing:
-//!
-//! - `ExcludeTagsMovies` / `ExcludeTagsSeries` gate whether `keywords` joins the
-//!   `append_to_response` (`TmdbClientManager.cs:68,142`) so that
-//!   `movieResult.Keywords.Keywords` become the item's Tags
-//!   (`TmdbMovieProvider.cs:250-257`). Ferrofin never requests `keywords` and
-//!   never writes TMDB tags, so it behaves as if both flags were permanently
-//!   ON. Un-defer path: add `keywords` to the `details()` append when the flag
-//!   is clear, parse `keywords.keywords[].name` (movies) /
-//!   `keywords.results[].name` (TV) onto `TmdbDetails::tags`, and merge it in
-//!   `apply_details` next to `studios`, which already has the
-//!   `merge_multi_value` shape.
-//! - `ImportSeasonName` overwrites a season's name with TMDB's
-//!   (`TmdbSeasonProvider.cs:73-76`). Ferrofin always names a season
-//!   `Season {n}` (`library_scan.rs`, `season_display_name`), so there is
-//!   nothing for the flag to switch. Un-defer path: give the season metadata
-//!   pass the cached `SeasonDetails::name` (already fetched for the poster) and
-//!   apply it under the flag, with the same "only when it differs" guard the
-//!   AudioDB rename uses.
 //!
 //! [`PluginManager`]: ferrofin_traits::plugins::PluginManager
 //! [`OpenSubtitlesProvider`]: crate::opensubtitles::OpenSubtitlesProvider

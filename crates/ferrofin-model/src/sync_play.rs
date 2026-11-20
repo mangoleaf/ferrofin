@@ -324,8 +324,11 @@ pub struct GroupInfoDto {
     /// Gets the group state.
     pub state: GroupStateType,
 
-    /// Gets the participants.
-    pub participants: Vec<String>,
+    /// Gets the participants: each member session's user name, null for an API
+    /// key's session (it has no user). Documented as the contract's string
+    /// items, which Jellyfin's spec also declares while it sends that null.
+    #[schema(value_type = Vec<String>)]
+    pub participants: Vec<Option<String>>,
 
     /// Gets the date when this DTO has been created.
     #[schema(value_type = String, format = "date-time")]
@@ -592,7 +595,8 @@ pub struct UserJoinedUpdate {
     pub group_id: Uuid,
 
     /// Gets the update data (the joining user's name).
-    pub data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
 }
 
 /// The `UserLeft` variant payload (`SyncPlayUserLeftUpdate`).
@@ -604,8 +608,10 @@ pub struct UserLeftUpdate {
     #[serde(with = "crate::json::guid")]
     pub group_id: Uuid,
 
-    /// Gets the update data (the leaving user's name).
-    pub data: String,
+    /// Gets the update data (the leaving user's name); omitted for an API key's
+    /// session, whose name is null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
 }
 
 /// The `GroupJoined` variant payload (`SyncPlayGroupJoinedUpdate`).

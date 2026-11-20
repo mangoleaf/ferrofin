@@ -60,8 +60,8 @@ static CREDENTIAL_HEADERS: [HeaderName; 4] = [
 /// parameter, and the caller's address.
 ///
 /// This runs on every request, images and segments included, so it copies only
-/// what the parser reads. A repeated header keeps its order and a non-UTF-8
-/// value is dropped, as in [`request_context`].
+/// what the parser reads. A repeated header keeps its order, and a value is
+/// read by [`header_text`]: one that is not UTF-8 is dropped.
 pub(crate) fn auth_request_context(
     headers: &HeaderMap,
     query: Option<&str>,
@@ -72,10 +72,7 @@ pub(crate) fn auth_request_context(
     let mut copied = Vec::new();
     for name in &CREDENTIAL_HEADERS {
         copied.extend(headers.get_all(name).iter().filter_map(|value| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.as_str().to_owned(), v.to_owned()))
+            header_text(value).map(|v| (name.as_str().to_owned(), v.to_owned()))
         }));
     }
     RequestContext {
@@ -86,17 +83,27 @@ pub(crate) fn auth_request_context(
     }
 }
 
+/// A header value as Kestrel reads it: ASCII, else UTF-8 (a device name
+/// such as `Salle de séjour`), where [`HeaderValue::to_str`] takes visible ASCII
+/// only. The server edge refuses a value that is neither, as Kestrel does, so
+/// `None` is only for a router served without it.
+///
+/// [`HeaderValue::to_str`]: axum::http::HeaderValue::to_str
+pub(crate) fn header_text(value: &axum::http::HeaderValue) -> Option<&str> {
+    std::str::from_utf8(value.as_bytes()).ok()
+}
+
 /// Builds a [`RequestContext`] from an axum request's headers and query string,
 /// for what reads more of the request than authentication does: the `Host` a
 /// system address is built from.
 ///
-/// Copies every header as a `(name, value)` pair (dropping non-UTF-8 values,
-/// which Jellyfin's ASCII header grammar never uses) and carries the raw query
-/// string.
+/// Copies every header as a `(name, value)` pair, read by [`header_text`] (a
+/// value that is not UTF-8 is dropped), and carries the raw query string.
 ///
-/// The scheme is left unresolved (`None`, read as `http`). A context that
-/// builds addresses comes from `handlers::system::context_from_parts`, which
-/// resolves it.
+/// The scheme is left unresolved (`None`, read as `http`), and the `Host` is
+/// the request's own. A context that builds addresses comes from
+/// `handlers::system::context_from_parts`, which resolves the scheme and puts
+/// a known proxy's `X-Forwarded-Host` in place of the `Host`.
 pub(crate) fn request_context(
     headers: &HeaderMap,
     query: Option<&str>,
@@ -106,10 +113,7 @@ pub(crate) fn request_context(
     // otherwise regrow this vector several times for every request that arrives.
     let mut copied = Vec::with_capacity(headers.len());
     copied.extend(headers.iter().filter_map(|(name, value)| {
-        value
-            .to_str()
-            .ok()
-            .map(|v| (name.as_str().to_owned(), v.to_owned()))
+        header_text(value).map(|v| (name.as_str().to_owned(), v.to_owned()))
     }));
     RequestContext {
         headers: copied,
@@ -286,7 +290,8 @@ impl FromRequestParts<AppState> for RequireAuthIgnoringSchedule {
 }
 
 /// Elevation combined with a controller-level default policy, as on
-/// ConfigurationController and ItemLookupController. Unlike bare elevation,
+/// ConfigurationController, ItemLookupController and the Intro Skipper
+/// plugin's SkipIntroController writes. Unlike bare elevation,
 /// these routes also enforce the user's remote-access restriction.
 #[derive(Debug, Clone)]
 pub struct RequireAdminWithDefault(pub AuthorizationInfo);
@@ -748,8 +753,8 @@ impl FromRequestParts<AppState> for RequireCollectionManagement {
 
 #[cfg(test)]
 mod tests {
-    use super::request_context;
-    use axum::http::HeaderMap;
+    use super::{auth_request_context, request_context};
+    use axum::http::{HeaderMap, header};
 
     #[test]
     fn access_schedule_preserves_fractional_second_boundaries() {
@@ -800,5 +805,24 @@ mod tests {
         let ctx = request_context(&headers, None, None);
         assert!(ctx.header("x-bytes").is_none());
         assert_eq!(ctx.query_string, None);
+    }
+
+    /// A UTF-8 value outside ASCII is read, as Kestrel reads it: a client
+    /// whose device name has an accent or a curly apostrophe signs in on
+    /// Jellyfin 12.4 under that name.
+    #[test]
+    fn context_builders_keep_a_utf8_value() {
+        let value = r#"MediaBrowser Client="probe", Device="Salle de séjour’s TV", DeviceId="d1", Version="1""#;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+        );
+        for ctx in [
+            auth_request_context(&headers, None, None),
+            request_context(&headers, None, None),
+        ] {
+            assert_eq!(ctx.header("authorization"), Some(value));
+        }
     }
 }

@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{DotnetGuid, Query};
+use crate::extract::{DotnetGuid, Query, StreamPattern, pattern_complaint, validation_failure};
 use crate::handlers::hls::nullable_enum_value;
 use crate::handlers::media_info::universal_audio_source;
 use crate::handlers::streaming::{
@@ -43,6 +43,11 @@ async fn get_audio_stream(
 ) -> Result<Response, ApiError> {
     let raw = request.uri().query().map(ToOwned::to_owned);
     let req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
+    if let Some(rejection) =
+        crate::handlers::hls::stream_pattern_failures(&req, req.output_container.as_deref())
+    {
+        return Ok(rejection);
+    }
     require_streamable_item(
         &state,
         &auth,
@@ -52,7 +57,6 @@ async fn get_audio_stream(
         req.media_source_id.as_deref(),
     )
     .await?;
-    crate::handlers::hls::validate_stream_request(&req)?;
     static_or_transcode(&state, item_id, true, req, request).await
 }
 
@@ -66,11 +70,12 @@ async fn get_audio_stream_by_container(
 ) -> Result<Response, ApiError> {
     let raw = request.uri().query().map(ToOwned::to_owned);
     let mut req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
-    req.output_container = Some(
-        stream_route_container(&container)
-            .ok_or_else(|| ApiError::NotFound("stream route".to_owned()))?
-            .to_owned(),
-    );
+    let container = stream_route_container(&container)
+        .ok_or_else(|| ApiError::NotFound("stream route".to_owned()))?;
+    if let Some(rejection) = crate::handlers::hls::route_container_failures(&req, Some(container)) {
+        return Ok(rejection);
+    }
+    req.output_container = Some(container.to_owned());
     require_streamable_item(
         &state,
         &auth,
@@ -80,7 +85,6 @@ async fn get_audio_stream_by_container(
         req.media_source_id.as_deref(),
     )
     .await?;
-    crate::handlers::hls::validate_stream_request(&req)?;
     static_or_transcode(&state, item_id, true, req, request).await
 }
 
@@ -266,6 +270,20 @@ async fn get_universal_audio_stream(
     Query(query): Query<UniversalAudioQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    // Upstream's `[RegularExpression(ContainerValidationRegexStr)]` binding.
+    if let Some(rejection) = validation_failure(
+        [
+            ("audioCodec", query.audio_codec.as_deref()),
+            (
+                "transcodingContainer",
+                query.transcoding_container.as_deref(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| pattern_complaint(name, value, StreamPattern::Container)),
+    ) {
+        return Ok(rejection);
+    }
     require_streamable_item(
         &state,
         &auth,
@@ -275,27 +293,12 @@ async fn get_universal_audio_stream(
         query.media_source_id.as_deref(),
     )
     .await?;
-    // Upstream's `[RegularExpression(ContainerValidationRegexStr)]` binding.
-    for value in [&query.audio_codec, &query.transcoding_container]
-        .into_iter()
-        .flatten()
-    {
-        if !ferrofin_model::media_info::is_valid_stream_identifier(value) {
-            return Err(ApiError::BadRequest(
-                "invalid streaming container or codec".to_owned(),
-            ));
-        }
-    }
-    let containers: Vec<&str> = query
-        .container
-        .as_deref()
-        .map(|c| {
-            c.split(',')
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let containers: Vec<&str> = query.container.as_deref().map_or_default(|c| {
+        c.split(',')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect()
+    });
     let profile = std::sync::Arc::new(universal_device_profile(&query, &containers));
     let negotiated = universal_audio_source(
         &state,
@@ -429,8 +432,7 @@ mod tests {
         let containers: Vec<&str> = query
             .container
             .as_deref()
-            .map(|c| c.split(',').filter(|c| !c.is_empty()).collect())
-            .unwrap_or_default();
+            .map_or_default(|c| c.split(',').filter(|c| !c.is_empty()).collect());
         universal_device_profile(&query, &containers)
     }
 

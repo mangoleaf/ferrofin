@@ -7,8 +7,9 @@
 //!
 //! - [`PluginUpdateTask`] — `PluginUpdateTask` (`PluginUpdates`)
 //!
-//! The C# `IProgress<double>` maps to [`TaskProgress`]; `CancellationToken`s are
-//! dropped (a queued run is cancelled by aborting its tokio task).
+//! The C# `IProgress<double>` maps to [`TaskProgress`]; the body does not check
+//! the run's token yet, so a stop drops it when it does not stop in time
+//! (gl-1709).
 
 use std::sync::Arc;
 

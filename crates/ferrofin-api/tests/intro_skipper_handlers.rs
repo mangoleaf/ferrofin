@@ -16,6 +16,7 @@ use ferrofin_api::test_support::{
     FakeFileSystem, FakeLibrary, FakeLocalization, FakeLyrics, FakeMediaSources, FakeMusic,
     FakePaths, FakePlaylists, FakeProviders, FakeSearch, FakeSessions, FakeSimilarItems,
     FakeSubtitles, FakeSystem, FakeTrickplay, FakeTvSeries, FakeUserData, FakeUserViews, FakeUsers,
+    FixedAuth,
 };
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::ServerConfiguration;
@@ -392,6 +393,15 @@ impl ferrofin_traits::intro_skipper::IntroSkipperAnalysis for FakeAnalysis {
     async fn plugin_configuration_changed(&self, _plugin_id: Uuid) {}
     async fn support_bundle(&self) -> String {
         String::new()
+    }
+    fn operating_system(&self) -> String {
+        String::new()
+    }
+    async fn create_or_replace_segment(
+        &self,
+        _segment: &MediaSegmentDto,
+    ) -> Result<(), ServiceError> {
+        Ok(())
     }
     /// The extension's typed settings, as its parse of the plugin config
     /// above (`SkipbuttonHideDelay` 11) gives them.
@@ -774,8 +784,15 @@ async fn analyzer_actions_bind_like_the_mvc_binder() {
         assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     }
     for body in ["[]", "5", r#"{"AnalyzerActions":{"Nope":"Default"}}"#] {
-        let (status, _) = send(app.clone(), "POST", uri, body).await;
+        let (status, problem) = send(app.clone(), "POST", uri, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        // gl-1673: the plugin's `[FromBody] … request` is named beside it.
+        let problem: serde_json::Value = serde_json::from_str(&problem).unwrap();
+        assert_eq!(
+            problem["errors"]["request"],
+            serde_json::json!(["The request field is required."]),
+            "{body}"
+        );
     }
     // `SetAnalyzerActionAsync`: each named mode is replaced, the rest kept.
     let nil = app
@@ -845,6 +862,72 @@ async fn plugin_routes_are_elevated_as_upstream() {
     ] {
         let (status, _) = send(user_app.clone(), method, &uri, "{}").await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
+/// An administrator whose account may not connect from outside the local
+/// network.
+fn admin_without_remote_access() -> FixedAuth {
+    FixedAuth(ferrofin_traits::options::AuthorizationInfo {
+        is_authenticated: true,
+        user: Some(Arc::new(ferrofin_api::test_support::sample_user())),
+        user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+            is_administrator: true,
+            ..Default::default()
+        })),
+        ..Default::default()
+    })
+}
+
+/// `SkipIntroController` is `[Authorize]` too, so its three elevated writes
+/// also run the default policy: an administrator who may not connect remotely
+/// is refused them from a remote address. Bare elevation, as on
+/// `TroubleshootingController`, does not check remote access.
+#[tokio::test]
+async fn skip_intro_writes_check_remote_access_as_upstream() {
+    let app = build_app_as(
+        Arc::new(MemSegments::default()),
+        Arc::new(MemTasks {
+            running: false,
+            started: Mutex::new(Vec::new()),
+        }),
+        Arc::new(MemConfig::default()),
+        Arc::new(admin_without_remote_access()),
+    );
+    let id = Uuid::from_u128(1);
+    for (method, uri, want) in [
+        (
+            "POST",
+            format!("/Episode/{id}/Timestamps"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "POST",
+            "/Intros/EraseTimestamps".to_owned(),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "POST",
+            "/Intros/RebuildDatabase".to_owned(),
+            StatusCode::FORBIDDEN,
+        ),
+        ("GET", "/IntroSkipper".to_owned(), StatusCode::OK),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri(&uri)
+            .header("content-type", "application/json")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.9:40000".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(Body::from("{}"))
+            .unwrap();
+        let status = create_router(app.clone())
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, want, "{method} {uri}");
     }
 }
 

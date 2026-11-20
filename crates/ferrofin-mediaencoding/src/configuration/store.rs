@@ -1,22 +1,11 @@
 //! Port of `EncodingConfigurationStore`. Upstream's `EncodingConfigurationFactory`
 //! only hands the store to reflection-based registration; the composition root
-//! registers it directly instead.
+//! registers it directly instead. The C# constructor's `Key`/`ConfigurationType`
+//! are the `"encoding"` key the composition root passes with this validator and
+//! the key matches in the configuration manager and `handlers/config.rs`.
 
-use ferrofin_common::configuration::{
-    ConfigurationStore, ConfigurationValidationError, ValidatingConfiguration,
-};
+use ferrofin_common::configuration::{ConfigurationValidationError, ValidatingConfiguration};
 use ferrofin_model::configuration::EncodingOptions;
-
-/// The configuration key under which encoding options are stored.
-///
-/// Port of the `Key = "encoding"` set in the C# constructor.
-pub const ENCODING_KEY: &str = "encoding";
-
-/// The `type_key` identifying the [`EncodingOptions`] body of this store.
-///
-/// Port of the C# `ConfigurationType = typeof(EncodingOptions)`; Rust carries no
-/// runtime `Type`, so the fully-qualified type name stands in.
-pub const ENCODING_TYPE_KEY: &str = "ferrofin_model::configuration::EncodingOptions";
 
 /// Checks whether a directory exists on disk.
 ///
@@ -41,9 +30,8 @@ impl DirChecker for RealDirChecker {
 
 /// The `"encoding"` configuration store.
 ///
-/// Port of `EncodingConfigurationStore`. Beyond describing the store (via
-/// [`store`](Self::store)) it validates a proposed [`EncodingOptions`] change
-/// before it is persisted.
+/// Port of `EncodingConfigurationStore`: it validates a proposed
+/// [`EncodingOptions`] change before it is persisted.
 pub struct EncodingConfigurationStore<D: DirChecker = RealDirChecker> {
     dir_checker: D,
 }
@@ -58,17 +46,6 @@ impl<D: DirChecker> EncodingConfigurationStore<D> {
     /// Creates a store validating directory existence via `dir_checker`.
     pub fn new(dir_checker: D) -> Self {
         Self { dir_checker }
-    }
-
-    /// Returns the [`ConfigurationStore`] descriptor for encoding options.
-    ///
-    /// Port of the C# constructor's `Key`/`ConfigurationType` assignment.
-    #[must_use]
-    pub fn store(&self) -> ConfigurationStore {
-        ConfigurationStore {
-            key: ENCODING_KEY.to_owned(),
-            type_key: ENCODING_TYPE_KEY.to_owned(),
-        }
     }
 }
 
@@ -133,15 +110,6 @@ mod tests {
 
     fn json(o: &EncodingOptions) -> String {
         serde_json::to_string(o).unwrap()
-    }
-
-    #[test]
-    fn store_describes_the_encoding_key() {
-        let store = EncodingConfigurationStore::new(FakeDirs(vec![])).store();
-        assert_eq!(
-            store.key, "encoding",
-            "the key the composition root registers"
-        );
     }
 
     #[test]

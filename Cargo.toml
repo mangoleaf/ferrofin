@@ -95,12 +95,17 @@ axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 httpdate = "1.0.3"
-# Decoders for the response-compression tests only (the server never decodes a
-# response it just encoded). Streaming readers validate the wire response.
+# zlib/gzip: the response-compression tests' decoders (the server never decodes
+# a response it just encoded), gzipped Live TV guides (ferrofin-livetv), and a
+# PDF's compressed cross-reference and object streams (ferrofin-providers books).
 flate2 = "1.1.11"
-zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-api, which adds `time`)
+zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-core, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
 sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
+# A PDF book's Standard security handler with the empty user password
+# (ferrofin-providers books page counts): AES-128/256 and MD5 key derivation.
+aes = "0.9.4"
+md-5 = "0.11.0"
 brotli = "9.1.1"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.6"
@@ -155,7 +160,11 @@ tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_support
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "query"] }
+# gzip, brotli and deflate: every client offers and decodes them, as every
+# `HttpClient` upstream's factory makes does (`AutomaticDecompression =
+# DecompressionMethods.All`, Startup.cs); a client upstream builds itself
+# without one opts out (`no_gzip()` …).
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "query", "gzip", "brotli", "deflate"] }
 # The HTTPS listener (server only): rustls with the aws-lc-rs provider reqwest
 # already builds, and Jellyfin's PKCS#12 (`.pfx`) certificates, read with both
 # the modern (PBES2) and the legacy (PBES1, `pbes1`) encryptions.
@@ -199,7 +208,7 @@ prometheus = { version = "0.14", default-features = false }
 # so the list is the sandbox's grant (`threads`, `gc` with exceptions,
 # `component-model-async` and `stack-switching` stay off, and so do the
 # profiling, cache, coredump and pooling extras). Only WASIp2 is linked.
-wasmtime = { version = "50.0.1", default-features = false, features = [
+wasmtime = { version = "50.0.3", default-features = false, features = [
     "addr2line",
     "anyhow",
     "backtrace",
@@ -211,20 +220,23 @@ wasmtime = { version = "50.0.1", default-features = false, features = [
     "std",
 ] }
 # Locked-down empty WASI ctx (no preopens/sockets) so std guests link.
-wasmtime-wasi = { version = "50.0.1", default-features = false, features = ["p2"] }
+wasmtime-wasi = { version = "50.0.3", default-features = false, features = ["p2"] }
 wat = "1.263.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────
-uuid = { version = "1.29.1", features = ["v4", "serde"] }
+uuid = { version = "1.29.2", features = ["v4", "serde"] }
 url = "2.5.8"
+# Unmaintained (RUSTSEC-2026-0543, no fixed release): gl-1860 replaces it, then drops that
+# advisory from deny.toml's ignores.
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.26"
-rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common)
+rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common), QuickConnect secrets (ferrofin-core)
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
 encoding_rs = "0.8.44"
 chardetng = "1.0.0"
 shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencoding `split_args`)
 async-trait = "0.1.92"
+dunce = "1.0.5"            # canonical paths without Windows' `\\?\` prefix (ferrofin-core storage probe)
 libc = "0.2"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
@@ -234,7 +246,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
-sha2 = "0.11.1"            # PBKDF2-HMAC-SHA512 (default hash id)
+sha2 = "0.11.1"            # PBKDF2-HMAC-SHA512 (default hash id); a PDF book's AES-256 key (revisions 5 and 6)
 sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "ico"] }
 kamadak-exif = "0.6.2"                                      # photo EXIF (ferrofin-drawing PhotoProvider)
@@ -252,14 +264,14 @@ bitflags = "2.13.2"
 # transitive dependency of flate2/zip, so it adds no new compilation. The WASM
 # host also uses it to tell whether a plugin's state file still holds the bytes
 # its kept map came from.
-crc32fast = "1.5.4"
+crc32fast = "1.5.5"
 regex = "1"
 percent-encoding = "2.3.2"
 # Base64 with .NET's rules (`Base64.IsValid`, `Convert.FromBase64String`) for
 # LDAP-Auth's profile images. Already in the lock file as a transitive dependency.
 base64 = "0.23.1"
-# CLDR root collation — the port of .NET `StringComparison.InvariantCulture`
-# used by the Live TV name sort. ICU4X 2.x is already in the tree (icu_normalizer
+# CLDR root collation — the port of .NET's invariant and current-culture string
+# comparers (name sorts, search). ICU4X 2.x is already in the tree (icu_normalizer
 # via idna), so this shares icu_collections/icu_provider/zerovec.
 icu_collator = "2.4.0"
 icu_casemap = "2.4.0"
@@ -269,7 +281,7 @@ icu_locale_fallback = "2.4.0"
 icu_normalizer = "2.4.0"
 icu_provider = "2.4.0"
 zerovec = "0.11.9"
-fancy-regex = "0.20.0"    # for C# regexes that use lookaround
+fancy-regex = "0.20.1"    # for C# regexes that use lookaround
 quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
 # Embedded lyric tags read from the file (ID3v2 SYLT, frame order), which
 # ffprobe's tag map cannot give — the scan's port of ATL's `Track.Lyrics`.

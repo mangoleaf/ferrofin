@@ -1,6 +1,6 @@
 //! The `MediaSegments` writes of
 //! [`FerrofinMediaSegmentManager`](crate::media_segment_manager::FerrofinMediaSegmentManager)
-//! that replace a provider's rows.
+//! that replace or clear a provider's rows.
 
 use ferrofin_db::Database;
 use ferrofin_db::store::guid_to_db;
@@ -71,4 +71,40 @@ pub(crate) async fn replace_rows(
         .map_err(db_err)?;
     }
     tx.commit().await.map_err(db_err)
+}
+
+/// Deletes every item's rows stored under each of `namespaces` (only those of
+/// `type_filter`, when given), in one write transaction, so a failure part-way
+/// leaves every namespace's rows (gl-1401). Returns the item of each deleted row.
+///
+/// # Errors
+///
+/// The database error, or a stored item id that is not a GUID, after which
+/// nothing has changed.
+pub(crate) async fn clear_rows(
+    db: &Database,
+    namespaces: &[String],
+    type_filter: Option<MediaSegmentType>,
+) -> Result<Vec<Uuid>, ServiceError> {
+    let mut delete = String::from(r#"DELETE FROM "MediaSegments" WHERE "SegmentProviderId" = ?1"#);
+    if type_filter.is_some() {
+        delete.push_str(r#" AND "Type" = ?2"#);
+    }
+    delete.push_str(r#" RETURNING "ItemId""#);
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    let mut items = Vec::new();
+    for namespace in namespaces {
+        let mut query =
+            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(delete.clone())).bind(namespace);
+        if let Some(kind) = type_filter {
+            query = query.bind(kind.json_value());
+        }
+        for item in query.fetch_all(&mut *tx).await.map_err(db_err)? {
+            items.push(
+                Uuid::parse_str(&item).map_err(|error| ServiceError::backend(error.to_string()))?,
+            );
+        }
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(items)
 }

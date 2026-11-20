@@ -9,7 +9,10 @@
 //! Differences from upstream, all faithful simplifications:
 //! - The C# constructor eagerly loads every device into concurrent maps; this
 //!   port queries the tables on demand instead (no cache-coherency window).
-//! - The `DeviceOptionsUpdated` event is dropped (event wiring is out of scope).
+//! - The `DeviceOptionsUpdated` event is not raised here. Its one subscriber
+//!   (C# `SessionManager.OnDeviceManagerDeviceOptionsUpdated`) is
+//!   `SessionManager::on_device_options_updated`, which `POST /Devices/Options`
+//!   calls after the save.
 //! - `GetDeviceOptions` returns the [`DeviceOptionsEntity`] row; the API layer
 //!   maps it to the `DeviceOptionsDto` upstream returns.
 
@@ -234,7 +237,8 @@ impl FerrofinDeviceManager {
     /// Applies a resolved [`DeviceAccess`] to one device id — the per-device
     /// half of `can_access_device`, with every query hoisted out of it.
     ///
-    /// The membership test is ASCII case-insensitive (C# `CanAccessDevice`),
+    /// The membership test ignores case as C# `CanAccessDevice` does
+    /// (`StringComparison.OrdinalIgnoreCase`),
     /// and the empty-id rejection stays per device so a listing still fails
     /// the way the per-device call failed.
     fn access_allows(&self, access: &DeviceAccess, device_id: &str) -> Result<bool, ServiceError> {
@@ -248,7 +252,7 @@ impl FerrofinDeviceManager {
             DeviceAccess::Unfiltered | DeviceAccess::All => Ok(true),
             DeviceAccess::Enabled(enabled) => Ok(enabled
                 .iter()
-                .any(|v| v.eq_ignore_ascii_case(device_id))
+                .any(|v| ferrofin_util::string_extensions::equals_ordinal_ignore_case(v, device_id))
                 // Devices that don't advertise a persistent identifier are
                 // always usable (C# `!GetCapabilities(id).SupportsPersistentIdentifier`).
                 || !self.capabilities_for(device_id).supports_persistent_identifier),
@@ -390,20 +394,6 @@ impl DeviceManager for FerrofinDeviceManager {
         query: &DeviceQuery,
     ) -> Result<QueryResult<DeviceEntity>, ServiceError> {
         self.query_devices(query).await
-    }
-
-    async fn get_device_infos(
-        &self,
-        query: &DeviceQuery,
-    ) -> Result<QueryResult<DeviceInfo>, ServiceError> {
-        let devices = self.query_devices(query).await?;
-        let rows: Vec<&DeviceEntity> = devices.items.iter().collect();
-        let infos = self.device_infos_for(&rows).await?;
-        Ok(QueryResult::new(
-            Some(devices.start_index),
-            Some(devices.total_record_count),
-            infos,
-        ))
     }
 
     async fn get_devices_for_user(
@@ -560,13 +550,6 @@ impl DeviceManager for FerrofinDeviceManager {
         device_id: &str,
     ) -> Result<Option<DeviceOptionsEntity>, ServiceError> {
         self.options_row(device_id).await
-    }
-
-    async fn to_client_capabilities_dto(
-        &self,
-        capabilities: &ClientCapabilities,
-    ) -> Result<ClientCapabilitiesDto, ServiceError> {
-        Ok(client_capabilities_to_dto(capabilities))
     }
 }
 
@@ -770,6 +753,29 @@ mod tests {
             .collect()
     }
 
+    /// `CanAccessDevice` matches an enabled id with `OrdinalIgnoreCase`, so a
+    /// case difference outside ASCII still enables the device.
+    #[tokio::test]
+    async fn an_enabled_device_matches_ignoring_case_beyond_ascii() {
+        let db = test_db().await;
+        let uid = Uuid::from_u128(11);
+        let user = seed_user(&db, uid).await;
+        let mgr = FerrofinDeviceManager::new(db.clone());
+        device_at(&mgr, uid, "dév-1", Utc::now()).await;
+        crate::user_entity_ext::set_preference(
+            &db,
+            &user.id,
+            PreferenceKind::EnabledDevices,
+            &["DÉV-1".to_owned()],
+        )
+        .await
+        .expect("enable");
+        assert_eq!(
+            ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")),
+            vec!["dév-1"]
+        );
+    }
+
     /// The access check is now resolved once per listing instead of once per
     /// device; this pins every branch of it as `GET /Devices` observes it —
     /// the `EnabledDevices` membership test, the no-persistent-identifier
@@ -922,21 +928,6 @@ mod tests {
         assert_eq!(listed.items[0].custom_name, None);
         assert_eq!(listed.items[1].last_user_name.as_deref(), Some("bee"));
         assert_eq!(listed.items[1].custom_name.as_deref(), Some("Living Room"));
-
-        // The un-filtered listing path (`GET /Devices/Info` bulk form) batches
-        // the same two reads and must agree.
-        let infos = mgr
-            .get_device_infos(&DeviceQuery::default())
-            .await
-            .expect("infos");
-        let by_id: HashMap<_, _> = infos
-            .items
-            .iter()
-            .map(|i| (i.id.clone().unwrap_or_default(), i))
-            .collect();
-        assert_eq!(by_id["dev-a"].last_user_name.as_deref(), Some("ay"));
-        assert_eq!(by_id["dev-b"].last_user_name.as_deref(), Some("bee"));
-        assert_eq!(by_id["dev-b"].custom_name.as_deref(), Some("Living Room"));
     }
 
     /// The wire paths must never carry a device's live bearer token: C# `ToDeviceInfo`
@@ -954,11 +945,6 @@ mod tests {
         assert!(listed.items.iter().all(|d| d.access_token.is_none()));
         let one = mgr.get_device("dev-tok").await.expect("get").expect("some");
         assert!(one.access_token.is_none());
-        let infos = mgr
-            .get_device_infos(&DeviceQuery::default())
-            .await
-            .expect("infos");
-        assert!(infos.items.iter().all(|d| d.access_token.is_none()));
     }
 
     /// A device whose owning `Users` row is missing is a `404`, not a silently

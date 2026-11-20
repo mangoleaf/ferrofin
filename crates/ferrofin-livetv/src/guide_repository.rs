@@ -14,7 +14,7 @@ use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::ParentalRestrictions;
 use ferrofin_traits::stubs::LiveTvChannelQuery;
 
-use crate::projection::{ChannelRow, ChannelUserData, ProgramRow};
+use crate::projection::{ChannelRow, ChannelUserData, ChannelUserDataRow, ProgramRow};
 
 /// A user's parental restrictions for a guide read: the item layer's
 /// predicate and the query its user's preferences were loaded onto.
@@ -50,13 +50,21 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
                       c."ChannelType" AS "ChannelMediaKind"
                FROM "FerrofinLiveTvPrograms" p
                JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
-/// Every channel in the lineup, in stored (`SortIndex`) order.
+/// The lineup channels the kind filters of `query` keep, in stored
+/// (`SortIndex`) order.
 ///
-/// Each kind `query` filters on (`IsMovie`, `IsSeries`, `IsKids`) is derived
-/// from the guide the way `GuideManager.RefreshChannels` aggregates it onto
-/// upstream channel items (`isMovie |= program.IsMovie; ...`, plus the "Kids"
-/// tag). The kinds it does not filter on read as `false`: only the channel
-/// kind filters read them, and each one costs a pass over the airings.
+/// Upstream's `GetInternalChannels` lists the stored channel items, so its
+/// kind filters read what the guide refresh stored on them
+/// (`save_channel_aggregates`; `TranslateQuery`, v12.4
+/// Jellyfin.Server.Implementations/Item/BaseItemRepository.TranslateQuery.cs:206-258,665-677):
+/// `IsMovie` and `IsSeries` the item's columns, `IsKids`, `IsNews` and
+/// `IsSports` its "Kids", "News" and "Sports" tags: any of the tags asked for,
+/// none of those asked against. The "Kids" tag stays once
+/// added, so a channel whose kids airing left the guide still matches.
+///
+/// With `stored_items_only`, a lineup channel is listed only once its item is
+/// stored, as upstream lists only the items (a guide refresh writes the lineup
+/// before the items). The guide refresh's own mirror reads the whole lineup.
 ///
 /// `restrictions` are the user's parental restrictions, which keep only the
 /// channels whose item that user may list.
@@ -68,8 +76,9 @@ pub(crate) async fn channel_rows(
     db: &Database,
     query: &LiveTvChannelQuery,
     restrictions: UserRestrictions<'_>,
+    stored_items_only: bool,
 ) -> Result<Vec<ChannelRow>, ServiceError> {
-    channel_rows_query(query, restrictions)
+    channel_rows_query(query, restrictions, stored_items_only)
         .build_query_as()
         .fetch_all(db.pool())
         .await
@@ -80,43 +89,79 @@ pub(crate) async fn channel_rows(
 fn channel_rows_query(
     query: &LiveTvChannelQuery,
     restrictions: UserRestrictions<'_>,
+    stored_items_only: bool,
 ) -> sqlx::QueryBuilder<sqlx::Sqlite> {
     let mut qb = sqlx::QueryBuilder::new(
-        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl""#,
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl"
+           FROM "FerrofinLiveTvChannels""#,
     );
-    // A kind left out reads as `false` (`ChannelRow`'s `#[sqlx(default)]`).
-    for (filter, kind) in [
-        (query.is_movie, "IsMovie"),
-        (query.is_series, "IsSeries"),
-        (query.is_kids, "IsKids"),
-    ] {
-        if filter.is_some() {
+    let mut joiner = " WHERE ";
+    // The restrictions' `EXISTS` over the item lists only stored items too.
+    if let Some(restrictions) = restrictions {
+        qb.push(std::mem::replace(&mut joiner, " AND "));
+        push_item_restrictions(&mut qb, r#""FerrofinLiveTvChannels"."Id""#, restrictions);
+    } else if stored_items_only {
+        qb.push(std::mem::replace(&mut joiner, " AND "));
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM "BaseItems" bi WHERE bi."Id" = "FerrofinLiveTvChannels"."Id")"#,
+        );
+    }
+    for (filter, column) in [(query.is_movie, "IsMovie"), (query.is_series, "IsSeries")] {
+        if let Some(want) = filter {
+            qb.push(std::mem::replace(&mut joiner, " AND "));
             qb.push(format_args!(
-                r#",EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
-                     WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."{kind}" = 1) AS "{kind}""#
-            ));
+                r#"COALESCE((SELECT bi."{column}" FROM "BaseItems" bi
+                     WHERE bi."Id" = "FerrofinLiveTvChannels"."Id"), 0) = "#
+            ))
+            .push_bind(want);
         }
     }
-    qb.push(r#" FROM "FerrofinLiveTvChannels""#);
-    if let Some(restrictions) = restrictions {
-        qb.push(" WHERE ");
-        push_item_restrictions(&mut qb, r#""FerrofinLiveTvChannels"."Id""#, restrictions);
+    // Upstream gathers the kinds asked for as one tag list and the kinds asked
+    // against as one excluded list: a channel matches when it carries any of
+    // the first and none of the second.
+    let kinds = [
+        (query.is_kids, "Kids"),
+        (query.is_news, "News"),
+        (query.is_sports, "Sports"),
+    ];
+    for want in [true, false] {
+        let tags: Vec<String> = kinds
+            .iter()
+            .filter(|(filter, _)| *filter == Some(want))
+            .map(|(_, tag)| ferrofin_util::string_extensions::get_clean_value(tag))
+            .collect();
+        if tags.is_empty() {
+            continue;
+        }
+        qb.push(std::mem::replace(&mut joiner, " AND "));
+        if !want {
+            qb.push("NOT ");
+        }
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               WHERE m."ItemId" = "FerrofinLiveTvChannels"."Id" AND v."Type" = "#,
+        )
+        .push_bind(i32::from(ferrofin_db::enums::ItemValueType::Tags))
+        .push(r#" AND v."CleanValue" IN ("#);
+        let mut separated = qb.separated(", ");
+        for tag in tags {
+            separated.push_bind(tag);
+        }
+        qb.push("))");
     }
     qb.push(r#" ORDER BY "SortIndex", "Name""#);
     qb
 }
 
-/// One channel by id, or `None` when unknown. The aggregated kind flags are
-/// not derived here — nothing on the single-channel path reads them (they are
-/// `[JsonIgnore]` upstream, filter-only).
+/// One channel by id, or `None` when unknown.
 ///
 /// # Errors
 ///
 /// Fails when the database read fails.
 pub async fn channel_row(db: &Database, id: Uuid) -> Result<Option<ChannelRow>, ServiceError> {
     sqlx::query_as(
-        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
-                  0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated"
            FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
     )
     .bind(guid_to_db(id))
@@ -146,8 +191,7 @@ pub async fn channel_rows_by_ids(
     // this lookup to run.
     for chunk in ferrofin_db::padded_in_chunks(ids) {
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
-            r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
-                  0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
+            r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated"
            FROM "FerrofinLiveTvChannels" WHERE "Id" IN ("#,
         );
         let mut separated = qb.separated(", ");
@@ -238,10 +282,9 @@ pub async fn program_rows_by_ids(
     Ok(out)
 }
 
-/// The user's channel user-data rows, keyed by the stored channel id:
-/// `(IsFavorite, Rating)`. Backs the favourite/like filters and
-/// favourite-first sorting, which upstream pushes into the item repository's
-/// SQL.
+/// The user's channel user-data rows, keyed by the stored channel id. Backs
+/// the favourite/like filters, favourite-first sorting and the play-state
+/// sort keys, which upstream pushes into the item repository's SQL.
 ///
 /// # Errors
 ///
@@ -251,7 +294,8 @@ pub async fn channel_user_data(
     user_id: Uuid,
 ) -> Result<ChannelUserData, ServiceError> {
     let rows = sqlx::query(
-        r#"SELECT ud."ItemId", ud."IsFavorite", ud."Rating"
+        r#"SELECT ud."ItemId", ud."IsFavorite", ud."Rating", ud."PlayCount", ud."Played",
+                  ud."LastPlayedDate"
            FROM "UserData" ud
            JOIN "FerrofinLiveTvChannels" c ON c."Id" = ud."ItemId"
            WHERE ud."UserId" = ?1 AND ud."CustomDataKey" = lower(ud."ItemId")"#,
@@ -265,17 +309,55 @@ pub async fn channel_user_data(
         .map(|r| {
             (
                 r.get::<String, _>("ItemId"),
-                (
-                    r.get::<bool, _>("IsFavorite"),
-                    r.get::<Option<f64>, _>("Rating"),
-                ),
+                ChannelUserDataRow {
+                    is_favorite: r.get("IsFavorite"),
+                    rating: r.get("Rating"),
+                    play_count: r.get("PlayCount"),
+                    played: r.get("Played"),
+                    last_played_date: r.get("LastPlayedDate"),
+                },
             )
         })
         .collect())
 }
 
-/// One channel of a tuner host's stored lineup, as the channel-mapping and
-/// guide-binding paths need it.
+/// [`channel_last_played_by_anyone`]'s statement: each channel's newest
+/// `LastPlayedDate` over every user's rows, seeking the rows by item.
+const CHANNEL_LAST_PLAYED_SQL: &str = r#"SELECT c."Id",
+       (SELECT MAX(ud."LastPlayedDate") FROM "UserData" ud WHERE ud."ItemId" = c."Id")
+           AS "LastPlayedDate"
+   FROM "FerrofinLiveTvChannels" c"#;
+
+/// Every channel's newest play by any user, for a `DatePlayed` sort with no
+/// user: upstream's `OrderMapper.cs:32-48` reads all of `UserData` when the
+/// query has no user (a channel has no alternate versions). Every channel gets
+/// a row and only `last_played_date` is read, so the other user-data keys and
+/// filters see the same values on every channel, as they do with no rows.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub async fn channel_last_played_by_anyone(db: &Database) -> Result<ChannelUserData, ServiceError> {
+    let rows = sqlx::query(CHANNEL_LAST_PLAYED_SQL)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("Id"),
+                ChannelUserDataRow {
+                    last_played_date: r.get("LastPlayedDate"),
+                    ..ChannelUserDataRow::default()
+                },
+            )
+        })
+        .collect())
+}
+
+/// One channel of a tuner host's stored lineup, as the guide-binding path
+/// needs it.
 ///
 /// The stored [`id`](Self::id) is Ferrofin's internal channel key;
 /// [`external_id`](Self::external_id) is the `ChannelInfo.Id` the owning
@@ -293,8 +375,6 @@ pub struct TunerLineupRow {
     pub name: String,
     /// The channel number, or empty when the playlist carried none.
     pub number: String,
-    /// The stream URL the channel plays from.
-    pub stream_url: String,
     /// The tuner host's `ChannelInfo.Id` for this channel.
     pub external_id: String,
 }
@@ -342,10 +422,9 @@ pub async fn channel_recommendation_data(
 
 /// One tuner host's stored lineup, in playlist order.
 ///
-/// Backs the port of `ListingsManager.GetChannelsForListingsProvider`, which
-/// upstream re-parses the tuner's M3U on every call; Ferrofin already caches
-/// the parse in this table, so the same `ChannelInfo` fields are read back
-/// from it.
+/// Backs the guide refresh's channel binding, which reads it right after the
+/// refresh stored the lineup it fetched. The channel-mapping dialog reads each
+/// tuner live instead, as upstream's `GetChannelsForListingsProvider` does.
 ///
 /// # Errors
 ///
@@ -355,7 +434,7 @@ pub async fn tuner_lineup(
     tuner_host_id: &str,
 ) -> Result<Vec<TunerLineupRow>, ServiceError> {
     let rows = sqlx::query(
-        r#"SELECT "Id","TvgId","Name","Number","StreamUrl","ExternalId" FROM "FerrofinLiveTvChannels"
+        r#"SELECT "Id","TvgId","Name","Number","ExternalId" FROM "FerrofinLiveTvChannels"
            WHERE "TunerHostId" = ?1 COLLATE NOCASE ORDER BY "SortIndex", "Name""#,
     )
     .bind(tuner_host_id)
@@ -369,7 +448,6 @@ pub async fn tuner_lineup(
             tvg_id: r.get("TvgId"),
             name: r.get("Name"),
             number: r.get::<Option<String>, _>("Number").unwrap_or_default(),
-            stream_url: r.get("StreamUrl"),
             external_id: r.get("ExternalId"),
         })
         .collect())
@@ -419,7 +497,8 @@ pub async fn all_program_ids(db: &Database) -> Result<Vec<String>, ServiceError>
 /// Deletes the programmes whose ids are listed.
 ///
 /// The second half of the [`all_program_ids`] pair: `CleanDatabase` deletes the
-/// stale rows one item at a time upstream; here they go in bind-limit chunks.
+/// stale rows one item at a time upstream; here they go in
+/// [`ferrofin_db::BATCH_BIND_CHUNK`]-sized chunks.
 ///
 /// # Errors
 ///
@@ -428,9 +507,10 @@ pub async fn delete_programs(db: &Database, ids: &[String]) -> Result<(), Servic
     delete_by_id(db, "FerrofinLiveTvPrograms", ids).await
 }
 
-/// The programme items among `ids` that have a tag in `ItemValues`, which the
-/// blocked and allowed tag rules read. An airing stored before the guide
-/// indexed its tags has none, so the guide refresh writes them once.
+/// The items among `ids` that have a tag in `ItemValues`, which the blocked
+/// and allowed tag rules read: the guide refresh asks it of its programmes and
+/// of its channels. An item stored before the guide indexed its tags has none,
+/// so the refresh writes them once.
 ///
 /// # Errors
 ///
@@ -489,7 +569,7 @@ pub(crate) async fn delete_programs_in(
     conn: &mut sqlx::SqliteConnection,
     ids: &[String],
 ) -> Result<(), ServiceError> {
-    for chunk in ids.chunks(IDS_PER_DELETE) {
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
         delete_by_id_statement("FerrofinLiveTvPrograms", chunk)
             .build()
             .execute(&mut *conn)
@@ -499,7 +579,7 @@ pub(crate) async fn delete_programs_in(
     Ok(())
 }
 
-/// Deletes rows of `table` by id, in bind-limit chunks.
+/// Deletes rows of `table` by id, in [`ferrofin_db::BATCH_BIND_CHUNK`]-sized chunks.
 ///
 /// `table` is one of two crate-private literals, never caller input.
 async fn delete_by_id(
@@ -507,7 +587,7 @@ async fn delete_by_id(
     table: &'static str,
     ids: &[String],
 ) -> Result<(), ServiceError> {
-    for chunk in ids.chunks(IDS_PER_DELETE) {
+    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
         delete_by_id_statement(table, chunk)
             .build()
             .execute(db.writer())
@@ -516,10 +596,6 @@ async fn delete_by_id(
     }
     Ok(())
 }
-
-/// How many ids one delete-by-id statement binds, under SQLite's
-/// 999-parameter limit.
-const IDS_PER_DELETE: usize = 500;
 
 /// The statement deleting the rows of `table` whose ids are `ids`.
 fn delete_by_id_statement(table: &'static str, ids: &[String]) -> sqlx::QueryBuilder<sqlx::Sqlite> {
@@ -804,13 +880,24 @@ pub mod test_support {
     }
 
     /// The `EXPLAIN QUERY PLAN` details of [`super::channel_rows`]' statement
-    /// for `query` and `restrictions`, in plan order.
+    /// for `query`, `restrictions` and `stored_items_only`, in plan order.
     pub(crate) async fn channel_rows_plan(
         db: &Database,
         query: &super::LiveTvChannelQuery,
         restrictions: super::UserRestrictions<'_>,
+        stored_items_only: bool,
     ) -> Result<Vec<String>, ServiceError> {
-        plan(db, super::channel_rows_query(query, restrictions)).await
+        plan(
+            db,
+            super::channel_rows_query(query, restrictions, stored_items_only),
+        )
+        .await
+    }
+
+    /// The `EXPLAIN QUERY PLAN` details of
+    /// [`super::channel_last_played_by_anyone`]'s statement, in plan order.
+    pub async fn channel_last_played_plan(db: &Database) -> Result<Vec<String>, ServiceError> {
+        plan(db, sqlx::QueryBuilder::new(super::CHANNEL_LAST_PLAYED_SQL)).await
     }
 
     /// The `EXPLAIN QUERY PLAN` details of `qb`'s statement, in plan order.
