@@ -167,6 +167,13 @@ impl ExternalIdentityStore for CountingLinks {
     async fn list(&self, provider_id: &str) -> Result<Vec<ExternalIdentity>, ServiceError> {
         self.inner.list(provider_id).await
     }
+    async fn list_for_user(
+        &self,
+        provider_id: &str,
+        user_id: Uuid,
+    ) -> Result<Vec<ExternalIdentity>, ServiceError> {
+        self.inner.list_for_user(provider_id, user_id).await
+    }
     async fn link(
         &self,
         user_id: Uuid,
