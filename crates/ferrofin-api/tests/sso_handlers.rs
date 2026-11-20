@@ -21,14 +21,19 @@ use ferrofin_api::test_support::{
 };
 use ferrofin_model::dto::{SessionInfoDto, UserDto};
 use ferrofin_model::secret::Secret;
-use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
+use ferrofin_model::sso::{
+    OidcAdminLink, OidcDiscovery, OidcLinkProvider, OidcProvider, OidcProviderInfo,
+    OidcProviderList, OidcUserLinks,
+};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::DisabledPluginManager;
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use ferrofin_traits::sso::{
-    OIDC_FLOW_COOKIE, OidcCallback, OidcExchangeRefusal, OidcExchangeReply, SsoManager, SsoReply,
+    OIDC_FLOW_COOKIE, OidcCallback, OidcExchangeRefusal, OidcExchangeReply, OidcLinkAt, SsoManager,
+    SsoReply,
 };
 use tower::ServiceExt;
+use uuid::Uuid;
 
 const SECRET: &str = "route-client-secret-31";
 
@@ -50,6 +55,8 @@ struct FakeSso {
     started: Mutex<Vec<(String, IpAddr)>>,
     finished: Mutex<Vec<(String, OidcCallback)>>,
     exchanged: Mutex<Vec<(Secret, Option<Secret>, AuthenticationRequest)>>,
+    /// Each link call: its name and the account it named.
+    links: Mutex<Vec<(String, Uuid)>>,
 }
 
 impl FakeSso {
@@ -93,6 +100,33 @@ impl FakeSso {
             && self.started().is_empty()
             && self.finished().is_empty()
             && self.exchanged().is_empty()
+            && self.link_calls().is_empty()
+    }
+
+    fn link_calls(&self) -> Vec<(String, Uuid)> {
+        self.links.lock().expect("links").clone()
+    }
+
+    /// Records the link call `call` for `user`.
+    fn record(&self, call: String, user: Uuid) {
+        self.links.lock().expect("links").push((call, user));
+    }
+}
+
+/// The account [`FakeSso`] says another account has the identity of.
+const TAKEN: &str = "taken";
+
+/// What [`FakeSso`] answers an admin's link with.
+fn admin_link(user_id: Uuid, provider: &str, subject: &str) -> OidcAdminLink {
+    OidcAdminLink {
+        user_id,
+        user_name: "alice".to_owned(),
+        single_sign_on_account: false,
+        provider: Some(provider.to_owned()),
+        provider_name: Some("Pocket ID".to_owned()),
+        issuer: "https://id.example.org".to_owned(),
+        subject: subject.to_owned(),
+        date_created: chrono::DateTime::UNIX_EPOCH,
     }
 }
 
@@ -261,7 +295,92 @@ impl SsoManager for FakeSso {
             set_cookies: vec![format!("{OIDC_FLOW_COOKIE}=; Path=/sso; Max-Age=0")],
         })
     }
+
+    async fn oidc_link_page(&self) -> Result<SsoReply, ServiceError> {
+        self.ensure_enabled().await?;
+        Ok(SsoReply {
+            status: 200,
+            location: None,
+            html: "<p id=\"status\">Loading…</p>".to_owned(),
+            set_cookies: Vec::new(),
+            content_security_policy: Some("default-src 'none'; script-src 'sha256-x'".to_owned()),
+        })
+    }
+
+    async fn oidc_links(&self, user_id: Uuid) -> Result<OidcUserLinks, ServiceError> {
+        self.ensure_enabled().await?;
+        self.record("links".to_owned(), user_id);
+        Ok(OidcUserLinks {
+            single_sign_on_account: true,
+            links: Vec::new(),
+            providers: vec![OidcLinkProvider {
+                key: "pocket".to_owned(),
+                name: "Pocket ID".to_owned(),
+            }],
+        })
+    }
+
+    async fn start_oidc_link(
+        &self,
+        key: &str,
+        user_id: Uuid,
+        client: IpAddr,
+    ) -> Result<SsoReply, ServiceError> {
+        self.ensure_enabled().await?;
+        if key != "pocket" {
+            return Err(ServiceError::not_found(format!("OIDC provider {key}")));
+        }
+        self.record(format!("start {key} {client}"), user_id);
+        Ok(SsoReply {
+            status: 302,
+            location: Some(AUTHORIZE.to_owned()),
+            html: String::new(),
+            set_cookies: vec![format!("{OIDC_FLOW_COOKIE}=l1; Path=/sso; HttpOnly")],
+            content_security_policy: None,
+        })
+    }
+
+    async fn all_oidc_links(&self) -> Result<Vec<OidcAdminLink>, ServiceError> {
+        self.ensure_enabled().await?;
+        self.record("all".to_owned(), Uuid::nil());
+        Ok(vec![admin_link(ALICE, "pocket", "alice-sub")])
+    }
+
+    async fn add_oidc_link(
+        &self,
+        user_id: Uuid,
+        key: &str,
+        subject: &str,
+    ) -> Result<OidcAdminLink, ServiceError> {
+        self.ensure_enabled().await?;
+        self.record(format!("add {key} {subject}"), user_id);
+        if subject == TAKEN {
+            return Err(ServiceError::Conflict(
+                "another account is linked to this identity: remove that link first".to_owned(),
+            ));
+        }
+        Ok(admin_link(user_id, key, subject))
+    }
+
+    async fn remove_oidc_link(
+        &self,
+        user_id: Uuid,
+        at: OidcLinkAt<'_>,
+    ) -> Result<(), ServiceError> {
+        self.ensure_enabled().await?;
+        self.record(format!("remove {at:?}"), user_id);
+        match at {
+            OidcLinkAt::Provider("pocket") | OidcLinkAt::Issuer("https://id.example.org") => Ok(()),
+            _ => Err(ServiceError::not_found("no such OIDC link")),
+        }
+    }
 }
+
+/// An account an admin names.
+const ALICE: Uuid = Uuid::from_u128(0xA11CE);
+
+/// The plain user [`as_user`] signs in as (`test_support::sample_user`).
+const SIGNED_IN: Uuid = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
 
 /// The session [`FakeSso`] answers the exchange code `good` with.
 fn signed_in() -> AuthenticationResultData {
@@ -605,6 +724,13 @@ async fn every_sso_plugin_route_is_registered() {
             ("get", "/sso/oidc/{provider}/start"),
             ("get", "/sso/oidc/{provider}/callback"),
             ("post", "/sso/oidc/exchange"),
+            ("get", "/sso/link"),
+            ("get", "/sso/links"),
+            ("delete", "/sso/links/{provider}"),
+            ("post", "/sso/oidc/{provider}/link"),
+            ("get", "/sso/admin/links"),
+            ("post", "/sso/admin/links"),
+            ("delete", "/sso/admin/links"),
         ]
     );
     for (method, path) in rows {
@@ -615,14 +741,24 @@ async fn every_sso_plugin_route_is_registered() {
                 .any(|(m, p, _)| *m == method && *p == path),
             "{path}"
         );
-        let path = path.replace("{provider}", "pocket");
-        let body = match method {
-            "put" => PAGE_BODY,
-            "post" => r#"{"Code":"good"}"#,
+        let mut path = path.replace("{provider}", "pocket");
+        if (method, path.as_str()) == ("delete", "/sso/admin/links") {
+            path.push_str("?userId=000000000000000000000000000a11ce&provider=pocket");
+        }
+        let body = match (method, path.as_str()) {
+            ("put", _) => PAGE_BODY,
+            ("post", "/sso/oidc/exchange") => r#"{"Code":"good"}"#,
+            ("post", "/sso/admin/links") => ADD_BODY,
             _ => "",
         };
+        // The user's link routes need a user, and the admin's an admin.
+        let state = if path.starts_with("/sso/links") || path.ends_with("/link") {
+            as_user(FakeSso::new(true))
+        } else {
+            as_admin(FakeSso::new(true))
+        };
         let (status, _) = send(
-            as_admin(FakeSso::new(true)),
+            state,
             request(&method.to_ascii_uppercase(), &path, body, true),
         )
         .await;
@@ -941,4 +1077,275 @@ async fn a_page_runs_only_what_its_policy_names_and_is_never_sniffed() {
         header(&start, "content-security-policy"),
         Vec::<&str>::new()
     );
+}
+
+/// What the settings page posts to link `ALICE` by hand.
+const ADD_BODY: &str =
+    r#"{"UserId":"000000000000000000000000000a11ce","Provider":"pocket","Subject":"alice-sub"}"#;
+
+/// The user's own link routes, as the link page calls them.
+const OWN_REQUESTS: [(&str, &str); 3] = [
+    ("GET", "/sso/links"),
+    ("POST", "/sso/oidc/pocket/link"),
+    ("DELETE", "/sso/links/pocket"),
+];
+
+/// The admin's link routes, as the settings page calls them.
+const ADMIN_REQUESTS: [(&str, &str, &str); 3] = [
+    ("GET", "/sso/admin/links", ""),
+    ("POST", "/sso/admin/links", ADD_BODY),
+    (
+        "DELETE",
+        "/sso/admin/links?userId=000000000000000000000000000a11ce&provider=pocket",
+        "",
+    ),
+];
+
+/// A user's route acts on the account the credentials name: a `userId` in
+/// the query names nobody.
+#[tokio::test]
+async fn a_user_reads_and_removes_only_their_own_links() {
+    let fake = FakeSso::new(true);
+    let (status, body) = send(
+        as_user(fake.clone()),
+        request(
+            "GET",
+            "/sso/links?userId=000000000000000000000000000a11ce",
+            "",
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let body = json(&body);
+    assert_eq!(body["SingleSignOnAccount"], true);
+    assert_eq!(body["Providers"][0]["Key"], "pocket");
+    let (status, _) = send(
+        as_user(fake.clone()),
+        request(
+            "DELETE",
+            "/sso/links/pocket?userId=000000000000000000000000000a11ce",
+            "",
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        as_user(fake.clone()),
+        request("DELETE", "/sso/links/nope", "", true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        fake.link_calls(),
+        [
+            ("links".to_owned(), SIGNED_IN),
+            (r#"remove Provider("pocket")"#.to_owned(), SIGNED_IN),
+            (r#"remove Provider("nope")"#.to_owned(), SIGNED_IN),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_link_starts_for_the_signed_in_user_and_answers_where_to_send_the_browser() {
+    let fake = FakeSso::new(true);
+    let response = respond(
+        as_user(fake.clone()),
+        request("POST", "/sso/oidc/pocket/link", "", true),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "set-cookie"),
+        ["ferrofin_sso_flow=l1; Path=/sso; HttpOnly"]
+    );
+    assert_eq!(header(&response, "cache-control"), ["no-store"]);
+    assert_eq!(header(&response, "location"), Vec::<&str>::new());
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(json(&body), serde_json::json!({ "Url": AUTHORIZE }));
+    assert_eq!(
+        fake.link_calls(),
+        [("start pocket 127.0.0.1".to_owned(), SIGNED_IN)]
+    );
+
+    for path in ["/sso/oidc/nope/link", "/sso/oidc/%FF/link"] {
+        let fake = FakeSso::new(true);
+        let (status, _) = send(as_user(fake.clone()), request("POST", path, "", true)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+/// An API key names no account to link.
+#[tokio::test]
+async fn an_api_key_has_no_links_of_its_own() {
+    for (method, path) in OWN_REQUESTS {
+        let fake = FakeSso::new(true);
+        let (status, _) = send(as_admin(fake.clone()), request(method, path, "", true)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        assert!(fake.untouched(), "{method} {path}");
+    }
+}
+
+/// The link page is a document anyone opens; the links behind it are not.
+#[tokio::test]
+async fn an_anonymous_caller_gets_the_link_page_but_no_links() {
+    let response = respond(
+        fake_state().with_sso(FakeSso::new(true)),
+        request("GET", "/sso/link", "", false),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "content-security-policy"),
+        ["default-src 'none'; script-src 'sha256-x'"]
+    );
+    assert_eq!(header(&response, "x-content-type-options"), ["nosniff"]);
+    assert_eq!(header(&response, "cache-control"), ["no-store"]);
+    for (method, path) in OWN_REQUESTS {
+        let fake = FakeSso::new(true);
+        let (status, _) = send(
+            fake_state().with_sso(fake.clone()),
+            request(method, path, "", false),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
+        assert!(fake.untouched(), "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn a_plain_user_cannot_reach_the_admin_links() {
+    for (method, path, body) in ADMIN_REQUESTS {
+        let fake = FakeSso::new(true);
+        let (status, _) = send(as_user(fake.clone()), request(method, path, body, true)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        assert!(fake.untouched(), "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn an_admin_lists_adds_and_removes_any_link() {
+    let fake = FakeSso::new(true);
+    let (status, body) = send(
+        as_admin(fake.clone()),
+        request("GET", "/sso/admin/links", "", true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = json(&body);
+    assert_eq!(listed[0]["UserId"], "000000000000000000000000000a11ce");
+    assert_eq!(listed[0]["UserName"], "alice");
+    assert_eq!(listed[0]["Provider"], "pocket");
+    assert_eq!(listed[0]["Subject"], "alice-sub");
+    assert_eq!(listed[0]["SingleSignOnAccount"], false);
+    assert!(listed[0]["DateCreated"].is_string(), "{listed}");
+
+    let (status, body) = send(
+        as_admin(fake.clone()),
+        request("POST", "/sso/admin/links", ADD_BODY, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["Subject"], "alice-sub");
+    let taken = ADD_BODY.replace("alice-sub", TAKEN);
+    let (status, body) = send(
+        as_admin(fake.clone()),
+        request("POST", "/sso/admin/links", &taken, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        json(&body)["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("remove that link first"))
+    );
+
+    for at in ["provider=pocket", "issuer=https%3A%2F%2Fid.example.org"] {
+        let (status, _) = send(
+            as_admin(fake.clone()),
+            request(
+                "DELETE",
+                &format!("/sso/admin/links?userId=000000000000000000000000000a11ce&{at}"),
+                "",
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{at}");
+    }
+    assert_eq!(
+        fake.link_calls(),
+        [
+            ("all".to_owned(), Uuid::nil()),
+            ("add pocket alice-sub".to_owned(), ALICE),
+            (format!("add pocket {TAKEN}"), ALICE),
+            (r#"remove Provider("pocket")"#.to_owned(), ALICE),
+            (
+                r#"remove Issuer("https://id.example.org")"#.to_owned(),
+                ALICE
+            ),
+        ]
+    );
+}
+
+/// A removal names one account and exactly one of the provider and the
+/// issuer; a body that does not bind is a validation problem.
+#[tokio::test]
+async fn an_admin_request_that_names_no_link_is_a_bad_request() {
+    for query in [
+        "?provider=pocket",
+        "?userId=000000000000000000000000000a11ce",
+        "?userId=000000000000000000000000000a11ce&provider=pocket&issuer=https%3A%2F%2Fx",
+        "?userId=not-a-guid&provider=pocket",
+    ] {
+        let fake = FakeSso::new(true);
+        let (status, _) = send(
+            as_admin(fake.clone()),
+            request("DELETE", &format!("/sso/admin/links{query}"), "", true),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        assert!(fake.untouched(), "{query}");
+    }
+    let fake = FakeSso::new(true);
+    let (status, body) = send(
+        as_admin(fake.clone()),
+        request("POST", "/sso/admin/links", r#"{"UserId":5}"#, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json(&body)["title"],
+        "One or more validation errors occurred."
+    );
+    assert!(fake.untouched());
+}
+
+/// B1 for the link routes: no such route, for any caller and any body.
+#[tokio::test]
+async fn the_link_routes_answer_not_found_while_disabled() {
+    let mut requests: Vec<(&str, &str, &str)> = ADMIN_REQUESTS.to_vec();
+    requests.push(("GET", "/sso/link", ""));
+    requests.extend(
+        OWN_REQUESTS
+            .iter()
+            .map(|&(method, path)| (method, path, "")),
+    );
+    for (method, path, body) in requests {
+        for (state, token) in [
+            (as_admin(FakeSso::new(false)), true),
+            (as_user(FakeSso::new(false)), true),
+            (fake_state().with_sso(FakeSso::new(false)), false),
+            (
+                authed_state_with_plugins(Arc::new(DisabledPluginManager)),
+                true,
+            ),
+        ] {
+            let (status, _) = send(state, request(method, path, body, token)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+        }
+    }
 }

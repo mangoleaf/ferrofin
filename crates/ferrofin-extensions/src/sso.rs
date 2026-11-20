@@ -28,7 +28,10 @@
 //!   every password;
 //! - [`complete`]: the completion page the callback answers, and the
 //!   exchange of its one-time code for the session, under the account rules
-//!   of a password sign-in.
+//!   of a password sign-in;
+//! - [`links`]: the links between accounts and identities, which a user
+//!   makes on the link page through a link flow, and an admin lists, adds and
+//!   removes.
 //!
 //! An identity provider is contacted only when an admin saves a provider or a
 //! user signs in with it (B1).
@@ -38,7 +41,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_model::secret::Secret;
-use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
+use ferrofin_model::sso::{
+    OidcAdminLink, OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList, OidcUserLinks,
+};
 use ferrofin_traits::activity::ActivityManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::ExternalIdentityStore;
@@ -46,7 +51,7 @@ use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
 use ferrofin_traits::security::AuthenticationManager;
 use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
-use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, SsoManager, SsoReply};
+use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, OidcLinkAt, SsoManager, SsoReply};
 use ferrofin_traits::tasks::ScheduledTask;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -59,6 +64,7 @@ pub mod discovery;
 #[cfg(any(test, feature = "test-util"))]
 pub mod fake_idp;
 pub mod flows;
+pub mod links;
 pub mod oidc_http;
 pub mod sign_in;
 
@@ -303,7 +309,10 @@ pub struct SsoService {
     /// account.
     activity: Arc<dyn ActivityManager>,
     /// Held while an account is created and linked, so two first sign-ins of
-    /// one identity end at one account.
+    /// one identity end at one account, while a link is checked and made or
+    /// removed ([`links`]), so a refusal and a link never interleave, and
+    /// while an exchange checks its link and mints its session, so a removal
+    /// cannot fall between the two.
     provisioning: tokio::sync::Mutex<()>,
     /// The server's published URL (`--published-url`,
     /// `FERROFIN_PUBLISHED_URL`), the public URL when the plugin sets none.
@@ -622,7 +631,8 @@ impl SsoManager for SsoService {
         key: &str,
         client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {
-        self.start_sign_in(key, client).await
+        self.start_sign_in(key, client, flows::FlowPurpose::SignIn)
+            .await
     }
 
     async fn finish_oidc_sign_in(
@@ -641,6 +651,45 @@ impl SsoManager for SsoService {
     ) -> Result<OidcExchangeReply, ServiceError> {
         self.exchange_sign_in(&code, flow_cookie.as_ref(), request)
             .await
+    }
+
+    async fn oidc_link_page(&self) -> Result<SsoReply, ServiceError> {
+        self.link_page().await
+    }
+
+    async fn oidc_links(&self, user_id: Uuid) -> Result<OidcUserLinks, ServiceError> {
+        self.user_links(user_id).await
+    }
+
+    async fn start_oidc_link(
+        &self,
+        key: &str,
+        user_id: Uuid,
+        client: std::net::IpAddr,
+    ) -> Result<SsoReply, ServiceError> {
+        self.start_sign_in(key, client, flows::FlowPurpose::Link(user_id))
+            .await
+    }
+
+    async fn all_oidc_links(&self) -> Result<Vec<OidcAdminLink>, ServiceError> {
+        self.all_links().await
+    }
+
+    async fn add_oidc_link(
+        &self,
+        user_id: Uuid,
+        key: &str,
+        subject: &str,
+    ) -> Result<OidcAdminLink, ServiceError> {
+        self.add_link(user_id, key, subject).await
+    }
+
+    async fn remove_oidc_link(
+        &self,
+        user_id: Uuid,
+        at: OidcLinkAt<'_>,
+    ) -> Result<(), ServiceError> {
+        self.remove_link(user_id, at).await
     }
 }
 

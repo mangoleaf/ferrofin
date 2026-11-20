@@ -6,7 +6,8 @@
 //! `SsoService::sign_in_verified`, which finds or creates its account
 //! ([`accounts`](super::accounts)); the callback then answers the completion
 //! page, whose script swaps an exchange code for the session
-//! ([`complete`](super::complete)).
+//! ([`complete`](super::complete)). A link flow's callback links the identity
+//! to the account that started it instead ([`links`](super::links)).
 //!
 //! The callback's checks, in order; the first that fails refuses it:
 //! 1. a pending flow for its `state`, at this provider, not expired, and
@@ -315,11 +316,13 @@ fn verified_payload(id_token: &CoreIdToken) -> Option<Map<String, Value>> {
 }
 
 impl SsoService {
-    /// [`SsoManager::start_oidc_sign_in`](ferrofin_traits::sso::SsoManager::start_oidc_sign_in).
+    /// [`SsoManager::start_oidc_sign_in`](ferrofin_traits::sso::SsoManager::start_oidc_sign_in),
+    /// for what the verified identity will be for.
     pub(super) async fn start_sign_in(
         &self,
         key: &str,
         client: IpAddr,
+        purpose: FlowPurpose,
     ) -> Result<SsoReply, ServiceError> {
         self.ensure_enabled().await?;
         let config = self.config().await?;
@@ -382,7 +385,7 @@ impl SsoService {
                 binding_hash: Sha256::digest(binding.secret().as_bytes()).into(),
                 created: Instant::now(),
                 client,
-                purpose: FlowPurpose::SignIn,
+                purpose,
             },
         );
         tracing::debug!(oidc_provider = %key, "OIDC sign-in started");
@@ -406,7 +409,7 @@ impl SsoService {
         let provider = sign_in_provider(&config, key)?;
         let public_url = self.public_url(&config).ok().flatten();
         // What the verified identity is for decides how the flow ends: a
-        // purpose added later (linking, Quick Connect approval) adds its own
+        // purpose other than signing in (linking, in `links`) has its own
         // arm, ending on its own page with no exchange code.
         let mut reply = match self.verify_callback(&provider, callback).await {
             Ok((FlowPurpose::SignIn, identity, cookie)) => {
@@ -417,6 +420,9 @@ impl SsoService {
                     Ok(code) => return Ok(completion_page(&code, &cookie, public_url.as_deref())),
                     Err(refusal) => refusal.refused(key),
                 }
+            }
+            Ok((FlowPurpose::Link(user_id), identity, _)) => {
+                self.link_verified(&provider, user_id, identity).await?
             }
             Err(refusal) => refusal.refused(key),
         };

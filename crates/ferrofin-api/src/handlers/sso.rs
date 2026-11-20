@@ -14,7 +14,8 @@
 //!   — a sign-in at the provider, for anyone (D2), which ends on the
 //!   completion page;
 //! - `POST /sso/oidc/exchange` — the completion page's script swaps its
-//!   one-time code for the session there, for anyone.
+//!   one-time code for the session there, for anyone;
+//! - the account-link routes, in [`links`].
 //!
 //! Not Jellyfin contract operations, so they are listed in
 //! [`PLUGIN_ROUTES`](super::PLUGIN_ROUTES) rather than in `REAL_ROUTES` or
@@ -45,6 +46,8 @@ use crate::auth::RequireAdmin;
 use crate::error::{ApiError, FailureLogged};
 use crate::extract::{JsonBody, ProblemDetails};
 use crate::state::AppState;
+
+pub(crate) mod links;
 
 /// The wired Single Sign-On service while its plugin is enabled, or the `404`
 /// a server without the plugin answers.
@@ -260,7 +263,9 @@ async fn start_oidc_sign_in(
 /// by its link or created, ends on the completion page, which keeps the flow
 /// cookie for [`exchange_oidc_sign_in`]; with no account, on a page saying
 /// what to ask an administrator; any other on the refusal page. Both clear the
-/// flow cookie.
+/// flow cookie. A link flow's callback ends on its own page: the account
+/// linked, or refused because another account has the identity
+/// ([`links`]).
 #[utoipa::path(
     get,
     path = "/sso/oidc/{provider}/callback",
@@ -275,6 +280,7 @@ async fn start_oidc_sign_in(
         (status = 200, description = "The completion page, which signs the verified identity's account in"),
         (status = 400, description = "Refused: the sign-in failed a check"),
         (status = 403, description = "Refused: no account is linked to the identity and none can be created; the page says what to ask an administrator"),
+        (status = 409, description = "A link flow refused: another account is linked to the identity"),
         (status = 502, description = "Refused: the identity provider could not be reached"),
         (status = 404, description = "No such enabled provider, or the Single Sign-On plugin is disabled or not available")
     ),
@@ -332,7 +338,7 @@ async fn finish_oidc_sign_in(
     request_body = OidcExchangeRequest,
     responses(
         (status = 200, description = "Signed in (AuthenticationResult)"),
-        (status = 400, description = "Refused: the code is unknown, used, expired or not this browser's, or the body does not bind"),
+        (status = 400, description = "Refused: the code is unknown, used, expired or not this browser's, its identity is no longer linked to the account, or the body does not bind"),
         (status = 403, description = "Refused: the account is disabled, outside its schedule or remote access, on a device it may not use, or at its session limit"),
         (status = 404, description = "The Single Sign-On plugin is disabled or not available")
     ),
@@ -389,6 +395,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/sso/oidc/{provider}/start", get(start_oidc_sign_in))
         .route("/sso/oidc/{provider}/callback", get(finish_oidc_sign_in))
         .route("/sso/oidc/exchange", post(exchange_oidc_sign_in))
+        .merge(links::register(Router::new()))
 }
 
 #[cfg(test)]

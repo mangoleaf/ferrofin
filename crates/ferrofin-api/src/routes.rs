@@ -427,11 +427,19 @@ mod tests {
     #[test]
     fn every_registered_path_is_matched_ignoring_case() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers");
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-            .expect("handlers dir")
-            .map(|entry| entry.expect("dir entry").path())
-            .collect();
-        files.push(format!("{dir}.rs").into());
+        let mut files: Vec<std::path::PathBuf> = vec![format!("{dir}.rs").into()];
+        // A handler module's children (`handlers/sso/links.rs`) register routes too.
+        let mut dirs = vec![std::path::PathBuf::from(dir)];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("handlers dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
         let mut registered = std::collections::BTreeSet::new();
         for file in files {
             let source = std::fs::read_to_string(&file).expect("handler source");

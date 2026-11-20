@@ -35,9 +35,11 @@ pub const MAX_PENDING_FLOWS: usize = 1000;
 /// What a flow's verified identity is for once its callback passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowPurpose {
-    /// Signing in to Ferrofin; the only purpose until linking and Quick
-    /// Connect approval add theirs.
+    /// Signing in to Ferrofin.
     SignIn,
+    /// Linking the identity to this account, the one signed in when the
+    /// flow started ([`links`](super::links)): it opens no session.
+    Link(Uuid),
 }
 
 /// One pending flow: what its callback is checked against.

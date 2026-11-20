@@ -82,6 +82,13 @@ pub trait ExternalIdentityStore: Send + Sync {
     /// [`find`](Self::find) never returns.
     async fn list(&self, provider_id: &str) -> Result<Vec<ExternalIdentity>, ServiceError>;
 
+    /// Every link of `user_id` at the provider, oldest first: one per issuer.
+    async fn list_for_user(
+        &self,
+        provider_id: &str,
+        user_id: Uuid,
+    ) -> Result<Vec<ExternalIdentity>, ServiceError>;
+
     /// Links `identity` to `user_id` with `avatar_hash`, and returns the new
     /// link. In one transaction it first removes the user's link for that
     /// provider and issuer and any link of that identity, so an identity

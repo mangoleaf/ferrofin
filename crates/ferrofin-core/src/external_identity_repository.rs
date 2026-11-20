@@ -118,6 +118,25 @@ impl ExternalIdentityStore for FerrofinExternalIdentityStore {
         Ok(rows.into_iter().filter_map(to_identity).collect())
     }
 
+    async fn list_for_user(
+        &self,
+        provider_id: &str,
+        user_id: Uuid,
+    ) -> Result<Vec<ExternalIdentity>, ServiceError> {
+        // `FerrofinIX_ExternalIdentities_UserId` finds the user's rows.
+        let sql = format!(
+            r#"SELECT {COLUMNS} FROM "FerrofinExternalIdentities"
+               WHERE "UserId" = ?1 AND "ProviderId" = ?2 ORDER BY "Id""#
+        );
+        let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(guid_to_db(user_id))
+            .bind(provider_id)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().filter_map(to_identity).collect())
+    }
+
     async fn link(
         &self,
         user_id: Uuid,
@@ -321,6 +340,54 @@ mod tests {
         assert_eq!(store.list(LDAP).await.expect("list"), vec![alice, bob]);
         assert_eq!(store.list(OIDC).await.expect("list oidc").len(), 1);
         assert_eq!(store.list("Other").await.expect("list other"), Vec::new());
+    }
+
+    /// One user's links at a provider, one per issuer, and never another
+    /// user's or another provider's; none once the user is deleted.
+    #[tokio::test]
+    async fn a_users_links_are_listed_by_provider() {
+        let (store, users, ids) = fixture(&["alice", "bob"]).await;
+        let at = |issuer, subject| ExternalIdentityKey {
+            provider_id: OIDC,
+            issuer,
+            subject,
+        };
+        let one = store
+            .link(ids[0], at("https://one.example", "a-1"), None)
+            .await
+            .expect("first issuer");
+        let two = store
+            .link(ids[0], at("https://two.example", "a-2"), Some("hash"))
+            .await
+            .expect("second issuer");
+        store
+            .link(ids[1], at("https://one.example", "b-1"), None)
+            .await
+            .expect("bob");
+        store
+            .link(ids[0], ldap("alice-uid"), None)
+            .await
+            .expect("ldap");
+
+        assert_eq!(
+            store.list_for_user(OIDC, ids[0]).await.expect("alice"),
+            vec![one, two]
+        );
+        let bobs = store.list_for_user(OIDC, ids[1]).await.expect("bob");
+        assert_eq!(bobs.len(), 1);
+        assert_eq!(bobs[0].subject, "b-1");
+        assert_eq!(store.list_for_user(LDAP, ids[1]).await.expect("none"), []);
+        assert_eq!(
+            store
+                .list_for_user(OIDC, Uuid::from_u128(0xDEAD))
+                .await
+                .expect("no such user"),
+            []
+        );
+
+        users.delete_user(ids[0]).await.expect("delete alice");
+        assert_eq!(store.list_for_user(OIDC, ids[0]).await.expect("gone"), []);
+        assert_eq!(store.list_for_user(OIDC, ids[1]).await.expect("bob"), bobs);
     }
 
     #[tokio::test]
