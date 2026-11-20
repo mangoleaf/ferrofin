@@ -132,7 +132,8 @@ rt_not_up() {
 }
 
 # rt_remove <cidfile>: remove the container docker created with that cidfile, if it did, with its anonymous
-# volumes (the Ferrofin image declares one at /data, which no stage mounts), and the file.
+# volumes (the Ferrofin image declares one at /data, which a route whose Ferrofin runs elsewhere does not
+# mount), and the file.
 rt_remove() {
   [ -s "$1" ] || return 0
   rt_docker rm -fv "$(cat "$1")" >/dev/null 2>&1 && rm -f -- "$1"

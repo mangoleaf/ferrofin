@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use ferrofin_db::JELLYFIN_GENERATIONS;
 use ferrofin_db::export::{
-    CODE_PRODUCT_VERSION, Disposition, EXPORTED_DATABASE, JELLYFIN_MIGRATIONS,
-    SCHEMA_PRODUCT_VERSION, export_data_dir,
+    CODE_PRODUCT_VERSION, DOCKER, Disposition, EXPORTED_DATABASE, JELLYFIN_MIGRATIONS,
+    SCHEMA_PRODUCT_VERSION, SourceDirs, export_data_dir,
 };
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -232,9 +232,14 @@ async fn a_10_11_8_history_records_the_schema_migrations_and_leaves_the_code_mig
     let source = source(scratch.path(), &ids).await;
     let out = scratch.path().join("out");
 
-    let summary = export_data_dir(&source, &source.join(EXPORTED_DATABASE), &out)
-        .await
-        .unwrap();
+    let summary = export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        &out,
+    )
+    .await
+    .unwrap();
 
     let history = exported_history(&out).await;
     assert_eq!(
@@ -282,9 +287,14 @@ async fn a_history_already_at_the_12_2_set_is_kept_as_it_is() {
     let source = source(scratch.path(), &ids).await;
     let out = scratch.path().join("out");
 
-    let summary = export_data_dir(&source, &source.join(EXPORTED_DATABASE), &out)
-        .await
-        .unwrap();
+    let summary = export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        &out,
+    )
+    .await
+    .unwrap();
 
     let history = exported_history(&out).await;
     assert_eq!(exported_locks(&out).await, 0);
@@ -308,9 +318,14 @@ async fn a_database_without_a_lock_table_is_rewritten_without_one() {
     let source = source_with(scratch.path(), &every_id_of("10.11.8"), false).await;
     let out = scratch.path().join("out");
 
-    export_data_dir(&source, &source.join(EXPORTED_DATABASE), &out)
-        .await
-        .unwrap();
+    export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        &out,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(schema_ids_in(&exported_history(&out).await), 56);
     let lock: Vec<(i64,)> = exported(

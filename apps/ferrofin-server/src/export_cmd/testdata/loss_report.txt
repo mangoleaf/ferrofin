@@ -17,6 +17,17 @@ Settings Jellyfin is not given:
   CertificatePath in config/network.xml: a path in Ferrofin's filesystem.
   Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported.
 
+Files and stored paths:
+  cache: left out of the copy; the server's cache, log or web client, which Jellyfin does not read.
+  metadata: left out of the copy; not the directory the server's settings name for it.
+  The metadata directory the server's settings name was not found where the export ran, so the output's metadata holds none of it: every image and folder Jellyfin looks for there through %MetadataPath% is missing. Export again where that directory is reachable at the path the settings give.
+  The database's root and library rows name another data directory than the one exported: the server ran at another path, or the directory moved since. The stored paths under it were rewritten for Jellyfin too; the export printed both directories.
+  playlist.xml of 2 playlists in data/playlists, collection.xml of 1 collection in data/collections: left out of the copy. Each may hold what Jellyfin last wrote rather than the changes made in Ferrofin since (a share or a member removed, a rename), which Jellyfin's metadata refresh would merge back; Jellyfin finds the playlists and collections without them, and writes each file again from the database when it next saves the playlist or collection.
+  data/collections/Odd/collection.xml: kept, though it may hold what Jellyfin last wrote rather than the changes made in Ferrofin since: its folder's name lacks [boxset], so the file is what makes the folder a collection for Jellyfin.
+  /media/movies/Heist [boxset]/collection.xml: the collection it belongs to is in a media library, which the export never writes, so the file stays; Jellyfin's metadata refresh may merge the members it lists back into the collection.
+  /media/music/Road.xml: the playlist it belongs to is in a media library, which the export never writes, so the file stays; Jellyfin's metadata refresh may merge the members and shares it lists back into the playlist.
+  1 playlist or collection in media libraries not found where the export ran (the first: /media/music/Gone [playlist]/playlist.xml): whether each has a metadata file that Jellyfin's metadata refresh may merge back is not known. Export where the media is mounted at the paths Ferrofin used, so each can be checked.
+
 Backups and scheduled tasks:
   2 backup archives in data/backups made by Ferrofin, which Jellyfin cannot restore.
   Scheduled tasks: Ferrofin keeps their triggers in task_triggers.json and their last results in task_results.json, which Jellyfin does not read. Its tasks keep what its own files held before adoption, or its defaults.

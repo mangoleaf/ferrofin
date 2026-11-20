@@ -26,9 +26,29 @@ fn address(n: u32) -> IpAddr {
     IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + n))
 }
 
+/// An exchange code issued `age` ago.
+fn exchange(age: Duration) -> PendingExchange {
+    PendingExchange {
+        binding_hash: [0; 32],
+        user_id: Uuid::nil(),
+        identity: VerifiedIdentity {
+            provider_key: "fake".to_owned(),
+            issuer: "https://id.example.org".to_owned(),
+            subject: "subject".to_owned(),
+            username: None,
+            claims: serde_json::Map::new(),
+        },
+        purpose: FlowPurpose::SignIn,
+        created: Instant::now()
+            .checked_sub(age)
+            .expect("the clock reaches back"),
+    }
+}
+
 #[test]
 fn the_limits_are_d19s_values() {
     assert_eq!(FLOW_LIFETIME, Duration::from_secs(600));
+    assert_eq!(EXCHANGE_CODE_LIFETIME, Duration::from_secs(60));
     assert_eq!(
         MAX_PENDING_FLOWS_PER_ADDRESS,
         ferrofin_core::quick_connect_manager::DEFAULT_PENDING_PER_IP
@@ -90,4 +110,36 @@ fn an_expired_flow_is_dropped_and_a_flow_is_taken_once() {
     let fresh = flows.take("fresh").expect("live");
     assert!(!fresh.expired());
     assert!(flows.take("fresh").is_none(), "once");
+}
+
+#[test]
+fn an_exchange_code_is_taken_once_and_expires_after_a_minute() {
+    let codes = ExchangeCodes::default();
+    codes.insert("stale".to_owned(), exchange(EXCHANGE_CODE_LIFETIME));
+    assert!(codes.take("stale").expect("still there").expired());
+    codes.insert(
+        "stale".to_owned(),
+        exchange(EXCHANGE_CODE_LIFETIME + Duration::from_secs(1)),
+    );
+    codes.insert("fresh".to_owned(), exchange(Duration::from_secs(59)));
+    assert_eq!(codes.len(), 1, "the next code drops it");
+    assert!(!codes.take("fresh").expect("live").expired());
+    assert!(codes.take("fresh").is_none(), "once");
+    assert!(codes.is_empty());
+}
+
+#[test]
+fn the_server_keeps_its_newest_exchange_codes_up_to_the_flows_cap() {
+    let codes = ExchangeCodes::default();
+    let cap = u64::try_from(MAX_PENDING_FLOWS).expect("small");
+    for n in 0..=cap {
+        codes.insert(
+            format!("code-{n}"),
+            exchange(Duration::from_millis(cap + 1 - n)),
+        );
+    }
+    assert_eq!(codes.len(), MAX_PENDING_FLOWS);
+    assert!(codes.take("code-0").is_none(), "the oldest went");
+    assert!(codes.take("code-1").is_some());
+    assert!(codes.take(&format!("code-{cap}")).is_some());
 }

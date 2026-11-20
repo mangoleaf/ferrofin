@@ -5,22 +5,28 @@
 # pristine synthetic fixture (gates/adoption/build-fixtures.sh), each stage records each of its checks:
 #   Ferrofin   IMAGE (default ferrofin:bench) adopts the copy and scans it, the usage stage runs (usage.py:
 #              watch state, accounts, a device, an API key, display preferences, playlists, collections,
-#              libraries, a metadata edit, an image and deletes; README.md) and captures
+#              libraries, a metadata edit, an image, deletes and a removed share; README.md) and captures
 #              Ferrofin's answers (answers.py) once its closing library scan has completed, and Ferrofin
 #              is stopped. Checks: ready; boot log (generation, migrations, no ERROR); the scan completes;
 #              the usage stage; a clean stop.
 #   Export     `ferrofin-server export-jellyfin` from IMAGE, in a container of its own, writes what
-#              Ferrofin left into the copy Jellyfin boots on (stage_export.sh). Check: it completes.
+#              Ferrofin left into the copy Jellyfin boots on (stage_export.sh). Checks: it completes; every
+#              path the exported database stores resolves in it, in the layout of Jellyfin's image, and
+#              none lies under the directory Ferrofin ran at (checks_paths.py stored).
 #   Jellyfin   the Jellyfin release UPSTREAM_TAG names (jellyfin/jellyfin:<minor>, or --jellyfin-image)
 #              boots on the export. Checks: ready within ROUNDTRIP_READY_TIMEOUT; every migration it
 #              began finished (a failure names the migration and its SQLite error); it ran the code
 #              migrations its own first start on the route's source ran (routes.sh) and no schema
 #              migration; no ERR or FTL entry outside checks_boot.py's allowlist up to that
-#              point; its answers equal Ferrofin's (adoption_normalise: ids, image sizes and the probes
+#              point; a full metadata refresh of every playlist completes (api.py refresh-playlists),
+#              then its answers equal Ferrofin's (adoption_normalise: ids, image sizes and the probes
 #              that differ by design left out), so everything answers.py captures came back: users and
 #              their logins, watch state, devices, API keys, settings, playlists and collections, and
-#              more; integrity_check and foreign_key_check
-#              clean once it has stopped.
+#              more; it serves every image, chapter and profile image, trickplay tile, external subtitle
+#              and attachment its database lists (probes.py, which writes probes.txt); its library scan
+#              completes; integrity_check and foreign_key_check clean once it has stopped; and every
+#              library folder row Ferrofin stopped with is still there after that scan, with its
+#              DateCreated (checks_paths.py libraries).
 # The errors check reads the log up to the probes: an error a probe causes is judged by the answers.
 # One PASS/FAIL line per route; the exit status is 1 if any failed, 2 if the run was refused. Every
 # check's verdict goes to WORK/results.jsonl as it runs, and WORK/report.html is built from it however
@@ -35,10 +41,10 @@
 # network share (refused). DIR defaults to the one build-fixtures.sh builds under $FERROFIN_GATES_DIR; the
 # work directory to $FERROFIN_GATES_DIR/runs/roundtrip-<id>, never reused.
 # Settings (environment): ROUNDTRIP_READY_TIMEOUT, the seconds a server may take to answer after its
-# start (default 300); ROUNDTRIP_SCAN_TIMEOUT, the seconds a library scan, a settle or the export may take
-# (default 600, as the adoption gate's); ROUNDTRIP_STOP_TIMEOUT, the seconds a TERM is given before docker
-# kills the server (default 60); ROUNDTRIP_DOCKER_TIMEOUT, the seconds any other docker call may take
-# (default 120).
+# start (default 300); ROUNDTRIP_SCAN_TIMEOUT, the seconds a library scan, a settle, the export or the
+# playlists' refresh may take (default 600, as the adoption gate's); ROUNDTRIP_STOP_TIMEOUT, the seconds a
+# TERM is given before docker kills the server (default 60); ROUNDTRIP_DOCKER_TIMEOUT, the seconds any other
+# docker call may take (default 120).
 set -uo pipefail
 CALLER=$PWD
 SELF=$(cd "$(dirname "$0")" && pwd)/${0##*/}
@@ -82,6 +88,9 @@ rt_valid_run_id "$RUN_ID" || die "--run-id must be lower-case letters, digits, d
 if [ -n "$ONLY" ]; then
   printf '%s\n' "${ROUNDTRIP_ROUTES[@]}" | cut -d'|' -f1 | grep -qxF -- "$ONLY" || die "no route $ONLY in routes.sh"
 fi
+for spec in "${ROUNDTRIP_ROUTES[@]}"; do   # the fifth field: where Ferrofin runs, an absolute directory
+  [[ "$(cut -d'|' -f5 <<<"$spec")" == /?* ]] || die "route ${spec%%|*} in routes.sh names no absolute data directory for Ferrofin"
+done
 [ -n "$FIXTURES" ] || FIXTURES=$(adoption_fixtures_dir roundtrip) || exit 2
 [ -d "$FIXTURES/media" ] || die "$FIXTURES has no media/: run gates/adoption/build-fixtures.sh first"
 if [ -z "$WORK" ]; then WORK=$(gates_dir roundtrip "runs/roundtrip-$RUN_ID") || exit 2; fi
@@ -148,7 +157,7 @@ reasons() { local out; out=$("$@" 2>&1) || printf '%s\n' "${out:-$1 failed}"; }
 MEDIA=(-v "$FIXTURES/media:/media:ro")
 failed=0
 for spec in "${ROUNDTRIP_ROUTES[@]}"; do
-  IFS='|' read -r route fixture generation first_start <<<"$spec"
+  IFS='|' read -r route fixture generation first_start ran_at <<<"$spec"
   [ -z "$ONLY" ] || [ "$ONLY" = "$route" ] || continue
   dst=$WORK/$route
   for needed in "$fixture" "$first_start.server.log"; do

@@ -165,7 +165,7 @@ struct GetUsersQuery {
 
 /// Reads the client identity (app/version/device) parsed by the auth-context
 /// middleware into this request's [`AuthorizationInfo`] extension.
-fn auth_info(parts: &Parts) -> AuthorizationInfo {
+pub(crate) fn auth_info(parts: &Parts) -> AuthorizationInfo {
     parts
         .extensions
         .get::<AuthorizationInfo>()
@@ -440,7 +440,7 @@ async fn quick_connect_user(state: &AppState, user_id: Uuid) -> Option<UserDto> 
 /// Assembles the [`AuthenticationResult`] wire body: the authenticated user,
 /// the session, the minted access token the client presents on later
 /// requests, and the session's `ServerId`.
-fn authentication_result(result: AuthenticationResultData) -> AuthenticationResult {
+pub(crate) fn authentication_result(result: AuthenticationResultData) -> AuthenticationResult {
     let AuthenticationResultData {
         user,
         session,

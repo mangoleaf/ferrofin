@@ -1,8 +1,9 @@
 //! `ferrofin-server export-jellyfin`: copies a stopped data directory and a
-//! consistent snapshot of its database into a new directory, leaving the
-//! source untouched, and writes Ferrofin's configuration over the copy as the
-//! XML Jellyfin reads. It is the way back to Jellyfin once the export is
-//! complete; until then the subcommand is hidden (see [`crate::config::Command`]).
+//! consistent snapshot of its database into a new directory in the layout of
+//! Jellyfin's docker image, leaving the source untouched, and writes
+//! Ferrofin's configuration over the copy as the XML Jellyfin reads. It is the
+//! way back to Jellyfin once the export is complete; until then the subcommand
+//! is hidden (see [`crate::config::Command`]).
 //!
 //! The copy is [`ferrofin_db::export::export_data_dir`] and the configuration
 //! is [`ferrofin_core::config_export`]; this file holds the subcommand's
@@ -13,7 +14,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ferrofin_core::config_export::{self, ConfigExport};
-use ferrofin_db::export::{DatabaseEdits, EXPORTED_DATABASE, HistoryRewrite, LOSS_REPORT};
+use ferrofin_db::export::{
+    ContainerFile, DOCKER, DatabaseEdits, EXPORTED_DATABASE, ExportSummary, HistoryRewrite,
+    LOSS_REPORT, LeftOut, LibraryContainer, Preflight, SourceDirs,
+};
 
 use crate::config::Config;
 
@@ -40,15 +44,19 @@ const PROBE_ANSWER_LIMIT: usize = 64 * 1024;
 /// Jellyfin's backups directory under the output (`{DataPath}/backups`).
 const JELLYFIN_BACKUPS: &str = "data/backups";
 
-/// Exports `config`'s data directory into `args.out`, writes the loss report
-/// into it ([`LOSS_REPORT`]) and prints what it wrote and the report.
+/// Exports `config`'s data directory into `args.out`, in the layout of
+/// Jellyfin's docker image ([`DOCKER`]), writes the loss report into it
+/// ([`LOSS_REPORT`]) and prints what it wrote and the report.
 ///
 /// Before anything is written, the export refuses to run when completing it
 /// would be unsafe or meaningless ([`ferrofin_db::export::refuse_unsafe`], a
 /// server for this data directory answering on its port), and reads the
 /// configuration, so a directory Ferrofin never served (it has none) is refused
-/// too. The export is then written into `<out>.partial` and renamed to `out`
-/// whole once complete; a failed one removes it, so it leaves no output.
+/// too; then it prints the preflight, the size of each class of file it
+/// copies and the free space. The export is then written into `<out>.partial`
+/// and renamed to `out` whole once complete; a failed one removes it, so it
+/// leaves no output. Each library's options are read once the database's rows
+/// have said where the server ran.
 ///
 /// # Errors
 /// Returns the refusal, or the export's error with the source and output
@@ -67,9 +75,12 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
             out.display()
         )
     };
-    let target = ferrofin_db::export::refuse_unsafe(source, &config.database_path(), out)
-        .await
-        .with_context(nothing_written)?;
+    let dirs = source_dirs(config);
+    let preflight =
+        ferrofin_db::export::refuse_unsafe(&dirs, &DOCKER, &config.database_path(), out)
+            .await
+            .with_context(nothing_written)?;
+    let target = preflight.target.clone();
     // Where the server would listen and mount: the Networking page's saved
     // port and base URL outrank `config.toml`'s, and a flag or variable
     // outranks both.
@@ -84,10 +95,10 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
         .context("the check for a running server did not finish")
         .and_then(|refused| refused)
         .with_context(nothing_written)?;
-    let configuration = read_configuration(config)
+    let (mut configuration, libraries) = read_configuration(config)
         .await
-        .context("its configuration cannot be read")
         .with_context(nothing_written)?;
+    print_preflight(&preflight, config, &dirs);
     let replaced = target.exists();
     let partial = ferrofin_db::export::partial_output(&target);
     let created = create_partial(&partial)
@@ -95,12 +106,16 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
         .with_context(nothing_written)?;
     let written = async {
         let summary =
-            ferrofin_db::export::export_data_dir(source, &config.database_path(), &partial).await?;
+            ferrofin_db::export::export_data_dir(&dirs, &DOCKER, &config.database_path(), &partial)
+                .await?;
+        let libraries = library_options(config, &summary, libraries).await?;
+        configuration.files.extend(libraries.files);
+        configuration.not_exported.extend(libraries.not_exported);
         write_configuration(&configuration, &partial).await?;
         let report = loss_report(
             &summary.edits,
             &configuration,
-            &report_inputs(config, &partial).await?,
+            &report_inputs(config, &dirs, &summary, &partial).await?,
         );
         let written = partial.join(LOSS_REPORT);
         tokio::fs::write(&written, &report)
@@ -145,8 +160,143 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
         }
     };
     print_summary(source, out, &target, &summary, &configuration, replaced);
+    print_paths(config, &target, &summary);
     print!("\n{report}");
     Ok(())
+}
+
+/// Reads Ferrofin's configuration as the files Jellyfin reads: the six
+/// configuration documents and the server id, which a directory Ferrofin never
+/// served lacks, and each library's `options.xml`, read now so a library the
+/// export cannot write is refused before anything is copied
+/// ([`library_options`] reads them again when the server ran elsewhere).
+async fn read_configuration(config: &Config) -> anyhow::Result<(ConfigExport, ConfigExport)> {
+    let documents = config_export::export_configuration(&config.config_dir)
+        .context("its configuration cannot be read")?;
+    let libraries = config_export::export_library_options(
+        &config.data_dir,
+        &config.config_dir,
+        &config.data_dir,
+    )
+    .await
+    .context("its libraries' options cannot be read")?;
+    Ok((documents, libraries))
+}
+
+/// Each library's options with their media paths reversed from where the
+/// server ran (the data directory the aggregate root row names,
+/// [`ferrofin_db::export::PathRewrite::ran_at`]) rather than from where they
+/// are read: `read`, read from the data directory, unless the rows name
+/// another one.
+async fn library_options(
+    config: &Config,
+    summary: &ExportSummary,
+    read: ConfigExport,
+) -> anyhow::Result<ConfigExport> {
+    let Some(ran_at) = summary.edits.paths.ran_at.as_deref().map(Path::new) else {
+        return Ok(read);
+    };
+    if ran_at == config.data_dir {
+        return Ok(read);
+    }
+    config_export::export_library_options(&config.data_dir, &config.config_dir, ran_at)
+        .await
+        .context("its libraries' options cannot be read")
+}
+
+/// The directories of `config`'s server, as the export reads them: its
+/// metadata directory as its settings name it (the default when they cannot
+/// be read, which the configuration's read then refuses), and its cache, log
+/// and web client directories, which hold nothing Jellyfin reads.
+fn source_dirs(config: &Config) -> SourceDirs {
+    SourceDirs {
+        program_data: config.data_dir.clone(),
+        config: config.config_dir.clone(),
+        metadata: config_export::metadata_dir(&config.data_dir, &config.config_dir)
+            .unwrap_or_else(|_| config.data_dir.join("metadata")),
+        not_needed: vec![
+            config.cache_dir.clone(),
+            config.data_dir.join("log"),
+            config.web_dir.clone(),
+        ],
+    }
+}
+
+/// Whether the metadata directory the server's settings name, outside its
+/// default place, is not there (or cannot be looked at).
+fn metadata_missing(config: &Config, dirs: &SourceDirs) -> bool {
+    dirs.metadata != SourceDirs::new(&config.data_dir).metadata
+        && !dirs.metadata.try_exists().unwrap_or(false)
+}
+
+/// Prints the preflight: what each class of file the export copies holds, and
+/// the room beside the output, before anything is copied; and a warning when
+/// the metadata directory of `dirs` is missing, while it can still be stopped.
+fn print_preflight(preflight: &Preflight, config: &Config, dirs: &SourceDirs) {
+    println!(
+        "Preflight: the export needs about {} beside {} (what it copies, and a second copy of the database while it is taken), and {} is free there. What it copies:",
+        amount(preflight.needed),
+        preflight.target.display(),
+        amount(preflight.available)
+    );
+    for (class, bytes) in &preflight.classes {
+        println!("  {class}: {}", amount(*bytes));
+    }
+    if metadata_missing(config, dirs) {
+        println!(
+            "Warning: the metadata directory the server's settings name, {}, is not there, so no artwork or other metadata will be carried; stop this export (Ctrl-C) and run it where that directory is reachable at that path.",
+            dirs.metadata.display()
+        );
+    }
+}
+
+/// Prints how the export laid out the source and rewrote the stored paths.
+fn print_paths(config: &Config, target: &Path, summary: &ExportSummary) {
+    let paths = &summary.edits.paths;
+    println!(
+        "It is in the layout of Jellyfin's docker image, for a volume mounted at {}: {} rewritten onto it{}.",
+        DOCKER.program_data,
+        count(paths.rows, "stored path was", "stored paths were"),
+        if paths.stored.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " from the data directory the database's root and library rows name ({})",
+                paths.stored.join(", ")
+            )
+        }
+    );
+    let elsewhere = ran_elsewhere(config, summary);
+    if !elsewhere.is_empty() {
+        println!(
+            "The database's root and library rows name {} as the data directory the server ran at, not {}, the one exported: the paths under each were rewritten.",
+            elsewhere.join(", "),
+            config.data_dir.display()
+        );
+    }
+    for (dir, place) in &summary.moved {
+        println!(
+            "{} was copied to {}, where Jellyfin reads it.",
+            dir.display(),
+            target.join(place).display()
+        );
+    }
+}
+
+/// The data directories the database's root and library rows name that are
+/// not the one exported (as given or as its real path).
+fn ran_elsewhere(config: &Config, summary: &ExportSummary) -> Vec<String> {
+    let real = std::fs::canonicalize(&config.data_dir).ok();
+    summary
+        .edits
+        .paths
+        .stored
+        .iter()
+        .filter(|dir| {
+            Path::new(dir) != config.data_dir && real.as_deref() != Some(Path::new(dir.as_str()))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Prints what the export of `source` into `out` (resolved to `target`) wrote:
@@ -155,7 +305,7 @@ fn print_summary(
     source: &Path,
     out: &Path,
     target: &Path,
-    summary: &ferrofin_db::export::ExportSummary,
+    summary: &ExportSummary,
     configuration: &ConfigExport,
     replaced: bool,
 ) {
@@ -198,12 +348,33 @@ struct ReportInputs {
     backups: usize,
     /// Whether the source keeps scheduled-task state Jellyfin does not read.
     task_state: bool,
+    /// The directories of the data directory left out of the copy, relative
+    /// to it, each with why.
+    left_out: Vec<(PathBuf, &'static str)>,
+    /// Whether the database's root and library rows name another data
+    /// directory than the one exported.
+    ran_elsewhere: bool,
+    /// Whether the metadata directory the server's settings name, kept outside
+    /// the data directory, was not found.
+    metadata_missing: bool,
+    /// The playlists' and box sets' metadata files in Jellyfin's own folders
+    /// of the data directory, relative to it, each left out or kept.
+    container_files: Vec<(PathBuf, ContainerFile)>,
+    /// The playlists and box sets in media libraries with a metadata file
+    /// Jellyfin may read, or whose path was not found.
+    library_containers: Vec<LibraryContainer>,
 }
 
 /// Reads what the loss report needs from the files: the size of
-/// the database exported into `partial`, the backups copied there, and
-/// whether `config`'s directories keep scheduled-task state.
-async fn report_inputs(config: &Config, partial: &Path) -> anyhow::Result<ReportInputs> {
+/// the database exported into `partial`, the backups copied there, whether
+/// `config`'s directories keep scheduled-task state, and how the export laid
+/// out `dirs` (`summary`).
+async fn report_inputs(
+    config: &Config,
+    dirs: &SourceDirs,
+    summary: &ExportSummary,
+    partial: &Path,
+) -> anyhow::Result<ReportInputs> {
     let database = partial.join(EXPORTED_DATABASE);
     let database_bytes = tokio::fs::metadata(&database)
         .await
@@ -225,10 +396,29 @@ async fn report_inputs(config: &Config, partial: &Path) -> anyhow::Result<Report
             .await
             .with_context(|| format!("could not read {}", file.display()))?;
     }
+    let left_out = summary
+        .left_out
+        .iter()
+        .map(|(dir, why)| {
+            let why = match why {
+                LeftOut::NotUsed => "not the directory the server's settings name for it",
+                LeftOut::Moved => "copied where Jellyfin reads it instead",
+                LeftOut::NotNeeded => {
+                    "the server's cache, log or web client, which Jellyfin does not read"
+                }
+            };
+            (dir.clone(), why)
+        })
+        .collect();
     Ok(ReportInputs {
         database_bytes,
         backups,
         task_state,
+        left_out,
+        ran_elsewhere: !ran_elsewhere(config, summary).is_empty(),
+        metadata_missing: metadata_missing(config, dirs),
+        container_files: summary.container_files.clone(),
+        library_containers: summary.library_containers.clone(),
     })
 }
 
@@ -236,7 +426,10 @@ async fn report_inputs(config: &Config, partial: &Path) -> anyhow::Result<Report
 /// Jellyfin's first start will change, the settings `configuration` does not
 /// carry, and, from `inputs`, the room the first start needs and the backups
 /// and scheduled-task state Jellyfin cannot use. It names no path of the
-/// source or the output, so two exports of one source write the same.
+/// source or the output, so two exports of one source write the same where
+/// the same directories are reachable (the media paths it names are the
+/// database's, and whether their files were found depends on what is mounted
+/// where the export runs).
 fn loss_report(
     edits: &DatabaseEdits,
     configuration: &ConfigExport,
@@ -280,6 +473,30 @@ fn loss_report(
         "  Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported.\n",
     );
 
+    report.push_str("\nFiles and stored paths:\n");
+    for (dir, why) in &inputs.left_out {
+        let _ = writeln!(report, "  {}: left out of the copy; {why}.", dir.display());
+    }
+    if inputs.metadata_missing {
+        report.push_str(
+            "  The metadata directory the server's settings name was not found where the export ran, so the output's metadata holds none of it: every image and folder Jellyfin looks for there through %MetadataPath% is missing. Export again where that directory is reachable at the path the settings give.\n",
+        );
+    }
+    if inputs.ran_elsewhere {
+        report.push_str(
+            "  The database's root and library rows name another data directory than the one exported: the server ran at another path, or the directory moved since. The stored paths under it were rewritten for Jellyfin too; the export printed both directories.\n",
+        );
+    }
+    container_files(&mut report, inputs);
+    if inputs.left_out.is_empty()
+        && !inputs.metadata_missing
+        && !inputs.ran_elsewhere
+        && inputs.container_files.is_empty()
+        && inputs.library_containers.is_empty()
+    {
+        report.push_str("  None.\n");
+    }
+
     report.push_str("\nBackups and scheduled tasks:\n");
     if inputs.backups > 0 {
         let _ = writeln!(
@@ -297,6 +514,90 @@ fn loss_report(
         report.push_str("  None.\n");
     }
     report
+}
+
+/// The loss report's lines on the playlists' and box sets' metadata files
+/// (gl-1903): those left out of the copy and why, a `collection.xml` kept, and
+/// those in media libraries, which the export never writes.
+fn container_files(report: &mut String, inputs: &ReportInputs) {
+    use std::fmt::Write as _;
+
+    let left_out = |name: &str| {
+        inputs
+            .container_files
+            .iter()
+            .filter(|(path, what)| {
+                *what == ContainerFile::LeftOut && path.file_name().is_some_and(|file| file == name)
+            })
+            .count() as u64
+    };
+    let files: Vec<String> = [
+        (
+            left_out("playlist.xml"),
+            "playlist.xml of",
+            "playlist in data/playlists",
+            "playlists in data/playlists",
+        ),
+        (
+            left_out("collection.xml"),
+            "collection.xml of",
+            "collection in data/collections",
+            "collections in data/collections",
+        ),
+    ]
+    .into_iter()
+    .filter(|(n, ..)| *n > 0)
+    .map(|(n, file, one, many)| format!("{file} {}", count(n, one, many)))
+    .collect();
+    if !files.is_empty() {
+        let _ = writeln!(
+            report,
+            "  {}: left out of the copy. Each may hold what Jellyfin last wrote rather than the changes made in Ferrofin since (a share or a member removed, a rename), which Jellyfin's metadata refresh would merge back; Jellyfin finds the playlists and collections without them, and writes each file again from the database when it next saves the playlist or collection.",
+            files.join(", ")
+        );
+    }
+    for (path, _) in inputs
+        .container_files
+        .iter()
+        .filter(|(_, what)| *what == ContainerFile::Kept)
+    {
+        let _ = writeln!(
+            report,
+            "  {}: kept, though it may hold what Jellyfin last wrote rather than the changes made in Ferrofin since: its folder's name lacks [boxset], so the file is what makes the folder a collection for Jellyfin.",
+            path.display()
+        );
+    }
+    for container in inputs.library_containers.iter().filter(|c| c.found) {
+        let what = if container.kind == "playlist" {
+            "the members and shares it lists back into the playlist"
+        } else {
+            "the members it lists back into the collection"
+        };
+        let _ = writeln!(
+            report,
+            "  {}: the {} it belongs to is in a media library, which the export never writes, so the file stays; Jellyfin's metadata refresh may merge {what}.",
+            container.file.display(),
+            container.kind
+        );
+    }
+    // A library not mounted where the export ran hides every one of them: one line.
+    let unchecked: Vec<&LibraryContainer> = inputs
+        .library_containers
+        .iter()
+        .filter(|c| !c.found)
+        .collect();
+    if let Some(first) = unchecked.first() {
+        let _ = writeln!(
+            report,
+            "  {} in media libraries not found where the export ran (the first: {}): whether each has a metadata file that Jellyfin's metadata refresh may merge back is not known. Export where the media is mounted at the paths Ferrofin used, so each can be checked.",
+            count(
+                unchecked.len() as u64,
+                "playlist or collection",
+                "playlists and collections"
+            ),
+            first.file.display()
+        );
+    }
 }
 
 /// The loss report's section on what Jellyfin changes on its first start: the
@@ -338,6 +639,17 @@ fn first_start(report: &mut String, history: &HistoryRewrite, database_bytes: u6
 /// `n` and the noun for it, `one` or `many`.
 fn count(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// `bytes` in gibibytes from 1 GiB up, else in mebibytes ([`mebibytes`]), to
+/// one decimal, rounded up.
+fn amount(bytes: u64) -> String {
+    const GIB: u64 = 1 << 30;
+    if bytes < GIB {
+        return mebibytes(bytes);
+    }
+    let tenths = bytes.saturating_mul(10).div_ceil(GIB);
+    format!("{}.{} GiB", tenths / 10, tenths % 10)
 }
 
 /// `bytes` in mebibytes, to one decimal, rounded up: a size the report gives
@@ -523,20 +835,6 @@ fn refuse_running_server(config: &Config, port: u16, base_url: &str) -> anyhow::
     Ok(())
 }
 
-/// Reads Ferrofin's configuration as the files Jellyfin reads: the six
-/// configuration documents, the server id and each library's `options.xml`.
-///
-/// It is read from the directories the server uses, so a library's media
-/// paths under them take Jellyfin's `%AppDataPath%` and `%MetadataPath%` forms.
-async fn read_configuration(config: &Config) -> anyhow::Result<ConfigExport> {
-    let mut export = config_export::export_configuration(&config.config_dir)?;
-    let libraries =
-        config_export::export_library_options(&config.data_dir, &config.config_dir).await?;
-    export.files.extend(libraries.files);
-    export.not_exported.extend(libraries.not_exported);
-    Ok(export)
-}
-
 /// Writes `export`'s files under `out`. Each goes through a `.partial` file and
 /// a rename, which also replaces a copy the source left read-only. A directory
 /// the source left read-only (the copy keeps its mode) cannot take one, and the
@@ -564,9 +862,12 @@ async fn write_configuration(export: &ConfigExport, out: &Path) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use ferrofin_core::config_export::{ConfigExport, NotExported};
-    use ferrofin_db::export::{DatabaseEdits, DroppedObjects, DroppedTable, HistoryRewrite};
+    use ferrofin_db::export::{
+        ContainerFile, DatabaseEdits, DroppedObjects, DroppedTable, HistoryRewrite,
+        LibraryContainer,
+    };
 
-    use super::{ReportInputs, loss_report, mebibytes};
+    use super::{ReportInputs, amount, loss_report, mebibytes};
 
     fn table(name: &str, rows: u64) -> DroppedTable {
         DroppedTable {
@@ -601,6 +902,7 @@ mod tests {
                     "FerrofinIX_UserData_UserId".to_owned(),
                 ],
             },
+            ..DatabaseEdits::default()
         };
         let configuration = ConfigExport {
             files: Vec::new(),
@@ -614,6 +916,53 @@ mod tests {
             database_bytes: 43_198_464,
             backups: 2,
             task_state: true,
+            left_out: vec![
+                (
+                    "cache".into(),
+                    "the server's cache, log or web client, which Jellyfin does not read",
+                ),
+                (
+                    "metadata".into(),
+                    "not the directory the server's settings name for it",
+                ),
+            ],
+            ran_elsewhere: true,
+            metadata_missing: true,
+            container_files: vec![
+                (
+                    "data/collections/Odd/collection.xml".into(),
+                    ContainerFile::Kept,
+                ),
+                (
+                    "data/collections/Saga [boxset]/collection.xml".into(),
+                    ContainerFile::LeftOut,
+                ),
+                (
+                    "data/playlists/Mix/playlist.xml".into(),
+                    ContainerFile::LeftOut,
+                ),
+                (
+                    "data/playlists/Road/playlist.xml".into(),
+                    ContainerFile::LeftOut,
+                ),
+            ],
+            library_containers: vec![
+                LibraryContainer {
+                    kind: "collection",
+                    file: "/media/movies/Heist [boxset]/collection.xml".into(),
+                    found: true,
+                },
+                LibraryContainer {
+                    kind: "playlist",
+                    file: "/media/music/Gone [playlist]/playlist.xml".into(),
+                    found: false,
+                },
+                LibraryContainer {
+                    kind: "playlist",
+                    file: "/media/music/Road.xml".into(),
+                    found: true,
+                },
+            ],
         };
         assert_eq!(
             loss_report(&edits, &configuration, &inputs),
@@ -632,6 +981,7 @@ mod tests {
                 tables: vec![table("_sqlx_migrations", 1)],
                 indexes: Vec::new(),
             },
+            ..DatabaseEdits::default()
         };
         let report = loss_report(&edits, &ConfigExport::default(), &ReportInputs::default());
         assert!(
@@ -669,5 +1019,8 @@ mod tests {
         assert_eq!(mebibytes(1024 * 1024 * 3 / 2), "1.5 MiB");
         assert_eq!(mebibytes(1), "0.1 MiB", "rounded up");
         assert_eq!(mebibytes(u64::MAX), "1759218604441.6 MiB");
+        assert_eq!(amount((1 << 30) - 1), "1024.0 MiB");
+        assert_eq!(amount(1 << 30), "1.0 GiB");
+        assert_eq!(amount((3 << 30) + 1), "3.1 GiB", "rounded up");
     }
 }
