@@ -433,7 +433,7 @@ async fn quick_connect_page(State(state): State<AppState>) -> Result<Response, A
     request_body(content = String, content_type = "application/x-www-form-urlencoded", description = "confirmation=…, from the confirmation page"),
     responses(
         (status = 200, description = "The app is signed in: a page saying so"),
-        (status = 400, description = "Refused: the confirmation is unknown, used, expired or not this browser's, or the code is unknown, expired or approved already"),
+        (status = 400, description = "Refused: the confirmation is unknown, used, expired or not this browser's, its identity is no longer linked to the account, or the code is unknown, expired or approved already"),
         (status = 403, description = "Refused: Quick Connect is turned off, or a sign-in rule refuses the account"),
         (status = 404, description = "The Single Sign-On plugin is disabled or not available")
     ),

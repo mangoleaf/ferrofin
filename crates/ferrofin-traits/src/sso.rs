@@ -273,14 +273,17 @@ pub trait SsoManager: Send + Sync {
 
     /// Approves the Quick Connect code of a confirmation page's
     /// `confirmation`, once: `flow_cookie` must be the [`OIDC_FLOW_COOKIE`] it
-    /// is bound to, and it at most a minute old. The account must pass the
-    /// sign-in rules of a password sign-in (disabled, remote access from the
-    /// approving browser at `client`, parental schedule); then
-    /// `QuickConnect::authorize_request` signs the app's device in, which
-    /// applies device access and the session limit. No browser session is
-    /// opened. Every answer is a page and clears the cookie: the app signed
-    /// in, or why not (`400` for a confirmation or cookie that does not check
-    /// out, and for a code that is unknown, expired or approved already;
+    /// is bound to, and it at most a minute old. The identity must still be
+    /// linked to the account (a link removed since the callback refuses it).
+    /// The account must pass the sign-in rules of a password sign-in
+    /// (disabled, remote access from the approving browser at `client`,
+    /// parental schedule); then `QuickConnect::authorize_request` signs the
+    /// app's device in, which applies device access and the session limit. No
+    /// browser session is opened. Every answer is a page and clears the
+    /// cookie: the app signed in, or why not (`400` for a confirmation or
+    /// cookie that does not check out, for an identity no longer linked to
+    /// the account, and for a code that is unknown, expired or approved
+    /// already;
     /// `403` for Quick Connect turned off, and for an account a sign-in rule
     /// refuses, which writes an `AuthenticationFailed` activity entry). The
     /// confirmation is used up by any attempt that reaches it.
@@ -343,9 +346,11 @@ pub trait SsoManager: Send + Sync {
     ) -> Result<OidcAdminLink, ServiceError>;
 
     /// Removes the link of `user_id` `at` a provider or an issuer, then signs
-    /// every session of that account out. An exchange code issued before the
-    /// removal is refused at [`exchange_oidc_sign_in`](Self::exchange_oidc_sign_in),
-    /// which looks the link up again. An account that signs in through
+    /// every session of that account out. An exchange code or a Quick
+    /// Connect confirmation issued before the removal is refused at
+    /// [`exchange_oidc_sign_in`](Self::exchange_oidc_sign_in) or
+    /// [`confirm_oidc_quick_connect`](Self::confirm_oidc_quick_connect),
+    /// which look the link up again. An account that signs in through
     /// Single Sign-On only cannot sign in again until it is linked again or
     /// given another authentication provider.
     ///

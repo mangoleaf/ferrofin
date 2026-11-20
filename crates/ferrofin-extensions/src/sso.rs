@@ -348,8 +348,8 @@ pub struct SsoService {
     /// Held while an account is created and linked, so two first sign-ins of
     /// one identity end at one account, while a link is checked and made or
     /// removed ([`links`]), so a refusal and a link never interleave, and
-    /// while an exchange checks its link and mints its session, so a removal
-    /// cannot fall between the two.
+    /// while an exchange or a Quick Connect approval checks its link and
+    /// mints its session, so a removal cannot fall between the two.
     provisioning: tokio::sync::Mutex<()>,
     /// The server's published URL (`--published-url`,
     /// `FERROFIN_PUBLISHED_URL`), the public URL when the plugin sets none.

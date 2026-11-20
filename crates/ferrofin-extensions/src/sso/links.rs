@@ -280,6 +280,26 @@ impl SsoService {
         })
     }
 
+    /// Whether `identity` is still linked to `user_id`: a sign-in verified
+    /// before its link was removed, or moved, signs nothing in. Callers hold
+    /// the provisioning lock from this check until their session is minted.
+    pub(super) async fn still_linked(
+        &self,
+        identity: &VerifiedIdentity,
+        user_id: Uuid,
+    ) -> Result<bool, ServiceError> {
+        let key = ExternalIdentityKey {
+            provider_id: PROVIDER_ID,
+            issuer: &identity.issuer,
+            subject: &identity.subject,
+        };
+        Ok(self
+            .identities
+            .find(key)
+            .await?
+            .is_some_and(|link| link.user_id == user_id))
+    }
+
     /// Links `identity` to `user_id`, unless another account has it: then
     /// nothing changes. A link it already has is kept as it is.
     async fn link_identity(
@@ -403,9 +423,10 @@ impl SsoService {
         }
         // The identity no longer signs in to the account: neither does any
         // session it, or anyone, opened (B12). The link is removed first,
-        // under the lock an exchange holds from its lookup of the link to its
-        // session: a sign-in it finished whose code is not swapped yet is
-        // refused there, and one already minted is signed out here. A failed
+        // under the lock an exchange or a Quick Connect approval holds from
+        // its lookup of the link to its session: a sign-in it finished whose
+        // code or confirmation is not used yet is refused there, and one
+        // already minted is signed out here. A failed
         // sign-out is an error for a removal that stands; the dashboard's
         // Devices page signs the sessions out too.
         self.sessions.revoke_user_tokens(user_id, "").await?;

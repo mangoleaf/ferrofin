@@ -33,7 +33,6 @@ use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::OidcProvider;
 use ferrofin_traits::activity::ActivityLogCreate;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::external_identities::ExternalIdentityKey;
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use ferrofin_traits::sso::{OidcExchangeRefusal, OidcExchangeReply, SsoManager as _, SsoReply};
 use openidconnect::CsrfToken;
@@ -41,7 +40,6 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::SsoService;
-use super::accounts::PROVIDER_ID;
 use super::flows::{EXCHANGE_CODE_LIFETIME, FlowPurpose, PendingExchange};
 use super::sign_in::{
     VerifiedIdentity, cleared_flow_cookie, escape_html, flow_cookie, log_refusal, page,
@@ -208,16 +206,9 @@ impl SsoService {
         // minted, so a removal, which unlinks under this lock and then signs
         // the account out, either signs this session out or refuses it.
         let _linked = self.provisioning.lock().await;
-        let identity = ExternalIdentityKey {
-            provider_id: PROVIDER_ID,
-            issuer: &pending.identity.issuer,
-            subject: &pending.identity.subject,
-        };
-        if self
-            .identities
-            .find(identity)
+        if !self
+            .still_linked(&pending.identity, pending.user_id)
             .await?
-            .is_none_or(|link| link.user_id != pending.user_id)
         {
             return Ok(Err(refused(Some(key), "unlinked")));
         }
