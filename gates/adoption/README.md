@@ -784,7 +784,9 @@ Python tests, so CI runs them too. `tests/test_watch_history.py` checks unchange
 history, changes to each playback field, deleted provider-keyed rows, progress for
 another user, unwatched-to-watched changes, missing API history, hidden versions,
 date/GUID normalization, private baselines, fixtures missing watched/resume data, and
-failure reporting. Its fixtures contain only invented IDs and playback data.
+failure reporting, and that its model of migration 0050's date rewrite matches the
+migration's own statement and leaves Jellyfin's form alone. Its fixtures contain only
+invented IDs and playback data.
 `tests/test_table_digests.py` checks a lost row in each listed table, a changed column, a
 lost and an added column, and a case per normaliser rule (each with the unrewritten change
 next to it that must still fail). `tests/test_messy.py` checks each shape's seeder and end-state
@@ -1092,6 +1094,14 @@ Both sides are Ferrofin, so every comparison is exact, with these exceptions:
   These are the seeded ratings' visibility, the harmonized conflicting user data, and the
   re-keyed id of the local alternate version, for which only the version count is
   compared. `synthetic.py run` holds each of these against Jellyfin 12.4.
+- **The date form of migration 0050.** It rewrites every stored date from Ferrofin's
+  seven-digit text (and the RFC 3339 form of some rows) into the text Jellyfin writes,
+  the same instant: `2026-01-01 12:00:00.0000000` becomes `2026-01-01 12:00:00`. The
+  start release's watch history is expected in that form: its `LastPlayedDate` and
+  `RetentionDate` are rewritten as the migration does (`watch_history.ef_text`). The
+  candidate's rows are compared as stored, so a build that wrote seven digits again
+  still fails. Jellyfin's own form is left as it is, so `synthetic.py run` expects
+  Jellyfin's rows unchanged.
 - **Avatars.** They are fetched with the admin's token, because v1.0.0 serves them to no
   anonymous client.
 - **A start release with a known API bug.** v1.0.0 lets a restricted user download an

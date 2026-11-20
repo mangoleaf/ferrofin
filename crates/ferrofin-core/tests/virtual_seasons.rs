@@ -399,10 +399,15 @@ async fn an_older_scans_season_with_no_folder_moves_to_jellyfins_id(#[case] mode
         Some(legacy_db.as_str())
     );
 
-    let rekeyed =
-        ferrofin_core::adoption_repairs::rekey_virtual_seasons(&fx.db, &fx.mode, None, None)
-            .await
-            .expect("repair");
+    let rekeyed = ferrofin_core::adoption_repairs::rekey_virtual_seasons(
+        &fx.db,
+        &fx.mode,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
+        None,
+        None,
+    )
+    .await
+    .expect("repair");
     assert_eq!(rekeyed, 1);
     let second_db = guid_to_db(second);
     let mut expected = vec![guid_to_db(first), second_db.clone()];
@@ -428,9 +433,15 @@ async fn an_older_scans_season_with_no_folder_moves_to_jellyfins_id(#[case] mode
         .expect("check");
     assert!(broken.is_empty(), "{broken:?}");
     assert_eq!(
-        ferrofin_core::adoption_repairs::rekey_virtual_seasons(&fx.db, &fx.mode, None, None)
-            .await
-            .expect("again"),
+        ferrofin_core::adoption_repairs::rekey_virtual_seasons(
+            &fx.db,
+            &fx.mode,
+            &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
+            None,
+            None,
+        )
+        .await
+        .expect("again"),
         0,
         "once"
     );
@@ -568,10 +579,15 @@ async fn the_repair_skips_a_season_whose_new_id_is_stored() {
     fx.rekey_season(first, second).await;
     let before = fx.seasons().await;
 
-    let rekeyed =
-        ferrofin_core::adoption_repairs::rekey_virtual_seasons(&fx.db, &fx.mode, None, None)
-            .await
-            .expect("repair");
+    let rekeyed = ferrofin_core::adoption_repairs::rekey_virtual_seasons(
+        &fx.db,
+        &fx.mode,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
+        None,
+        None,
+    )
+    .await
+    .expect("repair");
     assert_eq!(rekeyed, 0);
     assert_eq!(fx.seasons().await, before, "nothing moved");
     assert_eq!(

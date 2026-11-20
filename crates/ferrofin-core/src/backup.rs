@@ -332,6 +332,24 @@ fn list_backups_in(dir: &Path) -> std::io::Result<Vec<BackupManifest>> {
     Ok(manifests)
 }
 
+/// Jellyfin's backup engine version (`BackupService._backupEngineVersion`),
+/// the only one its restore accepts.
+const JELLYFIN_BACKUP_ENGINE_VERSION: &str = "0.2.0";
+
+/// How many archives in the backups directory `dir` Jellyfin cannot restore,
+/// for the export's loss report: those with a manifest whose engine version
+/// is not Jellyfin's (`RestoreBackupAsync` refuses them), which is every one
+/// Ferrofin wrote. An archive Jellyfin wrote before adoption is not counted.
+///
+/// # Errors
+/// When `dir` exists and cannot be read.
+pub fn archives_jellyfin_cannot_restore(dir: &Path) -> std::io::Result<usize> {
+    Ok(list_backups_in(dir)?
+        .iter()
+        .filter(|manifest| manifest.backup_engine_version != JELLYFIN_BACKUP_ENGINE_VERSION)
+        .count())
+}
+
 /// The file name `BackupController.SanitizePath` keeps of a requested archive:
 /// `Path.GetFileName(Path.GetFullPath(path))`. The value is resolved lexically
 /// against the working directory, as .NET does on Unix, and its last component
@@ -1650,6 +1668,18 @@ mod tests {
             list_backups_in(&tmp.path().join("nope"))
                 .unwrap()
                 .is_empty()
+        );
+        // Jellyfin would restore none of Ferrofin's archives, and one of its
+        // own that the directory kept from before adoption.
+        std::fs::copy(&foreign, backups.join("jellyfin-backup.zip")).unwrap();
+        assert_eq!(list_backups_in(&backups).unwrap().len(), 3);
+        assert_eq!(
+            super::archives_jellyfin_cannot_restore(&backups).unwrap(),
+            2
+        );
+        assert_eq!(
+            super::archives_jellyfin_cannot_restore(&tmp.path().join("nope")).unwrap(),
+            0
         );
     }
 

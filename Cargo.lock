@@ -1878,6 +1878,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "wat",
+ "zip",
 ]
 
 [[package]]

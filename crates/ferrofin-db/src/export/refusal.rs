@@ -336,9 +336,12 @@ pub(super) fn damaged_or(error: sqlx::Error) -> DbError {
 /// snapshot opens: one that fails `integrity_check` or `foreign_key_check`,
 /// one that is not Ferrofin's (no `_sqlx_migrations`), and an adopted one
 /// whose Jellyfin history matches no release Ferrofin adopts, so the export
-/// cannot tell which Jellyfin it came from. A Ferrofin-native database has no
-/// Jellyfin history.
-pub(super) async fn database(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+/// cannot tell which Jellyfin it came from. Returns that history, for the
+/// steps that change the copy; `None` for a Ferrofin-native database, which
+/// has no Jellyfin history.
+pub(super) async fn database(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<Option<super::history::SourceHistory>> {
     let integrity: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
         .fetch_all(&mut *conn)
         .await
@@ -383,21 +386,22 @@ pub(super) async fn database(conn: &mut sqlx::SqliteConnection) -> Result<()> {
     if table("__EFMigrationsHistory")
         .fetch_optional(&mut *conn)
         .await?
-        .is_some()
+        .is_none()
     {
-        let applied: Vec<String> =
-            sqlx::query_scalar(r#"SELECT "MigrationId" FROM "__EFMigrationsHistory" ORDER BY 1"#)
-                .fetch_all(&mut *conn)
-                .await?;
-        if crate::database::match_generation(&applied).is_none() {
-            return Err(refused(format!(
-                "the database's Jellyfin migration history ({} ids) matches no Jellyfin release \
-                 Ferrofin adopts, so the export cannot tell which release it came from",
-                applied.len()
-            )));
-        }
+        return Ok(None);
     }
-    Ok(())
+    let ids: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "MigrationId" FROM "__EFMigrationsHistory" ORDER BY 1"#)
+            .fetch_all(&mut *conn)
+            .await?;
+    let Some(generation) = crate::database::match_generation(&ids) else {
+        return Err(refused(format!(
+            "the database's Jellyfin migration history ({} ids) matches no Jellyfin release \
+             Ferrofin adopts, so the export cannot tell which release it came from",
+            ids.len()
+        )));
+    };
+    Ok(Some(super::history::SourceHistory { generation, ids }))
 }
 
 /// Refuses a write-ahead log the snapshot would not fold in whole.

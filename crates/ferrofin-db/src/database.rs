@@ -2028,7 +2028,7 @@ pub(crate) fn publish_snapshot(partial: &std::path::Path, backup: &std::path::Pa
 /// Passes `written` through, removing the half-written `partial` first when
 /// it failed: a copy cut short by a full disk must not keep holding the space
 /// the migrations after it need.
-pub(crate) fn abandon_on_error(partial: &std::path::Path, written: Result<()>) -> Result<()> {
+pub(crate) fn abandon_on_error<T>(partial: &std::path::Path, written: Result<T>) -> Result<T> {
     if written.is_err()
         && let Err(error) = std::fs::remove_file(partial)
         && error.kind() != std::io::ErrorKind::NotFound

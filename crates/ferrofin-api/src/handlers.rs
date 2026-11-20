@@ -5912,11 +5912,7 @@ pub const VERIFIED: &[Verified] = &[
             "The 400 for an itemId or index the route binder cannot convert (upstream's \
          ValidationProblemDetails), and the 401 and 403 bodies, are Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
-            "A row an adopted database stores with a %AppDataPath% or %MetadataPath% token (a \
-         subtitle Jellyfin saved in its metadata folder) is read unexpanded, so it is the \
-         folder-missing 404 below, where upstream expands it (MediaStreamRepository \
-         RestorePath) and deletes the file. Fix path: gl-1063.",
-            "Every other relative path is the folder-missing 404, without touching the disk, as \
+            "Every relative path is the folder-missing 404, without touching the disk, as \
          the item delete refuses one (item_deletion.rs delete_item_path). Upstream \
          resolves one against its working directory, so a relative row whose folder exists \
          there answers 204 and deletes the file it names beside the server process (gl-1723). \

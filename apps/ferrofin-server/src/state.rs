@@ -945,6 +945,7 @@ pub async fn build_app_state(
     ferrofin_core::adoption_repairs::run_rehome_local_versions(
         db,
         &id_derivation,
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
         item_persistence_service.as_ref(),
@@ -956,6 +957,7 @@ pub async fn build_app_state(
     ferrofin_core::adoption_repairs::run_rekey_virtual_seasons(
         db,
         &id_derivation,
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
     )
@@ -967,6 +969,7 @@ pub async fn build_app_state(
         db,
         &id_derivation,
         &format!("{}/playlists", paths.data_path()),
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
     )
@@ -979,6 +982,7 @@ pub async fn build_app_state(
     ferrofin_core::adoption_repairs::run_rekey_by_name_rows(
         db,
         by_name_identity.as_ref(),
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
     )
@@ -2642,6 +2646,11 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to remove extracted data of items that no longer exist")?;
+    // Once per database (gl-1616): the item and stream paths an earlier
+    // version stored resolved under the data and metadata directories take
+    // the `%AppDataPath%`/`%MetadataPath%` form every save writes. Last of the
+    // repairs, after every one that stores a path, and before a scan.
+    ferrofin_core::adoption_repairs::run_reverse_stored_virtual_paths(db, &virtual_paths).await;
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
