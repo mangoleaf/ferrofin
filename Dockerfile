@@ -71,7 +71,7 @@ RUN sed -i 's/^Components: main$/Components: main non-free/' /etc/apt/sources.li
 FROM ${WEB_IMAGE} AS web
 
 # ── server binary ───────────────────────────────────────────────────────
-FROM rust:1.99.1-trixie AS build
+FROM rust:1.100.0-trixie AS build
 # cargo-auditable embeds the crate list in the binary (a .dep-v0 section) for `cargo audit bin`
 # and image scanners; release.yml installs the same version. Before COPY, so a rebuild keeps it.
 RUN cargo install --locked cargo-auditable@0.7.7
