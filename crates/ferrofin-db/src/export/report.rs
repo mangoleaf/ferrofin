@@ -150,7 +150,7 @@ const FIRST_START: [(&str, &str); 19] = [
     ),
     (
         "20260729120000_RestorePlaylistChildrenFromMetadata",
-        "fills each playlist that has no entries from its playlist.xml",
+        "fills each playlist that has no entries from its playlist.xml, which only playlists in media libraries keep: the export leaves out those in data/playlists",
     ),
     (
         "20260915104305_FixNullEncoderPreset",

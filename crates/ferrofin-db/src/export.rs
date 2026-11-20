@@ -18,6 +18,8 @@
 //! - `classify`: which migrations are schema and which are code migrations;
 //! - `drop_objects`: removing Ferrofin's own tables and indexes from the copy;
 //! - `paths`: the stored paths, rewritten onto the output's layout;
+//! - `containers`: the playlists' and box sets' metadata files, left out of
+//!   the copy where they may be stale, and those in media libraries;
 //! - `report`: what the removed tables held and what Jellyfin's first start
 //!   changes, for the operator's loss report;
 //! - `refusal`: the conditions under which an export must not run.
@@ -35,6 +37,7 @@ use crate::{DbError, Result};
 pub use classify::{
     CODE_PRODUCT_VERSION, Disposition, JELLYFIN_MIGRATIONS, SCHEMA_PRODUCT_VERSION,
 };
+pub use containers::{ContainerFile, LibraryContainer};
 pub use drop_objects::{DroppedObjects, DroppedTable};
 pub use history::HistoryRewrite;
 pub use layout::{DOCKER, Layout, LeftOut, SourceDirs};
@@ -43,6 +46,7 @@ pub use refusal::Preflight;
 pub use report::{first_start_effects, table_note};
 
 mod classify;
+mod containers;
 mod drop_objects;
 mod history;
 mod layout;
@@ -147,6 +151,14 @@ pub struct ExportSummary {
     /// place in the output: a configuration or metadata directory kept
     /// elsewhere.
     pub moved: Vec<(PathBuf, PathBuf)>,
+    /// The playlists' and box sets' metadata files in Jellyfin's own folders
+    /// of the data directory, relative to it, sorted, each left out or kept
+    /// ([`ContainerFile`]).
+    pub container_files: Vec<(PathBuf, ContainerFile)>,
+    /// The playlists and box sets the database stores in media libraries
+    /// whose metadata file was there where the export ran, or whose path was
+    /// not ([`LibraryContainer`]).
+    pub library_containers: Vec<LibraryContainer>,
 }
 
 /// What the export changed in its copy of the database, step by step
@@ -202,7 +214,12 @@ async fn edit_staged(
 /// files of each. The snapshot holds what they do. Also left out is a
 /// `migrations.xml` in the configuration directory (the data directory's own,
 /// or the one copied to the layout's), which Jellyfin would read again: from
-/// one listing migrations it writes history rows, or stops its start.
+/// one listing migrations it writes history rows, or stops its start. So are
+/// the `playlist.xml` of each playlist in the data directory's
+/// `data/playlists` and the `collection.xml` of each `[boxset]` folder in its
+/// `data/collections`, which may hold what Jellyfin last wrote rather than
+/// the database's changes since, and which Jellyfin's metadata refresh would
+/// merge back ([`ExportSummary::container_files`]).
 /// The snapshot's `__EFMigrationsHistory` is rewritten ([`HistoryRewrite`]),
 /// Ferrofin's own tables and indexes are removed from it
 /// ([`DroppedObjects`]), and its stored paths are rewritten onto the layout
@@ -271,7 +288,9 @@ pub async fn export_data_dir(
     let (companions_before, copied, skip) = blocking(move || {
         // The data directory's walk leaves directories out; the others' do not.
         let skip = (
-            tree::Skip::new(skipped.clone())?.leaving_out(left_out),
+            tree::Skip::new(skipped.clone())?
+                .leaving_out(left_out)
+                .with_containers(),
             tree::Skip::new(skipped)?,
         );
         let companions = tree::digest_files(&files)?;
@@ -280,7 +299,8 @@ pub async fn export_data_dir(
     })
     .await?;
     let exported = out.join(EXPORTED_DATABASE);
-    let edits = snapshot::snapshot_database(&resolved, &exported, (dirs, layout)).await?;
+    let (edits, library_containers) =
+        snapshot::snapshot_database(&resolved, &exported, (dirs, layout)).await?;
     let mut dirs_copied = copied.dirs;
     // A source with no `data/` (a native one) has none to take the mode from:
     // the snapshot's directory takes the source's own.
@@ -310,6 +330,8 @@ pub async fn export_data_dir(
         edits,
         left_out: trees.left_out,
         moved: trees.copied.split_off(1),
+        container_files: copied.containers,
+        library_containers,
     })
 }
 

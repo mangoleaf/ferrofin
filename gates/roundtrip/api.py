@@ -7,11 +7,14 @@ already waits for a library scan the way the adoption gate does; this adds reque
 
     api.py scan   --base-url URL --data-dir DIR [--timeout S]   POST /Library/Refresh, wait until it completed
     api.py settle --base-url URL --data-dir DIR [--timeout S]   wait until no scheduled task is running
+    api.py refresh-playlists --base-url URL --data-dir DIR [--timeout S]
+                                                               a full metadata refresh of every playlist, waited for
 
 Exit status 0 when done, 1 with one line on stdout saying why not.
 """
 
 import argparse
+from contextlib import closing
 import http.client
 import json
 from pathlib import Path
@@ -25,6 +28,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1] / "adoption"))
 import metadata  # noqa: E402  (gates/adoption/metadata.py: Api, CheckError)
 
 CheckError = metadata.CheckError
+#: A playlist's stored type in BaseItems.
+PLAYLIST = "MediaBrowser.Controller.Playlists.Playlist"
 
 
 def database(data_dir):
@@ -86,10 +91,37 @@ class Server(metadata.Api):
                 raise CheckError(f"a scheduled task was still running after {timeout:.0f} s")
             time.sleep(interval)
 
+    def refresh_playlists(self, db, timeout, interval=2):
+        """A full metadata refresh of every playlist the copy's database `db` holds, replacing nothing: jellyfin-web's
+        "Refresh metadata" without "Replace existing metadata", for the metadata only (no image refresh, which could
+        build a playlist collage Ferrofin lacks), waited for: no task shows a queued refresh, so each
+        playlist's DateLastRefreshed must change, which a full refresh saves once its providers succeeded
+        (MetadataService.RefreshMetadata; a failed one is given up at `timeout`). The refresh runs every metadata
+        reader, playlist.xml's included, whatever the file's time. A database with no playlist is a reason: the
+        check would otherwise pass having refreshed nothing."""
+        def stamps():
+            with closing(metadata.connect(db)) as conn:
+                return dict(conn.execute('SELECT "Id", "DateLastRefreshed" FROM "BaseItems" WHERE "Type" = ?',
+                                         (PLAYLIST,)))
+        before = stamps()
+        if not before:
+            raise CheckError("the copy's database holds no playlist to refresh")
+        for key in before:
+            self.request(f"/Items/{metadata.item_id(key)}/Refresh?metadataRefreshMode=FullRefresh", method="POST")
+        deadline = time.monotonic() + timeout
+        while True:
+            after = stamps()
+            waiting = [key for key, stamp in before.items() if key in after and after[key] == stamp]
+            if not waiting:
+                return
+            if time.monotonic() >= deadline:
+                raise CheckError(f"{len(waiting)} of {len(before)} playlists were not refreshed after {timeout:.0f} s")
+            time.sleep(interval)
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("mode", choices=("scan", "settle"))
+    parser.add_argument("mode", choices=("scan", "settle", "refresh-playlists"))
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--timeout", type=float, default=600)
@@ -98,6 +130,8 @@ def main(argv=None):
         server = Server(args.base_url, args.data_dir)
         if args.mode == "scan":
             server.scan(args.timeout)
+        elif args.mode == "refresh-playlists":
+            server.refresh_playlists(database(args.data_dir), args.timeout)
         else:
             server.settle(args.timeout)
     except CheckError as error:

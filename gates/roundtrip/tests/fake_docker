@@ -11,7 +11,8 @@
 # `docker tag` made it. A container's id is not its name, and `rm` takes only an id (a name is "No such
 # container"); each removal is logged by name in $FAKE_STATE/removed.
 # Knobs: FAKE_RUN_DELAY (seconds a run takes), FAKE_EXIT_CODE (what a stopped container exited with),
-# FAKE_JELLYFIN=loses (Jellyfin's copy has lost a favorite), =hang (it answers 503 and never logs why),
+# FAKE_JELLYFIN=loses (Jellyfin's copy has lost a favorite), =reshares (its playlist refresh shares a playlist
+# again, as a stale playlist.xml would), =hang (it answers 503 and never logs why),
 # =exits (it stops with status 3 before it answers) or =setup (its setup server answers first);
 # FAKE_EXPORT=fails (the export exits 1), =hangs (it never ends), =history-kept (no fake-ran),
 # =all-recorded (an empty fake-ran: every id recorded, so Jellyfin runs no migration) or =stale-paths (the
@@ -59,7 +60,7 @@ case "$1" in
       cp -a "$config" "$out" || exit 1
       case ${FAKE_EXPORT:-} in
         stale-paths) sqlite3 "$out/data/jellyfin.db" \
-          "CREATE TABLE BaseItems (Path TEXT); INSERT INTO BaseItems VALUES ('$data/root/default/Movies')" || exit 1;;&
+          "INSERT INTO BaseItems (Path) VALUES ('$data/root/default/Movies')" || exit 1;;&
         history-kept) ;;
         all-recorded) : > "$out/fake-ran";;
         *) if [ -f "$config/fake-left-to-run" ]; then cp "$config/fake-left-to-run" "$out/fake-ran"; else : > "$out/fake-ran"; fi;;
@@ -72,7 +73,7 @@ case "$1" in
       role=jellyfin
       case $config in */10.11.8/*) [ -f "$config/fake-ran" ] || behaviour=start-failed log=start-failed;; esac
       case ${FAKE_JELLYFIN:-} in
-        loses) behaviour=loses;; hang) behaviour=start-failed;; setup) behaviour=setup;;
+        loses) behaviour=loses;; reshares) behaviour=reshares;; hang) behaviour=start-failed;; setup) behaviour=setup;;
         exits) behaviour=exits; echo 3 > "$state/$name.exit";;
       esac
     fi

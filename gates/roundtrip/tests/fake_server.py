@@ -16,9 +16,17 @@ test_usage.py serves a Stub in process. roundtrip.bats's fake docker starts one 
                                                           for as long /System/Ping 200 and everything else 503, as
                                                           the real server answers until its core startup completes,
                                                           then "ok"; "loses": the copy's first favorite is gone, a
-                                                          return that lost a write; "exits": the server stops
-                                                          (status 3) as soon as its port is written. ROLE names the
-                                                          product.
+                                                          return that lost a write; "reshares": a playlist's metadata
+                                                          refresh shares it again with the account its stale
+                                                          playlist.xml names, as Jellyfin's refresh merges the file;
+                                                          "exits": the server stops (status 3) as soon as its port is
+                                                          written. ROLE names the product.
+
+The copy holds SHARED, a playlist of synthetic-adult's (answers.SHARE_OWNER) shared with synthetic-child, with a
+playlist.xml listing the share, as the fixtures' Synthetic mixed order is. synthetic-adult also sees the playlists the
+stage makes, whose shares it is refused (403), as upstream refuses a playlist's shares to anyone but its owner. A full
+refresh of SHARED (POST /Items/SHARED/Refresh?metadataRefreshMode=FullRefresh) moves its DateLastRefreshed in
+CONFIG/data/jellyfin.db a moment later, as Jellyfin's queued refresh does; a refresh of another mode moves nothing.
 """
 
 import base64
@@ -33,25 +41,31 @@ import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
+import uuid
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import answers  # noqa: E402
 
 ADMIN = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ADULT, CHILD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccccccccccc"
+#: synthetic-adult's playlist, shared with synthetic-child, and its name.
+SHARED, SHARED_NAME = "dddddddddddddddddddddddddddddddd", "Synthetic mixed order"
 MOVIES = [f"{n:032x}" for n in range(1, 8)]   # seven movies; the first one is already played
 STATE = "fake-state.json"
 #: How long a "setup" server answers as Jellyfin's setup server does, and then as its starting real server does:
 #: each longer than the harness's poll interval.
 SETUP_SECONDS = 3
+#: How long after its request a queued refresh lands.
+REFRESH_SECONDS = 0.2
 #: What the stub keeps, and saves to CONFIG/fake-state.json.
 FIELDS = ("refreshes", "users", "data", "collections", "accounts", "prefs", "keys", "devices", "libraries", "items",
-          "images", "plays")
+          "images", "plays", "shares")
 
 
 def fresh():
     return {
         "refreshes": 0,
-        "users": {"synthetic-admin": ADMIN},
+        "users": {"synthetic-admin": ADMIN, "synthetic-adult": ADULT, "synthetic-child": CHILD},
         "data": {m: {"Played": m == MOVIES[0], "IsFavorite": False, "PlaybackPositionTicks": 0, "PlayCount": 0,
                      "Likes": None} for m in MOVIES},
         "collections": [],   # [type, name, id, [[entry id, movie id], ...]]
@@ -63,6 +77,7 @@ def fresh():
         "items": {m: {"Name": f"Movie {m[-1]}", "LockData": False, "LockedFields": [], "Overview": "x"} for m in MOVIES},
         "images": {},        # item id: image types
         "plays": {},         # user id (not ADMIN): movies played to the end
+        "shares": [CHILD],   # whom SHARED is shared with
     }
 
 
@@ -70,8 +85,9 @@ class Stub:
     """fail: a path prefix answered 500. drop: a path prefix (or, ending in $, a whole path; after "POST " or
     "DELETE ", that method's only) answered 200 but not kept (a write that was lost)."""
 
-    def __init__(self, fail="", drop="", state=None, product="Jellyfin Server", behaviour="ok"):
+    def __init__(self, fail="", drop="", state=None, product="Jellyfin Server", behaviour="ok", db=None):
         self.fail, self.drop, self.state, self.product, self.behaviour = fail, drop, state, product, behaviour
+        self.db = db or (state.parent / "data" / "jellyfin.db" if state else None)
         self.calls, self.lock = [], threading.Lock()
         self.setup_until = time.monotonic() + SETUP_SECONDS
         saved = json.loads(state.read_text()) if state and state.exists() else {}
@@ -126,6 +142,14 @@ class Stub:
         if path == "/ScheduledTasks":
             return 200, [{"Key": "RefreshLibrary", "State": "Idle",
                           "LastExecutionResult": {"Status": "Completed", "EndTimeUtc": str(self.refreshes)}}]
+        if parts[0] == "Playlists" and len(parts) == 3 and parts[2] == "Users":
+            if parts[1] != SHARED:
+                return 403, None
+            return 200, [{"UserId": user, "CanEdit": False} for user in self.shares]
+        if path == "/Items" and query.get("IncludeItemTypes") == ["Playlist"] and query.get("userId") == [ADULT]:
+            others = [{"Id": key, "Type": kind, "Name": name} for kind, name, key, _ in self.collections
+                      if kind == "Playlist"]
+            return 200, {"Items": [{"Id": SHARED, "Type": "Playlist", "Name": SHARED_NAME}, *others]}
         if path == "/Items" and "ParentId" in query or parts[0] == "Playlists" and len(parts) == 3:
             found = self.collection(query["ParentId"][0] if "ParentId" in query else parts[1])
             if not found:
@@ -223,6 +247,13 @@ class Stub:
         elif parts[0] == "Items" and len(parts) == 2:
             self.items[parts[1]].update({key: body[key] for key in ("Name", "LockData", "LockedFields", "Overview")})
             return 204, None
+        elif parts[0] == "Items" and parts[2] == "Refresh":
+            if query.get("metadataRefreshMode") == ["FullRefresh"]:
+                if self.behaviour == "reshares":
+                    self.shares = [CHILD]
+                if self.db:   # queued: the stamp moves after the answer
+                    threading.Timer(REFRESH_SECONDS, self.refreshed, (parts[1],)).start()
+            return 204, None
         elif parts[0] == "Items" and parts[2] == "Images":
             try:   # Jellyfin takes the image base64-encoded
                 image = base64.b64decode(body or "", validate=True)
@@ -243,7 +274,9 @@ class Stub:
 
     def delete(self, path, query, body, auth):
         parts = path.strip("/").split("/")
-        if parts[0] == "Playlists":
+        if parts[0] == "Playlists" and parts[2] == "Users":
+            self.shares = [user for user in self.shares if user != parts[3]]
+        elif parts[0] == "Playlists":
             entries = self.collection(parts[1])[3]
             entries[:] = [e for e in entries if e[0] not in query["entryIds"][0].split(",")]
         elif parts[0] == "Collections":
@@ -254,6 +287,12 @@ class Stub:
         elif parts[0] == "Items":
             self.collections = [c for c in self.collections if c[2] != parts[1]]
         return 204, None
+
+    def refreshed(self, key):
+        with closing(sqlite3.connect(self.db)) as db:
+            db.execute("UPDATE BaseItems SET DateLastRefreshed = datetime('now', '+1 second') WHERE Id = ?",
+                       (str(uuid.UUID(key)).upper(),))
+            db.commit()
 
     def create(self, kind, name, movies):
         key = f"{len(self.collections) + 100:032x}"
@@ -308,8 +347,12 @@ def server(stub):
 
 
 def copy(root):
-    """A data directory holding the tables the stages read: an API key and an administrator with a web session."""
-    (root / "data").mkdir(parents=True)
+    """A data directory holding the tables the stages read: an API key, an administrator and synthetic-adult each with
+    a web session, and the rows (with their folders) of SHARED, whose playlist.xml lists its share, and of a library."""
+    for folder in ("data/playlists/Synthetic mixed order", "root/default/Synthetic Movies"):
+        (root / folder).mkdir(parents=True)
+    (root / "data/playlists/Synthetic mixed order/playlist.xml").write_text(
+        f"<Item><Shares><Share><UserId>{uuid.UUID(CHILD)}</UserId></Share></Shares></Item>", encoding="utf-8")
     with closing(sqlite3.connect(root / "data" / "jellyfin.db")) as db:
         db.executescript("""
             CREATE TABLE ApiKeys (AccessToken TEXT, DateCreated TEXT);
@@ -320,6 +363,15 @@ def copy(root):
             INSERT INTO Users VALUES ('AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA', 'synthetic-admin');
             INSERT INTO Permissions VALUES ('AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA', 0, 1);
             INSERT INTO Devices VALUES ('AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA', 'usertoken', 'device', 'Jellyfin Web', '2026-01-02');
+            INSERT INTO Users VALUES ('BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB', 'synthetic-adult');
+            INSERT INTO Devices VALUES ('BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB', 'adulttoken', 'adult', 'Jellyfin Web', '2026-01-02');
+            CREATE TABLE BaseItems (Id TEXT, Type TEXT, Name TEXT, Path TEXT, DateCreated TEXT, DateLastRefreshed TEXT);
+            INSERT INTO BaseItems VALUES
+              ('DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD', 'MediaBrowser.Controller.Playlists.Playlist',
+               'Synthetic mixed order', '%AppDataPath%/playlists/Synthetic mixed order', '2026-01-01 00:00:00',
+               '2026-01-01 00:00:00'),
+              ('11111111-1111-1111-1111-111111111111', 'MediaBrowser.Controller.Entities.CollectionFolder',
+               'Synthetic Movies', '/config/root/default/Synthetic Movies', '2026-01-01 00:00:00', NULL);
         """)
         db.commit()
     return root

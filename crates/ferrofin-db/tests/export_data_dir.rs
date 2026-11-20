@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use ferrofin_db::DbError;
 use ferrofin_db::export::{
-    DOCKER, DatabaseEdits, DroppedObjects, DroppedTable, EXPORTED_DATABASE, HistoryRewrite,
-    LeftOut, PathRewrite, SourceDirs, export_data_dir,
+    ContainerFile, DOCKER, DatabaseEdits, DroppedObjects, DroppedTable, EXPORTED_DATABASE,
+    HistoryRewrite, LeftOut, LibraryContainer, PathRewrite, SourceDirs, export_data_dir,
 };
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
@@ -728,5 +728,132 @@ async fn a_log_damaged_before_its_end_is_refused() {
     assert!(
         reason.contains("write-ahead log is damaged at frame 1"),
         "{reason}"
+    );
+}
+
+/// A Ferrofin database at `database` whose items are a playlist and a box set
+/// in the data directory (one by a token path, one by an absolute path under
+/// `source`, as Ferrofin stores those it makes), and box sets, a playlist and a
+/// movie in `media`.
+async fn database_with_containers(database: &Path, source: &Path, media: &Path) {
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let mut conn = SqliteConnectOptions::new()
+        .filename(database)
+        .create_if_missing(true)
+        .connect()
+        .await
+        .unwrap();
+    for statement in [
+        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
+        r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT)"#.to_owned(),
+        format!(
+            r#"INSERT INTO "BaseItems" VALUES
+               ('MediaBrowser.Controller.Playlists.Playlist', '%AppDataPath%/playlists/Mix'),
+               ('MediaBrowser.Controller.Entities.Movies.BoxSet', '{source}/data/collections/Saga [boxset]'),
+               ('MediaBrowser.Controller.Entities.Movies.BoxSet', '{media}/Heist [boxset]'),
+               ('MediaBrowser.Controller.Entities.Movies.BoxSet', '{media}/Bare [boxset]'),
+               ('MediaBrowser.Controller.Playlists.Playlist', '{media}/Gone [playlist]'),
+               ('MediaBrowser.Controller.Entities.Movies.Movie', '{media}/Heist [boxset]/Heist.mkv')"#,
+            media = media.display(),
+            source = source.display()
+        ),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    sqlx::Connection::close(conn).await.unwrap();
+}
+
+/// The `playlist.xml` of a playlist in Jellyfin's playlists folder and the
+/// `collection.xml` of a `[boxset]` folder in its collections folder are left
+/// out (gl-1903): each may hold what Jellyfin last wrote, which its metadata
+/// refresh would merge back over the changes made since. Their folders stay,
+/// and so do a `collection.xml` whose folder only that file makes a box set,
+/// and files of those names elsewhere. The playlists and box sets in media
+/// libraries keep theirs, and are listed.
+#[tokio::test]
+async fn playlist_and_collection_files_in_the_data_directory_are_left_out() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = scratch.path().join("source");
+    let media = scratch.path().join("media");
+    database_with_containers(&source.join(EXPORTED_DATABASE), &source, &media).await;
+    let xml = b"<Item><Shares><Share><UserId>a</UserId></Share></Shares></Item>";
+    for file in [
+        "data/playlists/Mix/playlist.xml",
+        "data/collections/Saga [boxset]/collection.xml",
+        "data/collections/Saga [boxset]/poster.jpg",
+        "data/collections/Odd/collection.xml",
+        "data/playlists/Mix/extra/playlist.xml",
+        "metadata/library/ab/playlist.xml",
+    ] {
+        let path = source.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, xml).unwrap();
+    }
+    for folder in ["Heist [boxset]", "Bare [boxset]"] {
+        std::fs::create_dir_all(media.join(folder)).unwrap();
+    }
+    std::fs::write(media.join("Heist [boxset]/collection.xml"), xml).unwrap();
+    let out = scratch.path().join("out");
+    let before = files(&source);
+
+    let summary = export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        &out,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(files(&source), before, "the source is left as it was");
+    let copied = files(&out);
+    for left_out in [
+        "data/playlists/Mix/playlist.xml",
+        "data/collections/Saga [boxset]/collection.xml",
+    ] {
+        assert!(!copied.contains_key(Path::new(left_out)), "{left_out}");
+    }
+    for kept in [
+        "data/collections/Saga [boxset]/poster.jpg",
+        "data/collections/Odd/collection.xml",
+        "data/playlists/Mix/extra/playlist.xml",
+        "metadata/library/ab/playlist.xml",
+    ] {
+        assert!(copied.contains_key(Path::new(kept)), "{kept}");
+    }
+    assert!(out.join("data/playlists/Mix").is_dir(), "the folder stays");
+    assert_eq!(
+        summary.container_files,
+        [
+            ("data/collections/Odd/collection.xml", ContainerFile::Kept),
+            (
+                "data/collections/Saga [boxset]/collection.xml",
+                ContainerFile::LeftOut
+            ),
+            ("data/playlists/Mix/playlist.xml", ContainerFile::LeftOut),
+        ]
+        .map(|(path, what)| (PathBuf::from(path), what))
+    );
+    assert_eq!(
+        summary.library_containers,
+        [
+            LibraryContainer {
+                kind: "playlist",
+                file: media.join("Gone [playlist]/playlist.xml"),
+                found: false,
+            },
+            LibraryContainer {
+                kind: "collection",
+                file: media.join("Heist [boxset]/collection.xml"),
+                found: true,
+            },
+        ]
+    );
+    assert!(
+        media.join("Heist [boxset]/collection.xml").is_file(),
+        "media is never written"
     );
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The Jellyfin stage of a round-trip route, sourced by run.sh: boot the Jellyfin release under test on what
-# the export wrote, read its log (checks_boot.py), compare its answers with Ferrofin's oracle, probe the files
+# the export wrote, read its log (checks_boot.py), refresh every playlist's metadata in full (api.py
+# refresh-playlists), compare its answers with Ferrofin's oracle, probe the files
 # it serves (probes.py), scan its libraries, and check the file and its library rows (checks_paths.py) once it
 # has stopped. It uses run.sh's state: route, dst, first_start, the settings, FIXTURES, JELLYFIN_ID, MADE, and
 # why[] through check and mark.
@@ -43,6 +44,10 @@ jellyfin_stage() {
     mark Jellyfin "no ERR or FTL outside the allowlist"
   fi
   if [ -n "$ready" ]; then
+    # Before the answers: a refresh that merged a stale playlist.xml back would show in them (a removed share).
+    check reasons python3 "$HERE/api.py" refresh-playlists --base-url "$url" --data-dir "$dst/jellyfin" \
+      --timeout "$SCAN_TIMEOUT"
+    mark Jellyfin "every playlist's full metadata refresh completes"
     check reasons_within "$SCAN_TIMEOUT" "Jellyfin's answers" \
       python3 "$HERE/answers.py" --base-url "$url" --data-dir "$dst/jellyfin" --out "$dst/answers.txt"
     [ ! -f "$dst/answers.txt" ] || check rt_compare_answers "$dst/oracle.txt" "$dst/answers.txt"
