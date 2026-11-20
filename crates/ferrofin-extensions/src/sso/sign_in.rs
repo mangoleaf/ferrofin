@@ -221,6 +221,11 @@ pub(super) fn escape_html(text: &str) -> String {
 /// back to jellyfin-web, under [`PAGE_POLICY`]. The link is relative, from
 /// `/sso/oidc/{key}/…`, so a server under a base URL keeps it.
 pub(super) fn page(status: u16, title: &str, body: &str) -> SsoReply {
+    page_linking_home(status, title, body, "../../../web/")
+}
+
+/// [`page`] for a route whose relative link back to jellyfin-web is `home`.
+pub(super) fn page_linking_home(status: u16, title: &str, body: &str, home: &str) -> SsoReply {
     SsoReply {
         status,
         location: None,
@@ -228,7 +233,7 @@ pub(super) fn page(status: u16, title: &str, body: &str) -> SsoReply {
             "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
              <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
              <title>{title}</title></head>\n<body><main><h1>{title}</h1>\n{body}\n\
-             <p><a href=\"../../../web/\">Back to Ferrofin</a></p></main></body></html>\n"
+             <p><a href=\"{home}\">Back to Ferrofin</a></p></main></body></html>\n"
         ),
         set_cookies: Vec::new(),
         content_security_policy: Some(PAGE_POLICY.to_owned()),
@@ -320,11 +325,13 @@ fn verified_payload(id_token: &CoreIdToken) -> Option<Map<String, Value>> {
 }
 
 impl SsoService {
-    /// [`SsoManager::start_oidc_sign_in`](ferrofin_traits::sso::SsoManager::start_oidc_sign_in).
+    /// [`SsoManager::start_oidc_sign_in`](ferrofin_traits::sso::SsoManager::start_oidc_sign_in),
+    /// for what its verified identity is for, its `purpose`.
     pub(super) async fn start_sign_in(
         &self,
         key: &str,
         client: IpAddr,
+        purpose: FlowPurpose,
     ) -> Result<SsoReply, ServiceError> {
         self.ensure_enabled().await?;
         let config = self.config().await?;
@@ -387,7 +394,7 @@ impl SsoService {
                 binding_hash: Sha256::digest(binding.secret().as_bytes()).into(),
                 created: Instant::now(),
                 client,
-                purpose: FlowPurpose::SignIn,
+                purpose,
             },
         );
         tracing::debug!(oidc_provider = %key, "OIDC sign-in started");
@@ -410,9 +417,9 @@ impl SsoService {
         let config = self.config().await?;
         let provider = sign_in_provider(&config, key)?;
         let public_url = self.public_url(&config).ok().flatten();
-        // What the verified identity is for decides how the flow ends: a
-        // purpose added later (linking, Quick Connect approval) adds its own
-        // arm, ending on its own page with no exchange code.
+        // What the verified identity is for decides how the flow ends: each
+        // purpose but a sign-in has its own arm, ending on its own page with
+        // no session.
         let mut reply = match self.verify_callback(&provider, callback).await {
             Ok((FlowPurpose::SignIn, identity, cookie)) => {
                 tracing::info!(oidc_provider = %key, "OIDC sign-in verified");
@@ -420,6 +427,22 @@ impl SsoService {
                     // Keeps the cookie, the code's binding: the exchange
                     // clears it.
                     Ok(code) => return Ok(completion_page(&code, &cookie, public_url.as_deref())),
+                    Err(refusal) => refusal.refused(key),
+                }
+            }
+            Ok((FlowPurpose::QuickConnect(code), identity, cookie)) => {
+                match self
+                    .quick_connect_verified(
+                        &provider,
+                        identity,
+                        code,
+                        &cookie,
+                        public_url.as_deref(),
+                    )
+                    .await?
+                {
+                    // Keeps the cookie, the confirmation's binding.
+                    Ok(confirmation) => return Ok(confirmation),
                     Err(refusal) => refusal.refused(key),
                 }
             }
@@ -447,7 +470,12 @@ impl SsoService {
             Ok(user) => user,
             Err(refusal) => return Ok(Err(refusal)),
         };
-        Ok(Ok(self.issue_exchange_code(&user, identity, cookie)?))
+        Ok(Ok(self.issue_exchange_code(
+            &user,
+            identity,
+            cookie,
+            FlowPurpose::SignIn,
+        )?))
     }
 
     /// Runs the callback's checks, in the order of the module's list, and
