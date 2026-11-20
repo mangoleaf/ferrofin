@@ -22,6 +22,7 @@ use std::io::BufRead;
 
 use chrono::{DateTime, FixedOffset, TimeZone};
 use encoding_rs::{DecoderResult, Encoding};
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
@@ -873,8 +874,7 @@ fn read_events<R: BufRead>(
 /// never reached.
 fn attribute_value(a: &quick_xml::events::attributes::Attribute<'_>) -> String {
     a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
-        .map(std::borrow::Cow::into_owned)
-        .unwrap_or_default()
+        .map_or_default(std::borrow::Cow::into_owned)
 }
 
 /// Reads a `<programme>` start tag's `channel`/`start`/`stop` attributes in a
@@ -1019,8 +1019,7 @@ impl TextRun {
         self.values
             .into_iter()
             .nth(at)
-            .map(|(value, _)| value)
-            .unwrap_or_default()
+            .map_or_default(|(value, _)| value)
     }
 
     /// `ProcessMultipleNodes`' pick: only the values whose `lang` is exactly
@@ -1043,10 +1042,7 @@ impl TextRun {
 fn same_language(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(a), Some(b)) => a
-            .chars()
-            .flat_map(char::to_uppercase)
-            .eq(b.chars().flat_map(char::to_uppercase)),
+        (Some(a), Some(b)) => equals_ordinal_ignore_case(a, b),
         _ => false,
     }
 }
@@ -1361,7 +1357,7 @@ fn parses_as_invariant_double(s: &str) -> bool {
         .chain(fraction.chars())
         .any(|c| c.is_ascii_digit());
     let exponent_ok = exponent.is_none_or(|e| {
-        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        let e = e.trim_prefix(['+', '-']);
         !e.is_empty() && digits(e)
     });
     integer_ok && digits(fraction) && has_digit && exponent_ok
@@ -2816,6 +2812,34 @@ mod language_tests {
         );
         assert_eq!(guide.programmes[0].title, "News");
         assert_eq!(guide.programmes[0].categories, ["Nachrichten", "News"]);
+    }
+
+    /// The language is compared with .NET's per-character `OrdinalIgnoreCase`
+    /// fold (the oracle is `ferrofin-util`'s .NET 10 casing table), not Rust's
+    /// full uppercase: `ß` is not `SS`, the dotless `ı` and the long `ſ` keep
+    /// their own case, `ᾳ` is `ᾼ`, and `İ` is not `i`.
+    #[rstest::rstest]
+    #[case("EN", "en", true)]
+    #[case("SS", "\u{00DF}", false)]
+    #[case("I", "\u{0131}", false)]
+    #[case("S", "\u{017F}", false)]
+    #[case("\u{1FBC}", "\u{1FB3}", true)]
+    #[case("i", "\u{0130}", false)]
+    fn the_language_folds_as_ordinal_ignore_case(
+        #[case] lang: &str,
+        #[case] language: &str,
+        #[case] matched: bool,
+    ) {
+        let guide = read(
+            &format!(
+                "<tv><programme start=\"20260725060000 +0000\" channel=\"a\">\
+                 <title lang=\"{lang}\">Matched</title><title lang=\"\">Fallback</title>\
+                 </programme></tv>"
+            ),
+            Some(language),
+        );
+        let expected = if matched { "Matched" } else { "Fallback" };
+        assert_eq!(guide.programmes[0].title, expected);
     }
 
     /// A sub-title and a description are chosen the same way, and the run

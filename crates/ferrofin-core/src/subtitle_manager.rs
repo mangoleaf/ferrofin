@@ -12,9 +12,15 @@
 //!   fetches the content, and **attaches** it to the item (a sidecar in the library
 //!   configured media or internal-metadata folder + an external [`MediaStream`](ferrofin_model::entities_media::MediaStream)
 //!   row). `Self::upload_subtitle` attaches caller-supplied content the same way.
+//!   A failed download is recorded in the activity log
+//!   (`Self::report_download_failure`, `SubtitleDownloadFailureLogger`).
 //! - `Self::get_remote_subtitles` routes an id to its provider and returns the
 //!   raw content (the `/Providers/Subtitles/Subtitles/{id}` route).
-//! - `Self::delete_subtitles` removes the external stream row + sidecar file.
+//! - `Self::delete_subtitles` deletes an external subtitle's file; the item
+//!   refresh the route then awaits drops its stream.
+//! - `Self::drop_missing_subtitle_rows` drops the external subtitle rows whose
+//!   file is gone; the route runs it after that refresh, for one that cannot
+//!   probe.
 //! - `Self::get_supported_providers` lists the registered providers for an item.
 
 use ferrofin_util::directory_path::DirectoryPath;
@@ -23,20 +29,21 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
-use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::providers::{RemoteSubtitleInfo, SubtitleProviderInfo};
 use uuid::Uuid;
 
+use ferrofin_traits::activity::{ActivityLogCreate, ActivityManager};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, SelfWrite, SelfWriteGuard, VirtualFolderManager};
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::subtitles::{
     ProviderLogin, SubtitleManager, SubtitleMediaType, SubtitleProvider, SubtitleResponse,
-    SubtitleSearchRequest,
+    SubtitleSearchRequest, is_rate_limit_exceeded,
 };
 
-use crate::db_error::{db_err, media_stream_type_disc};
+use crate::db_error::media_stream_type_disc;
 
 /// The concrete subtitle manager.
 #[derive(Clone)]
@@ -54,6 +61,9 @@ pub struct FerrofinSubtitleManager {
     /// takes them for the server's own writes (`ILibraryMonitor`). `None` in
     /// unit tests.
     self_writes: Option<Arc<dyn SelfWriteGuard>>,
+    /// Where a failed download is recorded (`SubtitleDownloadFailureLogger`).
+    /// `None` in unit tests.
+    activity: Option<Arc<dyn ActivityManager>>,
 }
 
 impl std::fmt::Debug for FerrofinSubtitleManager {
@@ -84,7 +94,17 @@ impl FerrofinSubtitleManager {
             virtual_folders: None,
             metadata_path: metadata_path.into(),
             self_writes: None,
+            activity: None,
         }
+    }
+
+    /// Records each failed download in the activity log, as
+    /// `SubtitleDownloadFailureLogger` does. Called once by the composition
+    /// root.
+    #[must_use]
+    pub fn with_activity(mut self, activity: Arc<dyn ActivityManager>) -> Self {
+        self.activity = Some(activity);
+        self
     }
 
     /// Brackets each subtitle written or deleted, as `SubtitleManager` does
@@ -123,6 +143,12 @@ impl FerrofinSubtitleManager {
                 Some(culture.two_letter_iso_language_name.clone());
         }
         if let Some(item) = self.library_manager.get_item_by_id(request.item_id).await? {
+            // SearchSubtitles(Video, …): a disc rip or an ISO is never searched.
+            if crate::item_data::video_format(item.data.as_deref()).video_type
+                != ferrofin_model::entities::VideoType::VideoFile
+            {
+                return Ok(false);
+            }
             let Some(content_type) = subtitle_media_type(&item.type_) else {
                 return Ok(false);
             };
@@ -238,14 +264,19 @@ impl FerrofinSubtitleManager {
             // LibraryOptions.SaveSubtitlesWithMedia defaults to true.
             true
         };
-        let sidecar = sidecar_path(media_path, response)?;
+        let name = sidecar_name(media_path, response)?;
         let destination = if save_with_media {
-            sidecar
+            // `Video.ContainingFolderPath`: a DVD or Blu-ray folder rip's own
+            // folder, else the media file's. A root path has none (`Path.Combine`
+            // throws on upstream's null).
+            let folder = self
+                .library_manager
+                .containing_folder_path(&item)
+                .await
+                .ok_or_else(|| ServiceError::invalid_input("item has no folder for a sidecar"))?;
+            PathBuf::from(folder).join(name)
         } else {
-            let filename = sidecar
-                .file_name()
-                .ok_or_else(|| ServiceError::invalid_input("subtitle has no filename"))?;
-            self.item_metadata_dir(item_id).join(filename)
+            self.item_metadata_dir(item_id).join(name)
         };
         // The pinned SubtitleManager selects one destination. An unwritable
         // media folder is an error, not permission to write into metadata.
@@ -295,6 +326,35 @@ fn provider_id(name: &str) -> String {
     ferrofin_common::extensions::get_md5(&ferrofin_util::string_extensions::lower_invariant(name))
         .simple()
         .to_string()
+}
+
+/// `SubtitleDownloadFailureLogger.GetItemName` for the videos a subtitle is
+/// downloaded for: an episode is `{series} - S{season}, Ep{n} - {name}`, a
+/// music video `{first artist} - {name}`.
+fn item_name(item: &BaseItemEntity) -> String {
+    let mut name = item.name.clone().unwrap_or_default();
+    match item.type_.rsplit('.').next() {
+        Some("Episode") => {
+            if let Some(episode) = item.index_number {
+                name = format!("Ep{episode} - {name}");
+            }
+            if let Some(season) = item.parent_index_number {
+                name = format!("S{season}, {name}");
+            }
+            // `IHasSeries`: C# concatenates a null `SeriesName` as "".
+            name = format!(
+                "{} - {name}",
+                item.series_name.as_deref().unwrap_or_default()
+            );
+        }
+        Some("MusicVideo") => {
+            if let Some(artist) = crate::dto_service::split_multi(item.artists.as_deref()).first() {
+                name = format!("{artist} - {name}");
+            }
+        }
+        _ => {}
+    }
+    name
 }
 
 /// Only Movies and Episodes are supported by the subtitle manager's item
@@ -395,9 +455,8 @@ fn subtitle_extension(format: &str) -> Result<String, ServiceError> {
 }
 
 /// Builds the upstream `{stem}.{language}[.forced][.sdh].{format}` filename.
-fn sidecar_path(media_path: &str, response: &SubtitleResponse) -> Result<PathBuf, ServiceError> {
-    let path = Path::new(media_path);
-    let stem = path.file_stem().map_or_else(
+fn sidecar_name(media_path: &str, response: &SubtitleResponse) -> Result<String, ServiceError> {
+    let stem = Path::new(media_path).file_stem().map_or_else(
         || "subtitle".to_owned(),
         |stem| stem.to_string_lossy().into_owned(),
     );
@@ -418,10 +477,9 @@ fn sidecar_path(media_path: &str, response: &SubtitleResponse) -> Result<PathBuf
     } else {
         ""
     };
-    let name = format!("{stem}.{language}{forced}{hearing_impaired}.{extension}");
-    Ok(path
-        .parent()
-        .map_or_else(|| PathBuf::from(&name), |parent| parent.join(&name)))
+    Ok(format!(
+        "{stem}.{language}{forced}{hearing_impaired}.{extension}"
+    ))
 }
 
 /// Codec for the immediate external-stream record. Matroska subtitle files
@@ -494,8 +552,16 @@ impl SubtitleManager for FerrofinSubtitleManager {
         let (provider, local) = self
             .route(subtitle_id)
             .ok_or_else(|| ServiceError::invalid_input("unknown subtitle provider for id"))?;
-        let response = provider.get_subtitles(&local).await?;
-        self.attach(item_id, &response).await
+        let downloaded = async {
+            let response = provider.get_subtitles(&local).await?;
+            self.attach(item_id, &response).await
+        }
+        .await;
+        if let Err(error) = &downloaded {
+            self.report_download_failure(item_id, subtitle_id, error)
+                .await;
+        }
+        downloaded
     }
 
     async fn upload_subtitle(
@@ -513,17 +579,58 @@ impl SubtitleManager for FerrofinSubtitleManager {
         provider.get_subtitles(&local).await
     }
 
+    async fn report_download_failure(
+        &self,
+        item_id: Uuid,
+        subtitle_id: &str,
+        error: &ServiceError,
+    ) {
+        // `GetProvider` runs before the `try`, and `catch
+        // (RateLimitExceededException) { throw; }` raises nothing.
+        let (Some(activity), Some((provider, _))) = (&self.activity, self.route(subtitle_id))
+        else {
+            return;
+        };
+        if is_rate_limit_exceeded(error) {
+            return;
+        }
+        // The item was found before the download began; one gone since gets
+        // an empty name, and `ItemId` still names it.
+        let item = self
+            .library_manager
+            .get_item_by_id(item_id)
+            .await
+            .ok()
+            .flatten()
+            .map_or_default(|item| item_name(&item));
+        let entry = ActivityLogCreate {
+            name: format!(
+                "Subtitles failed to download from {} for {item}",
+                provider.name()
+            ),
+            type_: "SubtitleDownloadFailure".to_owned(),
+            item_id: Some(item_id),
+            short_overview: Some(error.message()),
+            ..Default::default()
+        };
+        if let Err(write) = activity.create_entry(entry).await {
+            tracing::warn!(
+                %item_id,
+                error = %write,
+                "could not record the failed subtitle download in the activity log"
+            );
+        }
+    }
+
     async fn delete_subtitles(&self, item_id: Uuid, index: i32) -> Result<(), ServiceError> {
-        // Resolve the row first so we can remove any on-disk sidecar, then drop
-        // the external subtitle stream at that index (mirrors the C# order:
-        // delete the file, then the stream row).
-        let subtitle_disc = i64::from(media_stream_type_disc(
-            ferrofin_model::entities::MediaStreamType::Subtitle,
-        ));
-        // Through the stream repository, which expands a stored
-        // `%MetadataPath%`/`%AppDataPath%` path (`RestorePath`), so the file
-        // removed is the one on disk.
-        let path: Option<String> = self
+        // `GetMediaStreams(…)[0]` throws for no subtitle stream at `index`, and
+        // `ReportFileSystemChangeBeginning` for one with no path (an embedded
+        // stream): both are `ArgumentException`s. Upstream stores no path on an
+        // embedded row, so skipping one that has a path changes no answer and
+        // keeps a stray path from deleting the media file. The stream
+        // repository expands a stored `%MetadataPath%`/`%AppDataPath%` path
+        // (`RestorePath`), so the file removed is the one on disk.
+        let path = self
             .media_streams
             .get_media_streams(&MediaStreamQuery {
                 item_id,
@@ -533,32 +640,66 @@ impl SubtitleManager for FerrofinSubtitleManager {
             .await?
             .into_iter()
             .find(|stream| stream.is_external)
-            .and_then(|stream| stream.path);
+            .and_then(|stream| stream.path)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_input(format!("no subtitle file at stream index {index}"))
+            })?;
+        // `File.Delete` ignores a file already gone, but throws
+        // `DirectoryNotFoundException` (a 404, before the refresh) when its
+        // folder is missing or a folder in the path is a file. The stream rows
+        // are left to the item refresh the caller awaits next
+        // (`item.RefreshMetadata`).
+        let _write = SelfWrite::begin(self.self_writes.as_ref(), path.as_str());
+        let folder_missing = |reason: &str| {
+            // The 404 is not logged where it is answered; name the row here.
+            tracing::debug!(
+                %item_id,
+                path = %ferrofin_util::source_url::redact_url(&path),
+                reason,
+                "subtitle folder not found"
+            );
+            ServiceError::not_found("subtitle folder not found")
+        };
+        let file = Path::new(&path);
+        // `File.Delete` resolves a relative path against the working
+        // directory, where a URL row's folder is missing; never touch the disk
+        // for one (a relative row whose folder exists there is a divergence).
+        if !file.is_absolute() {
+            return Err(folder_missing("relative path"));
+        }
+        settle_unlink(file, tokio::fs::remove_file(file).await, folder_missing).await
+    }
 
-        if let Some(path) = path.as_deref()
-            && !path.is_empty()
-        {
-            // A missing file is fine — the goal is that it no longer exists.
-            let _write = SelfWrite::begin(self.self_writes.as_ref(), path);
-            match tokio::fs::remove_file(path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(ServiceError::backend(e.to_string())),
+    async fn drop_missing_subtitle_rows(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let streams = self
+            .media_streams
+            .get_media_streams(&MediaStreamQuery {
+                item_id,
+                ..MediaStreamQuery::default()
+            })
+            .await?;
+        let subtitle = media_stream_type_disc(ferrofin_model::entities::MediaStreamType::Subtitle);
+        let before = streams.len();
+        let mut kept = Vec::with_capacity(before);
+        for stream in streams {
+            // Only an absolute path that is surely gone: a URL row, or one
+            // whose file cannot be checked, stays.
+            let gone = match stream.path.as_deref() {
+                Some(path) if stream.is_external && stream.stream_type == subtitle => {
+                    Path::new(path).is_absolute()
+                        && matches!(tokio::fs::try_exists(path).await, Ok(false))
+                }
+                _ => false,
+            };
+            if !gone {
+                kept.push(stream);
             }
         }
-
-        sqlx::query(
-            r#"DELETE FROM "MediaStreamInfos"
-               WHERE "ItemId" = ?1 AND "StreamIndex" = ?2
-                 AND "StreamType" = ?3 AND "IsExternal" = 1"#,
-        )
-        .bind(guid_to_db(item_id))
-        .bind(i64::from(index))
-        .bind(subtitle_disc)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
-        Ok(())
+        if kept.len() == before {
+            return Ok(());
+        }
+        self.media_streams.save_media_streams(item_id, &kept).await
     }
 
     async fn get_supported_providers(
@@ -593,6 +734,39 @@ impl SubtitleManager for FerrofinSubtitleManager {
             .find(|p| p.name() == provider_name)
             .ok_or_else(|| ServiceError::not_found(format!("subtitle provider {provider_name}")))?;
         provider.validate_login(config_json).await
+    }
+}
+
+/// Answers an `unlink` of a subtitle file as `File.Delete` does on Linux
+/// (dotnet/runtime `FileSystem.Unix.cs` `DeleteFile`).
+async fn settle_unlink(
+    file: &Path,
+    unlinked: std::io::Result<()>,
+    folder_missing: impl Fn(&str) -> ServiceError,
+) -> Result<(), ServiceError> {
+    match unlinked {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let folder = file.parent().unwrap_or(file);
+            if tokio::fs::metadata(folder).await.is_ok_and(|m| m.is_dir()) {
+                Ok(())
+            } else {
+                Err(folder_missing("no such folder"))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
+            Err(folder_missing("a folder in the path is a file"))
+        }
+        // A read-only mount answers `EROFS` before it looks the file up, so a
+        // file already gone is no error when an `lstat` finds nothing either
+        // (dotnet/runtime issue 22382); anything else at the path still fails.
+        Err(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => {
+            match tokio::fs::symlink_metadata(file).await {
+                Err(stat) if stat.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(ServiceError::backend(e.to_string())),
+            }
+        }
+        Err(e) => Err(ServiceError::backend(e.to_string())),
     }
 }
 
@@ -715,6 +889,43 @@ mod tests {
         async fn get_subtitles(&self, _: &str) -> Result<SubtitleResponse, ServiceError> {
             unreachable!("search only")
         }
+    }
+
+    /// gl-1524: `SearchSubtitles(Video, …)` returns `[]` before any provider
+    /// is asked unless the video's `VideoType` is `VideoFile`.
+    #[rstest::rstest]
+    #[case(r#"{"VideoType":"Dvd"}"#, false)]
+    #[case(r#"{"VideoType":"BluRay"}"#, false)]
+    #[case(r#"{"VideoType":"Iso","IsoType":"Dvd"}"#, false)]
+    #[case(r#"{"VideoType":"VideoFile"}"#, true)]
+    #[case("{}", true)]
+    #[tokio::test]
+    async fn search_asks_providers_only_for_a_video_file(
+        #[case] data: &str,
+        #[case] searched: bool,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mut row = library_manager_over(db.clone())
+            .get_item_by_id(item)
+            .await
+            .unwrap()
+            .unwrap();
+        row.data = Some(data.to_owned());
+        crate::test_support::save_item(&db, &row).await;
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mgr = manager(db, vec![Arc::new(CapturingProvider(captured.clone()))]);
+        let results = mgr
+            .search_subtitles(&SubtitleSearchRequest {
+                item_id: item,
+                language: "eng".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(captured.lock().unwrap().len(), usize::from(searched));
+        assert_eq!(results.len(), usize::from(searched));
     }
 
     /// gl-1462: `SearchSubtitles` hands providers the two-letter code of the
@@ -872,6 +1083,166 @@ mod tests {
         assert!(streams[0].is_external);
     }
 
+    /// A provider whose downloads fail: `quota` with the plugin's quota error,
+    /// `nfo` with content in a format no sidecar takes, anything else with a
+    /// refused account.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl SubtitleProvider for FailingProvider {
+        fn name(&self) -> &'static str {
+            "Failing"
+        }
+        async fn search(
+            &self,
+            _: &SubtitleSearchRequest,
+        ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn get_subtitles(&self, local: &str) -> Result<SubtitleResponse, ServiceError> {
+            match local {
+                "quota" => Err(ServiceError::backend_source(
+                    ferrofin_traits::subtitles::RateLimitExceeded("quota spent".to_owned()),
+                )),
+                "nfo" => Ok(SubtitleResponse {
+                    language: "eng".to_owned(),
+                    format: "nfo".to_owned(),
+                    ..Default::default()
+                }),
+                _ => Err(ServiceError::unauthorized("account not set up")),
+            }
+        }
+    }
+
+    /// `SubtitleManager.DownloadSubtitles` raises `SubtitleDownloadFailure`
+    /// for a failed fetch or save, and `SubtitleDownloadFailureLogger` records
+    /// it; a spent quota (`catch (RateLimitExceededException) { throw; }`) and
+    /// an id naming no provider (`GetProvider`, before the `try`) record
+    /// nothing.
+    #[tokio::test]
+    async fn a_failed_download_records_an_activity_entry_but_a_spent_quota_does_not() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join("Pilot.mkv");
+        std::fs::write(&media, b"x").expect("media");
+        crate::test_support::save_item(
+            &db,
+            &ferrofin_db::entities::base_items::BaseItemEntity {
+                id: guid_to_db(item),
+                type_: "MediaBrowser.Controller.Entities.TV.Episode".to_owned(),
+                name: Some("Pilot".to_owned()),
+                series_name: Some("Show".to_owned()),
+                parent_index_number: Some(1),
+                index_number: Some(2),
+                path: Some(media.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let activity = Arc::new(crate::FerrofinActivityManager::new(db.clone()));
+        let mgr = manager(db, vec![Arc::new(FailingProvider)]).with_activity(activity.clone());
+        let namespace = provider_id("Failing");
+
+        for local in ["auth", "quota", "nfo"] {
+            mgr.download_subtitles(item, &format!("{namespace}_{local}"))
+                .await
+                .expect_err(local);
+        }
+        mgr.download_subtitles(item, "nobody_auth")
+            .await
+            .expect_err("no provider");
+
+        let mut entries = activity
+            .get_paged_result(&ferrofin_traits::activity::ActivityLogQuery::default())
+            .await
+            .expect("entries")
+            .items;
+        entries.sort_by_key(|entry| entry.id);
+        let overviews: Vec<_> = entries
+            .iter()
+            .map(|entry| entry.short_overview.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            overviews,
+            ["account not set up", "unsupported subtitle format: nfo"]
+        );
+        for entry in &entries {
+            assert_eq!(
+                entry.name,
+                "Subtitles failed to download from Failing for Show - S1, Ep2 - Pilot"
+            );
+            assert_eq!(entry.type_, "SubtitleDownloadFailure");
+            assert_eq!(entry.item_id, Some(item.simple().to_string()));
+            assert_eq!(entry.user_id, Uuid::nil());
+            assert_eq!(
+                entry.severity,
+                ferrofin_model::activity::LogLevel::Information
+            );
+        }
+    }
+
+    /// `SubtitleDownloadFailureLogger.GetItemName` for the videos a subtitle
+    /// downloads for.
+    #[rstest::rstest]
+    #[case::movie("Movie", Some("Dune"), None, None, None, None, "Dune")]
+    #[case::episode(
+        "TV.Episode",
+        Some("Pilot"),
+        Some("Show"),
+        Some(1),
+        Some(2),
+        None,
+        "Show - S1, Ep2 - Pilot"
+    )]
+    #[case::episode_without_numbers_or_series(
+        "TV.Episode",
+        Some("Pilot"),
+        None,
+        None,
+        None,
+        None,
+        " - Pilot"
+    )]
+    #[case::music_video(
+        "MusicVideo",
+        Some("Song"),
+        None,
+        None,
+        None,
+        Some("Band|Guest"),
+        "Band - Song"
+    )]
+    #[case::music_video_without_artists(
+        "MusicVideo",
+        Some("Song"),
+        None,
+        None,
+        None,
+        Some(""),
+        "Song"
+    )]
+    fn failure_entries_name_the_item_as_upstream(
+        #[case] kind: &str,
+        #[case] name: Option<&str>,
+        #[case] series_name: Option<&str>,
+        #[case] season: Option<i64>,
+        #[case] episode: Option<i64>,
+        #[case] artists: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let item = ferrofin_db::entities::base_items::BaseItemEntity {
+            type_: format!("MediaBrowser.Controller.Entities.{kind}"),
+            name: name.map(str::to_owned),
+            series_name: series_name.map(str::to_owned),
+            parent_index_number: season,
+            index_number: episode,
+            artists: artists.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(item_name(&item), expected);
+    }
+
     async fn configured_library(
         media: &Path,
         save_with_media: bool,
@@ -909,12 +1280,12 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_path_rejects_invalid_input_and_preserves_upstream_names() {
+    fn sidecar_name_rejects_invalid_input_and_preserves_upstream_names() {
         let mut response = upload_response();
         for format in ["", ".VTT", "nfo", "strm", "srt ", "../srt"] {
             response.format = format.to_owned();
             assert!(matches!(
-                sidecar_path("/library/movie/Movie.mkv", &response),
+                sidecar_name("/library/movie/Movie.mkv", &response),
                 Err(ServiceError::InvalidInput(_))
             ));
         }
@@ -922,7 +1293,7 @@ mod tests {
         for language in ["x/../../outside/pwned", "eng\0"] {
             response.language = language.to_owned();
             assert!(matches!(
-                sidecar_path("/library/movie/Movie.mkv", &response),
+                sidecar_name("/library/movie/Movie.mkv", &response),
                 Err(ServiceError::InvalidInput(_))
             ));
         }
@@ -932,10 +1303,8 @@ mod tests {
         for extension in SUBTITLE_EXTENSIONS {
             response.format = extension.to_ascii_uppercase();
             assert_eq!(
-                sidecar_path("/library/movie/Movie.mkv", &response).unwrap(),
-                Path::new(&format!(
-                    "/library/movie/Movie.pt-br.forced.sdh.{extension}"
-                ))
+                sidecar_name("/library/movie/Movie.mkv", &response).unwrap(),
+                format!("Movie.pt-br.forced.sdh.{extension}")
             );
         }
         response.language.clear();
@@ -943,9 +1312,67 @@ mod tests {
         response.is_forced = false;
         response.is_hearing_impaired = false;
         assert_eq!(
-            sidecar_path("/library/movie/Movie.mkv", &response).unwrap(),
-            Path::new("/library/movie/Movie..srt")
+            sidecar_name("/library/movie/Movie.mkv", &response).unwrap(),
+            "Movie..srt"
         );
+    }
+
+    /// `TrySaveSubtitle` writes into `Video.ContainingFolderPath`: a DVD or
+    /// Blu-ray folder rip's own folder, else the folder of the file (of the
+    /// first part, for a stacked rip; a `.disc` placeholder's too).
+    #[rstest::rstest]
+    #[case::dvd_rip("Film", r#"{"VideoType":"Dvd"}"#, "Film/Film.eng.srt")]
+    #[case::bluray_rip("Film", r#"{"VideoType":"BluRay"}"#, "Film/Film.eng.srt")]
+    #[case::iso("Film/Film.iso", r#"{"VideoType":"Iso"}"#, "Film/Film.eng.srt")]
+    #[case::stacked_rip(
+        "Set/Set - Disc 1",
+        r#"{"VideoType":"Dvd","AdditionalParts":["Set/Set - Disc 2"]}"#,
+        "Set/Set - Disc 1.eng.srt"
+    )]
+    #[case::placeholder(
+        "Film/Film.disc",
+        r#"{"VideoType":"Dvd","IsPlaceHolder":true}"#,
+        "Film/Film.eng.srt"
+    )]
+    #[tokio::test]
+    async fn a_subtitle_is_saved_into_the_videos_containing_folder(
+        #[case] media: &str,
+        #[case] data: &str,
+        #[case] expected: &str,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        crate::test_support::seed_item_with_data(&db, item, BaseItemKind::Movie, "Film", data)
+            .await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join(media);
+        std::fs::create_dir_all(media.parent().unwrap()).unwrap();
+        set_item_path(&db, item, &media).await;
+        let response = upload_response();
+        manager(db, vec![])
+            .upload_subtitle(item, &response)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(tmp.path().join(expected)).unwrap(),
+            response.content
+        );
+    }
+
+    /// A root path has no containing folder, so nothing is written (never
+    /// into the working directory).
+    #[tokio::test]
+    async fn a_root_path_has_no_folder_for_a_sidecar() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        set_item_path(&db, item, Path::new("/")).await;
+        assert!(matches!(
+            manager(db, vec![])
+                .upload_subtitle(item, &upload_response())
+                .await,
+            Err(ServiceError::InvalidInput(_))
+        ));
     }
 
     #[tokio::test]
@@ -1687,8 +2114,10 @@ mod tests {
         assert!(subtitles.is_empty(), "{subtitles:?}");
     }
 
+    /// The stream rows stay: the refresh the handler awaits re-probes them, as
+    /// upstream's `DeleteSubtitles` leaves them to `item.RefreshMetadata`.
     #[tokio::test]
-    async fn delete_removes_external_stream_and_sidecar() {
+    async fn delete_removes_the_sidecar_and_leaves_the_rows_to_the_refresh() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
@@ -1727,13 +2156,14 @@ mod tests {
             })
             .await
             .expect("remaining");
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].stream_index, 3);
+        let indexes: Vec<_> = remaining.iter().map(|s| s.stream_index).collect();
+        assert_eq!(indexes, [2, 3]);
     }
 
     /// gl-1581: a sidecar in the metadata directory is stored `%MetadataPath%/…`,
     /// and the delete removes the file it points at, read through the stream
-    /// repository (`RestorePath`), not the stored text.
+    /// repository (`RestorePath`), not the stored text. The row is left to the
+    /// refresh.
     #[tokio::test]
     async fn delete_removes_a_sidecar_stored_tokenised() {
         let db = test_db().await;
@@ -1773,15 +2203,251 @@ mod tests {
             })
             .await
             .expect("remaining");
-        assert!(remaining.is_empty(), "{remaining:?}");
+        let indexes: Vec<_> = remaining.iter().map(|s| s.stream_index).collect();
+        assert_eq!(indexes, [2]);
     }
 
+    /// The stored indexes of every row, in order.
+    async fn indexes(repo: &FerrofinMediaStreamRepository, item: Uuid) -> Vec<i64> {
+        repo.get_media_streams(&MediaStreamQuery {
+            item_id: item,
+            ..MediaStreamQuery::default()
+        })
+        .await
+        .expect("rows")
+        .iter()
+        .map(|s| s.stream_index)
+        .collect()
+    }
+
+    /// gl-1875: only an external subtitle row whose absolute path is surely
+    /// gone is dropped; the rest keep their indexes. A URL or relative row, one
+    /// whose path cannot be checked, another kind of stream and an embedded row
+    /// stay.
     #[tokio::test]
-    async fn delete_missing_index_is_idempotent() {
+    async fn drop_missing_subtitle_rows_drops_only_gone_subtitle_files() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinMediaStreamRepository::new(db.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let present = tmp.path().join("movie.eng.srt");
+        std::fs::write(&present, b"1\n").expect("write sidecar");
+        let gone = tmp.path().join("movie.fre.srt");
+        let gone = gone.to_str().unwrap();
+        repo.save_media_streams(
+            item,
+            &[
+                MediaStreamInfoEntity {
+                    stream_index: 0,
+                    stream_type: media_stream_type_disc(MediaStreamType::Video),
+                    ..Default::default()
+                },
+                subtitle_stream(1, true, Some(present.to_str().unwrap())),
+                subtitle_stream(2, true, Some(gone)),
+                subtitle_stream(3, true, Some("http://relay.invalid/remote.en.srt")),
+                subtitle_stream(4, true, Some("relative.en.srt")),
+                MediaStreamInfoEntity {
+                    stream_index: 5,
+                    stream_type: media_stream_type_disc(MediaStreamType::Audio),
+                    is_external: true,
+                    path: Some(
+                        tmp.path()
+                            .join("movie.fre.mka")
+                            .to_str()
+                            .unwrap()
+                            .to_owned(),
+                    ),
+                    ..Default::default()
+                },
+                subtitle_stream(6, false, None),
+                // A folder in the path is a file: `ENOTDIR`, not surely gone.
+                subtitle_stream(7, true, Some(present.join("x.srt").to_str().unwrap())),
+            ],
+        )
+        .await
+        .expect("save streams");
+
         let mgr = manager(db, Vec::new());
-        mgr.delete_subtitles(item, 9).await.expect("no-op delete");
+        mgr.drop_missing_subtitle_rows(item).await.expect("sweep");
+        assert_eq!(indexes(&repo, item).await, [0, 1, 3, 4, 5, 6, 7]);
+        mgr.drop_missing_subtitle_rows(item)
+            .await
+            .expect("sweep again");
+        assert_eq!(indexes(&repo, item).await, [0, 1, 3, 4, 5, 6, 7]);
+    }
+
+    /// gl-1875, with no refresh that probes between the steps: a second delete
+    /// by the index the client then reads finds its row, and each delete's
+    /// sweep leaves no row of a deleted file.
+    #[tokio::test]
+    async fn a_second_delete_by_index_follows_the_first() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinMediaStreamRepository::new(db.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (eng, fre) = (tmp.path().join("m.eng.srt"), tmp.path().join("m.fre.srt"));
+        std::fs::write(&eng, b"1\n").expect("write eng");
+        std::fs::write(&fre, b"1\n").expect("write fre");
+        repo.save_media_streams(
+            item,
+            &[
+                MediaStreamInfoEntity {
+                    stream_index: 0,
+                    stream_type: media_stream_type_disc(MediaStreamType::Video),
+                    ..Default::default()
+                },
+                subtitle_stream(1, true, Some(eng.to_str().unwrap())),
+                subtitle_stream(2, true, Some(fre.to_str().unwrap())),
+            ],
+        )
+        .await
+        .expect("save streams");
+
+        let mgr = manager(db, Vec::new());
+        mgr.delete_subtitles(item, 1).await.expect("delete eng");
+        mgr.drop_missing_subtitle_rows(item).await.expect("sweep");
+        assert_eq!(indexes(&repo, item).await, [0, 2]);
+        mgr.delete_subtitles(item, 2)
+            .await
+            .expect("delete fre by its index");
+        mgr.drop_missing_subtitle_rows(item).await.expect("sweep");
+        assert_eq!(indexes(&repo, item).await, [0]);
+        assert!(!eng.exists() && !fre.exists());
+    }
+
+    /// gl-1723: `File.Delete` ignores a file that is already gone (the delete
+    /// succeeds and the refresh drops the stream), but throws
+    /// `DirectoryNotFoundException`, a `404` before the refresh, when the
+    /// file's folder is missing (`ENOENT`, no parent directory) or a folder in
+    /// the path is a file (`ENOTDIR`). A URL row is resolved against upstream's
+    /// working directory, where its folder is missing; here no relative path
+    /// reaches the disk, even one that would name a file. Each attempt is
+    /// bracketed.
+    #[rstest::rstest]
+    #[case::file_missing("{tmp}/movie.fre.srt", true)]
+    #[case::folder_missing("{tmp}/NoSuchFolder/missing.en.srt", false)]
+    #[case::folder_is_a_file("{tmp}/movie.mkv/missing.en.srt", false)]
+    #[case::url("http://relay.invalid/remote.en.srt", false)]
+    #[case::relative_to_a_real_file("{relative_tmp}/movie.mkv", false)]
+    #[tokio::test]
+    async fn delete_of_a_missing_sidecar_fails_only_for_a_missing_folder(
+        #[case] row: &str,
+        #[case] succeeds: bool,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join("movie.mkv");
+        std::fs::write(&media, b"media").expect("write media");
+        let root = tmp.path().to_str().unwrap();
+        let cwd = std::env::current_dir().expect("cwd");
+        let up = "../".repeat(cwd.components().count() - 1);
+        let path = row
+            .replace("{tmp}", root)
+            .replace("{relative_tmp}", &format!("{up}{}", &root[1..]));
+        FerrofinMediaStreamRepository::new(db.clone())
+            .save_media_streams(item, &[subtitle_stream(2, true, Some(&path))])
+            .await
+            .expect("save streams");
+
+        let recording = Arc::new(Recording::default());
+        let deleted = manager(db, Vec::new())
+            .with_self_writes(recording.clone())
+            .delete_subtitles(item, 2)
+            .await;
+        if succeeds {
+            deleted.expect("a missing file is no error");
+        } else {
+            let error = deleted.expect_err("a missing folder is");
+            assert!(matches!(error, ServiceError::NotFound(_)), "{error:?}");
+        }
+        assert_eq!(
+            recording.calls(),
+            [format!("begin {path}"), format!("complete {path} false")]
+        );
+        assert!(media.exists(), "no other file is deleted");
+    }
+
+    /// gl-1724: on a read-only mount `unlink` fails a file already gone with
+    /// `EROFS`, not `ENOENT`. `File.Delete` then returns when an `lstat` of
+    /// the path fails with `ENOENT`, and throws (a `500`) for anything else:
+    /// a file, a dangling link, or an `lstat` failing otherwise (`ENOTDIR`).
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case::file_missing("movie.fre.srt", true)]
+    #[case::file_present("movie.mkv", false)]
+    #[case::dangling_link("dangling.srt", false)]
+    #[case::folder_is_a_file("movie.mkv/missing.srt", false)]
+    #[tokio::test]
+    async fn read_only_unlink_succeeds_only_for_a_file_already_gone(
+        #[case] name: &str,
+        #[case] succeeds: bool,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("movie.mkv"), b"media").expect("write media");
+        std::os::unix::fs::symlink(tmp.path().join("gone.srt"), tmp.path().join("dangling.srt"))
+            .expect("symlink");
+        let erofs = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
+
+        let settled = settle_unlink(&tmp.path().join(name), Err(erofs), |reason: &str| {
+            ServiceError::not_found(reason)
+        })
+        .await;
+        if succeeds {
+            settled.expect("a file already gone is no error");
+        } else {
+            let error = settled.expect_err("something is at the path");
+            assert!(matches!(error, ServiceError::Backend(_)), "{error:?}");
+        }
+    }
+
+    /// gl-846: `DeleteSubtitles` throws an `ArgumentException`, a `400`, for an
+    /// index with no subtitle stream (`GetMediaStreams(…)[0]`) and for one with
+    /// no file (`ReportFileSystemChangeBeginning(null)`), deleting nothing.
+    #[rstest::rstest]
+    #[case::no_stream_at_the_index(9)]
+    #[case::not_a_subtitle_stream(0)]
+    #[case::embedded(1)]
+    #[case::external_without_a_path(3)]
+    #[case::embedded_naming_the_media_file(4)]
+    #[case::external_with_an_empty_path(5)]
+    #[tokio::test]
+    async fn delete_without_a_subtitle_file_is_invalid_input(#[case] index: i32) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join("movie.mkv");
+        std::fs::write(&media, b"media").expect("write media");
+        FerrofinMediaStreamRepository::new(db.clone())
+            .save_media_streams(
+                item,
+                &[
+                    MediaStreamInfoEntity {
+                        stream_index: 0,
+                        stream_type: media_stream_type_disc(MediaStreamType::Video),
+                        ..Default::default()
+                    },
+                    subtitle_stream(1, false, None),
+                    subtitle_stream(3, true, None),
+                    subtitle_stream(4, false, Some(media.to_str().unwrap())),
+                    subtitle_stream(5, true, Some("")),
+                ],
+            )
+            .await
+            .expect("save streams");
+
+        let error = manager(db, Vec::new())
+            .delete_subtitles(item, index)
+            .await
+            .expect_err("no subtitle file at the index");
+        assert!(matches!(error, ServiceError::InvalidInput(_)), "{error:?}");
+        assert!(
+            media.exists(),
+            "an embedded stream's row never names a file to delete"
+        );
     }
 }

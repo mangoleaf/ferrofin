@@ -60,7 +60,7 @@ impl RouteLabels {
             // Key by the axum template (== `MatchedPath`); store the spec path
             // sans leading slash as the Jellyfin-form endpoint label value.
             let key: Box<str> = normalize(path).into();
-            let endpoint = shared(path.strip_prefix('/').unwrap_or(path));
+            let endpoint = shared(path.trim_prefix('/'));
             let Some(methods) = item.as_object() else {
                 continue;
             };

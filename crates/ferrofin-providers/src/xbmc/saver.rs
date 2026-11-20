@@ -17,6 +17,10 @@ use std::fmt::Write as _;
 use chrono::{DateTime, Utc};
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities_media::MetadataProvider;
+use ferrofin_util::string_extensions::{
+    equals_ordinal_ignore_case, lower_invariant, replace_ignore_ascii_case,
+};
+use ferrofin_util::ticks::TICKS_PER_MINUTE;
 
 use crate::container_types::{MetadataResult, PersonInfo};
 
@@ -70,21 +74,6 @@ impl Collation {
     }
 }
 
-/// `StringComparer.OrdinalIgnoreCase.Equals`: equal after each character's
-/// simple (one-to-one) invariant upper-casing. Unlike `eq_ignore_ascii_case`
-/// it folds non-ASCII letters (`é`/`É`, `ж`/`Ж`), and unlike Rust's full case
-/// mapping it does not expand (`ß` stays `ß`, as .NET's `ToUpperInvariant`).
-pub(crate) fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
-    fn fold(c: char) -> char {
-        let mut upper = c.to_uppercase();
-        match (upper.next(), upper.next()) {
-            (Some(single), None) => single,
-            _ => c,
-        }
-    }
-    left.chars().map(fold).eq(right.chars().map(fold))
-}
-
 /// The `dateadded` timestamp format (`BaseNfoSaver.DateAddedFormat`).
 const DATE_ADDED_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
@@ -95,24 +84,22 @@ const YOUTUBE_WATCH_URL: &str = "https://www.youtube.com/watch?v=";
 /// (`BaseNfoSaver.GetOutputTrailerUrl`).
 const YOUTUBE_PLUGIN_URL: &str = "plugin://plugin.video.youtube/play/?video_id=";
 
-/// .NET ticks per minute; used to convert `RunTimeTicks` back to `<runtime>`.
-const TICKS_PER_MINUTE: i64 = 600_000_000;
-
 /// A minimal, in-memory XML writer mirroring the subset of `System.Xml.XmlWriter`
 /// the NFO savers use (indented start-document, element strings, nested
 /// start/end elements, and a single attribute-carrying `<url>`).
 ///
-/// Kept private: the savers drive it and hand back the finished string. Output is
+/// The savers drive it and hand back the finished string; the
+/// `collection.xml` saver ([`crate::local_xml`]) writes with it too. Output is
 /// UTF-8, two-space indented, with the same `<?xml version="1.0" ...?>` prolog
 /// `XmlWriter.WriteStartDocument(true)` emits.
-struct NfoWriter {
+pub(crate) struct NfoWriter {
     buf: String,
     depth: usize,
 }
 
 impl NfoWriter {
     /// Starts a document with the standalone XML declaration `XmlWriter` writes.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             buf: String::from("<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n"),
             depth: 0,
@@ -127,7 +114,7 @@ impl NfoWriter {
     }
 
     /// Opens an element `<name>` on its own indented line and descends a level.
-    fn start_element(&mut self, name: &str) {
+    pub(crate) fn start_element(&mut self, name: &str) {
         self.indent();
         let _ = write!(self.buf, "<{name}>");
         self.buf.push('\n');
@@ -135,7 +122,7 @@ impl NfoWriter {
     }
 
     /// Closes the most recently opened element.
-    fn end_element(&mut self, name: &str) {
+    pub(crate) fn end_element(&mut self, name: &str) {
         self.depth -= 1;
         self.indent();
         let _ = write!(self.buf, "</{name}>");
@@ -145,7 +132,7 @@ impl NfoWriter {
     /// Writes a leaf element `<name>value</name>` (`WriteElementString`).
     ///
     /// An empty value is written as `<name />`, matching `XmlWriter`.
-    fn element(&mut self, name: &str, value: &str) {
+    pub(crate) fn element(&mut self, name: &str, value: &str) {
         self.indent();
         if value.is_empty() {
             let _ = write!(self.buf, "<{name} />");
@@ -168,7 +155,7 @@ impl NfoWriter {
     }
 
     /// Finishes the document and returns the accumulated XML.
-    fn finish(self) -> String {
+    pub(crate) fn finish(self) -> String {
         self.buf
     }
 }
@@ -240,17 +227,13 @@ pub fn release_date_format_error(item: &NfoBaseItem, config: &NfoConfiguration) 
     })
 }
 
-/// The Kodi output form of a trailer URL (`BaseNfoSaver.GetOutputTrailerUrl`).
-///
-/// Replaces the YouTube watch prefix with the plugin prefix Kodi expects.
+/// The Kodi output form of a trailer URL (`BaseNfoSaver.GetOutputTrailerUrl`):
+/// `url.Replace(YouTubeWatchUrl, …, OrdinalIgnoreCase)`, every occurrence of
+/// the YouTube watch prefix replaced with the plugin prefix Kodi expects. Only
+/// ASCII characters match an ASCII needle under ordinal casing (it keeps the
+/// long `ſ`, see `to_upper_ordinal`), so the ASCII fold is exact.
 fn output_trailer_url(url: &str) -> String {
-    if url.len() >= YOUTUBE_WATCH_URL.len()
-        && url[..YOUTUBE_WATCH_URL.len()].eq_ignore_ascii_case(YOUTUBE_WATCH_URL)
-    {
-        format!("{YOUTUBE_PLUGIN_URL}{}", &url[YOUTUBE_WATCH_URL.len()..])
-    } else {
-        url.to_owned()
-    }
+    replace_ignore_ascii_case(url, YOUTUBE_WATCH_URL, YOUTUBE_PLUGIN_URL)
 }
 
 /// The lowercase `<key>id` tag `BaseNfoSaver.GetTagForProviderKey` derives.
@@ -259,17 +242,7 @@ fn output_trailer_url(url: &str) -> String {
 /// to one, non-ASCII letters included (a full Unicode mapping that expands a
 /// character is not .NET's).
 fn tag_for_provider_key(key: &str) -> String {
-    let lower: String = key
-        .chars()
-        .map(|c| {
-            let mut lower = c.to_lowercase();
-            match (lower.next(), lower.next()) {
-                (Some(single), None) => single,
-                _ => c,
-            }
-        })
-        .collect();
-    format!("{lower}id")
+    format!("{}id", lower_invariant(key))
 }
 
 /// Whether `item` derives from `Video` for the `is not Video` outline guard.
@@ -478,7 +451,9 @@ fn add_common_nodes(
     }
 
     if let Some(ticks) = item.run_time_ticks {
-        let minutes = ticks / TICKS_PER_MINUTE;
+        // `Convert.ToInt64(timespan.TotalMinutes)`: rounds, a half minute to the even one.
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let minutes = (ticks as f64 / TICKS_PER_MINUTE as f64).round_ties_even() as i64;
         writer.element("runtime", &minutes.to_string());
     }
 
@@ -1030,6 +1005,28 @@ fn people_slice(result: &MetadataResult<NfoBaseItem>) -> &[PersonInfo] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    /// `<runtime>` is `Convert.ToInt64(timespan.TotalMinutes)`: the nearest
+    /// whole minute, and a half minute goes to the even one.
+    #[rstest]
+    #[case::under_half_a_minute(29, 0)]
+    #[case::half_a_minute_ties_to_zero(30, 0)]
+    #[case::just_under_a_minute_and_a_half(89, 1)]
+    #[case::a_minute_and_a_half_ties_to_two(90, 2)]
+    #[case::two_and_a_half_minutes_tie_to_two(150, 2)]
+    #[case::three_and_a_half_minutes_tie_to_four(210, 4)]
+    #[case::fifteen_seconds_short_of_two_hours(7185, 120)]
+    #[case::exact_minutes(7200, 120)]
+    fn runtime_rounds_minutes_half_to_even(#[case] seconds: i64, #[case] minutes: i64) {
+        let mut result = MetadataResult::new(NfoBaseItem::new(NfoItemKind::Movie));
+        result.item.run_time_ticks = Some(seconds * 10_000_000);
+        let xml = save_movie(&result, &NfoConfiguration::default());
+        assert!(
+            xml.contains(&format!("<runtime>{minutes}</runtime>")),
+            "{xml}"
+        );
+    }
 
     /// `<type>` is `person.Type.ToString()`: a member's name, or an undeclared
     /// value's integer; an `Unknown` credit writes no `<type>` at all.
@@ -1077,6 +1074,30 @@ mod tests {
             output_trailer_url("https://example.com/x"),
             "https://example.com/x"
         );
+    }
+
+    /// `Replace(…, OrdinalIgnoreCase)` rewrites every occurrence, in any case,
+    /// anywhere in the URL; a multibyte character where the prefix would end
+    /// (byte 32) is no prefix and no panic.
+    #[rstest]
+    #[case(
+        "HTTPS://WWW.YOUTUBE.COM/WATCH?V=abc",
+        "plugin://plugin.video.youtube/play/?video_id=abc"
+    )]
+    #[case(
+        "https://t.example/?u=https://www.youtube.com/watch?v=a&w=https://WWW.youtube.com/watch?v=b",
+        "https://t.example/?u=plugin://plugin.video.youtube/play/?video_id=a&w=plugin://plugin.video.youtube/play/?video_id=b"
+    )]
+    #[case(
+        "http\u{17F}://www.youtube.com/watch?v=abc",
+        "http\u{17F}://www.youtube.com/watch?v=abc"
+    )]
+    #[case(
+        "https://www.youtube.com/watch?v\u{E9}abc",
+        "https://www.youtube.com/watch?v\u{E9}abc"
+    )]
+    fn output_trailer_url_replaces_like_dotnet(#[case] url: &str, #[case] expected: &str) {
+        assert_eq!(output_trailer_url(url), expected);
     }
 
     #[test]
@@ -1213,6 +1234,46 @@ mod tests {
         assert_eq!(tag_for_provider_key("MyCustom"), "mycustomid");
         assert_eq!(tag_for_provider_key("Imdb"), "imdbid");
         assert_eq!(tag_for_provider_key("\u{c4}pple"), "\u{e4}ppleid");
+    }
+
+    /// `ToLowerInvariant` is .NET's one-to-one fold (`ferrofin-util`'s .NET 10
+    /// table is the oracle): `İ` (U+0130) stays `İ`, a final `Σ` is `σ`, and
+    /// `ᾼ` is `ᾳ`.
+    #[rstest]
+    #[case("\u{0130}D", "\u{0130}did")]
+    #[case(
+        "\u{039F}\u{0394}\u{039F}\u{03A3}",
+        "\u{03BF}\u{03B4}\u{03BF}\u{03C3}id"
+    )]
+    #[case("\u{1FBC}", "\u{1FB3}id")]
+    #[case("\u{0131}\u{017F}", "\u{0131}\u{017F}id")]
+    fn tag_for_provider_key_folds_as_to_lower_invariant(#[case] key: &str, #[case] tag: &str) {
+        assert_eq!(tag_for_provider_key(key), tag);
+    }
+
+    /// The `OrdinalIgnoreCase` dedup keeps the dotless `ı` and the long `ſ`
+    /// apart from `I` and `S`, and merges `ᾳ` with `ᾼ`, as .NET's ordinal
+    /// casing does.
+    #[rstest]
+    #[case("K\u{0131}ral", "KIRAL", 2)]
+    #[case("\u{017F}am", "Sam", 2)]
+    #[case("\u{1FB3}x", "\u{1FBC}x", 1)]
+    #[case("\u{0130}lk", "ilk", 2)]
+    fn distinct_people_fold_as_ordinal_ignore_case(
+        #[case] first: &str,
+        #[case] second: &str,
+        #[case] kept: usize,
+    ) {
+        let person = |name: &str| PersonInfo {
+            name: name.to_owned(),
+            type_: PersonKind::Director,
+            ..PersonInfo::default()
+        };
+        let people = [person(first), person(second)];
+        assert_eq!(
+            distinct_sorted_people(&people, PersonKind::Director, &Collation(None)).len(),
+            kept
+        );
     }
 
     #[test]

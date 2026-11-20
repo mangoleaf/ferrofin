@@ -15,7 +15,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeMediaSources, FakeMusic, FakeSearch, FakeSessions,
-    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews,
+    FakeSimilarItems, FakeSystem, FakeUserData, FakeUserViews, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::users::UserEntity;
@@ -25,7 +25,7 @@ use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::{AuthService, AuthorizationContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
@@ -38,38 +38,8 @@ const USER_ID: Uuid = Uuid::from_u128(0x5150);
 /// Minimal authenticated user; every non-id field is a neutral zero value.
 fn user_entity(id: Uuid) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "bob".to_owned(),
-        normalized_username: "BOB".to_owned(),
+        ..fake_user_entity(id, "bob")
     }
 }
 
@@ -184,6 +154,10 @@ const MUSIC_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB01);
 const MUSIC_VIDEOS_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB02);
 const MOVIES_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB03);
 const MUSIC_FOLDER_ID: Uuid = Uuid::from_u128(0xBB04);
+/// A movie: a parent that is not a folder.
+const MOVIE_ID: Uuid = Uuid::from_u128(0xBB05);
+/// A by-name artist: a C# `Folder` whose `IsFolder` is false.
+const BY_NAME_ARTIST_ID: Uuid = Uuid::from_u128(0xBB06);
 
 fn one_aggregate(id: Uuid, name: &str) -> QueryResult<ItemWithCounts> {
     QueryResult::new(
@@ -346,8 +320,18 @@ impl LibraryManager for ByNameLibrary {
     }
 
     /// The `/Genres?parentId=` parents: libraries of each collection type, plus
-    /// a plain folder whose `Data` claims music (not an `ICollectionFolder`).
+    /// a plain folder whose `Data` claims music (not an `ICollectionFolder`),
+    /// and two parents stored `IsFolder = 0`: a movie and a by-name artist.
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if let Some(type_) = match id {
+            MOVIE_ID => Some("MediaBrowser.Controller.Entities.Movies.Movie"),
+            BY_NAME_ARTIST_ID => Some("MediaBrowser.Controller.Entities.Audio.MusicArtist"),
+            _ => None,
+        } {
+            let mut row = named_entity(id, "Not a folder");
+            type_.clone_into(&mut row.type_);
+            return Ok(Some(row));
+        }
         let (type_, collection_type) = match id {
             MUSIC_LIBRARY_ID => ("CollectionFolder", "music"),
             MUSIC_VIDEOS_LIBRARY_ID => ("CollectionFolder", "musicvideos"),
@@ -357,6 +341,7 @@ impl LibraryManager for ByNameLibrary {
         };
         let mut row = named_entity(id, "Library");
         row.type_ = format!("MediaBrowser.Controller.Entities.{type_}");
+        row.is_folder = true;
         row.data = Some(format!(r#"{{"CollectionType":"{collection_type}"}}"#));
         Ok(Some(row))
     }
@@ -376,13 +361,6 @@ impl LibraryManager for ByNameLibrary {
         _q: &InternalItemsQuery,
         _c: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
         unimplemented!()
     }
     async fn update_items(
@@ -428,9 +406,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(|| user_entity(USER_ID)))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -523,12 +498,6 @@ fn entity_to_dto(item: &BaseItemEntity) -> BaseItemDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -548,76 +517,23 @@ impl DtoService for OkDto {
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         Ok(items.iter().map(entity_to_dto).collect())
     }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _o: &DtoOptions,
-        _tagged: Option<&[Uuid]>,
-        _u: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
-    }
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] pair that authenticates as
 /// [`USER_ID`] so `RequireAuth` passes.
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _r: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID))
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] pair for an API key: an
 /// authenticated request with no user, as `AuthorizationContext` builds it for
 /// a server key.
-struct ApiKeyAuth;
-
-impl ApiKeyAuth {
-    fn info() -> AuthorizationInfo {
-        AuthorizationInfo {
-            is_api_key: true,
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        }
-    }
-}
-
-#[async_trait]
-impl AuthService for ApiKeyAuth {
-    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for ApiKeyAuth {
-    async fn get_authorization_info(
-        &self,
-        _r: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(Self::info())
-    }
+fn api_key_auth() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        is_api_key: true,
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 fn by_name_state() -> AppState {
@@ -638,7 +554,7 @@ fn by_name_state_with_dto(dto: Arc<dyn DtoService>) -> AppState {
 
 /// The by-name test state with both seams injected.
 fn by_name_state_with(dto: Arc<dyn DtoService>, library: ByNameLibrary) -> AppState {
-    by_name_state_authed(dto, library, Arc::new(OkAuth))
+    by_name_state_authed(dto, library, Arc::new(ok_auth()))
 }
 
 /// The by-name test state with both seams injected, authenticating every
@@ -932,6 +848,59 @@ async fn by_name_lists_pass_the_kind_lists_through() {
     }
 }
 
+/// v12.4 `GenresController.GetGenres`, `MusicGenresController.GetMusicGenres`
+/// and `StudiosController.GetStudios` declare none of `filters`, `mediaTypes`,
+/// `genres`, `genreIds`, `officialRatings`, `tags`, `years`, `studioIds`,
+/// `studios` or `minCommunityRating`, Genres and `MusicGenres` no
+/// `enableUserData`, and Studios no `sortBy`/`sortOrder` (gl-408). ASP.NET
+/// never binds them, so any value, valid or not, answers the unfiltered list.
+#[rstest::rstest]
+#[case::genres("/Genres", "enableUserData=abc&sortBy=SortName&sortOrder=Descending")]
+#[case::music_genres(
+    "/MusicGenres",
+    "enableUserData=abc&sortBy=SortName&sortOrder=Descending"
+)]
+#[case::studios("/Studios", "sortBy=Name&sortOrder=Descending")]
+#[tokio::test]
+async fn value_lists_ignore_parameters_their_action_does_not_declare(
+    #[case] route: &str,
+    #[case] own: &str,
+) {
+    let library = ByNameLibrary::default();
+    let uri = format!(
+        "{route}?filters=IsPlayed,IsUnplayed&mediaTypes=Video&genres=Drama&genreIds=abc\
+         &officialRatings=PG&tags=x&years=abc&studioIds=abc&studios=Acme\
+         &minCommunityRating=abc&{own}"
+    );
+    let response = create_router(by_name_state_with_library(library.clone()))
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let seen = library.seen.lock().expect("lock");
+    let query = seen.last().expect("a by-name query ran");
+    assert_eq!(query.is_played, None);
+    assert_eq!(query.media_types, []);
+    assert_eq!((query.genres.len(), query.genre_ids.len()), (0, 0));
+    assert_eq!((query.official_ratings.len(), query.tags.len()), (0, 0));
+    assert_eq!((query.years.len(), query.studio_ids.len()), (0, 0));
+    // The genre routes declare `sortBy`/`sortOrder`; Studios does not.
+    assert_eq!(
+        query.order_by.is_empty(),
+        route == "/Studios",
+        "{:?}",
+        query.order_by
+    );
+}
+
+/// Studios does declare `bool? enableUserData`, so a value the binder
+/// refuses is still a `400` there.
+#[tokio::test]
+async fn studios_refuse_an_enable_user_data_that_is_not_a_boolean() {
+    let response = get("/Studios?enableUserData=abc").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 /// `studios` on the artist routes (v12.2 `ArtistsController.cs:182-195`,
 /// `:336-349`): non-empty, the names' studio ids REPLACE `studioIds`. Upstream's
 /// `GetStudio` mints a row for an unknown name, whose id nothing references;
@@ -1084,12 +1053,6 @@ impl RecordingDto {
 
 #[async_trait]
 impl DtoService for RecordingDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -1110,16 +1073,6 @@ impl DtoService for RecordingDto {
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         self.seen.lock().expect("recorder lock").push(o.clone());
         Ok(items.iter().map(entity_to_dto).collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        o: &DtoOptions,
-        _tagged: Option<&[Uuid]>,
-        _u: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        self.seen.lock().expect("recorder lock").push(o.clone());
-        Ok(entity_to_dto(item))
     }
 }
 
@@ -1281,7 +1234,7 @@ async fn by_name_browses_honour_image_and_user_data_toggles() {
 #[tokio::test]
 async fn an_api_key_lists_by_name_items_with_no_user(#[case] uri: &str) {
     let library = ByNameLibrary::default();
-    let state = by_name_state_authed(Arc::new(OkDto), library.clone(), Arc::new(ApiKeyAuth));
+    let state = by_name_state_authed(Arc::new(OkDto), library.clone(), Arc::new(api_key_auth()));
     let response = create_router(state)
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
@@ -1322,7 +1275,7 @@ async fn an_api_key_reads_a_by_name_item_with_no_user(#[case] uri: &str, #[case]
     let state = by_name_state_authed(
         Arc::new(OkDto),
         ByNameLibrary::default(),
-        Arc::new(ApiKeyAuth),
+        Arc::new(api_key_auth()),
     );
     let response = create_router(state)
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -1330,6 +1283,57 @@ async fn an_api_key_reads_a_by_name_item_with_no_user(#[case] uri: &str, #[case]
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK, "{uri}");
     assert_eq!(json_body(response).await["Name"], name, "{uri}");
+}
+
+/// gl-971: v12.4's by-name controllers put a `Folder` parent in `AncestorIds`
+/// and any other item in `ItemIds` (`GenresController.cs:128-138`, and the
+/// Studios, `MusicGenres` and both Artists actions), so a movie lists the values
+/// it carries. A by-name artist is a `Folder` whose `IsFolder` is false: it
+/// still scopes by ancestor. `/Years` tests `IsFolder` instead
+/// (`YearsController.cs:111-128`): a parent stored as no folder, the by-name
+/// artist included, is its only item.
+#[rstest::rstest]
+#[case::genres("/Genres")]
+#[case::music_genres("/MusicGenres")]
+#[case::studios("/Studios")]
+#[case::artists("/Artists")]
+#[case::album_artists("/Artists/AlbumArtists")]
+#[case::years("/Years")]
+#[tokio::test]
+async fn a_parent_that_is_not_a_folder_lists_its_own_values(#[case] route: &str) {
+    let library = ByNameLibrary::default();
+    let state = by_name_state_with_library(library.clone());
+    for (parent, by_item) in [
+        (MOVIE_ID, true),
+        (BY_NAME_ARTIST_ID, route == "/Years"),
+        (MOVIES_LIBRARY_ID, false),
+    ] {
+        let uri = format!("{route}?parentId={}", parent.simple());
+        let response = create_router(state.clone())
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let seen = library.seen.lock().expect("lock");
+        let query = seen.last().expect("the list ran");
+        let (items, scope): (&[Uuid], &[Uuid]) = if by_item {
+            (&[parent], &[])
+        } else {
+            (&[], &[parent])
+        };
+        assert_eq!(query.item_ids, items, "{uri}");
+        if route == "/Years" {
+            assert_eq!(
+                query.parent_id,
+                scope.first().copied().unwrap_or_default(),
+                "{uri}"
+            );
+            assert!(query.ancestor_ids.is_empty(), "{uri}");
+            assert_eq!(query.include_owned_items, by_item, "{uri}");
+        } else {
+            assert_eq!(query.ancestor_ids, scope, "{uri}");
+        }
+    }
 }
 
 /// v12.2 `LibraryManager.GetParentItem` (`LibraryManager.cs:3276-3289`), which
@@ -1394,6 +1398,74 @@ async fn a_by_name_list_refuses_a_parent_naming_no_item(#[case] route: &str) {
             query.ancestor_ids,
             [MOVIES_LIBRARY_ID],
             "{route} scoped by its parent"
+        );
+    }
+}
+
+/// `GetArtists` and `GetAlbumArtists` declare `[FromQuery] double?
+/// minCommunityRating` (v12.4 `ArtistsController.cs:92`, `:246`): a value the
+/// binder cannot convert is a `400` before the action runs, a blank one binds
+/// null, and a valid one changes nothing, as `GetItemValues` copies it onto
+/// neither filter. The Genres, `MusicGenres` and Studios actions do not declare
+/// it, so there every value is ignored. Each value's status was measured on a
+/// stock Jellyfin 12.4.
+#[rstest::rstest]
+#[case::artists("/Artists", true)]
+#[case::album_artists("/Artists/AlbumArtists", true)]
+#[case::genres("/Genres", false)]
+#[case::music_genres("/MusicGenres", false)]
+#[case::studios("/Studios", false)]
+#[tokio::test]
+async fn min_community_rating_binds_as_a_double_where_declared(
+    #[case] route: &str,
+    #[case] declared: bool,
+) {
+    for (query, binds) in [
+        ("minCommunityRating=abc", false),
+        ("MINCOMMUNITYRATING=abc", false),
+        ("minCommunityRating=1.5%20x", false),
+        ("minCommunityRating=0x10", false),
+        // A scalar binds its first occurrence (`ValueProviderResult.FirstValue`).
+        ("minCommunityRating=abc&minCommunityRating=1.5", false),
+        ("minCommunityRating=1.5&minCommunityRating=abc", true),
+        ("minCommunityRating=1.5", true),
+        ("minCommunityRating=%201.5%20", true),
+        ("minCommunityRating=", true),
+        ("minCommunityRating=%09", true),
+        ("minCommunityRating=1e400", true),
+        ("minCommunityRating=-Infinity", true),
+        ("minCommunityRating=NaN", true),
+        // `DoubleModelBinder`: Rust's `inf` is no double, a group separator is.
+        ("minCommunityRating=inf", false),
+        ("minCommunityRating=%2Binf", false),
+        ("minCommunityRating=1%2C5", true),
+    ] {
+        let refused = declared && !binds;
+        let library = ByNameLibrary::default();
+        let response = create_router(by_name_state_with_library(library.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{route}?{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let expected = if refused {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(response.status(), expected, "{route}?{query}");
+        let seen = library.seen.lock().expect("lock");
+        assert_eq!(
+            seen.is_empty(),
+            refused,
+            "{route}?{query}: listed once bound"
+        );
+        assert!(
+            seen.iter().all(|q| q.min_community_rating.is_none()),
+            "{route}?{query}: never applied"
         );
     }
 }

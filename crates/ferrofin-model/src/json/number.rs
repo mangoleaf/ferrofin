@@ -20,7 +20,7 @@ macro_rules! integers {
         impl JsonNumber for $ty {
             fn parse_json_number(text: &str, _quoted: bool) -> Option<Self> {
                 let digits = if $signed {
-                    text.strip_prefix(['+', '-']).unwrap_or(text)
+                    text.trim_prefix(['+', '-'])
                 } else {
                     text
                 };

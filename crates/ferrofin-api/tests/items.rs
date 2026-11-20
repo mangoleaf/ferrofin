@@ -17,7 +17,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeConfig, FakeMediaSources, FakeMusic, FakeProviders, FakeSearch, FakeSessions,
-    FakeSimilarItems, FakeSystem, FakeUserData, minimal_base_item,
+    FakeSimilarItems, FakeSystem, FakeUserData, FixedAuth, fake_user_entity, minimal_base_item,
 };
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::entities::users::UserEntity;
@@ -32,7 +32,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{
     LibraryManager, UserManager, UserViewManager, VirtualFolderManager,
 };
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
+use ferrofin_traits::net::{AuthService, AuthorizationContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
@@ -57,38 +57,8 @@ const VIDEO_ID: Uuid = Uuid::from_u128(0x4444_4444_4444_4444_4444_4444_4444_4444
 /// field is a neutral zero value ([`UserEntity`] has no `Default`).
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
@@ -188,41 +158,21 @@ fn item_entity(id: Uuid, name: &str, kind: BaseItemKind) -> BaseItemEntity {
 
 /// An [`AuthService`] that always authenticates as [`USER_ID`], so `RequireAuth`
 /// yields an authenticated context in the success-path tests.
-struct OkAuthService;
-
-#[async_trait]
-impl AuthService for OkAuthService {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth_service() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID, "alice"))
 }
 
 /// An [`AuthorizationContext`] that resolves the same authenticated user.
-struct OkAuthContext;
-
-#[async_trait]
-impl AuthorizationContext for OkAuthContext {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            client: Some("Wolphin".to_owned()),
-            version: Some("1.0".to_owned()),
-            device_id: Some("dev-1".to_owned()),
-            device: Some("Test Device".to_owned()),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn ok_auth_context() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        user: Some(Arc::new(user_entity(USER_ID, "alice"))),
+        client: Some("Wolphin".to_owned()),
+        version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device: Some("Test Device".to_owned()),
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// A [`UserManager`] whose `get_user_by_id` returns the fixed user.
@@ -234,9 +184,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(|| user_entity(USER_ID, "alice")))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -381,6 +328,10 @@ struct OkLibrary {
     /// When set, `delete_item` signals it has started and waits to be
     /// released before it records the delete.
     gate: Option<Arc<DeleteGate>>,
+    /// The culture each `delete_item` call ran under.
+    delete_cultures: Arc<std::sync::Mutex<Vec<String>>>,
+    /// When set, `delete_item` fails with this backend error instead.
+    delete_error: Option<&'static str>,
     /// A Person item `get_item_by_id` also resolves, shared with the
     /// provider fake that refreshes it, and its images.
     person: SharedRow,
@@ -388,10 +339,15 @@ struct OkLibrary {
     /// When non-empty, the page `query_items` answers with, in this order and
     /// out of [`PAGE_TOTAL`] rows, instead of the single `item_id` row.
     rows: Vec<BaseItemEntity>,
-    /// The rows a `Name` + one-kind lookup (`get_item_list` / `get_item_ids`)
-    /// finds, matched ignoring case.
+    /// The rows a `Name` + one-kind lookup (`get_item_list` / `get_item_ids`,
+    /// and each name of `get_named_item_ids`) finds, matched ignoring case.
     named: Vec<(BaseItemKind, &'static str, Uuid)>,
+    /// Every `get_named_item_ids` call: the kind and the names it was given.
+    named_id_lookups: Arc<std::sync::Mutex<NameLookups>>,
 }
+
+/// The `get_named_item_ids` calls [`OkLibrary`] saw, in order.
+type NameLookups = Vec<(BaseItemKind, Vec<String>)>;
 
 impl OkLibrary {
     /// The ids of the [`OkLibrary::named`] rows `query` names.
@@ -612,8 +568,58 @@ impl LibraryManager for OkLibrary {
             vec![base_item_entity(self.item_id)],
         ))
     }
+    /// The builder's answers for the views these tests browse, as core's
+    /// (`library_manager/user_view_builder.rs`, whose tests pin the rules)
+    /// gives them; any other view fails the request, so a browse that should
+    /// never reach the builder shows it.
+    async fn apply_user_view_builder(
+        &self,
+        query: &mut InternalItemsQuery,
+        view: &BaseItemEntity,
+    ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
+        match Uuid::parse_str(&view.id).ok() {
+            // A recursive browse reports the playlists folder it displays.
+            Some(PLAYLISTS_VIEW_ID) if query.recursive => {
+                Ok((Some(BaseItemKind::PlaylistsFolder), true))
+            }
+            // Its display parent is gone: the view's own kind, no Folder policy.
+            Some(STALE_PLAYLISTS_VIEW_ID) => Ok((Some(BaseItemKind::UserView), false)),
+            // A direct browse moves onto the library the view displays.
+            Some(TV_VIEW_ID) if !query.recursive => {
+                let library = self.get_item_by_id(TV_LIBRARY_ID).await?.expect("library");
+                query.parent_id = TV_LIBRARY_ID;
+                query.user_root_children = false;
+                query.parent_row = Some(Arc::new(library));
+                Ok((Some(BaseItemKind::CollectionFolder), true))
+            }
+            _ => Err(ServiceError::backend("no builder answer for this view")),
+        }
+    }
     async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
         Ok(self.named_ids(query))
+    }
+    /// Records the call, so a test can tell one batched lookup from one per
+    /// name, and answers each name from [`OkLibrary::named`].
+    async fn get_named_item_ids(
+        &self,
+        kind: BaseItemKind,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        self.named_id_lookups
+            .lock()
+            .unwrap()
+            .push((kind, names.to_vec()));
+        Ok(names
+            .iter()
+            .map(|name| {
+                let query = InternalItemsQuery {
+                    name: Some(name.clone()),
+                    include_item_types: vec![kind],
+                    ..Default::default()
+                };
+                self.named_ids(&query).first().copied()
+            })
+            .collect())
     }
     async fn get_item_list(
         &self,
@@ -632,13 +638,6 @@ impl LibraryManager for OkLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _items: &[BaseItemEntity],
@@ -650,6 +649,13 @@ impl LibraryManager for OkLibrary {
         if let Some(gate) = &self.gate {
             gate.started.notify_one();
             gate.release.notified().await;
+        }
+        self.delete_cultures
+            .lock()
+            .expect("lock")
+            .push(ferrofin_util::current_culture::capture());
+        if let Some(error) = self.delete_error {
+            return Err(ServiceError::Backend(error.to_owned()));
         }
         self.deleted
             .lock()
@@ -782,12 +788,6 @@ fn entity_to_dto_with_fields(item: &BaseItemEntity, options: &DtoOptions) -> Bas
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -809,15 +809,6 @@ impl DtoService for OkDto {
             .iter()
             .map(|item| entity_to_dto_with_fields(item, options))
             .collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
     }
     async fn can_delete(
         &self,
@@ -897,7 +888,7 @@ fn ok_state_with_users(library: OkLibrary, users: Arc<dyn UserManager>) -> AppSt
         library,
         users,
         Arc::new(OkDto),
-        (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+        (Arc::new(ok_auth_context()), Arc::new(ok_auth_service())),
     )
 }
 
@@ -977,34 +968,8 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
 // ---- extras harness (`send`) --------------------------------------------------
 
 /// An auth pair that authenticates every request as [`USER_ID`].
-struct StubAuth;
-
-#[async_trait]
-impl AuthService for StubAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for StubAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn stub_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID, "alice"))
 }
 
 /// A [`LibraryManager`] that resolves [`ITEM_ID`], a [`ROOT_ID`] root folder, a
@@ -1086,13 +1051,6 @@ impl LibraryManager for StubLibrary {
         _q: &InternalItemsQuery,
         _c: ferrofin_model::data::CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn create_items(
-        &self,
-        _items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
         unimplemented!()
     }
     async fn update_items(
@@ -1431,7 +1389,7 @@ fn person_state(
         },
         Arc::new(OkUsers),
         Arc::new(OkDto),
-        (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+        (Arc::new(ok_auth_context()), Arc::new(ok_auth_service())),
         providers,
     )
 }
@@ -1713,8 +1671,8 @@ fn stub_state() -> AppState {
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(OkDto),
-        Arc::new(StubAuth),
-        Arc::new(StubAuth),
+        Arc::new(stub_auth()),
+        Arc::new(stub_auth()),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -1851,37 +1809,16 @@ async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
 /// no whitelist, so `Tags` here can only have come from the request's policy.
 #[tokio::test]
 async fn items_reads_the_callers_tag_whitelist_from_the_request_policy() {
-    struct WhitelistedAuth;
-    impl WhitelistedAuth {
-        fn info() -> AuthorizationInfo {
-            AuthorizationInfo {
-                user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-                user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
-                    allowed_tags: vec!["kids".to_owned()],
-                    ..ferrofin_model::users::UserPolicy::default()
-                })),
-                is_authenticated: true,
-                ..AuthorizationInfo::default()
-            }
-        }
-    }
-    #[async_trait]
-    impl AuthService for WhitelistedAuth {
-        async fn authenticate(
-            &self,
-            _request: &RequestContext,
-        ) -> Result<AuthorizationInfo, ServiceError> {
-            Ok(Self::info())
-        }
-    }
-    #[async_trait]
-    impl AuthorizationContext for WhitelistedAuth {
-        async fn get_authorization_info(
-            &self,
-            _request: &RequestContext,
-        ) -> Result<AuthorizationInfo, ServiceError> {
-            Ok(Self::info())
-        }
+    fn whitelisted_auth() -> FixedAuth {
+        FixedAuth(AuthorizationInfo {
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                allowed_tags: vec!["kids".to_owned()],
+                ..ferrofin_model::users::UserPolicy::default()
+            })),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        })
     }
 
     let library = OkLibrary {
@@ -1896,7 +1833,7 @@ async fn items_reads_the_callers_tag_whitelist_from_the_request_policy() {
         library,
         Arc::new(OkUsers),
         Arc::new(OkDto),
-        (Arc::new(WhitelistedAuth), Arc::new(WhitelistedAuth)),
+        (Arc::new(whitelisted_auth()), Arc::new(whitelisted_auth())),
     );
     let response = create_router(state)
         .oneshot(
@@ -2113,12 +2050,22 @@ async fn items_query_with_named(
     params: &str,
     named: Vec<(BaseItemKind, &'static str, Uuid)>,
 ) -> InternalItemsQuery {
+    items_query_and_name_lookups(params, named).await.0
+}
+
+/// [`items_query_with_named`], plus every `get_named_item_ids` call the
+/// request made.
+async fn items_query_and_name_lookups(
+    params: &str,
+    named: Vec<(BaseItemKind, &'static str, Uuid)>,
+) -> (InternalItemsQuery, NameLookups) {
     let library = OkLibrary {
         item_id: Uuid::from_u128(0x5A),
         named,
         ..Default::default()
     };
     let seen = Arc::clone(&library.last_query);
+    let lookups = Arc::clone(&library.named_id_lookups);
     let response = create_router(ok_state_with(library))
         .oneshot(
             Request::builder()
@@ -2130,7 +2077,8 @@ async fn items_query_with_named(
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK, "{params}");
-    seen.lock().unwrap().take().expect("query_items ran")
+    let query = seen.lock().unwrap().take().expect("query_items ran");
+    (query, lookups.lock().unwrap().clone())
 }
 
 /// `artists`, `albums` and `studios` name the items whose ids replace
@@ -2150,7 +2098,7 @@ async fn get_items_resolves_the_artist_album_and_studio_names() {
         (BaseItemKind::MusicAlbum, "Middle Years", album),
         (BaseItemKind::Studio, "Acme Pictures", studio),
     ];
-    let query = items_query_with_named(
+    let (query, lookups) = items_query_and_name_lookups(
         &format!(
             "recursive=true&artistIds={kept}&artists=test%20artist|Nobody\
              &albumIds={kept}&albums=Middle%20Years&studioIds={kept}&studios=Acme%20Pictures|Nope"
@@ -2161,6 +2109,16 @@ async fn get_items_resolves_the_artist_album_and_studio_names() {
     assert_eq!(query.artist_ids, [artist, Uuid::nil()]);
     assert_eq!(query.album_ids, [album]);
     assert_eq!(query.studio_ids, [studio, Uuid::nil()]);
+    // Each list resolves in one non-creating batch lookup, not one per name
+    // (gl-856).
+    let owned = |list: &[&str]| list.iter().map(|&n| n.to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        lookups,
+        [
+            (BaseItemKind::MusicArtist, owned(&["test artist", "Nobody"])),
+            (BaseItemKind::Studio, owned(&["Acme Pictures", "Nope"])),
+        ]
+    );
 
     // A repeated key joins with the declared pipe delimiter.
     let repeated = items_query_with_named(
@@ -2368,7 +2326,8 @@ async fn playlists_view_browses_list_its_playlists() {
 /// - an item-typed browse of a library that did not choose `recursive` is
 ///   recursive, while an explicit `recursive=false` or an untyped browse
 ///   lists direct children;
-/// - a `boxsets` library browsed untyped lists its box sets, recursively.
+/// - a `boxsets` library browsed untyped lists its box sets, recursively;
+///   browsed for `BoxSet`, it re-roots to the user root with no constraint.
 #[tokio::test]
 async fn filtered_user_root_and_typed_library_browses_run_recursively() {
     use ferrofin_model::data::BaseItemKind;
@@ -2428,11 +2387,28 @@ async fn filtered_user_root_and_typed_library_browses_run_recursively() {
     assert_eq!(rerooted.parent_id, Uuid::nil());
     assert_eq!(rerooted.linked_child_ancestor_ids, [TV_LIBRARY_ID]);
     assert!(rerooted.recursive);
+    // gl-1073: a BoxSet browse of the boxsets library re-roots too, with no
+    // linked-ancestor constraint: its collection type is the target's own.
+    let library = query_for(&format!(
+        "parentId={BOXSETS_LIBRARY_ID}&includeItemTypes=BoxSet"
+    ))
+    .await;
+    assert_eq!(library.parent_id, Uuid::nil());
+    assert!(library.apply_folder_display_options);
+    assert!(
+        library.linked_child_ancestor_ids.is_empty(),
+        "{:?}",
+        library.linked_child_ancestor_ids
+    );
+    assert!(library.recursive);
     // A view is no library (`ICollectionFolder`), even one delegating to a
     // library: a typed browse of it stays a direct one.
     let view = query_for(&format!("parentId={TV_VIEW_ID}&includeItemTypes=Episode")).await;
     assert_eq!(view.parent_id, TV_LIBRARY_ID);
     assert!(!view.recursive);
+    // The builder's answer reaches the query as it gave it.
+    assert_eq!(view.parent_type, Some(BaseItemKind::CollectionFolder));
+    assert!(view.apply_folder_display_options);
 }
 
 /// An empty id list means no filter, so ids the user may not open must answer
@@ -2462,6 +2438,88 @@ async fn ids_the_user_may_not_open_never_reach_the_query() {
         assert_eq!(body["Items"], serde_json::json!([]), "{path}: {body}");
         assert!(seen.lock().unwrap().is_none(), "{path}: the query ran");
     }
+}
+
+/// `TrailersController.GetTrailers` hands every argument to `GetItems` with
+/// `includeItemTypes = [Trailer]` and no `indexNumber` (v12.4
+/// TrailersController.cs:214-305): the types and index a client sends are
+/// replaced, and every other `GetItems` parameter and rule applies: the
+/// filters, the media-stream rule that takes in owned items, the recursive
+/// run of a typed request at the user root, and a search ordered by
+/// `SortName` first.
+#[tokio::test]
+async fn trailers_are_get_items_of_the_trailer_kind() {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/Trailers?includeItemTypes=Movie&indexNumber=3&years=1999,2001&isHd=true\
+                     &audioLanguages=eng,ger&audioLanguages=fre&searchTerm=blade&sortBy=PremiereDate",
+                )
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let query = seen.lock().unwrap().take().expect("query_items ran");
+    assert_eq!(query.include_item_types, [BaseItemKind::Trailer]);
+    assert_eq!(query.index_number, None);
+    assert_eq!(query.years, [1999, 2001]);
+    assert_eq!(query.is_hd, Some(true));
+    // The repeated key joins before the comma split, Ferrofin's own leniency
+    // (`parse_csv_strings`); upstream binds `["eng,ger", "fre"]`.
+    assert_eq!(query.audio_languages, ["eng", "ger", "fre"]);
+    assert!(query.include_owned_items);
+    assert!(query.recursive, "a filtered request at the user root");
+    assert_eq!(
+        query.order_by,
+        [
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            (ItemSortBy::PremiereDate, SortOrder::Ascending)
+        ]
+    );
+}
+
+/// A bare `/Trailers` is a typed request at the user root, so the `HasFilters`
+/// dispatch runs it recursively, as `GetItems` with `includeItemTypes=Trailer`
+/// does. An `indexNumber` still binds before it is cleared, so one that is no
+/// number answers 400.
+#[tokio::test]
+async fn a_bare_trailers_request_runs_recursively_at_the_user_root() {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let router = create_router(ok_state_with(library));
+    let get = |uri: &str| {
+        Request::builder()
+            .uri(uri)
+            .header("X-Emby-Token", "valid")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = router.clone().oneshot(get("/Trailers")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let query = seen.lock().unwrap().take().expect("query_items ran");
+    assert_eq!(query.include_item_types, [BaseItemKind::Trailer]);
+    assert!(query.recursive);
+    assert!(!query.user_root_children);
+
+    let response = router
+        .oneshot(get("/Trailers?indexNumber=abc"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 /// Explicit ids without a `sortBy` answer in the order they were asked for:
@@ -2715,6 +2773,13 @@ async fn get_items_forwards_the_stream_language_filters_but_the_user_route_drops
     assert_eq!(query.audio_languages, ["eng", "ger", "fre"]);
     assert_eq!(query.subtitle_languages, ["spa"]);
     // A subtitle language implies subtitles exist.
+    assert_eq!(query.has_subtitles, None);
+    assert!(query.include_owned_items);
+
+    // `GetTrailers` passes both lists on to `GetItems`.
+    let query = run(format!("/Trailers?{filters}")).await;
+    assert_eq!(query.audio_languages, ["eng", "ger", "fre"]);
+    assert_eq!(query.subtitle_languages, ["spa"]);
     assert_eq!(query.has_subtitles, None);
     assert!(query.include_owned_items);
 
@@ -3036,6 +3101,27 @@ async fn critic_reviews_are_empty() {
     assert!(result.items.is_empty(), "{:?}", result.items);
 }
 
+/// Jellyfin 10.11.8's `GetCriticReviews` binds no id at all, so whatever fills
+/// the `{itemId}` segment, a GUID or not, gets the empty result.
+#[tokio::test]
+async fn critic_reviews_take_any_item_id() {
+    for item_id in [
+        "not-a-guid",
+        "urn:uuid:00000000-0000-0000-0000-000000000001",
+        "%20",
+    ] {
+        let (status, body) = send(
+            "GET",
+            &format!("/Items/{item_id}/CriticReviews"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{item_id}");
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
+        assert!(result.items.is_empty(), "{item_id}: {:?}", result.items);
+    }
+}
+
 #[tokio::test]
 async fn latest_returns_flattened_items() {
     let (status, body) = send("GET", "/Items/Latest", Body::empty()).await;
@@ -3122,12 +3208,6 @@ struct DenyingDto(Vec<Uuid>);
 
 #[async_trait]
 impl DtoService for DenyingDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -3147,15 +3227,6 @@ impl DtoService for DenyingDto {
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         Ok(items.iter().map(entity_to_dto).collect())
     }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
-    }
     async fn can_delete(
         &self,
         item: &BaseItemEntity,
@@ -3174,12 +3245,6 @@ struct DtoSays(Option<bool>);
 
 #[async_trait]
 impl DtoService for DtoSays {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -3203,32 +3268,15 @@ impl DtoService for DtoSays {
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         unimplemented!()
     }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        unimplemented!()
-    }
 }
 
 /// An [`AuthService`] whose token is authenticated but names no user and is
 /// not an API key — a token whose user has gone.
-struct UserlessAuthService;
-
-#[async_trait]
-impl AuthService for UserlessAuthService {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+fn userless_auth_service() -> FixedAuth {
+    FixedAuth(AuthorizationInfo {
+        is_authenticated: true,
+        ..AuthorizationInfo::default()
+    })
 }
 
 /// Sends `DELETE uri` through a router over `state`.
@@ -3249,7 +3297,7 @@ async fn delete(state: AppState, uri: &str) -> StatusCode {
 
 /// The authenticated user every other test runs as.
 fn alice() -> Auth {
-    (Arc::new(OkAuthContext), Arc::new(OkAuthService))
+    (Arc::new(ok_auth_context()), Arc::new(ok_auth_service()))
 }
 
 /// The delete log a [`two_item_state`] library keeps.
@@ -3378,7 +3426,7 @@ async fn an_api_key_skips_the_check_and_a_userless_token_is_refused() {
             Arc::new(OkDto),
             (
                 Arc::new(ferrofin_api::test_support::FakeAuthContext),
-                Arc::new(UserlessAuthService),
+                Arc::new(userless_auth_service()),
             ),
         );
         assert_eq!(delete(state, &uri).await, expected, "{uri}");
@@ -3423,62 +3471,131 @@ async fn a_dropped_request_still_finishes_its_delete() {
     }
 }
 
+/// The delete's own task runs under the request's culture, as the delete
+/// upstream's action awaits does (.NET's `ExecutionContext` flows
+/// `CurrentCulture`), not under the system locale a spawned task starts with
+/// (gl-1808).
 #[tokio::test]
-async fn default_season_view_preserves_actual_parent_for_live_aired_selection_and_ids_bypass_it() {
-    for recursive in [false, true] {
-        for explicit in [false, true] {
-            let library = OkLibrary {
-                item_id: ITEM_ID,
-                adopted_tree: false,
-                last_query: Arc::default(),
-                deleted: Arc::default(),
-                gate: None,
-                ..Default::default()
-            };
-            let seen = library.last_query.clone();
-            let router = create_router(ok_state_with(library));
-            let path = format!(
-                "/Items?parentId={SEASON_VIEW_ID}&recursive={recursive}{}",
-                if explicit {
-                    format!("&ids={ITEM_ID}")
-                } else {
-                    String::new()
-                }
-            );
-            let response = router
-                .oneshot(
-                    Request::builder()
-                        .uri(path)
-                        .header("X-Emby-Token", "valid")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let query = seen.lock().unwrap().clone().expect("repository query");
-            assert_eq!(
-                query.parent_id,
-                if explicit {
-                    Uuid::nil()
-                } else {
-                    SEASON_BROWSE_ID
-                }
-            );
-            assert_eq!(
-                query.parent_type,
-                if explicit {
-                    None
-                } else {
-                    Some(BaseItemKind::Season)
-                }
-            );
-            assert_eq!(query.apply_folder_display_options, !explicit);
+async fn the_delete_runs_under_the_requests_culture() {
+    let item_id = Uuid::from_u128(0xAB56);
+    for uri in [format!("/Items/{item_id}"), format!("/Items?ids={item_id}")] {
+        let library = OkLibrary {
+            item_id,
+            ..Default::default()
+        };
+        let cultures = Arc::clone(&library.delete_cultures);
+        let state = ok_state_full(library, Arc::new(OkUsers), Arc::new(OkDto), alice())
+            // A culture no CI host runs under, so the system locale cannot pass.
+            .with_request_culture("sv")
+            .expect("culture");
+        assert_eq!(delete(state, &uri).await, StatusCode::NO_CONTENT, "{uri}");
+        assert_eq!(*cultures.lock().unwrap(), ["sv"], "{uri}");
+    }
+}
+
+/// Everything a `tracing` fmt subscriber writes while a test runs.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A delete that fails is logged once whether or not its client waited for
+/// the answer: the error boundary logs the `500` a connected client gets, and
+/// once the client has hung up the delete's own task logs the error no
+/// answer carries (gl-1808, LOGGING.md §2).
+#[tokio::test]
+async fn a_failed_delete_is_logged_once_even_after_the_client_hung_up() {
+    const CAUSE: &str = "the disk went away";
+    let item_id = Uuid::from_u128(0xAB57);
+    for hang_up in [false, true] {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish(),
+        );
+        let gate = Arc::new(DeleteGate::default());
+        let library = OkLibrary {
+            item_id,
+            gate: Some(Arc::clone(&gate)),
+            delete_error: Some(CAUSE),
+            ..Default::default()
+        };
+        let state = ok_state_full(library, Arc::new(OkUsers), Arc::new(OkDto), alice());
+        let uri = format!("/Items/{item_id}");
+        let request = tokio::spawn(async move { delete(state, &uri).await });
+        gate.started.notified().await;
+        let errors = || {
+            String::from_utf8(log.0.lock().expect("log").clone())
+                .expect("utf-8")
+                .lines()
+                .filter(|line| line.contains("ERROR") && line.contains(CAUSE))
+                .count()
+        };
+        if hang_up {
+            request.abort();
             assert!(
-                !query.folder_query_recursive,
-                "default delegation keeps the Season override instead of invoking Folder.QueryRecursive"
+                request.await.is_err_and(|e| e.is_cancelled()),
+                "the request was dropped"
+            );
+            gate.release.notify_one();
+            for _ in 0..200 {
+                if errors() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        } else {
+            gate.release.notify_one();
+            assert_eq!(
+                request.await.expect("answered"),
+                StatusCode::INTERNAL_SERVER_ERROR
             );
         }
+        assert_eq!(errors(), 1, "hang_up={hang_up}");
+    }
+}
+
+/// Explicit ids go straight to the repository (`Folder.GetItems`), before a
+/// view's builder could move the browse: the fake has no builder answer for
+/// this view, so a `200` shows it never ran. Its delegation to the Season is
+/// core's (`the_default_builder_moves_any_browse_of_a_season_onto_it`).
+#[tokio::test]
+async fn explicit_ids_bypass_a_views_builder() {
+    for recursive in [false, true] {
+        let library = OkLibrary {
+            item_id: ITEM_ID,
+            ..Default::default()
+        };
+        let seen = library.last_query.clone();
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?parentId={SEASON_VIEW_ID}&recursive={recursive}&ids={ITEM_ID}"
+                    ))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let query = seen.lock().unwrap().clone().expect("repository query");
+        assert_eq!(query.parent_id, Uuid::nil());
+        assert_eq!(query.parent_type, None);
+        assert!(!query.apply_folder_display_options);
+        assert!(!query.folder_query_recursive);
     }
 }
 
@@ -3879,12 +3996,6 @@ struct LinkedChildrenDto;
 
 #[async_trait]
 impl DtoService for LinkedChildrenDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -3918,15 +4029,6 @@ impl DtoService for LinkedChildrenDto {
             })
             .collect())
     }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(entity_to_dto(item))
-    }
 }
 
 /// A playlist's or box set's own listing is its linked children
@@ -3951,7 +4053,7 @@ async fn a_playlist_or_box_set_listing_projects_its_linked_children() {
             },
             Arc::new(OkUsers),
             Arc::new(LinkedChildrenDto),
-            (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+            (Arc::new(ok_auth_context()), Arc::new(ok_auth_service())),
         );
         let response = create_router(state)
             .oneshot(

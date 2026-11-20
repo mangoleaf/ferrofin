@@ -11,9 +11,9 @@
 //! pool directly, so the manager stays composition-root agnostic.
 //!
 //! Port simplifications, all faithful to the trait surface:
-//! - `create_items`/`update_items` collapse to `save_items` on the persistence
-//!   service (the row upsert is idempotent); the `parent_id` argument is accepted
-//!   for API parity but the parent linkage is already carried on each row's
+//! - `update_items` collapses to `save_items` on the persistence service (the
+//!   row upsert is idempotent); the `parent_id` argument is accepted for API
+//!   parity but the parent linkage is already carried on each row's
 //!   `ParentId` column. `update_items` is the edit's save, so first it does
 //!   what `UpdateItemsAsync` and the mapper do to a loaded item: it re-derives
 //!   `SortName` (a caller that must keep a key it supplies saves through the
@@ -38,11 +38,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use tracing::Instrument as _;
 
-use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
+use ferrofin_db::entities::base_items::{
+    BaseItemEntity, PeopleEntity, aired_episode_order, is_virtual_location, presentation_key,
+    relation_id,
+};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::ItemCounts;
-use ferrofin_model::entities::{ImageType, MediaStreamType, MetadataField};
+use ferrofin_model::entities::{CollectionTypeOptions, ImageType, MediaStreamType, MetadataField};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use uuid::Uuid;
 
@@ -59,6 +62,8 @@ use ferrofin_util::stable_sort::stable_sort_by;
 
 use crate::library_scan::{LaneRefresh, PriorityLane, ScanCancel, ScanPasses, ScanRun};
 use ferrofin_traits::library::ScanProgressSink;
+
+mod user_view_builder;
 
 /// The placeholder item row seeded by the initial migration, which every real
 /// item query excludes (the `Uuid` form of
@@ -152,6 +157,10 @@ pub struct FerrofinLibraryManager {
     /// How many items' `ItemValues` one writer transaction of `update_items`
     /// rewrites; at least 1. [`DEFAULT_ITEM_VALUES_WRITE_CHUNK`] unless set.
     item_values_write_chunk: usize,
+    /// The provider manager an item's refresh goes through when no scan
+    /// covers the item ([`LibraryManager::queue_item_refresh`]). Set by the
+    /// composition root; `None` (unit tests) refuses such a refresh.
+    providers: Option<Arc<dyn ferrofin_traits::providers::ProviderManager>>,
 }
 
 /// `Folder.QueryRecursive`'s post-filter gate (v12.2 Folder.cs:1008-1014): a
@@ -252,13 +261,15 @@ fn folder_allows_collapsing(query: &InternalItemsQuery) -> bool {
 
 fn folder_name_matches(item: &BaseItemEntity, query: &InternalItemsQuery) -> bool {
     use crate::item_repository::{folder_ordinal_compare, folder_sort_name};
-    use ferrofin_util::string_extensions::upper_invariant;
+    use ferrofin_util::string_extensions::ordinal_ignore_case_key;
     let sort = folder_sort_name(item);
     query
         .name_starts_with
         .as_ref()
         .filter(|value| !value.trim().is_empty())
-        .is_none_or(|prefix| upper_invariant(&sort).starts_with(&upper_invariant(prefix)))
+        .is_none_or(|prefix| {
+            ordinal_ignore_case_key(&sort).starts_with(&ordinal_ignore_case_key(prefix))
+        })
         && query
             .name_starts_with_or_greater
             .as_ref()
@@ -271,64 +282,19 @@ fn folder_name_matches(item: &BaseItemEntity, query: &InternalItemsQuery) -> boo
             .is_none_or(|bound| folder_ordinal_compare(Some(&sort), Some(bound)).is_lt())
 }
 
-fn episode_relation_id(value: Option<&str>) -> Option<Uuid> {
-    value
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .filter(|id| !id.is_nil())
-}
-
-/// A series' or season's `GetPresentationUniqueKey()`: its stored key, else
-/// its id — the key its episodes are queried under.
-pub(crate) fn episode_presentation_key(item: &BaseItemEntity) -> String {
-    item.presentation_unique_key
-        .as_ref()
-        .filter(|key| !key.is_empty())
-        .cloned()
-        .unwrap_or_else(|| item.id.clone())
-}
-
-fn episode_virtual_location(item: &BaseItemEntity) -> bool {
-    let kind = item.type_.rsplit('.').next().unwrap_or(&item.type_);
-    let channel = kind == "Channel"
-        || (!matches!(
-            kind,
-            "LiveTvChannel" | "TvChannel" | "LiveTvProgram" | "TvProgram"
-        ) && episode_relation_id(item.channel_id.as_deref()).is_some());
-    item.path.as_deref().is_none_or(str::is_empty) && !channel
-}
-
-fn episode_air_order(item: &BaseItemEntity) -> ferrofin_model::entities_media::AiredEpisodeOrder {
-    let data = item
-        .data
-        .as_deref()
-        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok());
-    let number = |key| {
-        data.as_ref()
-            .and_then(|data| data.get(key))
-            .and_then(serde_json::Value::as_i64)
-    };
-    ferrofin_model::entities_media::AiredEpisodeOrder {
-        season: item.parent_index_number,
-        episode: item.index_number,
-        premiere: item.premiere_date,
-        airs_before_season: number("AirsBeforeSeasonNumber"),
-        airs_after_season: number("AirsAfterSeasonNumber"),
-        airs_before_episode: number("AirsBeforeEpisodeNumber"),
-    }
-}
-
 /// `Season.GetEpisodes` → `Series.GetSeasonEpisodes(parentSeason, user, options,
 /// shouldIncludeMissingEpisodes: true)`: the series' episodes (its seasons
 /// alongside, to resolve each episode's parent) narrowed to `season`'s by
 /// `FilterEpisodesBySeason` — with `include_specials`
 /// (`DisplaySpecialsWithinSeasons`), a special airing within a numbered
 /// season belongs to it — and sorted in aired order (season 0 keeps the
-/// series' `SortName` order). Empty when the season has no series.
+/// series' `SortName` order). Empty when the season has no series; a series
+/// row that fails to read is an error here, which the scan's
+/// [`series_season_episode_rows`] caller counts as no series instead.
 /// `season_id` is the season's id; `query` supplies the user and the DTO
 /// options the series query runs with. The series' rows are read with only
 /// the columns the selection reads, and the full rows of the season's
 /// episodes after it (gl-1259).
-#[allow(clippy::too_many_lines)] // source relation resolution, then selection
 pub(crate) async fn season_episode_rows(
     items: &dyn ItemRepository,
     season_id: Uuid,
@@ -336,20 +302,42 @@ pub(crate) async fn season_episode_rows(
     query: &InternalItemsQuery,
     include_specials: bool,
 ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-    let series_id = episode_relation_id(season.series_id.as_deref())
-        .or_else(|| episode_relation_id(season.parent_id.as_deref()));
-    let series = match series_id {
+    let series = match season_series_column(&season).and_then(|id| relation_id(Some(id))) {
         Some(id) => items.retrieve_item(id).await?,
         None => None,
-    }
-    .filter(|row| row.type_.rsplit('.').next() == Some("Series"));
-    let Some(series) = series else {
+    };
+    series_season_episode_rows(items, season_id, season, series, query, include_specials).await
+}
+
+/// The column naming `season`'s series (`Season.Series`): its `SeriesId`,
+/// else its `ParentId`, skipping one [`relation_id`] reads as no relation.
+pub(crate) fn season_series_column(season: &BaseItemEntity) -> Option<&str> {
+    [season.series_id.as_deref(), season.parent_id.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|id| relation_id(Some(id)).is_some())
+}
+
+/// [`season_episode_rows`] with `series`, the row [`season_series_column`]
+/// names, already read (`Season.GetEpisodes(Series series, …)`). Empty when
+/// it is `None` or not a series.
+#[allow(clippy::too_many_lines)] // source relation resolution, then selection
+pub(crate) async fn series_season_episode_rows(
+    items: &dyn ItemRepository,
+    season_id: Uuid,
+    season: BaseItemEntity,
+    series: Option<BaseItemEntity>,
+    query: &InternalItemsQuery,
+    include_specials: bool,
+) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    let Some(series) = series.filter(|row| row.type_.rsplit('.').next() == Some("Series")) else {
         return Ok(Vec::new());
     };
+    let series_id = relation_id(Some(&series.id));
     let rows = items
         .get_episode_order_rows(&InternalItemsQuery {
             user: query.user.clone(),
-            series_presentation_unique_key: Some(episode_presentation_key(&series)),
+            series_presentation_unique_key: Some(presentation_key(&series).to_owned()),
             include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
             order_by: vec![(
                 ferrofin_model::live_tv::ItemSortBy::SortName,
@@ -367,14 +355,14 @@ pub(crate) async fn season_episode_rows(
         .collect();
     let mut seasons: HashMap<_, _> = series_seasons
         .iter()
-        .filter_map(|row| episode_relation_id(Some(&row.id)).map(|id| (id, row.clone())))
+        .filter_map(|row| relation_id(Some(&row.id)).map(|id| (id, row.clone())))
         .collect();
     seasons.insert(season_id, season.clone());
     let mut unknown = std::collections::HashSet::new();
     for row in &rows {
         if row.type_.rsplit('.').next() == Some("Episode")
-            && let Some(id) = episode_relation_id(row.season_id.as_deref())
-                .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+            && let Some(id) = relation_id(row.season_id.as_deref())
+                .or_else(|| relation_id(row.parent_id.as_deref()))
             && !seasons.contains_key(&id)
         {
             unknown.insert(id);
@@ -386,13 +374,13 @@ pub(crate) async fn season_episode_rows(
             .await?
         {
             if row.type_.rsplit('.').next() == Some("Season")
-                && let Some(id) = episode_relation_id(Some(&row.id))
+                && let Some(id) = relation_id(Some(&row.id))
             {
                 seasons.insert(id, row);
             }
         }
     }
-    let key = episode_presentation_key(&season);
+    let key = presentation_key(&season);
     let number = season.index_number;
     let support_specials = include_specials && number.is_some_and(|number| number != 0);
     let mut matches = Vec::new();
@@ -400,11 +388,11 @@ pub(crate) async fn season_episode_rows(
         .into_iter()
         .filter(|row| row.type_.rsplit('.').next() == Some("Episode"))
     {
-        let parent = episode_relation_id(row.season_id.as_deref())
-            .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+        let parent = relation_id(row.season_id.as_deref())
+            .or_else(|| relation_id(row.parent_id.as_deref()))
             .and_then(|id| seasons.get(&id))
             .or_else(|| {
-                (episode_relation_id(row.parent_id.as_deref()) == series_id)
+                (relation_id(row.parent_id.as_deref()) == series_id)
                     .then(|| {
                         series_seasons
                             .iter()
@@ -414,8 +402,8 @@ pub(crate) async fn season_episode_rows(
             });
         let same_season = parent.is_some_and(|parent| {
             ferrofin_util::string_extensions::equals_ordinal_ignore_case(
-                &episode_presentation_key(parent),
-                &key,
+                presentation_key(parent),
+                key,
             )
         });
         // The disabled source query is restricted to the season's
@@ -423,7 +411,7 @@ pub(crate) async fn season_episode_rows(
         if !include_specials && !same_season {
             continue;
         }
-        let order = episode_air_order(&row);
+        let order = aired_episode_order(&row);
         let current = if support_specials {
             order
                 .airs_after_season
@@ -435,8 +423,8 @@ pub(crate) async fn season_episode_rows(
         let matches_number = current.is_some() && number.is_some() && current == number;
         let matches_virtual = current.is_none()
             && number.is_none()
-            && episode_virtual_location(&season)
-            && parent.is_none_or(episode_virtual_location);
+            && is_virtual_location(&season)
+            && parent.is_none_or(is_virtual_location);
         if matches_number || matches_virtual || same_season {
             matches.push((order, row));
         }
@@ -1389,6 +1377,7 @@ impl FerrofinLibraryManager {
             app_paths: None,
             item_data: None,
             item_values_write_chunk: DEFAULT_ITEM_VALUES_WRITE_CHUNK as usize,
+            providers: None,
         }
     }
 
@@ -1666,12 +1655,15 @@ impl FerrofinLibraryManager {
 
     /// A box set's, album's or artist's own listing: the repository query,
     /// with no collection substitution, less the box-set members the user may
-    /// not see ([`Self::hidden_box_set_members`]).
+    /// not see ([`Self::hidden_box_set_members`]). It always counts, whatever
+    /// the request says: upstream's `PostFilterAndSort` → `SortAndPage` totals
+    /// every child before it pages.
     async fn direct_children(
         &self,
         mut resolved: InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
         resolved.collapse_box_set_items = None;
+        resolved.enable_total_record_count = true;
         let hidden = self.hidden_box_set_members(&resolved).await?;
         resolved.exclude_item_ids.extend(hidden);
         self.items.get_items(&resolved).await
@@ -2008,7 +2000,8 @@ impl FerrofinLibraryManager {
     /// [kind] }).FirstOrDefault()`). Shared by [`get_named_items`], which then
     /// adds the `CreateItemByName` write, and by `find_named_item`, which does
     /// not — the same split C# makes between `GetGenre` and
-    /// `GetItemFromSlugName`.
+    /// `GetItemFromSlugName`. A `Person` is read by id instead
+    /// ([`Self::resolve_person_rows`]).
     ///
     /// [`get_named_items`]: ferrofin_traits::library::LibraryManager::get_named_items
     async fn resolve_named_rows(
@@ -2016,6 +2009,9 @@ impl FerrofinLibraryManager {
         kind: BaseItemKind,
         trimmed: &[String],
     ) -> Result<Vec<Option<BaseItemEntity>>, ServiceError> {
+        if kind == BaseItemKind::Person {
+            return self.resolve_person_rows(trimmed).await;
+        }
         let lookup: Vec<String> = trimmed.iter().filter(|n| !n.is_empty()).cloned().collect();
         if lookup.is_empty() {
             return Ok(vec![None; trimmed.len()]);
@@ -2045,6 +2041,35 @@ impl FerrofinLibraryManager {
                     by_clean.get(&crate::text_util::get_clean_value(n)).cloned()
                 }
             })
+            .collect())
+    }
+
+    /// `LibraryManager.GetPerson` for each of `names`: the `Person` row at the
+    /// id the name derives
+    /// ([`find_person_item_ids`](ferrofin_traits::persistence::PeopleRepository::find_person_item_ids)),
+    /// one slot per name. Not the first row with the name's `CleanName`:
+    /// spellings sharing one are each their own person upstream.
+    async fn resolve_person_rows(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<Option<BaseItemEntity>>, ServiceError> {
+        let ids = self.people.find_person_item_ids(names).await?;
+        let mut found: Vec<Uuid> = ids.iter().flatten().copied().collect();
+        found.sort_unstable();
+        found.dedup();
+        let rows: HashMap<Uuid, BaseItemEntity> = if found.is_empty() {
+            HashMap::new()
+        } else {
+            self.items
+                .retrieve_items(&found)
+                .await?
+                .into_iter()
+                .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+                .collect()
+        };
+        Ok(ids
+            .into_iter()
+            .map(|id| id.and_then(|id| rows.get(&id).cloned()))
             .collect())
     }
 
@@ -2106,6 +2131,17 @@ impl FerrofinLibraryManager {
         notifier: Arc<crate::library_changed_notifier::LibraryChangedNotifier>,
     ) -> Self {
         self.changed = Some(notifier);
+        self
+    }
+
+    /// Attaches the provider manager an item's refresh goes through when no
+    /// scan covers the item (a box set, a person, a virtual season…).
+    #[must_use]
+    pub fn with_providers(
+        mut self,
+        providers: Arc<dyn ferrofin_traits::providers::ProviderManager>,
+    ) -> Self {
+        self.providers = Some(providers);
         self
     }
 
@@ -2590,7 +2626,7 @@ impl FerrofinLibraryManager {
                 .iter()
                 .find(|library| library.is_collection_folder(&item.id))
                 .and_then(|library| library.collection_type)
-                .and_then(crate::kinds::collection_type_of);
+                .and_then(CollectionTypeOptions::collection_type);
         }
         ferrofin_model::content_type_overrides::content_type_override(
             overrides,
@@ -2726,7 +2762,7 @@ impl LibraryManager for FerrofinLibraryManager {
             .find_map(|library| {
                 library
                     .collection_type
-                    .and_then(crate::kinds::collection_type_of)
+                    .and_then(CollectionTypeOptions::collection_type)
             });
         if top_type.is_some() {
             return Ok(top_type);
@@ -2947,7 +2983,11 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(Some(ferrofin_traits::options::ItemImageInfo {
             path,
             image_type: ferrofin_model::entities::ImageType::Chapter,
-            date_modified: chapter.image_date_modified.unwrap_or_else(chrono::Utc::now),
+            // `GetValueOrDefault()` upstream: a NULL date is `MinValue`, the
+            // same date the chapter's DTO tag is computed from.
+            date_modified: chapter
+                .image_date_modified
+                .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
             width: 0,
             height: 0,
             blur_hash: None,
@@ -2991,6 +3031,14 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(result);
         }
         self.items.get_items(query).await
+    }
+
+    async fn apply_user_view_builder(
+        &self,
+        query: &mut InternalItemsQuery,
+        view: &BaseItemEntity,
+    ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
+        self.user_view_builder(query, view).await
     }
 
     async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
@@ -3077,9 +3125,10 @@ impl LibraryManager for FerrofinLibraryManager {
         let mut resolved = self.resolve_named_rows(kind, &trimmed).await?;
         // `CreateItemByName<T>`: a by-name lookup MATERIALIZES the item
         // upstream (directory + row) rather than reporting it missing, so this
-        // is the read path's write. Deliberately not done in
-        // `get_named_item_ids`, the per-credit hot path — C# splits it the same
-        // way (`GetItemByNameId` derives, `CreateItemByName` writes).
+        // is the read path's write. Never done in `get_named_item_ids`: its
+        // trait contract is that it creates no row, and read paths rely on it —
+        // C# splits it the same way (`GetItemByNameId` derives,
+        // `CreateItemByName` writes).
         self.create_missing_by_name(kind, &trimmed, &mut resolved)
             .await?;
         Ok(resolved)
@@ -3124,7 +3173,11 @@ impl LibraryManager for FerrofinLibraryManager {
         // same first-match-wins — over a two-column projection, because the
         // caller wants the id and nothing else. On a cast-heavy page this is the
         // difference between decoding one 72-column row per credited name and
-        // decoding two columns.
+        // decoding two columns. A `Person` is read by its derived id
+        // (`GetPerson`), never by clean name.
+        if kind == BaseItemKind::Person {
+            return self.people.find_person_item_ids(names).await;
+        }
         let trimmed: Vec<String> = names.iter().map(|n| n.trim().to_owned()).collect();
         let lookup: Vec<String> = trimmed.iter().filter(|n| !n.is_empty()).cloned().collect();
         if lookup.is_empty() {
@@ -3166,33 +3219,6 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items
             .get_latest_item_list(query, collection_type)
             .await
-    }
-
-    async fn create_items(
-        &self,
-        items: &[BaseItemEntity],
-        _parent_id: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        // v12.2 `CreateItems` runs `OnMetadataChanged` on each item first: the
-        // parental filters read the stored score, so it must match the ratings
-        // saved.
-        let mut rated = items.to_vec();
-        if let Some(visibility) = &self.visibility {
-            visibility.update_rating_scores(&mut rated).await?;
-        }
-        // The parent linkage is already carried on each row's ParentId column; the
-        // upsert is the single persistence path (C# CreateItems == save + register).
-        self.persistence.save_items(&rated).await?;
-        // `ItemAdded` (LibraryChangedNotifier): announce only after the write
-        // succeeded, so a failed save never tells clients to fetch a row that
-        // is not there.
-        if let Some(changed) = &self.changed {
-            changed.record_added(&rated);
-        }
-        Ok(())
     }
 
     async fn update_items(
@@ -3276,11 +3302,15 @@ impl LibraryManager for FerrofinLibraryManager {
         item_id: Uuid,
         provider_ids: &[(String, String)],
     ) -> Result<(), ServiceError> {
-        // An assignment, not a merge (C# `item.ProviderIds = request.ProviderIds`):
-        // `replace_provider_ids` deletes the rows the new set lacks and upserts
-        // the rest in one transaction.
+        // `item.SetProviderIds(request.ProviderIds)` (v12.4
+        // `ItemUpdateController.UpdateItem`): an assignment, not a merge, of the
+        // pairs `TrySetProviderId` keeps. `replace_provider_ids` deletes the rows
+        // the new set lacks and upserts the rest in one transaction.
+        let provider_ids = ferrofin_providers::metadata_merge::set_provider_ids(
+            provider_ids.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        );
         self.persistence
-            .replace_provider_ids(item_id, provider_ids)
+            .replace_provider_ids(item_id, &provider_ids)
             .await?;
         self.edited([item_id]);
         // The edit's save copies the new ids to the item's local versions
@@ -3667,14 +3697,6 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(())
     }
 
-    async fn queue_library_scan_with_trigger(
-        &self,
-        trigger: ScanTrigger,
-    ) -> Result<(), ServiceError> {
-        self.spawn_scan(ScanRequest::defaults(trigger, ScanTarget::All));
-        Ok(())
-    }
-
     async fn queue_library_scan_scoped(&self, library_id: Uuid) -> Result<(), ServiceError> {
         self.spawn_scan(ScanRequest::defaults(
             ScanTrigger::Api,
@@ -3727,6 +3749,44 @@ impl LibraryManager for FerrofinLibraryManager {
         // for about one item plus its own refresh — never a library scan.
         self.run_scan(ScanRequest::item_refresh(target, options.clone()), None)
             .await
+    }
+
+    async fn queue_item_refresh(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        match self.refresh_target(item).await? {
+            Some(target) => self.queue_refresh_scan(target, options).await,
+            None => self.queue_provider_refresh(item, options).await,
+        }
+    }
+
+    async fn refresh_item_metadata(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        let Some(path) = item_refresh::refresh_scan_path(item) else {
+            self.queue_provider_refresh(item, options).await?;
+            return Ok(true);
+        };
+        self.run_refresh_scan(ScanTarget::Items(vec![path]), options)
+            .await
+    }
+
+    async fn refresh_full_item(
+        &self,
+        item: &BaseItemEntity,
+        options: &MetadataRefreshOptions,
+    ) -> Result<bool, ServiceError> {
+        if let Some(target) = self.identify_target(item).await? {
+            return self.run_refresh_scan(target, options).await;
+        }
+        self.providers()?
+            .refresh_full_item(item_refresh::item_id(item)?, options)
+            .await?;
+        Ok(true)
     }
 
     async fn run_library_scan(
@@ -4008,8 +4068,12 @@ fn settle_saved_sort_name(item: &mut BaseItemEntity) {
     ferrofin_providers::metadata_merge::settle_sort_name(item);
 }
 
+mod item_refresh;
+
 #[cfg(test)]
 mod delete_tests;
+#[cfg(test)]
+mod item_refresh_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4850,6 +4914,9 @@ mod tests {
 
         tasks.queue("RefreshLibrary").expect("queued");
         runner.started(1).await;
+        // The run reports 0 before the scan reports anything
+        // (`RefreshMediaLibraryTask`'s `progress.Report(0)`): 0 %, not none.
+        assert_eq!(info(&tasks).current_progress_percentage, Some(0.0));
         runner.release(1);
         for _ in 0..500 {
             if info(&tasks).current_progress_percentage == Some(48.0) {
@@ -4933,6 +5000,70 @@ mod tests {
             "a refused scan cancels the run"
         );
         assert_eq!(runner.runs().len(), 1, "nothing ran after shutdown");
+    }
+
+    /// `POST /Library/Refresh` over a running "Scan Media Library"
+    /// (`CancelIfRunningAndQueue`): the stop reaches the run's scan wait, so
+    /// the run ends Cancelled at once rather than after the stop's drop wait;
+    /// the scan it leaves stops at its next item; and the queued run's own
+    /// scan starts only after that one.
+    #[tokio::test]
+    async fn a_refresh_over_a_running_scan_task_cancels_it_and_scans_after_it() {
+        use crate::scheduled_tasks::{FerrofinTaskManager, RefreshLibraryTask};
+        use ferrofin_model::tasks::{TaskCompletionStatus, TaskState};
+        use ferrofin_traits::tasks::TaskManager as _;
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let tasks = FerrofinTaskManager::new();
+        tasks.register(Arc::new(RefreshLibraryTask::new(Arc::new(mgr.clone()))));
+        let id = ferrofin_traits::tasks::task_id_for_key("RefreshLibrary");
+
+        tasks.queue("RefreshLibrary").expect("queued");
+        runner.started(1).await;
+        let stopped = std::time::Instant::now();
+        tasks
+            .cancel_if_running_and_queue(&id)
+            .await
+            .expect("refresh");
+        // The first run has recorded Cancelled and the queued one runs.
+        for _ in 0..500 {
+            let info = tasks.get("RefreshLibrary").expect("task");
+            if info.state == TaskState::Running
+                && info
+                    .last_execution_result
+                    .is_some_and(|r| r.status == TaskCompletionStatus::Cancelled)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            stopped.elapsed() < crate::scheduled_tasks::STOP_WAIT,
+            "the stop reached the scan wait, not the drop"
+        );
+        assert_eq!(runner.runs().len(), 1, "no scan beside the stopping one");
+
+        // The left scan finishes its item in progress, then stops; the
+        // replacement's scan runs after it.
+        runner.release(1);
+        runner.started(2).await;
+        runner.release(GatedRunner::ITEMS);
+        for _ in 0..500 {
+            if tasks.get("RefreshLibrary").expect("task").state == TaskState::Idle {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let done = tasks.get("RefreshLibrary").expect("task");
+        assert_eq!(done.state, TaskState::Idle);
+        assert_eq!(
+            done.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Completed
+        );
+        let runs = runner.runs();
+        assert!(runs[0].stopped, "the left scan stopped at its next item");
+        assert_eq!(runs[1].items, GatedRunner::ITEMS);
     }
 
     /// The host's teardown: the running scan stops at its next item
@@ -5613,6 +5744,43 @@ mod tests {
         );
     }
 
+    /// gl-1590: a chapter image whose row carries no date is served dated
+    /// `MinValue`, as upstream reads it (`GetValueOrDefault()`), not "now".
+    #[tokio::test]
+    async fn a_chapter_image_without_a_date_is_dated_min_value() {
+        use ferrofin_traits::persistence::ChapterRepository as _;
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let chapters = Arc::new(crate::chapter_repository::FerrofinChapterRepository::new(
+            db.clone(),
+        ));
+        chapters
+            .save_chapters(
+                item,
+                &[ferrofin_db::entities::base_items::ChapterEntity {
+                    item_id: item.to_string(),
+                    chapter_index: 0,
+                    start_position_ticks: 0,
+                    name: None,
+                    image_path: Some("/meta/chapters/0.jpg".to_owned()),
+                    image_date_modified: None,
+                }],
+            )
+            .await
+            .expect("save");
+        let mgr = manager(&db).with_chapters(chapters);
+        let image = mgr
+            .get_chapter_image(item, 0)
+            .await
+            .expect("image")
+            .expect("present");
+        assert_eq!(
+            image.date_modified,
+            ferrofin_model::json::datetime::dotnet_min()
+        );
+    }
+
     /// Builds a manager backed by real repositories over the given database.
     fn manager(db: &Database) -> FerrofinLibraryManager {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
@@ -5755,10 +5923,10 @@ mod tests {
         );
     }
 
-    /// v12.2 `CreateItems` and `UpdateItemsAsync` run `OnMetadataChanged` on
-    /// each item before it is saved (`ParentalRatingScoreTests`): a created
-    /// item stores its score, a custom rating wins over the official one, and
-    /// clearing the ratings clears the score.
+    /// v12.2 `UpdateItemsAsync` runs `OnMetadataChanged` on each item before
+    /// it is saved (`ParentalRatingScoreTests`): a saved item stores its
+    /// score, a custom rating wins over the official one, and clearing the
+    /// ratings clears the score.
     #[tokio::test]
     async fn saved_items_store_the_score_of_their_ratings() {
         let db = test_db().await;
@@ -5790,7 +5958,7 @@ mod tests {
             custom_rating: Some("NC-17".to_owned()),
             ..BaseItemEntity::default()
         };
-        mgr.create_items(&[movie], None).await.expect("create");
+        mgr.update_items(&[movie], None).await.expect("first save");
         assert_eq!(
             stored().await.inherited_parental_rating_value,
             score("NC-17")
@@ -5939,9 +6107,6 @@ mod tests {
             Ok(true)
         }
         async fn set_ancestors(&self, _: Uuid, _: &[Uuid]) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn save_images(&self, _: &BaseItemEntity) -> Result<(), ServiceError> {
             Ok(())
         }
         async fn reattach_user_data(&self, _: &BaseItemEntity) -> Result<(), ServiceError> {
@@ -6109,7 +6274,7 @@ mod tests {
     }
 
     /// The metadata editor's external ids reach the `BaseItemProviders` table and
-    /// REPLACE what was there — the write behind C# `item.ProviderIds = request.ProviderIds`.
+    /// REPLACE what was there — the write behind C# `item.SetProviderIds(request.ProviderIds)`.
     #[tokio::test]
     async fn update_item_provider_ids_replaces_the_stored_set() {
         let db = test_db().await;
@@ -6146,6 +6311,48 @@ mod tests {
             .await
             .expect("lookup by the replaced id");
         assert!(stale.is_empty(), "the replaced key is gone, not merged");
+    }
+
+    /// The editor's set goes through `SetProviderIds` (v12.4
+    /// `ItemUpdateController.UpdateItem`): trimmed, an empty or invalid id
+    /// dropped, a known name in its canonical spelling.
+    #[tokio::test]
+    async fn update_item_provider_ids_sanitizes_the_set() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x7B);
+        seed_named_item(&db, id, BaseItemKind::Movie, "Heat").await;
+        let mgr = manager(&db);
+
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        mgr.update_item_provider_ids(
+            id,
+            &pairs(&[
+                ("Imdb", " tt0113277 "),
+                ("Tmdb", "nm0000123"),
+                ("TmdbCollection", "   "),
+                ("tvdb", "81189"),
+                ("Custom", " x "),
+            ]),
+        )
+        .await
+        .expect("write");
+
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let mut stored = store
+            .provider_ids_for_items(&[id])
+            .await
+            .expect("ids")
+            .remove(&id)
+            .unwrap_or_default();
+        stored.sort();
+        assert_eq!(
+            stored,
+            pairs(&[("Custom", "x"), ("Imdb", "tt0113277"), ("Tvdb", "81189")])
+        );
     }
 
     #[tokio::test]
@@ -6603,23 +6810,24 @@ mod tests {
     /// Two rows of the SAME kind sharing a `CleanName` must resolve to the same
     /// id every time — the resolver keeps the FIRST match.
     ///
-    /// Person rows have `SortName IS NULL`, so the resolver's bare
+    /// The seeded rows have `SortName IS NULL`, so the resolver's bare
     /// `ORDER BY SortName` is a total tie among duplicates and the row order is
     /// whatever the sorter emits. Keeping the first match is what makes the
     /// answer stable and makes it agree with `get_named_items`. Flipping
     /// `or_insert` to `insert` (last-match-wins) passed all 4,221 other tests.
+    /// (A `Person` is read by id instead, gl-1079.)
     #[tokio::test]
     async fn duplicate_names_of_one_kind_resolve_to_the_first_match() {
         let db = test_db().await;
         for n in [0x230u128, 0x231, 0x232] {
             let id = Uuid::from_u128(n);
-            seed_named_item(&db, id, BaseItemKind::Person, "Jane Doe").await;
+            seed_named_item(&db, id, BaseItemKind::Genre, "Jane Doe").await;
             set_clean_name(&db, id, "Jane Doe").await;
         }
         let mgr = manager(&db);
 
         let first = mgr
-            .get_named_item_ids(BaseItemKind::Person, &["Jane Doe".to_owned()])
+            .get_named_item_ids(BaseItemKind::Genre, &["Jane Doe".to_owned()])
             .await
             .expect("ids");
         assert_eq!(first.len(), 1, "one name in, one slot out");
@@ -6627,7 +6835,7 @@ mod tests {
 
         // It must be the same id the row-returning resolver picks...
         let rows = mgr
-            .get_named_items(BaseItemKind::Person, &["Jane Doe".to_owned()])
+            .get_named_items(BaseItemKind::Genre, &["Jane Doe".to_owned()])
             .await
             .expect("rows");
         assert_eq!(
@@ -6639,7 +6847,7 @@ mod tests {
         // ...and it must not drift between calls.
         for round in 0..5 {
             let again = mgr
-                .get_named_item_ids(BaseItemKind::Person, &["Jane Doe".to_owned()])
+                .get_named_item_ids(BaseItemKind::Genre, &["Jane Doe".to_owned()])
                 .await
                 .expect("ids");
             assert_eq!(
@@ -6648,6 +6856,78 @@ mod tests {
                 "round {round}: the resolved id must be stable across calls"
             );
         }
+    }
+
+    /// gl-1079: `GetPerson(name)` reads the item at the id that spelling
+    /// derives. Two rows sharing a clean name, as an adopted Jellyfin database
+    /// holds them, are two people to every person read: the listing, the
+    /// single lookup and the DTO's id-only lookup. Before, each name read the
+    /// first row with the clean name, so the listing showed one spelling twice.
+    #[tokio::test]
+    async fn person_reads_take_each_spellings_own_row() {
+        let db = test_db().await;
+        let people_root = tempfile::tempdir().expect("people root");
+        let mode = crate::item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: None,
+        };
+        let root = people_root.path().to_string_lossy().into_owned();
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let mgr = FerrofinLibraryManager::new(
+            Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+            Arc::new(FerrofinItemCountService::new(db.clone())),
+            Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+            Arc::new(
+                FerrofinPeopleRepository::new(db.clone()).with_identity(mode.clone(), root.clone()),
+            ),
+        );
+        let spellings = ["H Jon Benjamin".to_owned(), "H. Jon Benjamin".to_owned()];
+        let movie = Uuid::from_u128(0x1079);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let mut ids = Vec::new();
+        for (offset, name) in (1u128..).zip(&spellings) {
+            let id = crate::item_type_lookup::person_item_id(&mode, &root, name).expect("id");
+            seed_named_item(&db, id, BaseItemKind::Person, name).await;
+            set_clean_name(&db, id, name).await;
+            crate::people_repository::seed_credit(
+                &db,
+                movie,
+                Uuid::from_u128(0x1079 + offset),
+                name,
+            )
+            .await;
+            ids.push(id);
+        }
+
+        let rows = mgr
+            .get_named_items(BaseItemKind::Person, &spellings)
+            .await
+            .expect("rows");
+        let row_ids: Vec<Option<String>> = rows
+            .iter()
+            .map(|r| r.as_ref().map(|r| r.id.clone()))
+            .collect();
+        let expected: Vec<Option<String>> = ids.iter().map(|id| Some(guid_to_db(*id))).collect();
+        assert_eq!(row_ids, expected);
+        assert_eq!(
+            mgr.get_named_item_ids(BaseItemKind::Person, &spellings)
+                .await
+                .expect("ids"),
+            ids.iter().copied().map(Some).collect::<Vec<_>>()
+        );
+        let second = mgr
+            .get_named_item(BaseItemKind::Person, " H. Jon Benjamin ")
+            .await
+            .expect("lookup")
+            .expect("the second spelling resolves");
+        assert_eq!(second.name.as_deref(), Some("H. Jon Benjamin"));
+
+        let page = mgr
+            .get_people_items(&InternalPeopleQuery::default())
+            .await
+            .expect("people");
+        let names: Vec<Option<&str>> = page.items.iter().map(|p| p.name.as_deref()).collect();
+        assert_eq!(names, [Some("H Jon Benjamin"), Some("H. Jon Benjamin")]);
     }
 
     // The id-only twin of the batch resolver: the DTO prefetch resolves a page's
@@ -7403,6 +7683,49 @@ mod tests {
         .collect()
     }
 
+    /// The season listing answers an error when its series cannot be read;
+    /// only the scan counts such a series as none (gl-1748).
+    #[tokio::test]
+    async fn season_episode_rows_fails_when_the_series_cannot_be_read() {
+        let db = test_db().await;
+        let library = manager(&db);
+        let (series, season) = (Uuid::new_v4(), Uuid::new_v4());
+        library
+            .persistence
+            .save_items(&[
+                BaseItemEntity {
+                    id: guid_to_db(series),
+                    type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+                    is_folder: true,
+                    ..Default::default()
+                },
+                BaseItemEntity {
+                    id: guid_to_db(season),
+                    type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+                    index_number: Some(1),
+                    parent_id: Some(guid_to_db(series)),
+                    series_id: Some(guid_to_db(series)),
+                    is_folder: true,
+                    ..Default::default()
+                },
+            ])
+            .await
+            .unwrap();
+        let season_row = library.items.retrieve_item(season).await.unwrap().unwrap();
+        db.close().await;
+
+        let listed = season_episode_rows(
+            library.items.as_ref(),
+            season,
+            season_row,
+            &InternalItemsQuery::default(),
+            true,
+        )
+        .await;
+
+        assert!(listed.is_err(), "{listed:?}");
+    }
+
     /// gl-905, the undated shape: 22 unnumbered season-2 episodes in
     /// `SortName` order, premiered on days 20 to 11, then one undated, then
     /// days 10 to 0. The aired-order comparer calls the undated row equal to
@@ -7837,6 +8160,18 @@ mod tests {
                 ..Default::default()
             }
         ));
+        // The long s keeps its case: `ToUpperInvariant` maps it to `S`, ordinal casing does not.
+        let row = BaseItemEntity {
+            sort_name: Some("ſtar".into()),
+            ..Default::default()
+        };
+        assert!(!super::folder_name_matches(
+            &row,
+            &InternalItemsQuery {
+                name_starts_with: Some("S".into()),
+                ..Default::default()
+            }
+        ));
     }
 
     /// `Folder.QueryRecursive` post-filters a user's playlist-only listing
@@ -8095,7 +8430,8 @@ mod tests {
     /// `DisplayOrder` (default `PremiereDate`; `Default` keeps the order the
     /// members were added in; an unparseable one is `PremiereDate`) unless the
     /// request orders them itself — read off a Jellyfin 12.2 oracle on a set
-    /// created from Zeta (2001), Alpha (2003), Mid (1999), Beta (2002).
+    /// created from Zeta (2001), Alpha (2003), Mid (1999), Beta (2002). Its own
+    /// listing totals every member even with the count off.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one set, every display order
     async fn a_box_set_lists_its_members_by_its_display_order() {
@@ -8244,6 +8580,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names(around), ["Zeta", "Alpha", "Mid"]);
+        // With the count off, the set's own listing still totals every member
+        // (`PostFilterAndSort` → `SortAndPage` counts before it pages), and a
+        // recursive one, the repository's `GetItemList`, totals its page.
+        let uncounted = |recursive: bool| {
+            let query = InternalItemsQuery {
+                user: Some(Arc::new(user.clone())),
+                parent_id: set_id,
+                parent_type: Some(BaseItemKind::BoxSet),
+                recursive,
+                apply_folder_display_options: true,
+                start_index: Some(1),
+                limit: Some(2),
+                enable_total_record_count: false,
+                ..Default::default()
+            };
+            let library = Arc::clone(&library);
+            async move {
+                let result = library.query_items(&query).await.unwrap();
+                (result.items.len(), result.total_record_count)
+            }
+        };
+        assert_eq!(uncounted(false).await, (2, 4));
+        assert_eq!(uncounted(true).await, (2, 2));
     }
 
     #[tokio::test]

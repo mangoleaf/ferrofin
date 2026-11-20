@@ -2,17 +2,13 @@
 //!
 //! Port of `Jellyfin.MediaEncoding.Keyframes.FfProbe.FfProbeKeyframeExtractor`.
 
+use ferrofin_util::ticks::{TICKS_PER_MS, TICKS_PER_SECOND};
 use std::io::{BufRead, Read};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::KeyframesError;
 use crate::keyframe_data::KeyframeData;
-
-/// The number of ticks in a second. 1 tick = 100ns (mirrors `TimeSpan.TicksPerSecond`).
-const TICKS_PER_SECOND: i64 = 10_000_000;
-
-/// The number of ticks in a millisecond (mirrors `TimeSpan.TicksPerMillisecond`).
-const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 /// Extracts the keyframes using the ffprobe executable at the specified path.
 ///
@@ -20,14 +16,17 @@ const TICKS_PER_MILLISECOND: i64 = 10_000;
 ///
 /// * `ff_probe_path` - The path to the ffprobe executable.
 /// * `file_path` - The file path.
+/// * `stop` - Once set, ffprobe is killed at its next output read and the
+///   call fails: its caller has given up on the result.
 ///
 /// # Errors
 ///
 /// Returns [`KeyframesError`] if the ffprobe process cannot be spawned or its
-/// standard output cannot be read.
+/// standard output cannot be read, or if `stop` ended it.
 pub fn get_keyframe_data(
     ff_probe_path: &str,
     file_path: &str,
+    stop: &AtomicBool,
 ) -> Result<KeyframeData, KeyframesError> {
     let mut process = Command::new(ff_probe_path)
         .args([
@@ -64,12 +63,37 @@ pub fn get_keyframe_data(
         .take()
         .ok_or_else(|| std::io::Error::other("failed to capture ffprobe stdout"))?;
 
-    let result = parse_stream(stdout);
+    let result = parse_stream(UntilStopped {
+        inner: stdout,
+        stop,
+    });
 
+    let stopped = stop.load(Ordering::Relaxed);
+    if stopped {
+        let _ = process.kill();
+    }
     // Reap the child regardless of parse outcome.
     let _ = process.wait();
 
+    if stopped {
+        return Err(std::io::Error::other("ffprobe was stopped").into());
+    }
     Ok(result)
+}
+
+/// A reader that ends (reads nothing more) once `stop` is set.
+struct UntilStopped<'a, R> {
+    inner: R,
+    stop: &'a AtomicBool,
+}
+
+impl<R: Read> Read for UntilStopped<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        self.inner.read(buf)
+    }
 }
 
 /// Parses the CSV stream produced by ffprobe into [`KeyframeData`].
@@ -151,7 +175,7 @@ fn convert_to_i64(value: f64) -> i64 {
 fn time_span_from_seconds_ticks(value: f64) -> i64 {
     let millis = value * 1000.0;
     let rounded_millis = convert_to_i64(millis);
-    rounded_millis * TICKS_PER_MILLISECOND
+    rounded_millis * TICKS_PER_MS
 }
 
 #[cfg(test)]
@@ -241,8 +265,8 @@ mod tests {
         // opened for writing and still exercises the real spawn/read/wait path.
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/fake_ffprobe.sh");
 
-        let data =
-            get_keyframe_data(script, "/does/not/matter.mkv").expect("fake ffprobe should succeed");
+        let data = get_keyframe_data(script, "/does/not/matter.mkv", &AtomicBool::new(false))
+            .expect("fake ffprobe should succeed");
         assert_eq!(data.keyframe_ticks, vec![10_000_000]);
         assert_eq!(data.total_duration, 10_000_000);
     }
@@ -279,7 +303,8 @@ mod tests {
             "/tests/data/fake_ffprobe_nice.sh"
         );
 
-        let data = get_keyframe_data(script, "/does/not/matter.mkv").expect("fake ffprobe");
+        let data = get_keyframe_data(script, "/does/not/matter.mkv", &AtomicBool::new(false))
+            .expect("fake ffprobe");
         assert_eq!(data.total_duration, expected * TICKS_PER_SECOND);
     }
 
@@ -288,9 +313,34 @@ mod tests {
         let err = get_keyframe_data(
             "/nonexistent/path/to/ffprobe-should-not-exist",
             "/tmp/whatever.mkv",
+            &AtomicBool::new(false),
         )
         .expect_err("spawning a missing binary must fail");
         // The spawn IO error is surfaced as a KeyframesError.
         assert!(matches!(err, KeyframesError::Process(_)));
+    }
+
+    /// A stop set while the probe still writes ends it and fails the call.
+    /// The checked-in fake writes packets until it is killed.
+    #[cfg(unix)]
+    #[test]
+    fn get_keyframe_data_ends_the_probe_once_stopped() {
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/fake_ffprobe_endless.sh"
+        );
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let (done, finished) = std::sync::mpsc::channel();
+        let probe_stop = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let _ =
+                done.send(get_keyframe_data(script, "/does/not/matter.mkv", &probe_stop).is_ok());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        stop.store(true, Ordering::Relaxed);
+        let succeeded = finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the probe ends once stopped");
+        assert!(!succeeded, "a stopped probe is no result");
     }
 }

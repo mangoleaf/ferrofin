@@ -144,7 +144,7 @@ create-release:
 
 # ---------------------------------------------------------------------------
 # ci-image — the Rust CI base image (toolchain + rustfmt/clippy/nextest/llvm-cov),
-# built with kaniko and pushed to $CI_REGISTRY_IMAGE/ci:rust-1.99.1. The lint and
+# built with kaniko and pushed to $CI_REGISTRY_IMAGE/ci:rust-1.100.0. The lint and
 # coverage jobs use it as their `image:` so they don't reinstall tools every run.
 # Rebuilds automatically when ci/Dockerfile changes, on main or on the merge-request
 # pipeline that proposes the change; force a rebuild
@@ -162,7 +162,7 @@ ci-image:
     name: gcr.io/kaniko-project/executor:debug
     entrypoint: [""]
   variables:
-    CI_IMAGE: $CI_REGISTRY_IMAGE/ci:rust-1.99.1
+    CI_IMAGE: $CI_REGISTRY_IMAGE/ci:rust-1.100.0
   before_script:
     - mkdir -p /kaniko/.docker
     - AUTH="$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
@@ -348,7 +348,7 @@ benchmark-report:
 
 lint:
   stage: test
-  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # toolchain + nextest/llvm-cov baked in
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.100.0   # toolchain + nextest/llvm-cov baked in
   extends: .sccache
   variables:
     CARGO_TERM_COLOR: always
@@ -391,7 +391,7 @@ lint:
 # one before found, so an advisory never hides the rest.
 dependencies:
   stage: test
-  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # cargo-deny + cargo-machete baked in (ci/Dockerfile)
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.100.0   # cargo-deny + cargo-machete baked in (ci/Dockerfile)
   needs:
     # When ci/Dockerfile changed, wait for the image that carries the tools; ignored on runs
     # where ci-image is skipped.
@@ -421,7 +421,7 @@ dependencies:
 # changes only with the branch. create-release needs it.
 vet:
   stage: test
-  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # cargo-vet baked in (ci/Dockerfile)
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.100.0   # cargo-vet baked in (ci/Dockerfile)
   needs:
     - job: ci-image   # as in `dependencies`
       optional: true
@@ -435,24 +435,29 @@ vet:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
 
-# The shell tooling has its own tests: scripts/version.sh and the adoption harness
-# (gates/adoption/lib.sh driven with canned logs and throwaway SQLite files — no docker, no fixtures).
+# The shell tooling has its own tests, the same as GitHub's shell-tests job (ci.yml, which says what each
+# suite covers): scripts/ (version.sh, ci-config-check.sh, coverage-gate.sh, the git-cliff config and the
+# Python helpers) and every gate's own shellcheck, bats and Python tests, one list in the Makefile's
+# test-gates-offline target. None needs docker, a server or fixtures.
 shell-tests:
   stage: test
   image: alpine:3.22
   before_script:
     # Adoption checks invoke Python, with Pillow to validate preserved artwork and PyICU for the
-    # CleanValue check. The gates' scripts need findmnt (the network-filesystem refusal) and GNU
-    # coreutils (realpath -m, tail --pid, truncate's size suffixes), which the Alpine image lacks;
-    # GitHub's Ubuntu runner has them.
-    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml py3-icu findmnt coreutils py3-pip
+    # CleanValue check. The gates' scripts need findmnt (the network-filesystem refusal), GNU
+    # coreutils (realpath -m, tail --pid, truncate's size suffixes) and taskset (util-linux-misc: the
+    # parity runner's CPU pin), which the Alpine image lacks; GitHub's Ubuntu runner has them. make
+    # runs the Makefile's test-gates-offline.
+    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml py3-icu findmnt coreutils util-linux-misc py3-pip make
     # scripts/tests/git-cliff.bats runs git-cliff; the version is mise.toml's and release.yml's
     # (Alpine's PEP 668 marker needs --break-system-packages in this throwaway container).
     - pip install --break-system-packages git-cliff==2.14.2
   script:
-    - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh gates/lib.sh gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh
-    - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats scripts/tests/git-cliff.bats gates/adoption/tests/adoption.bats
-    - bats scripts/tests gates/adoption/tests
+    - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh
+    - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats scripts/tests/git-cliff.bats
+    - bats scripts/tests
+    - make test-gates-offline   # the gates' own shellcheck, bats and Python tests: one list, in the Makefile
+    - python3 -m unittest discover -s scripts/tests -p 'test_*.py'
     - scripts/ci-config-check.sh check
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -467,7 +472,7 @@ shell-tests:
 # re-gated on the release pipeline.
 coverage:
   stage: test
-  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # toolchain + nextest/llvm-cov baked in
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.100.0   # toolchain + nextest/llvm-cov baked in
   extends: .sccache
   parallel:
     matrix:

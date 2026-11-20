@@ -339,7 +339,9 @@ pub fn default_image_options(item_type: &str) -> &'static [ImageOption] {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct MediaPathInfo {
-    /// Gets or sets the path.
+    /// Gets or sets the path. A missing `Path` is `""`, as upstream's
+    /// `MediaPathInfo()` constructor sets it.
+    #[serde(default)]
     pub path: String,
 }
 

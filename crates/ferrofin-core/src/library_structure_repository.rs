@@ -279,6 +279,35 @@ pub(crate) async fn folder_of_kind(
     .map_err(db_err)
 }
 
+/// Records `item`'s parent chain as its ancestors: `parent`, then each
+/// `ParentId` above it up to the root, what `BaseItem.GetParents` walks
+/// (`BaseItem.cs:1116-1126`). It is all of `GetAncestorIds` for an item with no
+/// collection folders, such as a playlist under the Playlists folder. A link
+/// to a row that does not exist is skipped, as a key to it could not be stored.
+pub(crate) async fn add_parent_chain_in(
+    connection: &mut sqlx::SqliteConnection,
+    item: Uuid,
+    parent: Uuid,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"WITH RECURSIVE "chain"("ParentItemId") AS (
+               SELECT ?2
+               UNION
+               SELECT p."ParentId" FROM "chain" c
+                 JOIN "BaseItems" p ON p."Id" = c."ParentItemId"
+                WHERE p."ParentId" IS NOT NULL)
+           INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId")
+           SELECT ?1, "ParentItemId" FROM "chain"
+            WHERE "ParentItemId" IN (SELECT "Id" FROM "BaseItems")"#,
+    )
+    .bind(guid_to_db(item))
+    .bind(guid_to_db(parent))
+    .execute(&mut *connection)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// Records `ancestors` for `item`: `GetAncestorIds`, its parents up to the root
 /// and the libraries it belongs to. An ancestor with no row yet is skipped, as
 /// a key to it could not be stored.
@@ -423,6 +452,69 @@ pub(crate) async fn user_data_items(db: &Database, user: Uuid) -> Vec<String> {
         .fetch_all(db.pool())
         .await
         .expect("user data")
+}
+
+/// Test-only: makes every change of a `BaseItems` row's id fail while `on`.
+#[cfg(test)]
+pub(crate) async fn fail_item_rekeys(db: &Database, on: bool) {
+    let sql = if on {
+        r#"CREATE TRIGGER "fail_rekey" BEFORE UPDATE OF "Id" ON "BaseItems"
+           BEGIN SELECT RAISE(ABORT, 'disk full'); END"#
+    } else {
+        r#"DROP TRIGGER "fail_rekey""#
+    };
+    sqlx::query(sql)
+        .execute(db.writer())
+        .await
+        .expect("trigger");
+}
+
+/// Test-only: a `LinkedChildren` row, `parent` holding `child`.
+#[cfg(test)]
+pub(crate) async fn link_child(db: &Database, parent: Uuid, child: Uuid) {
+    sqlx::query(
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+           VALUES (?1, 0, ?2, 0)"#,
+    )
+    .bind(guid_to_db(parent))
+    .bind(guid_to_db(child))
+    .execute(db.writer())
+    .await
+    .expect("link");
+}
+
+/// Test-only: every `LinkedChildren` row as `(ParentId, ChildId)`, those of
+/// `last` last.
+#[cfg(test)]
+pub(crate) async fn linked_children(db: &Database, last: Uuid) -> Vec<(String, String)> {
+    sqlx::query_as(r#"SELECT "ParentId", "ChildId" FROM "LinkedChildren" ORDER BY "ParentId" = ?1"#)
+        .bind(guid_to_db(last))
+        .fetch_all(db.pool())
+        .await
+        .expect("links")
+}
+
+/// Test-only: marks every user's row of `item` a favourite.
+#[cfg(test)]
+pub(crate) async fn favourite_item(db: &Database, item: Uuid) {
+    sqlx::query(r#"UPDATE "UserData" SET "IsFavorite" = 1 WHERE "ItemId" = ?1"#)
+        .bind(guid_to_db(item))
+        .execute(db.writer())
+        .await
+        .expect("favourite");
+}
+
+/// Test-only: `item`'s one user-data row as `(CustomDataKey, IsFavorite,
+/// Played)`.
+#[cfg(test)]
+pub(crate) async fn user_data_row(db: &Database, item: Uuid) -> (String, bool, bool) {
+    sqlx::query_as(
+        r#"SELECT "CustomDataKey", "IsFavorite", "Played" FROM "UserData" WHERE "ItemId" = ?1"#,
+    )
+    .bind(guid_to_db(item))
+    .fetch_one(db.pool())
+    .await
+    .expect("user data")
 }
 
 #[cfg(test)]

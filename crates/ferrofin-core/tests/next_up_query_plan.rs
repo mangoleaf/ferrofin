@@ -49,7 +49,7 @@ async fn series_keys_are_index_driven_with_no_join_pin() {
     // user/type/placeholder + `n` `TopParentId` placeholders + cutoff, at
     // every length a padded list takes (gl-1243).
     for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
-        let sql = next_up_series_keys_sql(n, false);
+        let sql = next_up_series_keys_sql(n, false, false);
         assert!(!sql.contains("CROSS JOIN"), "no join-order pin: {sql}");
         let steps = plan(&db, &sql, n + 4).await;
 
@@ -73,9 +73,57 @@ async fn series_keys_are_index_driven_with_no_join_pin() {
     }
 
     // With a limit the statement carries one more bind and a LIMIT.
-    let limited = next_up_series_keys_sql(3, true);
+    let limited = next_up_series_keys_sql(3, false, true);
     assert!(limited.ends_with("LIMIT ?"), "bound LIMIT: {limited}");
     plan(&db, &limited, 8).await;
+}
+
+/// gl-36: a linked box set or playlist adds its descendant set
+/// (`DescendantQueryHelper`'s sub-select) to the same aggregate, and the
+/// statement keeps its shape: no join-order pin, `UserData` reached by
+/// `(UserId, ItemId)`, `AncestorIds` and `LinkedChildren` sought by parent, and
+/// no table scanned (only the `json_each` root lists and the materialized set).
+#[tokio::test]
+async fn series_keys_under_a_box_set_stay_index_driven() {
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrations");
+
+    for n in [1, 8] {
+        let sql = next_up_series_keys_sql(n, true, false);
+        assert!(!sql.contains("CROSS JOIN"), "no join-order pin: {sql}");
+        // user/type/placeholder + `n` parents + the descendant set's three + cutoff.
+        assert_eq!(sql.matches('?').count(), n + 7, "{sql}");
+        let steps = plan(&db, &sql, n + 7).await;
+
+        assert!(
+            steps.iter().any(|d| d.starts_with("SEARCH bi USING")),
+            "{n} parents: BaseItems must be read through an index, got: {steps:#?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|d| d.contains(" ud ") && d.contains("UserId=? AND ItemId=?")),
+            "{n} parents: UserData must be reached by (UserId, ItemId), got: {steps:#?}"
+        );
+        // The only scans are of the root lists (`json_each`) and the
+        // materialized descendant set; every table is reached by an index.
+        assert!(
+            steps
+                .iter()
+                .filter(|d| d.starts_with("SCAN"))
+                .all(|d| d.starts_with("SCAN json_each") || d == "SCAN all_descendants"),
+            "{n} parents: no full scan of a table: {steps:#?}"
+        );
+        for seek in [
+            "SEARCH a USING INDEX IX_AncestorIds_ParentItemId (ParentItemId=?)",
+            "SEARCH link USING INDEX IX_LinkedChildren_ParentId_ChildType (ParentId=?)",
+        ] {
+            assert!(
+                steps.iter().any(|d| d == seek),
+                "{n} parents: expected `{seek}`: {steps:#?}"
+            );
+        }
+    }
 }
 
 /// gl-979: without rewatching the projection sends no `PrimaryVersionId`

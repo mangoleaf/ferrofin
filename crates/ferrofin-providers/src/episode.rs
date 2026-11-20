@@ -13,11 +13,13 @@
 
 use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::store::guid_to_db;
+use ferrofin_model::data::PersonKind;
 use uuid::Uuid;
 
+use crate::container_types::PersonInfo;
 use crate::metadata_merge::MetadataResult;
 use crate::omdb::{OmdbItem, OmdbPersonKind};
-use crate::tmdb::{EpisodeDetails, EpisodeExtras};
+use crate::tmdb::{EpisodeDetails, EpisodeExtras, SeasonDetails};
 use crate::tvdb::{TvdbEpisodeDetails, TvdbPerson};
 
 /// Port of `EpisodeMetadataService.BeforeSaveInternal`'s range guard (v12.2,
@@ -84,6 +86,69 @@ pub struct EpisodeAnswer {
     pub language: Option<&'static str>,
 }
 
+/// A stored episode's range end (`Data.IndexNumberEnd`) as its lookup reads
+/// it (`Episode.GetLookupInfo`): none when it is below the episode number or
+/// there is none, as `EpisodeMetadataService.BeforeSaveInternal` drops it
+/// before the lookup is read.
+pub(crate) fn lookup_range_end(item: &BaseItemEntity) -> Option<i32> {
+    let data: serde_json::Value = serde_json::from_str(item.data.as_deref()?).ok()?;
+    let end = i32::try_from(data.get("IndexNumberEnd")?.as_i64()?).ok()?;
+    item.index_number
+        .is_some_and(|start| i64::from(end) >= start)
+        .then_some(end)
+}
+
+/// The episode `TmdbEpisodeProvider.GetMetadata` reads from `season`'s listing
+/// for the lookup's `IndexNumber` (`start`) and `IndexNumberEnd` (`end`),
+/// `TmdbEpisodeProvider.cs:106-158`: without an end, the entry for `start`;
+/// with one, the first entry from `start` to `end` the season lists (an
+/// episode TMDB lacks is skipped), its name and overview followed by each
+/// later one's, joined by ` / `. The rest (ids, air date, rating) and the
+/// episode request for its credits, ids and videos are the first one's.
+/// `None` when the season lists none of them, as for an end below `start`:
+/// the caller drops a stored one first, as `BeforeSaveInternal` does.
+#[must_use]
+pub fn tmdb_episode_in_range(
+    season: &SeasonDetails,
+    start: i32,
+    end: Option<i32>,
+) -> Option<EpisodeDetails> {
+    let Some(end) = end else {
+        return season
+            .episodes
+            .iter()
+            .find(|entry| entry.episode_number == start)
+            .cloned();
+    };
+    // Each number once, the first listed, as `GetEpisodeAsync` asks per number.
+    let mut found: Vec<&EpisodeDetails> = Vec::new();
+    for entry in &season.episodes {
+        if (start..=end).contains(&entry.episode_number)
+            && !found
+                .iter()
+                .any(|kept| kept.episode_number == entry.episode_number)
+        {
+            found.push(entry);
+        }
+    }
+    found.sort_by_key(|entry| entry.episode_number);
+    let (first, rest) = found.split_first()?;
+    let mut episode = (*first).clone();
+    if !rest.is_empty() {
+        // A `StringBuilder` appends a null name or overview as nothing.
+        let joined = |field: fn(&EpisodeDetails) -> Option<&str>| {
+            found
+                .iter()
+                .map(|entry| field(entry).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+        episode.name = Some(joined(|entry| entry.name.as_deref()));
+        episode.overview = Some(joined(|entry| entry.overview.as_deref()));
+    }
+    Some(episode)
+}
+
 /// `TmdbEpisodeProvider.GetMetadata`'s answer for episode `episode_number` of
 /// season `season_number`, from the season response's entry for it and the
 /// episode's own request (`credits,images,external_ids,videos`).
@@ -126,7 +191,7 @@ pub fn tmdb_answer(
         let trailers: Vec<_> = extras
             .trailers
             .iter()
-            .map(|trailer| (Some(trailer.name.clone()), trailer.url.clone()))
+            .map(|trailer| (trailer.name.clone(), trailer.url.clone()))
             .collect();
         if let Some(data) = data_with_trailers(&item, &trailers) {
             item.data = Some(data);
@@ -156,15 +221,19 @@ fn data_with_trailers(
     if trailers.is_empty() {
         return None;
     }
-    let list: Vec<_> = trailers
-        .iter()
-        .map(|(name, url)| {
-            serde_json::json!({
-                "Url": url,
-                "Name": name,
-            })
-        })
-        .collect();
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    for (name, url) in trailers {
+        // `AddTrailerUrl` skips a URL already added; upstream ignores case,
+        // but YouTube keys are case-sensitive.
+        if list.iter().any(|entry| entry["Url"] == *url) {
+            continue;
+        }
+        // A nameless trailer has no `Name`, as Jellyfin writes no null.
+        list.push(match name {
+            Some(name) => serde_json::json!({ "Url": url, "Name": name }),
+            None => serde_json::json!({ "Url": url }),
+        });
+    }
     let mut data: serde_json::Map<String, serde_json::Value> = item
         .data
         .as_deref()
@@ -231,8 +300,7 @@ pub fn omdb_answer(
         .imdb_id
         .as_deref()
         .filter(|id| !id.is_empty())
-        .map(|id| vec![("Imdb".to_owned(), id.to_owned())])
-        .unwrap_or_default();
+        .map_or_default(|id| vec![("Imdb".to_owned(), id.to_owned())]);
     let people = gates
         .cast_and_crew
         .then(|| omdb_people(omdb))
@@ -248,7 +316,7 @@ pub fn omdb_answer(
     }
 }
 
-/// Maps OMDb's credited people to persistable rows: the director, the writer,
+/// Maps OMDb's credited people to persistable rows: each director, each writer,
 /// then each actor. OMDb carries no per-person id or image.
 #[must_use]
 pub fn omdb_people(item: &OmdbItem) -> Vec<PeopleEntity> {
@@ -273,18 +341,35 @@ pub fn omdb_people(item: &OmdbItem) -> Vec<PeopleEntity> {
         .collect()
 }
 
-/// Maps TheTVDB's credited people to persistable rows. The plugin sets no
+/// Maps TheTVDB's credited people to persistable rows, each added through
+/// `MetadataResult.AddPerson` as the plugin's loops add them
+/// ([`crate::container_types::add_person`]): names trimmed, an actor credited
+/// again as a guest star in the same role merged into one guest-star credit,
+/// a role-less credit given the role a later one names. The plugin sets no
 /// `SortOrder` on its credits.
 #[must_use]
 pub fn tvdb_people(people: &[TvdbPerson]) -> Vec<PeopleEntity> {
-    people
-        .iter()
+    let mut credits = Vec::new();
+    for person in people {
+        crate::container_types::add_person(
+            &mut credits,
+            PersonInfo {
+                name: person.name.clone(),
+                role: person.role.clone(),
+                type_: PersonKind::from_stored(&person.person_type),
+                image_url: person.image_url.clone(),
+                ..PersonInfo::default()
+            },
+        );
+    }
+    credits
+        .into_iter()
         .map(|person| PeopleEntity {
-            id: guid_to_db(Uuid::new_v4()),
-            name: person.name.clone(),
-            person_type: Some(person.person_type.clone()),
-            role: person.role.clone(),
-            primary_image_url: person.image_url.clone(),
+            id: guid_to_db(person.id),
+            name: person.name,
+            person_type: Some(person.type_.json_name().into_owned()),
+            role: person.role,
+            primary_image_url: person.image_url,
             provider_id: None,
             sort_order: None,
         })
@@ -354,6 +439,69 @@ pub fn tvdb_answer(
 mod tests {
     use super::*;
     use crate::tmdb::TmdbPerson;
+
+    /// A stored range end is the lookup's unless `BeforeSaveInternal` drops
+    /// it: below the episode number, or with none.
+    #[rstest::rstest]
+    #[case::kept(Some(1), 2, Some(2))]
+    #[case::one_episode(Some(2), 2, Some(2))]
+    #[case::below_the_start(Some(3), 2, None)]
+    #[case::without_a_start(None, 2, None)]
+    fn a_stored_range_end_is_the_lookups_unless_dropped(
+        #[case] start: Option<i64>,
+        #[case] end: i64,
+        #[case] expected: Option<i32>,
+    ) {
+        assert_eq!(lookup_range_end(&ranged_episode(start, end)), expected);
+    }
+
+    /// A season listing episodes 1, 2 (no overview) and 4, out of order.
+    fn listed_season() -> SeasonDetails {
+        let entry = |n: i32, name: &str, overview: Option<&str>| EpisodeDetails {
+            tmdb_id: Some(i64::from(9000 + n)),
+            episode_number: n,
+            name: Some(name.to_owned()),
+            overview: overview.map(str::to_owned),
+            air_date: Some(format!("2011-04-0{n}")),
+            ..EpisodeDetails::default()
+        };
+        SeasonDetails {
+            episodes: vec![
+                entry(2, "Two", None),
+                entry(1, "One", Some("First.")),
+                entry(4, "Four", Some("Fourth.")),
+            ],
+            ..SeasonDetails::default()
+        }
+    }
+
+    /// `TmdbEpisodeProvider.GetMetadata` (v12.4 `:106-158`): a range takes
+    /// every episode TMDB lists in it, the first one's id and date, and joins
+    /// their names and overviews with ` / ` (a missing overview adds nothing
+    /// between the separators); a range TMDB lists one episode of, or none,
+    /// is that one alone, or nothing; no range is the start alone.
+    #[rstest::rstest]
+    #[case::single(1, None, Some(("One", Some("First."), 9001)))]
+    #[case::range(1, Some(2), Some(("One / Two", Some("First. / "), 9001)))]
+    #[case::gap_skipped(1, Some(4), Some(("One / Two / Four", Some("First. /  / Fourth."), 9001)))]
+    #[case::first_missing(3, Some(4), Some(("Four", Some("Fourth."), 9004)))]
+    #[case::none_listed(5, Some(6), None)]
+    #[case::reversed(2, Some(1), None)]
+    fn a_tmdb_episode_range_joins_what_the_season_lists(
+        #[case] start: i32,
+        #[case] end: Option<i32>,
+        #[case] expected: Option<(&str, Option<&str>, i64)>,
+    ) {
+        let found = tmdb_episode_in_range(&listed_season(), start, end);
+        assert_eq!(
+            found.as_ref().map(|e| (
+                e.name.as_deref().unwrap_or_default(),
+                e.overview.as_deref(),
+                e.tmdb_id.unwrap_or_default()
+            )),
+            expected
+        );
+    }
 
     /// An episode row with `IndexNumber` `start` and `Data.IndexNumberEnd` `end`.
     fn ranged_episode(start: Option<i64>, end: i64) -> BaseItemEntity {
@@ -458,10 +606,20 @@ mod tests {
 
         let extras = EpisodeExtras {
             provider_ids: vec![("Imdb".to_owned(), "tt1".to_owned())],
-            trailers: vec![crate::tmdb::TmdbTrailer {
-                name: "Clip".to_owned(),
-                url: "https://youtu.be/x".to_owned(),
-            }],
+            trailers: vec![
+                crate::tmdb::TmdbTrailer {
+                    name: Some("Clip".to_owned()),
+                    url: "https://youtu.be/x".to_owned(),
+                },
+                crate::tmdb::TmdbTrailer {
+                    name: None,
+                    url: "https://youtu.be/y".to_owned(),
+                },
+                crate::tmdb::TmdbTrailer {
+                    name: None,
+                    url: "https://youtu.be/x".to_owned(),
+                },
+            ],
             people: Some(vec![TmdbPerson {
                 tmdb_id: 31,
                 name: "Guest".to_owned(),
@@ -479,8 +637,16 @@ mod tests {
                 .contains(&("Imdb".to_owned(), "tt1".to_owned()))
         );
         assert_eq!(answer.result.people.as_ref().map(Vec::len), Some(1));
-        let data = answer.result.item.data.expect("trailers");
-        assert!(data.contains("RemoteTrailers") && data.contains("https://youtu.be/x"));
+        // Each URL once, and a nameless trailer has no `Name` key.
+        let data: serde_json::Value =
+            serde_json::from_str(&answer.result.item.data.expect("trailers")).unwrap();
+        assert_eq!(
+            data["RemoteTrailers"],
+            serde_json::json!([
+                {"Url":"https://youtu.be/x","Name":"Clip"},
+                {"Url":"https://youtu.be/y"}
+            ])
+        );
         // A credits payload that was unavailable is a null list, not an empty one.
         let missing = EpisodeExtras {
             people: None,
@@ -594,5 +760,39 @@ mod tests {
         );
         assert!(ordered.result.item.data.is_none());
         assert_eq!(ordered.result.people, Some(Vec::new()));
+    }
+
+    /// `MetadataResult.AddPerson` runs on TheTVDB's credits as on every
+    /// provider's answer (`PeopleHelper.AddPerson`): an actor credited again as
+    /// a guest star in the same role is one guest-star credit
+    /// (`IsSameCredit`), a role-less credit takes the role a later one names,
+    /// and names are trimmed.
+    #[test]
+    fn tvdb_people_merge_credits_as_add_person_does() {
+        let person = |name: &str, person_type: &str, role: Option<&str>| TvdbPerson {
+            name: name.to_owned(),
+            person_type: person_type.to_owned(),
+            role: role.map(str::to_owned),
+            image_url: None,
+        };
+        let people = tvdb_people(&[
+            person("Ann", "Actor", Some("Hero")),
+            person("Ann", "GuestStar", Some("Hero")),
+            person("Bo", "Actor", None),
+            person("Bo", "Actor", Some("Villain")),
+            person(" Cy ", "Unknown", None),
+        ]);
+        let rows: Vec<_> = people
+            .iter()
+            .map(|p| (p.name.as_str(), p.person_type.as_deref(), p.role.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Ann", Some("GuestStar"), Some("Hero")),
+                ("Bo", Some("Actor"), Some("Villain")),
+                ("Cy", Some("Unknown"), None),
+            ]
+        );
     }
 }

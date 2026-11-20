@@ -16,8 +16,10 @@
 //! `LibraryChanged` that Ferrofin did not (`j=1, h=0`).
 //!
 //! Rust shape: there are no C# events here, so the three hooks are direct calls
-//! from `FerrofinLibraryManager`'s `create_items` / `update_items` /
-//! `delete_item` — the same three write paths the C# events fire from.
+//! from the item writers the C# events fire from: the library scan
+//! (`announce_changes`), `FerrofinItemPersistenceService` (its saves, and
+//! `report_item_added` for an item created outside the scan) and
+//! `FerrofinLibraryManager::delete_item`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -132,10 +134,7 @@ impl Pending {
     }
 }
 
-/// The in-process event every debounced change set is published as, its
-/// payload the unfiltered `LibraryUpdateInfo`; never forwarded to clients
-/// (`LibraryChanged` is, filtered per user).
-pub const ITEMS_CHANGED: &str = "ItemsChanged";
+pub use ferrofin_traits::events::ITEMS_CHANGED;
 
 /// Accumulates library changes and pushes a folded `LibraryChanged` at the
 /// end of each batch's window.

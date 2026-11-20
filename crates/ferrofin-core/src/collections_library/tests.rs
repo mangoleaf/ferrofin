@@ -1,5 +1,6 @@
-//! The Collections library as `EnsureLibraryFolder` makes it, and the boot
-//! repair that retires the bare row an older Ferrofin made instead.
+//! The Collections library as `EnsureLibraryFolder` makes it, the boot
+//! repair that retires the bare row an older Ferrofin made instead, and the
+//! one that gives the box sets it made with no folder theirs.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,18 +13,24 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
 use ferrofin_traits::collections::{CollectionCreationOptions, CollectionManager};
 use ferrofin_traits::library::VirtualFolderManager;
+use ferrofin_traits::persistence::ItemPersistenceService as _;
 use ferrofin_traits::system::ServerApplicationPaths;
 use uuid::Uuid;
 
-use crate::adoption_repairs::{MergedCollectionsLibrary, merge_legacy_collections_library};
+use crate::adoption_repairs::{
+    MergedCollectionsLibrary, merge_legacy_collections_library, rekey_pathless_box_sets,
+};
 use crate::item_persistence_service::FerrofinItemPersistenceService;
-use crate::item_type_lookup::{IdDerivation, stored_type_name};
-use crate::library_structure_repository::{ancestors_of, fail_item_deletes, user_data_items};
+use crate::item_type_lookup::{IdDerivation, derive_item_id_with, stored_type_name};
+use crate::library_structure_repository::{
+    ancestors_of, fail_item_deletes, fail_item_rekeys, favourite_item, link_child, linked_children,
+    user_data_items, user_data_row,
+};
 use crate::linked_children_service::FerrofinLinkedChildrenService;
 use crate::test_support::{
     fetch_item, fetch_item_opt, image_info, item_repository_over, library_manager_over, save_item,
-    seed_child_item, seed_folder_with_data, seed_images, seed_user, seed_user_data, set_item_path,
-    test_db,
+    seed_child_item, seed_folder_with_data, seed_images, seed_item, seed_named_item, seed_user,
+    seed_user_data, set_item_path, test_db,
 };
 use crate::user_entity_ext::{get_preference, set_preference};
 use crate::virtual_paths::VirtualPathExpander;
@@ -197,6 +204,27 @@ impl Lab {
             &self.expander,
         )
         .await
+    }
+
+    async fn rekey_box_sets(&self) -> Result<usize, ferrofin_traits::error::ServiceError> {
+        rekey_pathless_box_sets(
+            &self.db,
+            &self.mode,
+            (&self.paths.data_path(), &self.paths.root_folder_path()),
+            &self.expander,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Where the repair and a create put a box set named `folder`, and the
+    /// id that path derives.
+    fn box_set_at(&self, folder: &str) -> (PathBuf, Uuid) {
+        let path = self.collections().join(format!("{folder} [boxset]"));
+        let id = derive_item_id_with(&self.mode, BaseItemKind::BoxSet, &path.to_string_lossy())
+            .expect("id");
+        (path, id)
     }
 
     async fn create(&self, name: &str) -> ferrofin_db::entities::base_items::BaseItemEntity {
@@ -700,4 +728,178 @@ async fn the_database_is_copied_only_when_there_is_work() {
     lab.seed_box_set("Heist", legacy).await;
     assert!(lab.merge().await.expect("repair").is_some());
     assert!(snapshot.is_file());
+}
+
+/// gl-738: a box set Ferrofin before 1.4.0 created with no folder gets the
+/// folder and id a create of its name gives today, its path stored in the
+/// token form. Its members, the playlist holding it, a user's favourite and
+/// played state and its image move with it, and one never refreshed is
+/// stamped as refreshed. Of two with one name the older gets the plain
+/// folder; a box set with a path is left alone; a scan finds the moved ones
+/// holding their folders; a second boot does nothing; and a later create of
+/// the name takes the next folder.
+#[tokio::test]
+async fn a_box_set_with_no_folder_gets_the_folder_and_id_a_create_gives() {
+    let lab = Lab::new().await;
+    let kept = lab.create("Kept").await;
+    let folder = id(FOLDER_ID);
+    let (older, newer) = (Uuid::from_u128(0xB), Uuid::from_u128(0xA));
+    for box_set in [older, newer] {
+        seed_child_item(&lab.db, box_set, BaseItemKind::BoxSet, "Heist", folder).await;
+    }
+    let earlier = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+        .expect("date")
+        .to_utc();
+    FerrofinItemPersistenceService::new(lab.db.clone())
+        .set_date_last_refreshed(newer, Some(earlier))
+        .await
+        .expect("refresh stamp");
+    let (movie, playlist) = (Uuid::new_v4(), Uuid::new_v4());
+    seed_item(&lab.db, movie, BaseItemKind::Movie).await;
+    seed_named_item(&lab.db, playlist, BaseItemKind::Playlist, "Mix").await;
+    link_child(&lab.db, older, movie).await;
+    link_child(&lab.db, playlist, older).await;
+    let user = Uuid::parse_str(&seed_user(&lab.db, Uuid::from_u128(0x6A)).await.id).expect("id");
+    seed_user_data(&lab.db, user, older, true, None).await;
+    favourite_item(&lab.db, older).await;
+    seed_images(
+        &lab.db,
+        older,
+        &[image_info(ImageType::Primary, "/art/heist.jpg", None)],
+    )
+    .await;
+
+    assert_eq!(lab.rekey_box_sets().await.expect("repair"), 2);
+
+    for (old, name) in [(older, "Heist"), (newer, "Heist1")] {
+        let (path, new) = lab.box_set_at(name);
+        assert!(path.is_dir(), "{} is made", path.display());
+        let row = fetch_item(&lab.db, new).await;
+        let stored = format!("%AppDataPath%/collections/{name} [boxset]");
+        assert_eq!(row.path.as_deref(), Some(stored.as_str()));
+        assert_eq!(row.name.as_deref(), Some("Heist"));
+        assert_eq!(row.parent_id, Some(guid_to_db(folder)));
+        assert!(fetch_item_opt(&lab.db, old).await.is_none(), "{name}");
+        let refreshed = row.date_last_refreshed.expect("stamped");
+        if old == older {
+            // Never refreshed: stamped, so a scan's first refresh keeps the name.
+            assert!(refreshed > earlier, "{name}: {refreshed}");
+        } else {
+            assert_eq!(refreshed, earlier, "{name}: a stamp it had stays");
+        }
+    }
+    let folders = Vec::from(
+        ["Heist", "Heist1"].map(|name| lab.box_set_at(name).0.to_string_lossy().into_owned()),
+    );
+    let added = lab
+        .manager()
+        .resolve_box_set_folders(&lab.collections_str(), &folders)
+        .await
+        .expect("scan");
+    assert_eq!(added, Some(Vec::new()), "no second row for a moved box set");
+    let (_, heist) = lab.box_set_at("Heist");
+    assert_eq!(
+        linked_children(&lab.db, heist).await,
+        [
+            (guid_to_db(playlist), guid_to_db(heist)),
+            (guid_to_db(heist), guid_to_db(movie)),
+        ]
+    );
+    assert_eq!(user_data_items(&lab.db, user).await, [guid_to_db(heist)]);
+    let (key, favourite, played) = user_data_row(&lab.db, heist).await;
+    assert_eq!(key, heist.to_string(), "the row is keyed by the new id");
+    assert!(favourite && played);
+    let images = item_repository_over(lab.db.clone())
+        .get_image_infos(heist)
+        .await
+        .expect("images");
+    assert_eq!(images.len(), 1, "{images:?}");
+    let kept_id = Uuid::parse_str(&kept.id).expect("id");
+    assert_eq!(fetch_item(&lab.db, kept_id).await.path, kept.path);
+
+    assert_eq!(lab.rekey_box_sets().await.expect("second boot"), 0);
+    assert_eq!(
+        lab.create("Heist").await.path.as_deref(),
+        Some("%AppDataPath%/collections/Heist2 [boxset]")
+    );
+}
+
+/// A move that fails is undone: the box set keeps its id and no path, the
+/// folder made for it goes, and the next boot gives it one. With no
+/// Collections library its folder is in `{data}/collections`, as a create's.
+#[tokio::test]
+async fn a_failed_box_set_move_is_undone_and_retried_on_the_next_boot() {
+    let lab = Lab::new().await;
+    let box_set = Uuid::new_v4();
+    seed_named_item(&lab.db, box_set, BaseItemKind::BoxSet, "Heist").await;
+    fail_item_rekeys(&lab.db, true).await;
+
+    assert_eq!(lab.rekey_box_sets().await.expect("repair"), 0);
+    let row = fetch_item(&lab.db, box_set).await;
+    assert_eq!(row.path, None);
+    assert!(row.date_last_refreshed.is_some(), "the refresh stamp stays");
+    let (path, to) = lab.box_set_at("Heist");
+    assert!(!path.exists(), "the unused folder is removed");
+
+    fail_item_rekeys(&lab.db, false).await;
+    assert_eq!(lab.rekey_box_sets().await.expect("next boot"), 1);
+    assert!(path.is_dir());
+    assert_eq!(
+        fetch_item(&lab.db, to).await.path.as_deref(),
+        Some("%AppDataPath%/collections/Heist [boxset]")
+    );
+    assert!(fetch_item_opt(&lab.db, box_set).await.is_none());
+}
+
+/// A box set with no folder goes where a create puts one: in the library
+/// location above `{data}/collections` that `FindFolders` finds.
+#[tokio::test]
+async fn a_box_set_with_no_folder_goes_in_the_folder_a_create_finds() {
+    let lab = Lab::new().await;
+    let above = Uuid::new_v4();
+    let data = lab.paths.data_path();
+    seed_folder_with_data(
+        &lab.db,
+        above,
+        BaseItemKind::Folder,
+        "data",
+        "{}",
+        Some(lab.aggregate),
+    )
+    .await;
+    set_item_path(&lab.db, above, &data).await;
+    let box_set = Uuid::new_v4();
+    seed_child_item(&lab.db, box_set, BaseItemKind::BoxSet, "Heist", above).await;
+
+    assert_eq!(lab.rekey_box_sets().await.expect("repair"), 1);
+    let path = format!("{data}/Heist [boxset]");
+    assert!(Path::new(&path).is_dir());
+    let to = derive_item_id_with(&lab.mode, BaseItemKind::BoxSet, &path).expect("id");
+    assert_eq!(
+        fetch_item(&lab.db, to).await.path.as_deref(),
+        Some("%AppDataPath%/Heist [boxset]")
+    );
+}
+
+/// The database file goes aside before a box set moves, and only when one has
+/// no folder.
+#[tokio::test]
+async fn the_database_is_copied_before_box_sets_get_folders() {
+    for pathless in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("jellyfin.db");
+        let db = Database::connect(&format!("sqlite://{}?mode=rwc", file.display()))
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrate");
+        let lab = Lab::over(db, "jellyfin-10.11.8").await;
+        lab.create("Kept").await;
+        if pathless {
+            seed_named_item(&lab.db, Uuid::new_v4(), BaseItemKind::BoxSet, "Heist").await;
+        }
+        let moved = lab.rekey_box_sets().await.expect("repair");
+        assert_eq!(moved, usize::from(pathless));
+        let snapshot = dir.path().join("jellyfin.db.pre-box-set-folders");
+        assert_eq!(snapshot.is_file(), pathless);
+    }
 }

@@ -155,8 +155,9 @@ async fn get_device_options(
 /// `POST /Devices/Options` — update a device's custom name.
 ///
 /// Port of `DevicesController.UpdateDeviceOptions`: upserts the device's custom
-/// name (only that field of the DTO is used, matching the C# call). Returns
-/// `204 No Content`.
+/// name (only that field of the DTO is used, matching the C# call), then renames
+/// the device's live sessions as upstream's `DeviceOptionsUpdated` handler does.
+/// Returns `204 No Content`.
 #[utoipa::path(
     post,
     path = "/Devices/Options",
@@ -176,6 +177,11 @@ async fn update_device_options(
         .devices
         .update_device_options(id, options.custom_name.as_deref())
         .await?;
+    // C# `DeviceOptionsUpdated` → `SessionManager.OnDeviceManagerDeviceOptionsUpdated`.
+    state
+        .sessions
+        .on_device_options_updated(id, options.custom_name.as_deref())
+        .await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -200,16 +206,12 @@ async fn delete_devices(
     Query(query): Query<DeleteDevicesQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     // Comma-delimited id list (Jellyfin's `string[]` query binding).
-    let ids: Vec<&str> = query
-        .id
-        .as_deref()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids: Vec<&str> = query.id.as_deref().map_or_default(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
 
     // Resolve every id first; a single unknown device fails the whole request
     // (C# returns `BadRequest` when `devices.Any(f => f is null)`).

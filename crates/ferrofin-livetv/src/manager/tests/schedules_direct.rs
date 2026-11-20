@@ -11,12 +11,13 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Utc};
 use ferrofin_db::Database;
+use ferrofin_model::dto::NameValuePair;
 use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::stubs::LiveTvManager;
 
-use super::{FakeDto, as_xmltv};
+use super::{FakeDto, as_xmltv, hdhr_device, hdhr_tuner};
 use crate::fetch::{RequestMethod, SourceFetcher, SourceRequest, SourceResponse};
 use crate::manager::FerrofinLiveTvManager;
 use crate::schedules_direct::API_URL;
@@ -85,7 +86,7 @@ impl Upstream {
 }
 
 fn sd_path(url: &str) -> &str {
-    let rest = url.strip_prefix(API_URL).unwrap_or(url);
+    let rest = url.trim_prefix(API_URL);
     rest.split('?').next().unwrap_or(rest)
 }
 
@@ -112,8 +113,7 @@ impl SourceFetcher for Upstream {
         let body = request
             .json
             .as_deref()
-            .map(String::from_utf8_lossy)
-            .unwrap_or_default();
+            .map_or_default(String::from_utf8_lossy);
         let routes = self.sd.lock().unwrap();
         let matches = |(m, p, _, _, _): &&Route| *m == request.method && p == path;
         let (status, body) = routes
@@ -578,7 +578,7 @@ async fn airings(mgr: &FerrofinLiveTvManager) -> Vec<(String, String)> {
         .into_iter()
         .map(|p| {
             (
-                p.channel_id.map(|id| id.to_string()).unwrap_or_default(),
+                p.channel_id.map_or_default(|id| id.to_string()),
                 p.name.unwrap_or_default(),
             )
         })
@@ -663,6 +663,46 @@ async fn a_provider_enabled_for_one_tuner_binds_only_its_channels() {
         serde_json::from_slice(schedules[0].json.as_deref().expect("body")).expect("json");
     assert_eq!(body[0]["stationID"], "20454");
     assert_eq!(airings(&mgr).await.len(), 1);
+}
+
+/// An HDHomeRun channel binds to an SD station through a mapping keyed on its
+/// `hdhr_{GuideNumber}` id (`GetEpgChannelFromTunerChannel`'s
+/// `GetMappedChannel(tunerChannel.Id, …)`): nothing else matches here, so SD is
+/// asked for that station only because the mapping applied.
+#[tokio::test]
+async fn an_hdhomerun_channel_binds_to_the_station_mapped_to_its_hdhr_id() {
+    let (mgr, upstream, _dir) = setup().await;
+    for (url, body) in hdhr_device() {
+        upstream.serve(&url, &body);
+    }
+    upstream.answer(RequestMethod::Post, "/token", 200, TOKEN_OK);
+    upstream.answer(RequestMethod::Get, "/lineups/USA-OTA-90210", 200, LINEUP);
+    mgr.save_tuner_host(hdhr_tuner()).await.expect("tuner");
+    mgr.save_listing_provider(
+        ListingsProviderInfo {
+            listings_id: Some("USA-OTA-90210".to_owned()),
+            channel_mappings: vec![NameValuePair {
+                name: Some("hdhr_4.1".to_owned()),
+                value: Some("20454".to_owned()),
+            }],
+            ..sd_account()
+        },
+        false,
+        false,
+    )
+    .await
+    .expect("provider");
+    upstream.answer(RequestMethod::Post, "/schedules", 200, &one_airing());
+    upstream.answer(RequestMethod::Post, "/programs", 200, &titled("Show"));
+    mgr.refresh_guide().await.expect("refresh");
+
+    let schedules = upstream.sent("/schedules");
+    assert_eq!(schedules.len(), 1);
+    let body: serde_json::Value =
+        serde_json::from_slice(schedules[0].json.as_deref().expect("body")).expect("json");
+    assert_eq!(body[0]["stationID"], "20454");
+    let channel = crate::manager::internal_channel_id("hdhr_4.1").to_string();
+    assert_eq!(airings(&mgr).await, [(channel, "Show".to_owned())]);
 }
 
 /// A tuner whose playlist cannot be read binds no station this pass, so SD

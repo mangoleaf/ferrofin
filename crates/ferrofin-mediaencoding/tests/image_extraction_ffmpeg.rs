@@ -1,10 +1,10 @@
 //! Real-ffmpeg integration test for `MediaEncoder::extract_video_image`, the
 //! chapter-image and screen-grab path: the JPEG it writes keeps the source's
-//! colours. Gated like every ffmpeg test: it runs only with
-//! `FERROFIN_FFMPEG_TESTS=1` and an `ffmpeg` on `PATH`.
+//! colours. `#[ignore]`d like every ffmpeg test; asked for, it needs an
+//! `ffmpeg` on `PATH`.
 //!
 //! Run with:
-//! `FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test image_extraction_ffmpeg`
+//! `cargo test -p ferrofin-mediaencoding --test image_extraction_ffmpeg -- --include-ignored`
 
 mod colour_bars;
 
@@ -48,18 +48,12 @@ fn probed_ffmpeg_version() -> Option<FfmpegVersion> {
 )]
 #[case::untagged(Matrix::Bt601, None)]
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_chapter_image_keeps_the_colours_of_the_source(
     #[case] matrix: Matrix,
     #[case] tags: Option<&str>,
 ) {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").ok().as_deref() != Some("1") {
-        eprintln!("skipping: FERROFIN_FFMPEG_TESTS!=1");
-        return;
-    }
-    let Some(version) = probed_ffmpeg_version() else {
-        eprintln!("skipping: no ffmpeg on PATH, or its version is unreadable");
-        return;
-    };
+    let version = probed_ffmpeg_version().expect("no ffmpeg on PATH, or its version is unreadable");
     if matches!(matrix, Matrix::Bt709) && version < MIN_FFMPEG_JPEG_MATRIX_CONVERSION {
         eprintln!(
             "skipping: ffmpeg {version} is older than {MIN_FFMPEG_JPEG_MATRIX_CONVERSION}, \

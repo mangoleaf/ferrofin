@@ -20,7 +20,8 @@
 //! [`PluginManager::get_plugin_configuration`]: ferrofin_traits::plugins::PluginManager::get_plugin_configuration
 //! [`OpenSubtitlesProvider`]: crate::opensubtitles::OpenSubtitlesProvider
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ferrofin_traits::plugins::PluginManager;
 use serde::Deserialize;
@@ -31,13 +32,17 @@ use uuid::Uuid;
 #[derive(Default)]
 pub struct ConfigSource {
     manager: OnceLock<Arc<dyn PluginManager>>,
+    /// The failure last logged at warn per plugin, until a read succeeds: a
+    /// scan reads the settings once per lookup, so a failure that stays is
+    /// logged at warn once and then at debug (docs/conventions/LOGGING.md rule 1).
+    reported: Mutex<HashMap<Uuid, String>>,
 }
 
 impl std::fmt::Debug for ConfigSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConfigSource")
             .field("attached", &self.manager.get().is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -69,22 +74,39 @@ impl ConfigSource {
     /// bound, the read fails, or the stored JSON does not fit `T`. The manager
     /// already overlays a partial saved config onto the plugin's registered
     /// defaults, so a body saved by an older dashboard still carries every key.
+    ///
+    /// A failure is logged at warn the first time, and at debug while the same
+    /// failure repeats, until a read succeeds.
     pub async fn load<T: serde::de::DeserializeOwned + Default>(&self, plugin_id: Uuid) -> T {
         let Some(manager) = self.manager.get() else {
             return T::default();
         };
-        match manager.get_plugin_configuration(plugin_id).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                tracing::warn!(plugin = %plugin_id, error = %e,
-                               "plugin configuration is unreadable; using defaults");
-                T::default()
-            }),
-            Err(e) => {
-                tracing::warn!(plugin = %plugin_id, error = %e,
-                               "plugin configuration read failed; using defaults");
-                T::default()
-            }
+        let failure = match manager.get_plugin_configuration(plugin_id).await {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(config) => {
+                    self.reported
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&plugin_id);
+                    return config;
+                }
+                Err(e) => e.to_string(),
+            },
+            Err(e) => e.to_string(),
+        };
+        let mut reported = self
+            .reported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reported.get(&plugin_id) == Some(&failure) {
+            tracing::debug!(plugin = %plugin_id, error = %failure,
+                            "plugin configuration still unusable; using defaults");
+        } else {
+            tracing::warn!(plugin = %plugin_id, error = %failure,
+                           "plugin configuration unusable; using defaults");
+            reported.insert(plugin_id, failure);
         }
+        T::default()
     }
 }
 
@@ -102,9 +124,9 @@ pub struct TmdbConfig {
     /// Include adult titles in searches (`SearchMovieAsync(includeAdult:)`).
     pub include_adult: bool,
     /// Drop `keywords` from the series append-to-response
-    /// (`TmdbClientManager.cs:142`), so TMDb keywords stop becoming tags.
+    /// (`TmdbClientManager.cs:152-155`), so TMDb keywords stop becoming tags.
     pub exclude_tags_series: bool,
-    /// Drop `keywords` from the movie append-to-response (`:68`).
+    /// Drop `keywords` from the movie append-to-response (`:78-81`).
     pub exclude_tags_movies: bool,
     /// Overwrite a season's name with TMDb's (`TmdbSeasonProvider.cs:73-76`).
     pub import_season_name: bool,
@@ -234,6 +256,16 @@ impl TmdbConfig {
         raw.as_deref().map(str::trim).filter(|s| !s.is_empty())
     }
 
+    /// Whether `kind`'s images are fetched at their original size: unset, or
+    /// `original` in any case (`TmdbUtils.IsOriginalImageSize`). TMDb's
+    /// width and height describe the original file, so a candidate at any
+    /// other size goes without them (`ConvertToRemoteImageInfo`'s `scaleImage`).
+    #[must_use]
+    pub fn is_original_size(&self, kind: TmdbImageKind) -> bool {
+        self.image_size(kind)
+            .is_none_or(|size| size.eq_ignore_ascii_case("original"))
+    }
+
     /// The absolute CDN URL for a TMDb-relative image `path`.
     ///
     /// `GetUrl` (`TmdbClientManager.cs:514-521`): *"Use `original` as default
@@ -241,7 +273,13 @@ impl TmdbConfig {
     /// already begins with `/`.
     #[must_use]
     pub fn image_url(&self, kind: TmdbImageKind, path: &str) -> String {
-        let size = self.image_size(kind).unwrap_or("original");
+        self.sized_image_url(self.image_size(kind).unwrap_or("original"), path)
+    }
+
+    /// The absolute CDN URL for a TMDb-relative image `path` at the size
+    /// segment `size`, whatever the settings page says.
+    #[must_use]
+    pub fn sized_image_url(&self, size: &str, path: &str) -> String {
         let root = self.image_root.as_deref().unwrap_or(TMDB_IMAGE_ROOT);
         format!("{root}/{size}{path}")
     }
@@ -354,6 +392,9 @@ pub(crate) mod tests_support {
     struct OnePlugin {
         id: Uuid,
         config: std::sync::Mutex<Vec<u8>>,
+        /// Whether `get_plugin` reports the plugin, enabled; otherwise it
+        /// reports none.
+        listed: bool,
     }
 
     #[async_trait]
@@ -361,8 +402,12 @@ pub(crate) mod tests_support {
         async fn list_plugins(&self) -> Result<Vec<PluginDescriptor>, ServiceError> {
             Ok(Vec::new())
         }
-        async fn get_plugin(&self, _id: Uuid) -> Result<Option<PluginDescriptor>, ServiceError> {
-            Ok(None)
+        async fn get_plugin(&self, id: Uuid) -> Result<Option<PluginDescriptor>, ServiceError> {
+            Ok((self.listed && id == self.id).then(|| PluginDescriptor {
+                id,
+                enabled: true,
+                ..PluginDescriptor::default()
+            }))
         }
         async fn enable_plugin(&self, _id: Uuid) -> Result<(), ServiceError> {
             Ok(())
@@ -414,6 +459,16 @@ pub(crate) mod tests_support {
         Arc::new(OnePlugin {
             id: plugin_id,
             config: std::sync::Mutex::new(config),
+            listed: false,
+        })
+    }
+
+    /// A manager that reports `plugin_id` installed and enabled.
+    pub(crate) fn enabled_plugin(plugin_id: Uuid) -> Arc<dyn PluginManager> {
+        Arc::new(OnePlugin {
+            id: plugin_id,
+            config: std::sync::Mutex::new(b"{}".to_vec()),
+            listed: true,
         })
     }
 }
@@ -495,6 +550,24 @@ mod tests {
         );
     }
 
+    /// `TmdbUtilsTests.IsOriginalImageSize_Valid_Success`: an unconfigured
+    /// size fetches the original image, so it keeps the original resolution.
+    #[rstest::rstest]
+    #[case(None, true)]
+    #[case(Some(""), true)]
+    #[case(Some("original"), true)]
+    #[case(Some("Original"), true)]
+    #[case(Some("w500"), false)]
+    #[case(Some("original2"), false)]
+    fn is_original_image_size(#[case] size: Option<&str>, #[case] expected: bool) {
+        use super::TmdbImageKind;
+        let cfg = TmdbConfig {
+            still_size: size.map(str::to_owned),
+            ..TmdbConfig::default()
+        };
+        assert_eq!(cfg.is_original_size(TmdbImageKind::Still), expected);
+    }
+
     /// The client's image root replaces the CDN's, and the settings page's
     /// JSON can never set it.
     #[test]
@@ -563,5 +636,70 @@ mod tests {
         assert!(!src.is_attached());
         let cfg: TmdbConfig = src.load(crate::builtin_plugins::TMDB.id).await;
         assert_eq!(cfg, TmdbConfig::default());
+    }
+
+    /// A configuration that stays unusable is logged at warn once and then at
+    /// debug, since a scan reads it once per lookup; a good read forgets it,
+    /// so a later failure is a warning again.
+    #[tokio::test]
+    async fn an_unusable_configuration_is_warned_once_until_it_reads() {
+        use crate::log_capture::{LogBuffer, init_log_capture};
+        use tracing::instrument::WithSubscriber as _;
+
+        init_log_capture();
+        let id = crate::builtin_plugins::TMDB.id;
+        let wrong_kind = br#"{"PosterSize":500}"#.to_vec();
+        let manager = super::tests_support::manager_with(id, wrong_kind.clone());
+        let src = ConfigSource::new();
+        src.attach(std::sync::Arc::clone(&manager));
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .finish();
+        async {
+            for _ in 0..3 {
+                let cfg: TmdbConfig = src.load(id).await;
+                assert_eq!(cfg, TmdbConfig::default());
+            }
+            let good = br#"{"PosterSize":"w500"}"#.to_vec();
+            manager.set_plugin_configuration(id, good).await.unwrap();
+            let cfg: TmdbConfig = src.load(id).await;
+            assert_eq!(cfg.poster_size.as_deref(), Some("w500"));
+            manager
+                .set_plugin_configuration(id, wrong_kind)
+                .await
+                .unwrap();
+            let _: TmdbConfig = src.load(id).await;
+            // Another plugin's read fails on its own account: the manager knows
+            // no such plugin.
+            for _ in 0..2 {
+                let cfg: OmdbConfig = src.load(crate::builtin_plugins::OMDB.id).await;
+                assert_eq!(cfg, OmdbConfig::default());
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let lines = |level: &str, plugin: uuid::Uuid| {
+            logs.lines()
+                .filter(|line| {
+                    line.contains(level)
+                        && line.contains("plugin configuration")
+                        && line.contains(&plugin.to_string())
+                })
+                .count()
+        };
+        assert_eq!(
+            lines("WARN", id),
+            2,
+            "the first failure and the one after a good read:\n{logs}"
+        );
+        assert_eq!(lines("DEBUG", id), 2, "the two repeats:\n{logs}");
+        let omdb = crate::builtin_plugins::OMDB.id;
+        assert_eq!(lines("WARN", omdb), 1, "the failed read:\n{logs}");
+        assert_eq!(lines("DEBUG", omdb), 1, "its repeat:\n{logs}");
     }
 }

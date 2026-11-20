@@ -69,7 +69,7 @@ fn known_proxies_parse_as_add_proxy_addresses_does(
 fn a_proxy_named_by_host_name_vouches_for_its_client() {
     let nm = manager_with(&["localhost"], true, true);
     assert_eq!(
-        nm.client_address(ip("127.0.0.1"), &[ip("203.0.113.7")]),
+        nm.client_address(ip("127.0.0.1"), [ip("203.0.113.7")]),
         ip("203.0.113.7")
     );
 }
@@ -99,6 +99,50 @@ fn a_mapped_subnet_is_unmapped_only_within_the_mapped_range() {
     assert!(!nm.is_known_proxy(ip("192.0.2.1")));
 }
 
+/// `AddProxyAddresses` reads an entry with `IPAddress.TryParse`, or
+/// `IPNetwork.TryParse` for a subnet, so the old numeric IPv4 spellings name
+/// proxies too: Jellyfin 12.4 trusted each of these and neither address beside
+/// them (measured over `X-Forwarded-For`).
+#[test]
+fn numeric_ipv4_spellings_name_proxies() {
+    let nm = manager_with(
+        &["0x0a000005", "10.6", "10.0.0.07", "0xa.0x2.0/16"],
+        true,
+        false,
+    );
+    for (address, known) in [
+        ("10.0.0.5", true),
+        ("10.0.0.6", true),
+        ("10.0.0.7", true),
+        ("10.2.0.9", true),
+        ("10.0.0.8", false),
+        ("10.1.2.3", false),
+    ] {
+        assert_eq!(nm.is_known_proxy(ip(address)), known, "{address}");
+    }
+}
+
+/// An unspecified address in any spelling is a single-host proxy, as
+/// `IPAddress.TryParse` reads it before `TryParseToSubnet` could widen it to
+/// the whole address space: it vouches for no real peer.
+#[test]
+fn an_unspecified_address_in_any_spelling_trusts_no_peer() {
+    let nm = manager_with(&["0", "0x0", "0.0", "00", "[::]", "::%1"], true, true);
+    assert_eq!(
+        nm.known_proxies(),
+        [
+            host("0.0.0.0"),
+            host("0.0.0.0"),
+            host("0.0.0.0"),
+            host("0.0.0.0"),
+            host("::"),
+            host("::")
+        ]
+    );
+    assert!(!nm.is_known_proxy(ip("10.0.0.1")));
+    assert!(!nm.is_known_proxy(ip("2001:db8::1")));
+}
+
 /// `ConfigureForwardHeaders` keeps ASP.NET's default `KnownProxies` (`::1`) and
 /// `KnownIPNetworks` (`127.0.0.0/8`) whenever the setting is not empty, even
 /// when no entry parses; an empty setting turns forwarding off altogether.
@@ -108,7 +152,7 @@ fn a_configured_list_also_trusts_the_loopback_defaults() {
         let nm = manager_with(proxies, true, true);
         for loopback in ["127.0.0.1", "127.8.9.10", "::1"] {
             assert_eq!(
-                nm.client_address(ip(loopback), &[ip("203.0.113.7")]),
+                nm.client_address(ip(loopback), [ip("203.0.113.7")]),
                 ip("203.0.113.7"),
                 "{proxies:?} {loopback}"
             );
@@ -116,7 +160,7 @@ fn a_configured_list_also_trusts_the_loopback_defaults() {
     }
     let nm = manager_with(&[], true, true);
     assert_eq!(
-        nm.client_address(ip("127.0.0.1"), &[ip("203.0.113.7")]),
+        nm.client_address(ip("127.0.0.1"), [ip("203.0.113.7")]),
         ip("127.0.0.1")
     );
 }
@@ -134,8 +178,7 @@ fn unparsable_entries_are_reported() {
 }
 
 /// A settings reload that leaves the entries and the address families alone
-/// (every live interface refresh) looks no host name up again; a changed
-/// family does.
+/// looks no host name up again; a changed family does.
 #[test]
 fn host_names_are_resolved_again_only_when_their_inputs_change() {
     static LOOKUPS: AtomicUsize = AtomicUsize::new(0);
@@ -233,7 +276,7 @@ fn an_ipv4_mapped_proxy_is_recognised() {
 fn without_known_proxies_the_chain_is_ignored() {
     let nm = manager(&[]);
     assert_eq!(
-        nm.client_address(ip("10.4.0.9"), &[ip("203.0.113.7")]),
+        nm.client_address(ip("10.4.0.9"), [ip("203.0.113.7")]),
         ip("10.4.0.9")
     );
 }
@@ -243,7 +286,7 @@ fn without_known_proxies_the_chain_is_ignored() {
 fn a_known_proxy_s_client_is_the_client() {
     let nm = manager(&["10.0.0.0/8"]);
     assert_eq!(
-        nm.client_address(ip("10.4.0.9"), &[ip("203.0.113.7")]),
+        nm.client_address(ip("10.4.0.9"), [ip("203.0.113.7")]),
         ip("203.0.113.7")
     );
 }
@@ -254,13 +297,13 @@ fn a_known_proxy_s_client_is_the_client() {
 fn the_walk_stops_at_the_first_unknown_hop() {
     let nm = manager(&["10.0.0.0/8"]);
     assert_eq!(
-        nm.client_address(ip("10.4.0.9"), &[ip("198.51.100.1"), ip("203.0.113.7")]),
+        nm.client_address(ip("10.4.0.9"), [ip("203.0.113.7"), ip("198.51.100.1")]),
         ip("203.0.113.7"),
-        "the rightmost entry is the one the proxy vouched for"
+        "the nearest hop (the rightmost entry) is the one the proxy vouched for"
     );
     // A chain of proxies IS walked through, to the client behind them.
     assert_eq!(
-        nm.client_address(ip("10.4.0.9"), &[ip("203.0.113.7"), ip("10.9.9.9")]),
+        nm.client_address(ip("10.4.0.9"), [ip("10.9.9.9"), ip("203.0.113.7")]),
         ip("203.0.113.7"),
         "a hop that is itself a proxy keeps the walk going"
     );
@@ -271,7 +314,7 @@ fn the_walk_stops_at_the_first_unknown_hop() {
 fn a_stranger_cannot_forge_its_own_address() {
     let nm = manager(&["10.0.0.0/8"]);
     assert_eq!(
-        nm.client_address(ip("198.51.100.4"), &[ip("203.0.113.7")]),
+        nm.client_address(ip("198.51.100.4"), [ip("203.0.113.7")]),
         ip("198.51.100.4")
     );
 }
@@ -281,5 +324,5 @@ fn a_stranger_cannot_forge_its_own_address() {
 #[test]
 fn a_known_proxy_with_no_chain_is_itself() {
     let nm = manager(&["10.0.0.0/8"]);
-    assert_eq!(nm.client_address(ip("10.4.0.9"), &[]), ip("10.4.0.9"));
+    assert_eq!(nm.client_address(ip("10.4.0.9"), []), ip("10.4.0.9"));
 }

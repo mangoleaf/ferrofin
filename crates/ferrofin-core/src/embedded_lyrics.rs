@@ -308,9 +308,7 @@ impl Lyrics {
                 // ATL reads the timestamp as a signed big-endian int.
                 start: start.cast_signed(),
                 end: -1,
-                text: text
-                    .strip_prefix('\n')
-                    .map_or_else(|| text.clone(), str::to_owned),
+                text: text.trim_prefix('\n').to_owned(),
                 beats: Vec::new(),
             })
             .collect();

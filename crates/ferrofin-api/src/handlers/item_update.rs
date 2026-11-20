@@ -35,13 +35,11 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::{BaseItemKind, CollectionType, PersonKind};
 use ferrofin_model::dto::{DayOfWeek, MetadataEditorInfo, NameGuidPair, NameValuePair};
 use ferrofin_model::entities::{MetadataField, SeriesStatus, Video3DFormat};
-use ferrofin_traits::library::ScanTarget;
 use ferrofin_traits::options::InternalItemsQuery;
-use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use ferrofin_util::finite::finite_or_none;
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 
-use crate::handlers::refresh_scan_path;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -71,6 +69,11 @@ pub(crate) async fn update_item(
     Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     JsonBody(request): JsonBody<Box<UpdateItemRequest>>,
 ) -> Result<StatusCode, ApiError> {
+    // Upstream edits the cached item a running refresh also holds, so that
+    // refresh's save carries the edit. Here each loads its own row: wait out
+    // the provider manager's refresh of this item, and keep it out until the
+    // edit is written. TODO(gl-1504): the library scan's refresh too.
+    let metadata = state.providers.lock_item_metadata(item_id).await;
     let mut item = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_deref())
@@ -112,16 +115,15 @@ pub(crate) async fn update_item(
         .update_items(std::slice::from_ref(&item), None)
         .await?;
     // External ids live in their own table (`BaseItemProviders`), so they are a
-    // second write rather than a column on the row. C# strips empty values and
-    // then ASSIGNS the dictionary, which is why this replaces the set instead of
-    // merging into it.
+    // second write rather than a column on the row. C# `SetProviderIds` ASSIGNS
+    // the dictionary, which is why this replaces the set instead of merging into
+    // it; the manager drops, trims and renames the pairs as `TrySetProviderId` does.
     if let Some(ids) = &request.provider_ids {
-        let mut pairs: Vec<(String, String)> = ids
-            .iter()
-            .filter(|(_, v)| !v.is_empty())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let mut pairs: Vec<(String, String)> =
+            ids.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         // A HashMap has no order; sort so the write (and its test) is deterministic.
+        // Of two keys differing only in case, the later in this byte order wins,
+        // where C# keeps the later in the JSON.
         pairs.sort();
         state
             .library
@@ -137,6 +139,9 @@ pub(crate) async fn update_item(
             .update_item_locked_fields(item_id, fields)
             .await?;
     }
+    // The item's own writes are done. TODO(gl-1504): the cascade rewrites
+    // whole child rows with no lock of theirs.
+    drop(metadata);
     cascade_to_children(&state, &item, &previous_ratings, &request, &current_tags).await?;
     // `if (displayOrderChanged) QueueRefresh(series, FullRefresh/FullRefresh,
     // ReplaceAllMetadata, High)` (`:120-132`): the episodes are renumbered under
@@ -148,7 +153,7 @@ pub(crate) async fn update_item(
             replace_all_metadata: true,
             ..MetadataRefreshOptions::default()
         };
-        queue_item_refresh(&state, &item, item_id, &options).await?;
+        state.library.queue_item_refresh(&item, &options).await?;
     }
     // `if (isLockedChanged && item.IsFolder)`: every descendant takes the
     // new lock (`ItemUpdateController.cs:104-113`).
@@ -248,9 +253,10 @@ pub(crate) struct UpdateItemRequest {
     #[serde(default)]
     album_artists: Option<Vec<NameGuidPair>>,
     /// The item's external ids. C# assigns the whole dictionary
-    /// (`item.ProviderIds = request.ProviderIds`), so a key the client dropped
-    /// is REMOVED, not merged — and pairs with an empty value are stripped
-    /// first (`ItemUpdateController.UpdateItem`, v10.11.8 lines 402-410).
+    /// (`item.SetProviderIds(request.ProviderIds)`), so a key the client
+    /// dropped is REMOVED, not merged — and each pair is trimmed and dropped
+    /// when blank or invalid for its provider (`ItemUpdateController.UpdateItem`,
+    /// v12.4 lines 435-438).
     ///
     /// An ABSENT key leaves the stored ids alone. The vendored contract types
     /// `BaseItemDto.ProviderIds` as `nullable: true`, so a body without it is a
@@ -391,7 +397,7 @@ fn apply_update(
 ) {
     item.name.clone_from(&request.name);
     item.forced_sort_name.clone_from(&request.forced_sort_name);
-    item.original_title = non_empty(request.original_title.as_deref());
+    item.original_title = non_blank(request.original_title.as_deref());
     // `item.OriginalLanguage = string.IsNullOrWhiteSpace(request.OriginalLanguage)
     // ? null : request.OriginalLanguage` (`ItemUpdateController.cs:245`): the
     // value is NOT trimmed, an absent member clears it, and the assignment
@@ -413,7 +419,7 @@ fn apply_update(
     item.overview.clone_from(&request.overview);
 
     if let Some(genres) = &request.genres {
-        item.genres = Some(join_distinct(genres));
+        item.genres = Some(distinct_ordinal_ignore_case(genres.iter().cloned()).join("|"));
     }
     if let Some(taglines) = &request.taglines {
         item.tagline = taglines.first().cloned();
@@ -423,26 +429,37 @@ fn apply_update(
             .iter()
             .filter_map(|s| s.name.clone())
             .collect::<Vec<_>>();
-        item.studios = Some(join_distinct(&names));
+        item.studios = Some(distinct_ordinal_ignore_case(names).join("|"));
     }
     if let Some(created) = request.date_created {
         item.date_created = Some(created);
     }
-    if let Some(series_name) = &request.series_name {
+    let kind = BaseItemKind::from_stored_type_name(&item.type_);
+    // `if (request.SeriesName is not null && item is IHasSeries)` (`:286-289`).
+    if let Some(series_name) = &request.series_name
+        && has_series(kind)
+    {
         item.series_name = Some(series_name.clone());
     }
 
     item.end_date = request.end_date;
     item.premiere_date = request.premiere_date;
     item.production_year = request.production_year.map(i64::from);
-    item.official_rating = non_empty(request.official_rating.as_deref());
+    item.official_rating = non_blank(request.official_rating.as_deref());
     item.custom_rating.clone_from(&request.custom_rating);
 
     if let Some(tags) = &request.tags {
-        item.tags = Some(join_distinct(tags));
+        item.tags = Some(trimmed_distinct(tags).join("|"));
     }
     if let Some(locations) = &request.production_locations {
-        item.production_locations = Some(join_distinct(locations));
+        // `Distinct(OrdinalIgnoreCase)` here (`ItemUpdateController.cs:404-407`), then the
+        // mapper drops the blank ones as it saves (`BaseItemMapper.cs:332`).
+        item.production_locations = Some(
+            distinct_ordinal_ignore_case(
+                locations.iter().filter(|p| !p.trim().is_empty()).cloned(),
+            )
+            .join("|"),
+        );
     }
 
     item.preferred_metadata_country_code
@@ -454,31 +471,81 @@ fn apply_update(
     // `if (item is IHasDisplayOrder hasDisplayOrder) hasDisplayOrder.DisplayOrder
     // = request.DisplayOrder` (`ItemUpdateController.cs:412-415`): kept in the
     // row's `Data`, where the series and the box set read it from.
-    if matches!(
-        BaseItemKind::from_stored_type_name(&item.type_),
-        Some(BaseItemKind::Series | BaseItemKind::BoxSet)
-    ) {
+    if matches!(kind, Some(BaseItemKind::Series | BaseItemKind::BoxSet)) {
         set_data_string(item, "DisplayOrder", request.display_order.as_deref());
     }
     apply_kind_fields(item, request);
 
-    if let Some(album) = &request.album {
-        item.album = Some(album.clone());
+    // `case Audio song: song.Album = request.Album` and the `MusicVideo` case
+    // (`:461-467`): only there, and an absent member clears it.
+    if has_album(kind) {
+        item.album.clone_from(&request.album);
     }
-    if let Some(artist_items) = &request.artist_items {
+    // `item is IHasArtist` (`:453-459`).
+    if let Some(artist_items) = &request.artist_items
+        && has_artist(kind)
+    {
         let names: Vec<String> = artist_items
             .iter()
             .filter_map(|a| a.name.clone())
             .collect::<Vec<_>>();
-        item.artists = Some(join_distinct(&names));
+        item.artists = Some(trimmed_distinct(&names).join("|"));
     }
-    if let Some(album_artists) = &request.album_artists {
+    // `item is IHasAlbumArtist` (`:445-451`).
+    if let Some(album_artists) = &request.album_artists
+        && has_album_artist(kind)
+    {
         let names: Vec<String> = album_artists
             .iter()
             .filter_map(|a| a.name.clone())
             .collect::<Vec<_>>();
-        item.album_artists = Some(join_distinct(&names));
+        item.album_artists = Some(trimmed_distinct(&names).join("|"));
     }
+}
+
+/// An `IHasSeries` at `v12.4`: `AudioBook`, `Book`, `Episode`, `Season`
+/// (gl-1619).
+fn has_series(kind: Option<BaseItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            BaseItemKind::AudioBook
+                | BaseItemKind::Book
+                | BaseItemKind::Episode
+                | BaseItemKind::Season
+        )
+    )
+}
+
+/// An `IHasArtist`: `Audio`, `AudioBook` (a subclass of `Audio`), `MusicAlbum`,
+/// `MusicVideo`.
+fn has_artist(kind: Option<BaseItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            BaseItemKind::Audio
+                | BaseItemKind::AudioBook
+                | BaseItemKind::MusicAlbum
+                | BaseItemKind::MusicVideo
+        )
+    )
+}
+
+/// An `IHasAlbumArtist`: `Audio` (and `AudioBook`), `MusicAlbum`.
+fn has_album_artist(kind: Option<BaseItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(BaseItemKind::Audio | BaseItemKind::AudioBook | BaseItemKind::MusicAlbum)
+    )
+}
+
+/// The kinds the editor's `Album` switch names: `Audio` (and `AudioBook`) and
+/// `MusicVideo`.
+fn has_album(kind: Option<BaseItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(BaseItemKind::Audio | BaseItemKind::AudioBook | BaseItemKind::MusicVideo)
+    )
 }
 
 /// The fields `UpdateItem` writes only on some kinds: a video's aspect ratio
@@ -616,14 +683,16 @@ async fn recursive_children(
     Ok(all)
 }
 
-/// The values of a `|`-joined list column.
+/// The values of a `|`-joined tag column, as upstream's `Tags` getter reads
+/// them (`BaseItemMapper.cs:148`): none for a blank column, else every
+/// segment, an empty one included, so a removed blank tag cascades too.
 fn split_list(value: Option<&str>) -> Vec<String> {
-    value
-        .unwrap_or_default()
-        .split('|')
-        .filter(|v| !v.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+    match value {
+        Some(value) if !value.trim().is_empty() => {
+            value.split('|').map(ToOwned::to_owned).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// `a.Except(b)` — ordinal, and distinct like every LINQ set operator.
@@ -657,7 +726,7 @@ impl TagEdit {
         };
         // `request.Tags.Select(t => t.Trim()).Distinct(OrdinalIgnoreCase)`,
         // as the item's own column stores it.
-        let new = split_list(Some(&join_distinct(tags)));
+        let new = trimmed_distinct(tags);
         Self {
             added: except(&new, current),
             removed: except(current, &new),
@@ -670,7 +739,7 @@ impl TagEdit {
         let mut tags = split_list(child.tags.as_deref());
         tags.extend(self.added.iter().cloned());
         let kept = except(&tags, &self.removed);
-        let joined = join_distinct(&kept);
+        let joined = distinct_ordinal_ignore_case(kept).join("|");
         child.tags = (!joined.is_empty() || child.tags.is_some()).then_some(joined);
     }
 }
@@ -886,30 +955,33 @@ async fn cascade_to_children(
     Ok(())
 }
 
-/// Returns the trimmed value, or [`None`] when it is blank — mirrors the C#
-/// `string.IsNullOrWhiteSpace(x) ? null : x` guards.
-fn non_empty(value: Option<&str>) -> Option<String> {
+/// `string.IsNullOrWhiteSpace(x) ? null : x`: the value as sent, untrimmed, or
+/// [`None`] when it is blank (`ItemUpdateController.cs:244,296-298`).
+fn non_blank(value: Option<&str>) -> Option<String> {
     value
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .map(ToOwned::to_owned)
 }
 
-/// Joins values with `|` after a case-insensitive de-duplication, matching how
-/// `ferrofin-db` stores the `Genres`/`Studios`/`Artists`/`Tags` columns and C#'s
-/// `Distinct(StringComparer.OrdinalIgnoreCase)`.
-fn join_distinct(values: &[String]) -> String {
-    let mut seen: Vec<String> = Vec::with_capacity(values.len());
+/// `Distinct(StringComparer.OrdinalIgnoreCase)`: the first of the values .NET's
+/// ordinal ignore-case rule holds equal (the simple invariant uppercase, so `Ä`
+/// and `ä` are one), in order. Nothing is trimmed or dropped: the editor trims
+/// only the tags and the artists, and the mapper drops only blank production
+/// locations (gl-1588).
+fn distinct_ordinal_ignore_case(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
     for value in values {
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        if !seen.iter().any(|s| s.eq_ignore_ascii_case(value)) {
-            seen.push(value.to_owned());
+        if !seen.iter().any(|s| equals_ordinal_ignore_case(s, &value)) {
+            seen.push(value);
         }
     }
-    seen.join("|")
+    seen
+}
+
+/// `values.Select(v => v.Trim()).Distinct(StringComparer.OrdinalIgnoreCase)`,
+/// the editor's tags and artists (`ItemUpdateController.cs:306,449,457`).
+fn trimmed_distinct(values: &[String]) -> Vec<String> {
+    distinct_ordinal_ignore_case(values.iter().map(|v| v.trim().to_owned()))
 }
 
 /// Query parameters for `POST /Items/{itemId}/ContentType`.
@@ -923,7 +995,8 @@ struct ContentTypeQuery {
 
 /// `POST /Items/{itemId}/ContentType` — sets the folder content-type override.
 ///
-/// Port of `ItemUpdateController.UpdateItemContentType`. A missing item is a
+/// Port of `ItemUpdateController.UpdateItemContentType`. A nil id is a `400`
+/// (`GetItemById(Guid.Empty)` throws `ArgumentException`), a missing item a
 /// `404`. Otherwise the server configuration's `ContentTypes` list is saved
 /// without the entry for the item's `ContainingFolderPath` (its own folder for
 /// a folder, its file's directory for a file), with the new type added under
@@ -934,6 +1007,7 @@ struct ContentTypeQuery {
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 204, description = "Content type updated"),
+        (status = 400, description = "A nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -944,6 +1018,9 @@ async fn update_item_content_type(
     Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<ContentTypeQuery>,
 ) -> Result<StatusCode, ApiError> {
+    if item_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     let item = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_deref())
@@ -983,182 +1060,6 @@ struct RefreshQuery {
     regenerate_trickplay: Option<bool>,
 }
 
-/// How `POST /Items/{itemId}/Refresh` refreshes an item — upstream's
-/// `ProviderManager.RefreshItem` and `RefreshArtist`
-/// (`ProviderManager.cs:1211-1290`).
-struct RefreshRoute {
-    /// The folders validated, or the file refreshed, with the request's
-    /// options, as a scan.
-    scan: Option<ScanTarget>,
-    /// The item's own refresh through the provider manager (an item with no
-    /// file of its own).
-    item: bool,
-}
-
-impl RefreshRoute {
-    /// A scan of `target`, which refreshes the item too.
-    fn scan(target: ScanTarget) -> Self {
-        Self {
-            scan: Some(target),
-            item: false,
-        }
-    }
-
-    /// The item's own refresh only.
-    fn item_only() -> Self {
-        Self {
-            scan: None,
-            item: true,
-        }
-    }
-}
-
-/// Routes an item's refresh. A music artist refreshes as
-/// [`artist_refresh_route`] says; everything else as
-/// [`refresh_scan_target`] says, and the item refreshes itself through the
-/// provider manager when no scan covers it.
-async fn refresh_route(
-    state: &AppState,
-    item: &BaseItemEntity,
-    item_id: Uuid,
-) -> Result<RefreshRoute, ApiError> {
-    if BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::MusicArtist) {
-        return artist_refresh_route(state, item, item_id).await;
-    }
-    Ok(match refresh_scan_target(item, item_id) {
-        Some(target) => RefreshRoute::scan(target),
-        None => RefreshRoute::item_only(),
-    })
-}
-
-/// The scan an item's refresh is (`ProviderManager.RefreshItem`), if any. A
-/// CollectionFolder refreshes its physical folders
-/// (`RefreshCollectionFolderChildren`), the root every library, and any
-/// other folder validates its own children — its subtree, not its whole
-/// library — which the scan refreshes along with the folder itself.
-///
-/// A file item (a movie, an episode, a track, a book, a photo, a video…)
-/// refreshes itself (`RefreshSingleItem`) through the same metadata service
-/// the scan runs: here the scan of its one path, so it gets the scan's
-/// refresh decision, merge, field locks, probe, NFO and every metadata
-/// provider, and nothing else of its library is walked.
-///
-/// No scan covers an item upstream validates no children for and that has
-/// no file of its own: a box set's members and a playlist's entries are
-/// linked, not physical (`BoxSet.GetNonCachedChildren` returns none,
-/// `Playlist.ValidateChildrenInternal` is a no-op), a view's folder holds
-/// none, a folder with no path of its own — a virtual season, whose episodes
-/// sit in the series folder — is not `IsFileProtocol`, so
-/// `ValidateChildrenInternal2` validates and refreshes no child
-/// (`Folder.cs:430-436,780-812`), and a person, genre, studio or channel
-/// item has no file. Those refresh through the provider manager.
-pub(crate) fn refresh_scan_target(item: &BaseItemEntity, item_id: Uuid) -> Option<ScanTarget> {
-    if !item.is_folder {
-        return refresh_scan_path(item).map(|path| ScanTarget::Items(vec![path]));
-    }
-    match BaseItemKind::from_stored_type_name(&item.type_) {
-        Some(BaseItemKind::CollectionFolder) => Some(ScanTarget::Library(item_id)),
-        Some(BaseItemKind::AggregateFolder | BaseItemKind::UserRootFolder) => Some(ScanTarget::All),
-        Some(
-            BaseItemKind::BoxSet
-            | BaseItemKind::Playlist
-            | BaseItemKind::ManualPlaylistsFolder
-            | BaseItemKind::PlaylistsFolder
-            | BaseItemKind::UserView,
-        ) => None,
-        _ => item
-            .path
-            .clone()
-            .filter(|p| !p.is_empty())
-            .map(|path| ScanTarget::Paths(vec![path])),
-    }
-}
-
-/// `ProviderManager.RefreshArtist` (`ProviderManager.cs:1258-1290`): the
-/// albums credited to the artist (`ArtistIds`) each name their
-/// `MusicArtist` — the nearest artist folder above them
-/// (`MusicAlbum.GetMusicArtist`) — and those artist folders validate their
-/// CHILDREN with the request's options (`ValidateChildren` refreshes a
-/// folder's children, never the folder itself, `Folder.cs:831-870`); then
-/// the artist refreshes itself (`item.RefreshMetadata`).
-///
-/// A folder-backed artist refreshes itself in the same scan
-/// ([`ScanTarget::Artist`]'s `path`); its own folder is validated only when
-/// one of its credited albums sits under it. An artist known only by name
-/// has no folder (`MusicArtist.ValidateChildrenInternal` returns on
-/// `IsAccessedByName`): the scanner refreshes it after its albums' folders
-/// (a `path` of `None`), its music providers under the request's options —
-/// through the scan queue's priority lane when there is no folder to
-/// validate, so it runs inside a running scan and never beside one. An album
-/// with no artist folder above it names the by-name artist, whose validation
-/// is that no-op, so it is not scanned — as upstream.
-async fn artist_refresh_route(
-    state: &AppState,
-    item: &BaseItemEntity,
-    item_id: Uuid,
-) -> Result<RefreshRoute, ApiError> {
-    let own_folder = item
-        .path
-        .clone()
-        .filter(|p| !p.is_empty())
-        .filter(|_| item.top_parent_id.as_deref().is_some_and(|t| !t.is_empty()));
-    let albums = state
-        .library
-        .get_item_list(&InternalItemsQuery {
-            include_item_types: vec![BaseItemKind::MusicAlbum],
-            artist_ids: vec![item_id],
-            ..InternalItemsQuery::default()
-        })
-        .await?;
-    let mut folders: Vec<String> = Vec::new();
-    for album in &albums {
-        if let Some(path) = artist_folder_above(state, album).await?
-            && !folders.contains(&path)
-        {
-            folders.push(path);
-        }
-    }
-    Ok(RefreshRoute::scan(ScanTarget::Artist {
-        id: item_id,
-        path: own_folder,
-        folders,
-    }))
-}
-
-/// The path of the nearest folder-backed `MusicArtist` above `album` (the
-/// parent chain `MusicAlbum.GetMusicArtist` walks), if any.
-async fn artist_folder_above(
-    state: &AppState,
-    album: &BaseItemEntity,
-) -> Result<Option<String>, ApiError> {
-    let mut seen: Vec<String> = vec![album.id.clone()];
-    let mut next = album.parent_id.clone();
-    while let Some(parent_id) = next.take() {
-        let Ok(parent_uuid) = Uuid::parse_str(&parent_id) else {
-            break;
-        };
-        if seen.contains(&parent_id) {
-            break;
-        }
-        seen.push(parent_id);
-        let Some(parent) = state.library.get_item_by_id(parent_uuid).await? else {
-            break;
-        };
-        match BaseItemKind::from_stored_type_name(&parent.type_) {
-            Some(BaseItemKind::MusicArtist) => {
-                return Ok(parent.path.filter(|p| !p.is_empty()));
-            }
-            Some(
-                BaseItemKind::CollectionFolder
-                | BaseItemKind::AggregateFolder
-                | BaseItemKind::UserRootFolder,
-            ) => break,
-            _ => next = parent.parent_id,
-        }
-    }
-    Ok(None)
-}
-
 /// The wire spelling of the refresh-mode query enum. Mirrors the vendored
 /// contract's `MetadataRefreshMode` (PascalCase), mapped onto the service-layer
 /// [`MetadataRefreshMode`].
@@ -1187,14 +1088,16 @@ impl From<RefreshMode> for MetadataRefreshMode {
 
 /// `POST /Items/{itemId}/Refresh` — queues a metadata/image refresh.
 ///
-/// Port of `ItemRefreshController.RefreshItem`. A missing item is a `404`; on
-/// success the refresh is queued at high priority and the handler returns `204`.
+/// Port of `ItemRefreshController.RefreshItem`. A missing item is a `404`, the
+/// all-zero id a `400` (`GetItemById(Guid.Empty)` throws); on success the
+/// refresh is queued at high priority and the handler returns `204`.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}/Refresh",
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 204, description = "Refresh queued"),
+        (status = 400, description = "A nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -1205,6 +1108,9 @@ async fn refresh_item(
     Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<StatusCode, ApiError> {
+    if item_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     let item = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_deref())
@@ -1230,40 +1136,11 @@ async fn refresh_item(
         query.replace_all_images.unwrap_or(false),
         query.regenerate_trickplay.unwrap_or(false),
     );
-    // Refreshing a folder (a library's CollectionFolder, a series, a season,
-    // an album…) means "validate its children" — `folder.ValidateChildren(…,
-    // options)` — so it drives the filesystem scan over that folder's subtree,
-    // and every item in it refreshes with those options. A file item's
-    // refresh is the scan of its own path: the scan's refresh decision and
-    // merge, with the probe (upstream probes inside `RefreshMetadata`, so a
-    // "Search for missing metadata" re-probes the file and a Default refresh
-    // of an unchanged one does not), the NFO and every metadata provider.
-    queue_item_refresh(&state, &item, item_id, &options).await?;
+    // `_providerManager.QueueRefresh(item.Id, refreshOptions,
+    // RefreshPriority.High)`: a folder validates its subtree, a file
+    // refreshes through the scan of its own path (`queue_item_refresh`).
+    state.library.queue_item_refresh(&item, &options).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Queues the refresh `options` ask of `item`: the scan that covers it (a
-/// folder's subtree, a file's own path), and for an item with no file of its
-/// own — a box set, a playlist, a view, a virtual season, a person, a by-name
-/// artist — the provider queue, which spawns the refresh and returns at once,
-/// like the C# queued refresh.
-async fn queue_item_refresh(
-    state: &AppState,
-    item: &BaseItemEntity,
-    item_id: Uuid,
-    options: &MetadataRefreshOptions,
-) -> Result<(), ApiError> {
-    let route = refresh_route(state, item, item_id).await?;
-    if let Some(target) = route.scan {
-        state.library.queue_refresh_scan(target, options).await?;
-    }
-    if route.item {
-        state
-            .providers
-            .queue_refresh(item_id, options, RefreshPriority::High)
-            .await?;
-    }
-    Ok(())
 }
 
 /// Registers the item-refresh + content-type routes.
@@ -1413,11 +1290,7 @@ async fn offers_content_type(state: &AppState, item: &BaseItemEntity) -> Result<
     });
     if video
         && let (Some(live_tv), Some(path)) = (&state.live_tv, item.path.as_deref())
-        && live_tv
-            .active_recording_paths()
-            .await?
-            .iter()
-            .any(|recording| recording == path)
+        && live_tv.is_active_recording(path).await?
     {
         return Ok(false);
     }
@@ -1451,7 +1324,10 @@ crate::query::query_parameters! {
 
 #[cfg(test)]
 mod tests {
-    use super::{UpdateItemRequest, join_distinct, non_empty, propagate_rating};
+    use super::{
+        TagEdit, UpdateItemRequest, distinct_ordinal_ignore_case, non_blank, propagate_rating,
+        split_list, trimmed_distinct,
+    };
     use rstest::rstest;
 
     /// `ItemUpdateController.UpdateItem` (v12.2 :417-420): a video
@@ -1667,21 +1543,161 @@ mod tests {
         assert_eq!(rating.as_deref(), expected);
     }
 
+    /// `Distinct(StringComparer.OrdinalIgnoreCase)` folds non-ASCII case too and
+    /// keeps every value as sent; the tags and artists alone are trimmed first.
     #[test]
-    fn join_distinct_dedups_case_insensitively() {
-        let values = vec![
-            "Action".to_owned(),
-            "action".to_owned(),
-            " Sci-Fi ".to_owned(),
-            String::new(),
-        ];
-        assert_eq!(join_distinct(&values), "Action|Sci-Fi");
+    fn list_values_dedupe_as_dotnet_does() {
+        let values = [
+            "Action", "action", "Ärger", "ärger", " Sci-Fi ", "Sci-Fi", "",
+        ]
+        .map(ToOwned::to_owned);
+        assert_eq!(
+            distinct_ordinal_ignore_case(values.clone()),
+            ["Action", "Ärger", " Sci-Fi ", "Sci-Fi", ""]
+        );
+        assert_eq!(trimmed_distinct(&values), ["Action", "Ärger", "Sci-Fi", ""]);
+        // .NET's simple uppercase: `ß` has none, so it is not `SS`.
+        assert_eq!(
+            distinct_ordinal_ignore_case(["Straße", "STRASSE"].map(ToOwned::to_owned)).len(),
+            2
+        );
     }
 
     #[test]
-    fn non_empty_trims_and_blanks_to_none() {
-        assert_eq!(non_empty(Some("  x ")), Some("x".to_owned()));
-        assert_eq!(non_empty(Some("   ")), None);
-        assert_eq!(non_empty(None), None);
+    fn non_blank_keeps_the_value_as_sent() {
+        assert_eq!(non_blank(Some("  x ")), Some("  x ".to_owned()));
+        assert_eq!(non_blank(Some("   ")), None);
+        assert_eq!(non_blank(None), None);
+    }
+
+    /// Each field the editor sends is stored as `ItemUpdateController.UpdateItem`
+    /// and the mapper store it (gl-1588).
+    #[test]
+    fn the_editor_stores_each_field_as_upstream_does() {
+        let request: UpdateItemRequest = crate::extract::deserialize_mvc(
+            r#"{"Name":"Movie","OriginalTitle":" Le Film ","OfficialRating":" PG ",
+                "Genres":["Drama"," drama ","Ärger","ärger"],
+                "Studios":[{"Name":"Ölwerk"},{"Name":"ÖLWERK"},{"Name":" Ölwerk "}],
+                "Tags":[" Kept ","kept","Neu"],
+                "ProductionLocations":["Paris","paris"," ","Wien "]}"#,
+        )
+        .expect("binds");
+        let mut item = crate::test_support::minimal_base_item(
+            uuid::Uuid::new_v4(),
+            "Movie",
+            ferrofin_model::data::BaseItemKind::Movie
+                .stored_type_name()
+                .expect("stored name"),
+        );
+        super::apply_update(&mut item, &request, &crate::test_support::FakeLocalization);
+        assert_eq!(item.original_title.as_deref(), Some(" Le Film "));
+        assert_eq!(item.official_rating.as_deref(), Some(" PG "));
+        assert_eq!(item.genres.as_deref(), Some("Drama| drama |Ärger"));
+        assert_eq!(item.studios.as_deref(), Some("Ölwerk| Ölwerk "));
+        assert_eq!(item.tags.as_deref(), Some("Kept|Neu"));
+        assert_eq!(item.production_locations.as_deref(), Some("Paris|Wien "));
+    }
+
+    /// A track's artists and album artists are trimmed, then deduped with .NET's
+    /// case rule (`ItemUpdateController.cs:449,457`).
+    #[test]
+    fn the_editor_trims_and_dedupes_a_tracks_artists() {
+        let request: UpdateItemRequest = crate::extract::deserialize_mvc(
+            r#"{"Name":"Song",
+                "ArtistItems":[{"Name":" Ölwerk "},{"Name":"ölwerk"},{"Name":"Band"}],
+                "AlbumArtists":[{"Name":"Ärger "},{"Name":"ärger"}]}"#,
+        )
+        .expect("binds");
+        let mut item = crate::test_support::minimal_base_item(
+            uuid::Uuid::new_v4(),
+            "Song",
+            ferrofin_model::data::BaseItemKind::Audio
+                .stored_type_name()
+                .expect("stored name"),
+        );
+        super::apply_update(&mut item, &request, &crate::test_support::FakeLocalization);
+        assert_eq!(item.artists.as_deref(), Some("Ölwerk|Band"));
+        assert_eq!(item.album_artists.as_deref(), Some("Ärger"));
+    }
+
+    /// jellyfin-web sends `Album`, `ArtistItems`, `AlbumArtists` and `SeriesName` with
+    /// every save; each is written only on the kinds that have it, and a track's
+    /// `Album` follows the request even when it is absent (gl-1619).
+    #[test]
+    fn the_music_and_series_fields_go_only_where_the_item_has_them() {
+        use ferrofin_model::data::BaseItemKind as K;
+        let item_of = |kind: ferrofin_model::data::BaseItemKind| {
+            let mut item = crate::test_support::minimal_base_item(
+                uuid::Uuid::new_v4(),
+                "Item",
+                kind.stored_type_name().expect("stored name"),
+            );
+            item.album = Some("Kept".to_owned());
+            item.series_name = Some("Kept".to_owned());
+            item
+        };
+        let web: UpdateItemRequest = crate::extract::deserialize_mvc(
+            r#"{"Name":"Item","Album":"An Album","SeriesName":"A Show",
+                "ArtistItems":[{"Name":"Band"}],"AlbumArtists":[{"Name":"Band"}]}"#,
+        )
+        .expect("binds");
+        let cases = [
+            (K::Movie, ("Kept", "Kept", None, None)),
+            // A series is no `IHasSeries`: its own `SeriesName` is never written.
+            (K::Series, ("Kept", "Kept", None, None)),
+            (K::Audio, ("An Album", "Kept", Some("Band"), Some("Band"))),
+            // `Audio`'s subclass, and an `IHasSeries` as well.
+            (
+                K::AudioBook,
+                ("An Album", "A Show", Some("Band"), Some("Band")),
+            ),
+            // Artists, but no case in the `Album` switch.
+            (K::MusicAlbum, ("Kept", "Kept", Some("Band"), Some("Band"))),
+            (K::MusicVideo, ("An Album", "Kept", Some("Band"), None)),
+            (K::Episode, ("Kept", "A Show", None, None)),
+            (K::Season, ("Kept", "A Show", None, None)),
+            (K::Book, ("Kept", "A Show", None, None)),
+        ];
+        for (kind, (album, series, artists, album_artists)) in cases {
+            let mut item = item_of(kind);
+            super::apply_update(&mut item, &web, &crate::test_support::FakeLocalization);
+            assert_eq!(item.album.as_deref(), Some(album), "{kind:?}");
+            assert_eq!(item.series_name.as_deref(), Some(series), "{kind:?}");
+            assert_eq!(item.artists.as_deref(), artists, "{kind:?}");
+            assert_eq!(item.album_artists.as_deref(), album_artists, "{kind:?}");
+        }
+        let bare: UpdateItemRequest =
+            crate::extract::deserialize_mvc(r#"{"Name":"Item"}"#).expect("binds");
+        for kind in [K::Audio, K::AudioBook, K::MusicVideo] {
+            let mut item = item_of(kind);
+            super::apply_update(&mut item, &bare, &crate::test_support::FakeLocalization);
+            assert_eq!(item.album, None, "an absent Album clears a {kind:?}'s");
+        }
+    }
+
+    /// The children's tags take `Concat(added).Except(removed).Distinct(OrdinalIgnoreCase)`,
+    /// untrimmed; a blank tag the parent drops is removed from them too.
+    #[test]
+    fn the_tag_cascade_dedupes_as_dotnet_does_and_trims_nothing() {
+        let edit = TagEdit {
+            added: vec!["Ärger".to_owned()],
+            removed: Vec::new(),
+        };
+        let mut child = crate::test_support::minimal_base_item(
+            uuid::Uuid::new_v4(),
+            "Episode",
+            ferrofin_model::data::BaseItemKind::Episode
+                .stored_type_name()
+                .expect("stored name"),
+        );
+        child.tags = Some("ärger| x ".to_owned());
+        edit.apply(&mut child);
+        assert_eq!(child.tags.as_deref(), Some("ärger| x "));
+
+        let request: UpdateItemRequest =
+            crate::extract::deserialize_mvc(r#"{"Name":"Show","Tags":["Kept"]}"#).expect("binds");
+        let edit = TagEdit::of(&split_list(Some("Kept|")), &request);
+        assert_eq!(edit.removed, [String::new()]);
+        assert_eq!(edit.added, Vec::<String>::new());
     }
 }

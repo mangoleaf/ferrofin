@@ -14,6 +14,14 @@ setup() {
   printf 'on: push\njobs: {}\n' >.github/workflows/ci.yml
   echo 'stages: [test]' >.gitlab-ci.yml
   echo 'fn main() {}' >crates/a.rs
+  # A small pin table in place of the repository's: a toolchain pin and a tool pinned twice.
+  printf '[toolchain]\nchannel = "1.2.3"\n' >rust-toolchain.toml
+  printf 'rust = "1.2.3"\ntool = "0.4.0"\n' >pins.toml
+  echo 'install tool@0.4.0' >tools.txt
+  export CI_CONFIG_PINS='
+rust pins.toml ^rust = "[0-9.]+"
+tool pins.toml ^tool = "[0-9.]+"
+tool tools.txt tool@[0-9.]+'
   git add -A
   git commit -q -m "chore: base"
   git checkout -q -b topic
@@ -204,4 +212,52 @@ commit_file() {
   chmod +x "$BATS_TEST_TMPDIR/bin/glab"
   run "$SCRIPT" check --gitlab
   [ "$status" -eq 1 ]
+}
+
+@test "check: pins that agree pass" {
+  run "$SCRIPT" check
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"pins agree (rust 1.2.3)"* ]]
+}
+
+@test "check: a toolchain pin that differs from rust-toolchain.toml fails and names it" {
+  printf 'rust = "1.2.4"\ntool = "0.4.0"\n' >pins.toml
+  run "$SCRIPT" check
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"pins.toml:1: rust 1.2.4, but rust-toolchain.toml names 1.2.3"* ]]
+}
+
+@test "check: a bump of rust-toolchain.toml alone fails" {
+  printf '[toolchain]\nchannel = "1.3.0"\n' >rust-toolchain.toml
+  run "$SCRIPT" check
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"pins.toml:1: rust 1.2.3, but rust-toolchain.toml names 1.3.0"* ]]
+}
+
+@test "check: a tool pinned twice must name one version" {
+  echo 'install tool@0.5.0' >tools.txt
+  run "$SCRIPT" check
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"tools.txt:1: tool 0.5.0, but pins.toml:2 names 0.4.0"* ]]
+}
+
+@test "check: a pin its pattern no longer finds fails" {
+  printf 'rust-version = "1.2.3"\ntool = "0.4.0"\n' >pins.toml
+  run "$SCRIPT" check
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"pins.toml: no rust pin matches"* ]]
+}
+
+@test "check: a missing pin file fails" {
+  rm tools.txt
+  run "$SCRIPT" check
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"tools.txt: no tool pin matches"* ]]
+}
+
+@test "check: rust-toolchain.toml without a channel fails" {
+  echo '[toolchain]' >rust-toolchain.toml
+  run "$SCRIPT" check
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"rust-toolchain.toml: no channel"* ]]
 }

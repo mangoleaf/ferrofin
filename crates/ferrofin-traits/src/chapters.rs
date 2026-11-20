@@ -23,6 +23,7 @@
 
 use async_trait::async_trait;
 use ferrofin_model::entities_media::ChapterInfo;
+use ferrofin_util::change_watch::Watch;
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -67,6 +68,28 @@ pub trait ChapterManager: Send + Sync {
 
     /// Deletes all chapter data for an item.
     async fn delete_chapter_data(&self, item_id: Uuid) -> Result<(), ServiceError>;
+
+    /// Starts watching the item's chapter data for [`Self::delete_chapter_data`],
+    /// before a refresh of its chapter images reads it, for
+    /// [`Self::save_refreshed_chapters`]. The default watches nothing; an
+    /// implementation whose deletion can land during a refresh overrides
+    /// both.
+    async fn watch_chapter_data(&self, item_id: Uuid) -> Watch<Uuid> {
+        Watch::detached(item_id)
+    }
+
+    /// Saves the chapters a refresh of the item's chapter images updated,
+    /// unless the item's chapter data was deleted since `watch` began: a
+    /// changed file's prune, which the old file's chapters would undo. Whether
+    /// they were saved. The default always saves.
+    async fn save_refreshed_chapters(
+        &self,
+        watch: Watch<Uuid>,
+        chapters: &[ChapterInfo],
+    ) -> Result<bool, ServiceError> {
+        self.save_chapters(*watch.key(), chapters).await?;
+        Ok(true)
+    }
 }
 
 fn _assert_object_safe_chapter_manager(_: &dyn ChapterManager) {}

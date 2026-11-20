@@ -19,7 +19,8 @@
 //!   `ArgumentException`, `InvalidOperationException`) become
 //!   [`ServiceError`] variants: [`ServiceError::NotFound`] for a missing input,
 //!   [`ServiceError::InvalidInput`] for a bad argument/undecodable image, and
-//!   [`ServiceError::Backend`] for an I/O/encode failure.
+//!   [`ServiceError::BackendSource`] for an I/O/encode failure (a
+//!   [`DrawingError`](crate::error::DrawingError), its cause kept as the source).
 //! - `GetImageSize` returns [`ImageDimensions::default`] (`0×0`) on a zero-byte or
 //!   undecodable file, exactly like the Skia `return default;` fallbacks.
 //! - `CreateSplashscreen` builds `{DataPath}/splashscreen.png` (see
@@ -840,9 +841,9 @@ fn composite(
                 }
             }
             if let Some(layer) = foreground {
-                // ponytail: Rust's float syntax, not .NET's double.TryParse (no
-                // thousands separators); any other value is upstream's 0.4.
-                let opacity = layer.trim().parse::<f64>().unwrap_or(0.4);
+                // `double.TryParse`'s styles, in the invariant culture rather
+                // than the server's; any other value is upstream's 0.4.
+                let opacity = ferrofin_util::invariant_float::parse::<f64>(layer).unwrap_or(0.4);
                 // `(byte)((1 - opacity) * 0xFF)`: truncating, and saturating as
                 // .NET 9+ converts, which `as` matches.
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1049,7 +1050,7 @@ fn blur_line(
 /// anything else, where `SKColor.Parse` throws.
 fn parse_sk_color(text: &str) -> Option<image::Rgba<u8>> {
     let hex = text.trim();
-    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    let hex = hex.trim_prefix('#');
     if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -1922,6 +1923,9 @@ mod tests {
     #[case::half("0.5", 128)]
     #[case::not_a_number("dark", 102)]
     #[case::opaque_layer("0", 0)]
+    // `double.TryParse`: Rust's `inf` is no number, and `0,5` is 5.
+    #[case::rust_inf("inf", 102)]
+    #[case::group_separator("0,5", 255)]
     #[tokio::test]
     async fn a_foreground_layer_darkens_the_image(#[case] layer: &str, #[case] grey: u8) {
         let out = composited(

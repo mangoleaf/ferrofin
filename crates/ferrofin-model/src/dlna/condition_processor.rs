@@ -8,67 +8,18 @@
 //! negotiation; here it is a [`StreamBuilderError`], never a panic, since the
 //! conditions come from the client's device profile.
 
+use ferrofin_util::invariant_float;
+
 use super::enums::{ProfileConditionType, ProfileConditionValue};
 use super::profile_condition::ProfileCondition;
 use crate::data::VideoRangeType;
 use crate::media_info::TransportStreamTimestamp;
 
-/// Parses a [`VideoRangeType`] from its wire name, case-insensitively.
-///
-/// Public wrapper over `parse_video_range_type` for reuse by `StreamInfo`.
-#[must_use]
-pub fn parse_video_range_type_pub(value: &str) -> Option<VideoRangeType> {
-    parse_video_range_type(value)
-}
-
-/// Parses a [`VideoRangeType`] from its wire name, case-insensitively.
-///
-/// Mirrors C# `Enum.TryParse<VideoRangeType>(value, true, out _)`.
-fn parse_video_range_type(value: &str) -> Option<VideoRangeType> {
-    for candidate in video_range_type_names() {
-        if candidate.1.eq_ignore_ascii_case(value) {
-            return Some(candidate.0);
-        }
-    }
-    None
-}
-
-/// The wire name of a [`VideoRangeType`], mirroring `Enum.GetName`.
-pub(crate) fn video_range_type_name(value: VideoRangeType) -> &'static str {
-    for candidate in video_range_type_names() {
-        if candidate.0 == value {
-            return candidate.1;
-        }
-    }
-    "Unknown"
-}
-
-/// All [`VideoRangeType`] variants and their wire names, in declaration order
-/// (mirrors `Enum.GetNames<VideoRangeType>()`).
-fn video_range_type_names() -> [(VideoRangeType, &'static str); 13] {
-    [
-        (VideoRangeType::Unknown, "Unknown"),
-        (VideoRangeType::Sdr, "SDR"),
-        (VideoRangeType::Hdr10, "HDR10"),
-        (VideoRangeType::Hlg, "HLG"),
-        (VideoRangeType::Dovi, "DOVI"),
-        (VideoRangeType::DoviWithHdr10, "DOVIWithHDR10"),
-        (VideoRangeType::DoviWithHlg, "DOVIWithHLG"),
-        (VideoRangeType::DoviWithSdr, "DOVIWithSDR"),
-        (VideoRangeType::DoviWithEl, "DOVIWithEL"),
-        (VideoRangeType::DoviWithHdr10Plus, "DOVIWithHDR10Plus"),
-        (VideoRangeType::DoviWithElhdr10Plus, "DOVIWithELHDR10Plus"),
-        (VideoRangeType::DoviInvalid, "DOVIInvalid"),
-        (VideoRangeType::Hdr10Plus, "HDR10Plus"),
-    ]
-}
-
-/// All [`VideoRangeType`] wire names (mirrors `Enum.GetNames<VideoRangeType>()`).
-pub(crate) fn video_range_type_all_names() -> Vec<&'static str> {
-    video_range_type_names()
-        .iter()
-        .map(|(_, name)| *name)
-        .collect()
+/// `Enum.TryParse(value, true, out VideoRangeType result)`: a name in any case, a
+/// number, or a comma list OR'ed, white space around each ignored, as C# parses
+/// them. `None` is its `false` return: empty, white space only, or an unknown name.
+pub(crate) fn parse_video_range_type(value: &str) -> Option<VideoRangeType> {
+    crate::json::enums::try_parse(value, true)
 }
 
 /// What upstream's `ConditionProcessor` and `StreamBuilder` throw for a device
@@ -353,14 +304,14 @@ fn is_double_satisfied(
 
     if condition.condition == ProfileConditionType::EqualsAny {
         for single in condition.value.split('|') {
-            if single.trim().parse::<f64>() == Ok(current_value) {
+            if invariant_float::parse::<f64>(single) == Some(current_value) {
                 return Ok(true);
             }
         }
         return Ok(false);
     }
 
-    if let Ok(expected) = condition.value.parse::<f64>() {
+    if let Some(expected) = invariant_float::parse::<f64>(&condition.value) {
         return match condition.condition {
             ProfileConditionType::Equals => Ok(current_value == expected),
             ProfileConditionType::GreaterThanEqual => Ok(current_value >= expected),
@@ -460,12 +411,10 @@ fn is_range_satisfied_value(
     Ok(false)
 }
 
-pub(crate) use video_range_type_name as range_type_name;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ProfileConditionType::{Equals, LessThanEqual, NotEquals};
+    use ProfileConditionType::{Equals, EqualsAny, LessThanEqual, NotEquals};
 
     fn condition(
         condition: ProfileConditionType,
@@ -486,6 +435,29 @@ mod tests {
             condition, None, None, None, None, profile, None, None, None, None, timestamp, None,
             None, None, 1, None, None, None, None, None,
         )
+    }
+
+    /// `IsConditionSatisfied(condition, double?)` reads the value with
+    /// `double.TryParse(…, NumberStyles.Float | NumberStyles.AllowThousands,
+    /// CultureInfo.InvariantCulture, …)` (`ConditionProcessor.cs:293`, `:303`):
+    /// a group separator and ASCII white space are a number, Rust's `inf` and
+    /// an NBSP are not, so that condition is unsatisfied.
+    #[test]
+    fn a_double_condition_reads_its_value_as_dotnet_does() {
+        let level = |kind, value: &str, current| {
+            is_double_satisfied(
+                &condition(kind, ProfileConditionValue::VideoLevel, value),
+                Some(current),
+            )
+        };
+        assert_eq!(level(LessThanEqual, "1,000", 999.0), Ok(true));
+        assert_eq!(level(LessThanEqual, " 51 ", 41.0), Ok(true));
+        assert_eq!(level(LessThanEqual, "Infinity", 41.0), Ok(true));
+        assert_eq!(level(LessThanEqual, "inf", 41.0), Ok(false));
+        assert_eq!(level(EqualsAny, "1,000|50", 1000.0), Ok(true));
+        assert_eq!(level(EqualsAny, " 50 |1", 50.0), Ok(true));
+        assert_eq!(level(EqualsAny, "inf|50", f64::INFINITY), Ok(false));
+        assert_eq!(level(EqualsAny, "\u{a0}50|1", 50.0), Ok(false));
     }
 
     /// A property an audio file or track has none of is upstream's
@@ -567,6 +539,60 @@ mod tests {
             Err(StreamBuilderError::UnexpectedConditionType(
                 ProfileConditionType::Unrecognized(9)
             ))
+        );
+    }
+
+    /// The range type is read with `Enum.TryParse(value, true, out _)`
+    /// (`ConditionProcessor.cs:366,376`): any case, white space, a number
+    /// declared or not, and a comma list OR'ed (SDR 1 | HDR10 2 is HLG 3). A
+    /// value that does not parse is false for `Equals` and `NotEquals` alike;
+    /// `EqualsAny` skips that entry.
+    #[rstest::rstest]
+    #[case(Equals, "HDR10", VideoRangeType::Hdr10, true)]
+    #[case(Equals, "hdr10", VideoRangeType::Hdr10, true)]
+    #[case(Equals, " HDR10 ", VideoRangeType::Hdr10, true)]
+    #[case(Equals, "2", VideoRangeType::Hdr10, true)]
+    #[case(Equals, "SDR,HDR10", VideoRangeType::Hlg, true)]
+    #[case(Equals, "HDR11", VideoRangeType::Hdr10, false)]
+    #[case(NotEquals, "99", VideoRangeType::Hdr10, true)]
+    #[case(NotEquals, "HDR11", VideoRangeType::Hdr10, false)]
+    #[case(EqualsAny, "HDR11|dovi", VideoRangeType::Dovi, true)]
+    #[case(EqualsAny, "SDR|12", VideoRangeType::Hdr10Plus, true)]
+    #[case(Equals, "2", VideoRangeType::Hdr10Plus, true)]
+    #[case(Equals, "", VideoRangeType::Hdr10, false)]
+    #[case(Equals, "   ", VideoRangeType::Hdr10, false)]
+    #[case(NotEquals, "   ", VideoRangeType::Hdr10, false)]
+    fn a_range_type_condition_parses_its_value_as_enum_try_parse_does(
+        #[case] kind: ProfileConditionType,
+        #[case] value: &str,
+        #[case] current: VideoRangeType,
+        #[case] expected: bool,
+    ) {
+        let c = condition(kind, ProfileConditionValue::VideoRangeType, value);
+        assert_eq!(
+            ConditionProcessor::is_video_condition_satisfied(
+                &c,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(current),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            Ok(expected)
         );
     }
 

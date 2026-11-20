@@ -5,6 +5,7 @@ mod common;
 use std::net::{IpAddr, Ipv4Addr};
 
 use common::CapturingLogger;
+use ferrofin_model::net::{IpData, IpNetwork};
 use ferrofin_networking::net_utils;
 use ferrofin_networking::{
     NetworkConfiguration, NetworkManager, RemoteAccessPolicyResult, StartupConfig,
@@ -107,6 +108,43 @@ fn try_parse_invalid_ip_strings_false(#[case] address: &str) {
     assert!(net_utils::try_parse_to_subnet(address, false).is_none());
 }
 
+/// `TryParseToSubnet` reads an address with `IPAddress.TryParse`, so the old
+/// numeric IPv4 spellings name the same networks they do on Jellyfin, and an
+/// unspecified one is the whole address space, as `IPAddress.Any` is there.
+#[rstest]
+#[case("10.6", "10.0.0.6/32")]
+#[case("0x0a000005", "10.0.0.5/32")]
+#[case("10.0.0.07", "10.0.0.7/32")]
+#[case("0xa.0x2.0/16", "10.2.0.0/16")]
+#[case("0", "0.0.0.0/0")]
+fn numeric_ipv4_spellings_parse_to_subnets(#[case] value: &str, #[case] expected: &str) {
+    let (address, prefix) = expected.split_once('/').expect("a network");
+    let subnet = net_utils::try_parse_to_subnet(value, false)
+        .expect("parses")
+        .subnet;
+    assert_eq!(
+        (subnet.base_address, subnet.prefix_length),
+        (
+            address.parse::<IpAddr>().expect("address"),
+            prefix.parse::<u8>().expect("prefix")
+        ),
+        "{value}"
+    );
+}
+
+/// `TryParseHost` reads an address, with or without a port, the same way.
+#[rstest]
+#[case("10.6", "10.0.0.6")]
+#[case("10.6:8096", "10.0.0.6")]
+#[case("0x0a000005", "10.0.0.5")]
+fn numeric_ipv4_spellings_parse_as_hosts(#[case] host: &str, #[case] expected: &str) {
+    assert_eq!(
+        net_utils::try_parse_host_with(host, true, false, |_| None),
+        Some(vec![expected.parse::<IpAddr>().expect("expected")]),
+        "{host}"
+    );
+}
+
 /// `TryParseToSubnets_InvalidEntries_LogsWarnings`.
 #[test]
 fn try_parse_to_subnets_invalid_entries_logs_warnings() {
@@ -169,6 +207,68 @@ fn try_parse_to_subnets_polarity_mismatch_ipv6_does_not_warn() {
     assert_eq!(excluded.as_ref().map(Vec::len), Some(1));
 
     assert_eq!(logger.warning_count(), 0);
+}
+
+/// The live manager reports the LAN, exclusion and published-server entries
+/// it ignores (upstream's `InitializeLan` at Warning, `InitializeOverrides` at
+/// Error) and its network information (`PrintNetworkInformation(config,
+/// false)` at Information) once per settings load: at construction and at each
+/// save. An override naming an interface is not reported for the parse that
+/// runs before the interfaces are read, an override's URL shows only its scheme
+/// and host, and a network change reports the LAN entries again, as
+/// `OnNetworkChange`'s `InitializeLan` does, but its network information only
+/// at debug (unless IPv6 is enabled and the operating system has none, where
+/// upstream runs the whole `UpdateSettings`).
+#[test]
+fn a_live_manager_reports_ignored_settings_once_per_load() {
+    let config = NetworkConfiguration {
+        local_network_subnets: split("192.168.1.0/24,fd23:184f:2029:0100/56,!lan-printer", ','),
+        published_server_uri_by_subnet: split(
+            "eth0=http://lan.example,nowhere=https://me:pw@wan.example/a,a=b=c",
+            ',',
+        ),
+        ..NetworkConfiguration::default()
+    };
+    let address: IpAddr = "192.168.1.2".parse().expect("address");
+    let mut eth0 = IpData::new(address, Some(IpNetwork::new(address, 24)), "eth0");
+    eth0.index = 2;
+    let logger = Arc::new(CapturingLogger::new());
+    let mut manager = NetworkManager::live_with_enumerator(
+        config.clone(),
+        Arc::new(move |_, _| vec![eth0.clone()]),
+        logger.clone(),
+    );
+
+    let warnings = [
+        "Invalid IPv6 subnet 'fd23:184f:2029:0100/56': IPv6 prefix-only notation is not \
+         supported. Use the full notation including '::' (e.g. 'fd23:184f:2029:0100::/56').",
+        "Invalid subnet '!lan-printer' will be ignored.",
+    ];
+    let errors = [
+        "Unable to parse bind override: nowhere=https://wan.example",
+        "Unable to parse bind override: a=b=c",
+    ];
+    assert_eq!(logger.warnings(), warnings);
+    assert_eq!(logger.errors(), errors);
+    let infos = logger.infos();
+    assert_eq!(infos.len(), 7, "{infos:?}");
+    assert_eq!(infos[0], r#"Defined LAN subnets: ["192.168.1.0/24"]"#);
+    assert_eq!(infos[1], "Defined LAN exclusions: []");
+    assert_eq!(infos[2], r#"Used LAN subnets: ["192.168.1.0/24"]"#);
+    assert_eq!(infos[3], "Filtered interface addresses: [192.168.1.2]");
+    assert!(infos[4].starts_with("Bind Addresses ["), "{infos:?}");
+    assert_eq!(infos[5], "Remote IP filter is Allowlist");
+    assert_eq!(infos[6], "Filtered subnets: []");
+
+    manager.update_settings(&config);
+    assert_eq!(logger.warnings(), [warnings, warnings].concat());
+    assert_eq!(logger.errors(), [errors, errors].concat());
+    assert_eq!(logger.infos(), [infos.clone(), infos.clone()].concat());
+
+    manager.on_network_change_with(|| true);
+    assert_eq!(logger.warnings(), [warnings, warnings, warnings].concat());
+    assert_eq!(logger.errors(), [errors, errors].concat());
+    assert_eq!(logger.infos(), [infos.clone(), infos].concat());
 }
 
 /// `IPv4SubnetMaskMatchesValidIPAddress`.
@@ -432,6 +532,14 @@ fn get_bind_address_published_server_override_parses_host_and_port(
 )]
 #[case("185.10.10.10", "185.10.10.10", RemoteAccessPolicyResult::Allow)]
 #[case("", "100.100.100.100", RemoteAccessPolicyResult::Allow)]
+// Not upstream's cases: `InitializeRemote` reads a bare entry with
+// `IPAddress.TryParse`, so an old numeric spelling names its address.
+#[case("185.2570", "185.0.10.10", RemoteAccessPolicyResult::Allow)]
+#[case(
+    "185.2570",
+    "185.0.10.11",
+    RemoteAccessPolicyResult::RejectDueToNotAllowlistedRemoteIp
+)]
 fn has_remote_access_given_whitelist_allows_only_ips_in_whitelist(
     #[case] addresses: &str,
     #[case] remote_ip: &str,
@@ -675,6 +783,23 @@ fn initialize_overrides_full_url_public_path_differs_from_base_url_logs_warning(
     assert!(!overrides.is_empty(), "the override was parsed");
     let warned = ferrofin_networking::published_urls_missing_base_url(overrides, base_url);
     assert_eq!(!warned.is_empty(), expect_warning, "{warned:?}");
+}
+
+/// gl-1821: a published URL that ends with the base URL in either spelling is
+/// not warned about, whichever spelling was saved, and one that does not still
+/// is. Upstream compares the decoded path with the saved spelling, so it warns
+/// for one saved escaped.
+#[rstest]
+#[case::saved_escaped("/my%20jellyfin", "https://media.example.com/my%20jellyfin", false)]
+#[case::saved_plain("/my jellyfin", "https://media.example.com/my%20jellyfin", false)]
+#[case::elsewhere("/my%20jellyfin", "https://media.example.com/other", true)]
+fn a_base_url_clients_escape_is_found_in_the_published_url(
+    #[case] base_url: &str,
+    #[case] published: &str,
+    #[case] warns: bool,
+) {
+    let warned = ferrofin_networking::published_urls_missing_base_url([published], base_url);
+    assert_eq!(!warned.is_empty(), warns, "{warned:?}");
 }
 
 /// `InitializeOverrides_StartupPublishedServerUrlPathDiffersFromBaseUrl_LogsWarningWithoutCredentials`:

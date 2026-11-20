@@ -607,6 +607,27 @@ class Filed(Scratch):
     def test_the_shipped_links_file_is_valid(self):
         diff.load_filed(diff.HERE / "filed.toml")
 
+    def test_findings_check_the_links_file_as_it_is_now_against_a_finished_run(self):
+        # The run stored Count as unfiled and Name as filed; the file has changed since.
+        difference = lambda path, filed: {"path": path, "at": path, "kind": "value", "oracle": "1", "ferrofin": "2", "filed": filed}
+        run = {"version": 1, "requests": [{"request": "a", "method": "GET", "target": "/x", "source": "", "rules_applied": [],
+                                           "bodies": {"oracle": {}, "ferrofin": {}},
+                                           "differences": [difference("Count", None), difference("Name", 5), difference("Size", None)]}]}
+        write(self.dir, "run/new-differences.json", json.dumps(run))
+        filed = write(self.dir, "f.toml", 'version = 1\n'
+                      '[[filed]]\nrequest = "a"\npath = "Count"\nkind = "value"\nissue = 830\n'   # added after the run
+                      '[[filed]]\nrequest = "a"\npath = "Cuont"\nkind = "value"\nissue = 831\n')  # mistyped
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(diff.main(["findings", "--out", str(self.dir / "run"), "--filed", filed]), 0)
+        text = stdout.getvalue()
+        self.assertIn("# New parity differences: 2 not filed yet", text)
+        self.assertNotIn("`Count` (value)", text)   # filed now
+        self.assertIn("`Name` (value)", text)       # its entry has left the file
+        self.assertIn("`Size` (value)", text)
+        self.assertIn("- `a` `Cuont`: gl-831", text)
+        self.assertNotIn("gl-830", text)
+
 
 class Ledger(Scratch):
     def test_the_ledger_shipped_with_the_harness_is_valid(self):
@@ -1501,10 +1522,11 @@ class Live(Scratch):
         self.assertIn("gl-830", page)
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            self.assertEqual(diff.main(["findings", "--out", str(out)]), 0)
+            self.assertEqual(diff.main(["findings", "--out", str(out), "--filed", filed]), 0)
         text = stdout.getvalue()
         self.assertIn("`Overview` (null)", text)
         self.assertNotIn("`Count` (value)", text)   # filed already: not offered again
+        self.assertNotIn("matched nothing", text)   # the one entry matched
         self.assertIn("GET /Items/m1", text)
         summary = json.loads((out / "results.json").read_text())
         self.assertEqual(summary["unused_filed"], [])
@@ -1521,7 +1543,7 @@ class Live(Scratch):
         body = {"Text": "```" + "x" * 5000}
         new = {"requests": [{"request": "a", "method": "GET", "target": "/x", "source": "", "rules_applied": [], "bodies": {"oracle": body, "ferrofin": {}},
                              "differences": [{"path": "Text", "at": "Text", "kind": "value", "oracle": "1", "ferrofin": "2", "filed": None}]}]}
-        text = diff.findings(new)
+        text = diff.findings(new, [])
         self.assertIn("cut at 4000 characters; the whole body is in new-differences.json", text)
         self.assertIn("````json", text)
 
@@ -1531,7 +1553,7 @@ class Live(Scratch):
                                    "differences": [{"path": p, "at": p, "kind": k, "oracle": "1", "ferrofin": "2", "filed": None} for p, k in diffs]}
         new = {"requests": [entry("a", [("Hashes.Primary." + "a" * 32, "missing"), ("N", "value")]),
                             entry("b", [("Hashes.Primary." + "b" * 32, "missing")])]}
-        text = diff.findings(new)
+        text = diff.findings(new, [])
         self.assertIn("`Hashes.Primary.<tag>` (missing) in 2 request(s)", text)
         self.assertLess(text.index("Hashes.Primary.<tag>"), text.index("`N` (value)"))
 

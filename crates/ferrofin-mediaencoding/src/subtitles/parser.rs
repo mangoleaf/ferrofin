@@ -95,13 +95,14 @@ impl Format {
         }
     }
 
-    /// `LoadSubtitle` into `subtitle`, returning its `ErrorCount`.
-    fn load(self, subtitle: &mut Subtitle, lines: &[String]) -> Result<i32, String> {
+    /// `LoadSubtitle` into `subtitle`, returning its `ErrorCount` and its
+    /// `Errors` (empty for WebVTT, which keeps none).
+    fn load(self, subtitle: &mut Subtitle, lines: &[String]) -> Result<(i32, String), String> {
         match self {
             Self::SubRip => Ok(srt::load(subtitle, lines)),
             Self::Ssa => Ok(ssa::load_ssa(subtitle, lines)),
             Self::Ass => Ok(ssa::load_ass(subtitle, lines)),
-            Self::WebVtt => vtt::load(subtitle, lines),
+            Self::WebVtt => vtt::load(subtitle, lines).map(|errors| (errors, String::new())),
         }
     }
 }
@@ -113,7 +114,7 @@ impl Format {
 /// `ReadLine` loop.
 fn read_all_lines(data: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(data);
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let text = text.trim_prefix('\u{feff}');
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines: Vec<String> = normalized.split('\n').map(str::to_owned).collect();
     if lines.last().is_some_and(String::is_empty) {
@@ -144,18 +145,21 @@ impl SubtitleParser for SubtitleEditParser {
                 "trying a subtitle format parser"
             );
             let mut subtitle = Subtitle::new();
-            let errors = format.load(&mut subtitle, &lines)?;
+            let (errors, messages) = format.load(&mut subtitle, &lines)?;
             if errors == 0 {
                 clean = Some(subtitle);
                 break;
             }
-            // Upstream logs this at error, with libse's messages. Debug here:
-            // it repeats on every request for the same file, so its volume
-            // follows the request rate (LOGGING.md, "Levels mean things").
+            // Upstream logs this at error. Debug here: it repeats on every
+            // request for the same file, so its volume follows the request rate
+            // (LOGGING.md, "Levels mean things"). The messages, as `TryGetErrors`
+            // gives them, only when there are any; they quote the file, so `?`.
+            let messages = (!messages.trim().is_empty()).then(|| tracing::field::debug(&messages));
             tracing::debug!(
                 errors,
                 file_extension,
                 parser = format.name(),
+                messages,
                 "errors encountered while parsing a subtitle"
             );
             first.get_or_insert(subtitle);

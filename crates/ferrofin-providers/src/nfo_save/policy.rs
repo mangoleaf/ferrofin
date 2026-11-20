@@ -106,8 +106,11 @@ pub(super) fn enabled(
     }) {
         return false;
     }
+    // ACCEPTED DIVERGENCE (owner decision 2026-11-19, gl-1870): upstream's
+    // `IsSaverEnabledForItem` also saves an edit over a sidecar that already
+    // exists; Ferrofin writes nothing into a media folder the library did not
+    // open, and a sidecar left in place can be read again at a refresh.
     library.is_some_and(|library| library.save_local_metadata)
-        || (update == ItemUpdateType::MetadataEdit && path.is_file())
 }
 
 #[cfg(test)]
@@ -256,8 +259,9 @@ mod tests {
             true,
             &path
         ));
+        // An existing sidecar does not open the media folder (gl-1870).
         std::fs::write(&path, "<movie />").unwrap();
-        assert!(enabled(
+        assert!(!enabled(
             Some(&library),
             None,
             NfoItemKind::Movie,

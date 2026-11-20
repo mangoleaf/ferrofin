@@ -13,19 +13,21 @@
 //! [module docs](crate::entities):
 //! - `INTEGER` surrogate keys → [`i64`]; other `INTEGER` numerics → [`i64`]
 //!   (`Option<i64>` where nullable).
-//! - `TEXT` `Guid` columns → [`String`] (the hyphenated form as stored; the
-//!   conversion layer parses these into `Uuid`). All foreign keys to
+//! - `TEXT` `Guid` columns → [`String`] (the hyphenated form as stored; callers
+//!   parse these into `Uuid`). All foreign keys to
 //!   `BaseItems` are bare `Guid` columns (there is no ORM navigation).
 //! - `TEXT` `DateTime` columns → [`DateTime<Utc>`](chrono::DateTime).
 //! - `REAL` columns → [`f64`]; `INTEGER` booleans → [`bool`].
 //! - Enum-valued `INTEGER` columns are kept as [`i32`] discriminants and mapped
 //!   onto the [`crate::enums`] types (`ItemValueType`, `LinkedChildType`,
 //!   `MediaStreamTypeEntity`), or for image types onto
-//!   `ferrofin_model::entities::ImageType`, by the conversion layer.
+//!   `ferrofin_model::entities::ImageType`, by callers.
 //! - The `Blurhash` `BLOB` → [`Vec<u8>`]; the `KeyframeTicks` JSON `TEXT` → a
-//!   [`String`] holding the raw JSON (parsed by the conversion layer).
+//!   [`String`] holding the raw JSON (parsed by callers).
 
 use chrono::{DateTime, Utc};
+use ferrofin_model::entities_media::AiredEpisodeOrder;
+use uuid::Uuid;
 
 /// A row of the `BaseItems` table — the central library-item record.
 ///
@@ -531,7 +533,7 @@ pub struct MediaStreamInfoEntity {
 /// item.
 ///
 /// `KeyframeTicks` is a JSON `TEXT` column and kept here as a [`String`]
-/// holding the raw JSON (parsed by the conversion layer).
+/// holding the raw JSON (parsed by callers).
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
 pub struct KeyframeDataEntity {
@@ -581,9 +583,140 @@ pub fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
     out
 }
 
+// The episode and season relations below live here, beside the entity they
+// read, because the API handlers and `ferrofin-core` both need them and the
+// handlers may not depend on `ferrofin-core`.
+
+/// A relation column (`SeriesId`, `SeasonId`, `ParentId`, `ChannelId`, …) as
+/// the item it names: `None` when unset, unparsable or the nil `Guid`, which
+/// C# stores for "no relation".
+#[must_use]
+pub fn relation_id(value: Option<&str>) -> Option<Uuid> {
+    value
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .filter(|id| !id.is_nil())
+}
+
+/// A series' or season's `GetPresentationUniqueKey()`: its stored
+/// `PresentationUniqueKey` when set, else its id (`GetUniqueSeriesKey`); the
+/// key its episodes are queried and matched under.
+#[must_use]
+pub fn presentation_key(item: &BaseItemEntity) -> &str {
+    item.presentation_unique_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .unwrap_or(&item.id)
+}
+
+/// Whether the row's `BaseItem.LocationType` is `Virtual`: it has no path and
+/// is not a channel item (kind `Channel`, or a kind other than a Live TV
+/// channel or program that has a channel). Derived from `Path` and the
+/// source, not from the saved `IsVirtualItem` bit.
+#[must_use]
+pub fn is_virtual_location(item: &BaseItemEntity) -> bool {
+    let kind = item.type_.rsplit('.').next().unwrap_or(&item.type_);
+    let channel = kind == "Channel"
+        || (!matches!(
+            kind,
+            "LiveTvChannel" | "TvChannel" | "LiveTvProgram" | "TvProgram"
+        ) && relation_id(item.channel_id.as_deref()).is_some());
+    item.path.as_deref().is_none_or(str::is_empty) && !channel
+}
+
+/// The row's aired position for `AiredEpisodeOrderComparer` and
+/// `FilterEpisodesBySeason`: its season and episode numbers, premiere date,
+/// and the `Airs*` numbers of its `Data` blob
+/// ([`airs_numbers`](ferrofin_model::entities_media::airs_numbers)), read for
+/// every row, not only specials.
+#[must_use]
+pub fn aired_episode_order(item: &BaseItemEntity) -> AiredEpisodeOrder {
+    let [airs_before_season, airs_after_season, airs_before_episode] =
+        ferrofin_model::entities_media::airs_numbers(item.data.as_deref());
+    AiredEpisodeOrder {
+        season: item.parent_index_number,
+        episode: item.index_number,
+        premiere: item.premiere_date,
+        airs_before_season,
+        airs_after_season,
+        airs_before_episode,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BaseItemEntity, item_values_of};
+    use super::{
+        BaseItemEntity, aired_episode_order, is_virtual_location, item_values_of, presentation_key,
+        relation_id,
+    };
+
+    /// A relation column names an item only when it holds a non-nil `Guid`.
+    #[test]
+    fn relation_id_drops_unset_unparsable_and_nil_values() {
+        let id = uuid::Uuid::from_u128(7);
+        assert_eq!(relation_id(Some(&id.to_string())), Some(id));
+        assert_eq!(relation_id(Some(&id.simple().to_string())), Some(id));
+        assert_eq!(relation_id(Some(&uuid::Uuid::nil().to_string())), None);
+        assert_eq!(relation_id(Some("not a guid")), None);
+        assert_eq!(relation_id(Some("")), None);
+        assert_eq!(relation_id(None), None);
+    }
+
+    /// The stored key wins; an unset or empty one falls back to the id.
+    #[test]
+    fn presentation_key_falls_back_to_the_id() {
+        let mut row = BaseItemEntity {
+            id: "row-id".into(),
+            presentation_unique_key: Some("stored".into()),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(presentation_key(&row), "stored");
+        row.presentation_unique_key = Some(String::new());
+        assert_eq!(presentation_key(&row), "row-id");
+        row.presentation_unique_key = None;
+        assert_eq!(presentation_key(&row), "row-id");
+    }
+
+    #[test]
+    fn virtual_location_uses_path_and_actual_channel_source_instead_of_the_saved_bit() {
+        let mut row = BaseItemEntity {
+            type_: "Episode".into(),
+            path: Some("/media/episode.mkv".into()),
+            is_virtual_item: true,
+            ..Default::default()
+        };
+        assert!(!is_virtual_location(&row));
+        row.path = None;
+        row.is_virtual_item = false;
+        assert!(is_virtual_location(&row));
+        row.channel_id = Some(uuid::Uuid::from_u128(1).to_string());
+        assert!(!is_virtual_location(&row));
+        row.type_ = "LiveTvProgram".into();
+        assert!(is_virtual_location(&row));
+        row.type_ = "Channel".into();
+        row.channel_id = None;
+        assert!(!is_virtual_location(&row));
+    }
+
+    /// Every row's `Airs*` numbers are read, not only a special's, and a blob
+    /// that is no JSON leaves them unset.
+    #[test]
+    fn aired_episode_order_reads_every_row_and_bad_data_is_neutral() {
+        let mut item = BaseItemEntity {
+            parent_index_number: Some(2),
+            index_number: Some(5),
+            data: Some(r#"{"AirsAfterSeasonNumber":1,"AirsBeforeSeasonNumber":3}"#.to_owned()),
+            ..Default::default()
+        };
+        let order = aired_episode_order(&item);
+        assert_eq!(
+            (order.season, order.episode, order.airs_after_season),
+            (Some(2), Some(5), Some(1))
+        );
+        assert_eq!(order.airs_before_season, Some(3));
+        item.data = Some("broken".to_owned());
+        assert_eq!(aired_episode_order(&item).airs_before_season, None);
+        assert_eq!(aired_episode_order(&item).season, Some(2));
+    }
 
     /// The five pipe-joined columns fan out into their `ItemValues` type
     /// discriminants in C#'s order — artists, album artists, genres, studios,

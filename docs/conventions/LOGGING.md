@@ -108,10 +108,10 @@ line and the stderr tail in its errors filtered (`transcoding::ffmpeg_log`). The
 `-user_agent` and `-referer` values go too. An ordinary file transcode's log stays byte
 for byte. A `.strm` item's media path is its target URL, so whatever names that path does
 the same: subtitle extraction, a failed probe and the `.strm` reader log it through
-`redact_url`, and an error that quotes the input (attachment extraction) passes it through
-`redact_urls_in`. A process runner's error that quotes ffmpeg's or ffprobe's arguments (a
-failed spawn or run, unbalanced quoting) also hides the `-user_agent`, `-referer` and
-`-headers` values (`transcoding::shown_argument_line`).
+`redact_url`, and an error that quotes the input (attachment extraction) or ffmpeg's stderr
+(subtitle extraction) passes it through `redact_urls_in`. A process runner's error that
+quotes ffmpeg's or ffprobe's arguments (a failed spawn or run, unbalanced quoting) also hides
+the `-user_agent`, `-referer` and `-headers` values (`transcoding::shown_argument_line`).
 
 ## 6. The sinks are fixed
 
@@ -128,6 +128,8 @@ with `?` (Debug escapes it), never as the message.
 ## 7. Panics must be visible
 
 The panic hook installed in `init_tracing` logs every panic through `tracing` before
-delegating to the previous hook. **Never remove it "temporarily."** Spawned tasks that
+delegating to the previous hook, and records where it happened
+(`ferrofin_util::panic::record_location`) for a scheduled task's `LongErrorMessage`.
+**Never remove it "temporarily."** Spawned tasks that
 can panic must surface it — check the `JoinHandle` or wrap the future body so a panic
 logs `error!` with the `task` field instead of vanishing into a dead handle.

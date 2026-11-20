@@ -114,6 +114,7 @@ impl MediaEncoder for Frames {
         _: &str,
         _: &str,
         _: &MediaSourceInfo,
+        _: Option<&MediaStream>,
         _: i32,
         _: ImageFormat,
     ) -> Result<String, ServiceError> {

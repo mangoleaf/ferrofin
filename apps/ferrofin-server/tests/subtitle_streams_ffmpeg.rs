@@ -5,7 +5,8 @@
 //! track burned in with the fonts its file ships, extracted into the cache;
 //! and an `.srt` sidecar embedded into a progressive stream that starts
 //! mid-file, also from the copy the server cuts to the start for an ffmpeg
-//! that cannot cut it.
+//! that cannot cut it; and a song's embedded subtitle left out of its audio
+//! streams.
 //!
 //! ffmpeg has no PGS encoder, so the subtitle is written here: display sets
 //! drawing a white box in the middle of a black picture ([`SHOWINGS`]).
@@ -13,7 +14,7 @@
 //! older-ffmpeg case hides the version from the server instead:
 //!
 //! ```bash
-//! FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server --test subtitle_streams_ffmpeg
+//! cargo test -p ferrofin-server --test subtitle_streams_ffmpeg -- --include-ignored
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -61,10 +62,10 @@ fn wrapper(root: &Path, name: &str, real: &Path) -> PathBuf {
     path
 }
 
-/// Like [`wrapper`] for ffmpeg, but its `-version` banner is one the server
-/// cannot read (`ffmpeg version N-…`, as static and git builds print), so the
-/// server takes it for the oldest supported ffmpeg, without `-isync`.
-fn unread_version_wrapper(root: &Path, real: &Path) -> PathBuf {
+/// Like [`wrapper`] for ffmpeg, but its `-version` output is a git build's
+/// (`ffmpeg version N-…`) with 4.4's libavutil, so the server reads it as the
+/// oldest supported ffmpeg, 4.4, without `-isync`.
+fn ffmpeg_4_4_wrapper(root: &Path, real: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let path = root.join("bin").join("ffmpeg");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -74,7 +75,8 @@ fn unread_version_wrapper(root: &Path, real: &Path) -> PathBuf {
         "#!/bin/sh\nprintf '%s %s\\n' 'ffmpeg' \"$*\" >> '{}'\n\
          for arg in \"$@\"; do\n\
          if [ \"$arg\" = -version ]; then\n\
-         '{real}' -version | sed '1s/^ffmpeg version [^ ]*/ffmpeg version N-117000-g0123abcd/'\n\
+         '{real}' -version | sed -e '1s/^ffmpeg version [^ ]*/ffmpeg version N-117000-g0123abcd/' \
+         -e 's|^libavutil .*|libavutil      56. 70.100 / 56. 70.100|'\n\
          exit 0\n\
          fi\n\
          done\n\
@@ -548,22 +550,16 @@ fn has_input_sync(ffmpeg: &Path) -> bool {
         .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("-isync"))
 }
 
-/// The real ffmpeg and ffprobe, or `None` (saying why) when this run skips:
-/// `FERROFIN_FFMPEG_TESTS` unset, a tool missing, no libx264, or an ffmpeg
-/// older than 5.1.
+/// The real ffmpeg and ffprobe, or `None` (saying why) when this run skips
+/// because the ffmpeg is older than 5.1. The tests are `#[ignore]`d, so a run
+/// that asks for them fails when a tool or libx264 is missing.
 fn tools() -> Option<(PathBuf, PathBuf)> {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").as_deref() != Ok("1") {
-        eprintln!("skipping: set FERROFIN_FFMPEG_TESTS=1 to run");
-        return None;
-    }
-    let (Some(ffmpeg), Some(ffprobe)) = (tool("ffmpeg"), tool("ffprobe")) else {
-        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
-        return None;
-    };
-    if !can_generate(&ffmpeg) {
-        eprintln!("skipping: this ffmpeg has no libx264 to generate the media");
-        return None;
-    }
+    let ffmpeg = tool("ffmpeg").expect("ffmpeg not found on PATH");
+    let ffprobe = tool("ffprobe").expect("ffprobe not found on PATH");
+    assert!(
+        can_generate(&ffmpeg),
+        "this ffmpeg has no libx264 to generate the media"
+    );
     if !has_input_sync(&ffmpeg) {
         eprintln!("skipping: this ffmpeg is older than 5.1 (no -isync)");
         return None;
@@ -598,6 +594,7 @@ impl Server {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 #[allow(clippy::too_many_lines)]
 async fn bitmap_subtitles_embed_and_burn_in_from_the_movie_and_a_sidecar() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
@@ -698,6 +695,7 @@ async fn bitmap_subtitles_embed_and_burn_in_from_the_movie_and_a_sidecar() {
 /// is a path is written inside the cache folder all the same, by its leaf
 /// (gl-414): nothing lands where the tag points.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_burned_ass_track_reads_the_fonts_its_file_ships_from_the_cache() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
@@ -878,6 +876,7 @@ async fn seeked_text_embeds_start_on_time(
 /// it is the 8.5-11 s cue, still on screen, which moved every stream 0.5 s
 /// later; now it shows from 0 for the 2 s it has left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
@@ -893,8 +892,8 @@ async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
     seeked_text_embeds_start_on_time(&server, root, &real_ffprobe, &movies).await;
 }
 
-/// The same streams on an ffmpeg the server reads no version of (counted as
-/// the oldest supported, 4.4), whose output trim cannot cut the sidecar as
+/// The same streams on an ffmpeg the server reads as the oldest supported,
+/// 4.4 (a git build with 4.4's libavutil), whose output trim cannot cut the sidecar as
 /// `FilterEvents` does (gl-1199): it dropped the cue on screen from 9 s, and
 /// on 4.4 a track converted to ASS started every stream 4.7 s late from 8.2
 /// s. The server cuts the sidecar to the start itself and the embed reads
@@ -902,7 +901,8 @@ async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
 /// copy lives beside the job's output and goes with it when the job is
 /// stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn without_a_readable_version_a_seeked_text_embed_reads_a_copy_cut_to_the_start() {
+#[ignore = "runs the real ffmpeg; run with --ignored"]
+async fn on_ffmpeg_4_4_a_seeked_text_embed_reads_a_copy_cut_to_the_start() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
     };
@@ -910,7 +910,7 @@ async fn without_a_readable_version_a_seeked_text_embed_reads_a_copy_cut_to_the_
     let root = tmp.path();
     let movies = root.join("media").join("movies");
     generate_srt_movie(&real_ffmpeg, &movies.join("Cues (2021)"));
-    let ffmpeg = unread_version_wrapper(root, &real_ffmpeg);
+    let ffmpeg = ffmpeg_4_4_wrapper(root, &real_ffmpeg);
     let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
 
     let server = Server::boot(root, &ffmpeg, &ffprobe).await;
@@ -964,19 +964,27 @@ async fn without_a_readable_version_a_seeked_text_embed_reads_a_copy_cut_to_the_
                 .await;
         }
     }
+    // The files go after `DeletePartialStreamFiles`' 1.5 s wait.
     for copy in copies {
+        for _ in 0..100 {
+            if !Path::new(&copy).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert!(!Path::new(&copy).exists(), "deleted with its job: {copy}");
     }
 }
 
-/// On an ffmpeg the server knows no `-isync` for (an unreadable version
-/// banner counts as the oldest supported), the `.sup` sidecar is read from its
+/// On an ffmpeg the server knows no `-isync` for (a git build with 4.4's
+/// libavutil reads as 4.4), the `.sup` sidecar is read from its
 /// start on its own timestamps and moved back by the seek (gl-929). Embedded
 /// from 1 s, before its first cue, and from 9 s, its cues keep their times on
 /// the movie's clock; burned into the segment from 2 to 4 s the box shows from
 /// 3.5 s. Seeked instead, the sidecar lost its first display set there, and
 /// unsynced its cues came 3.5 s early.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn without_isync_a_bitmap_sidecar_stays_on_the_movies_clock() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
@@ -985,7 +993,7 @@ async fn without_isync_a_bitmap_sidecar_stays_on_the_movies_clock() {
     let root = tmp.path();
     let movies = root.join("media").join("movies");
     generate_movie(&real_ffmpeg, &movies.join("Movie (2020)"));
-    let ffmpeg = unread_version_wrapper(root, &real_ffmpeg);
+    let ffmpeg = ffmpeg_4_4_wrapper(root, &real_ffmpeg);
     let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
 
     let server = Server::boot(root, &ffmpeg, &ffprobe).await;
@@ -1063,6 +1071,7 @@ async fn without_isync_a_bitmap_sidecar_stays_on_the_movies_clock() {
 /// the whole display set an embed from the movie's start holds, at its time on
 /// the movie's clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_seeked_embed_of_a_bitmap_sidecar_keeps_its_first_display_set() {
     let Some((real_ffmpeg, real_ffprobe)) = tools() else {
         return;
@@ -1133,4 +1142,107 @@ async fn a_seeked_embed_of_a_bitmap_sidecar_keeps_its_first_display_set() {
         embed_from_9.contains("-probesize 1G -isync 0 -i file:"),
         "{embed_from_9}"
     );
+}
+
+/// An audio route ignores a `SubtitleStreamIndex`, as upstream's
+/// `AttachMediaSourceInfo` reads it for a video request alone (gl-1780): a
+/// song with an embedded `.srt` track streams as audio, progressively and as
+/// an HLS segment, where mapping the track into the audio-only output with
+/// `SubtitleMethod=Embed` stopped ffmpeg from starting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
+async fn an_audio_stream_ignores_a_requested_embedded_subtitle() {
+    let Some((real_ffmpeg, real_ffprobe)) = tools() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let music = root.join("media").join("music");
+    let album = music.join("Artist").join("Album");
+    std::fs::create_dir_all(&album).unwrap();
+    let srt = root.join("song.srt");
+    std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:04,000\nsung\n\n").unwrap();
+    let status = Command::new(&real_ffmpeg)
+        .args(["-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=10"])
+        .arg("-i")
+        .arg(&srt)
+        .args(["-map", "0:a", "-map", "1:s", "-c:a", "flac", "-c:s", "srt"])
+        .arg(album.join("01 - Song.mka"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "generating the song");
+    let ffmpeg = wrapper(root, "ffmpeg", &real_ffmpeg);
+    let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
+
+    let server = Server::boot(root, &ffmpeg, &ffprobe).await;
+    let type_options = ["MusicArtist", "MusicAlbum", "Audio"]
+        .map(|kind| json!({"Type": kind, "MetadataFetchers": [], "ImageFetchers": []}));
+    let options = json!({
+        "PathInfos": [{"Path": music}],
+        "EnableRealtimeMonitor": false,
+        "EnableInternetProviders": false,
+        "TypeOptions": type_options
+    });
+    server
+        .send(
+            reqwest::Method::POST,
+            "/Library/VirtualFolders?name=Music&collectionType=music&refreshLibrary=false",
+            Some(&json!({"LibraryOptions": options})),
+        )
+        .await;
+    server.scan().await;
+    let songs = server
+        .get("/Items?Recursive=true&IncludeItemTypes=Audio&Fields=MediaSources")
+        .await;
+    let song = &songs["Items"][0];
+    let item = song["Id"].as_str().expect("the song was scanned");
+    let source = &song["MediaSources"][0];
+    let source_id = source["Id"].as_str().unwrap();
+    let subtitle = source["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["Type"] == "Subtitle")
+        .unwrap_or_else(|| panic!("the embedded subtitle in {source}"))["Index"]
+        .as_i64()
+        .unwrap();
+
+    let query =
+        format!("mediaSourceId={source_id}&subtitleStreamIndex={subtitle}&subtitleMethod=Embed");
+    for (what, path) in [
+        (
+            "progressive",
+            format!(
+                "/Audio/{item}/stream?container=mp3&audioCodec=mp3&static=false\
+                 &playSessionId=audio-progressive&{query}"
+            ),
+        ),
+        (
+            "segment",
+            format!(
+                "/Audio/{item}/hls1/main/0.ts?audioCodec=aac&segmentContainer=ts\
+                 &runtimeTicks=0&actualSegmentLengthTicks=30000000\
+                 &playSessionId=audio-hls&{query}"
+            ),
+        ),
+    ] {
+        let output = root.join(format!("audio-{what}.out"));
+        std::fs::write(&output, server.download(&path).await).unwrap();
+        let streams = probe_streams(&real_ffprobe, &output);
+        let kinds: Vec<&Value> = streams.iter().map(|s| &s["codec_type"]).collect();
+        assert_eq!(kinds, [&json!("audio")], "{what}: {streams:?}");
+    }
+    // Neither job mapped the track: the HLS muxer would write it out as
+    // WebVTT segments beside the audio ones.
+    let calls = std::fs::read_to_string(root.join("calls.log")).unwrap();
+    let jobs: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.starts_with("ffmpeg ") && line.contains("/transcodes/"))
+        .collect();
+    assert!(jobs.len() >= 2, "both jobs ran: {calls}");
+    for job in jobs {
+        assert!(job.contains(" -map -0:s "), "{job}");
+        assert!(!job.contains(&format!("-map 0:{subtitle} ")), "{job}");
+    }
 }

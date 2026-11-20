@@ -10,4 +10,4 @@
 
 pub mod extractor;
 
-pub use extractor::{AttachmentExtractorImpl, AttachmentIo, MediaSourceResolver, NoopAttachmentIo};
+pub use extractor::{AttachmentExtractorImpl, AttachmentIo, MediaSourceResolver};

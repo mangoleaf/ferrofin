@@ -6,11 +6,10 @@ use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_model::entities::VideoType;
 use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_traits::media_encoding::TranscodingProgress;
+use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 /// How often an eligible job checks the current throttle policy.
 pub const THROTTLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-/// .NET ticks per second.
-pub const TICKS_PER_SECOND: i64 = 10_000_000;
 /// The minimum runtime eligible for throttling (five minutes).
 pub const MINIMUM_RUNTIME_TICKS: i64 = 300 * TICKS_PER_SECOND;
 

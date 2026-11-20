@@ -11,14 +11,17 @@ use ferrofin_model::entities_media::AiredEpisodeOrder;
 use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_util::stable_sort::stable_sort_by;
 
-/// `folder_ordinal_compare` as it was before gl-1002, verbatim, so the
-/// oracle does not share the key the sort now computes.
+/// `folder_ordinal_compare` as it was before gl-1002, on today's
+/// `OrdinalIgnoreCase` fold (gl-1658), so the oracle does not share the key
+/// the sort now computes.
 fn ordinal_compare_before(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
     match (left, right) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(left), Some(right)) => upper_invariant(left).cmp(&upper_invariant(right)),
+        (Some(left), Some(right)) => {
+            ordinal_ignore_case_key(left).cmp(&ordinal_ignore_case_key(right))
+        }
     }
 }
 

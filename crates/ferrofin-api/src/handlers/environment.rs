@@ -302,5 +302,5 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 crate::query::query_parameters! {
     DirectoryContentsQuery {} => [("get", "/Environment/DirectoryContents")];
-    ParentPathQuery {} => [("get", "/Environment/NetworkShares")];
+    ParentPathQuery {} => [("get", "/Environment/ParentPath")];
 }
