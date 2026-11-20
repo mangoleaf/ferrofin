@@ -15,12 +15,11 @@ use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::stubs::LiveTvManager;
 use ferrofin_traits::system::PathManager;
+use ferrofin_util::ticks::{TICKS_PER_SECOND, UNIX_EPOCH_TICKS};
 use uuid::Uuid;
 
 use crate::ScanCancel;
 use crate::library_scan::off_runtime;
-
-const TICKS_PER_SECOND: i64 = 10_000_000;
 
 /// Extraction and reconciliation without ownership of the library or chapters.
 /// This can be shared with the scanner without a library ownership cycle.
@@ -126,6 +125,9 @@ impl ChapterImageExtractor {
     ///
     /// # Errors
     /// Returns failures reading library options or stored video streams.
+    // One pass over the chapters in `RefreshChapterImages`' order, with its
+    // count and log line; split up it would only scatter the source order.
+    #[allow(clippy::too_many_lines)]
     pub async fn refresh(
         &self,
         video: &BaseItemEntity,
@@ -195,6 +197,7 @@ impl ChapterImageExtractor {
             .paths
             .chapter_image_folder_path(item_id, video.path.as_deref().unwrap_or_default());
         outcome.current_images = off_runtime(|| saved_images(&directory));
+        let mut extracted = 0_u32;
         for chapter in chapters {
             if chapter.start_position_ticks >= video.run_time_ticks.unwrap_or(0) {
                 break;
@@ -220,7 +223,7 @@ impl ChapterImageExtractor {
                 }
             }
             let result = self
-                .refresh_chapter(chapter, &outcome.current_images, &context)
+                .refresh_chapter(chapter, &outcome.current_images, &context, &mut extracted)
                 .await;
             match result {
                 Ok(changed) => outcome.changed |= changed,
@@ -230,6 +233,16 @@ impl ChapterImageExtractor {
                     break;
                 }
             }
+        }
+        // `RefreshChapterImages` logs this at Information; debug here, as a
+        // first run over a library logs it once per video (LOGGING.md rule 1).
+        if extracted > 0 {
+            tracing::debug!(
+                item_id = %item_id,
+                count = extracted,
+                path = %video.path.as_deref().unwrap_or_default(),
+                "extracted chapter images"
+            );
         }
         Ok(outcome)
     }
@@ -253,8 +266,11 @@ impl ChapterImageExtractor {
         let Some(live_tv) = self.live_tv.as_ref().and_then(Weak::upgrade) else {
             return false;
         };
-        match live_tv.active_recording_paths().await {
-            Ok(paths) => paths.iter().any(|path| video.path.as_ref() == Some(path)),
+        match live_tv
+            .is_active_recording(video.path.as_deref().unwrap_or_default())
+            .await
+        {
+            Ok(recording) => recording,
             Err(error) => {
                 tracing::warn!(item_id = %video.id, %error, "active recording lookup failed");
                 true
@@ -262,11 +278,14 @@ impl ChapterImageExtractor {
         }
     }
 
+    /// Reconciles one chapter's image, extracting it when it is due;
+    /// `extracted` counts the images extracted. Returns whether the row changed.
     async fn refresh_chapter(
         &self,
         chapter: &mut ChapterInfo,
         current_images: &[String],
         context: &RefreshContext<'_>,
+        extracted: &mut u32,
     ) -> Result<bool, ServiceError> {
         let target = self.paths.chapter_image_path(
             context.item_id,
@@ -289,6 +308,7 @@ impl ChapterImageExtractor {
                 }
                 chapter.image_date_modified = last_write_time(&target);
                 chapter.image_path = Some(target);
+                *extracted += 1;
                 return Ok(true);
             }
             if chapter
@@ -428,7 +448,7 @@ fn average_chapter_duration(chapters: &[ChapterInfo]) -> i64 {
 /// `0001-01-01`); unset is `DateTime.MinValue`, 0 ticks.
 pub(crate) fn date_modified_ticks(date: Option<DateTime<Utc>>) -> i64 {
     date.map_or(0, |date| {
-        621_355_968_000_000_000
+        UNIX_EPOCH_TICKS
             + date.timestamp() * TICKS_PER_SECOND
             + i64::from(date.timestamp_subsec_nanos() / 100)
     })
@@ -437,8 +457,7 @@ pub(crate) fn date_modified_ticks(date: Option<DateTime<Utc>>) -> i64 {
 fn last_write_time(path: &str) -> DateTime<Utc> {
     off_runtime(|| std::fs::metadata(path))
         .and_then(|metadata| metadata.modified())
-        .map(DateTime::<Utc>::from)
-        .unwrap_or_default()
+        .map_or_default(DateTime::<Utc>::from)
 }
 
 fn saved_images(directory: &str) -> Vec<String> {
@@ -478,12 +497,23 @@ pub(crate) mod tests {
         missing_frame: bool,
         cancel_on: Option<(usize, ScanCancel)>,
         cancel_after: Option<(usize, ScanCancel)>,
+        /// Each extraction notifies the first and waits for the second.
+        hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     }
 
     impl RecordingEncoder {
         pub(crate) fn cancelling_after(call: usize, cancel: ScanCancel) -> Self {
             Self {
                 cancel_after: Some((call, cancel)),
+                ..Default::default()
+            }
+        }
+        pub(crate) fn holding(
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        ) -> Self {
+            Self {
+                hold: Some((entered, release)),
                 ..Default::default()
             }
         }
@@ -543,6 +573,10 @@ pub(crate) mod tests {
             {
                 cancel.cancel();
                 std::future::pending::<()>().await;
+            }
+            if let Some((entered, release)) = &self.hold {
+                entered.notify_one();
+                release.notified().await;
             }
             if self.fail_on == Some(count) {
                 return Err(ServiceError::backend("broken frame"));
@@ -1009,6 +1043,60 @@ pub(crate) mod tests {
         fixture.video.run_time_ticks = None;
         assert!(!fixture.refresh(&mut sparse, true).await.changed);
         assert!(!fixture.refresh(&mut [], true).await.changed);
+    }
+
+    /// Each video logs how many chapter images it extracted, as Jellyfin
+    /// 12.2's `RefreshChapterImages` does (gl-401): after the loop, so a
+    /// failure still counts the ones before it, and not when it extracted none
+    /// (images already saved, or only reconciled).
+    #[tokio::test]
+    async fn a_video_logs_how_many_chapter_images_it_extracted() {
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish(),
+        );
+        let extracted_lines = || {
+            logs.text()
+                .lines()
+                .filter(|line| line.contains("extracted chapter images"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let fixture = Fixture::new(RecordingEncoder::default()).await;
+        let mut all = chapters(&[0, 200_000_000, 400_000_000]);
+        assert!(fixture.refresh(&mut all, true).await.success);
+        // A second pass finds every image saved: nothing extracted, no line.
+        assert!(fixture.refresh(&mut all, true).await.success);
+        // Rows that do not name the saved images yet are pointed at them, a
+        // change but no extraction: no line either.
+        let mut fresh = chapters(&[0, 200_000_000, 400_000_000]);
+        let reconciled = fixture.refresh(&mut fresh, true).await;
+        assert!(reconciled.success && reconciled.changed);
+        assert!(fresh.iter().all(|chapter| chapter.image_path.is_some()));
+        let failing = Fixture::new(RecordingEncoder {
+            fail_on: Some(2),
+            ..Default::default()
+        })
+        .await;
+        let mut stopped = chapters(&[0, 200_000_000, 400_000_000]);
+        assert!(!failing.refresh(&mut stopped, true).await.success);
+
+        let lines = extracted_lines();
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        for (line, fixture, count) in [(&lines[0], &fixture, 3), (&lines[1], &failing, 1)] {
+            for expected in [
+                "DEBUG".to_owned(),
+                format!("item_id={}", Uuid::parse_str(&fixture.video.id).unwrap()),
+                format!("count={count}"),
+                format!("path={}", fixture.video.path.as_deref().unwrap()),
+            ] {
+                assert!(line.contains(&expected), "{expected} missing: {line}");
+            }
+        }
     }
 
     #[tokio::test]

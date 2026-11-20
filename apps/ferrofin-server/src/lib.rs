@@ -27,6 +27,7 @@ mod encoding_options;
 mod existing_database;
 pub mod export_cmd;
 pub mod listen;
+mod log_file;
 mod log_lines;
 pub mod media_encoding;
 pub mod metrics_wiring;
@@ -100,9 +101,11 @@ fn log_startup_banner(config: &Config) {
     );
     tracing::info!(
         bind = %config.bind_addr,
-        port = config.port,
-        https_port = config.https_port,
-        base_url = %config.base_url,
+        // Before the saved network configuration is read: the ports and the
+        // base URL served are on the "ferrofin-server ready" line.
+        bootstrap_port = config.port,
+        bootstrap_https_port = config.https_port,
+        bootstrap_base_url = %config.base_url,
         published_url = config.published_url.as_deref().unwrap_or("<auto>"),
         "network"
     );
@@ -237,30 +240,45 @@ async fn shutdown_signal(
 
 /// The graceful-shutdown future handed to axum: waits for the first shutdown
 /// trigger, then tells connected clients before the socket drains, so they
-/// show "server unavailable" instead of silently hanging (`ServerShuttingDown`
-/// for restart and shutdown alike, where C# sends `ServerRestarting` for a
-/// restart: gl-1123), and closes every WebSocket: an upgraded connection is
-/// outside axum's drain, and a socket that survived would stay bound to the OLD
-/// host's session manager after an in-process restart (Kestrel closes them on
-/// stop; clients reconnect).
+/// show "server unavailable" instead of silently hanging, and closes every
+/// WebSocket: an upgraded connection is outside axum's drain, and a socket that
+/// survived would stay bound to the OLD host's session manager after an
+/// in-process restart (Kestrel closes them on stop; clients reconnect).
+///
+/// The push is `SessionManager.OnApplicationStopping`'s: `ServerRestarting` when
+/// the host comes back ([`restarts_host`], upstream's `ShouldRestart`),
+/// `ServerShuttingDown` otherwise.
 async fn announce_shutdown(
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     sessions: Arc<dyn ferrofin_traits::session::SessionManager>,
+    lifecycle: Arc<state::FerrofinLifecycleController>,
     signals: Signals,
     discovery: Option<tokio::task::AbortHandle>,
 ) {
+    use ferrofin_model::session::SessionMessageType;
     let reason = shutdown_signal(shutdown_rx, &signals).await;
+    // `IsShuttingDown` is `ApplicationStopping`, which a signal cancels too.
+    lifecycle.mark_shutting_down();
     if let Some(discovery) = discovery {
         discovery.abort();
     }
-    tracing::info!(reason, "graceful shutdown requested");
-    let _ = sessions
-        .send_message_to_all_sessions(
-            ferrofin_model::session::SessionMessageType::ServerShuttingDown,
-            "",
-        )
-        .await;
+    // `stop` stores the restart flag before it fires the trigger.
+    let restart = restarts_host(&lifecycle, signals.fired());
+    tracing::info!(reason, restart, "graceful shutdown requested");
+    let message = if restart {
+        SessionMessageType::ServerRestarting
+    } else {
+        SessionMessageType::ServerShuttingDown
+    };
+    let _ = sessions.send_message_to_all_sessions(message, "").await;
     ferrofin_api::handlers::websocket::close_all_sockets();
+}
+
+/// Whether the stop that drained this lifetime restarts the host: an API
+/// restart (`stop(true)`: `POST /System/Restart` or a backup restore) that no
+/// signal raced. A signal exits the process whatever was asked.
+fn restarts_host(lifecycle: &state::FerrofinLifecycleController, signal_fired: bool) -> bool {
+    lifecycle.restart_requested() && !signal_fired
 }
 
 /// Boots the server from a resolved [`Config`] and serves until shutdown.
@@ -471,7 +489,9 @@ struct ProcessMetrics {
 /// program-data paths. It runs after the directory check
 /// (`bootstrap::check_application_paths`, upstream's order), so all three
 /// already exist. A failure stops the boot before the database is opened or a
-/// restore is applied.
+/// restore is applied. A path whose free space cannot be read is logged and
+/// passed, where Jellyfin's `DriveInfo` throws (the deliberate difference
+/// `test_common_paths_for_storage_capacity` records).
 fn check_storage_capacity(config: &Config) -> anyhow::Result<()> {
     ferrofin_core::system_manager::test_common_paths_for_storage_capacity(
         &ferrofin_core::system_manager::FsStorageProbe,
@@ -488,7 +508,7 @@ fn check_storage_capacity(config: &Config) -> anyhow::Result<()> {
 /// leave the startup server unable to answer.
 async fn apply_scheduled_restore_off_runtime(
     config: &Config,
-) -> anyhow::Result<Option<ferrofin_api::handlers::backup::RestoreFailure>> {
+) -> anyhow::Result<Option<ferrofin_core::backup::RestoreFailure>> {
     let config = config.clone();
     tokio::task::spawn_blocking(move || apply_scheduled_restore(&config))
         .await
@@ -506,50 +526,48 @@ async fn apply_scheduled_restore_off_runtime(
 /// to restore is not re-checked, as Jellyfin's restart loop is not.
 fn apply_scheduled_restore(
     config: &Config,
-) -> anyhow::Result<Option<ferrofin_api::handlers::backup::RestoreFailure>> {
+) -> anyhow::Result<Option<ferrofin_core::backup::RestoreFailure>> {
     static STORAGE_CHECKED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
     let roots = boot_tree_roots(config);
     if !STORAGE_CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed)
-        || ferrofin_api::handlers::backup::restore_pending(&roots)
+        || ferrofin_core::backup::restore_pending(&roots)
     {
         check_storage_capacity(config)?;
     }
-    Ok(
-        match ferrofin_api::handlers::backup::apply_pending_restore(&roots) {
-            Ok(Some(archive)) => {
-                tracing::warn!(archive = %archive.display(), "restored backup");
-                None
-            }
-            Ok(None) => None,
-            // Moving the extracted files into place began and failed: the trees are
-            // partly replaced. Jellyfin throws out of startup here; booting on them
-            // would let the web client (which reads "the server answers again" as
-            // success) announce a restore that did not happen. The marker is gone, so
-            // the next boot starts on them, as a restarted Jellyfin does.
-            Err(failure) if failure.partially_applied => {
-                return Err(anyhow::anyhow!(
-                    "the scheduled backup restore failed part-way and the data directory may be \
+    Ok(match ferrofin_core::backup::apply_pending_restore(&roots) {
+        Ok(Some(archive)) => {
+            tracing::warn!(archive = %archive.display(), "restored backup");
+            None
+        }
+        Ok(None) => None,
+        // Moving the extracted files into place began and failed: the trees are
+        // partly replaced. Jellyfin throws out of startup here; booting on them
+        // would let the web client (which reads "the server answers again" as
+        // success) announce a restore that did not happen. The marker is gone, so
+        // the next boot starts on them, as a restarted Jellyfin does.
+        Err(failure) if failure.partially_applied => {
+            return Err(anyhow::anyhow!(
+                "the scheduled backup restore failed part-way and the data directory may be \
                  partly restored: {failure}"
-                ));
-            }
-            // Nothing was replaced (a missing or foreign archive, a marker that could
-            // not be removed, or an extraction that failed and removed what it
-            // wrote): the server boots on its untouched data and records the failure
-            // in the activity log, where an administrator will see it.
-            Err(failure) => {
-                tracing::error!(error = %failure, "scheduled backup restore failed and replaced nothing");
-                Some(failure)
-            }
-        },
-    )
+            ));
+        }
+        // Nothing was replaced (a missing or foreign archive, a marker that could
+        // not be removed, or an extraction that failed and removed what it
+        // wrote): the server boots on its untouched data and records the failure
+        // in the activity log, where an administrator will see it.
+        Err(failure) => {
+            tracing::error!(error = %failure, "scheduled backup restore failed and replaced nothing");
+            Some(failure)
+        }
+    })
 }
 
 /// Records a restore that replaced nothing in the activity log: the only durable,
 /// administrator-visible trace of it.
 async fn record_restore_failure(
     activity: &dyn ferrofin_traits::activity::ActivityManager,
-    failure: &ferrofin_api::handlers::backup::RestoreFailure,
+    failure: &ferrofin_core::backup::RestoreFailure,
 ) {
     let entry = ferrofin_traits::activity::ActivityLogCreate {
         name: "Restoring the backup failed".to_owned(),
@@ -587,7 +605,7 @@ async fn serve_once(
     // addresses below and stays bound for the whole lifetime, so a pending
     // one runs before the bind; with nothing pending the storage check runs
     // after it.
-    let restore_pending = ferrofin_api::handlers::backup::restore_pending(&boot_tree_roots(config));
+    let restore_pending = ferrofin_core::backup::restore_pending(&boot_tree_roots(config));
     let early_restore = if restore_pending {
         Some(apply_scheduled_restore_off_runtime(config).await?)
     } else {
@@ -720,6 +738,7 @@ async fn serve_once(
         ferrofin_api::create_router(wired.state.clone()),
         &config.web_dir,
         Arc::clone(&wired.file_transformations),
+        &wired.state,
     );
 
     // Optional Prometheus `/metrics` (gated on `EnableMetrics`, restart required —
@@ -775,7 +794,7 @@ async fn serve_once(
         .map(tokio::task::JoinHandle::abort_handle);
     // The handover: the listeners serving the startup answers serve the
     // lifetime's router from the next request on, and HTTPS starts with it.
-    let app = lifetime_app(router, &config.base_url, https_redirect(config, &wired));
+    let app = lifetime_app(router, &wired.base_url, https_redirect(&wired));
     serving.serve(https_listeners, &app);
     // `ready` is this lifetime's own, so this is its only `set`.
     let _ = ready.set(app);
@@ -783,6 +802,7 @@ async fn serve_once(
     tracing::info!(
         addresses = ?addresses,
         https_addresses = ?https_addresses,
+        base_url = %wired.base_url,
         "ferrofin-server ready"
     );
 
@@ -791,6 +811,7 @@ async fn serve_once(
             announce_shutdown(
                 shutdown_rx,
                 Arc::clone(&wired.state.sessions),
+                Arc::clone(&wired.lifecycle),
                 signals.clone(),
                 discovery_abort,
             ),
@@ -801,7 +822,7 @@ async fn serve_once(
     // Tear the host down (Jellyfin: `using CoreAppHost` per iteration): stop
     // every background task, then close the pools so nothing from this lifetime
     // still holds the database file when the next one opens — or restores — it.
-    let restart = wired.lifecycle.restart_requested() && !signals.fired();
+    let restart = restarts_host(&wired.lifecycle, signals.fired());
     tear_down_host(wired, discovery, sampler, config.shutdown_timeout_secs).await;
     db.close().await;
     serve_result?;
@@ -821,12 +842,13 @@ async fn serve_once(
 /// restore (applied by the next lifetime, after this one's teardown) never
 /// races a scan writing into the tree it replaces.
 ///
-/// The transcodes are killed and the DVR stopped the same way (gl-141), so no
-/// ffmpeg writes into the transcode cache the next lifetime purges, and every
-/// capture in flight has settled before its database closes: otherwise the
-/// next lifetime would re-arm its timer and record the showing twice. They get
-/// `shutdown_timeout_secs` between them, as upstream's hosted services get the
-/// host's `ShutdownTimeout` to stop in, so a stuck tuner cannot hold a restart.
+/// The attachment extractions and the transcodes are killed and the DVR stopped
+/// the same way (gl-141), so no ffmpeg keeps writing into a cache the next
+/// lifetime purges or extracts into, and every capture in flight has settled
+/// before its database closes: otherwise the next lifetime would re-arm its
+/// timer and record the showing twice. They get `shutdown_timeout_secs`
+/// between them, as upstream's hosted services get the host's
+/// `ShutdownTimeout` to stop in, so a stuck tuner cannot hold a restart.
 async fn tear_down_host(
     wired: WiredApp,
     discovery: Option<tokio::task::JoinHandle<()>>,
@@ -837,7 +859,10 @@ async fn tear_down_host(
     wired.task_manager.shutdown().await;
     wired.state.library.shutdown_scans().await;
     // Transcodes first: a live one holds a tuner stream that Live TV then closes.
+    // Before them the attachment extractions, which are quick to stop and come
+    // before the transcode that burns their fonts in.
     let playback = async {
+        wired.state.attachments.shutdown().await;
         wired.state.hls.shutdown().await;
         if let Some(live_tv) = &wired.state.live_tv {
             live_tv.shutdown().await;
@@ -847,7 +872,7 @@ async fn tear_down_host(
     if tokio::time::timeout(timeout, playback).await.is_err() {
         tracing::warn!(
             timeout_secs,
-            "transcodes or recordings were still stopping when the shutdown timeout ran out; going on without them"
+            "attachment extractions, transcodes or recordings were still stopping when the shutdown timeout ran out; going on without them"
         );
     }
     stop_background_tasks(wired.background).await;
@@ -903,8 +928,8 @@ async fn serve_until_drained(
         .await
 }
 
-/// The lifetime's router behind the path-case, HTTPS-redirect and base-URL
-/// rewrites, which run before routing, and the panic boundary.
+/// The lifetime's router behind the path- and method-case, HTTPS-redirect and
+/// base-URL rewrites, which run before routing, and the panic boundary.
 fn lifetime_app(
     router: axum::Router,
     base: &str,
@@ -915,15 +940,239 @@ fn lifetime_app(
     let app =
         axum::middleware::from_fn_with_state(https_redirect, tls::redirect_to_https).layer(app);
     // Jellyfin's `ExceptionMiddleware` comes first inside the base URL mount.
-    // The API router answers its own panics, so this one is the backstop for
-    // what is mounted beside it (the web client, File Transformation,
-    // `/metrics`) and the rewrites above it.
+    // The API router, the web client and `/metrics` answer their own panics,
+    // so this one is the backstop for the rewrites above them and anything
+    // mounted without one.
     let app =
         axum::middleware::from_fn(ferrofin_api::panic_boundary::panic_boundary_layer).layer(app);
     let app = axum::middleware::from_fn_with_state(base_url::normalize(base), base_url::rewrite)
         .layer(app);
     axum::Router::new().fallback_service(app)
 }
+
+/// Kestrel refuses these requests before any middleware runs, with an empty
+/// `400` that closes the connection (measured on Jellyfin 12.4), on the
+/// startup server too:
+/// - a path holding a NUL (`%00`), so no decoded path segment a handler sees
+///   holds a NUL; the query still may;
+/// - a request target whose path or query holds a byte outside ASCII, which
+///   `http` takes when it is UTF-8;
+/// - a header value that is not UTF-8: Kestrel reads a value as ASCII, then as
+///   strict UTF-8 (its default header encoding, which Jellyfin keeps), and
+///   fails one that is neither, where hyper takes bytes 0x80-0xFF as
+///   `obs-text`;
+/// - a target form or a `Host` Kestrel refuses ([`target_and_host_refusal`]),
+///   which hyper never checks.
+///
+/// hyper itself refuses, with the same answer, the rest of what was measured
+/// refused on both: a NUL or a lone CR in a value, a header name outside the
+/// token characters or with whitespace before its colon, a folded header
+/// line, a target that is not UTF-8, a request line with a doubled space and
+/// two different `Content-Length`s. Where Ferrofin's answer departs from
+/// Kestrel's once hyper or `http` has parsed the request is in
+/// [`KESTREL_REFUSAL_DIVERGENCES`].
+async fn kestrel_refusals(request: Request, next: Next) -> Response {
+    let uri = request.uri();
+    let reason = if uri.path().contains("%00") {
+        "a NUL in the path"
+    } else if !uri
+        .path_and_query()
+        .is_none_or(|target| target.as_str().is_ascii())
+    {
+        "a request target outside ASCII"
+    } else if request
+        .headers()
+        .values()
+        .any(|value| std::str::from_utf8(value.as_bytes()).is_err())
+    {
+        "a header value that is not UTF-8"
+    } else if let Some(reason) = target_and_host_refusal(&request) {
+        reason
+    } else {
+        return next.run(request).await;
+    };
+    tracing::debug!(reason, "request rejected");
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        [(axum::http::header::CONNECTION, "close")],
+    )
+        .into_response()
+}
+
+/// Why Kestrel refuses a request's target form or its `Host`, if it does
+/// (ASP.NET Core 10.0.14, the runtime Jellyfin 12.4 ships, which keeps
+/// `AllowHostHeaderOverride` off).
+///
+/// `Http1Connection.OnStartLine` reads a target with a scheme other than
+/// `http` or `https` as authority-form, whose bytes `OnAuthorityFormTarget`
+/// holds to `:.-[]@` and alphanumerics. `EnsureHostHeaderExists` then wants
+/// one `Host` on HTTP/1.1 and at most one on HTTP/1.0, a host Kestrel takes
+/// ([`host_is_valid`]) that names an absolute- or authority-form target's
+/// authority.
+fn target_and_host_refusal(request: &Request) -> Option<&'static str> {
+    use axum::http::Version;
+    // Ported for HTTP/1 only: HTTP/2 (gl-814) carries `:authority` instead.
+    if !matches!(request.version(), Version::HTTP_10 | Version::HTTP_11) {
+        return None;
+    }
+    let uri = request.uri();
+    match (uri.scheme_str(), uri.authority()) {
+        (Some("http" | "https"), _) | (None, None) => {}
+        (None, Some(authority))
+            if authority
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b":.-[]@".contains(&byte)) => {}
+        _ => return Some("a request target Kestrel cannot read"),
+    }
+    let mut hosts = request.headers().get_all(axum::http::header::HOST).iter();
+    let Some(host) = hosts.next() else {
+        return (request.version() == Version::HTTP_11).then_some("a missing Host header");
+    };
+    if hosts.next().is_some() {
+        return Some("more than one Host header");
+    }
+    let host = host.as_bytes();
+    let names_target = match (uri.scheme_str(), uri.authority()) {
+        // Absolute-form: `System.Uri.Authority`, the host canonical and a
+        // default port left out, or that with the default port written.
+        (Some(scheme), Some(authority)) => {
+            let default = if scheme == "http" { 80 } else { 443 };
+            let name = uri_host(authority.host());
+            match authority.port_u16().filter(|&port| port != default) {
+                Some(port) => host == format!("{name}:{port}").as_bytes(),
+                None => host == name.as_bytes() || host == format!("{name}:{default}").as_bytes(),
+            }
+        }
+        // Authority-form: the target as sent.
+        (None, Some(authority)) => host == authority.as_str().as_bytes(),
+        _ => true,
+    };
+    (!names_target || !host_is_valid(host)).then_some("an invalid Host header")
+}
+
+/// A host as `System.Uri` writes it: an IPv4 address in dotted decimal
+/// ([`uri_ipv4`]), an IPv6 literal in its canonical form, a name lower-cased.
+fn uri_host(host: &str) -> String {
+    if let Some(address) = uri_ipv4(host) {
+        return address.to_string();
+    }
+    match host
+        .strip_prefix('[')
+        .and_then(|literal| literal.strip_suffix(']'))
+        .and_then(|literal| literal.parse::<std::net::Ipv6Addr>().ok())
+    {
+        Some(address) => format!("[{address}]"),
+        None => host.to_ascii_lowercase(),
+    }
+}
+
+/// `System.Uri`'s reading of an IPv4 host (`IPv4AddressHelper`, measured on
+/// Jellyfin 12.4): one to four dot-separated numbers, each decimal, octal
+/// after a leading `0` or hexadecimal after `0x`, the last one filling the
+/// bytes the others leave (`127.1` is `127.0.0.1`, `0x7f.1` too). Anything
+/// else (`256.1.1.1`, `08.1.1.1`, a trailing dot) is a name.
+fn uri_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let mut values = Vec::with_capacity(4);
+    for part in host.split('.') {
+        let (digits, radix) = match part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None if part.len() > 1 && part.starts_with('0') => (&part[1..], 8),
+            None => (part, 10),
+        };
+        if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+            return None;
+        }
+        values.push(u64::from_str_radix(digits, radix).ok()?);
+    }
+    let (last, leading) = values.split_last()?;
+    // The bytes the last number fills: four for one number, one for four.
+    let last_bytes = 4_usize
+        .checked_sub(leading.len())
+        .filter(|&bytes| bytes > 0)?;
+    if leading.iter().any(|&value| value > 255) || *last >> (8 * last_bytes) != 0 {
+        return None;
+    }
+    let leading = leading
+        .iter()
+        .fold(0, |address, &value| (address << 8) | value);
+    let address = (leading << (8 * last_bytes)) | last;
+    u32::try_from(address).ok().map(std::net::Ipv4Addr::from)
+}
+
+/// Kestrel's `HttpUtilities.IsHostHeaderValid`: empty, or a name of
+/// `HttpCharacters`' host characters or a bracketed IPv6 address, then
+/// optionally `:` and a port of at least one digit.
+fn host_is_valid(host: &[u8]) -> bool {
+    // RFC 3986's reg-name without "*+,;=" and percent-encoding, as Http.Sys.
+    let in_name = |byte: &u8| byte.is_ascii_alphanumeric() || b"!$&'()-._~".contains(byte);
+    let port_is_valid = |rest: &[u8]| match rest {
+        [b':', digits @ ..] => !digits.is_empty() && digits.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    match host {
+        [] => true,
+        [b'[', rest @ ..] => rest
+            .iter()
+            .position(|&byte| byte == b']')
+            .is_some_and(|end| {
+                // `[::1]` is the shortest.
+                end >= 3
+                    && rest[..end]
+                        .iter()
+                        .all(|byte| byte.is_ascii_hexdigit() || b":.".contains(byte))
+                    && (end + 1 == rest.len() || port_is_valid(&rest[end + 1..]))
+            }),
+        [b':', ..] => false,
+        _ => host
+            .iter()
+            .position(|byte| !in_name(byte))
+            .is_none_or(|end| port_is_valid(&host[end..])),
+    }
+}
+
+/// Where the requests refused before routing depart from Kestrel's, each with
+/// its fix path.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "a record for readers; a test checks its form")
+)]
+const KESTREL_REFUSAL_DIVERGENCES: &[&str] = &[
+    "hyper refuses a header value holding a \
+     control byte other than a tab (0x01-0x08, 0x0B, 0x0C, 0x0E-0x1F and 0x7F, each \
+     measured on Jellyfin 12.4) with an empty 400 before any of Ferrofin's code runs; \
+     Kestrel takes them and Jellyfin serves the request. Fix path: gl-1848; httparse, \
+     hyper's HTTP/1 parser, has no option to take them, so one proposed upstream, or a \
+     patched httparse until it lands.",
+    "hyper answers a request line naming an HTTP version other than 1.0 and 1.1 \
+     (HTTP/1.2, HTTP/2.0, http/1.1) with 400; Kestrel answers 505. Fix path: gl-1848; \
+     the version token is gone once hyper has refused the request, so the answer has \
+     to come from below it, at the socket, where the connection limits already see \
+     the request's bytes.",
+    "hyper takes a Content-Length sent twice with the same value, keeping one; Kestrel \
+     refuses it (400). Fix path: gl-1848; hyper drops the second line before any of \
+     Ferrofin's code runs (proto/h1/role.rs), so the refusal has to come from hyper or \
+     from below it.",
+    "hyper refuses a Content-Length with a sign (+1) with 400; Kestrel takes it. Fix \
+     path: gl-1848; the refusal is hyper's own Content-Length reading \
+     (hyper::headers::from_digits), not httparse's.",
+    "http drops a request target's fragment (#...) before any of Ferrofin's code runs, \
+     so the request is served on the path before it; Kestrel keeps the fragment in the \
+     path (404) and refuses one holding a byte outside ASCII (400). Fix path: gl-1848; \
+     only the raw request line still holds the fragment.",
+    "http reads a target's scheme ignoring case, so HTTP://a/... is served as an \
+     absolute-form target; Kestrel takes only a lower-case http:// or https:// as \
+     one and refuses HTTP://a/... (400) as an authority-form target holding a '/'. \
+     Fix path: gl-1850; the scheme's case is gone before any of Ferrofin's code runs.",
+    "An asterisk-form target with a method other than OPTIONS, and an authority-form \
+     one with a method other than CONNECT, are routed (404) where Kestrel answers 405 \
+     with Allow; OPTIONS * and CONNECT reach Jellyfin's pipeline with an empty path \
+     (302 to web/), where Ferrofin answers them 404. Fix path: gl-1850.",
+    "An absolute-form IPv6 host embedding an IPv4 address other than ::ffff:a.b.c.d \
+     (::1.2.3.4, ::ffff:0:1.2.3.4, ISATAP) is compared in Rust's hexadecimal form; \
+     System.Uri writes it dotted, so Host must name it dotted on Jellyfin. Fix path: \
+     gl-1850.",
+];
 
 /// A lifetime's serve loops, one per listening address, all stopped by the
 /// same trigger. Dropping it aborts them and closes the listeners.
@@ -958,12 +1207,15 @@ impl Serving {
         serving
     }
 
-    /// Serves `app` on more listeners, stopped by the same trigger.
+    /// Serves `app` on more listeners, stopped by the same trigger, behind
+    /// Kestrel's own refusals ([`kestrel_refusals`]).
     fn serve(
         &mut self,
         listeners: impl IntoIterator<Item = listen::ServedListener>,
         app: &axum::Router,
     ) {
+        let app = axum::Router::new()
+            .fallback_service(axum::middleware::from_fn(kestrel_refusals).layer(app.clone()));
         for listener in listeners {
             let mut stop = self.stop.subscribe();
             let app = app.clone();
@@ -1065,9 +1317,12 @@ async fn bind_http_listeners(
     // The same saved network settings `build_app_state` gives the shared
     // network manager, read before it exists.
     let paths = bootstrap::application_paths(config);
+    let saved = state::load_network_configuration(&paths).await;
+    let (port, _) = listen::ports(config, &saved);
+    // Quiet: the shared manager logs the settings it ignores, once.
     let network =
-        ferrofin_networking::NetworkManager::live(state::load_network_configuration(&paths).await);
-    let addresses = listen_addresses(config, Some(&network), config.port);
+        ferrofin_networking::NetworkManager::live(saved, Arc::new(ferrofin_networking::NullLogger));
+    let addresses = listen_addresses(config, Some(&network), port);
     anyhow::ensure!(
         !addresses.is_empty(),
         "the network settings leave no address to listen on (IPv4 and IPv6 are both disabled)"
@@ -1084,12 +1339,12 @@ async fn bind_http_listeners(
 /// The HTTPS redirect this lifetime serves: Jellyfin adds
 /// `UseHttpsRedirection` when `RequireHttps` is set and it listens with HTTPS.
 /// It points at the bound HTTPS port, so it follows the listeners.
-fn https_redirect(config: &Config, wired: &WiredApp) -> Option<Arc<tls::HttpsRedirect>> {
+fn https_redirect(wired: &WiredApp) -> Option<Arc<tls::HttpsRedirect>> {
     use ferrofin_traits::system::ServerApplicationHost as _;
     wired.https.as_ref().filter(|https| https.require).map(|_| {
         Arc::new(tls::HttpsRedirect {
             port: wired.app_host.https_port(),
-            base: base_url::normalize(&config.base_url),
+            base: wired.base_url.clone(),
             network: wired.state.network.clone(),
             config: Arc::clone(&wired.state.config),
         })
@@ -1104,18 +1359,22 @@ fn bind_https_listeners(
     config: &Config,
     wired: &WiredApp,
 ) -> anyhow::Result<(Vec<listen::ServedListener>, Vec<SocketAddr>)> {
+    use ferrofin_traits::system::ServerApplicationHost as _;
     let Some(https) = wired.https.as_ref() else {
         return Ok((Vec::new(), Vec::new()));
     };
+    // The lifetime's HTTPS port (`listen::ports`): the host holds it until
+    // the bound one replaces it.
+    let port = wired.app_host.https_port();
     let network = wired
         .state
         .network
         .as_ref()
         .and_then(|network| network.read().ok());
-    let addresses = listen_addresses(config, network.as_deref(), config.https_port);
+    let addresses = listen_addresses(config, network.as_deref(), port);
     drop(network);
     let listeners = listen::bind_all(&addresses)
-        .context("failed to bind the HTTPS listeners (FERROFIN_HTTPS_PORT)")?
+        .with_context(|| format!("failed to bind the HTTPS listeners on port {port}"))?
         .into_iter()
         .map(|listener| {
             tls::TlsListener::new(listener, Arc::clone(&https.config))
@@ -1134,18 +1393,16 @@ fn listen_addresses(
     network: Option<&ferrofin_networking::NetworkManager>,
     port: u16,
 ) -> Vec<SocketAddr> {
-    let interfaces: Vec<listen::BindInterface> = network
-        .map(|network| {
-            network
-                .get_all_bind_interfaces(false)
-                .into_iter()
-                .map(|interface| listen::BindInterface {
-                    address: interface.address,
-                    index: u32::try_from(interface.index).unwrap_or(0),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let interfaces: Vec<listen::BindInterface> = network.map_or_default(|network| {
+        network
+            .get_all_bind_interfaces(false)
+            .into_iter()
+            .map(|interface| listen::BindInterface {
+                address: interface.address,
+                index: u32::try_from(interface.index).unwrap_or(0),
+            })
+            .collect()
+    });
     listen::plan_addresses(
         config.bind_addr_explicit.then_some(config.bind_addr),
         port,
@@ -1157,15 +1414,13 @@ fn listen_addresses(
 /// configuration manager exists: the configured data/config dirs and database
 /// file, plus `MetadataPath` read straight from `system.json` so a relocated
 /// metadata tree is restored where the server will look for it.
-fn boot_tree_roots(config: &Config) -> ferrofin_api::handlers::backup::TreeRoots {
-    let mut roots = ferrofin_api::handlers::backup::TreeRoots::defaults(
+fn boot_tree_roots(config: &Config) -> ferrofin_core::backup::TreeRoots {
+    let mut roots = ferrofin_core::backup::TreeRoots::defaults(
         &config.data_dir,
         &config.config_dir,
         &config.database_path(),
     );
-    if let Some(metadata) =
-        ferrofin_api::handlers::backup::restored_metadata_root(&config.config_dir)
-    {
+    if let Some(metadata) = ferrofin_core::backup::restored_metadata_root(&config.config_dir) {
         roots.metadata = metadata;
     }
     roots
@@ -1309,7 +1564,13 @@ fn enable_metrics_endpoint(
 }
 
 /// Rewrites a request's path to its canonical Jellyfin case before routing
-/// (the query string is passed through unchanged).
+/// (the query string is passed through unchanged), and its method to upper
+/// case: ASP.NET routing matches a method ignoring case, so Jellyfin answers
+/// `get` as it answers `GET` (measured on Jellyfin 12.4), where axum's router
+/// compares methods exactly. A lower-case `head` reaches the HEAD routes and
+/// keeps its body, as on Jellyfin, where Kestrel drops the body only for a
+/// method it parsed as `HEAD` (hyper does the same). On a route with no HEAD
+/// action it meets the GET handler, as `HEAD` does (gl-1840).
 ///
 /// Jellyfin's API is case-insensitive (ASP.NET); axum's router is case-sensitive,
 /// and clients call some paths in non-canonical case (e.g. `/Localization/countries`).
@@ -1321,6 +1582,12 @@ async fn canonicalize_path_case(
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let method = request.method().as_str();
+    if method.bytes().any(|byte| byte.is_ascii_lowercase())
+        && let Ok(upper) = axum::http::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+    {
+        *request.method_mut() = upper;
+    }
     // Path: re-case to the registered route where recognized (asset/unknown paths
     // return `None` and keep their significant case). Query keys are left as
     // sent: `ferrofin_api::extract::Query` binds them to each handler's members
@@ -1358,12 +1625,14 @@ async fn canonicalize_path_case(
 /// a built [`jellyfin-web`](https://github.com/jellyfin/jellyfin-web) `dist/`.
 /// The web client talks to Ferrofin over the same-origin HTTP API, exactly as it
 /// would against upstream Jellyfin. If the directory has no `index.html` the
-/// server runs API-only and `/` returns `404` (the API is unaffected either way,
-/// since no contract route lives under `/web` or at `/`).
+/// server runs API-only and `/` returns `404`. The API is unaffected either
+/// way: its routes under `/web` (`/web/ConfigurationPages`,
+/// `/web/ConfigurationPage`) match before the static mount.
 fn mount_web(
     router: Router,
     web_dir: &Path,
     transformations: Arc<dyn ferrofin_traits::plugins::FileTransformationService>,
+    state: &ferrofin_api::AppState,
 ) -> Router {
     let index = web_dir.join("index.html");
     if !index.is_file() {
@@ -1399,26 +1668,28 @@ fn mount_web(
         let web_root = web_root.clone();
         async move { transform_web_file(&transformations, &web_root, req, next).await }
     });
-    router
+    let web = Router::new()
         .nest_service("/web", ServeDir::new(web_dir))
-        .route("/", get(|| async { Redirect::permanent("/web/") }))
         .layer(axum::middleware::from_fn(redirect_bare_web))
         .layer(transform_layer)
         .layer(axum::middleware::from_fn(no_cache_web_index))
-        // Jellyfin's `UseResponseCompression()` sits above BOTH its API and its
-        // static-file middleware, and jellyfin-web's bundles are the payloads
-        // that gain most from it. `nest_service` mounts a service the API
-        // router's own compression layer never sees, and a transformed file is
-        // answered by the middleware above rather than by `ServeDir`, so the
-        // layer goes here — outside both. An API response arrives already
-        // carrying `Content-Encoding`, and `tower_http` never re-encodes one,
-        // so the two layers cannot compound.
-        .layer(ferrofin_api::compression::compression_layer())
+        // `ExceptionMiddleware`, inside the layers below as in `create_router`.
+        .layer(axum::middleware::from_fn(
+            ferrofin_api::panic_boundary::panic_boundary_layer,
+        ));
+    // Startup's response-time, compression and CORS middleware sit above
+    // `UseStaticFiles` (and so above the File Transformation answer too), and
+    // the API router's layers never see a route added after them. `/` is
+    // redirected outside the base-URL `Map` upstream, so it stays bare.
+    ferrofin_api::startup_layers(web, state)
+        .merge(router)
+        .route("/", get(|| async { Redirect::permanent("/web/") }))
 }
 
 /// Serves a `/web` file through the File Transformation pipeline when a
-/// registered transformation matches it; all other requests pass through to
-/// the static `ServeDir` untouched.
+/// registered transformation matches it and would change it; a matched file
+/// no step would change now goes to the static `ServeDir` with `no-cache`, and
+/// all other requests pass through to it untouched.
 ///
 /// Port of the File Transformation plugin's static-file middleware: it reads
 /// the matched file, runs the pipeline over its text, and responds with the
@@ -1450,32 +1721,49 @@ async fn transform_web_file(
             )
         })
         && transformations.needs_transformation(rel).await
-        && let Ok(bytes) = tokio::fs::read(web_root.join(rel)).await
-        && let Ok(text) = String::from_utf8(bytes)
     {
-        let transformed = transformations.run_transformation(rel, text).await;
-        // The plugin's validator (`FileTransformationMiddleware` @ 0900de8f1,
-        // ahead of the ported rev): an `ETag` over the transformed bytes and
-        // `no-cache`, and no `Last-Modified` (so no `If-Modified-Since` to
-        // answer). A changed transform revalidates to a `200`, never stale.
-        let etag = transformed_etag(&transformed);
-        let validators = [
-            (axum::http::header::ETAG, etag.as_str()),
-            (axum::http::header::CACHE_CONTROL, "no-cache"),
-        ];
-        if req
-            .headers()
-            .get(axum::http::header::IF_NONE_MATCH)
-            .is_some_and(|v| v.as_bytes() == etag.as_bytes())
-        {
-            return (axum::http::StatusCode::NOT_MODIFIED, validators).into_response();
+        if !transformations.would_transform(rel).await {
+            // No matching step would change the file now (Intro Skipper's
+            // patch while its opt-in is off, the default), so the static
+            // server sends it, with its validators and `Range`, instead of
+            // the pipeline copying and hashing it. The plugin's middleware
+            // runs such a step; the bytes are the same. `no-cache`, as the
+            // pipeline's answer has: a step that turns on reaches a browser
+            // holding the file at its next load.
+            let mut response = next.run(req).await;
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-cache"),
+            );
+            return response;
         }
-        return (
-            [(axum::http::header::CONTENT_TYPE, web_file_mime(rel))],
-            validators,
-            transformed,
-        )
-            .into_response();
+        if let Ok(bytes) = tokio::fs::read(web_root.join(rel)).await
+            && let Ok(text) = String::from_utf8(bytes)
+        {
+            let transformed = transformations.run_transformation(rel, text).await;
+            // The plugin's validator (`FileTransformationMiddleware` @ 0900de8f1,
+            // ahead of the ported rev): an `ETag` over the transformed bytes and
+            // `no-cache`, and no `Last-Modified` (so no `If-Modified-Since` to
+            // answer). A changed transform revalidates to a `200`, never stale.
+            let etag = transformed_etag(&transformed);
+            let validators = [
+                (axum::http::header::ETAG, etag.as_str()),
+                (axum::http::header::CACHE_CONTROL, "no-cache"),
+            ];
+            if req
+                .headers()
+                .get(axum::http::header::IF_NONE_MATCH)
+                .is_some_and(|v| v.as_bytes() == etag.as_bytes())
+            {
+                return (axum::http::StatusCode::NOT_MODIFIED, validators).into_response();
+            }
+            return (
+                [(axum::http::header::CONTENT_TYPE, web_file_mime(rel))],
+                validators,
+                transformed,
+            )
+                .into_response();
+        }
     }
     next.run(req).await
 }
@@ -1552,10 +1840,38 @@ mod tests {
     use axum::Router;
 
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{Request, StatusCode, Version};
     use ferrofin_traits::plugins::FileTransformationService;
     use std::sync::Arc;
     use tower::ServiceExt as _;
+
+    /// gl-1123: only an API restart that no signal raced restarts the host and
+    /// is announced as `ServerRestarting` (upstream's `ShouldRestart`); a
+    /// shutdown or a signal exits the process.
+    #[tokio::test]
+    async fn only_an_api_restart_no_signal_raced_restarts_the_host() {
+        use ferrofin_core::system_manager::LifecycleController as _;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let lifecycle = crate::state::FerrofinLifecycleController::new(tx);
+        assert!(
+            !super::restarts_host(&lifecycle, false),
+            "nothing was asked"
+        );
+        lifecycle.stop(true).await.expect("restart");
+        assert!(
+            super::restarts_host(&lifecycle, false),
+            "POST /System/Restart or a backup restore"
+        );
+        assert!(
+            !super::restarts_host(&lifecycle, true),
+            "a signal exits whatever was asked"
+        );
+        lifecycle.stop(false).await.expect("shutdown");
+        assert!(
+            !super::restarts_host(&lifecycle, false),
+            "POST /System/Shutdown"
+        );
+    }
 
     /// Every connection carries its peer (`ConnectInfo`, which handlers read)
     /// and the address it was accepted on (`ConnectionLocalAddr`, which the IP
@@ -1611,11 +1927,327 @@ mod tests {
         );
     }
 
-    /// A panic in what the server mounts beside the API router (the web client,
-    /// File Transformation, `/metrics`), here a test-local route, gets the same
-    /// `500` the router's own boundary answers, inside the base URL mount. A
-    /// panic the router's boundary answered reaches this one as an ordinary
-    /// `500`, so either way it is logged once.
+    /// A path holding a NUL, a request target outside ASCII (its path or its
+    /// query) and a header value that is not UTF-8 are Kestrel's empty `400`,
+    /// and the connection closes after it, on the startup server and the
+    /// lifetime's router alike, as are a `Host` Kestrel refuses and the heads
+    /// hyper refuses itself; a NUL in the query, a percent-encoded target, a
+    /// UTF-8 header value and a `Host` Kestrel takes reach the route (measured
+    /// on Jellyfin 12.4).
+    #[rstest::rstest]
+    #[case::starting(true)]
+    #[case::ready(false)]
+    #[tokio::test]
+    async fn what_kestrel_refuses_is_refused_on_every_listener(#[case] starting: bool) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = super::listen::bind("127.0.0.1:0".parse().expect("address")).expect("bind");
+        let address = axum::serve::Listener::local_addr(&listener).expect("local address");
+        let app = if starting {
+            crate::startup::dispatcher(crate::startup::Ready::default())
+        } else {
+            let router =
+                Router::new().route("/echo/{value}", axum::routing::get(|| async { "ok" }));
+            super::lifetime_app(router, "/jellyfin", None)
+        };
+        let _serving =
+            super::Serving::start(vec![crate::listen::ServedListener::Plain(listener)], &app);
+        // Each a request line and its headers.
+        let refused: [&[u8]; 25] = [
+            b"GET /jellyfin/echo/1%00 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /System/Info/Public%00 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /x%00 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /jellyfin/echo/caf\xC3\xA9 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /jellyfin/echo/1?q=caf\xC3\xA9 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test: caf\xE9\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nUser-Agent: \xC0\xAF\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: \xED\xA0\x80\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test: ok\r\nX-Test: caf\xC3\r\n",
+            // Refused by hyper itself, with the same answer.
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test: a\x00b\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test : a\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nX-Test: a\r\n b\r\n",
+            // `Host`: missing, sent twice, invalid, not naming the target.
+            b"GET /x HTTP/1.1\r\n",
+            b"GET /x HTTP/1.1\r\nHost: x\r\nHost: y\r\n",
+            b"GET /x HTTP/1.0\r\nHost: a\r\nHost: b\r\n",
+            b"GET /x HTTP/1.1\r\nHost: a b\r\n",
+            b"GET /x HTTP/1.0\r\nHost: u@x\r\n",
+            b"GET http://a:8096/jellyfin/echo/1 HTTP/1.1\r\nHost: a\r\n",
+            b"GET http://A/jellyfin/echo/1 HTTP/1.1\r\nHost: A\r\n",
+            b"GET http://[0:0::1]/jellyfin/echo/1 HTTP/1.1\r\nHost: [0:0::1]\r\n",
+            b"GET ftp://a/jellyfin/echo/1 HTTP/1.1\r\nHost: a\r\n",
+            b"CONNECT x:80 HTTP/1.1\r\nHost: y:80\r\n",
+            b"CONNECT a_b:80 HTTP/1.1\r\nHost: a_b:80\r\n",
+            b"GET http://0x7f.1/jellyfin/echo/1 HTTP/1.1\r\nHost: 0x7f.1\r\n",
+            b"GET http://1.2.3.4./jellyfin/echo/1 HTTP/1.1\r\nHost: 1.2.3.4\r\n",
+        ];
+        let served: [&[u8]; 15] = [
+            b"GET /jellyfin/echo/1?limit=1%00 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /jellyfin/echo/1%2500 HTTP/1.1\r\nHost: x\r\n",
+            b"GET /jellyfin/echo/caf%C3%A9?q=caf%C3%A9 HTTP/1.1\r\nHost: x\r\nX-Test: caf\xC3\xA9\r\n",
+            b"GET /jellyfin/echo/1 HTTP/1.0\r\n",
+            b"GET /jellyfin/echo/1 HTTP/1.1\r\nHost:\r\n",
+            b"GET /jellyfin/echo/1 HTTP/1.1\r\nHost: [::1]:8096\r\n",
+            b"GET http://A:80/jellyfin/echo/1 HTTP/1.1\r\nHost: a\r\n",
+            b"GET http://a/jellyfin/echo/1 HTTP/1.1\r\nHost: a:80\r\n",
+            b"GET https://u@a/jellyfin/echo/1 HTTP/1.1\r\nHost: a:443\r\n",
+            b"GET http://[0:0::1]/jellyfin/echo/1 HTTP/1.1\r\nHost: [::1]\r\n",
+            b"GET http://a:8096/jellyfin/echo/1 HTTP/1.1\r\nHost: a:8096\r\n",
+            b"GET http://[::1]:8096/jellyfin/echo/1 HTTP/1.1\r\nHost: [::1]:8096\r\n",
+            b"GET http://0x7f.1/jellyfin/echo/1 HTTP/1.1\r\nHost: 127.0.0.1\r\n",
+            b"GET http://010.1.1.1/jellyfin/echo/1 HTTP/1.1\r\nHost: 8.1.1.1\r\n",
+            b"GET http://256.1.1.1/jellyfin/echo/1 HTTP/1.1\r\nHost: 256.1.1.1\r\n",
+        ];
+        let cases = refused.iter().map(|head| (head, true)).chain(
+            served
+                .iter()
+                .filter(|_| !starting)
+                .map(|head| (head, false)),
+        );
+        for (head, expect_refusal) in cases {
+            let label = head.escape_ascii().to_string();
+            let mut stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("connect");
+            stream
+                .write_all(&[head, &b"\r\n"[..]].concat())
+                .await
+                .expect("request");
+            let mut response = Vec::new();
+            if expect_refusal {
+                // Read to the end: only a closed connection ends it.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.read_to_end(&mut response),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{label}: the connection stays open"))
+                .expect("response");
+            } else {
+                let mut chunk = [0_u8; 1024];
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.read(&mut chunk),
+                )
+                .await
+                .expect("answered in time")
+                .expect("response");
+                response.extend_from_slice(&chunk[..read]);
+            }
+            let response = String::from_utf8_lossy(&response).to_ascii_lowercase();
+            let status = if expect_refusal { "400" } else { "200" };
+            assert_eq!(
+                response.split(' ').nth(1),
+                Some(status),
+                "{label}: {response}"
+            );
+            if expect_refusal {
+                assert!(
+                    response.contains("content-length: 0"),
+                    "{label}: {response}"
+                );
+                assert!(
+                    response.ends_with("\r\n\r\n"),
+                    "{label}: no body: {response}"
+                );
+            }
+        }
+    }
+
+    /// Kestrel's own valid hosts (`HttpUtilitiesTest.HostHeaderData`, ASP.NET
+    /// Core v10.0.14), then the ones measured served on Jellyfin 12.4.
+    #[rstest::rstest]
+    #[case("z")]
+    #[case("1")]
+    #[case("y:1")]
+    #[case("1:1")]
+    #[case("[ABCdef]")]
+    #[case("[abcDEF]:0")]
+    #[case("[abcdef:127.2355.1246.114]:0")]
+    #[case("[::1]:80")]
+    #[case("127.0.0.1:80")]
+    #[case("900.900.900.900:9523547852")]
+    #[case("foo")]
+    #[case("foo:234")]
+    #[case("foo.bar.baz")]
+    #[case("foo.BAR.baz:46245")]
+    #[case("foo.ba-ar.baz:46245")]
+    #[case("-foo:1234")]
+    #[case("xn--asdfaf:134")]
+    #[case("-")]
+    #[case("_")]
+    #[case("~")]
+    #[case("!")]
+    #[case("$")]
+    #[case("'")]
+    #[case("(")]
+    #[case(")")]
+    #[case("")]
+    #[case("[::1]:8096")]
+    #[case("a!$&'()-._~")]
+    fn kestrel_takes_the_host(#[case] host: &str) {
+        assert!(super::host_is_valid(host.as_bytes()));
+    }
+
+    /// Kestrel's own invalid hosts (`HttpUtilitiesTest.HostHeaderInvalidData`),
+    /// then the ones measured refused on Jellyfin 12.4.
+    #[rstest::rstest]
+    #[case("[]")]
+    #[case("[::]")]
+    #[case("[ghijkl]")]
+    #[case("[afd:adf:123")]
+    #[case("[afd:adf]123")]
+    #[case("[afd:adf]:")]
+    #[case("[afd adf]")]
+    #[case("[ad-314]")]
+    #[case(":1234")]
+    #[case("a:b:c")]
+    #[case("::1")]
+    #[case("::")]
+    #[case("abcd:1abcd")]
+    #[case("abcd:1.2")]
+    #[case("1.2.3.4:")]
+    #[case("1.2 .4")]
+    #[case("a b")]
+    #[case("café")]
+    #[case("[bad")]
+    #[case("u@x")]
+    #[case("[fe80::1%25eth0]")]
+    #[case("a:")]
+    #[case(":80")]
+    #[case("a*b")]
+    #[case("a%41")]
+    fn kestrel_refuses_the_host(#[case] host: &str) {
+        assert!(!super::host_is_valid(host.as_bytes()));
+    }
+
+    /// The rest of `HostHeaderInvalidData`: each character it lists, alone,
+    /// inside brackets and as a port.
+    #[test]
+    fn kestrel_refuses_the_characters_it_lists() {
+        let alone = "\"#%*+,/;<=>?@[]\\^`{}|".chars().map(String::from);
+        let bracketed = "!\"#$%&'()*+,/;<=>?@[]\\^_`{}|~-"
+            .chars()
+            .map(|ch| format!("[abd{ch}]:1234"));
+        let ports = "!\"#$%&'()*+,/;<=>?@[]\\^_`{}|~:abcABC-."
+            .chars()
+            .map(|ch| format!("a.b.c:{ch}"));
+        for host in alone.chain(bracketed).chain(ports) {
+            assert!(!super::host_is_valid(host.as_bytes()), "{host}");
+        }
+    }
+
+    /// What the end-to-end test cannot show, as these requests reach no
+    /// route: an authority-form target its `Host` names passes, and HTTP/2
+    /// carries no `Host` to check.
+    #[rstest::rstest]
+    #[case("CONNECT", "x:80", Version::HTTP_11, Some("x:80"), None)]
+    #[case(
+        "CONNECT",
+        "x:80",
+        Version::HTTP_11,
+        Some("y:80"),
+        Some("an invalid Host header")
+    )]
+    #[case(
+        "GET",
+        "a_b:80",
+        Version::HTTP_10,
+        None,
+        Some("a request target Kestrel cannot read")
+    )]
+    #[case("GET", "/x", Version::HTTP_11, None, Some("a missing Host header"))]
+    #[case("GET", "/x", Version::HTTP_2, None, None)]
+    fn target_and_host_refusal_reads_the_target_forms(
+        #[case] method: &str,
+        #[case] target: &str,
+        #[case] version: Version,
+        #[case] host: Option<&str>,
+        #[case] refusal: Option<&str>,
+    ) {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(target)
+            .version(version);
+        if let Some(host) = host {
+            request = request.header(axum::http::header::HOST, host);
+        }
+        let request = request.body(axum::body::Body::empty()).expect("request");
+        assert_eq!(super::target_and_host_refusal(&request), refusal);
+    }
+
+    /// An absolute-form target's host as `System.Uri` writes it before Kestrel
+    /// compares `Host` with it (each measured on Jellyfin 12.4).
+    #[rstest::rstest]
+    #[case("010.1.1.1", "8.1.1.1")]
+    #[case("0177.0.0.1", "127.0.0.1")]
+    #[case("127.1", "127.0.0.1")]
+    #[case("0x7f.1", "127.0.0.1")]
+    #[case("2130706433", "127.0.0.1")]
+    #[case("1.256", "1.0.1.0")]
+    #[case("256.1.1.1", "256.1.1.1")]
+    #[case("1.2.3.4.5", "1.2.3.4.5")]
+    #[case("1.2.3.4.", "1.2.3.4.")]
+    #[case("08.1.1.1", "08.1.1.1")]
+    #[case("0x", "0x")]
+    #[case("cafe.de", "cafe.de")]
+    #[case("A", "a")]
+    #[case("[0:0::1]", "[::1]")]
+    #[case("[::FFFF:1.2.3.4]", "[::ffff:1.2.3.4]")]
+    fn uri_host_is_the_host_system_uri_writes(#[case] host: &str, #[case] written: &str) {
+        assert_eq!(super::uri_host(host), written);
+    }
+
+    /// A method in any case reaches the route its upper-case spelling does,
+    /// as ASP.NET routing matches it (measured on Jellyfin 12.4: `get` and
+    /// `Get` answer as `GET`, `post` as `POST`, `head` as `HEAD` on a HEAD
+    /// route); one no route takes stays 405.
+    #[rstest::rstest]
+    #[case("get", "/echo", StatusCode::OK)]
+    #[case("Get", "/echo", StatusCode::OK)]
+    #[case("GET", "/echo", StatusCode::OK)]
+    #[case("post", "/posted", StatusCode::OK)]
+    #[case("get", "/posted", StatusCode::METHOD_NOT_ALLOWED)]
+    #[case("foo", "/echo", StatusCode::METHOD_NOT_ALLOWED)]
+    #[case("head", "/headed", StatusCode::NOT_FOUND)]
+    #[tokio::test]
+    async fn a_method_routes_whatever_its_case(
+        #[case] method: &str,
+        #[case] path: &str,
+        #[case] status: StatusCode,
+    ) {
+        let router = Router::new()
+            .route("/echo", axum::routing::get(|| async { "ok" }))
+            .route("/posted", axum::routing::post(|| async { "ok" }))
+            .route(
+                "/headed",
+                axum::routing::head(|| async { StatusCode::NOT_FOUND }),
+            );
+        let response = super::lifetime_app(router, "", None)
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), status);
+    }
+
+    #[test]
+    fn every_kestrel_refusal_divergence_names_its_fix_path() {
+        for divergence in super::KESTREL_REFUSAL_DIVERGENCES {
+            assert!(divergence.contains("Fix path: gl-"), "{divergence}");
+        }
+    }
+
+    /// A panic in a route mounted with no boundary of its own, here a
+    /// test-local one, gets the same `500` the router's own boundary answers,
+    /// inside the base URL mount. A panic the router's boundary answered
+    /// reaches this one as an ordinary `500`, so either way it is logged once.
     #[rstest::rstest]
     #[case::beside_the_router(false)]
     #[case::inside_the_router(true)]
@@ -1765,6 +2397,15 @@ mod tests {
         }
     }
 
+    /// A test transformer that panics, as a faulty plugin's might.
+    struct Panics;
+    #[async_trait::async_trait]
+    impl ferrofin_traits::plugins::FileTransformer for Panics {
+        async fn transform(&self, _path: &str, _contents: String) -> String {
+            panic!("a faulty transformation")
+        }
+    }
+
     /// An identity test transformer (registration presence is what matters).
     struct Identity;
     #[async_trait::async_trait]
@@ -1802,12 +2443,107 @@ mod tests {
         )
     }
 
+    /// gl-903: Startup runs `ResponseTimeMiddleware`, `UseResponseCompression`
+    /// and `UseCors` inside the base-URL `Map`, above `UseStaticFiles`, so a
+    /// `/web` answer carries `X-Response-Time-ms` and the CORS headers as an
+    /// API one does; `/` is redirected outside the `Map` and carries neither.
+    /// An API answer carries them too, and mounting the web client keeps the
+    /// API router's layered fallback.
+    #[tokio::test]
+    async fn web_answers_carry_the_response_time_and_cors_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
+        std::fs::write(dir.path().join("bundle.js"), "//js").unwrap();
+        let state = ferrofin_api::test_support::fake_state();
+        let app = mount_web(
+            ferrofin_api::create_router(state.clone()),
+            dir.path(),
+            transformations(dir.path()),
+            &state,
+        );
+        let get = |uri: &str| {
+            Request::builder()
+                .uri(uri)
+                .header("origin", "http://client.example")
+                .body(Body::empty())
+                .unwrap()
+        };
+        for (uri, status, stamped) in [
+            ("/web/index.html", StatusCode::OK, true),
+            ("/web/bundle.js", StatusCode::OK, true),
+            ("/web/missing.js", StatusCode::NOT_FOUND, true),
+            ("/web", StatusCode::PERMANENT_REDIRECT, true),
+            // An API route under `/web` is the API's, not a missing file.
+            ("/web/ConfigurationPages", StatusCode::UNAUTHORIZED, true),
+            ("/no/such/path", StatusCode::NOT_FOUND, true),
+            ("/", StatusCode::PERMANENT_REDIRECT, false),
+        ] {
+            let response = app.clone().oneshot(get(uri)).await.unwrap();
+            assert_eq!(response.status(), status, "{uri}");
+            let count = |name: &str| response.headers().get_all(name).iter().count();
+            let expected = usize::from(stamped);
+            assert_eq!(count("x-response-time-ms"), expected, "{uri}");
+            assert_eq!(count("access-control-allow-origin"), expected, "{uri}");
+        }
+
+        // `UseCors` answers a `/web` preflight as it does an API one.
+        let preflight = Request::builder()
+            .method("OPTIONS")
+            .uri("/web/bundle.js")
+            .header("origin", "http://client.example")
+            .header("access-control-request-method", "GET")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(preflight).await.unwrap();
+        assert!(response.status().is_success(), "{}", response.status());
+        assert!(
+            response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+
+        // An unmatched path still gets the API router's own (layered) fallback.
+        let marked = Router::new().layer(axum::middleware::from_fn(
+            |request: Request<Body>, next: axum::middleware::Next| async move {
+                let mut response = next.run(request).await;
+                response
+                    .headers_mut()
+                    .insert("x-api-router", axum::http::HeaderValue::from_static("1"));
+                response
+            },
+        ));
+        let app = mount_web(marked, dir.path(), transformations(dir.path()), &state);
+        let response = app.oneshot(get("/no/such/path")).await.unwrap();
+        assert!(response.headers().contains_key("x-api-router"));
+
+        // A panic under `/web` is answered `500` inside those layers, as
+        // `ExceptionMiddleware` sits outside `ResponseTimeMiddleware` upstream.
+        let service = transformations(dir.path());
+        service
+            .add_transformation(uuid::Uuid::from_u128(15), "bundle.js", Arc::new(Panics))
+            .await;
+        let app = mount_web(Router::new(), dir.path(), service, &state);
+        let response = app.oneshot(get("/web/bundle.js")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().contains_key("x-response-time-ms"));
+        assert!(
+            response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
+    }
+
     #[tokio::test]
     async fn serves_web_bundle_and_redirects_root() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
 
-        let app = mount_web(Router::new(), dir.path(), transformations(dir.path()));
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            transformations(dir.path()),
+            &ferrofin_api::test_support::fake_state(),
+        );
 
         // `/` redirects to the web client.
         let root = app
@@ -1863,7 +2599,12 @@ mod tests {
         let js = "function chunk(){return 'ferrofin';}\n".repeat(200);
         std::fs::write(dir.path().join("bundle.js"), &js).unwrap();
 
-        let app = mount_web(Router::new(), dir.path(), transformations(dir.path()));
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            transformations(dir.path()),
+            &ferrofin_api::test_support::fake_state(),
+        );
 
         let plain = app
             .clone()
@@ -1934,7 +2675,12 @@ mod tests {
         service
             .add_transformation(uuid::Uuid::from_u128(11), "a.js", Arc::new(Upper))
             .await;
-        let app = mount_web(Router::new(), dir.path(), Arc::clone(&service));
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            Arc::clone(&service),
+            &ferrofin_api::test_support::fake_state(),
+        );
 
         let gz = app
             .oneshot(
@@ -2000,7 +2746,12 @@ mod tests {
         std::fs::write(dir.path().join("bundle.js"), "//js").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/index.html"), "<!doctype html>").unwrap();
-        let app = mount_web(Router::new(), dir.path(), transformations(dir.path()));
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            transformations(dir.path()),
+            &ferrofin_api::test_support::fake_state(),
+        );
 
         let mut request = Request::builder().uri(uri);
         if let Some((name, value)) = header {
@@ -2028,7 +2779,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<body></body>").unwrap();
         let service = transformations(dir.path());
-        let app = mount_web(Router::new(), dir.path(), Arc::clone(&service));
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            Arc::clone(&service),
+            &ferrofin_api::test_support::fake_state(),
+        );
         let get = |headers: &[(&str, &str)]| {
             let mut request = Request::builder().uri("/web/");
             for (name, value) in headers {
@@ -2059,7 +2815,12 @@ mod tests {
     async fn api_only_when_no_bundle() {
         let dir = tempfile::tempdir().unwrap();
         // No index.html written → router is returned unchanged (no `/` route).
-        let app = mount_web(Router::new(), dir.path(), transformations(dir.path()));
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            transformations(dir.path()),
+            &ferrofin_api::test_support::fake_state(),
+        );
         let root = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
@@ -2079,7 +2840,12 @@ mod tests {
             .add_transformation(uuid::Uuid::from_u128(9), "a.js", Arc::new(Upper))
             .await;
 
-        let app = mount_web(Router::new(), dir.path(), Arc::clone(&service));
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            Arc::clone(&service),
+            &ferrofin_api::test_support::fake_state(),
+        );
 
         // The matching file is transformed and typed by extension.
         let hit = app
@@ -2129,7 +2895,12 @@ mod tests {
         service
             .add_transformation(uuid::Uuid::from_u128(13), "a.js", Arc::new(Identity))
             .await;
-        let app = mount_web(Router::new(), dir.path(), Arc::clone(&service));
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            Arc::clone(&service),
+            &ferrofin_api::test_support::fake_state(),
+        );
         let get = |if_none_match: Option<&str>| {
             let mut request = Request::builder().uri("/web/a.js");
             if let Some(etag) = if_none_match {
@@ -2167,6 +2938,86 @@ mod tests {
         assert_eq!(&body[..], b"HELLO WORLD");
     }
 
+    /// gl-1536: while Intro Skipper's opt-in is off (the default), the bundle
+    /// its skip-button step is registered on is sent by the static server,
+    /// with `Range`, instead of through the pipeline; still `no-cache`, so the
+    /// opt-in, once on, reaches the browser at its next load.
+    #[tokio::test]
+    async fn a_web_file_no_step_would_change_is_served_statically_and_revalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
+        std::fs::write(
+            dir.path().join("main.jellyfin.bundle.js"),
+            "(t.hideTimeout=setTimeout(t.hideSkipButton.bind(t),8e3))",
+        )
+        .unwrap();
+        let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> =
+            Arc::new(ferrofin_core::FerrofinPluginManager::new(
+                ferrofin_extensions::registered_plugins(&ferrofin_extensions::builtin_extensions()),
+                dir.path().join("plugins"),
+            ));
+        let service: Arc<dyn FileTransformationService> = Arc::new(
+            ferrofin_extensions::file_transformation::WebFileTransformationService::new(
+                Arc::clone(&plugins),
+                Arc::new(NoLocalApi),
+            ),
+        );
+        ferrofin_extensions::file_transformation::register_skip_button_transformer(
+            service.as_ref(),
+            Arc::clone(&plugins),
+        )
+        .await;
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            service,
+            &ferrofin_api::test_support::fake_state(),
+        );
+        let get = |header: Option<(&str, &str)>| {
+            let mut request = Request::builder().uri("/web/main.jellyfin.bundle.js");
+            if let Some((name, value)) = header {
+                request = request.header(name, value);
+            }
+            app.clone().oneshot(request.body(Body::empty()).unwrap())
+        };
+
+        let full = get(None).await.unwrap();
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers()["accept-ranges"], "bytes");
+        assert_eq!(full.headers()["cache-control"], "no-cache");
+        let etag = full.headers()["etag"].to_str().unwrap().to_owned();
+        let part = get(Some(("range", "bytes=0-2"))).await.unwrap();
+        assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(part.headers()["cache-control"], "no-cache");
+        let body = axum::body::to_bytes(part.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"(t.");
+        let revalidated = get(Some(("if-none-match", &etag))).await.unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()["cache-control"], "no-cache");
+
+        // Opted in, the browser's next revalidation gets the patched bundle.
+        plugins
+            .set_plugin_configuration(
+                // The Intro Skipper's plugin id.
+                uuid::Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b),
+                br#"{"UseFileTransformationPlugin":true,"SkipbuttonHideDelay":5}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        let patched = get(Some(("if-none-match", &etag))).await.unwrap();
+        assert_eq!(patched.status(), StatusCode::OK);
+        assert_eq!(patched.headers()["cache-control"], "no-cache");
+        let body = axum::body::to_bytes(patched.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"false||(t.hideTimeout=setTimeout(t.hideSkipButton.bind(t),5000))"
+        );
+    }
+
     #[tokio::test]
     async fn directory_request_runs_the_index_transforms() {
         // Browsers enter the SPA at `/web/` — never `/web/index.html` — so
@@ -2178,7 +3029,12 @@ mod tests {
         service
             .add_transformation(uuid::Uuid::from_u128(7), "index.html", Arc::new(Upper))
             .await;
-        let app = mount_web(Router::new(), dir.path(), service);
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            service,
+            &ferrofin_api::test_support::fake_state(),
+        );
         let out = app
             .oneshot(Request::builder().uri("/web/").body(Body::empty()).unwrap())
             .await
@@ -2200,7 +3056,12 @@ mod tests {
         service
             .add_transformation(uuid::Uuid::from_u128(9), ".*", Arc::new(Identity))
             .await;
-        let app = mount_web(Router::new(), dir.path(), service);
+        let app = mount_web(
+            Router::new(),
+            dir.path(),
+            service,
+            &ferrofin_api::test_support::fake_state(),
+        );
         // `..` components must not be read+served by the transform branch.
         let out = app
             .oneshot(

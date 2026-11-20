@@ -18,7 +18,8 @@ use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::handlers::streaming::{
-    require_streamable_item, serve_static_file, static_or_transcode, stream_route_container,
+    physical_file_path, require_streamable_item, serve_physical_file, static_or_transcode,
+    stream_route_container,
 };
 use crate::state::AppState;
 
@@ -37,6 +38,11 @@ async fn get_video_stream(
 ) -> Result<Response, ApiError> {
     let raw = request.uri().query().map(ToOwned::to_owned);
     let req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
+    if let Some(rejection) =
+        crate::handlers::hls::stream_pattern_failures(&req, req.output_container.as_deref())
+    {
+        return Ok(rejection);
+    }
     require_streamable_item(
         &state,
         &auth,
@@ -46,7 +52,6 @@ async fn get_video_stream(
         req.media_source_id.as_deref(),
     )
     .await?;
-    crate::handlers::hls::validate_stream_request(&req)?;
     static_or_transcode(&state, item_id, false, req, request).await
 }
 
@@ -60,11 +65,12 @@ async fn get_video_stream_by_container(
 ) -> Result<Response, ApiError> {
     let raw = request.uri().query().map(ToOwned::to_owned);
     let mut req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
-    req.output_container = Some(
-        stream_route_container(&container)
-            .ok_or_else(|| ApiError::NotFound("stream route".to_owned()))?
-            .to_owned(),
-    );
+    let container = stream_route_container(&container)
+        .ok_or_else(|| ApiError::NotFound("stream route".to_owned()))?;
+    if let Some(rejection) = crate::handlers::hls::route_container_failures(&req, Some(container)) {
+        return Ok(rejection);
+    }
+    req.output_container = Some(container.to_owned());
     require_streamable_item(
         &state,
         &auth,
@@ -74,7 +80,6 @@ async fn get_video_stream_by_container(
         req.media_source_id.as_deref(),
     )
     .await?;
-    crate::handlers::hls::validate_stream_request(&req)?;
     static_or_transcode(&state, item_id, false, req, request).await
 }
 
@@ -236,10 +241,12 @@ async fn delete_alternate_sources(
 /// `GET /Items/{itemId}/Download` — download the item's media file.
 ///
 /// Port of `LibraryController.GetDownload`: resolves the item and streams its
-/// on-disk file as an attachment after enforcing the download permission.
-/// The file is served through the shared streaming helper (Range /
-/// `HEAD` / `404`), with a `Content-Disposition: attachment` header carrying the
-/// file name (matching the C# `FileResult` download semantics).
+/// on-disk file (a link's final target) as an attachment after enforcing the
+/// download permission (an item with no path is a `400`). The file is served
+/// through the shared streaming helper (Range / `HEAD` / `404`), typed by
+/// `MimeTypes.GetMimeType`, with a `Content-Disposition: attachment` header
+/// carrying the item's file name on a 200, 206 or 416 (matching the C#
+/// `FileResult` download semantics).
 #[utoipa::path(
     get,
     path = "/Items/{itemId}/Download",
@@ -273,15 +280,24 @@ async fn get_download(
     }
     // Download the requested item's own file. Playback-source resolution can
     // promote an alternate version to its primary and would serve the wrong file.
+    // An empty path is MimeTypes.GetMimeType's ArgumentException, a 400.
     let path = item
         .path
+        .filter(|p| !p.is_empty())
         .ok_or_else(|| ApiError::BadRequest("item has no download path".to_owned()))?;
     let filename = std::path::Path::new(&path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("download");
-    let mut response = serve_static_file(&path, request).await?;
-    if let Ok(value) = header::HeaderValue::from_str(&attachment_disposition(filename)) {
+    let mut response =
+        serve_physical_file(&physical_file_path(path.clone()).await?, request).await?;
+    // SetHeadersAndLog names the file only past its 304/412 short cut, and a
+    // missing file is PhysicalFile's FileNotFoundException before it.
+    if matches!(
+        response.status(),
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT | StatusCode::RANGE_NOT_SATISFIABLE
+    ) && let Ok(value) = header::HeaderValue::from_str(&attachment_disposition(filename))
+    {
         response
             .headers_mut()
             .insert(header::CONTENT_DISPOSITION, value);
@@ -294,27 +310,22 @@ async fn get_download(
 ///
 /// `LibraryController.GetDownload` first strips every `"` from the file name,
 /// then ASP.NET's `ContentDispositionHeaderValue.SetHttpFileName` builds both
-/// forms: `filename=` carries the name with every control / non-ASCII character
-/// replaced by `_`, quoted (with `\` escaped) only when the result is not a
-/// plain HTTP token; `filename*` carries the exact UTF-8 name percent-encoded
-/// per RFC 5987 (only `attr-char` survives unencoded). Both are sent on every
-/// download, so a client with a non-ASCII title still gets the real file name.
-///
-/// One deliberate non-port: ASP.NET sanitizes UTF-16 code units, so an
-/// astral-plane character (an emoji) becomes `__` there and `_` here; the
-/// `filename*` form — the one clients prefer — is byte-identical either way.
+/// forms: `filename=` carries the name with each control character, and each
+/// UTF-16 code unit of a non-ASCII one, replaced by `_` (an astral-plane
+/// character such as an emoji becomes `__`), quoted (with `\` escaped) only
+/// when the result is not a plain HTTP token; `filename*` carries the exact
+/// UTF-8 name percent-encoded per RFC 5987 (only `attr-char` survives
+/// unencoded). Every disposition the download sends carries both, so a client
+/// with a non-ASCII title still gets the real file name.
 fn attachment_disposition(filename: &str) -> String {
     let filename = filename.replace('"', "");
     // ASP.NET `HttpRuleParser` token characters.
     let is_token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
     let sanitized: String = filename
         .chars()
-        .map(|c| {
-            if c.is_ascii() && !c.is_ascii_control() {
-                c
-            } else {
-                '_'
-            }
+        .flat_map(|c| {
+            let kept = c.is_ascii() && !c.is_ascii_control();
+            std::iter::repeat_n(if kept { c } else { '_' }, c.len_utf16())
         })
         .collect();
     let plain = if sanitized.chars().all(is_token) {
@@ -395,6 +406,11 @@ mod tests {
         assert_eq!(
             attachment_disposition("Amélie.mkv"),
             "attachment; filename=Am_lie.mkv; filename*=UTF-8''Am%C3%A9lie.mkv"
+        );
+        // An astral-plane character is two UTF-16 code units, so two `_`.
+        assert_eq!(
+            attachment_disposition("\u{1F3AC}.mkv"),
+            "attachment; filename=__.mkv; filename*=UTF-8''%F0%9F%8E%AC.mkv"
         );
         // Quotes are stripped up front (GetDownload); a backslash forces quoting and is escaped.
         assert_eq!(

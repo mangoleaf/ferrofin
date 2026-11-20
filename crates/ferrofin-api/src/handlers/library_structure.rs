@@ -40,6 +40,7 @@ use uuid::Uuid;
 use crate::auth::FirstTimeSetupOrElevated;
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
+use crate::handlers::query_parse::parse_csv_strings;
 use crate::state::AppState;
 
 /// Asks the library monitor to restart so its watch set matches the
@@ -205,16 +206,12 @@ async fn add_virtual_folder(
     // The query `paths` (comma-delimited) override the body's PathInfos, exactly
     // as the C# controller assigns `libraryOptions.PathInfos` when `paths` is
     // non-empty.
-    if let Some(raw) = query.paths.as_deref() {
-        let paths: Vec<MediaPathInfo> = raw
-            .split(',')
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(|p| MediaPathInfo { path: p.to_owned() })
+    let paths = parse_csv_strings(query.paths.as_deref());
+    if !paths.is_empty() {
+        options.path_infos = paths
+            .into_iter()
+            .map(|path| MediaPathInfo { path })
             .collect();
-        if !paths.is_empty() {
-            options.path_infos = paths;
-        }
     }
 
     // Scope by the id the add returns, never by `name`: the stored name can
@@ -540,7 +537,8 @@ struct UpdateLibraryOptionsBody {
 /// **parsed** `Uuid` — comparing `id.to_string()` (hyphenated) against the
 /// projected string can never succeed. Parsing also makes the route
 /// format-agnostic the way C#'s `Guid` lookup is. `Name` is still honored when
-/// supplied; a request matching no library (by either) is a `404`.
+/// supplied; without it, a missing, null or all-zero `Id` is a `400` (upstream's
+/// `GetItemById(Guid.Empty)` throws), and an `Id` matching no library is a `404`.
 ///
 /// **Missing options.** A body without `LibraryOptions` (or with `null`) is a
 /// `400` and writes nothing. Upstream fails the same request after its lookup,
@@ -552,7 +550,7 @@ struct UpdateLibraryOptionsBody {
     request_body = UpdateLibraryOptionsBody,
     responses(
         (status = 204, description = "Library updated"),
-        (status = 400, description = "LibraryOptions missing or null"),
+        (status = 400, description = "Id empty, or LibraryOptions missing or null"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -567,9 +565,11 @@ async fn update_library_options(
     let name = if let Some(name) = body.name.filter(|n| !n.trim().is_empty()) {
         name
     } else {
+        // A missing Id binds as `Guid.Empty` upstream, which `GetItemById` refuses.
         let id = body
             .id
-            .ok_or_else(|| ApiError::NotFound("library (no Id or Name supplied)".to_owned()))?;
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| ApiError::BadRequest("Guid can't be empty".to_owned()))?;
         state
             .virtual_folders
             .get_virtual_folders()

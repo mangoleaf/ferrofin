@@ -3,11 +3,11 @@
 //!
 //! Exercises the un-mockable piece (the real process spawn plus the ported
 //! `fps`/`scale` filter chain) against a live ffmpeg on a tiny generated clip.
-//! Skips itself unless `FERROFIN_FFMPEG_TESTS` is set *and* `ffmpeg` is on
-//! `PATH`, so ffmpeg-less CI stays green.
+//! `#[ignore]`d, so a default run lists it as skipped; asked for, it needs
+//! `ffmpeg` on `PATH`.
 //!
 //! Run with:
-//! `FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test trickplay_frames_ffmpeg`
+//! `cargo test -p ferrofin-mediaencoding --test trickplay_frames_ffmpeg -- --include-ignored`
 
 mod colour_bars;
 
@@ -104,18 +104,10 @@ fn on_path(program: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Whether the ffmpeg-gated suite should run: `FERROFIN_FFMPEG_TESTS` set AND
-/// `ffmpeg` present. Prints a skip line and returns `false` otherwise.
-fn ffmpeg_gate() -> bool {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").is_err() {
-        eprintln!("skipping: FERROFIN_FFMPEG_TESTS not set");
-        return false;
-    }
-    if !on_path("ffmpeg") {
-        eprintln!("skipping: ffmpeg not found on PATH");
-        return false;
-    }
-    true
+/// Panics unless `ffmpeg` is on `PATH`: these tests are `#[ignore]`d, so a
+/// run that asks for them must not pass without it.
+fn require_ffmpeg() {
+    assert!(on_path("ffmpeg"), "ffmpeg not found on PATH");
 }
 
 /// Generates a tiny 6-second silent `testsrc` clip at `path` (mirrors the
@@ -149,10 +141,9 @@ fn make_clip(path: &Path) {
 }
 
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn extracts_interval_frames_from_a_real_clip() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let clip = tmp.path().join("clip (with spaces).mp4");
@@ -222,10 +213,9 @@ fn sampling_factors(path: &str) -> Vec<(u8, u8)> {
 #[case::full_chroma(true)]
 #[case::jellyfin_chroma(false)]
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn frames_are_written_at_the_chroma_asked_for(#[case] full_chroma: bool) {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let clip = tmp.path().join("clip.mp4");
@@ -293,14 +283,13 @@ fn bars_stream() -> MediaStream {
 )]
 #[case::untagged(Matrix::Bt601, None, false)]
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn frames_keep_the_colours_of_the_source(
     #[case] matrix: Matrix,
     #[case] tags: Option<&str>,
     #[case] full_chroma: bool,
 ) {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
 
     let version = probed_ffmpeg_version();
     if matches!(matrix, Matrix::Bt709)
@@ -369,10 +358,9 @@ async fn frames_keep_the_colours_of_the_source(
 #[case::vaapi_qsv_download("scale=128:72,format=nv12")]
 #[case::vaapi_qsv_full_range_download("scale=128:72:out_range=pc,format=nv12")]
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_downloaded_frame_is_converted_to_bt601_at_its_own_size(#[case] download: &str) {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let version = probed_ffmpeg_version();
     if version.is_none_or(|v| v < MIN_FFMPEG_JPEG_MATRIX_CONVERSION) {
         eprintln!("skipping: ffmpeg is unprobed or older than {MIN_FFMPEG_JPEG_MATRIX_CONVERSION}");
@@ -571,10 +559,9 @@ impl ferrofin_traits::configuration::ServerConfigurationManager for DefaultEncod
 #[case::jellyfin_chroma(false)]
 #[case::full_chroma(true)]
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn an_hdr10_source_is_tone_mapped_to_its_sdr_colours(#[case] full_chroma: bool) {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     if !has_tonemapx() {
         eprintln!("skipping: ffmpeg has no tonemapx (jellyfin-ffmpeg has it)");
         return;
@@ -717,15 +704,14 @@ fn frame_bytes(frames: &[String]) -> Vec<Vec<u8>> {
 #[case::hdr(false, false, false, true)]
 #[case::hdr_full_chroma(false, true, false, true)]
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn several_widths_from_one_decode_match_their_own_runs(
     #[case] interlaced: bool,
     #[case] full_chroma: bool,
     #[case] keyframe_only: bool,
     #[case] hdr: bool,
 ) {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     if hdr && !has_tonemapx() {
         eprintln!("skipping: ffmpeg has no tonemapx (jellyfin-ffmpeg has it)");
         return;
@@ -827,10 +813,9 @@ async fn several_widths_from_one_decode_match_their_own_runs(
 }
 
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn missing_input_is_an_error() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let out_dir = tmp.path().join("frames");

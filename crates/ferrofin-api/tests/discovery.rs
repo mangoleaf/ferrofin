@@ -15,7 +15,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeConfig, FakeMediaSources, FakeProviders, FakeSessions, FakeSystem,
-    FakeUserData, FakeUserViews,
+    FakeUserData, FakeUserViews, FixedAuth, fake_user_entity,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -30,9 +30,8 @@ use ferrofin_traits::library::{
     LibraryManager, MusicManager, SearchManager, SearchResult, SimilarItemsManager,
     SimilarItemsRecommendation, UserManager,
 };
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{
-    AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
+    DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
 use ferrofin_traits::persistence::ItemWithCounts;
 use tower::ServiceExt;
@@ -47,42 +46,22 @@ const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_7E11);
 /// `/Similar` route resolves to, the way C# falls back to `GetUserRootFolder()`.
 const ROOT_FOLDER_ID: Uuid = Uuid::from_u128(0x0000_0007);
 
+/// A row the user-scoped similar and recommendation queries return but
+/// `IsVisible` rejects: the stub library's `is_item_visible` and the stub DTO
+/// service's visibility pass both drop it.
+const HIDDEN_ID: Uuid = Uuid::from_u128(0x00A3);
+
+/// Whether `item` is [`HIDDEN_ID`].
+fn is_hidden(item: &BaseItemEntity) -> bool {
+    Uuid::parse_str(&item.id).is_ok_and(|id| id == HIDDEN_ID)
+}
+
 /// Builds a minimal [`UserEntity`] with the given id/name; every other field is a
 /// neutral zero value ([`UserEntity`] has no `Default`).
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
     UserEntity {
-        id: id.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: username.to_owned(),
-        normalized_username: username.to_uppercase(),
+        ..fake_user_entity(id, username)
     }
 }
 
@@ -164,35 +143,9 @@ fn item_entity(id: Uuid, name: &str) -> BaseItemEntity {
     }
 }
 
-/// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+/// An `AuthService`/`AuthorizationContext` that authenticates as [`USER_ID`].
+fn ok_auth() -> FixedAuth {
+    FixedAuth::signed_in(user_entity(USER_ID, "alice"))
 }
 
 /// A [`UserManager`] resolving the fixed authenticated user.
@@ -204,9 +157,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(|| user_entity(USER_ID, "alice")))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -299,12 +249,6 @@ fn to_dto(item: &BaseItemEntity) -> BaseItemDto {
 
 #[async_trait]
 impl DtoService for OkDto {
-    async fn get_primary_image_aspect_ratio(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         item: &BaseItemEntity,
@@ -318,20 +262,17 @@ impl DtoService for OkDto {
         &self,
         items: &[BaseItemEntity],
         _options: &DtoOptions,
-        _user: Option<&UserEntity>,
+        user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
-        _skip_visibility_check: bool,
+        skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        Ok(items.iter().map(to_dto).collect())
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        item: &BaseItemEntity,
-        _options: &DtoOptions,
-        _tagged_item_ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<BaseItemDto, ServiceError> {
-        Ok(to_dto(item))
+        // The real service's `items.Where(x => x.IsVisible(user))` pass.
+        let check = user.is_some() && !skip_visibility_check;
+        Ok(items
+            .iter()
+            .filter(|item| !(check && is_hidden(item)))
+            .map(to_dto)
+            .collect())
     }
 }
 
@@ -349,10 +290,10 @@ impl LibraryManager for StubLibrary {
     }
     async fn is_item_visible(
         &self,
-        _item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        item: &ferrofin_db::entities::base_items::BaseItemEntity,
         _user: &ferrofin_db::entities::users::UserEntity,
     ) -> Result<bool, ferrofin_traits::error::ServiceError> {
-        Ok(true)
+        Ok(!is_hidden(item))
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
@@ -449,13 +390,6 @@ impl LibraryManager for StubLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _i: &[BaseItemEntity],
@@ -530,14 +464,6 @@ impl MusicManager for StubMusic {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         Ok(mix())
     }
-    async fn get_instant_mix_from_artist(
-        &self,
-        _artist_id: Uuid,
-        _user_id: Option<Uuid>,
-        _dto_options: &DtoOptions,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(mix())
-    }
     async fn get_instant_mix_from_genres(
         &self,
         _genres: &[String],
@@ -574,6 +500,7 @@ impl SimilarItemsManager for StubSimilar {
         }
         Ok(Some(vec![
             item_entity(Uuid::from_u128(0xA1), "Similar A"),
+            item_entity(HIDDEN_ID, "Hidden"),
             item_entity(Uuid::from_u128(0xA2), "Similar B"),
         ]))
     }
@@ -598,10 +525,17 @@ impl SimilarItemsManager for StubSimilar {
                 recommendation_type: RecommendationType::SimilarToLikedItem,
                 items: vec![
                     item_entity(Uuid::from_u128(0x44), "Ronin"),
+                    item_entity(HIDDEN_ID, "Hidden"),
                     // The same item may recommend under several categories; the
                     // single-pass projection must keep the duplicate in place.
                     item_entity(Uuid::from_u128(0x42), "Aliens"),
                 ],
+            },
+            SimilarItemsRecommendation {
+                baseline_item_name: "Because you liked Hidden".to_owned(),
+                category_id: Uuid::from_u128(0x45),
+                recommendation_type: RecommendationType::SimilarToLikedItem,
+                items: vec![item_entity(HIDDEN_ID, "Hidden")],
             },
         ])
     }
@@ -674,8 +608,8 @@ fn state() -> AppState {
         Arc::new(StubSimilar),
         Arc::new(StubSearch),
         Arc::new(OkDto),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
+        Arc::new(ok_auth()),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -729,7 +663,7 @@ async fn movie_recommendations_returns_categories() {
     let (status, body) = get("/Movies/Recommendations").await;
     assert_eq!(status, StatusCode::OK);
     let recs: Vec<RecommendationDto> = serde_json::from_slice(&body).expect("recommendations");
-    assert_eq!(recs.len(), 2);
+    assert_eq!(recs.len(), 3);
     assert_eq!(
         recs[0].baseline_item_name.as_deref(),
         Some("Because you watched Alien")
@@ -743,7 +677,11 @@ async fn movie_recommendations_returns_categories() {
             .map(|items| items.iter().map(|d| d.name.as_deref()).collect::<Vec<_>>())
     };
     assert_eq!(names(0), Some(vec![Some("Aliens")]));
+    // C# projects each category with `GetBaseItemDtos(r.Items, dtoOptions,
+    // user)`, whose `IsVisible` pass drops the hidden row; a category it
+    // empties stays in the list with no items.
     assert_eq!(names(1), Some(vec![Some("Ronin"), Some("Aliens")]));
+    assert_eq!(names(2), Some(Vec::new()));
 }
 
 #[tokio::test]
@@ -774,8 +712,12 @@ async fn similar_items_returns_two() {
         let (status, body) = get(&format!("/{kind}/{ITEM_ID}/Similar")).await;
         assert_eq!(status, StatusCode::OK, "{kind}");
         let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("similar");
-        assert_eq!(result.items.len(), 2, "{kind}");
-        assert_eq!(result.items[0].name.as_deref(), Some("Similar A"));
+        // C# `GetBaseItemDtos(itemsResult, dtoOptions, user)` runs `IsVisible`
+        // and drops the hidden row; `TotalRecordCount` is `itemsResult.Count`,
+        // the count before that pass.
+        let names: Vec<_> = result.items.iter().map(|d| d.name.as_deref()).collect();
+        assert_eq!(names, [Some("Similar A"), Some("Similar B")], "{kind}");
+        assert_eq!(result.total_record_count, 3, "{kind}");
     }
 }
 
@@ -839,8 +781,8 @@ async fn user_scoped_suggestions_alias_forwards() {
 /// answered `200` with the other account's data — a cross-user read, not a
 /// cosmetic divergence.
 ///
-/// The stub caller is `USER_ID` with a `UserDto` carrying no `Policy`, i.e. not
-/// an administrator, so this exercises the refusing branch.
+/// The stub caller is `USER_ID` with a `UserDto` whose policy is not an
+/// administrator's, so this exercises the refusing branch.
 #[tokio::test]
 async fn suggestions_alias_forbids_another_users_id() {
     let other = uuid::Uuid::from_u128(0x11);

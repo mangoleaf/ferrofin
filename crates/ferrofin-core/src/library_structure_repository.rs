@@ -36,6 +36,7 @@ pub(crate) async fn preserve_children(
     collection: Uuid,
     aggregate: Uuid,
     mode: &IdDerivation,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<(), ServiceError> {
     let cf = guid_to_db(collection);
     let mut tx = db.writer().begin().await.map_err(db_err)?;
@@ -76,11 +77,15 @@ pub(crate) async fn preserve_children(
                 UNION SELECT b."Id" FROM "BaseItems" b JOIN tree t ON b."ParentId" = t.id
             ) SELECT b."Id" AS id, b."Path" AS path FROM "BaseItems" b JOIN tree t ON b."Id" = t.id"#,
         ).bind(&child.id).fetch_all(&mut *tx).await.map_err(db_err)?;
+        // stored tokenised under the data directory (gl-1581); the locations
+        // are the resolved directories
         let physical_path = child
             .path
             .as_deref()
-            .or_else(|| descendants.iter().find_map(|row| row.path.as_deref()));
+            .or_else(|| descendants.iter().find_map(|row| row.path.as_deref()))
+            .map(|path| virtual_paths.expand(path));
         let location = physical_path
+            .as_deref()
             .and_then(|path| {
                 locations
                     .iter()
@@ -103,7 +108,8 @@ pub(crate) async fn preserve_children(
             .ok_or_else(|| ServiceError::backend("cannot derive the library location id"))?;
         let folder = guid_to_db(id);
         let now = Utc::now();
-        ensure_location(&mut tx, id, Some(&aggregate), location, (now, now)).await?;
+        let stored = virtual_paths.reverse(location);
+        ensure_location(&mut tx, id, Some(&aggregate), &stored, (now, now)).await?;
         sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ? WHERE "Id" = ?"#)
             .bind(if child.id == folder {
                 &aggregate
@@ -152,12 +158,19 @@ async fn ensure_location(
         .and_then(|v| v.to_str())
         .unwrap_or(location);
     sqlx::query(
-            r#"INSERT INTO "BaseItems" (
+            concat!(
+                r#"INSERT INTO "BaseItems" (
                 "Id", "Type", "Name", "SortName", "CleanName", "Path", "ParentId", "TopParentId",
                 "PresentationUniqueKey", "DateCreated", "DateModified", "DateLastSaved",
-                "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem"
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?1, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0)
-            ON CONFLICT("Id") DO NOTHING"#,
+                "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem",
+                "UnratedType", "#,
+                crate::item_persistence_service::unset_columns!(),
+                r#"
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?1, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0, ?12, "#,
+                crate::item_persistence_service::unset_values!(),
+                r#")
+            ON CONFLICT("Id") DO NOTHING"#
+            ),
         ).bind(&folder).bind(stored_type_name(BaseItemKind::Folder).unwrap_or_default())
             .bind(name)
             .bind(crate::kinds::saved_sort_name(BaseItemKind::Folder, name, None))
@@ -165,6 +178,7 @@ async fn ensure_location(
             .bind(location).bind(aggregate).bind(id.simple().to_string())
             .bind(datetime_to_db(dates.0)).bind(datetime_to_db(dates.1))
             .bind(datetime_to_db(Utc::now()))
+            .bind(crate::item_persistence_service::unrated_type_name(BaseItemKind::Folder))
             .execute(&mut *connection).await.map_err(db_err)?;
     if let Some(aggregate) = aggregate {
         sqlx::query(
@@ -263,6 +277,35 @@ pub(crate) async fn folder_of_kind(
     .fetch_optional(db.pool())
     .await
     .map_err(db_err)
+}
+
+/// Records `item`'s parent chain as its ancestors: `parent`, then each
+/// `ParentId` above it up to the root, what `BaseItem.GetParents` walks
+/// (`BaseItem.cs:1116-1126`). It is all of `GetAncestorIds` for an item with no
+/// collection folders, such as a playlist under the Playlists folder. A link
+/// to a row that does not exist is skipped, as a key to it could not be stored.
+pub(crate) async fn add_parent_chain_in(
+    connection: &mut sqlx::SqliteConnection,
+    item: Uuid,
+    parent: Uuid,
+) -> Result<(), ServiceError> {
+    sqlx::query(
+        r#"WITH RECURSIVE "chain"("ParentItemId") AS (
+               SELECT ?2
+               UNION
+               SELECT p."ParentId" FROM "chain" c
+                 JOIN "BaseItems" p ON p."Id" = c."ParentItemId"
+                WHERE p."ParentId" IS NOT NULL)
+           INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId")
+           SELECT ?1, "ParentItemId" FROM "chain"
+            WHERE "ParentItemId" IN (SELECT "Id" FROM "BaseItems")"#,
+    )
+    .bind(guid_to_db(item))
+    .bind(guid_to_db(parent))
+    .execute(&mut *connection)
+    .await
+    .map_err(db_err)?;
+    Ok(())
 }
 
 /// Records `ancestors` for `item`: `GetAncestorIds`, its parents up to the root
@@ -409,4 +452,119 @@ pub(crate) async fn user_data_items(db: &Database, user: Uuid) -> Vec<String> {
         .fetch_all(db.pool())
         .await
         .expect("user data")
+}
+
+/// Test-only: makes every change of a `BaseItems` row's id fail while `on`.
+#[cfg(test)]
+pub(crate) async fn fail_item_rekeys(db: &Database, on: bool) {
+    let sql = if on {
+        r#"CREATE TRIGGER "fail_rekey" BEFORE UPDATE OF "Id" ON "BaseItems"
+           BEGIN SELECT RAISE(ABORT, 'disk full'); END"#
+    } else {
+        r#"DROP TRIGGER "fail_rekey""#
+    };
+    sqlx::query(sql)
+        .execute(db.writer())
+        .await
+        .expect("trigger");
+}
+
+/// Test-only: a `LinkedChildren` row, `parent` holding `child`.
+#[cfg(test)]
+pub(crate) async fn link_child(db: &Database, parent: Uuid, child: Uuid) {
+    sqlx::query(
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+           VALUES (?1, 0, ?2, 0)"#,
+    )
+    .bind(guid_to_db(parent))
+    .bind(guid_to_db(child))
+    .execute(db.writer())
+    .await
+    .expect("link");
+}
+
+/// Test-only: every `LinkedChildren` row as `(ParentId, ChildId)`, those of
+/// `last` last.
+#[cfg(test)]
+pub(crate) async fn linked_children(db: &Database, last: Uuid) -> Vec<(String, String)> {
+    sqlx::query_as(r#"SELECT "ParentId", "ChildId" FROM "LinkedChildren" ORDER BY "ParentId" = ?1"#)
+        .bind(guid_to_db(last))
+        .fetch_all(db.pool())
+        .await
+        .expect("links")
+}
+
+/// Test-only: marks every user's row of `item` a favourite.
+#[cfg(test)]
+pub(crate) async fn favourite_item(db: &Database, item: Uuid) {
+    sqlx::query(r#"UPDATE "UserData" SET "IsFavorite" = 1 WHERE "ItemId" = ?1"#)
+        .bind(guid_to_db(item))
+        .execute(db.writer())
+        .await
+        .expect("favourite");
+}
+
+/// Test-only: `item`'s one user-data row as `(CustomDataKey, IsFavorite,
+/// Played)`.
+#[cfg(test)]
+pub(crate) async fn user_data_row(db: &Database, item: Uuid) -> (String, bool, bool) {
+    sqlx::query_as(
+        r#"SELECT "CustomDataKey", "IsFavorite", "Played" FROM "UserData" WHERE "ItemId" = ?1"#,
+    )
+    .bind(guid_to_db(item))
+    .fetch_one(db.pool())
+    .await
+    .expect("user data")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{fetch_item, save_item, seed_named_item, test_db};
+
+    /// gl-1581: a legacy child of a library stored tokenised under the data
+    /// directory (a recording) is matched to its resolved location by its
+    /// expanded path, and the location folder it moves under is stored the
+    /// way every save stores it, its id still the one the resolved location
+    /// derives.
+    #[tokio::test]
+    async fn preserve_children_matches_a_tokenised_child_to_its_location() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(tmp.path());
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(&*paths);
+        let expander =
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths));
+        let location = format!("{data}/livetv/recordings");
+        let (aggregate, library, child) = (
+            Uuid::from_u128(0xA66),
+            Uuid::from_u128(0xCF1),
+            Uuid::from_u128(0xC41),
+        );
+        seed_named_item(&db, aggregate, BaseItemKind::AggregateFolder, "root").await;
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Recs").await;
+        seed_named_item(&db, child, BaseItemKind::Movie, "Rec").await;
+        let mut row = fetch_item(&db, library).await;
+        row.data = Some(serde_json::json!({ "PhysicalLocationsList": [location] }).to_string());
+        save_item(&db, &row).await;
+        let mut row = fetch_item(&db, child).await;
+        row.parent_id = Some(guid_to_db(library));
+        row.path = Some("%AppDataPath%/livetv/recordings/Rec/Rec.ts".to_owned());
+        save_item(&db, &row).await;
+
+        let mode = IdDerivation::LegacyLowercase;
+        preserve_children(&db, library, aggregate, &mode, &expander)
+            .await
+            .expect("preserved");
+        let folder = derive_item_id_with(&mode, BaseItemKind::Folder, &location).expect("id");
+        assert_eq!(
+            fetch_item(&db, child).await.parent_id,
+            Some(guid_to_db(folder)),
+            "the child moves under its location's folder"
+        );
+        assert_eq!(
+            fetch_item(&db, folder).await.path.as_deref(),
+            Some("%AppDataPath%/livetv/recordings")
+        );
+    }
 }

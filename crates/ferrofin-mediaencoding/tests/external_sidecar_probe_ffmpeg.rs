@@ -6,11 +6,10 @@
 //! built exactly as the resolver builds them (`MediaProtocol::File`, no
 //! chapters, `MediaType = Audio` only for the audio resolver).
 //!
-//! Gated like every ffmpeg test: `FERROFIN_FFMPEG_TESTS=1`, skipped when
-//! ffmpeg/ffprobe are absent.
+//! `#[ignore]`d like every ffmpeg test; asked for, it needs ffmpeg and ffprobe.
 //!
 //! ```text
-//! FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test external_sidecar_probe_ffmpeg
+//! cargo test -p ferrofin-mediaencoding --test external_sidecar_probe_ffmpeg -- --include-ignored
 //! ```
 
 use std::path::Path;
@@ -31,18 +30,12 @@ fn on_path(program: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Whether the ffmpeg-gated suite should run: `FERROFIN_FFMPEG_TESTS` set AND
-/// both binaries present. Prints a skip line and returns `false` otherwise.
-fn ffmpeg_gate() -> bool {
-    if std::env::var("FERROFIN_FFMPEG_TESTS").is_err() {
-        eprintln!("skipping: FERROFIN_FFMPEG_TESTS not set");
-        return false;
+/// Panics unless `ffmpeg` and `ffprobe` are on `PATH`: these tests are
+/// `#[ignore]`d, so a run that asks for them must not pass without the tools.
+fn require_ffmpeg() {
+    for program in ["ffmpeg", "ffprobe"] {
+        assert!(on_path(program), "{program} not found on PATH");
     }
-    if !on_path("ffmpeg") || !on_path("ffprobe") {
-        eprintln!("skipping: ffmpeg/ffprobe not found on PATH");
-        return false;
-    }
-    true
 }
 
 fn encoder() -> MediaEncoderImpl<TokioTranscoder> {
@@ -68,10 +61,9 @@ fn sidecar_request(path: &Path, media_is_audio: bool) -> MediaInfoRequest {
 }
 
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn a_srt_sidecar_probes_as_one_subrip_subtitle_stream() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let dir = tempfile::tempdir().expect("tempdir");
     let srt = dir.path().join("Heat (1995).eng.forced.srt");
     std::fs::write(
@@ -96,10 +88,9 @@ async fn a_srt_sidecar_probes_as_one_subrip_subtitle_stream() {
 }
 
 #[tokio::test]
+#[ignore = "runs the real ffmpeg; run with --ignored"]
 async fn an_audio_sidecar_probes_as_one_audio_stream() {
-    if !ffmpeg_gate() {
-        return;
-    }
+    require_ffmpeg();
     let dir = tempfile::tempdir().expect("tempdir");
     let mka = dir.path().join("Heat (1995).commentary.mka");
     let status = std::process::Command::new("ffmpeg")

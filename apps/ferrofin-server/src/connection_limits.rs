@@ -11,6 +11,13 @@
 //! - **From that byte**, it has [`KESTREL_LIMITS`]`.request_headers` to finish
 //!   the request line and headers. Past it the connection is answered `408` and
 //!   closes.
+//! - **While the request line and headers arrive**, they are held to
+//!   `HEAD_LIMITS`, counted as the bytes come in, before hyper has buffered
+//!   more of them: Kestrel's header limits (`MaxRequestHeadersTotalSize`,
+//!   `MaxRequestHeaderCount`), and 64 KB for the request line, where Kestrel's
+//!   `MaxRequestLineSize` is 8 KB (an accepted divergence, gl-1869). A request
+//!   line past its size is answered `414`, headers past theirs or their count
+//!   `431`, and the connection closes.
 //! - **While a handler waits for request body bytes** that have not arrived,
 //!   the body must keep up [`KESTREL_LIMITS`]`.min_request_body_rate` (Kestrel's
 //!   `MinRequestBodyDataRate`). Only the waits count: time the handler spends on
@@ -109,6 +116,62 @@ const KESTREL_MIN_DATA_RATE: MinDataRate = MinDataRate {
     grace: Duration::from_secs(5),
 };
 
+/// The sizes a request's line and headers may take: Kestrel's
+/// `MaxRequestLineSize`, `MaxRequestHeadersTotalSize` and
+/// `MaxRequestHeaderCount`.
+#[derive(Debug, Clone, Copy)]
+struct HeadLimits {
+    /// The bytes of the request line, its line ending included.
+    request_line: usize,
+    /// The bytes of the header lines, line endings included. The blank line
+    /// that ends them may take 2 more (`_remainingRequestHeadersBytesAllowed`
+    /// starts at the limit plus 2).
+    headers_total: usize,
+    /// The header lines.
+    header_count: usize,
+}
+
+/// Kestrel's defaults for the headers, which Jellyfin does not override either
+/// (`KestrelServerLimits`: 32 KB and 100), and 64 KB for the request line, not
+/// Kestrel's 8 KB ([`HEAD_LIMIT_DIVERGENCES`]).
+///
+/// TODO(gl-307): tuning literals like [`KESTREL_LIMITS`], candidate settings
+/// for the owner; they keep these values until then.
+const HEAD_LIMITS: HeadLimits = HeadLimits {
+    request_line: 64 * 1024,
+    headers_total: 32 * 1024,
+    header_count: 100,
+};
+
+/// Where the head limits depart from Kestrel's, each with its fix path or the
+/// owner decision that keeps it.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "a record for readers; a test checks its form")
+)]
+const HEAD_LIMIT_DIVERGENCES: &[&str] = &[
+    "A request line may take 64 KB; Kestrel's MaxRequestLineSize is 8 KB, which \
+     Jellyfin v12.4 does not override, so it answers 414 past it. jellyfin-web puts id lists \
+     with no cap in the query: ItemIds on POST /Sessions/{id}/Playing when it controls \
+     another session's playback, Ids when it adds items to a collection or a playlist \
+     or groups versions. They pass 8 KB at about 232 ids, and v1.5.1 served them. \
+     Owner decision (gl-1869, 2026-11-19).",
+    "Not every head is counted: one hyper read wholly or partly with the request \
+     before it (pipelining), whose count then starts mid-head and holds that first \
+     partial line to the request line's 64 KB, where Kestrel holds a header line to \
+     the headers' 32 KB; and the one after a request whose body \
+     the handler left unread, since hyper drains that body and its bytes cannot be told \
+     from a request's here. A peer can bring the second about at will, with a small \
+     body to a route that answers before reading it, and gets hyper's own limits (its \
+     400 KB read buffer, 100 headers) for the request after it. Fix path: gl-1810, \
+     follow each request's body framing to the next head.",
+    "A chunked body's trailer lines are not counted. Kestrel counts them against what \
+     is left of the header total and count. Fix path: gl-1810, count the trailers as \
+     the body framing reaches them.",
+    "The 414 and 431 answers, like the header timeout's 408, carry no Date header; \
+     Kestrel's do. Fix path: write the current HTTP date into the canned answers.",
+];
+
 /// Where the minimum data rates depart from Kestrel's, each with its fix path.
 #[cfg_attr(
     not(test),
@@ -148,6 +211,87 @@ const DATA_RATE_DIVERGENCES: &[&str] = &[
 const REQUEST_TIMEOUT_RESPONSE: &[u8] =
     b"HTTP/1.1 408 Request Timeout\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
+/// What the peer of a request line past [`HeadLimits::request_line`] is sent:
+/// Kestrel's `RequestRejectionReason.RequestLineTooLong`.
+const REQUEST_LINE_TOO_LONG_RESPONSE: &[u8] =
+    b"HTTP/1.1 414 URI Too Long\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+/// What the peer of headers past [`HeadLimits::headers_total`] or
+/// [`HeadLimits::header_count`] is sent: Kestrel's
+/// `RequestRejectionReason.HeadersExceedMaxTotalSize` and `TooManyHeaders`.
+const HEADERS_TOO_LARGE_RESPONSE: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\n\
+    content-length: 0\r\nconnection: close\r\n\r\n";
+
+/// How a request's head stands once more of it has arrived.
+#[derive(Debug, PartialEq, Eq)]
+enum Head {
+    /// More is to come.
+    Incomplete,
+    /// The blank line that ends the headers has arrived.
+    Complete,
+    /// Past a limit: what the peer is sent before the connection closes, and
+    /// which limit it was.
+    Rejected(&'static [u8], &'static str),
+}
+
+/// A request's line and headers as they arrive, held to [`HeadLimits`]:
+/// Kestrel's `Http1Connection.TakeStartLine` and `TakeMessageHeaders`.
+#[derive(Debug, Default)]
+struct HeadScan {
+    /// The blank lines before the request are behind (`ParseRequest` skips
+    /// them).
+    started: bool,
+    /// The request line has ended.
+    in_headers: bool,
+    /// The bytes of the line so far.
+    line: usize,
+    /// The byte before this one.
+    last: u8,
+    /// The bytes of the header lines so far.
+    header_bytes: usize,
+    /// The header lines so far.
+    headers: usize,
+}
+
+impl HeadScan {
+    /// Counts `bytes`, the next ones read, against `limits`. Nothing after the
+    /// head's end is looked at.
+    fn feed(&mut self, bytes: &[u8], limits: HeadLimits) -> Head {
+        for &byte in bytes {
+            if !self.started {
+                if matches!(byte, b'\r' | b'\n') {
+                    continue;
+                }
+                self.started = true;
+            }
+            self.line += 1;
+            if self.in_headers {
+                self.header_bytes += 1;
+                if self.header_bytes > limits.headers_total + 2 {
+                    return Head::Rejected(HEADERS_TOO_LARGE_RESPONSE, "request headers size");
+                }
+                if byte == b'\n' {
+                    if self.line == 1 || (self.line == 2 && self.last == b'\r') {
+                        return Head::Complete;
+                    }
+                    self.headers += 1;
+                    if self.headers > limits.header_count {
+                        return Head::Rejected(HEADERS_TOO_LARGE_RESPONSE, "request header count");
+                    }
+                    self.line = 0;
+                }
+            } else if byte == b'\n' {
+                self.in_headers = true;
+                self.line = 0;
+            } else if self.line >= limits.request_line {
+                return Head::Rejected(REQUEST_LINE_TOO_LONG_RESPONSE, "request line size");
+            }
+            self.last = byte;
+        }
+        Head::Incomplete
+    }
+}
+
 const WAITING: u8 = 0;
 const READING_HEADERS: u8 = 1;
 const SERVING: u8 = 2;
@@ -161,6 +305,9 @@ pub struct ConnectionPhase {
     reader: AtomicWaker,
     /// A response has been handed to hyper, and its first write is to come.
     response_started: AtomicBool,
+    /// The request's body has bytes the handler has not taken: what is read
+    /// next may be them, drained by hyper, rather than a request.
+    body_unread: AtomicBool,
 }
 
 impl ConnectionPhase {
@@ -222,6 +369,8 @@ pub struct LimitedIo<I> {
     write_grace_due: bool,
     /// Runs out at `write_deadline`, for a write that waits on the peer.
     write_timer: Option<Pin<Box<Sleep>>>,
+    /// The head of the request being read, until it is complete.
+    head: Option<HeadScan>,
 }
 
 impl<I> LimitedIo<I> {
@@ -237,6 +386,7 @@ impl<I> LimitedIo<I> {
             write_deadline: None,
             write_grace_due: false,
             write_timer: None,
+            head: None,
         }
     }
 
@@ -394,8 +544,32 @@ impl<I: AsyncRead + AsyncWrite + Unpin> AsyncRead for LimitedIo<I> {
                     && this.phase.advance(WAITING, READING_HEADERS)
                 {
                     this.timing = None;
+                    // Bytes after a body the handler left unread may be that
+                    // body, which hyper drains: they start no count. Every
+                    // connection is HTTP/1 (hyper-util's `http2` feature is
+                    // off); serving HTTP/2 (gl-814) must stop this count on one.
+                    if !this.phase.body_unread.load(Ordering::Relaxed) {
+                        this.head = Some(HeadScan::default());
+                    }
                 }
-                Poll::Ready(Ok(()))
+                let Some(head) = this.head.as_mut() else {
+                    return Poll::Ready(Ok(()));
+                };
+                match head.feed(received, HEAD_LIMITS) {
+                    Head::Incomplete => Poll::Ready(Ok(())),
+                    Head::Complete => {
+                        this.head = None;
+                        Poll::Ready(Ok(()))
+                    }
+                    Head::Rejected(answer, limit) => {
+                        this.head = None;
+                        // Best effort, as for the header timeout's 408.
+                        let _ = Pin::new(&mut this.io).poll_write(cx, answer);
+                        let _ = Pin::new(&mut this.io).poll_shutdown(cx);
+                        tracing::debug!(limit, "request rejected");
+                        Poll::Ready(Err(std::io::ErrorKind::InvalidData.into()))
+                    }
+                }
             }
             Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
         }
@@ -456,6 +630,7 @@ impl RequestTracker {
     #[must_use]
     pub fn start(&self) -> RunningRequest {
         self.phase.set(SERVING);
+        self.phase.body_unread.store(false, Ordering::Relaxed);
         RunningRequest {
             phase: Arc::clone(&self.phase),
             body_rate: self.body_rate,
@@ -487,7 +662,9 @@ impl RunningRequest {
         }
         let rate = self.body_rate;
         let timed_out = Arc::clone(&self.body_timed_out);
-        request.map(|body| Body::new(TimedRequestBody::new(body, rate, timed_out)))
+        self.phase.body_unread.store(true, Ordering::Relaxed);
+        let phase = Arc::clone(&self.phase);
+        request.map(|body| Body::new(TimedRequestBody::new(body, rate, timed_out, phase)))
     }
 
     /// Ties this request to its `response`: the connection waits for its next
@@ -563,10 +740,17 @@ struct TimedRequestBody {
     timer: Option<Pin<Box<Sleep>>>,
     /// Set when it did, for the request's answer.
     timed_out: Arc<AtomicBool>,
+    /// The connection, told when the body has been taken to its end.
+    phase: Arc<ConnectionPhase>,
 }
 
 impl TimedRequestBody {
-    fn new(body: Body, rate: MinDataRate, timed_out: Arc<AtomicBool>) -> Self {
+    fn new(
+        body: Body,
+        rate: MinDataRate,
+        timed_out: Arc<AtomicBool>,
+        phase: Arc<ConnectionPhase>,
+    ) -> Self {
         Self {
             body,
             rate,
@@ -575,6 +759,7 @@ impl TimedRequestBody {
             waiting_since: None,
             timer: None,
             timed_out,
+            phase,
         }
     }
 
@@ -619,6 +804,9 @@ impl HttpBody for TimedRequestBody {
                     && let Some(data) = frame.data_ref()
                 {
                     this.bytes += u64::try_from(data.len()).unwrap_or(u64::MAX);
+                }
+                if frame.is_none() || this.body.is_end_stream() {
+                    this.phase.body_unread.store(false, Ordering::Relaxed);
                 }
                 Poll::Ready(frame)
             }
@@ -738,8 +926,10 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        ConnectionLimits, DATA_RATE_DIVERGENCES, KESTREL_LIMITS, KESTREL_MIN_DATA_RATE, LimitedIo,
-        MinDataRate, TimedRequestBody,
+        ConnectionLimits, DATA_RATE_DIVERGENCES, HEAD_LIMIT_DIVERGENCES, HEAD_LIMITS,
+        HEADERS_TOO_LARGE_RESPONSE, Head, HeadLimits, HeadScan, KESTREL_LIMITS,
+        KESTREL_MIN_DATA_RATE, LimitedIo, MinDataRate, REQUEST_LINE_TOO_LONG_RESPONSE,
+        TimedRequestBody,
     };
 
     /// Long enough that only a connection nothing closes takes this long.
@@ -1477,6 +1667,7 @@ mod tests {
             Body::from_stream(chunks),
             KESTREL_MIN_DATA_RATE,
             std::sync::Arc::clone(&timed_out),
+            std::sync::Arc::default(),
         );
         (sender, body, timed_out)
     }
@@ -1567,9 +1758,12 @@ mod tests {
     }
 
     #[test]
-    fn every_data_rate_divergence_names_its_fix_path() {
-        for divergence in DATA_RATE_DIVERGENCES {
-            assert!(divergence.contains("Fix path: "), "{divergence}");
+    fn every_divergence_names_its_fix_path_or_its_decision() {
+        for divergence in DATA_RATE_DIVERGENCES.iter().chain(HEAD_LIMIT_DIVERGENCES) {
+            assert!(
+                divergence.contains("Fix path: ") || divergence.contains("Owner decision (gl-"),
+                "{divergence}"
+            );
         }
     }
 
@@ -1628,5 +1822,331 @@ mod tests {
             .expect("ended in time")
             .expect_err("timed out");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// `request` counted whole, and a byte at a time: a limit cannot depend on
+    /// how the bytes arrive.
+    fn scan(request: &str, limits: HeadLimits) -> Head {
+        let whole = HeadScan::default().feed(request.as_bytes(), limits);
+        let mut bytewise = HeadScan::default();
+        let split = request
+            .as_bytes()
+            .chunks(1)
+            .map(|byte| bytewise.feed(byte, limits))
+            .find(|head| *head != Head::Incomplete)
+            .unwrap_or(Head::Incomplete);
+        assert_eq!(whole, split, "{request:?}");
+        whole
+    }
+
+    /// Kestrel's `RequestHeaderLimitsTests.MakeHeaders`.
+    fn make_headers(count: usize) -> String {
+        std::iter::once("Host:\r\n".to_owned())
+            .chain((0..count.saturating_sub(1)).map(|i| format!("Header-{i}: value{i}\r\n")))
+            .collect()
+    }
+
+    /// Kestrel's `MaxRequestLineSizeTests.ServerAcceptsRequestLineWithinLimit`.
+    #[rstest]
+    #[case("GET / HTTP/1.1\r\nHost:\r\n\r\n", 16)]
+    #[case("GET / HTTP/1.1\r\nHost:\r\n\r\n", 17)]
+    #[case("GET / HTTP/1.1\r\nHost:\r\n\r\n", 137)]
+    #[case("POST /abc/de HTTP/1.1\r\nHost:\r\nContent-Length: 0\r\n\r\n", 23)]
+    #[case("POST /abc/de HTTP/1.1\r\nHost:\r\nContent-Length: 0\r\n\r\n", 24)]
+    #[case("POST /abc/de HTTP/1.1\r\nHost:\r\nContent-Length: 0\r\n\r\n", 287)]
+    #[case("PUT /abc/de?f=ghi HTTP/1.1\r\nHost:\r\nContent-Length: 0\r\n\r\n", 28)]
+    #[case("PUT /abc/de?f=ghi HTTP/1.1\r\nHost:\r\nContent-Length: 0\r\n\r\n", 29)]
+    #[case(
+        "PUT /abc/de?f=ghi HTTP/1.1\r\nHost:\r\nContent-Length: 0\r\n\r\n",
+        589
+    )]
+    #[case("DELETE /a%20b%20c/d%20e?f=ghi HTTP/1.1\r\nHost:\r\n\r\n", 40)]
+    #[case("DELETE /a%20b%20c/d%20e?f=ghi HTTP/1.1\r\nHost:\r\n\r\n", 41)]
+    #[case("DELETE /a%20b%20c/d%20e?f=ghi HTTP/1.1\r\nHost:\r\n\r\n", 1027)]
+    fn a_request_line_within_its_limit_is_accepted(#[case] request: &str, #[case] limit: usize) {
+        assert_eq!(
+            scan(
+                request,
+                HeadLimits {
+                    request_line: limit,
+                    ..HEAD_LIMITS
+                }
+            ),
+            Head::Complete
+        );
+    }
+
+    /// Kestrel's `MaxRequestLineSizeTests.ServerRejectsRequestLineExceedingLimit`.
+    #[rstest]
+    #[case("GET / HTTP/1.1\r\n")]
+    #[case("POST /abc/de HTTP/1.1\r\n")]
+    #[case("PUT /abc/de?f=ghi HTTP/1.1\r\n")]
+    #[case("DELETE /a%20b%20c/d%20e?f=ghi HTTP/1.1\r\n")]
+    fn a_request_line_past_its_limit_is_answered_414(#[case] request_line: &str) {
+        let limits = HeadLimits {
+            request_line: request_line.len() - 1,
+            ..HEAD_LIMITS
+        };
+        assert_eq!(
+            scan(request_line, limits),
+            Head::Rejected(REQUEST_LINE_TOO_LONG_RESPONSE, "request line size")
+        );
+    }
+
+    /// Kestrel's `RequestHeaderLimitsTests.ServerAcceptsRequestWithHeaderTotalSizeWithinLimit`.
+    #[rstest]
+    #[case(0, 1)]
+    #[case(0, 1337)]
+    #[case(1, 0)]
+    #[case(1, 1)]
+    #[case(1, 1337)]
+    #[case(5, 0)]
+    #[case(5, 1)]
+    #[case(5, 1337)]
+    fn headers_within_their_total_size_are_accepted(#[case] count: usize, #[case] extra: usize) {
+        let headers = make_headers(count);
+        let limits = HeadLimits {
+            headers_total: headers.len() + extra,
+            ..HEAD_LIMITS
+        };
+        let request = format!("GET / HTTP/1.1\r\n{headers}\r\n");
+        assert_eq!(scan(&request, limits), Head::Complete);
+    }
+
+    /// Kestrel's `RequestHeaderLimitsTests.ServerAcceptsRequestWithHeaderCountWithinLimit`.
+    #[rstest]
+    #[case(0, 1)]
+    #[case(0, 1337)]
+    #[case(1, 1)]
+    #[case(1, 2)]
+    #[case(1, 1337)]
+    #[case(5, 5)]
+    #[case(5, 6)]
+    #[case(5, 1337)]
+    fn headers_within_their_count_are_accepted(#[case] count: usize, #[case] max: usize) {
+        let request = format!("GET / HTTP/1.1\r\n{}\r\n", make_headers(count));
+        assert_eq!(
+            scan(
+                &request,
+                HeadLimits {
+                    header_count: max,
+                    ..HEAD_LIMITS
+                }
+            ),
+            Head::Complete
+        );
+    }
+
+    /// Kestrel's `RequestHeaderLimitsTests.ServerRejectsRequestWithHeaderTotalSizeOverLimit`.
+    #[rstest]
+    #[case(1)]
+    #[case(5)]
+    fn headers_past_their_total_size_are_answered_431(#[case] count: usize) {
+        let headers = make_headers(count);
+        let limits = HeadLimits {
+            headers_total: headers.len() - 1,
+            ..HEAD_LIMITS
+        };
+        let request = format!("GET / HTTP/1.1\r\n{headers}\r\n");
+        assert_eq!(
+            scan(&request, limits),
+            Head::Rejected(HEADERS_TOO_LARGE_RESPONSE, "request headers size")
+        );
+    }
+
+    /// Kestrel's `RequestHeaderLimitsTests.ServerRejectsRequestWithHeaderCountOverLimit`.
+    #[rstest]
+    #[case(2, 1)]
+    #[case(5, 1)]
+    #[case(5, 4)]
+    fn headers_past_their_count_are_answered_431(#[case] count: usize, #[case] max: usize) {
+        let request = format!("GET / HTTP/1.1\r\n{}\r\n", make_headers(count));
+        assert_eq!(
+            scan(
+                &request,
+                HeadLimits {
+                    header_count: max,
+                    ..HEAD_LIMITS
+                }
+            ),
+            Head::Rejected(HEADERS_TOO_LARGE_RESPONSE, "request header count")
+        );
+    }
+
+    /// The blank lines before a request count against nothing
+    /// (`ParseRequest` skips them), and nothing after the head is counted.
+    #[rstest]
+    #[case::blank_lines_first("\r\n\r\nGET / HTTP/1.1\r\n\r\n", 16, Head::Complete)]
+    #[case::lf_line_endings("GET / HTTP/1.1\nHost:\n\n", 15, Head::Complete)]
+    #[case::a_body_after_the_head(
+        "GET / HTTP/1.1\r\n\r\nxxxxxxxxxxxxxxxxxxxxxxx",
+        16,
+        Head::Complete
+    )]
+    fn only_the_request_head_is_counted(
+        #[case] request: &str,
+        #[case] line_limit: usize,
+        #[case] expected: Head,
+    ) {
+        assert_eq!(
+            scan(
+                request,
+                HeadLimits {
+                    request_line: line_limit,
+                    ..HEAD_LIMITS
+                }
+            ),
+            expected
+        );
+    }
+
+    /// One request to a real serve loop, answered under the head limits: what
+    /// the server sends before it closes, or the start of its `hello`.
+    async fn send_head(request: &[u8]) -> String {
+        let server = Server::start(hello(), LIMITS);
+        let mut stream = server.connect().await;
+        stream.write_all(request).await.expect("request");
+        let mut received = Vec::new();
+        let mut chunk = [0; 1024];
+        while !received.ends_with(b"hello") {
+            match timeout(ANSWER_TIMEOUT, stream.read(&mut chunk))
+                .await
+                .expect("answered in time")
+            {
+                Ok(0) | Err(_) => break,
+                Ok(read) => received.extend_from_slice(&chunk[..read]),
+            }
+        }
+        server.stop().await;
+        String::from_utf8_lossy(&received).into_owned()
+    }
+
+    /// The head limits hold at the server seam (gl-1380, gl-1869): 64 KB for
+    /// the request line, Kestrel's 32 KB for the headers and 100 headers; one
+    /// byte or header more is refused by this module's count. hyper's own
+    /// limits are larger for the sizes (for the line only just: its target may
+    /// take 65,534 bytes) and the same 100 for the count.
+    #[rstest]
+    #[case::request_line_at_its_limit(64 * 1024, 0, 1, "HTTP/1.1 200")]
+    #[case::request_line_past_its_limit(64 * 1024 + 1, 0, 1, "HTTP/1.1 414 URI Too Long\r\n")]
+    #[case::headers_at_their_limit(0, 32 * 1024, 1, "HTTP/1.1 200")]
+    #[case::headers_past_their_limit(
+        0,
+        32 * 1024 + 1,
+        1,
+        "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+    )]
+    #[case::headers_at_their_count(0, 0, 100, "HTTP/1.1 200")]
+    #[case::headers_past_their_count(0, 0, 101, "HTTP/1.1 431 Request Header Fields Too Large\r\n")]
+    #[tokio::test]
+    async fn the_head_limits_hold_at_the_server(
+        #[case] request_line: usize,
+        #[case] headers_total: usize,
+        #[case] header_count: usize,
+        #[case] expected: &str,
+    ) {
+        // `GET /hello?<padding> HTTP/1.1\r\n`, padded to `request_line` bytes.
+        let fixed = "GET /hello? HTTP/1.1\r\n".len();
+        let line = format!(
+            "GET /hello?{} HTTP/1.1\r\n",
+            "a".repeat(request_line.saturating_sub(fixed))
+        );
+        // `Host: x`, then `X-N: v` lines, the last padded so the header lines
+        // take `headers_total` bytes.
+        let mut headers = String::from("Host: x\r\n");
+        headers.extend((1..header_count).map(|n| format!("X-{n}: v\r\n")));
+        if headers_total > headers.len() {
+            let pad = headers_total - headers.len() - "X-Pad: \r\n".len();
+            headers.extend([format!("X-Pad: {}\r\n", "a".repeat(pad))]);
+            assert_eq!(headers.len(), headers_total);
+        }
+        let response = send_head(format!("{line}{headers}\r\n").as_bytes()).await;
+        assert!(response.starts_with(expected), "{response:?}");
+        // A refusal is this module's canned answer, not hyper's own 431 (which
+        // carries a date): for 101 headers, where hyper would refuse too, this
+        // is what shows the count here refused it.
+        if !expected.starts_with("HTTP/1.1 200") {
+            let canned = [REQUEST_LINE_TOO_LONG_RESPONSE, HEADERS_TOO_LARGE_RESPONSE];
+            assert!(canned.contains(&response.as_bytes()), "{response:?}");
+        }
+    }
+
+    /// Only a request's head is counted: each request on a keep-alive
+    /// connection gets a count of its own (two 20 KiB heads pass), a body with
+    /// no line ending read after its head is not counted, and the head after a
+    /// body read to its end is counted again (a 33 KiB head is refused).
+    #[tokio::test]
+    async fn a_body_and_the_next_request_are_not_counted_with_a_head() {
+        let router = Router::new()
+            .route("/hello", get(|| async { "hello" }))
+            .route(
+                "/upload",
+                post(|body: String| async move { format!("got {}", body.len()) }),
+            );
+        let server = Server::start(router, LIMITS);
+        let mut stream = server.connect().await;
+        let pad = format!("X-Pad: {}\r\n", "a".repeat(20 * 1024));
+        let first = format!("GET /hello HTTP/1.1\r\nHost: x\r\n{pad}\r\n");
+        stream.write_all(first.as_bytes()).await.expect("first");
+        let response = read_hello(&mut stream).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let head =
+            format!("POST /upload HTTP/1.1\r\nHost: x\r\n{pad}Content-Length: 40000\r\n\r\n");
+        stream.write_all(head.as_bytes()).await.expect("head");
+        sleep(Duration::from_millis(50)).await;
+        stream
+            .write_all("a".repeat(40_000).as_bytes())
+            .await
+            .expect("body");
+        let mut received = Vec::new();
+        let mut chunk = [0; 1024];
+        while !received.ends_with(b"got 40000") {
+            let read = timeout(ANSWER_TIMEOUT, stream.read(&mut chunk))
+                .await
+                .expect("answered in time")
+                .expect("read");
+            assert_ne!(read, 0, "closed: {:?}", String::from_utf8_lossy(&received));
+            received.extend_from_slice(&chunk[..read]);
+        }
+        assert!(received.starts_with(b"HTTP/1.1 200"));
+        let large = format!("X-Pad: {}\r\n", "a".repeat(33 * 1024));
+        let last = format!("GET /hello HTTP/1.1\r\nHost: x\r\n{large}\r\n");
+        stream.write_all(last.as_bytes()).await.expect("last");
+        let response = read_to_close(&mut stream).await;
+        assert!(
+            response.as_bytes() == HEADERS_TOO_LARGE_RESPONSE,
+            "{response:?}"
+        );
+        server.stop().await;
+    }
+
+    /// A request whose body the handler left unread: what is read next may be
+    /// that body, which hyper drains, so it is not taken for a head, however
+    /// long its line.
+    #[tokio::test]
+    async fn a_body_left_unread_is_not_counted_as_a_head() {
+        // A line one byte past the request line's limit.
+        let past_the_line = vec![b'a'; HEAD_LIMITS.request_line + 1];
+        let (mut peer, io) = tokio::io::duplex(past_the_line.len());
+        let mut io = LimitedIo::new(io, KESTREL_LIMITS);
+        let head = b"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n";
+        peer.write_all(head).await.expect("head");
+        let mut buf = vec![0; past_the_line.len()];
+        assert_eq!(io.read(&mut buf).await.expect("head read"), head.len());
+        let running = io.requests().start();
+        let request = running.time_body(axum::extract::Request::new(Body::from("body")));
+        // Answered without the body: the request ends with it unread.
+        drop(running);
+        drop(request);
+        peer.write_all(&past_the_line).await.expect("body");
+        let mut read = 0;
+        while read < past_the_line.len() {
+            read += io.read(&mut buf).await.expect("body read");
+        }
+        // The next request ran without a body: what follows it is counted.
+        drop(io.requests().start());
+        peer.write_all(&past_the_line).await.expect("line");
+        let error = io.read(&mut buf).await.expect_err("a 414");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

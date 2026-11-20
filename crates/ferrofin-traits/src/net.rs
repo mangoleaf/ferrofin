@@ -43,7 +43,9 @@ pub struct RequestContext {
     /// The HTTP layer gives [`AuthorizationContext`] and [`AuthService`] only
     /// the headers they read (`Authorization`, `X-Emby-Authorization`,
     /// `X-Emby-Token` and `X-MediaBrowser-Token`), and every header to the
-    /// other readers, such as the `Host` a system address is built from.
+    /// other readers, such as the `Host` a system address is built from (a
+    /// known proxy's `X-Forwarded-Host` in its place, as
+    /// `ForwardedHeadersMiddleware` leaves it).
     pub headers: Vec<(String, String)>,
 
     /// The raw query string (without the leading `?`), if any. Jellyfin also

@@ -16,7 +16,7 @@ use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
     FakeAppHost, FakeCollections, FakeConfig, FakeMusic, FakePlaylists, FakeProviders,
     FakeQuickConnect, FakeSearch, FakeSessions, FakeSimilarItems, FakeSystem, FakeTvSeries,
-    FakeUserData, FakeUserViews, minimal_base_item,
+    FakeUserData, FakeUserViews, FixedAuth, fake_user_entity, minimal_base_item,
 };
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -26,10 +26,7 @@ use ferrofin_model::media_info::{LiveStreamRequest, MediaProtocol};
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager, UserManager};
-use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
-use ferrofin_traits::options::{
-    AuthorizationInfo, DeleteOptions, InternalItemsQuery, InternalPeopleQuery,
-};
+use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use ferrofin_traits::persistence::ItemWithCounts;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -40,70 +37,14 @@ const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_0001);
 /// A minimal authenticated user for the stubs.
 fn user() -> UserEntity {
     UserEntity {
-        id: USER_ID.to_string(),
-        audio_language_preference: None,
-        authentication_provider_id: String::new(),
-        cast_receiver_id: None,
-        display_collections_view: false,
-        display_missing_episodes: false,
-        enable_auto_login: false,
-        enable_local_password: false,
-        enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
-        hide_played_in_latest: false,
-        internal_id: 0,
-        invalid_login_attempt_count: 0,
-        last_activity_date: None,
-        last_login_date: None,
-        login_attempts_before_lockout: None,
-        max_active_sessions: 0,
-        max_parental_rating_score: None,
-        max_parental_rating_sub_score: None,
-        must_update_password: false,
         password: Some("hashed".to_owned()),
-        password_reset_provider_id: String::new(),
-        play_default_audio_track: false,
-        remember_audio_selections: false,
-        remember_subtitle_selections: false,
-        remote_client_bitrate_limit: None,
-        row_version: 0,
-        subtitle_language_preference: None,
-        subtitle_mode: 0,
-        sync_play_access: 0,
-        username: "alice".to_owned(),
-        normalized_username: "ALICE".to_owned(),
+        ..fake_user_entity(USER_ID, "alice")
     }
 }
 
-/// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
-struct OkAuth;
-
-#[async_trait]
-impl AuthService for OkAuth {
-    async fn authenticate(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
-}
-
-#[async_trait]
-impl AuthorizationContext for OkAuth {
-    async fn get_authorization_info(
-        &self,
-        _request: &RequestContext,
-    ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(AuthorizationInfo {
-            user: Some(Arc::new(user())),
-            is_authenticated: true,
-            ..AuthorizationInfo::default()
-        })
-    }
+/// An `AuthService`/`AuthorizationContext` that authenticates as [`USER_ID`].
+fn ok_auth() -> FixedAuth {
+    FixedAuth::signed_in(user())
 }
 
 /// A [`UserManager`] resolving the fixed authenticated user.
@@ -115,9 +56,6 @@ impl UserManager for OkUsers {
         Ok((id == USER_ID).then(user))
     }
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn initialize(&self) -> Result<(), ServiceError> {
@@ -326,13 +264,6 @@ impl LibraryManager for StreamLibrary {
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn create_items(
-        &self,
-        _i: &[BaseItemEntity],
-        _p: Option<Uuid>,
-    ) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn update_items(
         &self,
         _i: &[BaseItemEntity],
@@ -428,9 +359,6 @@ struct DownloadDto(bool);
 
 #[async_trait]
 impl ferrofin_traits::dto::DtoService for DownloadDto {
-    async fn get_primary_image_aspect_ratio(&self, _id: Uuid) -> Result<Option<f64>, ServiceError> {
-        unimplemented!()
-    }
     async fn get_base_item_dto(
         &self,
         _item: &BaseItemEntity,
@@ -451,15 +379,6 @@ impl ferrofin_traits::dto::DtoService for DownloadDto {
         _owner: Option<Uuid>,
         _skip: bool,
     ) -> Result<Vec<ferrofin_model::dto::BaseItemDto>, ServiceError> {
-        unimplemented!()
-    }
-    async fn get_item_by_name_dto(
-        &self,
-        _item: &BaseItemEntity,
-        _options: &ferrofin_traits::options::DtoOptions,
-        _ids: Option<&[Uuid]>,
-        _user: Option<&UserEntity>,
-    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
         unimplemented!()
     }
     async fn can_delete(
@@ -514,8 +433,8 @@ fn state_with_download(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(DownloadDto(downloadable)),
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        Arc::new(ok_auth()),
+        Arc::new(ok_auth()),
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),
         Arc::new(FakeCollections),
@@ -680,8 +599,170 @@ async fn administrator_download_still_honors_the_item_permission() {
     assert!(!response.headers().contains_key("content-disposition"));
 }
 
+/// `GetDownload` and `GetFile` answer `PhysicalFile(filePath,
+/// MimeTypes.GetMimeType(filePath), …)`, `filePath` a link's final target
+/// (`FileSystemHelper.ResolveLinkTarget`): the ported table's type, not the one
+/// `ServeFile` guesses (`audio/aiff`), on a whole file, a range and a link.
+#[cfg(unix)]
+#[rstest::rstest]
+#[case::download("Download")]
+#[case::file("File")]
 #[tokio::test]
-async fn bitrate_test_returns_requested_size() {
+async fn download_and_file_are_typed_by_the_mime_types_table(#[case] route: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let tone = dir.path().join("tone.aiff");
+    std::fs::write(&tone, b"FORM-aiff").unwrap();
+    // A chain: linked.mkv -> hop.mkv -> tone.aiff, typed by its final target.
+    let hop = dir.path().join("hop.mkv");
+    std::os::unix::fs::symlink(&tone, &hop).unwrap();
+    let link = dir.path().join("linked.mkv");
+    std::os::unix::fs::symlink(&hop, &link).unwrap();
+    for (path, range) in [(&tone, None), (&tone, Some("bytes=0-3")), (&link, None)] {
+        let mut request = authed("GET", &format!("/Items/{ITEM_ID}/{route}"));
+        if let Some(range) = range {
+            request
+                .headers_mut()
+                .insert("Range", range.parse().unwrap());
+        }
+        let response = create_router(state(path.to_str().unwrap()).app)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert!(response.status().is_success(), "{path:?} {range:?}");
+        assert_eq!(
+            response.headers()["content-type"],
+            "audio/x-aiff",
+            "{path:?} {range:?}"
+        );
+        // The download keeps the item's own name: Path.GetFileName(item.Path).
+        if route == "Download" && path == &link {
+            let disposition = response.headers()["content-disposition"].to_str().unwrap();
+            assert!(
+                disposition.contains("filename=linked.mkv;"),
+                "{disposition}"
+            );
+        }
+    }
+}
+
+/// A directory, a link to one and a dangling link are `PhysicalFile`'s
+/// `FileNotFoundException`, a 404 (`ServeFile` would open the directory).
+#[cfg(unix)]
+#[rstest::rstest]
+#[case::download("Download")]
+#[case::file("File")]
+#[tokio::test]
+async fn download_and_file_of_a_directory_or_a_dangling_link_are_404(#[case] route: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("Rip (2020)");
+    std::fs::create_dir(&folder).unwrap();
+    let folder_link = dir.path().join("rip-link");
+    std::os::unix::fs::symlink(&folder, &folder_link).unwrap();
+    let dangling = dir.path().join("gone.mkv");
+    std::os::unix::fs::symlink(dir.path().join("missing.mkv"), &dangling).unwrap();
+    for path in [&folder, &folder_link, &dangling] {
+        let response = create_router(state(path.to_str().unwrap()).app)
+            .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/{route}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path:?}");
+        assert!(!response.headers().contains_key("content-disposition"));
+        // The body never carries the on-disk path.
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("Rip (2020)"));
+    }
+}
+
+/// An item with an empty path is `MimeTypes.GetMimeType`'s
+/// `ArgumentException` in `GetFile` and `GetDownload`: a 400, not a 404.
+#[rstest::rstest]
+#[case::download("Download")]
+#[case::file("File")]
+#[tokio::test]
+async fn download_and_file_of_an_item_without_a_path_are_400(#[case] route: &str) {
+    let response = create_router(state("").app)
+        .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/{route}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `GetDownload` names the file on the answers ASP.NET's `SetHeadersAndLog`
+/// names it on (200, 206 and 416), not on its 304/412 short cut nor on a
+/// missing file's 404 (`PhysicalFile`'s `FileNotFoundException`).
+#[rstest::rstest]
+#[case::whole(None, StatusCode::OK, true)]
+#[case::range(Some(("Range", "bytes=0-4")), StatusCode::PARTIAL_CONTENT, true)]
+#[case::past_the_end(Some(("Range", "bytes=1000-")), StatusCode::RANGE_NOT_SATISFIABLE, true)]
+#[case::precondition_failed(
+    Some(("If-Unmodified-Since", "Sat, 01 Jan 2000 00:00:00 GMT")),
+    StatusCode::PRECONDITION_FAILED,
+    false
+)]
+#[tokio::test]
+async fn download_names_the_file_only_where_upstream_does(
+    #[case] header: Option<(&'static str, &'static str)>,
+    #[case] status: StatusCode,
+    #[case] named: bool,
+) {
+    let (_dir, path) = temp_media();
+    let mut request = authed("GET", &format!("/Items/{ITEM_ID}/Download"));
+    if let Some((name, value)) = header {
+        request.headers_mut().insert(name, value.parse().unwrap());
+    }
+    let response = create_router(state(&path).app)
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), status);
+    assert_eq!(
+        response.headers().contains_key("content-disposition"),
+        named
+    );
+}
+
+/// A 304 is `SetHeadersAndLog`'s short cut too (an `If-Modified-Since` at the
+/// file's own `Last-Modified`, which ASP.NET also answers 304).
+#[tokio::test]
+async fn download_not_modified_names_no_file() {
+    let (_dir, path) = temp_media();
+    let uri = format!("/Items/{ITEM_ID}/Download");
+    let first = create_router(state(&path).app)
+        .oneshot(authed("GET", &uri))
+        .await
+        .unwrap();
+    let mut request = authed("GET", &uri);
+    request.headers_mut().insert(
+        "If-Modified-Since",
+        first.headers()["last-modified"].clone(),
+    );
+    let response = create_router(state(&path).app)
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+    assert!(!response.headers().contains_key("content-disposition"));
+}
+
+#[tokio::test]
+async fn download_of_a_missing_file_names_no_file() {
+    let response = create_router(state("/nonexistent/ferrofin/movie.mkv").app)
+        .oneshot(authed("GET", &format!("/Items/{ITEM_ID}/Download")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(!response.headers().contains_key("content-disposition"));
+}
+
+/// The body is `size` random bytes (`Random.Shared.NextBytes`), which a
+/// compressing proxy or VPN between server and client cannot shrink: a body it
+/// could would download faster than the link allows and inflate the bitrate the
+/// client measures.
+#[tokio::test]
+async fn bitrate_test_returns_requested_size_of_incompressible_bytes() {
+    use std::io::Write as _;
     let (_dir, path) = temp_media();
     let app = state(&path).app;
     let router = create_router(app);
@@ -694,6 +775,31 @@ async fn bitrate_test_returns_requested_size() {
         .await
         .unwrap();
     assert_eq!(body.len(), 2048);
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&body).unwrap();
+    let compressed = gzip.finish().unwrap().len();
+    assert!(
+        compressed >= body.len(),
+        "gzip shrank the {} bytes to {compressed}",
+        body.len()
+    );
+}
+
+/// No `size` is the C# default, 102400 bytes, exactly: not the power of two
+/// upstream's `ArrayPool` rental rounds it up to.
+#[tokio::test]
+async fn bitrate_test_defaults_to_102400_bytes() {
+    let (_dir, path) = temp_media();
+    let router = create_router(state(&path).app);
+    let resp = router
+        .oneshot(authed("GET", "/Playback/BitrateTest"))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.len(), 102_400);
 }
 
 #[tokio::test]

@@ -285,8 +285,7 @@ impl AuthCache {
         self.read_user_dto(entity, |dto| {
             dto.configuration
                 .as_ref()
-                .map(|c| c.latest_items_excludes.clone())
-                .unwrap_or_default()
+                .map_or_default(|c| c.latest_items_excludes.clone())
         })
     }
 

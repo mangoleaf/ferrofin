@@ -26,8 +26,7 @@ pub(crate) async fn resolve(
         preferences
             .iter()
             .find(|(stored, _)| *stored == i32::from(kind))
-            .map(|(_, value)| value.split(',').filter(|v| !v.is_empty()).collect())
-            .unwrap_or_default()
+            .map_or_default(|(_, value)| value.split(',').filter(|v| !v.is_empty()).collect())
     };
     let mut resolved = filter.clone();
     if resolved.block_unrated_items.is_empty() {

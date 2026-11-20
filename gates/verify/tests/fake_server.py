@@ -30,6 +30,7 @@ series' tvshow.nfo before its first scan. FAKE_FETCHERS=on or off saves the libr
 metadata-fetcher choice for every kind of its items (TheMovieDb ticked, or none);
 FAKE_TYPE_OPTIONS (a JSON list) saves exactly that; unset, the library saved none.
 FAKE_SAVERS (a JSON list) is the library's chosen metadata savers; unset, it chose none.
+FAKE_SAVE_LOCAL=true turns on the library's SaveLocalMetadata ("Save artwork into media folders").
 FAKE_CONFIG (a JSON object) adds fields to the server configuration.
 """
 
@@ -49,6 +50,7 @@ SERIES = json.loads(os.environ["FAKE_SERIES"]) if os.environ.get("FAKE_SERIES") 
 SERIES_ID = "5e1e5e1e5e1e5e1e5e1e5e1e5e1e5e1e"
 FETCHERS = os.environ.get("FAKE_FETCHERS")
 SAVERS = json.loads(os.environ["FAKE_SAVERS"]) if os.environ.get("FAKE_SAVERS") else None
+SAVE_LOCAL = os.environ.get("FAKE_SAVE_LOCAL") == "true"
 CONFIG = json.loads(os.environ.get("FAKE_CONFIG") or "{}")
 KINDS = ["Movie"] if KIND == "movies" else ["Series", "Season", "Episode"]
 if os.environ.get("FAKE_TYPE_OPTIONS"):
@@ -193,7 +195,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "Name": "Lib", "ItemId": LIBRARY_ID, "CollectionType": KIND,
                     "Locations": [LIBRARY_ROOT],
                     "LibraryOptions": {"EnableRealtimeMonitor": False, "TypeOptions": TYPE_OPTIONS,
-                                       "MetadataSavers": SAVERS},
+                                       "MetadataSavers": SAVERS, "SaveLocalMetadata": SAVE_LOCAL},
                 }])
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             if method == "GET" and path == "/Items" and query.get("IncludeItemTypes") == ["Series"]:

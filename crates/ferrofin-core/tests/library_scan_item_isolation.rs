@@ -587,6 +587,64 @@ async fn children_of_an_undecodable_parent_get_remote_metadata(#[case] kind: &st
     }
 }
 
+// A season's full refresh takes its premiere date from its episodes, which it
+// lists through its series (`Season.GetEpisodes`). A series row that cannot be
+// read counts as none there too, whose season lists no episodes and keeps its
+// date: the season is refreshed and stamped rather than skipped on every scan,
+// and the row is warned about once.
+#[tokio::test]
+async fn a_season_of_an_undecodable_series_is_refreshed() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let fx = Fixture::new().await;
+    fx.episode("Corrupt", 1);
+    fx.scanner.scan_all().await.expect("first scan");
+    fx.corrupt("Series", "Corrupt").await;
+    // A first refresh is a full one, which derives the date from the episodes.
+    fx.run(
+        r#"UPDATE "BaseItems" SET "DateLastRefreshed" = NULL,
+               "PremiereDate" = '2001-02-03 00:00:00.0000000', "ProductionYear" = 2001
+           WHERE "Type" LIKE '%.Season'"#,
+    )
+    .await;
+
+    let warnings = Warnings::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+    let rescan = fx.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(rescan.skipped, 0, "the season is not skipped");
+    let season = fx.shows.join("Corrupt").join("Season 1");
+    assert!(
+        fx.refreshed(&season).await.is_some(),
+        "the season is stamped"
+    );
+    let dates: (Option<String>, Option<i64>) = sqlx::query_as(
+        r#"SELECT substr("PremiereDate", 1, 10), "ProductionYear" FROM "BaseItems"
+           WHERE "Path" = ?1"#,
+    )
+    .bind(season.to_string_lossy().into_owned())
+    .fetch_one(fx.db.pool())
+    .await
+    .expect("dates");
+    assert_eq!(
+        dates,
+        (Some("2001-02-03".to_owned()), Some(2001)),
+        "the season keeps its date"
+    );
+    let warned = warnings.0.lock().expect("warnings").clone();
+    assert_eq!(
+        warned
+            .iter()
+            .filter(|message| {
+                message.contains("could not read a parent row")
+                    || message.contains("could not read series display order")
+            })
+            .count(),
+        1,
+        "{warned:?}"
+    );
+}
+
 // A write that fails for one new item skips that item alone. It is neither
 // counted as created nor announced, it stays out of the prune, and the next
 // scan creates it.

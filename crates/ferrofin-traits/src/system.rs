@@ -152,20 +152,6 @@ pub trait ServerApplicationHost: LocalApiAccess + Send + Sync {
         &self,
         peer: std::net::IpAddr,
     ) -> Result<String, ServiceError>;
-
-    /// Builds a LAN-reachable API URL for the given host/scheme/port.
-    async fn get_local_api_url(
-        &self,
-        hostname: &str,
-        scheme: Option<&str>,
-        port: Option<u16>,
-    ) -> Result<String, ServiceError>;
-
-    /// Expands a stored virtual path to an absolute filesystem path.
-    fn expand_virtual_path(&self, path: &str) -> String;
-
-    /// Collapses an absolute filesystem path back to its virtual form.
-    fn reverse_virtual_path(&self, path: &str) -> String;
 }
 
 fn _assert_object_safe_server_application_host(_: &dyn ServerApplicationHost) {}

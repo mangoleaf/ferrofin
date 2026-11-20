@@ -272,6 +272,35 @@ pub trait ProviderManager: Send + Sync {
         options: &MetadataRefreshOptions,
     ) -> Result<ItemUpdateType, ServiceError>;
 
+    /// Holds `item_id`'s metadata for one read-modify-write of its row. The
+    /// provider manager's refresh holds it from loading the row to saving it,
+    /// and a metadata edit (`POST /Items/{itemId}`) around its own load and
+    /// save, so neither saves over the other with the row it loaded first.
+    ///
+    /// TODO(gl-1504): the library scan's refresh of a file-backed item
+    /// (`scan_item`) and the edit's cascade to child rows take no lock yet.
+    ///
+    /// Upstream needs no lock: the edit and the refresh both change the cached
+    /// `BaseItem` that `LibraryManager.GetItemById` hands out, so the
+    /// refresh's save carries an edit made while it ran. Ferrofin loads a row
+    /// per caller instead. A manager that runs no refresh has nothing to
+    /// exclude, so the default holds a lock no one else shares.
+    async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        let _ = item_id;
+        std::sync::Arc::new(tokio::sync::Mutex::new(()))
+            .lock_owned()
+            .await
+    }
+
+    /// Whether the refresh queue's worker is running
+    /// (`ProviderManager._isProcessingRefreshQueue`): from the first queued
+    /// refresh until it has finished the last one. Unlike
+    /// [`get_refresh_queue`](Self::get_refresh_queue), it covers the refresh
+    /// the worker has taken off the queue and is still running.
+    async fn is_processing_refresh_queue(&self) -> bool {
+        false
+    }
+
     /// Downloads and stores an image for an item from a URL.
     async fn save_image_from_url(
         &self,

@@ -1,9 +1,8 @@
 //! Encoding configuration store.
 //!
 //! Port of `MediaBrowser.MediaEncoding.Configuration`:
-//! [`EncodingConfigurationStore`] (the `"encoding"`-keyed
-//! [`ConfigurationStore`](ferrofin_common::configuration::ConfigurationStore) whose
-//! body is [`EncodingOptions`](ferrofin_model::configuration::EncodingOptions)). Its
+//! [`EncodingConfigurationStore`] (the `"encoding"`-keyed store whose body is
+//! [`EncodingOptions`](ferrofin_model::configuration::EncodingOptions)). Its
 //! [`Validate`](ferrofin_common::configuration::ValidatingConfiguration::validate)
 //! guard — reject an `EncoderAppPath` change and require any new
 //! `TranscodingTempPath` to exist — is ported with the un-mockable directory

@@ -90,6 +90,15 @@ fresh-install or migration procedure below before starting it.
 To check an installed binary, from the package or the tarball, for known vulnerabilities, see
 [`SECURITY.md`](../SECURITY.md#checking-a-binary-for-known-vulnerabilities).
 
+### RAR comics
+
+A `.cbr` comic that is really a RAR archive gets its cover from `7z` on `PATH`, or `bsdtar`
+when 7z is absent or cannot decode RAR, looked for when the first one is read; restart the
+server after installing either. Without one it gets no cover, and the server logs that once.
+Debian's and Ubuntu's 7-Zip decodes RAR only with its plugin from the non-free (Debian) or
+multiverse (Ubuntu) component, so install `7zip 7zip-rar` (`p7zip-full p7zip-rar` on older
+releases), or `libarchive-tools` for bsdtar. The Docker image ships 7z with the plugin.
+
 ## 3. The unit
 
 The unit runs as the `ferrofin` user with no extra sandboxing, like Jellyfin's own unit.
@@ -156,15 +165,18 @@ holds the database, playlists and collections:
 | `/var/lib/jellyfin/metadata/` | `{data_dir}/metadata/` | images and downloaded metadata |
 | `/etc/jellyfin/` | `{config_dir}/` | XML configuration |
 | `/var/lib/jellyfin/plugins/configurations/LDAP-Auth.xml` | `{data_dir}/plugins/configurations/` | LDAP-Auth's settings, if Jellyfin used it |
+| `/var/lib/jellyfin/plugins/configurations/Jellyfin.Plugin.{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages}.xml` | `{data_dir}/plugins/configurations/` | the settings of the metadata plugins Jellyfin builds in |
 
 The script reads `data_dir` and `config_dir` from `/etc/ferrofin/config.toml`. The package
 sets only `data_dir`, so `config_dir` is `{data_dir}/config`; `/etc/ferrofin` keeps just
 `config.toml` and stays read-only to the service.
 
 The rest of Jellyfin's `data/` (subtitle and attachment extraction caches, backups, task
-history) is not copied, nor are `plugins/` and `Subtitle Edit/`, except
-`plugins/configurations/LDAP-Auth.xml`, the LDAP-Auth plugin's settings, which Ferrofin's
-LDAP-Auth imports on the first start. `root/default/` holds
+history) is not copied, nor are `plugins/` and `Subtitle Edit/`, except the plugin
+settings Ferrofin imports on the first start from `plugins/configurations/`:
+`LDAP-Auth.xml`, the LDAP-Auth plugin's, and the `Jellyfin.Plugin.*.xml` files of the
+metadata plugins Jellyfin builds in (TMDb, OMDb, MusicBrainz, AudioDB, Studio Images).
+An import never replaces settings already saved in Ferrofin. `root/default/` holds
 only the library definitions (`.mblink` files naming each media path); media stays where
 it is.
 
@@ -181,11 +193,12 @@ Jellyfin files untouched. For Docker or other non-Debian layouts, `--help` lists
 for the Jellyfin and Ferrofin directories.
 
 Jellyfin .NET plugins cannot run in Ferrofin; they require Ferrofin-compatible
-replacements. `network.xml` carries remote-access policy, IP filters, trusted proxies, and
-local-network definitions. A copied symbolic link still points at its original target, so
-ensure any linked external state remains available to Ferrofin. If Jellyfin uses custom
-cache, metadata, or configuration paths, copy those separately to the configured Ferrofin
-paths.
+replacements. `network.xml` carries remote-access policy, IP filters, trusted proxies,
+local-network definitions, the base URL the server is served under and the ports it
+listens on (unless `FERROFIN_PORT`, `--port` or `FERROFIN_HTTPS_PORT` pins them). A copied symbolic
+link still points at its original target, so ensure any linked external state remains
+available to Ferrofin. If Jellyfin uses custom cache, metadata, or configuration paths,
+copy those separately to the configured Ferrofin paths.
 
 #### Unicode usernames
 

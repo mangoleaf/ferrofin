@@ -4,11 +4,10 @@
 //! extension), `ProbeProvider.FetchShortcutInfo` (the first line that is not
 //! blank or a `#` comment, and only when it is an `http`, `https`, `rtsp` or
 //! `rtp` URL — a local path in a `.strm` would read arbitrary files off the
-//! server) and `MediaSourceManager.GetPathProtocol`.
+//! server). The target's protocol is
+//! [`path_protocol`](ferrofin_model::media_info::path_protocol).
 
 use std::path::Path;
-
-use ferrofin_model::media_info::MediaProtocol;
 
 /// The schemes a `.strm` target may use (`ProbeProvider.FetchShortcutInfo`).
 const REMOTE_SCHEMES: [&str; 4] = ["http", "https", "rtsp", "rtp"];
@@ -61,32 +60,6 @@ pub(crate) async fn read_target(path: &str) -> Option<String> {
     }
 }
 
-/// `MediaSourceManager.GetPathProtocol`: the protocol a path or URL is read
-/// over — by its prefix, and a path that is not a local file is HTTP.
-#[must_use]
-pub(crate) fn path_protocol(path: &str) -> MediaProtocol {
-    let lower = path.to_ascii_lowercase();
-    if path.is_empty() {
-        MediaProtocol::File
-    } else if lower.starts_with("rtsp") {
-        MediaProtocol::Rtsp
-    } else if lower.starts_with("rtmp") {
-        MediaProtocol::Rtmp
-    } else if lower.starts_with("http") {
-        MediaProtocol::Http
-    } else if lower.starts_with("rtp") {
-        MediaProtocol::Rtp
-    } else if lower.starts_with("ftp") {
-        MediaProtocol::Ftp
-    } else if lower.starts_with("udp") {
-        MediaProtocol::Udp
-    } else if crate::media_info_resolver::is_file_protocol(path) {
-        MediaProtocol::File
-    } else {
-        MediaProtocol::Http
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -112,21 +85,6 @@ mod tests {
         #[case] expected: Option<&str>,
     ) {
         assert_eq!(remote_target(contents).as_deref(), expected);
-    }
-
-    #[rstest]
-    #[case("/media/a.mkv", MediaProtocol::File)]
-    #[case("", MediaProtocol::File)]
-    #[case("http://h/a", MediaProtocol::Http)]
-    #[case("HTTPS://h/a", MediaProtocol::Http)]
-    #[case("rtsp://h/a", MediaProtocol::Rtsp)]
-    #[case("rtmp://h/a", MediaProtocol::Rtmp)]
-    #[case("rtp://h/a", MediaProtocol::Rtp)]
-    #[case("ftp://h/a", MediaProtocol::Ftp)]
-    #[case("udp://h:1", MediaProtocol::Udp)]
-    #[case("smb://h/a", MediaProtocol::Http)]
-    fn the_protocol_follows_the_path_prefix(#[case] path: &str, #[case] expected: MediaProtocol) {
-        assert_eq!(path_protocol(path), expected);
     }
 
     /// A target refused for its scheme is logged by its scheme and host: it can

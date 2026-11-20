@@ -1,10 +1,12 @@
 //! End-to-end test against the REAL example guest (`examples/wasm-hello`),
 //! built from source at test time — no committed `.wasm` (artifact policy).
 //!
-//! Gated behind `FERROFIN_WASM_GUEST_TESTS=1` (the `FERROFIN_FFMPEG_TESTS`
-//! pattern) because the guest build needs the wasm32-wasip2 target and a few
-//! minutes of cold compile. CI always sets it; locally it skips with a
-//! message unless opted in.
+//! Gated behind `FERROFIN_WASM_GUEST_TESTS=1` because the guest build needs
+//! the wasm32-wasip2 target and a few minutes of cold compile. CI always sets
+//! it; locally it returns early with a message unless opted in, and the
+//! harness counts that as a pass. It keeps the variable instead of
+//! `#[ignore]`, unlike the other opt-in suites, because CI must run it in its
+//! ordinary test pass, which runs no ignored tests.
 //!
 //! This test also produces the **measured RSS-per-plugin** number that
 //! validates (or corrects) the `FERROFIN_WASM_MEMORY_LIMIT_MB=128` default —
@@ -57,12 +59,21 @@ fn build_guest() -> Option<PathBuf> {
         .expect("spawn cargo for the guest build");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let channel = std::fs::read_to_string(guest_dir.join("rust-toolchain.toml"))
+            .expect("read the guest's rust-toolchain.toml")
+            .lines()
+            .find_map(|l| Some(l.strip_prefix("channel = ")?.split('"').nth(1)?.to_owned()))
+            .expect("the guest's rust-toolchain.toml names a channel");
         // Only a genuinely-missing target/toolchain is an environment gap
         // worth a skip; every other failure (network, compile error in the
-        // guest, WIT drift) is a real failure and must fail loudly.
+        // guest, WIT drift) is a real failure and must fail loudly. rustup
+        // names the toolchain `'<channel>-<host triple>'`, older releases
+        // `'<channel>'`.
         let missing_toolchain = stderr.contains("may not be installed")
             || stderr.contains("rustup target add wasm32-wasip2")
-            || stderr.contains("toolchain '1.99.1' is not installed");
+            || stderr.lines().any(|l| {
+                l.contains(&format!("toolchain '{channel}")) && l.contains("is not installed")
+            });
         assert!(
             missing_toolchain,
             "guest build FAILED (not a toolchain gap — this is a real error):\n{stderr}"

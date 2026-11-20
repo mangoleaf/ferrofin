@@ -1,0 +1,13 @@
+[07:53:39] [INF] [10] Main: Jellyfin version: 12.4.0
+[07:53:39] [INF] [10] Jellyfin.Database.Providers.Sqlite.SqliteDatabaseProvider: SQLITE connection pragma command set to:
+PRAGMA locking_mode=NORMAL;
+PRAGMA synchronous=1;
+
+[07:53:39] [INF] [10] InternalCodeMigration: Perform migration 20260915104305_FixNullEncoderPreset
+[07:53:39] [INF] [10] InternalCodeMigration: Migration 20260915104305_FixNullEncoderPreset was successfully applied
+[07:53:39] [INF] [10] InternalDatabaseMigration: Perform migration 20260113102337_AddLinkedChildrenTable
+[07:53:39] [INF] [10] InternalDatabaseMigration: Migration 20260113102337_AddLinkedChildrenTable was successfully applied
+[07:53:40] [WRN] [10] Jellyfin.Server.Migrations.Routines.MigrateLinkedChildren: Dropping unresolvable LinkedChild of 341eef04
+[07:53:44] [ERR] [25] Emby.Server.Implementations.Updates.InstallationManager: An error occurred while accessing the plugin manifest: https://repo.jellyfin.org/files/plugin/manifest.json
+System.Net.Http.HttpRequestException: Connection refused (127.0.0.1:9)
+[07:53:45] [INF] [25] Main: Startup complete 0:00:06.1

@@ -50,10 +50,12 @@ publish-results:
 
 # The gates' own tests, which need no docker, server or fixtures: shellcheck, the bats tests and the
 # standard-library Python tests of every gate. CI's shell-tests job runs this target.
-GATE_SCRIPTS = gates/lib.sh gates/run gates/verify/run.sh gates/verify/lib.sh gates/verify/scan-behaviour.sh gates/bench/run.sh \
+GATE_SCRIPTS = gates/lib.sh gates/isolation.sh gates/run gates/verify/run.sh gates/verify/lib.sh gates/verify/scan-behaviour.sh gates/bench/run.sh \
 	gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh \
-	gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh gates/bench/testdata/build.sh
-GATE_TESTS = gates/tests gates/verify/tests gates/adoption/tests gates/parity/tests
+	gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh gates/bench/testdata/build.sh \
+	gates/roundtrip/lib.sh gates/roundtrip/run.sh gates/roundtrip/routes.sh gates/roundtrip/stage_ferrofin.sh \
+	gates/roundtrip/stage_jellyfin.sh gates/roundtrip/tests/fake_docker
+GATE_TESTS = gates/tests gates/verify/tests gates/adoption/tests gates/parity/tests gates/roundtrip/tests
 
 test-gates-offline:
 	shellcheck -x $(GATE_SCRIPTS)
@@ -63,4 +65,5 @@ test-gates-offline:
 	python3 -m unittest discover -s gates/verify/tests
 	python3 -m unittest discover -s gates/adoption/tests
 	python3 -m unittest discover -s gates/parity/tests
+	python3 -m unittest discover -s gates/roundtrip/tests
 	python3 -m unittest discover -s gates/bench -p 'test_*.py'
