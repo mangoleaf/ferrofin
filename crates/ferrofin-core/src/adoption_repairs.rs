@@ -1708,7 +1708,9 @@ const PLAYLIST_SNAPSHOT_EXTENSION: &str = "db.pre-playlist-folders";
 /// Jellyfin's rescan resolves every folder in the playlists folder to that
 /// id and deletes a playlist row it finds no folder for
 /// (`Folder.ValidateChildrenInternal`), so the path and the new id are
-/// written together, in the move's own savepoint (`rekey_rows_at`). The
+/// written together, in the move's own savepoint (`rekey_rows_at`). The path
+/// is stored as a create stores it, through `virtual_paths`
+/// (`%AppDataPath%/playlists/<name>`, `ReverseVirtualPath`). The
 /// entries, owner and shares, user data and images move with it. An upload
 /// an older Ferrofin stored in the playlist's metadata folder stays there:
 /// nothing tells it from a generated image.
@@ -1723,6 +1725,7 @@ pub async fn rekey_pathless_playlists(
     db: &Database,
     derivation: &IdDerivation,
     playlists: &str,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
@@ -1788,7 +1791,8 @@ pub async fn rekey_pathless_playlists(
             merged: Vec::new(),
             extra: false,
         });
-        paths.push(path);
+        // Stored as `CreatePlaylist`'s save stores it: `%AppDataPath%/playlists/<name>`.
+        paths.push(virtual_paths.reverse(&path));
     }
     let made: BTreeSet<Uuid> = match rekey_rows_at(db, &moves, &paths, RekeyKind::Represented).await
     {
@@ -1826,10 +1830,19 @@ pub async fn run_rekey_pathless_playlists(
     db: &Database,
     derivation: &IdDerivation,
     playlists: &str,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<(), ServiceError> {
-    let moved = rekey_pathless_playlists(db, derivation, playlists, art_root, path_manager).await?;
+    let moved = rekey_pathless_playlists(
+        db,
+        derivation,
+        playlists,
+        virtual_paths,
+        art_root,
+        path_manager,
+    )
+    .await?;
     if moved > 0 {
         tracing::info!(
             items = moved,
@@ -7512,7 +7525,16 @@ mod tests {
         .await
         .expect("entry");
 
-        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                &root,
+                format!("{root}/log"),
+                format!("{root}/config"),
+                format!("{root}/cache"),
+                format!("{root}/web"),
+            ),
+        ));
+        let moved = rekey_pathless_playlists(&db, &mode, &playlists, &paths, None, None)
             .await
             .expect("repair");
         assert_eq!(moved, 2);
@@ -7533,7 +7555,11 @@ mod tests {
             let path = format!("{playlists}/{folder}");
             assert!(Path::new(&path).is_dir(), "{path} is made");
             let new = derive_item_id_with(&mode, BaseItemKind::Playlist, &path).expect("id");
-            assert_eq!(at(new).await, Some(Some(path)), "{folder} is at its path");
+            assert_eq!(
+                at(new).await,
+                Some(Some(format!("%AppDataPath%/playlists/{folder}"))),
+                "{folder} is at its path, stored as `CreatePlaylist`'s save stores it"
+            );
             assert_eq!(at(old).await, None, "and no longer at its old id");
         }
         let new = derive_item_id_with(&mode, BaseItemKind::Playlist, &format!("{playlists}/Mix"))
@@ -7558,7 +7584,7 @@ mod tests {
         );
 
         assert_eq!(
-            rekey_pathless_playlists(&db, &mode, &playlists, None, None)
+            rekey_pathless_playlists(&db, &mode, &playlists, &paths, None, None)
                 .await
                 .expect("second boot"),
             0
@@ -7595,9 +7621,16 @@ mod tests {
         let pathless = Uuid::new_v4();
         seed_named_item(&db, pathless, BaseItemKind::Playlist, "Mix").await;
 
-        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
-            .await
-            .expect("repair");
+        let moved = rekey_pathless_playlists(
+            &db,
+            &mode,
+            &playlists,
+            &VirtualPathExpander::identity(),
+            None,
+            None,
+        )
+        .await
+        .expect("repair");
         assert_eq!(moved, 1);
         assert_eq!(
             stored_path(&db, taken).await,
@@ -7627,9 +7660,16 @@ mod tests {
         .await
         .expect("trigger");
 
-        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
-            .await
-            .expect("repair");
+        let moved = rekey_pathless_playlists(
+            &db,
+            &mode,
+            &playlists,
+            &VirtualPathExpander::identity(),
+            None,
+            None,
+        )
+        .await
+        .expect("repair");
         assert_eq!(moved, 0);
         assert_eq!(stored_path(&db, pathless).await, Some(None));
         let folder = format!("{playlists}/Mix");
@@ -7639,9 +7679,16 @@ mod tests {
             .execute(db.writer())
             .await
             .expect("drop trigger");
-        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
-            .await
-            .expect("next boot");
+        let moved = rekey_pathless_playlists(
+            &db,
+            &mode,
+            &playlists,
+            &VirtualPathExpander::identity(),
+            None,
+            None,
+        )
+        .await
+        .expect("next boot");
         assert_eq!(moved, 1, "the next boot runs it again");
         let to = derive_item_id_with(&mode, BaseItemKind::Playlist, &folder).expect("id");
         assert_eq!(stored_path(&db, to).await, Some(Some(folder)));
@@ -8484,6 +8531,21 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
             "database snapshot taken before rewriting paths under a previous program-data directory"
         );
     }
+    let rows = rewrite_paths(db, &PATH_COLUMNS, &plan.rewrites).await?;
+    Ok((rows > 0).then(|| Rebased {
+        from: plan.from.clone(),
+        rows,
+    }))
+}
+
+/// Writes `rewrites`, `(index into columns, rowid, stored path, new path)`,
+/// in one transaction, each only where its row still holds the stored path:
+/// a row saved since it was read keeps its value. Returns the rows written.
+async fn rewrite_paths(
+    db: &Database,
+    columns: &[(&str, &str)],
+    rewrites: &[(usize, i64, String, String)],
+) -> Result<u64, ServiceError> {
     // One statement per column, not per row, keeps the write lock short (the
     // other version waits 30 s for it): each column's rewrites go into a
     // temporary table keyed by rowid, and the column is updated from it.
@@ -8500,9 +8562,8 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
     .await
     .map_err(db_err)?;
     let mut rows = 0;
-    for (column, (table, name)) in PATH_COLUMNS.into_iter().enumerate() {
-        let moves: Vec<(i64, &str, &str)> = plan
-            .rewrites
+    for (column, &(table, name)) in columns.iter().enumerate() {
+        let moves: Vec<(i64, &str, &str)> = rewrites
             .iter()
             .filter(|(of, ..)| *of == column)
             .map(|(_, rowid, from, to)| (*rowid, from.as_str(), to.as_str()))
@@ -8526,8 +8587,8 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        // Table and column names come from `PATH_COLUMNS`. Compare-and-set: a
-        // row saved since it was read keeps its value.
+        // Table and column names come from the callers' constants.
+        // Compare-and-set: a row saved since it was read keeps its value.
         rows += sqlx::query(sqlx::AssertSqlSafe(format!(
             r#"UPDATE "{table}" SET "{name}" = r."New" FROM temp."FerrofinPathRebase" r
                WHERE r."Row" = "{table}".rowid AND r."Old" = "{table}"."{name}""#
@@ -8542,10 +8603,7 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
         .await
         .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
-    Ok((rows > 0).then(|| Rebased {
-        from: plan.from.clone(),
-        rows,
-    }))
+    Ok(rows)
 }
 
 /// The previous program-data directories the database's rows still name.
@@ -8719,6 +8777,450 @@ fn profile_image_target(stored: &str, config: &str) -> Option<String> {
             .to_string_lossy()
             .into_owned(),
     )
+}
+
+// Stores the paths an earlier Ferrofin wrote resolved under this server's own
+// data and metadata directories the way every save does since gl-1581
+// (gl-1616).
+//
+// A save stores `BaseItems.Path` and `MediaStreamInfos.Path` through
+// `VirtualPathExpander::reverse`, but the scan writes a row only when it
+// changed, comparing it expanded, so a row an earlier build stored resolved
+// keeps that form until something else about it changes, and a by-name item,
+// a user view, the playlists folder or an external stream rarely does. Those
+// rows name this server's directories, which an export into another layout or
+// a move of the metadata directory leaves behind.
+
+/// The columns upstream stores through `ReverseVirtualPath`: `BaseItems.Path`
+/// (`BaseItemMapper.Map` → `GetPathToSave`, `BaseItemMapper.cs:272,531-538`)
+/// and `MediaStreamInfos.Path` (`MediaStreamRepository.cs:69-87,209`). Image
+/// and chapter paths are stored raw upstream (`MapImageToEntity`), and so are
+/// they here.
+const VIRTUAL_PATH_COLUMNS: [(&str, &str); 2] =
+    [("BaseItems", "Path"), ("MediaStreamInfos", "Path")];
+
+/// Rewrites each path in `BaseItems.Path` and `MediaStreamInfos.Path` stored
+/// at or under this server's data or internal metadata directory into the
+/// form a save stores ([`VirtualPathExpander::reverse`]: `%AppDataPath%/…`,
+/// `%MetadataPath%/…`): by-name items, user views, the playlists folder and
+/// playlists, items under the data directory (recordings in the default
+/// `livetv/recordings`), and external stream files there. Library folders
+/// (under `{program data}/root`), media outside the two directories and
+/// paths already tokenised are not touched.
+///
+/// A path is rewritten only when expanding its new form gives back the
+/// stored text exactly, so no row changes what it names and every read
+/// returns what it returned before; that is also why no snapshot is taken,
+/// which would cost a full database's disk on nearly every install. A path
+/// that names a directory in another spelling (case) is left as it is. The
+/// rows are read per directory in partitions (`virtual_path_candidates_sql`),
+/// each written in its own short transaction, compare-and-set: a row the
+/// previous version saves meanwhile keeps its value, and one it saves after
+/// this ran stays resolved, which every reader expands alike. Runs once per
+/// database (`FerrofinMeta`); an interrupted pass runs again from the start
+/// on the next boot.
+///
+/// Returns the rows rewritten.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a read or a partition's write fails; the
+/// partitions written before stay, and the next boot runs it again.
+pub async fn reverse_stored_virtual_paths(
+    db: &Database,
+    paths: &VirtualPathExpander,
+) -> Result<u64, ServiceError> {
+    reverse_virtual_paths_in_partitions(db, paths, REPAIR_PARTITION).await
+}
+
+/// The next partition of `table`'s `(rowid, column)` rows whose path lies in
+/// `[?1, ?3)` after the `(path, rowid)` cursor `(?1, ?2)`, at most `?4`, in
+/// `(path, rowid)` order. For `BaseItems` that is a range seek on
+/// `IX_BaseItems_Path` in index order (`EXPLAIN QUERY PLAN` pinned by
+/// `the_base_items_read_seeks_the_path_index`); `MediaStreamInfos` has no
+/// path index, so each of its partitions is a scan, and the external stream
+/// files under these directories are few.
+fn virtual_path_candidates_sql(table: &str, column: &str) -> String {
+    // Table and column names come from `VIRTUAL_PATH_COLUMNS`.
+    format!(
+        r#"SELECT rowid, "{column}" FROM "{table}"
+           WHERE "{column}" >= ?1 AND ("{column}", rowid) > (?1, ?2) AND "{column}" < ?3
+           ORDER BY "{column}", rowid LIMIT ?4"#
+    )
+}
+
+/// [`reverse_stored_virtual_paths`], reading `partition` rows at a time.
+async fn reverse_virtual_paths_in_partitions(
+    db: &Database,
+    paths: &VirtualPathExpander,
+    partition: i64,
+) -> Result<u64, ServiceError> {
+    const KEY: &str = "virtual_paths_reversed_v160";
+    let (Some(data), Some(metadata)) = (paths.data_path(), paths.internal_metadata_path()) else {
+        return Ok(0);
+    };
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    tracing::info!(
+        "storing the item and stream paths under the data and metadata directories \
+         as %AppDataPath% and %MetadataPath%"
+    );
+    let mut rewritten = 0;
+    for (column, (table, name)) in VIRTUAL_PATH_COLUMNS.into_iter().enumerate() {
+        let sql = virtual_path_candidates_sql(table, name);
+        for dir in [&data, &metadata] {
+            // Every path that starts with the directory, as stored, byte for
+            // byte: `]` sorts after both `/` and `\`, so a Windows directory's
+            // rows are in range too (`path_prefix_range` covers `/` only), and
+            // `reverse` turns down a look-alike sibling (`data-old`).
+            let dir = dir.trim_end_matches(['/', '\\']);
+            let end = format!("{dir}]");
+            let mut cursor = (dir.to_owned(), i64::MIN);
+            loop {
+                let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+                    .bind(&cursor.0)
+                    .bind(cursor.1)
+                    .bind(&end)
+                    .bind(partition)
+                    .fetch_all(db.pool())
+                    .await
+                    .map_err(db_err)?;
+                let more = i64::try_from(rows.len()).is_ok_and(|read| read >= partition);
+                let Some((last, last_path)) = rows.last() else {
+                    break;
+                };
+                cursor = (last_path.clone(), *last);
+                let rewrites: Vec<(usize, i64, String, String)> = rows
+                    .into_iter()
+                    .filter_map(|(rowid, stored)| {
+                        let reversed = paths.reverse(&stored);
+                        (reversed != stored && paths.expand(&reversed) == stored)
+                            .then_some((column, rowid, stored, reversed))
+                    })
+                    .collect();
+                if !rewrites.is_empty() {
+                    rewritten += rewrite_paths(db, &VIRTUAL_PATH_COLUMNS, &rewrites).await?;
+                }
+                if !more {
+                    break;
+                }
+            }
+        }
+    }
+    done(db, KEY).await?;
+    Ok(rewritten)
+}
+
+/// [`reverse_stored_virtual_paths`] and its log line, for the composition
+/// root. A failure is a warning and never stops the boot: every reader
+/// expands both forms, and the next boot runs it again.
+pub async fn run_reverse_stored_virtual_paths(db: &Database, paths: &VirtualPathExpander) {
+    match reverse_stored_virtual_paths(db, paths).await {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!(
+            rows,
+            "stored the item and stream paths under the data and metadata directories \
+             as %AppDataPath% and %MetadataPath%"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not store the item and stream paths under the data and metadata \
+             directories as %AppDataPath% and %MetadataPath%; the next boot runs it again"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod virtual_path_tests {
+    use std::sync::Arc;
+
+    use ferrofin_model::data::BaseItemKind;
+
+    use super::*;
+    use crate::test_support::{seed_folder_item, test_db};
+
+    /// This server's directories: `/pd/data` and `/pd/metadata`.
+    fn paths() -> VirtualPathExpander {
+        VirtualPathExpander::from_paths(Arc::new(crate::FerrofinServerApplicationPaths::new(
+            "/pd", "/pd/log", "/pd/c", "/pd/k", "/pd/w",
+        )))
+    }
+
+    async fn seed(db: &Database, kind: BaseItemKind, path: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        seed_folder_item(db, id, kind, "x", None).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(path)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn seed_stream(db: &Database, item: Uuid, index: i64, path: Option<&str>) {
+        sqlx::query(
+            r#"INSERT INTO "MediaStreamInfos"
+               ("ItemId", "StreamIndex", "StreamType", "IsDefault", "IsExternal", "IsForced", "Path")
+               VALUES (?1, ?2, 2, 0, 1, 0, ?3)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(index)
+        .bind(path)
+        .execute(db.writer())
+        .await
+        .unwrap();
+    }
+
+    async fn item_path(db: &Database, id: Uuid) -> Option<String> {
+        sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn stream_paths(db: &Database, item: Uuid) -> Vec<Option<String>> {
+        sqlx::query_scalar(
+            r#"SELECT "Path" FROM "MediaStreamInfos" WHERE "ItemId" = ?1 ORDER BY "StreamIndex""#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+    }
+
+    /// Every row under the data or metadata directory takes the form a save
+    /// stores; everything else, and a second boot, stays as it is. The
+    /// partition of 2 makes the `BaseItems` pass cross several partitions.
+    #[tokio::test]
+    async fn resolved_rows_under_this_servers_directories_are_stored_tokenised() {
+        let db = test_db().await;
+        let tokenised = [
+            (
+                BaseItemKind::Genre,
+                "/pd/metadata/Genre/Rock",
+                "%MetadataPath%/Genre/Rock",
+            ),
+            (
+                BaseItemKind::Person,
+                "/pd/metadata/People/A/Ann Lee",
+                "%MetadataPath%/People/A/Ann Lee",
+            ),
+            (
+                BaseItemKind::UserView,
+                "/pd/metadata/views/ab12",
+                "%MetadataPath%/views/ab12",
+            ),
+            (
+                BaseItemKind::Folder,
+                "/pd/data/playlists",
+                "%AppDataPath%/playlists",
+            ),
+            (
+                BaseItemKind::Playlist,
+                "/pd/data/playlists/Mix",
+                "%AppDataPath%/playlists/Mix",
+            ),
+            (
+                BaseItemKind::Movie,
+                "/pd/data/livetv/recordings/News.ts",
+                "%AppDataPath%/livetv/recordings/News.ts",
+            ),
+        ];
+        let mut expected = Vec::new();
+        for (kind, stored, form) in tokenised {
+            expected.push((seed(&db, kind, stored).await, Some(form.to_owned())));
+        }
+        for (kind, stored) in [
+            // A library folder lives under the root, which is never tokenised.
+            (
+                BaseItemKind::CollectionFolder,
+                Some("/pd/root/default/Movies"),
+            ),
+            (BaseItemKind::Movie, Some("/media/Movies/A.mkv")),
+            // Only whole directories: a look-alike sibling stays.
+            (BaseItemKind::Movie, Some("/pd/data-other/B.mkv")),
+            (BaseItemKind::Playlist, Some("%AppDataPath%/playlists/Kept")),
+            // Another spelling of the directory would read back differently.
+            (BaseItemKind::Movie, Some("/PD/data/livetv/recordings/C.ts")),
+            (BaseItemKind::Season, None),
+        ] {
+            let id = seed(&db, kind, stored.unwrap_or_default()).await;
+            if stored.is_none() {
+                sqlx::query(r#"UPDATE "BaseItems" SET "Path" = NULL WHERE "Id" = ?1"#)
+                    .bind(guid_to_db(id))
+                    .execute(db.writer())
+                    .await
+                    .unwrap();
+            }
+            expected.push((id, stored.map(ToOwned::to_owned)));
+        }
+        let movie = seed(&db, BaseItemKind::Movie, "/media/Movies/A.mkv").await;
+        seed_stream(&db, movie, 0, None).await;
+        seed_stream(&db, movie, 1, Some("/pd/metadata/library/cf/cf75/A.en.srt")).await;
+        seed_stream(&db, movie, 2, Some("/media/Movies/A.fr.srt")).await;
+        seed_stream(&db, movie, 3, Some("/pd/data/subtitles/A.de.srt")).await;
+
+        assert_eq!(
+            reverse_virtual_paths_in_partitions(&db, &paths(), 2)
+                .await
+                .unwrap(),
+            8
+        );
+        for (id, path) in &expected {
+            assert_eq!(&item_path(&db, *id).await, path);
+        }
+        assert_eq!(
+            stream_paths(&db, movie).await,
+            [
+                None,
+                Some("%MetadataPath%/library/cf/cf75/A.en.srt".to_owned()),
+                Some("/media/Movies/A.fr.srt".to_owned()),
+                Some("%AppDataPath%/subtitles/A.de.srt".to_owned()),
+            ]
+        );
+
+        // Once per database: a row stored resolved after it ran stays so.
+        let later = seed(&db, BaseItemKind::Studio, "/pd/metadata/Studio/S").await;
+        assert_eq!(
+            reverse_stored_virtual_paths(&db, &paths()).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            item_path(&db, later).await.as_deref(),
+            Some("/pd/metadata/Studio/S")
+        );
+    }
+
+    /// The `(Path, rowid)` cursor: three rows sharing a path across a
+    /// partition of 2 are all rewritten, and three that are never rewritten
+    /// (a look-alike sibling) still end the pass.
+    #[tokio::test]
+    async fn rows_sharing_a_path_across_partitions_are_all_rewritten() {
+        let db = test_db().await;
+        let mut shared = Vec::new();
+        for _ in 0..3 {
+            shared.push(seed(&db, BaseItemKind::Movie, "/pd/data/livetv/recordings/A.ts").await);
+            seed(&db, BaseItemKind::Movie, "/pd/data-other/B.ts").await;
+        }
+
+        assert_eq!(
+            reverse_virtual_paths_in_partitions(&db, &paths(), 2)
+                .await
+                .unwrap(),
+            3
+        );
+        for id in shared {
+            assert_eq!(
+                item_path(&db, id).await.as_deref(),
+                Some("%AppDataPath%/livetv/recordings/A.ts")
+            );
+        }
+    }
+
+    /// A metadata directory configured under the data directory: `reverse`
+    /// tries the data directory first, as upstream's `Replace` order does, and
+    /// the row still reads back as stored.
+    #[tokio::test]
+    async fn a_metadata_directory_under_the_data_directory_takes_the_data_token() {
+        let db = test_db().await;
+        let app_paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+            "/pd", "/pd/log", "/pd/c", "/pd/k", "/pd/w",
+        ));
+        app_paths.set_internal_metadata_path(Some("/pd/data/meta/"));
+        let paths = VirtualPathExpander::from_paths(app_paths);
+        let genre = seed(&db, BaseItemKind::Genre, "/pd/data/meta/Genre/Rock").await;
+
+        assert_eq!(reverse_stored_virtual_paths(&db, &paths).await.unwrap(), 1);
+        assert_eq!(
+            item_path(&db, genre).await.as_deref(),
+            Some("%AppDataPath%/meta/Genre/Rock")
+        );
+    }
+
+    /// A partition whose write fails leaves the repair due; the next boot
+    /// finishes it.
+    #[tokio::test]
+    async fn a_failed_write_leaves_the_repair_due() {
+        let db = test_db().await;
+        let genre = seed(&db, BaseItemKind::Genre, "/pd/metadata/Genre/Rock").await;
+        sqlx::query(
+            r#"CREATE TRIGGER "fail_path" BEFORE UPDATE OF "Path" ON "BaseItems"
+               BEGIN SELECT RAISE(ABORT, 'disk full'); END"#,
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        assert!(reverse_stored_virtual_paths(&db, &paths()).await.is_err());
+        assert_eq!(
+            item_path(&db, genre).await.as_deref(),
+            Some("/pd/metadata/Genre/Rock")
+        );
+
+        sqlx::query(r#"DROP TRIGGER "fail_path""#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        assert_eq!(
+            reverse_stored_virtual_paths(&db, &paths()).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            item_path(&db, genre).await.as_deref(),
+            Some("%MetadataPath%/Genre/Rock")
+        );
+    }
+
+    /// The `BaseItems` read is a range seek on `IX_BaseItems_Path` in index
+    /// order: no scan of the table and no sort.
+    #[tokio::test]
+    async fn the_base_items_read_seeks_the_path_index() {
+        let db = test_db().await;
+        let explain = format!(
+            "EXPLAIN QUERY PLAN {}",
+            virtual_path_candidates_sql("BaseItems", "Path")
+        );
+        let plan: Vec<String> =
+            sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain.as_str()))
+                .bind("/pd/data")
+                .bind(i64::MIN)
+                .bind("/pd/data]")
+                .bind(2_i64)
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
+        assert!(
+            plan.iter()
+                .all(|step| step.starts_with("SEARCH") && step.contains("IX_BaseItems_Path")),
+            "{plan:?}"
+        );
+    }
+
+    /// With no directories (the identity), nothing is read and the repair
+    /// stays due.
+    #[tokio::test]
+    async fn the_identity_rewrites_nothing_and_leaves_the_repair_due() {
+        let db = test_db().await;
+        let genre = seed(&db, BaseItemKind::Genre, "/pd/metadata/Genre/Rock").await;
+        assert_eq!(
+            reverse_stored_virtual_paths(&db, &VirtualPathExpander::identity())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            reverse_stored_virtual_paths(&db, &paths()).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            item_path(&db, genre).await.as_deref(),
+            Some("%MetadataPath%/Genre/Rock")
+        );
+    }
 }
 
 #[cfg(test)]

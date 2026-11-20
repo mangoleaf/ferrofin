@@ -52,6 +52,12 @@ impl VirtualPathExpander {
             .map(|paths| paths.internal_metadata_path())
     }
 
+    /// This server's data directory, `None` for [`Self::identity`].
+    #[must_use]
+    pub fn data_path(&self) -> Option<String> {
+        self.paths.as_ref().map(|paths| paths.data_path())
+    }
+
     /// The stored path with both tokens replaced, case-insensitively, as
     /// `string.Replace(…, StringComparison.OrdinalIgnoreCase)` does upstream.
     #[must_use]
