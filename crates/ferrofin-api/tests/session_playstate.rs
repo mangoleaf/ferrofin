@@ -220,6 +220,13 @@ impl UserManager for OkUsers {
     ) -> Result<Option<UserEntity>, ServiceError> {
         unimplemented!()
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
     async fn update_configuration(
         &self,
         _u: Uuid,

@@ -257,6 +257,13 @@ impl UserManager for OkUsers {
     ) -> Result<Option<UserEntity>, ServiceError> {
         unimplemented!()
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
     async fn get_authentication_providers(
         &self,
     ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {

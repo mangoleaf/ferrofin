@@ -1522,29 +1522,7 @@ impl UserManager for FerrofinUserManager {
             return Err(ServiceError::unauthorized(INVALID_CREDENTIALS_MESSAGE));
         };
 
-        if has_permission(self.db.pool(), &user.id, PermissionKind::IsDisabled).await? {
-            tracing::warn!(username, user_id = %user.id, reason = "disabled", "login failed");
-            return Err(ServiceError::Forbidden(format!(
-                "The {} account is currently disabled. Please consult with your administrator.",
-                user.username
-            )));
-        }
-
-        if !self.is_local_client(remote_endpoint)
-            && !has_permission(self.db.pool(), &user.id, PermissionKind::EnableRemoteAccess).await?
-        {
-            tracing::warn!(username, user_id = %user.id, reason = "remote_access", "login failed");
-            return Err(ServiceError::Forbidden(
-                "remote access is not permitted for this user".to_owned(),
-            ));
-        }
-
-        if !is_parental_schedule_allowed(self.db.pool(), &user.id, chrono::Local::now()).await? {
-            tracing::warn!(username, user_id = %user.id, reason = "parental_schedule", "login failed");
-            return Err(ServiceError::Forbidden(
-                "User is not allowed access at this time.".to_owned(),
-            ));
-        }
+        self.ensure_sign_in_allowed(&user, remote_endpoint).await?;
 
         if !success {
             self.record_login_failure(&user).await?;
@@ -1600,6 +1578,38 @@ impl UserManager for FerrofinUserManager {
         // The writes above touch this user's row only.
         self.user_changed(&user.id);
         Ok(Some(user))
+    }
+
+    async fn ensure_sign_in_allowed(
+        &self,
+        user: &UserEntity,
+        remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        // The account's name: a sign-in without a password has no typed one.
+        let username = user.username.as_str();
+        if has_permission(self.db.pool(), &user.id, PermissionKind::IsDisabled).await? {
+            tracing::warn!(username, user_id = %user.id, reason = "disabled", "login failed");
+            return Err(ServiceError::Forbidden(format!(
+                "The {username} account is currently disabled. Please consult with your administrator."
+            )));
+        }
+
+        if !self.is_local_client(remote_endpoint)
+            && !has_permission(self.db.pool(), &user.id, PermissionKind::EnableRemoteAccess).await?
+        {
+            tracing::warn!(username, user_id = %user.id, reason = "remote_access", "login failed");
+            return Err(ServiceError::Forbidden(
+                "remote access is not permitted for this user".to_owned(),
+            ));
+        }
+
+        if !is_parental_schedule_allowed(self.db.pool(), &user.id, chrono::Local::now()).await? {
+            tracing::warn!(username, user_id = %user.id, reason = "parental_schedule", "login failed");
+            return Err(ServiceError::Forbidden(
+                "User is not allowed access at this time.".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
@@ -3820,6 +3830,10 @@ mod tests {
 #[cfg(test)]
 #[path = "user_manager/provider_tests.rs"]
 mod provider_tests;
+
+#[cfg(test)]
+#[path = "user_manager/sign_in_rules_tests.rs"]
+mod sign_in_rules_tests;
 
 #[cfg(test)]
 #[path = "user_manager/password_reset_tests.rs"]

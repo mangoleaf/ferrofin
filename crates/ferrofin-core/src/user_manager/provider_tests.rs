@@ -1043,6 +1043,13 @@ impl UserManager for Delegating {
             .authenticate_user(username, password, remote_endpoint, is_user_session)
             .await
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        user: &UserEntity,
+        remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        self.0.ensure_sign_in_allowed(user, remote_endpoint).await
+    }
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
         self.0.get_authentication_providers().await
     }

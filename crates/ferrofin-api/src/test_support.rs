@@ -839,6 +839,15 @@ impl UserManager for PolicyUsers {
             .authenticate_user(username, password, remote_endpoint, is_user_session)
             .await
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        user: &UserEntity,
+        remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        FakeUsers
+            .ensure_sign_in_allowed(user, remote_endpoint)
+            .await
+    }
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
         FakeUsers.get_authentication_providers().await
     }
@@ -933,6 +942,13 @@ impl UserManager for FakeUsers {
         _remote_endpoint: &str,
         _is_user_session: bool,
     ) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
@@ -1089,6 +1105,13 @@ impl UserManager for FakeAdminUsers {
         _remote_endpoint: &str,
         _is_user_session: bool,
     ) -> Result<Option<UserEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
