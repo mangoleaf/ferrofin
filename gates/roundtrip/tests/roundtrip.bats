@@ -18,9 +18,19 @@ setup() {
     python3 "$BATS_TEST_DIRNAME/fake_server.py" copy "fixtures/${spec%%:*}"
     echo "${spec#*:}" > "fixtures/${spec%%:*}/fake-generation"
   done
+  # The code migrations the export leaves to run on a 10.11.8 source, and the build logs of Jellyfin's own
+  # first start on each route's source: on 10.11.8 it applied a schema migration too, on 12.3 nothing.
+  printf '%s\n' "${CODE_MIGRATIONS[@]}" > fixtures/jellyfin-10.11.8/fake-left-to-run
+  { head -n 1 "$BATS_TEST_DIRNAME/jellyfin-ok.log"
+    echo '[07:53:39] [INF] [10] InternalDatabaseMigration: Perform migration 20260113102337_AddLinkedChildrenTable'
+    for ran in "${CODE_MIGRATIONS[@]}"; do echo "[07:53:39] [INF] [10] InternalCodeMigration: Perform migration $ran"; done
+  } > fixtures/jellyfin-12.4-from-10.server.log
+  head -n 1 "$BATS_TEST_DIRNAME/jellyfin-ok.log" > fixtures/jellyfin-12.4-from-123.server.log
   unset FERROFIN_ADOPTION_FIXTURES FERROFIN_GATES_DIR ADOPTION_USER ROUNDTRIP_READY_TIMEOUT FAKE_RUN_DELAY FAKE_EXIT_CODE \
-    FAKE_JELLYFIN
+    FAKE_JELLYFIN FAKE_EXPORT
 }
+
+CODE_MIGRATIONS=(20260113120000_MigrateLinkedChildren 20260915104305_FixNullEncoderPreset)
 
 teardown() { # no fake server outlives its test
   local pid
@@ -78,7 +88,7 @@ removed() { [ ! -f "$TMP/state/removed" ] || grep "^${1:-}" "$TMP/state/removed"
   [[ "$id" == cid-* ]]   # docker's id, not the name
   rt_remove "$TMP/x.cid"
   [ ! -e x.cid ]
-  grep -qx "rm -f $id" state/calls
+  grep -qx "rm -fv $id" state/calls
   [ "$(removed)" = rt-x-route-ferrofin ]
 }
 
@@ -191,28 +201,97 @@ EOS
 
 # --- whole runs ------------------------------------------------------------------------------------
 
-@test "run.sh: the 12.4 route passes, and the 10.11.8 route fails naming the migration Jellyfin could not apply" {
+@test "run.sh: both routes pass on the export, Jellyfin running on the 10.11.8 route the code migrations it left to run" {
   run run_gate "$TMP/w" --run-id both
-  [ "$status" -eq 1 ]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS  10.11.8        "* ]]
   [[ "$output" == *"PASS  12.4-from-123  "* ]]
-  [[ "$output" == *"FAIL  10.11.8        its start failed; migration 20260113102337_AddLinkedChildrenTable failed: SQLite Error 1: 'table \"LinkedChildren\" already exists'; "* ]]
-  # every check of the passing route ran and passed, Jellyfin's ones on its answers too
-  checks=$(jq -r 'select(.event == "check" and .fixture == "12.4-from-123") | "\(.stage)|\(.check)|\(.verdict)"' "$TMP/w/results.jsonl")
-  [ "$(grep -c '|PASS$' <<<"$checks")" -eq 11 ]
-  grep -qx "Jellyfin|answers equal Ferrofin's before the stop|PASS" <<<"$checks"
+  # every check of each route ran and passed, the export's and Jellyfin's ones on its answers too
+  for route in 10.11.8 12.4-from-123; do
+    checks=$(jq -r --arg r "$route" 'select(.event == "check" and .fixture == $r) | "\(.stage)|\(.check)|\(.verdict)"' \
+      "$TMP/w/results.jsonl")
+    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 13 ]
+    grep -qx "Export|the export completes|PASS" <<<"$checks"
+    grep -qx "Jellyfin|answers equal Ferrofin's before the stop|PASS" <<<"$checks"
+    grep -q '^Exported /config into /route/jellyfin$' "$TMP/w/$route/export.log"
+  done
   grep -q '^login roundtrip-user 200 token=yes$' "$TMP/w/12.4-from-123/answers.txt"
   cmp "$TMP/w/12.4-from-123/oracle.txt" "$TMP/w/12.4-from-123/answers.txt" >/dev/null ||
     diff <(adoption_normalise "$TMP/w/12.4-from-123/oracle.txt") <(adoption_normalise "$TMP/w/12.4-from-123/answers.txt")
-  # the passing route keeps its logs and answers, not its copies; the failing one keeps its copies
-  [ ! -e "$TMP/w/12.4-from-123/jellyfin" ]
+  # the export ran from the image under test, as the calling user, on the server's data directory at its path
+  grep -E -- "^run --pull never --cidfile $TMP/w/10.11.8/export.cid --name rt-both-10.11.8-export --user $(id -u):$(id -g) --network none -e FERROFIN_DATA_DIR=/config -v $TMP/w/10.11.8/ferrofin:/config -v $TMP/w/10.11.8:/route ferrofin-roundtrip:both export-jellyfin --out /route/jellyfin$" \
+    state/calls
+  grep -c 'InternalCodeMigration: Perform migration' "$TMP/w/10.11.8/jellyfin.log" | grep -qx 2
+  # a passing route keeps its logs and answers, not its copies
+  [ ! -e "$TMP/w/10.11.8/jellyfin" ]
   [ ! -e "$TMP/w/12.4-from-123/ferrofin" ]
-  [ -d "$TMP/w/10.11.8/jellyfin" ]
+  [ -f "$TMP/w/report.html" ]
+  [ "$(started rt-both-)" = "$(removed rt-both-)" ]
+  [ "$(started rt-both- | wc -l)" -eq 6 ]
+  grep -qx 'rmi ferrofin-roundtrip:both' state/calls
+}
+
+@test "run.sh: an export that leaves the history as it was fails the 10.11.8 route, naming the migration Jellyfin could not apply" {
+  FAKE_EXPORT=history-kept run run_gate "$TMP/w" --run-id kept --only 10.11.8
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  10.11.8        its start failed; migration 20260113102337_AddLinkedChildrenTable failed: SQLite Error 1: 'table \"LinkedChildren\" already exists'; "* ]]
   jq -e 'select(.event == "check" and .fixture == "10.11.8" and .stage == "Jellyfin" and .check == "ready")
          | .verdict == "FAIL"' "$TMP/w/results.jsonl" >/dev/null
-  [ -f "$TMP/w/report.html" ]
+  # the failing route keeps its copies to look into
+  [ -d "$TMP/w/10.11.8/jellyfin" ]
   grep -q 'AddLinkedChildrenTable' "$TMP/w/report.html"
-  [ "$(started rt-both-)" = "$(removed rt-both-)" ]
-  grep -qx 'rmi ferrofin-roundtrip:both' state/calls
+  [ "$(started rt-kept-)" = "$(removed rt-kept-)" ]
+}
+
+@test "run.sh: an export that records every id fails the 10.11.8 route: the code migrations Jellyfin runs on the source did not run" {
+  FAKE_EXPORT=all-recorded run run_gate "$TMP/w" --only 10.11.8
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  10.11.8        2 code migration(s) it runs on the source did not run: ${CODE_MIGRATIONS[0]}, ${CODE_MIGRATIONS[1]}"* ]]
+  check="it ran the code migrations it runs on the source, and no schema migration"
+  [ "$(jq -r --arg c "$check" 'select(.event == "check" and .check == $c) | .verdict' "$TMP/w/results.jsonl")" = FAIL ]
+  # the one check that failed: Jellyfin started and answered as Ferrofin did
+  [ "$(jq -r 'select(.event == "check" and .verdict == "FAIL") | .check' "$TMP/w/results.jsonl")" = "$check" ]
+}
+
+@test "run.sh: an export that fails fails its route, Jellyfin is never booted, and the export's container is removed" {
+  FAKE_EXPORT=fails run run_gate "$TMP/w" --run-id broken --only 12.4-from-123
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  12.4-from-123  the export failed with status 1: the database is damaged"* ]]
+  [ "$(jq -r 'select(.event == "check" and .stage == "Export") | .verdict' "$TMP/w/results.jsonl")" = FAIL ]
+  run ! grep -q -- '--name rt-broken-[^ ]*-jellyfin ' state/calls
+  [ "$(started rt-broken-)" = "$(removed rt-broken-)" ]
+  grep -q 'Caused by' "$TMP/w/12.4-from-123/export.log"
+}
+
+@test "run.sh: an export that never ends is given up at ROUNDTRIP_SCAN_TIMEOUT, and its container is removed" {
+  # the bound of the scans and the usage stage too: room for those on a slow host
+  FAKE_EXPORT=hangs ROUNDTRIP_SCAN_TIMEOUT=8 run run_gate "$TMP/w" --run-id hung --only 12.4-from-123
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  12.4-from-123  the export had no result within 8 s"* ]]
+  run ! grep -q -- '--name rt-hung-[^ ]*-jellyfin ' state/calls
+  [ "$(started rt-hung-)" = "$(removed rt-hung-)" ]
+}
+
+@test "run.sh: a run stopped during the export stops at once and removes the export's container" {
+  FAKE_EXPORT=hangs ROUNDTRIP_SCAN_TIMEOUT=120 "$ROUNDTRIP/run.sh" --image ferrofin:test --jellyfin-image jellyfin/jellyfin:test \
+    --fixtures "$TMP/fixtures" --work "$TMP/w" --run-id cut --only 12.4-from-123 > out.txt 2>&1 &
+  pid=$!
+  for _ in $(seq 150); do [ -s state/rt-cut-12.4-from-123-export.pid ] && break; sleep 0.2; done
+  [ -s state/rt-cut-12.4-from-123-export.pid ]   # the export is under way, and ignores TERM
+  kill -TERM "$pid"
+  start=$SECONDS; status=0; wait "$pid" || status=$?
+  [ "$status" -eq 143 ]
+  [ $((SECONDS - start)) -lt 10 ]   # not the 120 s the export may take
+  [ "$(started rt-cut-)" = "$(removed rt-cut-)" ]
+  [ "$(started rt-cut- | wc -l)" -eq 2 ]
+}
+
+@test "run.sh: a route whose first-start log is missing fails before anything starts" {
+  rm fixtures/jellyfin-12.4-from-10.server.log
+  run run_gate "$TMP/w" --only 10.11.8
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  10.11.8        fixture jellyfin-12.4-from-10.server.log missing"* ]]
+  run ! grep -q '^run ' state/calls
 }
 
 @test "run.sh: a Jellyfin whose setup server answers first is ready only once the real server answers" {
@@ -256,12 +335,12 @@ EOS
   [ -n "$idb" ]
   [ "$ida" != "$idb" ]
   # they ran at the same time: both had started a container before either removed one
-  first_rm=$(grep -n '^rm -f ' state/calls | head -n 1 | cut -d: -f1)
+  first_rm=$(grep -n '^rm -fv ' state/calls | head -n 1 | cut -d: -f1)
   for id in "$ida" "$idb"; do
     first_run=$(grep -n "^run .*--name rt-$id-" state/calls | head -n 1 | cut -d: -f1)
     [ "$first_run" -lt "$first_rm" ]
-    # both routes, both servers where they got that far, under this run's names; exactly those removed
-    [ "$(started "rt-$id-" | wc -l)" -eq 4 ]
+    # both routes, both servers and the export, under this run's names; exactly those removed
+    [ "$(started "rt-$id-" | wc -l)" -eq 6 ]
     [ "$(started "rt-$id-")" = "$(removed "rt-$id-")" ]
     grep -qx "rmi ferrofin-roundtrip:$id" state/calls
   done
@@ -269,6 +348,8 @@ EOS
   run ! grep -q -- '-p 127.0.0.1:[0-9]' state/calls
   grep -q '^PASS  12.4-from-123' a.out
   grep -q '^PASS  12.4-from-123' b.out
+  grep -q '^PASS  10.11.8' a.out
+  grep -q '^PASS  10.11.8' b.out
   [ -f "$TMP/gates/runs/roundtrip-$ida/report.html" ]
   [ -f "$TMP/gates/runs/roundtrip-$idb/report.html" ]
 }
@@ -286,7 +367,7 @@ EOS
   [ "$status" -eq 1 ]
   [[ "$output" == *"FAIL  12.4-from-123  exited with status 137 after TERM"* ]]
   [ "$(started)" = "$(started rt-)" ]
-  run ! grep -q -- '--name rt-[^ ]*-jellyfin ' state/calls
+  run ! grep -q -- '--name rt-[^ ]*-\(export\|jellyfin\) ' state/calls
 }
 
 @test "run.sh: a run stopped mid-stage removes the containers it started and its tag" {
@@ -300,7 +381,7 @@ EOS
   status=0; wait "$pid" || status=$?
   [ "$status" -eq 143 ]
   [ "$(started rt-stopped-)" = "$(removed rt-stopped-)" ]
-  [ "$(started rt-stopped- | wc -l)" -eq 2 ]
+  [ "$(started rt-stopped- | wc -l)" -eq 3 ]
   grep -qx 'rmi ferrofin-roundtrip:stopped' state/calls
   [ -z "$(compgen -G "$TMP/state/*.pid" || true)" ]   # no fake server left running
   [ -f "$TMP/w/report.html" ]
