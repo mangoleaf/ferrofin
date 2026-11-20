@@ -1,6 +1,7 @@
 //! The pending OIDC flows: each sign-in started and not yet called back, in
 //! memory, keyed by its `state` and bounded (D19), and each exchange code a
-//! completion page holds and has not yet swapped for a session. A restart
+//! completion page holds and has not yet swapped for a session, or a Quick
+//! Connect confirmation page has not yet posted. A restart
 //! forgets both, as does a pod a callback or an exchange reaches that did not
 //! start it: the refusal's "Try again" covers both.
 
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 use openidconnect::{Nonce, PkceCodeVerifier};
 use uuid::Uuid;
 
+use super::quick_connect::QuickConnectCode;
 use super::sign_in::VerifiedIdentity;
 
 /// How long a sign-in may take, from its start to its callback: 10 minutes.
@@ -35,9 +37,12 @@ pub const MAX_PENDING_FLOWS: usize = 1000;
 /// What a flow's verified identity is for once its callback passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowPurpose {
-    /// Signing in to Ferrofin; the only purpose until linking and Quick
-    /// Connect approval add theirs.
+    /// Signing in to Ferrofin.
     SignIn,
+    /// Approving a native app's Quick Connect code
+    /// ([`quick_connect`](super::quick_connect)): it ends on a confirmation
+    /// page, and opens no browser session.
+    QuickConnect(QuickConnectCode),
 }
 
 /// One pending flow: what its callback is checked against.
@@ -120,9 +125,10 @@ impl PendingFlows {
     }
 }
 
-/// A verified sign-in whose completion page holds its exchange code: who
-/// signs in, and the browser the code is bound to. `Debug` leaves the claims
-/// out.
+/// A verified sign-in whose completion page holds its exchange code, or
+/// whose Quick Connect confirmation page holds its confirmation: who signs
+/// in, what for, and the browser the code is bound to. `Debug` leaves the
+/// claims and a Quick Connect code out.
 #[derive(Debug)]
 pub struct PendingExchange {
     /// The SHA-256 of the flow cookie's value the sign-in was verified with:
@@ -132,6 +138,9 @@ pub struct PendingExchange {
     pub user_id: Uuid,
     /// The verified identity, its provider and claims.
     pub identity: VerifiedIdentity,
+    /// What the code is for: a browser session, or the confirmation of a
+    /// Quick Connect approval, which the exchange refuses.
+    pub purpose: FlowPurpose,
     /// When the code was issued.
     pub created: Instant,
 }

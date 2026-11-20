@@ -33,7 +33,9 @@
 //!   exchange of its one-time code for the session, under the account rules
 //!   of a password sign-in;
 //! - [`login_buttons`]: the "Sign in with" buttons jellyfin-web's login page
-//!   shows under its form.
+//!   shows under its form;
+//! - [`quick_connect`]: a native app's Quick Connect code approved through a
+//!   sign-in and a confirmation page, under the account rules of a sign-in.
 //!
 //! An identity provider is contacted only when an admin saves a provider or a
 //! user signs in with it (B1).
@@ -49,7 +51,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::ExternalIdentityStore;
 use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
-use ferrofin_traits::security::AuthenticationManager;
+use ferrofin_traits::security::{AuthenticationManager, QuickConnect};
 use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
 use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, SsoManager, SsoReply};
 use ferrofin_traits::tasks::ScheduledTask;
@@ -66,6 +68,7 @@ pub mod fake_idp;
 pub mod flows;
 pub mod login_buttons;
 pub mod oidc_http;
+pub mod quick_connect;
 pub mod roles;
 pub mod sign_in;
 
@@ -354,6 +357,9 @@ pub struct SsoService {
     /// The sign-ins called back whose completion page has not yet swapped
     /// its exchange code.
     exchanges: ExchangeCodes,
+    /// Approves a native app's Quick Connect code ([`quick_connect`]), once
+    /// [`with_quick_connect`](Self::with_quick_connect) gives it.
+    quick_connect: Option<Arc<dyn QuickConnect>>,
 }
 
 impl SsoService {
@@ -384,6 +390,7 @@ impl SsoService {
             metadata: MetadataCache::default(),
             flows: PendingFlows::default(),
             exchanges: ExchangeCodes::default(),
+            quick_connect: None,
         }
     }
 
@@ -660,7 +667,8 @@ impl SsoManager for SsoService {
         key: &str,
         client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {
-        self.start_sign_in(key, client).await
+        self.start_sign_in(key, client, flows::FlowPurpose::SignIn)
+            .await
     }
 
     async fn finish_oidc_sign_in(
@@ -683,6 +691,29 @@ impl SsoManager for SsoService {
 
     async fn login_buttons(&self) -> Result<Option<String>, ServiceError> {
         self.login_button_forms().await
+    }
+
+    async fn quick_connect_page(&self) -> Result<SsoReply, ServiceError> {
+        self.code_entry_page().await
+    }
+
+    async fn start_oidc_quick_connect(
+        &self,
+        key: &str,
+        client: std::net::IpAddr,
+        code: &str,
+    ) -> Result<SsoReply, ServiceError> {
+        self.start_quick_connect(key, client, code).await
+    }
+
+    async fn confirm_oidc_quick_connect(
+        &self,
+        confirmation: Option<Secret>,
+        flow_cookie: Option<Secret>,
+        client: std::net::IpAddr,
+    ) -> Result<SsoReply, ServiceError> {
+        self.confirm_quick_connect(confirmation.as_ref(), flow_cookie.as_ref(), client)
+            .await
     }
 }
 

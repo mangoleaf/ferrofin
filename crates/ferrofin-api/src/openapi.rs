@@ -63,6 +63,8 @@ pub const JELLYFIN_API_VERSION: &str = "12.4.0";
         crate::handlers::sso::start_oidc_sign_in,
         crate::handlers::sso::finish_oidc_sign_in,
         crate::handlers::sso::exchange_oidc_sign_in,
+        crate::handlers::sso::quick_connect_page,
+        crate::handlers::sso::confirm_quick_connect,
         crate::handlers::plugins::get_plugins,
         crate::handlers::plugins::get_plugin_configuration,
         crate::handlers::plugins::update_plugin_configuration,
