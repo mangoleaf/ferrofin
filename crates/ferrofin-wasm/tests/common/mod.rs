@@ -402,6 +402,13 @@ impl ferrofin_traits::library::UserManager for StubUsers {
     ) -> Result<Option<UserEntity>, ServiceError> {
         unimplemented!("stub")
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("stub")
+    }
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
         unimplemented!("stub")
     }
