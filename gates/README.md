@@ -11,7 +11,10 @@ own README defines its numbers:
 | [`bench/`](bench/README.md) | How fast, and how much memory, against Jellyfin or the previous release? | the benchmark corpus; idle cores |
 | [`roundtrip/`](roundtrip/README.md) | Does the latest Jellyfin start on what Ferrofin leaves, with what the user did? | the adoption fixtures; the Jellyfin image `UPSTREAM_TAG` names |
 
-`roundtrip/` is not part of a `gates/run` session yet: run `gates/roundtrip/run.sh` on its own.
+Two gates also run per change. Adoption runs for any change to the migration chain, the adoption gate or the boot
+repairs; the round trip for any change to the export command, the configuration writers, the history table, the
+migration chain or a writer of a Jellyfin-owned table, on the routes the change touches (`roundtrip/run.sh --only`).
+Both run on every route before every release, in the `Adoption` workflow ([`../RELEASE.md`](../RELEASE.md)).
 
 [`gates/supply-chain/`](supply-chain) is not a gate. It is cargo-vet's store (`config.toml`, `audits.toml`,
 `imports.lock`), which CI's `vet` job reads and `gates/run` never runs.
@@ -34,13 +37,13 @@ $FERROFIN_GATES_DIR/
 
 ## Running them
 
-`gates/run` validates one commit with one image, all four gates or the ones named:
+`gates/run` validates one commit with one image, all five gates or the ones named:
 
 ```bash
 export FERROFIN_GATES_DIR=/srv/gates
 gates/run all --dry-run          # the preflight and every gate's command; nothing starts
 docker build --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t IMAGE .   # the image the preflight names
-gates/run all                    # verify, adoption, parity, bench, in that order
+gates/run all                    # verify, adoption, roundtrip, parity, bench, in that order
 gates/run adoption               # one gate: a session all the same
 gates/run bench --previous ghcr.io/mangoleaf/ferrofin:vPREV   # bench as the release A/B gate: vPREV is the latest
                                  # release of the minor line before (v1.4.1: v1.3.2), enforced for a release:
@@ -65,8 +68,8 @@ fails does not stop the next; `gates/run` exits 1 when one failed and 2 when the
 Each gate's own script still runs on its own; its README says how.
 
 Stop a run with Ctrl-C or a TERM: it stops at once, removes what it started and still writes its
-report, and exits 130 or 143. `gates/run`, `verify/run.sh`, `verify/scan-behaviour.sh`, `parity/run.sh`
-and `bench/run.sh` hand the run to a worker in a session of its own and only wait for it, then pass a
+report, and exits 130 or 143. `gates/run`, `verify/run.sh`, `verify/scan-behaviour.sh`, `roundtrip/run.sh`,
+`parity/run.sh` and `bench/run.sh` hand the run to a worker in a session of its own and only wait for it, then pass a
 signal on as a TERM, again every second until the worker's cleanup has started ([`lib.sh`](lib.sh),
 `gates_supervise`): bash 5.2 drops a trapped signal that lands while it parses a `$( … )`. So what a
 run records (`session.json`, a report) says 143 for a Ctrl-C too. Under `set -e` (`parity/run.sh`, and
@@ -77,8 +80,8 @@ suspends only the waiting shell.
 `adoption/run.sh` hands its run to a worker too, but its own supervisor stops the worker outright and
 builds the report itself ([its README](adoption/README.md)).
 
-The root [`Makefile`](../Makefile) offers the same as targets: `make run-gates` for all four, and
-`make run-verify`, `make run-adoption`, `make run-parity` or `make run-bench` for one, with `IMAGE=`,
+The root [`Makefile`](../Makefile) offers the same as targets: `make run-gates` for all five, and
+`make run-verify`, `make run-adoption`, `make run-roundtrip`, `make run-parity` or `make run-bench` for one, with `IMAGE=`,
 `PREVIOUS=` and `RELEASE=` passed through from the command line (`make run-gates IMAGE=ferrofin:v1.4.0-rc
 PREVIOUS=ghcr.io/mangoleaf/ferrofin:v1.3.2`); a bare `make` only lists them. `make test-gates-offline`
 runs the gates' own tests, which need no docker, server or fixtures, as CI's shell-tests job does:
@@ -98,6 +101,7 @@ every gate included:
 |---|---|---|
 | verify | checks passed, failed and skipped, over both libraries, from its `result.json` | the verify report; each library's rows, `result.json`, `verify.json` and the server log |
 | adoption | from its `result.json`: fixture rows passed, failed, unfinished and skipped, by the adoption report's own rules | the adoption report |
+| roundtrip | from its `result.json`: routes passed, failed, unfinished and skipped, by the adoption report's rules (it records its routes with that report) | the round-trip report |
 | parity | from its `result.json`: new differences, the groups of them not filed yet, requests sent and planned; the verdict and its reason | the parity report |
 | bench | from its `result.json`: phases completed, failed, unfinished and skipped; for the A/B gate (`--previous`), the gated cells regressed, not comparable, improved and within noise, and whether anything blocks | the benchmark or A/B gate report |
 

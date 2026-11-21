@@ -13,7 +13,9 @@ Exit status 0 when there is nothing to say, 1 with the reasons on stdout, 2 when
 holds no entry at all (an empty capture, or a format this no longer parses, must never pass), or DB's
 history cannot be read.
 The log is the container's output: entries such as `[07:53:39] [INF] [10] Main: Jellyfin version: 12.4.0`,
-a multi-line entry continuing on the lines that do not start one.
+a multi-line entry continuing on the lines that do not start one. The time has milliseconds
+(`[07:53:39.252]`) where the configuration's logging.default.json asks for them, as the one a fresh install of
+12.2 or later writes does.
 """
 
 from contextlib import closing
@@ -22,7 +24,7 @@ import re
 import sqlite3
 import sys
 
-ENTRY = re.compile(r"^\[\d\d:\d\d:\d\d\] \[(VRB|DBG|INF|WRN|ERR|FTL)\] \[\d+\] ([^:]+): ?(.*)$")
+ENTRY = re.compile(r"^\[\d\d:\d\d:\d\d(?:\.\d+)?\] \[(VRB|DBG|INF|WRN|ERR|FTL)\] \[\d+\] ([^:]+): ?(.*)$")
 BEGUN = re.compile(r"^Perform migration (\S+)$")
 DONE = re.compile(r"^Migration (\S+) was successfully applied$")
 SQLITE = re.compile(r"SQLite Error \d+: '[^\n]*?'")

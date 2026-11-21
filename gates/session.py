@@ -22,7 +22,7 @@ import re
 import sys
 from datetime import datetime
 
-GATES = ("verify", "adoption", "parity", "bench")
+GATES = ("verify", "adoption", "roundtrip", "parity", "bench")
 STATUSES = ("pending", "running", "passed", "failed", "skipped")
 
 

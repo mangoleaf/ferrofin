@@ -14,7 +14,7 @@ import json
 import os
 
 SCHEMA = 1
-GATES = ("verify", "adoption", "parity", "bench")
+GATES = ("verify", "adoption", "roundtrip", "parity", "bench")
 SOURCE = ("commit", "image", "image_digest", "oracle", "host_class", "fixture")
 NAME = "result.json"
 

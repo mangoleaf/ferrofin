@@ -15,22 +15,39 @@ are compared with Ferrofin's.
 | `10.11.10`, `10.11.11` | `jellyfin-10.11.10`, `jellyfin-10.11.11` (10.11.11) | `/data` | applies none (the history records 18) and runs 18 code migrations; its own first start there runs `UpdateNormalizedUsername` too, which the source records: there the first schema migration it applies reverts the later ones, and `AddNormalizedUsername`'s `Down` drops that routine's row |
 | `12.0` | `jellyfin-12.0` (12.0.0) | `/data` | applies none (the history records `MakeOwnerIdIndexesPartial`) and runs 5 code migrations |
 | `12.1-from-10`, `12.1-from-12` | `jellyfin-12.1-from-10`, `jellyfin-12.1-from-12` (12.1.0) | `/data` | applies none (the history records `MakeOwnerIdIndexesPartial`) and runs 3 code migrations |
-| `12.2-from-10`, `12.2-from-12`, `12.2-from-121`, `12.3-from-122`, `12.3-from-10` | the fixture of that name (12.2.0) | `/data` | runs no migration: the history is already the 12.2 set, which 12.3 and 12.4 keep |
+| `12.2-from-10`, `12.2-from-12`, `12.2-from-121`, `12.3-from-122`, `12.3-from-10`, `12.4-from-10` | the fixture of that name (12.2.0) | `/data` | runs no migration: the history is already the 12.2 set, which 12.3 and 12.4 keep |
 | `12.4-from-123` | `jellyfin-12.4-from-123` (12.2.0) | `/config` | runs no migration, as above |
+| `12.2-fresh`, `12.3-fresh`, `12.4-fresh` | that release's first run, not upgraded (12.2.0) | `/data` | runs no migration: the history is the fresh-install set (105 ids), which the export keeps as it is |
+| `12.4-debian` | a 12.4 first run in a Debian package's layout (`/var/lib/jellyfin`, `/etc/jellyfin`; 12.2.0) | `/var/lib/ferrofin`, its configuration at `/etc/ferrofin` | runs no migration; the export reads Ferrofin's two directories and writes the docker layout, the only one it writes |
+| `10.11.11-messy`, `12.4-messy` | `messy.py`'s copies of `jellyfin-10.11.11` and `jellyfin-12.4-from-123`, with the rows of shapes no API makes (10.11.11, 12.2.0), on `media-messy/` | `/data` | as on its source's route |
+| `10.11.11-scale` | `scale.py`'s copy of `jellyfin-10.11.11`, cloned up to 40,000 items (10.11.11), on `media-scale/` | `/data` | as on the `10.11.11` route; the time each stage took and the export's size are on its line, recorded, not gated. Ferrofin adopts it and stops with no scan and no usage stage, and Jellyfin's checks end with its start and its file: the clones' files are hard links to their templates', so a scan re-identifies and re-extracts every clone, which measures the fixture rather than the way back (the adoption gate scans it neither). It needs a few GB free under the run directory (the export alone came to 1.6 GB on the development host) and, unlike the adoption gate's scale row, checks no free space first |
 
-The routes are in [`routes.sh`](routes.sh), one per source generation and upgrade route. TODO, open work:
-routes for the other fixtures. Their history is the set of a route above: `jellyfin-12.4-from-10`, the fresh
-installs, the Debian-layout fixture and `jellyfin-12.4-messy` adopt as 12.2.0, whose history the export keeps as
-it is (the 12.2 to 12.4 routes); `jellyfin-10.11.11-messy` and `jellyfin-10.11.11-scale` are copies of
-`jellyfin-10.11.11` (the `10.11.10` and `10.11.11` routes). `build-fixtures.sh` already logs Jellyfin 12.4's
-first start on the fresh installs of 12.2 and 12.3.
+The routes are in [`routes.sh`](routes.sh): one record per route, every fixture `build-fixtures.sh` builds, with
+everything that makes a route differ in its own fields (its fixture, the generation Ferrofin adopts it as, the
+log of Jellyfin's own first start on its source, the data directory Ferrofin runs at, its configuration directory
+when apart, and its kind, which names its media tree). `run.sh` needs no change for a new route: a fixture added
+later gets a record, and [`tests/test_routes.py`](tests/test_routes.py) fails until it has one.
+Open work: two sources have no route yet, so a green run does not cover every supported source. A database that
+never came from Jellyfin (a Ferrofin-native route, gl-1552) needs a seeding step that makes its API key,
+administrator and web session; and no route starts from a database an earlier Ferrofin release wrote, whose rows
+keep the forms of the writers of their day.
 Jellyfin always runs at `/config`, its image's layout. Ferrofin runs at
-`/data`, its own image's directory, on every route but `12.4-from-123`, and the export reads it there, so the
-export must rewrite every stored path from `/data` onto `/config`: with source and output both at `/config`, a
-missed rewrite could not show. Without the history rewrite, Jellyfin's start fails on the 10.11 routes:
+`/data`, its own image's directory, on every route but `12.4-from-123` and `12.4-debian`, and the export reads
+it there, so the export must rewrite every stored path from `/data` onto `/config`: with source and output both
+at `/config`, a missed rewrite could not show. The Debian-layout route is a source layout: Ferrofin adopts that
+fixture into its own package directories, its configuration apart, as the adoption gate does, and the export
+still writes the docker layout. Without the history rewrite, Jellyfin's start fails on the 10.11 routes:
 `migration 20260113102337_AddLinkedChildrenTable failed: SQLite Error 1: 'table "LinkedChildren" already exists'`;
 on the 12.0 and 12.1 routes it applies `20261002210711_MakeOwnerIdIndexesPartial`, which the check below fails;
 the 12.2 and later routes have nothing to rewrite.
+
+### When to run it
+
+Run it for any change to the export command, the configuration writers, the history table, the migration chain
+or a writer of a Jellyfin-owned table, on the routes the change touches (`--only`), and attach the report's
+verdict table to the pull request. Every release runs it on every route: the `Adoption` workflow
+(`.github/workflows/adoption.yml`) runs it on the frozen release commit after the adoption gate, and a failure
+there blocks the release like an adoption failure ([`RELEASE.md`](../../RELEASE.md), "Validate adoption").
 
 ## Running it
 
@@ -42,9 +59,14 @@ docker pull jellyfin/jellyfin:12.4            # the release UPSTREAM_TAG names
 gates/roundtrip/run.sh                        # every route; --only 10.11.8,12.0 for some
 ```
 
-It prints one `PASS`/`FAIL` line per route, and the reasons. It exits 1 if a route failed and 2 if
-the run was refused. The run directory, `$FERROFIN_GATES_DIR/runs/roundtrip-<run id>/`, holds
-`report.html` (every route, stage and check, built however the run ends) and `results.jsonl` (the same
+`make run-roundtrip` (`gates/run roundtrip`) runs it as a gates session instead, after the session's preflight,
+into the session's `roundtrip/` folder, and the session's report reads its `result.json`.
+
+It prints one `PASS`/`FAIL` line per route listed, and the reasons (a missing fixture fails its route, never
+skips it), then how many of them passed. It exits 1 if a route failed, and 2 if the run was refused: an unknown
+route in `--only`, or no route at all. The run directory, `$FERROFIN_GATES_DIR/runs/roundtrip-<run id>/`, holds
+`report.html` (every route, stage and check, built however the run ends), `result.json` (the same, in the
+envelope every gate writes, [`../result.py`](../result.py), gate `roundtrip`) and `results.jsonl` (the
 events, the adoption report's format). Each route also has a folder with:
 
 | File | What |
@@ -56,7 +78,7 @@ events, the adoption report's format). Each route also has a folder with:
 | `probes.txt` | how many of each kind of file Jellyfin served with 200, of those its database lists |
 | `ferrofin-boot.log`, `ferrofin.log` | Ferrofin's log after the scan, and its whole log |
 | `jellyfin-boot.log`, `jellyfin.log` | Jellyfin's log up to the probes, and its whole log |
-| `ferrofin/`, `jellyfin/` | the copy Ferrofin ran on and the export Jellyfin ran on, kept only when the route failed |
+| `ferrofin/`, `ferrofin-config/`, `jellyfin/` | the copy Ferrofin ran on (its configuration apart on the Debian-layout route) and the export Jellyfin ran on, kept only when the route failed |
 | `ferrofin.cid`, `export.cid`, `jellyfin.cid` | while a container runs, the id docker gave it |
 
 Options: `--image IMAGE` (default `ferrofin:bench`), `--jellyfin-image IMAGE` (default
@@ -72,7 +94,7 @@ Settings (environment), each a whole number of seconds:
 | Setting | Default | What |
 |---|---|---|
 | `ROUNDTRIP_READY_TIMEOUT` | 300 | how long a server may take to answer after its start |
-| `ROUNDTRIP_SCAN_TIMEOUT` | 600 | how long a library scan, the export, Jellyfin's startup tasks, its playlists' refresh, Jellyfin's answers or its probes may take (the adoption gate's scan timeout); five times that bounds the whole usage stage (two scans, each followed by a settle, and the probes) |
+| `ROUNDTRIP_SCAN_TIMEOUT` | 600 | how long a library scan, the export, Jellyfin's startup tasks (and Ferrofin's on the scale route), its playlists' refresh, Jellyfin's answers or its probes may take (the adoption gate's scan timeout); five times that bounds the whole usage stage (two scans, each followed by a settle, and the probes) |
 | `ROUNDTRIP_STOP_TIMEOUT` | 60 | how long a server is given to stop after TERM before docker kills it |
 | `ROUNDTRIP_DOCKER_TIMEOUT` | 120 | how long any other docker call may take (a stop gets `ROUNDTRIP_STOP_TIMEOUT` more) |
 
@@ -82,11 +104,12 @@ Settings (environment), each a whole number of seconds:
 |---|---|---|
 | Ferrofin | ready | the server never answers `/System/Ping` and `/System/Info/Public` (it exited, named with its status, or the deadline passed) |
 | | the library scan completes | `POST /Library/Refresh` does not end `Completed` |
+| | its startup tasks finish | the scale route only, in place of the scan and the usage stage: no scheduled task runs on two polls in a row within `ROUNDTRIP_SCAN_TIMEOUT` |
 | | boot log (generation, migrations, no ERROR) | as in the adoption gate (`adoption_check_boot_log`) |
 | | usage stage, then Ferrofin's answers | an action fails (named), an action does not show in the answers, or no answers were written |
 | | clean stop | the server does not exit 0 on TERM (judged only when every check before it passed) |
 | Export | the export completes | `export-jellyfin`, run from the image under test in a container of its own on the stopped server's data directory, exits non-zero (its last line is the reason) or runs past `ROUNDTRIP_SCAN_TIMEOUT` |
-| | every stored path is in the export, none under the directory Ferrofin ran at | a path in `BaseItems.Path`, `BaseItemImageInfos.Path`, `Chapters.ImagePath`, `MediaStreamInfos.Path` or `ImageInfos.Path` of the exported database does not resolve as Jellyfin's image reads it (`/config/…` in the export, `%AppDataPath%` and `%MetadataPath%` under its `data` and `metadata`, `/media/…` in the fixture's media), or lies under the directory Ferrofin ran at (`/data`) or the copy's own path ([`checks_paths.py`](checks_paths.py) `stored`). Checked before Jellyfin opens the file |
+| | every stored path is in the export, none under the directory Ferrofin ran at | a path in `BaseItems.Path`, `BaseItemImageInfos.Path`, `Chapters.ImagePath`, `MediaStreamInfos.Path` or `ImageInfos.Path` of the exported database does not resolve as Jellyfin's image reads it (`/config/…` in the export, `%AppDataPath%` and `%MetadataPath%` under its `data` and `metadata`, `/media/…` in the route's media tree), or lies under a directory Ferrofin ran at (`/data`, and its configuration directory where it is apart) or the copy's own path ([`checks_paths.py`](checks_paths.py) `stored`). A path the same column of the database Ferrofin stopped with already stored without a file where it points, in the copy or the media (a person whose folder Jellyfin never made, a file gone from the media), is not the export's to resolve and is left out of that half of the check; an absolute path outside both never is. Checked before Jellyfin opens the file |
 | Jellyfin | ready | its start failed (`Main: Error while starting server`; it keeps answering 503, so the wait stops at that line), it exited (named with its status), or it is not ready within `ROUNDTRIP_READY_TIMEOUT`. Ready is `/System/Ping` and then `/System/Info/Public` answering: Jellyfin's setup server answers `/System/Info/Public` while Jellyfin still runs its last migrations and optimises the database, and 503 to everything else; the real server then answers only `/System/Ping` until its core startup completes |
 | | its startup tasks finish | no scheduled task runs on two polls in a row, within `ROUNDTRIP_SCAN_TIMEOUT` |
 | | every migration it began finished | a `Perform migration` with no `was successfully applied`, named with its SQLite error ([`checks_boot.py`](checks_boot.py)); a log with no entry at all fails too |
@@ -100,7 +123,8 @@ Settings (environment), each a whole number of seconds:
 | | every library keeps its folder row and DateCreated through its scan | a library folder row (`CollectionFolder`) of the database Ferrofin stopped with is gone from Jellyfin's, or has another `DateCreated`: Jellyfin's scan deletes a library whose stored folder does not exist, and with it the library's playlist and collection entries ([`checks_paths.py`](checks_paths.py) `libraries`) |
 
 Jellyfin is booted only on an export of a copy Ferrofin finished with: when a Ferrofin or export check
-fails, the route stops there.
+fails, the route stops there. On the scale route Jellyfin's checks are its start, its log and its file:
+there are no answers of Ferrofin's to compare, and no scan.
 
 ### Controls
 
@@ -136,7 +160,8 @@ Runs do not share anything:
 
 There is no lock. On any exit a run removes only the containers whose ids docker wrote to its own
 cidfiles, never one by a name another run could hold, and only the tag it made. Unlike the adoption gate
-(fixed ports) and `gates/run` (`gates.lock`), two agents can run it at once.
+(fixed ports), two agents can run `run.sh` directly at once; `make run-roundtrip` and `gates/run` take
+`gates.lock` as for every session.
 
 ## The usage-stage contract
 
@@ -271,10 +296,15 @@ The gate reuses the adoption gate's parts: its fixtures, `smoke.sh`, `lib.sh` (`
     deadline) and one that exits (named with its status);
   - a Ferrofin that exits at once, and one that does not exit 0 on TERM;
   - a run stopped mid-stage (it removes its containers and its tag);
-  - the refusals, and two runs at the same time sharing nothing, run directories included.
-- [`tests/test_routes.py`](tests/test_routes.py) checks every route of `routes.sh` against the fixtures
-  `build-fixtures.sh` builds: its fixture, the generation Ferrofin adopts it as, and the first-start log it
-  returns to.
+  - the refusals (no route to run among them), and two runs at the same time sharing nothing, run directories
+    included;
+  - a route of each other kind: the Debian-layout route, its configuration directory moved apart for
+    Ferrofin and its export, a messy route on its own media tree (or failing without it) and the scale route,
+    its time and size on its line; and `result.json`, the round trip's in the gates' envelope.
+- [`tests/test_routes.py`](tests/test_routes.py) checks `routes.sh` against the fixtures `build-fixtures.sh`
+  builds: every fixture has a route, and each route its fixture, the generation Ferrofin adopts it as, the
+  first-start log it returns to, a configuration directory exactly where the fixture was written in another
+  layout, and its kind (a messy or the scale copy, or a path).
 - Canned Jellyfin logs exercise `checks_boot.py`.
 - Databases shaped as Jellyfin's tables exercise `checks_paths.py` and what `probes.py` probes.
 - The same fake server, in process, exercises `usage.py` and `answers.py` (a lost write included, a copy
