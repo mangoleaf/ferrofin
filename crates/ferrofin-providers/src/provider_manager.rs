@@ -2158,6 +2158,46 @@ impl LocalProviderManager {
         }
     }
 
+    /// `ProviderManager.SaveMetadataAsync`: the NFO saver, then the
+    /// `collection.xml`/`playlist.xml` saver, over one read of the item's row
+    /// (each saver reads it again under its file's lock before it writes).
+    /// Returns whether the latter wrote its file. Failures are logged, never
+    /// returned: the metadata is already committed.
+    async fn run_savers(&self, item_id: Uuid, update: ItemUpdateType) -> bool {
+        if self.nfo_saver.is_none() && self.container_xml.is_none() {
+            return false;
+        }
+        // A manager built without an item store (no remote images wired):
+        // each saver reads for itself.
+        let Some(items) = &self.items else {
+            self.save_nfo(item_id, update).await;
+            return self.save_container_xml(item_id, update).await;
+        };
+        let row = match items.retrieve_item(item_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(%item_id, %error, "the metadata savers could not read the item");
+                return false;
+            }
+        };
+        if let Some(saver) = &self.nfo_saver
+            && let Err(error) = saver.save_read(item_id, &row, update).await
+        {
+            tracing::warn!(%item_id, %error, "NFO metadata saver failed");
+        }
+        let Some(saver) = &self.container_xml else {
+            return false;
+        };
+        saver
+            .save_read(item_id, &row, update)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%item_id, %error, "local XML metadata saver failed");
+                false
+            })
+    }
+
     /// `ProviderManager.SaveMetadataAsync` with the `collection.xml` and
     /// `playlist.xml` saver: whether it wrote the file. A failure is logged, never returned: the
     /// metadata is already committed.
@@ -5562,12 +5602,11 @@ impl ProviderManager for LocalProviderManager {
     ) -> Result<(), ServiceError> {
         // ProviderManager.SaveMetadataAsync logs saver failures; metadata has
         // already been committed and an unwritable sidecar must not undo it.
-        self.save_nfo(item_id, update_type).await;
         // "Modify again, so saved value is after write time of externally
         // saved metadata" (`LibraryManager.UpdateItemsAsync`): the XML
         // reader's change monitor has no tolerance, so the server's own write
         // must not read as a change.
-        if self.save_container_xml(item_id, update_type).await
+        if self.run_savers(item_id, update_type).await
             && let Some(store) = &self.image_store
             && let Err(error) = store.touch_item_updated(item_id).await
         {
@@ -5584,8 +5623,7 @@ impl ProviderManager for LocalProviderManager {
         // `LibraryManager.UpdateItemsAsync` runs the savers, then the save
         // re-stamps `DateLastSaved` "after write time of externally saved
         // metadata" and `ItemUpdated` fires, once.
-        self.save_nfo(item_id, update_type).await;
-        self.save_container_xml(item_id, update_type).await;
+        self.run_savers(item_id, update_type).await;
         if let Some(store) = &self.image_store {
             store.touch_item_updated(item_id).await?;
             // A video's save gives its local versions its images and

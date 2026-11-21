@@ -367,17 +367,29 @@ impl ContainerXmlSaver {
         if update == ItemUpdateType::None {
             return Ok(false);
         }
+        match self.items.retrieve_item(item_id).await? {
+            Some(row) => self.save_read(item_id, &row, update).await,
+            None => Ok(false),
+        }
+    }
+
+    /// [`save`](Self::save) for an item whose row the caller has just read
+    /// (`read`), so the savers of one save share that read: anything but a
+    /// box set or a playlist folder returns at once. It only gates: the row
+    /// is read again under the lock, and that one is written.
+    ///
+    /// # Errors
+    /// As [`save`](Self::save).
+    pub async fn save_read(
+        &self,
+        item_id: Uuid,
+        read: &BaseItemEntity,
+        update: ItemUpdateType,
+    ) -> Result<bool, ServiceError> {
         // Every item's metadata save comes here: only a box set's or a
         // playlist's waits on the lock, and reads its row again under it, so
         // the last writer writes the newest row.
-        if self
-            .items
-            .retrieve_item(item_id)
-            .await?
-            .as_ref()
-            .and_then(xml_path)
-            .is_none()
-        {
+        if update == ItemUpdateType::None || xml_path(read).is_none() {
             return Ok(false);
         }
         let _guard = self.lock.lock().await;
