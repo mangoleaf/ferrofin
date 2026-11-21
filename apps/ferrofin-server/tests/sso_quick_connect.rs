@@ -1,13 +1,15 @@
 //! A native app's Quick Connect code approved through Single Sign-On (B13,
-//! D8), through the composition root and the real router (`tower` oneshot),
-//! against the fake identity provider: the app's `POST /QuickConnect/Initiate`,
-//! the browser's code-entry page `GET /sso/quickconnect`, its
-//! `GET /sso/oidc/{provider}/start?quickConnect=CODE`, the provider's
-//! authorization endpoint, the callback's confirmation page and its
-//! `POST /sso/quickconnect`. The app then sees its request authorized and
-//! swaps its secret for a session of the SSO account; the browser gets none.
-//! Nothing is approved without the confirmation, a confirmation works once
-//! and only with its cookie, and Quick Connect turned off refuses.
+//! D8 as D23 amends it), through the composition root and the real router
+//! (`tower` oneshot), against the fake identity provider: the app's
+//! `POST /QuickConnect/Initiate`, the browser's `GET /sso/quickconnect`, its
+//! link to `GET /sso/oidc/{provider}/start?quickConnect`, the provider's
+//! authorization endpoint, the callback's confirmation page, where the code is
+//! typed, and its `POST /sso/quickconnect`. The app then sees its request
+//! authorized and swaps its secret for a session of the SSO account; the
+//! browser gets none. Nothing is approved without the typed code, a start
+//! link carrying a code is refused, a wrong code spends the confirmation, a
+//! confirmation works once and only with its cookie, and Quick Connect turned
+//! off refuses.
 
 #[path = "support/sso.rs"]
 mod sso;
@@ -24,7 +26,8 @@ use sso::{SsoServer, header_text, text};
 const PUBLISHED_URL: &str = "https://media.example.org/jf";
 
 /// The flow cookie, cleared.
-const CLEARED: &str = "ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure";
+const CLEARED: &str =
+    "__Host-ferrofin_sso_flow=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure";
 
 /// The native app's client header, as Swiftfin sends it.
 const APP: &str =
@@ -92,23 +95,19 @@ async fn authorized(server: &SsoServer, secret: &str) -> bool {
         .expect("a flag")
 }
 
-/// The browser submits `code` on the code-entry page's button for `fake`,
-/// signs in at `fake` and is sent back: the callback's page, and the flow
-/// cookie's `name=value`.
-async fn confirmation_page(
-    server: &SsoServer,
-    fake: &FakeIdentityProvider,
-    code: &str,
-) -> (Response, String) {
+/// The browser follows the page's link for `fake`, signs in at `fake` and
+/// is sent back: the callback's page, and the flow cookie's `name=value`.
+async fn confirmation_page(server: &SsoServer, fake: &FakeIdentityProvider) -> (Response, String) {
     let page = server.get("/sso/quickconnect", None).await;
     assert_eq!(page.status(), StatusCode::OK);
     let html = text(page).await;
-    // The form's button for `fake` starts there, relative to the page.
-    assert!(html.contains("formaction=\"oidc/fake/start\""), "{html}");
-    assert!(html.contains("name=\"quickConnect\""), "{html}");
-    let start = server
-        .get(&format!("/sso/oidc/fake/start?quickConnect={code}"), None)
-        .await;
+    // The link for `fake` starts there, relative to the page, with no code.
+    assert!(
+        html.contains("<a href=\"oidc/fake/start?quickConnect\">"),
+        "{html}"
+    );
+    assert!(!html.contains("<input"), "{html}");
+    let start = server.get("/sso/oidc/fake/start?quickConnect", None).await;
     assert_eq!(start.status(), StatusCode::FOUND);
     let cookie = header_text(&start, header::SET_COOKIE);
     let cookie = cookie.split(';').next().expect("name=value").to_owned();
@@ -129,9 +128,14 @@ fn confirmation_of(html: &str) -> String {
         )
 }
 
-/// The browser's `POST /sso/quickconnect`: the confirmation page's form,
-/// with `cookie` (`name=value`) when given.
-async fn confirm(server: &SsoServer, confirmation: &str, cookie: Option<&str>) -> Response {
+/// The browser's `POST /sso/quickconnect`: the confirmation page's form, with
+/// the typed `code`, and `cookie` (`name=value`) when given.
+async fn confirm(
+    server: &SsoServer,
+    confirmation: &str,
+    code: &str,
+    cookie: Option<&str>,
+) -> Response {
     let mut request = Request::builder()
         .method("POST")
         .uri("/sso/quickconnect")
@@ -142,7 +146,9 @@ async fn confirm(server: &SsoServer, confirmation: &str, cookie: Option<&str>) -
     server
         .send(
             request
-                .body(Body::from(format!("confirmation={confirmation}")))
+                .body(Body::from(format!(
+                    "confirmation={confirmation}&code={code}"
+                )))
                 .expect("request"),
         )
         .await
@@ -163,19 +169,21 @@ async fn devices(server: &SsoServer) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn an_app_is_signed_in_as_the_sso_user_once_the_browser_confirms_its_code() {
+async fn an_app_is_signed_in_as_the_sso_user_once_the_browser_types_its_code() {
     let fake = FakeIdentityProvider::start().await;
     let temp = tempfile::tempdir().expect("temp dir");
     let server = server_with_provider(&fake, &temp).await;
     let (code, secret) = initiate(&server).await;
 
-    // The callback asks, naming the code and the account, and keeps the
-    // cookie for the confirmation's minute.
-    let (page, cookie) = confirmation_page(&server, &fake, &code).await;
+    // The callback names the account and asks for the code, and keeps the
+    // cookie, host-only on this `https` public URL, for the confirmation's
+    // minute.
+    let (page, cookie) = confirmation_page(&server, &fake).await;
     assert_eq!(page.status(), StatusCode::OK);
+    assert!(cookie.starts_with("__Host-ferrofin_sso_flow="), "{cookie}");
     assert_eq!(
         header_text(&page, header::SET_COOKIE),
-        format!("{cookie}; Path=/jf/sso; Max-Age=60; HttpOnly; SameSite=Lax; Secure")
+        format!("{cookie}; Path=/; Max-Age=60; HttpOnly; SameSite=Lax; Secure")
     );
     assert_eq!(
         header_text(&page, header::CONTENT_SECURITY_POLICY),
@@ -184,7 +192,7 @@ async fn an_app_is_signed_in_as_the_sso_user_once_the_browser_confirms_its_code(
     let html = text(page).await;
     assert!(
         html.contains(&format!(
-            "Sign in the device showing code <strong>{code}</strong> as <strong>{USERNAME}</strong>?"
+            "You are signed in as <strong>{USERNAME}</strong>. Type the code your app shows"
         )),
         "{html}"
     );
@@ -192,9 +200,11 @@ async fn an_app_is_signed_in_as_the_sso_user_once_the_browser_confirms_its_code(
         html.contains("<form method=\"post\" action=\"../../quickconnect\">"),
         "{html}"
     );
+    assert!(html.contains("name=\"code\""), "{html}");
+    assert!(!html.contains(&code), "the page knows no code: {html}");
     let confirmation = confirmation_of(&html);
 
-    // Nothing is approved until the browser confirms.
+    // Nothing is approved until the browser types the code.
     assert!(!authorized(&server, &secret).await);
     assert!(devices(&server).await.is_empty(), "no session yet");
 
@@ -205,14 +215,14 @@ async fn an_app_is_signed_in_as_the_sso_user_once_the_browser_confirms_its_code(
         .await;
     assert_eq!(exchanged.status(), StatusCode::BAD_REQUEST);
     assert!(devices(&server).await.is_empty(), "no browser session");
-    let used = confirm(&server, &confirmation, Some(&cookie)).await;
+    let used = confirm(&server, &confirmation, &code, Some(&cookie)).await;
     assert_eq!(used.status(), StatusCode::BAD_REQUEST);
     assert!(!authorized(&server, &secret).await);
 
-    // Start again: this time the browser confirms.
-    let (page, cookie) = confirmation_page(&server, &fake, &code).await;
+    // Start again: this time the browser types the code.
+    let (page, cookie) = confirmation_page(&server, &fake).await;
     let confirmation = confirmation_of(&text(page).await);
-    let approved = confirm(&server, &confirmation, Some(&cookie)).await;
+    let approved = confirm(&server, &confirmation, &code, Some(&cookie)).await;
     assert_eq!(approved.status(), StatusCode::OK);
     assert_eq!(header_text(&approved, header::SET_COOKIE), CLEARED);
     assert_eq!(header_text(&approved, header::CACHE_CONTROL), "no-store");
@@ -251,46 +261,74 @@ async fn an_app_is_signed_in_as_the_sso_user_once_the_browser_confirms_its_code(
     assert_eq!(devices(&server).await, ["qc-app-1"]);
 
     // A replayed confirmation does nothing.
-    let replayed = confirm(&server, &confirmation, Some(&cookie)).await;
+    let replayed = confirm(&server, &confirmation, &code, Some(&cookie)).await;
     assert_eq!(replayed.status(), StatusCode::BAD_REQUEST);
     assert_eq!(devices(&server).await, ["qc-app-1"]);
 }
 
 #[tokio::test]
-async fn a_confirmation_without_its_cookie_approves_nothing() {
+async fn a_confirmation_without_its_cookie_or_with_a_wrong_code_approves_nothing() {
     let fake = FakeIdentityProvider::start().await;
     let temp = tempfile::tempdir().expect("temp dir");
     let server = server_with_provider(&fake, &temp).await;
     let (code, secret) = initiate(&server).await;
-    let (page, _) = confirmation_page(&server, &fake, &code).await;
+    let (page, cookie) = confirmation_page(&server, &fake).await;
     let confirmation = confirmation_of(&text(page).await);
 
-    let stolen = confirm(&server, &confirmation, None).await;
+    let stolen = confirm(&server, &confirmation, &code, None).await;
     assert_eq!(stolen.status(), StatusCode::BAD_REQUEST);
-    let other = confirm(&server, &confirmation, Some("ferrofin_sso_flow=other")).await;
-    assert_eq!(other.status(), StatusCode::BAD_REQUEST);
+    // Under the old name, which a sibling host could set (D23).
+    let old_name = cookie.strip_prefix("__Host-").expect("prefixed");
+    for planted in [old_name, "__Host-ferrofin_sso_flow=other"] {
+        let (page, _) = confirmation_page(&server, &fake).await;
+        let confirmation = confirmation_of(&text(page).await);
+        let refused = confirm(&server, &confirmation, &code, Some(planted)).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{planted}");
+    }
+
+    // A wrong code: refused, and the confirmation is spent.
+    let wrong = if code == "111111" { "222222" } else { "111111" };
+    let (page, cookie) = confirmation_page(&server, &fake).await;
+    let confirmation = confirmation_of(&text(page).await);
+    let refused = confirm(&server, &confirmation, wrong, Some(&cookie)).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        text(refused)
+            .await
+            .contains("No app is waiting with this code")
+    );
+    let late = confirm(&server, &confirmation, &code, Some(&cookie)).await;
+    assert_eq!(late.status(), StatusCode::BAD_REQUEST);
     assert!(!authorized(&server, &secret).await);
     assert_eq!(devices(&server).await, Vec::<String>::new());
 }
 
+/// D23: a start link that carries a code, or anything else, is refused
+/// before the identity provider, and sets no cookie.
 #[tokio::test]
-async fn a_code_that_is_not_a_quick_connect_code_never_reaches_the_identity_provider() {
+async fn a_start_link_carrying_a_code_never_reaches_the_identity_provider() {
     let fake = FakeIdentityProvider::start().await;
     let temp = tempfile::tempdir().expect("temp dir");
     let server = server_with_provider(&fake, &temp).await;
-    for code in ["", "12345", "1234567", "12a456", "%3Cb%3E123456"] {
+    let (code, secret) = initiate(&server).await;
+    for query in [
+        format!("quickConnect={code}"),
+        format!("quickConnect&quickConnect={code}"),
+        "quickConnect=12345".to_owned(),
+        "quickConnect=%3Cb%3E123456".to_owned(),
+    ] {
         let start = server
-            .get(&format!("/sso/oidc/fake/start?quickConnect={code}"), None)
+            .get(&format!("/sso/oidc/fake/start?{query}"), None)
             .await;
-        assert_eq!(start.status(), StatusCode::BAD_REQUEST, "{code:?}");
-        assert!(
-            start.headers().get(header::SET_COOKIE).is_none(),
-            "{code:?}"
-        );
+        assert_eq!(start.status(), StatusCode::BAD_REQUEST, "{query}");
+        assert!(start.headers().get(header::SET_COOKIE).is_none(), "{query}");
         let html = text(start).await;
-        assert!(html.contains("six digits"), "{code:?}: {html}");
-        assert!(!html.contains("<b>"), "{code:?}: {html}");
+        assert!(html.contains("carries no code"), "{query}: {html}");
+        assert!(!html.contains(&code), "{query}: {html}");
+        assert!(!html.contains("<b>"), "{query}: {html}");
     }
+    assert!(fake.requests().is_empty(), "the provider was never asked");
+    assert!(!authorized(&server, &secret).await);
 }
 
 #[tokio::test]
@@ -299,7 +337,7 @@ async fn quick_connect_turned_off_refuses_the_page_the_start_and_the_confirmatio
     let temp = tempfile::tempdir().expect("temp dir");
     let server = server_with_provider(&fake, &temp).await;
     let (code, _) = initiate(&server).await;
-    let (page, cookie) = confirmation_page(&server, &fake, &code).await;
+    let (page, cookie) = confirmation_page(&server, &fake).await;
     let confirmation = confirmation_of(&text(page).await);
 
     let mut config = (*server.state.config.configuration().await.expect("config")).clone();
@@ -313,10 +351,8 @@ async fn quick_connect_turned_off_refuses_the_page_the_start_and_the_confirmatio
 
     for response in [
         server.get("/sso/quickconnect", None).await,
-        server
-            .get(&format!("/sso/oidc/fake/start?quickConnect={code}"), None)
-            .await,
-        confirm(&server, &confirmation, Some(&cookie)).await,
+        server.get("/sso/oidc/fake/start?quickConnect", None).await,
+        confirm(&server, &confirmation, &code, Some(&cookie)).await,
     ] {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(

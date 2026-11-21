@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use openidconnect::{Nonce, PkceCodeVerifier};
 use uuid::Uuid;
 
-use super::quick_connect::QuickConnectCode;
 use super::sign_in::VerifiedIdentity;
 
 /// How long a sign-in may take, from its start to its callback: 10 minutes.
@@ -51,8 +50,8 @@ pub enum FlowPurpose {
     },
     /// Approving a native app's Quick Connect code
     /// ([`quick_connect`](super::quick_connect)): it ends on a confirmation
-    /// page, and opens no browser session.
-    QuickConnect(QuickConnectCode),
+    /// page, where the code is typed (D23), and opens no browser session.
+    QuickConnect,
 }
 
 /// One pending flow: what its callback is checked against.
@@ -149,7 +148,7 @@ impl PendingFlows {
 /// A verified sign-in whose completion page holds its exchange code, or
 /// whose Quick Connect confirmation page holds its confirmation: who signs
 /// in, what for, and the browser the code is bound to. `Debug` leaves the
-/// claims and a Quick Connect code out.
+/// claims out.
 #[derive(Debug)]
 pub struct PendingExchange {
     /// The SHA-256 of the flow cookie's value the sign-in was verified with:

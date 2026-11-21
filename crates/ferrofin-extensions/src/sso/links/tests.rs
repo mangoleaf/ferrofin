@@ -69,11 +69,7 @@ async fn signed_in(harness: &Harness, user: &UserEntity) -> (Secret, String) {
 /// cookie's value.
 fn started(reply: SsoReply) -> (String, String) {
     assert_eq!(reply.status, 302, "{reply:?}");
-    let cookie = reply.set_cookies[0]
-        .strip_prefix("ferrofin_sso_flow=")
-        .and_then(|rest| rest.split(';').next())
-        .expect("the flow cookie")
-        .to_owned();
+    let cookie = crate::sso::sign_in::tests::flow_cookie_value(&reply.set_cookies[0]);
     (reply.location.expect("a redirect"), cookie)
 }
 
@@ -223,7 +219,7 @@ async fn a_user_links_their_account_then_signs_in_to_it_and_keeps_their_password
     assert!(harness.sso.exchanges.is_empty());
     assert_eq!(
         page.set_cookies,
-        ["ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
+        ["__Host-ferrofin_sso_flow=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
     );
     assert_eq!(owner(&harness, SUBJECT).await, Some(id(&alice)));
 

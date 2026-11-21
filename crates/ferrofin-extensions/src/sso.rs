@@ -516,6 +516,14 @@ impl SsoManager for SsoService {
         }
     }
 
+    async fn flow_cookie_name(&self) -> Result<&'static str, ServiceError> {
+        self.ensure_enabled().await?;
+        let config = self.config().await?;
+        Ok(sign_in::flow_cookie_name(
+            self.public_url(&config).ok().flatten().as_deref(),
+        ))
+    }
+
     async fn oidc_providers(&self) -> Result<OidcProviderList, ServiceError> {
         self.ensure_enabled().await?;
         let config = self.config().await?;
@@ -717,25 +725,26 @@ impl SsoManager for SsoService {
     }
 
     async fn quick_connect_page(&self) -> Result<SsoReply, ServiceError> {
-        self.code_entry_page().await
+        self.sign_in_links_page().await
     }
 
     async fn start_oidc_quick_connect(
         &self,
         key: &str,
         client: std::net::IpAddr,
-        code: &str,
+        quick_connect: &str,
     ) -> Result<SsoReply, ServiceError> {
-        self.start_quick_connect(key, client, code).await
+        self.start_quick_connect(key, client, quick_connect).await
     }
 
     async fn confirm_oidc_quick_connect(
         &self,
         confirmation: Option<Secret>,
+        code: Option<&str>,
         flow_cookie: Option<Secret>,
         client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {
-        self.confirm_quick_connect(confirmation.as_ref(), flow_cookie.as_ref(), client)
+        self.confirm_quick_connect(confirmation.as_ref(), code, flow_cookie.as_ref(), client)
             .await
     }
 
