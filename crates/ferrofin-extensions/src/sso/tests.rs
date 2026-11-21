@@ -42,7 +42,6 @@ pub(super) async fn service(
             ),
         ),
         sessions,
-        Arc::new(ferrofin_core::FerrofinDeviceManager::new(db.clone())),
         Arc::new(ferrofin_core::FerrofinActivityManager::new(db)),
         published_url.map(str::to_owned),
     );

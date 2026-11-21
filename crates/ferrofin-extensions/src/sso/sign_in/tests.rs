@@ -50,14 +50,15 @@ pub(in crate::sso) const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)
 
 /// The service with the plugin enabled and the provider `fake` saved at the
 /// fake identity provider, and what they run on: the accounts, with the
-/// Single Sign-On provider registered, the identity links, the sessions and
-/// their events, and the activity log.
+/// Single Sign-On provider registered, the identity links, the sessions,
+/// their devices and their events, and the activity log.
 pub(in crate::sso) struct Harness {
     pub(in crate::sso) sso: SsoService,
     pub(in crate::sso) fake: FakeIdentityProvider,
     pub(in crate::sso) users: Arc<FerrofinUserManager>,
     pub(in crate::sso) identities: Arc<FerrofinExternalIdentityStore>,
     pub(in crate::sso) sessions: Arc<FerrofinSessionManager>,
+    pub(in crate::sso) devices: Arc<FerrofinDeviceManager>,
     pub(in crate::sso) events: Arc<FerrofinEventManager>,
     pub(in crate::sso) activity: Arc<FerrofinActivityManager>,
     _dir: tempfile::TempDir,
@@ -233,7 +234,6 @@ impl Harness {
             Arc::clone(&users) as Arc<dyn UserManager>,
             Arc::clone(&identities) as Arc<dyn ExternalIdentityStore>,
             Arc::clone(&sessions) as Arc<dyn SessionManager>,
-            Arc::new(FerrofinDeviceManager::new(db.clone())),
             Arc::clone(&activity) as Arc<dyn ActivityManager>,
             published_url.map(str::to_owned),
         );
@@ -246,6 +246,7 @@ impl Harness {
             users,
             identities,
             sessions,
+            devices: Arc::new(FerrofinDeviceManager::new(db.clone())),
             events,
             activity,
             _dir: dir,

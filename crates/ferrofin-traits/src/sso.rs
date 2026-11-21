@@ -367,7 +367,7 @@ pub trait SsoManager: Send + Sync {
     /// The flow keeps the session token's hash, never the token. Its callback
     /// links the verified identity to `user_id` only while that session is
     /// still one of the account's (a sign-out by any route before the
-    /// callback's session check ends the flow),
+    /// callback's write ends the flow),
     /// unless another account has the identity or the account was linked at
     /// that issuer since, and ends on a page saying which; it opens no
     /// session.

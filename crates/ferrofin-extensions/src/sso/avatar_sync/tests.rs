@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferrofin_traits::external_identities::{ExternalIdentity, ExternalIdentityKey};
+use ferrofin_traits::external_identities::{
+    ConditionalLink, ExternalIdentity, ExternalIdentityKey, LinkBy,
+};
 use ferrofin_traits::remote_images::RemoteImageError;
 use serde_json::{Value, json};
 
@@ -182,6 +184,14 @@ impl ExternalIdentityStore for CountingLinks {
     ) -> Result<ExternalIdentity, ServiceError> {
         self.inner.link(user_id, identity, avatar_hash).await
     }
+    async fn link_unless_taken(
+        &self,
+        user_id: Uuid,
+        identity: ExternalIdentityKey<'_>,
+        by: LinkBy,
+    ) -> Result<ConditionalLink, ServiceError> {
+        self.inner.link_unless_taken(user_id, identity, by).await
+    }
     async fn set_avatar_hash(
         &self,
         identity: ExternalIdentityKey<'_>,
@@ -261,7 +271,6 @@ async fn two_syncs_at_once_store_the_picture_once() {
         Arc::clone(&harness.sso.users),
         Arc::clone(&links) as Arc<dyn ExternalIdentityStore>,
         Arc::clone(&harness.sso.sessions),
-        Arc::clone(&harness.sso.devices),
         Arc::clone(&harness.sso.activity),
         Some(PUBLIC_URL.to_owned()),
     )

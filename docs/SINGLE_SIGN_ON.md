@@ -256,8 +256,7 @@ not enough to add one:
 - **An attempt ends with its session.** A link attempt the user started and has not finished at
   the identity provider links nothing once the session that started it has ended, however it
   ended: signing out, Dashboard → Devices, a password change made from another session (which
-  signs every other session out), or a link removed. (A sign-out in the very instant the link is
-  made, while the server is writing it, can still let it through; a link removed cannot.)
+  signs every other session out), or a link removed.
 
 Linking never changes the account's provider or password.
 
@@ -272,9 +271,11 @@ from …", with who did it, and the identity's issuer and subject in the entry's
 types are `UserIdentityLinked` and `UserIdentityUnlinked`.
 
 Removing a link signs out every session of the account, and ends every attempt to link a sign-in
-that the account started and has not finished at the identity provider. An account Single Sign-On
-created whose last link is removed cannot sign in at all, until an administrator links it again
-or gives it another authentication provider. Deleting a user removes their links.
+that the account started and has not finished at the identity provider. A removal finishes, sign-out
+included, even when the browser leaves the page or the connection drops before the answer. An
+account Single Sign-On created whose last link is removed cannot sign in at all, until an
+administrator links it again or gives it another authentication provider. Deleting a user removes
+their links.
 
 ## Native apps: Quick Connect
 
