@@ -3412,7 +3412,9 @@ pub async fn build_app_state(
             Arc::clone(&state.activity),
             config.published_url.clone(),
         )
-        .with_quick_connect(Arc::clone(&state.quick_connect)),
+        .with_quick_connect(Arc::clone(&state.quick_connect))
+        // A `picture` claim's URL is downloaded under the image limits.
+        .with_remote_images(Arc::clone(&extension_cx.remote_images)),
     );
     // The backup engine behind `/Backup*`: archives come from and go back to
     // the live application paths, and each manifest records this release.

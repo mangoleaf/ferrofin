@@ -320,16 +320,21 @@ it: run it by hand for changes to `crates/ferrofin-extensions/src/ldap_auth/`:
 cargo test -p ferrofin-extensions --test ldap_directory -- --include-ignored --nocapture
 ```
 
-So is the Single Sign-On extension's identity provider test. `oidc_keycloak` saves a provider for
-a Keycloak holding the test realm of `contrib/oidc-test-realm/` and checks that its discovery
-finds the realm's endpoints and keys, and fails cleanly, the provider still saved, for a realm
-that does not exist and for an issuer that differs by a trailing `/`; then it signs a realm user
-in through Keycloak's login form and the server's router, to a token that opens `GET /Users/Me`.
-It takes the Keycloak from the environment, not from a container it starts: the realm's issuer,
-client id and client secret (`FERROFIN_OIDC_TEST_ISSUER`, `…_CLIENT_ID`, `…_CLIENT_SECRET`; the
-README lists the test users' variables too), and returns early with a message while any is unset.
-CI does not run it: run it by hand for changes to `crates/ferrofin-extensions/src/sso/`, with the
-realm's values in a file outside the repository:
+So is the Single Sign-On extension's identity provider test. `oidc_keycloak` runs the whole OIDC
+flow against a Keycloak holding the test realm of `contrib/oidc-test-realm/`, through Keycloak's
+login form and the server's router: discovery (and its clean failures), a first sign-in that
+creates the account and a second that finds it, no password signing in to it, replayed and
+tampered callbacks and codes refused, provisioning off and a taken name refused, the required
+group, role sync's administrator flag (the last administrator kept) and its library and Live TV
+mappings, a link and an unlink that signs the account out, and a Quick Connect code approved.
+Every test also fails if a secret it handled (the client secret, a password, a code, a token, a
+JWT, a subject) is in what the process logged at `debug`. It takes the Keycloak from the
+environment, not from a container it starts: the realm's issuer, client and test users
+(`FERROFIN_OIDC_TEST_*`, listed in the realm's README), and each test returns early with a message
+while its variables are unset. Steps that need Keycloak's admin login (a user's group or
+`picture` attribute changed) are not in it: the README lists them as by-hand checks. CI does not
+run it: run it by hand for changes to `crates/ferrofin-extensions/src/sso/`, with the realm's
+values in a file outside the repository:
 
 ```bash
 set -a; . ~/.config/ferrofin/oidc-test.env; set +a
@@ -372,7 +377,7 @@ gates/bench/run.sh                                     # ~40 min → $FERROFIN_G
 python3 gates/bench/report.py --serve                  # compare runs at 127.0.0.1:8097
 ```
 
-`gates/run all` runs verify, adoption, parity and bench against one image as one session, after one
+`gates/run all` runs verify, adoption, roundtrip, parity and bench against one image as one session, after one
 preflight, and ends with one report, the session's `index.html` ([`gates/README.md`](gates/README.md));
 each gate's own script still runs alone. `make run-gates` (or `make run-<gate>`) does the same, and
 `make test-gates-offline` runs the gates' own tests (no docker), as CI does.
@@ -451,6 +456,15 @@ requirement is unaffected by the release-branch rule above. The full adoption va
 (`gates/adoption/run.sh` and the synthetic preservation matrix) also runs before every release,
 and a failure there blocks the release (see `RELEASE.md`).
 The shell tests in CI exercise the harness without these live fixtures.
+
+### The round trip has its own live check — `gates/roundtrip/`
+`gates/roundtrip/run.sh --image ferrofin:bench` (or `make run-roundtrip`) runs every route of
+`gates/roundtrip/routes.sh` on the adoption fixtures: Ferrofin adopts and uses a copy, `export-jellyfin` exports
+it, and the Jellyfin release `UPSTREAM_TAG` names boots on the export and must answer as Ferrofin did. Run it,
+on the routes a change touches (`--only`), for any change to the export command, the configuration writers,
+the history table, the migration chain or a writer of a Jellyfin-owned table, with its verdict table in the PR.
+The `Adoption` workflow runs it on every route before every release, and a failure there blocks the release
+(see `RELEASE.md`).
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only

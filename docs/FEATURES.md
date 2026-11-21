@@ -220,6 +220,17 @@ Wired and working, with a documented limitation or lighter verification:
   divergences (off by default, an outage not counted toward lockout, the last administrator
   never demoted, timeouts, a blank reset refused, among others) are listed in
   [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md#ldap-auth).
+- **Single Sign-On (OpenID Connect)** — Ferrofin's own internal plugin, compiled in and off
+  until an administrator enables it under Dashboard → Plugins ([`SINGLE_SIGN_ON.md`](SINGLE_SIGN_ON.md)).
+  Jellyfin has no counterpart, so there is nothing to compare against. A "Sign in with" button on
+  jellyfin-web's login page for each provider; accounts created at a first sign-in or linked by
+  hand, matched by issuer and subject; a required role, and role sync for the administrator flag,
+  libraries and Live TV; linking at `/sso/link`; profile pictures from the `picture` claim; native
+  apps signed in by approving their Quick Connect code at `/sso/quickconnect`. Proven against
+  Keycloak 26.7 by the `#[ignore]`d live test and from jellyfin-web 12.4. **Not tried yet: other
+  identity providers, a real native app approving its Quick Connect code (only the requests an app
+  makes), native apps' login screens, the Android app, and a private certificate authority.**
+  Nothing of the community SSO-Auth plugin is imported.
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote

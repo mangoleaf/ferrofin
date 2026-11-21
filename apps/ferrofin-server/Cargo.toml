@@ -89,6 +89,9 @@ rstest.workspace = true
 reqwest.workspace = true
 # oidc_keycloak: the form it signs in with at Keycloak's login page.
 form_urlencoded.workspace = true
+# oidc_keycloak: the client secret as the token request's Basic credentials,
+# which the log must not hold either.
+base64.workspace = true
 # HTTPS tests: a self-signed certificate, written as the PKCS#12 Jellyfin reads.
 rcgen.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

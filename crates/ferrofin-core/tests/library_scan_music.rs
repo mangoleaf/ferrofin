@@ -2479,6 +2479,16 @@ async fn a_row_that_cannot_be_read_skips_itself_only() {
         )
         .await
         .expect("edit");
+    // The editor saves the lists with their links; a scan save rewrites the
+    // links from the lists (gl-1636).
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "AlbumArtists" = 'Gil Evans|Bill Evans|Tadd Dameron',
+               "Studios" = 'Blue Note|Prestige|Riverside' WHERE "Id" = ?1"#,
+    )
+    .bind(ferrofin_db::store::guid_to_db(track))
+    .execute(fx.db.writer())
+    .await
+    .expect("edit the lists");
     // Corrupt the album walked first, and the first of each selection.
     let corrupt = |id: String| {
         let db = fx.db.clone();

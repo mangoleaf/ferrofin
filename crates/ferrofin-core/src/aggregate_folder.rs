@@ -159,8 +159,9 @@ impl AggregateFolderStore {
     }
 
     /// Provisions the aggregate root and the playlists folder, moves both to
-    /// this server's directories when the stored rows are elsewhere, and
-    /// re-parents the aggregate's virtual children, returning both root ids.
+    /// this server's directories when the stored rows are elsewhere, gives a
+    /// root stored without `Data` its `IsRoot`, and re-parents the
+    /// aggregate's virtual children, returning both root ids.
     ///
     /// Idempotent, and meant to be called **once per process** from the
     /// composition root — it is startup work, not request work.
@@ -201,6 +202,11 @@ impl AggregateFolderStore {
             }
             Some(_) => {}
         }
+        // A root an earlier Ferrofin created has no `Data`, which Jellyfin
+        // reads back with `IsRoot` false and never sets true again (gl-1629).
+        // After the match, so a root another process inserted meanwhile is
+        // filled too.
+        crate::item_persistence_service::fill_root_folder_data(&self.db, aggregate).await?;
         self.repair_playlists_folder(aggregate, user_root).await?;
         Ok(RootFolderIds {
             user_root,
@@ -496,7 +502,9 @@ pub(crate) fn playlists_folder_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{fetch_item, seed_folder_item, set_item_path, test_db};
+    use crate::test_support::{
+        fetch_item, seed_folder_item, seed_folder_with_data, set_item_path, test_db,
+    };
     use ferrofin_db::store::guid_to_db as db_guid;
     use rstest::rstest;
 
@@ -549,8 +557,46 @@ mod tests {
             row.presentation_unique_key.as_deref(),
             Some(ids.aggregate.as_simple().to_string().as_str())
         );
+        assert_eq!(
+            row.data.as_deref(),
+            Some(r#"{"IsRoot":true}"#),
+            "Jellyfin reads IsRoot from the blob alone (gl-1629)"
+        );
         // Idempotent: a second call finds the row and changes nothing.
         assert_eq!(store.ensure().await.expect("again"), ids);
+    }
+
+    /// A root an earlier Ferrofin stored with no `Data` is given its `IsRoot`
+    /// at the next start; a root with any blob (an adopted Jellyfin root's)
+    /// keeps it as stored, not completed (gl-1629).
+    #[rstest]
+    #[case::no_data(None, r#"{"IsRoot":true}"#)]
+    #[case::any_blob(
+        Some(r#"{"IsRoot":false,"PhysicalLocationsList":[]}"#),
+        r#"{"IsRoot":false,"PhysicalLocationsList":[]}"#
+    )]
+    #[tokio::test]
+    async fn ensure_gives_a_root_without_data_its_is_root(
+        #[case] stored: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        let aggregate = store.id();
+        let kind = BaseItemKind::AggregateFolder;
+        match stored {
+            None => seed_folder_item(&db, aggregate, kind, "root", None).await,
+            Some(data) => seed_folder_with_data(&db, aggregate, kind, "root", data, None).await,
+        }
+        set_item_path(&db, aggregate, &store.path().to_string_lossy()).await;
+
+        store.ensure().await.expect("ensure");
+
+        assert_eq!(
+            fetch_item(&db, aggregate).await.data.as_deref(),
+            Some(expected)
+        );
     }
 
     /// `CreateRootFolder` saves the playlists folder on every start where it

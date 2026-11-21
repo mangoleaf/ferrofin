@@ -883,9 +883,9 @@ fn in_library_set(item: &BaseItemEntity) -> bool {
 ///
 /// Port of the row `LibraryManager.CreateRootFolder()` persists: `Name`,
 /// `SortName` and `CleanName` all the directory's own name, `Path` the
-/// directory, `PresentationUniqueKey` the id in simple form. The NOT NULL flag
-/// columns are spelled out because the pinned 10.11.8 schema gives them no
-/// defaults.
+/// directory, `PresentationUniqueKey` the id in simple form, and `Data`
+/// [`ROOT_FOLDER_DATA`]. The NOT NULL flag columns are spelled out because the
+/// pinned 10.11.8 schema gives them no defaults.
 pub(crate) async fn insert_root_folder(
     db: &Database,
     id: Uuid,
@@ -900,10 +900,10 @@ pub(crate) async fn insert_root_folder(
              ("Id", "Type", "Name", "SortName", "CleanName", "Path",
               "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
               "IsRepeat", "IsSeries", "IsVirtualItem",
-              "PresentationUniqueKey", "DateCreated", "UnratedType", "#,
+              "PresentationUniqueKey", "DateCreated", "UnratedType", "Data", "#,
         unset_columns!(),
         r#")
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, 0, 0, 0, 0, 0, ?7, ?8, ?9, "#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, 0, 0, 0, 0, 0, ?7, ?8, ?9, ?10, "#,
         unset_values!(),
         ")"
     ))
@@ -916,10 +916,30 @@ pub(crate) async fn insert_root_folder(
     .bind(id.as_simple().to_string())
     .bind(ferrofin_db::store::datetime_to_db(chrono::Utc::now()))
     .bind(unrated_type_name(kind))
+    .bind(ROOT_FOLDER_DATA)
     .execute(db.writer())
     .await
     .map_err(db_err)?;
     db.invalidate_libraries();
+    Ok(())
+}
+
+/// A root folder's `Data`: `IsRoot`, which upstream reads only from the blob.
+/// `GenericFolderResolver` sets it on a root it resolves afresh, and
+/// `CreateRootFolder` loads a stored root without it, so a root stored with no
+/// `Data` stays `IsRoot` false under Jellyfin (gl-1629).
+const ROOT_FOLDER_DATA: &str = r#"{"IsRoot":true}"#;
+
+/// Gives root folder `id` [`ROOT_FOLDER_DATA`] when its row has no `Data`, as
+/// [`insert_root_folder`] wrote it before gl-1629. Idempotent: a row with
+/// `Data` (an adopted Jellyfin root's own blob) is left alone.
+pub(crate) async fn fill_root_folder_data(db: &Database, id: Uuid) -> Result<(), ServiceError> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1 AND "Data" IS NULL"#)
+        .bind(guid_to_db(id))
+        .bind(ROOT_FOLDER_DATA)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
     Ok(())
 }
 
@@ -10290,6 +10310,67 @@ mod tests {
         assert_eq!(
             by_name_row_id(&db, "Genre", "Other").await,
             Some(guid_to_db(taken))
+        );
+    }
+
+    /// A padded list entry keeps its text, as upstream's `Value = f.Value`
+    /// writes it (gl-1635): `Drama` and ` drama ` are two `ItemValues` rows
+    /// and two links but one Genre row, their clean name and derived id being
+    /// one; alone, ` Noir ` names its Genre row with the padding
+    /// (`CreateItemByName`'s `Name = name`) under the trimmed path's id.
+    #[tokio::test]
+    async fn a_padded_value_keeps_its_text() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let db = test_db().await;
+        let (movie, other) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        seed_item(&db, other, BaseItemKind::Movie).await;
+        let identity = crate::test_support::by_name_identity();
+        let svc = FerrofinItemPersistenceService::new(db.clone())
+            .with_by_name_identity(Some(identity.clone()));
+        let values = |genres: &str| {
+            ferrofin_db::entities::base_items::item_values_of(&BaseItemEntity {
+                genres: Some(genres.to_owned()),
+                ..BaseItemEntity::default()
+            })
+        };
+        svc.save_item_values(movie, &values("Drama| drama "))
+            .await
+            .expect("save");
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT "Value", "CleanValue" FROM "ItemValues" WHERE "Type" = 2 ORDER BY "Value""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("values");
+        assert_eq!(
+            rows,
+            [
+                (" drama ".to_owned(), "drama".to_owned()),
+                ("Drama".to_owned(), "drama".to_owned())
+            ]
+        );
+        let links: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "ItemValuesMap" WHERE "ItemId" = ?1"#)
+                .bind(guid_to_db(movie))
+                .fetch_one(db.pool())
+                .await
+                .expect("links");
+        assert_eq!(links, 2);
+        let genres: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Name" FROM "BaseItems" WHERE "Type" LIKE '%.Genre'"#)
+                .fetch_all(db.pool())
+                .await
+                .expect("genres");
+        assert_eq!(genres, ["Drama"]);
+
+        svc.save_item_values(other, &values(" Noir "))
+            .await
+            .expect("save");
+        let noir = identity.id(BaseItemKind::Genre, "Noir").expect("derived");
+        assert_eq!(
+            by_name_row_id(&db, "Genre", " Noir ").await,
+            Some(guid_to_db(noir))
         );
     }
 

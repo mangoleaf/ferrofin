@@ -176,9 +176,11 @@ history) is not copied, nor are `plugins/` and `Subtitle Edit/`, except the plug
 settings Ferrofin imports on the first start from `plugins/configurations/`:
 `LDAP-Auth.xml`, the LDAP-Auth plugin's, and the `Jellyfin.Plugin.*.xml` files of the
 metadata plugins Jellyfin builds in (TMDb, OMDb, MusicBrainz, AudioDB, Studio Images).
-An import never replaces settings already saved in Ferrofin. `root/default/` holds
-only the library definitions (`.mblink` files naming each media path); media stays where
-it is.
+An import never replaces settings already saved in Ferrofin. The community SSO-Auth plugin's
+`SSO-Auth.xml` is not imported: Ferrofin's Single Sign-On starts off, and its providers are added
+again ([`SINGLE_SIGN_ON.md`](SINGLE_SIGN_ON.md#adopting-a-jellyfin-that-used-the-sso-auth-plugin)).
+`root/default/` holds only the library definitions (`.mblink` files naming each media path);
+media stays where it is.
 
 ```sh
 sudo systemctl stop jellyfin ferrofin

@@ -219,7 +219,8 @@ impl Harness {
         let events = Arc::new(FerrofinEventManager::new());
         let users = Arc::new(
             FerrofinUserManager::new(db.clone())
-                .with_events(Arc::clone(&events) as Arc<dyn EventManager>),
+                .with_events(Arc::clone(&events) as Arc<dyn EventManager>)
+                .with_profile_image_dir(dir.path().join("users")),
         );
         users.set_extension_providers(vec![Arc::new(SsoAuthProvider::new(
             Arc::clone(&plugins) as Arc<dyn PluginManager>

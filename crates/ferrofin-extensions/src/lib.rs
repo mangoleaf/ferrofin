@@ -39,6 +39,7 @@ pub mod intro_skipper;
 pub mod ldap_auth;
 mod library_pages;
 pub mod merge_versions;
+mod profile_images;
 pub mod sso;
 
 /// The collaborators an extension's tasks are allowed to touch (trait objects
