@@ -629,7 +629,7 @@ async fn a_self_service_link_never_replaces_one_and_the_admin_still_can() {
     );
 }
 
-/// An account Single Sign-On created has no password of its own: it cannot
+/// An account Single Sign-On created has a password no one knows: it cannot
 /// link itself whatever it sends, and is told that an administrator adds the
 /// link; the admin's route links it.
 #[tokio::test]

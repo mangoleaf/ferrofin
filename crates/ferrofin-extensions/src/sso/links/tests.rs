@@ -336,7 +336,7 @@ async fn an_account_rule_answers_as_a_wrong_password_does() {
     assert!(harness.sso.flows.is_empty());
 }
 
-/// D22: an account Single Sign-On created has no password of its own, so it
+/// D22: an account Single Sign-On created has a password no one knows, so it
 /// cannot link itself whatever it sends; no password is tried for it.
 #[tokio::test]
 async fn an_account_single_sign_on_created_cannot_start_a_link() {

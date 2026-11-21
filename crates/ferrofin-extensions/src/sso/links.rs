@@ -17,8 +17,8 @@
 //! - Linking is a credential change, so it needs more than a session (D22):
 //!   the start asks for the account's current password and checks it as a
 //!   sign-in does (counted, and paced by the login backoff). An account whose
-//!   provider is Single Sign-On's has no password of its own and cannot link
-//!   itself: an administrator links it.
+//!   provider is Single Sign-On's has a password no one knows (D21) and
+//!   cannot link itself: an administrator links it.
 //! - A self-service link never replaces one: an account linked at the
 //!   provider's issuer is refused at the start, and again at the callback
 //!   under the lock every link write holds, so of two flows only one links.
