@@ -5671,6 +5671,10 @@ impl LibraryScanner {
     /// configured, an unreadable configuration or a shortcut that did not
     /// resolve must not read as a removed location, which would take every
     /// item under it with it. A library created with no folder adds none.
+    ///
+    /// The locations it prunes by are first stored on the root
+    /// ([`Self::record_root_locations`]); when it holds back, the root keeps
+    /// the list it has.
     async fn prune_orphan_locations(&self) -> Vec<(Uuid, Vec<Uuid>)> {
         let (Some(aggregate), Some(items)) = (self.root_folder, &self.item_repository) else {
             return Vec::new();
@@ -5683,6 +5687,8 @@ impl LibraryScanner {
                 return Vec::new();
             }
         };
+        self.record_root_locations(aggregate, items.as_ref(), &locations)
+            .await;
         let configured: std::collections::HashSet<String> = locations
             .iter()
             .map(|location| trimmed_dir(location).to_lowercase())
@@ -5739,6 +5745,47 @@ impl LibraryScanner {
                 tracing::warn!(%err, "failed to prune the folders of removed locations");
                 Vec::new()
             }
+        }
+    }
+
+    /// Stores the aggregate root's `PhysicalLocationsList` as
+    /// `AggregateFolder.CreateResolveArgs` computes it: the root's own path,
+    /// then `locations`, every library's in the order their folders list them,
+    /// expanded. Merged into the root's `Data`, which keeps its `IsRoot`, and
+    /// written only when it changed. Upstream saves the list one validation
+    /// late (its opening `RootFolder.RefreshMetadata` saves what the previous
+    /// `ValidateChildren` computed); this stores the list the scan prunes by,
+    /// which a returned Jellyfin computes alike, once the export has carried
+    /// its paths onto Jellyfin's layout (gl-1924) and while its folders list in
+    /// the same order (gl-1933), and so does not save again. A failure is
+    /// logged.
+    async fn record_root_locations(
+        &self,
+        aggregate: Uuid,
+        items: &dyn ItemRepository,
+        locations: &[String],
+    ) {
+        let root = match items.retrieve_item(aggregate).await {
+            Ok(Some(root)) => root,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(%err, "failed to read the root folder");
+                return;
+            }
+        };
+        let Some(path) = root.path.as_deref().map(|p| self.virtual_paths.expand(p)) else {
+            return;
+        };
+        let list = std::iter::once(path)
+            .chain(locations.iter().cloned())
+            .map(serde_json::Value::String)
+            .collect();
+        let fields = serde_json::Map::from_iter([(
+            "PhysicalLocationsList".to_owned(),
+            serde_json::Value::Array(list),
+        )]);
+        if let Err(err) = self.persistence.merge_data_fields(aggregate, &fields).await {
+            tracing::warn!(%err, "failed to record the root folder's locations");
         }
     }
 
