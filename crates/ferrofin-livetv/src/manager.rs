@@ -436,6 +436,8 @@ pub struct FerrofinLiveTvManager {
     paths: LiveTvPaths,
     /// The tuner HTTP seam the live-stream engine opens channels through.
     tuner_source: Arc<dyn TunerStreamSource>,
+    #[cfg(target_os = "linux")]
+    linux_dvb: Arc<crate::linux_dvb::LinuxDvbHost>,
     /// Where a live stream's buffered file and an in-progress recording are
     /// served from — C# `IServerApplicationHost.GetApiUrlForLocalAccess()`,
     /// asked per stream as upstream does, so it follows the bound listener and
@@ -1277,19 +1279,17 @@ impl FerrofinLiveTvManager {
     ) -> Self {
         let cache_dir: ferrofin_util::directory_path::DirectoryPath = cache_dir.into();
         let xmltv = crate::xmltv_cache::XmlTvCache::new(Arc::clone(&fetcher), cache_dir.clone());
-        // The same two hosts, in the same order, that
-        // `LiveTvServiceCollectionExtensions.AddLiveTvServices` registers
-        // (v10.11.8 LiveTvServiceCollectionExtensions.cs:41-42): HDHomeRun
-        // then M3U. The ORDER of registration is not the advertised order —
-        // `GetTunerHostTypes` sorts by name — but keeping it identical means a
-        // future first-match rule cannot silently diverge.
         let local_network = Arc::new(OnceLock::new());
+        #[cfg(target_os = "linux")]
+        let linux_dvb = Arc::new(crate::linux_dvb::LinuxDvbHost::default());
         let hosts: Vec<Arc<dyn crate::tuner_host::TunerHost>> = vec![
             Arc::new(crate::hdhomerun::HdHomerunHost::new(Arc::clone(&fetcher))),
             Arc::new(
                 crate::tuner_host::M3uTunerHost::new(Arc::clone(&fetcher))
                     .sharing_local_network(Arc::clone(&local_network)),
             ),
+            #[cfg(target_os = "linux")]
+            linux_dvb.clone(),
         ];
         let schedules_direct = SchedulesDirect::new(fetcher, cache_dir);
         Self {
@@ -1304,6 +1304,8 @@ impl FerrofinLiveTvManager {
             dto: OnceLock::new(),
             paths: LiveTvPaths::default(),
             tuner_source: Arc::new(crate::stream::ReqwestTunerSource::new()),
+            #[cfg(target_os = "linux")]
+            linux_dvb,
             local_api: Arc::new(OnceLock::new()),
             local_network,
             live_streams: Arc::new(Mutex::new(HashMap::new())),
@@ -3370,8 +3372,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             _ => Uuid::new_v4().simple().to_string(),
         };
         info.id = Some(id.clone());
-        let url = info.url.clone().unwrap_or_default();
-        if url.is_empty() {
+        if info.url.as_deref().is_none_or(str::is_empty) {
             return Err(ServiceError::InvalidInput(
                 "tuner host Url is required".into(),
             ));
@@ -3389,7 +3390,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             &self.db,
             stored.as_deref(),
             &id,
-            &url,
+            info.url.as_deref().unwrap_or_default(),
             &type_id,
             &data,
         )
@@ -7640,11 +7641,12 @@ impl FerrofinLiveTvManager {
     /// Starts the live stream the host chose, buffering it when it can be
     /// shared, and rewrites `source` to point at whatever a client should read.
     ///
-    /// The three arms are upstream's three: `HdHomerunUdpStream` (which always
+    /// The network paths include `HdHomerunUdpStream` (which always
     /// buffers — there is no URL a client could read instead, only datagrams
     /// this server is receiving), `SharedHttpStream` (one tuner connection
     /// feeding every consumer through the temp file), and the bare `LiveStream`
-    /// pass-through for a tuner whose stream cannot be shared.
+    /// pass-through for a tuner whose stream cannot be shared. Local DVB
+    /// capture always uses the shared buffer.
     async fn start_live_stream(
         &self,
         kind: &crate::tuner_host::ChannelStreamKind,
@@ -7675,6 +7677,15 @@ impl FerrofinLiveTvManager {
                     .await?,
                     base_url,
                 ))
+            }
+            #[cfg(target_os = "linux")]
+            crate::tuner_host::ChannelStreamKind::LinuxDvb(plan) => {
+                let base_url = self.local_api_url().await?;
+                let transcode_dir = self.transcode_dir().await?;
+                let body = self.linux_dvb.open_body(plan).await?;
+                let opened =
+                    crate::stream::open_shared_body(body, &transcode_dir, "Linux DVB").await?;
+                Some((opened, base_url))
             }
             crate::tuner_host::ChannelStreamKind::Http => {
                 let share = tuner.allow_stream_sharing
@@ -9483,8 +9494,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_advertised_tuner_types_are_the_registered_hosts() {
-        // The exact bytes Jellyfin 10.11.8 answers on
-        // `GET /LiveTv/TunerHosts/Types`, in its order (`OrderBy(i => i.Name)`).
+        // The tuner-host API advertises the available types in name order.
         let mgr = manager_with(FakeFetcher(HashMap::new())).await;
         assert_eq!(
             mgr.tuner_host_types()
@@ -9493,6 +9503,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("HD Homerun".to_owned(), "hdhomerun".to_owned()),
+                #[cfg(target_os = "linux")]
+                ("Linux DVB".to_owned(), "linuxdvb".to_owned()),
                 ("M3U Tuner".to_owned(), "m3u".to_owned()),
             ]
         );
@@ -12223,6 +12235,88 @@ mod tests {
         assert!(
             channel_media_sources.is_empty(),
             "{channel_media_sources:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires two idle DVB adapters and FERROFIN_DVB_TEST_LINEUP"]
+    async fn linux_dvb_hardware_shares_and_releases_adapters() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager_with(FakeFetcher(HashMap::new()))
+            .await
+            .with_paths(LiveTvPaths {
+                transcode_dir: dir.path().to_path_buf().into(),
+                ..LiveTvPaths::default()
+            });
+        mgr.set_local_api_access(Arc::new(LoopbackApi));
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("linuxdvb".to_owned()),
+            url: Some(std::env::var("FERROFIN_DVB_TEST_LINEUP").unwrap()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .unwrap();
+        mgr.refresh_guide().await.unwrap();
+        let channels = channel_ids(&mgr).await;
+        assert_eq!(channels.len(), 3, "supply three receivable channels");
+        let mut opened = Vec::new();
+        for channel in &channels[..2] {
+            let sources = mgr.get_channel_media_sources(*channel).await.unwrap();
+            let source_id = sources[0].id.as_deref();
+            let started = std::time::Instant::now();
+            let source = mgr.open_channel_stream(*channel, source_id).await.unwrap();
+            println!("DVB open: {:?}", started.elapsed());
+            let path = source.path.as_deref().unwrap();
+            let file = mgr
+                .get_live_stream_file(&unique_id_of(path))
+                .await
+                .unwrap()
+                .unwrap();
+            let joined = mgr.open_channel_stream(*channel, source_id).await.unwrap();
+            assert_eq!(source.path, joined.path);
+            let live_id = source.live_stream_id.unwrap();
+            assert!(!mgr.close_channel_stream(&live_id).await.unwrap());
+            opened.push((live_id, file.path));
+        }
+        let third = &mgr.get_channel_media_sources(channels[2]).await.unwrap()[0];
+        assert!(matches!(
+            mgr.open_channel_stream(channels[2], third.id.as_deref())
+                .await,
+            Err(ServiceError::Conflict(_))
+        ));
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        for (index, (id, path)) in opened.into_iter().enumerate() {
+            let bytes = tokio::fs::read(&path).await.unwrap();
+            assert!(bytes.len() >= 188 && bytes[0] == 0x47);
+            if let Some(output) = std::env::var_os("FERROFIN_DVB_TEST_OUTPUT") {
+                tokio::fs::write(
+                    std::path::Path::new(&output).join(format!("{index}.ts")),
+                    bytes,
+                )
+                .await
+                .unwrap();
+            }
+            assert!(mgr.close_channel_stream(&id).await.unwrap());
+            assert!(!path.exists());
+        }
+        let mut retry = 0;
+        let reopened = loop {
+            match mgr
+                .open_channel_stream(channels[2], third.id.as_deref())
+                .await
+            {
+                Err(ServiceError::Conflict(_)) if retry < 20 => {
+                    retry += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                result => break result.unwrap(),
+            }
+        };
+        assert!(
+            mgr.close_channel_stream(&reopened.live_stream_id.unwrap())
+                .await
+                .unwrap()
         );
     }
 

@@ -4164,14 +4164,28 @@ pub const VERIFIED: &[Verified] = &[
                save_tuner_host (tuner_host::find_host, guide_repository::existing_config_id, \
                TunerHost::validate, guide_repository::store_tuner_host), then \
                queue_guide_refresh (TunerHostManager.SaveTunerHost, M3UTunerHost.Validate, \
-               HdHomerunHost.Validate)",
-        date: "2026-10-28",
+               HdHomerunHost.Validate; LinuxDvbHost.validate)",
+        date: "2026-11-15",
         divergences: &[
+            "On Linux, Ferrofin also accepts linuxdvb with an absolute, readable dvbv5 lineup path.",
             "An M3U tuner without a Url, or with a null one, is a 400; upstream's \
          M3uParser.GetListingsStream dereferences the null Url and answers a \
          NullReferenceException 500. Jellyfin bug not ported.",
             "The 404 (an unknown or missing tuner Type, or an M3U playlist file that is not \
          there) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/TunerHosts/Types",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetTunerHostTypes",
+        ferrofin: "handlers/live_tv.rs get_tuner_host_types to ferrofin-livetv tuner_host.rs \
+               tuner_host_types (supported hosts ordered by name; TunerHostManager.GetTunerHostTypes)",
+        date: "2026-11-15",
+        divergences: &[
+            "Ferrofin advertises Linux DVB on Linux alongside the Jellyfin tuner types.",
         ],
         refs: &[],
     },

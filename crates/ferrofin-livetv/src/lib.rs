@@ -29,6 +29,8 @@ pub mod error;
 pub mod fetch;
 pub mod guide_repository;
 pub mod hdhomerun;
+#[cfg(target_os = "linux")]
+mod linux_dvb;
 pub mod m3u;
 pub mod manager;
 pub mod mapping;
