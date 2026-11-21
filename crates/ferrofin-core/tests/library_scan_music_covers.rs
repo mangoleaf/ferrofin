@@ -357,9 +357,10 @@ impl Library {
         (lib, ids)
     }
 
-    /// The item's own art folder.
+    /// The item's own art folder, Jellyfin's `{xx}/{idN}`.
     fn own_folder(&self, id: Uuid) -> PathBuf {
-        self.meta.join(guid_to_db(id))
+        let simple = id.simple().to_string();
+        self.meta.join(&simple[..2]).join(&simple)
     }
 }
 
@@ -522,7 +523,7 @@ async fn rows_naming_an_earlier_builds_shared_cover_are_replaced_by_the_next_sca
     for own in [&pic.path, &first.path, &copy.path] {
         std::fs::remove_file(own).unwrap();
     }
-    let third = lib.own_folder(ids.embedded_third).join("primary.jpg");
+    let third = lib.own_folder(ids.embedded_third).join("poster.jpg");
     std::fs::remove_file(&third).unwrap();
     let probes = lib.probe.probes.load(Ordering::SeqCst);
     Box::pin(lib.scanner.scan_all()).await.unwrap();

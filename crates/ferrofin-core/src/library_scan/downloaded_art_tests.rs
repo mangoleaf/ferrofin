@@ -394,7 +394,7 @@ async fn a_photo_is_not_written_into_a_media_folder_without_the_librarys_opt_in(
         .collect();
     assert_eq!(
         paths,
-        [art_dir.join("primary.png").to_string_lossy().into_owned()]
+        [art_dir.join("folder.png").to_string_lossy().into_owned()]
     );
     assert_eq!(files_in(&folder), Vec::<std::path::PathBuf>::new());
 }

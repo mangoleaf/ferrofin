@@ -3086,8 +3086,9 @@ const ORPHAN_SWEEP_PROGRESS_STEP: usize = 500;
 /// `{id}` folder — under the metadata root only its `chapters` folder —
 /// whose id no `BaseItems` row has. Nothing else is touched: a folder whose
 /// name is not two characters at the first level, or not an id at the
-/// second, stays, and so do Ferrofin's `{metadata}/library/{GUID}` art
-/// folders and every trickplay folder saved beside the media.
+/// second, stays, and so does the art in an `{id}` folder, as do the
+/// `{metadata}/library/{GUID}` art folders earlier builds wrote and every
+/// trickplay folder saved beside the media.
 ///
 /// Runs once on every database, Ferrofin's own and adopted ones alike:
 /// every Ferrofin before this one left these folders behind when a library
@@ -6745,8 +6746,8 @@ mod tests {
         (cleanup, external)
     }
 
-    /// `id`'s art folder (`{metadata}/library/{GUID}`) under `root`'s test
-    /// directories, written with a file.
+    /// `id`'s own art folder (`{metadata}/library/{xx}/{idN}`) under `root`'s
+    /// test directories, written with a file.
     fn planted_art_folder(root: &Path, id: Uuid) -> PathBuf {
         let art = root.join("program/metadata/library");
         let folder = crate::item_folders::item_art_folders(&art, id)[0].clone();
@@ -8560,7 +8561,7 @@ mod tests {
         std::fs::create_dir_all(orphan_meta.join("chapters")).expect("chapters");
         let live_meta = id_folder(&metadata, &live.simple().to_string());
         std::fs::create_dir_all(live_meta.join("chapters")).expect("chapters");
-        // Ferrofin's own art folder is no `{xx}/{id}` folder.
+        // The `{ID}` art folder earlier builds wrote is no `{xx}/{id}` folder.
         let art = metadata.join(orphan.hyphenated().to_string().to_uppercase());
         std::fs::create_dir_all(&art).expect("art");
 
