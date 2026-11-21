@@ -10295,6 +10295,67 @@ mod tests {
         );
     }
 
+    /// A padded list entry keeps its text, as upstream's `Value = f.Value`
+    /// writes it (gl-1635): `Drama` and ` drama ` are two `ItemValues` rows
+    /// and two links but one Genre row, their clean name and derived id being
+    /// one; alone, ` Noir ` names its Genre row with the padding
+    /// (`CreateItemByName`'s `Name = name`) under the trimmed path's id.
+    #[tokio::test]
+    async fn a_padded_value_keeps_its_text() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let db = test_db().await;
+        let (movie, other) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        seed_item(&db, other, BaseItemKind::Movie).await;
+        let identity = crate::test_support::by_name_identity();
+        let svc = FerrofinItemPersistenceService::new(db.clone())
+            .with_by_name_identity(Some(identity.clone()));
+        let values = |genres: &str| {
+            ferrofin_db::entities::base_items::item_values_of(&BaseItemEntity {
+                genres: Some(genres.to_owned()),
+                ..BaseItemEntity::default()
+            })
+        };
+        svc.save_item_values(movie, &values("Drama| drama "))
+            .await
+            .expect("save");
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            r#"SELECT "Value", "CleanValue" FROM "ItemValues" WHERE "Type" = 2 ORDER BY "Value""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("values");
+        assert_eq!(
+            rows,
+            [
+                (" drama ".to_owned(), "drama".to_owned()),
+                ("Drama".to_owned(), "drama".to_owned())
+            ]
+        );
+        let links: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "ItemValuesMap" WHERE "ItemId" = ?1"#)
+                .bind(guid_to_db(movie))
+                .fetch_one(db.pool())
+                .await
+                .expect("links");
+        assert_eq!(links, 2);
+        let genres: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Name" FROM "BaseItems" WHERE "Type" LIKE '%.Genre'"#)
+                .fetch_all(db.pool())
+                .await
+                .expect("genres");
+        assert_eq!(genres, ["Drama"]);
+
+        svc.save_item_values(other, &values(" Noir "))
+            .await
+            .expect("save");
+        let noir = identity.id(BaseItemKind::Genre, "Noir").expect("derived");
+        assert_eq!(
+            by_name_row_id(&db, "Genre", " Noir ").await,
+            Some(guid_to_db(noir))
+        );
+    }
+
     /// The value-id read seeks `IX_ItemValues_Type_Value` for its pairs, and
     /// the by-name insert's guard seeks `IX_BaseItems_Type_CleanName` per row,
     /// as the one-value statements did: neither scans its table (gl-1282).
