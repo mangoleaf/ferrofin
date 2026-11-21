@@ -384,6 +384,8 @@ impl SsoService {
         {
             Ok(_) => {
                 tracing::info!(oidc_provider = %key, user_id = %user.id, "OIDC Quick Connect approval completed");
+                // Not awaited: the picture never holds the sign-in (B16).
+                self.start_avatar_sync(&provider, &pending.identity, pending.user_id);
                 Ok(at_home(
                     200,
                     "Your app is signed in",

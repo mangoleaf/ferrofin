@@ -226,6 +226,22 @@
                             has is always refused.
                         </div>
                     </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoSyncPictures" />
+                            <span>Sync profile pictures</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            After each sign-in, a user's profile picture is set from the image the provider's
+                            picture claim names, whenever that image is new or has changed, or the user has no
+                            picture, replacing a picture the user set in Ferrofin. It is downloaded under the server's image download limits: a
+                            picture on a private address needs that address in the server's
+                            image_private_http_allow. A sign-in without the claim, or whose picture cannot be
+                            downloaded, leaves the picture as it is; the download never holds up the sign-in.
+                            When the ID token has no picture claim, each sign-in also asks the provider's userinfo
+                            endpoint for it, which adds one request to the provider, of up to 10 seconds.
+                        </div>
+                    </div>
                     <h4>Roles</h4>
                     <div class="inputContainer">
                         <input is="emby-input" type="text" class="ssoRoleClaim" label="Role claim"
@@ -669,6 +685,7 @@
                     field(page, 'ssoScopes').value = info ? info.Scopes : DEFAULT_SCOPES;
                     field(page, 'ssoUsernameClaim').value = info ? info.UsernameClaim : DEFAULT_USERNAME_CLAIM;
                     field(page, 'ssoCreateUsers').checked = info ? !!info.CreateUsers : true;
+                    field(page, 'ssoSyncPictures').checked = info ? !!info.SyncProfilePictures : false;
                     field(page, 'ssoRoleClaim').value = info ? info.RoleClaim : DEFAULT_ROLE_CLAIM;
                     field(page, 'ssoRequiredRole').value = info ? info.RequiredRole : '';
                     field(page, 'ssoRoleSync').checked = info ? !!info.RoleSync : false;
@@ -702,6 +719,7 @@
                         Scopes: field(page, 'ssoScopes').value.trim(),
                         UsernameClaim: field(page, 'ssoUsernameClaim').value.trim(),
                         CreateUsers: field(page, 'ssoCreateUsers').checked,
+                        SyncProfilePictures: field(page, 'ssoSyncPictures').checked,
                         RoleClaim: field(page, 'ssoRoleClaim').value.trim(),
                         RequiredRole: field(page, 'ssoRequiredRole').value.trim(),
                         RoleSync: field(page, 'ssoRoleSync').checked,

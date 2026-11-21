@@ -24,7 +24,11 @@
 //!    `azp` naming the client), `azp`, expiry and nonce;
 //! 8. when the username claim, or the role claim of a provider that reads
 //!    roles, is not in the ID token, the userinfo answer's `sub`, which must
-//!    be the ID token's.
+//!    be the ID token's. Asked only for the `picture` claim, by a sign-in
+//!    (not a link flow) at a provider that syncs pictures
+//!    ([`avatar_sync`](super::avatar_sync)), userinfo refuses nothing: an
+//!    answer that fails is not used, and of one that passes only the
+//!    `picture` is taken.
 //!
 //! `SsoService::sign_in_verified` then refuses an identity without the
 //! provider's required role ([`roles`](super::roles)) before any account is
@@ -82,7 +86,8 @@ pub struct VerifiedIdentity {
     pub subject: String,
     /// The value of the provider's username claim, when it is a string.
     pub username: Option<String>,
-    /// The ID token's claims, then the userinfo answer's the ID token lacks.
+    /// The ID token's claims, then the userinfo answer's the ID token lacks
+    /// (only its `picture`, when userinfo was asked for the picture alone).
     pub claims: Map<String, Value>,
 }
 
@@ -554,6 +559,23 @@ impl SsoService {
                 .await?
             {
                 claims.entry(name).or_insert(value);
+            }
+        } else if super::avatar_sync::wants_userinfo(provider, &flow.purpose, &claims) {
+            // Asked for the picture only, which never fails a sign-in (B16).
+            match self
+                .userinfo(provider, &metadata, tokens.access_token(), &subject)
+                .await
+            {
+                Ok(mut answer) => {
+                    if let Some(picture) = answer.remove(super::avatar_sync::PICTURE_CLAIM) {
+                        claims.insert(super::avatar_sync::PICTURE_CLAIM.to_owned(), picture);
+                    }
+                }
+                Err(refusal) => tracing::warn!(
+                    oidc_provider = %provider.key,
+                    reason = refusal.reason,
+                    "the userinfo answer for the picture claim is not used"
+                ),
             }
         }
         let username = claims

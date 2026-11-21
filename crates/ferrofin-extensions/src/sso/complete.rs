@@ -235,6 +235,8 @@ impl SsoService {
         match self.sessions.authenticate_direct(&request).await {
             Ok(session) => {
                 tracing::info!(oidc_provider = %key, user_id = %user.id, "OIDC sign-in completed");
+                // Not awaited: the picture never holds the sign-in (B16).
+                self.start_avatar_sync(provider, &pending.identity, pending.user_id);
                 Ok(Ok(session))
             }
             // A device the account may not use, or its session limit: logged

@@ -7,8 +7,9 @@
 //! private address, on the first request or on any redirect, unless
 //! `image_private_http_allow` lets it (gl-1096), and it reads at most
 //! `image_download_max_mb` of the body (gl-1095). LDAP-Auth's profile images
-//! given as a URL (`LdapProfileImageFormat` `Url`) are fetched through it;
-//! upstream's plugin uses the default `HttpClient` with neither check.
+//! given as a URL (`LdapProfileImageFormat` `Url`) and Single Sign-On's
+//! `picture` claim (gl-1892) are fetched through it; upstream's LDAP plugin
+//! uses the default `HttpClient` with neither check.
 //!
 //! The trait is object-safe and carries an `_assert_object_safe` assertion.
 

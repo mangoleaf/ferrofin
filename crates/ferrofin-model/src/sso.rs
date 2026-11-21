@@ -32,8 +32,8 @@ pub const DEFAULT_ROLE_CLAIM: &str = "groups";
 ///
 /// A member a body or a stored provider leaves out takes its default: enabled,
 /// [`DEFAULT_SCOPES`], [`DEFAULT_USERNAME_CLAIM`], an `https` issuer only,
-/// accounts created at a first sign-in, [`DEFAULT_ROLE_CLAIM`], role sync off,
-/// and empty text and lists otherwise. `Debug` leaves the secret out.
+/// accounts created at a first sign-in, [`DEFAULT_ROLE_CLAIM`], role sync and
+/// picture sync off, and empty text and lists otherwise. `Debug` leaves the secret out.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)] // one field per setting, each its own switch
@@ -104,6 +104,13 @@ pub struct OidcProvider {
     /// With [`role_sync`](Self::role_sync) on, the roles that allow managing
     /// Live TV recordings (`EnableLiveTvManagement`).
     pub live_tv_management_roles: Vec<String>,
+    /// Keeps a user's profile picture in step with the `picture` claim at
+    /// each sign-in (D18): downloaded after the sign-in, under the server's
+    /// image download limits, and stored unless it is the one the claim gave
+    /// last and the user still has it. A sign-in without the claim, or whose
+    /// download fails, leaves the picture as it is. Off, a sign-in never
+    /// touches it.
+    pub sync_profile_pictures: bool,
 }
 
 /// One entry of [`OidcProvider::folder_roles`]: a role, and the libraries it
@@ -141,6 +148,7 @@ impl Default for OidcProvider {
             folder_roles: Vec::new(),
             live_tv_roles: Vec::new(),
             live_tv_management_roles: Vec::new(),
+            sync_profile_pictures: false,
         }
     }
 }
@@ -352,6 +360,11 @@ mod tests {
         assert_eq!(provider.folder_roles, Vec::<OidcFolderRole>::new());
         assert_eq!(provider.live_tv_roles, Vec::<String>::new());
         assert_eq!(provider.live_tv_management_roles, Vec::<String>::new());
+        assert!(!provider.sync_profile_pictures, "off by default");
+        assert_eq!(
+            serde_json::to_value(&provider).expect("serializes")["SyncProfilePictures"],
+            false
+        );
         assert_eq!(
             provider.client_secret.as_ref().map(Secret::expose),
             Some("s3cr3t-value")

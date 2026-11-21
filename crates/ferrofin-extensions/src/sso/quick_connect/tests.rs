@@ -740,6 +740,43 @@ async fn without_the_required_role_no_code_is_approved_and_no_account_made() {
     assert_eq!(page.status, 200, "{}", page.html);
 }
 
+/// B16: approving a code is a sign-in, so with picture sync on the account's
+/// picture follows the `picture` claim, after the app is signed in.
+#[tokio::test]
+async fn an_approved_code_syncs_the_picture() {
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x04, 0x03, 0x04, 0xFF, 0xD9];
+    const URL: &str = "https://pictures.example.org/approver.jpg";
+    let mut approval = Approval::with(|provider| provider.sync_profile_pictures = true).await;
+    let images = crate::ldap_auth::provider::profile_image::FakeImages::default();
+    images.answer(URL, Ok(JPEG.to_vec()));
+    approval.harness.sso = approval.harness.sso.with_remote_images(Arc::new(images));
+    approval.harness.fake.sign_in(|sign_in| {
+        sign_in.claims.insert("picture".to_owned(), json!(URL));
+    });
+
+    let (secret, reply) = approval.approved().await;
+    assert_eq!(reply.status, 200, "{}", reply.html);
+    assert!(approval.authorized(&secret).await);
+    let user_id = Uuid::parse_str(&approval.account().await.id).expect("an id");
+    let stored = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(image) = approval
+                .harness
+                .users
+                .get_profile_image(user_id)
+                .await
+                .expect("lookup")
+            {
+                return std::fs::read(image.path).expect("read the picture");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the picture is stored");
+    assert_eq!(stored, JPEG);
+}
+
 /// B9: approving a code is a sign-in on the app's device, so role sync
 /// keeps the administrator flag in step with the role claim, both ways.
 #[tokio::test]
