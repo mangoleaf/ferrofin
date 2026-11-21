@@ -72,7 +72,7 @@
 //! land, this is where their key belongs.
 
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_util::string_extensions::remove_diacritics;
+use ferrofin_util::string_extensions::{remove_diacritics, zero_padded};
 use uuid::Uuid;
 
 use crate::kinds::is_video;
@@ -200,8 +200,7 @@ pub fn user_data_keys(item: &KeySource<'_>, series: Option<&KeySource<'_>>) -> V
 
     match item.kind {
         BaseItemKind::Season => {
-            let mut keys =
-                series_derived(series, &format!("{:03}", item.index_number.unwrap_or(0)));
+            let mut keys = series_derived(series, &zero_padded(item.index_number.unwrap_or(0), 3));
             keys.push(own);
             keys
         }
@@ -212,8 +211,10 @@ pub fn user_data_keys(item: &KeySource<'_>, series: Option<&KeySource<'_>>) -> V
             else {
                 return vec![own];
             };
-            let mut keys =
-                series_derived_dropping_own_id(series, &format!("{season:03}{episode:03}"));
+            let mut keys = series_derived_dropping_own_id(
+                series,
+                &format!("{}{}", zero_padded(season, 3), zero_padded(episode, 3)),
+            );
             keys.push(own);
             keys
         }
@@ -473,10 +474,11 @@ fn audio_key(item: &KeySource<'_>) -> String {
         key.push('-');
     }
     if let Some(disc) = item.parent_index_number {
-        let _ = std::fmt::Write::write_fmt(&mut key, format_args!("{disc:04}-"));
+        key.push_str(&zero_padded(disc, 4));
+        key.push('-');
     }
     if let Some(track) = item.index_number {
-        let _ = std::fmt::Write::write_fmt(&mut key, format_args!("{track:04}"));
+        key.push_str(&zero_padded(track, 4));
     }
     if let Some(name) = item.name {
         key.push_str(name);
@@ -601,6 +603,50 @@ mod tests {
             user_data_keys(&ep, Some(&series())),
             vec!["12345002007".to_owned(), id(4).to_string()]
         );
+    }
+
+    /// A negative number is padded as C#'s `"000"`/`"0000"` custom formats
+    /// pad it, its digits to the width and the sign in front: `(-1).ToString("000")` is
+    /// `-001` (`Season.cs:111`, `Episode.cs:177`, `Audio.cs:104-108`).
+    #[rstest::rstest]
+    #[case::season(BaseItemKind::Season, None, Some(-1), "12345-001")]
+    #[case::episode(BaseItemKind::Episode, Some(-1), Some(-12), "12345-001-012")]
+    #[case::episode_zero(BaseItemKind::Episode, Some(0), Some(7), "12345000007")]
+    #[case::wide(BaseItemKind::Season, None, Some(1000), "123451000")]
+    fn a_negative_index_pads_its_digits_with_the_sign_in_front(
+        #[case] kind: BaseItemKind,
+        #[case] parent_index_number: Option<i64>,
+        #[case] index_number: Option<i64>,
+        #[case] first: &str,
+    ) {
+        let item = KeySource {
+            item_id: id(4),
+            kind,
+            parent_index_number,
+            index_number,
+            ..KeySource::default()
+        };
+        assert_eq!(user_data_keys(&item, Some(&series()))[0], first);
+    }
+
+    #[rstest::rstest]
+    #[case(Some(-1), Some(-2), "-0001--0002Track")]
+    #[case(Some(1), Some(12), "0001-0012Track")]
+    #[case(None, Some(-12345), "-12345Track")]
+    fn a_tracks_negative_disc_and_track_pad_as_csharp_does(
+        #[case] parent_index_number: Option<i64>,
+        #[case] index_number: Option<i64>,
+        #[case] first: &str,
+    ) {
+        let track = KeySource {
+            item_id: id(5),
+            kind: BaseItemKind::Audio,
+            name: Some("Track"),
+            parent_index_number,
+            index_number,
+            ..KeySource::default()
+        };
+        assert_eq!(user_data_keys(&track, None)[0], first);
     }
 
     #[test]

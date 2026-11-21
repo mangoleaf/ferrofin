@@ -45,6 +45,7 @@ use ferrofin_traits::library::{
     ContentPermissions, LibraryManager, UserDataManager, UserDataSaveListener,
 };
 use ferrofin_traits::persistence::ItemCountService;
+use ferrofin_util::string_extensions::zero_padded;
 use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 use crate::db_error::db_err;
@@ -671,7 +672,8 @@ impl FerrofinUserDataManager {
     /// is briefly incomplete mid-refresh, and a deleted and re-added item
     /// reattaches by them. Without this the any-row filters (`IsFavorite`,
     /// `IsPlayed`, `IsResumable`) match a stale row the item's DTO no longer
-    /// reads. `RetentionDate` stays untouched, as on [`Self::upsert_one`].
+    /// reads. `RetentionDate` stays untouched: upstream's `ExecuteUpdate` sets
+    /// these nine columns alone.
     async fn update_retired(
         tx: &mut sqlx::SqliteConnection,
         row: &UserDataEntity,
@@ -712,8 +714,9 @@ impl FerrofinUserDataManager {
     /// `(item, user)` at once. Read-then-branch let both see "absent" and both
     /// run the `INSERT`, and the loser failed `PK_UserData` — a 500 on a
     /// playback report. `ON CONFLICT … DO UPDATE` resolves that inside SQLite.
-    /// `RetentionDate` stays untouched on the update leg, exactly as the
-    /// previous `UPDATE` did.
+    /// The update leg writes every non-key column, `RetentionDate` cleared: upstream
+    /// maps the data to a fresh `UserData`, which has none, and attaches it as
+    /// `Modified` (`UserDataManager.SaveUserData`, `Map`).
     async fn upsert_one(
         tx: &mut sqlx::SqliteConnection,
         row: &UserDataEntity,
@@ -734,7 +737,8 @@ impl FerrofinUserDataManager {
                  "PlaybackPositionTicks" = excluded."PlaybackPositionTicks",
                  "Played" = excluded."Played",
                  "Rating" = excluded."Rating",
-                 "SubtitleStreamIndex" = excluded."SubtitleStreamIndex""#,
+                 "SubtitleStreamIndex" = excluded."SubtitleStreamIndex",
+                 "RetentionDate" = NULL"#,
         )
         .bind(&row.item_id)
         .bind(&row.user_id)
@@ -1689,7 +1693,7 @@ fn row_data_keys(
     let derived: Vec<String> = match kind {
         BaseItemKind::Season => series
             .iter()
-            .map(|key| format!("{key}{:03}", item.index_number.unwrap_or(0)))
+            .map(|key| format!("{key}{}", zero_padded(item.index_number.unwrap_or(0), 3)))
             .collect(),
         BaseItemKind::Episode => {
             let (Some(season), Some(episode)) = (item.parent_index_number, item.index_number)
@@ -1706,7 +1710,7 @@ fn row_data_keys(
             series
                 .iter()
                 .take(take)
-                .map(|key| format!("{key}{season:03}{episode:03}"))
+                .map(|key| format!("{key}{}{}", zero_padded(season, 3), zero_padded(episode, 3)))
                 .collect()
         }
         _ => return keys,
@@ -3078,6 +3082,58 @@ mod tests {
             theirs,
             [(guid_to_db(other), "Old Key".to_owned(), false, 111)],
             "another user's row is left alone"
+        );
+    }
+
+    /// A save writes every column of the rows under the item's current keys,
+    /// `RetentionDate` included, which it clears: upstream maps the item data
+    /// to a fresh `UserData` without one and attaches it as `Modified`
+    /// (`UserDataManager.cs:63-75, 158-176`). A row under a retired key keeps
+    /// its date, as upstream's `ExecuteUpdate` sets the nine play-state
+    /// columns alone.
+    #[tokio::test]
+    async fn a_save_clears_the_retention_date_of_the_rows_it_writes() {
+        let db = test_db().await;
+        let (user, item) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        for key in [item.to_string(), "Old Key".to_owned()] {
+            sqlx::query(
+                r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite",
+                       "PlayCount","PlaybackPositionTicks","Played","RetentionDate")
+                   VALUES (?1, ?2, ?3, 0, 0, 0, 0, '2026-10-01 00:00:00')"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .bind(key)
+            .execute(db.writer())
+            .await
+            .expect("seed a row with a retention date");
+        }
+
+        FerrofinUserDataManager::new(db.clone(), config())
+            .save_user_data(user, item, &favorite_dto())
+            .await
+            .expect("save");
+
+        let rows: Vec<(String, bool, Option<String>)> = sqlx::query_as(
+            r#"SELECT "CustomDataKey", "IsFavorite", "RetentionDate" FROM "UserData"
+               WHERE "ItemId" = ?1 ORDER BY 1"#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .expect("rows");
+        assert_eq!(
+            rows,
+            [
+                (item.to_string(), true, None),
+                (
+                    "Old Key".to_owned(),
+                    true,
+                    Some("2026-10-01 00:00:00".to_owned())
+                ),
+            ]
         );
     }
 
@@ -4939,6 +4995,49 @@ mod tests {
                 .likes,
             None,
             "Likes getter derives from Rating rather than a stale serialized Likes column"
+        );
+    }
+
+    /// A page's keys pad a negative season or episode number as C#'s `"000"`
+    /// does (`-001`), as the write path's keys do.
+    #[tokio::test]
+    async fn a_page_s_keys_pad_a_negative_index_as_csharp_does() {
+        let db = test_db().await;
+        let (season, episode) = (Uuid::from_u128(0xF00D), Uuid::from_u128(0xF00E));
+        let mut series_keys = HashMap::new();
+        for (item, kind, parent_index) in [
+            (season, BaseItemKind::Season, None),
+            (episode, BaseItemKind::Episode, Some(-1)),
+        ] {
+            seed_item(&db, item, kind).await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "ParentIndexNumber" = ?2, "IndexNumber" = ?3
+                   WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(parent_index)
+            .bind(if kind == BaseItemKind::Season {
+                -1
+            } else {
+                -12
+            })
+            .execute(db.writer())
+            .await
+            .unwrap();
+            series_keys.insert(guid_to_db(item), vec!["12345".to_owned(), "s".to_owned()]);
+        }
+        let (season_row, episode_row) = (
+            fetch_item(&db, season).await,
+            fetch_item(&db, episode).await,
+        );
+        let none = HashMap::new();
+        assert_eq!(
+            row_data_keys(&season_row, season, &none, &series_keys)[..2],
+            ["12345-001", "s-001"]
+        );
+        assert_eq!(
+            row_data_keys(&episode_row, episode, &none, &series_keys)[0],
+            "12345-001-012"
         );
     }
 

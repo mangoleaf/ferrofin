@@ -6,6 +6,9 @@
 //! small explicit map for non-decomposable ligatures (e.g. `œ` → `oe`). This
 //! matches the ported test oracle exactly. Transliteration runs ICU4X's CLDR
 //! transforms (see [`transliterated`]).
+//!
+//! [`zero_padded`] is not from that file: it is .NET's zero-placeholder
+//! integer format, which the user-data keys are built with.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, OnceLock};
@@ -459,10 +462,37 @@ const NEWER_UNICODE_CASE_PAIRS: [char; 40] = [
     '\u{1df7f}',
 ];
 
+/// .NET's zero-placeholder custom format of an integer in the invariant
+/// culture (`n.ToString("000")`, `"0000"`): the digits zero-padded to
+/// `digits`, then the sign before them. Rust's `{:03}` counts the sign in the
+/// width, so `-1` is `-01` there and `-001` here.
+#[must_use]
+pub fn zero_padded(value: i64, digits: usize) -> String {
+    let sign = if value < 0 { "-" } else { "" };
+    format!("{sign}{:0digits$}", value.unsigned_abs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    // The C# output is the oracle: `(-1).ToString("000")` is `-001`.
+    #[rstest]
+    #[case(-1, 3, "-001")]
+    #[case(0, 3, "000")]
+    #[case(7, 3, "007")]
+    #[case(1000, 3, "1000")]
+    #[case(-1, 4, "-0001")]
+    #[case(-12345, 4, "-12345")]
+    #[case(i64::MIN, 3, "-9223372036854775808")]
+    fn zero_padded_matches_dotnet_custom_zero_format(
+        #[case] value: i64,
+        #[case] digits: usize,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(zero_padded(value, digits), expected);
+    }
 
     #[test]
     fn invariant_casing_matches_dotnet_for_every_unicode_scalar() {
