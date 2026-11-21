@@ -18,6 +18,9 @@
 //! - `classify`: which migrations are schema and which are code migrations;
 //! - `drop_objects`: removing Ferrofin's own tables and indexes from the copy;
 //! - `paths`: the stored paths, rewritten onto the output's layout;
+//! - `carried`: what Ferrofin's own tables hold that Jellyfin keeps in files
+//!   (Live TV tuners, guides and timers, LDAP-Auth's uid map), read before
+//!   they are removed;
 //! - `containers`: the playlists' and box sets' metadata files, left out of
 //!   the copy where they may be stale, and those in media libraries;
 //! - `report`: what the removed tables held and what Jellyfin's first start
@@ -34,6 +37,9 @@ use sqlx::SqliteConnection;
 
 use crate::{DbError, Result};
 
+pub use carried::{
+    CarriedRows, IdentityLink, MirroredLiveTv, RecordingRow, SeriesTimerRow, TimerRow,
+};
 pub use classify::{
     CODE_PRODUCT_VERSION, Disposition, JELLYFIN_MIGRATIONS, SCHEMA_PRODUCT_VERSION,
 };
@@ -45,6 +51,7 @@ pub use paths::PathRewrite;
 pub use refusal::Preflight;
 pub use report::{first_start_effects, table_note};
 
+mod carried;
 mod classify;
 mod containers;
 mod drop_objects;
@@ -171,6 +178,9 @@ pub struct DatabaseEdits {
     pub dropped: DroppedObjects,
     /// The stored paths, rewritten onto the output's layout.
     pub paths: PathRewrite,
+    /// What Ferrofin's own tables held that Jellyfin keeps in files, read
+    /// before they were removed.
+    pub carried: CarriedRows,
 }
 
 /// The export's changes to its staged copy of the database, in order, on the
@@ -186,10 +196,14 @@ async fn edit_staged(
     (dirs, layout): (&SourceDirs, &Layout),
 ) -> Result<DatabaseEdits> {
     let mut tx = sqlx::Connection::begin(conn).await?;
+    let history = history::rewrite(&mut tx, history).await?;
+    // Before the drop, which removes the tables it reads.
+    let carried = carried::read(&mut tx).await?;
     let edits = DatabaseEdits {
-        history: history::rewrite(&mut tx, history).await?,
+        history,
         dropped: drop_objects::remove(&mut tx).await?,
         paths: paths::rewrite(&mut tx, dirs, layout).await?,
+        carried,
     };
     tx.commit().await?;
     Ok(edits)
@@ -221,9 +235,10 @@ async fn edit_staged(
 /// the database's changes since, and which Jellyfin's metadata refresh would
 /// merge back ([`ExportSummary::container_files`]).
 /// The snapshot's `__EFMigrationsHistory` is rewritten ([`HistoryRewrite`]),
-/// Ferrofin's own tables and indexes are removed from it
-/// ([`DroppedObjects`]), and its stored paths are rewritten onto the layout
-/// ([`PathRewrite`]).
+/// what Ferrofin's own tables hold that Jellyfin keeps in files is read
+/// ([`CarriedRows`]) before those tables and Ferrofin's indexes are removed
+/// from it ([`DroppedObjects`]), and its stored paths are rewritten onto the
+/// layout ([`PathRewrite`]).
 ///
 /// What is copied is digested while it is copied and again once the database
 /// snapshot is written, and so are the files SQLite keeps beside the

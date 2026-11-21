@@ -28,8 +28,8 @@ Upstream paths are in `jellyfin/jellyfin` at `v12.4` unless another repository i
 | Where Jellyfin keeps timers and series timers | `data/livetv/timers.json` and `data/livetv/seriestimers.json`, not the database | C#, reproduced |
 | Where Jellyfin keeps recordings | media files and NFO sidecars in the recording folders, scanned as libraries; a `Completed` entry stays in `timers.json` | C# |
 | Where Jellyfin keeps plugin settings | `plugins/configurations/<name>.xml` | C#, reproduced for the bundled plugins |
-| Do Ferrofin's timers map to those files without loss | Yes for scheduled timers and series timers: Ferrofin's stored rows, mapped by upstream's own DTO mapping plus two Ferrofin columns, came back from Jellyfin's guide refresh identical to what Jellyfin writes itself. Proven for an M3U tuner with a UTC XMLTV guide only, and only if the first guide refresh succeeds. | reproduced on Jellyfin 12.4 |
-| Do Ferrofin's plugin settings map to those files | LDAP-Auth: yes, every setting, with its uid map from `FerrofinExternalIdentities`. The other plugins: not checked field by field, and two known shape differences | code and live |
+| Do Ferrofin's timers map to those files without loss | Yes for scheduled timers and series timers: Ferrofin's stored rows, mapped by upstream's own DTO mapping plus two Ferrofin columns, came back from Jellyfin's guide refresh identical to what Jellyfin writes itself. Proven for an M3U tuner with an XMLTV guide (UTC and `+0100` times). On an export, which keeps the channel and programme items Ferrofin mirrors, they survive a first guide refresh that cannot read the guide too; one that cannot read the tuner deletes them, as on any Jellyfin (the repeat trial, below). | reproduced on Jellyfin 12.4 |
+| Do Ferrofin's plugin settings map to those files | Yes, member by member, for LDAP-Auth (its uid map from `FerrofinExternalIdentities`), the five bundled plugins, Intro Skipper, Merge Versions, File Transformation and OpenSubtitles, but for TMDb's `SimilarItemsCacheDays`, which Ferrofin does not keep, and OpenSubtitles' `ApiKey`, which upstream lacks (gl-1556's member lists, checked against each `PluginConfiguration`) | code and live |
 | D6 | **A**, including timers, series timers and the recordings' completed timers | below |
 | D7 | **A**, for LDAP-Auth (uid map included) and for every plugin whose settings match the upstream shape | below |
 
@@ -176,7 +176,13 @@ Upstream paths are in `jellyfin/jellyfin` at `v12.4` unless another repository i
     (`manager.rs:1006-1022`);
   - a series timer's airing ids follow the same MD5 rule (`manager.rs:7619-7650`).
 
-  Channels and programmes live in `FerrofinLiveTvChannels` and `FerrofinLiveTvPrograms`, not in `BaseItems`.
+  Channels and programmes live in `FerrofinLiveTvChannels` and `FerrofinLiveTvPrograms`, and Ferrofin also
+  mirrors every stored channel and programme into `BaseItems` at each guide refresh, as the `LiveTvChannel` and
+  `LiveTvProgram` items Jellyfin keeps (`sync_channel_items` and `sync_program_items`,
+  `crates/ferrofin-livetv/src/manager.rs`; rows built by `channel_entity` and `program_entity`,
+  `crates/ferrofin-livetv/src/projection.rs`), with their image and provider rows. A user's favourite channel
+  is `UserData` on its channel item. (An earlier version of this file said they were not in `BaseItems`; that
+  was wrong, and the first trial below was built on it.)
 
 ### Plugin settings
 
@@ -223,7 +229,8 @@ guide with six airings of a series and one film.
    - the stored `Data` has the key set of Jellyfin's own `TimerInfoDto`, less the embedded `ProgramInfo` item the
      API adds when it answers.
 3. **The export from Ferrofin's rows.** Jellyfin's server from step 1 was stopped and copied. Both JSON files and
-   every `LiveTv*` row in `BaseItems` were removed, because Ferrofin has no such rows to export. Ferrofin's
+   every `LiveTv*` row in `BaseItems` were removed, on the mistaken premise that Ferrofin has no such rows to
+   export. So this step did not test what an export produces; the repeat trial below does. Ferrofin's
    `FerrofinLiveTvTimers` and `FerrofinLiveTvSeriesTimers` rows were then written as the two files:
    - upstream's `GetTimerInfo` and `GetSeriesTimerInfo` mapping on `Data`;
    - `Id` = `ExternalId`;
@@ -249,14 +256,46 @@ guide with six airings of a series and one film.
    - `IsManual` decides whether a series fan-out sets it back to `New`, so a completed timer takes its `IsManual`
      column too.
 
-Scope of the proof: an M3U tuner with an XMLTV guide whose times are in UTC. Two cases are unproven:
-- HDHomeRun channel ids and Schedules Direct programme ids come from other code on both sides;
-- an XMLTV programme id embeds the guide's own offset (`{channel}_{start:O}` over the source `DateTimeOffset`,
-  `Jellyfin.LiveTv/Listings/XmlTvListingsProvider.cs:321`), so a guide in another time zone writes `+01:00`.
-  Ferrofin ports that (`manager.rs:1006-1022`), but only its unit tests cover it.
+Scope of the proof: an M3U tuner with an XMLTV guide, whose times are in UTC and, in the repeat trial, `+0100`.
+One case is unproven: HDHomeRun channel ids and Schedules Direct programme ids come from other code on both
+sides, and a trial needs the hardware or an account. An XMLTV programme id embeds the guide's own offset
+(`{channel}_{start:O}` over the source `DateTimeOffset`, `Jellyfin.LiveTv/Listings/XmlTvListingsProvider.cs:321`);
+Ferrofin ports that (`manager.rs:1006-1022`), and the repeat trial showed the id equal for a `+0100` programme.
 
 It matters: a programme id that
 does not match makes Jellyfin delete the timer at its first guide refresh (`DefaultLiveTvService.cs:107-112`).
+
+### The repeat trial, on an export (gl-1556, 2026-11-21)
+
+Ferrofin built from `release/v1.6.0` with gl-1556's export, on a copy of the synthetic `jellyfin-12.4-fresh`
+adoption fixture, and `jellyfin/jellyfin:12.4` at the pinned digest. The fixture: an M3U tuner of two channels
+and an XMLTV guide of eight programmes (six airings of a series and a film in UTC, one programme at `+0100`),
+both served over HTTP to both servers at the same URL.
+
+1. Jellyfin alone (the oracle) and Ferrofin alone each added the tuner and the guide, refreshed the guide, made
+   a timer on the film and a series timer on the series, and made one channel a favourite. Ferrofin's channel
+   ids, all eight programme ids (the `+0100` one included), and every timer's external channel and programme ids
+   were Jellyfin's.
+2. Ferrofin was stopped and `export-jellyfin` ran. The source's every file had the same SHA-256 after as before.
+   The export kept the 2 channel and 8 programme items and the favourite, and wrote `livetv.xml`, 7 timers and
+   the series timer.
+3. Jellyfin 12.4 started on three copies of the export:
+
+| Copy | First guide refresh | Timers | Series timers | Channels | Favourite channel | Programmes |
+|---|---|---|---|---|---|---|
+| A | succeeded | 7, then 7 | 1, then 1 | 2, then 2 | kept | 8, then 8 |
+| B | the guide unreachable (404) | 7, then 7 | 1, then 1 | 2, then 2 | kept | 8, then 8 |
+| C | the tuner and the guide unreachable | 7, then 0 | 1, then 1 | 2, then 0 | lost | 8, then 0 |
+
+   Every id after the refresh in A and B was the one Ferrofin had. In C, `M3UTunerHost` could not read the
+   channel list and the refresh removed every channel (`CleanDatabase`), the favourite with it (the `UserData`
+   key cascades), and every timer whose programme went. A Jellyfin that never left does the same on a refresh
+   that cannot read its tuner, so this is no hazard of the export's; the loss report tells the operator to make
+   every tuner reachable from Jellyfin's container before its first guide refresh.
+
+So the first-refresh hazards described under D6 below do not apply to an export that keeps the mirrored items,
+except an unreachable tuner, which is upstream's behaviour on any refresh. A completed recording was not
+reproduced (the fixture's streams do not play); its mapping is unit-tested against the C#.
 
 ## D6: what the export can carry
 
@@ -270,7 +309,7 @@ keeps, and it is lossless for scheduled timers and series timers, provided Jelly
 | `FerrofinLiveTvTimers` | `data/livetv/timers.json` | upstream's `GetTimerInfo` on `Data`, `Id` = `ExternalId`, plus `IsManual` from its column, completed timers included |
 | `FerrofinLiveTvRecordings` for a `Completed` timer | that timer's `RecordingPath` and programme facts | joined on `TimerId` = the timer row's `Id`; the path rewritten into the target layout (D5) |
 | `FerrofinLiveTvSeriesTimers` | `data/livetv/seriestimers.json` | upstream's `GetSeriesTimerInfo` on `Data`, `Id` = `ExternalId`, plus `SeriesId` from its column |
-| `FerrofinLiveTvChannels`, `FerrofinLiveTvPrograms` | none | Jellyfin rebuilds them from the guide with the same GUIDs; reported as regenerated, not lost |
+| `FerrofinLiveTvChannels`, `FerrofinLiveTvPrograms` | the `LiveTvChannel` and `LiveTvProgram` items Ferrofin mirrors in `BaseItems`, kept | Ferrofin's own tables are dropped; the items, with their image, provider and user data rows, stay, and Jellyfin's guide refresh updates them in place with the same GUIDs (owner decision, 2026-11-21) |
 | recording files and NFO sidecars | the same files | they are library media; D5 decides how they are copied |
 
 What the trial and the C# say about the risks:
@@ -278,6 +317,9 @@ What the trial and the C# say about the risks:
   - at start (`Jellyfin.LiveTv/Recordings/RecordingsHost.cs:30-31`) an ended timer is deleted
     (`TimerManager.cs:93-108`, `DefaultLiveTvService.cs:540-554`);
   - missing programme facts are copied back at the guide refresh and again when the timer fires (`:571-584`).
+- **Superseded by the repeat trial above:** the export keeps the channel and programme items, so Jellyfin starts
+  with them, as a native install does, and the two hazards below apply only to an export that removed them. As
+  first written, on that premise:
 - **Until the first guide refresh, Jellyfin has no channel and no programme items.** Two hazards follow, and
   native Jellyfin meets neither:
   - Nothing refreshes the guide at start. The scheduled task first runs an hour after start when it has never
@@ -291,10 +333,11 @@ What the trial and the C# say about the risks:
     refresh, so its timers survive; an export has none stored. A guide path or URL not carried over, an unreachable
     source or a Schedules Direct login that fails would do it.
 
-  Mitigations for gl-1556: the export checks that every tuner and guide source is reachable from the target, and
-  the loss report tells the operator to run "Refresh Guide" right after the first start. Writing Ferrofin's
-  channels and programmes as `BaseItems` rows would remove both hazards, but it needs the `BaseItems` writer
-  audit (gl-1558) first.
+  The mitigation first proposed here (a reachability check and writing the channels and programmes as items) was
+  overtaken: Ferrofin already mirrors them as items and the export keeps them (the repeat trial). What remains is
+  a tuner Jellyfin's container cannot reach at its first guide refresh, which deletes its channels as on any
+  Jellyfin; the export cannot test reachability from the target, so the loss report tells the operator to check
+  it, and names a tuner whose playlist is a file or at a loopback address.
 - **The ids line up** for an M3U tuner with an XMLTV guide (step 2). A series fan-out after the swap finds the
   exported timers instead of scheduling duplicates (step 4). The gate must repeat this for HDHomeRun and Schedules
   Direct before the claim covers them.
@@ -338,7 +381,8 @@ The evidence supports **option A**, and it extends past LDAP-Auth:
 - **Intro Skipper, Merge Versions, File Transformation, OpenSubtitles** have Jellyfin counterparts that read the
   files above once they are reinstalled. Write each one whose stored settings match the upstream
   `PluginConfiguration`, map the known differences (OpenSubtitles' `ApiKey` has no upstream field; upstream's
-  `CredentialsInvalid` starts `false`), and report the rest by name. The field-by-field check is gl-1556's.
+  `CredentialsInvalid` starts `false`), and report the rest by name. gl-1556 made the field-by-field check: its
+  member lists match each upstream `PluginConfiguration`.
 - **Ferrofin Settings** and WASM plugins have no Jellyfin counterpart: report them as lost.
 
 Option B (report as lost) gives up a mapping that is a single serialization step. The operator would have to
@@ -351,5 +395,5 @@ re-enter LDAP bind credentials and filters by hand.
 - The gate (gl-1546 and later) should repeat steps 3 and 4 against an export from a real Ferrofin data directory,
   with an HDHomeRun tuner, a Schedules Direct guide and an XMLTV guide in a non-UTC time zone as well as the
   UTC M3U and XMLTV case.
-- Favourites and other user data on Live TV channels key on channel items, which an export does not write. Who
-  carries them is gl-1559's audit (users and user data).
+- Favourites and other user data on Live TV channels key on channel items. The export keeps those items, so it
+  carries them (the repeat trial: a favourite channel survived Jellyfin's first guide refresh).

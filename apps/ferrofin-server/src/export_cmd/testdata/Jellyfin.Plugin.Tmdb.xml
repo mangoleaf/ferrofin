@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PluginConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <TmdbApiKey />
+  <IncludeAdult>false</IncludeAdult>
+  <ExcludeTagsSeries>false</ExcludeTagsSeries>
+  <ExcludeTagsMovies>false</ExcludeTagsMovies>
+  <ImportSeasonName>false</ImportSeasonName>
+  <ImportUnairedEpisodes>false</ImportUnairedEpisodes>
+  <ImportMissingEpisodes>false</ImportMissingEpisodes>
+  <ImportSpecials>false</ImportSpecials>
+  <EnabledMissingEpisodeLibraries />
+  <MissingEpisodeRefreshIntervalDays>7</MissingEpisodeRefreshIntervalDays>
+  <UpcomingEpisodeGracePeriodDays>7</UpcomingEpisodeGracePeriodDays>
+  <MaxCastMembers>15</MaxCastMembers>
+  <MaxCrewMembers>15</MaxCrewMembers>
+  <HideMissingCastMembers>false</HideMissingCastMembers>
+  <HideMissingCrewMembers>false</HideMissingCrewMembers>
+  <SimilarItemsCacheDays>90</SimilarItemsCacheDays>
+</PluginConfiguration>

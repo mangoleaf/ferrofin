@@ -6,11 +6,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use ferrofin_db::DbError;
 use ferrofin_db::export::{
-    ContainerFile, DOCKER, DatabaseEdits, DroppedObjects, DroppedTable, EXPORTED_DATABASE,
-    HistoryRewrite, LeftOut, LibraryContainer, PathRewrite, SourceDirs, export_data_dir,
+    CarriedRows, ContainerFile, DOCKER, DatabaseEdits, DroppedObjects, DroppedTable,
+    EXPORTED_DATABASE, HistoryRewrite, IdentityLink, LeftOut, LibraryContainer, MirroredLiveTv,
+    PathRewrite, RecordingRow, SeriesTimerRow, SourceDirs, TimerRow, export_data_dir,
 };
+use ferrofin_db::{Database, DbError};
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
@@ -175,10 +176,24 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
                 }],
                 indexes: Vec::new(),
             },
-            paths: PathRewrite::default(),
+            paths: PathRewrite {
+                moves: summary.edits.paths.moves.clone(),
+                ..PathRewrite::default()
+            },
+            // (the moves themselves are checked below)
+            carried: CarriedRows::default(),
         }
     );
     assert_eq!(summary.left_out.len(), 0);
+    // The source's own directory moves to the layout's, for the paths written
+    // into files.
+    assert_eq!(
+        summary
+            .edits
+            .paths
+            .moved(&format!("{}/data/livetv/x.ts", source.display())),
+        Some("/config/data/livetv/x.ts".to_owned())
+    );
     assert_eq!(exported_names(&out).await, ["one", "two", "three"]);
 }
 
@@ -866,5 +881,156 @@ async fn playlist_and_collection_files_in_the_data_directory_are_left_out() {
     assert!(
         media.join("Heist [boxset]/collection.xml").is_file(),
         "media is never written"
+    );
+}
+
+/// A migrated Ferrofin database holding Live TV (a tuner, a guide, a timer
+/// that recorded, a series timer, a channel and a programme item with a
+/// user's favourite) and an LDAP-Auth link: the export reads what Jellyfin
+/// keeps in files before it drops Ferrofin's tables, keeps the items Jellyfin
+/// reads with the favourite on them (gl-1556), and leaves the source byte for
+/// byte as it was.
+#[tokio::test]
+async fn live_tv_and_identity_rows_are_carried_and_the_items_kept() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = scratch.path().join("source");
+    let database = source.join(EXPORTED_DATABASE);
+    let user = "5386A6F7-707F-47CC-8E9E-6756292CDAFF";
+    live_tv_database(&database, user).await;
+    let before = files(&source);
+    let out = scratch.path().join("out");
+
+    let summary = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        files(&source),
+        before,
+        "the source is left byte for byte as it was"
+    );
+    assert_live_tv_carried(&summary.edits.carried, user);
+    let mut conn = SqliteConnectOptions::new()
+        .filename(out.join(EXPORTED_DATABASE))
+        .read_only(true)
+        .connect()
+        .await
+        .unwrap();
+    let kept: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT b."Type", COALESCE(MAX(u."IsFavorite"), 0) FROM "BaseItems" b
+           LEFT JOIN "UserData" u ON u."ItemId" = b."Id"
+           WHERE b."Type" LIKE 'MediaBrowser.Controller.LiveTv.%' GROUP BY b."Type" ORDER BY 1"#,
+    )
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        kept,
+        [
+            ("MediaBrowser.Controller.LiveTv.LiveTvChannel".to_owned(), 1),
+            ("MediaBrowser.Controller.LiveTv.LiveTvProgram".to_owned(), 0),
+        ],
+        "the channel and the programme are kept, the favourite with them"
+    );
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name GLOB 'Ferrofin*'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// A migrated Ferrofin database at `database` holding Live TV and an LDAP-Auth
+/// link for `user`: [`live_tv_and_identity_rows_are_carried_and_the_items_kept`]'s.
+async fn live_tv_database(database: &Path, user: &str) {
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let db = Database::connect(&format!("sqlite://{}", database.display()))
+        .await
+        .unwrap();
+    let channel = "714EE2D0-C390-F438-28ED-AFC33B39CC9A";
+    for statement in [
+        r#"INSERT INTO "Users" ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess", "HidePlayedInLatest",
+            "InternalId", "InvalidLoginAttemptCount", "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack", "RememberAudioSelections",
+            "RememberSubtitleSelections", "RowVersion", "SubtitleMode", "SyncPlayAccess",
+            "Username", "NormalizedUsername")
+           VALUES (?1, 'auth', 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 'reset', 1, 1, 1, 0, 0, 0,
+                   'ann', 'ANN')"#,
+        r#"INSERT INTO "BaseItems" ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked",
+            "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem", "Name")
+           VALUES (?2, 'MediaBrowser.Controller.LiveTv.LiveTvChannel', 0, 0, 0, 0, 0, 0, 0, 'Test News'),
+                  ('9086A3A8-7441-6453-6DCB-4C74BF66B4C3', 'MediaBrowser.Controller.LiveTv.LiveTvProgram',
+                   0, 0, 0, 0, 0, 1, 0, 'Quiz Night')"#,
+        r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "PlayCount",
+            "PlaybackPositionTicks", "Played") VALUES (?2, ?1, 'key', 1, 0, 0, 0)"#,
+        r#"INSERT INTO "FerrofinLiveTvTunerHosts" ("Id", "Url", "Type", "Data")
+           VALUES ('t', 'http://tuner.lan/a.m3u', 'm3u', '{"Id":"t","Url":"http://tuner.lan/a.m3u"}')"#,
+        r#"INSERT INTO "FerrofinLiveTvListingProviders" ("Id", "Type", "Path", "Data")
+           VALUES ('g', 'xmltv', '/srv/guide.xml', '{"Id":"g","Path":"/srv/guide.xml"}')"#,
+        r#"INSERT INTO "FerrofinLiveTvTimers" ("Id", "ChannelId", "StartDate", "Status", "Data", "IsManual")
+           VALUES ('timer', ?2, '2026-11-22 20:00:00', 'Completed', '{"ExternalId":"x"}', 1)"#,
+        r#"INSERT INTO "FerrofinLiveTvRecordings" ("Id", "ChannelId", "TimerId", "StartDate",
+            "Status", "Path", "EpisodeTitle", "SeasonNumber", "IsKids")
+           VALUES ('rec', ?2, 'timer', '2026-11-22 20:00:00', 'Completed', '/srv/rec.ts', 'Round 1', 1, 1)"#,
+        r#"INSERT INTO "FerrofinLiveTvSeriesTimers" ("Id", "Data", "ExternalId", "SeriesId")
+           VALUES ('series', '{"Name":"Quiz Night"}', 'ext', 'quiz')"#,
+        r#"INSERT INTO "FerrofinExternalIdentities" ("UserId", "ProviderId", "Subject", "AvatarHash",
+            "DateCreated")
+           VALUES (?1, 'Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin', 'ann', 'h1',
+                   '2026-11-21 00:00:00')"#,
+    ] {
+        // Literal test ids only, no binds: a statement takes the ones it names.
+        let statement = statement
+            .replace("?1", &format!("'{user}'"))
+            .replace("?2", &format!("'{channel}'"));
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    db.close().await;
+}
+
+/// Fails unless `carried` is what [`live_tv_database`] stored for `user`.
+fn assert_live_tv_carried(carried: &CarriedRows, user: &str) {
+    assert_eq!(
+        *carried,
+        CarriedRows {
+            tuner_hosts: vec![r#"{"Id":"t","Url":"http://tuner.lan/a.m3u"}"#.to_owned()],
+            listing_providers: vec![r#"{"Id":"g","Path":"/srv/guide.xml"}"#.to_owned()],
+            timers: vec![TimerRow {
+                id: "timer".to_owned(),
+                data: r#"{"ExternalId":"x"}"#.to_owned(),
+                is_manual: true,
+                recording: Some(RecordingRow {
+                    status: "Completed".to_owned(),
+                    path: Some("/srv/rec.ts".to_owned()),
+                    episode_title: Some("Round 1".to_owned()),
+                    season_number: Some(1),
+                    is_kids: true,
+                    ..RecordingRow::default()
+                }),
+            }],
+            series_timers: vec![SeriesTimerRow {
+                data: r#"{"Name":"Quiz Night"}"#.to_owned(),
+                external_id: "ext".to_owned(),
+                series_id: Some("quiz".to_owned()),
+            }],
+            identity_links: vec![IdentityLink {
+                provider_id: "Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin"
+                    .to_owned(),
+                user_id: user.to_owned(),
+                subject: "ann".to_owned(),
+                avatar_hash: Some("h1".to_owned()),
+            }],
+            mirrored: MirroredLiveTv {
+                channels: 1,
+                programs: 1,
+                favorite_channels: 1,
+            },
+        }
     );
 }

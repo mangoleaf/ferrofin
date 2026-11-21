@@ -208,6 +208,11 @@ fn num_cpus_for_analysis() -> usize {
 /// The package name reported in system info (`IStartupOptions.PackageName`).
 const PACKAGE_NAME: &str = "ferrofin-server";
 
+/// The OpenSubtitles plugin's settings before an admin saves them; the export
+/// reads them too.
+pub(crate) const OPENSUBTITLES_DEFAULT_CONFIG: &[u8] =
+    br#"{"ApiKey":"","Username":"","Password":""}"#;
+
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
 /// name refresh, and the lifecycle controller's restart flag).
@@ -2154,7 +2159,7 @@ pub async fn build_app_state(
             },
             None,
         )
-        .with_default_config(br#"{"ApiKey":"","Username":"","Password":""}"#.to_vec()),
+        .with_default_config(OPENSUBTITLES_DEFAULT_CONFIG.to_vec()),
     ];
     // Jellyfin's five IN-TREE provider plugins (TMDb, Studio Images, OMDb,
     // MusicBrainz, AudioDB). They are compiled into `MediaBrowser.Providers`
