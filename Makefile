@@ -12,11 +12,11 @@
 cli = $(if $(filter command line,$(origin $(1))),$($(1)))
 GATES_RUN = $(strip gates/run $(if $(call cli,IMAGE),--image '$(IMAGE)') $(if $(call cli,PREVIOUS),--previous '$(PREVIOUS)') $(if $(call cli,RELEASE),--release '$(RELEASE)'))
 
-.PHONY: help run-gates run-verify run-adoption run-parity run-bench test-gates-offline publish-results
+.PHONY: help run-gates run-verify run-adoption run-roundtrip run-parity run-bench test-gates-offline publish-results
 
 help:
 	@echo "make run-gates                 every gate against one image, as one session (gates/run all)"
-	@echo "make run-verify|run-adoption|run-parity|run-bench   one gate, as a session"
+	@echo "make run-verify|run-adoption|run-roundtrip|run-parity|run-bench   one gate, as a session"
 	@echo "    IMAGE=<image>  the image under test; PREVIOUS=<image>  bench as the release A/B gate"
 	@echo "    RELEASE=vX.Y.Z  the release that gate is for, when not on its release/vX.Y.Z branch (a patch cut from main)"
 	@echo "make test-gates-offline        the gates' own tests: no docker, server or fixtures"
@@ -30,6 +30,9 @@ run-verify:
 
 run-adoption:
 	$(GATES_RUN) adoption
+
+run-roundtrip:
+	$(GATES_RUN) roundtrip
 
 run-parity:
 	$(GATES_RUN) parity

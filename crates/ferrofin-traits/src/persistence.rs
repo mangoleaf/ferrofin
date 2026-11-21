@@ -1386,7 +1386,7 @@ pub trait ItemPersistenceService: Send + Sync {
     /// What the library scan's change detection compares a rescan of each of
     /// `item_ids` against, besides its `BaseItems` row: its image rows, its
     /// ancestor closure, the external subtitle/audio files its stored
-    /// streams came from, and its locked metadata fields (which the scan's
+    /// streams came from, its embedded pictures, and its locked metadata fields (which the scan's
     /// merge must honour). Read one window of the plan at a time.
     ///
     /// `Ok(None)` means the service cannot answer (the default, for
@@ -2552,6 +2552,10 @@ pub struct StoredItemLinks {
     pub external_subtitles: Vec<String>,
     /// The paths of its external audio streams, upstream's `Video.AudioFiles`.
     pub external_audio: Vec<String>,
+    /// Its embedded pictures (`EmbeddedImage` stream rows, with their index
+    /// and comment): what `AudioImageProvider` reads (`GetMediaStreams`) when
+    /// the scan does not probe the file again.
+    pub embedded_images: Vec<MediaStreamInfoEntity>,
     /// Its locked metadata fields (`BaseItemMetadataFields`), which the scan's
     /// merge never overwrites.
     pub locked_fields: Vec<MetadataField>,

@@ -327,10 +327,11 @@ def stamp(seconds):
     return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="seconds") if seconds else None
 
 
-def result_doc(run, rows, skipped=0, finished=None):
-    """The run's result envelope: its verdict and the rows' verdicts counted, as the page shows them, and
-    per fixture its kind, expected generation, verdict, reason, every check and its scale measurements.
-    The table differences and shapes stay in the page (they can be megabytes)."""
+def result_doc(run, rows, skipped=0, finished=None, gate="adoption"):
+    """The run's result envelope, as `gate`'s (gates/roundtrip records its routes here too): its verdict and
+    the rows' verdicts counted, as the page shows them, and per fixture its kind, expected generation,
+    verdict, reason, every check and its scale measurements. The table differences and shapes stay in the
+    page (they can be megabytes)."""
     verdict = overall(rows)
     counts = {v.lower(): sum(1 for r in rows if row_verdict(r) == v) for v in ("PASS", "FAIL", "INCOMPLETE", "SKIP")}
     detail = {"title": run.get("title") or "Adoption run", "skipped_lines": skipped, "rows": [
@@ -342,16 +343,16 @@ def result_doc(run, rows, skipped=0, finished=None):
     source = {"commit": run.get("commit") or None, "image": run.get("image") or None,
               "image_digest": run.get("image_id") or None, "oracle": run.get("oracle") or None,
               "host_class": gate_result().host_class(), "fixture": None}
-    return gate_result().envelope("adoption", {"PASS": "passed", "FAIL": "failed"}.get(verdict, "nothing ran"), counts,
+    return gate_result().envelope(gate, {"PASS": "passed", "FAIL": "failed"}.get(verdict, "nothing ran"), counts,
                                   source, stamp(run.get("started")), stamp(finished), detail)
 
 
-def build(work):
-    """WORK/report.html and WORK/result.json, from one reading of the run."""
+def build(work, gate="adoption"):
+    """WORK/report.html and WORK/result.json (as `gate`'s), from one reading of the run."""
     run, rows, skipped = load(work)
     finished = time.time()
     page = render(run, rows, skipped, finished=finished)
-    doc = result_doc(run, rows, skipped, finished)
+    doc = result_doc(run, rows, skipped, finished, gate)
     path = Path(work) / REPORT
     path.write_text(page, encoding="utf-8")
     gate_result().write(str(work), doc)

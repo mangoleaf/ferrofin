@@ -377,7 +377,7 @@ gates/bench/run.sh                                     # ~40 min → $FERROFIN_G
 python3 gates/bench/report.py --serve                  # compare runs at 127.0.0.1:8097
 ```
 
-`gates/run all` runs verify, adoption, parity and bench against one image as one session, after one
+`gates/run all` runs verify, adoption, roundtrip, parity and bench against one image as one session, after one
 preflight, and ends with one report, the session's `index.html` ([`gates/README.md`](gates/README.md));
 each gate's own script still runs alone. `make run-gates` (or `make run-<gate>`) does the same, and
 `make test-gates-offline` runs the gates' own tests (no docker), as CI does.
@@ -456,6 +456,15 @@ requirement is unaffected by the release-branch rule above. The full adoption va
 (`gates/adoption/run.sh` and the synthetic preservation matrix) also runs before every release,
 and a failure there blocks the release (see `RELEASE.md`).
 The shell tests in CI exercise the harness without these live fixtures.
+
+### The round trip has its own live check — `gates/roundtrip/`
+`gates/roundtrip/run.sh --image ferrofin:bench` (or `make run-roundtrip`) runs every route of
+`gates/roundtrip/routes.sh` on the adoption fixtures: Ferrofin adopts and uses a copy, `export-jellyfin` exports
+it, and the Jellyfin release `UPSTREAM_TAG` names boots on the export and must answer as Ferrofin did. Run it,
+on the routes a change touches (`--only`), for any change to the export command, the configuration writers,
+the history table, the migration chain or a writer of a Jellyfin-owned table, with its verdict table in the PR.
+The `Adoption` workflow runs it on every route before every release, and a failure there blocks the release
+(see `RELEASE.md`).
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only

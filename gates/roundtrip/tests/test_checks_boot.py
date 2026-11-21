@@ -94,6 +94,13 @@ class Errors(unittest.TestCase):
         self.assertIn("[FTL] InternalDatabaseMigration: Error: SQLite Error 1", reasons[0])
         self.assertTrue(reasons[0].endswith("; and 1 more"), reasons[0])
 
+    def test_a_time_with_milliseconds_is_an_entry(self):
+        # the console template of the logging.default.json a fresh install of 12.2 or later writes
+        log = "[20:31:19.252] [INF] [1] Main: starting\n[20:31:19.371] [ERR] [11] Main: broken\n"
+        self.assertEqual(checks_boot.errors(log), ["1 unexpected error(s): [ERR] Main: broken"])
+        self.assertEqual(checks_boot.migrations(log.replace("Main: starting", "InternalCodeMigration: Perform migration X")),
+                         ["migration X failed: Main: broken"])
+
     def test_a_continuation_line_is_never_an_entry(self):
         log = "[01:00:00] [INF] [1] Main: starting\n[ERR] looks like a level but continues the entry above\n"
         self.assertEqual(checks_boot.errors(log), [])
