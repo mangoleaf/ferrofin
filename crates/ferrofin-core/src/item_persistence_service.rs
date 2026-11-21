@@ -2176,7 +2176,7 @@ impl FerrofinItemPersistenceService {
             else {
                 continue;
             };
-            let key = format!("{series_key}-{index:03}");
+            let key = crate::kinds::season_presentation_key(series_key, index);
             if stored_key.as_deref() == Some(key.as_str()) {
                 continue;
             }
