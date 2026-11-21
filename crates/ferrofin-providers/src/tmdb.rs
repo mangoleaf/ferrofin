@@ -475,21 +475,47 @@ pub struct TmdbPerson {
 /// TMDB's person id (which keys the biography/headshot enrichment) and each
 /// credit's `SortOrder`.
 ///
+/// Every TMDB provider adds each credit through `MetadataResult.AddPerson`
+/// (`TmdbMovieProvider.cs:312,359`, `TmdbSeriesProvider.cs:240`,
+/// `TmdbSeasonProvider.cs:112,153`, `TmdbEpisodeProvider.cs:242,273,314`), so
+/// the credits are folded in order through [`add_person`]'s merge rules: a
+/// guest star with a cast entry's name and role is one credit, and so is a
+/// roleless credit beside the person's credit of the same kind.
+///
 /// [`PeopleEntity`]: ferrofin_db::entities::base_items::PeopleEntity
+/// [`add_person`]: crate::container_types::add_person
 #[must_use]
 pub fn people_entities(
     people: &[TmdbPerson],
 ) -> Vec<ferrofin_db::entities::base_items::PeopleEntity> {
-    people
-        .iter()
+    use crate::container_types::{PersonInfo, add_person};
+    const TMDB: &str = "Tmdb";
+    let mut merged = Vec::with_capacity(people.len());
+    for p in people {
+        let mut person = PersonInfo {
+            name: p.name.clone(),
+            role: p.role.clone(),
+            type_: ferrofin_model::data::PersonKind::from_stored(&p.person_type),
+            sort_order: p.sort_order,
+            image_url: p.profile_url.clone(),
+            ..PersonInfo::default()
+        };
+        // `if (actor.Id > 0) personInfo.SetProviderId(Tmdb, …)`.
+        if p.tmdb_id > 0 {
+            person.set_provider_id(TMDB, &p.tmdb_id.to_string());
+        }
+        add_person(&mut merged, person);
+    }
+    merged
+        .into_iter()
         .map(|p| ferrofin_db::entities::base_items::PeopleEntity {
             id: ferrofin_db::store::guid_to_db(uuid::Uuid::new_v4()),
-            name: p.name.clone(),
-            person_type: Some(p.person_type.clone()),
-            role: p.role.clone(),
-            primary_image_url: p.profile_url.clone(),
-            provider_id: Some(p.tmdb_id),
+            person_type: Some(p.type_.json_name().into_owned()),
+            provider_id: p.provider_ids.get(TMDB).and_then(|id| id.parse().ok()),
             sort_order: p.sort_order.map(i64::from),
+            name: p.name,
+            role: p.role,
+            primary_image_url: p.image_url,
         })
         .collect()
 }
@@ -4071,6 +4097,108 @@ mod tests {
                 .is_some_and(|u| u.ends_with("/r1.jpg"))
         );
         assert_eq!(people[1].profile_url, None);
+    }
+
+    /// Every TMDB credit goes through `MetadataResult.AddPerson`
+    /// (`TmdbEpisodeProvider.cs:242,273,314`), so `PeopleHelper.AddPerson`'s
+    /// rules merge them: a guest star with a cast entry's name and role
+    /// promotes it, a roleless credit merges into the person's credit of the
+    /// same kind, and a credit with a role fills a roleless one. A second
+    /// character stays a credit of its own, a name is trimmed and a blank one
+    /// dropped (`Name = x.Name.Trim()`, `IsNullOrWhiteSpace`), and a merge
+    /// keeps the headshot, sort order and TMDB id it has when the newer credit
+    /// brings none (an id of 0 is none: `if (actor.Id > 0)`).
+    #[test]
+    fn people_entities_merge_credits_as_add_person_does() {
+        let person =
+            |id: i64, name: &str, kind: &str, role: Option<&str>, order: Option<i32>| TmdbPerson {
+                tmdb_id: id,
+                name: name.to_owned(),
+                person_type: kind.to_owned(),
+                role: role.map(str::to_owned),
+                sort_order: order,
+                profile_url: None,
+            };
+        let mut first = person(1, "Both Lists", "Actor", Some("Mayor"), Some(0));
+        first.profile_url = Some("https://image.tmdb.org/t/p/original/a.jpg".to_owned());
+        let rows = people_entities(&[
+            first,
+            person(2, "Roleless Later", "Actor", Some("Clerk"), Some(1)),
+            person(3, "Role Filled", "Actor", None, Some(2)),
+            person(5, "Two Parts", "Actor", Some("Twin A"), Some(3)),
+            person(5, "Two Parts", "Actor", Some("Twin B"), Some(4)),
+            person(6, "  Padded  ", "Actor", Some("Guard"), Some(5)),
+            person(7, "   ", "Actor", Some("Nobody"), Some(6)),
+            person(1, "both lists", "GuestStar", Some("mayor"), Some(510)),
+            person(2, "Roleless Later", "Actor", None, Some(511)),
+            person(3, "Role Filled", "Actor", Some("Barber"), Some(512)),
+            person(4, "Ep Director", "Director", Some("Director"), None),
+            person(0, "BOTH LISTS", "GuestStar", Some("Mayor"), None),
+            person(0, "No Id", "Actor", Some("Extra"), Some(7)),
+        ]);
+        let got: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}|{}|{}|{:?}|{:?}",
+                    r.name,
+                    r.person_type.as_deref().unwrap_or_default(),
+                    r.role.as_deref().unwrap_or_default(),
+                    r.sort_order,
+                    r.provider_id,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "Both Lists|GuestStar|Mayor|Some(510)|Some(1)",
+                "Roleless Later|Actor|Clerk|Some(511)|Some(2)",
+                "Role Filled|Actor|Barber|Some(512)|Some(3)",
+                "Two Parts|Actor|Twin A|Some(3)|Some(5)",
+                "Two Parts|Actor|Twin B|Some(4)|Some(5)",
+                "Padded|Actor|Guard|Some(5)|Some(6)",
+                "Ep Director|Director|Director|None|Some(4)",
+                "No Id|Actor|Extra|Some(7)|None",
+            ]
+        );
+        assert_eq!(
+            rows[0].primary_image_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/a.jpg")
+        );
+    }
+
+    /// An episode whose TMDB credits list one person in both its cast and its
+    /// guest stars, with the same character, keeps one `GuestStar` credit, as
+    /// Jellyfin stores it.
+    #[tokio::test]
+    async fn episode_cast_member_also_a_guest_star_is_one_credit() {
+        use crate::mock_http::MockServer;
+        let body = r#"{
+          "cast": [{"id": 1, "name": "Twice Billed", "character": "Mayor", "order": 0}],
+          "guest_stars": [{"id": 1, "name": "Twice Billed", "character": "Mayor", "order": 510}],
+          "crew": []
+        }"#;
+        let server =
+            MockServer::start(vec![("/episode/", format!(r#"{{"credits":{body}}}"#))]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let people = client
+            .episode_extras_for_language(1399, 1, 1, None)
+            .await
+            .and_then(|extras| extras.people)
+            .expect("credits fetched");
+        let rows: Vec<_> = people_entities(&people)
+            .into_iter()
+            .map(|r| (r.name, r.person_type, r.role))
+            .collect();
+        assert_eq!(
+            rows,
+            [(
+                "Twice Billed".to_owned(),
+                Some("GuestStar".to_owned()),
+                Some("Mayor".to_owned())
+            )]
+        );
     }
 
     /// `TmdbUtils.MapCrewToPersonType` (v12.4) keys on the department AND
