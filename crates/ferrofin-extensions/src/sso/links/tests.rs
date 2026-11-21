@@ -638,6 +638,56 @@ async fn a_code_issued_before_the_removal_opens_no_session() {
     refused(swap(&harness, &second, "browser-late-2").await);
 }
 
+/// A link flow the account started before a removal links nothing when it is
+/// called back, whoever signs in at the provider: the removal ends it with
+/// the account's sessions. Another account's link flow is left alone.
+#[tokio::test]
+async fn a_link_flow_started_before_a_removal_links_nothing() {
+    let harness = Harness::new().await;
+    let alice = local(&harness, "alice").await;
+    let bob = local(&harness, "bob").await;
+    assert_eq!(link(&harness, &alice).await.status, 200);
+    let (alice_location, alice_cookie) = start_link(&harness, &alice).await;
+    let (bob_location, bob_cookie) = start_link(&harness, &bob).await;
+
+    harness
+        .sso
+        .remove_oidc_link(id(&alice), OidcLinkAt::Provider("fake"))
+        .await
+        .expect("removed");
+
+    harness
+        .fake
+        .sign_in(|s| s.subject = "mallory-sub".to_owned());
+    let late = callback(&harness, &alice_location, Some(&alice_cookie)).await;
+    let page = harness
+        .sso
+        .finish_oidc_sign_in("fake", late)
+        .await
+        .expect("an answer");
+    assert_eq!(page.status, 400, "{}", page.html);
+    assert_eq!(owner(&harness, "mallory-sub").await, None);
+    assert_eq!(
+        harness
+            .sso
+            .oidc_links(id(&alice))
+            .await
+            .expect("links")
+            .links,
+        []
+    );
+
+    harness.fake.sign_in(|s| s.subject = "bob-sub".to_owned());
+    let other = callback(&harness, &bob_location, Some(&bob_cookie)).await;
+    let page = harness
+        .sso
+        .finish_oidc_sign_in("fake", other)
+        .await
+        .expect("an answer");
+    assert_eq!(page.status, 200, "{}", page.html);
+    assert_eq!(owner(&harness, "bob-sub").await, Some(id(&bob)));
+}
+
 /// A link whose provider was deleted is listed without one, and removed by
 /// its issuer, which no provider key names any more.
 #[tokio::test]
