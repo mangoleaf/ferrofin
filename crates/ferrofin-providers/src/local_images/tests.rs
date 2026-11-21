@@ -393,6 +393,31 @@ fn season_zero_uses_specials_marker() {
     );
 }
 
+/// A negative season number is padded as C#'s `ToString("00")` pads it, sign
+/// in front (`LocalImageProvider.cs:422`), the name the image saver writes.
+#[test]
+fn a_negative_season_finds_its_sign_padded_marker() {
+    let season = ImageItem {
+        kind: ImageItemKind::Season,
+        name: "Season -1".to_owned(),
+        path: None,
+        containing_folder_path: None,
+        file_name_without_extension: None,
+        is_in_mixed_folder: false,
+        index_number: Some(-1),
+        series_folder_path: Some("/media/series".to_owned()),
+        physical_locations: Vec::new(),
+    };
+    let mut fs = FakeDirectoryService::new();
+    fs.file("/media/series", "season-01-poster.png");
+    let images = LocalImageProvider::get_images(&season, &fs);
+    assert!(
+        images
+            .iter()
+            .any(|i| i.file_info.name == "season-01-poster.png")
+    );
+}
+
 /// A season in its own folder, as the scan sees it: its folder is
 /// `/media/series/Season 1`, its series' folder `/media/series`.
 fn folder_season(series_folder: Option<&str>) -> ImageItem {
