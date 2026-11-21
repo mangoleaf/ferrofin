@@ -16,7 +16,10 @@
 //! gives it its provider inside the transaction that inserts it, never under
 //! the default provider first: a default-provider account with no password
 //! accepts an empty one, which was the community SSO plugin's bug on Jellyfin
-//! 10.11.
+//! 10.11. In the same transaction it gets the hash of a random secret no one
+//! keeps as its password (D21), so when its provider later becomes the
+//! default one (a save of its user page while the plugin is off does that),
+//! no password signs in to it until an administrator sets one.
 //!
 //! A refusal's page says what to ask an administrator, and its one `warn`
 //! line holds its reason code only, never the name or another claim (B15).
@@ -185,6 +188,8 @@ impl SsoService {
             // As a new local account's: role mapping (D6) may narrow it.
             enable_all_folders: true,
             enabled_folders: None,
+            // D21: never passwordless, whatever provider it later has.
+            unusable_password: true,
         };
         let created = match self.users.create_external_user(name, &setup).await {
             Ok(user) => user,

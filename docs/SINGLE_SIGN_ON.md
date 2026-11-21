@@ -144,16 +144,18 @@ never by name.
   parental schedule, device access and the session limit refuse a sign-in with the reason. A
   refused sign-in is in the activity log, and the sign-in page says why.
 
-**Passwords.** An account Single Sign-On created has no password. Every password is refused with
-the usual `401`, an empty one included, and a refused password does not count toward the
-account's lockout, so no one can lock it out by guessing. No password can be set while Single
-Sign-On is its provider. A forgotten-password PIN is issued for it as for any account (asked for
-from the local network), but it cannot be redeemed (read from the code). To give such an account
-a password, change its authentication provider on its profile page to the default one, and set
-a password straight away:
-
-> **Warning:** an account of the default provider with no password signs in with an empty
-> password. Between the provider change and the new password, anyone can sign in to it.
+**Passwords.** An account Single Sign-On created has a password no one knows: when it creates
+the account, Ferrofin stores the hash of a random secret and throws the secret away. Every
+password is refused with the usual `401`, an empty one included, and a refused password does not
+count toward the account's lockout, so no one can lock it out by guessing. No password can be
+set while Single Sign-On is its provider. A forgotten-password PIN is issued for it as for any
+account (asked for from the local network), but it cannot be redeemed (read from the code). To
+give such an account a password, change its authentication provider on its profile page to the
+default one, then set a password on its Password tab. Until then no password signs in to it,
+an empty one included. Under the default provider it is a local account like any other: a refused
+password counts toward its lockout, and resetting its password on that tab removes the stored one
+(an administrator's cannot be reset to none), after which it signs in with an empty password until
+one is set.
 
 A local account a user links to an identity keeps its password: both sign in to it.
 
@@ -163,12 +165,13 @@ Sign-On provider is not registered: its accounts are refused as accounts of an u
 and there a refused password does count toward their lockout. Either way their links and
 settings stay, and work again once the plugin is back.
 
-> **Warning:** while the plugin is disabled, do not save the profile page (Dashboard → Users →
-> the user) of an account Single Sign-On created. The server then lists only the default
-> provider, so jellyfin-web hides the provider choice and saves the default one: the account
-> moves to the default provider with no password, and signs in with an empty one. Enable the
-> plugin first. (Seen with the API call the page makes, and read from jellyfin-web 12.4's user
-> page.)
+Saving the profile page (Dashboard → Users → the user) of such an account while the plugin is
+disabled, or while all extensions are off, gives it the default provider: the server then lists
+only that one, so jellyfin-web hides the provider choice and saves it. The account still has its
+password no one knows, so no password signs in to it, and once the plugin is enabled again it
+signs in through Single Sign-On as before. To give it the Single Sign-On provider back, choose
+that provider on the same page once the plugin is enabled. (Seen with the API call the page
+makes, and read from jellyfin-web 12.4's user page.)
 
 ## Roles
 
@@ -210,8 +213,9 @@ not enough to add one:
   or LDAP's for an LDAP account): a wrong one counts toward the account's failed sign-ins and the
   login backoff paces the next attempt, as at the login page. An account without a password sets
   one on its profile first. The page sends the password once and keeps it nowhere.
-- **Accounts Single Sign-On created** have no password of their own, so they cannot link
-  themselves: the page says so, and an administrator adds further links on the settings page.
+- **Accounts Single Sign-On created** have a password no one knows
+  ([Who signs in](#who-signs-in)), so they cannot link themselves: the page says so, and an
+  administrator adds further links on the settings page.
 - **A link is never replaced here.** A user linked at a provider removes that link before linking
   another sign-in there; removing it signs every session out, the one that removes it included.
   An identity another account has is refused.
@@ -343,9 +347,11 @@ tables, the identity links among them, and keeps every account's saved provider,
 Single Sign-On created carries a provider Jellyfin does not know and cannot sign in there until
 it has the default provider. Saving its profile page in Jellyfin's dashboard gives it that
 provider (with only the default one, the page hides the choice and saves it), and from then on
-the account signs in with an empty password until one is set: set one right after the save, since
-one set before it is ignored (read from jellyfin-web 12.4 and Jellyfin 12.4, not run on
-Jellyfin). The export's loss report says the same.
+the account signs in with a password an administrator sets after that save (one set before it is
+ignored). Until then no password signs in to it, an empty one included: its stored hash is in
+Jellyfin's own password format, which Jellyfin checks as it checks any other (read from
+jellyfin-web 12.4 and Jellyfin 12.4, not run on Jellyfin). The export's loss report says the
+same.
 
 ## Known limits
 
@@ -358,4 +364,3 @@ Jellyfin). The export's loss report says the same.
 - If the server stops between creating an account and linking it, the account keeps the name
   unlinked, and that user's next sign-in is refused as a name collision. An administrator links
   it by hand or deletes it.
-- See the warning in [Who signs in](#who-signs-in) about a disabled plugin and the user page.

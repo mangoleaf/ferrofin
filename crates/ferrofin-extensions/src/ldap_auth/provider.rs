@@ -758,6 +758,9 @@ impl AuthenticationManager for LdapAuthProvider {
                 enable_all_folders: config.enable_all_folders,
                 enabled_folders: (!config.enable_all_folders)
                     .then(|| config.enabled_folders.clone()),
+                // As upstream's plugin: no password is stored. Only Single
+                // Sign-On's accounts get an unusable one.
+                unusable_password: false,
             };
             let created = self.users.create_external_user(&name, &setup).await?;
             // Linked before the picture, which may be a download, so a

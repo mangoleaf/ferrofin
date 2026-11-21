@@ -1,7 +1,8 @@
 //! The server the Single Sign-On tests sign in to: wired by the composition
-//! root over a fresh database, with the plugin enabled, and the requests a
-//! browser and its completion page make, through the real router (`tower`
-//! oneshot).
+//! root over a fresh database, with the plugin enabled (or booted again over
+//! the database an earlier boot left, with a configuration of its own), and
+//! the requests a browser and its completion page make, through the real
+//! router (`tower` oneshot).
 
 #![allow(dead_code)] // Each test binary uses its own subset.
 
@@ -40,12 +41,31 @@ pub async fn server_with(
     published_url: &str,
     edit: impl FnOnce(&mut Config),
 ) -> SsoServer {
-    let mut config = Config {
+    let mut config = config(temp, published_url);
+    edit(&mut config);
+    let server = boot(&config).await;
+    // The admin's step, through the manager: `sso_settings` covers the route.
+    server
+        .state
+        .plugins
+        .enable_plugin(EXTENSION_ID)
+        .await
+        .expect("enable");
+    server
+}
+
+/// The configuration of a server over `temp`, published at `published_url`.
+pub fn config(temp: &tempfile::TempDir, published_url: &str) -> Config {
+    Config {
         server_name: "sso-test".to_owned(),
         published_url: Some(published_url.to_owned()),
         ..Config::test_stub(temp.path())
-    };
-    edit(&mut config);
+    }
+}
+
+/// The server `config` describes, over its database as it is, booted as the
+/// composition root wires it.
+pub async fn boot(config: &Config) -> SsoServer {
     for dir in [&config.config_dir, &config.data_dir, &config.cache_dir] {
         std::fs::create_dir_all(dir).expect("dir");
     }
@@ -61,16 +81,9 @@ pub async fn server_with(
         chromaprint_muxer: false,
     };
     let (shutdown_tx, shutdown) = tokio::sync::oneshot::channel();
-    let wired = build_app_state(&db, &config, &ffmpeg, None, shutdown_tx)
+    let wired = build_app_state(&db, config, &ffmpeg, None, shutdown_tx)
         .await
         .expect("wire app state");
-    // The admin's step, through the manager: `sso_settings` covers the route.
-    wired
-        .state
-        .plugins
-        .enable_plugin(EXTENSION_ID)
-        .await
-        .expect("enable");
     SsoServer {
         router: ferrofin_api::create_router(wired.state.clone()),
         state: wired.state,

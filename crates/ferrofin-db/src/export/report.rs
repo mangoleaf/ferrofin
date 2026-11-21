@@ -13,7 +13,7 @@ const TABLE_NOTES: [(&str, &str); 20] = [
     ),
     (
         "FerrofinExternalIdentities",
-        "the links from LDAP-Auth and Single Sign-On identities to users, not exported; Jellyfin's LDAP-Auth plugin keeps its own in its settings. Jellyfin does not know Single Sign-On's provider, so an account Single Sign-On created cannot sign in there until it has the default provider, which saving its profile page in Jellyfin's dashboard gives it; from then on it signs in with an empty password until one is set, so set one right after saving (one set before is ignored)",
+        "the links from LDAP-Auth and Single Sign-On identities to users, not exported; Jellyfin's LDAP-Auth plugin keeps its own in its settings. Jellyfin does not know Single Sign-On's provider, so an account Single Sign-On created cannot sign in there until it has the default provider, which saving its profile page in Jellyfin's dashboard gives it; from then on it signs in with a password an administrator sets after saving (one set before is ignored), and with no other, an empty one included",
     ),
     (
         "FerrofinIntroSkipperDisabledEpisodes",
