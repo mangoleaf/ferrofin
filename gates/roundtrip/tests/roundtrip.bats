@@ -41,6 +41,12 @@ fake_fixture() { # fake_fixture <fixture> <generation> [first-start log]: one mo
   [ -z "${3:-}" ] || { mkdir -p "$(dirname "fixtures/$3")"; head -n 1 "$BATS_TEST_DIRNAME/jellyfin-ok.log" > "fixtures/$3.server.log"; }
 }
 
+scratch_repo() { # scratch_repo <gates>: the gates, and Jellyfin's schema the run reads (RT_SCHEMA), in repo/
+  local data=repo/crates/ferrofin-db/tests/data
+  cp -r "$1/lib.sh" "$1/result.py" "$1/adoption" "$1/roundtrip" repo/gates/
+  mkdir -p "$data" && cp "$1/../crates/ferrofin-db/tests/data/jellyfin-12.2-schema.sql" "$data/"
+}
+
 teardown() { # no fake server outlives its test
   local pid
   for pid in "$TMP"/state/*.pid; do [ ! -f "$pid" ] || kill "$(cat "$pid")" 2>/dev/null || true; done
@@ -214,7 +220,7 @@ EOS
 @test "run.sh: no route to run is refused, and nothing starts" {
   mkdir -p repo/gates
   gates=$(cd "$ROUNDTRIP/.." && pwd)
-  cp -r "$gates/lib.sh" "$gates/result.py" "$gates/adoption" "$gates/roundtrip" repo/gates/
+  scratch_repo "$gates"
   echo 'ROUNDTRIP_ROUTES=()' > repo/gates/roundtrip/routes.sh
   run --separate-stderr repo/gates/roundtrip/run.sh --image ferrofin:test --jellyfin-image jellyfin/jellyfin:test \
     --fixtures "$TMP/fixtures" --work "$TMP/w"
@@ -227,7 +233,7 @@ EOS
 @test "run.sh: a route record names a data directory, a configuration directory and a kind it knows" {
   mkdir -p repo/gates
   gates=$(cd "$ROUNDTRIP/.." && pwd)
-  cp -r "$gates/lib.sh" "$gates/result.py" "$gates/adoption" "$gates/roundtrip" repo/gates/
+  scratch_repo "$gates"
   for record in 'x|f|g|s|data|-|path' 'x|f|g|s|/data|etc|path' 'x|f|g|s|/data|-|odd'; do
     echo "ROUNDTRIP_ROUTES=('$record')" > repo/gates/roundtrip/routes.sh
     run --separate-stderr repo/gates/roundtrip/run.sh --image ferrofin:test --jellyfin-image jellyfin/jellyfin:test \
@@ -298,12 +304,29 @@ EOS
   for route in 10.11.8 12.4-from-123; do
     checks=$(jq -r --arg r "$route" 'select(.event == "check" and .fixture == $r) | "\(.stage)|\(.check)|\(.verdict)"' \
       "$TMP/w/results.jsonl")
-    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 18 ]
+    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 35 ]
+    [ "$(grep -c . <<<"$checks")" -eq 35 ]
     grep -qx "Export|the export completes|PASS" <<<"$checks"
     grep -qx "Export|every stored path is in the export, none under the directory Ferrofin ran at|PASS" <<<"$checks"
+    grep -qx "Export|its database has Jellyfin's schema, and its loss report every table of Ferrofin's that held rows|PASS" \
+      <<<"$checks"
     grep -qx "Jellyfin|every playlist's full metadata refresh completes|PASS" <<<"$checks"
     grep -qx "Jellyfin|answers equal Ferrofin's before the stop|PASS" <<<"$checks"
     grep -qx "Jellyfin|every library keeps its folder row and DateCreated through its scan|PASS" <<<"$checks"
+    for window in "its start changed" "the gate's requests changed" "its scan changed" "changed from then until its stop"; do
+      grep -qx "Jellyfin|every row $window is explained|PASS" <<<"$checks"
+    done
+    grep -qx "Jellyfin|its scan kept every item, and the item counts by type|PASS" <<<"$checks"
+    grep -qx "Jellyfin|answers after its scan equal Ferrofin's before the stop|PASS" <<<"$checks"
+    grep -qx "Jellyfin|it stops cleanly|PASS" <<<"$checks"
+    grep -qx "Jellyfin again|it ran no migration|PASS" <<<"$checks"
+    grep -qx "Jellyfin again|every row its start changed is explained|PASS" <<<"$checks"
+    grep -qx "Jellyfin again|answers equal Ferrofin's before the stop|PASS" <<<"$checks"
+    # each window's rows: the playlist refresh moved one stamp, which an entry explains; nothing else changed
+    grep -qx '  BaseItems changed DateLastRefreshed: timestamp:refreshed 1' "$TMP/w/$route/rows-capture.txt"
+    for window in start scan stop restart; do grep -qx 'unexplained (0):' "$TMP/w/$route/rows-$window.txt"; done
+    [ -f "$TMP/w/$route/rows-scan.txt.jsonl.gz" ]
+    [ ! -e "$TMP/w/$route/db" ]   # a passing route keeps no snapshot
   done
   # the 10.11.8 route's Ferrofin runs at /data, its own image's directory, and the export reads it there
   grep -q '^Exported /data into /route/jellyfin$' "$TMP/w/10.11.8/export.log"
@@ -325,7 +348,7 @@ EOS
   [ "$(jq -r '"\(.gate) \(.verdict) \(.counts.pass) \(.counts.fail) \(.detail.rows | map(.kind) | join(","))"' "$TMP/w/result.json")" = \
     "roundtrip passed 2 0 path,path" ]
   [ "$(started rt-both-)" = "$(removed rt-both-)" ]
-  [ "$(started rt-both- | wc -l)" -eq 6 ]
+  [ "$(started rt-both- | wc -l)" -eq 8 ]   # per route Ferrofin, the export and Jellyfin twice
   grep -qx 'rmi ferrofin-roundtrip:both' state/calls
 }
 
@@ -430,7 +453,7 @@ EOS
   # the gates go to a repository of their own here, as gates/adoption/tests/adoption.bats has them.
   mkdir -p repo/gates
   gates=$(cd "$ROUNDTRIP/.." && pwd)   # resolved: a source ending in .. would copy into repo/ itself
-  cp -r "$gates/lib.sh" "$gates/result.py" "$gates/adoption" "$gates/roundtrip" repo/gates/
+  scratch_repo "$gates"
   git -C repo init -q
   pids=()
   for side in a b; do
@@ -449,8 +472,8 @@ EOS
   for id in "$ida" "$idb"; do
     first_run=$(grep -n "^run .*--name rt-$id-" state/calls | head -n 1 | cut -d: -f1)
     [ "$first_run" -lt "$first_rm" ]
-    # both routes, both servers and the export, under this run's names; exactly those removed
-    [ "$(started "rt-$id-" | wc -l)" -eq 6 ]
+    # both routes, Ferrofin, the export and both starts of Jellyfin, under this run's names; exactly those removed
+    [ "$(started "rt-$id-" | wc -l)" -eq 8 ]
     [ "$(started "rt-$id-")" = "$(removed "rt-$id-")" ]
     grep -qx "rmi ferrofin-roundtrip:$id" state/calls
   done
@@ -470,6 +493,67 @@ EOS
   [[ "$output" == *"FAIL  12.4-from-123  2 line(s) differ, first: < userdata synthetic-admin "*" fav=1 "* ]]
   jq -e 'select(.event == "check" and .check == "answers equal Ferrofin'"'"'s before the stop") | .verdict == "FAIL"' \
     "$TMP/w/results.jsonl" >/dev/null
+}
+
+verdict() { # verdict <work> <stage> <check>: the verdict the run recorded for one check
+  jq -r --arg s "$2" --arg c "$3" 'select(.event == "check" and .stage == $s and .check == $c) | .verdict' "$1/results.jsonl"
+}
+
+failed() { # failed <work>: "<stage>|<check>" of every check that failed, sorted
+  jq -r 'select(.event == "check" and .verdict == "FAIL") | "\(.stage)|\(.check)"' "$1/results.jsonl" | sort
+}
+
+@test "run.sh: a scan that removes an item fails its row diff and its counts, and the copies stay" {
+  FAKE_JELLYFIN=churns run run_gate "$TMP/w" --only 12.4-from-123
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  12.4-from-123  2 row(s) the scan changed that no allowlist entry explains: BaseItemImageInfos 1 removed, BaseItems 1 removed (rows-scan.txt); item counts by type changed: Playlist 1 -> 0; 1 item(s) removed, first: Synthetic mixed order (Playlist)"* ]]
+  [ "$(failed "$TMP/w")" = "Jellyfin|every row its scan changed is explained
+Jellyfin|its scan kept every item, and the item counts by type" ]
+  grep -q '"DateCreated": "2026-01-01 00:00:00"' "$TMP/w/12.4-from-123/rows-scan.txt"   # the removed row, named
+  # what the diff compared is kept, to run it again with another allowlist
+  [ -f "$TMP/w/12.4-from-123/db/captured.db" ]
+  [ -f "$TMP/w/12.4-from-123/db/scanned.db" ]
+}
+
+@test "run.sh: a Jellyfin killed at its stop, logging an error after its startup or migrating again fails, named" {
+  FAKE_JELLYFIN=killed run run_gate "$TMP/w1" --only 12.4-from-123
+  [ "$status" -eq 1 ]
+  [ "$(failed "$TMP/w1")" = "Jellyfin again|it stops cleanly
+Jellyfin|it stops cleanly" ]
+  [[ "$output" == *"exited with status 137 after TERM"* ]]
+  FAKE_JELLYFIN=errs run run_gate "$TMP/w2" --only 12.4-from-123
+  [ "$status" -eq 1 ]
+  [ "$(failed "$TMP/w2")" = "Jellyfin again|no ERR or FTL outside the allowlist
+Jellyfin|no ERR or FTL after its startup outside the allowlist" ]
+  [[ "$output" == *"1 unexpected error(s): [ERR] Emby.Server.Implementations.Library.LibraryManager: Error validating the library"* ]]
+  [ "$(verdict "$TMP/w2" Jellyfin "no ERR or FTL outside the allowlist")" = PASS ]   # its startup's own log is clean
+  FAKE_JELLYFIN=migrates-again run run_gate "$TMP/w3" --only 12.4-from-123
+  [ "$status" -eq 1 ]
+  [ "$(failed "$TMP/w3")" = "Jellyfin again|it ran no migration" ]
+  [[ "$output" == *"it began 1 migration(s) on a database it had started on: 20260729120000_RestorePlaylistChildrenFromMetadata"* ]]
+}
+
+@test "run.sh: an export that leaves a table of Ferrofin's, or one its loss report misses, fails before Jellyfin boots" {
+  check="its database has Jellyfin's schema, and its loss report every table of Ferrofin's that held rows"
+  FAKE_EXPORT=extra-table run run_gate "$TMP/w1" --run-id extra --only 12.4-from-123
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  12.4-from-123  schema: 1 object(s) Jellyfin's schema does not have, first: table FerrofinAdoption on FerrofinAdoption"* ]]
+  [ "$(verdict "$TMP/w1" Export "$check")" = FAIL ]
+  FAKE_EXPORT=unreported run run_gate "$TMP/w2" --run-id unreported --only 12.4-from-123
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  12.4-from-123  loss report: 1 table(s) of Ferrofin's held rows and are not in it with their count, first: FerrofinAdoption (1)"* ]]
+  run ! grep -q -- '--name rt-\(extra\|unreported\)-[^ ]*-jellyfin' state/calls
+}
+
+@test "run.sh: an export that loses the settings changed in Ferrofin fails every comparison" {
+  FAKE_EXPORT=drops-config run run_gate "$TMP/w" --only 12.4-from-123
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  12.4-from-123  12 line(s) differ, first: < config system "* ]]   # each of the six documents
+  grep -q '^config system .* LibraryMonitorDelay=75 ' "$TMP/w/12.4-from-123/oracle.txt"
+  grep -q '^config system .* LibraryMonitorDelay=None ' "$TMP/w/12.4-from-123/answers.txt"
+  [ "$(failed "$TMP/w")" = "Jellyfin again|answers equal Ferrofin's before the stop
+Jellyfin|answers after its scan equal Ferrofin's before the stop
+Jellyfin|answers equal Ferrofin's before the stop" ]
 }
 
 @test "run.sh: a share removed in Ferrofin that Jellyfin's playlist refresh brings back fails the comparison" {

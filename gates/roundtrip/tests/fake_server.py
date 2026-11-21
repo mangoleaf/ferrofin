@@ -19,8 +19,15 @@ test_usage.py serves a Stub in process. roundtrip.bats's fake docker starts one 
                                                           return that lost a write; "reshares": a playlist's metadata
                                                           refresh shares it again with the account its stale
                                                           playlist.xml names, as Jellyfin's refresh merges the file;
-                                                          "exits": the server stops (status 3) as soon as its port is
-                                                          written. ROLE names the product.
+                                                          "churns": a library scan deletes SHARED's row, as a scan that
+                                                          removes an item would; "exits": the server stops (status 3)
+                                                          as soon as its port is written. ROLE names the product.
+    fake_server.py export OUT                             what the export does to the copy it wrote to OUT: drops the
+                                                          tables of Ferrofin's from OUT/data/jellyfin.db and lists each
+                                                          in OUT's loss report. FAKE_EXPORT=unreported leaves them out
+                                                          of the report, =extra-table keeps them in the database, and
+                                                          =drops-config loses the settings the copy's state holds, as
+                                                          an export that wrote no configuration document would
 
 The copy holds SHARED, a playlist of synthetic-adult's (answers.SHARE_OWNER) shared with synthetic-child, with a
 playlist.xml listing the share, as the fixtures' Synthetic mixed order is. synthetic-adult also sees the playlists the
@@ -34,6 +41,7 @@ import binascii
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -59,7 +67,11 @@ SETUP_SECONDS = 3
 REFRESH_SECONDS = 0.2
 #: What the stub keeps, and saves to CONFIG/fake-state.json.
 FIELDS = ("refreshes", "users", "data", "collections", "accounts", "prefs", "keys", "devices", "libraries", "items",
-          "images", "plays", "shares")
+          "images", "plays", "shares", "config", "options")
+#: Jellyfin's schema, which the copy's database has (gates/roundtrip/lib.sh RT_SCHEMA).
+SCHEMA = Path(__file__).resolve().parents[3] / "crates" / "ferrofin-db" / "tests" / "data" / "jellyfin-12.2-schema.sql"
+#: The export's loss report (lib.sh RT_LOSS_REPORT).
+LOSS_REPORT = "ferrofin-export-report.txt"
 
 
 def fresh():
@@ -78,6 +90,8 @@ def fresh():
         "images": {},        # item id: image types
         "plays": {},         # user id (not ADMIN): movies played to the end
         "shares": [CHILD],   # whom SHARED is shared with
+        "config": {},        # document ("system", "encoding", …): the settings posted to it
+        "options": {},       # library name: the LibraryOptions it was added with
     }
 
 
@@ -181,7 +195,10 @@ class Stub:
         if path == "/Library/MediaFolders":
             return 200, {"Items": [{"Name": name} for name, _, _ in self.libraries]}
         if path == "/Library/VirtualFolders":
-            return 200, [{"Name": name, "CollectionType": kind, "ItemId": key} for name, kind, key in self.libraries]
+            return 200, [{"Name": name, "CollectionType": kind, "ItemId": key, "LibraryOptions": self.options.get(name, {})}
+                         for name, kind, key in self.libraries]
+        if parts[:2] == ["System", "Configuration"]:
+            return 200, self.config.get(parts[2] if len(parts) > 2 else "system", {})
         return 200, {}
 
     def filtered(self, name, user):
@@ -239,6 +256,7 @@ class Stub:
             return 204, None
         elif path == "/Library/VirtualFolders":
             self.libraries.append([query["name"][0], query["collectionType"][0], f"{len(self.libraries) + 50:032x}"])
+            self.options[query["name"][0]] = (body or {}).get("LibraryOptions") or {}
             return 204, None
         elif path == "/Sessions/Playing/Stopped":
             user = re.search(r'Token="token-(\w+)"', auth).group(1)
@@ -265,6 +283,14 @@ class Stub:
             return 204, None
         elif path == "/Library/Refresh":
             self.refreshes += 1
+            if self.behaviour == "churns" and self.db:
+                with closing(sqlite3.connect(self.db)) as db:
+                    db.execute("PRAGMA foreign_keys = ON")   # its image row goes with it, as in Jellyfin's schema
+                    db.execute("DELETE FROM BaseItems WHERE Id = ?", (str(uuid.UUID(SHARED)).upper(),))
+                    db.commit()
+            return 204, None
+        elif parts[:2] == ["System", "Configuration"]:
+            self.config[parts[2] if len(parts) > 2 else "system"] = body
             return 204, None
         elif path == "/Users/AuthenticateByName":
             key = self.users.get(body["Username"])
@@ -346,41 +372,77 @@ def server(stub):
     return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 
 
+def insert(db, table, **values):
+    """A row of `table` with `values`, every other column Jellyfin's schema needs a value for given 0 or '' (a
+    numbered key SQLite's)."""
+    for _, column, kind, needed, default, key in db.execute(f'PRAGMA table_info("{table}")'):
+        if needed and default is None and not key and column not in values:
+            values[column] = 0 if kind.upper() in ("INTEGER", "REAL") else ""
+    db.execute(f'INSERT INTO "{table}" ({", ".join(values)}) VALUES ({", ".join("?" * len(values))})',
+               tuple(values.values()))
+
+
 def copy(root):
-    """A data directory holding the tables the stages read: an API key, an administrator and synthetic-adult each with
-    a web session, and the rows (with their folders) of SHARED, whose playlist.xml lists its share, and of a library."""
-    for folder in ("data/playlists/Synthetic mixed order", "root/default/Synthetic Movies"):
+    """A data directory holding Jellyfin's schema and the rows the stages read: an API key, an administrator and
+    synthetic-adult each with a web session, and the rows (with their folders) of SHARED, whose playlist.xml lists its
+    share and which has a primary image, and of a library; and a table of Ferrofin's with a row, as an adopted copy
+    has."""
+    for folder in ("data/playlists/Synthetic mixed order", "root/default/Synthetic Movies", "metadata"):
         (root / folder).mkdir(parents=True)
+    (root / "metadata/playlist.jpg").write_bytes(b"\xff\xd8\xff\xe0 a jpeg")
     (root / "data/playlists/Synthetic mixed order/playlist.xml").write_text(
         f"<Item><Shares><Share><UserId>{uuid.UUID(CHILD)}</UserId></Share></Shares></Item>", encoding="utf-8")
+    admin, adult = str(uuid.UUID(ADMIN)).upper(), str(uuid.UUID(ADULT)).upper()
     with closing(sqlite3.connect(root / "data" / "jellyfin.db")) as db:
-        db.executescript("""
-            CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
-            CREATE TABLE ApiKeys (AccessToken TEXT, DateCreated TEXT);
-            CREATE TABLE Users (Id TEXT, Username TEXT);
-            CREATE TABLE Permissions (UserId TEXT, Kind INTEGER, Value INTEGER);
-            CREATE TABLE Devices (UserId TEXT, AccessToken TEXT, DeviceId TEXT, AppName TEXT, DateLastActivity TEXT);
-            INSERT INTO ApiKeys VALUES ('apikey', '2026-01-01');
-            INSERT INTO Users VALUES ('AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA', 'synthetic-admin');
-            INSERT INTO Permissions VALUES ('AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA', 0, 1);
-            INSERT INTO Devices VALUES ('AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA', 'usertoken', 'device', 'Jellyfin Web', '2026-01-02');
-            INSERT INTO Users VALUES ('BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB', 'synthetic-adult');
-            INSERT INTO Devices VALUES ('BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB', 'adulttoken', 'adult', 'Jellyfin Web', '2026-01-02');
-            CREATE TABLE BaseItems (Id TEXT, Type TEXT, Name TEXT, Path TEXT, DateCreated TEXT, DateLastRefreshed TEXT);
-            INSERT INTO BaseItems VALUES
-              ('DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD', 'MediaBrowser.Controller.Playlists.Playlist',
-               'Synthetic mixed order', '%AppDataPath%/playlists/Synthetic mixed order', '2026-01-01 00:00:00',
-               '2026-01-01 00:00:00'),
-              ('11111111-1111-1111-1111-111111111111', 'MediaBrowser.Controller.Entities.CollectionFolder',
-               'Synthetic Movies', '/config/root/default/Synthetic Movies', '2026-01-01 00:00:00', NULL);
-        """)
+        db.execute("PRAGMA synchronous = OFF")   # a throwaway file: no flush per statement
+        db.executescript(SCHEMA.read_text(encoding="utf-8"))
+        insert(db, "ApiKeys", Id=1, Name="Synthetic adoption", AccessToken="apikey", DateCreated="2026-01-01",
+               DateLastActivity="2026-01-01")
+        for key, name, token, device in ((admin, "synthetic-admin", "usertoken", "device"),
+                                         (adult, "synthetic-adult", "adulttoken", "adult")):
+            insert(db, "Users", Id=key, Username=name, NormalizedUsername=name.upper())
+            insert(db, "Devices", UserId=key, AccessToken=token, DeviceId=device, AppName="Jellyfin Web",
+                   DateLastActivity="2026-01-02")
+        insert(db, "Permissions", UserId=admin, Kind=0, Value=1)
+        insert(db, "BaseItems", Id=str(uuid.UUID(SHARED)).upper(), Type="MediaBrowser.Controller.Playlists.Playlist",
+               Name=SHARED_NAME, Path="%AppDataPath%/playlists/Synthetic mixed order", DateCreated="2026-01-01 00:00:00",
+               DateLastRefreshed="2026-01-01 00:00:00", IsFolder=1)
+        insert(db, "BaseItemImageInfos", Id="12121212-1212-1212-1212-121212121212", ItemId=str(uuid.UUID(SHARED)).upper(),
+               Path="%MetadataPath%/playlist.jpg", ImageType=0, DateModified="2026-01-01 00:00:00", Width=1, Height=1)
+        insert(db, "BaseItems", Id="11111111-1111-1111-1111-111111111111", Name="Synthetic Movies",
+               Type="MediaBrowser.Controller.Entities.CollectionFolder", Path="/config/root/default/Synthetic Movies",
+               DateCreated="2026-01-01 00:00:00", IsFolder=1)
+        db.executescript("CREATE TABLE FerrofinAdoption (Generation TEXT); INSERT INTO FerrofinAdoption VALUES ('fake');")
         db.commit()
     return root
+
+
+def export(out, knob=""):
+    """What the export does to the copy it wrote to `out`: the tables of Ferrofin's dropped, each in the loss report
+    with its count; `knob` (FAKE_EXPORT) breaks one part (the module's docstring)."""
+    with closing(sqlite3.connect(out / "data" / "jellyfin.db")) as db:
+        held = [(name, db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]) for (name,) in db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'Ferrofin%'").fetchall()]
+        if knob != "extra-table":
+            for name, _ in held:
+                db.execute(f'DROP TABLE "{name}"')
+        db.commit()
+    lines = [f"  {name} ({rows} {'row' if rows == 1 else 'rows'}): a table of Ferrofin's." for name, rows in held]
+    (out / LOSS_REPORT).write_text("What the export to Jellyfin left behind\n\n"
+                                   + "".join(f"{line}\n" for line in lines if knob != "unreported"), encoding="utf-8")
+    state = out / STATE
+    if knob == "drops-config" and state.exists():
+        saved = json.loads(state.read_text())
+        saved.pop("config", None)
+        state.write_text(json.dumps(saved))
 
 
 def main(argv):
     if len(argv) == 2 and argv[0] == "copy":
         copy(Path(argv[1]))
+        return 0
+    if len(argv) == 2 and argv[0] == "export":
+        export(Path(argv[1]), os.environ.get("FAKE_EXPORT", ""))
         return 0
     if len(argv) == 5 and argv[0] == "serve":
         port_file, role, config, behaviour = argv[1:]
