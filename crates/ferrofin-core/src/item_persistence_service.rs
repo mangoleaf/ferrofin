@@ -883,9 +883,9 @@ fn in_library_set(item: &BaseItemEntity) -> bool {
 ///
 /// Port of the row `LibraryManager.CreateRootFolder()` persists: `Name`,
 /// `SortName` and `CleanName` all the directory's own name, `Path` the
-/// directory, `PresentationUniqueKey` the id in simple form. The NOT NULL flag
-/// columns are spelled out because the pinned 10.11.8 schema gives them no
-/// defaults.
+/// directory, `PresentationUniqueKey` the id in simple form, and `Data`
+/// [`ROOT_FOLDER_DATA`]. The NOT NULL flag columns are spelled out because the
+/// pinned 10.11.8 schema gives them no defaults.
 pub(crate) async fn insert_root_folder(
     db: &Database,
     id: Uuid,
@@ -900,10 +900,10 @@ pub(crate) async fn insert_root_folder(
              ("Id", "Type", "Name", "SortName", "CleanName", "Path",
               "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
               "IsRepeat", "IsSeries", "IsVirtualItem",
-              "PresentationUniqueKey", "DateCreated", "UnratedType", "#,
+              "PresentationUniqueKey", "DateCreated", "UnratedType", "Data", "#,
         unset_columns!(),
         r#")
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, 0, 0, 0, 0, 0, ?7, ?8, ?9, "#,
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0, 0, 0, 0, 0, 0, ?7, ?8, ?9, ?10, "#,
         unset_values!(),
         ")"
     ))
@@ -916,10 +916,30 @@ pub(crate) async fn insert_root_folder(
     .bind(id.as_simple().to_string())
     .bind(ferrofin_db::store::datetime_to_db(chrono::Utc::now()))
     .bind(unrated_type_name(kind))
+    .bind(ROOT_FOLDER_DATA)
     .execute(db.writer())
     .await
     .map_err(db_err)?;
     db.invalidate_libraries();
+    Ok(())
+}
+
+/// A root folder's `Data`: `IsRoot`, which upstream reads only from the blob.
+/// `GenericFolderResolver` sets it on a root it resolves afresh, and
+/// `CreateRootFolder` loads a stored root without it, so a root stored with no
+/// `Data` stays `IsRoot` false under Jellyfin (gl-1629).
+const ROOT_FOLDER_DATA: &str = r#"{"IsRoot":true}"#;
+
+/// Gives root folder `id` [`ROOT_FOLDER_DATA`] when its row has no `Data`, as
+/// [`insert_root_folder`] wrote it before gl-1629. Idempotent: a row with
+/// `Data` (an adopted Jellyfin root's own blob) is left alone.
+pub(crate) async fn fill_root_folder_data(db: &Database, id: Uuid) -> Result<(), ServiceError> {
+    sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1 AND "Data" IS NULL"#)
+        .bind(guid_to_db(id))
+        .bind(ROOT_FOLDER_DATA)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
     Ok(())
 }
 

@@ -37,7 +37,9 @@ use uuid::Uuid;
 use ferrofin_traits::activity::{ActivityLogCreate, ActivityManager};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, SelfWrite, SelfWriteGuard, VirtualFolderManager};
-use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
+use ferrofin_traits::persistence::{
+    ItemPersistenceService as _, MediaStreamQuery, MediaStreamRepository,
+};
 use ferrofin_traits::subtitles::{
     ProviderLogin, SubtitleManager, SubtitleMediaType, SubtitleProvider, SubtitleResponse,
     SubtitleSearchRequest, is_rate_limit_exceeded,
@@ -238,7 +240,8 @@ impl FerrofinSubtitleManager {
     }
 
     /// Writes subtitle content to the configured destination, preserving any
-    /// existing subtitle file, then records an external subtitle stream row.
+    /// existing subtitle file, then records an external subtitle stream row
+    /// and the item's `HasSubtitles`.
     async fn attach(&self, item_id: Uuid, response: &SubtitleResponse) -> Result<(), ServiceError> {
         let item = self
             .library_manager
@@ -315,6 +318,17 @@ impl FerrofinSubtitleManager {
         });
         self.media_streams
             .save_media_streams(item_id, &streams)
+            .await?;
+        // Upstream's refresh after a download or upload re-probes, and
+        // `FFProbeVideoInfo.cs:270` counts the new subtitle in `HasSubtitles`,
+        // which only `Data` holds (gl-1632). Here the row just saved matches
+        // the sidecar on disk, so the next scan sees no change to re-probe.
+        let fields = serde_json::Map::from_iter([(
+            "HasSubtitles".to_owned(),
+            serde_json::Value::Bool(true),
+        )]);
+        crate::item_persistence_service::FerrofinItemPersistenceService::new(self.db.clone())
+            .merge_data_fields(item_id, &fields)
             .await
     }
 }
@@ -968,8 +982,6 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn search_enriches_ids_episode_range_and_runtime_from_saved_item() {
-        use ferrofin_traits::persistence::ItemPersistenceService as _;
-
         use crate::test_support::{save_item, seed_provider_id};
         let db = test_db().await;
         let item = Uuid::new_v4();
@@ -1070,7 +1082,7 @@ mod tests {
         // The sidecar was written and an external subtitle row recorded.
         let sidecar = tmp.path().join("Movie.eng.srt");
         assert!(sidecar.exists(), "sidecar written");
-        let repo = FerrofinMediaStreamRepository::new(db);
+        let repo = FerrofinMediaStreamRepository::new(db.clone());
         let streams = repo
             .get_media_streams(&MediaStreamQuery {
                 item_id: item,
@@ -1081,6 +1093,12 @@ mod tests {
             .expect("streams");
         assert_eq!(streams.len(), 1);
         assert!(streams[0].is_external);
+        // The video now has a subtitle, which `Data` records (gl-1632).
+        let data = crate::test_support::fetch_item(&db, item).await.data;
+        assert_eq!(
+            crate::item_data::parse_data(data.as_deref())["HasSubtitles"],
+            true
+        );
     }
 
     /// A provider whose downloads fail: `quota` with the plugin's quota error,
@@ -1494,8 +1512,6 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn live_library_destination_applies_to_uploads_and_downloads_without_overwriting() {
-        use ferrofin_traits::persistence::ItemPersistenceService as _;
-
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;

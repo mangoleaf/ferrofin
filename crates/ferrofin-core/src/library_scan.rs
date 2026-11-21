@@ -11218,7 +11218,6 @@ impl LibraryScanner {
         media_is_audio: bool,
         policy: FetcherPolicy<'_>,
     ) -> ProbeRows {
-        use ferrofin_model::configuration::EmbeddedSubtitleOptions;
         let Some(probed) = probed else {
             return ProbeRows::default();
         };
@@ -11301,29 +11300,12 @@ impl LibraryScanner {
         {
             entity.data = Some(data);
         }
-        let allowed = policy
-            .options
-            .map_or(EmbeddedSubtitleOptions::AllowAll, |o| {
-                o.allow_embedded_subtitles
-            });
-        // FFProbeVideoInfo filters after numbering the combined external and
-        // embedded streams. Keep those indexes, including holes left by a
-        // removed subtitle, and leave the audio prober and all externals alone.
-        let streams = source
-            .media_streams
-            .iter()
-            .filter(|s| {
-                media_is_audio
-                    || s.stream_type != ferrofin_model::entities::MediaStreamType::Subtitle
-                    || s.is_external
-                    || match allowed {
-                        EmbeddedSubtitleOptions::AllowText => s.is_text_subtitle_stream(),
-                        EmbeddedSubtitleOptions::AllowImage => !s.is_text_subtitle_stream(),
-                        EmbeddedSubtitleOptions::AllowNone => false,
-                        EmbeddedSubtitleOptions::AllowAll
-                        | EmbeddedSubtitleOptions::Unrecognized(_) => true,
-                    }
-            })
+        let kept = saved_streams(&source.media_streams, media_is_audio, policy);
+        if !media_is_audio {
+            set_has_subtitles(entity, &kept);
+        }
+        let streams = kept
+            .into_iter()
             .map(|s| stream_dto_to_entity(&entity.id, s))
             .collect();
         let chapters = source
@@ -23152,28 +23134,79 @@ fn overlay_shortcut_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
     }
 }
 
+/// The streams a probe saves. FFProbeVideoInfo filters after numbering the
+/// combined external and embedded streams. Keep those indexes, including holes
+/// left by a removed subtitle, and leave the audio prober and all externals
+/// alone.
+fn saved_streams<'a>(
+    streams: &'a [ferrofin_model::entities_media::MediaStream],
+    media_is_audio: bool,
+    policy: FetcherPolicy<'_>,
+) -> Vec<&'a ferrofin_model::entities_media::MediaStream> {
+    use ferrofin_model::configuration::EmbeddedSubtitleOptions;
+    let allowed = policy
+        .options
+        .map_or(EmbeddedSubtitleOptions::AllowAll, |o| {
+            o.allow_embedded_subtitles
+        });
+    streams
+        .iter()
+        .filter(|s| {
+            media_is_audio
+                || s.stream_type != ferrofin_model::entities::MediaStreamType::Subtitle
+                || s.is_external
+                || match allowed {
+                    EmbeddedSubtitleOptions::AllowText => s.is_text_subtitle_stream(),
+                    EmbeddedSubtitleOptions::AllowImage => !s.is_text_subtitle_stream(),
+                    EmbeddedSubtitleOptions::AllowNone => false,
+                    EmbeddedSubtitleOptions::AllowAll
+                    | EmbeddedSubtitleOptions::Unrecognized(_) => true,
+                }
+        })
+        .collect()
+}
+
+/// `video.HasSubtitles = mediaStreams.Any(i => i.Type == Subtitle)` over the
+/// streams a video probe saves (`FFProbeVideoInfo.cs:270`). Upstream keeps it in
+/// `Data` alone, so a return to Jellyfin reads it from there (gl-1632).
+fn set_has_subtitles(
+    entity: &mut BaseItemEntity,
+    streams: &[&ferrofin_model::entities_media::MediaStream],
+) {
+    let has_subtitles = streams
+        .iter()
+        .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Subtitle);
+    if let Some(data) = crate::item_data::merge_data_fields(
+        entity.data.as_deref(),
+        &[("HasSubtitles", Some(serde_json::json!(has_subtitles)))],
+    ) {
+        entity.data = Some(data);
+    }
+}
+
 /// Restores direct probe properties after the provider metadata merge. A
-/// completed video probe owns its nullable stream index regardless of the
-/// metadata replacement choice (FFProbeVideoInfo.cs:268); metadata fill rules
-/// must not restore an index from the previous probe. An audio probe owns
-/// `LyricFiles` the same way (`AudioFileProber.AddExternalLyrics`), so the
-/// lyric files that are gone do not survive as "existing" data.
+/// completed video probe owns its nullable stream index and `HasSubtitles`
+/// regardless of the metadata replacement choice (FFProbeVideoInfo.cs:268,
+/// 270); metadata fill rules must not restore either from the previous
+/// probe. An audio probe owns `LyricFiles` the same way
+/// (`AudioFileProber.AddExternalLyrics`), so the lyric files that are gone
+/// do not survive as "existing" data.
 fn overlay_probe_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
     let data = crate::item_data::parse_data(scanned.data.as_deref());
     if let Some(container) = crate::item_data::read_data_string(&data, "Container") {
         row.data = crate::item_data::set_data_field(row.data.as_deref(), "Container", &container);
     }
-    let field = match scanned.media_type.as_deref() {
-        Some("Video") => data
-            .get("DefaultVideoStreamIndex")
-            .cloned()
-            .map(|index| ("DefaultVideoStreamIndex", Some(index))),
+    let fields: Vec<_> = match scanned.media_type.as_deref() {
+        Some("Video") => ["DefaultVideoStreamIndex", "HasSubtitles"]
+            .into_iter()
+            .filter_map(|key| data.get(key).cloned().map(|value| (key, Some(value))))
+            .collect(),
         // No key: the track has no lyric files now, and the stored list goes.
-        Some("Audio") => Some(("LyricFiles", data.get("LyricFiles").cloned())),
-        _ => None,
+        Some("Audio") => vec![("LyricFiles", data.get("LyricFiles").cloned())],
+        _ => Vec::new(),
     };
-    if let Some(field) = field
-        && let Some(data) = crate::item_data::merge_data_fields(row.data.as_deref(), &[field])
+    if !fields.is_empty()
+        && let Some(data) = crate::item_data::merge_data_fields(row.data.as_deref(), &fields)
     {
         row.data = Some(data);
     }
@@ -47141,6 +47174,99 @@ mod chapter_image_refresh_tests {
                     );
                     assert_eq!(data["Retained"], true);
                 }
+            }
+        }
+    }
+
+    /// `FFProbeVideoInfo.cs:270`: a completed video probe stores `HasSubtitles`
+    /// in `Data`, true when a subtitle stream it keeps exists (an external one,
+    /// or an embedded one the library allows), and the metadata merge keeps
+    /// the probe's value over the stored one, locked or not (gl-1632). The
+    /// scan save then keeps a locked row's stored `Data`, as it does every
+    /// probe-owned key (TODO(gl-1913): a locked row keeps them).
+    #[rstest::rstest]
+    #[case::embedded(
+        false,
+        ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowAll,
+        true
+    )]
+    #[case::embedded_not_allowed(
+        false,
+        ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowNone,
+        false
+    )]
+    #[case::external(
+        true,
+        ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowNone,
+        true
+    )]
+    fn a_video_probe_stores_has_subtitles(
+        #[case] external: bool,
+        #[case] allowed: ferrofin_model::configuration::EmbeddedSubtitleOptions,
+        #[case] expected: bool,
+    ) {
+        use ferrofin_model::entities::MediaStreamType;
+        use ferrofin_model::entities_media::MediaStream;
+        let stream = |stream_type, is_external| MediaStream {
+            stream_type,
+            is_external,
+            codec: Some("subrip".to_owned()),
+            ..Default::default()
+        };
+        let mut with = MediaInfo::default();
+        with.media_source.media_streams = vec![
+            stream(MediaStreamType::Video, false),
+            stream(MediaStreamType::Subtitle, external),
+        ];
+        let mut without = MediaInfo::default();
+        without.media_source.media_streams = vec![stream(MediaStreamType::Video, false)];
+        let options = ferrofin_model::configuration::LibraryOptions {
+            allow_embedded_subtitles: allowed,
+            ..Default::default()
+        };
+        let policy = FetcherPolicy {
+            options: Some(&options),
+            ..Default::default()
+        };
+        let mut track = BaseItemEntity::default();
+        LibraryScanner::apply_probe(&mut track, Some(&with), true, policy);
+        assert!(
+            crate::item_data::parse_data(track.data.as_deref())
+                .get("HasSubtitles")
+                .is_none(),
+            "an audio probe stores no HasSubtitles"
+        );
+        for (probed, expected) in [(&with, expected), (&without, false)] {
+            for locked in [false, true] {
+                let stored = BaseItemEntity {
+                    media_type: Some("Video".to_owned()),
+                    data: Some(format!(r#"{{"HasSubtitles":{}}}"#, !expected)),
+                    ..Default::default()
+                };
+                let mut scanned = stored.clone();
+                LibraryScanner::apply_probe(&mut scanned, Some(probed), false, policy);
+                let saved = merge_onto_stored(
+                    &stored,
+                    &scanned,
+                    SaveFacts {
+                        locked,
+                        probe_ran: true,
+                        locked_fields: &[],
+                        merge: MergeMode::DEFAULT,
+                        before_refresh: false,
+                        replace_all: false,
+                        naming: crate::library_scan::EpisodeNaming::default(),
+                        remote_answered: false,
+                        redated: None,
+                    },
+                    None,
+                );
+                assert_eq!(
+                    crate::item_data::parse_data(saved.data.as_deref())["HasSubtitles"],
+                    expected,
+                    "locked={locked}, streams={}",
+                    probed.media_source.media_streams.len()
+                );
             }
         }
     }
