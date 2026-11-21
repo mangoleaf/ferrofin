@@ -475,6 +475,27 @@ async fn call(
         .await
 }
 
+/// `POST /sso/oidc/keycloak/link` with `token` and the account's
+/// `password`, as the link page sends it.
+async fn start_link(server: &SsoServer, token: &str, password: &str) -> axum::response::Response {
+    server
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri("/sso/oidc/keycloak/link")
+                .header(
+                    header::AUTHORIZATION,
+                    format!(r#"MediaBrowser Token="{token}""#),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "Password": password }).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+}
+
 /// `response`'s body, as JSON.
 async fn json(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_str(&text(response).await).expect("a JSON body")
@@ -1011,8 +1032,9 @@ async fn provisioning_off_and_a_taken_name_are_refused_and_no_account_is_taken()
     seen.assert_no_secret_logged(&realm);
 }
 
-/// B12 and D5: a local account signed in with its password links itself to
-/// a realm identity at `/sso/oidc/{provider}/link`; the identity then signs
+/// B12, D5 and D22: a local account signed in with its password links itself
+/// to a realm identity at `/sso/oidc/{provider}/link`, giving that password
+/// again (its token alone starts nothing); the identity then signs
 /// in to it, and so does its password; removing the link signs out every
 /// session of the account, and the identity no longer signs in.
 #[tokio::test]
@@ -1053,8 +1075,15 @@ async fn a_local_account_links_a_realm_identity_and_unlinking_signs_it_out() {
     let token = token.expect("a token");
     seen.secret(&token);
 
-    // The link page's request, then Keycloak, then the callback.
-    let started = call(&server, "POST", "/sso/oidc/keycloak/link", &token).await;
+    // The link page's request needs the account's password: the token alone
+    // starts nothing (D22). With it, then Keycloak, then the callback.
+    let refused = call(&server, "POST", "/sso/oidc/keycloak/link", &token).await;
+    assert!(
+        refused.status().is_client_error() && refused.headers().get(header::SET_COOKIE).is_none(),
+        "the token alone starts no link: {}",
+        refused.status()
+    );
+    let started = start_link(&server, &token, local_password).await;
     assert_eq!(started.status(), StatusCode::OK, "the link starts");
     let set_cookie = header_text(&started, header::SET_COOKIE);
     let url = json(started).await["Url"]

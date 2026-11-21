@@ -329,10 +329,12 @@
                     <h3 class="sectionTitle">Linked accounts</h3>
                     <p class="fieldDescription">
                         A linked identity at a provider signs in to its Ferrofin account. Users link their own
-                        account on the page <code class="ssoLinkPage"></code>. Removing a link signs out every
-                        session of its account. An account that signs in through Single Sign-On only cannot sign
-                        in at all without a link, until it is linked again or given another authentication
-                        provider on its profile page.
+                        account on the page <code class="ssoLinkPage"></code>, giving their password; there a
+                        link is never replaced, so a user removes theirs before linking another sign-in at the
+                        same provider. An account that signs in through Single Sign-On only has no password to
+                        give, so it is linked here. Removing a link signs out every session of its account. An
+                        account that signs in through Single Sign-On only cannot sign in at all without a link,
+                        until it is linked again or given another authentication provider on its profile page.
                     </p>
                     <div class="ssoNotice ssoLinksError hide" role="alert"></div>
                     <div class="ssoLinkList"></div>

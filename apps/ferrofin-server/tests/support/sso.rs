@@ -31,11 +31,21 @@ pub struct SsoServer {
 /// The server over a fresh database in `temp`, published at `published_url`,
 /// with the Single Sign-On plugin enabled and no provider.
 pub async fn server(temp: &tempfile::TempDir, published_url: &str) -> SsoServer {
-    let config = Config {
+    server_with(temp, published_url, |_| {}).await
+}
+
+/// [`server`], with `edit` applied to its configuration first.
+pub async fn server_with(
+    temp: &tempfile::TempDir,
+    published_url: &str,
+    edit: impl FnOnce(&mut Config),
+) -> SsoServer {
+    let mut config = Config {
         server_name: "sso-test".to_owned(),
         published_url: Some(published_url.to_owned()),
         ..Config::test_stub(temp.path())
     };
+    edit(&mut config);
     for dir in [&config.config_dir, &config.data_dir, &config.cache_dir] {
         std::fs::create_dir_all(dir).expect("dir");
     }

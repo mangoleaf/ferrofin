@@ -202,19 +202,41 @@ user at their next sign-in. A session already open keeps its rights until then.
 
 A user signed in to Ferrofin links their account to an identity at `{public URL}/sso/link`
 (jellyfin-web's profile page has no place for it). The page uses the session jellyfin-web keeps
-in that browser and lists the user's links. Linking at a provider the user is already linked at
-replaces that link. An identity another account has is refused. Linking never changes the
-account's provider or password.
+in that browser and lists the user's links. A link is a new way into the account, so a session is
+not enough to add one:
+
+- **The password.** Starting a link asks for the account's current Ferrofin password. It is
+  checked as a sign-in checks it, through the account's own authentication provider (Ferrofin's,
+  or LDAP's for an LDAP account): a wrong one counts toward the account's failed sign-ins and the
+  login backoff paces the next attempt, as at the login page. An account without a password sets
+  one on its profile first. The page sends the password once and keeps it nowhere.
+- **Accounts Single Sign-On created** have no password of their own, so they cannot link
+  themselves: the page says so, and an administrator adds further links on the settings page.
+- **A link is never replaced here.** A user linked at a provider removes that link before linking
+  another sign-in there; removing it signs every session out, the one that removes it included.
+  An identity another account has is refused.
+- **An attempt ends with its session.** A link attempt the user started and has not finished at
+  the identity provider links nothing once the session that started it has ended, however it
+  ended: signing out, Dashboard → Devices, a password change made from another session (which
+  signs every other session out), or a link removed. (A sign-out in the very instant the link is
+  made, while the server is writing it, can still let it through; a link removed cannot.)
+
+Linking never changes the account's provider or password.
 
 Administrators see every link under **Linked accounts** on the settings page. There they remove
 any link, or link an account by hand with the identity's subject: the `sub` claim of its ID
-tokens, which Keycloak's admin console shows as the user's ID.
+tokens, which Keycloak's admin console shows as the user's ID. An administrator's link replaces
+the account's link at that provider, if it has one.
+
+Each link added and removed, by the user or an administrator, is in the activity log
+(Dashboard → Activity): "A sign-in at `{provider}` was linked to `{user}`" or "… was unlinked
+from …", with who did it, and the identity's issuer and subject in the entry's details. Their
+types are `UserIdentityLinked` and `UserIdentityUnlinked`.
 
 Removing a link signs out every session of the account, and ends every attempt to link a sign-in
-that the account started and has not finished at the identity provider (a sign-out by another
-route, such as Dashboard → Devices or a password change, does not end one). An account Single
-Sign-On created whose last link is removed cannot sign in at all, until an administrator links it
-again or gives it another authentication provider. Deleting a user removes their links.
+that the account started and has not finished at the identity provider. An account Single Sign-On
+created whose last link is removed cannot sign in at all, until an administrator links it again
+or gives it another authentication provider. Deleting a user removes their links.
 
 ## Native apps: Quick Connect
 

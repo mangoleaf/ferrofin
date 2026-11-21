@@ -165,7 +165,8 @@ the callback Keycloak sends the browser back to to the router. Its eight tests c
    every library, Live TV and its recordings; `oidc-member`'s first session has only that library,
    `oidc-admin`'s every library and both Live TV permissions, `oidc-guest`'s none of them.
 7. **Linking** (`oidc-guest`): a local account signed in with its password links itself at
-   `POST /sso/oidc/keycloak/link`; the identity then signs in to it and so does the password;
+   `POST /sso/oidc/keycloak/link`, giving that password again (its token alone is refused); the
+   identity then signs in to it and so does the password;
    removing the link signs out all three sessions, and the identity is refused again.
 8. **Quick Connect** (`oidc-member`): an app's code entered at `/sso/quickconnect`, signed in at
    Keycloak and confirmed signs the app in, on its own device only.
