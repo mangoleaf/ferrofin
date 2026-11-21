@@ -3237,7 +3237,11 @@ mod tests {
 
     /// The locations a prune reads are read under the structure-change lock:
     /// a rename moves a library folder, and a read mid-move could leave its
-    /// locations out. A read under way holds the lock a change needs.
+    /// locations out. A read started during a change waits for it and takes
+    /// the lock before it reads, so no change slips in first. No step depends
+    /// on timing: the read cannot finish while the change holds the lock, and
+    /// tokio's fair lock hands the released permit to the queued read inside
+    /// the guard's drop (`batch_semaphore` `add_permits_locked`).
     #[tokio::test]
     async fn locations_for_removal_hold_out_a_structure_change() {
         use futures_util::FutureExt as _;
@@ -3250,14 +3254,16 @@ mod tests {
         )
         .await
         .expect("add");
+        let change = mgr.structure_change.write().await;
         let mut read = Box::pin(mgr.locations_for_removal());
         assert!(
             (&mut read).now_or_never().is_none(),
-            "the read is under way"
+            "the read waits for the change"
         );
+        drop(change);
         assert!(
             mgr.structure_change.try_write().is_err(),
-            "an under-way read holds the lock a structure change needs"
+            "the queued read holds the lock once the change releases it"
         );
         assert_eq!(read.await.expect("read"), Some(vec![media]));
     }
