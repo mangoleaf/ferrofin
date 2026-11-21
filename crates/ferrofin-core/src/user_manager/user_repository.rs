@@ -65,17 +65,33 @@ where
 
 /// Stores a user's password hash (`None` for a password-less user), bumping
 /// `RowVersion` as an EF save of the entity does.
-pub(super) async fn set_password(
-    pool: &SqlitePool,
+pub(super) async fn set_password<'e, E>(
+    executor: E,
     user_id: &str,
     hash: Option<&str>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: SqliteExecutor<'e>,
+{
     sqlx::query(
         r#"UPDATE "Users" SET "Password" = ?2, "RowVersion" = "RowVersion" + 1
            WHERE "Id" = ?1"#,
     )
     .bind(user_id)
     .bind(hash)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Makes every later write of a password fail, for the test of what such a
+/// failure leaves behind.
+#[cfg(test)]
+pub(super) async fn refuse_password_writes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"CREATE TRIGGER "refuse_passwords" BEFORE UPDATE OF "Password" ON "Users"
+           BEGIN SELECT RAISE(ABORT, 'no password today'); END"#,
+    )
     .execute(pool)
     .await?;
     Ok(())

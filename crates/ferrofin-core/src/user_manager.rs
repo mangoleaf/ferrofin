@@ -1352,6 +1352,15 @@ impl UserManager for FerrofinUserManager {
         setup: &ExternalUserSetup,
     ) -> Result<UserEntity, ServiceError> {
         require_valid_username(name)?;
+        // Hashed before the transaction opens, so PBKDF2 never holds the
+        // writer; the secret itself is dropped here.
+        let password = if setup.unusable_password {
+            self.default_provider
+                .format_password_hash(&ferrofin_common::cryptography::unusable_password())
+                .await?
+        } else {
+            None
+        };
         // Set up inside the insert's transaction: committed first and set up
         // after, the row would for a moment be a passwordless local account,
         // which the built-in provider signs in with an empty password.
@@ -1359,6 +1368,11 @@ impl UserManager for FerrofinUserManager {
         let user = self
             .insert_user(name, move |tx, id| {
                 Box::pin(async move {
+                    if let Some(hash) = password.as_deref() {
+                        user_repository::set_password(&mut **tx, id, Some(hash))
+                            .await
+                            .map_err(db_err)?;
+                    }
                     user_repository::set_providers(
                         &mut **tx,
                         id,
