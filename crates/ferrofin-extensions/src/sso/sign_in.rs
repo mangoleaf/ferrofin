@@ -6,7 +6,8 @@
 //! `SsoService::sign_in_verified`, which finds or creates its account
 //! ([`accounts`](super::accounts)); the callback then answers the completion
 //! page, whose script swaps an exchange code for the session
-//! ([`complete`](super::complete)).
+//! ([`complete`](super::complete)). A link flow's callback links the identity
+//! to the account that started it instead ([`links`](super::links)).
 //!
 //! The callback's checks, in order; the first that fails refuses it:
 //! 1. a pending flow for its `state`, at this provider, not expired, and
@@ -429,6 +430,9 @@ impl SsoService {
                     Ok(code) => return Ok(completion_page(&code, &cookie, public_url.as_deref())),
                     Err(refusal) => refusal.refused(key),
                 }
+            }
+            Ok((FlowPurpose::Link(user_id), identity, _)) => {
+                self.link_verified(&provider, user_id, identity).await?
             }
             Ok((FlowPurpose::QuickConnect(code), identity, cookie)) => {
                 match self

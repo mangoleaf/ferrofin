@@ -1,6 +1,7 @@
 //! The Single Sign-On plugin's wire types: the OIDC providers its settings
-//! page lists and saves through `/sso/admin/oidc/providers`, and what a
-//! completion page posts to `/sso/oidc/exchange`.
+//! page lists and saves through `/sso/admin/oidc/providers`, what a
+//! completion page posts to `/sso/oidc/exchange`, and the links between
+//! accounts and identities that `/sso/links` and `/sso/admin/links` list.
 //!
 //! Ferrofin's own, not Jellyfin contract types and not the community SSO-Auth
 //! plugin's: the routes are the plugin's own (D2). Their JSON is PascalCase,
@@ -11,6 +12,7 @@
 //! `GET` entry, so a later setting is one more member here. Its client secret
 //! is only ever read from a request: it is never serialized (D16).
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -225,6 +227,106 @@ pub struct OidcExchangeRequest {
     /// The exchange code; a missing one is refused as an unknown one.
     #[schema(value_type = String)]
     pub code: Secret,
+}
+
+/// What `POST /sso/oidc/{provider}/link` answers: the identity provider's
+/// sign-in page, for the link page to send the browser to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct OidcLinkStart {
+    /// The authorization URL: its query holds the flow's `state`.
+    pub url: String,
+}
+
+/// What `GET /sso/links` answers: the caller's own links, the providers they
+/// can link at, and whether their account signs in through Single Sign-On
+/// only. It never holds a subject.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct OidcUserLinks {
+    /// Whether the account's authentication provider is Single Sign-On's,
+    /// which refuses every password: without a link, it cannot sign in.
+    pub single_sign_on_account: bool,
+    /// The account's links, oldest first.
+    pub links: Vec<OidcLink>,
+    /// The enabled providers, in the configuration's order.
+    pub providers: Vec<OidcLinkProvider>,
+}
+
+/// One of the caller's links.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct OidcLink {
+    /// The key of the first provider at the link's issuer; absent when no
+    /// provider has that issuer any more.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// That provider's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    /// The issuer the identity is at.
+    pub issuer: String,
+    /// When the link was made.
+    #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
+    pub date_created: DateTime<Utc>,
+}
+
+/// A provider a user can link at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct OidcLinkProvider {
+    /// The provider's key.
+    pub key: String,
+    /// The provider's name.
+    pub name: String,
+}
+
+/// One link, as `GET /sso/admin/links` lists it and `POST /sso/admin/links`
+/// answers it.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct OidcAdminLink {
+    /// The linked account.
+    #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
+    pub user_id: Uuid,
+    /// Its name.
+    pub user_name: String,
+    /// Whether its authentication provider is Single Sign-On's: without a
+    /// link, it cannot sign in.
+    pub single_sign_on_account: bool,
+    /// The key of the first provider at the link's issuer; absent when no
+    /// provider has that issuer any more.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// That provider's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    /// The issuer the identity is at.
+    pub issuer: String,
+    /// The identity at that issuer: the ID token's `sub`.
+    pub subject: String,
+    /// When the link was made.
+    #[schema(value_type = String, format = "date-time")]
+    #[serde(with = "crate::json::datetime")]
+    pub date_created: DateTime<Utc>,
+}
+
+/// What an admin posts to `POST /sso/admin/links`: link the account
+/// `UserId` to the identity `Subject` at the provider `Provider`, whose issuer
+/// it takes.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct OidcLinkRequest {
+    /// The account to link.
+    #[schema(value_type = String, format = "uuid")]
+    #[serde(with = "crate::json::guid")]
+    pub user_id: Uuid,
+    /// The provider's key.
+    pub provider: String,
+    /// The identity's `sub` at the provider, as its ID tokens carry it.
+    pub subject: String,
 }
 
 #[cfg(test)]

@@ -39,6 +39,9 @@ pub const MAX_PENDING_FLOWS: usize = 1000;
 pub enum FlowPurpose {
     /// Signing in to Ferrofin.
     SignIn,
+    /// Linking the identity to this account, the one signed in when the
+    /// flow started ([`links`](super::links)): it opens no session.
+    Link(Uuid),
     /// Approving a native app's Quick Connect code
     /// ([`quick_connect`](super::quick_connect)): it ends on a confirmation
     /// page, and opens no browser session.

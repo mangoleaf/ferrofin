@@ -11,10 +11,10 @@
 //!    and replaces itself with `/web`.
 //! 3. The exchange ([`SsoService::exchange_sign_in`]) uses the code up, checks
 //!    its age and the cookie, and opens the session in
-//!    [`SsoService::open_session`]: role sync
-//!    ([`roles`](super::roles)), then the account rules of a password
-//!    sign-in, then `SessionManager::authenticate_direct`, which applies device
-//!    access and the session limit and logs the success
+//!    [`SsoService::open_session`]: the identity still linked to the
+//!    account, role sync ([`roles`](super::roles)), then the account rules
+//!    of a password sign-in, then `SessionManager::authenticate_direct`,
+//!    which applies device access and the session limit and logs the success
 //!    (`AuthenticationSucceeded`). A refusal of a known account writes an
 //!    `AuthenticationFailed` activity entry; any other refusal is one log
 //!    line. Nothing here touches the account's failed-login counter. A
@@ -185,10 +185,11 @@ impl SsoService {
     /// Opens the session of a redeemed sign-in at `provider` with `request`'s
     /// device and address, or answers why not.
     ///
-    /// Just before the session is minted, the account passes the rules of a
-    /// password sign-in; whatever else must hold of the account, or change
-    /// on it, at each sign-in belongs beside them. Just after it the sign-in
-    /// is complete; work that must never delay or fail it belongs there,
+    /// Just before the session is minted, the identity must still be linked
+    /// to the account, and the account passes the rules of a password
+    /// sign-in; whatever else must hold of the account, or change on it, at
+    /// each sign-in belongs beside them. Just after it the sign-in is
+    /// complete; work that must never delay or fail it belongs there,
     /// started without being awaited.
     async fn open_session(
         &self,
@@ -200,6 +201,17 @@ impl SsoService {
         let Some(user) = self.users.get_user_by_id(pending.user_id).await? else {
             return Ok(Err(refused(Some(key), "no_account")));
         };
+        // Unlinked or linked elsewhere since the callback (B12): the identity
+        // no longer signs in to this account. Held until the session is
+        // minted, so a removal, which unlinks under this lock and then signs
+        // the account out, either signs this session out or refuses it.
+        let _linked = self.provisioning.lock().await;
+        if !self
+            .still_linked(&pending.identity, pending.user_id)
+            .await?
+        {
+            return Ok(Err(refused(Some(key), "unlinked")));
+        }
         let remote_endpoint = request.remote_endpoint.clone().unwrap_or_default();
         // Role sync first, as a password sign-in applies its provider's
         // administrator flag before the account rules.

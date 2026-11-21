@@ -782,3 +782,94 @@ async fn role_sync_applies_when_a_code_is_approved() {
     assert_eq!(reply.status, 200, "{}", reply.html);
     assert!(!approval.is_administrator().await, "demoted");
 }
+
+/// B12: a link removed since the callback approves nothing, as an exchange
+/// code issued before a removal opens no session.
+#[tokio::test]
+async fn a_link_removed_since_the_callback_refuses_the_approval() {
+    let approval = Approval::new().await;
+    let (code, secret) = approval.initiate().await;
+    let (page, cookie) = approval.called_back(&code).await;
+    assert_eq!(page.status, 200, "{}", page.html);
+    let user = approval.account().await;
+    approval
+        .harness
+        .sso
+        .remove_oidc_link(
+            Uuid::parse_str(&user.id).expect("an id"),
+            ferrofin_traits::sso::OidcLinkAt::Provider("fake"),
+        )
+        .await
+        .expect("removed");
+
+    let reply = approval
+        .confirm(Some(&confirmation_of(&page.html)), Some(&cookie))
+        .await;
+    assert_eq!(reply.status, 400, "{}", reply.html);
+    assert!(!approval.authorized(&secret).await);
+}
+
+/// B12: a removal that starts while an approval is minting the app's session
+/// waits for it, then signs that session out: the approval holds the lock the
+/// removal unlinks under from its lookup of the link to its session.
+#[tokio::test]
+async fn a_removal_during_an_approval_signs_the_app_out() {
+    let approval = Approval::new().await;
+    let (code, _secret) = approval.initiate().await;
+    let (page, cookie) = approval.called_back(&code).await;
+    assert_eq!(page.status, 200, "{}", page.html);
+    let user = Uuid::parse_str(&approval.account().await.id).expect("an id");
+    // The session's success event stalls the approval after the app's
+    // session is minted, until released.
+    let minting = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (entered, waiting) = (Arc::clone(&minting), Arc::clone(&release));
+    approval.harness.events.subscribe(
+        "AuthenticationSucceeded",
+        Arc::new(move |_: &str| -> ferrofin_traits::events::EventFuture {
+            let (entered, waiting) = (Arc::clone(&entered), Arc::clone(&waiting));
+            Box::pin(async move {
+                entered.notify_one();
+                waiting.notified().await;
+                Ok(())
+            })
+        }),
+    );
+
+    let confirmation = confirmation_of(&page.html);
+    let removal = async {
+        tokio::time::timeout(Duration::from_secs(30), minting.notified())
+            .await
+            .expect("the approval reaches its success event");
+        let removing = approval
+            .harness
+            .sso
+            .remove_oidc_link(user, ferrofin_traits::sso::OidcLinkAt::Provider("fake"));
+        tokio::pin!(removing);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut removing)
+                .await
+                .is_err(),
+            "the removal waits for the approval"
+        );
+        release.notify_one();
+        removing.await
+    };
+    let (reply, removed) = tokio::join!(
+        approval.confirm(Some(&confirmation), Some(&cookie)),
+        removal
+    );
+    removed.expect("removed");
+    assert_eq!(
+        reply.status, 200,
+        "approved before the removal: {}",
+        reply.html
+    );
+    let sessions = approval
+        .harness
+        .sessions
+        .get_session_summaries()
+        .await
+        .expect("sessions");
+    assert!(sessions.is_empty(), "and signed out by it: {sessions:?}");
+}
