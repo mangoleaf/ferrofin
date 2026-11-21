@@ -1098,7 +1098,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
 
 /// B15: the log of a sign-in, at every level and from every crate, holds no
 /// code, token, verifier, nonce, state, cookie, client secret or claim, nor
-/// the exchange code or the session's token.
+/// the exchange code, the session's token or the new account's password hash.
 #[tokio::test]
 async fn the_log_of_a_sign_in_holds_no_secret_and_no_claim() {
     let logs = CapturedLogs::default();
@@ -1147,6 +1147,12 @@ async fn the_log_of_a_sign_in_holds_no_secret_and_no_claim() {
             secrets.extend([code, session.access_token.expose().to_owned()]);
         }
     }
+    // The created account's unusable password: its hash, salt and digest.
+    let created = harness.users.get_user_by_name(USERNAME).await;
+    let stored = created.expect("lookup").expect("created").password;
+    let stored = stored.expect("a password hash");
+    secrets.extend(stored.rsplit('$').take(2).map(str::to_owned));
+    secrets.push(stored);
     for request in harness.fake.requests() {
         if request.path == harness.fake.path(TOKEN_PATH) {
             let form: HashMap<String, String> = url::form_urlencoded::parse(&request.body)

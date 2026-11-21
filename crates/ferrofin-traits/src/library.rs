@@ -1662,7 +1662,8 @@ pub enum AdminFlagOutcome {
 /// How [`UserManager::create_external_user`] sets up a user an outside
 /// authentication provider creates at their first sign-in: what upstream's
 /// LDAP plugin writes onto the new `User` before `UpdateUserAsync`
-/// (jellyfin-plugin-ldapauth v24, `LdapAuthenticationProviderPlugin.Authenticate`).
+/// (jellyfin-plugin-ldapauth v24, `LdapAuthenticationProviderPlugin.Authenticate`),
+/// and Ferrofin's own [`unusable_password`](Self::unusable_password).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExternalUserSetup {
     /// Saved as the user's `AuthenticationProviderId`, so their sign-ins go
@@ -1676,6 +1677,12 @@ pub struct ExternalUserSetup {
     /// upstream's `SetPreference` stores them; `None` keeps the new user's
     /// empty one.
     pub enabled_folders: Option<Vec<String>>,
+    /// Store the hash of a random secret no one keeps
+    /// ([`unusable_password`](ferrofin_common::cryptography::unusable_password))
+    /// as the user's password, in the default provider's format, so the user
+    /// never has an empty password, whatever provider they later belong to.
+    /// Single Sign-On sets it; LDAP, as upstream's plugin, does not.
+    pub unusable_password: bool,
 }
 
 /// The state of the server a policy save is checked against: the user's
@@ -1776,14 +1783,15 @@ pub trait UserManager: Send + Sync {
     /// ids and the folder access on the user, then saves it with
     /// `UpdateUserAsync`.
     ///
-    /// The concrete manager writes the row and `setup` in one transaction.
-    /// Created first and set up after, the account would for a moment be a
-    /// local one without a password, which the built-in provider signs in
-    /// with an empty password; upstream has that window. It also records the
-    /// "User … has been created" activity entry, as `CreateUserAsync` does.
-    /// The default creates the user and then saves `setup` with
-    /// [`Self::update_policy`], so impls without a store of their own compile
-    /// unchanged.
+    /// The concrete manager writes the row and `setup`, the unusable password
+    /// included, in one transaction. Created first and set up after, the
+    /// account would for a moment be a local one without a password, which
+    /// the built-in provider signs in with an empty password; upstream has
+    /// that window. It also records the "User … has been created" activity
+    /// entry, as `CreateUserAsync` does. The default creates the user, sets
+    /// the unusable password with [`Self::change_password`], and then saves
+    /// `setup` with [`Self::update_policy`], so impls without a store of
+    /// their own compile unchanged.
     ///
     /// # Errors
     ///
@@ -1797,6 +1805,11 @@ pub trait UserManager: Send + Sync {
         let user = self.create_user(name).await?;
         let user_id =
             Uuid::parse_str(&user.id).map_err(|error| ServiceError::backend(error.to_string()))?;
+        if setup.unusable_password {
+            // Still the default provider's user, which stores the hash.
+            self.change_password(user_id, &ferrofin_common::cryptography::unusable_password())
+                .await?;
+        }
         let mut policy = self
             .get_user_dto(&user, None)
             .await?

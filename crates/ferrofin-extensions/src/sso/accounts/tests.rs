@@ -56,7 +56,12 @@ async fn a_first_sign_in_creates_an_account_with_the_password_refusing_provider_
     let created = user(&harness, USERNAME).await.expect("created");
     assert_eq!(created.authentication_provider_id, PROVIDER_ID);
     assert_eq!(created.password_reset_provider_id, PROVIDER_ID);
-    assert_eq!(created.password, None);
+    // D21: a password no one knows, in the default provider's format.
+    let password = created.password.as_deref().expect("a password hash");
+    assert!(
+        password.starts_with("$PBKDF2-SHA512$iterations=210000$"),
+        "{password}"
+    );
     let link = harness
         .identities
         .find(identity(&harness.fake.issuer(), SUBJECT))
@@ -231,7 +236,10 @@ async fn regression_jellyfin_10_11_a_created_account_never_signs_in_with_a_passw
     ] {
         assert!(matches!(set, Err(ServiceError::Forbidden(_))), "{set:?}");
     }
-    assert_eq!(user(&harness, USERNAME).await.expect("kept").password, None);
+    assert_eq!(
+        user(&harness, USERNAME).await.expect("kept").password,
+        created.password
+    );
 
     // With the plugin off, its provider is absent: still refused, still
     // not counted.

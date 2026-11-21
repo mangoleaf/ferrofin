@@ -7,7 +7,9 @@
 //! without the cookie, are refused. Each account rule of a password sign-in
 //! refuses the exchange and writes the activity log, and that account refuses
 //! every password at `POST /Users/AuthenticateByName` without its lockout
-//! counter moving.
+//! counter moving. It still does after a save of its user page gives it the
+//! default provider (the plugin disabled, every extension off, or an admin's
+//! choice), until an admin sets it a password.
 
 #[path = "support/sso.rs"]
 mod sso;
@@ -16,13 +18,16 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use ferrofin_core::auth_providers::DEFAULT_AUTH_PROVIDER_ID;
 use ferrofin_db::entities::users::UserEntity;
+use ferrofin_extensions::sso::EXTENSION_ID;
 use ferrofin_extensions::sso::accounts::{PROVIDER_ID, PROVIDER_NAME};
 use ferrofin_extensions::sso::fake_idp::{FakeIdentityProvider, USERNAME};
 use ferrofin_model::activity::ActivityLogEntry;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::OidcProvider;
 use ferrofin_model::users::{AccessSchedule, DynamicDayOfWeek, UserPolicy};
+use ferrofin_server::config::Config;
 use ferrofin_traits::activity::ActivityLogQuery;
 use ferrofin_traits::devices::DeviceQuery;
 use sso::{SsoServer, exchange_code, header_text, text};
@@ -256,25 +261,245 @@ async fn the_account_a_sign_in_creates_refuses_every_password() {
     // No password signs in to it, not even an empty one, and the refusals
     // leave its lockout counter alone (D20).
     for password in ["", "guess"] {
-        let attempt = Request::builder()
-            .method("POST")
-            .uri("/Users/AuthenticateByName")
-            .header(
-                header::AUTHORIZATION,
-                r#"MediaBrowser Client="sso-sign-in-test", Device="fixture", DeviceId="sso-sign-in-test", Version="1""#,
-            )
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::json!({ "Username": USERNAME, "Pw": password }).to_string(),
-            ))
-            .expect("request");
         assert_eq!(
-            server.send(attempt).await.status(),
+            password_sign_in(&server, USERNAME, password).await.status(),
             StatusCode::UNAUTHORIZED,
             "{password:?}"
         );
     }
     assert_eq!(account(&server).await.invalid_login_attempt_count, 0);
+}
+
+const ADMIN_PASSWORD: &str = "sso-sign-in-admin-pw";
+
+/// Seeds the administrator `admin`, before any other account exists.
+async fn seed_admin(server: &SsoServer, temp: &tempfile::TempDir) {
+    let config = Config {
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        ..Config::test_stub(temp.path())
+    };
+    ferrofin_server::seed::seed_default_admin(server.state.users.as_ref(), &config)
+        .await
+        .expect("seed admin");
+}
+
+/// `POST /Users/AuthenticateByName` as `name` with `password`.
+async fn password_sign_in(
+    server: &SsoServer,
+    name: &str,
+    password: &str,
+) -> axum::response::Response {
+    server
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/AuthenticateByName")
+                .header(
+                    header::AUTHORIZATION,
+                    r#"MediaBrowser Client="sso-sign-in-test", Device="fixture", DeviceId="sso-sign-in-test", Version="1""#,
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "Username": name, "Pw": password }).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+}
+
+/// The `Authorization` header of the administrator, signed in with their
+/// password.
+async fn admin(server: &SsoServer) -> String {
+    let answer = password_sign_in(server, "admin", ADMIN_PASSWORD).await;
+    assert_eq!(answer.status(), StatusCode::OK);
+    let answer: serde_json::Value = serde_json::from_str(&text(answer).await).expect("JSON");
+    format!(
+        r#"MediaBrowser Client="sso-sign-in-test", Device="admin", DeviceId="sso-sign-in-admin", Version="1", Token="{}""#,
+        answer["AccessToken"].as_str().expect("a token")
+    )
+}
+
+/// `method uri` as `admin`, with `body` as JSON: the status and the answer
+/// as JSON (`null` when it is none).
+async fn as_admin(
+    server: &SsoServer,
+    admin: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, admin)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+        .expect("request");
+    let answer = server.send(request).await;
+    let status = answer.status();
+    (
+        status,
+        serde_json::from_str(&text(answer).await).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// The ids `GET uri` lists.
+async fn listed_ids(server: &SsoServer, admin: &str, uri: &str) -> Vec<String> {
+    let (status, list) = as_admin(server, admin, "GET", uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}");
+    list.as_array()
+        .expect("a list")
+        .iter()
+        .map(|pair| pair["Id"].as_str().expect("an id").to_owned())
+        .collect()
+}
+
+/// What jellyfin-web 12.4's user page (`Profile.tsx`) posts when an admin
+/// saves the fake's account with `login` chosen: the policy `GET /Users/{id}`
+/// returned, with each provider select's value. A list of one provider is
+/// hidden with that one selected; a longer one keeps the account's provider,
+/// or the browser selects the first option when that is not listed.
+async fn save_user_page(server: &SsoServer, admin: &str, login: &str) {
+    let id = Uuid::parse_str(&account(server).await.id)
+        .expect("an id")
+        .simple();
+    let (status, user) = as_admin(server, admin, "GET", &format!("/Users/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut policy = user["Policy"].clone();
+    let resets = listed_ids(server, admin, "/Auth/PasswordResetProviders").await;
+    let reset = policy["PasswordResetProviderId"].as_str().expect("an id");
+    let reset = if resets.len() > 1 && resets.iter().any(|listed| listed == reset) {
+        reset.to_owned()
+    } else {
+        resets[0].clone()
+    };
+    policy["AuthenticationProviderId"] = login.into();
+    policy["PasswordResetProviderId"] = reset.into();
+    let (status, _) = as_admin(
+        server,
+        admin,
+        "POST",
+        &format!("/Users/{id}/Policy"),
+        Some(policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(account(server).await.authentication_provider_id, login);
+}
+
+/// No password signs in to the fake's account, not even an empty one.
+async fn assert_no_password_signs_in(server: &SsoServer, when: &str) {
+    for password in ["", "guess", USERNAME] {
+        assert_eq!(
+            password_sign_in(server, USERNAME, password).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{when}: {password:?}"
+        );
+    }
+}
+
+/// B11 and D21: with the plugin disabled, the server lists the default
+/// provider only, so the user page hides its choice and saves that one.
+/// The account Single Sign-On created still has no password anyone knows,
+/// then and once the plugin is enabled again.
+#[tokio::test]
+async fn the_user_page_saved_while_the_plugin_is_disabled_opens_no_password() {
+    let fake = FakeIdentityProvider::start().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = server_with_provider(&fake, &temp).await;
+    seed_admin(&server, &temp).await;
+    let admin = admin(&server).await;
+    let signed_in = sign_in(&server, &fake, "sso-browser-1", None).await;
+    assert_eq!(signed_in.status(), StatusCode::OK);
+
+    server
+        .state
+        .plugins
+        .disable_plugin(EXTENSION_ID)
+        .await
+        .expect("disable");
+    assert_eq!(
+        listed_ids(&server, &admin, "/Auth/Providers").await,
+        [DEFAULT_AUTH_PROVIDER_ID]
+    );
+    save_user_page(&server, &admin, DEFAULT_AUTH_PROVIDER_ID).await;
+    assert_no_password_signs_in(&server, "plugin disabled").await;
+
+    server
+        .state
+        .plugins
+        .enable_plugin(EXTENSION_ID)
+        .await
+        .expect("enable");
+    assert_no_password_signs_in(&server, "plugin enabled again").await;
+}
+
+/// The same with every extension off (`FERROFIN_DISABLE_EXTENSIONS`), on a
+/// server booted again over the database the sign-in wrote.
+#[tokio::test]
+async fn the_user_page_saved_with_extensions_disabled_opens_no_password() {
+    let fake = FakeIdentityProvider::start().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = server_with_provider(&fake, &temp).await;
+    seed_admin(&server, &temp).await;
+    let signed_in = sign_in(&server, &fake, "sso-browser-1", None).await;
+    assert_eq!(signed_in.status(), StatusCode::OK);
+    drop(server);
+
+    let server = sso::boot(&Config {
+        disable_extensions: true,
+        ..sso::config(&temp, PUBLISHED_URL)
+    })
+    .await;
+    let admin = admin(&server).await;
+    assert_eq!(
+        listed_ids(&server, &admin, "/Auth/Providers").await,
+        [DEFAULT_AUTH_PROVIDER_ID]
+    );
+    save_user_page(&server, &admin, DEFAULT_AUTH_PROVIDER_ID).await;
+    assert_no_password_signs_in(&server, "extensions disabled").await;
+}
+
+/// D5: an admin may choose the default provider for the account on its page,
+/// the plugin enabled. No password signs in to it until the admin sets one,
+/// and then that one only.
+#[tokio::test]
+async fn an_account_moved_to_the_default_provider_signs_in_with_the_password_an_admin_sets() {
+    let fake = FakeIdentityProvider::start().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = server_with_provider(&fake, &temp).await;
+    seed_admin(&server, &temp).await;
+    let admin = admin(&server).await;
+    let signed_in = sign_in(&server, &fake, "sso-browser-1", None).await;
+    assert_eq!(signed_in.status(), StatusCode::OK);
+
+    let providers = listed_ids(&server, &admin, "/Auth/Providers").await;
+    assert!(
+        providers.iter().any(|id| id == PROVIDER_ID),
+        "{providers:?}"
+    );
+    save_user_page(&server, &admin, DEFAULT_AUTH_PROVIDER_ID).await;
+    assert_no_password_signs_in(&server, "moved, no password set").await;
+
+    let id = Uuid::parse_str(&account(&server).await.id)
+        .expect("an id")
+        .simple();
+    let (status, _) = as_admin(
+        &server,
+        &admin,
+        "POST",
+        &format!("/Users/{id}/Password"),
+        Some(serde_json::json!({ "NewPw": "chosen-by-the-admin" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        password_sign_in(&server, USERNAME, "chosen-by-the-admin")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_no_password_signs_in(&server, "the admin's password set").await;
 }
 
 /// A change to an account's policy that makes a sign-in rule refuse it.
