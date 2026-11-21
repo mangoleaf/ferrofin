@@ -647,8 +647,8 @@ compare with.
     `LdapServer` is still that placeholder is imported with the server empty, and a warning
     names `LdapServer`: the plugin is on for its LDAP users but inactive until an
     administrator sets a server.
-  - **No `LdapUsers` in the configuration** (D12: one store of external identities, which the
-    OIDC sign-in planned next is to share, that links an identity to at most one user, writes
+  - **No `LdapUsers` in the configuration** (D12: one store of external identities, which
+    Single Sign-On's OIDC links share, that links an identity to at most one user, writes
     each link in a transaction so concurrent first sign-ins cannot lose one, and removes a
     user's links with the user): which LDAP uid belongs to which user lives in Ferrofin's
     external-identity table, so `GET /Plugins/{id}/Configuration` does not return it, and a

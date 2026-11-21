@@ -171,11 +171,34 @@ proven against OpenLDAP only: Active Directory has not been tested.
 > must also be unique: two entries sharing a `cn` would otherwise share the account until it is
 > linked.
 
+### Single Sign-On
+
+Beside the ports, two extensions are Ferrofin's own. The first, **Single Sign-On**
+(`crates/ferrofin-extensions/src/sso.rs` and `sso/`), signs users in with an OpenID Connect
+identity provider: a "Sign in with" button on jellyfin-web's login page, accounts created and
+linked by issuer and subject, roles from a claim (a required role, the administrator flag,
+libraries and Live TV), linking and unlinking, profile pictures, and native apps signed in by
+approving their Quick Connect code through the same sign-in. It is **off by default**; its own
+settings page (`assets/sso/settings.html`) holds the providers. Its admin guide is
+[`SINGLE_SIGN_ON.md`](SINGLE_SIGN_ON.md).
+
+It ports no plugin: it has its own id (`67a29a1d-e02b-4aaa-bba0-4b2275e765d0`) and routes, and
+is not the community SSO-Auth plugin, whose settings and links are not imported. Its
+authentication provider (`Ferrofin.SingleSignOn.SsoAuthenticationProvider`) refuses every
+password, and its refusals never count toward lockout. Its routes are in
+`handlers::PLUGIN_ROUTES` and answer `404` while the plugin is off: the provider settings
+(`/sso/admin/oidc/providers`, `/sso/admin/oidc/providers/{provider}`), the sign-in
+(`/sso/oidc/{provider}/start`, `/sso/oidc/{provider}/callback`, `/sso/oidc/exchange`), Quick
+Connect approval (`/sso/quickconnect`), and linking (`/sso/link`, `/sso/links`,
+`/sso/links/{provider}`, `/sso/oidc/{provider}/link`, `/sso/admin/links`). The client secrets
+live in the plugin's private file, which no route serves. To try it,
+[`contrib/oidc-test-realm/`](../contrib/oidc-test-realm/README.md) holds a Keycloak test realm;
+it has been proven against Keycloak only.
+
 ### The Ferrofin Settings extension
 
-Beside the ports, two extensions are Ferrofin's own: **Single Sign-On**
-(`crates/ferrofin-extensions/src/sso.rs`), off by default, and **Ferrofin Settings**
-(`crates/ferrofin-extensions/src/ferrofin_settings.rs`). This section is about the second, which
+The second of Ferrofin's own extensions is **Ferrofin Settings**
+(`crates/ferrofin-extensions/src/ferrofin_settings.rs`), which
 ports no plugin and has no tasks, hooks or providers; it gives the server's own settings (`GET` and `POST /Ferrofin/Settings`, see
 [`CONFIG.md`](CONFIG.md#seeing-what-is-set)) a plugin identity and an enabled flag, so the
 dashboard's Disable toggle turns them off. Its version is the server's release.

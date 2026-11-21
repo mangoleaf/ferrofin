@@ -136,23 +136,62 @@ set -a; . ~/.config/ferrofin/oidc-test.env; set +a
 cargo test -p ferrofin-server --test oidc_keycloak -- --include-ignored --nocapture
 ```
 
-It runs on the server the composition root wires, through its router. It saves the realm's client
-as a provider and checks that discovery finds the realm's endpoints and keys, and that it fails
-cleanly, with the provider still saved, for a realm that does not exist and for the issuer written
-with a trailing `/`. Then it signs the member user in: it starts a sign-in, fills in Keycloak's own
-login form, hands the callback Keycloak sends the browser back to to the router, and swaps the
-completion page's code for a session at `POST /sso/oidc/exchange`. It checks that the session's
-token opens `GET /Users/Me` as the member, that the account was created and linked under the
-Single Sign-On provider, that no password (the realm's, or an empty one) signs in to that account
-or counts toward its lockout, that the same callback and the same code are each refused a second
-time, that a callback without the flow cookie (another browser) is refused, and that a second
-sign-in finds the same account. It builds callback URLs on `http://127.0.0.1:8096`, which the
-realm's redirect URIs accept; nothing needs to listen there.
-A third test checks the roles read from the `groups` claim: with `ferrofin-users` as the
-provider's required role, `oidc-guest` (no group, so no `groups` claim) is refused and no account is
-created for it, while `oidc-member` signs in; with role sync on and `ferrofin-admins` as the
-administrator role, `oidc-admin`'s first session is an administrator's and `oidc-member`'s is not.
-A fourth maps the groups to libraries and Live TV with role sync on: `ferrofin-users` to one
-library, `ferrofin-admins` to every library, Live TV and its recordings. `oidc-member`'s first
-session has only that library, `oidc-admin`'s has every library and both Live TV permissions, and
-`oidc-guest`'s has no library and no Live TV.
+It runs on the server the composition root wires, through its router, one fresh server per test,
+and builds callback URLs on `http://127.0.0.1:8096`, which the realm's redirect URIs accept; nothing
+needs to listen there. Each test starts a sign-in, fills in Keycloak's own login form, and hands
+the callback Keycloak sends the browser back to to the router. Its eight tests check:
+
+1. **Discovery**: saving the realm's client as a provider finds the realm's endpoints and keys,
+   and fails cleanly, the provider still saved, for a realm that does not exist and for the issuer
+   written with a trailing `/`.
+2. **Sign-in** (`oidc-member`): the completion page's code swaps for a session at
+   `POST /sso/oidc/exchange` whose token opens `GET /Users/Me`; the account was created and linked
+   under the Single Sign-On provider; no password (the realm's, or an empty one) signs in to it,
+   through the user manager or `POST /Users/AuthenticateByName`, or counts toward its lockout; the
+   same callback and the same code are each refused a second time, and so are a callback without
+   the flow cookie (another browser), one with a tampered `state` and one with a tampered `iss`;
+   a second sign-in finds the same account.
+3. **Provisioning** (`oidc-member`): with "Create accounts at first sign-in" off the user is
+   refused and no account is made; with it on, a local account with the same name makes the
+   sign-in refused, is neither linked nor changed, and its password still signs in.
+4. **The required group and the administrator flag**: with `ferrofin-users` required,
+   `oidc-guest` (no group, so no `groups` claim) is refused and no account is created for it,
+   while `oidc-member` signs in; with role sync on and `ferrofin-admins` as the administrator
+   role, `oidc-admin`'s first session is an administrator's and `oidc-member`'s is not.
+5. **The administrator role moving**: with role sync on, `oidc-admin` is made an administrator,
+   then keeps the flag as the last administrator once the role moves to `ferrofin-users`;
+   `oidc-member` then gains it, and `oidc-admin`'s next sign-in demotes them.
+6. **Libraries and Live TV**: `ferrofin-users` mapped to one library and `ferrofin-admins` to
+   every library, Live TV and its recordings; `oidc-member`'s first session has only that library,
+   `oidc-admin`'s every library and both Live TV permissions, `oidc-guest`'s none of them.
+7. **Linking** (`oidc-guest`): a local account signed in with its password links itself at
+   `POST /sso/oidc/keycloak/link`; the identity then signs in to it and so does the password;
+   removing the link signs out all three sessions, and the identity is refused again.
+8. **Quick Connect** (`oidc-member`): an app's code entered at `/sso/quickconnect`, signed in at
+   Keycloak and confirmed signs the app in, on its own device only.
+
+Every test also captures what the process logs meanwhile (at `debug`, the server's crates at
+`trace`, span fields included) and fails if a secret it handled is in it: the client secret (also
+as the token request's `Basic` credentials), the users' passwords, the code, `state`, the nonce,
+the flow cookie, the exchange code, the session tokens, a JWT, an identity's subject. With
+`--nocapture` each test prints what it verified and how many bytes of log it searched.
+
+## By hand
+
+Some checks need Keycloak's admin login, which the live test does not take, or a browser or an
+app. They are run by hand against a scratch server (above, "Running Ferrofin against it"), and
+the realm is put back afterwards:
+
+- **A demotion at Keycloak**: with role sync on and `ferrofin-admins` as the administrator role,
+  sign `oidc-admin` in (an administrator), take it out of `ferrofin-admins`, and sign in again: no
+  longer an administrator (the server's own seeded administrator keeps another one). Put it back
+  in the group, and the next sign-in makes it one again. The admin REST calls this was run with,
+  with an administrator's access token: `DELETE` (out) or `PUT` (back in)
+  `/admin/realms/ferrofin-test/users/{user id}/groups/{group id}`.
+- **Profile pictures**: step 8 of "Running Ferrofin against it".
+- **jellyfin-web**: steps 5 to 7 of "Running Ferrofin against it" from a browser, the login page's button
+  ([`docs/SINGLE_SIGN_ON.md`](../../docs/SINGLE_SIGN_ON.md#what-clients-show)), `/sso/link` and the
+  settings page's **Linked accounts**, and `/sso/quickconnect` with a code an app started.
+- **Native apps** (not yet run): approve a real app's Quick Connect code through
+  `/sso/quickconnect`, look at what each app's login screen shows while a provider is enabled,
+  and try the button in the Android app, which wraps jellyfin-web.

@@ -120,7 +120,10 @@
                         <div class="fieldDescription">
                             The address users reach this server at, base path included, such as
                             https://media.example.org. Each provider's callback URL is built on it. When it
-                            is empty, the Published server URL in Ferrofin Settings is used.
+                            is empty, the server's published URL is used. Ferrofin Settings shows it,
+                            read-only, as Published server URL; set it with --published-url,
+                            FERROFIN_PUBLISHED_URL or published_url in config.toml, and restart. Dashboard →
+                            Networking's published server URIs are not used.
                         </div>
                         <div class="fieldDescription ssoRefused ssoPublicUrlError hide" role="alert"></div>
                     </div>
@@ -594,8 +597,9 @@
                         callback.appendChild(document.createTextNode('Callback URL to register at the provider: '));
                         callback.appendChild(element('code', null, info.CallbackUrl));
                     } else {
-                        callback.textContent = 'Fill in the Public URL above, or set the Published server URL in '
-                            + 'Ferrofin Settings, to get the callback URL to register at the provider.';
+                        callback.textContent = 'Fill in the Public URL above, or start the server with a published '
+                            + 'URL (--published-url, FERROFIN_PUBLISHED_URL or published_url in config.toml), to get '
+                            + 'the callback URL to register at the provider.';
                     }
                     row.appendChild(callback);
                     if (state.discovery[info.Key]) {
