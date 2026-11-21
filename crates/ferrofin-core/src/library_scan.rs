@@ -55,7 +55,7 @@ use ferrofin_providers::metadata_merge::{
     forced_sort_name, language_subtag, matches_preferred_language, season_sort_name,
     settle_sort_name,
 };
-use ferrofin_providers::provider_manager::parse_ymd;
+use ferrofin_providers::provider_manager::{is_shared_album_artwork, parse_ymd};
 use ferrofin_providers::{
     EpisodeLocalImageProvider, FsDirectoryService, ImageItem, ImageItemKind, LocalImageProvider,
     RemoteImage, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
@@ -133,10 +133,12 @@ struct ArtworkCache {
     /// Album → the first `REPLAYGAIN_ALBUM_GAIN` its unlocked tracks' probes
     /// read this scan, for the music pass to store on an album that has none.
     album_gains: HashMap<Uuid, f64>,
-    /// Album → immutable shared cover, including dimensions and blurhash.
-    album_covers: HashMap<Uuid, ItemImageInfo>,
-    /// Albums containing tracks scanned before a usable cover was found.
-    albums_needing_backfill: std::collections::HashSet<Uuid>,
+    /// The embedded cover the first track of an album and tag pair
+    /// ([`AlbumCoverKey`]) extracted this scan (that track's own copy,
+    /// measured), which its other tracks with a picture copy instead of
+    /// extracting their own: the one extraction
+    /// `AudioImageProvider.GetAudioImagePath` shares.
+    album_track_covers: HashMap<AlbumCoverKey, ItemImageInfo>,
     /// Series item id → matched TMDB series id.
     series_tmdb: std::collections::HashMap<String, i64>,
     /// (series item id, season number, language) → TMDB details, fetched
@@ -190,8 +192,7 @@ struct ArtworkCache {
     /// sharing one `folder.jpg` share the answer. Only a complete probe is
     /// kept ([`remember_probed_image`]): no other can be adopted.
     ///
-    /// Before the walk it holds the planned albums' rows, for their covers;
-    /// then the stored rows of the items in the current stored-row window,
+    /// It holds the stored rows of the items in the current stored-row window,
     /// each window's replacing the last ([`StoredRows::enter`]), so it never
     /// holds the whole library.
     stored_images: ProbedImages,
@@ -2094,9 +2095,10 @@ pub enum ScanPasses {
     /// `ValidateTopLibraryFolders` opens with.
     Library,
     /// Only what is scoped to the items this scan touched: the music
-    /// refresh of the albums and artists among them, their album covers, the
+    /// refresh of the albums and artists among them, the
     /// children-derived columns of the folders it planned, and the generated
-    /// Primaries of the photo albums, folders and playlists among them — plus
+    /// Primaries of the music and photo albums, folders and playlists among
+    /// them — plus
     /// the library tiles for a library's or the root's refresh, and the user
     /// root's image for the root's.
     /// An item or folder refresh over the API, and the library monitor's
@@ -3609,6 +3611,73 @@ impl<'a> PlanCtx<'a> {
     }
 }
 
+/// What tracks share one extracted cover by: their `MusicAlbum`'s id, their
+/// `Album` tag and their first album artist, as `GetAudioImagePath` names its
+/// file by the last two. The album's id keeps two albums sharing both apart
+/// (upstream gives them one file: a Jellyfin bug not ported).
+type AlbumCoverKey = (Uuid, String, String);
+
+/// The [`AlbumCoverKey`] of a track in `album`, or `None` when its `Album`
+/// tag or its first album artist is blank: `GetAudioImagePath` then gives
+/// the item a file of its own.
+fn album_cover_key(album: Uuid, track: &BaseItemEntity) -> Option<AlbumCoverKey> {
+    fn named(value: Option<&str>) -> Option<&str> {
+        value.map(str::trim).filter(|v| !v.is_empty())
+    }
+    let tag = named(track.album.as_deref())?;
+    // `Split('|', RemoveEmptyEntries)` (`BaseItemMapper`), then `[0]`.
+    let artist = named(
+        track
+            .album_artists
+            .as_deref()?
+            .split('|')
+            .find(|a| !a.is_empty()),
+    )?;
+    Some((album, tag.to_owned(), artist.to_owned()))
+}
+
+/// Each planned track's album, by id from the plan, never by album title
+/// (two albums may share one): the planned `MusicAlbum` among its ancestors,
+/// so a multi-disc album's tracks are its own.
+fn track_albums(planned: &[Planned]) -> HashMap<Uuid, Uuid> {
+    let albums: std::collections::HashSet<Uuid> = planned
+        .iter()
+        .filter(|p| image_item_kind(&p.entity.type_) == ImageItemKind::MusicAlbum)
+        .map(|p| p.id)
+        .collect();
+    planned
+        .iter()
+        .filter(|p| image_item_kind(&p.entity.type_) == ImageItemKind::Audio)
+        .filter_map(|p| {
+            let album = p.ancestors.iter().rev().find(|id| albums.contains(id))?;
+            Some((p.id, *album))
+        })
+        .collect()
+}
+
+/// The embedded picture `AudioImageProvider.GetImage` extracts: the first
+/// whose comment names the front cover, else the first naming a cover, else
+/// the first; `None` when the file embeds none.
+fn audio_cover_stream(streams: &[MediaStreamInfoEntity]) -> Option<i32> {
+    // In stream order, as `GetMediaStreams` lists them.
+    let mut pictures: Vec<&MediaStreamInfoEntity> = streams
+        .iter()
+        .filter(|s| s.stream_type == EMBEDDED_IMAGE_STREAM_TYPE)
+        .collect();
+    pictures.sort_by_key(|s| s.stream_index);
+    let named = |word: &str| {
+        pictures.iter().copied().find(|s| {
+            s.comment
+                .as_deref()
+                .is_some_and(|c| c.to_lowercase().contains(word))
+        })
+    };
+    named("front")
+        .or_else(|| named("cover"))
+        .or_else(|| pictures.first().copied())
+        .and_then(|s| i32::try_from(s.stream_index).ok())
+}
+
 /// The folders under the art `root` the scan writes `entity`'s art to: its
 /// own folder ([`crate::dynamic_images::own_art_dir`]), then the lower-cased
 /// [`crate::dynamic_images::legacy_art_dir`] older scans also wrote to, while
@@ -3827,36 +3896,7 @@ pub(crate) fn dead_by_name_queries() -> [InternalItemsQuery; 2] {
 
 /// The closing passes [`LibraryScanner::post_scan_passes`] runs, each worth
 /// an equal share of the last 4 % of a scan's progress.
-const POST_SCAN_PASSES: u32 = 11;
-
-/// The `albums` whose stored Primary is still the cover `covers` holds for
-/// them, from one read of their image rows. A failed read is logged and
-/// counts as none: each album then has its cover published again, as an
-/// album whose rows could not be read always had.
-async fn albums_keeping_their_cover(
-    items: &dyn ItemRepository,
-    albums: &[Uuid],
-    covers: &HashMap<Uuid, ItemImageInfo>,
-) -> std::collections::HashSet<Uuid> {
-    let stored = items
-        .get_image_infos_batch(albums)
-        .await
-        .unwrap_or_else(|err| {
-            tracing::warn!(%err, "could not read the albums' stored artwork to check their covers");
-            HashMap::new()
-        });
-    stored
-        .into_iter()
-        .filter(|(id, images)| {
-            covers.get(id).is_some_and(|cover| {
-                images
-                    .iter()
-                    .any(|image| image.image_type == ImageType::Primary && image.path == cover.path)
-            })
-        })
-        .map(|(id, _)| id)
-        .collect()
-}
+const POST_SCAN_PASSES: u32 = 10;
 
 /// How many items the splashscreen draws its posters (and, separately, its
 /// thumbs or backdrops) from: `GetItemsWithImageType`'s `Limit = 30`.
@@ -3921,7 +3961,6 @@ async fn splashscreen_images(items: &dyn ItemRepository, image_type: ImageType) 
 #[derive(Debug, Default)]
 struct PassTimings {
     music: std::time::Duration,
-    album_covers: std::time::Duration,
     artists: std::time::Duration,
     dead_by_name: std::time::Duration,
     aggregates: std::time::Duration,
@@ -3940,7 +3979,6 @@ impl PassTimings {
     fn log(&self, albums_and_artists: usize, elapsed: std::time::Duration) {
         let [
             music,
-            album_covers,
             artists,
             dead_by_name,
             aggregates,
@@ -3953,7 +3991,6 @@ impl PassTimings {
         ] = crate::scan_metrics::SCAN_PASSES;
         crate::scan_metrics::passes_finished(&[
             (music, self.music),
-            (album_covers, self.album_covers),
             (artists, self.artists),
             (dead_by_name, self.dead_by_name),
             (aggregates, self.aggregates),
@@ -3968,7 +4005,6 @@ impl PassTimings {
         tracing::info!(
             albums_and_artists,
             music_ms = ms(self.music),
-            album_covers_ms = ms(self.album_covers),
             artists_ms = ms(self.artists),
             dead_by_name_ms = ms(self.dead_by_name),
             aggregates_ms = ms(self.aggregates),
@@ -3989,7 +4025,7 @@ impl PassTimings {
 /// as it starts (`number` of [`POST_SCAN_PASSES`]) and one as it finishes,
 /// with `elapsed_ms` and an `outcome`: `cancelled` when the scan was cancelled
 /// by then, `failed` when `work` answers `false` (it logged its error itself),
-/// else `completed`. A pass whose failures are per item (music, album covers)
+/// else `completed`. A pass whose failures are per item (music, dynamic images)
 /// logs those inside and answers `true`, as an upstream task completes over
 /// its items' errors. Both lines and every event of `work` run in a
 /// `post_scan_pass` span carrying `pass`, the pass's
@@ -4210,6 +4246,7 @@ static NO_STORED_LINKS: StoredItemLinks = StoredItemLinks {
     ancestors: Vec::new(),
     external_subtitles: Vec::new(),
     external_audio: Vec::new(),
+    embedded_images: Vec::new(),
     locked_fields: Vec::new(),
 };
 
@@ -4488,11 +4525,6 @@ pub struct LibraryScanner {
     metadata_configuration: Option<MetadataConfigurationReader>,
     /// Post-refresh TrickplayProvider and its live global scan timing.
     trickplay: Option<trickplay::ScanTrickplay>,
-    /// What each album's shared cover was last published from, so an
-    /// unchanged source is not read and hashed again on every scan
-    /// ([`shared_album_cover`](Self::shared_album_cover)). One small entry per
-    /// album the scanner has seen, never pruned: bounded by the library.
-    album_cover_sources: std::sync::Mutex<HashMap<Uuid, SharedCoverSource>>,
     /// The persistence's [`user_data_detach_epoch`] when the last full
     /// user-data recovery sweep began; `None` until one has run, so the first
     /// scan after a start always sweeps ([`recover_user_data`]).
@@ -4523,20 +4555,6 @@ pub struct LibraryScanner {
     /// whose photo failed); give it image_negative_cache_ttl_secs if an outage
     /// should stop holding photos back before a restart.
     photos_failed: std::sync::Mutex<std::collections::HashSet<String>>,
-}
-
-/// The source an album's shared cover was hashed from, with the stamp it had
-/// then ([`LibraryScanner::shared_album_cover`]).
-#[derive(Debug, Clone)]
-struct SharedCoverSource {
-    /// The source image's path.
-    source: String,
-    /// Its size when it was hashed.
-    len: u64,
-    /// Its mtime when it was hashed.
-    modified: std::time::SystemTime,
-    /// The shared copy it was published as.
-    shared_path: String,
 }
 
 /// A live reader of the server-wide `MetadataOptions`
@@ -4731,7 +4749,6 @@ impl LibraryScanner {
             nfo_configuration: None,
             content_types: None,
             directory_cache_limits: DirectoryCacheLimits::default(),
-            album_cover_sources: std::sync::Mutex::new(HashMap::new()),
             swept_at_epoch: std::sync::Mutex::new(None),
             biographies_asked: std::sync::Mutex::default(),
             photos_failed: std::sync::Mutex::default(),
@@ -6995,15 +7012,11 @@ impl LibraryScanner {
         }
         // Carries matched series' TMDB ids + their episode-still URLs across the
         // scan so seasons/episodes resolve against the same series lookup.
-        let (mut art_cache, locked_items, touched) = self.scan_prereads(&planned, run).await;
+        let (mut art_cache, locked_items) = self.scan_prereads(&planned, run).await;
         // The presentation key each series settled on once its provider ids
         // were known, for the seasons/episodes planned after it (a series
         // always precedes its children in plan order).
         let mut series_keys: HashMap<Uuid, String> = HashMap::new();
-        if !touched.is_empty() {
-            // The lane served while the album covers were read.
-            Box::pin(self.reread_touched(&touched, &mut art_cache, &mut series_keys)).await;
-        }
         // Each planned item's stored row, read a window at a time just ahead
         // of the loop (see `StoredRows`) — never the whole library at once.
         let mut stored_rows = StoredRows::default();
@@ -7791,7 +7804,7 @@ impl LibraryScanner {
     /// After a lane refresh touched the items `touched`: what this scan
     /// cached about them is read again — a kept series' provider ids (an
     /// Identify replaced them; a first-pass save of the old ones would put
-    /// them back), a touched album's cover and a touched series'
+    /// them back) and a touched series'
     /// presentation key (its episodes further on take it) — and every lookup
     /// this scan resolved for them is dropped: a series' TMDB and TVDB
     /// match, its seasons' TMDB details (the names, overviews and stills of
@@ -7851,24 +7864,6 @@ impl LibraryScanner {
         cache.resolved_locales.retain(|id, _| !keys.contains(id));
         // A refresh may have rewritten a row above the next item, rating or parent alike.
         cache.rating_ancestors.clear();
-        let albums: Vec<Uuid> = touched
-            .iter()
-            .filter(|id| cache.album_covers.remove(id).is_some())
-            .copied()
-            .collect();
-        if let Some(items) = &self.item_repository {
-            // The album's cover as the refresh stored it (the shared,
-            // content-addressed copy `finish_album_artwork` publishes).
-            for album in albums {
-                if let Ok(images) = items.get_image_infos(album).await
-                    && let Some(primary) =
-                        images.iter().find(|i| i.image_type == ImageType::Primary)
-                    && let Some(cover) = self.shared_album_cover(album, primary)
-                {
-                    cache.album_covers.insert(album, cover);
-                }
-            }
-        }
         let series: Vec<Uuid> = touched
             .iter()
             .filter(|id| series_keys.contains_key(id))
@@ -7892,9 +7887,10 @@ impl LibraryScanner {
 
     /// The closing passes of an item or folder refresh, and of the library
     /// monitor's scan ([`ScanPasses::Touched`]): the music refresh of the
-    /// albums and artists it refreshed, the album covers this pass gathered,
+    /// albums and artists it refreshed,
     /// the children-derived columns of the folders it planned, the generated
-    /// Primaries of the photo albums, folders and playlists it refreshed, and
+    /// Primaries of the music and photo albums, folders and playlists it
+    /// refreshed, and
     /// the tiles of the `libraries` a library's or the root's refresh
     /// validated whole — never a pass over the whole database. (The folders
     /// planned for context included: see the owner-approved divergence at
@@ -7913,7 +7909,6 @@ impl LibraryScanner {
         let mut served = work.served.clone();
         self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
             .await;
-        self.finish_album_artwork(art_cache, run).await;
         // The TMDb missing/unaired episodes of each series it refreshed (a
         // series' own refresh is a touched scan).
         if let Err(err) = self
@@ -7926,7 +7921,7 @@ impl LibraryScanner {
             tracing::warn!(%err, "folder aggregates pass failed");
         }
         // The custom providers of what it refreshed, after the art they draw
-        // from: the photo albums, folders and playlists it walked. A cancel
+        // from: the music and photo albums, folders and playlists it walked. A cancel
         // stops between two passes, as library validation's do.
         if let Some(providers) = self.dynamic_image_providers() {
             let between =
@@ -8710,9 +8705,23 @@ impl LibraryScanner {
         // full refresh; the plan already refuses the remote ones.
         let dynamic_images =
             !locked || options.image_refresh_mode == MetadataRefreshMode::FullRefresh;
+        // A track's cover provider reads its stored pictures when this pass
+        // probed nothing (`AudioImageProvider.GetImage`: `GetMediaStreams`).
+        let streams = match links {
+            Some(links)
+                if !probe_ran
+                    && matches!(
+                        image_item_kind(&entity.type_),
+                        ImageItemKind::Audio | ImageItemKind::AudioBook
+                    ) =>
+            {
+                links.embedded_images.as_slice()
+            }
+            _ => rows.streams.as_slice(),
+        };
         let art = ArtworkPass {
             entity: &entity,
-            streams: &rows.streams,
+            streams,
             policy,
             embedded_images,
             nfo_images: local.remote_images,
@@ -8723,6 +8732,7 @@ impl LibraryScanner {
             remove_existing: options.remove_old_metadata && options.replace_all_images,
             dynamic_images,
             stored: links.map(|l| l.images.as_slice()),
+            locked,
             // The season premiere-date gate below, its one reader.
             judge_local_images: season_base.is_none()
                 && !locked
@@ -9468,8 +9478,8 @@ impl LibraryScanner {
     }
 
     /// The batches the walk reads across items, gathered once up front: the
-    /// series' recorded provider ids, the albums' artwork and the locked-item
-    /// set. What only an item's own visit reads, its recorded provider ids and
+    /// series' recorded provider ids and the locked-item set, with each
+    /// track's album from the plan. What only an item's own visit reads, its recorded provider ids and
     /// stored image probes, is read with its stored-row window instead
     /// ([`read_window_prereads`](Self::read_window_prereads)).
     ///
@@ -9481,11 +9491,7 @@ impl LibraryScanner {
         &self,
         planned: &[Planned],
         run: ScanRun<'_>,
-    ) -> (
-        Box<ArtworkCache>,
-        std::collections::HashSet<Uuid>,
-        Vec<Uuid>,
-    ) {
+    ) -> (Box<ArtworkCache>, std::collections::HashSet<Uuid>) {
         // TheTVDB's responses are kept as long as its client keeps its own
         // (the plugin's one `CacheDurationInHours` covers them all).
         let tvdb_duration = self
@@ -9510,13 +9516,11 @@ impl LibraryScanner {
         // stored-row window at a time, with its rows (`read_window_prereads`).
         self.preload_kept_provider_ids(planned, &mut art_cache)
             .await;
-        let touched = self
-            .preload_album_artwork(planned, &mut art_cache, run)
-            .await;
+        art_cache.track_albums = track_albums(planned);
         // One read of the locked-item set for the whole scan, for the items
         // whose stored row the walk has none of (see `locked_items`).
         let locked_items = self.locked_items(planned).await;
-        (art_cache, locked_items, touched)
+        (art_cache, locked_items)
     }
 
     /// Seeds the scan's provider-id cache with the ids previous scans recorded
@@ -9542,289 +9546,107 @@ impl LibraryScanner {
         }
     }
 
-    /// Resolve ownership from the plan, never album titles (which collide).
-    /// Serves `run`'s lane between two albums and returns what the refreshes
-    /// it served touched.
-    async fn preload_album_artwork(
-        &self,
-        planned: &[Planned],
-        cache: &mut ArtworkCache,
-        run: ScanRun<'_>,
-    ) -> Vec<Uuid> {
-        let mut touched = Vec::new();
-        let albums: HashMap<Uuid, &Planned> = planned
-            .iter()
-            .filter(|p| image_item_kind(&p.entity.type_) == ImageItemKind::MusicAlbum)
-            .map(|p| (p.id, p))
-            .collect();
-        for item in planned {
-            if image_item_kind(&item.entity.type_) == ImageItemKind::Audio
-                && let Some(album) = item
-                    .ancestors
-                    .iter()
-                    .rev()
-                    .find(|id| albums.contains_key(id))
-            {
-                cache.track_albums.insert(item.id, *album);
-            }
-        }
-        // What previous scans probed for the albums' images, for their covers
-        // below: an album stores its shared cover as its own Primary. The
-        // rest of the plan's probes are read a stored-row window at a time
-        // (`read_window_prereads`), and the walk's first window replaces
-        // these.
-        let album_ids: Vec<Uuid> = albums.keys().copied().collect();
-        if !album_ids.is_empty() {
-            match self.persistence.image_metadata_for_items(&album_ids).await {
-                Ok(stored) => remember_stored_images(&mut cache.stored_images, stored),
-                Err(err) => {
-                    tracing::warn!(%err, "could not preload the albums' stored image metadata");
-                }
-            }
-        }
-        let has_primary =
-            |images: &[ItemImageInfo]| images.iter().any(|i| i.image_type == ImageType::Primary);
-        // Each album's own artwork, listed afresh (the walk may have saved
-        // artwork into the album's folder since the run listed it), off the
-        // runtime workers: a directory listing per album.
-        let mut listed: Vec<(Uuid, Vec<ItemImageInfo>)> = Vec::with_capacity(albums.len());
-        for (&id, album) in &albums {
-            touched.extend(Box::pin(self.serve_lane(run)).await);
-            let images = off_runtime(|| {
-                let album = album.entity.to_entity();
-                let mut images = discover_local_images(&album, None, &FsDirectoryService::new());
-                self.append_art_dir_images(&album, &mut images);
-                images
-            });
-            listed.push((id, images));
-        }
-        // The stored artwork of every album with no local Primary, in one read.
-        let lacking: Vec<Uuid> = listed
-            .iter()
-            .filter(|(_, images)| !has_primary(images))
-            .map(|(id, _)| *id)
-            .collect();
-        // Read once, after the listing: a lane refresh served below may
-        // change an album's rows after this, as one served between two
-        // albums could before.
-        let mut stored = match &self.item_repository {
-            Some(items) if !lacking.is_empty() => {
-                match items.get_image_infos_batch(&lacking).await {
-                    Ok(stored) => stored,
-                    Err(err) => {
-                        tracing::warn!(%err, "could not read the albums' stored artwork");
-                        HashMap::new()
-                    }
-                }
-            }
-            _ => HashMap::new(),
-        };
-        for (id, mut images) in listed {
-            touched.extend(Box::pin(self.serve_lane(run)).await);
-            if !has_primary(&images) {
-                images.extend(stored.remove(&id).unwrap_or_default());
-            }
-            // Publishing the shared copy reads and hashes the cover the first
-            // time: off the runtime workers too.
-            if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary)
-                && let Some(mut cover) = off_runtime(|| self.shared_album_cover(id, primary))
-            {
-                adopt_stored_image_metadata(std::slice::from_mut(&mut cover), &cache.stored_images);
-                self.fill_image_metadata(id, std::slice::from_mut(&mut cover))
-                    .await;
-                cache.album_covers.insert(id, cover);
-            }
-        }
-        touched
-    }
-
-    /// Immutable, content-addressed album assets are outside item upload dirs.
-    /// Replacing a track/album image therefore cannot overwrite another item's
-    /// file. Old assets are retained as a persistent cache, including on delete.
+    /// `AudioImageProvider` for a track or an audiobook (`item is Audio`)
+    /// that has no Primary: the picture its own file embeds, stored in its
+    /// own art folder as its Primary. A file embedding none gets no image
+    /// (`GetImage`'s guard), so a track without a picture has no image of its
+    /// own and clients show its album's (`AlbumPrimaryImageTag`).
     ///
-    /// A source keeping the size and mtime it had when it was last hashed is
-    /// taken to be the same cover, and its shared copy is reused unread
-    /// ([`album_cover_sources`](Self::album_cover_sources)); a cover edited in
-    /// place without changing either keeps the old copy until it does.
-    fn shared_album_cover(&self, album: Uuid, image: &ItemImageInfo) -> Option<ItemImageInfo> {
-        self.publish_album_cover(album, image, true)
-    }
-
-    /// [`shared_album_cover`](Self::shared_album_cover), consulting and
-    /// recording the source stamp only when `remember` is set: a transient
-    /// source (a cover just extracted from a track, deleted right after) must
-    /// not evict the album's real cover from the stamp cache.
-    fn publish_album_cover(
+    /// A track's picture is extracted once per `share` key
+    /// ([`album_cover_key`]): the other tracks with that key and a picture
+    /// copy the first one's file, as `GetAudioImagePath` shares one
+    /// extraction between an album's tracks, and the copy takes its
+    /// dimensions and blurhash, the same file's. A track with no key, or an
+    /// audiobook, has its own, as `GetAudioImagePath` keys it by the item. A track whose copy is
+    /// already on disk reuses it without running ffmpeg. Best-effort: no
+    /// encoder, no metadata dir, no picture or a failed extraction yield
+    /// nothing.
+    async fn extract_embedded_cover(
         &self,
-        album: Uuid,
-        image: &ItemImageInfo,
-        remember: bool,
-    ) -> Option<ItemImageInfo> {
-        use sha2::{Digest as _, Sha256};
-        use std::fmt::Write as _;
-        let root = self.metadata_dir.as_ref()?;
-        let source = Path::new(&image.path);
-        let dir = root
-            .join(ferrofin_providers::provider_manager::SHARED_ALBUM_ARTWORK_DIR)
-            .join(guid_to_db(album));
-        if source.starts_with(&dir) && source.is_file() {
-            return Some(image.clone());
-        }
-        // A source with the size and mtime it had when it was last hashed is
-        // the same cover: reuse its shared copy (while it exists) rather than
-        // reading and hashing the whole file on every scan.
-        let stamp = remember
-            .then(|| std::fs::metadata(source).ok())
-            .flatten()
-            .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
-        let known = stamp.and_then(|(len, modified)| {
-            self.album_cover_sources
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&album)
-                .filter(|known| {
-                    known.source == image.path && known.len == len && known.modified == modified
-                })
-                .map(|known| known.shared_path.clone())
-        });
-        if let Some(shared_path) = known.filter(|path| Path::new(path).is_file()) {
-            let mut shared = image.clone();
-            shared.date_modified = file_date_modified(Path::new(&shared_path));
-            shared.path = shared_path;
-            return Some(shared);
-        }
-        let bytes = std::fs::read(source).ok()?;
-        let mut digest = String::with_capacity(64);
-        for byte in Sha256::digest(&bytes) {
-            write!(digest, "{byte:02x}").ok()?;
-        }
-        let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
-        let dest = dir.join(format!("{digest}.{ext}"));
-        std::fs::create_dir_all(&dir).ok()?;
-        if !dest.exists() {
-            // Publish a complete file, never a partially copied image.
-            let temporary = dir.join(format!("{}.tmp", Uuid::new_v4()));
-            if std::fs::write(&temporary, &bytes)
-                .and_then(|()| std::fs::rename(&temporary, &dest))
-                .is_err()
-            {
-                let _ = std::fs::remove_file(&temporary);
-                return None;
-            }
-        }
-        let mut shared = image.clone();
-        shared.path = dest.to_string_lossy().into_owned();
-        shared.date_modified = file_date_modified(&dest);
-        if let Some((len, modified)) = stamp {
-            self.album_cover_sources
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(
-                    album,
-                    SharedCoverSource {
-                        source: image.path.clone(),
-                        len,
-                        modified,
-                        shared_path: shared.path.clone(),
-                    },
-                );
-        }
-        Some(shared)
-    }
-
-    /// Select the first usable embedded cover once for an album. Misses
-    /// are not cached: a later track may have a valid picture when this one does not.
-    async fn album_track_cover(
-        &self,
-        album: Uuid,
+        item_id: Uuid,
         entity: &BaseItemEntity,
         streams: &[MediaStreamInfoEntity],
+        share: Option<AlbumCoverKey>,
         cache: &mut ArtworkCache,
     ) -> Vec<ItemImageInfo> {
-        if let Some(cover) = cache.album_covers.get(&album) {
-            return vec![cover.clone()];
+        if !matches!(
+            image_item_kind(&entity.type_),
+            ImageItemKind::Audio | ImageItemKind::AudioBook
+        ) {
+            return Vec::new();
         }
-        let (Some(encoder), Some(path)) = (&self.media_encoder, entity.path.as_deref()) else {
+        let (Some(encoder), Some(meta_root), Some(path)) = (
+            &self.media_encoder,
+            &self.metadata_dir,
+            entity.path.as_deref(),
+        ) else {
             return Vec::new();
         };
-        let Some(index) = streams
-            .iter()
-            .find(|s| s.stream_type == EMBEDDED_IMAGE_STREAM_TYPE)
-            .and_then(|s| i32::try_from(s.stream_index).ok())
-        else {
+        let Some(index) = audio_cover_stream(streams) else {
             return Vec::new();
         };
-        let Ok(extracted) = encoder.extract_audio_image(path, Some(index)).await else {
-            return Vec::new();
-        };
-        let image = ItemImageInfo {
-            path: extracted.clone(),
+        let stem = image_type_file_stem(ImageType::Primary);
+        let dir = art_dir_for(&meta_root.resolve(), item_id, stem);
+        let dest = dir.join(format!("{stem}.jpg"));
+        let mut image = ItemImageInfo {
+            path: dest.to_string_lossy().into_owned(),
             image_type: ImageType::Primary,
-            date_modified: file_date_modified(Path::new(&extracted)),
+            date_modified: DateTime::<Utc>::default(),
             width: 0,
             height: 0,
             blur_hash: None,
         };
-        let shared = self.publish_album_cover(album, &image, false);
-        let _ = std::fs::remove_file(extracted);
-        let Some(mut cover) = shared else {
-            return Vec::new();
-        };
-        adopt_stored_image_metadata(std::slice::from_mut(&mut cover), &cache.stored_images);
-        self.fill_image_metadata(album, std::slice::from_mut(&mut cover))
-            .await;
-        cache.album_covers.insert(album, cover.clone());
-        vec![cover]
-    }
-
-    async fn finish_album_artwork(&self, cache: &ArtworkCache, run: ScanRun<'_>) {
-        let Some(items) = &self.item_repository else {
-            return;
-        };
-        let mut albums: Vec<Uuid> = cache
-            .track_albums
-            .values()
-            .chain(cache.album_covers.keys())
-            .copied()
-            .collect();
-        albums.sort_unstable();
-        albums.dedup();
-        // Unchanged albums already supplied covers during the item walk.
-        // Avoid re-reading every track's images on each routine rescan.
-        let unchanged = |id: &Uuid| {
-            !cache.albums_needing_backfill.contains(id) && cache.album_covers.contains_key(id)
-        };
-        // The unchanged albums still storing that cover, from one read of
-        // their image rows.
-        let mut keeping: Option<std::collections::HashSet<Uuid>> = None;
-        for (index, &id) in albums.iter().enumerate() {
-            // Between two albums: the lane's refreshes run. A refresh served
-            // here may have rewritten the rows read for the albums still to
-            // come, so they are read again: none is judged by rows it rewrote.
-            if !Box::pin(self.serve_lane(run)).await.is_empty() {
-                keeping = None;
-            }
-            if unchanged(&id) {
-                if keeping.is_none() {
-                    let rest: Vec<Uuid> = albums[index..]
-                        .iter()
-                        .copied()
-                        .filter(|id| unchanged(id))
-                        .collect();
-                    keeping = Some(
-                        albums_keeping_their_cover(items.as_ref(), &rest, &cache.album_covers)
-                            .await,
-                    );
+        let mut extracted = false;
+        if !off_runtime(|| dest.exists()) {
+            let shared = share
+                .as_ref()
+                .and_then(|key| cache.album_track_covers.get(key))
+                .filter(|cover| off_runtime(|| Path::new(&cover.path).is_file()))
+                .cloned();
+            let source = match &shared {
+                Some(cover) => cover.path.clone(),
+                None => match encoder.extract_audio_image(path, Some(index)).await {
+                    Ok(source) => {
+                        extracted = true;
+                        source
+                    }
+                    Err(err) => {
+                        // Per track, so `debug!` (LOGGING.md rule 1).
+                        tracing::debug!(%err, item_id = %item_id, "failed to extract embedded cover art");
+                        return Vec::new();
+                    }
+                },
+            };
+            // Into the item's own art folder, beside the artwork of movies
+            // and TV, written whole (an interrupted copy would pass for the
+            // cover on every later scan); a temporary extraction is removed
+            // either way. Off the runtime workers: a copy per track.
+            let stored = off_runtime(|| {
+                let stored = std::fs::read(&source).and_then(|bytes| {
+                    ferrofin_util::file_helper::atomic_write_media(&dest, &bytes)
+                });
+                if extracted {
+                    let _ = std::fs::remove_file(&source);
                 }
-                if keeping
-                    .as_ref()
-                    .is_some_and(|keeping| keeping.contains(&id))
-                {
-                    continue;
-                }
+                stored
+            });
+            if let Err(err) = stored {
+                tracing::debug!(%err, item_id = %item_id, "failed to store embedded cover art");
+                return Vec::new();
             }
-            self.inherit_album_cover(id, items.as_ref()).await;
+            if let Some(cover) = shared {
+                image.width = cover.width;
+                image.height = cover.height;
+                image.blur_hash = cover.blur_hash;
+            }
         }
+        image.date_modified = off_runtime(|| file_date_modified(&dest));
+        if extracted && let Some(key) = share {
+            self.fill_image_metadata(item_id, std::slice::from_mut(&mut image))
+                .await;
+            cache.album_track_covers.insert(key, image.clone());
+        }
+        vec![image]
     }
 
     /// The best-effort closing passes of a library validation
@@ -9843,7 +9665,6 @@ impl LibraryScanner {
     /// | pass | selection | upstream |
     /// |---|---|---|
     /// | music | the walk's per-item decision for each album and artist ([`music`]); the item keeps what made it due until this pass writes it; then every album the scan planned, its artist credits written where they moved | `MetadataService.RefreshMetadata`; `AlbumMetadataService.SetPeople` |
-    /// | album covers | the albums this scan planned whose cover is not stored yet | the cover a track's `AudioImageProvider` extracts, shared with its album |
     /// | artists | the by-name artists a library artist supersedes; the by-name artists never refreshed (`DateLastRefreshed IS NULL`) | `ArtistsValidator.cs:86-91` (`isNew \|\| neverRefreshed`) |
     /// | dead by-name rows | the unlocked genres, music genres and studios no item value names, and the by-name artists no item credits | `GenresValidator.cs:107-119`, `StudiosValidator.cs:108-120`, `ArtistsValidator.cs:130-143` |
     /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
@@ -9851,7 +9672,7 @@ impl LibraryScanner {
     /// | first refreshes | the genres and music genres never refreshed, stamped; the root and user root too where their opening refresh cannot run; the Playlists folder never refreshed, once its directory holds an entry | `GenresValidator.cs:79-83`, `MusicGenresValidator.cs:64-67`, `ValidateTopLibraryFolders`; `Folder.cs:400-412` |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
     /// | library tiles | their own 7-day staleness (`HasChangedByDate`), every tile when the validation runs every provider; never a locked library's | `CollectionFolderImageProvider` |
-    /// | dynamic images | first the photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`); never a locked row; never the two root folders, which the validation refreshes at its opening | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders`; `ValidateTopLibraryFolders` |
+    /// | dynamic images | first the music and photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`, never for a music album); never a locked row; never the two root folders, which the validation refreshes at its opening | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders`; `ValidateTopLibraryFolders` |
     /// | collections | movies in libraries with automatic collections enabled | `CollectionPostScanTask` |
     /// | splashscreen | 30 random movies and series rated at most 13, for posters and thumbs (backdrops when no thumb); rebuilt on every validation, as upstream's | `SplashscreenPostScanTask` |
     // One straight sequence of the closing passes, each timed and logged by
@@ -9875,7 +9696,6 @@ impl LibraryScanner {
         }
         let [
             music,
-            album_covers,
             artists,
             dead_by_name,
             aggregates,
@@ -9894,14 +9714,6 @@ impl LibraryScanner {
         timings.music = post_scan_pass(music, done + 1, run.cancel, async {
             self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
                 .await;
-            true
-        })
-        .await;
-        if !self.between_passes(run, &mut done).await {
-            return false;
-        }
-        timings.album_covers = post_scan_pass(album_covers, done + 1, run.cancel, async {
-            self.finish_album_artwork(art_cache, run).await;
             true
         })
         .await;
@@ -10023,7 +9835,7 @@ impl LibraryScanner {
         if !self.between_passes(run, &mut done).await {
             return false;
         }
-        // Genre / music-genre / playlist / photo-album Primaries (upstream's
+        // Genre / music-genre / playlist / music- and photo-album Primaries (upstream's
         // `BaseDynamicImageProvider` family, run by the by-name validators at
         // the end of library validation). Same ordering reason as the library
         // tiles: the collages sample the artwork the passes above produced.
@@ -13488,72 +13300,6 @@ impl LibraryScanner {
         Ok(())
     }
 
-    /// Extracts a track's embedded cover art (ID3 `APIC` / FLAC picture) into
-    /// the item's metadata dir as its `Primary` image, when the probe found an
-    /// embedded-image stream and the file has no local artwork.
-    ///
-    /// Port of upstream's `AudioImageProvider`. Best-effort: no encoder, no
-    /// metadata dir, no image stream, or a failed extraction all yield nothing.
-    /// Idempotent — an already-extracted file is reused without re-running
-    /// ffmpeg.
-    async fn extract_embedded_cover(
-        &self,
-        item_id: Uuid,
-        entity: &BaseItemEntity,
-        streams: &[MediaStreamInfoEntity],
-    ) -> Vec<ItemImageInfo> {
-        if image_item_kind(&entity.type_) != ImageItemKind::Audio {
-            return Vec::new();
-        }
-        let (Some(encoder), Some(meta_root), Some(path)) = (
-            &self.media_encoder,
-            &self.metadata_dir,
-            entity.path.as_deref(),
-        ) else {
-            return Vec::new();
-        };
-        // `StreamType` 3 is EmbeddedImage (the probe's classification of an
-        // attached picture); without one there is nothing to extract.
-        let Some(index) = streams
-            .iter()
-            .find(|s| s.stream_type == EMBEDDED_IMAGE_STREAM_TYPE)
-            .map(|s| s.stream_index)
-        else {
-            return Vec::new();
-        };
-        let stem = image_type_file_stem(ImageType::Primary);
-        let dir = art_dir_for(&meta_root.resolve(), item_id, stem);
-        let dest = dir.join(format!("{stem}.jpg"));
-        if !dest.exists() {
-            let index = i32::try_from(index).ok();
-            let extracted = match encoder.extract_audio_image(path, index).await {
-                Ok(extracted) => extracted,
-                Err(err) => {
-                    tracing::warn!(%err, item = %item_id, "failed to extract embedded cover art");
-                    return Vec::new();
-                }
-            };
-            // Copy the temporary extraction into permanent item metadata,
-            // alongside the artwork for movies and TV, then clean up the temp file.
-            if let Err(err) = std::fs::create_dir_all(&dir)
-                .and_then(|()| std::fs::copy(&extracted, &dest).map(|_| ()))
-            {
-                tracing::warn!(%err, item = %item_id, "failed to store embedded cover art");
-                let _ = std::fs::remove_file(&extracted);
-                return Vec::new();
-            }
-            let _ = std::fs::remove_file(&extracted);
-        }
-        vec![ItemImageInfo {
-            path: dest.to_string_lossy().into_owned(),
-            image_type: ImageType::Primary,
-            date_modified: file_date_modified(&dest),
-            width: 0,
-            height: 0,
-            blur_hash: None,
-        }]
-    }
-
     /// A video's embedded pictures, for each supported type the item still
     /// lacks and the library's image limit allows.
     #[allow(clippy::too_many_arguments)]
@@ -13708,109 +13454,6 @@ impl LibraryScanner {
         })
     }
 
-    /// Publish the album cover and backfill tracks that had no picture before
-    /// the first successful extraction. Existing track-specific art wins.
-    async fn inherit_album_cover(&self, album_uuid: Uuid, items: &dyn ItemRepository) {
-        let Ok(mut existing) = items.get_image_infos(album_uuid).await else {
-            return;
-        };
-        let Ok(tracks) = items
-            .get_item_list(&InternalItemsQuery {
-                parent_id: album_uuid,
-                recursive: true,
-                include_item_types: vec![BaseItemKind::Audio],
-                ..Default::default()
-            })
-            .await
-        else {
-            return;
-        };
-        let mut track_images = Vec::new();
-        for track in tracks {
-            if let Ok(id) = Uuid::parse_str(&track.id)
-                && let Ok(images) = items.get_image_infos(id).await
-            {
-                track_images.push((id, images));
-            }
-        }
-        let primary = existing
-            .iter()
-            .find(|i| i.image_type == ImageType::Primary)
-            .or_else(|| {
-                track_images
-                    .iter()
-                    .flat_map(|(_, images)| images)
-                    .find(|i| i.image_type == ImageType::Primary)
-            });
-        let Some(mut cover) = primary.and_then(|image| self.shared_album_cover(album_uuid, image))
-        else {
-            return;
-        };
-        self.fill_image_metadata(album_uuid, std::slice::from_mut(&mut cover))
-            .await;
-        let mut album_cover = cover.clone();
-        if let Some(saver) = &self.image_saver
-            && let Ok(Some(row)) = items.retrieve_item(album_uuid).await
-        {
-            // Not forgotten in the run's listings: this closing pass runs
-            // after the walk, and the music pass lists album folders afresh.
-            match saver.save(&row, album_cover.clone(), 0, &existing).await {
-                Ok(saved) => {
-                    album_cover = saved.image;
-                    if let Some(error) = saved.cleanup {
-                        tracing::warn!(%error, item_id=%album_uuid, "could not remove replaced album artwork");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, item_id=%album_uuid, "could not publish album artwork");
-                }
-            }
-        }
-        let album_changed =
-            existing.iter().find(|i| i.image_type == ImageType::Primary) != Some(&album_cover);
-        existing.retain(|i| i.image_type != ImageType::Primary);
-        existing.push(album_cover);
-        if album_changed {
-            if let Err(err) = self
-                .persistence
-                .save_item_images(album_uuid, &existing)
-                .await
-            {
-                tracing::warn!(%err, album = %album_uuid, "failed to inherit album cover");
-            } else {
-                self.save_metadata_sidecars(
-                    album_uuid,
-                    ferrofin_traits::providers::ItemUpdateType::ImageUpdate,
-                )
-                .await;
-            }
-        }
-        let shared_root = self
-            .metadata_dir
-            .as_ref()
-            .map(|root| root.join(ferrofin_providers::provider_manager::SHARED_ALBUM_ARTWORK_DIR));
-        for (id, mut images) in track_images {
-            let primary = images.iter().find(|i| i.image_type == ImageType::Primary);
-            if primary.is_some_and(|i| {
-                !shared_root
-                    .as_ref()
-                    .is_some_and(|root| Path::new(&i.path).starts_with(root))
-            }) {
-                continue;
-            }
-            if primary
-                .is_some_and(|i| i.path == cover.path && i.date_modified == cover.date_modified)
-            {
-                continue;
-            }
-            images.retain(|i| i.image_type != ImageType::Primary);
-            images.push(cover.clone());
-            if let Err(err) = self.persistence.save_item_images(id, &images).await {
-                tracing::warn!(%err, item = %id, "failed to share album cover");
-            }
-        }
-    }
-
     /// Discovers the item's artwork and returns the image set to store:
     /// local files next to the media first (poster/backdrop/logo/…), then —
     /// when this refresh runs the remote image providers — a TMDB fallback for
@@ -13859,6 +13502,7 @@ impl LibraryScanner {
             remove_existing,
             dynamic_images,
             stored,
+            locked,
             judge_local_images,
             cancel,
         } = art;
@@ -13924,14 +13568,28 @@ impl LibraryScanner {
         // the `TypeOptions.ImageFetchers` check, and that checkbox list only ever
         // names remote fetchers — gating on it silently dropped all sidecar art.
         let mut images = art_cache.discover_local_images(entity);
-        // Explicit music uploads/sidecars take precedence over shared art.
+        // Earlier builds stored an album's and its tracks' covers as shared
+        // copies in `album-covers/` (gl-692, gl-1633), a row upstream never
+        // stores: validation keeps none of them, so the item takes the image
+        // upstream gives it. A locked item keeps them: the dynamic image
+        // pass never draws a locked album's copy, so nothing would replace
+        // them. The files stay where they are.
+        let music = matches!(short, "Audio" | "MusicAlbum");
+        let shared =
+            |i: &ItemImageInfo| music && i.is_local_file() && is_shared_album_artwork(&i.path);
+        let unshared: Vec<ItemImageInfo>;
+        let keepable = match stored {
+            Some(rows) if !locked && rows.iter().any(shared) => {
+                unshared = rows.iter().filter(|i| !shared(i)).cloned().collect();
+                Some(unshared.as_slice())
+            }
+            rows => rows,
+        };
+        // A track's or an album's own art (an upload, its extracted cover)
+        // takes precedence over its providers.
         if fetch != ImageFetch::All || matches!(short, "Audio" | "MusicAlbum") {
             self.append_art_dir_images(entity, &mut images);
-            // Shared album references must follow the album's current cover;
-            // importing the previous reference here would block that refresh.
-            if !matches!(short, "Audio" | "MusicAlbum") {
-                keep_stored_images(&mut images, stored, &self.virtual_paths);
-            }
+            keep_stored_images(&mut images, keepable, &self.virtual_paths);
         }
         // `ValidateImages`' set: an image full refresh adds the art dir and
         // the kept images only after its fetch, so they are added here.
@@ -13940,15 +13598,15 @@ impl LibraryScanner {
                 let mut local = images.clone();
                 if fetch == ImageFetch::All {
                     self.append_art_dir_images(entity, &mut local);
-                    keep_stored_images(&mut local, stored, &self.virtual_paths);
+                    keep_stored_images(&mut local, keepable, &self.virtual_paths);
                 }
                 image_files_changed(&local, stored)
             });
         // The NFO's artwork URLs, before any image provider runs.
         // TODO(parity, open work item — gl-1818): an album's or an artist's
         // are not saved. Un-defer path: save them in the music pass, before
-        // `music_images`, keeping an NFO Primary ahead of an album's shared
-        // embedded cover (which replaces the Primary below).
+        // `music_images`, keeping an NFO Primary ahead of the copy of a
+        // track's cover the closing dynamic image pass gives an album.
         if !nfo_images.is_empty() && !music::owns_providers(short) {
             let saved = self.save_nfo_images(entity, nfo_images, &mut images);
             cut_short |= cancel.unless_cancelled(Box::pin(saved)).await.is_none();
@@ -13976,25 +13634,8 @@ impl LibraryScanner {
         if remote || cut_short {
             self.append_art_dir_images(entity, &mut images);
         }
-        // An album's Primary is stored as its shared, content-addressed cover
-        // (what `finish_album_artwork` publishes after the walk). Storing the
-        // source file here instead made the two passes rewrite each other's
-        // row on every scan.
-        if image_item_kind(&entity.type_) == ImageItemKind::MusicAlbum
-            && let Some(cover) = art_cache.album_covers.get(&item_id)
-        {
-            images.retain(|image| image.image_type != ImageType::Primary);
-            images.push(cover.clone());
-        }
         if !remote {
-            keep_stored_images(&mut images, stored, &self.virtual_paths);
-        }
-        if !images
-            .iter()
-            .any(|image| image.image_type == ImageType::Primary)
-            && let Some(album) = art_cache.track_albums.get(&item_id)
-        {
-            art_cache.albums_needing_backfill.insert(*album);
+            keep_stored_images(&mut images, keepable, &self.virtual_paths);
         }
         adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
         cut_short |= self
@@ -14007,9 +13648,10 @@ impl LibraryScanner {
         // them (`ValidateImages` drops the deleted ones and saves), so an
         // empty set is stored then, as it is after `RemoveImages` removed
         // them (`item.RemoveImages`, then the save); a fetch that found
-        // nothing still writes nothing.
-        let stale_rows =
-            (!remote || remove_existing) && stored.is_some_and(|stored| !stored.is_empty());
+        // nothing still writes nothing, but a shared album cover it let go.
+        let stale_rows = ((!remote || remove_existing)
+            && stored.is_some_and(|stored| !stored.is_empty()))
+            || stored.map(<[_]>::len) != keepable.map(<[_]>::len);
         (
             (!images.is_empty() || stale_rows).then_some(images),
             cut_short,
@@ -14368,9 +14010,8 @@ impl LibraryScanner {
         }
     }
 
-    /// The embedded-cover provider for an item with no Primary: a track's
-    /// album cover, the album's shared cover, or the cover extracted from
-    /// the item's own file.
+    /// The embedded-cover provider for an item with no Primary: the cover
+    /// its own file embeds ([`extract_embedded_cover`](Self::extract_embedded_cover)).
     async fn embedded_primary(
         &self,
         item_id: Uuid,
@@ -14405,19 +14046,15 @@ impl LibraryScanner {
         } else {
             fetcher_names::EMBEDDED_IMAGES
         };
-        let enabled = policy.image_enabled(short, provider);
-        if let Some(album) = art_cache.track_albums.get(&item_id).copied() {
-            if enabled {
-                return self
-                    .album_track_cover(album, entity, streams, art_cache)
-                    .await;
-            }
-        } else if let Some(cover) = art_cache.album_covers.get(&item_id) {
-            return vec![cover.clone()];
-        } else if enabled {
-            return self.extract_embedded_cover(item_id, entity, streams).await;
+        if !policy.image_enabled(short, provider) {
+            return Vec::new();
         }
-        Vec::new()
+        let share = art_cache
+            .track_albums
+            .get(&item_id)
+            .and_then(|&album| album_cover_key(album, entity));
+        self.extract_embedded_cover(item_id, entity, streams, share, art_cache)
+            .await
     }
 
     /// The remote image providers, when this refresh runs them
@@ -19967,6 +19604,8 @@ struct PersonLock {
 
 /// One item's inputs to the artwork pass, grouped so
 /// [`LibraryScanner::collect_artwork`] keeps a readable signature.
+// Each flag is an independent fact of the item's refresh, not a state.
+#[allow(clippy::struct_excessive_bools)]
 struct ArtworkPass<'a> {
     /// The scanned row (already enriched, not yet re-read from the DB).
     entity: &'a BaseItemEntity,
@@ -19993,6 +19632,8 @@ struct ArtworkPass<'a> {
     dynamic_images: bool,
     /// The item's stored image rows, when known.
     stored: Option<&'a [ItemImageInfo]>,
+    /// The item is locked: it keeps an earlier build's shared album cover.
+    locked: bool,
     /// Whether to work out if the local image validation changed the stored
     /// images: only the season premiere-date gate reads it, for a stored,
     /// unlocked season outside a full refresh.
@@ -26277,67 +25918,6 @@ mod tests {
         assert_eq!(kept(&none, &row(Some(owner), Some(1))), None);
     }
 
-    /// An album's cover is read and hashed into the shared, content-addressed
-    /// store once: while the file keeps its size and mtime (and the shared
-    /// copy is still there), a later scan reuses that copy without reading the
-    /// cover again. A change its metadata shows is read and hashed afresh.
-    #[tokio::test]
-    async fn an_unchanged_album_cover_is_not_read_and_hashed_again() {
-        use ferrofin_model::entities::ImageType;
-        use ferrofin_traits::library::VirtualFolderManager;
-        use ferrofin_traits::options::ItemImageInfo;
-
-        let db = crate::test_support::test_db().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let persistence = std::sync::Arc::new(FerrofinItemPersistenceService::new(db));
-        let vf: std::sync::Arc<dyn VirtualFolderManager> = std::sync::Arc::new(
-            crate::FerrofinVirtualFolderManager::new(tmp.path().join("views"))
-                .with_item_store(persistence.clone()),
-        );
-        let scanner = LibraryScanner::new(
-            vf,
-            std::sync::Arc::new(FerrofinFileSystem::new()),
-            persistence,
-        )
-        .with_metadata_dir(tmp.path().join("metadata"));
-        let album = uuid::Uuid::new_v4();
-        let cover = tmp.path().join("folder.jpg");
-        std::fs::write(&cover, b"first cover").unwrap();
-        let image = ItemImageInfo {
-            path: cover.to_string_lossy().into_owned(),
-            image_type: ImageType::Primary,
-            date_modified: super::file_date_modified(&cover),
-            width: 0,
-            height: 0,
-            blur_hash: None,
-        };
-        let first = scanner.shared_album_cover(album, &image).expect("shared");
-
-        // Other bytes, the same size and mtime: only a re-read would notice.
-        let modified = std::fs::metadata(&cover).unwrap().modified().unwrap();
-        std::fs::write(&cover, b"other cover").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&cover)
-            .unwrap()
-            .set_modified(modified)
-            .unwrap();
-        let again = scanner.shared_album_cover(album, &image).expect("shared");
-        assert_eq!(again.path, first.path, "the shared copy is reused unread");
-
-        // A shared copy that is gone is published again.
-        std::fs::remove_file(&first.path).unwrap();
-        let republished = scanner.shared_album_cover(album, &image).expect("shared");
-        assert!(
-            std::path::Path::new(&republished.path).is_file(),
-            "{republished:?}"
-        );
-
-        std::fs::write(&cover, b"a new, longer cover").unwrap();
-        let changed = scanner.shared_album_cover(album, &image).expect("shared");
-        assert_ne!(changed.path, first.path, "a changed cover is hashed afresh");
-    }
-
     /// After the walk, each planned primary's local versions are written
     /// under it — their ids derived with the primary's kind — and a version
     /// a later walk released from the group is unlinked. A stopped walk
@@ -29864,17 +29444,56 @@ mod tests {
         let local = image(movie_dir.join("poster.jpg"), ImageType::Primary);
         let published = image(meta.join("heat").join("backdrop.jpg"), ImageType::Backdrop);
         saver
-            .save_all(&movie, &mut [local, published.clone()], &[published])
+            .save_all(
+                &movie,
+                &mut [local, published.clone()],
+                std::slice::from_ref(&published),
+            )
             .await
             .expect("nothing to publish");
         assert_eq!(folders.counts(), (0, 0), "no destination asked for");
+        // The stored image listed again from its art folder: the file's own
+        // nanoseconds, which its row keeps at the database's 100 ns, and no
+        // size yet. A generated album copy is one (gl-1633).
+        let listed = ItemImageInfo {
+            date_modified: published.date_modified + chrono::Duration::nanoseconds(37),
+            ..published.clone()
+        };
+        let measured = ItemImageInfo {
+            width: 1280,
+            height: 720,
+            ..published.clone()
+        };
+        saver
+            .save_all(&movie, &mut [listed], std::slice::from_ref(&measured))
+            .await
+            .expect("nothing to publish");
+        assert_eq!(
+            folders.counts(),
+            (0, 0),
+            "an unchanged file is no acquisition"
+        );
+        // The same file written again, at a new time, is one.
+        let rewritten = ItemImageInfo {
+            date_modified: published.date_modified + chrono::Duration::seconds(1),
+            ..published
+        };
+        saver
+            .save_all(&movie, &mut [rewritten], &[measured])
+            .await
+            .expect("no library saves beside the media");
+        assert_eq!(
+            folders.counts(),
+            (0, 1),
+            "a rewritten file is an acquisition"
+        );
 
         let fetched = image(meta.join("heat").join("logo.png"), ImageType::Logo);
         saver
             .save_all(&movie, &mut [fetched], &[])
             .await
             .expect("no library saves beside the media");
-        assert_eq!(folders.counts(), (0, 1), "the snapshot, once");
+        assert_eq!(folders.counts(), (0, 2), "the snapshot, once a save");
     }
 
     /// gl-1084: the NFO saver refuses a scan's `MetadataImport` of an episode
@@ -36451,7 +36070,7 @@ mod tests {
         let scanner = scanner.with_tvdb(Arc::new(
             ferrofin_providers::TvdbClient::new().with_cache_duration(duration),
         ));
-        let (mut cache, _, _) = scanner.scan_prereads(&[], super::ScanRun::defaults()).await;
+        let (mut cache, _) = scanner.scan_prereads(&[], super::ScanRun::defaults()).await;
         let series = "SERIES".to_owned();
         cache.series_tvdb.insert(
             series.clone(),
@@ -39319,8 +38938,72 @@ mod tests {
         assert_eq!(PersonKind::from_stored("27"), PersonKind::Unrecognized(27));
     }
 
-    // A track's embedded cover becomes its Primary image, stored in the
-    // metadata dir (never next to the user's media), and the album inherits it.
+    // `GetAudioImagePath`'s key: a track shares its album's extraction only
+    // with a non-blank `Album` tag and first album artist.
+    #[rstest::rstest]
+    #[case::tagged(Some("Kind of Blue"), Some("Miles Davis|Bill Evans"), true)]
+    #[case::no_album_tag(None, Some("Miles Davis"), false)]
+    #[case::blank_album_tag(Some("  "), Some("Miles Davis"), false)]
+    #[case::no_album_artist(Some("Kind of Blue"), None, false)]
+    #[case::blank_first_album_artist(Some("Kind of Blue"), Some(" |Bill Evans"), false)]
+    fn a_track_shares_an_extraction_only_with_its_album_tag_and_artist(
+        #[case] album_tag: Option<&str>,
+        #[case] album_artists: Option<&str>,
+        #[case] shared: bool,
+    ) {
+        let album = uuid::Uuid::from_u128(7);
+        let track = super::BaseItemEntity {
+            album: album_tag.map(str::to_owned),
+            album_artists: album_artists.map(str::to_owned),
+            ..Default::default()
+        };
+        let key = super::album_cover_key(album, &track);
+        assert_eq!(key.is_some(), shared, "{key:?}");
+        if shared {
+            assert_eq!(
+                key,
+                Some((album, "Kind of Blue".to_owned(), "Miles Davis".to_owned()))
+            );
+        }
+    }
+
+    // `AudioImageProvider.GetImage`'s choice: a picture whose comment names
+    // the front cover (any case), else one naming a cover, else the first in
+    // stream order; none without a picture.
+    #[rstest::rstest]
+    #[case::front_over_cover(&[(2, Some("Cover (back)")), (3, Some("Cover (front)"))], Some(3))]
+    #[case::cover_over_first(&[(2, Some("Other")), (3, Some("cover"))], Some(3))]
+    #[case::first_by_index(&[(4, None), (2, Some("Artist"))], Some(2))]
+    #[case::front_in_any_case(&[(1, Some("cover")), (2, Some("FRONT"))], Some(2))]
+    #[case::no_picture(&[], None)]
+    fn the_audio_cover_is_the_front_then_a_cover_then_the_first_picture(
+        #[case] pictures: &[(i64, Option<&str>)],
+        #[case] chosen: Option<i32>,
+    ) {
+        let mut streams = vec![super::MediaStreamInfoEntity {
+            stream_index: 0,
+            stream_type: 1,
+            comment: Some("front".into()),
+            ..Default::default()
+        }];
+        streams.extend(
+            pictures
+                .iter()
+                .map(|&(index, comment)| super::MediaStreamInfoEntity {
+                    stream_index: index,
+                    stream_type: super::EMBEDDED_IMAGE_STREAM_TYPE,
+                    comment: comment.map(str::to_owned),
+                    ..Default::default()
+                }),
+        );
+        assert_eq!(super::audio_cover_stream(&streams), chosen);
+    }
+
+    // A track's embedded cover becomes its own Primary image, stored in the
+    // metadata dir (never next to the user's media). The album takes a copy
+    // of it in its own art folder (`MusicAlbumImageProvider`), never in its
+    // media folder, whatever "Save artwork into media folders" says
+    // (gl-1633), and keeps that copy on later refreshes.
     #[rstest::rstest]
     #[case(false)]
     #[case(true)]
@@ -39441,8 +39124,9 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let mut cache = super::ArtworkCache::default();
         let images = scanner
-            .extract_embedded_cover(track_id, &track, &streams)
+            .extract_embedded_cover(track_id, &track, &streams, None, &mut cache)
             .await;
         assert_eq!(images.len(), 1);
         assert_eq!(
@@ -39458,44 +39142,78 @@ mod tests {
         // ffmpeg's scratch file next to the media is cleaned up.
         assert!(!tmp.path().join("01 - So What.flac.image.jpg").exists());
 
-        // Persist it, then the album inherits it (upstream AlbumImageProvider).
+        // Persist it, then the album's provider copies it.
         persistence
             .save_item_images(track_id, &images)
             .await
             .expect("save track image");
-        scanner.inherit_album_cover(album_id, items.as_ref()).await;
+        let providers = crate::dynamic_images::DynamicImageProviders::new(
+            Arc::clone(&items),
+            persistence.clone(),
+            Arc::new(crate::test_support::FakeImages),
+            meta.clone(),
+        );
+        let album = items.retrieve_item(album_id).await.unwrap().unwrap();
+        assert_eq!(
+            providers.refresh_item(&album, false).await.unwrap(),
+            ferrofin_traits::providers::ItemUpdateType::ImageUpdate
+        );
         let album_images = items.get_image_infos(album_id).await.unwrap();
         assert_eq!(album_images.len(), 1);
-        assert_ne!(album_images[0].path, images[0].path);
-        assert_eq!(std::fs::read(&album_images[0].path).unwrap(), b"COVER");
-        // Pin the content-addressed filename across digest crate upgrades.
         assert_eq!(
-            std::path::Path::new(&album_images[0].path)
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            if save_local {
-                "folder.jpg"
-            } else {
-                "2864716a6e437019a72d7dada2f071b83b2113cf85005475a5d228b6a73cf54a.jpg"
-            }
+            std::path::Path::new(&album_images[0].path),
+            crate::dynamic_images::own_art_dir(&meta, album_id).join("primary.jpg"),
+            "the album's copy is in its own art folder"
         );
-
+        assert_eq!(std::fs::read(&album_images[0].path).unwrap(), b"COVER");
+        assert!(
+            !tmp.path().join("folder.jpg").exists(),
+            "nothing is written into the album's media folder"
+        );
         assert!(
             stored.is_file(),
             "the track retains its internal embedded cover"
         );
-        scanner.inherit_album_cover(album_id, items.as_ref()).await;
+        // `HasChangedByDate` is false for an album: its copy is not drawn
+        // again, even once its file's time moved; a forced refresh draws it.
+        std::fs::File::options()
+            .write(true)
+            .open(&album_images[0].path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
         assert_eq!(
-            items.get_image_infos(album_id).await.unwrap(),
-            album_images,
-            "an unchanged inherited cover keeps its destination and mtime"
+            providers.refresh_item(&album, false).await.unwrap(),
+            ferrofin_traits::providers::ItemUpdateType::None
+        );
+        assert_eq!(items.get_image_infos(album_id).await.unwrap(), album_images);
+        assert_eq!(
+            providers.refresh_item(&album, true).await.unwrap(),
+            ferrofin_traits::providers::ItemUpdateType::ImageUpdate
+        );
+
+        // An audiobook (`item is Audio` upstream) extracts its own.
+        let book_id = uuid::Uuid::new_v4();
+        let book = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(book_id),
+            type_: stored_type_name(BaseItemKind::AudioBook)
+                .unwrap()
+                .to_owned(),
+            ..track.clone()
+        };
+        let covers = scanner
+            .extract_embedded_cover(book_id, &book, &streams, None, &mut cache)
+            .await;
+        assert_eq!(covers.len(), 1, "{covers:?}");
+        assert!(
+            std::path::Path::new(&covers[0].path)
+                .starts_with(crate::dynamic_images::own_art_dir(&meta, book_id)),
+            "{covers:?}"
         );
 
         // A track with no image stream extracts nothing.
         let none = scanner
-            .extract_embedded_cover(track_id, &track, &streams[..1])
+            .extract_embedded_cover(track_id, &track, &streams[..1], None, &mut cache)
             .await;
         assert!(none.is_empty(), "{none:?}");
     }
@@ -39863,6 +39581,18 @@ mod tests {
                 ..Default::default()
             })
         }
+        async fn get_media_info_full(
+            &self,
+            request: &MediaInfoRequest,
+        ) -> Result<ferrofin_model::media_info::MediaInfo, ServiceError> {
+            // One album tag and album artist: the tracks share one extraction.
+            Ok(ferrofin_model::media_info::MediaInfo {
+                media_source: self.get_media_info(request).await?,
+                album: Some("Album".to_owned()),
+                album_artists: vec!["Artist".to_owned()],
+                ..Default::default()
+            })
+        }
         async fn extract_audio_image(
             &self,
             path: &str,
@@ -39900,7 +39630,8 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn album_artwork_is_shared_across_discs_rescans_and_image_edits() {
+    async fn album_artwork_follows_discs_rescans_and_image_edits() {
+        use ferrofin_db::store::guid_to_db;
         use ferrofin_model::data::BaseItemKind;
         use ferrofin_model::entities::ImageType;
         use ferrofin_traits::options::InternalItemsQuery;
@@ -39974,92 +39705,93 @@ mod tests {
         assert_eq!(tracks.len(), 12);
         assert_eq!(albums.len(), 1);
         let album = Uuid::parse_str(&albums[0].id).unwrap();
-        let cover = items.get_image_infos(album).await.unwrap().remove(0);
+        // One extraction for the album's two discs; each track with a
+        // picture has its own copy, measured, and the two without have none.
         assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut covered = 0;
+        for track in &tracks {
+            let id = Uuid::parse_str(&track.id).unwrap();
+            let images = items.get_image_infos(id).await.unwrap();
+            if track
+                .path
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with("00.flac")
+            {
+                assert!(images.is_empty(), "{images:?}");
+                continue;
+            }
+            covered += 1;
+            assert_eq!(images.len(), 1);
+            assert!(Path::new(&images[0].path).starts_with(meta.join(guid_to_db(id))));
+            assert_eq!((images[0].width, images[0].height), (4, 4));
+            assert!(images[0].blur_hash.is_some());
+        }
+        assert_eq!(covered, 10);
+        // The album copies its first track's cover into its own folder.
+        let cover = items.get_image_infos(album).await.unwrap().remove(0);
+        assert!(Path::new(&cover.path).starts_with(meta.join(guid_to_db(album))));
         assert_eq!((cover.width, cover.height), (4, 4));
         assert!(cover.blur_hash.is_some());
-        for track in &tracks {
-            let image = items
-                .get_image_infos(Uuid::parse_str(&track.id).unwrap())
-                .await
-                .unwrap()
-                .remove(0);
-            assert_eq!(image.path, cover.path);
-            assert_eq!(image.blur_hash, cover.blur_hash);
-        }
         Box::pin(scanner.scan_all()).await.unwrap();
         assert_eq!(
             probe.calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "rescan must not extract again"
         );
-        let current = Arc::new(std::sync::RwLock::new(meta.clone()));
-        let source = Arc::clone(&current);
+        assert_eq!(
+            items.get_image_infos(album).await.unwrap(),
+            vec![cover.clone()]
+        );
         let manager = ferrofin_providers::LocalProviderManager::default().with_image_store(
             persistence.clone(),
-            ferrofin_util::directory_path::DirectoryPath::live(move || {
-                source.read().unwrap().clone()
-            }),
+            ferrofin_util::directory_path::DirectoryPath::from(meta.clone()),
         );
-        *current.write().unwrap() = tmp.path().join("replacement-metadata");
+        // An upload to a track or to the album is that item's own, and stays
+        // through a rescan; the album's leaves every track's cover alone.
         let first = Uuid::parse_str(&tracks[0].id).unwrap();
-        manager
-            .delete_image(first, ImageType::Primary, None)
-            .await
+        let replacement = tmp.path().join("new-cover.png");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([20, 160, 90]))
+            .save(&replacement)
             .unwrap();
-        assert!(
-            Path::new(&cover.path).is_file(),
-            "deleting one reference must not delete shared art"
-        );
-        *current.write().unwrap() = meta;
-        let bytes = std::fs::read(&cover.path).unwrap();
+        let bytes = std::fs::read(replacement).unwrap();
         manager
             .save_image(first, &bytes, "image/png", ImageType::Primary, None)
             .await
             .unwrap();
         let uploaded = items.get_image_infos(first).await.unwrap().remove(0);
-        assert_ne!(uploaded.path, cover.path, "upload must use copy-on-write");
+        // The rows' files; the rescan measures the upload (stored 0x0, gl-1054).
+        let paths = |images: Vec<ferrofin_traits::options::ItemImageInfo>| -> Vec<String> {
+            images.into_iter().map(|image| image.path).collect()
+        };
+        let before: Vec<_> = {
+            let mut images = Vec::new();
+            for track in &tracks {
+                let id = Uuid::parse_str(&track.id).unwrap();
+                images.push(paths(items.get_image_infos(id).await.unwrap()));
+            }
+            images
+        };
+        manager
+            .save_image(album, &bytes, "image/png", ImageType::Primary, None)
+            .await
+            .unwrap();
+        let album_upload = items.get_image_infos(album).await.unwrap().remove(0);
+        assert_ne!(album_upload.path, cover.path);
         Box::pin(scanner.scan_all()).await.unwrap();
         assert_eq!(
             items.get_image_infos(first).await.unwrap()[0].path,
             uploaded.path
         );
-        assert!(Path::new(&cover.path).is_file());
-        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        // Replacing album art propagates to shared references, not explicit tracks.
-        let replacement = tmp.path().join("new-cover.png");
-        image::RgbImage::from_pixel(8, 8, image::Rgb([20, 160, 90]))
-            .save(&replacement)
-            .unwrap();
-        manager
-            .save_image(
-                album,
-                &std::fs::read(replacement).unwrap(),
-                "image/png",
-                ImageType::Primary,
-                None,
-            )
-            .await
-            .unwrap();
-        Box::pin(scanner.scan_all()).await.unwrap();
-        let new_cover = items.get_image_infos(album).await.unwrap().remove(0);
-        assert_ne!(new_cover.path, cover.path);
-        for track in &tracks {
-            let id = Uuid::parse_str(&track.id).unwrap();
-            let image = items.get_image_infos(id).await.unwrap().remove(0);
-            assert_eq!(
-                image.path,
-                if id == first {
-                    uploaded.path.clone()
-                } else {
-                    new_cover.path.clone()
-                }
-            );
-        }
-        assert!(
-            Path::new(&cover.path).is_file(),
-            "old shared assets remain safe for in-flight readers"
+        assert_eq!(
+            items.get_image_infos(album).await.unwrap()[0].path,
+            album_upload.path
         );
+        for (track, images) in tracks.iter().zip(before) {
+            let id = Uuid::parse_str(&track.id).unwrap();
+            assert_eq!(paths(items.get_image_infos(id).await.unwrap()), images);
+        }
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -41978,16 +41710,15 @@ mod tests {
     }
 
     // A planned item's recorded provider ids and stored image probes are read
-    // by its own visit, a series' ids by its seasons and episodes too, and an
-    // album's probes by the cover pass before the walk. So only those are
-    // read before the walk; every other item's are read with its stored-row
-    // window, never the whole library's at once (gl-234).
+    // by its own visit, and a series' ids by its seasons and episodes too. So
+    // only those are read before the walk; every other item's are read with
+    // its stored-row window, never the whole library's at once (gl-234).
     #[tokio::test]
     async fn the_scan_prereads_only_what_items_further_on_read() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (scanner, planned) = two_windows_of_episodes(tmp.path()).await;
 
-        let (cache, _, _) = scanner
+        let (cache, _) = scanner
             .scan_prereads(&planned, super::ScanRun::defaults())
             .await;
         let series = ferrofin_db::store::guid_to_db(planned[0].id);
@@ -42000,37 +41731,35 @@ mod tests {
             "only the series' ids, which its episodes read, of {} planned items",
             planned.len()
         );
-        assert_eq!(
-            cache.stored_images.len(),
-            0,
-            "no item's image probes: the plan holds no album"
-        );
+        assert_eq!(cache.stored_images.len(), 0, "no item's image probes");
     }
 
-    // An album's cover is adopted before the walk from the probe its own row
-    // stores: so the albums' probes are read up front, and only theirs, not
-    // their tracks' (gl-234).
+    // An album's images are read with its stored-row window like any item's,
+    // not up front: nothing copies its cover to its tracks any more (gl-692).
+    // What the walk takes from the plan is each track's album, the one its
+    // embedded cover is extracted once for.
     #[tokio::test]
-    async fn the_albums_stored_probes_are_read_before_the_walk() {
+    async fn an_albums_probes_are_not_read_before_the_walk() {
         use ferrofin_model::data::BaseItemKind;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let album = uuid::Uuid::from_u128(1);
         let track = uuid::Uuid::from_u128(2);
-        let planned = vec![
+        let mut planned = vec![
             planned_row(album, BaseItemKind::MusicAlbum, None),
             planned_row(track, BaseItemKind::Audio, None),
         ];
+        planned[1].ancestors = vec![album];
         let (scanner, _) = preread_scanner(tmp.path(), &planned).await;
 
-        let (cache, _, _) = scanner
+        let (cache, _) = scanner
             .scan_prereads(&planned, super::ScanRun::defaults())
             .await;
-        assert!(
-            cache.stored_images.contains_key(&stored_poster(album)),
-            "the album's stored probe, for its cover"
+        assert!(cache.stored_images.is_empty(), "{:?}", cache.stored_images);
+        assert_eq!(
+            cache.track_albums,
+            std::collections::HashMap::from([(track, album)])
         );
-        assert_eq!(cache.stored_images.len(), 1, "not the track's");
     }
 
     // Entering a stored-row window replaces the previous window's recorded
@@ -42044,7 +41773,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (scanner, planned) = two_windows_of_episodes(tmp.path()).await;
         let run = super::ScanRun::defaults();
-        let (mut cache, _, _) = scanner.scan_prereads(&planned, run).await;
+        let (mut cache, _) = scanner.scan_prereads(&planned, run).await;
         let refresh = super::RefreshContext::of(run);
         let mut probes = scanner.probe_pipeline(&planned, run);
         let mut window = super::StoredRows::default();

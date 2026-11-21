@@ -3737,25 +3737,43 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                     out.entry(id).or_default().ancestors.push(parent);
                 }
             }
-            let externals = format!(
-                r#"SELECT "ItemId", "StreamType", "Path" FROM "MediaStreamInfos"
-                   WHERE "ItemId" IN ({placeholders}) AND "IsExternal" = 1
-                     AND "Path" IS NOT NULL"#
+            let streams = format!(
+                r#"SELECT "ItemId", "StreamType", "Path", "StreamIndex", "Comment"
+                   FROM "MediaStreamInfos"
+                   WHERE "ItemId" IN ({placeholders})
+                     AND (("IsExternal" = 1 AND "Path" IS NOT NULL) OR "StreamType" = {})"#,
+                crate::db_error::media_stream_type_to_disc(MediaStreamType::EmbeddedImage)
             );
-            let mut query =
-                sqlx::query_as::<_, (String, i32, String)>(sqlx::AssertSqlSafe(externals.as_str()));
+            let mut query = sqlx::query_as::<_, (String, i32, Option<String>, i64, Option<String>)>(
+                sqlx::AssertSqlSafe(streams.as_str()),
+            );
             for id in chunk {
                 query = query.bind(guid_to_db(*id));
             }
-            for (item, stream_type, path) in
+            for (item, stream_type, path, index, comment) in
                 query.fetch_all(self.db.pool()).await.map_err(db_err)?
             {
                 let Some(id) = key(&item) else { continue };
+                let links = out.entry(id).or_default();
+                let kind = crate::db_error::media_stream_type_from_disc(stream_type);
+                if kind == MediaStreamType::EmbeddedImage {
+                    links.embedded_images.push(
+                        ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+                            item_id: item,
+                            stream_index: index,
+                            stream_type,
+                            comment,
+                            ..Default::default()
+                        },
+                    );
+                    continue;
+                }
                 // the scan compares these with the files beside the media:
                 // a stored token is expanded first (`RestorePath`)
-                let path = self.virtual_paths.expand(&path);
-                let links = out.entry(id).or_default();
-                match crate::db_error::media_stream_type_from_disc(stream_type) {
+                let Some(path) = path.map(|path| self.virtual_paths.expand(&path)) else {
+                    continue;
+                };
+                match kind {
                     MediaStreamType::Subtitle => links.external_subtitles.push(path),
                     MediaStreamType::Audio => links.external_audio.push(path),
                     _ => {}
