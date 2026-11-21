@@ -292,7 +292,7 @@ class AdoptionExpectationTest(unittest.TestCase):
 
     def test_a_null_date_loses_and_a_full_tie_goes_to_the_lower_key(self):
         self.play("dated", "2020-01-01 00:00:00", 1, 0, False)
-        # Unplayed: migration 0010 stamps a date on played rows that have none.
+        # Unplayed: this case is about the date order, not a played row without a date.
         self.play("never", None, 50, 900, False)
         self.play("tie-b", "2022-02-02 00:00:00", 3, 30, False, item=STILL, IsFavorite=1)
         self.play("tie-a", "2022-02-02 00:00:00", 3, 30, False, item=STILL, IsFavorite=0)
