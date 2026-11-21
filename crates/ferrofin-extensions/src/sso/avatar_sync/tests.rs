@@ -261,6 +261,7 @@ async fn two_syncs_at_once_store_the_picture_once() {
         Arc::clone(&harness.sso.users),
         Arc::clone(&links) as Arc<dyn ExternalIdentityStore>,
         Arc::clone(&harness.sso.sessions),
+        Arc::clone(&harness.sso.devices),
         Arc::clone(&harness.sso.activity),
         Some(PUBLIC_URL.to_owned()),
     )
@@ -479,15 +480,32 @@ fn a_logged_picture_url_keeps_its_scheme_and_host_only() {
 /// userinfo for the picture.
 #[tokio::test]
 async fn a_link_flow_never_asks_userinfo_for_the_picture() {
+    use ferrofin_traits::session::SessionManager as _;
     use ferrofin_traits::sso::SsoManager as _;
     let harness = syncing(Arc::new(FakeImages::default())).await;
     picture_claim(&harness, Value::Null);
     let user = harness.users.create_user("linker").await.expect("created");
+    let user_id = Uuid::parse_str(&user.id).expect("an id");
+    let password = ferrofin_model::secret::Secret::new("linker-password");
+    harness
+        .users
+        .change_password(user_id, password.expose())
+        .await
+        .expect("password set");
+    let session = harness
+        .sessions
+        .authenticate_new_session(&ferrofin_traits::session::AuthenticationRequest {
+            username: Some("linker".to_owned()),
+            password: Some(password.clone()),
+            ..crate::sso::sign_in::tests::device("linker-browser")
+        })
+        .await
+        .expect("signed in");
     let client = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
     let started = Harness::started(
         harness
             .sso
-            .start_oidc_link("fake", Uuid::parse_str(&user.id).expect("an id"), client)
+            .start_oidc_link("fake", user_id, &password, &session.access_token, client)
             .await
             .expect("starts"),
     );

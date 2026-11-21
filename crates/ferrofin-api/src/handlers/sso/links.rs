@@ -3,8 +3,9 @@
 //!   session jellyfin-web keeps in the browser and calls the routes below;
 //! - `GET /sso/links` — the caller's own links and the providers to link at;
 //! - `POST /sso/oidc/{provider}/link` — starts a link of the caller's account
-//!   at the provider, answering the URL to send the browser to (a top-level
-//!   navigation cannot carry the access token, so the flow starts here);
+//!   at the provider, with the account's password, answering the URL to send
+//!   the browser to (a top-level navigation cannot carry the access token, so
+//!   the flow starts here);
 //! - `DELETE /sso/links/{provider}` — removes the caller's link there;
 //! - `GET`, `POST` and `DELETE /sso/admin/links` — every link, for an
 //!   administrator, who adds one by hand and removes any.
@@ -20,7 +21,10 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use ferrofin_model::sso::{OidcAdminLink, OidcLinkRequest, OidcLinkStart, OidcUserLinks};
+use ferrofin_model::secret::Secret;
+use ferrofin_model::sso::{
+    OidcAdminLink, OidcLinkRequest, OidcLinkStart, OidcLinkStartRequest, OidcUserLinks,
+};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::sso::OidcLinkAt;
 use uuid::Uuid;
@@ -31,17 +35,22 @@ use crate::error::ApiError;
 use crate::extract::{JsonBody, ProblemDetails, Query, QueryParameters, QueryRejection};
 use crate::state::AppState;
 
-/// The account a user's route acts for: the one the credentials name. An API
-/// key names none.
-fn caller(auth: Result<RequireAuth, ApiError>) -> Result<Uuid, ApiError> {
+/// The account a user's route acts for, the one the credentials name, and
+/// the session's access token. An API key names neither.
+fn caller_session(auth: Result<RequireAuth, ApiError>) -> Result<(Uuid, Secret), ApiError> {
     let RequireAuth(info) = auth?;
     let user = info.user_id();
-    if user.is_nil() {
-        return Err(ApiError::Forbidden(
+    match info.token {
+        Some(token) if !user.is_nil() => Ok((user, token)),
+        _ => Err(ApiError::Forbidden(
             "linking needs a user's session, not an API key".to_owned(),
-        ));
+        )),
     }
-    Ok(user)
+}
+
+/// The account a user's route acts for ([`caller_session`]).
+fn caller(auth: Result<RequireAuth, ApiError>) -> Result<Uuid, ApiError> {
+    caller_session(auth).map(|(user, _)| user)
 }
 
 /// `GET /sso/link` — the link page. Anonymous as a document: without a
@@ -84,19 +93,24 @@ async fn my_links(
 }
 
 /// `POST /sso/oidc/{provider}/link` — starts a link of the caller's account
-/// at the provider: sets the flow cookie and answers the identity provider's
-/// sign-in URL, for the link page to send the browser to. Its callback links
-/// the verified identity to this account, unless another account has it, and
-/// opens no session.
+/// at the provider, once the body's `Password` signs the account in: sets the
+/// flow cookie and answers the identity provider's sign-in URL, for the link
+/// page to send the browser to. Its callback links the verified identity to
+/// this account while the caller's session lasts, unless another account has
+/// it or this one was linked at that issuer since, and opens no session. A
+/// refusal sets no cookie.
 #[utoipa::path(
     post,
     path = "/sso/oidc/{provider}/link",
     params(("provider" = String, Path, description = "The provider's key")),
+    request_body = OidcLinkStartRequest,
     responses(
         (status = 200, description = "Where to send the browser, with the flow cookie set", body = OidcLinkStart),
+        (status = 400, description = "No password, or the body does not bind"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "An API key, or an account the access policy refuses"),
+        (status = 403, description = "A wrong password (counted and paced as at sign-in), an account that signs in through Single Sign-On only (an administrator links it), an API key, or an account the access policy refuses"),
         (status = 404, description = "No such enabled provider, or the Single Sign-On plugin is disabled or not available"),
+        (status = 409, description = "The account is linked at the provider's issuer already: that link is removed first"),
         (status = 502, description = "The identity provider could not be reached: a page saying so"),
         (status = 503, description = "No public URL is set to build the callback URL on: a page naming the setting")
     ),
@@ -107,12 +121,23 @@ async fn start_link(
     auth: Result<RequireAuth, ApiError>,
     provider: Result<Path<String>, PathRejection>,
     parts: Parts,
+    body: Result<JsonBody<OidcLinkStartRequest>, ProblemDetails>,
 ) -> Result<Response, ApiError> {
     let sso = enabled_service(&state).await?;
-    let user = caller(auth)?;
+    let (user, session) = caller_session(auth)?;
     let provider = sign_in_provider(provider)?;
+    let request = match body {
+        Ok(JsonBody(request)) => request,
+        Err(problem) => return Ok(problem.into_response()),
+    };
     let mut reply = sso
-        .start_oidc_link(&provider, user, state.client_address(&parts))
+        .start_oidc_link(
+            &provider,
+            user,
+            &request.password,
+            &session,
+            state.client_address(&parts),
+        )
         .await?;
     let Some(url) = reply.location.take() else {
         // Not started: the page that says why.
@@ -146,7 +171,7 @@ async fn remove_my_link(
     let sso = enabled_service(&state).await?;
     let user = caller(auth)?;
     let provider = sign_in_provider(provider)?;
-    sso.remove_oidc_link(user, OidcLinkAt::Provider(&provider))
+    sso.remove_oidc_link(user, user, OidcLinkAt::Provider(&provider))
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -197,13 +222,18 @@ async fn add_link(
     body: Result<JsonBody<OidcLinkRequest>, ProblemDetails>,
 ) -> Result<Response, ApiError> {
     let sso = enabled_service(&state).await?;
-    admin?;
+    let RequireAdmin(admin) = admin?;
     let request = match body {
         Ok(JsonBody(request)) => request,
         Err(problem) => return Ok(problem.into_response()),
     };
     let link = sso
-        .add_oidc_link(request.user_id, &request.provider, &request.subject)
+        .add_oidc_link(
+            admin.user_id(),
+            request.user_id,
+            &request.provider,
+            &request.subject,
+        )
         .await?;
     Ok(Json(link).into_response())
 }
@@ -253,7 +283,7 @@ async fn remove_link(
     query: Result<Query<RemovalQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let sso = enabled_service(&state).await?;
-    admin?;
+    let RequireAdmin(admin) = admin?;
     let query = match query {
         Ok(Query(query)) => query,
         Err(rejection) => return Ok(rejection.into_response()),
@@ -270,7 +300,7 @@ async fn remove_link(
             );
         }
     };
-    sso.remove_oidc_link(user, at).await?;
+    sso.remove_oidc_link(admin.user_id(), user, at).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

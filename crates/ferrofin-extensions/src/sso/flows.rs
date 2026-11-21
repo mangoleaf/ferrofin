@@ -39,9 +39,16 @@ pub const MAX_PENDING_FLOWS: usize = 1000;
 pub enum FlowPurpose {
     /// Signing in to Ferrofin.
     SignIn,
-    /// Linking the identity to this account, the one signed in when the
-    /// flow started ([`links`](super::links)): it opens no session.
-    Link(Uuid),
+    /// Linking the identity to an account ([`links`](super::links)): it
+    /// opens no session.
+    Link {
+        /// The account signed in when the flow started.
+        user_id: Uuid,
+        /// The SHA-256 of the access token of the session that started it,
+        /// never the token: the callback links only while that session is
+        /// still one of the account's.
+        session: [u8; 32],
+    },
     /// Approving a native app's Quick Connect code
     /// ([`quick_connect`](super::quick_connect)): it ends on a confirmation
     /// page, and opens no browser session.
@@ -118,7 +125,9 @@ impl PendingFlows {
         self.flows
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|_, flow| flow.purpose != FlowPurpose::Link(user_id));
+            .retain(|_, flow| {
+                !matches!(flow.purpose, FlowPurpose::Link { user_id: of, .. } if of == user_id)
+            });
     }
 
     /// How many flows are pending.

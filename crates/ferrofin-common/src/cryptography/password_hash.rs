@@ -285,7 +285,7 @@ fn hex_val(c: u8) -> Result<u8> {
 }
 
 /// Formats bytes as UPPERCASE hex (mirrors `Convert.ToHexString`).
-fn to_hex_string(bytes: &[u8]) -> String {
+pub(crate) fn to_hex_string(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {

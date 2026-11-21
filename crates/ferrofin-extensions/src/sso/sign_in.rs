@@ -436,8 +436,9 @@ impl SsoService {
                     Err(refusal) => refusal.refused(key),
                 }
             }
-            Ok((FlowPurpose::Link(user_id), identity, _)) => {
-                self.link_verified(&provider, user_id, identity).await?
+            Ok((FlowPurpose::Link { user_id, session }, identity, _)) => {
+                self.link_verified(&provider, user_id, &session, identity)
+                    .await?
             }
             Ok((FlowPurpose::QuickConnect(code), identity, cookie)) => {
                 match self

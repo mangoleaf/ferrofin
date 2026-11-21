@@ -1034,11 +1034,13 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
-    /// Writes what a library scan read of the playlists it resolved off disk
-    /// (`PlaylistResolver`): each one's ownership row — owned by nobody,
-    /// open to everyone, as the resolver creates it — when it has none, and
-    /// the members its local reader found, when it ran
-    /// ([`ScannedPlaylist::members`]).
+    /// Writes what a refresh read of playlists' local files: each one's
+    /// ownership row when it has none — owned by nobody and open to
+    /// everyone, as `PlaylistResolver` creates a playlist the library scan
+    /// resolved — and
+    /// the members and shares its local reader found, when it ran
+    /// ([`ScannedPlaylist::members`], [`ScannedPlaylist::shares`]), with the
+    /// `Data` copy of the shares.
     ///
     /// The default is a no-op (for stub/fake services).
     ///
@@ -1051,6 +1053,23 @@ pub trait ItemPersistenceService: Send + Sync {
     ) -> Result<(), ServiceError> {
         let _ = playlists;
         Ok(())
+    }
+
+    /// `playlist`'s owner and shares from its permission rows, the source of
+    /// truth once it has a `FerrofinPlaylists` row; `None` without one, when
+    /// its `Data` is the only record.
+    ///
+    /// The default is `None` (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn playlist_ownership(
+        &self,
+        playlist: Uuid,
+    ) -> Result<Option<PlaylistOwnership>, ServiceError> {
+        let _ = playlist;
+        Ok(None)
     }
 
     /// Joins the members a box set's `collection.xml` names to its links, as
@@ -2670,10 +2689,27 @@ pub struct ScannedPlaylist {
     /// (`PlaylistItemsProvider`), which count only when one of them names a
     /// stored item; a `playlist.xml`'s count whatever they name.
     pub from_file: bool,
-    /// Whether `members` replace the stored ones, or come first with the
-    /// stored ones not among them appended (`PlaylistMetadataService.
+    /// Whether `members` and `shares` replace the stored ones, or come first
+    /// with the stored ones not among them appended (`PlaylistMetadataService.
     /// MergeData` with `replaceData` false).
     pub replace: bool,
+    /// The shares its `playlist.xml` names, in file order — `None` when no
+    /// `playlist.xml` was read, which leaves the stored shares alone. Merged
+    /// as `PlaylistMetadataService.MergeData` merges them: they replace the
+    /// stored ones when `replace` is set or none is stored (an empty list
+    /// removes every share), else they come first and the stored shares of
+    /// the other users follow.
+    pub shares: Option<Vec<ferrofin_model::entities_media::PlaylistUserPermissions>>,
+}
+
+/// A playlist's owner and shares as its permission rows hold them
+/// ([`ItemPersistenceService::playlist_ownership`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaylistOwnership {
+    /// The owner; `None` when the row names none.
+    pub owner: Option<Uuid>,
+    /// Every share row, in share order.
+    pub shares: Vec<ferrofin_model::entities_media::PlaylistUserPermissions>,
 }
 
 /// One entry a playlist's local reader returned — the C# `LinkedChild`: an

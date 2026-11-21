@@ -18,7 +18,7 @@ use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{
-    authed_state_with_plugins, fake_state, user_authed_state_with_plugins,
+    authed_state_with_plugins, fake_state, user_session_state_with_plugins,
 };
 use ferrofin_model::dto::{SessionInfoDto, UserDto};
 use ferrofin_model::secret::Secret;
@@ -394,6 +394,7 @@ impl SsoManager for FakeSso {
             providers: vec![OidcLinkProvider {
                 key: "pocket".to_owned(),
                 name: "Pocket ID".to_owned(),
+                linked: false,
             }],
         })
     }
@@ -402,13 +403,27 @@ impl SsoManager for FakeSso {
         &self,
         key: &str,
         user_id: Uuid,
+        password: &Secret,
+        session_token: &Secret,
         client: IpAddr,
     ) -> Result<SsoReply, ServiceError> {
         self.ensure_enabled().await?;
         if key != "pocket" {
             return Err(ServiceError::not_found(format!("OIDC provider {key}")));
         }
-        self.record(format!("start {key} {client}"), user_id);
+        self.record(
+            format!(
+                "start {key} {client} {} {}",
+                password.expose(),
+                session_token.expose()
+            ),
+            user_id,
+        );
+        if password.expose() != LINK_PASSWORD {
+            return Err(ServiceError::Forbidden(
+                "invalid user or password entered".to_owned(),
+            ));
+        }
         Ok(SsoReply {
             status: 302,
             location: Some(AUTHORIZE.to_owned()),
@@ -426,12 +441,13 @@ impl SsoManager for FakeSso {
 
     async fn add_oidc_link(
         &self,
+        by: Uuid,
         user_id: Uuid,
         key: &str,
         subject: &str,
     ) -> Result<OidcAdminLink, ServiceError> {
         self.ensure_enabled().await?;
-        self.record(format!("add {key} {subject}"), user_id);
+        self.record(format!("add {key} {subject} by {by}"), user_id);
         if subject == TAKEN {
             return Err(ServiceError::Conflict(
                 "another account is linked to this identity: remove that link first".to_owned(),
@@ -442,11 +458,12 @@ impl SsoManager for FakeSso {
 
     async fn remove_oidc_link(
         &self,
+        by: Uuid,
         user_id: Uuid,
         at: OidcLinkAt<'_>,
     ) -> Result<(), ServiceError> {
         self.ensure_enabled().await?;
-        self.record(format!("remove {at:?}"), user_id);
+        self.record(format!("remove {at:?} by {by}"), user_id);
         match at {
             OidcLinkAt::Provider("pocket") | OidcLinkAt::Issuer("https://id.example.org") => Ok(()),
             _ => Err(ServiceError::not_found("no such OIDC link")),
@@ -484,8 +501,15 @@ fn as_admin(fake: Arc<FakeSso>) -> AppState {
     authed_state_with_plugins(Arc::new(DisabledPluginManager)).with_sso(fake)
 }
 
+/// The password [`FakeSso`] starts a link with; any other is wrong.
+const LINK_PASSWORD: &str = "alice-pw-route";
+
+/// The access token of [`as_user`]'s session.
+const SESSION_TOKEN: &str = "alice-session-token";
+
+/// A plain user's session, with its access token, as a browser presents it.
 fn as_user(fake: Arc<FakeSso>) -> AppState {
-    user_authed_state_with_plugins(Arc::new(DisabledPluginManager)).with_sso(fake)
+    user_session_state_with_plugins(Arc::new(DisabledPluginManager), SESSION_TOKEN).with_sso(fake)
 }
 
 /// What the settings page sends for a new provider.
@@ -832,7 +856,7 @@ async fn every_sso_plugin_route_is_registered() {
             ("put", _) => PAGE_BODY,
             ("post", "/sso/quickconnect") => "confirmation=c1",
             ("post", "/sso/admin/links") => ADD_BODY,
-            ("post", "/sso/oidc/pocket/link") => "",
+            ("post", "/sso/oidc/pocket/link") => r#"{"Password":"alice-pw-route"}"#,
             ("post", _) => r#"{"Code":"good"}"#,
             _ => "",
         };
@@ -1335,18 +1359,27 @@ async fn a_user_reads_and_removes_only_their_own_links() {
         fake.link_calls(),
         [
             ("links".to_owned(), SIGNED_IN),
-            (r#"remove Provider("pocket")"#.to_owned(), SIGNED_IN),
-            (r#"remove Provider("nope")"#.to_owned(), SIGNED_IN),
+            (
+                format!(r#"remove Provider("pocket") by {SIGNED_IN}"#),
+                SIGNED_IN
+            ),
+            (
+                format!(r#"remove Provider("nope") by {SIGNED_IN}"#),
+                SIGNED_IN
+            ),
         ]
     );
 }
+
+/// The link page's start: the account's password in the body.
+const START_BODY: &str = r#"{"Password":"alice-pw-route"}"#;
 
 #[tokio::test]
 async fn a_link_starts_for_the_signed_in_user_and_answers_where_to_send_the_browser() {
     let fake = FakeSso::new(true);
     let response = respond(
         as_user(fake.clone()),
-        request("POST", "/sso/oidc/pocket/link", "", true),
+        request("POST", "/sso/oidc/pocket/link", START_BODY, true),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1360,16 +1393,70 @@ async fn a_link_starts_for_the_signed_in_user_and_answers_where_to_send_the_brow
         .await
         .expect("body");
     assert_eq!(json(&body), serde_json::json!({ "Url": AUTHORIZE }));
+    // The plugin is given the password and the session's token, which the
+    // flow is tied to.
     assert_eq!(
         fake.link_calls(),
-        [("start pocket 127.0.0.1".to_owned(), SIGNED_IN)]
+        [(
+            format!("start pocket 127.0.0.1 {LINK_PASSWORD} {SESSION_TOKEN}"),
+            SIGNED_IN
+        )]
     );
 
     for path in ["/sso/oidc/nope/link", "/sso/oidc/%FF/link"] {
         let fake = FakeSso::new(true);
-        let (status, _) = send(as_user(fake.clone()), request("POST", path, "", true)).await;
+        let (status, _) = send(
+            as_user(fake.clone()),
+            request("POST", path, START_BODY, true),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
     }
+}
+
+/// A start with the token alone, or a body that does not bind, never reaches
+/// the plugin; a refused password sets no cookie.
+#[tokio::test]
+async fn a_link_start_without_a_password_reaches_nothing() {
+    for body in ["", "[]", "{"] {
+        let fake = FakeSso::new(true);
+        let response = respond(
+            as_user(fake.clone()),
+            request("POST", "/sso/oidc/pocket/link", body, true),
+        )
+        .await;
+        assert!(
+            response.status().is_client_error(),
+            "{body}: {}",
+            response.status()
+        );
+        assert_eq!(
+            header(&response, "set-cookie"),
+            Vec::<&str>::new(),
+            "{body}"
+        );
+        assert!(fake.untouched(), "{body}");
+    }
+    let fake = FakeSso::new(true);
+    let response = respond(
+        as_user(fake.clone()),
+        request(
+            "POST",
+            "/sso/oidc/pocket/link",
+            r#"{"Password":"not-alices"}"#,
+            true,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(header(&response, "set-cookie"), Vec::<&str>::new());
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert!(
+        !String::from_utf8_lossy(&body).contains("not-alices"),
+        "the password is never echoed"
+    );
 }
 
 /// An API key names no account to link.
@@ -1472,13 +1559,20 @@ async fn an_admin_lists_adds_and_removes_any_link() {
     }
     assert_eq!(
         fake.link_calls(),
+        // The caller is an API key, which names no administrator.
         [
             ("all".to_owned(), Uuid::nil()),
-            ("add pocket alice-sub".to_owned(), ALICE),
-            (format!("add pocket {TAKEN}"), ALICE),
-            (r#"remove Provider("pocket")"#.to_owned(), ALICE),
+            (format!("add pocket alice-sub by {}", Uuid::nil()), ALICE),
+            (format!("add pocket {TAKEN} by {}", Uuid::nil()), ALICE),
             (
-                r#"remove Issuer("https://id.example.org")"#.to_owned(),
+                format!(r#"remove Provider("pocket") by {}"#, Uuid::nil()),
+                ALICE
+            ),
+            (
+                format!(
+                    r#"remove Issuer("https://id.example.org") by {}"#,
+                    Uuid::nil()
+                ),
                 ALICE
             ),
         ]

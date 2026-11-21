@@ -833,6 +833,7 @@ async fn a_link_removed_since_the_callback_refuses_the_approval() {
         .harness
         .sso
         .remove_oidc_link(
+            Uuid::nil(),
             Uuid::parse_str(&user.id).expect("an id"),
             ferrofin_traits::sso::OidcLinkAt::Provider("fake"),
         )
@@ -878,10 +879,11 @@ async fn a_removal_during_an_approval_signs_the_app_out() {
         tokio::time::timeout(Duration::from_secs(30), minting.notified())
             .await
             .expect("the approval reaches its success event");
-        let removing = approval
-            .harness
-            .sso
-            .remove_oidc_link(user, ferrofin_traits::sso::OidcLinkAt::Provider("fake"));
+        let removing = approval.harness.sso.remove_oidc_link(
+            Uuid::nil(),
+            user,
+            ferrofin_traits::sso::OidcLinkAt::Provider("fake"),
+        );
         tokio::pin!(removing);
         assert!(
             tokio::time::timeout(Duration::from_millis(300), &mut removing)

@@ -284,8 +284,9 @@ async fn start_oidc_sign_in(
 /// [`confirm_quick_connect`]); with no account, on a page saying what to ask
 /// an administrator; any other on the refusal page. Both clear the flow
 /// cookie. A link flow's callback ends on its own page: the account linked,
-/// or refused (a missing required role, or another account has the
-/// identity; [`links`]).
+/// or refused (the session that started it has ended, a missing required
+/// role, another account has the identity, or the account was linked at the
+/// issuer since; [`links`]).
 #[utoipa::path(
     get,
     path = "/sso/oidc/{provider}/callback",
@@ -298,9 +299,9 @@ async fn start_oidc_sign_in(
     ),
     responses(
         (status = 200, description = "The completion page, which signs the verified identity's account in; for a sign-in started with quickConnect, the confirmation page, which asks before approving the code"),
-        (status = 400, description = "Refused: the sign-in failed a check"),
+        (status = 400, description = "Refused: the sign-in failed a check, or a link flow's starting session has ended"),
         (status = 403, description = "Refused: no account is linked to the identity and none can be created; the page says what to ask an administrator"),
-        (status = 409, description = "A link flow refused: another account is linked to the identity"),
+        (status = 409, description = "A link flow refused: another account is linked to the identity, or the account was linked at the issuer since the flow started"),
         (status = 502, description = "Refused: the identity provider could not be reached"),
         (status = 404, description = "No such enabled provider, or the Single Sign-On plugin is disabled or not available")
     ),

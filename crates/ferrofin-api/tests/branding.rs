@@ -774,6 +774,8 @@ impl SsoManager for LoginButtons {
         &self,
         _key: &str,
         _user_id: Uuid,
+        _password: &Secret,
+        _session_token: &Secret,
         _client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {
         Err(unused())
@@ -783,6 +785,7 @@ impl SsoManager for LoginButtons {
     }
     async fn add_oidc_link(
         &self,
+        _by: Uuid,
         _user_id: Uuid,
         _key: &str,
         _subject: &str,
@@ -791,6 +794,7 @@ impl SsoManager for LoginButtons {
     }
     async fn remove_oidc_link(
         &self,
+        _by: Uuid,
         _user_id: Uuid,
         _at: OidcLinkAt<'_>,
     ) -> Result<(), ServiceError> {
