@@ -43,7 +43,7 @@ fn main() {
         .unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")));
     println!("cargo:rustc-env=FERROFIN_BUILD_VERSION={version}");
     // The same without the tag's `v`, for `RELEASE_VERSION` and `USER_AGENT`.
-    let release = version.strip_prefix('v').unwrap_or(&version);
+    let release = version.trim_prefix('v');
     println!("cargo:rustc-env=FERROFIN_RELEASE_VERSION={release}");
     println!("cargo:rerun-if-env-changed=FERROFIN_GIT_DESCRIBE");
 }

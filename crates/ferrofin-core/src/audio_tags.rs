@@ -66,13 +66,11 @@ pub(super) fn for_library(info: &MediaInfo, options: Option<&LibraryOptions>) ->
             .then(|| read_tag(raw, nonstandard, path))
             .flatten();
         let tag = preferred.or_else(|| read_tag(raw, standard, path));
-        let values: Vec<_> = tag
-            .map(|tag| {
-                tag.split(INTERNAL_VALUE_SEPARATOR)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let values: Vec<_> = tag.map_or_default(|tag| {
+            tag.split(INTERNAL_VALUE_SEPARATOR)
+                .map(str::to_owned)
+                .collect()
+        });
         if use_custom {
             values
                 .iter()
@@ -89,13 +87,11 @@ pub(super) fn for_library(info: &MediaInfo, options: Option<&LibraryOptions>) ->
     );
     let credit_album_artists = album_artists.clone();
     let credit_performers = artists.clone();
-    let composers: Vec<String> = read_tag(raw, &["composer"], path)
-        .map(|tag| {
-            tag.split(INTERNAL_VALUE_SEPARATOR)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    let composers: Vec<String> = read_tag(raw, &["composer"], path).map_or_default(|tag| {
+        tag.split(INTERNAL_VALUE_SEPARATOR)
+            .map(str::to_owned)
+            .collect()
+    });
     // Upstream applies this fallback after custom splitting, before dropping
     // blank names for storage. An explicit blank multivalue is not absence.
     let album_artists = if album_artists.is_empty() {
@@ -103,18 +99,16 @@ pub(super) fn for_library(info: &MediaInfo, options: Option<&LibraryOptions>) ->
     } else {
         album_artists
     };
-    let genres: Vec<String> = read_tag(raw, &["genre"], path)
-        .map(|tag| {
-            let values = tag.split(INTERNAL_VALUE_SEPARATOR);
-            if use_custom {
-                values
-                    .flat_map(|value| split_custom(value, &delimiters, whitelist))
-                    .collect()
-            } else {
-                values.map(str::to_owned).collect()
-            }
-        })
-        .unwrap_or_default();
+    let genres: Vec<String> = read_tag(raw, &["genre"], path).map_or_default(|tag| {
+        let values = tag.split(INTERNAL_VALUE_SEPARATOR);
+        if use_custom {
+            values
+                .flat_map(|value| split_custom(value, &delimiters, whitelist))
+                .collect()
+        } else {
+            values.map(str::to_owned).collect()
+        }
+    });
     let genres = distinct_case(
         genres
             .into_iter()

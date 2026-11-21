@@ -375,8 +375,7 @@ pub fn three_letter_language_names(
                     .any(|n| language.eq_ignore_ascii_case(n))
                 || language.eq_ignore_ascii_case(&c.two_letter_iso_language_name)
         })
-        .map(|c| c.three_letter_iso_language_names.clone())
-        .unwrap_or_default()
+        .map_or_default(|c| c.three_letter_iso_language_names.clone())
 }
 
 /// `TvdbSdkExtensions.IsMatch` (`:103-127`): whether a TVDB translation's
@@ -1494,11 +1493,7 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
         studios,
         runtime_minutes: wire.average_runtime,
         status: wire.status.and_then(|s| s.name),
-        air_days: wire
-            .airs_days
-            .as_ref()
-            .map(AirsDaysWire::days)
-            .unwrap_or_default(),
+        air_days: wire.airs_days.as_ref().map_or_default(AirsDaysWire::days),
         air_time: wire.airs_time.filter(|t| !t.is_empty()),
         slug: wire.slug,
         collection_ids: official_collection_ids(wire.lists),

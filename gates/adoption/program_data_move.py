@@ -11,14 +11,15 @@ repair rebase_program_data_paths). Jellyfin has no such repair, so it cannot be 
 the expectation is the documented one.
 
 snapshot, before Ferrofin starts: every stored path under a previous directory and what it must
-read after the first boot, the libraries (CollectionFolder rows) by name, which of them have a
-Primary image, and the users with a profile image. --moved OLD NEW HOST, once per directory, names
-a previous directory, the one it moved to (both as the servers see them) and where the copy is on
-this host.
+read after the first boot, the item and image type of each such image row, the libraries
+(CollectionFolder rows) by name, which of them have a Primary image, and the users with a profile
+image. --moved OLD NEW HOST, once per directory, names a previous directory, the one it moved to
+(both as the servers see them) and where the copy is on this host.
 
-check, after a boot: every recorded path reads what it must, and no other row names a previous
-directory where the copy holds its file; the libraries are the same rows; no library's stored Data
-still names a previous directory (the virtual-folder sync rewrites it at boot);
+check, after a boot: every recorded path reads what it must (or, for an image row, a new row of its
+item and type replaced it, a file the copy holds under a new directory), and no other row names a
+previous directory where the copy holds its file; the libraries are the same rows; no library's
+stored Data still names a previous directory (the virtual-folder sync rewrites it at boot);
 /Library/VirtualFolders lists every library with its CollectionFolder id; each library's Primary
 image and each profile image is served and decodes; the repair's snapshot of the database exists;
 and with --snapshots FILE, the database snapshots beside it are recorded on the first check and a
@@ -26,6 +27,7 @@ later check fails on any snapshot taken or rewritten since.
 """
 
 import argparse
+from collections import Counter
 from contextlib import closing
 import json
 import os
@@ -47,7 +49,7 @@ COLLECTION_FOLDER = "MediaBrowser.Controller.Entities.CollectionFolder"
 PRIMARY = 0
 # The extension of the snapshot the repair takes before it rewrites (adoption_repairs.rs).
 REPAIR_SNAPSHOT = ".pre-program-data-move"
-VERSION = 1
+VERSION = 2
 
 
 def moved_path(value, moves):
@@ -71,6 +73,12 @@ def moved_path(value, moves):
     old, new, host = best
     rest = value[len(old) + 1:]
     return f"{new}/{rest}" if (Path(host) / rest).exists() else value
+
+
+def in_copy(value, moves):
+    """Whether `value` names a file under one of the new directories that the copy on this host holds."""
+    # moved_path read backwards: it maps a path under a new directory only when the copy holds the file.
+    return isinstance(value, str) and moved_path(value, [(new, old, host) for old, new, host in moves]) != value
 
 
 def under(value, moves):
@@ -117,12 +125,15 @@ def snapshot(db, moves):
         for table, column in COLUMNS:
             paths[table] = {key: [stored, moved_path(stored, moves)]
                             for key, stored in keyed(conn, table, column).items() if under(stored, moves)}
+        owners = {str(normalize(key)): [normalize(item), kind] for key, item, kind in conn.execute(
+            'SELECT "Id", "ItemId", "ImageType" FROM "BaseItemImageInfos"')}
         found = libraries(conn)
         images = {normalize(item) for (item,) in conn.execute(
             'SELECT "ItemId" FROM "BaseItemImageInfos" WHERE "ImageType" = ?', (PRIMARY,))}
         profiles = sorted({normalize(user) for (user,) in conn.execute(
             'SELECT "UserId" FROM "ImageInfos" WHERE "UserId" IS NOT NULL AND "Path" IS NOT NULL')})
     baseline = {"version": VERSION, "moves": [list(move) for move in moves], "paths": paths,
+                "image_owners": {key: owners[key] for key in paths["BaseItemImageInfos"]},
                 "libraries": {item: name for item, (name, _) in found.items()},
                 "library_images": sorted(item for item in found if item in images), "profiles": profiles}
     validate(baseline)
@@ -148,6 +159,20 @@ def first(rows):
     return f"{key}: {rows[key]}"
 
 
+def unreplaced(conn, gone, baseline, moves):
+    """The image rows of `gone` that no redraw replaced. A redraw (the scan's library tile, once 7 days
+    old) saves the item's images again at new ids, as Jellyfin's every save does, at Ferrofin's own
+    path: the rows of an item and image type pass when the item now has as many rows of that type at
+    ids the baseline did not record, each a file the copy holds under a new directory."""
+    owners = {key: tuple(owner) for key, owner in baseline["image_owners"].items()}
+    recorded = baseline["paths"]["BaseItemImageInfos"]
+    fresh = Counter((normalize(item), kind) for key, item, kind, path in conn.execute(
+        'SELECT "Id", "ItemId", "ImageType", "Path" FROM "BaseItemImageInfos"')
+        if str(normalize(key)) not in recorded and in_copy(path, moves))
+    lost = Counter(owners[key] for key in gone)
+    return {key: stored for key, stored in gone.items() if fresh[owners[key]] < lost[owners[key]]}
+
+
 def check_paths(conn, baseline, moves):
     """One line per table with a recorded path that does not read what it must, or a row that still
     names a previous directory although the copy holds its file."""
@@ -156,6 +181,8 @@ def check_paths(conn, baseline, moves):
         now = keyed(conn, table, column)
         recorded = baseline["paths"].get(table, {})
         gone = {key: stored for key, (stored, _) in recorded.items() if key not in now}
+        if table == "BaseItemImageInfos":
+            gone = unreplaced(conn, gone, baseline, moves)
         stale = {key: now[key] for key, (stored, after) in recorded.items()
                  if key in now and now[key] != after and now[key] == stored}
         other = {key: now[key] for key, (stored, after) in recorded.items()

@@ -1838,8 +1838,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 let stem = running
                     .playlist_path
                     .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                    .map_or_default(|s| s.to_string_lossy().into_owned());
                 let deletion = delete_partial_stream_files(
                     std::sync::Arc::clone(&self.file_cleaner),
                     std::sync::Arc::downgrade(&self.jobs),
@@ -2332,8 +2331,7 @@ fn segment_path(playlist: &Path, index: i32, extension: &str) -> PathBuf {
     let folder = playlist.parent().unwrap_or_else(|| Path::new(""));
     let stem = playlist
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|s| s.to_string_lossy().into_owned());
     folder.join(format!("{stem}{index}{extension}"))
 }
 
@@ -2836,8 +2834,7 @@ mod start_ffmpeg_tests {
             arguments: args,
             log_dir: output_path
                 .parent()
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_default(),
+                .map_or_default(std::path::Path::to_path_buf),
             working_dir: None,
             user_id: None,
         }

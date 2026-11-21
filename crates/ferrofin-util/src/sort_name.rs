@@ -6,7 +6,10 @@
 
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
-use crate::string_extensions::{lower_invariant, remove_diacritics};
+use icu_properties::CodePointMapData;
+use icu_properties::props::GeneralCategory;
+
+use crate::string_extensions::{lower_invariant, remove_diacritics, transliterated};
 
 /// `ServerConfiguration.SortRemoveWords` defaults — leading/interior/trailing
 /// articles.
@@ -75,7 +78,9 @@ fn installed_rules() -> Arc<SortRules> {
 /// (at the start, surrounded by spaces, or at the end), delete the
 /// remove-character set, turn each replace-character into a space, then
 /// `modify_sort_chunks` left-pads every run of digits to 10 so numbers sort
-/// naturally (`Movie 0001 (2020)` → `movie 0000000001 (0000002020)`).
+/// naturally (`Movie 0001 (2020)` → `movie 0000000001 (0000002020)`), strips
+/// diacritics, and romanises a name that is still not ASCII
+/// (`Café 東京` → `cafe dong jing`).
 ///
 /// **The stage order is load-bearing and matches C#: words, then removes, then
 /// replaces.** Doing characters first changes the answer for real titles —
@@ -102,7 +107,28 @@ pub fn get_sort_name_with_rules(
     enable_alpha_numeric_sorting: bool,
     rules: &SortRules,
 ) -> String {
-    get_sort_name_with(name, enable_alpha_numeric_sorting, lower_invariant, rules)
+    get_sort_name_with(
+        name,
+        enable_alpha_numeric_sorting,
+        lower_invariant,
+        rules,
+        modify_sort_chunks,
+    )
+}
+
+/// [`get_sort_name`] as builds before the transliteration step derived it
+/// (ASCII digit runs padded, nothing romanised), over the installed rules,
+/// kept only so the one-shot sort-name repair can recognise the keys they
+/// stored. Never use it for a new write or a query parameter.
+#[must_use]
+pub fn untransliterated_sort_name(name: &str) -> String {
+    get_sort_name_with(
+        name,
+        true,
+        lower_invariant,
+        &installed_rules(),
+        modify_sort_chunks_untransliterated,
+    )
 }
 
 /// The derivation before invariant casing (full Unicode `to_lowercase`), kept
@@ -111,24 +137,37 @@ pub fn get_sort_name_with_rules(
 /// configured ones). Never use it for a new write or a query parameter.
 #[must_use]
 pub fn previous_create_sort_name(name: &str) -> String {
-    get_sort_name_with(name, true, str::to_lowercase, &SortRules::default())
+    get_sort_name_with(
+        name,
+        true,
+        str::to_lowercase,
+        &SortRules::default(),
+        modify_sort_chunks_untransliterated,
+    )
 }
 
-/// [`create_sort_name`] over Jellyfin's default rules, whatever is installed:
-/// the `ferrofin_sort_name` SQLite function released migrations call, which
-/// must keep giving the answer they were written against (and stay
-/// deterministic, as the function is registered).
+/// [`create_sort_name`] over Jellyfin's default rules, whatever is installed,
+/// as it was before the transliteration step: the `ferrofin_sort_name` SQLite
+/// function released migrations call, which must keep giving the answer they
+/// were written against (and stay deterministic, as the function is
+/// registered).
 #[must_use]
 pub fn default_rules_sort_name(name: &str) -> String {
-    get_sort_name_with_rules(name, true, &SortRules::default())
+    get_sort_name_with(
+        name,
+        true,
+        lower_invariant,
+        &SortRules::default(),
+        modify_sort_chunks_untransliterated,
+    )
 }
 
 /// [`forced_sort_key`] over Jellyfin's default rules: the
-/// `ferrofin_forced_sort_key` SQLite function, for the same reason as
+/// `ferrofin_forced_sort_key` SQLite function, frozen for the same reason as
 /// [`default_rules_sort_name`].
 #[must_use]
 pub fn default_rules_forced_sort_key(forced: &str) -> String {
-    get_sort_name_with_rules(forced, true, &SortRules::default())
+    default_rules_sort_name(forced)
 }
 
 /// The 10.11.8-era forced key — `ModifySortChunks(ForcedSortName)` through
@@ -136,7 +175,7 @@ pub fn default_rules_forced_sort_key(forced: &str) -> String {
 /// stored values written with it.
 #[must_use]
 pub fn previous_forced_sort_key(forced: &str) -> String {
-    modify_sort_chunks(forced).to_lowercase()
+    modify_sort_chunks_untransliterated(forced).to_lowercase()
 }
 
 fn get_sort_name_with(
@@ -144,6 +183,7 @@ fn get_sort_name_with(
     enable_alpha_numeric_sorting: bool,
     lowercase: fn(&str) -> String,
     rules: &SortRules,
+    modify_chunks: fn(&str) -> String,
 ) -> String {
     if !enable_alpha_numeric_sorting {
         return name.trim_start().to_owned();
@@ -164,7 +204,7 @@ fn get_sort_name_with(
     for replace in rules.replace_characters.iter().filter(|s| !s.is_empty()) {
         sortable = sortable.replace(replace.as_str(), " ");
     }
-    modify_sort_chunks(&sortable)
+    modify_chunks(&sortable)
 }
 
 /// Port of C# `BaseItem.CreateSortName` for a kind with alphanumeric sorting
@@ -197,42 +237,58 @@ pub fn forced_sort_key(forced: &str) -> String {
     get_sort_name(forced, true)
 }
 
-/// Left-pads each maximal run of ASCII digits in `name` to width 10 with `0`,
-/// then strips diacritics.
+/// Port of `BaseItem.ModifySortChunks`: left-pads each run of digits in
+/// `name` to width 10 with `0`, strips diacritics, and when anything is still
+/// non-ASCII, romanises the result ([`transliterated`], upstream's
+/// `Transliterated()`).
 ///
-/// Port of `BaseItem.ModifySortChunks`.
-///
-/// TODO(open work, not an accepted divergence): two steps of the C# are still
-/// missing, and both change the sort key a client sees.
-///
-/// 1. Upstream closes with `if (!result.All(char.IsAscii)) result.Transliterated()`
-///    — an ICU romanization of whatever is still non-ASCII after the strip. A
-///    Cyrillic, Greek or CJK title therefore sorts differently here than on
-///    Jellyfin, and `SortName` drives the client play queue. Porting it means
-///    taking an ICU transliteration dependency, which is the owner's call to
-///    make; raise it rather than leaving this note to rot.
-/// 2. C# `char.IsDigit` matches the whole Unicode `Nd` category, not just
-///    ASCII — so an Arabic-Indic or fullwidth digit run goes unpadded here.
-///    That one is a local fix (`char::is_numeric` plus a width decision).
+/// A digit is C#'s `char.IsDigit` on a UTF-16 unit: any Unicode `Nd`
+/// character in the Basic Multilingual Plane (`٣`, `２`), never one outside it,
+/// which C# sees as two surrogates.
 fn modify_sort_chunks(name: &str) -> String {
+    let categories = CodePointMapData::<GeneralCategory>::new();
+    let folded = remove_diacritics(&pad_digit_runs(name, |c| {
+        c.is_ascii_digit()
+            || (!c.is_ascii()
+                && u32::from(c) <= 0xFFFF
+                && categories.get(c) == GeneralCategory::DecimalNumber)
+    }));
+    if folded.is_ascii() {
+        folded
+    } else {
+        transliterated(&folded)
+    }
+}
+
+/// [`modify_sort_chunks`] as builds before the transliteration step had it:
+/// ASCII digit runs padded and diacritics stripped, nothing romanised. Frozen
+/// for the functions released migrations call and the repair that recognises
+/// the keys it gave.
+fn modify_sort_chunks_untransliterated(name: &str) -> String {
+    remove_diacritics(&pad_digit_runs(name, |c| c.is_ascii_digit()))
+}
+
+/// Left-pads each maximal run of `is_digit` characters in `name` to 10
+/// characters with ASCII `0`.
+fn pad_digit_runs(name: &str, is_digit: impl Fn(char) -> bool) -> String {
     let mut out = String::with_capacity(name.len());
     let mut chars = name.chars().peekable();
-    while let Some(&c) = chars.peek() {
-        if c.is_ascii_digit() {
-            let mut digits = String::new();
-            while chars.peek().is_some_and(char::is_ascii_digit) {
-                digits.push(chars.next().unwrap_or_default());
-            }
-            for _ in digits.len()..10 {
-                out.push('0');
-            }
-            out.push_str(&digits);
-        } else {
+    while let Some(c) = chars.next() {
+        if !is_digit(c) {
             out.push(c);
-            chars.next();
+            continue;
         }
+        let mut run = String::from(c);
+        while let Some(digit) = chars.next_if(|&next| is_digit(next)) {
+            run.push(digit);
+        }
+        out.extend(std::iter::repeat_n(
+            '0',
+            10_usize.saturating_sub(run.chars().count()),
+        ));
+        out.push_str(&run);
     }
-    remove_diacritics(&out)
+    out
 }
 
 #[cfg(test)]
@@ -408,6 +464,226 @@ mod tests {
             create_sort_name("Crosby, Stills + Nash"),
             "crosby stills   nash"
         );
+    }
+
+    /// The oracle: each name created as a collection on a stock Jellyfin 12.4
+    /// (`POST /Collections`), its `SortName` read back. Upstream romanises
+    /// whatever is still non-ASCII after the diacritic fold
+    /// (`ModifySortChunks` → `Transliterated()`), and pads every Unicode `Nd`
+    /// digit run (`char.IsDigit`).
+    #[rstest]
+    #[case("Æon Flux", "aeon flux")]
+    #[case("Amélie", "amelie")]
+    #[case("霸王别姬", "ba wang bie ji")]
+    #[case("Брат", "brat")]
+    #[case("Café Ünïcode 東京", "cafe unicode dong jing")]
+    #[case("Χάος", "chaos")]
+    #[case("ちびまる子ちゃん", "chibimaru zichan")]
+    #[case("重庆森林", "chong qing sen lin")]
+    #[case("大話西遊", "da hua xi you")]
+    #[case("東京 2", "dong jing 0000000002")]
+    #[case("東京物語", "dong jing wu yu")]
+    #[case("Ευρώπη", "europe")]
+    #[case("Ёжик в тумане", "ezik v tumane")]
+    #[case("Garðarsson", "gardarsson")]
+    #[case("기생충", "gisaengchung")]
+    #[case("괴물", "goemul")]
+    #[case("ゴジラ", "gojira")]
+    #[case("حب في القاهرة", "hb fy alqahrt")]
+    #[case("Иван Грозный", "ivan groznyi")]
+    #[case("ジョジョの奇妙な冒険", "jojono qi miaona mao xian")]
+    #[case("君の名は。", "junno mingha")]
+    #[case("カウボーイビバップ", "kauboibibappu")]
+    #[case("Kraków ł", "krakow l")]
+    #[case("もののけ姫", "mononoke ji")]
+    #[case("Μπουμπουλίνα", "mpoumpoulina")]
+    #[case("नमस्ते", "namaste")]
+    #[case("Οδύσσεια", "odysseia")]
+    #[case("오징어 게임", "ojingeo geim")]
+    #[case("올드보이", "oldeuboi")]
+    #[case("Пётр 1", "petr 0000000001")]
+    #[case("七人の侍", "qi renno shi")]
+    #[case("千と千尋の神隠し", "qianto qian xunno shen yinshi")]
+    #[case("“Quoted” Title", "quoted title")]
+    #[case("ラーメン", "ramen")]
+    #[case("살인의 추억", "salinui chueog")]
+    #[case("Щелкунчик", "selkuncik")]
+    #[case("שלום", "slwm")]
+    #[case("Spider-Man: 東京!", "spiderman dong jing")]
+    #[case("Сталкер", "stalker")]
+    #[case("Straße", "strasse")]
+    #[case("Тарас Бульба", "taras bulba")]
+    #[case("Θεός", "theos")]
+    #[case("Þorsteinn", "thorsteinn")]
+    #[case("となりのトトロ", "tonarinototoro")]
+    #[case("Українська ніч", "ukrainska nic")]
+    #[case("Ünïcode — Dash", "unicode  dash")]
+    #[case("Ⅷ Legion", "viii legion")]
+    #[case("Война и мир", "voina i mir")]
+    #[case("ヴァイオレット・エヴァーガーデン", "vu~aiorettoevu~agaden")]
+    #[case("長江七號", "zhang jiang qi hao")]
+    #[case("Ζορμπάς", "zormpas")]
+    #[case("Αλέξης Ζορμπάς", "alexes zormpas")]
+    #[case("Ангел-хранитель: Ночь!", "angelhranitel noc")]
+    #[case("北京", "bei jing")]
+    #[case("ＤＥＡＴＨ ＮＯＴＥ", "death note")]
+    #[case("東京ゴッドファーザーズ", "dong jinggoddofazazu")]
+    #[case("ガンダム", "gandamu")]
+    #[case("한국", "hangug")]
+    #[case("Їжак", "izak")]
+    #[case("ジョジョ", "jojo")]
+    #[case("Movie 🎬", "movie 🎬")]
+    #[case("Ω Ζ", "o z")]
+    #[case("Ολυμπία", "olympia")]
+    #[case("ポケモン", "pokemon")]
+    #[case("Ψυχή", "psyche")]
+    #[case("日本", "ri ben")]
+    #[case("사랑", "salang")]
+    #[case("신과함께", "singwahamkke")]
+    #[case("ヱヴァンゲリヲン", "wevu~angeriwon")]
+    #[case("臥虎藏龍", "wo hu cang long")]
+    #[case("卧虎藏龙", "wo hu cang long")]
+    #[case("ファーザー東京", "faza dong jing")]
+    #[case("東京ファーザー", "dong jingfaza")]
+    #[case("Tokyo東京", "tokyo dong jing")]
+    #[case("東京Tokyo", "dong jingtokyo")]
+    #[case("Москва東京", "moskva dong jing")]
+    #[case("ジョッ東京", "jo~tsu dong jing")]
+    #[case("東京っ", "dong jing~tsu")]
+    #[case("がっこう", "gakkou")]
+    #[case("東京２", "dong jing0000000002")]
+    #[case("Movie ٣", "movie 0000000003")]
+    #[case("सत्या २", "satya 0000000002")]
+    #[case("Film 𝟙", "film 𝟙")]
+    #[case("ｶﾞﾝﾀﾞﾑ", "gandamu")]
+    #[case("東京\u{3000}物語", "dong jing wu yu")]
+    #[case("ＲＥＤ２", "red0000000002")]
+    #[case("ΟΔΥΣΣΕΑΣ", "odysseas")]
+    #[case("Արարատ", "ararat")]
+    #[case("თბილისი", "tbilisi")]
+    #[case("기생충 2", "gisaengchung 0000000002")]
+    #[case("Москва Moscow", "moskva moscow")]
+    #[case("東京・物語", "dong jingwu yu")]
+    #[case("東京：物語", "dong jing wu yu")]
+    #[case("ﬁlm", "film")]
+    #[case("ひらがな", "hiragana")]
+    #[case("Pokémon ポケモン", "pokemon pokemon")]
+    #[case("Đorđe", "dorde")]
+    #[case("ıstanbul", "istanbul")]
+    #[case("€uro 東京", "€uro dong jing")]
+    #[case("Love ♥ 東京", "love ♥ dong jing")]
+    #[case("«Брат»", "<<brat>>")]
+    #[case("Ærø 東京", "aero dong jing")]
+    #[case("Mañana Ψ", "manana ps")]
+    #[case("Ⅻ Cyrillic Б", "xii cyrillic b")]
+    #[case("Ελλάδα 2024", "ellada 0000002024")]
+    #[case("Шрек 2", "srek 0000000002")]
+    #[case("鬼滅の刃", "gui mieno ren")]
+    #[case("進撃の巨人", "jin jino ju ren")]
+    #[case("魔女の宅急便", "mo nuno zhai ji bian")]
+    #[case("天気の子", "tian qino zi")]
+    #[case("攻殻機動隊", "gong qiao ji dong dui")]
+    #[case("龍猫", "long mao")]
+    #[case("饕餮", "tao tie")]
+    #[case("いすゞ", "isuzu")]
+    #[case("こゝろ", "kokoro")]
+    #[case("ヶ月", "~ke yue")]
+    #[case("ヴィンランド・サガ", "vu~inrandosaga")]
+    #[case("シン・ゴジラ", "shingojira")]
+    #[case("ワンピース", "wanpisu")]
+    #[case("ハウルの動く城", "hauruno dongku cheng")]
+    #[case("ポニョ", "ponyo")]
+    #[case("ﾄﾄﾛ", "totoro")]
+    #[case("마더", "madeo")]
+    #[case("아가씨", "agassi")]
+    #[case("버닝", "beoning")]
+    #[case("헤어질 결심", "heeojil gyeolsim")]
+    #[case("ДЖЕНТЛЬМЕНЫ УДАЧИ", "dzentlmeny udaci")]
+    #[case("Сергей Бондарчук", "sergei bondarcuk")]
+    #[case("Љубав", "lubav")]
+    #[case("Ђорђе", "dorde")]
+    #[case("Ґрунт", "grunt")]
+    #[case("Ўзбек", "uzbek")]
+    #[case("Ἰλιάς", "ilias")]
+    #[case("Αθηνά", "athena")]
+    #[case("Ωραία", "oraia")]
+    #[case("Ἀχιλλεύς", "achilleus")]
+    #[case("בראשית", "brsyt")]
+    #[case("الرسالة", "alrsalt")]
+    #[case("दिलवाले दुल्हनिया ले जाएंगे", "dilavale dulhaniya le jaenge")]
+    #[case("শোলে", "sole")]
+    #[case("தமிழ்", "tamil")]
+    #[case("తెలుగు", "telugu")]
+    #[case("ಕನ್ನಡ", "kannada")]
+    #[case("മലയാളം", "malayalam")]
+    #[case("ગુજરાતી", "gujarati")]
+    #[case("ਪੰਜਾਬੀ", "pajabi")]
+    #[case("ଓଡ଼ିଆ", "oria")]
+    #[case("Հայաստան", "hayastan")]
+    #[case("საქართველო", "sakartvelo")]
+    #[case("ދިވެހި", "divehi")]
+    #[case("ܐܪܡܝܐ", "ܐܪܡܝܐ")]
+    #[case("ᐃᓄᒃᑎᑐᑦ", "ᐃᓄᒃᑎᑐᑦ")]
+    #[case("አማርኛ", "አማርኛ")]
+    #[case("ဗမာ", "ဗမာ")]
+    #[case("ខ្មែរ", "ខមែរ")]
+    #[case("ລາວ", "ລາວ")]
+    #[case("བོད་", "བད")]
+    #[case("Ελλάδα: 東京 — Москва!", "ellada dong jing  moskva")]
+    #[case("Café ½", "cafe  12")]
+    #[case("x² Movie", "x² movie")]
+    #[case("№ 5", "no 0000000005")]
+    #[case("Ⅳ", "iv")]
+    #[case("℃ Story", "℃ story")]
+    #[case("𝐁𝐨𝐥𝐝", "𝐁𝐨𝐥𝐝")]
+    #[case("ⓐⓑⓒ", "ⓐⓑⓒ")]
+    #[case("Ｍｏｖｉｅ\u{3000}Ｎｏ．１", "movie no0000000001")]
+    #[case("Ǆungla", "dzungla")]
+    #[case("Ŋ Œuvre", "n oeuvre")]
+    #[case("සිංහල", "සංහල")]
+    #[case("ᠮᠣᠩᠭᠣᠯ", "ᠮᠣᠩᠭᠣᠯ")]
+    #[case("ᏣᎳᎩ", "ꮳꮃꭹ")]
+    #[case("ꆈꌠ", "ꆈꌠ")]
+    #[case("ᚠᚢᚦ", "ᚠᚢᚦ")]
+    #[case("ⲙⲉⲧⲣⲉⲙ", "ⲙⲉⲧⲣⲉⲙ")]
+    #[case("ⰀⰁⰂ", "ⰰⰱⰲ")]
+    #[case("𐌲𐌿𐍄", "𐌲𐌿𐍄")]
+    #[case("ߒߞߏ", "ߒߞߏ")]
+    #[case("ⵜⴰⵎⴰⵣⵉⵖⵜ", "ⵜⴰⵎⴰⵣⵉⵖⵜ")]
+    #[case("ꦗꦮ", "ꦗꦮ")]
+    #[case("ᬩᬮᬶ", "ᬩᬮ")]
+    #[case("ㆍ한글", "ㆍhangeul")]
+    #[case("\u{1100}\u{1161}", "ga")]
+    #[case("ꓡꓲ", "ꓡꓲ")]
+    #[case("ᜊᜌ᜔ᜊᜌᜒᜈ᜔", "ᜊᜌᜊᜌᜈ")]
+    fn sort_names_match_jellyfin_12_4(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(create_sort_name(name), expected, "{name}");
+    }
+
+    /// Where the same oracle differs, with Jellyfin 12.4's key in the comment.
+    /// ICU4X has no Thai-Latin (gl-1907). Its CLDR is newer than ICU 60's
+    /// for Bopomofo (no tone number), `Latin-ASCII` (it folds `ꜱ`) and
+    /// Hebrew-Latin (it drops the vowel points). The vowel points of Hebrew
+    /// and Arabic are also removed by the diacritic fold before
+    /// transliteration, where `Diacritics.Extensions` keeps them (gl-1908);
+    /// for Arabic the transliteration itself agrees
+    /// ([`a_pointed_name_transliterates_as_on_jellyfin`]).
+    #[rstest]
+    #[case("สวัสดี", "สวสด")] // swasdi
+    #[case("ภาพยนตร์", "ภาพยนตร")] // phaphyntr
+    #[case("ㄅㄆㄇ", "bpm")] // bpm1
+    #[case("ꜱᴍᴀʟʟ ᴄᴀᴘꜱ", "small caps")] // ꜱmall capꜱ
+    #[case("שָׁלוֹם", "slwm")] // salwom
+    #[case("مُحَمَّد", "mhmd")] // muhamad
+    fn sort_names_that_differ_from_jellyfin_12_4(#[case] name: &str, #[case] ours: &str) {
+        assert_eq!(create_sort_name(name), ours, "{name}");
+    }
+
+    /// The pointed Arabic name above, transliterated without the diacritic
+    /// fold, gives Jellyfin's key.
+    #[test]
+    fn a_pointed_name_transliterates_as_on_jellyfin() {
+        assert_eq!(crate::string_extensions::transliterated("مُحَمَّد"), "muhamad");
     }
 
     #[test]

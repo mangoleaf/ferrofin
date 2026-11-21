@@ -1154,8 +1154,7 @@ impl RecordingVisibility for ListedRecordingVisibility<'_> {
         let holders = recording
             .path
             .as_deref()
-            .map(|path| holding_libraries(&self.folders, path))
-            .unwrap_or_default();
+            .map_or_default(|path| holding_libraries(&self.folders, path));
         let key = (channel, holders);
         if let Some(&known) = self
             .answers

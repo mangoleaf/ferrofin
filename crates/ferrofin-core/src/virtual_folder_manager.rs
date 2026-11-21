@@ -479,6 +479,7 @@ impl FerrofinVirtualFolderManager {
                 id,
                 *aggregate,
                 &self.id_derivation,
+                &self.virtual_paths,
             )
             .await?;
         }
@@ -556,8 +557,7 @@ impl FerrofinVirtualFolderManager {
                 .await?;
         let file_name = |path: &Path| {
             path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
+                .map_or_default(|n| n.to_string_lossy().into_owned())
         };
         let (Some(old_id), Some(new_id)) = (
             stored
@@ -895,8 +895,7 @@ impl FerrofinVirtualFolderManager {
         let stored_ids = data
             .get("PhysicalFolderIds")
             .and_then(serde_json::Value::as_array)
-            .map(|values| as_ids(values))
-            .unwrap_or_default();
+            .map_or_default(|values| as_ids(values));
         !stored_paths
             .iter()
             .map(String::as_str)
@@ -922,8 +921,7 @@ impl FerrofinVirtualFolderManager {
         };
         let name = folder_path
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+            .map_or_default(|name| name.to_string_lossy().into_owned());
         row.sort_name = Some(ferrofin_util::sort_name::create_sort_name(&name));
         row.name = Some(name);
         row.path = Some(folder_path.to_string_lossy().into_owned());
@@ -4917,7 +4915,7 @@ mod tests {
         let options_before = std::fs::read(folder.join(OPTIONS_FILE)).unwrap();
         for blank in ["", "  "] {
             let mut new_opts = opts_with_paths(&[m1.clone(), m2.clone(), blank.to_owned()]);
-            new_opts.enable_realtime_monitor = !new_opts.enable_realtime_monitor;
+            new_opts.enable_realtime_monitor.toggle();
             let error = mgr
                 .update_library_options("Lib", &new_opts)
                 .await

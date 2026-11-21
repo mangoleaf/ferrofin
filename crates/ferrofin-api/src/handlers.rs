@@ -162,6 +162,7 @@ pub mod search;
 pub mod session;
 pub(crate) mod session_ctx;
 pub mod similar;
+pub mod sso;
 pub mod startup;
 pub(crate) mod streaming;
 pub mod studios;
@@ -771,8 +772,9 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
 /// controller, which the vendored spec does not describe.
 ///
 /// They are in neither [`REAL_ROUTES`] nor [`EXTENSION_ROUTES`] (contract
-/// operations only) and carry no [`VERIFIED`] row; each plugin's comparison
-/// with its upstream is recorded in `docs/PLUGINS_UPSTREAM.md`. Like every
+/// operations only) and carry no [`VERIFIED`] row; each ported plugin's
+/// comparison with its upstream is recorded in `docs/PLUGINS_UPSTREAM.md`, and
+/// Ferrofin's own Single Sign-On plugin has none to compare with. Like every
 /// ASP.NET route they are matched ignoring case
 /// ([`canonicalize_path`](crate::routes::canonicalize_path) reads this list):
 /// a plugin's settings page calls them as it spells them.
@@ -781,6 +783,23 @@ pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
     ("post", "/Ldap/TestServerBind", "ldap-auth"),
     ("post", "/Ldap/TestLdapFilters", "ldap-auth"),
     ("post", "/Ldap/LdapUserSearch", "ldap-auth"),
+    // Single Sign-On plugin (see handlers::sso): Ferrofin's own, with no
+    // upstream to compare with (D15).
+    ("get", "/sso/admin/oidc/providers", "sso"),
+    ("put", "/sso/admin/oidc/providers/{provider}", "sso"),
+    ("delete", "/sso/admin/oidc/providers/{provider}", "sso"),
+    ("get", "/sso/oidc/{provider}/start", "sso"),
+    ("get", "/sso/oidc/{provider}/callback", "sso"),
+    ("post", "/sso/oidc/exchange", "sso"),
+    ("get", "/sso/quickconnect", "sso"),
+    ("post", "/sso/quickconnect", "sso"),
+    ("get", "/sso/link", "sso"),
+    ("get", "/sso/links", "sso"),
+    ("delete", "/sso/links/{provider}", "sso"),
+    ("post", "/sso/oidc/{provider}/link", "sso"),
+    ("get", "/sso/admin/links", "sso"),
+    ("post", "/sso/admin/links", "sso"),
+    ("delete", "/sso/admin/links", "sso"),
 ];
 
 /// Every path a handler registers that is neither a contract route nor in
@@ -970,7 +989,10 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// and with what lookup, the Identify case first, shared by Identify → Apply,
 /// the item refresh and the library scan, and `metadata-providers` what
 /// TheMovieDb's movie, series, season and episode providers write onto an item
-/// from TMDb's answer.
+/// from TMDb's answer. `guide-programme-items` is what the guide refresh
+/// stores on each programme item and its external ids, which every programme
+/// operation reads. `music-artwork` is what a library scan stores as a music
+/// album's and a track's Primary, which the item and image operations serve.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -994,6 +1016,8 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "direct-recording",
     "metadata-refresh",
     "metadata-providers",
+    "guide-programme-items",
+    "music-artwork",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1021,6 +1045,54 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "guide-programme-items",
+        upstream_file: "src/Jellyfin.LiveTv/Guide/GuideManager.cs",
+        upstream_method: "GetProgram",
+        ferrofin: "What the guide refresh stores on each programme item and its external \
+                   ids. ferrofin-livetv manager.rs insert_programs and \
+                   insert_schedules_direct_programs keep the listing's Etag (xmltv_etag over \
+                   xmltv_etag.rs xmltv_program_etag, a port of XmlTvProgramEtag.TryCreate; \
+                   Schedules Direct's md5), Audio, IsHD, OriginalAirDate and Zap2It series id \
+                   in FerrofinLiveTvPrograms; sync_channel_program_items saves the items \
+                   (projection.rs program_entity for a new airing, program_item_update for a \
+                   stored one) and replaces their ids (program_provider_ids, \
+                   program_provider_ids_replaced, replace_provider_ids_for_items). Compared \
+                   with GuideManager.GetProgram, XmlTvListingsProvider.GetProgramInfo and \
+                   GetProgramInfoWithEtag and src/Jellyfin.LiveTv/Listings/XmlTvProgramEtag.cs \
+                   at the pinned v12.4 tag, and the etag bytes with those a Jellyfin 12.4 \
+                   server stored for the same guide. The XMLTV reader keeps a guide's text \
+                   as Jellyfin.XmlTv reads it (xmltv.rs apply_end, end_programme_run, \
+                   push_text; gl-1631), checked against that server on padded, empty, blank, \
+                   CRLF and date text, and its times and dates through one port of \
+                   XmlTvReader.ParseDate (parse_xmltv_time, copyright_year; gl-1646) that \
+                   upstream's XmlTvReaderDateTimeTests pin, with PopulateHeader's \
+                   MinValue for a missing time in the guide window (manager.rs \
+                   in_guide_window) and the previously-shown check.",
+        date: "2026-11-11",
+        divergences: &[
+            "Jellyfin.XmlTv drops the element right after an <image> or <url> when no \
+             whitespace separates them: ProcessImageNode reads past the end tag and its caller \
+             skips one more node. Ferrofin reads that element, so on such a compact guide the \
+             airing's rating, artwork or other field, and its etag, differ from Jellyfin's. \
+             Jellyfin bug not ported.",
+            "An airing whose start is missing or does not parse (and whose stop is in the \
+             guide window) is kept with no start date and one id per channel and title; \
+             upstream's PopulateHeader takes DateTimeOffset.MinValue, year 1, which gives \
+             every such airing of a channel the same programme id. Jellyfin bug not ported.",
+            "A programme's image URL padded with whitespace is stored trimmed, so the \
+             artwork loads; upstream's UpdateImage stores the padded path, which does not. \
+             Jellyfin bug not ported.",
+            "A programme is saved only when a field GetProgram assigns changed. Upstream skips \
+             only an XMLTV airing whose etag equals the stored one; every other airing is \
+             saved on every refresh, which moves its DateLastSaved and the DTO Etag derived \
+             from it: each Schedules Direct one, because GetProgram overwrites the stored \
+             provider ids before it compares the md5, and an XMLTV one with no etag, which \
+             counts as updated. No known client reads either, and keeping the save to a \
+             changed programme avoids one full-row write per airing per refresh (owner \
+             decision 2026-11-20, gl-1628).",
+        ],
+    },
     VerifiedSubsystem {
         key: "paging-sort",
         upstream_file: "Jellyfin.Api/Helpers/RequestHelpers.cs",
@@ -1602,7 +1674,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    profile photo (the credit's URL from TheMovieDb, TheTVDB, or an NFO \
                    actor's <thumb> through library_scan.rs person_to_entity) and a studio's \
                    thumb (ferrofin-core library_scan.rs \
-                   download_images and studio_thumb, named from the resolved type through \
+                   download_image and studio_thumb, named from the resolved type through \
                    tmdb.rs TmdbClient::download and studios.rs StudiosClient::download; \
                    enrich_people and enrich_studio_images hand the file to ferrofin-providers \
                    image_save.rs ImageFileSaver through finish_artwork, which puts a person's \
@@ -1616,6 +1688,27 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    per-type limits, as upstream; downloaded through tmdb.rs \
                    TmdbClient::download, written by artwork.rs write_acquired_image and \
                    published by finish_artwork's image saver), \
+                   and where every image the server keeps is saved: the item's \
+                   GetInternalMetadataPath, {metadata}/library/{idN[..2]}/{idN}, under \
+                   GetStandardSavePath's name for a save that is not local (ferrofin-providers \
+                   local_images/merge.rs own_art_dir and internal_image_stem; used by \
+                   provider_manager.rs write_image_file and write_automatic_image for an \
+                   upload, a chosen remote image, a refresh's downloads and a plugin's \
+                   images; ferrofin-core dynamic_images.rs refresh_item for a collage or a \
+                   copy, and library_scan.rs refresh_library_image, art_dir_for, \
+                   own_art_dir_of and art_stem for the library tiles and the scan's \
+                   downloads, extractions and grabbed frames), with the replaced file \
+                   deleted (provider_manager.rs remove_replaced_internal_file, \
+                   dynamic_images.rs replaced_primary), \
+                   and what a save through the provider manager records of its images: \
+                   ferrofin-providers provider_manager.rs update_images, run by \
+                   update_to_repository (an upload, a chosen image, a delete, a reorder, \
+                   a collection's edit) and by a refresh's save: it measures each local \
+                   image that image_metadata.rs image_needs_refresh flags, or every one for \
+                   a save from ImageUpdate up in upstream's order (an image, download or \
+                   edit save), with image_metadata.rs fill_image_metadata (the scan's too: \
+                   0x0 when the size cannot be read, an empty blurhash when it cannot be \
+                   computed), dating it by its file and dropping one whose file is gone, \
                    compared with \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    MediaBrowser.Providers/Manager/ItemImageProvider.cs (EnableImageStub, \
@@ -1624,6 +1717,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    RefreshImages), \
                    MediaBrowser.Providers/Manager/ImageSaver.cs (SaveImage, \
                    GetStandardSavePath), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (GetInternalMetadataPath), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler), \
                    MediaBrowser.Controller/Extensions/XmlReaderExtensions.cs \
                    (GetPersonFromXmlNode), \
@@ -1631,9 +1725,31 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Manager/MetadataService.cs (RefreshWithProviders' \
                    local-provider loop, MergePeople) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs \
-                   (SavePeopleMetadataAsync, UpdateImagesAsync, ConvertImageToLocal)",
-        date: "2026-11-14",
+                   (SavePeopleMetadataAsync, UpdateImagesAsync, ImageNeedsRefresh, \
+                   RunMetadataSavers, UpdateItemsAsync, ConvertImageToLocal), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (ValidateImages) and \
+                   src/Jellyfin.Drawing/ImageProcessor.cs (GetImageBlurHash)",
+        date: "2026-11-20",
         divergences: &[
+            "The metadata editor's save (POST /Items/{itemId}, and its cascade to the \
+             children) runs the savers only, so it neither measures nor validates the item's \
+             images, where UpdateItem's UpdateToRepositoryAsync(MetadataEdit) forces \
+             UpdateImagesAsync. Fix path: gl-1922.",
+            "A remote image row is not downloaded into a local file when its item is saved \
+             (UpdateImagesAsync's ConvertImageToLocal): it stays a URL, downloaded when it is \
+             served (cached_remote_image). Upstream's rows of that kind are a Live TV \
+             channel's logo, which gl-1560 proposes as an accepted divergence (its P8), \
+             pending the owner's decision.",
+            "Art an earlier build saved in the item's {metadata}/library/{ID} folder (and an \
+             older scan's lower-cased {id} one), under Ferrofin's own names, stays there: the \
+             scan finds it and its rows keep naming it, until a new image of its type replaces it \
+             (an upload, a chosen or downloaded image, a redrawn collage or tile, or a \
+             \"Replace existing images\" refresh) and its file is deleted, while Jellyfin counts \
+             only GetInternalMetadataPath as the item's. Fix path: gl-1916, an owner decision.",
+            "A channel's, a Live TV channel's or programme's and a channel-supplied item's art is \
+             saved in the library layout, where GetInternalMetadataPath's overrides use \
+             channels/ and livetv/ (Channel.cs, LiveTvChannel.cs, LiveTvProgram.cs). Fix path: \
+             gl-1917.",
             "A stored blurhash that is not UTF-8 reads as none, and the scan computes it \
              again, where MapImageFromEntity's Encoding.UTF8.GetString replaces the \
              invalid bytes with U+FFFD and sends the garbled hash. An empty one reads as \
@@ -1755,7 +1871,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/Movies/BoxSet.cs (MarkPlayed, MarkUnplayed), \
                    MediaBrowser.Controller/Entities/TV/Episode.cs and \
                    MediaBrowser.Controller/Entities/TV/Season.cs (Series, FindSeriesId, \
-                   GetUserDataKeys), \
+                   GetUserDataKeys), MediaBrowser.Controller/Entities/Audio/Audio.cs \
+                   (GetUserDataKeys; the keys themselves from user_data_keys.rs \
+                   user_data_keys), \
                    MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
                    Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
                    UpdateUserItemRatingInternal). The version groups: dto_service.rs prefetch's \
@@ -1780,7 +1898,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Jellyfin.Database.Implementations/DescendantQueryHelper.cs \
                    (GetAllDescendantIds) and MediaBrowser.Controller/Entities/Folder.cs \
                    (IsPlayed)",
-        date: "2026-11-11",
+        date: "2026-11-20",
         divergences: &[
             "After a scan or boot-repair fold, which upstream does not have (it deletes the \
              duplicate, and ReconcileUserDataAsync gives the user's rows the most recent play when \
@@ -1816,7 +1934,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    visible_view_rows → library_enabled under scope_to_user_libraries, \
                    root_folder_top_parents and grouped_libraries (GetChildren(user, true) in \
                    AddUserToQuery's GetUserViews, UserViewManager.HasVisibleItem and \
-                   GetTopParentIdsForQuery's grouping arm), reading a library's options at its \
+                   GetTopParentIdsForQuery's grouping arm), and UserViewMaterialisation, the \
+                   scope's get_user_views_with_query call that writes the user's views as \
+                   AddUserToQuery's GetUserViews call writes them (LibraryManager.AddUserToQuery, \
+                   UserViewManager.GetUserViews, compared 2026-11-10), with \
+                   user_view_manager.rs ensure_user_playlists_view and view_refresh_due dating \
+                   and refreshing the Playlists view (LibraryManager.GetNamedView, compared \
+                   2026-11-11), reading a library's options at its \
                    Path expanded as BaseItemMapper.Map expands it \
                    (CollectionFolder.GetLibraryOptions, compared 2026-11-05); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
@@ -1875,6 +1999,25 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",
+            "An unscoped query for a user writes the user's views (the Playlists view, a \
+             grouped view, the Folders view, the Live TV view), where upstream's \
+             AddUserToQuery calls GetUserViews on every such query: for the life of the \
+             process, once per user and per set of root folders the user may see. Those \
+             writes create a missing row or rename a Playlists, grouped, Folders or Live TV \
+             view whose name changed, so the rows end the same, except that a change while the set \
+             stays the same (for example a view row deleted, the Folders view enabled, a new \
+             server culture, a changed grouped-folders preference, or Live TV becoming \
+             available to the user), or a write that failed, is written by the next GET \
+             /UserViews rather than the next query; a write its query was cancelled in is \
+             retried. The query \
+             that writes them is scoped by the rows read before the write (gl-1584). \
+             GetNamedView's refresh of the Playlists view (when it is new, 24 hours after its last refresh, \
+             or once its display parent was saved since) is the view's save, made at once \
+             rather than queued (gl-1625); the collage that refresh draws upstream is \
+             TODO(gl-1656), and the other views' dates and refresh TODO(gl-1655). It falls \
+             due only where the views are read: on every GET /UserViews, and on the query \
+             path when that writes them, so a refresh due while the set stays the same \
+             waits for the next GET /UserViews.",
             "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, or \
              as the signed-in caller when a POST body names no user, so a series that user \
              cannot open (library, rating or tag rules) answers like an id that is no series: \
@@ -2328,11 +2471,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ReplaceAllMetadata, a FullRefresh, or a first or required refresh at Default \
                    or above, else the change-monitored ones; for a locked item \
                    CanRefreshMetadata keeps the forced providers and RefreshWithProviders \
-                   returns after them, so only the probe runs), scan_item's run_local gate \
+                   returns after them, so only the probe runs, and the Data keys it owns, \
+                   item_data.rs PROBE_OWNED_KEYS, are saved whatever the lock through \
+                   item_persistence_service.rs locked_data_sql), scan_item's run_local gate \
                    (RefreshWithProviders runs \
                    no local reader when SearchResult is set (the NFO, and a book's embedded \
                    readers in enrich_from_file), nor under ReplaceAllMetadata for an item a \
-                   saver rewrites (the NFO); a photo's PhotoProvider is a custom provider and \
+                   saver rewrites (the NFO, a playlist folder's playlist.xml through \
+                   container_xml.rs saves_metadata); a photo's PhotoProvider is a custom provider and \
                    runs whatever the options), ApplySearchResult \
                    (ResolverGuesses::pin_search's name and year and search_result_ids for the \
                    lookup; a season or an episode keeps none of its own ids, \
@@ -2351,8 +2497,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    music_images on the refresh's options, so the albums below an identified \
                    artist run the chosen provider first as well (MetadataRefreshOptions' copy \
                    keeps SearchResult through ValidateChildren), and music_fold_start's local \
-                   reader skip. An item the provider manager refreshes (a box set, person, \
-                   genre or studio, a virtual season or episode): ferrofin-providers \
+                   reader skip. An item the provider manager refreshes (a box set, a playlist, \
+                   a person, genre or studio, a virtual season or episode): ferrofin-providers \
                    provider_manager.rs \
                    refresh_item (the chosen ids stored first, RemoveImages under \
                    RemoveOldMetadata with ReplaceAllImages by local_images/merge.rs \
@@ -2364,7 +2510,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    cleared (ApplySearchResult runs whenever the item has a provider: an \
                    episode always, its forced ProbeProvider and TrickplayProvider, a \
                    path-less season only when a remote one runs), refresh_ordered_images \
-                   with the chosen provider first). Compared with RefreshMetadata, \
+                   with the chosen provider first). A box set's or playlist folder's \
+                   local XML file: ferrofin-providers container_xml.rs (BoxSetXmlProvider and \
+                   PlaylistXmlProvider, HasChanged as LocalMetadataFormat::Xml; the saver gate \
+                   IsSaverEnabledForItem) read in provider_manager.rs refresh_item and, for a \
+                   playlist folder a scan reaches, library_scan/playlists.rs read_folder_xml; \
+                   PlaylistMetadataService.MergeData's PlaylistMediaType, its LinkedChildren \
+                   only outside the data directory, and its Shares by item_data.rs \
+                   merge_playlist_shares_in through sync_scanned_playlists (replace on \
+                   replaceData or none stored, else the file's first, DistinctBy UserId); \
+                   OwnerUserId is read and merged nowhere, as upstream. Compared with RefreshMetadata, \
                    ApplySearchResult, GetProviders, RefreshWithProviders, \
                    GetNonLocalImageProviders, ProviderManager.RefreshItem, \
                    GetMetadataProvidersInternal and GetImageProvidersInternal, and \
@@ -2372,7 +2527,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    movie, series, season and episode providers answer is the \
                    metadata-providers row's; what the other providers answer (gl-1815) and how \
                    the answers merge field by field (gl-1813) are not part of this row.",
-        date: "2026-11-19",
+        date: "2026-11-20",
         divergences: &[
             "An album below an identified artist is looked up by its own ids, name and year; \
              upstream's ApplySearchResult gives every child but a season or an episode the \
@@ -2400,11 +2555,24 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              of 2026-10-17 on media-library writes to deletes; the owner has not yet \
              ruled on the narrower deletes.",
             "In a library with no metadata saver list and SaveLocalMetadata off, \
-             ReplaceAllMetadata reads an item's existing NFO or a box set's existing \
-             collection.xml; upstream's IsSaverEnabledForItem counts the saver enabled in \
-             that library (isSavingMetadata) for an existing NFO, and always for a box set, \
-             so it skips the file and rewrites it, where Ferrofin reads it and never rewrites \
-             it (owner decision 2026-11-19).",
+             ReplaceAllMetadata reads an item's existing NFO, a box set's existing \
+             collection.xml or a playlist folder's existing playlist.xml; upstream's \
+             IsSaverEnabledForItem counts the saver enabled in that library \
+             (isSavingMetadata) for an existing NFO, and always for a box set or a \
+             playlist, so it skips the file and rewrites it, where Ferrofin reads it and \
+             never rewrites it (owner decision 2026-11-19).",
+            "A playlist folder's playlist.xml already there at the playlist's first \
+             refresh is read; upstream's first refresh saves the new item before its local \
+             providers run (SaveItemAsync(MetadataImport) on isFirstRefresh), and \
+             PlaylistXmlSaver writes a playlist's name with no members or shares over the \
+             file it then reads. And the playlist.xml written lists every stored member by \
+             its path, where upstream's AddLinkedChildren writes only links carrying an \
+             item id, an empty <PlaylistItems /> right after a refresh read the members by \
+             path. Both measured on Jellyfin 12.4.0; Jellyfin bugs not ported.",
+            "A playlist FILE's <name>.xml sidecar (PlaylistXmlSaver.GetSavePath) is neither \
+             written nor read: upstream writes it with no members and then reads it before \
+             the playlist file, which empties the playlist. Whether to port either half is \
+             an owner decision. Fix path: gl-1915.",
         ],
     },
     VerifiedSubsystem {
@@ -2425,7 +2593,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    the MaxCastMembers and MaxCrewMembers caps, HideMissingCastMembers and \
                    HideMissingCrewMembers), series_people (the creators, outside the caps), \
                    season_details_for_language and season_details_from, \
-                   episode_extras_for_language and episode_people_from (guest stars); \
+                   episode_extras_for_language and episode_people_from (guest stars), and \
+                   people_entities, which folds every credit in order through \
+                   container_types.rs add_person, as each provider's MetadataResult.AddPerson \
+                   runs PeopleHelper.AddPerson (gl-1651); \
                    ferrofin-core library_scan.rs fetch_tmdb_metadata (a pinned TMDb id, else \
                    find_tmdb_id's /find by an IMDb id, a series also by its TVDB id, else the \
                    parsed-name search and find_best_match, for a movie only without an IMDb \
@@ -2446,7 +2617,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
                    TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
                    this row.",
-        date: "2026-11-15",
+        date: "2026-11-20",
         divergences: &[
             "A movie, series, season or episode TMDb has no overview for answers the \
              refresh no Overview, so Identify → Apply and a Replace all metadata refresh \
@@ -2479,6 +2650,70 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              episode_run_time is empty as no runtime; upstream stores 0 for both, which \
              keeps a later provider (OMDb, TheTVDB) from filling them. Jellyfin bug not \
              ported.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "music-artwork",
+        upstream_file: "MediaBrowser.Providers/MediaInfo/AudioImageProvider.cs",
+        upstream_method: "GetImage",
+        ferrofin: "What a library scan stores as a track's and a music album's Primary \
+                   (docs/MUSIC_ARTWORK.md). A track or an audiobook: ferrofin-core \
+                   library_scan.rs \
+                   embedded_primary → extract_embedded_cover (GetImage: no EmbeddedImage \
+                   stream, no image; audio_cover_stream picks the stream whose comment names \
+                   the front cover, then a cover, then the first; one extraction per \
+                   album_cover_key, the plan's album with GetAudioImagePath's Album tag and \
+                   first album artist (none when either is blank, nor for an audiobook), \
+                   copied into each such track's own art folder as GetAudioImagePath shares \
+                   it, and ItemImageProvider.RefreshFromProvider \
+                   saves it as the track's own image, poster.jpg in its \
+                   GetInternalMetadataPath as ImageSaver names it), with the stored pictures \
+                   (StoredItemLinks.embedded_images, item_persistence_service.rs \
+                   scan_stored_links; GetMediaStreams) when the pass probes nothing. An album: \
+                   collect_artwork's local discovery (LocalImageProvider, which supports no \
+                   song) and kept rows (ValidateImages), then dynamic_images.rs \
+                   DynamicImageKind::MusicAlbum (MusicAlbumImageProvider: the first child \
+                   that is no folder with a Primary, CreateSingleImage into the album's own \
+                   folder as folder.<ext> whatever SaveLocalMetadata says, \
+                   HasChangedByDate false, FetchAsync \
+                   never replacing an image outside it), drawn by the closing dynamic image \
+                   pass, whose windows read their rows' images in one statement; the next \
+                   scan lists the copy in the album's art folder, and ferrofin-providers \
+                   image_save.rs save_all publishes beside the media only an image the pass \
+                   acquired, never one the item stores with the same file and time, as \
+                   ImageSaver writes only what SaveImage is given. A row naming \
+                   an earlier build's shared album-covers copy is not kept by validation, \
+                   except on a locked item (see the divergences), so the next scan gives any \
+                   other item the image above. Compared with \
+                   AudioImageProvider.cs (GetImage, GetAudioImagePath, Supports), \
+                   Emby.Server.Implementations/Images/MusicAlbumImageProvider.cs, \
+                   BaseFolderImageProvider.cs (GetItemsWithImages, HasChangedByDate), \
+                   BaseDynamicImageProvider.cs (FetchAsync, FetchToFileInternal, HasChanged, \
+                   CreateSingleImage), MediaBrowser.LocalMetadata/Images/LocalImageProvider.cs \
+                   (Supports, GetImages), MediaBrowser.Providers/Manager/ItemImageProvider.cs \
+                   (RefreshFromProvider) and MetadataService.cs (RefreshMetadata's order), and \
+                   live against Jellyfin 12.4 on the same music folder: an album with a \
+                   folder.jpg and one without, each with a track that embeds a picture and \
+                   one that does not.",
+        date: "2026-11-20",
+        divergences: &[
+            "A locked album or track keeps a row naming an earlier build's shared \
+             album-covers copy, as its lock keeps the stored row (and refuses an album's \
+             copy), \
+             so a returned Jellyfin keeps naming that file for it; upstream never stores \
+             such a row. Whether a lock should keep it is the owner's question, raised \
+             with gl-692.",
+            "Tracks share one extraction within one scan, keyed by their album's id, Album \
+             tag and first album artist; GetAudioImagePath keys a cache file by the last \
+             two only, and it outlives the scan, so two albums sharing both share one \
+             picture there (a Jellyfin bug not ported), and a track added to an album in \
+             a later scan gets the cached picture there and its own here.",
+            "An album's copy is drawn in the scan's closing passes, after the music pass \
+             downloads TheAudioDB's and fanart.tv's images, where upstream's custom \
+             provider runs before its remote image providers: an image full refresh below \
+             a full metadata refresh keeps a downloaded Primary where upstream keeps the \
+             copy, and Replace all images keeps the copy where upstream keeps the \
+             download. Fix path: gl-1909.",
         ],
     },
 ];
@@ -3362,11 +3597,11 @@ pub const VERIFIED: &[Verified] = &[
             "A Chapter image's file is not deleted: chapter images are not image rows, so the \
              delete finds nothing and answers 204, where GetImageInfo returns the chapter's \
              image and DeleteImageAsync deletes its file. Fix path: gl-1663.",
-            "A file in the shared album-covers directory is kept, as an album and its tracks \
-             name the same file there (docs/MUSIC_ARTWORK.md); DeleteImageAsync deletes any \
-             local file, a track's extracted cover that the album's other tracks share \
-             (AudioImageProvider.GetAudioImagePath) included, which leaves them naming a \
-             missing file. Whether tracks keep the album's cover is gl-692.",
+            "A file in the album-covers directory is kept: earlier builds stored there one \
+             copy of an album's cover that the album and every one of its tracks named, and \
+             rows a library scan has not yet replaced may still name it (docs/MUSIC_ARTWORK.md); \
+             DeleteImageAsync deletes any local file. No build writes there any more (gl-692, \
+             gl-1633).",
             "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &["images"],
@@ -3562,6 +3797,29 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "get",
+        path: "/Branding/Configuration",
+        upstream_file: "Jellyfin.Api/Controllers/BrandingController.cs",
+        upstream_method: "GetBrandingOptions",
+        ferrofin: "handlers/branding.rs get_branding_options (anonymous, as the controller has \
+               no [Authorize]; no parameter) → ferrofin-core configuration_manager.rs \
+               get_branding (read_named_kept: GetConfiguration<BrandingOptions>(\"branding\")) → \
+               the BrandingOptionsDto projection, SplashscreenLocation left out, nulls omitted \
+               as JsonDefaults' WhenWritingNull does → login_buttons and with_login_buttons over \
+               SsoManager::login_buttons (ferrofin-extensions sso/login_buttons.rs)",
+        date: "2026-11-20",
+        divergences: &[
+            "While the Single Sign-On plugin (Ferrofin's own: Jellyfin has no sign-in through an \
+         identity provider) is enabled with ShowLoginButton on, a usable public URL and at least \
+         one enabled provider, LoginDisclaimer is the stored text, a blank line, then one \
+         \"Sign in with\" <form> per provider between <!-- ferrofin:sso-login-buttons --> \
+         marker comments, for every client (D7 and D17 of the OIDC sign-in milestone). In \
+         every other case, a plugin configuration that does not read included, the body is \
+         the stored configuration's, unchanged, as upstream's. Deliberate.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
         path: "/Branding/Splashscreen",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "GetSplashscreen",
@@ -3594,7 +3852,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UploadCustomSplashscreen",
         ferrofin: "handlers/branding.rs upload_splashscreen → handlers/image_upload.rs \
                (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
-               to_extension, decode_base64)",
+               to_extension, decode_base64) → the write and the save on handlers.rs \
+               run_detached's task, so a client that hangs up once the body is in stops \
+               neither, as upstream's CancellationToken.None copy and synchronous save",
         date: "2026-10-28",
         divergences: &[
             "The body is decoded in full before anything is written, and the location is \
@@ -3628,7 +3888,8 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/users.rs authenticate_by_name, authenticate, login_failure, \
                authentication_result → ferrofin-core session_manager.rs authenticate_internal \
                (AuthenticateNewSessionInternal), admit_session → user_manager.rs \
-               authenticate_user (UserManager.AuthenticateUser), authentication_providers_for \
+               authenticate_user (UserManager.AuthenticateUser) with ensure_sign_in_allowed \
+               (its disabled, remote and schedule checks), authentication_providers_for \
                (GetAuthenticationProviders(User)), authenticate_with_providers \
                (AuthenticateLocalUser) and apply_external_administrator; a 401 or 403 \
                answers as ExceptionMiddleware does \
@@ -3680,6 +3941,14 @@ pub const VERIFIED: &[Verified] = &[
          UserUpdated push, no device check), so an administrator a provider demotes keeps \
          the devices their policy refuses signed in until a later policy save or rename, as \
          upstream does (gl-1191 asks the owner whether to keep that).",
+            "A provider may say a password it refuses never counts toward lockout \
+         (AuthenticationManager::counts_failed_passwords, read for the provider the account \
+         names, enabled or not): such a refusal answers the usual 401 and leaves \
+         InvalidLoginAttemptCount and the enabled flag alone, where upstream's AuthenticateUser \
+         counts every refused password. Only the Single Sign-On extension's provider says so, \
+         since it refuses every password of the accounts it owns; the built-in providers and \
+         LDAP-Auth count as upstream does, and the login backoff still paces the caller. \
+         Owner decision (D20 of the OIDC sign-in milestone, 2026-11-20).",
             "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
          publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
          AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
@@ -3908,6 +4177,39 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "get",
+        path: "/LiveTv/Channels",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetLiveTvChannels",
+        ferrofin: "handlers/live_tv.rs get_channels (items.rs resolve_user_opt, \
+               program_dto_options, add_current_program) → ferrofin-livetv manager.rs \
+               get_channels (user_restrictions; guide_repository.rs channel_rows: only the \
+               lineup channels whose item is stored, the user's parental restrictions, and \
+               isMovie/isSeries over the stored channel item's \
+               columns and isKids/isNews/isSports over its Kids/News/Sports tags; \
+               channel_user_data; projection.rs filter_channel_rows, sort_channel_rows, \
+               remove_fields; channel_entity → DtoService get_base_item_dtos, which runs \
+               AddChannelInfo) (RequestHelpers.GetUserId, LiveTvManager.GetInternalChannels, \
+               BaseItemRepository.TranslateQuery, RemoveFields)",
+        date: "2026-11-10",
+        divergences: &[
+            "type keeps the channels of that ChannelType, as the parameter documents; \
+         upstream's GetInternalChannels never passes LiveTvChannelQuery.ChannelType on and \
+         lists every channel. Jellyfin bug not ported.",
+            "Every sortBy key but SortName, Name, IsFavoriteOrLiked and DateCreated compares \
+         equal, so the appended SortName decides; upstream's OrderMapper sorts on them. Fix \
+         path: gl-1354.",
+            "isFavorite and isLiked with no user (an API key naming none) match no channel \
+         when true and every channel when false, and enableFavoriteSorting sorts nothing; \
+         upstream's TranslateQuery and OrderMapper dereference the null user \
+         (filter.User!.Id) and fail the request. Jellyfin bug not ported.",
+            "The 400 (a value the query binder cannot convert) and 403 (another user's id \
+         without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
+        ],
+        refs: &["access-filtering", "user-data"],
+    },
+    Verified {
+        method: "get",
         path: "/LiveTv/Recordings",
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "GetRecordings",
@@ -3981,24 +4283,27 @@ pub const VERIFIED: &[Verified] = &[
             "With no user (an API key), sortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "Programme DTOs are projected from the guide's own table, not the stored \
-         LiveTvProgram item, so what that table has no column for is missing: \
-         CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \
-         listing's Width and Height, and the ProgramEtag and SeriesZap2It provider ids; \
-         upstream's GuideManager.GetProgram stores each on the item the DTO is made from. \
-         Fix path: gl-763, gl-1591.",
-            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags) are read \
-         from the guide table, so a change saved to a programme's item (POST \
-         /Items/{itemId}) is not shown here; upstream lists the stored item, the change \
-         included, until a guide refresh that updates the programme assigns the listing's \
-         values over it. Fix path: gl-1690.",
+            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags, \
+         PremiereDate, Audio and an HD listing's Width and Height) are read from the guide \
+         table, so a change saved to a programme's item (POST /Items/{itemId}) is not shown \
+         here. CommunityRating, which no listing sets, is never shown. Upstream lists the \
+         stored item, the change included, until a guide refresh that updates the programme \
+         assigns the listing's values over it. A PremiereDate an earlier listing stored is \
+         no longer shown once a later one makes the airing a first-run episode, nor is a \
+         1280x720 size once the listing is not HD; upstream's item keeps both. Fix path: \
+         gl-1690.",
             "A malformed id in channelIds or genreIds is a 400; upstream's \
          CommaDelimitedCollectionModelBinder drops it. Fix path: gl-884.",
             "The 400 (a value the query binder cannot convert) and 403 (another user's id \
          without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
          Fix path: gl-666.",
         ],
-        refs: &["access-filtering", "images", "paging-sort"],
+        refs: &[
+            "access-filtering",
+            "images",
+            "paging-sort",
+            "guide-programme-items",
+        ],
     },
     Verified {
         method: "post",
@@ -4037,21 +4342,24 @@ pub const VERIFIED: &[Verified] = &[
             "With no body UserId, SortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "Programme DTOs are projected from the guide's own table, not the stored \
-         LiveTvProgram item, so what that table has no column for is missing: \
-         CommunityRating, PremiereDate (the listing's original air date), Audio, an HD \
-         listing's Width and Height, and the ProgramEtag and SeriesZap2It provider ids; \
-         upstream's GuideManager.GetProgram stores each on the item the DTO is made from. \
-         Fix path: gl-763, gl-1591.",
-            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags) are read \
-         from the guide table, so a change saved to a programme's item (POST \
-         /Items/{itemId}) is not shown here; upstream lists the stored item, the change \
-         included, until a guide refresh that updates the programme assigns the listing's \
-         values over it. Fix path: gl-1690.",
+            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags, \
+         PremiereDate, Audio and an HD listing's Width and Height) are read from the guide \
+         table, so a change saved to a programme's item (POST /Items/{itemId}) is not shown \
+         here. CommunityRating, which no listing sets, is never shown. Upstream lists the \
+         stored item, the change included, until a guide refresh that updates the programme \
+         assigns the listing's values over it. A PremiereDate an earlier listing stored is \
+         no longer shown once a later one makes the airing a first-run episode, nor is a \
+         1280x720 size once the listing is not HD; upstream's item keeps both. Fix path: \
+         gl-1690.",
             "The 400 (a body that does not bind) body is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
-        refs: &["access-filtering", "images", "paging-sort"],
+        refs: &[
+            "access-filtering",
+            "images",
+            "paging-sort",
+            "guide-programme-items",
+        ],
     },
     Verified {
         method: "delete",
@@ -4246,7 +4554,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UpdateNamedConfiguration",
         ferrofin: "handlers/config.rs update_named_configuration (RequiredRouteString key: \
                ConvertEmptyStringToNull, then [Required]; normalize_named_configuration: \
-               GetConfigurationType and Deserialize) → save_named_configuration, on \
+               GetConfigurationType and Deserialize) → for branding, strip_login_buttons, \
+               then ServerConfigurationManager::update_branding and the committed checks on \
+               run_detached's task; otherwise save_named_configuration, on \
                handlers.rs run_detached's task so it finishes for a client that hangs up, in \
                the request's span and culture \
                (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
@@ -4263,10 +4573,15 @@ pub const VERIFIED: &[Verified] = &[
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
                RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
                and provider saves run too, as upstream's save of livetv does)",
-        date: "2026-11-15",
+        date: "2026-11-20",
         divergences: &[
             "database is refused with a 400: Ferrofin has no other database provider (owner \
          decision 2026-10-23).",
+            "A branding LoginDisclaimer is saved without the Single Sign-On sign-in buttons \
+         GET /Branding/Configuration appends (the block between its \
+         <!-- ferrofin:sso-login-buttons --> markers and the blank line before it), as \
+         POST /System/Configuration/Branding saves it. Ferrofin's own: upstream has no such \
+         block.",
             "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
          the database, so lists in a posted document are stored with it but neither add nor \
          change a tuner or a provider.",
@@ -4313,6 +4628,38 @@ pub const VERIFIED: &[Verified] = &[
          entry whole.",
             "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/System/Configuration/Branding",
+        upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
+        upstream_method: "UpdateBrandingConfiguration",
+        ferrofin: "handlers/config.rs update_branding_configuration (RequireAdminWithDefault: \
+               RequiresElevation; JsonBody<BrandingOptionsDto>: [FromBody, Required] through \
+               JsonDefaults' converters, member names matched ignoring case, an empty or null \
+               body a 400) → on handlers.rs run_detached's task, so the synchronous action's \
+               save finishes for a client that hangs up, in the request's span and culture: \
+               ferrofin-core configuration_manager.rs get_branding \
+               (GetConfiguration(\"branding\"), which keeps SplashscreenLocation) → the DTO's \
+               LoginDisclaimer, CustomCss and SplashscreenEnabled over it → handlers/branding.rs \
+               strip_login_buttons → update_branding (SaveConfiguration(\"branding\", …): the \
+               atomic write, then the listeners) → run_committed_checks. Every spelling of \
+               POST /System/Configuration/branding reaches it, jellyfin-web's \
+               updateNamedConfiguration('branding') included, as ASP.NET prefers this literal \
+               route to Configuration/{key}",
+        date: "2026-11-20",
+        divergences: &[
+            "A LoginDisclaimer holding the Single Sign-On sign-in buttons \
+         GET /Branding/Configuration appends (the block between its \
+         <!-- ferrofin:sso-login-buttons --> markers, and the blank line before it, in \\n \
+         line breaks as jellyfin-web 12.4 sends them, or \\r\\n) is saved without them, so \
+         jellyfin-web's branding page, which saves the text it was served, never stores the \
+         buttons (D7 of the OIDC sign-in milestone). Ferrofin's own: upstream has no such \
+         block.",
+            "The 404 and 500 bodies (a store that cannot be read or written, or a committed \
+         check that fails) are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -4367,10 +4714,9 @@ pub const VERIFIED: &[Verified] = &[
         date: "2026-11-15",
         divergences: &[
             "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
-         own table, so it lacks what that table has no column for (CommunityRating, \
-         PremiereDate, Audio, an HD listing's Width and Height, the ProgramEtag and \
-         SeriesZap2It provider ids) and shows the listing's fields, not a change saved to \
-         the programme's item. Fix path: gl-763, gl-1591, gl-1690.",
+         own table, so it shows the listing's fields, not a change saved to the programme's \
+         item, nor a PremiereDate or 1280x720 size an earlier listing stored. Fix path: \
+         gl-1690.",
             "A series timer's timer whose name is blank runs no lookup by name, so its \
          ProgramInfo takes no Thumb or Backdrop from a library series, and without a listings \
          series id no Primary from a guide programme; upstream's FillImages then filters on \
@@ -4378,7 +4724,7 @@ pub const VERIFIED: &[Verified] = &[
          programme with a Primary. Fix path: gl-1790, an owner decision.",
             "The 400 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &["images"],
+        refs: &["images", "guide-programme-items"],
     },
     Verified {
         method: "delete",
@@ -4435,10 +4781,9 @@ pub const VERIFIED: &[Verified] = &[
          that id (GetInternalSeriesTimerId), so it lists every timer of no series timer. \
          Jellyfin bug not ported.",
             "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
-         own table, so it lacks what that table has no column for (CommunityRating, \
-         PremiereDate, Audio, an HD listing's Width and Height, the ProgramEtag and \
-         SeriesZap2It provider ids) and shows the listing's fields, not a change saved to \
-         the programme's item. Fix path: gl-763, gl-1591, gl-1690.",
+         own table, so it shows the listing's fields, not a change saved to the programme's \
+         item, nor a PremiereDate or 1280x720 size an earlier listing stored. Fix path: \
+         gl-1690.",
             "A series timer's timer whose name is blank runs no lookup by name, so its \
          ProgramInfo takes no Thumb or Backdrop from a library series, and without a listings \
          series id no Primary from a guide programme; upstream's FillImages then filters on \
@@ -4447,7 +4792,7 @@ pub const VERIFIED: &[Verified] = &[
             "The 400 body (a value the query binder cannot convert) is Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
         ],
-        refs: &["images"],
+        refs: &["images", "guide-programme-items"],
     },
     Verified {
         method: "get",
@@ -4477,7 +4822,7 @@ pub const VERIFIED: &[Verified] = &[
          decision.",
             "The 400 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &["images"],
+        refs: &["images", "guide-programme-items"],
     },
     Verified {
         method: "get",
@@ -4759,7 +5104,7 @@ pub const VERIFIED: &[Verified] = &[
                AddToCollectionAsync's refusal of an id naming no item after the box set \
                is stored, then its UpdateToRepositoryAsync(MetadataEdit) through \
                save_membership → ProviderManager::update_to_repository, whose \
-               ferrofin-providers box_set_xml.rs BoxSetXmlSaver writes the box set's \
+               ferrofin-providers container_xml.rs ContainerXmlSaver writes the box set's \
                collection.xml (BoxSetXmlSaver, BaseXmlSaver.AddCommonNodesAsync and \
                AddLinkedChildren in local_xml.rs save_collection_xml, \
                ProviderManager.IsSaverEnabledForItem) and stamps DateLastSaved after it \
@@ -4767,8 +5112,9 @@ pub const VERIFIED: &[Verified] = &[
                ensure_collections_folder → collections_library.rs (EnsureLibraryFolder: \
                physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
                LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
-               makes)",
-        date: "2026-11-19",
+               makes, and the new library's scan, AddVirtualFolder's StartScanInBackground, \
+               queue_library_scan's RefreshLibrary task run)",
+        date: "2026-11-20",
         divergences: &[
             "A missing name makes a box set with an empty name, where upstream's \
          GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",
@@ -4781,6 +5127,19 @@ pub const VERIFIED: &[Verified] = &[
          AddChild overwrites it. Jellyfin bug not ported.",
             "The 400 bodies (a malformed id, an id naming no item) are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "The first collection's box-set refresh runs in a background task \
+         (refresh_full_item) rather than the High-priority refresh queue, and the new \
+         library's scan is queued once it has run, where upstream queues the scan when \
+         AddVirtualFolder makes the library and the refresh through QueueRefresh. \
+         Upstream's slower background scan almost always loses that race; Ferrofin's \
+         would win it and give the box set a Default first refresh, which takes TMDb's \
+         collection name over the typed one of a create with items. The scan this create \
+         queues now always follows the refresh; a membership change or an unrelated scan \
+         during that refresh can still race it, as upstream (gl-1622).",
+            "The new library's scan is queued behind a running scan, as a RefreshLibrary task \
+         run once the running one ends; upstream's StartScanInBackground drops it when a \
+         scan is running, which misses the new library when that scan listed the libraries \
+         before it. Jellyfin bug not ported.",
             "collection.xml writes <Added> and <PremiereDate> in UTC and reads both <Taglines> \
          and <TagLines>; upstream writes the dates in the server's local time and reads \
          them back as UTC, which shifts them on every round trip on a server outside UTC, \
@@ -4860,13 +5219,14 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "RemoveVirtualFolder",
         ferrofin: "handlers/library_structure.rs remove_virtual_folder → finish_structure_change \
                (after_structure_change: LibraryMonitor::restart, then queue_library_scan when \
-               refreshLibrary) → ferrofin-core virtual_folder_manager.rs remove_virtual_folder \
+               refreshLibrary, a RefreshLibrary task run through FerrofinTaskManager::queue_library_change, \
+               QueueLibraryScan's QueueScheduledTask) → ferrofin-core virtual_folder_manager.rs remove_virtual_folder \
                (LibraryManager.RemoveVirtualFolder: child_path and require_folder for \
                GetChildPath and Directory.Exists, preserve_legacy_children, the CollectionFolder \
                row deleted, remove_dir_all, prune_orphan_collection_folders for \
                ValidateTopLibraryFolders' tail) → library_monitor.rs restart and run \
                (LibraryMonitor.Stop and Start, StartWatchingPath)",
-        date: "2026-11-03",
+        date: "2026-11-20",
         divergences: &[
             "Without refreshLibrary, upstream waits 1000 ms (Task.Delay) inside the request before \
          LibraryMonitor.Start, so its directory watchers miss the removal; Ferrofin answers at \
@@ -4928,13 +5288,13 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/library_structure.rs rename_virtual_folder (the name and newName 400s) \
                → library_id_by_name for the scan's scope → finish_structure_change \
                (after_structure_change: LibraryMonitor::restart, then queue_library_scan_scoped \
-               when refreshLibrary) → ferrofin-core virtual_folder_manager.rs \
-               rename_virtual_folder (child_path for GetChildPath, the 404 and 409 checks, \
+               when refreshLibrary, a RefreshLibrary task run) → ferrofin-core \
+               virtual_folder_manager.rs rename_virtual_folder (child_path for GetChildPath, the 404 and 409 checks, \
                case_hop for the case-only temp hop, the preference remap for \
                ReplaceLibraryIdInUserPreferencesAsync over library_preference_repository.rs, \
                repath_collection_folder and prune_orphan_collection_folders) → \
                library_monitor.rs restart and run (LibraryMonitor.Stop and Start)",
-        date: "2026-11-03",
+        date: "2026-11-20",
         divergences: &[
             "The monitor keeps watching while the folder moves and restarts after; upstream stops \
          it first. The move happens under the libraries root, which is not a library location, \
@@ -4942,9 +5302,10 @@ pub const VERIFIED: &[Verified] = &[
             "Without refreshLibrary the restart runs at once on the monitor's own task; upstream's \
          RefreshAfterRenameAsync waits 1000 ms (Task.Delay) first, which for the reason above \
          has nothing to let settle here.",
-            "With refreshLibrary a scan scoped to the renamed library is queued and the monitor is \
+            "With refreshLibrary a scan scoped to the renamed library runs as a RefreshLibrary task \
+         run, queued behind a running one (owner decision 2026-11-20), and the monitor is \
          restarted; upstream refreshes the library's physical folders directly on a background \
-         task, beside any running scan, and never calls Start, so real-time monitoring stays off \
+         task, outside the task and beside any running scan, and never calls Start, so real-time monitoring stays off \
          until the next full scan. Jellyfin bug not ported (the missing restart).",
             "Without refreshLibrary the old library's row is repathed or deleted and orphan rows \
          pruned at once, and the listing writes the new row; upstream validates the top folders \
@@ -4972,14 +5333,15 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "AddMediaPath",
         ferrofin: "handlers/library_structure.rs add_media_path (the Name and PathInfo/Path 400s, \
                PathInfo preferred over Path) → finish_structure_change (after_structure_change: \
-               LibraryMonitor::restart, then queue_library_scan when refreshLibrary) → \
-               ferrofin-core virtual_folder_manager.rs add_media_path \
+               LibraryMonitor::restart, then queue_library_scan when refreshLibrary, \
+               a RefreshLibrary task run through FerrofinTaskManager::queue_library_change, \
+               QueueLibraryScan's QueueScheduledTask) → ferrofin-core virtual_folder_manager.rs add_media_path \
                (LibraryManager.AddMediaPath and AddMediaPathInternal: the path's existence, \
                require_folder, create_shortcut for CreateShortcut, \
                remove_content_type_overrides, sync_options_to_locations for \
                SyncLibraryOptionsToLocations, save_options, record_changed_locations) → \
                library_monitor.rs restart and run (LibraryMonitor.Stop and Start)",
-        date: "2026-11-03",
+        date: "2026-11-20",
         divergences: &[
             "A request refused for its arguments or for a missing library or path (400, 404) \
          restarts nothing and queues no scan; upstream makes those checks inside its try, so its \
@@ -5023,13 +5385,14 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "RemoveMediaPath",
         ferrofin: "handlers/library_structure.rs remove_media_path (the name and path 400s) → \
                finish_structure_change (after_structure_change: LibraryMonitor::restart, then \
-               queue_library_scan when refreshLibrary) → ferrofin-core virtual_folder_manager.rs \
-               remove_media_path (LibraryManager.RemoveMediaPath: require_folder, \
+               queue_library_scan when refreshLibrary, a RefreshLibrary task run through FerrofinTaskManager::queue_library_change, \
+               QueueLibraryScan's QueueScheduledTask) → \
+               ferrofin-core virtual_folder_manager.rs remove_media_path (LibraryManager.RemoveMediaPath: require_folder, \
                delete_shortcut_for (every match) over resolve_shortcut and the virtual-path \
                expansion, compared with the path ignoring case, the ordinal PathInfos filter, \
                both past trailing separators, save_options, record_changed_locations) → \
                library_monitor.rs restart and run (LibraryMonitor.Stop and Start)",
-        date: "2026-11-17",
+        date: "2026-11-20",
         divergences: &[
             "The path is compared with each shortcut's target and each PathInfos entry past \
          their trailing separators, and every matching shortcut is deleted, as every matching \
@@ -5182,8 +5545,12 @@ pub const VERIFIED: &[Verified] = &[
                %AppDataPath%/playlists/<name> (BaseItemMapper.Map → GetPathToSave → \
                ReverseVirtualPath), then report_item_added for AddChild's \
                ItemAdded; playlist_items for AddToPlaylistInternal and \
-               Playlist.GetPlaylistItems)",
-        date: "2026-11-03",
+               Playlist.GetPlaylistItems; the ForceSave refresh's save through \
+               ferrofin-providers container_xml.rs ContainerXmlSaver, PlaylistXmlSaver: the \
+               folder's playlist.xml with BaseXmlSaver's common nodes, OwnerUserId, the \
+               PlaylistItems, the Shares and PlaylistMediaType, local_xml.rs \
+               save_playlist_xml)",
+        date: "2026-11-20",
         divergences: &[
             "A request with neither a body nor a name query is a 400; upstream's \
          GetValidFilename(null) throws a NullReferenceException (500). Jellyfin bug not \
@@ -5200,8 +5567,6 @@ pub const VERIFIED: &[Verified] = &[
          combines the found folder's Path; they differ only for a folder found by type away \
          from that directory, since startup keeps the folder in use there \
          (AggregateFolderStore::ensure).",
-            "The first ForceSave refresh writes no playlist.xml into the new folder, where \
-         upstream's PlaylistXmlSaver saves one. Fix path: gl-341.",
             "With no media type named, a folder whose tree-order walk finds no playable \
          member (a box set of series or video folders, whose linked folders \
          GetRecursiveChildren never looks inside; a season whose episodes are stored under \
@@ -5261,8 +5626,13 @@ pub const VERIFIED: &[Verified] = &[
                (constructor defaults) → ferrofin-core collection_manager.rs \
                FerrofinPlaylistManager::update_playlist (PlaylistManager.UpdatePlaylist: \
                playlist_items for the Ids' AddToPlaylistInternal, rename_named_item_in, \
-               OpenAccess, share_playlist_in, sync_container_data_in, queue_refresh)",
-        date: "2026-10-28",
+               OpenAccess, share_playlist_in, sync_container_data_in, queue_refresh; \
+               announce_updated for UpdatePlaylistInternal's \
+               UpdateToRepositoryAsync(MetadataEdit) through \
+               ProviderManager::update_to_repository, whose ferrofin-providers \
+               container_xml.rs ContainerXmlSaver rewrites the folder's playlist.xml, \
+               PlaylistXmlSaver)",
+        date: "2026-11-20",
         divergences: &[
             "An empty-GUID id in Ids (`\"Ids\":[null]` or all zeros) is dropped and the other \
          ids replace the entries (204); upstream's UpdatePlaylist clears the entries and \
@@ -5345,8 +5715,13 @@ pub const VERIFIED: &[Verified] = &[
                (PlaylistManager.MoveItemAsync: the item id names an entry only in its N \
                form, either case, as the string compare with ItemId.ToString(\"N\") \
                ignoring case does; the first occurrence moves, the index counts the \
-               caller's list, no write when it is already there) and visible_entries",
-        date: "2026-11-14",
+               caller's list, no write when it is already there) and visible_entries; \
+               announce_updated for UpdatePlaylistInternal's \
+               UpdateToRepositoryAsync(MetadataEdit) through \
+               ProviderManager::update_to_repository, whose ferrofin-providers \
+               container_xml.rs ContainerXmlSaver rewrites the folder's playlist.xml in the \
+               new order, PlaylistXmlSaver",
+        date: "2026-11-20",
         divergences: &[
             "The index counts the members GET /Playlists/{id}/Items gave the caller, so the \
          standalone check, library included, where upstream's accessibleChildren take \
@@ -5386,10 +5761,13 @@ pub const VERIFIED: &[Verified] = &[
                require_user, GetUserById(Guid.Empty)'s 400 for a nil target; \
                item_data::share_playlist_in removes the user's share and appends one with \
                CanEdit ?? false; the Data sync and announce_updated for \
-               UpdateToRepositoryAsync. UpdatePlaylistInternal's SavePlaylistFile is \
+               UpdateToRepositoryAsync(MetadataEdit) through \
+               ProviderManager::update_to_repository, whose ferrofin-providers \
+               container_xml.rs ContainerXmlSaver rewrites the folder's playlist.xml with the \
+               new Shares, PlaylistXmlSaver. UpdatePlaylistInternal's SavePlaylistFile is \
                unreachable on both: a scanned playlist file has no owner, so the owner check \
                refuses it first)",
-        date: "2026-11-15",
+        date: "2026-11-20",
         divergences: &[
             "A target user the playlist is hidden from (a private playlist not shared with \
          them, a parental rating limit no member passes) or one that does not exist is given \
@@ -5398,10 +5776,6 @@ pub const VERIFIED: &[Verified] = &[
          NullReferenceException, so it answers 500 and writes nothing: only a user who can \
          already see the playlist can be added there (measured on Jellyfin 12.4.0 for a \
          private playlist and an unknown id). Jellyfin bug not ported.",
-            "UpdateToRepositoryAsync runs the metadata savers, and PlaylistXmlSaver (enabled \
-         for a Playlist at MetadataEdit) rewrites the playlist folder's playlist.xml with the \
-         new Shares (measured on Jellyfin 12.4.0); Ferrofin writes no playlist.xml. Fix path: \
-         gl-341.",
             "A user named twice in the shares has one entry here, which a re-share replaces; \
          upstream removes only the first of their entries and appends the new one, so the \
          second keeps its permission. Fix path: gl-949.",
@@ -5760,24 +6134,23 @@ pub const VERIFIED: &[Verified] = &[
                queued instead for an item outside every library, as for the lyrics delete) → \
                subtitle_manager.rs drop_missing_subtitle_rows (the item's external subtitle \
                rows whose absolute path is gone dropped, the rest kept with their indexes; \
-               nothing to drop after a refresh that probed). \
+               nothing to drop after a refresh that probed; when it drops one, \
+               media_stream_repository.rs sync_has_subtitles stores Data's HasSubtitles from \
+               the rows left, the rule FFProbeVideoInfo.cs:270 applies to the streams it \
+               saves). \
                The parity sweep's request (the corpus movie's stream 0, its video) expects \
                the 400. Measured on 12.4: an embedded, a \
                missing and a video stream's index, a nil id, an unknown id and an external \
                sidecar's index; and that sidecar's row pointed at a missing file (204), a \
                missing folder (404, row kept) and an http URL (404, row kept)",
-        date: "2026-11-17",
+        date: "2026-11-21",
         divergences: &[
             "A hex (0x, #, &h) or padded index is a 400; upstream's route binder reads it as \
          a number. Fix path: gl-1664.",
             "The 400 for an itemId or index the route binder cannot convert (upstream's \
          ValidationProblemDetails), and the 401 and 403 bodies, are Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
-            "A row an adopted database stores with a %AppDataPath% or %MetadataPath% token (a \
-         subtitle Jellyfin saved in its metadata folder) is read unexpanded, so it is the \
-         folder-missing 404 below, where upstream expands it (MediaStreamRepository \
-         RestorePath) and deletes the file. Fix path: gl-1063.",
-            "Every other relative path is the folder-missing 404, without touching the disk, as \
+            "Every relative path is the folder-missing 404, without touching the disk, as \
          the item delete refuses one (item_deletion.rs delete_item_path). Upstream \
          resolves one against its working directory, so a relative row whose folder exists \
          there answers 204 and deletes the file it names beside the server process (gl-1723). \
@@ -5789,7 +6162,8 @@ pub const VERIFIED: &[Verified] = &[
          (gl-1875); the indexes keep the gap until a refresh that probes renumbers them. \
          After a refresh that probed there is nothing to drop and the rows are upstream's. \
          Upstream keeps the row after a failed probe (read in FFProbeVideoInfo.ProbeVideo, \
-         not measured): a Jellyfin bug, deliberately not ported.",
+         not measured), and the video's stored HasSubtitles with it; here the flag follows \
+         the rows left: a Jellyfin bug, deliberately not ported.",
         ],
         refs: &["access-filtering"],
     },
@@ -7147,6 +7521,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // The LDAP-Auth plugin's own controller — not a contract operation, so
     // listed in PLUGIN_ROUTES.
     let router = ldap::register(router);
+    // The Single Sign-On plugin's own routes — not contract operations, so
+    // listed in PLUGIN_ROUTES.
+    let router = sso::register(router);
     // Live TV over the `LiveTvManager`; with nothing configured the reads answer
     // the empty state jellyfin-web shows as "not configured".
     let router = live_tv::register(router);

@@ -303,7 +303,9 @@ fn lower_normalization_priority(child: &tokio::process::Child, program: &str) {
 /// Parses the integrated-loudness value from ffmpeg `ebur128` stderr output.
 ///
 /// Port of the C# `^\s+I:\s+(.*?)\s+LUFS` regex: the first summary line of the
-/// form `I: -23.1 LUFS` wins.
+/// form `I: -23.1 LUFS` wins. The value is a float, as upstream's `float.Parse`
+/// and `float?` column make it, widened for the `REAL` column: `-23.1` is
+/// stored as `-23.100000381469727`, as Jellyfin stores it.
 #[must_use]
 pub fn parse_lufs(stderr: &str) -> Option<f64> {
     for line in stderr.lines() {
@@ -314,9 +316,9 @@ pub fn parse_lufs(stderr: &str) -> Option<f64> {
         if parts.next() == Some("I:")
             && let Some(value) = parts.next()
             && parts.next() == Some("LUFS")
-            && let Ok(lufs) = value.parse::<f64>()
+            && let Ok(lufs) = value.parse::<f32>()
         {
-            return Some(lufs);
+            return Some(f64::from(lufs));
         }
     }
     None
@@ -786,14 +788,13 @@ impl ScheduledTask for ChapterImagesTask {
         // Lossy: the file is only ever appended to, so a key torn mid-write by
         // a crash must cost that one key, not the whole history.
         let mut failed: std::collections::BTreeSet<String> = std::fs::read(&fail_history_path)
-            .map(|bytes| {
+            .map_or_default(|bytes| {
                 String::from_utf8_lossy(&bytes)
                     .split('|')
                     .filter(|s| !s.is_empty())
                     .map(str::to_lowercase)
                     .collect()
-            })
-            .unwrap_or_default();
+            });
 
         // A blocklist this large is almost always the fingerprint of a past
         // systemic failure (an unwritable temp directory failing every
@@ -1966,7 +1967,7 @@ mod tests {
             .await
             .expect("sh runs");
         assert_eq!(stderr, "title: caf\u{fffd}\n    I: -23.1 LUFS\n");
-        assert_eq!(parse_lufs(&stderr), Some(-23.1));
+        assert_eq!(parse_lufs(&stderr), Some(f64::from(-23.1_f32)));
 
         let clean = super::TokioFfmpegRunner
             .run_stderr("sh", &["-c".to_owned(), "printf 'ok' >&2".to_owned()])
@@ -1986,7 +1987,9 @@ mod tests {
             "    I:         -23.1 LUFS\n",
             "    Threshold: -33.6 LUFS\n",
         );
-        assert_eq!(parse_lufs(stderr), Some(-23.1));
+        // Parsed as a float, as upstream's `float.Parse`, and stored widened,
+        // as its `float?` column is: not -23.1.
+        assert_eq!(parse_lufs(stderr), Some(-23.100_000_381_469_727));
         assert_eq!(parse_lufs("no summary here"), None);
         assert_eq!(parse_lufs("    I: not-a-number LUFS"), None);
         assert_eq!(parse_lufs("I: -21.0 LUFS"), None);
@@ -2958,6 +2961,12 @@ mod tests {
         ) -> Result<bool, ServiceError> {
             self.0.run_library_scan(trigger, progress).await
         }
+        async fn run_requested_library_scans(
+            &self,
+            progress: Option<ferrofin_traits::library::ScanProgressSink>,
+        ) -> Result<bool, ServiceError> {
+            self.0.run_requested_library_scans(progress).await
+        }
         fn is_scan_running(&self) -> bool {
             self.0.is_scan_running()
         }
@@ -3179,6 +3188,8 @@ mod tests {
             ("nan", None),
             ("-inf", None),
             ("inf", None),
+            // Past a float's range: parsed as infinity, so no measurement.
+            ("1e39", None),
             ("-21.5", Some(-21.5)),
         ] {
             let task = AudioNormalizationTask::new(
@@ -4893,8 +4904,7 @@ mod tests {
         ) -> Option<ferrofin_keyframes::keyframe_data::KeyframeData> {
             let file = Path::new(file_path)
                 .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .map_or_default(|n| n.to_string_lossy().into_owned());
             self.log
                 .lock()
                 .expect("log")
@@ -5134,7 +5144,7 @@ mod tests {
 
     #[tokio::test]
     async fn chapter_images_page_past_the_first_page() {
-        let files: Vec<String> = (0..past_one_page()).map(|n| format!("{n}.mkv")).collect();
+        let files: Vec<String> = Vec::from_fn(past_one_page(), |n| format!("{n}.mkv"));
         let names: Vec<&str> = files.iter().map(String::as_str).collect();
         let (media, _movie, chapters, streams, task) = chapter_task_parts(false, &names).await;
         task.execute(&TaskProgress::default()).await.expect("run");

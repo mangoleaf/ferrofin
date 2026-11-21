@@ -1648,7 +1648,7 @@ impl LibraryScanner {
                         .collect();
                         fold.take(&mut temp, result);
                     }
-                    audiodb_images = Some(album.map(|a| a.images).unwrap_or_default());
+                    audiodb_images = Some(album.map_or_default(|a| a.images));
                 }
                 MusicSource::Dynamic(index) => {
                     let Some(result) = self
@@ -1804,7 +1804,7 @@ impl LibraryScanner {
                         .collect();
                         fold.take(&mut temp, result);
                     }
-                    audiodb_images = Some(artist.map(|a| a.images).unwrap_or_default());
+                    audiodb_images = Some(artist.map_or_default(|a| a.images));
                 }
                 MusicSource::Dynamic(index) => {
                     let Some(result) = self
@@ -1889,9 +1889,7 @@ impl LibraryScanner {
                     match (audiodb, &self.audiodb, group.as_deref()) {
                         (Some(images), ..) => found.extend(images),
                         (None, Some(adb), Some(group)) => {
-                            found.extend(
-                                adb.album(group).await.map(|a| a.images).unwrap_or_default(),
-                            );
+                            found.extend(adb.album(group).await.map_or_default(|a| a.images));
                         }
                         _ => {}
                     }
@@ -1916,8 +1914,7 @@ impl LibraryScanner {
                     match (audiodb, &self.audiodb, artist_key.as_deref()) {
                         (Some(images), ..) => found.extend(images),
                         (None, Some(adb), Some(id)) => {
-                            found
-                                .extend(adb.artist(id).await.map(|a| a.images).unwrap_or_default());
+                            found.extend(adb.artist(id).await.map_or_default(|a| a.images));
                         }
                         _ => {}
                     }
@@ -2011,8 +2008,10 @@ impl LibraryScanner {
             }
         }
         if fetch.images == ImageFetch::All {
-            let legacy = crate::dynamic_images::legacy_art_dir(&meta_root, work.id);
-            super::artwork::prune_old_backdrops_in(&[dir.clone(), legacy], &images);
+            super::artwork::prune_replaced_in(
+                &crate::dynamic_images::internal_metadata_dirs(&meta_root, work.id),
+                &images,
+            );
             let acquired: HashSet<_> = images.iter().map(|image| image.image_type).collect();
             images.extend(
                 stored

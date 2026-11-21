@@ -22,6 +22,14 @@ Conventions:
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
 | LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | ported |
 
+Ferrofin's own extensions have no row, since they port nothing: Ferrofin Settings, and Single
+Sign-On, which is not the community SSO-Auth plugin (its own id and routes). Single Sign-On's
+routes in `handlers::PLUGIN_ROUTES` (`/sso/admin/oidc/providers`,
+`/sso/admin/oidc/providers/{provider}`, `/sso/oidc/{provider}/start`,
+`/sso/oidc/{provider}/callback`, `/sso/oidc/exchange`, `/sso/quickconnect`, `/sso/link`, `/sso/links`,
+`/sso/links/{provider}`, `/sso/oidc/{provider}/link` and `/sso/admin/links`) have no upstream to
+compare with.
+
 ## Per-plugin notes
 
 ### Intro Skipper
@@ -350,8 +358,9 @@ Conventions:
   `AuthenticationProviderId` is LDAP-Auth's (ignoring case), and otherwise stays off. The file
   is only read. A missing file is silent; one that cannot be read or parsed, or a write that
   fails, is a warning, and the next boot tries again (`config.json` is written last, so its
-  presence means the import finished). `scripts/migrate-jellyfin.sh` copies this one file of
-  Jellyfin's `plugins/`.
+  presence means the import finished). `scripts/migrate-jellyfin.sh` copies this file of
+  Jellyfin's `plugins/`, and the `Jellyfin.Plugin.*.xml` settings of the metadata plugins
+  Jellyfin builds in, which adoption imports the same way.
 - Profile images (v24, `d11c86a`): the profile-image block of `Authenticate`,
   `LdapUtils.TryDetermineAttributeFormat`, `ProfileImageUpdater.SetProfileImage` and
   `LdapProfileImageSyncTask`. While `EnableLdapProfileImageSync` is on, `LocateLdapUser` also
@@ -638,8 +647,8 @@ Conventions:
     `LdapServer` is still that placeholder is imported with the server empty, and a warning
     names `LdapServer`: the plugin is on for its LDAP users but inactive until an
     administrator sets a server.
-  - **No `LdapUsers` in the configuration** (D12: one store of external identities, which the
-    OIDC sign-in planned next is to share, that links an identity to at most one user, writes
+  - **No `LdapUsers` in the configuration** (D12: one store of external identities, which
+    Single Sign-On's OIDC links share, that links an identity to at most one user, writes
     each link in a transaction so concurrent first sign-ins cannot lose one, and removes a
     user's links with the user): which LDAP uid belongs to which user lives in Ferrofin's
     external-identity table, so `GET /Plugins/{id}/Configuration` does not return it, and a

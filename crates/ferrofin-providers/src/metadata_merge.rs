@@ -38,6 +38,7 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::MetadataField;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use ferrofin_util::string_extensions::zero_padded;
 use serde_json::{Map, Value};
 
 /// A `Data` column value's JSON object; `NULL`, empty and malformed payloads
@@ -513,8 +514,8 @@ pub fn derived_sort_name(entity: &BaseItemEntity, title: &str) -> String {
 /// (a dead Next button and no autoplay).
 #[must_use]
 pub fn episode_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &str) -> String {
-    let season = parent_index.map_or_else(String::new, |n| format!("{n:03} - "));
-    let episode = index.map_or_else(String::new, |n| format!("{n:04} - "));
+    let season = parent_index.map_or_else(String::new, |n| format!("{} - ", zero_padded(n, 3)));
+    let episode = index.map_or_else(String::new, |n| format!("{} - ", zero_padded(n, 4)));
     format!("{season}{episode}{name}")
 }
 
@@ -523,7 +524,7 @@ pub fn episode_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &s
 /// no number, without the article-stripping, lower-casing name pipeline.
 #[must_use]
 pub fn season_sort_name(index: Option<i64>, name: &str) -> String {
-    index.map_or_else(|| name.to_owned(), |n| format!("{n:04}"))
+    index.map_or_else(|| name.to_owned(), |n| zero_padded(n, 4))
 }
 
 /// Port of C# `Audio.CreateSortName` (v10.11.8
@@ -538,8 +539,8 @@ pub fn season_sort_name(index: Option<i64>, name: &str) -> String {
 /// that contains one.
 #[must_use]
 pub fn audio_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &str) -> String {
-    let disc = parent_index.map_or_else(String::new, |n| format!("{n:04} - "));
-    let track = index.map_or_else(String::new, |n| format!("{n:04} - "));
+    let disc = parent_index.map_or_else(String::new, |n| format!("{} - ", zero_padded(n, 4)));
+    let track = index.map_or_else(String::new, |n| format!("{} - ", zero_padded(n, 4)));
     format!("{disc}{track}{name}")
 }
 
@@ -1344,7 +1345,7 @@ fn guid_x(text: &[char]) -> Option<uuid::Uuid> {
 /// digits (none reads as zero). `None` for any other character, or for more
 /// than eight significant digits (its `overflow`).
 fn guid_hex(s: &[char]) -> Option<u32> {
-    let s = s.strip_prefix(&['+']).unwrap_or(s);
+    let s = s.trim_prefix(&['+']);
     let s = match s {
         ['0', 'x' | 'X', rest @ ..] => rest,
         _ => s,

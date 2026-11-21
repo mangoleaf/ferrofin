@@ -112,7 +112,7 @@ async fn scan_generates_the_genre_collage_from_the_library_posters() {
         .expect("the scan generated a Primary for the genre");
     assert_eq!(
         Path::new(&primary.path),
-        meta_root.join(guid_to_db(genre_id)).join("primary.png"),
+        jellyfin_art_dir(tmp.path(), genre_id).join("poster.png"),
         "written into the genre's own art folder"
     );
     let decoded = image::open(&primary.path).expect("a decodable PNG");
@@ -191,7 +191,8 @@ fn png(colour: [u8; 3]) -> Vec<u8> {
 /// is true), with the file's own modification time — so neither a rescan nor
 /// a full-refresh validation draws the collage over it. A row adopted from
 /// Jellyfin stores that path as `%MetadataPath%/Genre/…`, which the item read
-/// expands (gl-848) and every save keeps as stored.
+/// expands (gl-848); every save stores it that way, a Ferrofin row's too
+/// (`ReverseVirtualPath`, gl-1581).
 #[rstest::rstest]
 #[case::ferrofin(false)]
 #[case::adopted(true)]
@@ -323,15 +324,10 @@ async fn an_uploaded_genre_primary_survives_rescans(#[case] adopted: bool) {
             .fetch_one(db.pool())
             .await
             .expect("stored path");
-    let expected = if adopted {
-        "%MetadataPath%/Genre/Crime".to_owned()
-    } else {
-        genre_dir.to_string_lossy().into_owned()
-    };
     assert_eq!(
         stored.as_deref(),
-        Some(expected.as_str()),
-        "the saves keep the path as stored"
+        Some("%MetadataPath%/Genre/Crime"),
+        "every save stores the path tokenised"
     );
 }
 
@@ -608,12 +604,7 @@ async fn uploads_save_beside_their_path_for_the_overriding_kinds(
     let images = lib.items.get_image_infos(id).await.expect("images");
     let want = match beside {
         Some(name) => path.join(name),
-        None => lib
-            .tmp
-            .path()
-            .join("metadata/library")
-            .join(guid_to_db(id))
-            .join("primary.png"),
+        None => jellyfin_art_dir(lib.tmp.path(), id).join("poster.png"),
     };
     assert_eq!(
         images
@@ -1599,7 +1590,7 @@ async fn a_media_subfolder_image_is_not_the_librarys() {
             .expect("id");
     let primary = primary_of(&lib.items, library).await.path;
     assert!(
-        primary.ends_with("primary.png") && !primary.contains("Trip"),
+        primary.ends_with("poster.png") && !primary.contains("Trip"),
         "the library keeps its collage: {primary}"
     );
 }

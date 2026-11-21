@@ -95,7 +95,7 @@ async fn stored_rows_preread_cost() {
     // Episode rows shaped like a scanned library's: title, synopsis, path,
     // provider-owned text and a `Data` blob.
     let episode = stored_type_name(BaseItemKind::Episode).unwrap().to_owned();
-    let ids: Vec<Uuid> = (0..count).map(|_| Uuid::new_v4()).collect();
+    let ids: Vec<Uuid> = Vec::from_fn(count, |_| Uuid::new_v4());
     let rows: Vec<BaseItemEntity> = ids
         .iter()
         .enumerate()

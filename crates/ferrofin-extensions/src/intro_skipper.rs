@@ -2187,14 +2187,12 @@ mod tests {
 
     /// The cache files a detection run left behind for `id`.
     pub(super) fn cache_files(h: &Harness, id: Uuid) -> Vec<String> {
-        std::fs::read_dir(h.task.cache_dir.resolve())
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
-                    .filter(|name| name.starts_with(&id.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        std::fs::read_dir(h.task.cache_dir.resolve()).map_or_default(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|name| name.starts_with(&id.to_string()))
+                .collect()
+        })
     }
 
     /// `DeleteForItem` / `DeleteByMode`: by item, by mode, or everything —
@@ -2460,23 +2458,21 @@ mod tests {
         let season = |n: usize| Uuid::from_u128(0x2000 + u128::try_from(n).expect("n"));
         let episode_type =
             ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Episode).expect("type");
-        let mut rows: Vec<BaseItemEntity> = (0..count)
-            .map(|n| {
-                let n128 = u128::try_from(n).expect("n");
-                BaseItemEntity {
-                    id: guid_to_db(Uuid::from_u128(0x1000 + n128)),
-                    type_: episode_type.to_owned(),
-                    path: Some(format!("{}/show {n:03}/s01e01.mkv", roots[n % 3])),
-                    run_time_ticks: Some(1_800 * 10_000_000),
-                    season_id: Some(guid_to_db(season(n))),
-                    series_id: Some(guid_to_db(Uuid::from_u128(0x3000 + n128))),
-                    series_name: Some(format!("Show {n:03}")),
-                    parent_index_number: Some(1),
-                    index_number: Some(1),
-                    ..BaseItemEntity::default()
-                }
-            })
-            .collect();
+        let mut rows: Vec<BaseItemEntity> = Vec::from_fn(count, |n| {
+            let n128 = u128::try_from(n).expect("n");
+            BaseItemEntity {
+                id: guid_to_db(Uuid::from_u128(0x1000 + n128)),
+                type_: episode_type.to_owned(),
+                path: Some(format!("{}/show {n:03}/s01e01.mkv", roots[n % 3])),
+                run_time_ticks: Some(1_800 * 10_000_000),
+                season_id: Some(guid_to_db(season(n))),
+                series_id: Some(guid_to_db(Uuid::from_u128(0x3000 + n128))),
+                series_name: Some(format!("Show {n:03}")),
+                parent_index_number: Some(1),
+                index_number: Some(1),
+                ..BaseItemEntity::default()
+            }
+        });
         // A file under no library's location is never queued.
         rows.push(BaseItemEntity {
             id: guid_to_db(Uuid::from_u128(0x1fff)),

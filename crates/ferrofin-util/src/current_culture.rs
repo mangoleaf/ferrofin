@@ -334,21 +334,17 @@ pub struct CultureFuture<F> {
     future: Pin<Box<F>>,
 }
 
-struct Restore(Option<String>, Option<String>);
-impl Drop for Restore {
-    fn drop(&mut self) {
-        CURRENT.with(|current| *current.borrow_mut() = self.0.take());
-        CURRENT_UI.with(|current| *current.borrow_mut() = self.1.take());
-    }
-}
-
 impl<F: Future> Future for CultureFuture<F> {
     type Output = F::Output;
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         let previous = CURRENT.with(|current| current.replace(Some(this.culture.clone())));
         let previous_ui = CURRENT_UI.with(|current| current.replace(this.ui_culture.clone()));
-        let _restore = Restore(previous, previous_ui);
+        let _restore =
+            std::mem::DropGuard::new((previous, previous_ui), |(previous, previous_ui)| {
+                CURRENT.with(|current| *current.borrow_mut() = previous);
+                CURRENT_UI.with(|current| *current.borrow_mut() = previous_ui);
+            });
         this.future.as_mut().poll(context)
     }
 }

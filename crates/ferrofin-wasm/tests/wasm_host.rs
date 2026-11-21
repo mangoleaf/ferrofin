@@ -1379,12 +1379,10 @@ async fn a_full_plugin_queue_turns_a_web_request_away_at_once() {
     };
     tokio::time::sleep(SETTLE).await;
     // ...while four task runs fill the whole queue behind it.
-    let queued: Vec<_> = (0..4)
-        .map(|_| {
-            let plugin = Arc::clone(&plugin);
-            tokio::spawn(async move { plugin.run_task_for_test("ok".to_owned()).await })
-        })
-        .collect();
+    let queued: Vec<_> = Vec::from_fn(4, |_| {
+        let plugin = Arc::clone(&plugin);
+        tokio::spawn(async move { plugin.run_task_for_test("ok".to_owned()).await })
+    });
     tokio::time::sleep(SETTLE).await;
 
     // A web request finds no room and is answered at once, not parked.

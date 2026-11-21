@@ -7,7 +7,6 @@
 //! the `debug` line for a response slower than the threshold; the header is
 //! sent either way, as upstream's is.
 
-use std::convert::Infallible;
 use std::net::IpAddr;
 use std::time::Instant;
 
@@ -60,7 +59,7 @@ pub async fn with_response_time<S, C>(
     inner: S,
 ) -> Response
 where
-    S: Service<Request, Response = Response, Error = Infallible> + Send,
+    S: Service<Request, Response = Response, Error = !> + Send,
     S::Future: Send,
     C: FnOnce(IpAddr, &axum::http::HeaderMap) -> IpAddr + Send,
 {

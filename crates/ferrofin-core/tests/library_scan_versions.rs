@@ -21,15 +21,19 @@ use ferrofin_core::item_type_lookup::{
     IdDerivation, ItemTypeLookup, derive_item_id, stored_type_name,
 };
 use ferrofin_core::{
-    FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
-    LibraryScanner, LocalizationManager,
+    FerrofinChapterRepository, FerrofinItemPersistenceService, FerrofinItemRepository,
+    FerrofinMediaStreamRepository, FerrofinVirtualFolderManager, LibraryScanner,
+    LocalizationManager,
 };
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::entities::CollectionTypeOptions;
+use ferrofin_model::dto::MediaSourceInfo;
+use ferrofin_model::entities::{CollectionTypeOptions, MediaStreamType, Video3DFormat};
+use ferrofin_model::entities_media::MediaStream;
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::persistence::ItemPersistenceService as _;
 use uuid::Uuid;
@@ -777,6 +781,7 @@ async fn an_adopted_group_repaired_at_boot_scans_quietly() {
     let rehomed = ferrofin_core::adoption_repairs::rehome_local_versions(
         &f.db,
         &IdDerivation::LegacyLowercase,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
         None,
         None,
         f.store.as_ref(),
@@ -848,6 +853,7 @@ async fn a_version_ferrofin_1_0_split_off_is_reunited_at_boot() {
     ferrofin_core::adoption_repairs::rehome_local_versions(
         &f.db,
         &IdDerivation::LegacyLowercase,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
         None,
         None,
         f.store.as_ref(),
@@ -1009,6 +1015,7 @@ async fn an_adopted_alternate_takes_its_primarys_rating_at_boot() {
     let rehomed = ferrofin_core::adoption_repairs::rehome_local_versions(
         &f.db,
         &IdDerivation::LegacyLowercase,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
         None,
         None,
         f.store.as_ref(),
@@ -1042,6 +1049,312 @@ async fn an_adopted_alternate_takes_its_primarys_rating_at_boot() {
         rating(&f.row(ALTERNATE).await),
         (Some("MA15+".to_owned()), Some(15), Some(3))
     );
+}
+
+/// Probes every file as Jellyfin 12.4's probe reads the synthetic adoption
+/// fixture's version files: 825 bits a second in all, an H.264 stream with
+/// no bitrate of its own and an AAC one, and nothing where it measures
+/// nothing (`IsAvc` and `Level` of the audio, the video's `BitRate`).
+struct Probe;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::media_encoding::MediaEncoder for Probe {
+    fn encoder_path(&self) -> String {
+        "ffmpeg".to_owned()
+    }
+    fn probe_path(&self) -> String {
+        "ffprobe".to_owned()
+    }
+    async fn set_ffmpeg_path(&self) -> Result<bool, ServiceError> {
+        Ok(true)
+    }
+    async fn get_media_info(
+        &self,
+        _: &ferrofin_traits::media_encoding::MediaInfoRequest,
+    ) -> Result<MediaSourceInfo, ServiceError> {
+        Ok(MediaSourceInfo {
+            run_time_ticks: Some(10_000_000),
+            container: Some("mkv".to_owned()),
+            bitrate: Some(825),
+            media_streams: vec![
+                MediaStream {
+                    index: 0,
+                    stream_type: MediaStreamType::Video,
+                    codec: Some("h264".to_owned()),
+                    width: Some(320),
+                    height: Some(180),
+                    is_avc: Some(true),
+                    level: Some(11.0),
+                    ..MediaStream::default()
+                },
+                MediaStream {
+                    index: 1,
+                    stream_type: MediaStreamType::Audio,
+                    codec: Some("aac".to_owned()),
+                    bit_rate: Some(192_000),
+                    channels: Some(1),
+                    sample_rate: Some(8000),
+                    ..MediaStream::default()
+                },
+            ],
+            ..MediaSourceInfo::default()
+        })
+    }
+    async fn extract_audio_image(&self, _: &str, _: Option<i32>) -> Result<String, ServiceError> {
+        Err(ServiceError::backend("no cover"))
+    }
+    async fn extract_video_image(
+        &self,
+        _: &str,
+        _: &str,
+        _: &MediaSourceInfo,
+        _: &MediaStream,
+        _: Option<Video3DFormat>,
+        _: Option<i64>,
+    ) -> Result<String, ServiceError> {
+        Err(ServiceError::backend("no frame"))
+    }
+    fn get_input_argument(&self, input_file: &str, _: &MediaSourceInfo) -> String {
+        input_file.to_owned()
+    }
+    fn get_time_parameter(&self, _: i64) -> String {
+        String::new()
+    }
+    async fn convert_image(&self, _: &str, _: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// `(StreamIndex, Codec, BitRate, Height, Width, IsAvc, Level)` of each
+/// stream stored for `id`.
+type StreamRow = (
+    i64,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<bool>,
+    Option<f64>,
+);
+
+async fn streams(db: &Database, id: &str) -> Vec<StreamRow> {
+    sqlx::query_as(
+        r#"SELECT "StreamIndex", "Codec", "BitRate", "Height", "Width", "IsAvc", "Level"
+           FROM "MediaStreamInfos" WHERE "ItemId" = ?1 ORDER BY "StreamIndex""#,
+    )
+    .bind(id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
+}
+
+/// `(UserId, Played, IsFavorite, PlaybackPositionTicks)` of each user's data
+/// on `id`.
+async fn user_data_of(db: &Database, id: &str) -> Vec<(String, bool, bool, i64)> {
+    sqlx::query_as(
+        r#"SELECT "UserId", "Played", "IsFavorite", "PlaybackPositionTicks"
+           FROM "UserData" WHERE "ItemId" = ?1 ORDER BY "UserId""#,
+    )
+    .bind(id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
+}
+
+/// The synthetic adoption fixture's Jellyfin 10.11.8 alternate, as 10.11
+/// left it and an earlier Ferrofin's boot moved it to its `Movie` id: named
+/// after its file (`Twin Horizon - 720p`), the primary's total bitrate
+/// (192825), 10.11's stream values (zeros where a probe now reads nothing),
+/// played and a favourite for one user, resumable for another. Jellyfin 12.4
+/// deletes the row and its scan creates the version afresh
+/// (`LibraryManager.ResolveAlternateVersion`): the resolver's name
+/// (`Twin Horizon -`: `CleanStringParser` keeps what precedes the ` 720p`)
+/// and a first refresh that probes the file and reads the folder's
+/// `movie.nfo` (`Twin Horizon`, the fixture's 12.4 row), after which its
+/// primary's save copies the primary's metadata over it (its rating among
+/// it). The boot hands the kept row back to the scan (`rederive_adopted_versions`), whose first
+/// refresh derives it as that fresh row — its name too, unless the name is
+/// locked or not the one 10.11 gave it — while its id, user data and link
+/// stay. A name edited in a folder whose NFO titles the movie gives way to
+/// that title, as at any item's first refresh and as on 12.4's row; only a
+/// lock keeps it. The next scan writes nothing.
+#[rstest::rstest]
+#[case::generated("Twin Horizon - 720p", false, false, false, "Twin Horizon -")]
+#[case::generated_with_nfo("Twin Horizon - 720p", true, false, false, "Twin Horizon")]
+#[case::edited(
+    "Twin Horizon Remastered",
+    false,
+    false,
+    false,
+    "Twin Horizon Remastered"
+)]
+#[case::edited_with_nfo("Twin Horizon Remastered", true, false, false, "Twin Horizon")]
+#[case::name_locked("Twin Horizon - 720p", false, true, false, "Twin Horizon - 720p")]
+#[case::item_locked("Twin Horizon - 720p", false, false, true, "Twin Horizon - 720p")]
+#[tokio::test]
+async fn an_adopted_alternate_is_derived_afresh_keeping_its_user_data(
+    #[case] adopted_name: &str,
+    #[case] nfo: bool,
+    #[case] name_locked: bool,
+    #[case] item_locked: bool,
+    #[case] expected_name: &str,
+) {
+    const PRIMARY: &str = "Twin Horizon/Twin Horizon - 1080p.mkv";
+    const ALTERNATE: &str = "Twin Horizon/Twin Horizon - 720p.mkv";
+    let mut f = Fixture::movies(&[PRIMARY, ALTERNATE]).await;
+    if nfo {
+        std::fs::write(
+            f.path("Twin Horizon/movie.nfo"),
+            "<movie><title>Twin Horizon</title><year>2020</year><mpaa>G</mpaa></movie>",
+        )
+        .unwrap();
+    }
+    f.scanner = f.scanner.with_probe(
+        Arc::new(Probe) as Arc<dyn ferrofin_traits::media_encoding::MediaEncoder>,
+        Arc::new(FerrofinMediaStreamRepository::new(f.db.clone())),
+        Arc::new(FerrofinChapterRepository::new(f.db.clone())),
+    );
+    f.scanner.scan_all().await.unwrap();
+    let primary = f.row(PRIMARY).await;
+    let planned = f.row(ALTERNATE).await;
+    let fresh = streams(&f.db, &planned.id).await;
+    // The primary since rated otherwise than its NFO, as the fixture's is.
+    sqlx::query(r#"UPDATE "BaseItems" SET "OfficialRating" = 'MA15+' WHERE "Id" = ?1"#)
+        .bind(&primary.id)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    assert_eq!(
+        planned.name.as_deref(),
+        Some(if nfo {
+            "Twin Horizon"
+        } else {
+            "Twin Horizon -"
+        })
+    );
+    sqlx::query(r#"DELETE FROM "LinkedChildren""#)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"CREATE TABLE "TestStreams" AS SELECT * FROM "MediaStreamInfos" WHERE "ItemId" = ?1"#,
+    )
+    .bind(&planned.id)
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+    let adopted = guid_to_db(f.id(BaseItemKind::Video, ALTERNATE));
+    f.restore_as(ALTERNATE, |row| {
+        row.id.clone_from(&adopted);
+        row.type_ = stored_type_name(BaseItemKind::Video).unwrap().to_owned();
+        row.name = Some(adopted_name.to_owned());
+        row.sort_name = None;
+        row.total_bitrate = Some(192_825);
+        row.is_locked = item_locked;
+        row.primary_version_id = None;
+        row.presentation_unique_key =
+            Some(Uuid::parse_str(&adopted).unwrap().as_simple().to_string());
+        row.parent_id = None;
+        row.top_parent_id = None;
+    })
+    .await;
+    // 10.11's probe stored zeros where the probe now reads nothing.
+    sqlx::query(
+        r#"UPDATE "TestStreams" SET "ItemId" = ?1, "Height" = coalesce("Height", 0),
+               "Width" = coalesce("Width", 0), "IsAvc" = coalesce("IsAvc", 0),
+               "Level" = coalesce("Level", 0), "BitRate" = coalesce("BitRate", 825)"#,
+    )
+    .bind(&adopted)
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+    sqlx::query(r#"INSERT INTO "MediaStreamInfos" SELECT * FROM "TestStreams""#)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    if name_locked {
+        sqlx::query(r#"INSERT INTO "BaseItemMetadataFields" ("Id", "ItemId") VALUES (5, ?1)"#)
+            .bind(&adopted)
+            .execute(f.db.writer())
+            .await
+            .unwrap();
+    }
+    // 10.11 keeps the version under its primary in `Data` only; the boot's
+    // membership import links it as 12.0's migration does.
+    sqlx::query(
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+           VALUES (?1, 0, ?2, 2)"#,
+    )
+    .bind(&primary.id)
+    .bind(&adopted)
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+    let (watched, resuming) = (seed_user(&f.db).await, seed_user(&f.db).await);
+    sqlx::query(
+        r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+           "PlayCount", "PlaybackPositionTicks", "Played") VALUES
+           (?1, ?2, ?1, 1, 1, 0, 1), (?1, ?3, ?1, 0, 0, 1234000000, 0)"#,
+    )
+    .bind(&adopted)
+    .bind(guid_to_db(watched))
+    .bind(guid_to_db(resuming))
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+    let held = user_data_of(&f.db, &adopted).await;
+    assert_eq!(held.len(), 2);
+    f.db.record_adoption("10.11.8").await.unwrap();
+
+    ferrofin_core::adoption_repairs::run_rehome_local_versions(
+        &f.db,
+        &IdDerivation::LegacyLowercase,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
+        None,
+        None,
+        f.store.as_ref(),
+    )
+    .await
+    .unwrap();
+    let handed_back = f.row(ALTERNATE).await;
+    assert_eq!(handed_back.id, planned.id);
+    assert_eq!(
+        handed_back.name.as_deref(),
+        Some(adopted_name),
+        "until the scan"
+    );
+    assert_eq!(handed_back.date_last_refreshed, None);
+
+    f.scanner.scan_all().await.unwrap();
+    let alternate = f.row(ALTERNATE).await;
+    assert_eq!(alternate.id, planned.id);
+    assert_eq!(alternate.name.as_deref(), Some(expected_name));
+    if alternate.name == planned.name {
+        assert_eq!(
+            (&alternate.clean_name, &alternate.sort_name),
+            (&planned.clean_name, &planned.sort_name),
+            "the names derived from it follow"
+        );
+    }
+    assert_eq!(
+        alternate.total_bitrate,
+        Some(825),
+        "the version's own probe"
+    );
+    assert_eq!(
+        alternate.official_rating.as_deref(),
+        Some("MA15+"),
+        "its primary's save copies over what its own refresh read"
+    );
+    assert_eq!(streams(&f.db, &alternate.id).await, fresh);
+    assert!(alternate.date_last_refreshed.is_some());
+    assert_eq!(user_data_of(&f.db, &alternate.id).await, held);
+    assert_eq!(f.links(&primary.id).await, vec![(alternate.id.clone(), 2)]);
+
+    count_item_writes(&f.db).await;
+    let quiet = f.scanner.scan_all().await.unwrap();
+    assert_eq!((quiet.created, quiet.updated), (0, 0));
+    assert_eq!(item_writes(&f.db).await, 0);
 }
 
 /// An older Ferrofin scan stored a stack's second part as a `Movie` of its

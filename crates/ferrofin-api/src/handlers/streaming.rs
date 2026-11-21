@@ -627,10 +627,7 @@ pub(crate) async fn serve_static_file(
 /// One [`ServeFile`] answer for `request`, its infallible response mapped into
 /// an axum body.
 async fn serve_file(path: &str, request: Request) -> Result<Response, ApiError> {
-    let response = ServeFile::new(path)
-        .oneshot(request)
-        .await
-        .map_err(|e| ApiError::NotFound(e.to_string()))?;
+    let Ok(response) = ServeFile::new(path).oneshot(request).await;
     Ok(response.map(Body::new))
 }
 

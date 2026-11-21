@@ -171,6 +171,49 @@ ADULT = "99999999-9999-9999-9999-999999999999"
 COLUMNS = ("ItemId", "UserId", "CustomDataKey", "AudioStreamIndex", "IsFavorite", "LastPlayedDate",
            "Likes", "PlayCount", "PlaybackPositionTicks", "Played", "Rating", "SubtitleStreamIndex",
            "RetentionDate")
+MIGRATION_0050 = Path(__file__).resolve().parents[3] / "crates/ferrofin-db/migrations/0050_datetime_text_ef_form.sql"
+
+
+def migrate_0050(db):
+    """Run migration 0050's UserData statement on `db`, read from the migration itself."""
+    text = MIGRATION_0050.read_text()
+    start = text.index('UPDATE "UserData"')
+    with contextlib.closing(sqlite3.connect(db)) as conn, conn:
+        conn.execute(text[start:text.index(";", start)])
+
+
+class MigrationDateFormTest(unittest.TestCase):
+    """ef_text is migration 0050's rewrite of a stored date, and a no-op on Jellyfin's own form."""
+
+    def test_ef_text_rewrites_as_migration_0050_does(self):
+        values = ["2026-01-01 12:00:00.0000000", "2026-05-14 17:35:09.5330000", "2026-05-14 17:35:09.000",
+                  "2026-05-14 17:35:09.0", "2026-11-11T00:54:23.994092718+00:00", "2026-11-11T00:54:23+00:00",
+                  "2026-11-11T00:54:23.100+00:00", "2026-11-11T00:54:23.000000+00:00", "2026-11-11T00:54:23.+00:00",
+                  # left alone: Jellyfin's form, another zone, Z, a non-digit fraction, not a date
+                  "2026-05-14 17:35:09", "2026-05-14 17:35:09.533", "2026-05-14 17:35:09.4740651",
+                  "2026-11-11T00:54:23.5+01:00", "2023-08-14T00:00:00.0000000Z", "2026-05-14 17:35:09.12a0",
+                  "2026-05-14T17:35:09.50", "not a date", "", None]
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "dates.db"
+            with contextlib.closing(sqlite3.connect(db)) as conn, conn:
+                conn.execute("CREATE TABLE UserData(Id INTEGER PRIMARY KEY, LastPlayedDate TEXT, RetentionDate TEXT)")
+                conn.executemany("INSERT INTO UserData VALUES (?, ?, ?)", [(n, v, v) for n, v in enumerate(values)])
+            migrate_0050(db)
+            with contextlib.closing(sqlite3.connect(db)) as conn:
+                migrated = conn.execute("SELECT LastPlayedDate, RetentionDate FROM UserData ORDER BY Id").fetchall()
+        self.assertEqual(migrated, [(history.ef_text(v), history.ef_text(v)) for v in values])
+        self.assertEqual([history.ef_text(v) for v in values[:9]], [
+            "2026-01-01 12:00:00", "2026-05-14 17:35:09.533", "2026-05-14 17:35:09", "2026-05-14 17:35:09",
+            "2026-11-11 00:54:23.9940927", "2026-11-11 00:54:23", "2026-11-11 00:54:23.1", "2026-11-11 00:54:23",
+            "2026-11-11 00:54:23"])
+
+    def test_every_form_jellyfin_writes_is_left_unchanged(self):
+        # 'yyyy-MM-dd HH:mm:ss.FFFFFFF': F drops the fraction's trailing zeros, and the '.' with them.
+        # A prime stride through the second's ten million ticks varies every digit position.
+        for ticks in (*range(0, 10_000_000, 9_973), *(10 ** n for n in range(7)), 9_999_999):
+            fraction = f"{ticks:07d}".rstrip("0")
+            text = "2026-08-08 19:14:50" + ("." + fraction if fraction else "")
+            self.assertEqual(history.ef_text(text), text)
 
 
 class AdoptionExpectationTest(unittest.TestCase):
@@ -249,7 +292,7 @@ class AdoptionExpectationTest(unittest.TestCase):
 
     def test_a_null_date_loses_and_a_full_tie_goes_to_the_lower_key(self):
         self.play("dated", "2020-01-01 00:00:00", 1, 0, False)
-        # Unplayed: migration 0010 stamps a date on played rows that have none.
+        # Unplayed: this case is about the date order, not a played row without a date.
         self.play("never", None, 50, 900, False)
         self.play("tie-b", "2022-02-02 00:00:00", 3, 30, False, item=STILL, IsFavorite=1)
         self.play("tie-a", "2022-02-02 00:00:00", 3, 30, False, item=STILL, IsFavorite=0)
@@ -272,12 +315,33 @@ class AdoptionExpectationTest(unittest.TestCase):
         self.assertFalse(history.compare_db(expected, history.snapshot(self.db)))
 
     def test_one_instant_written_two_ways_is_no_conflict(self):
-        # EF trims trailing fraction zeros; Ferrofin writes seven digits. Likes differs,
+        # EF trims trailing fraction zeros; Ferrofin wrote seven digits before 0050. Likes differs,
         # but it is not one of the five fields the repair's query compares.
         self.play("ef", "2026-05-14 17:35:09.533", 1, 10, False)
         self.play("ferrofin", "2026-05-14 17:35:09.5330000", 1, 10, False, Likes=1)
-        self.assertFalse(history.compare_db(history.snapshot(self.db, expected=True),
-                                            history.snapshot(self.db)))
+        expected = history.snapshot(self.db, expected=True)
+        migrate_0050(self.db)
+        self.assertFalse(history.compare_db(expected, history.snapshot(self.db)))
+
+    def test_0050s_date_rewrite_is_expected_and_only_it(self):
+        # A Ferrofin release before 0050 stored seven digits (and RFC 3339 for some rows);
+        # the candidate's 0050 rewrites both into Jellyfin's form, the same instants.
+        self.play("seven", "2026-01-01 12:00:00.0000000", 1, 10, True)
+        self.play("rfc", "2026-11-11T00:54:23.994092718+00:00", 1, 10, True, item=STILL)
+        self.play("kept", "2025-01-01 08:00:00", 1, 0, False, item=PLACEHOLDER_ID,
+                  RetentionDate="2026-10-12 08:00:00.1230000")
+        expected = history.snapshot(self.db, expected=True)
+        self.assertEqual(history.compare_db(expected, history.snapshot(self.db)),
+                         {"database changed watch-history row": 3})
+        migrate_0050(self.db)
+        self.assertFalse(history.compare_db(expected, history.snapshot(self.db)))
+        # The candidate's side is compared as stored: seven digits again, or another
+        # instant in Jellyfin's form, is a change.
+        for date in ("2026-01-01 12:00:00.0000000", "2026-01-01 12:00:01"):
+            with self.subTest(date=date):
+                self.sql("UPDATE UserData SET LastPlayedDate = ? WHERE CustomDataKey = 'seven'", date)
+                self.assertEqual(history.compare_db(expected, history.snapshot(self.db)),
+                                 {"database changed watch-history row": 1})
 
     def test_the_winners_date_text_is_copied_verbatim(self):
         self.play("497698", "2023-08-14 00:00:00", 9, 0, True)

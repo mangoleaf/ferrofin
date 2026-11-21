@@ -220,8 +220,7 @@ fn fs_metadata_from(path: &Path, metadata: &std::fs::Metadata) -> FileSystemMeta
     let is_directory = metadata.is_dir();
     let name = path
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|n| n.to_string_lossy().into_owned());
     let extension = path
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy()));

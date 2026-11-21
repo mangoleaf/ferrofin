@@ -68,13 +68,14 @@ work across subsystems:
 | `library` | library name/id |
 | `task` | scheduled-task key |
 | `provider` | metadata provider name |
+| `oidc_provider` | Single Sign-On OIDC provider key |
 | `tuner` | Live TV tuner host id |
 | `listings_provider` | Live TV listings provider id |
 | `channel` | Live TV channel name |
 | `job_id` | transcode/other job id |
 | `path` | filesystem path |
 | `config_file` | the bootstrap `config.toml` in use, as context (the startup banner, configuration warnings), when `path` would name the wrong subject |
-| `trigger` | `api` \| `schedule` \| `startup` \| `watcher` \| `webhook` (library scans: `ScanTrigger`) |
+| `trigger` | `api` \| `schedule` \| `startup` \| `watcher` \| `webhook` (library scans: `ScanTrigger`); a scheduled task's run can also be `library_change` (a "Scan Media Library" run a library change queued, whose scan is `api`) |
 | `trigger_trace_id` | originating sampled request's trace id (hex), when known |
 
 `Uuid`s via `tracing::field::display()`. Values born inside a function:

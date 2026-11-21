@@ -906,8 +906,7 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
             &ferrofin_db::item_data::parse_data(ep.data.as_deref()),
             "IndexNumberEnd",
         )
-        .map(|end| end.to_string())
-        .unwrap_or_default();
+        .map_or_default(|end| end.to_string());
         return format!("{series}|number:{parent}:{index}:{end}");
     }
     // The title fallback also carries the file name's version key — a second
@@ -937,9 +936,7 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
         "{series}|title:{}:{}:{}",
         ep.season_name.as_deref().unwrap_or_default(),
         ep.name.as_deref().unwrap_or_default(),
-        ep.production_year
-            .map(|y| y.to_string())
-            .unwrap_or_default()
+        ep.production_year.map_or_default(|y| y.to_string())
     );
     let Some(path) = ep.path.as_deref() else {
         return key;

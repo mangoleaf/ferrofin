@@ -76,12 +76,10 @@ async fn sql_ordered_folder_children_keep_the_rows_handed_in() {
 async fn reading_only_the_ids_keeps_the_full_row_plan() {
     let db = test_db().await;
     let user = Arc::new(seed_user_with_defaults(&db, Uuid::new_v4()).await);
-    let rows: Vec<_> = (0..200)
-        .map(|_| BaseItemEntity {
-            id: Uuid::new_v4().to_string(),
-            ..Default::default()
-        })
-        .collect();
+    let rows: Vec<_> = Vec::from_fn(200, |_| BaseItemEntity {
+        id: Uuid::new_v4().to_string(),
+        ..Default::default()
+    });
     for order_by in [
         vec![
             (ItemSortBy::IsFolder, SortOrder::Ascending),

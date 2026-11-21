@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
 description = "Ferrofin media server — a Rust implementation of the Jellyfin server speaking the same API"
 
 [lints]
@@ -72,8 +73,13 @@ opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
+# export_jellyfin: the backup archives the loss report counts.
+zip.workspace = true
 # state.rs storage test, planner.rs label test: the virtual-folder fake that counts full listings.
 ferrofin-api = { workspace = true, features = ["test-util"] }
+# sso_settings and sso_sign_in: the fake identity provider a saved provider's
+# discovery, and a sign-in, are tested against.
+ferrofin-extensions = { workspace = true, features = ["test-util"] }
 # manpage test: renders contrib/debian/ferrofin-server.1 from the clap `Cli`.
 clap_mangen.workspace = true
 tempfile.workspace = true
@@ -81,6 +87,11 @@ tempfile.workspace = true
 rstest.workspace = true
 # restart integration test: drives the real `run()` over loopback HTTP.
 reqwest.workspace = true
+# oidc_keycloak: the form it signs in with at Keycloak's login page.
+form_urlencoded.workspace = true
+# oidc_keycloak: the client secret as the token request's Basic credentials,
+# which the log must not hold either.
+base64.workspace = true
 # HTTPS tests: a self-signed certificate, written as the PKCS#12 Jellyfin reads.
 rcgen.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

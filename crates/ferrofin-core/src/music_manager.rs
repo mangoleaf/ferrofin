@@ -53,15 +53,12 @@ impl std::fmt::Debug for FerrofinMusicManager {
 
 /// The display genres of a row (its `Genres` column, pipe-split).
 fn row_genres(row: &BaseItemEntity) -> Vec<String> {
-    row.genres
-        .as_deref()
-        .map(|g| {
-            g.split('|')
-                .filter(|p| !p.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    row.genres.as_deref().map_or_default(|g| {
+        g.split('|')
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
 }
 
 /// C# `Jellyfin.Extensions.DistinctNames` — distinct, case-insensitive, first

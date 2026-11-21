@@ -58,8 +58,7 @@ fn system_time_to_utc(
     time: std::io::Result<std::time::SystemTime>,
 ) -> chrono::DateTime<chrono::Utc> {
     time.ok()
-        .map(chrono::DateTime::<chrono::Utc>::from)
-        .unwrap_or_default()
+        .map_or_default(chrono::DateTime::<chrono::Utc>::from)
 }
 
 /// When a file was created (C# `FileSystemInfo.CreationTimeUtc`). A filesystem

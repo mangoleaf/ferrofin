@@ -477,9 +477,9 @@ mod tests {
         0x9126_7e8a
     )]
     fn crc32_matches_the_upstream_vectors(#[case] hex: &str, #[case] expected: u32) {
-        let bytes: Vec<u8> = (0..hex.len() / 2)
-            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex"))
-            .collect();
+        let bytes: Vec<u8> = Vec::from_fn(hex.len() / 2, |i| {
+            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex")
+        });
         assert_eq!(crc32(&bytes), expected);
     }
 

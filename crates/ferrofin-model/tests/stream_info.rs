@@ -80,9 +80,7 @@ fn to_url_original(item: &StreamInfo, base_url: &str, access_token: Option<&str>
     list.push(("AudioCodec".into(), audio_codecs));
     list.push((
         "AudioStreamIndex".into(),
-        item.audio_stream_index
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
+        item.audio_stream_index.map_or_default(|v| v.to_string()),
     ));
     list.push((
         "SubtitleStreamIndex".into(),
@@ -98,33 +96,27 @@ fn to_url_original(item: &StreamInfo, base_url: &str, access_token: Option<&str>
     ));
     list.push((
         "VideoBitrate".into(),
-        item.video_bitrate
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
+        item.video_bitrate.map_or_default(|v| v.to_string()),
     ));
     list.push((
         "AudioBitrate".into(),
-        item.audio_bitrate
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
+        item.audio_bitrate.map_or_default(|v| v.to_string()),
     ));
     list.push((
         "AudioSampleRate".into(),
-        item.audio_sample_rate
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
+        item.audio_sample_rate.map_or_default(|v| v.to_string()),
     ));
     list.push((
         "MaxFramerate".into(),
-        item.max_framerate.map(format_framerate).unwrap_or_default(),
+        item.max_framerate.map_or_default(format_framerate),
     ));
     list.push((
         "MaxWidth".into(),
-        item.max_width.map(|v| v.to_string()).unwrap_or_default(),
+        item.max_width.map_or_default(|v| v.to_string()),
     ));
     list.push((
         "MaxHeight".into(),
-        item.max_height.map(|v| v.to_string()).unwrap_or_default(),
+        item.max_height.map_or_default(|v| v.to_string()),
     ));
 
     let start_position_ticks = item.start_position_ticks;
@@ -167,8 +159,7 @@ fn to_url_original(item: &StreamInfo, base_url: &str, access_token: Option<&str>
         list.push((
             "TranscodingMaxAudioChannels".into(),
             item.transcoding_max_audio_channels
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
+                .map_or_default(|v| v.to_string()),
         ));
         if item.enable_subtitles_in_manifest {
             list.push((

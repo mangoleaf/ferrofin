@@ -158,6 +158,13 @@ impl UserManager for OkUsers {
     ) -> Result<Option<UserEntity>, ServiceError> {
         unimplemented!()
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
     async fn get_authentication_providers(
         &self,
     ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {
@@ -1209,8 +1216,7 @@ async fn agent_origin() -> String {
         axum::routing::get(|headers: axum::http::HeaderMap| async move {
             headers
                 .get(header::USER_AGENT)
-                .map(|agent| agent.as_bytes().to_vec())
-                .unwrap_or_default()
+                .map_or_default(|agent| agent.as_bytes().to_vec())
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -1,4 +1,5 @@
 use super::*;
+use ferrofin_common::cryptography::PasswordHash;
 use ferrofin_traits::security::ProviderAuthenticationResult;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -908,6 +909,7 @@ async fn an_external_user_is_created_already_owned_by_its_provider() {
         password_reset_provider_id: "Tests.External.Reset".to_owned(),
         enable_all_folders: false,
         enabled_folders: Some(vec![folder.to_string()]),
+        unusable_password: false,
     };
 
     let user = mgr
@@ -969,6 +971,7 @@ async fn an_external_user_without_folders_or_with_a_bad_name() {
         password_reset_provider_id: "Tests.External".to_owned(),
         enable_all_folders: true,
         enabled_folders: None,
+        unusable_password: false,
     };
     let user = mgr
         .create_external_user("dana", &setup)
@@ -993,6 +996,104 @@ async fn an_external_user_without_folders_or_with_a_bad_name() {
         );
     }
     assert_eq!(mgr.get_users().await.expect("users").len(), 1);
+}
+
+/// What Single Sign-On asks for (D21): an outside provider's user with a
+/// password no one knows.
+fn unusable() -> ExternalUserSetup {
+    ExternalUserSetup {
+        authentication_provider_id: "Tests.External".to_owned(),
+        password_reset_provider_id: "Tests.External".to_owned(),
+        enable_all_folders: true,
+        enabled_folders: None,
+        unusable_password: true,
+    }
+}
+
+/// The stored password of a user created with `unusable_password` is a
+/// well-formed hash in Jellyfin's default PBKDF2 format, the one a password
+/// a user sets gets, and each user's is another.
+fn assert_unusable_hash(user: &UserEntity) {
+    let stored = user.password.as_deref().expect("a password hash");
+    let hash = PasswordHash::parse(stored).expect("a well-formed hash");
+    assert_eq!(hash.id(), "PBKDF2-SHA512");
+    assert_eq!(
+        hash.parameters(),
+        [("iterations".to_owned(), "210000".to_owned())]
+    );
+    assert_eq!(hash.salt().len(), 16);
+    assert_eq!(hash.hash().len(), 64);
+    assert!(DefaultAuthenticationProvider::new().hash_is_current(&hash));
+    assert_eq!(hash.to_string(), stored, "it formats back as stored");
+}
+
+/// B11: the row `create_external_user` returns, its first read, already has
+/// the hash, and two users get different ones. Moved to the default provider,
+/// the user signs in with no password, the empty one included, until one is
+/// set; then with that one only.
+#[tokio::test]
+async fn an_external_user_asked_for_an_unusable_password_never_has_an_empty_one() {
+    let (mgr, provider) = manager(true, false).await;
+    let dana = mgr
+        .create_external_user("dana", &unusable())
+        .await
+        .expect("create");
+    let erin = mgr
+        .create_external_user("erin", &unusable())
+        .await
+        .expect("create");
+    assert_unusable_hash(&dana);
+    assert_unusable_hash(&erin);
+    assert_ne!(dana.password, erin.password);
+    assert_eq!(dana.authentication_provider_id, "Tests.External");
+
+    let dana_id = Uuid::parse_str(&dana.id).expect("id");
+    let mut policy = mgr
+        .get_user_dto(&dana, None)
+        .await
+        .expect("dto")
+        .policy
+        .expect("policy");
+    policy.authentication_provider_id = DEFAULT_AUTH_PROVIDER_ID.to_owned();
+    mgr.update_policy(dana_id, &policy).await.expect("moved");
+    for password in ["", "guess"] {
+        assert!(
+            mgr.authenticate_user("dana", password, "127.0.0.1", true)
+                .await
+                .expect("sign in")
+                .is_none(),
+            "{password:?}"
+        );
+    }
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0, "the default one");
+
+    mgr.change_password(dana_id, "chosen").await.expect("set");
+    assert!(
+        mgr.authenticate_user("dana", "chosen", "127.0.0.1", true)
+            .await
+            .expect("sign in")
+            .is_some()
+    );
+    assert!(
+        mgr.authenticate_user("dana", "", "127.0.0.1", true)
+            .await
+            .expect("sign in")
+            .is_none()
+    );
+}
+
+/// The hash is written by the transaction that inserts the user: when its
+/// write fails, no user is left behind without one.
+#[tokio::test]
+async fn an_external_user_whose_password_write_fails_is_not_created() {
+    let (mgr, _) = manager(true, false).await;
+    user_repository::refuse_password_writes(mgr.db.writer())
+        .await
+        .expect("trigger");
+
+    let refused = mgr.create_external_user("dana", &unusable()).await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(mgr.get_users().await.expect("users"), Vec::new());
 }
 
 /// Delegates everything but `create_external_user` to the real manager.
@@ -1043,6 +1144,13 @@ impl UserManager for Delegating {
             .authenticate_user(username, password, remote_endpoint, is_user_session)
             .await
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        user: &UserEntity,
+        remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        self.0.ensure_sign_in_allowed(user, remote_endpoint).await
+    }
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
         self.0.get_authentication_providers().await
     }
@@ -1072,7 +1180,8 @@ impl UserManager for Delegating {
 }
 
 /// The trait's default, for managers without a store of their own, sets the
-/// user up with a policy save after creating them.
+/// user up with a policy save after creating them, and the unusable password
+/// before it when asked.
 #[tokio::test]
 async fn the_default_external_user_creation_saves_the_setup() {
     let (mgr, _) = manager(true, false).await;
@@ -1086,6 +1195,7 @@ async fn the_default_external_user_creation_saves_the_setup() {
                 password_reset_provider_id: "Tests.External".to_owned(),
                 enable_all_folders: false,
                 enabled_folders: Some(vec![folder.to_string(), "not a guid".to_owned()]),
+                unusable_password: false,
             },
         )
         .await
@@ -1100,4 +1210,102 @@ async fn the_default_external_user_creation_saves_the_setup() {
         .expect("policy");
     assert!(!policy.enable_all_folders);
     assert_eq!(policy.enabled_folders, [folder]);
+    assert_eq!(user.password, None);
+
+    // Asked for, it sets the unusable password before the provider moves.
+    let erin = users
+        .create_external_user("erin", &unusable())
+        .await
+        .expect("create");
+    assert_eq!(erin.authentication_provider_id, "Tests.External");
+    assert_unusable_hash(&erin);
+}
+
+/// A provider that refuses every password and says its refusals never count,
+/// as Single Sign-On's does (D20).
+struct NoPasswords {
+    enabled: bool,
+}
+
+#[async_trait]
+impl AuthenticationManager for NoPasswords {
+    fn name(&self) -> &'static str {
+        "Tests.NoPasswords"
+    }
+    async fn is_enabled(&self) -> Result<bool, ServiceError> {
+        Ok(self.enabled)
+    }
+    async fn authenticate(
+        &self,
+        _username: &str,
+        _password: &str,
+        _resolved_user: Option<&UserEntity>,
+    ) -> Result<ProviderAuthenticationResult, ServiceError> {
+        Err(ServiceError::unauthorized("no password signs in"))
+    }
+    async fn change_password(
+        &self,
+        _user: &UserEntity,
+        _new_password: &str,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::Forbidden("no password".to_owned()))
+    }
+    fn new_user_policy(&self) -> Option<UserPolicy> {
+        None
+    }
+    fn counts_failed_passwords(&self) -> bool {
+        false
+    }
+}
+
+/// D20: a password refused for an account whose provider never counts its
+/// refusals is the usual failure, and leaves the account's counter and
+/// enabled flag alone, whether that provider is enabled or not (the invalid
+/// provider then refuses in its place). An account of any other provider is
+/// counted and locked out as before.
+#[rstest::rstest]
+#[case::enabled("Tests.NoPasswords", true, false)]
+#[case::disabled("tests.nopasswords", false, false)]
+#[case::default_provider(DEFAULT_AUTH_PROVIDER_ID, true, true)]
+#[case::missing_provider("missing", true, true)]
+#[tokio::test]
+async fn a_provider_whose_refusals_never_count_leaves_the_lockout_alone(
+    #[case] saved: &str,
+    #[case] enabled: bool,
+    #[case] counted: bool,
+) {
+    let db = crate::test_support::test_db().await;
+    let mgr = FerrofinUserManager::with_providers(db, vec![Arc::new(NoPasswords { enabled })]);
+    let user = mgr.create_user("no-password").await.unwrap();
+    let uid = Uuid::parse_str(&user.id).unwrap();
+    mgr.update_policy(
+        uid,
+        &UserPolicy {
+            authentication_provider_id: saved.to_owned(),
+            login_attempts_before_lockout: 2,
+            ..UserPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Two failures: the second reaches the lockout, when they count.
+    for password in ["guess", "again"] {
+        let refused = mgr
+            .authenticate_user("no-password", password, "127.0.0.1", true)
+            .await;
+        assert!(matches!(refused, Ok(None)), "{saved}: {refused:?}");
+    }
+    let user = mgr.get_user_by_id(uid).await.unwrap().unwrap();
+    assert_eq!(
+        user.invalid_login_attempt_count,
+        if counted { 2 } else { 0 },
+        "{saved}"
+    );
+    assert_eq!(
+        has_permission(mgr.db.pool(), &user.id, PermissionKind::IsDisabled)
+            .await
+            .unwrap(),
+        counted,
+        "{saved}: locked out only when counted"
+    );
 }

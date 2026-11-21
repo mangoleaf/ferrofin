@@ -509,9 +509,7 @@ fn generate_srt(stream_index: usize, cue_count: usize) -> String {
 }
 
 fn generate_sources() -> Vec<Vec<u8>> {
-    (0..STREAM_COUNT)
-        .map(|i| generate_srt(i, CUE_COUNT).into_bytes())
-        .collect()
+    Vec::from_fn(STREAM_COUNT, |i| generate_srt(i, CUE_COUNT).into_bytes())
 }
 
 async fn convert(

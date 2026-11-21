@@ -118,6 +118,25 @@ impl ExternalIdentityStore for FerrofinExternalIdentityStore {
         Ok(rows.into_iter().filter_map(to_identity).collect())
     }
 
+    async fn list_for_user(
+        &self,
+        provider_id: &str,
+        user_id: Uuid,
+    ) -> Result<Vec<ExternalIdentity>, ServiceError> {
+        // `FerrofinIX_ExternalIdentities_UserId` finds the user's rows.
+        let sql = format!(
+            r#"SELECT {COLUMNS} FROM "FerrofinExternalIdentities"
+               WHERE "UserId" = ?1 AND "ProviderId" = ?2 ORDER BY "Id""#
+        );
+        let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(guid_to_db(user_id))
+            .bind(provider_id)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().filter_map(to_identity).collect())
+    }
+
     async fn link(
         &self,
         user_id: Uuid,
@@ -144,13 +163,16 @@ impl ExternalIdentityStore for FerrofinExternalIdentityStore {
         }
         // Upstream's `AddUser`: "Ensure we do not have more than one entry for a
         // given user" — `RemoveUser(userGuid)`, then `RemoveUser(ldapUid)`. The
-        // map was LDAP's own, so here both are scoped to the provider.
+        // map was LDAP's own, so here both are scoped to the provider, and the
+        // user's is scoped to the issuer too: LDAP's is always empty, and an
+        // OIDC user keeps their link at another identity provider.
         sqlx::query(
             r#"DELETE FROM "FerrofinExternalIdentities"
-               WHERE "UserId" = ?1 AND "ProviderId" = ?2"#,
+               WHERE "UserId" = ?1 AND "ProviderId" = ?2 AND "Issuer" = ?3"#,
         )
         .bind(&user)
         .bind(identity.provider_id)
+        .bind(identity.issuer)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -320,6 +342,54 @@ mod tests {
         assert_eq!(store.list("Other").await.expect("list other"), Vec::new());
     }
 
+    /// One user's links at a provider, one per issuer, and never another
+    /// user's or another provider's; none once the user is deleted.
+    #[tokio::test]
+    async fn a_users_links_are_listed_by_provider() {
+        let (store, users, ids) = fixture(&["alice", "bob"]).await;
+        let at = |issuer, subject| ExternalIdentityKey {
+            provider_id: OIDC,
+            issuer,
+            subject,
+        };
+        let one = store
+            .link(ids[0], at("https://one.example", "a-1"), None)
+            .await
+            .expect("first issuer");
+        let two = store
+            .link(ids[0], at("https://two.example", "a-2"), Some("hash"))
+            .await
+            .expect("second issuer");
+        store
+            .link(ids[1], at("https://one.example", "b-1"), None)
+            .await
+            .expect("bob");
+        store
+            .link(ids[0], ldap("alice-uid"), None)
+            .await
+            .expect("ldap");
+
+        assert_eq!(
+            store.list_for_user(OIDC, ids[0]).await.expect("alice"),
+            vec![one, two]
+        );
+        let bobs = store.list_for_user(OIDC, ids[1]).await.expect("bob");
+        assert_eq!(bobs.len(), 1);
+        assert_eq!(bobs[0].subject, "b-1");
+        assert_eq!(store.list_for_user(LDAP, ids[1]).await.expect("none"), []);
+        assert_eq!(
+            store
+                .list_for_user(OIDC, Uuid::from_u128(0xDEAD))
+                .await
+                .expect("no such user"),
+            []
+        );
+
+        users.delete_user(ids[0]).await.expect("delete alice");
+        assert_eq!(store.list_for_user(OIDC, ids[0]).await.expect("gone"), []);
+        assert_eq!(store.list_for_user(OIDC, ids[1]).await.expect("bob"), bobs);
+    }
+
     #[tokio::test]
     async fn a_second_link_for_the_same_identity_replaces_the_first() {
         let (store, _users, ids) = fixture(&["alice", "bob"]).await;
@@ -368,6 +438,47 @@ mod tests {
         assert!(store.find(oidc).await.expect("find oidc").is_some());
     }
 
+    /// OIDC: a user linked at one identity provider keeps that link when
+    /// linked at a second, and a relink at the first replaces only its own.
+    #[tokio::test]
+    async fn a_user_keeps_one_link_per_provider_and_issuer() {
+        let (store, _users, ids) = fixture(&["alice"]).await;
+        let at = |issuer, subject| ExternalIdentityKey {
+            provider_id: OIDC,
+            issuer,
+            subject,
+        };
+        store
+            .link(ids[0], at("https://one.example", "sub-1"), None)
+            .await
+            .expect("first issuer");
+        store
+            .link(ids[0], at("https://two.example", "sub-2"), None)
+            .await
+            .expect("second issuer");
+        assert!(
+            store
+                .find(at("https://one.example", "sub-1"))
+                .await
+                .expect("find")
+                .is_some(),
+            "the first issuer's link stays"
+        );
+        store
+            .link(ids[0], at("https://one.example", "sub-3"), None)
+            .await
+            .expect("relink at the first issuer");
+        let mut subjects: Vec<String> = store
+            .list(OIDC)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|l| l.subject)
+            .collect();
+        subjects.sort();
+        assert_eq!(subjects, ["sub-2", "sub-3"]);
+    }
+
     #[tokio::test]
     async fn linking_a_missing_user_is_not_found_and_changes_nothing() {
         let (store, _users, ids) = fixture(&["alice"]).await;
@@ -396,7 +507,7 @@ mod tests {
     async fn concurrent_links_lose_no_entry() {
         let (store, _users, ids) = fixture(&["u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7"]).await;
         let store = Arc::new(store);
-        let uids: Vec<String> = (0..ids.len()).map(|i| format!("uid-{i}")).collect();
+        let uids: Vec<String> = Vec::from_fn(ids.len(), |i| format!("uid-{i}"));
         let mut tasks = Vec::new();
         for (id, uid) in ids.iter().copied().zip(uids.iter().cloned()) {
             let store = Arc::clone(&store);

@@ -10,6 +10,7 @@
 //! | `MusicGenreImageProvider`   | `MusicGenre` | 4 random `MusicAlbum`/`MusicVideo`/`Audio` with the genre + Primary |
 //! | `PlaylistImageProvider`     | `Playlist`   | the playlist's members (episode → its series, song → its album)   |
 //! | `PhotoAlbumImageProvider`   | `PhotoAlbum` | the album's first child with a Primary (`BaseFolderImageProvider`) |
+//! | `MusicAlbumImageProvider`   | `MusicAlbum` | the album's first child that is no folder, with a Primary (`BaseFolderImageProvider`) |
 //! | `FolderImageProvider`       | any `Folder` | the folder's first descendant with a Primary (`BaseFolderImageProvider`) |
 //! | `ArtistImageProvider`       | `MusicArtist`| none — upstream returns `Array.Empty` (see [`ArtistSources`])       |
 //!
@@ -31,11 +32,16 @@
 //!
 //! Every provider here supports only `ImageType.Primary`, and the base class
 //! routes all five kinds to `CreateSquareCollage` — a
-//! [`SQUARE_COLLAGE_SIZE`]-pixel square 2×2 tile — except the photo album,
-//! whose `BaseFolderImageProvider` copies the single source image verbatim
-//! (`CreateSingleImage`). The source image preference is upstream's
-//! `GetStripCollageImagePaths`: Primary, then Thumb (the Backdrop-first rule is
-//! reserved for `CollectionFolder`/`UserView`).
+//! [`SQUARE_COLLAGE_SIZE`]-pixel square 2×2 tile — except the music and photo
+//! albums, whose `BaseFolderImageProvider` copies the single source image
+//! verbatim (`CreateSingleImage`). A music album with no image of its own (no
+//! `folder.jpg` beside it, no upload) takes a copy of its first track's
+//! cover, in its own art folder whatever "Save artwork into media folders"
+//! says (`FetchToFileInternal` saves with `saveLocallyWithMedia: false`).
+//!
+//! The source image preference is upstream's `GetStripCollageImagePaths`:
+//! Primary, then Thumb (the Backdrop-first rule is reserved for
+//! `CollectionFolder`/`UserView`).
 //!
 //! # When an image is (re)generated
 //!
@@ -56,7 +62,8 @@
 //!   no path of its own to save beside) →
 //!   regenerated only when the file's modification time no longer matches the
 //!   recorded `DateModified` (`HasChangedByDate`; an upload records its file's
-//!   time), or when the refresh is forced (`FullRefresh` /
+//!   time; never for a music album, `BaseFolderImageProvider.HasChangedByDate`),
+//!   or when the refresh is forced (`FullRefresh` /
 //!   `ReplaceAllMetadata`, [`DynamicImageProviders::refresh_item`] with
 //!   `force`), which draws over such an upload (as upstream does for a photo
 //!   album or folder; upstream saves every playlist's upload beside its path,
@@ -136,11 +143,6 @@ pub const GENRE_COLLAGE_SOURCES: i32 = 4;
 /// so four source images fill it; collecting more changes nothing.
 const SQUARE_COLLAGE_TILES: usize = 4;
 
-/// The image file every provider writes (`Path.ChangeExtension(…, ".png")` in
-/// `CreateImage`, stored under the metadata folder as Jellyfin's `SaveImage`
-/// names a Primary: `primary.<ext>`).
-const PRIMARY_STEM: &str = "primary";
-
 /// The image file extensions `SaveImage` may have left behind for an earlier
 /// Primary of the same item; a regeneration replaces all of them.
 const ART_FILE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
@@ -156,6 +158,8 @@ pub enum DynamicImageKind {
     Playlist,
     /// `PhotoAlbumImageProvider`.
     PhotoAlbum,
+    /// `MusicAlbumImageProvider`.
+    MusicAlbum,
     /// `ArtistImageProvider` — supported, but upstream gives it no sources.
     MusicArtist,
     /// `FolderImageProvider` — a generic folder that is not a top parent.
@@ -172,6 +176,7 @@ impl DynamicImageKind {
             BaseItemKind::MusicGenre => Some(Self::MusicGenre),
             BaseItemKind::Playlist => Some(Self::Playlist),
             BaseItemKind::PhotoAlbum => Some(Self::PhotoAlbum),
+            BaseItemKind::MusicAlbum => Some(Self::MusicAlbum),
             BaseItemKind::MusicArtist => Some(Self::MusicArtist),
             // `FolderImageProvider : BaseFolderImageProvider<Folder>` — every
             // `Folder`, minus the two album kinds handled above and minus the
@@ -195,8 +200,8 @@ impl DynamicImageKind {
             // `IsTopParent` (BaseItem.cs:733-757).
             //
             // Confirmed on the batch pair: 10.11.8 serves NO `ImageTags.Primary`
-            // for any Series, Season, MusicAlbum, BoxSet or plain Folder on the
-            // fixture, only for the two roots (and for Playlists, which is
+            // for any Series, Season, BoxSet or plain Folder on the fixture,
+            // only for the two roots (and for Playlists, which is
             // `PlaylistImageProvider`, handled above).
             BaseItemKind::Folder | BaseItemKind::UserRootFolder | BaseItemKind::AggregateFolder => {
                 Some(Self::Folder)
@@ -221,6 +226,20 @@ impl ArtistSources {
     }
 }
 
+/// The kinds the scan-time pass draws, in order. A music album copies its
+/// track's cover before the music-genre and playlist collages sample album
+/// covers, as upstream draws an album's in its refresh, before the
+/// validators and playlists that follow the walk.
+const PASS_KINDS: &[BaseItemKind] = &[
+    BaseItemKind::MusicAlbum,
+    BaseItemKind::Genre,
+    BaseItemKind::MusicGenre,
+    BaseItemKind::Playlist,
+    BaseItemKind::PhotoAlbum,
+    // `FolderImageProvider`.
+    BaseItemKind::Folder,
+];
+
 /// What one pass over the library produced.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DynamicImageReport {
@@ -244,7 +263,7 @@ pub struct DynamicImageProviders {
     persistence: Arc<dyn ItemPersistenceService>,
     processor: Arc<dyn ImageProcessor>,
     /// The item-art root (`{metadata}/library`); an item's folder is
-    /// `{root}/{ID}`, the same layout the scanner's downloads and the
+    /// [`own_art_dir`], the same layout the scanner's downloads and the
     /// image-upload endpoint use, so an upload of another type survives and a
     /// rescan re-adopts the generated file.
     metadata_dir: DirectoryPath,
@@ -325,41 +344,31 @@ impl DynamicImageProviders {
     /// leaving out the rows in `done` (the ones a forced pass already drew).
     ///
     /// Cost is bounded by the gate: a row with a current generated image costs
-    /// one image-row read and one `stat`; only rows without a Primary run their
-    /// provider's (`LIMIT`ed) source query. Per-row failures are logged and
+    /// its share of one image-row read per window and a `stat` per file; only
+    /// rows without a Primary run their provider's (`LIMIT`ed) source query. Per-row failures are logged and
     /// skipped — one unreadable poster must not lose every other collage.
     ///
     /// `Genre` and `MusicGenre` are separate rows, as upstream keeps them: a
-    /// scan writes a `Genre` row for a non-music item's genre (its id is the
-    /// `ItemValueId`) and a `MusicGenre` row for a music item's (a derived id),
-    /// so a name used by both a movie and an album has two rows and two
-    /// Primaries. An adopted database's rows keep Jellyfin's ids.
+    /// scan writes a `Genre` row for a non-music item's genre and a `MusicGenre`
+    /// row for a music item's, each under the id Jellyfin derives from its path
+    /// (gl-1597), so a name used by both a movie and an album has two rows and
+    /// two Primaries. An adopted database's rows keep Jellyfin's ids.
     ///
     /// The two root folders are not here: library validation refreshes them
     /// at its opening ([`refresh_roots_between`](Self::refresh_roots_between)).
     ///
     /// # Errors
     ///
-    /// Only when a supported kind's id list, or a window of its rows, cannot
-    /// be read; a failure on one row is logged and the pass continues.
+    /// Only when a supported kind's id list, or a window of its rows or of
+    /// their images, cannot be read; a failure on one row is logged and the
+    /// pass continues.
     pub async fn refresh_all_between<'b>(
         &self,
         done: &std::collections::HashSet<Uuid>,
         between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
     ) -> Result<DynamicImageReport, ServiceError> {
         let report = self
-            .refresh_kinds_between(
-                &[
-                    BaseItemKind::Genre,
-                    BaseItemKind::MusicGenre,
-                    BaseItemKind::Playlist,
-                    BaseItemKind::PhotoAlbum,
-                    // `FolderImageProvider`.
-                    BaseItemKind::Folder,
-                ],
-                done,
-                between,
-            )
+            .refresh_kinds_between(PASS_KINDS, done, between)
             .await?;
         tracing::debug!(
             examined = report.examined,
@@ -515,7 +524,10 @@ impl DynamicImageProviders {
     /// `rows` in order, each behind its gate and forced as listed, tallied
     /// into `report`. Whole rows are read a bind-sized window at a time, so a
     /// pass holds one window however many rows it draws; an id with no row
-    /// is skipped.
+    /// is skipped. The window's image rows are read with it, and a row they
+    /// settle ([`is_settled`](Self::is_settled)) costs no read of its own: a
+    /// rescan of a music library reads no album's images one at a time
+    /// (gl-1277).
     async fn refresh_windows<'b>(
         &self,
         rows: &[(Uuid, bool)],
@@ -531,11 +543,16 @@ impl DynamicImageProviders {
                 .into_iter()
                 .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
                 .collect();
+            let stored = self.items.get_image_infos_batch(&ids).await?;
             for &(id, force) in chunk {
                 let Some(row) = found.remove(&id) else {
                     continue;
                 };
                 between().await;
+                if !row.is_locked && self.is_settled(&row, id, stored.get(&id), force) {
+                    report.examined += 1;
+                    continue;
+                }
                 self.refresh_tallied(&row, force, report).await;
             }
         }
@@ -615,15 +632,15 @@ impl DynamicImageProviders {
             tracing::warn!(%err, item_id = %item_id, "failed to drop the item's missing images");
         }
         let item_dir = self.item_dir(item_id);
-        if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary) {
-            // `FetchAsync`: an image that is not ours is never replaced.
-            if !is_own_image(&self.metadata_dir.resolve(), item_id, primary) {
-                return Ok(ItemUpdateType::None);
-            }
-            // `HasChanged` → `HasChangedByDate`: unchanged on disk means done.
-            if !force && !has_changed_by_date(primary) {
-                return Ok(ItemUpdateType::None);
-            }
+        // `SaveImage` names the file as `GetStandardSavePath` names a Primary
+        // kept in the item's folder (`Path.ChangeExtension(…, ".png")` in
+        // `CreateImage`): `poster.png`, `folder.<ext>` for an album.
+        let stem =
+            ferrofin_providers::local_images::internal_image_stem(&item.type_, ImageType::Primary);
+        if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary)
+            && self.primary_is_settled(kind, item_id, primary, force)
+        {
+            return Ok(ItemUpdateType::None);
         }
 
         let sources = self.sources_for(kind, item, item_id).await?;
@@ -640,19 +657,19 @@ impl DynamicImageProviders {
         })?;
         let output = if matches!(
             kind,
-            DynamicImageKind::PhotoAlbum | DynamicImageKind::Folder
+            DynamicImageKind::PhotoAlbum | DynamicImageKind::MusicAlbum | DynamicImageKind::Folder
         ) {
             // One closure: the stale Primaries go before the copy lands.
-            off_runtime(|| copy_single_image(&item_dir, &sources[0]))?
+            off_runtime(|| copy_single_image(&item_dir, &stem, &sources[0]))?
         } else {
-            let output = item_dir.join(format!("{PRIMARY_STEM}.png"));
+            let output = item_dir.join(format!("{stem}.png"));
             let options = ImageCollageOptions {
                 input_paths: sources,
                 output_path: output.to_string_lossy().into_owned(),
                 width: SQUARE_COLLAGE_SIZE,
                 height: SQUARE_COLLAGE_SIZE,
             };
-            off_runtime(|| remove_other_primaries(&item_dir, &output));
+            off_runtime(|| remove_other_primaries(&item_dir, &stem, &output));
             self.processor
                 .create_image_collage(&options, item.name.as_deref())
                 .await?;
@@ -677,11 +694,58 @@ impl DynamicImageProviders {
             &mut info,
         )
         .await;
+        let replaced = off_runtime(|| {
+            replaced_primary(&self.metadata_dir.resolve(), item_id, &images, &output)
+        });
         images.retain(|i| i.image_type != ImageType::Primary);
         images.insert(0, info);
         self.persistence.save_item_images(item_id, &images).await?;
+        if let Some(file) = replaced {
+            off_runtime(|| remove_replaced_file(item_id, &file));
+        }
         tracing::debug!(item_id = %item.id, kind = ?kind, "dynamic image generated");
         Ok(ItemUpdateType::ImageUpdate)
+    }
+
+    /// Whether the item's stored `primary` leaves `kind`'s provider nothing to
+    /// do: `FetchAsync` never replaces an image that is not the item's own,
+    /// and `HasChanged` → `HasChangedByDate` redraws its own only when the
+    /// file changed on disk (never a music album's), unless `force`.
+    fn primary_is_settled(
+        &self,
+        kind: DynamicImageKind,
+        item_id: Uuid,
+        primary: &ItemImageInfo,
+        force: bool,
+    ) -> bool {
+        !is_own_image(&self.metadata_dir.resolve(), item_id, primary)
+            || (!force && (kind == DynamicImageKind::MusicAlbum || !has_changed_by_date(primary)))
+    }
+
+    /// Whether `row` needs no refresh by its `stored` images, read for its
+    /// whole window before the pass reached it: every local file is still
+    /// there, so `ValidateImages` drops none, and its Primary is settled
+    /// ([`primary_is_settled`](Self::primary_is_settled)). A row this cannot
+    /// settle is refreshed, which reads its images afresh, so one a lane
+    /// refresh changed since the window's read is never drawn from stale rows.
+    fn is_settled(
+        &self,
+        row: &BaseItemEntity,
+        item_id: Uuid,
+        stored: Option<&Vec<ItemImageInfo>>,
+        force: bool,
+    ) -> bool {
+        let (Some(kind), Some(images)) = (DynamicImageKind::for_entity(row), stored) else {
+            return false;
+        };
+        let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary) else {
+            return false;
+        };
+        off_runtime(|| {
+            images
+                .iter()
+                .all(|image| !image.is_local_file() || Path::new(&image.path).is_file())
+        }) && self.primary_is_settled(kind, item_id, primary, force)
     }
 
     /// `FolderImageProvider.Supports` for a row [`DynamicImageKind::for_entity`]
@@ -721,7 +785,7 @@ impl DynamicImageProviders {
         ))
     }
 
-    /// The item's art folder (`{root}/{ID}`).
+    /// The item's art folder ([`own_art_dir`]).
     fn item_dir(&self, item_id: Uuid) -> PathBuf {
         own_art_dir(&self.metadata_dir.resolve(), item_id)
     }
@@ -752,8 +816,9 @@ impl DynamicImageProviders {
             }
             DynamicImageKind::Playlist => self.playlist_sources(item_id).await,
             DynamicImageKind::PhotoAlbum | DynamicImageKind::Folder => {
-                self.folder_sources(item_id).await
+                self.folder_sources(item_id, false).await
             }
+            DynamicImageKind::MusicAlbum => self.folder_sources(item_id, true).await,
             DynamicImageKind::MusicArtist => Ok(ArtistSources::image_paths()),
         }
     }
@@ -855,14 +920,32 @@ impl DynamicImageProviders {
     }
 
     /// `BaseFolderImageProvider.GetItemsWithImages` (BaseFolderImageProvider.cs:29-44),
-    /// shared by `PhotoAlbumImageProvider` and `FolderImageProvider`: the
-    /// folder's first descendant with a Primary — files before folders, then by
-    /// sort name, `Limit = 1`.
-    async fn folder_sources(&self, album_id: Uuid) -> Result<Vec<String>, ServiceError> {
-        let ids = self
+    /// shared by the music and photo album providers and `FolderImageProvider`:
+    /// the folder's first descendant with a Primary — files before folders, then by
+    /// sort name, `Limit = 1`. With `files_only`, `MusicAlbumImageProvider`'s:
+    /// that row is dropped when it is a folder (an `IsFolder` filter in the
+    /// query would steer it onto the `IsFolder` index, every file of the
+    /// library, where the subtree drives it now).
+    async fn folder_sources(
+        &self,
+        album_id: Uuid,
+        files_only: bool,
+    ) -> Result<Vec<String>, ServiceError> {
+        let mut ids = self
             .items
             .get_item_ids(&folder_sources_query(album_id))
             .await?;
+        if files_only && !ids.is_empty() {
+            let files: std::collections::HashSet<Uuid> = self
+                .items
+                .retrieve_items(&ids)
+                .await?
+                .into_iter()
+                .filter(|row| !row.is_folder)
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect();
+            ids.retain(|id| files.contains(id));
+        }
         // `CreateSingleImage` takes the Primary only (no Thumb fallback) and
         // needs a file extension to carry over.
         let mut paths = Vec::new();
@@ -966,53 +1049,7 @@ fn folder_sources_query(folder_id: Uuid) -> InternalItemsQuery {
     }
 }
 
-/// Dimensions + blurhash for a written image file, the way the scanner records
-/// every other image (so the DTO carries `Width`/`Height`/`ImageBlurHashes`):
-/// what `LibraryManager.UpdateImagesAsync` fills for a saved image. `path` is
-/// the file to read: `image.path` itself, or its expansion when the row stores
-/// a virtual path.
-///
-/// Best-effort: an error reading the size leaves the size the caller set,
-/// and an error computing the blurhash leaves no hash. Each failure is logged
-/// with the item, the image type and the path, the events `UpdateImagesAsync`
-/// and its encoder log, at levels set by LOGGING.md rule 1: a missing file, an
-/// error reading the size and a failed blurhash at `warn!` (upstream: Warning,
-/// Error, Error), a file measured 0x0 at `debug!` (upstream: Debug when empty
-/// or unsupported, Warning when undecodable, which this encoder cannot tell
-/// apart).
-pub(crate) async fn fill_image_metadata(
-    processor: &dyn ImageProcessor,
-    item_id: Uuid,
-    path: &str,
-    image: &mut ItemImageInfo,
-) {
-    let image_type = image.image_type;
-    let dims = match processor.get_image_dimensions(path).await {
-        Ok(dims) => dims,
-        Err(ServiceError::NotFound(_)) => {
-            tracing::warn!(item_id = %item_id, ?image_type, path = %path, "image not found");
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(%error, item_id = %item_id, ?image_type, path = %path, "cannot get image dimensions");
-            return;
-        }
-    };
-    if dims.width <= 0 || dims.height <= 0 {
-        // The encoder answers an empty, unsupported or undecodable file 0x0,
-        // and cannot say which: debug, as an SVG logo (no decoder, gl-802) is
-        // one per movie, measured again on every scan.
-        tracing::debug!(item_id = %item_id, ?image_type, path = %path, "unable to determine image dimensions");
-    }
-    image.width = dims.width;
-    image.height = dims.height;
-    match processor.get_image_blur_hash_sized(path, dims).await {
-        Ok(hash) => image.blur_hash = Some(hash),
-        Err(error) => {
-            tracing::warn!(%error, item_id = %item_id, ?image_type, path = %path, "cannot compute blurhash");
-        }
-    }
-}
+pub(crate) use ferrofin_providers::image_metadata::fill_image_metadata;
 
 /// `BaseDynamicImageProvider.HasChangedByDate`: the recorded `DateModified`
 /// differs from the file's current modification time. A file that can no
@@ -1032,7 +1069,7 @@ fn has_changed_by_date(image: &ItemImageInfo) -> bool {
 }
 
 pub(crate) use ferrofin_providers::local_images::{
-    internal_metadata_dirs, legacy_art_dir, own_art_dir,
+    earlier_art_dir, internal_metadata_dirs, legacy_art_dir, own_art_dir,
 };
 
 /// Whether `image` is the item's own (`BaseDynamicImageProvider.FetchAsync` /
@@ -1062,16 +1099,16 @@ pub(crate) fn drop_missing_images(images: &mut Vec<ItemImageInfo>) -> bool {
 pub(crate) use ferrofin_providers::local_images::file_date_modified;
 
 /// `BaseDynamicImageProvider.CreateSingleImage`: copies the source into the
-/// item's folder as `primary.<source extension>`, replacing any earlier Primary.
-fn copy_single_image(item_dir: &Path, source: &str) -> Result<PathBuf, ServiceError> {
+/// item's folder as `<stem>.<source extension>`, replacing any earlier Primary.
+fn copy_single_image(item_dir: &Path, stem: &str, source: &str) -> Result<PathBuf, ServiceError> {
     let source = Path::new(source);
     let ext = source
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
         .ok_or_else(|| ServiceError::invalid_input("single-image source has no extension"))?;
-    let output = item_dir.join(format!("{PRIMARY_STEM}.{ext}"));
-    remove_other_primaries(item_dir, &output);
+    let output = item_dir.join(format!("{stem}.{ext}"));
+    remove_other_primaries(item_dir, stem, &output);
     std::fs::copy(source, &output).map_err(|e| {
         ServiceError::backend(format!(
             "failed to copy {} to {}: {e}",
@@ -1082,18 +1119,63 @@ fn copy_single_image(item_dir: &Path, source: &str) -> Result<PathBuf, ServiceEr
     Ok(output)
 }
 
-/// Removes every `primary.<ext>` in `item_dir` other than `keep`, so a
+/// Removes every `<stem>.<ext>` in `item_dir` other than `keep`, so a
 /// regeneration under a different extension leaves one Primary file behind
 /// (the rescan re-adopts files by stem and would otherwise find two).
-fn remove_other_primaries(item_dir: &Path, keep: &Path) {
+fn remove_other_primaries(item_dir: &Path, stem: &str, keep: &Path) {
     for ext in ART_FILE_EXTENSIONS {
-        let candidate = item_dir.join(format!("{PRIMARY_STEM}.{ext}"));
+        let candidate = item_dir.join(format!("{stem}.{ext}"));
         if candidate != keep
             && candidate.exists()
             && let Err(err) = std::fs::remove_file(&candidate)
         {
             tracing::debug!(%err, path = %candidate.display(), "stale primary not removed");
         }
+    }
+}
+
+/// `ImageSaver.SaveImage`'s "Delete the current path" once `output` is the
+/// item's new Primary: the file of the Primary `images` stored until now, such
+/// as one an earlier build drew in the item's `{ID}` folder. It is named only
+/// when it lies in one of the item's own folders ([`is_own_image`]), with its
+/// links resolved too, is not `output` (ignoring case, as upstream compares
+/// paths), and no other of the item's rows names it. The caller removes it
+/// once the new row is saved ([`remove_replaced_file`]), so no stored row
+/// names a deleted file.
+pub(crate) fn replaced_primary(
+    root: &Path,
+    item_id: Uuid,
+    images: &[ItemImageInfo],
+    output: &Path,
+) -> Option<PathBuf> {
+    use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
+    let previous = images.iter().find(|i| i.image_type == ImageType::Primary)?;
+    if equals_ordinal_ignore_case(&previous.path, &output.to_string_lossy())
+        || !is_own_image(root, item_id, previous)
+        || images
+            .iter()
+            .filter(|i| equals_ordinal_ignore_case(&i.path, &previous.path))
+            .count()
+            > 1
+    {
+        return None;
+    }
+    let file = Path::new(&previous.path);
+    let parent = file.parent()?.canonicalize().ok()?;
+    internal_metadata_dirs(root, item_id)
+        .iter()
+        .filter_map(|dir| dir.canonicalize().ok())
+        .any(|dir| parent.starts_with(dir))
+        .then(|| file.to_owned())
+}
+
+/// Deletes the replaced Primary [`replaced_primary`] named; one already gone
+/// is no failure, and one that cannot go stays, logged.
+pub(crate) fn remove_replaced_file(item_id: Uuid, file: &Path) {
+    if let Err(err) = std::fs::remove_file(file)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(%err, %item_id, path = %file.display(), "replaced primary not removed");
     }
 }
 
@@ -1248,11 +1330,7 @@ mod tests {
         let primary = fx.primary_of(genre_id).await.expect("genre has a Primary");
         assert_eq!(
             Path::new(&primary.path),
-            fx.tmp
-                .path()
-                .join("metadata/library")
-                .join(guid_to_db(genre_id))
-                .join("primary.png")
+            own_art_dir(&fx.tmp.path().join("metadata/library"), genre_id).join("poster.png")
         );
         let decoded = image::open(&primary.path).expect("decodable png");
         assert_eq!((decoded.width(), decoded.height()), (600, 600));
@@ -1263,6 +1341,51 @@ mod tests {
         let rgb = decoded.to_rgb8();
         let tl = rgb.get_pixel(10, 10).0;
         assert!(tl == [200, 20, 20] || tl == [20, 20, 200], "{tl:?}");
+    }
+
+    /// A collage an earlier build drew into the item's `{ID}` folder as
+    /// `primary.png` is the item's own: drawn again, the new one goes to
+    /// Jellyfin's `{xx}/{idN}/poster.png` and the old file goes with its row
+    /// (`ImageSaver.SaveImage`'s "Delete the current path").
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_collage_an_earlier_build_drew_moves_to_jellyfins_folder() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let a = write_png(&media, "a-poster.png", [200, 20, 20]);
+        fx.seed(BaseItemKind::Movie, "Heat", Some("Crime"), Some(&a))
+            .await;
+        fx.providers.refresh_all().await.expect("first pass");
+        let genre = fx.by_name(BaseItemKind::Genre, "Crime").await;
+        let genre_id = Uuid::parse_str(&genre.id).expect("genre id");
+        let root = fx.tmp.path().join("metadata/library");
+        let earlier = earlier_art_dir(&root, genre_id).join("primary.png");
+        std::fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+        std::fs::write(&earlier, b"an earlier collage").unwrap();
+        std::fs::remove_file(own_art_dir(&root, genre_id).join("poster.png")).unwrap();
+        seed_images(
+            &fx.db,
+            genre_id,
+            &[image_info(
+                ImageType::Primary,
+                &earlier.to_string_lossy(),
+                None,
+            )],
+        )
+        .await;
+
+        let update = fx
+            .providers
+            .refresh_item(&genre, true)
+            .await
+            .expect("redraw");
+        assert_eq!(update, ItemUpdateType::ImageUpdate);
+        let primary = fx.primary_of(genre_id).await.expect("primary");
+        assert_eq!(
+            Path::new(&primary.path),
+            own_art_dir(&root, genre_id).join("poster.png")
+        );
+        assert!(Path::new(&primary.path).is_file());
+        assert!(!earlier.exists(), "the replaced collage is removed");
     }
 
     /// A second pass over a current image is a no-op: the recorded
@@ -1401,13 +1524,7 @@ mod tests {
         let genre = fx.by_name(BaseItemKind::Genre, "Crime").await;
         let genre_id = Uuid::parse_str(&genre.id).expect("id");
         assert!(fx.primary_of(genre_id).await.is_none());
-        assert!(
-            !fx.tmp
-                .path()
-                .join("metadata/library")
-                .join(guid_to_db(genre_id))
-                .exists()
-        );
+        assert!(!own_art_dir(&fx.tmp.path().join("metadata/library"), genre_id).exists());
     }
 
     /// `MusicGenreImageProvider` samples the audio kinds: a genre carried only
@@ -1755,7 +1872,7 @@ mod tests {
         fx.providers.refresh_all().await.expect("pass");
 
         let primary = fx.primary_of(user_root).await.expect("root primary");
-        assert!(primary.path.ends_with("primary.png"), "{}", primary.path);
+        assert!(primary.path.ends_with("poster.png"), "{}", primary.path);
         assert_eq!(
             std::fs::read(&primary.path).unwrap(),
             std::fs::read(&tile).unwrap(),
@@ -2021,13 +2138,146 @@ mod tests {
 
         assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 1);
         let primary = fx.primary_of(album).await.expect("album primary");
-        assert!(primary.path.ends_with("primary.jpg"), "{}", primary.path);
+        assert!(primary.path.ends_with("folder.jpg"), "{}", primary.path);
         assert_eq!(
             std::fs::read(&primary.path).unwrap(),
             std::fs::read(&first).unwrap(),
             "the sort-name-first photo is the one copied"
         );
         assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 0);
+    }
+
+    /// `MusicAlbumImageProvider`: an album copies its first child that is no
+    /// folder and has a Primary; a folder below it with one is no source.
+    #[tokio::test]
+    async fn a_music_album_copies_its_first_file_never_a_folder() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let album = fx
+            .seed(BaseItemKind::MusicAlbum, "Kind of Blue", None, None)
+            .await;
+        let child = |kind: BaseItemKind, name: &str, colour: u8| {
+            let path = media.join(format!("{name}.png"));
+            image::RgbImage::from_pixel(4, 4, image::Rgb([colour, 0, 0]))
+                .save(&path)
+                .expect("png");
+            (Uuid::new_v4(), kind, name.to_owned(), path)
+        };
+        let folder = child(BaseItemKind::Folder, "A folder", 10);
+        let track = child(BaseItemKind::Audio, "Z track", 20);
+        for (id, kind, name, path) in [&folder, &track] {
+            fx.persistence
+                .save_items(&[BaseItemEntity {
+                    id: guid_to_db(*id),
+                    type_: stored_type_name(*kind).unwrap().to_owned(),
+                    name: Some(name.clone()),
+                    sort_name: Some(name.clone()),
+                    is_folder: *kind == BaseItemKind::Folder,
+                    parent_id: Some(guid_to_db(album)),
+                    ..Default::default()
+                }])
+                .await
+                .expect("child");
+            fx.persistence
+                .set_ancestors(*id, &[album])
+                .await
+                .expect("ancestors");
+            if *kind == BaseItemKind::Folder {
+                seed_images(
+                    &fx.db,
+                    *id,
+                    &[image_info(
+                        ImageType::Primary,
+                        &path.to_string_lossy(),
+                        None,
+                    )],
+                )
+                .await;
+            }
+        }
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 0);
+        assert!(
+            fx.primary_of(album).await.is_none(),
+            "a folder is no source"
+        );
+
+        seed_images(
+            &fx.db,
+            track.0,
+            &[image_info(
+                ImageType::Primary,
+                &track.3.to_string_lossy(),
+                None,
+            )],
+        )
+        .await;
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 1);
+        let copy = fx.primary_of(album).await.expect("album primary");
+        assert_eq!(
+            std::fs::read(&copy.path).unwrap(),
+            std::fs::read(&track.3).unwrap()
+        );
+        // Its copy is not drawn again by date (`HasChangedByDate`).
+        std::fs::File::options()
+            .write(true)
+            .open(&copy.path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 0);
+    }
+
+    /// A row whose Primary is current is settled by its window's one image
+    /// read, without a read of its own, only while every file it names is
+    /// there: one with a missing file is refreshed, which drops it
+    /// (`ValidateImages`).
+    #[tokio::test]
+    async fn a_current_row_with_a_missing_file_is_still_validated() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let album = fx
+            .seed(BaseItemKind::PhotoAlbum, "Iceland", None, None)
+            .await;
+        let photo_path = media.join("aurora.png");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([7, 7, 7]))
+            .save(&photo_path)
+            .expect("png");
+        let photo = Uuid::new_v4();
+        fx.persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(photo),
+                type_: stored_type_name(BaseItemKind::Photo).unwrap().to_owned(),
+                name: Some("aurora".to_owned()),
+                parent_id: Some(guid_to_db(album)),
+                path: Some(photo_path.to_string_lossy().into_owned()),
+                ..Default::default()
+            }])
+            .await
+            .expect("photo");
+        fx.persistence
+            .set_ancestors(photo, &[album])
+            .await
+            .expect("ancestors");
+        let photo_image = image_info(ImageType::Primary, &photo_path.to_string_lossy(), None);
+        seed_images(&fx.db, photo, std::slice::from_ref(&photo_image)).await;
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 1);
+        let primary = fx.primary_of(album).await.expect("album primary");
+
+        let gone = media.join("gone-backdrop.png");
+        seed_images(
+            &fx.db,
+            album,
+            &[
+                primary.clone(),
+                image_info(ImageType::Backdrop, &gone.to_string_lossy(), None),
+            ],
+        )
+        .await;
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 0);
+        assert_eq!(
+            fx.items.get_image_infos(album).await.unwrap(),
+            vec![primary]
+        );
     }
 
     /// The album's photo is copied off the runtime worker, so a copy from a
@@ -2078,7 +2328,7 @@ mod tests {
         std::fs::create_dir_all(&art).expect("art dir");
         // Nothing reads it back: the image probe answers 0x0 for a zero-length
         // file (the FIFO) without opening it, which would block forever.
-        let output = art.join("primary.jpg");
+        let output = art.join("folder.jpg");
         let status = std::process::Command::new("mkfifo")
             .arg(&output)
             .status()
@@ -2196,16 +2446,94 @@ mod tests {
         assert!(!is_own_image(root, id, &image("https://e.test/a.jpg")));
     }
 
+    /// Only the item's own earlier Primary is replaced: never the new file
+    /// itself (in any case), a file outside its folders (beside the media, or
+    /// reached through a link out of them), or a file another of its rows
+    /// still names.
+    #[test]
+    fn only_the_items_own_replaced_primary_goes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("library");
+        let id = Uuid::from_u128(0x1575);
+        let row = |path: &Path, image_type| ItemImageInfo {
+            path: path.to_string_lossy().into_owned(),
+            image_type,
+            date_modified: Utc::now(),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        let earlier = earlier_art_dir(&root, id);
+        std::fs::create_dir_all(&earlier).unwrap();
+        let old = earlier.join("primary.png");
+        std::fs::write(&old, b"old").unwrap();
+        let output = own_art_dir(&root, id).join("poster.png");
+        let replaced =
+            |images: &[ItemImageInfo], output: &Path| replaced_primary(&root, id, images, output);
+        assert_eq!(
+            replaced(&[row(&old, ImageType::Primary)], &output),
+            Some(old.clone())
+        );
+        assert_eq!(
+            replaced(&[row(&old, ImageType::Logo)], &output),
+            None,
+            "no Primary"
+        );
+        let upper = PathBuf::from(old.to_string_lossy().replace("primary.png", "PRIMARY.PNG"));
+        assert_eq!(
+            replaced(&[row(&old, ImageType::Primary)], &upper),
+            None,
+            "the new file"
+        );
+        assert_eq!(
+            replaced(
+                &[row(&old, ImageType::Primary), row(&old, ImageType::Thumb)],
+                &output
+            ),
+            None,
+            "another row names it"
+        );
+        let media = tmp.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("poster.jpg"), b"user").unwrap();
+        assert_eq!(
+            replaced(
+                &[row(&media.join("poster.jpg"), ImageType::Primary)],
+                &output
+            ),
+            None,
+            "beside the media"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&media, earlier.join("out")).unwrap();
+            assert_eq!(
+                replaced(
+                    &[row(
+                        &earlier.join("out").join("poster.jpg"),
+                        ImageType::Primary
+                    )],
+                    &output
+                ),
+                None,
+                "through a link out of its folders"
+            );
+        }
+        remove_replaced_file(id, &old);
+        assert!(!old.exists());
+        remove_replaced_file(id, &old);
+    }
+
     #[test]
     fn regeneration_removes_stale_primaries_of_other_extensions() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        std::fs::write(dir.join("primary.jpg"), b"old").unwrap();
+        std::fs::write(dir.join("poster.jpg"), b"old").unwrap();
         std::fs::write(dir.join("backdrop.jpg"), b"keep").unwrap();
-        let keep = dir.join("primary.png");
+        let keep = dir.join("poster.png");
         std::fs::write(&keep, b"new").unwrap();
-        remove_other_primaries(dir, &keep);
-        assert!(!dir.join("primary.jpg").exists());
+        remove_other_primaries(dir, "poster", &keep);
+        assert!(!dir.join("poster.jpg").exists());
         assert!(dir.join("backdrop.jpg").exists());
         assert!(keep.exists());
     }
@@ -2293,6 +2621,15 @@ mod tests {
         );
     }
 
+    /// The pass draws a music album's copy of its track's cover before the
+    /// collages that sample album covers.
+    #[test]
+    fn a_music_album_is_drawn_before_the_collages_that_sample_it() {
+        let at = |kind| PASS_KINDS.iter().position(|&k| k == kind).unwrap();
+        assert!(at(BaseItemKind::MusicAlbum) < at(BaseItemKind::MusicGenre));
+        assert!(at(BaseItemKind::MusicAlbum) < at(BaseItemKind::Playlist));
+    }
+
     /// gl-1482: the closing pass lists a kind's ids, not its rows, and reads
     /// the rows a window at a time. Only the projection may change: the same
     /// plan keeps the rows' order, ties included, so the pass draws them in
@@ -2314,7 +2651,8 @@ mod tests {
     /// cannot be decoded as unmeasurable (`debug!`), and a truncated one whose
     /// header still gives its size as having no blurhash (`warn!`), each with
     /// the item, the image type and the path (gl-384,
-    /// `LibraryManager.UpdateImagesAsync`); none gets a hash.
+    /// `LibraryManager.UpdateImagesAsync`); the unreadable ones get an empty
+    /// hash, as upstream stores, and the missing one none.
     #[tokio::test]
     async fn an_unreadable_image_is_logged_with_its_item_type_and_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2363,8 +2701,11 @@ mod tests {
             let mut info = image_info(image_type, path, None);
             fill_image_metadata(&processor, item, path, &mut info).await;
             assert_eq!((info.width, info.height), size, "{path}");
-            assert!(
-                info.blur_hash.as_deref().is_none_or(str::is_empty),
+            // A missing file is left as it is; an unreadable one gets
+            // upstream's empty blurhash.
+            assert_eq!(
+                info.blur_hash.as_deref(),
+                (*path != missing).then_some(""),
                 "{path}"
             );
 

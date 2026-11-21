@@ -227,6 +227,38 @@ pub trait PluginManager: Send + Sync {
     async fn set_plugin_configuration(&self, id: Uuid, config: Vec<u8>)
     -> Result<(), ServiceError>;
 
+    /// A plugin's private data (opaque bytes, JSON by convention), or `None`
+    /// while it has none.
+    ///
+    /// Kept beside the plugin's configuration in a file no route serves:
+    /// [`get_plugin_configuration`](Self::get_plugin_configuration) never
+    /// returns it, and `POST /Plugins/{id}/Configuration` cannot write it. It
+    /// is for what a plugin must keep but no administrator may read back, such
+    /// as the Single Sign-On plugin's client secrets. The default reports
+    /// none, for a manager that keeps no files.
+    ///
+    /// # Errors
+    /// [`ServiceError::NotFound`] when no such plugin is installed; backend
+    /// errors when the file cannot be read.
+    async fn get_plugin_private_data(&self, _id: Uuid) -> Result<Option<Vec<u8>>, ServiceError> {
+        Ok(None)
+    }
+
+    /// Replaces a plugin's private data (see
+    /// [`get_plugin_private_data`](Self::get_plugin_private_data)), written
+    /// whole (a temporary file, then a rename) and readable by the server's
+    /// user only (`0600` on Unix). The default refuses, for a manager that
+    /// keeps no files.
+    ///
+    /// # Errors
+    /// [`ServiceError::NotFound`] when no such plugin is installed; backend
+    /// errors when the file cannot be written.
+    async fn set_plugin_private_data(&self, _id: Uuid, _data: Vec<u8>) -> Result<(), ServiceError> {
+        Err(ServiceError::backend(
+            "this plugin manager keeps no private plugin data",
+        ))
+    }
+
     /// Returns a plugin's bundled image, or `None` when it has none.
     async fn plugin_image(&self, id: Uuid) -> Result<Option<PluginImage>, ServiceError>;
 
@@ -607,6 +639,12 @@ impl PluginManager for DisabledPluginManager {
         id: Uuid,
         _config: Vec<u8>,
     ) -> Result<(), ServiceError> {
+        Err(Self::not_found(id))
+    }
+    async fn get_plugin_private_data(&self, id: Uuid) -> Result<Option<Vec<u8>>, ServiceError> {
+        Err(Self::not_found(id))
+    }
+    async fn set_plugin_private_data(&self, id: Uuid, _data: Vec<u8>) -> Result<(), ServiceError> {
         Err(Self::not_found(id))
     }
     async fn plugin_image(&self, _id: Uuid) -> Result<Option<PluginImage>, ServiceError> {

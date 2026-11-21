@@ -1390,19 +1390,17 @@ mod tests {
         category: Category,
         season_number: i64,
     ) -> Vec<Item> {
-        (0..count)
-            .map(|i| {
-                let hours = i64::try_from(i).expect("small");
-                Item::new(QueuedEpisode {
-                    category,
-                    season_number,
-                    // The queue already filtered exclusions, so the flag is moot.
-                    is_excluded: true,
-                    date_added: Some(newest - chrono::Duration::hours(hours)),
-                    ..entry(hours + 1)
-                })
+        Vec::from_fn(count, |i| {
+            let hours = i64::try_from(i).expect("small");
+            Item::new(QueuedEpisode {
+                category,
+                season_number,
+                // The queue already filtered exclusions, so the flag is moot.
+                is_excluded: true,
+                date_added: Some(newest - chrono::Duration::hours(hours)),
+                ..entry(hours + 1)
             })
-            .collect()
+        })
     }
 
     /// `TestSeasonReanalysis.IsSettledForReanalysis_*`: hours since the newest

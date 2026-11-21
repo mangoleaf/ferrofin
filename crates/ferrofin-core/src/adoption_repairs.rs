@@ -48,8 +48,8 @@ use crate::item_persistence_service::{
     detach_user_data, move_user_data, rekey_rows, rekey_rows_at, user_weights,
 };
 use crate::item_type_lookup::{
-    IdDerivation, derive_item_id_with, kind_from_type_name, legacy_virtual_season_id,
-    stored_type_name, virtual_season_id,
+    ByNameIdentity, IdDerivation, derive_item_id_with, kind_from_type_name,
+    legacy_virtual_season_id, stored_type_name, virtual_season_id,
 };
 use crate::library_scan::{SeasonNames, rekey_source};
 use crate::virtual_paths::VirtualPathExpander;
@@ -114,6 +114,10 @@ pub async fn run_all(db: &Database, paths: &VirtualPathExpander) -> Result<(), S
     if people > 0 {
         tracing::info!(items = people, "merged case-only duplicate people");
     }
+    // Upstream's 20260729, after the duplicate-path fold and the 20260508
+    // merges, on the boot that imported a 10.11 database; before the state's
+    // `save_playlist_xml_once` rewrites a `playlist.xml` from the database.
+    restore_playlist_children_once(db, paths).await?.log();
     // After the merges, which fold rows of one item under several keys (as
     // upstream's 20260508 merges run before its 20260912 harmonize); it logs
     // its own summary, which needs the group count too.
@@ -185,10 +189,7 @@ pub async fn sync_child_parent_names(db: &Database) -> Result<u64, ServiceError>
 
 /// Whether `key` still has to run.
 async fn once(db: &Database, key: &str) -> Result<bool, ServiceError> {
-    if db.meta_get(key).await?.is_some() {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(db.meta_get(key).await?.is_none())
 }
 
 async fn done(db: &Database, key: &str) -> Result<(), ServiceError> {
@@ -207,9 +208,11 @@ type ImportRow = (String, String, Option<String>, bool, Option<String>);
 /// 10.11.11). A 12.0 adoption, a Ferrofin-native database and an install
 /// adopted before the record existed have no such record and are skipped.
 /// `paths` expands a container's stored `%AppDataPath%` path, which entries
-/// relative to the container resolve against.
+/// relative to the container resolve against. Its commit also leaves
+/// [`restore_playlist_children_once`] owed, which fills a playlist left with no
+/// rows from its `playlist.xml`.
 ///
-/// Returns the number of rows written.
+/// Returns the number of rows written from `Data`.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -264,16 +267,30 @@ pub async fn import_membership_once(
                             .map(|d| d.to_string_lossy().into_owned())
                     })
                 };
-                let done =
-                    import_membership(&mut tx, &id, folder.as_deref(), type_ == playlist, &map)
-                        .await?;
+                let done = import_membership(
+                    &mut tx,
+                    &id,
+                    folder.as_deref(),
+                    type_ == playlist,
+                    &map,
+                    paths,
+                )
+                .await?;
                 written += done.written;
                 dropped += done.dropped;
             }
         } else {
-            written += import_video_alternate_versions(&mut tx, &id, &map).await?;
+            written += import_video_alternate_versions(&mut tx, &id, &map, paths).await?;
         }
     }
+    // Upstream's `RestorePlaylistChildrenFromMetadata` runs later in the same
+    // migration pass: [`run_all`] runs it at that point on this boot, keyed by
+    // this marker, which commits with the flag.
+    sqlx::query(r#"INSERT OR REPLACE INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')"#)
+        .bind(RESTORE_PLAYLISTS_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
     sqlx::query(r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#)
         .execute(&mut *tx)
         .await
@@ -283,6 +300,263 @@ pub async fn import_membership_once(
         tracing::warn!(dropped, "dropped unresolvable LinkedChildren entries");
     }
     Ok(written)
+}
+
+/// The `FerrofinMeta` key [`import_membership_once`] sets for
+/// [`restore_playlist_children_once`], which clears it.
+const RESTORE_PLAYLISTS_KEY: &str = "restore_playlist_children_pending_v1";
+
+/// What [`restore_playlist_children_once`] did, for its two log lines.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RestoredPlaylists {
+    /// Playlists given entries, and the entries written.
+    playlists: usize,
+    entries: usize,
+    /// `playlist.xml` paths no item has.
+    unresolved: usize,
+    /// Playlists left as they are with fewer entries than their file lists.
+    short: usize,
+    /// Files that could not be read or do not parse.
+    unreadable: usize,
+}
+
+impl RestoredPlaylists {
+    fn log(&self) {
+        if self.entries > 0 {
+            tracing::info!(
+                entries = self.entries,
+                playlists = self.playlists,
+                "restored the entries of empty playlists from their playlist.xml"
+            );
+        }
+        if self.unresolved + self.short + self.unreadable > 0 {
+            tracing::warn!(
+                unresolved = self.unresolved,
+                short = self.short,
+                unreadable = self.unreadable,
+                "playlist.xml entries not restored: paths no item has, playlists that still hold \
+                 fewer entries than their file lists (check them by hand), files that do not \
+                 read (each one is logged at debug)"
+            );
+        }
+    }
+}
+
+/// `RestorePlaylistChildrenFromMetadata.ReadEntryPaths`: the `<Path>` that
+/// first follows each `<PlaylistItem>` element anywhere in the document,
+/// trimmed, blank ones left out, read as a stream up to the first malformed
+/// spot (a truncated file keeps the entries before it); and whether the whole
+/// document read.
+fn playlist_entry_paths(xml: &str) -> (Vec<String>, bool) {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let (mut paths, mut in_entry, mut open, mut root) = (Vec::new(), false, 0_usize, false);
+    loop {
+        let (element, empty) = match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                open += 1;
+                root = true;
+                (e, false)
+            }
+            Ok(Event::Empty(e)) => {
+                root = true;
+                (e, true)
+            }
+            Ok(Event::End(_)) => {
+                open = open.saturating_sub(1);
+                continue;
+            }
+            // No root, or an element left open: `XmlReader`'s unexpected end
+            // of file.
+            Ok(Event::Eof) => return (paths, root && open == 0),
+            // An entity XML does not define.
+            Ok(Event::GeneralRef(e))
+                if quick_xml::escape::unescape(&format!("&{};", e.as_ref())).is_err() =>
+            {
+                return (paths, false);
+            }
+            // `DtdProcessing.Prohibit`.
+            Ok(Event::DocType(_)) | Err(_) => return (paths, false),
+            Ok(_) => continue,
+        };
+        // `XmlReader` checks an element's attributes as it reads it.
+        if element.attributes().any(|attribute| attribute.is_err()) {
+            return (paths, false);
+        }
+        match element.name().as_ref() {
+            "PlaylistItem" => in_entry = true,
+            "Path" if in_entry => {
+                in_entry = false;
+                // shortcut: the text is read raw, so a CDATA section, a
+                // comment or a child element in `<Path>` is kept as markup
+                // where `XmlReader` would read or refuse it; Jellyfin's
+                // `XmlWriter` writes only escaped text, so upgrade only if a
+                // writer ever does.
+                let value = if empty {
+                    String::new()
+                } else {
+                    // Through its end tag.
+                    open -= 1;
+                    let Ok(raw) = reader.read_text(element.name()) else {
+                        return (paths, false);
+                    };
+                    let Ok(text) = quick_xml::escape::unescape(&raw) else {
+                        return (paths, false);
+                    };
+                    text.into_owned()
+                };
+                if !value.trim().is_empty() {
+                    paths.push(value.trim().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The playlists [`restore_playlist_children_once`] may fill: each one's id,
+/// `playlist.xml` and the paths it lists, read before the write. A file that
+/// does not read, or not whole, counts in `done`.
+async fn listed_playlist_entries(
+    db: &Database,
+    paths: &VirtualPathExpander,
+    done: &mut RestoredPlaylists,
+) -> Result<Vec<(String, PathBuf, Vec<String>)>, ServiceError> {
+    let playlists: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ?1 AND "Path" IS NOT NULL
+           ORDER BY rowid"#,
+    )
+    .bind(stored_type_name(BaseItemKind::Playlist).unwrap_or_default())
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let mut listed = Vec::new();
+    for (id, path) in playlists {
+        let folder = paths.expand(&path);
+        let file = ferrofin_providers::playlist_xml_path(&folder, false);
+        if !Path::new(&folder).is_dir() || !file.is_file() {
+            continue;
+        }
+        let item_id = id.to_ascii_lowercase();
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::debug!(%err, %item_id, path = %file.display(), "could not read playlist.xml");
+                done.unreadable += 1;
+                continue;
+            }
+        };
+        // Upstream keeps the entries read before a malformed spot.
+        let (entries, clean) = playlist_entry_paths(&ferrofin_providers::decode_playlist(&bytes));
+        if !clean {
+            tracing::debug!(%item_id, path = %file.display(), "playlist.xml does not read whole");
+            done.unreadable += 1;
+        }
+        if !entries.is_empty() {
+            listed.push((id, file, entries));
+        }
+    }
+    Ok(listed)
+}
+
+/// 12.0's `RestorePlaylistChildrenFromMetadata`
+/// (`20260729120000_RestorePlaylistChildrenFromMetadata.cs`), once, on the
+/// boot whose [`import_membership_once`] imported a 10.11 database, at
+/// upstream's point in [`run_all`] (after the duplicate-path fold and the
+/// merges, before `save_playlist_xml_once` rewrites a file from the database):
+/// a playlist whose folder holds a `playlist.xml` and which has no
+/// `LinkedChildren` row gets a `Manual` row per `<PlaylistItem><Path>` that is
+/// exactly an item's `Path`, in file order from 0. A playlist that still has
+/// rows is left alone (merging could bring back what a user removed), and so
+/// is a playlist file (`.m3u`), which the scan reads. The files are read
+/// before the write; the rows and the marker's removal commit together.
+///
+/// Upstream's `MigrateLinkedChildren` also removes the 10.11 items whose files
+/// are gone before this runs; here that sweep (`sweep_missing_items`) runs
+/// later in the boot, so an entry naming such an item is restored and then
+/// deleted with it, leaving a gap in `SortOrder` where upstream counts the
+/// entry as unresolved.
+async fn restore_playlist_children_once(
+    db: &Database,
+    paths: &VirtualPathExpander,
+) -> Result<RestoredPlaylists, ServiceError> {
+    let mut done = RestoredPlaylists::default();
+    if db.meta_get(RESTORE_PLAYLISTS_KEY).await?.is_none() {
+        return Ok(done);
+    }
+    let listed = listed_playlist_entries(db, paths, &mut done).await?;
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
+    for (id, file, entries) in listed {
+        // `None`: the other version deleted the playlist since it was read.
+        let children: Option<i64> = sqlx::query_scalar(
+            r#"SELECT (SELECT COUNT(*) FROM "LinkedChildren" WHERE "ParentId" = p."Id")
+               FROM "BaseItems" p WHERE p."Id" = ?1"#,
+        )
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some(children) = children else {
+            continue;
+        };
+        if children > 0 {
+            if entries.len() > usize::try_from(children).unwrap_or(usize::MAX) {
+                tracing::debug!(
+                    item_id = %id.to_ascii_lowercase(),
+                    children,
+                    listed = entries.len(),
+                    path = %file.display(),
+                    "a playlist holds fewer entries than its playlist.xml lists; not restored"
+                );
+                done.short += 1;
+            }
+            continue;
+        }
+        let mut order = 0_i64;
+        for entry in &entries {
+            // Upstream's map takes the first row of each `Path`, as stored.
+            let child: Option<String> = sqlx::query_scalar(
+                r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1 ORDER BY rowid LIMIT 1"#,
+            )
+            .bind(entry)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let Some(child) = child else {
+                tracing::debug!(item_id = %id.to_ascii_lowercase(), path = %entry, "no item has this playlist.xml path");
+                done.unresolved += 1;
+                continue;
+            };
+            sqlx::query(
+                r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+                   VALUES (?1, ?2, ?3, ?4)"#,
+            )
+            .bind(&id)
+            .bind(order)
+            .bind(child)
+            .bind(i32::from(ferrofin_db::enums::LinkedChildType::Manual))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            order += 1;
+        }
+        if order > 0 {
+            tracing::debug!(item_id = %id.to_ascii_lowercase(), entries = order, "restored a playlist's entries");
+            done.playlists += 1;
+            done.entries += usize::try_from(order).unwrap_or_default();
+        }
+    }
+    sqlx::query(r#"DELETE FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+        .bind(RESTORE_PLAYLISTS_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok(done)
 }
 
 /// `MigrateLinkedChildren.ProcessVideoAlternateVersions`: `LocalAlternateVersions`
@@ -295,6 +569,7 @@ async fn import_video_alternate_versions(
     tx: &mut sqlx::SqliteConnection,
     parent_db: &str,
     map: &Map<String, Value>,
+    virtual_paths: &VirtualPathExpander,
 ) -> Result<usize, ServiceError> {
     let mut candidates: Vec<(String, i64)> = Vec::new();
     if let Some(paths) = map.get("LocalAlternateVersions").and_then(Value::as_array) {
@@ -302,7 +577,7 @@ async fn import_video_alternate_versions(
             if path.is_empty() {
                 continue;
             }
-            if let Some(child) = item_by_path(tx, path).await? {
+            if let Some(child) = item_by_path(tx, path, virtual_paths).await? {
                 candidates.push((child, LOCAL_ALTERNATE_VERSION));
             } else {
                 tracing::warn!(
@@ -318,7 +593,7 @@ async fn import_video_alternate_versions(
         linked_map.insert("LinkedChildren".to_owned(), v.clone());
     }
     for child in read_linked_children(&linked_map) {
-        if let Some(child_db) = resolve_linked_child(tx, &child, None).await? {
+        if let Some(child_db) = resolve_linked_child(tx, &child, None, virtual_paths).await? {
             candidates.push((child_db, LINKED_ALTERNATE_VERSION));
         } else {
             tracing::warn!(
@@ -1326,7 +1601,9 @@ struct GroupRow {
 /// the rows — their user data and streams, and their images and provider
 /// ids through the move (a local version then takes its primary's, below) —
 /// and gives them the shape the scan would store, so an adopted database's
-/// first scan writes nothing for them (owner decision D9c):
+/// first scan moves nothing for them (owner decision D9c);
+/// [`rederive_adopted_versions`] then hands its local versions back to that
+/// scan to probe and name as the rows upstream's scan creates:
 ///
 /// - a local version — a row at a path in a movie's, music video's,
 ///   video's or episode's `LocalAlternateVersions`, or a `ChildType` 2 link's child, in
@@ -1338,8 +1615,9 @@ struct GroupRow {
 ///   it takes the primary as `OwnerId` and `PrimaryVersionId`, the
 ///   primary's `PresentationUniqueKey` (its N-format id), `ParentId`,
 ///   `TopParentId`, `IsInMixedFolder` and ancestors, and is linked under it
-///   as a local version (`ChildType` 2). Its name stands: the scan never
-///   renames an owned version (`library_scan::renamed_extra`).
+///   as a local version (`ChildType` 2). Its name stands here: the scan
+///   gives it the resolver's once [`rederive_adopted_versions`] handed it
+///   back (`library_scan::renamed_extra`).
 ///
 ///   Upstream's scan then finds the primary's version links short of its
 ///   `LocalAlternateVersions` — the deleted row took its link along — and
@@ -1374,14 +1652,16 @@ struct GroupRow {
 /// 12.x shape are left alone. Runs once per database (`FerrofinMeta`),
 /// after [`run_all`] — it needs the item-id derivation and the folder roots
 /// the composition root resolves (`art_root` is the item art root,
-/// `{metadata}/library`), and the persistence service the server saves
-/// items through (`persistence`, with its localization attached).
+/// `{metadata}/library`; `virtual_paths`' `reverse` gives the form a path
+/// under it is saved in), and the persistence service the server saves items
+/// through (`persistence`, with its localization attached).
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
 pub async fn rehome_local_versions(
     db: &Database,
     derivation: &IdDerivation,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
     persistence: &dyn ItemPersistenceService,
@@ -1417,6 +1697,7 @@ pub async fn rehome_local_versions(
         );
     }
     let folders = FolderRoots {
+        virtual_paths,
         art_root,
         path_manager,
     };
@@ -1531,25 +1812,121 @@ fn uuid_of(id: &str) -> Result<Uuid, ServiceError> {
     Uuid::parse_str(id).map_err(|err| ServiceError::Backend(err.to_string()))
 }
 
-/// [`rehome_local_versions`] and its log line, for the composition root.
+/// Hands every local alternate version of a database adopted from Jellyfin
+/// 10.11 back to the scan, to be derived afresh with its id, user data and
+/// links kept (owner decision on gl-1599). Jellyfin 12.x deletes a 10.11
+/// local version stored as a `Video` (`MigrateLinkedChildren.
+/// CleanupWrongTypeAlternateVersions`) and its scan creates it again
+/// (`LibraryManager.ResolveAlternateVersion`, `Video.RefreshMetadataForVersions`,
+/// `Video.cs:578-627`): the resolver names it, and its first refresh probes
+/// the file, so its `TotalBitrate` and streams are its own where 10.11 had
+/// stored the primary's bitrate and its own probe's zeros.
+/// [`rehome_local_versions`] keeps the row instead (D9c), so this clears its
+/// refresh stamp: the next scan refreshes it as that new row, probe and
+/// remote providers included, and gives it the resolver's name in place of
+/// the file name 10.11 gave it, unless the item or its name is locked or the
+/// name was edited (`library_scan::adopted_version_name`).
+///
+/// Upstream re-creates only the versions whose type is not their primary's
+/// (`ChildType != ParentType`), and 10.11 stored every local version as a
+/// `Video` (`GetLocalAlternateVersionIds`, 10.11.8 `Video.cs:367-370`): so
+/// the versions handed back are those linked as a local one (`ChildType` 2)
+/// under a primary that is not a `Video`. A home video's versions keep their
+/// row as upstream keeps it. The ones a scan created since the adoption are
+/// handed back too, and so is a version 10.11 already stored with its
+/// primary's type (the Merge Versions plugin links movies of other folders
+/// as local versions): one more probe and first refresh each, the price of
+/// re-deriving a database an earlier Ferrofin adopted and repaired, whose
+/// versions all have their primary's type by now.
+/// It runs once per database adopted from 10.11 ([`adopted_from_10_11`]),
+/// after [`rehome_local_versions`] has completed (until then its versions
+/// are not all linked yet); the stamp a scan of the version beside this one
+/// in a rolling update writes after it stands. Returns the number of
+/// versions handed back.
 ///
 /// # Errors
-/// Returns [`ServiceError`] if the repair's queries fail.
+/// Returns [`ServiceError`] if a query fails; the repair is not marked done
+/// then, and the next boot runs it again.
+pub async fn rederive_adopted_versions(db: &Database) -> Result<u64, ServiceError> {
+    const KEY: &str = "rederive_adopted_versions_v160";
+    const REHOME_KEY: &str = "rehome_local_versions_v12";
+    if once(db, REHOME_KEY).await? || !once(db, KEY).await? || !adopted_from_10_11(db).await? {
+        return Ok(0);
+    }
+    let handed_back = sqlx::query(
+        r#"UPDATE "BaseItems" SET "DateLastRefreshed" = NULL
+           WHERE "DateLastRefreshed" IS NOT NULL
+             AND "Id" IN (SELECT link."ChildId" FROM "LinkedChildren" AS link
+                          JOIN "BaseItems" AS primary_item ON primary_item."Id" = link."ParentId"
+                          WHERE link."ChildType" = ?1 AND primary_item."Type" IS NOT ?2)"#,
+    )
+    .bind(LOCAL_ALTERNATE_VERSION)
+    .bind(stored_type_name(BaseItemKind::Video))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    done(db, KEY).await?;
+    Ok(handed_back)
+}
+
+/// Whether the database was adopted from Jellyfin 10.11, so Jellyfin 12.0's
+/// `MigrateLinkedChildren` (whose `CleanupWrongTypeAlternateVersions` has the
+/// versions re-created) never ran on it: its adoption record names a 10.11
+/// release, or, adopted by a Ferrofin before 1.2 that wrote no record, its
+/// Jellyfin history, which adoption leaves untouched, lacks the routine. A
+/// Ferrofin-native database has neither.
+async fn adopted_from_10_11(db: &Database) -> Result<bool, ServiceError> {
+    if let Some(adoption) = db.adoption_state().await? {
+        return Ok(adoption.generation.starts_with("10.11."));
+    }
+    let jellyfin: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
+    )
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(jellyfin.is_some()
+        && !db
+            .jellyfin_migration_applied("20260113120000_MigrateLinkedChildren")
+            .await?)
+}
+
+/// [`rehome_local_versions`], then [`rederive_adopted_versions`], and their
+/// log lines, for the composition root.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a repair's queries fail.
 pub async fn run_rehome_local_versions(
     db: &Database,
     derivation: &IdDerivation,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
     persistence: &dyn ItemPersistenceService,
 ) -> Result<(), ServiceError> {
-    let rehomed =
-        rehome_local_versions(db, derivation, art_root, path_manager, persistence).await?;
+    let rehomed = rehome_local_versions(
+        db,
+        derivation,
+        virtual_paths,
+        art_root,
+        path_manager,
+        persistence,
+    )
+    .await?;
     if rehomed != RehomedVersions::default() {
         tracing::info!(
             rekeyed = rehomed.rekeyed,
             versions = rehomed.versions,
             parts = rehomed.parts,
             "gave local alternate versions and stacked parts their owner's shape"
+        );
+    }
+    let handed_back = rederive_adopted_versions(db).await?;
+    if handed_back > 0 {
+        tracing::info!(
+            items = handed_back,
+            "repaired adopted local alternate versions: the next scan probes and names them afresh"
         );
     }
     Ok(())
@@ -1582,6 +1959,7 @@ const SEASON_SNAPSHOT_EXTENSION: &str = "db.pre-season-ids";
 pub async fn rekey_virtual_seasons(
     db: &Database,
     derivation: &IdDerivation,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
@@ -1637,7 +2015,8 @@ pub async fn rekey_virtual_seasons(
     for (from, to) in targets {
         // A season with no folder has no media path (its trickplay folder,
         // which one never has, is the internal one).
-        let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+        let (folders, dirs) =
+            move_item_folders(virtual_paths, art_root, path_manager, (from, to), "", false);
         renamed.push((to, folders));
         moves.push(ItemRekey {
             from,
@@ -1679,10 +2058,12 @@ pub async fn rekey_virtual_seasons(
 pub async fn run_rekey_virtual_seasons(
     db: &Database,
     derivation: &IdDerivation,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<(), ServiceError> {
-    let moved = rekey_virtual_seasons(db, derivation, art_root, path_manager).await?;
+    let moved =
+        rekey_virtual_seasons(db, derivation, virtual_paths, art_root, path_manager).await?;
     if moved > 0 {
         tracing::info!(
             items = moved,
@@ -1704,7 +2085,9 @@ const PLAYLIST_SNAPSHOT_EXTENSION: &str = "db.pre-playlist-folders";
 /// Jellyfin's rescan resolves every folder in the playlists folder to that
 /// id and deletes a playlist row it finds no folder for
 /// (`Folder.ValidateChildrenInternal`), so the path and the new id are
-/// written together, in the move's own savepoint (`rekey_rows_at`). The
+/// written together, in the move's own savepoint (`rekey_rows_at`). The path
+/// is stored as a create stores it, through `virtual_paths`
+/// (`%AppDataPath%/playlists/<name>`, `ReverseVirtualPath`). The
 /// entries, owner and shares, user data and images move with it. An upload
 /// an older Ferrofin stored in the playlist's metadata folder stays there:
 /// nothing tells it from a generated image.
@@ -1719,6 +2102,7 @@ pub async fn rekey_pathless_playlists(
     db: &Database,
     derivation: &IdDerivation,
     playlists: &str,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
@@ -1774,7 +2158,8 @@ pub async fn rekey_pathless_playlists(
                 continue;
             }
         };
-        let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+        let (folders, dirs) =
+            move_item_folders(virtual_paths, art_root, path_manager, (from, to), "", false);
         renamed.push((to, folders, path.clone()));
         moves.push(ItemRekey {
             from,
@@ -1784,7 +2169,8 @@ pub async fn rekey_pathless_playlists(
             merged: Vec::new(),
             extra: false,
         });
-        paths.push(path);
+        // Stored as `CreatePlaylist`'s save stores it: `%AppDataPath%/playlists/<name>`.
+        paths.push(virtual_paths.reverse(&path));
     }
     let made: BTreeSet<Uuid> = match rekey_rows_at(db, &moves, &paths, RekeyKind::Represented).await
     {
@@ -1822,10 +2208,19 @@ pub async fn run_rekey_pathless_playlists(
     db: &Database,
     derivation: &IdDerivation,
     playlists: &str,
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<(), ServiceError> {
-    let moved = rekey_pathless_playlists(db, derivation, playlists, art_root, path_manager).await?;
+    let moved = rekey_pathless_playlists(
+        db,
+        derivation,
+        playlists,
+        virtual_paths,
+        art_root,
+        path_manager,
+    )
+    .await?;
     if moved > 0 {
         tracing::info!(
             items = moved,
@@ -1833,6 +2228,203 @@ pub async fn run_rekey_pathless_playlists(
         );
     }
     Ok(())
+}
+
+/// Moves per transaction in [`rekey_by_name_rows`], keeping each write short.
+const BY_NAME_MOVES_PER_TRANSACTION: usize = 128;
+
+/// The moves [`rekey_by_name_rows`] makes: `(from, to, stored type name)`
+/// for each row provably Ferrofin's whose derived id is free.
+async fn plan_by_name_moves(
+    db: &Database,
+    identity: &ByNameIdentity,
+) -> Result<Vec<(Uuid, Uuid, &'static str)>, ServiceError> {
+    let mut planned: Vec<(Uuid, Uuid, &'static str)> = Vec::new();
+    let mut kept = 0_usize;
+    for (kind, value_type) in [
+        (BaseItemKind::Genre, Some(2)),
+        (BaseItemKind::Studio, Some(3)),
+        (BaseItemKind::MusicGenre, None),
+    ] {
+        let Some(type_name) = stored_type_name(kind) else {
+            continue;
+        };
+        // A genre or studio is Ferrofin's when its id is its value's
+        // `ItemValueId`; a music genre has no value row of its own.
+        let rows: Vec<(String, Option<String>, bool)> = match value_type {
+            Some(value_type) => sqlx::query_as(
+                r#"SELECT b."Id", b."Name",
+                          EXISTS (SELECT 1 FROM "ItemValues" v
+                                  WHERE v."ItemValueId" = b."Id" AND v."Type" = ?2)
+                   FROM "BaseItems" b WHERE b."Type" = ?1 ORDER BY b.rowid"#,
+            )
+            .bind(type_name)
+            .bind(value_type),
+            None => sqlx::query_as(
+                r#"SELECT "Id", "Name", 0 FROM "BaseItems" WHERE "Type" = ?1 ORDER BY rowid"#,
+            )
+            .bind(type_name),
+        }
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+        let stored: HashSet<Uuid> = rows
+            .iter()
+            .filter_map(|(id, ..)| Uuid::parse_str(id).ok())
+            .collect();
+        let mut targets = HashSet::new();
+        for (id, name, is_value_id) in &rows {
+            let (Ok(from), Some(name)) = (Uuid::parse_str(id), name.as_deref()) else {
+                continue;
+            };
+            // A music genre is Ferrofin's when its id derives from the bare
+            // name, untrimmed (`music_genre_row`) or trimmed
+            // (`ensure_by_name_item`).
+            let ferrofin_wrote_it = *is_value_id
+                || (value_type.is_none()
+                    && [name, name.trim()].iter().any(|n| {
+                        crate::item_type_lookup::derive_item_id(BaseItemKind::MusicGenre, n)
+                            == Some(from)
+                    }));
+            let Some(to) = identity
+                .id(kind, name)
+                .filter(|to| ferrofin_wrote_it && *to != from)
+            else {
+                continue;
+            };
+            if stored.contains(&to) || !targets.insert(to) {
+                tracing::debug!(
+                    item_id = %from,
+                    to = %to,
+                    "a by-name row's derived id is taken; it keeps its id"
+                );
+                kept += 1;
+                continue;
+            }
+            planned.push((from, to, type_name));
+        }
+    }
+    if kept > 0 {
+        tracing::info!(
+            kept,
+            "genre, music genre or studio rows keep their old ids: another row holds their \
+             derived ids"
+        );
+    }
+    Ok(planned)
+}
+
+/// Moves the by-name `Genre`, `MusicGenre` and `Studio` rows an earlier
+/// Ferrofin wrote under its own ids to the ids Jellyfin derives from their
+/// metadata paths (gl-1597, [`ByNameIdentity`]), with their user data, images,
+/// provider ids and id-named folders, as a scan's rekey moves an item
+/// (`rekey_rows`, `RekeyKind::Represented`: the kind, refresh stamp and
+/// provider ids stay).
+///
+/// Only rows provably Ferrofin's move: a genre or studio whose id is its
+/// `ItemValues` row's, and a music genre whose id derives from the bare name
+/// (`derive_item_id`). A row under any other id, Jellyfin's on an adopted
+/// database among them, stays as it is, and so does a locked row whose value
+/// row was pruned and made again under a new id. So does a row whose derived
+/// id another row already holds, or that a second row also derives: nothing is
+/// folded or deleted.
+///
+/// It runs on every boot, not once: the previous version, beside this one in
+/// a rolling update, keeps writing rows under the old ids, and the next boot
+/// moves them. A database with none to move costs one read per kind. A move
+/// that fails is undone, its folders with it.
+///
+/// No snapshot is taken: the moves delete and fold nothing, every reference
+/// moves inside the move's transaction under the deferred foreign-key check,
+/// and almost every database that ever scanned a genre has rows to move, so
+/// a kept copy would cost a full database's disk on nearly every install. The
+/// old id stays recoverable: a genre's or studio's is its `ItemValueId`, a
+/// music genre's derives from its name.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the planning read fails. A batch whose
+/// transaction cannot be opened or committed is logged, and the repair stops
+/// there for the next boot.
+pub async fn rekey_by_name_rows(
+    db: &Database,
+    identity: &ByNameIdentity,
+    virtual_paths: &VirtualPathExpander,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) -> Result<usize, ServiceError> {
+    let planned = plan_by_name_moves(db, identity).await?;
+    if planned.is_empty() {
+        return Ok(0);
+    }
+    let mut made = 0;
+    for chunk in planned.chunks(BY_NAME_MOVES_PER_TRANSACTION) {
+        let (mut moves, mut renamed) = (Vec::new(), Vec::new());
+        for &(from, to, type_name) in chunk {
+            let (folders, dirs) =
+                move_item_folders(virtual_paths, art_root, path_manager, (from, to), "", false);
+            renamed.push((to, folders));
+            moves.push(ItemRekey {
+                from,
+                to,
+                type_name: type_name.to_owned(),
+                dirs,
+                merged: Vec::new(),
+                extra: false,
+            });
+        }
+        let done: BTreeSet<Uuid> = match rekey_rows(db, &moves, RekeyKind::Represented).await {
+            Ok(done) => done.iter().map(|m| m.to).collect(),
+            // The transaction could not be opened or committed (a move that
+            // fails alone is undone inside it): the lock or the database is
+            // the problem, and the next batch would wait as long again. Stop
+            // here; the batches already made stay, the next boot does the rest.
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "could not move genre, music genre and studio rows to their ids; \
+                     the next boot does the rest"
+                );
+                for (_, folders) in renamed {
+                    folders.undo();
+                }
+                break;
+            }
+        };
+        for (to, folders) in renamed {
+            if done.contains(&to) {
+                folders.commit();
+            } else {
+                folders.undo();
+            }
+        }
+        made += done.len();
+    }
+    Ok(made)
+}
+
+/// [`rekey_by_name_rows`] and its log line, for the composition root: a
+/// failure is logged and the next boot retries, never stopping this one.
+pub async fn run_rekey_by_name_rows(
+    db: &Database,
+    identity: Option<&ByNameIdentity>,
+    virtual_paths: &VirtualPathExpander,
+    art_root: Option<&Path>,
+    path_manager: Option<&dyn PathManager>,
+) {
+    let Some(identity) = identity else {
+        return;
+    };
+    match rekey_by_name_rows(db, identity, virtual_paths, art_root, path_manager).await {
+        Ok(0) => {}
+        Ok(moved) => tracing::info!(
+            moved,
+            "moved genre, music genre and studio rows to the ids Jellyfin derives"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not move genre, music genre and studio rows to their ids; the next boot retries"
+        ),
+    }
 }
 
 /// The extension of the database snapshot [`expand_saved_playlist_containers`]
@@ -1988,6 +2580,127 @@ pub async fn run_expand_saved_playlist_containers(
             %err,
             "could not expand the container entries of playlists an older Ferrofin saved; \
              the repair runs again on the next boot"
+        ),
+    }
+}
+
+/// What [`save_playlist_xml_once`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedPlaylistXml {
+    /// Files written.
+    pub written: usize,
+    /// Playlists whose file could not be written; the repair runs again on
+    /// the next boot.
+    pub pending: usize,
+    /// The first of those failures, for the one warning.
+    pub first_error: Option<String>,
+}
+
+/// Writes the `playlist.xml` of every playlist in the playlists folder once,
+/// from what the database holds (gl-341). No earlier Ferrofin wrote the file:
+/// a playlist Jellyfin made keeps the file Jellyfin last wrote, whatever was
+/// changed here since, and a refresh now reads that file (a full refresh
+/// merges its shares into the stored ones), so a share removed, or a name or
+/// lock changed, since adoption would come back from it. A playlist the saver
+/// does not write (a server-wide disable list) is left alone. When a file
+/// cannot be written, the repair runs again on the next boot, and then writes
+/// every playlist's file again.
+///
+/// During a rolling update the previous version keeps serving after this
+/// ran: a change it makes to a playlist is not in that playlist's file until
+/// the playlist is next changed here, and until then a full refresh of it can
+/// take a share the previous version removed back from the file.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the playlists cannot be listed or the marker
+/// write fails.
+pub async fn save_playlist_xml_once(
+    db: &Database,
+    playlists: &crate::FerrofinPlaylistManager,
+    saver: &ferrofin_providers::container_xml::ContainerXmlSaver,
+    persistence: &dyn ItemPersistenceService,
+) -> Result<SavedPlaylistXml, ServiceError> {
+    const KEY: &str = "playlist_xml_saved_v1";
+    let mut result = SavedPlaylistXml::default();
+    if !once(db, KEY).await? {
+        return Ok(result);
+    }
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as(r#"SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ?1 ORDER BY rowid"#)
+            .bind(stored_type_name(BaseItemKind::Playlist).unwrap_or_default())
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+    for (id, path) in rows {
+        let (Ok(id), Some(path)) = (Uuid::parse_str(&id), path) else {
+            continue;
+        };
+        if !playlists.in_playlists_folder(&path) {
+            continue;
+        }
+        // `MetadataEdit`, as a playlist manager change saves it; the stamp
+        // after the write keeps the file from reading as changed.
+        let outcome = match saver
+            .save(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
+            .await
+        {
+            Ok(true) => persistence.touch_item_updated(id).await.map(|_| true),
+            other => other,
+        };
+        match outcome {
+            Ok(true) => result.written += 1,
+            Ok(false) => {}
+            // One line per playlist would scale with the library: the count
+            // is the caller's warning.
+            Err(err) => {
+                tracing::debug!(
+                    %err,
+                    item_id = %id,
+                    path = %path,
+                    "could not save a playlist's playlist.xml"
+                );
+                result.pending += 1;
+                result
+                    .first_error
+                    .get_or_insert_with(|| format!("{path}: {err}"));
+            }
+        }
+    }
+    if result.pending == 0 {
+        done(db, KEY).await?;
+    }
+    Ok(result)
+}
+
+/// [`save_playlist_xml_once`] and its log line, for the composition root. A
+/// failure is logged, not returned: the repair is not needed to serve, and it
+/// runs again on the next boot.
+pub async fn run_save_playlist_xml_once(
+    db: &Database,
+    playlists: &crate::FerrofinPlaylistManager,
+    saver: &ferrofin_providers::container_xml::ContainerXmlSaver,
+    persistence: &dyn ItemPersistenceService,
+) {
+    match save_playlist_xml_once(db, playlists, saver, persistence).await {
+        Ok(SavedPlaylistXml {
+            written: 0,
+            pending: 0,
+            ..
+        }) => {}
+        Ok(did) if did.pending > 0 => tracing::warn!(
+            written = did.written,
+            pending = did.pending,
+            first_error = did.first_error.as_deref().unwrap_or_default(),
+            "could not save the playlist.xml of some playlists in the playlists folder \
+             (each one's reason is logged at debug); the repair runs again on the next boot"
+        ),
+        Ok(did) => tracing::info!(
+            written = did.written,
+            "wrote the playlist.xml of the playlists in the playlists folder from the database"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not write the playlists' playlist.xml; the repair runs again on the next boot"
         ),
     }
 }
@@ -2262,7 +2975,8 @@ async fn give_box_set_its_folder(
     let (path, to) =
         crate::collection_manager::new_box_set_folder_and_id(db, derivation, collections, name)
             .await?;
-    let (folders, dirs) = move_item_folders(art_root, path_manager, (from, to), "", false);
+    let (folders, dirs) =
+        move_item_folders(virtual_paths, art_root, path_manager, (from, to), "", false);
     let rekey = ItemRekey {
         from,
         to,
@@ -2643,8 +3357,9 @@ const ORPHAN_SWEEP_PROGRESS_STEP: usize = 500;
 /// `{id}` folder — under the metadata root only its `chapters` folder —
 /// whose id no `BaseItems` row has. Nothing else is touched: a folder whose
 /// name is not two characters at the first level, or not an id at the
-/// second, stays, and so do Ferrofin's `{metadata}/library/{GUID}` art
-/// folders and every trickplay folder saved beside the media.
+/// second, stays, and so does the art in an `{id}` folder, as do the
+/// `{metadata}/library/{GUID}` art folders earlier builds wrote and every
+/// trickplay folder saved beside the media.
 ///
 /// Runs once on every database, Ferrofin's own and adopted ones alike:
 /// every Ferrofin before this one left these folders behind when a library
@@ -3235,8 +3950,10 @@ async fn delete_swept(
     Ok(deleted)
 }
 
-/// Where a re-keyed row's id-named folders live.
+/// Where a re-keyed row's id-named folders live, and the expander (`reverse`)
+/// that gives the form a path under them is saved in.
 struct FolderRoots<'a> {
+    virtual_paths: &'a VirtualPathExpander,
     art_root: Option<&'a Path>,
     path_manager: Option<&'a dyn PathManager>,
 }
@@ -3302,7 +4019,7 @@ fn data_paths(row: &GroupRow, key: &str) -> Vec<String> {
     parse_data(row.data.as_deref())
         .get(key)
         .and_then(Value::as_array)
-        .map(|paths| {
+        .map_or_default(|paths| {
             paths
                 .iter()
                 .filter_map(Value::as_str)
@@ -3310,7 +4027,6 @@ fn data_paths(row: &GroupRow, key: &str) -> Vec<String> {
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// The stored rows standing for the file at `path` beside `owner`: the
@@ -3576,6 +4292,7 @@ async fn rekey_to_owner_kind(
             Vec::new()
         } else {
             let (renamed, dirs) = move_item_folders(
+                folders.virtual_paths,
                 folders.art_root,
                 folders.path_manager,
                 (source, *to),
@@ -4098,12 +4815,13 @@ const HARMONIZE_SNAPSHOT_EXTENSION: &str = "db.pre-harmonize";
 ///
 /// Upstream compares the dates as `DateTime`s; here they are text, written
 /// two ways for one instant: EF trims trailing fraction zeros
-/// (`2026-05-14 17:35:09.533`, `2023-08-14 00:00:00`), Ferrofin's
-/// `datetime_to_db` always writes seven digits (`… 09.5330000`). So each
-/// date is padded to the seven-digit form first — exact to the tick (100 ns),
-/// which `julianday` (milliseconds) is not, and ordered like the instant.
-/// A database Ferrofin has run on holds both forms, and a group that only
-/// differs in that way is no conflict.
+/// (`2026-05-14 17:35:09.533`, `2023-08-14 00:00:00`), and Ferrofin's
+/// `datetime_to_db` wrote seven digits (`… 09.5330000`) until 0050 moved
+/// it, and its rows, to EF's form; a previous version still writes them
+/// during a rolling update. So each date is padded to the seven-digit form
+/// first — exact to the tick (100 ns), which `julianday` (milliseconds) is
+/// not, and ordered like the instant. A group that only differs in that way
+/// is no conflict.
 const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
    WHERE "ItemId" <> ?1
      AND ("ItemId" > ?2 OR ("ItemId" = ?2 AND "UserId" > ?3))
@@ -4308,6 +5026,145 @@ mod tests {
         test_db,
     };
 
+    /// No data or metadata directory: the re-key repairs' stored forms are the resolved ones.
+    static NO_PATHS: std::sync::LazyLock<VirtualPathExpander> =
+        std::sync::LazyLock::new(VirtualPathExpander::identity);
+
+    /// The id of the row of `type_suffix` named `name`.
+    async fn row_id(db: &Database, type_suffix: &str, name: &str) -> Option<String> {
+        sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Type" LIKE '%.' || ?1 AND "Name" = ?2"#,
+        )
+        .bind(type_suffix)
+        .bind(name)
+        .fetch_optional(db.pool())
+        .await
+        .expect("row")
+    }
+
+    /// gl-1597: the genre, music genre and studio rows an earlier Ferrofin
+    /// wrote under its own ids move to the ids Jellyfin derives, a user's
+    /// favourite and the generated art folder with them. A row that already
+    /// carries another id (Jellyfin's, on an adopted database) stays, and a
+    /// second boot moves nothing.
+    #[tokio::test]
+    async fn by_name_rows_move_to_the_ids_jellyfin_derives() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let art = tempfile::tempdir().expect("art root");
+        let (movie, song, user) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        crate::test_support::seed_item(&db, movie, BaseItemKind::Movie).await;
+        crate::test_support::seed_item(&db, song, BaseItemKind::Audio).await;
+        crate::test_support::seed_user(&db, user).await;
+        // As an earlier version wrote them: no identity wired.
+        let old = crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        old.save_item_values(
+            movie,
+            &[(2, "Adventure".to_owned()), (3, "Pixar".to_owned())],
+        )
+        .await
+        .expect("movie values");
+        old.save_item_values(song, &[(2, "Ambient".to_owned())])
+            .await
+            .expect("song values");
+        let old_genre = row_id(&db, "Genre", "Adventure").await.expect("old genre");
+        sqlx::query(
+            r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite","Played",
+                                       "PlayCount","PlaybackPositionTicks")
+               VALUES (?1, ?2, lower(?1), 1, 0, 0, 0)"#,
+        )
+        .bind(&old_genre)
+        .bind(guid_to_db(user))
+        .execute(db.writer())
+        .await
+        .expect("favourite");
+        let old_art = crate::dynamic_images::own_art_dir(
+            art.path(),
+            Uuid::parse_str(&old_genre).expect("guid"),
+        );
+        std::fs::create_dir_all(&old_art).expect("art dir");
+        std::fs::write(old_art.join("primary.jpg"), b"collage").expect("collage");
+        // An adopted Jellyfin row: neither its value id nor a name-derived one.
+        let adopted = Uuid::from_u128(0x0AD0_97ED);
+        crate::test_support::seed_named_item(&db, adopted, BaseItemKind::Genre, "Drama").await;
+
+        let identity = crate::test_support::by_name_identity();
+        let moved = rekey_by_name_rows(&db, &identity, &NO_PATHS, Some(art.path()), None)
+            .await
+            .expect("repair");
+        assert_eq!(moved, 3);
+        let derived = |kind, name| identity.id(kind, name).map(guid_to_db);
+        let genre = derived(BaseItemKind::Genre, "Adventure").expect("derived");
+        assert_eq!(
+            row_id(&db, "Genre", "Adventure").await.as_deref(),
+            Some(genre.as_str())
+        );
+        assert_eq!(
+            row_id(&db, "Studio", "Pixar").await,
+            derived(BaseItemKind::Studio, "Pixar")
+        );
+        assert_eq!(
+            row_id(&db, "MusicGenre", "Ambient").await,
+            derived(BaseItemKind::MusicGenre, "Ambient")
+        );
+        assert_eq!(
+            row_id(&db, "Genre", "Drama").await,
+            Some(guid_to_db(adopted)),
+            "an adopted row keeps Jellyfin's id"
+        );
+        let favourite: Option<bool> = sqlx::query_scalar(
+            r#"SELECT "IsFavorite" FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2"#,
+        )
+        .bind(&genre)
+        .bind(guid_to_db(user))
+        .fetch_optional(db.pool())
+        .await
+        .expect("favourite");
+        assert_eq!(favourite, Some(true), "the favourite moved with the genre");
+        let new_art =
+            crate::dynamic_images::own_art_dir(art.path(), Uuid::parse_str(&genre).expect("guid"));
+        assert!(
+            new_art.join("primary.jpg").is_file(),
+            "the art folder moved"
+        );
+        assert!(!old_art.exists());
+        assert_eq!(
+            rekey_by_name_rows(&db, &identity, &NO_PATHS, Some(art.path()), None)
+                .await
+                .expect("again"),
+            0
+        );
+    }
+
+    /// gl-1597: a Ferrofin row whose derived id another row already holds
+    /// keeps its id; nothing is folded or deleted.
+    #[tokio::test]
+    async fn a_by_name_row_whose_derived_id_is_taken_stays() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        crate::test_support::seed_item(&db, movie, BaseItemKind::Movie).await;
+        let old = crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        old.save_item_values(movie, &[(2, "Adventure".to_owned())])
+            .await
+            .expect("values");
+        let identity = crate::test_support::by_name_identity();
+        let taken = identity
+            .id(BaseItemKind::Genre, "Adventure")
+            .expect("derived");
+        // Another genre, under another name, already at that id.
+        crate::test_support::seed_named_item(&db, taken, BaseItemKind::Genre, "Other").await;
+        let before = row_id(&db, "Genre", "Adventure").await;
+        assert_eq!(
+            rekey_by_name_rows(&db, &identity, &NO_PATHS, None, None)
+                .await
+                .expect("repair"),
+            0
+        );
+        assert_eq!(row_id(&db, "Genre", "Adventure").await, before);
+        assert_eq!(row_id(&db, "Genre", "Other").await, Some(guid_to_db(taken)));
+    }
+
     #[tokio::test]
     async fn child_parent_names_are_synced_once() {
         let db = test_db().await;
@@ -4499,6 +5356,304 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
     }
 
+    /// A playlist folder's `playlist.xml` as 10.11 writes it, listing `paths`.
+    fn write_playlist_xml(folder: &Path, paths: &[&str]) {
+        let items = paths
+            .iter()
+            .map(|p| format!("    <PlaylistItem>\n      <Path>{p}</Path>\n    </PlaylistItem>\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        std::fs::create_dir_all(folder).expect("folder");
+        std::fs::write(
+            folder.join("playlist.xml"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n<Item>\n  \
+                 <LocalTitle>Mix</LocalTitle>\n  <PlaylistItems>\n{items}  </PlaylistItems>\n  \
+                 <PlaylistMediaType>Video</PlaylistMediaType>\n</Item>\n"
+            ),
+        )
+        .expect("playlist.xml");
+    }
+
+    /// A 10.11 playlist at `%AppDataPath%/playlists/<name>` whose `Data`
+    /// lists `children` (`None`: no `LinkedChildren` key).
+    async fn seed_10_11_playlist(db: &Database, name: &str, children: Option<&[Uuid]>) -> Uuid {
+        let id = Uuid::new_v4();
+        seed_folder_item(db, id, BaseItemKind::Playlist, name, None).await;
+        set_path(db, id, &format!("%AppDataPath%/playlists/{name}")).await;
+        let entries: Vec<String> = children
+            .unwrap_or_default()
+            .iter()
+            .map(|c| format!(r#"{{"Type":"Manual","ItemId":"{}"}}"#, c.simple()))
+            .collect();
+        let data = match children {
+            Some(_) => format!(r#"{{"LinkedChildren":[{}]}}"#, entries.join(",")),
+            None => "{}".to_owned(),
+        };
+        set_data(db, id, &data).await;
+        id
+    }
+
+    /// gl-1648, 12.0's `RestorePlaylistChildrenFromMetadata`: on the boot that
+    /// imports a 10.11 database's membership, a playlist left with no rows
+    /// (its `Data` empty, unresolvable or keyless) takes a `Manual` row per
+    /// `playlist.xml` path that is exactly an item's, in file order (a repeat
+    /// kept, an unknown path skipped; a malformed file gives the entries
+    /// before its error). A playlist that still has rows, has no file, lists
+    /// nothing or is a playlist file keeps what it has; and it runs once.
+    #[tokio::test]
+    async fn an_empty_10_11_playlist_is_restored_from_its_playlist_xml() {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let root = tempfile::tempdir().expect("program data");
+        let lists = root.path().join("data/playlists");
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                root.path(),
+                "/pd/log",
+                "/pd/c",
+                "/pd/k",
+                "/pd/w",
+            ),
+        ));
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, path) in [(a, "/m/a.mkv"), (b, "/m/b.mkv"), (c, "/m/c.mkv")] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_path(&db, id, path).await;
+        }
+        // Its one `Data` entry names an item that is gone: the import drops it.
+        let emptied = seed_10_11_playlist(&db, "Emptied", Some(&[Uuid::new_v4()])).await;
+        write_playlist_xml(
+            &lists.join("Emptied"),
+            &["/m/a.mkv", "/m/gone.mkv", " /m/b.mkv ", "/m/a.mkv"],
+        );
+        // No `LinkedChildren` key at all: no rows either.
+        let keyless = seed_10_11_playlist(&db, "Keyless", None).await;
+        write_playlist_xml(&lists.join("Keyless"), &["/m/c.mkv"]);
+        // Rows from `Data`: neither restored nor, listing no more, counted.
+        let short = seed_10_11_playlist(&db, "Short", Some(&[c])).await;
+        write_playlist_xml(&lists.join("Short"), &["/m/c.mkv", "/m/a.mkv"]);
+        let even = seed_10_11_playlist(&db, "Even", Some(&[b])).await;
+        write_playlist_xml(&lists.join("Even"), &["/m/c.mkv"]);
+        let no_file = seed_10_11_playlist(&db, "No File", Some(&[])).await;
+        std::fs::create_dir_all(lists.join("No File")).expect("folder");
+        let blank = seed_10_11_playlist(&db, "Blank", Some(&[])).await;
+        write_playlist_xml(&lists.join("Blank"), &["  "]);
+        // Malformed after its first entry: that entry is restored.
+        let broken = seed_10_11_playlist(&db, "Broken", Some(&[])).await;
+        std::fs::create_dir_all(lists.join("Broken")).expect("folder");
+        std::fs::write(
+            lists.join("Broken/playlist.xml"),
+            "<Item><PlaylistItems><PlaylistItem><Path>/m/c.mkv</Path></PlaylistItem>\
+             <PlaylistItem a=></PlaylistItem></PlaylistItems></Item>",
+        )
+        .expect("xml");
+        // A playlist file: the scan's.
+        let m3u = seed_10_11_playlist(&db, "Road.m3u", Some(&[])).await;
+        std::fs::write(lists.join("Road.m3u"), "/m/a.mkv\n").expect("m3u");
+
+        import_membership_once(&db, &paths).await.expect("import");
+        assert_eq!(
+            restore_playlist_children_once(&db, &paths)
+                .await
+                .expect("restore"),
+            RestoredPlaylists {
+                playlists: 3,
+                entries: 5,
+                unresolved: 1,
+                short: 1,
+                unreadable: 1,
+            }
+        );
+
+        let g = guid_to_db;
+        assert_eq!(
+            links(&db)
+                .await
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                (g(emptied), g(a), 0, 0),
+                (g(emptied), g(b), 0, 1),
+                (g(emptied), g(a), 0, 2),
+                (g(keyless), g(c), 0, 0),
+                (g(short), g(c), 0, 0),
+                (g(even), g(b), 0, 0),
+                (g(broken), g(c), 0, 0),
+            ]
+            .into_iter()
+            .collect()
+        );
+        // Once: emptied again, it stays empty.
+        sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
+            .bind(g(keyless))
+            .execute(db.writer())
+            .await
+            .expect("emptied");
+        assert_eq!(
+            restore_playlist_children_once(&db, &paths)
+                .await
+                .expect("again"),
+            RestoredPlaylists::default()
+        );
+        for untouched in [no_file, blank, m3u] {
+            assert!(
+                links(&db).await.iter().all(|l| l.0 != g(untouched)),
+                "{untouched}"
+            );
+        }
+    }
+
+    /// `ReadEntryPaths`: the first `<Path>` after each `<PlaylistItem>`,
+    /// wherever it sits, trimmed, blanks left out.
+    #[rstest::rstest]
+    #[case::one_path_per_entry(
+        "<Item><PlaylistItems><PlaylistItem><Path> /a </Path><Path>/b</Path></PlaylistItem>\
+         <PlaylistItem><ItemId>x</ItemId></PlaylistItem></PlaylistItems></Item>",
+        &["/a"],
+        true
+    )]
+    #[case::outside_playlist_items(
+        "<Item><Path>/x</Path><PlaylistItem><Path>/a</Path></PlaylistItem></Item>",
+        &["/a"],
+        true
+    )]
+    #[case::blank_skipped(
+        "<Item><PlaylistItem><Path>  </Path></PlaylistItem><PlaylistItem><Path/></PlaylistItem>\
+         <PlaylistItem><Path>/b</Path></PlaylistItem></Item>",
+        &["/b"],
+        true
+    )]
+    #[case::entities_unescaped(
+        "<Item><PlaylistItem><Path>/m/Tom &amp; Jerry.mkv</Path></PlaylistItem></Item>",
+        &["/m/Tom & Jerry.mkv"],
+        true
+    )]
+    #[case::up_to_a_bad_attribute(
+        "<Item><PlaylistItems><PlaylistItem><Path>/a</Path></PlaylistItem><PlaylistItem x=>\
+         </PlaylistItem></PlaylistItems></Item>",
+        &["/a"],
+        false
+    )]
+    #[case::truncated_in_a_tag(
+        "<Item><PlaylistItems><PlaylistItem><Path>/a</Path></PlaylistItem><PlaylistItem><Pa",
+        &["/a"],
+        false
+    )]
+    #[case::doctype_prohibited(
+        "<!DOCTYPE Item><Item><PlaylistItem><Path>/a</Path></PlaylistItem></Item>",
+        &[],
+        false
+    )]
+    #[case::undefined_entity(
+        "<Item><PlaylistItem><Path>/a</Path></PlaylistItem><Title>&nbsp;</Title>\
+         <PlaylistItem><Path>/b</Path></PlaylistItem></Item>",
+        &["/a"],
+        false
+    )]
+    #[case::no_root("", &[], false)]
+    #[case::truncated_after_a_tag("<Item><PlaylistItem><Path>/a</Path></PlaylistItem>", &["/a"], false)]
+    fn playlist_xml_entries_read_like_upstream(
+        #[case] xml: &str,
+        #[case] expected: &[&str],
+        #[case] clean: bool,
+    ) {
+        assert_eq!(
+            playlist_entry_paths(xml),
+            (expected.iter().map(|p| (*p).to_owned()).collect(), clean)
+        );
+    }
+
+    /// Upstream runs the routine once, in the pass that imports a 10.11
+    /// database. A 12.x adoption ran it in Jellyfin, a database adopted from
+    /// 10.11 by an earlier Ferrofin has been edited here since (its
+    /// `playlist.xml` is the stale one Jellyfin left), and a Ferrofin
+    /// database never had `Data` membership to lose: none is restored.
+    #[rstest::rstest]
+    #[case::not_adopted(None, false)]
+    #[case::adopted_from_12(Some("12.0.0"), false)]
+    #[case::imported_by_an_earlier_boot(Some("10.11.8"), true)]
+    #[tokio::test]
+    async fn no_playlist_is_restored_outside_a_new_10_11_import(
+        #[case] generation: Option<&str>,
+        #[case] imported: bool,
+    ) {
+        let db = test_db().await;
+        if let Some(generation) = generation {
+            db.record_adoption(generation).await.expect("record");
+        }
+        if imported {
+            sqlx::query(r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#)
+                .execute(db.writer())
+                .await
+                .expect("imported");
+        }
+        let root = tempfile::tempdir().expect("program data");
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                root.path(),
+                "/pd/log",
+                "/pd/c",
+                "/pd/k",
+                "/pd/w",
+            ),
+        ));
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        set_path(&db, item, "/m/a.mkv").await;
+        seed_10_11_playlist(&db, "Emptied", Some(&[])).await;
+        write_playlist_xml(&root.path().join("data/playlists/Emptied"), &["/m/a.mkv"]);
+
+        run_all(&db, &paths).await.expect("repairs");
+
+        let found = links(&db).await;
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// Upstream restores after `FixIncorrectOwnerIdRelationships` folds the
+    /// items sharing a path, so an entry whose path two rows held lands on the
+    /// keeper (the newest), not on the first row, which the fold deletes with
+    /// its playlist entries.
+    #[tokio::test]
+    async fn a_restored_entry_lands_on_the_row_the_duplicate_path_fold_keeps() {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let root = tempfile::tempdir().expect("program data");
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                root.path(),
+                "/pd/log",
+                "/pd/c",
+                "/pd/k",
+                "/pd/w",
+            ),
+        ));
+        let (older, newer) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, created) in [
+            (older, "2025-01-01 00:00:00"),
+            (newer, "2026-01-01 00:00:00"),
+        ] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_path(&db, id, "/m/dup.mkv").await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "DateCreated" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(created)
+                .execute(db.writer())
+                .await
+                .expect("created");
+        }
+        let playlist = seed_10_11_playlist(&db, "Dup", Some(&[])).await;
+        write_playlist_xml(&root.path().join("data/playlists/Dup"), &["/m/dup.mkv"]);
+
+        run_all(&db, &paths).await.expect("repairs");
+
+        assert!(!exists(&db, older).await, "the fold keeps the newest row");
+        assert_eq!(
+            links(&db).await,
+            [(guid_to_db(playlist), guid_to_db(newer), 0, 0)]
+        );
+    }
+
     /// `MigrateLinkedChildren.ResolveChildId`: a cached `ItemId` counts only
     /// while its row exists, then the exact path, a path relative to the
     /// container's expanded folder, and `LibraryItemId`. An entry that
@@ -4554,6 +5709,37 @@ mod tests {
                 .expect("state")
                 .expect("record")
                 .membership_import_done
+        );
+    }
+
+    /// gl-1581: Jellyfin stores a child under its data directory (a
+    /// recording) as `%AppDataPath%/…`, and `FindByPath` reverses the entry's
+    /// resolved path before the comparison, so the entry resolves.
+    #[tokio::test]
+    async fn a_10_11_linked_child_stored_tokenised_resolves_by_its_resolved_path() {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let (boxset, recording) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_folder_item(&db, boxset, BaseItemKind::BoxSet, "Set", None).await;
+        seed_item(&db, recording, BaseItemKind::Movie).await;
+        set_path(&db, recording, "%AppDataPath%/livetv/recordings/R/R.ts").await;
+        set_data(
+            &db,
+            boxset,
+            r#"{"LinkedChildren":[{"Type":"Manual","Path":"/pd/data/livetv/recordings/R/R.ts"}]}"#,
+        )
+        .await;
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new("/pd", "/pd/log", "/pd/c", "/pd/k", "/pd/w"),
+        ));
+
+        assert_eq!(
+            import_membership_once(&db, &paths).await.expect("import"),
+            1
+        );
+        assert_eq!(
+            links(&db).await,
+            vec![(guid_to_db(boxset), guid_to_db(recording), 0, 0)]
         );
     }
 
@@ -4807,6 +5993,119 @@ mod tests {
         [adopted, part, older]
     }
 
+    async fn refreshed(db: &Database, id: Uuid) -> Option<String> {
+        shape(db, id).await.and_then(|shape| shape.7)
+    }
+
+    /// [`rederive_adopted_versions`] hands the local versions of a database
+    /// adopted from 10.11 back to the scan, once its [`rehome_local_versions`]
+    /// completed: their refresh stamps go, and only theirs (the primary keeps
+    /// its own, and so does a home video's version, which 10.11 stored with
+    /// its primary's type and upstream keeps). A 12.x or Ferrofin-native
+    /// database is left as it is, and a second run, even after a scan stamped
+    /// the version again, changes nothing.
+    #[rstest::rstest]
+    #[case::from_10_11_8(Some("10.11.8"), None, 1)]
+    #[case::from_10_11_11(Some("10.11.11"), None, 1)]
+    #[case::from_12_2(Some("12.2.0"), None, 0)]
+    #[case::native(None, None, 0)]
+    #[case::from_10_11_before_the_record(None, Some(false), 1)]
+    #[case::from_12_before_the_record(None, Some(true), 0)]
+    #[tokio::test]
+    async fn adopted_10_11_versions_are_handed_back_to_the_scan_once(
+        #[case] generation: Option<&str>,
+        #[case] history_migrated_linked_children: Option<bool>,
+        #[case] handed_back: u64,
+    ) {
+        const STAMP: &str = "2026-09-03 08:00:00.0000000";
+        let db = test_db().await;
+        if let Some(generation) = generation {
+            db.record_adoption(generation).await.unwrap();
+        }
+        // A Ferrofin before 1.2 wrote no adoption record; Jellyfin's own
+        // history, which adoption leaves untouched, tells the release.
+        if let Some(migrated) = history_migrated_linked_children {
+            sqlx::query(
+                r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT)"#,
+            )
+            .execute(db.writer())
+            .await
+            .unwrap();
+            let id = if migrated {
+                "20260113120000_MigrateLinkedChildren"
+            } else {
+                "20250714044826_ResetJournalMode"
+            };
+            sqlx::query(r#"INSERT INTO "__EFMigrationsHistory" VALUES (?1, '9.0.0')"#)
+                .bind(id)
+                .execute(db.writer())
+                .await
+                .unwrap();
+        }
+        let g = seed_group(&db).await;
+        seed_10_11_rows(&db, &g).await;
+        set_columns(
+            &db,
+            g.primary,
+            r#""DateLastRefreshed" = ?2"#,
+            &[Some(STAMP.to_owned())],
+        )
+        .await;
+        assert_eq!(
+            rederive_adopted_versions(&db).await.unwrap(),
+            0,
+            "nothing is handed back before the rehome has completed"
+        );
+        rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
+            .await
+            .unwrap();
+        let alternate = derive_item_id_with(&DERIVATION, BaseItemKind::Movie, ALTERNATE).unwrap();
+        let adopted_stamp = refreshed(&db, alternate).await;
+        assert!(adopted_stamp.is_some());
+        let home_version = Uuid::from_u128(0x1002);
+        seed_item(&db, home_version, BaseItemKind::Video).await;
+        set_columns(
+            &db,
+            home_version,
+            r#""OwnerId" = ?2, "PrimaryVersionId" = ?2, "DateLastRefreshed" = ?3"#,
+            &[Some(guid_to_db(g.stack)), Some(STAMP.to_owned())],
+        )
+        .await;
+        link(&db, g.stack, home_version, LOCAL_ALTERNATE_VERSION, 0).await;
+        // A version merged by hand is its own title, not a local version.
+        let merged = Uuid::from_u128(0x1003);
+        seed_item(&db, merged, BaseItemKind::Movie).await;
+        set_columns(
+            &db,
+            merged,
+            r#""PrimaryVersionId" = ?2, "DateLastRefreshed" = ?3"#,
+            &[Some(guid_to_db(g.primary)), Some(STAMP.to_owned())],
+        )
+        .await;
+        link(&db, g.primary, merged, LINKED_ALTERNATE_VERSION, 1).await;
+
+        assert_eq!(rederive_adopted_versions(&db).await.unwrap(), handed_back);
+        assert_eq!(refreshed(&db, home_version).await.as_deref(), Some(STAMP));
+        assert_eq!(refreshed(&db, merged).await.as_deref(), Some(STAMP));
+        let expected = if handed_back > 0 {
+            None
+        } else {
+            adopted_stamp.clone()
+        };
+        assert_eq!(refreshed(&db, alternate).await, expected);
+        assert_eq!(refreshed(&db, g.primary).await.as_deref(), Some(STAMP));
+
+        set_columns(
+            &db,
+            alternate,
+            r#""DateLastRefreshed" = ?2"#,
+            &[Some(STAMP.to_owned())],
+        )
+        .await;
+        assert_eq!(rederive_adopted_versions(&db).await.unwrap(), 0);
+        assert_eq!(refreshed(&db, alternate).await.as_deref(), Some(STAMP));
+    }
+
     /// A 10.11 `Data` carries both path lists on every video, almost always
     /// empty: only the videos whose list holds an entry are read, so the
     /// boot repair does not hold every video's `Data` to find its few
@@ -4863,7 +6162,7 @@ mod tests {
         let db = test_db().await;
         let g = seed_group(&db).await;
         let [adopted, part, older] = seed_10_11_rows(&db, &g).await;
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!(
@@ -4942,7 +6241,7 @@ mod tests {
         }
 
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default()
@@ -4952,7 +6251,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default(),
@@ -5035,7 +6334,7 @@ mod tests {
             crate::localization_manager::LocalizationManager::new("US"),
         ));
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store)
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store)
             .await
             .unwrap();
 
@@ -5080,7 +6379,7 @@ mod tests {
             link(&db, g.primary, alternate, LOCAL_ALTERNATE_VERSION, 0).await;
         }
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
 
@@ -5194,7 +6493,7 @@ mod tests {
         let alternate = derive_item_id_with(&DERIVATION, BaseItemKind::Movie, ALTERNATE).unwrap();
 
         assert!(
-            rehome_local_versions(&db, &DERIVATION, None, None, &FailingCopy)
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &FailingCopy)
                 .await
                 .is_err()
         );
@@ -5210,7 +6509,7 @@ mod tests {
                 .is_none()
         );
 
-        rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!(copied(&db, alternate).await.0.as_deref(), Some("PG-13"));
@@ -5235,7 +6534,7 @@ mod tests {
         link(&db, g.primary, alternate, LOCAL_ALTERNATE_VERSION, 0).await;
         db.meta_set(COPY_KEY, &g.primary.to_string()).await.unwrap();
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
 
@@ -5301,7 +6600,7 @@ mod tests {
         )
         .await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
 
@@ -5407,9 +6706,10 @@ mod tests {
         }
         fail_moves(&db).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None, &store(&db))
-            .await
-            .unwrap();
+        let rehomed =
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, Some(&art), None, &store(&db))
+                .await
+                .unwrap();
         assert_eq!(rehomed.rekeyed, 0);
         assert!(exists(&db, adopted).await && exists(&db, target).await);
         assert!(art_folder(&art, adopted).join("poster.jpg").is_file());
@@ -5425,9 +6725,10 @@ mod tests {
             .execute(db.writer())
             .await
             .unwrap();
-        let rehomed = rehome_local_versions(&db, &DERIVATION, Some(&art), None, &store(&db))
-            .await
-            .unwrap();
+        let rehomed =
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, Some(&art), None, &store(&db))
+                .await
+                .unwrap();
         // The version and the older scan's `Movie` part.
         assert_eq!((rehomed.rekeyed, rehomed.versions), (2, 1));
         assert!(!exists(&db, adopted).await);
@@ -5466,7 +6767,7 @@ mod tests {
         seed_user(&db, user).await;
         seed_user_data(&db, user, target, true, None).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!((rehomed.rekeyed, rehomed.versions), (1, 1));
@@ -5540,7 +6841,7 @@ mod tests {
         .await;
         link(&db, primary, as_movie, LINKED_ALTERNATE_VERSION, 0).await;
 
-        let rehomed = rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
         assert_eq!(
@@ -5584,7 +6885,7 @@ mod tests {
             }
         };
         let quiet = open("quiet.db").await;
-        rehome_local_versions(&quiet, &DERIVATION, None, None, &store(&quiet))
+        rehome_local_versions(&quiet, &DERIVATION, &NO_PATHS, None, None, &store(&quiet))
             .await
             .unwrap();
         assert!(!tmp.path().join("quiet.db.pre-rehome").exists());
@@ -5592,7 +6893,7 @@ mod tests {
         let db = open("jellyfin.db").await;
         let g = seed_group(&db).await;
         seed_10_11_rows(&db, &g).await;
-        rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+        rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
             .await
             .unwrap();
         assert!(tmp.path().join("jellyfin.db.pre-rehome").is_file());
@@ -5651,7 +6952,7 @@ mod tests {
         );
 
         assert_eq!(
-            rehome_local_versions(&db, &DERIVATION, None, None, &store(&db))
+            rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store(&db))
                 .await
                 .unwrap(),
             RehomedVersions::default()
@@ -6014,8 +7315,8 @@ mod tests {
         (cleanup, external)
     }
 
-    /// `id`'s art folder (`{metadata}/library/{GUID}`) under `root`'s test
-    /// directories, written with a file.
+    /// `id`'s own art folder (`{metadata}/library/{xx}/{idN}`) under `root`'s
+    /// test directories, written with a file.
     fn planted_art_folder(root: &Path, id: Uuid) -> PathBuf {
         let art = root.join("program/metadata/library");
         let folder = crate::item_folders::item_art_folders(&art, id)[0].clone();
@@ -6947,7 +8248,7 @@ mod tests {
     }
 
     /// One instant written two ways — EF trims fraction zeros, Ferrofin
-    /// writes seven digits — is no conflict: nothing is written (not even
+    /// wrote seven digits before 0050 — is no conflict: nothing is written (not even
     /// the other columns, which differ) and no snapshot is taken. Exact to
     /// the tick: dates one tick apart do conflict.
     #[rstest::rstest]
@@ -7148,7 +8449,16 @@ mod tests {
         .await
         .expect("entry");
 
-        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                &root,
+                format!("{root}/log"),
+                format!("{root}/config"),
+                format!("{root}/cache"),
+                format!("{root}/web"),
+            ),
+        ));
+        let moved = rekey_pathless_playlists(&db, &mode, &playlists, &paths, None, None)
             .await
             .expect("repair");
         assert_eq!(moved, 2);
@@ -7169,7 +8479,11 @@ mod tests {
             let path = format!("{playlists}/{folder}");
             assert!(Path::new(&path).is_dir(), "{path} is made");
             let new = derive_item_id_with(&mode, BaseItemKind::Playlist, &path).expect("id");
-            assert_eq!(at(new).await, Some(Some(path)), "{folder} is at its path");
+            assert_eq!(
+                at(new).await,
+                Some(Some(format!("%AppDataPath%/playlists/{folder}"))),
+                "{folder} is at its path, stored as `CreatePlaylist`'s save stores it"
+            );
             assert_eq!(at(old).await, None, "and no longer at its old id");
         }
         let new = derive_item_id_with(&mode, BaseItemKind::Playlist, &format!("{playlists}/Mix"))
@@ -7194,7 +8508,7 @@ mod tests {
         );
 
         assert_eq!(
-            rekey_pathless_playlists(&db, &mode, &playlists, None, None)
+            rekey_pathless_playlists(&db, &mode, &playlists, &paths, None, None)
                 .await
                 .expect("second boot"),
             0
@@ -7231,9 +8545,16 @@ mod tests {
         let pathless = Uuid::new_v4();
         seed_named_item(&db, pathless, BaseItemKind::Playlist, "Mix").await;
 
-        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
-            .await
-            .expect("repair");
+        let moved = rekey_pathless_playlists(
+            &db,
+            &mode,
+            &playlists,
+            &VirtualPathExpander::identity(),
+            None,
+            None,
+        )
+        .await
+        .expect("repair");
         assert_eq!(moved, 1);
         assert_eq!(
             stored_path(&db, taken).await,
@@ -7263,9 +8584,16 @@ mod tests {
         .await
         .expect("trigger");
 
-        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
-            .await
-            .expect("repair");
+        let moved = rekey_pathless_playlists(
+            &db,
+            &mode,
+            &playlists,
+            &VirtualPathExpander::identity(),
+            None,
+            None,
+        )
+        .await
+        .expect("repair");
         assert_eq!(moved, 0);
         assert_eq!(stored_path(&db, pathless).await, Some(None));
         let folder = format!("{playlists}/Mix");
@@ -7275,9 +8603,16 @@ mod tests {
             .execute(db.writer())
             .await
             .expect("drop trigger");
-        let moved = rekey_pathless_playlists(&db, &mode, &playlists, None, None)
-            .await
-            .expect("next boot");
+        let moved = rekey_pathless_playlists(
+            &db,
+            &mode,
+            &playlists,
+            &VirtualPathExpander::identity(),
+            None,
+            None,
+        )
+        .await
+        .expect("next boot");
         assert_eq!(moved, 1, "the next boot runs it again");
         let to = derive_item_id_with(&mode, BaseItemKind::Playlist, &folder).expect("id");
         assert_eq!(stored_path(&db, to).await, Some(Some(folder)));
@@ -7795,7 +9130,7 @@ mod tests {
         std::fs::create_dir_all(orphan_meta.join("chapters")).expect("chapters");
         let live_meta = id_folder(&metadata, &live.simple().to_string());
         std::fs::create_dir_all(live_meta.join("chapters")).expect("chapters");
-        // Ferrofin's own art folder is no `{xx}/{id}` folder.
+        // The `{ID}` art folder earlier builds wrote is no `{xx}/{id}` folder.
         let art = metadata.join(orphan.hyphenated().to_string().to_uppercase());
         std::fs::create_dir_all(&art).expect("art");
 
@@ -7943,15 +9278,15 @@ mod tests {
     }
 }
 
-// Rebases the absolute paths a database stores under a previous program-data
-// directory onto this server's directories (gl-1165).
+// Rebases the paths a database stores under a previous program-data directory
+// onto this server's directories (gl-1165), relative ones included (gl-1668).
 //
 // Jellyfin stores `{program data}/root`, its library folders and every image
 // path absolute: `ReverseVirtualPath` tokenises only `{program data}/data` and
 // the metadata directory, and `BaseItemMapper.MapImageToEntity` saves image
-// paths raw. Ferrofin writes every path resolved, except the Collections
-// library's folder and the box sets and playlists created through the API
-// (gl-941), which it tokenises as upstream does and so never rewrites. The ids of items under
+// paths raw. Ferrofin tokenises the same two directories on every save
+// (gl-1581), and never rewrites those rows; only a row an earlier build stored
+// resolved is rebased here. The ids of items under
 // program data are derived from the path relative to it (`GetNewItemId`), so
 // after the directory moves (a Debian `/var/lib/jellyfin` adopted into
 // `/var/lib/ferrofin`, or Ferrofin's own data directory relocated) every id
@@ -7964,7 +9299,7 @@ mod tests {
 // written under the new directories, and writes nothing on a server that did
 // not move.
 
-/// The columns that can hold an absolute program-data path.
+/// The columns that can hold a program-data path.
 const PATH_COLUMNS: [(&str, &str); 7] = [
     ("BaseItems", "Path"),
     ("BaseItemImageInfos", "Path"),
@@ -8120,6 +9455,21 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
             "database snapshot taken before rewriting paths under a previous program-data directory"
         );
     }
+    let rows = rewrite_paths(db, &PATH_COLUMNS, &plan.rewrites).await?;
+    Ok((rows > 0).then(|| Rebased {
+        from: plan.from.clone(),
+        rows,
+    }))
+}
+
+/// Writes `rewrites`, `(index into columns, rowid, stored path, new path)`,
+/// in one transaction, each only where its row still holds the stored path:
+/// a row saved since it was read keeps its value. Returns the rows written.
+async fn rewrite_paths(
+    db: &Database,
+    columns: &[(&str, &str)],
+    rewrites: &[(usize, i64, String, String)],
+) -> Result<u64, ServiceError> {
     // One statement per column, not per row, keeps the write lock short (the
     // other version waits 30 s for it): each column's rewrites go into a
     // temporary table keyed by rowid, and the column is updated from it.
@@ -8136,9 +9486,8 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
     .await
     .map_err(db_err)?;
     let mut rows = 0;
-    for (column, (table, name)) in PATH_COLUMNS.into_iter().enumerate() {
-        let moves: Vec<(i64, &str, &str)> = plan
-            .rewrites
+    for (column, &(table, name)) in columns.iter().enumerate() {
+        let moves: Vec<(i64, &str, &str)> = rewrites
             .iter()
             .filter(|(of, ..)| *of == column)
             .map(|(_, rowid, from, to)| (*rowid, from.as_str(), to.as_str()))
@@ -8162,8 +9511,8 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        // Table and column names come from `PATH_COLUMNS`. Compare-and-set: a
-        // row saved since it was read keeps its value.
+        // Table and column names come from the callers' constants.
+        // Compare-and-set: a row saved since it was read keeps its value.
         rows += sqlx::query(sqlx::AssertSqlSafe(format!(
             r#"UPDATE "{table}" SET "{name}" = r."New" FROM temp."FerrofinPathRebase" r
                WHERE r."Row" = "{table}".rowid AND r."Old" = "{table}"."{name}""#
@@ -8178,10 +9527,7 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
         .await
         .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
-    Ok((rows > 0).then(|| Rebased {
-        from: plan.from.clone(),
-        rows,
-    }))
+    Ok(rows)
 }
 
 /// The previous program-data directories the database's rows still name.
@@ -8193,10 +9539,13 @@ async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased
 /// root's `ensure()` re-paths it on the first start after a move (since
 /// v1.4.0), and the user root's `ensure()` re-paths that one, so on a database
 /// started since, the libraries are what still name the old directory. Both
-/// run after this pass, which reads them first. Empty when no row names a
-/// directory other than this server's program data, and for a database with
-/// [`IdDerivation::LegacyLowercase`] ids: they embed the absolute path, so
-/// after a move none is the id derived here.
+/// run after this pass, which reads them first. A relative directory counts:
+/// a server started with a relative data directory before every directory was
+/// made absolute (gl-1151) stored its paths relative, and they move like any
+/// others: onto this server's directories, where the file exists. Empty when
+/// no row names a directory other than this server's program data, and for a
+/// database with [`IdDerivation::LegacyLowercase`] ids: they embed the path as
+/// it was stored, so after a move none is the id derived here.
 async fn previous_program_data_dirs(
     db: &Database,
     derivation: &IdDerivation,
@@ -8244,11 +9593,13 @@ async fn previous_program_data_dirs(
             }
             Path::new("root/default").join(name)
         };
+        // A relative directory is one a server started with a relative data
+        // directory stored (gl-1668); an empty one would name every path.
         if let Some(old) = path
             .ends_with(&place)
             .then(|| path.ancestors().nth(place.components().count()))
             .flatten()
-            .filter(|old| old.is_absolute() && *old != program_data)
+            .filter(|old| !old.as_os_str().is_empty() && *old != program_data)
         {
             previous.insert(old.to_string_lossy().into_owned());
         }
@@ -8355,6 +9706,450 @@ fn profile_image_target(stored: &str, config: &str) -> Option<String> {
             .to_string_lossy()
             .into_owned(),
     )
+}
+
+// Stores the paths an earlier Ferrofin wrote resolved under this server's own
+// data and metadata directories the way every save does since gl-1581
+// (gl-1616).
+//
+// A save stores `BaseItems.Path` and `MediaStreamInfos.Path` through
+// `VirtualPathExpander::reverse`, but the scan writes a row only when it
+// changed, comparing it expanded, so a row an earlier build stored resolved
+// keeps that form until something else about it changes, and a by-name item,
+// a user view, the playlists folder or an external stream rarely does. Those
+// rows name this server's directories, which an export into another layout or
+// a move of the metadata directory leaves behind.
+
+/// The columns upstream stores through `ReverseVirtualPath`: `BaseItems.Path`
+/// (`BaseItemMapper.Map` → `GetPathToSave`, `BaseItemMapper.cs:272,531-538`)
+/// and `MediaStreamInfos.Path` (`MediaStreamRepository.cs:69-87,209`). Image
+/// and chapter paths are stored raw upstream (`MapImageToEntity`), and so are
+/// they here.
+const VIRTUAL_PATH_COLUMNS: [(&str, &str); 2] =
+    [("BaseItems", "Path"), ("MediaStreamInfos", "Path")];
+
+/// Rewrites each path in `BaseItems.Path` and `MediaStreamInfos.Path` stored
+/// at or under this server's data or internal metadata directory into the
+/// form a save stores ([`VirtualPathExpander::reverse`]: `%AppDataPath%/…`,
+/// `%MetadataPath%/…`): by-name items, user views, the playlists folder and
+/// playlists, items under the data directory (recordings in the default
+/// `livetv/recordings`), and external stream files there. Library folders
+/// (under `{program data}/root`), media outside the two directories and
+/// paths already tokenised are not touched.
+///
+/// A path is rewritten only when expanding its new form gives back the
+/// stored text exactly, so no row changes what it names and every read
+/// returns what it returned before; that is also why no snapshot is taken,
+/// which would cost a full database's disk on nearly every install. A path
+/// that names a directory in another spelling (case) is left as it is. The
+/// rows are read per directory in partitions (`virtual_path_candidates_sql`),
+/// each written in its own short transaction, compare-and-set: a row the
+/// previous version saves meanwhile keeps its value, and one it saves after
+/// this ran stays resolved, which every reader expands alike. Runs once per
+/// database (`FerrofinMeta`); an interrupted pass runs again from the start
+/// on the next boot.
+///
+/// Returns the rows rewritten.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a read or a partition's write fails; the
+/// partitions written before stay, and the next boot runs it again.
+pub async fn reverse_stored_virtual_paths(
+    db: &Database,
+    paths: &VirtualPathExpander,
+) -> Result<u64, ServiceError> {
+    reverse_virtual_paths_in_partitions(db, paths, REPAIR_PARTITION).await
+}
+
+/// The next partition of `table`'s `(rowid, column)` rows whose path lies in
+/// `[?1, ?3)` after the `(path, rowid)` cursor `(?1, ?2)`, at most `?4`, in
+/// `(path, rowid)` order. For `BaseItems` that is a range seek on
+/// `IX_BaseItems_Path` in index order (`EXPLAIN QUERY PLAN` pinned by
+/// `the_base_items_read_seeks_the_path_index`); `MediaStreamInfos` has no
+/// path index, so each of its partitions is a scan, and the external stream
+/// files under these directories are few.
+fn virtual_path_candidates_sql(table: &str, column: &str) -> String {
+    // Table and column names come from `VIRTUAL_PATH_COLUMNS`.
+    format!(
+        r#"SELECT rowid, "{column}" FROM "{table}"
+           WHERE "{column}" >= ?1 AND ("{column}", rowid) > (?1, ?2) AND "{column}" < ?3
+           ORDER BY "{column}", rowid LIMIT ?4"#
+    )
+}
+
+/// [`reverse_stored_virtual_paths`], reading `partition` rows at a time.
+async fn reverse_virtual_paths_in_partitions(
+    db: &Database,
+    paths: &VirtualPathExpander,
+    partition: i64,
+) -> Result<u64, ServiceError> {
+    const KEY: &str = "virtual_paths_reversed_v160";
+    let (Some(data), Some(metadata)) = (paths.data_path(), paths.internal_metadata_path()) else {
+        return Ok(0);
+    };
+    if !once(db, KEY).await? {
+        return Ok(0);
+    }
+    tracing::info!(
+        "storing the item and stream paths under the data and metadata directories \
+         as %AppDataPath% and %MetadataPath%"
+    );
+    let mut rewritten = 0;
+    for (column, (table, name)) in VIRTUAL_PATH_COLUMNS.into_iter().enumerate() {
+        let sql = virtual_path_candidates_sql(table, name);
+        for dir in [&data, &metadata] {
+            // Every path that starts with the directory, as stored, byte for
+            // byte: `]` sorts after both `/` and `\`, so a Windows directory's
+            // rows are in range too (`path_prefix_range` covers `/` only), and
+            // `reverse` turns down a look-alike sibling (`data-old`).
+            let dir = dir.trim_end_matches(['/', '\\']);
+            let end = format!("{dir}]");
+            let mut cursor = (dir.to_owned(), i64::MIN);
+            loop {
+                let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
+                    .bind(&cursor.0)
+                    .bind(cursor.1)
+                    .bind(&end)
+                    .bind(partition)
+                    .fetch_all(db.pool())
+                    .await
+                    .map_err(db_err)?;
+                let more = i64::try_from(rows.len()).is_ok_and(|read| read >= partition);
+                let Some((last, last_path)) = rows.last() else {
+                    break;
+                };
+                cursor = (last_path.clone(), *last);
+                let rewrites: Vec<(usize, i64, String, String)> = rows
+                    .into_iter()
+                    .filter_map(|(rowid, stored)| {
+                        let reversed = paths.reverse(&stored);
+                        (reversed != stored && paths.expand(&reversed) == stored)
+                            .then_some((column, rowid, stored, reversed))
+                    })
+                    .collect();
+                if !rewrites.is_empty() {
+                    rewritten += rewrite_paths(db, &VIRTUAL_PATH_COLUMNS, &rewrites).await?;
+                }
+                if !more {
+                    break;
+                }
+            }
+        }
+    }
+    done(db, KEY).await?;
+    Ok(rewritten)
+}
+
+/// [`reverse_stored_virtual_paths`] and its log line, for the composition
+/// root. A failure is a warning and never stops the boot: every reader
+/// expands both forms, and the next boot runs it again.
+pub async fn run_reverse_stored_virtual_paths(db: &Database, paths: &VirtualPathExpander) {
+    match reverse_stored_virtual_paths(db, paths).await {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!(
+            rows,
+            "stored the item and stream paths under the data and metadata directories \
+             as %AppDataPath% and %MetadataPath%"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not store the item and stream paths under the data and metadata \
+             directories as %AppDataPath% and %MetadataPath%; the next boot runs it again"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod virtual_path_tests {
+    use std::sync::Arc;
+
+    use ferrofin_model::data::BaseItemKind;
+
+    use super::*;
+    use crate::test_support::{seed_folder_item, test_db};
+
+    /// This server's directories: `/pd/data` and `/pd/metadata`.
+    fn paths() -> VirtualPathExpander {
+        VirtualPathExpander::from_paths(Arc::new(crate::FerrofinServerApplicationPaths::new(
+            "/pd", "/pd/log", "/pd/c", "/pd/k", "/pd/w",
+        )))
+    }
+
+    async fn seed(db: &Database, kind: BaseItemKind, path: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        seed_folder_item(db, id, kind, "x", None).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(path)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn seed_stream(db: &Database, item: Uuid, index: i64, path: Option<&str>) {
+        sqlx::query(
+            r#"INSERT INTO "MediaStreamInfos"
+               ("ItemId", "StreamIndex", "StreamType", "IsDefault", "IsExternal", "IsForced", "Path")
+               VALUES (?1, ?2, 2, 0, 1, 0, ?3)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(index)
+        .bind(path)
+        .execute(db.writer())
+        .await
+        .unwrap();
+    }
+
+    async fn item_path(db: &Database, id: Uuid) -> Option<String> {
+        sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn stream_paths(db: &Database, item: Uuid) -> Vec<Option<String>> {
+        sqlx::query_scalar(
+            r#"SELECT "Path" FROM "MediaStreamInfos" WHERE "ItemId" = ?1 ORDER BY "StreamIndex""#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+    }
+
+    /// Every row under the data or metadata directory takes the form a save
+    /// stores; everything else, and a second boot, stays as it is. The
+    /// partition of 2 makes the `BaseItems` pass cross several partitions.
+    #[tokio::test]
+    async fn resolved_rows_under_this_servers_directories_are_stored_tokenised() {
+        let db = test_db().await;
+        let tokenised = [
+            (
+                BaseItemKind::Genre,
+                "/pd/metadata/Genre/Rock",
+                "%MetadataPath%/Genre/Rock",
+            ),
+            (
+                BaseItemKind::Person,
+                "/pd/metadata/People/A/Ann Lee",
+                "%MetadataPath%/People/A/Ann Lee",
+            ),
+            (
+                BaseItemKind::UserView,
+                "/pd/metadata/views/ab12",
+                "%MetadataPath%/views/ab12",
+            ),
+            (
+                BaseItemKind::Folder,
+                "/pd/data/playlists",
+                "%AppDataPath%/playlists",
+            ),
+            (
+                BaseItemKind::Playlist,
+                "/pd/data/playlists/Mix",
+                "%AppDataPath%/playlists/Mix",
+            ),
+            (
+                BaseItemKind::Movie,
+                "/pd/data/livetv/recordings/News.ts",
+                "%AppDataPath%/livetv/recordings/News.ts",
+            ),
+        ];
+        let mut expected = Vec::new();
+        for (kind, stored, form) in tokenised {
+            expected.push((seed(&db, kind, stored).await, Some(form.to_owned())));
+        }
+        for (kind, stored) in [
+            // A library folder lives under the root, which is never tokenised.
+            (
+                BaseItemKind::CollectionFolder,
+                Some("/pd/root/default/Movies"),
+            ),
+            (BaseItemKind::Movie, Some("/media/Movies/A.mkv")),
+            // Only whole directories: a look-alike sibling stays.
+            (BaseItemKind::Movie, Some("/pd/data-other/B.mkv")),
+            (BaseItemKind::Playlist, Some("%AppDataPath%/playlists/Kept")),
+            // Another spelling of the directory would read back differently.
+            (BaseItemKind::Movie, Some("/PD/data/livetv/recordings/C.ts")),
+            (BaseItemKind::Season, None),
+        ] {
+            let id = seed(&db, kind, stored.unwrap_or_default()).await;
+            if stored.is_none() {
+                sqlx::query(r#"UPDATE "BaseItems" SET "Path" = NULL WHERE "Id" = ?1"#)
+                    .bind(guid_to_db(id))
+                    .execute(db.writer())
+                    .await
+                    .unwrap();
+            }
+            expected.push((id, stored.map(ToOwned::to_owned)));
+        }
+        let movie = seed(&db, BaseItemKind::Movie, "/media/Movies/A.mkv").await;
+        seed_stream(&db, movie, 0, None).await;
+        seed_stream(&db, movie, 1, Some("/pd/metadata/library/cf/cf75/A.en.srt")).await;
+        seed_stream(&db, movie, 2, Some("/media/Movies/A.fr.srt")).await;
+        seed_stream(&db, movie, 3, Some("/pd/data/subtitles/A.de.srt")).await;
+
+        assert_eq!(
+            reverse_virtual_paths_in_partitions(&db, &paths(), 2)
+                .await
+                .unwrap(),
+            8
+        );
+        for (id, path) in &expected {
+            assert_eq!(&item_path(&db, *id).await, path);
+        }
+        assert_eq!(
+            stream_paths(&db, movie).await,
+            [
+                None,
+                Some("%MetadataPath%/library/cf/cf75/A.en.srt".to_owned()),
+                Some("/media/Movies/A.fr.srt".to_owned()),
+                Some("%AppDataPath%/subtitles/A.de.srt".to_owned()),
+            ]
+        );
+
+        // Once per database: a row stored resolved after it ran stays so.
+        let later = seed(&db, BaseItemKind::Studio, "/pd/metadata/Studio/S").await;
+        assert_eq!(
+            reverse_stored_virtual_paths(&db, &paths()).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            item_path(&db, later).await.as_deref(),
+            Some("/pd/metadata/Studio/S")
+        );
+    }
+
+    /// The `(Path, rowid)` cursor: three rows sharing a path across a
+    /// partition of 2 are all rewritten, and three that are never rewritten
+    /// (a look-alike sibling) still end the pass.
+    #[tokio::test]
+    async fn rows_sharing_a_path_across_partitions_are_all_rewritten() {
+        let db = test_db().await;
+        let mut shared = Vec::new();
+        for _ in 0..3 {
+            shared.push(seed(&db, BaseItemKind::Movie, "/pd/data/livetv/recordings/A.ts").await);
+            seed(&db, BaseItemKind::Movie, "/pd/data-other/B.ts").await;
+        }
+
+        assert_eq!(
+            reverse_virtual_paths_in_partitions(&db, &paths(), 2)
+                .await
+                .unwrap(),
+            3
+        );
+        for id in shared {
+            assert_eq!(
+                item_path(&db, id).await.as_deref(),
+                Some("%AppDataPath%/livetv/recordings/A.ts")
+            );
+        }
+    }
+
+    /// A metadata directory configured under the data directory: `reverse`
+    /// tries the data directory first, as upstream's `Replace` order does, and
+    /// the row still reads back as stored.
+    #[tokio::test]
+    async fn a_metadata_directory_under_the_data_directory_takes_the_data_token() {
+        let db = test_db().await;
+        let app_paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+            "/pd", "/pd/log", "/pd/c", "/pd/k", "/pd/w",
+        ));
+        app_paths.set_internal_metadata_path(Some("/pd/data/meta/"));
+        let paths = VirtualPathExpander::from_paths(app_paths);
+        let genre = seed(&db, BaseItemKind::Genre, "/pd/data/meta/Genre/Rock").await;
+
+        assert_eq!(reverse_stored_virtual_paths(&db, &paths).await.unwrap(), 1);
+        assert_eq!(
+            item_path(&db, genre).await.as_deref(),
+            Some("%AppDataPath%/meta/Genre/Rock")
+        );
+    }
+
+    /// A partition whose write fails leaves the repair due; the next boot
+    /// finishes it.
+    #[tokio::test]
+    async fn a_failed_write_leaves_the_repair_due() {
+        let db = test_db().await;
+        let genre = seed(&db, BaseItemKind::Genre, "/pd/metadata/Genre/Rock").await;
+        sqlx::query(
+            r#"CREATE TRIGGER "fail_path" BEFORE UPDATE OF "Path" ON "BaseItems"
+               BEGIN SELECT RAISE(ABORT, 'disk full'); END"#,
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        assert!(reverse_stored_virtual_paths(&db, &paths()).await.is_err());
+        assert_eq!(
+            item_path(&db, genre).await.as_deref(),
+            Some("/pd/metadata/Genre/Rock")
+        );
+
+        sqlx::query(r#"DROP TRIGGER "fail_path""#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        assert_eq!(
+            reverse_stored_virtual_paths(&db, &paths()).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            item_path(&db, genre).await.as_deref(),
+            Some("%MetadataPath%/Genre/Rock")
+        );
+    }
+
+    /// The `BaseItems` read is a range seek on `IX_BaseItems_Path` in index
+    /// order: no scan of the table and no sort.
+    #[tokio::test]
+    async fn the_base_items_read_seeks_the_path_index() {
+        let db = test_db().await;
+        let explain = format!(
+            "EXPLAIN QUERY PLAN {}",
+            virtual_path_candidates_sql("BaseItems", "Path")
+        );
+        let plan: Vec<String> =
+            sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain.as_str()))
+                .bind("/pd/data")
+                .bind(i64::MIN)
+                .bind("/pd/data]")
+                .bind(2_i64)
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
+        assert!(
+            plan.iter()
+                .all(|step| step.starts_with("SEARCH") && step.contains("IX_BaseItems_Path")),
+            "{plan:?}"
+        );
+    }
+
+    /// With no directories (the identity), nothing is read and the repair
+    /// stays due.
+    #[tokio::test]
+    async fn the_identity_rewrites_nothing_and_leaves_the_repair_due() {
+        let db = test_db().await;
+        let genre = seed(&db, BaseItemKind::Genre, "/pd/metadata/Genre/Rock").await;
+        assert_eq!(
+            reverse_stored_virtual_paths(&db, &VirtualPathExpander::identity())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            reverse_stored_virtual_paths(&db, &paths()).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            item_path(&db, genre).await.as_deref(),
+            Some("%MetadataPath%/Genre/Rock")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8470,6 +10265,11 @@ mod program_data_tests {
         /// A child of this one: the deb's old `/var/lib/ferrofin/data` moved to
         /// `/var/lib/ferrofin`.
         Child,
+        /// `--data-dir dB`, stored relative before every directory was made
+        /// absolute (gl-1668).
+        Relative,
+        /// `--data-dir ./data`, the README's quick start, stored the same way.
+        RelativeDot,
     }
 
     /// One row under `old` in each path column besides the item and image
@@ -8547,6 +10347,8 @@ mod program_data_tests {
                 .to_string_lossy()
                 .into_owned(),
             Previous::Child => program_data.join("data").to_string_lossy().into_owned(),
+            Previous::Relative => "dB".to_owned(),
+            Previous::RelativeDot => "./data".to_owned(),
         };
         let mode = derivation(&program_data);
         let root = program_data.join("root");
@@ -8633,6 +10435,8 @@ mod program_data_tests {
     #[case::elsewhere(Previous::Elsewhere)]
     #[case::into_a_subdirectory(Previous::Parent)]
     #[case::out_of_a_subdirectory(Previous::Child)]
+    #[case::relative(Previous::Relative)]
+    #[case::relative_dot(Previous::RelativeDot)]
     #[tokio::test]
     async fn rewrites_each_moved_path_once_where_its_file_is(#[case] previous: Previous) {
         let moved = moved(previous).await;
@@ -8703,6 +10507,7 @@ mod program_data_tests {
         ];
         expected.sort();
         assert_eq!(image_paths(&moved.db).await, expected);
+        assert_eq!(moved.rebase().await, None, "a second start writes nothing");
     }
 
     #[tokio::test]
@@ -8879,6 +10684,39 @@ mod program_data_tests {
         assert_eq!(item_path(&moved.db, moved.aggregate).await, "/srv/library");
     }
 
+    /// A data directory of `""` stored `root/default/…`: its previous
+    /// directory is empty, which would put every stored path under it.
+    #[tokio::test]
+    async fn an_empty_previous_directory_is_no_evidence_of_a_move() {
+        let moved = moved(Previous::Elsewhere).await;
+        for (id, path) in [
+            (moved.aggregate, "root"),
+            (moved.user_root, "root/default"),
+            (moved.library, "root/default/Movies"),
+        ] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(path)
+                .execute(moved.db.writer())
+                .await
+                .unwrap();
+        }
+
+        let previous = previous_program_data_dirs(
+            &moved.db,
+            &derivation(&moved.program_data),
+            &dirs(&moved.program_data),
+        )
+        .await
+        .unwrap();
+        assert!(previous.is_empty(), "{previous:?}");
+        assert_eq!(moved.rebase().await, None);
+        assert_eq!(
+            item_path(&moved.db, moved.library).await,
+            "root/default/Movies"
+        );
+    }
+
     #[tokio::test]
     async fn a_library_row_whose_id_is_not_its_name_s_is_no_evidence_of_a_move() {
         let moved = moved(Previous::Elsewhere).await;
@@ -9024,7 +10862,8 @@ mod playlist_container_tests {
         .await
         .unwrap();
         assert!(!manager.apply_saved_container_plan(&plan).await.unwrap());
-        assert_eq!(media_type(&db, made).await, None);
+        // A save stores `Unknown` for no media type, as `BaseItemMapper` does.
+        assert_eq!(media_type(&db, made).await.as_deref(), Some("Unknown"));
 
         let ran = expand_saved_playlist_containers(&db, &manager)
             .await
@@ -9038,7 +10877,7 @@ mod playlist_container_tests {
             }
         );
         assert_eq!(media_type(&db, made).await.as_deref(), Some("Video"));
-        assert_eq!(media_type(&db, scanned).await, None);
+        assert_eq!(media_type(&db, scanned).await.as_deref(), Some("Unknown"));
         assert!(db.meta_get(KEY).await.unwrap().is_none());
 
         set_item_path(&db, unfiled, &in_playlists("Unfiled")).await;

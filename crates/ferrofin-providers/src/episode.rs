@@ -300,8 +300,7 @@ pub fn omdb_answer(
         .imdb_id
         .as_deref()
         .filter(|id| !id.is_empty())
-        .map(|id| vec![("Imdb".to_owned(), id.to_owned())])
-        .unwrap_or_default();
+        .map_or_default(|id| vec![("Imdb".to_owned(), id.to_owned())]);
     let people = gates
         .cast_and_crew
         .then(|| omdb_people(omdb))

@@ -93,6 +93,9 @@ pub struct FerrofinNextUpService {
     /// Expands a library row stored tokenised before its options are read
     /// (see [`FerrofinNextUpService::with_virtual_paths`]).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    /// The user-view manager the library scope runs `GetUserViews` through
+    /// (see [`FerrofinNextUpService::with_user_views`]).
+    user_views: crate::item_repository::UserViewsSlot,
 }
 
 impl std::fmt::Debug for FerrofinNextUpService {
@@ -109,7 +112,18 @@ impl FerrofinNextUpService {
         Self {
             db,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+            user_views: crate::item_repository::UserViewsSlot::default(),
         }
+    }
+
+    /// Installs the slot the composition root binds to the server's user-view
+    /// manager, the same one the item repository holds, so the library scope
+    /// writes the user's views exactly when a query's does (`AddUserToQuery`'s
+    /// `GetUserViews`). Left empty, it writes none.
+    #[must_use]
+    pub fn with_user_views(mut self, slot: crate::item_repository::UserViewsSlot) -> Self {
+        self.user_views = slot;
+        self
     }
 
     /// Installs the server's [`VirtualPathExpander`](crate::virtual_paths::VirtualPathExpander),
@@ -239,10 +253,15 @@ impl FerrofinNextUpService {
             // `AddUserToQuery`: `DescendantOfId` is not one of its guards. No
             // visibility evaluator: it only drops the playlists folder and a
             // box-set library, which hold no episodes.
-            scope_to_user_libraries(&self.db, &self.virtual_paths, None, filter)
-                .await?
-                .map(|scoped| scoped.top_parent_ids)
-                .unwrap_or_default()
+            scope_to_user_libraries(
+                &self.db,
+                &self.virtual_paths,
+                None,
+                &self.user_views,
+                filter,
+            )
+            .await?
+            .map_or_default(|scoped| scoped.top_parent_ids)
         } else {
             self.top_parent_ids(&filter.top_parent_ids, user).await?
         };
@@ -796,7 +815,7 @@ pub fn next_up_projection_sql(
     series_keys: usize,
     rewatching: bool,
 ) -> String {
-    let keys: Vec<String> = (0..series_keys).map(|n| n.to_string()).collect();
+    let keys: Vec<String> = Vec::from_fn(series_keys, |n| n.to_string());
     let access = Access {
         filter,
         top_parents,
@@ -852,7 +871,7 @@ pub fn next_up_specials_sql(
     top_parents: &[Uuid],
     series_keys: usize,
 ) -> String {
-    let keys: Vec<String> = (0..series_keys).map(|n| n.to_string()).collect();
+    let keys: Vec<String> = Vec::from_fn(series_keys, |n| n.to_string());
     let access = Access {
         filter,
         top_parents,

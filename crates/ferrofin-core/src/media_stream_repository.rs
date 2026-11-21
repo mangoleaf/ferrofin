@@ -52,6 +52,10 @@ fn stream_type_probe_sql(ids: usize) -> String {
 #[derive(Clone)]
 pub struct FerrofinMediaStreamRepository {
     db: Database,
+    /// The virtual-path pair a stream's `Path` is stored and read with
+    /// (`MediaStreamRepository.GetPathToSave` / `RestorePath`): the identity
+    /// (unit tests) stores and reads it as given.
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinMediaStreamRepository {
@@ -65,7 +69,30 @@ impl FerrofinMediaStreamRepository {
     /// Creates a media-stream repository over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+        }
+    }
+
+    /// Wires the virtual-path tokens: a stream file in this server's data or
+    /// metadata directory (a downloaded subtitle, a recording's sidecar) is
+    /// stored as `%AppDataPath%/…` or `%MetadataPath%/…` and expanded on every
+    /// read, as upstream's `MediaStreamRepository` does (`:69-87,209`).
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
+    }
+
+    /// `RestorePath`: the row's stored `Path` expanded to this server's
+    /// directories.
+    fn restore_path(&self, mut row: MediaStreamInfoEntity) -> MediaStreamInfoEntity {
+        self.virtual_paths.expand_in_place(&mut row.path);
+        row
     }
 
     /// The subset of `item_ids` carrying at least one stream of `stream_type`.
@@ -134,7 +161,13 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         if let Some(stream_type) = filter.stream_type {
             query = query.bind(i64::from(media_stream_type_disc(stream_type)));
         }
-        query.fetch_all(self.db.pool()).await.map_err(db_err)
+        Ok(query
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?
+            .into_iter()
+            .map(|row| self.restore_path(row))
+            .collect())
     }
 
     async fn get_media_streams_batch(
@@ -159,11 +192,41 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
             }
             for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let Ok(id) = Uuid::parse_str(&row.item_id) {
-                    map.entry(id).or_default().push(row);
+                    map.entry(id).or_default().push(self.restore_path(row));
                 }
             }
         }
         Ok(map)
+    }
+
+    async fn sync_has_subtitles(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let id = guid_to_db(item_id);
+        // The JSON functions read `Data` only once `json_valid` passed: they
+        // raise on malformed input, which would fail the statement.
+        let written = sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "Data" = json_set(coalesce(nullif("Data", ''), '{}'), '$.HasSubtitles',
+                   json(CASE WHEN EXISTS (SELECT 1 FROM "MediaStreamInfos"
+                                          WHERE "ItemId" = ?1 AND "StreamType" = ?2)
+                        THEN 'true' ELSE 'false' END))
+               WHERE "Id" = ?1
+                 AND CASE WHEN json_valid(coalesce(nullif("Data", ''), '{}'))
+                     THEN json_type(coalesce(nullif("Data", ''), '{}')) = 'object'
+                          AND json_extract(coalesce(nullif("Data", ''), '{}'), '$.HasSubtitles')
+                              IS NOT EXISTS (SELECT 1 FROM "MediaStreamInfos"
+                                             WHERE "ItemId" = ?1 AND "StreamType" = ?2)
+                     ELSE 0 END"#,
+        )
+        .bind(&id)
+        .bind(i64::from(media_stream_type_disc(MediaStreamType::Subtitle)))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if written > 0 {
+            self.db.note_items_written([id.as_str()]);
+        }
+        Ok(())
     }
 
     async fn get_item_ids_with_subtitles(
@@ -265,7 +328,11 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
                     .bind(&s.language)
                     .bind(s.level)
                     .bind(&s.nal_length_size)
-                    .bind(&s.path)
+                    .bind(
+                        s.path
+                            .as_deref()
+                            .map(|path| self.virtual_paths.reverse(path)),
+                    )
                     .bind(&s.pixel_format)
                     .bind(&s.profile)
                     .bind(s.real_frame_rate)
@@ -294,6 +361,73 @@ mod tests {
     use ferrofin_model::entities::MediaStreamType;
     use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
     use uuid::Uuid;
+
+    /// `sync_has_subtitles` stores `Data.HasSubtitles` from the item's rows in
+    /// one statement: a `NULL` or empty blob becomes an object holding it, a
+    /// missing, `null` or disagreeing key is written, and an agreeing key or a
+    /// blob that is no JSON object is left as it was, byte for byte.
+    #[rstest::rstest]
+    #[case::null(None, true, Some(r#"{"HasSubtitles":true}"#))]
+    #[case::empty(Some(""), false, Some(r#"{"HasSubtitles":false}"#))]
+    #[case::missing(Some(r#"{"A":1}"#), false, Some(r#"{"A":1,"HasSubtitles":false}"#))]
+    #[case::null_value(
+        Some(r#"{"HasSubtitles":null}"#),
+        true,
+        Some(r#"{"HasSubtitles":true}"#)
+    )]
+    #[case::disagrees(
+        Some(r#"{"HasSubtitles":true,"A":1}"#),
+        false,
+        Some(r#"{"HasSubtitles":false,"A":1}"#)
+    )]
+    #[case::agrees(
+        Some(r#"{"HasSubtitles": true, "A" : 1}"#),
+        true,
+        Some(r#"{"HasSubtitles": true, "A" : 1}"#)
+    )]
+    #[case::invalid(Some("not json"), true, Some("not json"))]
+    #[case::array(Some("[1]"), true, Some("[1]"))]
+    #[tokio::test]
+    async fn sync_has_subtitles_stores_the_flag_the_rows_hold(
+        #[case] data: Option<&str>,
+        #[case] subtitle: bool,
+        #[case] expected: Option<&str>,
+    ) {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_item(&db, id, BaseItemKind::Movie).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .bind(data)
+            .execute(db.writer())
+            .await
+            .expect("seed data");
+        let repo = FerrofinMediaStreamRepository::new(db.clone());
+        let mut rows = vec![stream(0, 1, None)];
+        if subtitle {
+            rows.push(stream(1, 2, Some("eng")));
+        }
+        repo.save_media_streams(id, &rows).await.expect("rows");
+
+        repo.sync_has_subtitles(id).await.expect("sync");
+
+        let stored: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("data");
+        assert_eq!(stored.as_deref(), expected);
+    }
+
+    /// No row, nothing to write, and no error.
+    #[tokio::test]
+    async fn sync_has_subtitles_without_a_row_writes_nothing() {
+        FerrofinMediaStreamRepository::new(test_db().await)
+            .sync_has_subtitles(Uuid::new_v4())
+            .await
+            .expect("sync");
+    }
 
     fn stream(index: i64, stream_type: i32, language: Option<&str>) -> MediaStreamInfoEntity {
         MediaStreamInfoEntity {
@@ -348,6 +482,52 @@ mod tests {
         }
     }
 
+    /// gl-1581: a stream file in the metadata directory (a downloaded
+    /// subtitle) is stored `%MetadataPath%/…`, as upstream's
+    /// `MediaStreamRepository` writes it (`GetPathToSave`), and every read
+    /// gives the resolved path back (`RestorePath`), the batch read included.
+    #[tokio::test]
+    async fn a_stream_path_is_stored_tokenised_and_read_back_resolved() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let repo = FerrofinMediaStreamRepository::new(db.clone()).with_virtual_paths(
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths)),
+        );
+        let resolved = format!("{metadata}/library/ab/abcd/movie.en.srt");
+        let mut subtitle = stream(0, 2, Some("eng"));
+        subtitle.path = Some(resolved.clone());
+        repo.save_media_streams(item, std::slice::from_ref(&subtitle))
+            .await
+            .expect("save");
+
+        let stored: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "MediaStreamInfos" WHERE "ItemId" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(item))
+                .fetch_one(db.pool())
+                .await
+                .expect("row");
+        assert_eq!(
+            stored.as_deref(),
+            Some("%MetadataPath%/library/ab/abcd/movie.en.srt")
+        );
+        let one = repo
+            .get_media_streams(&MediaStreamQuery {
+                item_id: item,
+                stream_type: None,
+                index: None,
+            })
+            .await
+            .expect("read");
+        assert_eq!(one[0].path.as_deref(), Some(resolved.as_str()));
+        let batch = repo.get_media_streams_batch(&[item]).await.expect("batch");
+        assert_eq!(batch[&item][0].path.as_deref(), Some(resolved.as_str()));
+    }
+
     /// More streams than one statement's rows are saved whole, each with its
     /// own values (gl-1181).
     #[tokio::test]
@@ -356,10 +536,10 @@ mod tests {
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
         let repo = FerrofinMediaStreamRepository::new(db);
-        let languages: Vec<String> = (0..25).map(|i| format!("l{i:02}")).collect();
-        let streams: Vec<MediaStreamInfoEntity> = (0..25)
-            .map(|i| stream(i, 2, Some(&languages[usize::try_from(i).expect("index")])))
-            .collect();
+        let languages: Vec<String> = Vec::from_fn(25, |i| format!("l{i:02}"));
+        let streams: Vec<MediaStreamInfoEntity> = Vec::from_fn(25, |i| {
+            stream(i64::try_from(i).expect("index"), 2, Some(&languages[i]))
+        });
         repo.save_media_streams(item, &streams).await.expect("save");
         let got: Vec<(i64, Option<String>)> = repo
             .get_media_streams(&MediaStreamQuery {

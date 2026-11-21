@@ -611,11 +611,8 @@ pub(crate) async fn serve_image_file(
     {
         request_headers.remove(axum::http::header::IF_MODIFIED_SINCE);
     }
-    let mut response = ServeFile::new(&serve_path)
-        .oneshot(request)
-        .await
-        .map_err(|e| ApiError::NotFound(e.to_string()))?
-        .map(Body::new);
+    let Ok(response) = ServeFile::new(&serve_path).oneshot(request).await;
+    let mut response = response.map(Body::new);
     // The processor may have converted the format, so trust its MIME over the
     // extension `ServeFile` guessed.
     if let Some(mime) = content_type

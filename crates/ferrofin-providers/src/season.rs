@@ -142,8 +142,7 @@ pub fn tvdb_answer(
         people: None,
         provider_ids: record
             .tvdb_id
-            .map(|id| vec![("Tvdb".to_owned(), id.to_string())])
-            .unwrap_or_default(),
+            .map_or_default(|id| vec![("Tvdb".to_owned(), id.to_string())]),
         locked_fields: Vec::new(),
     }
 }

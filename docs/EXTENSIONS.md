@@ -69,8 +69,8 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
 - **Vendored settings pages.** The upstream plugin's HTML settings page is committed into
   `crates/ferrofin-extensions/assets/<name>/` at build time, so normal builds are hermetic
   (no network fetch). Refresh with `FERROFIN_REFRESH_PLUGIN_ASSETS=1 cargo build -p ferrofin-extensions`.
-  The Ferrofin Settings extension's own page is the exception: it is authored here
-  ([below](#the-ferrofin-settings-extension)).
+  Ferrofin's own extensions, Ferrofin Settings ([below](#the-ferrofin-settings-extension)) and
+  Single Sign-On (`assets/sso/settings.html`), are the exception: their pages are authored here.
 - **Authentication providers join sign-in late.** The user manager is built before the
   extensions, so the composition root hands it every extension's `auth_providers` once
   they are wired (`register_auth_providers`). Sign-in consults them after the built-in
@@ -79,7 +79,9 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
   user's administrator flag in its result rather than saving the user's policy itself
   (which would wait forever on the login lock it is called under). The user manager applies
   it through `UserManager::apply_external_administrator`, which sign-in paths outside the
-  password flow call too, and never demotes the last administrator.
+  password flow call too, and never demotes the last administrator. A provider that refuses
+  every password (Single Sign-On's) answers `false` from `counts_failed_passwords`, so a
+  refused password never counts toward its accounts' lockout.
 - **Password-reset providers join the same way.** `register_auth_providers` also hands the
   user manager every extension's `password_reset_providers`. A forgotten-password request
   goes to the enabled provider a user's `PasswordResetProviderId` names, and to the
@@ -169,11 +171,35 @@ proven against OpenLDAP only: Active Directory has not been tested.
 > must also be unique: two entries sharing a `cn` would otherwise share the account until it is
 > linked.
 
+### Single Sign-On
+
+Beside the ports, two extensions are Ferrofin's own. The first, **Single Sign-On**
+(`crates/ferrofin-extensions/src/sso.rs` and `sso/`), signs users in with an OpenID Connect
+identity provider: a "Sign in with" button on jellyfin-web's login page, accounts created and
+linked by issuer and subject, roles from a claim (a required role, the administrator flag,
+libraries and Live TV), linking and unlinking, profile pictures, and native apps signed in by
+approving their Quick Connect code through the same sign-in. It is **off by default**; its own
+settings page (`assets/sso/settings.html`) holds the providers. Its admin guide is
+[`SINGLE_SIGN_ON.md`](SINGLE_SIGN_ON.md).
+
+It ports no plugin: it has its own id (`67a29a1d-e02b-4aaa-bba0-4b2275e765d0`) and routes, and
+is not the community SSO-Auth plugin, whose settings and links are not imported. Its
+authentication provider (`Ferrofin.SingleSignOn.SsoAuthenticationProvider`) refuses every
+password, and its refusals never count toward lockout. Its routes are in
+`handlers::PLUGIN_ROUTES` and answer `404` while the plugin is off: the provider settings
+(`/sso/admin/oidc/providers`, `/sso/admin/oidc/providers/{provider}`), the sign-in
+(`/sso/oidc/{provider}/start`, `/sso/oidc/{provider}/callback`, `/sso/oidc/exchange`), Quick
+Connect approval (`/sso/quickconnect`), and linking (`/sso/link`, `/sso/links`,
+`/sso/links/{provider}`, `/sso/oidc/{provider}/link`, `/sso/admin/links`). The client secrets
+live in the plugin's private file, which no route serves. To try it,
+[`contrib/oidc-test-realm/`](../contrib/oidc-test-realm/README.md) holds a Keycloak test realm;
+it has been proven against Keycloak only.
+
 ### The Ferrofin Settings extension
 
-Beside the ports, one extension is Ferrofin's own: **Ferrofin Settings**
-(`crates/ferrofin-extensions/src/ferrofin_settings.rs`). It ports no plugin and has no tasks,
-hooks or providers; it gives the server's own settings (`GET` and `POST /Ferrofin/Settings`, see
+The second of Ferrofin's own extensions is **Ferrofin Settings**
+(`crates/ferrofin-extensions/src/ferrofin_settings.rs`), which
+ports no plugin and has no tasks, hooks or providers; it gives the server's own settings (`GET` and `POST /Ferrofin/Settings`, see
 [`CONFIG.md`](CONFIG.md#seeing-what-is-set)) a plugin identity and an enabled flag, so the
 dashboard's Disable toggle turns them off. Its version is the server's release.
 `FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.

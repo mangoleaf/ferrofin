@@ -5,8 +5,7 @@
 fn os_description() -> String {
     let read = |name: &str| {
         std::fs::read_to_string(format!("/proc/sys/kernel/{name}"))
-            .map(|value| value.trim().to_owned())
-            .unwrap_or_default()
+            .map_or_default(|value| value.trim().to_owned())
     };
     format!(
         "{} {} {}",

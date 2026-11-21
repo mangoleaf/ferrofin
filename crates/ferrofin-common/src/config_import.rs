@@ -156,12 +156,18 @@ const READINGS: [Reading; 3] = [Reading::Inferred, Reading::EmptyAsList, Reading
 
 /// A parsed XML element: local name, trimmed text, child elements, and whether
 /// it carried `xsi:nil="true"` (how `XmlSerializer` writes a null value type).
+/// Public for the configuration export's tests, which compare documents as
+/// these trees.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Node {
-    name: String,
-    text: String,
-    nil: bool,
-    children: Vec<Node>,
+pub struct Node {
+    /// The local name, without a namespace prefix.
+    pub name: String,
+    /// The trimmed text.
+    pub text: String,
+    /// Whether the element carried `xsi:nil="true"`.
+    pub nil: bool,
+    /// The child elements, in document order.
+    pub children: Vec<Node>,
 }
 
 /// Imports `xml` over `default`, returning the merged configuration.
@@ -420,7 +426,12 @@ fn parse_number(text: &str) -> Option<Value> {
 }
 
 /// Parses an XML document into its root [`Node`].
-fn parse(xml: &str) -> Result<Node, ConfigImportError> {
+///
+/// # Errors
+///
+/// Returns [`ConfigImportError`] if the XML is malformed, nests deeper than
+/// the import allows, or has no root element.
+pub fn parse(xml: &str) -> Result<Node, ConfigImportError> {
     use quick_xml::events::Event;
 
     let mut reader = quick_xml::Reader::from_str(xml);

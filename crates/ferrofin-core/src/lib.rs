@@ -187,6 +187,7 @@ pub mod chapter_repository;
 pub mod client_event_logger;
 pub mod collection_manager;
 mod collections_library;
+pub mod config_export;
 pub mod config_import;
 pub mod configuration_manager;
 pub mod db_error;
@@ -245,6 +246,7 @@ pub mod people_repository;
 pub mod playback_activity;
 pub mod playback_metrics;
 mod playback_sessions_repository;
+pub mod plugin_config_adoption;
 pub mod plugin_manager;
 pub mod plugin_offered_item_repository;
 mod query_restrictions;
@@ -313,7 +315,8 @@ pub use file_system::FerrofinFileSystem;
 pub use item_count_service::FerrofinItemCountService;
 pub use item_persistence_service::FerrofinItemPersistenceService;
 pub use item_repository::{
-    ActiveRecordingSlot, ActiveRecordingSource, FerrofinItemRepository, VisibilitySlot,
+    ActiveRecordingSlot, ActiveRecordingSource, FerrofinItemRepository, UserViewMaterialisation,
+    UserViewsSlot, VisibilitySlot,
 };
 pub use item_type_lookup::ItemTypeLookup;
 pub use keyframe_repository::FerrofinKeyframeRepository;

@@ -55,7 +55,7 @@ use ferrofin_providers::metadata_merge::{
     forced_sort_name, language_subtag, matches_preferred_language, season_sort_name,
     settle_sort_name,
 };
-use ferrofin_providers::provider_manager::parse_ymd;
+use ferrofin_providers::provider_manager::{is_shared_album_artwork, parse_ymd};
 use ferrofin_providers::{
     EpisodeLocalImageProvider, FsDirectoryService, ImageItem, ImageItemKind, LocalImageProvider,
     RemoteImage, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
@@ -133,10 +133,12 @@ struct ArtworkCache {
     /// Album → the first `REPLAYGAIN_ALBUM_GAIN` its unlocked tracks' probes
     /// read this scan, for the music pass to store on an album that has none.
     album_gains: HashMap<Uuid, f64>,
-    /// Album → immutable shared cover, including dimensions and blurhash.
-    album_covers: HashMap<Uuid, ItemImageInfo>,
-    /// Albums containing tracks scanned before a usable cover was found.
-    albums_needing_backfill: std::collections::HashSet<Uuid>,
+    /// The embedded cover the first track of an album and tag pair
+    /// ([`AlbumCoverKey`]) extracted this scan (that track's own copy,
+    /// measured), which its other tracks with a picture copy instead of
+    /// extracting their own: the one extraction
+    /// `AudioImageProvider.GetAudioImagePath` shares.
+    album_track_covers: HashMap<AlbumCoverKey, ItemImageInfo>,
     /// Series item id → matched TMDB series id.
     series_tmdb: std::collections::HashMap<String, i64>,
     /// (series item id, season number, language) → TMDB details, fetched
@@ -190,8 +192,7 @@ struct ArtworkCache {
     /// sharing one `folder.jpg` share the answer. Only a complete probe is
     /// kept ([`remember_probed_image`]): no other can be adopted.
     ///
-    /// Before the walk it holds the planned albums' rows, for their covers;
-    /// then the stored rows of the items in the current stored-row window,
+    /// It holds the stored rows of the items in the current stored-row window,
     /// each window's replacing the last ([`StoredRows::enter`]), so it never
     /// holds the whole library.
     stored_images: ProbedImages,
@@ -599,6 +600,9 @@ struct LocalNfo {
     /// The artwork the file names by URL (`<thumb>`, `<fanart><thumb>`), the
     /// first of each type: upstream's `localItem.RemoteImages`.
     remote_images: Vec<(String, ImageType)>,
+    /// A playlist folder's `playlist.xml`: the members and shares the walk
+    /// merges once every row is saved ([`playlists`]).
+    playlist: Option<playlists::PlaylistXmlRead>,
 }
 
 /// The `People` of an answer from a provider that only ever `AddPerson`s
@@ -779,55 +783,42 @@ fn lookup_series_tvdb_id(
     }
 }
 
-/// Downloads each [`RemoteImage`] into `item_dir` (as `{type}` plus the
+/// Downloads the [`RemoteImage`] into `item_dir` (as `stem` plus the
 /// extension of the type the response resolved to, as upstream's `ImageSaver`
-/// names it) and returns the persisted-image rows.
+/// names it) and returns the persisted-image row.
 ///
 /// Idempotent per file: an image already on disk is referenced without a
-/// re-download. Individual download/write failures are skipped (best-effort); a
-/// wholly-failed set yields an empty vec.
-async fn download_images(
+/// re-download. A failed download or write is skipped (best-effort): `None`.
+async fn download_image(
     tmdb: &TmdbClient,
-    item_dir: &Path,
+    (item_dir, stem): (&Path, &str),
     item_id: &str,
-    images: Vec<RemoteImage>,
-) -> Vec<ItemImageInfo> {
-    let mut infos: Vec<ItemImageInfo> = Vec::new();
-    let mut satisfied = std::collections::HashSet::new();
-    for image in images {
-        if satisfied.contains(&image.image_type) {
-            continue;
+    image: RemoteImage,
+) -> Option<ItemImageInfo> {
+    // Reuse any on-disk file of this stem regardless of extension — it is
+    // either this download from an earlier scan or a user upload (which
+    // must win over a re-download).
+    let dest = if let Some(existing) = existing_art_file(item_dir, stem) {
+        existing
+    } else {
+        let (bytes, content_type) = tmdb.download(&image.url).await?;
+        let dest = item_dir.join(format!("{stem}{}", art_extension(&content_type)));
+        if let Err(err) =
+            off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
+        {
+            tracing::warn!(%err, item = %item_id, "failed to write downloaded artwork");
+            return None;
         }
-        let stem = image_type_file_stem(image.image_type);
-        // Reuse any on-disk file of this stem regardless of extension — it is
-        // either this download from an earlier scan or a user upload (which
-        // must win over a re-download).
-        let dest = if let Some(existing) = existing_art_file(item_dir, stem) {
-            existing
-        } else {
-            let Some((bytes, content_type)) = tmdb.download(&image.url).await else {
-                continue;
-            };
-            let dest = item_dir.join(format!("{stem}{}", art_extension(&content_type)));
-            if let Err(err) =
-                off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
-            {
-                tracing::warn!(%err, item = %item_id, "failed to write downloaded artwork");
-                continue;
-            }
-            dest
-        };
-        satisfied.insert(image.image_type);
-        infos.push(ItemImageInfo {
-            path: dest.to_string_lossy().into_owned(),
-            image_type: image.image_type,
-            date_modified: file_date_modified(&dest),
-            width: 0,
-            height: 0,
-            blur_hash: None,
-        });
-    }
-    infos
+        dest
+    };
+    Some(ItemImageInfo {
+        path: dest.to_string_lossy().into_owned(),
+        image_type: image.image_type,
+        date_modified: file_date_modified(&dest),
+        width: 0,
+        height: 0,
+        blur_hash: None,
+    })
 }
 
 /// The per-library fetcher gate, derived from the owning library's
@@ -870,13 +861,20 @@ impl<'a> FetcherPolicy<'a> {
     }
 
     /// Whether a metadata saver will rewrite `row`'s metadata
-    /// ([`ferrofin_providers::nfo_save::saves_metadata`]), with this policy's
-    /// library and server-wide options. It reads the configuration only, not
-    /// whether this scanner was given savers: the composition root always
-    /// wires the Nfo saver, as upstream always registers it.
+    /// ([`ferrofin_providers::nfo_save::saves_metadata`], and a box set's
+    /// `collection.xml` or a playlist folder's `playlist.xml`,
+    /// [`ferrofin_providers::container_xml::saves_metadata`]),
+    /// with this policy's library and server-wide options. It reads the
+    /// configuration only, not whether this scanner was given savers: the
+    /// composition root always wires both, as upstream always registers them.
     fn saves_metadata(self, row: &BaseItemEntity) -> bool {
         let kind = row.type_.rsplit('.').next().unwrap_or_default();
         ferrofin_providers::nfo_save::saves_metadata(row, self.options, self.global_for(kind))
+            || ferrofin_providers::container_xml::saves_metadata(
+                row,
+                self.options,
+                self.global_for(kind),
+            )
     }
 
     /// Whether the library enabled metadata fetcher `name` for `kind`.
@@ -1185,8 +1183,9 @@ fn pick_embedded_picture(
             .to_owned(),
             None => Path::new(file_name.unwrap_or_default())
                 .extension()
-                .map(|extension| format!(".{}", extension.to_string_lossy().to_lowercase()))
-                .unwrap_or_default(),
+                .map_or_default(|extension| {
+                    format!(".{}", extension.to_string_lossy().to_lowercase())
+                }),
         };
         let format = match extension.as_str() {
             ".bmp" => ImageFormat::Bmp,
@@ -1278,16 +1277,15 @@ enum StudioThumb {
     RepositoryDown,
 }
 
-/// `StudiosImageProvider` for one studio named `name` whose art folder is
-/// `dir`: a thumb already in the folder, else the repository's, downloaded
-/// there.
+/// `StudiosImageProvider` for one studio named `name` whose thumb is `stem`
+/// in its art folder `dir`: a thumb already in the folder, else the
+/// repository's, downloaded there.
 async fn studio_thumb(
     studios: &ferrofin_providers::StudiosClient,
-    dir: &Path,
+    (dir, stem): (&Path, &str),
     name: &str,
 ) -> StudioThumb {
     use ferrofin_providers::rate_limit::count_request_failures;
-    let stem = image_type_file_stem(ImageType::Thumb);
     if let Some(existing) = existing_art_file(dir, stem) {
         return StudioThumb::Found(existing);
     }
@@ -1316,9 +1314,10 @@ async fn studio_thumb(
 }
 
 /// Parses an art-dir file back to its [`ImageType`] — the inverse of the
-/// `image_file_stem` naming both the scan's downloads and the image-upload
-/// endpoint write (`primary.jpg`, `backdrop1.jpg`, `logo.png`, …). `None` for
-/// unrecognized stems/extensions.
+/// naming the scan's downloads and the image-upload endpoint write
+/// (`internal_image_stem`: `poster.jpg`, `backdrop1.jpg`, `landscape.png`, …)
+/// and of the names earlier builds wrote ([`earlier_art_stem`]:
+/// `primary.jpg`, `thumb.png`, …). `None` for unrecognized stems/extensions.
 fn parse_art_file_stem(path: &Path) -> Option<ImageType> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     if !ART_FILE_EXTENSIONS.contains(&ext.as_str()) {
@@ -1327,17 +1326,17 @@ fn parse_art_file_stem(path: &Path) -> Option<ImageType> {
     let stem = path.file_stem()?.to_str()?;
     let base = stem.trim_end_matches(|c: char| c.is_ascii_digit());
     Some(match base {
-        "primary" => ImageType::Primary,
-        "art" => ImageType::Art,
+        "primary" | "poster" | "folder" => ImageType::Primary,
+        "art" | "clearart" => ImageType::Art,
         "backdrop" => ImageType::Backdrop,
         "banner" => ImageType::Banner,
         "logo" => ImageType::Logo,
-        "thumb" => ImageType::Thumb,
-        "disc" => ImageType::Disc,
+        "thumb" | "landscape" => ImageType::Thumb,
+        "disc" | "cdart" => ImageType::Disc,
         "box" => ImageType::Box,
         "screenshot" => ImageType::Screenshot,
         "menu" => ImageType::Menu,
-        "boxrear" => ImageType::BoxRear,
+        "boxrear" | "back" => ImageType::BoxRear,
         "profile" => ImageType::Profile,
         _ => return None,
     })
@@ -2093,9 +2092,10 @@ pub enum ScanPasses {
     /// `ValidateTopLibraryFolders` opens with.
     Library,
     /// Only what is scoped to the items this scan touched: the music
-    /// refresh of the albums and artists among them, their album covers, the
+    /// refresh of the albums and artists among them, the
     /// children-derived columns of the folders it planned, and the generated
-    /// Primaries of the photo albums, folders and playlists among them — plus
+    /// Primaries of the music and photo albums, folders and playlists among
+    /// them — plus
     /// the library tiles for a library's or the root's refresh, and the user
     /// root's image for the root's.
     /// An item or folder refresh over the API, and the library monitor's
@@ -2103,8 +2103,8 @@ pub enum ScanPasses {
     /// webhooks): upstream's `ProviderManager.RefreshItem` runs no post-scan
     /// task, so a refresh of one movie never enriches every album in the
     /// database. What a library-wide pass owes the items such a refresh
-    /// created (a new studio's artwork, a new year, a new by-name artist's
-    /// first refresh) is selected by the next library validation from what
+    /// created (a new studio's artwork, a new by-name artist's first
+    /// refresh) is selected by the next library validation from what
     /// is stored — each pass's persisted selection — never from this scan's
     /// memory.
     Touched,
@@ -3028,6 +3028,9 @@ struct ItemState<'s, 'a> {
     /// its children. Its stamp is withheld until the end, except a stamp the
     /// scan could not read, which the save keeps.
     save_attempted: bool,
+    /// Set by [`LibraryScanner::scan_item`] when it read a playlist folder's
+    /// `playlist.xml`: what the walk merges once every row is saved.
+    playlist_xml: Option<playlists::PlaylistXmlRead>,
 }
 
 /// Whether [`LibraryScanner::scan_item`] wrote the item.
@@ -3608,37 +3611,149 @@ impl<'a> PlanCtx<'a> {
     }
 }
 
-/// The folders under the art `root` the scan writes `entity`'s art to: its
-/// own folder ([`crate::dynamic_images::own_art_dir`]), then the lower-cased
-/// [`crate::dynamic_images::legacy_art_dir`] older scans also wrote to, while
-/// that is a different folder. A row whose id is no UUID has its stored id's
-/// folder only.
+/// What tracks share one extracted cover by: their `MusicAlbum`'s id, their
+/// `Album` tag and their first album artist, as `GetAudioImagePath` names its
+/// file by the last two. The album's id keeps two albums sharing both apart
+/// (upstream gives them one file: a Jellyfin bug not ported).
+type AlbumCoverKey = (Uuid, String, String);
+
+/// The [`AlbumCoverKey`] of a track in `album`, or `None` when its `Album`
+/// tag or its first album artist is blank: `GetAudioImagePath` then gives
+/// the item a file of its own.
+fn album_cover_key(album: Uuid, track: &BaseItemEntity) -> Option<AlbumCoverKey> {
+    fn named(value: Option<&str>) -> Option<&str> {
+        value.map(str::trim).filter(|v| !v.is_empty())
+    }
+    let tag = named(track.album.as_deref())?;
+    // `Split('|', RemoveEmptyEntries)` (`BaseItemMapper`), then `[0]`.
+    let artist = named(
+        track
+            .album_artists
+            .as_deref()?
+            .split('|')
+            .find(|a| !a.is_empty()),
+    )?;
+    Some((album, tag.to_owned(), artist.to_owned()))
+}
+
+/// Each planned track's album, by id from the plan, never by album title
+/// (two albums may share one): the planned `MusicAlbum` among its ancestors,
+/// so a multi-disc album's tracks are its own.
+fn track_albums(planned: &[Planned]) -> HashMap<Uuid, Uuid> {
+    let albums: std::collections::HashSet<Uuid> = planned
+        .iter()
+        .filter(|p| image_item_kind(&p.entity.type_) == ImageItemKind::MusicAlbum)
+        .map(|p| p.id)
+        .collect();
+    planned
+        .iter()
+        .filter(|p| image_item_kind(&p.entity.type_) == ImageItemKind::Audio)
+        .filter_map(|p| {
+            let album = p.ancestors.iter().rev().find(|id| albums.contains(id))?;
+            Some((p.id, *album))
+        })
+        .collect()
+}
+
+/// The embedded picture `AudioImageProvider.GetImage` extracts: the first
+/// whose comment names the front cover, else the first naming a cover, else
+/// the first; `None` when the file embeds none.
+fn audio_cover_stream(streams: &[MediaStreamInfoEntity]) -> Option<i32> {
+    // In stream order, as `GetMediaStreams` lists them.
+    let mut pictures: Vec<&MediaStreamInfoEntity> = streams
+        .iter()
+        .filter(|s| s.stream_type == EMBEDDED_IMAGE_STREAM_TYPE)
+        .collect();
+    pictures.sort_by_key(|s| s.stream_index);
+    let named = |word: &str| {
+        pictures.iter().copied().find(|s| {
+            s.comment
+                .as_deref()
+                .is_some_and(|c| c.to_lowercase().contains(word))
+        })
+    };
+    named("front")
+        .or_else(|| named("cover"))
+        .or_else(|| pictures.first().copied())
+        .and_then(|s| i32::try_from(s.stream_index).ok())
+}
+
+/// The folders under the art `root` the scan writes `entity`'s art to and
+/// finds it in, the one it writes to first
+/// ([`internal_metadata_dirs`](crate::dynamic_images::internal_metadata_dirs)).
+/// A row whose id is no UUID has its stored id's folder only.
 fn written_art_dirs(root: &Path, entity: &BaseItemEntity) -> Vec<PathBuf> {
     let Ok(id) = Uuid::parse_str(&entity.id) else {
         return vec![root.join(&entity.id)];
     };
-    let own = crate::dynamic_images::own_art_dir(root, id);
-    let legacy = crate::dynamic_images::legacy_art_dir(root, id);
-    if legacy == own {
-        vec![own]
-    } else {
-        vec![own, legacy]
-    }
+    let mut dirs = crate::dynamic_images::internal_metadata_dirs(root, id).to_vec();
+    dirs.dedup();
+    dirs
 }
 
-/// The folder a writer looks for and writes `id`'s `stem` art in: the item's
-/// own folder, unless only the legacy folder older scans wrote to holds a file
-/// of that stem. That file is then reused where it is, its stored path intact,
-/// rather than fetched or extracted again into the own folder.
-fn art_dir_for(root: &Path, id: Uuid, stem: &str) -> PathBuf {
+/// The folder the scan writes `entity`'s art to
+/// ([`own_art_dir`](crate::dynamic_images::own_art_dir)), or its stored id's
+/// when that is no UUID.
+fn own_art_dir_of(root: &Path, entity: &BaseItemEntity) -> PathBuf {
+    Uuid::parse_str(&entity.id).map_or_else(
+        |_| root.join(&entity.id),
+        |id| crate::dynamic_images::own_art_dir(root, id),
+    )
+}
+
+/// `entity`'s type, its short name (`Movie`).
+fn short_type(entity: &BaseItemEntity) -> &str {
+    entity.type_.rsplit('.').next().unwrap_or(&entity.type_)
+}
+
+/// The file name, without its extension, the scan saves `entity`'s
+/// `image_type` art under ([`internal_image_stem`](ferrofin_providers::local_images::internal_image_stem)).
+fn art_stem(entity: &BaseItemEntity, image_type: ImageType) -> String {
+    ferrofin_providers::local_images::internal_image_stem(short_type(entity), image_type)
+}
+
+/// The folder and file name a writer looks for and writes `id`'s
+/// `image_type` art in, for an item of `kind`: its own folder and upstream's
+/// name, unless only a folder earlier builds wrote to holds a file of the
+/// name they gave it ([`earlier_art_stem`]). That file is then reused where
+/// it is, its stored path intact, rather than fetched or extracted again into
+/// the own folder.
+fn art_dir_for(root: &Path, id: Uuid, kind: &str, image_type: ImageType) -> (PathBuf, String) {
     let own = crate::dynamic_images::own_art_dir(root, id);
-    if existing_art_file(&own, stem).is_none() {
-        let legacy = crate::dynamic_images::legacy_art_dir(root, id);
-        if legacy != own && existing_art_file(&legacy, stem).is_some() {
-            return legacy;
+    let stem = ferrofin_providers::local_images::internal_image_stem(kind, image_type);
+    if existing_art_file(&own, &stem).is_none() {
+        let earlier = earlier_art_stem(image_type);
+        for dir in [
+            crate::dynamic_images::earlier_art_dir(root, id),
+            crate::dynamic_images::legacy_art_dir(root, id),
+        ] {
+            if existing_art_file(&dir, earlier).is_some() {
+                return (dir, earlier.to_owned());
+            }
         }
     }
-    own
+    (own, stem)
+}
+
+/// The image a writer reuses rather than fetch or extract `entity`'s
+/// `image_type` art again: a file already in `id`'s own folder, or in one an
+/// earlier build wrote ([`art_dir_for`]), dated by the file and not measured.
+fn existing_art_image(
+    root: &Path,
+    id: Uuid,
+    entity: &BaseItemEntity,
+    image_type: ImageType,
+) -> Option<ItemImageInfo> {
+    let (dir, stem) = art_dir_for(root, id, short_type(entity), image_type);
+    let path = existing_art_file(&dir, &stem)?;
+    Some(ItemImageInfo {
+        date_modified: file_date_modified(&path),
+        path: path.to_string_lossy().into_owned(),
+        image_type,
+        width: 0,
+        height: 0,
+        blur_hash: None,
+    })
 }
 
 /// `dir` without its trailing slashes (`/` stays `/`).
@@ -3826,36 +3941,7 @@ pub(crate) fn dead_by_name_queries() -> [InternalItemsQuery; 2] {
 
 /// The closing passes [`LibraryScanner::post_scan_passes`] runs, each worth
 /// an equal share of the last 4 % of a scan's progress.
-const POST_SCAN_PASSES: u32 = 12;
-
-/// The `albums` whose stored Primary is still the cover `covers` holds for
-/// them, from one read of their image rows. A failed read is logged and
-/// counts as none: each album then has its cover published again, as an
-/// album whose rows could not be read always had.
-async fn albums_keeping_their_cover(
-    items: &dyn ItemRepository,
-    albums: &[Uuid],
-    covers: &HashMap<Uuid, ItemImageInfo>,
-) -> std::collections::HashSet<Uuid> {
-    let stored = items
-        .get_image_infos_batch(albums)
-        .await
-        .unwrap_or_else(|err| {
-            tracing::warn!(%err, "could not read the albums' stored artwork to check their covers");
-            HashMap::new()
-        });
-    stored
-        .into_iter()
-        .filter(|(id, images)| {
-            covers.get(id).is_some_and(|cover| {
-                images
-                    .iter()
-                    .any(|image| image.image_type == ImageType::Primary && image.path == cover.path)
-            })
-        })
-        .map(|(id, _)| id)
-        .collect()
-}
+const POST_SCAN_PASSES: u32 = 10;
 
 /// How many items the splashscreen draws its posters (and, separately, its
 /// thumbs or backdrops) from: `GetItemsWithImageType`'s `Limit = 30`.
@@ -3920,8 +4006,6 @@ async fn splashscreen_images(items: &dyn ItemRepository, image_type: ImageType) 
 #[derive(Debug, Default)]
 struct PassTimings {
     music: std::time::Duration,
-    album_covers: std::time::Duration,
-    years: std::time::Duration,
     artists: std::time::Duration,
     dead_by_name: std::time::Duration,
     aggregates: std::time::Duration,
@@ -3940,8 +4024,6 @@ impl PassTimings {
     fn log(&self, albums_and_artists: usize, elapsed: std::time::Duration) {
         let [
             music,
-            album_covers,
-            years,
             artists,
             dead_by_name,
             aggregates,
@@ -3954,8 +4036,6 @@ impl PassTimings {
         ] = crate::scan_metrics::SCAN_PASSES;
         crate::scan_metrics::passes_finished(&[
             (music, self.music),
-            (album_covers, self.album_covers),
-            (years, self.years),
             (artists, self.artists),
             (dead_by_name, self.dead_by_name),
             (aggregates, self.aggregates),
@@ -3970,8 +4050,6 @@ impl PassTimings {
         tracing::info!(
             albums_and_artists,
             music_ms = ms(self.music),
-            album_covers_ms = ms(self.album_covers),
-            years_ms = ms(self.years),
             artists_ms = ms(self.artists),
             dead_by_name_ms = ms(self.dead_by_name),
             aggregates_ms = ms(self.aggregates),
@@ -3992,7 +4070,7 @@ impl PassTimings {
 /// as it starts (`number` of [`POST_SCAN_PASSES`]) and one as it finishes,
 /// with `elapsed_ms` and an `outcome`: `cancelled` when the scan was cancelled
 /// by then, `failed` when `work` answers `false` (it logged its error itself),
-/// else `completed`. A pass whose failures are per item (music, album covers)
+/// else `completed`. A pass whose failures are per item (music, dynamic images)
 /// logs those inside and answers `true`, as an upstream task completes over
 /// its items' errors. Both lines and every event of `work` run in a
 /// `post_scan_pass` span carrying `pass`, the pass's
@@ -4213,6 +4291,7 @@ static NO_STORED_LINKS: StoredItemLinks = StoredItemLinks {
     ancestors: Vec::new(),
     external_subtitles: Vec::new(),
     external_audio: Vec::new(),
+    embedded_images: Vec::new(),
     locked_fields: Vec::new(),
 };
 
@@ -4390,10 +4469,6 @@ pub struct LibraryScanner {
     /// and their tracks) and the other closing passes. Absent → no music
     /// pass.
     item_repository: Option<Arc<dyn ItemRepository>>,
-    /// The `Year` by-name provisioner for the post-scan year pass (one `Year`
-    /// row per distinct scanned `ProductionYear`, so `/Years` lists every
-    /// year without a write on the read path). Absent → no year pass.
-    years: Option<crate::years::YearStore>,
     /// The `Genre`/`MusicGenre`/`Studio`/`MusicArtist` by-name provisioner. The
     /// scan uses it only to backfill the metadata `Path` of the by-name rows it
     /// materialized itself — Jellyfin's carry one and the DTO emits it
@@ -4408,7 +4483,8 @@ pub struct LibraryScanner {
     /// Studio artwork-repository client for the post-scan studio-thumb pass.
     /// Absent → Studio rows keep whatever images they already have.
     studios_client: Option<Arc<ferrofin_providers::StudiosClient>>,
-    /// The directory downloaded artwork is stored under (`{meta}/library/{id}`).
+    /// The item-art root downloaded artwork is stored under (`{meta}/library`,
+    /// an item's [`own_art_dir`](crate::dynamic_images::own_art_dir) in it).
     metadata_dir: Option<DirectoryPath>,
     /// Where cast/crew credits are persisted (paired with [`tmdb`](Self::tmdb) so a
     /// movie/series with no overview gets its TMDB cast during the scan).
@@ -4459,7 +4535,8 @@ pub struct LibraryScanner {
     /// image rows store, for the local image validation's existence check and
     /// the image measuring: the stored rows reach the scan expanded already
     /// when its persistence service has the server's paths, so this matters
-    /// for one that has not. Identity until
+    /// for one that has not. Its `reverse` also gives the stored form of a
+    /// re-keyed item's folders ([`Self::move_item_folders`]). Identity until
     /// [`with_virtual_paths`](Self::with_virtual_paths).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
     /// The `AggregateFolder` (`CreateRootFolder()`), which each library
@@ -4494,11 +4571,6 @@ pub struct LibraryScanner {
     metadata_configuration: Option<MetadataConfigurationReader>,
     /// Post-refresh TrickplayProvider and its live global scan timing.
     trickplay: Option<trickplay::ScanTrickplay>,
-    /// What each album's shared cover was last published from, so an
-    /// unchanged source is not read and hashed again on every scan
-    /// ([`shared_album_cover`](Self::shared_album_cover)). One small entry per
-    /// album the scanner has seen, never pruned: bounded by the library.
-    album_cover_sources: std::sync::Mutex<HashMap<Uuid, SharedCoverSource>>,
     /// The persistence's [`user_data_detach_epoch`] when the last full
     /// user-data recovery sweep began; `None` until one has run, so the first
     /// scan after a start always sweeps ([`recover_user_data`]).
@@ -4529,20 +4601,6 @@ pub struct LibraryScanner {
     /// whose photo failed); give it image_negative_cache_ttl_secs if an outage
     /// should stop holding photos back before a restart.
     photos_failed: std::sync::Mutex<std::collections::HashSet<String>>,
-}
-
-/// The source an album's shared cover was hashed from, with the stamp it had
-/// then ([`LibraryScanner::shared_album_cover`]).
-#[derive(Debug, Clone)]
-struct SharedCoverSource {
-    /// The source image's path.
-    source: String,
-    /// Its size when it was hashed.
-    len: u64,
-    /// Its mtime when it was hashed.
-    modified: std::time::SystemTime,
-    /// The shared copy it was published as.
-    shared_path: String,
 }
 
 /// A live reader of the server-wide `MetadataOptions`
@@ -4705,7 +4763,6 @@ impl LibraryScanner {
             musicbrainz: None,
             audiodb: None,
             item_repository: None,
-            years: None,
             by_name: None,
             recording_paths: None,
             self_writes: None,
@@ -4738,7 +4795,6 @@ impl LibraryScanner {
             nfo_configuration: None,
             content_types: None,
             directory_cache_limits: DirectoryCacheLimits::default(),
-            album_cover_sources: std::sync::Mutex::new(HashMap::new()),
             swept_at_epoch: std::sync::Mutex::new(None),
             biographies_asked: std::sync::Mutex::default(),
             photos_failed: std::sync::Mutex::default(),
@@ -4897,10 +4953,7 @@ impl LibraryScanner {
     /// The server-wide per-kind `MetadataOptions` as configured now (none
     /// without a reader).
     fn server_metadata_options(&self) -> Vec<ferrofin_model::configuration::MetadataOptions> {
-        self.metadata_options
-            .as_ref()
-            .map(|read| read())
-            .unwrap_or_default()
+        self.metadata_options.as_ref().map_or_default(|read| read())
     }
 
     /// Reads the server metadata language and country at scan time. Library
@@ -4967,15 +5020,6 @@ impl LibraryScanner {
         self
     }
 
-    /// Attaches the `Year` provisioner so every scan ends by materializing a
-    /// `Year` item per distinct production year (needs
-    /// [`with_items`](Self::with_items) for the distinct-year query).
-    #[must_use]
-    pub fn with_years(mut self, years: crate::years::YearStore) -> Self {
-        self.years = Some(years);
-        self
-    }
-
     /// Reads the files Live TV is recording to right now, which the walk leaves
     /// out until the capture's own refresh finds them.
     ///
@@ -5018,7 +5062,8 @@ impl LibraryScanner {
     }
 
     /// Installs the server's [`VirtualPathExpander`], so the local image
-    /// validation finds an adopted row's `%MetadataPath%` image on disk.
+    /// validation finds an adopted row's `%MetadataPath%` image on disk, and a
+    /// re-key moves the paths stored in the form saves store them in.
     ///
     /// [`VirtualPathExpander`]: crate::virtual_paths::VirtualPathExpander
     #[must_use]
@@ -6496,7 +6541,7 @@ impl LibraryScanner {
     }
 
     /// [`item_folders::move_item_folders`] under this scanner's art root and
-    /// path manager.
+    /// path manager, with its virtual-path expander for the stored forms.
     fn move_item_folders(
         &self,
         ids: (Uuid, Uuid),
@@ -6505,6 +6550,7 @@ impl LibraryScanner {
     ) -> (MovedFolders, Vec<(String, String)>) {
         let metadata_dir = self.metadata_dir.as_ref().map(DirectoryPath::resolve);
         item_folders::move_item_folders(
+            &self.virtual_paths,
             metadata_dir.as_deref(),
             self.path_manager.as_deref(),
             ids,
@@ -7012,15 +7058,11 @@ impl LibraryScanner {
         }
         // Carries matched series' TMDB ids + their episode-still URLs across the
         // scan so seasons/episodes resolve against the same series lookup.
-        let (mut art_cache, locked_items, touched) = self.scan_prereads(&planned, run).await;
+        let (mut art_cache, locked_items) = self.scan_prereads(&planned, run).await;
         // The presentation key each series settled on once its provider ids
         // were known, for the seasons/episodes planned after it (a series
         // always precedes its children in plan order).
         let mut series_keys: HashMap<Uuid, String> = HashMap::new();
-        if !touched.is_empty() {
-            // The lane served while the album covers were read.
-            Box::pin(self.reread_touched(&touched, &mut art_cache, &mut series_keys)).await;
-        }
         // Each planned item's stored row, read a window at a time just ahead
         // of the loop (see `StoredRows`) — never the whole library at once.
         let mut stored_rows = StoredRows::default();
@@ -7125,7 +7167,8 @@ impl LibraryScanner {
             if run.cancel.is_cancelled() {
                 self.sync_local_version_groups(&[], &released).await;
                 self.copy_to_owned_videos(&owners, false).await;
-                self.sync_playlists(&due_playlists, key_folders).await;
+                // A stopped walk writes no file back ([`Self::save_playlist_files`]).
+                let _ = self.sync_playlists(&due_playlists, key_folders).await;
                 let stop = self.stop_early(
                     &mut probes,
                     (&items_added, &items_updated, &moved_away),
@@ -7206,6 +7249,11 @@ impl LibraryScanner {
                 Stored::Existing(row) => released_from(item.id, row, &entity, &version_groups),
                 _ => None,
             };
+            // A local version a boot handed back stands in for the row
+            // upstream's scan creates, whose missing link makes its primary
+            // save and copy to it (`Video.cs:560-575,704-726`), as a version
+            // this walk creates does.
+            let handed_back = stored.row().is_some_and(handed_back_version);
             // A locked item's metadata and cast are user-owned: no NFO or
             // remote provider runs for it (`RefreshWithProviders` returns on
             // `IsLocked`), and its people are left alone. The scan-upsert's
@@ -7249,12 +7297,14 @@ impl LibraryScanner {
                 refresh: &refresh,
                 renamed_extra: false,
                 save_attempted: false,
+                playlist_xml: None,
             };
             // Boxed: the per-item pipeline is the deepest future the scan
             // holds, and inlining it puts the scan future over clippy's
             // `large_futures` ceiling.
             let scanned_item = Box::pin(self.scan_item(pass, &mut state)).await;
             let extra_renamed = state.renamed_extra;
+            let mut playlist_xml = state.playlist_xml.take();
             let save_attempted = state.save_attempted;
             if undecodable || scanned_item.is_err() {
                 self.keep_stored_series_key(item, &mut series_keys).await;
@@ -7285,7 +7335,10 @@ impl LibraryScanner {
                         if let Some(owner) = released_by {
                             released.entry(owner).or_default().push(item.id);
                         }
-                        owners.note_saved(item, is_new || moved_ids.contains(&item.id));
+                        owners.note_saved(
+                            item,
+                            is_new || handed_back || moved_ids.contains(&item.id),
+                        );
                         if item.entity.extra_type.is_some() {
                             owners.note_extra(
                                 item,
@@ -7363,10 +7416,14 @@ impl LibraryScanner {
                     == Some(BaseItemKind::Playlist)
                 && let Some(path) = item.entity.path.clone()
             {
+                // `isLocalLocked` merges as a replace.
+                let xml = playlist_xml.take();
                 due_playlists.push(playlists::DuePlaylist {
                     id: item.id,
                     path,
-                    replace: playlists::replaces_members(request.options),
+                    replace: playlists::replaces_members(request.options)
+                        || xml.as_ref().is_some_and(|xml| xml.locked),
+                    xml,
                 });
             }
             // `RefreshWithProviders`' custom providers (`MetadataService.cs:
@@ -7430,7 +7487,8 @@ impl LibraryScanner {
                     let at = "inside an item, before any write";
                     self.sync_local_version_groups(&[], &released).await;
                     self.copy_to_owned_videos(&owners, false).await;
-                    self.sync_playlists(&due_playlists, key_folders).await;
+                    // A stopped walk writes no file back ([`Self::save_playlist_files`]).
+                    let _ = self.sync_playlists(&due_playlists, key_folders).await;
                     return Ok(self.stop_early(
                         &mut probes,
                         (&items_added, &items_updated, &moved_away),
@@ -7442,6 +7500,7 @@ impl LibraryScanner {
             }
             // A saved owner copies to its owned videos; so does an owner
             // whose part or local version this walk created or moved (re-keyed),
+            // or whose local version a boot handed back (`handed_back`),
             // though the owner itself was unchanged — upstream's refresh of
             // the owner reports a change when its version links do not match
             // (`Video.cs:560-575`), and its save copies (`Video.cs:704-726`).
@@ -7451,7 +7510,7 @@ impl LibraryScanner {
             // its title metadata to its parts (`Video.RefreshedOwnedItems`,
             // `Video.cs:549-555`); that copy writes only a part that differs.
             if matches!(saved, ItemSaved::Saved) {
-                owners.note_saved(item, is_new || moved_ids.contains(&item.id));
+                owners.note_saved(item, is_new || handed_back || moved_ids.contains(&item.id));
             } else if matches!(saved, ItemSaved::Unchanged)
                 && crate::video_versions::additional_part_count(item.entity.data.as_deref()) > 0
             {
@@ -7486,7 +7545,8 @@ impl LibraryScanner {
         if run.cancel.is_cancelled() {
             self.sync_local_version_groups(&[], &released).await;
             self.copy_to_owned_videos(&owners, false).await;
-            self.sync_playlists(&due_playlists, key_folders).await;
+            // A stopped walk writes no file back ([`Self::save_playlist_files`]).
+            let _ = self.sync_playlists(&due_playlists, key_folders).await;
             let stop = self.stop_early(
                 &mut probes,
                 (&items_added, &items_updated, &moved_away),
@@ -7508,7 +7568,9 @@ impl LibraryScanner {
         self.copy_to_owned_videos(&owners, scope.is_none()).await;
         // After every row is saved, so each entry finds its item, and before
         // the closing passes, whose collage draws the members.
-        self.sync_playlists(&due_playlists, key_folders).await;
+        if self.sync_playlists(&due_playlists, key_folders).await {
+            self.save_playlist_files(&due_playlists).await;
+        }
         let touched = Box::pin(self.serve_lane_reach(run)).await;
         work.served(&touched);
         let removed = Box::pin(self.prune_after_scan(
@@ -7519,9 +7581,9 @@ impl LibraryScanner {
             (&excluded, &superseded, &unmoved),
         ))
         .await;
-        // Boxed: the post-scan passes (music, years, studio/library/dynamic
-        // images) run once per scan, and inlining their state kept the scan
-        // future at clippy's `large_futures` ceiling.
+        // Boxed: the post-scan passes (music, studio/library/dynamic images)
+        // run once per scan, and inlining their state kept the scan future at
+        // clippy's `large_futures` ceiling.
         outcome.stopped = !match run.passes {
             ScanPasses::Library => {
                 Box::pin(self.post_scan_passes(folders, &planned, &art_cache, &work, run)).await
@@ -7799,7 +7861,7 @@ impl LibraryScanner {
     /// After a lane refresh touched the items `touched`: what this scan
     /// cached about them is read again — a kept series' provider ids (an
     /// Identify replaced them; a first-pass save of the old ones would put
-    /// them back), a touched album's cover and a touched series'
+    /// them back) and a touched series'
     /// presentation key (its episodes further on take it) — and every lookup
     /// this scan resolved for them is dropped: a series' TMDB and TVDB
     /// match, its seasons' TMDB details (the names, overviews and stills of
@@ -7859,24 +7921,6 @@ impl LibraryScanner {
         cache.resolved_locales.retain(|id, _| !keys.contains(id));
         // A refresh may have rewritten a row above the next item, rating or parent alike.
         cache.rating_ancestors.clear();
-        let albums: Vec<Uuid> = touched
-            .iter()
-            .filter(|id| cache.album_covers.remove(id).is_some())
-            .copied()
-            .collect();
-        if let Some(items) = &self.item_repository {
-            // The album's cover as the refresh stored it (the shared,
-            // content-addressed copy `finish_album_artwork` publishes).
-            for album in albums {
-                if let Ok(images) = items.get_image_infos(album).await
-                    && let Some(primary) =
-                        images.iter().find(|i| i.image_type == ImageType::Primary)
-                    && let Some(cover) = self.shared_album_cover(album, primary)
-                {
-                    cache.album_covers.insert(album, cover);
-                }
-            }
-        }
         let series: Vec<Uuid> = touched
             .iter()
             .filter(|id| series_keys.contains_key(id))
@@ -7900,9 +7944,10 @@ impl LibraryScanner {
 
     /// The closing passes of an item or folder refresh, and of the library
     /// monitor's scan ([`ScanPasses::Touched`]): the music refresh of the
-    /// albums and artists it refreshed, the album covers this pass gathered,
+    /// albums and artists it refreshed,
     /// the children-derived columns of the folders it planned, the generated
-    /// Primaries of the photo albums, folders and playlists it refreshed, and
+    /// Primaries of the music and photo albums, folders and playlists it
+    /// refreshed, and
     /// the tiles of the `libraries` a library's or the root's refresh
     /// validated whole — never a pass over the whole database. (The folders
     /// planned for context included: see the owner-approved divergence at
@@ -7921,7 +7966,6 @@ impl LibraryScanner {
         let mut served = work.served.clone();
         self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
             .await;
-        self.finish_album_artwork(art_cache, run).await;
         // The TMDb missing/unaired episodes of each series it refreshed (a
         // series' own refresh is a touched scan).
         if let Err(err) = self
@@ -7934,7 +7978,7 @@ impl LibraryScanner {
             tracing::warn!(%err, "folder aggregates pass failed");
         }
         // The custom providers of what it refreshed, after the art they draw
-        // from: the photo albums, folders and playlists it walked. A cancel
+        // from: the music and photo albums, folders and playlists it walked. A cancel
         // stops between two passes, as library validation's do.
         if let Some(providers) = self.dynamic_image_providers() {
             let between =
@@ -8321,11 +8365,12 @@ impl LibraryScanner {
             && !locked
             && search.is_none()
             && !(options.replace_all_metadata && policy.saves_metadata(&entity));
-        let local = if run_local {
+        let mut local = if run_local {
             self.fetch_local_nfo(&mut entity, policy).await
         } else {
             LocalNfo::default()
         };
+        state.playlist_xml = local.playlist.take();
         // An NFO always credits a list, empty when it names nobody
         // (`BaseNfoParser` calls `ResetPeople`).
         let nfo_people = local.found.then_some(local.people);
@@ -8718,9 +8763,23 @@ impl LibraryScanner {
         // full refresh; the plan already refuses the remote ones.
         let dynamic_images =
             !locked || options.image_refresh_mode == MetadataRefreshMode::FullRefresh;
+        // A track's cover provider reads its stored pictures when this pass
+        // probed nothing (`AudioImageProvider.GetImage`: `GetMediaStreams`).
+        let streams = match links {
+            Some(links)
+                if !probe_ran
+                    && matches!(
+                        image_item_kind(&entity.type_),
+                        ImageItemKind::Audio | ImageItemKind::AudioBook
+                    ) =>
+            {
+                links.embedded_images.as_slice()
+            }
+            _ => rows.streams.as_slice(),
+        };
         let art = ArtworkPass {
             entity: &entity,
-            streams: &rows.streams,
+            streams,
             policy,
             embedded_images,
             nfo_images: local.remote_images,
@@ -8731,6 +8790,7 @@ impl LibraryScanner {
             remove_existing: options.remove_old_metadata && options.replace_all_images,
             dynamic_images,
             stored: links.map(|l| l.images.as_slice()),
+            locked,
             // The season premiere-date gate below, its one reader.
             judge_local_images: season_base.is_none()
                 && !locked
@@ -8967,8 +9027,10 @@ impl LibraryScanner {
         // Scan-variant save: its SQL guards back the merge above up for a
         // row it could not read (and for a writer that raced this scan):
         // `PrimaryVersionId`, the first-import `DateCreated`, the refresh
-        // dates and a locked row's metadata and `Data` are never lost. A
-        // re-dated file, or a date a reader supplied, writes its
+        // dates and a locked row's metadata and `Data` are never lost (its
+        // probe-owned keys follow the probe, and are kept when the probe
+        // could not send them, `LyricFiles` excepted: `PROBE_OWNED_KEYS`).
+        // A re-dated file, or a date a reader supplied, writes its
         // `DateCreated` over the stored one, which the first-import guard
         // would otherwise keep.
         state.save_attempted = true;
@@ -8989,8 +9051,13 @@ impl LibraryScanner {
                 .repoint_series_children(item.id, &key)
                 .await?;
         }
-        self.persist_provider_ids_and_values(item.id, &entity, &settled_ids)
-            .await?;
+        self.persist_provider_ids_and_values(
+            item.id,
+            &entity,
+            &settled_ids,
+            matches!(stored, Stored::Existing(_)),
+        )
+        .await?;
         self.persistence.reattach_user_data(&entity).await?;
         if ancestors_changed {
             self.persistence
@@ -9096,19 +9163,23 @@ impl LibraryScanner {
                 .set_date_last_refreshed(item.id, stamp)
                 .await?;
         }
-        self.save_metadata_sidecars(
-            item.id,
-            if has_remote_metadata || options.force_save || options.replace_all_metadata {
-                ItemUpdateType::MetadataDownload
-            } else if images_changed {
-                ItemUpdateType::ImageUpdate
-            } else if probe_ran || local.found || embedded_found {
-                ItemUpdateType::MetadataImport
-            } else {
-                ItemUpdateType::None
-            },
-        )
-        .await;
+        // A playlist folder whose `playlist.xml` this pass read is written
+        // once its members and shares are merged ([`playlists`]).
+        if state.playlist_xml.is_none() {
+            self.save_metadata_sidecars(
+                item.id,
+                if has_remote_metadata || options.force_save || options.replace_all_metadata {
+                    ItemUpdateType::MetadataDownload
+                } else if images_changed {
+                    ItemUpdateType::ImageUpdate
+                } else if probe_ran || local.found || embedded_found {
+                    ItemUpdateType::MetadataImport
+                } else {
+                    ItemUpdateType::None
+                },
+            )
+            .await;
+        }
         Ok(ItemSaved::Saved)
     }
 
@@ -9355,14 +9426,23 @@ impl LibraryScanner {
     /// Persists the item's external provider ids (the remote match's
     /// Tmdb/Imdb/Tvdb plus the embedded MusicBrainz tag ids — they key the
     /// id-dependent providers and make re-scans stable; best-effort, a
-    /// write failure is logged, not fatal) and mirrors genres/studios/tags
-    /// into ItemValues so the genre/studio/tag *filters* (More Like This,
-    /// genre browse) match. `settled` is [`settle_provider_ids`]'s answer.
+    /// write failure is logged, not fatal) and mirrors the artists, album
+    /// artists, genres, studios and tags into ItemValues so the *filters*
+    /// (More Like This, genre browse) match. `settled` is [`settle_provider_ids`]'s answer.
+    ///
+    /// An item left with no values loses its links, as every upstream save
+    /// rewrites them (`ItemPersistenceService.cs:364-422`, gl-1636), when
+    /// `stored_read`: the scan read the item's stored row. A new item has no
+    /// links to drop. A row the scan could not read (only a scanner without
+    /// an item repository has one) keeps them: the scan cannot tell whether
+    /// it is locked, and the save keeps a locked row's Artists, AlbumArtists,
+    /// Genres, Studios and Tags it was not given.
     async fn persist_provider_ids_and_values(
         &self,
         item_id: Uuid,
         entity: &BaseItemEntity,
         settled: &SettledProviderIds,
+        stored_read: bool,
     ) -> Result<(), ServiceError> {
         if settled.drops_stored {
             // A recorded id is gone: the set is rewritten whole. It is
@@ -9385,7 +9465,7 @@ impl LibraryScanner {
             }
         }
         let item_values = item_values_of(entity);
-        if !item_values.is_empty() {
+        if stored_read || !item_values.is_empty() {
             self.persistence
                 .save_item_values(item_id, &item_values)
                 .await?;
@@ -9398,7 +9478,7 @@ impl LibraryScanner {
     ///
     /// # Errors
     ///
-    /// Propagates a storage failure from the stream or chapter write.
+    /// Propagates a storage failure from the stream, flag or attachment write.
     async fn persist_probe_rows(
         &self,
         item_id: Uuid,
@@ -9417,6 +9497,12 @@ impl LibraryScanner {
                     .await?;
             } else {
                 repo.save_media_streams(item_id, &probe.streams).await?;
+            }
+            // The item's row went first, with the flag the probe's snapshot
+            // gave (`FFProbeVideoInfo.cs:270`); a subtitle a download attached
+            // since, kept above or replaced, must not leave the two apart.
+            if probe.save_attachments {
+                repo.sync_has_subtitles(item_id).await?;
             }
         }
         // Attachments are replaced whenever a video probe ran (an empty set clears
@@ -9442,7 +9528,9 @@ impl LibraryScanner {
                 start_position_ticks: chapter.start_position_ticks,
                 name: chapter.name.clone(),
                 image_path: chapter.image_path.clone(),
-                image_date_modified: chapter.image_date_modified.unwrap_or_default(),
+                image_date_modified: chapter
+                    .image_date_modified
+                    .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
                 image_tag: None,
             })
             .collect::<Vec<_>>();
@@ -9474,8 +9562,8 @@ impl LibraryScanner {
     }
 
     /// The batches the walk reads across items, gathered once up front: the
-    /// series' recorded provider ids, the albums' artwork and the locked-item
-    /// set. What only an item's own visit reads, its recorded provider ids and
+    /// series' recorded provider ids and the locked-item set, with each
+    /// track's album from the plan. What only an item's own visit reads, its recorded provider ids and
     /// stored image probes, is read with its stored-row window instead
     /// ([`read_window_prereads`](Self::read_window_prereads)).
     ///
@@ -9487,11 +9575,7 @@ impl LibraryScanner {
         &self,
         planned: &[Planned],
         run: ScanRun<'_>,
-    ) -> (
-        Box<ArtworkCache>,
-        std::collections::HashSet<Uuid>,
-        Vec<Uuid>,
-    ) {
+    ) -> (Box<ArtworkCache>, std::collections::HashSet<Uuid>) {
         // TheTVDB's responses are kept as long as its client keeps its own
         // (the plugin's one `CacheDurationInHours` covers them all).
         let tvdb_duration = self
@@ -9516,13 +9600,11 @@ impl LibraryScanner {
         // stored-row window at a time, with its rows (`read_window_prereads`).
         self.preload_kept_provider_ids(planned, &mut art_cache)
             .await;
-        let touched = self
-            .preload_album_artwork(planned, &mut art_cache, run)
-            .await;
+        art_cache.track_albums = track_albums(planned);
         // One read of the locked-item set for the whole scan, for the items
         // whose stored row the walk has none of (see `locked_items`).
         let locked_items = self.locked_items(planned).await;
-        (art_cache, locked_items, touched)
+        (art_cache, locked_items)
     }
 
     /// Seeds the scan's provider-id cache with the ids previous scans recorded
@@ -9548,289 +9630,111 @@ impl LibraryScanner {
         }
     }
 
-    /// Resolve ownership from the plan, never album titles (which collide).
-    /// Serves `run`'s lane between two albums and returns what the refreshes
-    /// it served touched.
-    async fn preload_album_artwork(
-        &self,
-        planned: &[Planned],
-        cache: &mut ArtworkCache,
-        run: ScanRun<'_>,
-    ) -> Vec<Uuid> {
-        let mut touched = Vec::new();
-        let albums: HashMap<Uuid, &Planned> = planned
-            .iter()
-            .filter(|p| image_item_kind(&p.entity.type_) == ImageItemKind::MusicAlbum)
-            .map(|p| (p.id, p))
-            .collect();
-        for item in planned {
-            if image_item_kind(&item.entity.type_) == ImageItemKind::Audio
-                && let Some(album) = item
-                    .ancestors
-                    .iter()
-                    .rev()
-                    .find(|id| albums.contains_key(id))
-            {
-                cache.track_albums.insert(item.id, *album);
-            }
-        }
-        // What previous scans probed for the albums' images, for their covers
-        // below: an album stores its shared cover as its own Primary. The
-        // rest of the plan's probes are read a stored-row window at a time
-        // (`read_window_prereads`), and the walk's first window replaces
-        // these.
-        let album_ids: Vec<Uuid> = albums.keys().copied().collect();
-        if !album_ids.is_empty() {
-            match self.persistence.image_metadata_for_items(&album_ids).await {
-                Ok(stored) => remember_stored_images(&mut cache.stored_images, stored),
-                Err(err) => {
-                    tracing::warn!(%err, "could not preload the albums' stored image metadata");
-                }
-            }
-        }
-        let has_primary =
-            |images: &[ItemImageInfo]| images.iter().any(|i| i.image_type == ImageType::Primary);
-        // Each album's own artwork, listed afresh (the walk may have saved
-        // artwork into the album's folder since the run listed it), off the
-        // runtime workers: a directory listing per album.
-        let mut listed: Vec<(Uuid, Vec<ItemImageInfo>)> = Vec::with_capacity(albums.len());
-        for (&id, album) in &albums {
-            touched.extend(Box::pin(self.serve_lane(run)).await);
-            let images = off_runtime(|| {
-                let album = album.entity.to_entity();
-                let mut images = discover_local_images(&album, None, &FsDirectoryService::new());
-                self.append_art_dir_images(&album, &mut images);
-                images
-            });
-            listed.push((id, images));
-        }
-        // The stored artwork of every album with no local Primary, in one read.
-        let lacking: Vec<Uuid> = listed
-            .iter()
-            .filter(|(_, images)| !has_primary(images))
-            .map(|(id, _)| *id)
-            .collect();
-        // Read once, after the listing: a lane refresh served below may
-        // change an album's rows after this, as one served between two
-        // albums could before.
-        let mut stored = match &self.item_repository {
-            Some(items) if !lacking.is_empty() => {
-                match items.get_image_infos_batch(&lacking).await {
-                    Ok(stored) => stored,
-                    Err(err) => {
-                        tracing::warn!(%err, "could not read the albums' stored artwork");
-                        HashMap::new()
-                    }
-                }
-            }
-            _ => HashMap::new(),
-        };
-        for (id, mut images) in listed {
-            touched.extend(Box::pin(self.serve_lane(run)).await);
-            if !has_primary(&images) {
-                images.extend(stored.remove(&id).unwrap_or_default());
-            }
-            // Publishing the shared copy reads and hashes the cover the first
-            // time: off the runtime workers too.
-            if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary)
-                && let Some(mut cover) = off_runtime(|| self.shared_album_cover(id, primary))
-            {
-                adopt_stored_image_metadata(std::slice::from_mut(&mut cover), &cache.stored_images);
-                self.fill_image_metadata(id, std::slice::from_mut(&mut cover))
-                    .await;
-                cache.album_covers.insert(id, cover);
-            }
-        }
-        touched
-    }
-
-    /// Immutable, content-addressed album assets are outside item upload dirs.
-    /// Replacing a track/album image therefore cannot overwrite another item's
-    /// file. Old assets are retained as a persistent cache, including on delete.
+    /// `AudioImageProvider` for a track or an audiobook (`item is Audio`)
+    /// that has no Primary: the picture its own file embeds, stored in its
+    /// own art folder as its Primary. A file embedding none gets no image
+    /// (`GetImage`'s guard), so a track without a picture has no image of its
+    /// own and clients show its album's (`AlbumPrimaryImageTag`).
     ///
-    /// A source keeping the size and mtime it had when it was last hashed is
-    /// taken to be the same cover, and its shared copy is reused unread
-    /// ([`album_cover_sources`](Self::album_cover_sources)); a cover edited in
-    /// place without changing either keeps the old copy until it does.
-    fn shared_album_cover(&self, album: Uuid, image: &ItemImageInfo) -> Option<ItemImageInfo> {
-        self.publish_album_cover(album, image, true)
-    }
-
-    /// [`shared_album_cover`](Self::shared_album_cover), consulting and
-    /// recording the source stamp only when `remember` is set: a transient
-    /// source (a cover just extracted from a track, deleted right after) must
-    /// not evict the album's real cover from the stamp cache.
-    fn publish_album_cover(
+    /// A track's picture is extracted once per `share` key
+    /// ([`album_cover_key`]): the other tracks with that key and a picture
+    /// copy the first one's file, as `GetAudioImagePath` shares one
+    /// extraction between an album's tracks, and the copy takes its
+    /// dimensions and blurhash, the same file's. A track with no key, or an
+    /// audiobook, has its own, as `GetAudioImagePath` keys it by the item. A track whose copy is
+    /// already on disk reuses it without running ffmpeg. Best-effort: no
+    /// encoder, no metadata dir, no picture or a failed extraction yield
+    /// nothing.
+    async fn extract_embedded_cover(
         &self,
-        album: Uuid,
-        image: &ItemImageInfo,
-        remember: bool,
-    ) -> Option<ItemImageInfo> {
-        use sha2::{Digest as _, Sha256};
-        use std::fmt::Write as _;
-        let root = self.metadata_dir.as_ref()?;
-        let source = Path::new(&image.path);
-        let dir = root
-            .join(ferrofin_providers::provider_manager::SHARED_ALBUM_ARTWORK_DIR)
-            .join(guid_to_db(album));
-        if source.starts_with(&dir) && source.is_file() {
-            return Some(image.clone());
-        }
-        // A source with the size and mtime it had when it was last hashed is
-        // the same cover: reuse its shared copy (while it exists) rather than
-        // reading and hashing the whole file on every scan.
-        let stamp = remember
-            .then(|| std::fs::metadata(source).ok())
-            .flatten()
-            .and_then(|meta| Some((meta.len(), meta.modified().ok()?)));
-        let known = stamp.and_then(|(len, modified)| {
-            self.album_cover_sources
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&album)
-                .filter(|known| {
-                    known.source == image.path && known.len == len && known.modified == modified
-                })
-                .map(|known| known.shared_path.clone())
-        });
-        if let Some(shared_path) = known.filter(|path| Path::new(path).is_file()) {
-            let mut shared = image.clone();
-            shared.date_modified = file_date_modified(Path::new(&shared_path));
-            shared.path = shared_path;
-            return Some(shared);
-        }
-        let bytes = std::fs::read(source).ok()?;
-        let mut digest = String::with_capacity(64);
-        for byte in Sha256::digest(&bytes) {
-            write!(digest, "{byte:02x}").ok()?;
-        }
-        let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("jpg");
-        let dest = dir.join(format!("{digest}.{ext}"));
-        std::fs::create_dir_all(&dir).ok()?;
-        if !dest.exists() {
-            // Publish a complete file, never a partially copied image.
-            let temporary = dir.join(format!("{}.tmp", Uuid::new_v4()));
-            if std::fs::write(&temporary, &bytes)
-                .and_then(|()| std::fs::rename(&temporary, &dest))
-                .is_err()
-            {
-                let _ = std::fs::remove_file(&temporary);
-                return None;
-            }
-        }
-        let mut shared = image.clone();
-        shared.path = dest.to_string_lossy().into_owned();
-        shared.date_modified = file_date_modified(&dest);
-        if let Some((len, modified)) = stamp {
-            self.album_cover_sources
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(
-                    album,
-                    SharedCoverSource {
-                        source: image.path.clone(),
-                        len,
-                        modified,
-                        shared_path: shared.path.clone(),
-                    },
-                );
-        }
-        Some(shared)
-    }
-
-    /// Select the first usable embedded cover once for an album. Misses
-    /// are not cached: a later track may have a valid picture when this one does not.
-    async fn album_track_cover(
-        &self,
-        album: Uuid,
+        item_id: Uuid,
         entity: &BaseItemEntity,
         streams: &[MediaStreamInfoEntity],
+        share: Option<AlbumCoverKey>,
         cache: &mut ArtworkCache,
     ) -> Vec<ItemImageInfo> {
-        if let Some(cover) = cache.album_covers.get(&album) {
-            return vec![cover.clone()];
+        if !matches!(
+            image_item_kind(&entity.type_),
+            ImageItemKind::Audio | ImageItemKind::AudioBook
+        ) {
+            return Vec::new();
         }
-        let (Some(encoder), Some(path)) = (&self.media_encoder, entity.path.as_deref()) else {
+        let (Some(encoder), Some(meta_root), Some(path)) = (
+            &self.media_encoder,
+            &self.metadata_dir,
+            entity.path.as_deref(),
+        ) else {
             return Vec::new();
         };
-        let Some(index) = streams
-            .iter()
-            .find(|s| s.stream_type == EMBEDDED_IMAGE_STREAM_TYPE)
-            .and_then(|s| i32::try_from(s.stream_index).ok())
-        else {
+        let Some(index) = audio_cover_stream(streams) else {
             return Vec::new();
         };
-        let Ok(extracted) = encoder.extract_audio_image(path, Some(index)).await else {
-            return Vec::new();
-        };
-        let image = ItemImageInfo {
-            path: extracted.clone(),
+        let (dir, stem) = art_dir_for(
+            &meta_root.resolve(),
+            item_id,
+            short_type(entity),
+            ImageType::Primary,
+        );
+        let dest = dir.join(format!("{stem}.jpg"));
+        let mut image = ItemImageInfo {
+            path: dest.to_string_lossy().into_owned(),
             image_type: ImageType::Primary,
-            date_modified: file_date_modified(Path::new(&extracted)),
+            date_modified: DateTime::<Utc>::default(),
             width: 0,
             height: 0,
             blur_hash: None,
         };
-        let shared = self.publish_album_cover(album, &image, false);
-        let _ = std::fs::remove_file(extracted);
-        let Some(mut cover) = shared else {
-            return Vec::new();
-        };
-        adopt_stored_image_metadata(std::slice::from_mut(&mut cover), &cache.stored_images);
-        self.fill_image_metadata(album, std::slice::from_mut(&mut cover))
-            .await;
-        cache.album_covers.insert(album, cover.clone());
-        vec![cover]
-    }
-
-    async fn finish_album_artwork(&self, cache: &ArtworkCache, run: ScanRun<'_>) {
-        let Some(items) = &self.item_repository else {
-            return;
-        };
-        let mut albums: Vec<Uuid> = cache
-            .track_albums
-            .values()
-            .chain(cache.album_covers.keys())
-            .copied()
-            .collect();
-        albums.sort_unstable();
-        albums.dedup();
-        // Unchanged albums already supplied covers during the item walk.
-        // Avoid re-reading every track's images on each routine rescan.
-        let unchanged = |id: &Uuid| {
-            !cache.albums_needing_backfill.contains(id) && cache.album_covers.contains_key(id)
-        };
-        // The unchanged albums still storing that cover, from one read of
-        // their image rows.
-        let mut keeping: Option<std::collections::HashSet<Uuid>> = None;
-        for (index, &id) in albums.iter().enumerate() {
-            // Between two albums: the lane's refreshes run. A refresh served
-            // here may have rewritten the rows read for the albums still to
-            // come, so they are read again: none is judged by rows it rewrote.
-            if !Box::pin(self.serve_lane(run)).await.is_empty() {
-                keeping = None;
-            }
-            if unchanged(&id) {
-                if keeping.is_none() {
-                    let rest: Vec<Uuid> = albums[index..]
-                        .iter()
-                        .copied()
-                        .filter(|id| unchanged(id))
-                        .collect();
-                    keeping = Some(
-                        albums_keeping_their_cover(items.as_ref(), &rest, &cache.album_covers)
-                            .await,
-                    );
+        let mut extracted = false;
+        if !off_runtime(|| dest.exists()) {
+            let shared = share
+                .as_ref()
+                .and_then(|key| cache.album_track_covers.get(key))
+                .filter(|cover| off_runtime(|| Path::new(&cover.path).is_file()))
+                .cloned();
+            let source = match &shared {
+                Some(cover) => cover.path.clone(),
+                None => match encoder.extract_audio_image(path, Some(index)).await {
+                    Ok(source) => {
+                        extracted = true;
+                        source
+                    }
+                    Err(err) => {
+                        // Per track, so `debug!` (LOGGING.md rule 1).
+                        tracing::debug!(%err, item_id = %item_id, "failed to extract embedded cover art");
+                        return Vec::new();
+                    }
+                },
+            };
+            // Into the item's own art folder, beside the artwork of movies
+            // and TV, written whole (an interrupted copy would pass for the
+            // cover on every later scan); a temporary extraction is removed
+            // either way. Off the runtime workers: a copy per track.
+            let stored = off_runtime(|| {
+                let stored = std::fs::read(&source).and_then(|bytes| {
+                    ferrofin_util::file_helper::atomic_write_media(&dest, &bytes)
+                });
+                if extracted {
+                    let _ = std::fs::remove_file(&source);
                 }
-                if keeping
-                    .as_ref()
-                    .is_some_and(|keeping| keeping.contains(&id))
-                {
-                    continue;
-                }
+                stored
+            });
+            if let Err(err) = stored {
+                tracing::debug!(%err, item_id = %item_id, "failed to store embedded cover art");
+                return Vec::new();
             }
-            self.inherit_album_cover(id, items.as_ref()).await;
+            if let Some(cover) = shared {
+                image.width = cover.width;
+                image.height = cover.height;
+                image.blur_hash = cover.blur_hash;
+            }
         }
+        image.date_modified = off_runtime(|| file_date_modified(&dest));
+        if extracted && let Some(key) = share {
+            self.fill_image_metadata(item_id, std::slice::from_mut(&mut image))
+                .await;
+            cache.album_track_covers.insert(key, image.clone());
+        }
+        vec![image]
     }
 
     /// The best-effort closing passes of a library validation
@@ -9849,15 +9753,14 @@ impl LibraryScanner {
     /// | pass | selection | upstream |
     /// |---|---|---|
     /// | music | the walk's per-item decision for each album and artist ([`music`]); the item keeps what made it due until this pass writes it; then every album the scan planned, its artist credits written where they moved | `MetadataService.RefreshMetadata`; `AlbumMetadataService.SetPeople` |
-    /// | album covers | the albums this scan planned whose cover is not stored yet | the cover a track's `AudioImageProvider` extracts, shared with its album |
-    /// | years | the library's distinct production years, created where no `Year` row exists | none: Jellyfin creates them lazily on read |
     /// | artists | the by-name artists a library artist supersedes; the by-name artists never refreshed (`DateLastRefreshed IS NULL`) | `ArtistsValidator.cs:86-91` (`isNew \|\| neverRefreshed`) |
     /// | dead by-name rows | the unlocked genres, music genres and studios no item value names, and the by-name artists no item credits | `GenresValidator.cs:107-119`, `StudiosValidator.cs:108-120`, `ArtistsValidator.cs:130-143` |
     /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
     /// | by-name paths | the by-name rows with no `Path` | `CreateItemByName` sets it at insert |
+    /// | first refreshes | the genres and music genres never refreshed, stamped; the root and user root too where their opening refresh cannot run; the Playlists folder never refreshed, once its directory holds an entry | `GenresValidator.cs:79-83`, `MusicGenresValidator.cs:64-67`, `ValidateTopLibraryFolders`; `Folder.cs:400-412` |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
     /// | library tiles | their own 7-day staleness (`HasChangedByDate`), every tile when the validation runs every provider; never a locked library's | `CollectionFolderImageProvider` |
-    /// | dynamic images | first the photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`); never a locked row; never the two root folders, which the validation refreshes at its opening | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders`; `ValidateTopLibraryFolders` |
+    /// | dynamic images | first the music and photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`, never for a music album); never a locked row; never the two root folders, which the validation refreshes at its opening | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders`; `ValidateTopLibraryFolders` |
     /// | collections | movies in libraries with automatic collections enabled | `CollectionPostScanTask` |
     /// | splashscreen | 30 random movies and series rated at most 13, for posters and thumbs (backdrops when no thumb); rebuilt on every validation, as upstream's | `SplashscreenPostScanTask` |
     // One straight sequence of the closing passes, each timed and logged by
@@ -9881,8 +9784,6 @@ impl LibraryScanner {
         }
         let [
             music,
-            album_covers,
-            years,
             artists,
             dead_by_name,
             aggregates,
@@ -9902,27 +9803,6 @@ impl LibraryScanner {
             self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
                 .await;
             true
-        })
-        .await;
-        if !self.between_passes(run, &mut done).await {
-            return false;
-        }
-        timings.album_covers = post_scan_pass(album_covers, done + 1, run.cancel, async {
-            self.finish_album_artwork(art_cache, run).await;
-            true
-        })
-        .await;
-        if !self.between_passes(run, &mut done).await {
-            return false;
-        }
-        // One `Year` item per distinct ProductionYear now in the library
-        // (Jellyfin creates them lazily from `/Years`; doing it here keeps
-        // that read write-free and lists every year on first request).
-        timings.years = post_scan_pass(years, done + 1, run.cancel, async {
-            self.materialize_years()
-                .await
-                .inspect_err(|err| tracing::warn!(%err, "year pass failed"))
-                .is_ok()
         })
         .await;
         if !self.between_passes(run, &mut done).await {
@@ -9996,14 +9876,18 @@ impl LibraryScanner {
         // at insert time; here the row is a by-product of `save_item_values`,
         // which has no notion of the metadata root, so it is filled here.
         timings.by_name_paths = post_scan_pass(by_name_paths, done + 1, run.cancel, async {
-            let Some(store) = &self.by_name else {
-                return true;
-            };
-            store
-                .backfill_paths()
-                .await
-                .inspect_err(|err| tracing::warn!(%err, "by-name path backfill failed"))
-                .is_ok()
+            let mut succeeded = true;
+            if let Some(store) = &self.by_name
+                && let Err(err) = store.backfill_paths().await
+            {
+                tracing::warn!(%err, "by-name path backfill failed");
+                succeeded = false;
+            }
+            if let Err(err) = self.stamp_first_refreshes().await {
+                tracing::warn!(%err, "first-refresh stamp failed");
+                succeeded = false;
+            }
+            succeeded
         })
         .await;
         if !self.between_passes(run, &mut done).await {
@@ -10039,7 +9923,7 @@ impl LibraryScanner {
         if !self.between_passes(run, &mut done).await {
             return false;
         }
-        // Genre / music-genre / playlist / photo-album Primaries (upstream's
+        // Genre / music-genre / playlist / music- and photo-album Primaries (upstream's
         // `BaseDynamicImageProvider` family, run by the by-name validators at
         // the end of library validation). Same ordering reason as the library
         // tiles: the collages sample the artwork the passes above produced.
@@ -10541,26 +10425,6 @@ impl LibraryScanner {
             self.persistence
                 .update_date_last_media_added(*id, date.aggregate)
                 .await?;
-        }
-        Ok(())
-    }
-
-    /// The post-scan year pass: reads the distinct `ProductionYear`s across
-    /// the whole library and creates the `Year` rows that are missing. No-op
-    /// unless both the item repository and the year provisioner are wired.
-    async fn materialize_years(&self) -> Result<(), ServiceError> {
-        let (Some(items), Some(years)) = (&self.item_repository, &self.years) else {
-            return Ok(());
-        };
-        let distinct = items
-            .get_distinct_years(&InternalItemsQuery {
-                recursive: true,
-                ..InternalItemsQuery::default()
-            })
-            .await?;
-        let created = years.ensure_missing(&distinct).await?;
-        if !created.is_empty() {
-            tracing::info!(created = created.len(), "materialized year items");
         }
         Ok(())
     }
@@ -11146,7 +11010,7 @@ impl LibraryScanner {
     /// DTO layer can surface Width/Height and ImageBlurHashes. Dimensions are read once and
     /// reused for the blurhash. Best-effort per image; a no-op when no processor is wired
     /// (unit tests), and a failure is logged with `item_id`, the item owning the images;
-    /// the image stays browsable with 0×0 / no hash.
+    /// the image stays browsable, stored as upstream stores it (0×0, an empty hash).
     ///
     /// The file read is the expanded path, as upstream's `ItemImageInfo.Path`
     /// is once the row is read (`ExpandVirtualPath`): a kept row an adopted
@@ -11442,7 +11306,6 @@ impl LibraryScanner {
         media_is_audio: bool,
         policy: FetcherPolicy<'_>,
     ) -> ProbeRows {
-        use ferrofin_model::configuration::EmbeddedSubtitleOptions;
         let Some(probed) = probed else {
             return ProbeRows::default();
         };
@@ -11525,29 +11388,12 @@ impl LibraryScanner {
         {
             entity.data = Some(data);
         }
-        let allowed = policy
-            .options
-            .map_or(EmbeddedSubtitleOptions::AllowAll, |o| {
-                o.allow_embedded_subtitles
-            });
-        // FFProbeVideoInfo filters after numbering the combined external and
-        // embedded streams. Keep those indexes, including holes left by a
-        // removed subtitle, and leave the audio prober and all externals alone.
-        let streams = source
-            .media_streams
-            .iter()
-            .filter(|s| {
-                media_is_audio
-                    || s.stream_type != ferrofin_model::entities::MediaStreamType::Subtitle
-                    || s.is_external
-                    || match allowed {
-                        EmbeddedSubtitleOptions::AllowText => s.is_text_subtitle_stream(),
-                        EmbeddedSubtitleOptions::AllowImage => !s.is_text_subtitle_stream(),
-                        EmbeddedSubtitleOptions::AllowNone => false,
-                        EmbeddedSubtitleOptions::AllowAll
-                        | EmbeddedSubtitleOptions::Unrecognized(_) => true,
-                    }
-            })
+        let kept = saved_streams(&source.media_streams, media_is_audio, policy);
+        if !media_is_audio {
+            set_has_subtitles(entity, &kept);
+        }
+        let streams = kept
+            .into_iter()
             .map(|s| stream_dto_to_entity(&entity.id, s))
             .collect();
         let chapters = source
@@ -11579,7 +11425,8 @@ impl LibraryScanner {
     }
 
     /// Fetches remote artwork (TMDB) for an item that has no local images,
-    /// downloading each image into `{metadata}/library/{id}` and returning the
+    /// downloading each image into the item's own folder
+    /// ([`own_art_dir`](crate::dynamic_images::own_art_dir)) and returning the
     /// rows to persist.
     ///
     /// Covers movies + the whole TV tree: a movie/series poster+backdrop, a
@@ -11605,6 +11452,10 @@ impl LibraryScanner {
         use ferrofin_providers::xbmc::{
             self, base_parser::NoDirectoryService, config::NfoConfiguration, item::NfoItemKind,
         };
+        // A playlist folder's reader is `PlaylistXmlProvider`, no NFO.
+        if item_type_lookup::kind_from_type_name(&entity.type_) == Some(BaseItemKind::Playlist) {
+            return playlists::read_folder_xml(entity).await.unwrap_or_default();
+        }
         if !policy.local_reader_enabled(fetcher_names::NFO) {
             return LocalNfo::default();
         }
@@ -11717,6 +11568,7 @@ impl LibraryScanner {
             is_locked: result.item.is_locked,
             locked_fields: result.item.locked_fields.clone(),
             remote_images: result.remote_images,
+            playlist: None,
         }
     }
 
@@ -12653,15 +12505,12 @@ impl LibraryScanner {
             .and_then(|e| e.people.as_ref())
             .map(|p| ferrofin_providers::tmdb::people_entities(p))
             .and_then(added);
-        let trailers = extras
-            .as_ref()
-            .map(|e| {
-                e.trailers
-                    .iter()
-                    .map(|t| (t.name.clone(), t.url.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let trailers = extras.as_ref().map_or_default(|e| {
+            e.trailers
+                .iter()
+                .map(|t| (t.name.clone(), t.url.clone()))
+                .collect::<Vec<_>>()
+        });
         if let Some(data) =
             crate::item_data::merge_remote_trailers(answer.item.data.as_deref(), &trailers)
         {
@@ -13188,22 +13037,25 @@ impl LibraryScanner {
                 .image_url
                 .filter(|url| !has_primary && !photos_failed().contains(url))
             {
-                let dir = art_dir_for(
+                let (dir, stem) = art_dir_for(
                     &meta_root.resolve(),
                     person.id,
-                    image_type_file_stem(ImageType::Primary),
+                    "Person",
+                    ImageType::Primary,
                 );
-                let mut infos = download_images(
+                let mut infos: Vec<_> = download_image(
                     tmdb,
-                    &dir,
+                    (&dir, &stem),
                     &id,
-                    vec![RemoteImage {
+                    RemoteImage {
                         image_type: ImageType::Primary,
                         url: url.clone(),
                         ..Default::default()
-                    }],
+                    },
                 )
-                .await;
+                .await
+                .into_iter()
+                .collect();
                 if infos.is_empty() {
                     photos_failed().insert(url);
                 }
@@ -13315,6 +13167,94 @@ impl LibraryScanner {
         }
     }
 
+    /// The first refresh of the rows upstream refreshes with nothing to fetch
+    /// for them (gl-1586):
+    /// - each new genre and music genre (`GenresValidator.cs:79-83`,
+    ///   `MusicGenresValidator.cs:64-67` refresh a genre no row existed for
+    ///   when the validation began; the scan here creates that row, so it is
+    ///   one never refreshed);
+    /// - the root and user root folders (`ValidateTopLibraryFolders`,
+    ///   `LibraryManager.cs:1434-1452`, every validation);
+    /// - the Playlists folder, the root's virtual child
+    ///   (`AggregateFolder.cs:171-174`), once its directory holds an entry:
+    ///   the validation skips a top parent whose directory is empty
+    ///   (`Folder.cs:400-412`, `DirectoryService.IsAccessible`), and keeps its
+    ///   row as it is (gl-1625). Its save restats that directory, which has no
+    ///   `DateModified` (`MetadataService.cs:244-256`, D2).
+    ///
+    /// A first refresh saves the row with `DateLastRefreshed` and
+    /// `DateLastSaved` stamped (`MetadataService.cs:154-156,221-223`). A later
+    /// one finds nothing changed and saves nothing, so only the rows never
+    /// refreshed are stamped.
+    ///
+    /// No other pass selects these kinds by that stamp. The roots' refreshes
+    /// (`refresh_roots_between`) read it as upstream's `isFirstRefresh`. Where
+    /// the validation's opening refresh of the roots runs
+    /// ([`Self::refresh_root_folders`]), it stamps them itself, and leaves a
+    /// root whose refresh failed unstamped, as upstream does; the roots are
+    /// stamped here only where it cannot run (no collage-capable image
+    /// processor).
+    ///
+    /// A genre made on demand (`ensure_by_name_item`, a by-name lookup) is one
+    /// the validator finds existing and leaves alone. It is the one never
+    /// refreshed genre with a `DateModified`: `CreateItemByName` dates it, and
+    /// the scan's insert does not (its directory has none, D2).
+    async fn stamp_first_refreshes(&self) -> Result<(), ServiceError> {
+        let mut genres = Vec::new();
+        for kind in [BaseItemKind::Genre, BaseItemKind::MusicGenre] {
+            genres.extend(self.persistence.never_refreshed_ids(kind, false).await?);
+        }
+        let mut fresh = match (&self.item_repository, genres.is_empty()) {
+            (Some(repo), false) => repo
+                .retrieve_items(&genres)
+                .await?
+                .into_iter()
+                .filter(|row| row.date_modified.is_none())
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect(),
+            _ => genres,
+        };
+        let roots_refreshed = self.dynamic_image_providers().is_some()
+            && self
+                .image_processor
+                .as_ref()
+                .is_some_and(|processor| processor.supports_image_collage_creation());
+        if !roots_refreshed {
+            for kind in [BaseItemKind::AggregateFolder, BaseItemKind::UserRootFolder] {
+                fresh.extend(self.persistence.never_refreshed_ids(kind, false).await?);
+            }
+        }
+        if !fresh.is_empty() {
+            self.persistence
+                .stamp_date_last_refreshed(&fresh, Utc::now())
+                .await?;
+        }
+        let folders = self
+            .persistence
+            .never_refreshed_ids(BaseItemKind::PlaylistsFolder, false)
+            .await?;
+        if let (Some(repo), false) = (&self.item_repository, folders.is_empty()) {
+            for mut row in repo.retrieve_items(&folders).await? {
+                let accessible = match row.path.as_deref() {
+                    Some(path) => match tokio::fs::read_dir(path).await {
+                        Ok(mut entries) => entries.next_entry().await.is_ok_and(|e| e.is_some()),
+                        Err(_) => false,
+                    },
+                    None => false,
+                };
+                if !accessible {
+                    continue;
+                }
+                ferrofin_providers::provider_manager::restat_directory(&mut row).await;
+                row.date_last_refreshed = Some(Utc::now());
+                self.persistence
+                    .save_items(std::slice::from_ref(&row))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// The studio half of upstream's `StudiosValidator` (`StudiosValidator.cs:
     /// 69-84`): a studio is refreshed once, when it is new, with the default
     /// options — its first refresh, so `StudiosImageProvider` (a remote image
@@ -13383,17 +13323,8 @@ impl LibraryScanner {
                     continue;
                 }
             }
-            let dest = match studio_thumb(
-                studios,
-                &art_dir_for(
-                    &meta_root.resolve(),
-                    id,
-                    image_type_file_stem(ImageType::Thumb),
-                ),
-                name,
-            )
-            .await
-            {
+            let (dir, stem) = art_dir_for(&meta_root.resolve(), id, "Studio", ImageType::Thumb);
+            let dest = match studio_thumb(studios, (&dir, &stem), name).await {
                 StudioThumb::Found(dest) => dest,
                 StudioThumb::Answered => {
                     refreshed.push(id);
@@ -13437,72 +13368,6 @@ impl LibraryScanner {
                 .await?;
         }
         Ok(())
-    }
-
-    /// Extracts a track's embedded cover art (ID3 `APIC` / FLAC picture) into
-    /// the item's metadata dir as its `Primary` image, when the probe found an
-    /// embedded-image stream and the file has no local artwork.
-    ///
-    /// Port of upstream's `AudioImageProvider`. Best-effort: no encoder, no
-    /// metadata dir, no image stream, or a failed extraction all yield nothing.
-    /// Idempotent — an already-extracted file is reused without re-running
-    /// ffmpeg.
-    async fn extract_embedded_cover(
-        &self,
-        item_id: Uuid,
-        entity: &BaseItemEntity,
-        streams: &[MediaStreamInfoEntity],
-    ) -> Vec<ItemImageInfo> {
-        if image_item_kind(&entity.type_) != ImageItemKind::Audio {
-            return Vec::new();
-        }
-        let (Some(encoder), Some(meta_root), Some(path)) = (
-            &self.media_encoder,
-            &self.metadata_dir,
-            entity.path.as_deref(),
-        ) else {
-            return Vec::new();
-        };
-        // `StreamType` 3 is EmbeddedImage (the probe's classification of an
-        // attached picture); without one there is nothing to extract.
-        let Some(index) = streams
-            .iter()
-            .find(|s| s.stream_type == EMBEDDED_IMAGE_STREAM_TYPE)
-            .map(|s| s.stream_index)
-        else {
-            return Vec::new();
-        };
-        let stem = image_type_file_stem(ImageType::Primary);
-        let dir = art_dir_for(&meta_root.resolve(), item_id, stem);
-        let dest = dir.join(format!("{stem}.jpg"));
-        if !dest.exists() {
-            let index = i32::try_from(index).ok();
-            let extracted = match encoder.extract_audio_image(path, index).await {
-                Ok(extracted) => extracted,
-                Err(err) => {
-                    tracing::warn!(%err, item = %item_id, "failed to extract embedded cover art");
-                    return Vec::new();
-                }
-            };
-            // Copy the temporary extraction into permanent item metadata,
-            // alongside the artwork for movies and TV, then clean up the temp file.
-            if let Err(err) = std::fs::create_dir_all(&dir)
-                .and_then(|()| std::fs::copy(&extracted, &dest).map(|_| ()))
-            {
-                tracing::warn!(%err, item = %item_id, "failed to store embedded cover art");
-                let _ = std::fs::remove_file(&extracted);
-                return Vec::new();
-            }
-            let _ = std::fs::remove_file(&extracted);
-        }
-        vec![ItemImageInfo {
-            path: dest.to_string_lossy().into_owned(),
-            image_type: ImageType::Primary,
-            date_modified: file_date_modified(&dest),
-            width: 0,
-            height: 0,
-            blur_hash: None,
-        }]
     }
 
     /// A video's embedded pictures, for each supported type the item still
@@ -13566,17 +13431,11 @@ impl LibraryScanner {
         if !embedded_image_eligible(path, &data) {
             return None;
         }
-        let dir = meta_root.join(&entity.id);
-        let stem = image_type_file_stem(image_type);
-        if !replace && let Some(existing) = existing_art_file(&dir, stem) {
-            return Some(ItemImageInfo {
-                path: existing.to_string_lossy().into_owned(),
-                image_type,
-                date_modified: file_date_modified(&existing),
-                width: 0,
-                height: 0,
-                blur_hash: None,
-            });
+        if !replace
+            && let Some(existing) =
+                existing_art_image(&meta_root.resolve(), item_id, entity, image_type)
+        {
+            return Some(existing);
         }
         // The probe that just ran is authoritative; without one the stored rows are.
         let attachments = match (probe_attachments, &self.media_attachments) {
@@ -13642,7 +13501,10 @@ impl LibraryScanner {
                 return None;
             }
         };
-        let dest = match store_extracted_art(&dir, stem, picture.format.extension(), &extracted) {
+        // A new extraction goes to the own folder, whatever an earlier build left.
+        let dir = crate::dynamic_images::own_art_dir(&meta_root.resolve(), item_id);
+        let stem = art_stem(entity, image_type);
+        let dest = match store_extracted_art(&dir, &stem, picture.format.extension(), &extracted) {
             Ok(dest) => dest,
             Err(err) => {
                 tracing::warn!(%err, %item_id, "failed to store embedded image");
@@ -13657,109 +13519,6 @@ impl LibraryScanner {
             height: 0,
             blur_hash: None,
         })
-    }
-
-    /// Publish the album cover and backfill tracks that had no picture before
-    /// the first successful extraction. Existing track-specific art wins.
-    async fn inherit_album_cover(&self, album_uuid: Uuid, items: &dyn ItemRepository) {
-        let Ok(mut existing) = items.get_image_infos(album_uuid).await else {
-            return;
-        };
-        let Ok(tracks) = items
-            .get_item_list(&InternalItemsQuery {
-                parent_id: album_uuid,
-                recursive: true,
-                include_item_types: vec![BaseItemKind::Audio],
-                ..Default::default()
-            })
-            .await
-        else {
-            return;
-        };
-        let mut track_images = Vec::new();
-        for track in tracks {
-            if let Ok(id) = Uuid::parse_str(&track.id)
-                && let Ok(images) = items.get_image_infos(id).await
-            {
-                track_images.push((id, images));
-            }
-        }
-        let primary = existing
-            .iter()
-            .find(|i| i.image_type == ImageType::Primary)
-            .or_else(|| {
-                track_images
-                    .iter()
-                    .flat_map(|(_, images)| images)
-                    .find(|i| i.image_type == ImageType::Primary)
-            });
-        let Some(mut cover) = primary.and_then(|image| self.shared_album_cover(album_uuid, image))
-        else {
-            return;
-        };
-        self.fill_image_metadata(album_uuid, std::slice::from_mut(&mut cover))
-            .await;
-        let mut album_cover = cover.clone();
-        if let Some(saver) = &self.image_saver
-            && let Ok(Some(row)) = items.retrieve_item(album_uuid).await
-        {
-            // Not forgotten in the run's listings: this closing pass runs
-            // after the walk, and the music pass lists album folders afresh.
-            match saver.save(&row, album_cover.clone(), 0, &existing).await {
-                Ok(saved) => {
-                    album_cover = saved.image;
-                    if let Some(error) = saved.cleanup {
-                        tracing::warn!(%error, item_id=%album_uuid, "could not remove replaced album artwork");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, item_id=%album_uuid, "could not publish album artwork");
-                }
-            }
-        }
-        let album_changed =
-            existing.iter().find(|i| i.image_type == ImageType::Primary) != Some(&album_cover);
-        existing.retain(|i| i.image_type != ImageType::Primary);
-        existing.push(album_cover);
-        if album_changed {
-            if let Err(err) = self
-                .persistence
-                .save_item_images(album_uuid, &existing)
-                .await
-            {
-                tracing::warn!(%err, album = %album_uuid, "failed to inherit album cover");
-            } else {
-                self.save_metadata_sidecars(
-                    album_uuid,
-                    ferrofin_traits::providers::ItemUpdateType::ImageUpdate,
-                )
-                .await;
-            }
-        }
-        let shared_root = self
-            .metadata_dir
-            .as_ref()
-            .map(|root| root.join(ferrofin_providers::provider_manager::SHARED_ALBUM_ARTWORK_DIR));
-        for (id, mut images) in track_images {
-            let primary = images.iter().find(|i| i.image_type == ImageType::Primary);
-            if primary.is_some_and(|i| {
-                !shared_root
-                    .as_ref()
-                    .is_some_and(|root| Path::new(&i.path).starts_with(root))
-            }) {
-                continue;
-            }
-            if primary
-                .is_some_and(|i| i.path == cover.path && i.date_modified == cover.date_modified)
-            {
-                continue;
-            }
-            images.retain(|i| i.image_type != ImageType::Primary);
-            images.push(cover.clone());
-            if let Err(err) = self.persistence.save_item_images(id, &images).await {
-                tracing::warn!(%err, item = %id, "failed to share album cover");
-            }
-        }
     }
 
     /// Discovers the item's artwork and returns the image set to store:
@@ -13810,6 +13569,7 @@ impl LibraryScanner {
             remove_existing,
             dynamic_images,
             stored,
+            locked,
             judge_local_images,
             cancel,
         } = art;
@@ -13875,14 +13635,28 @@ impl LibraryScanner {
         // the `TypeOptions.ImageFetchers` check, and that checkbox list only ever
         // names remote fetchers — gating on it silently dropped all sidecar art.
         let mut images = art_cache.discover_local_images(entity);
-        // Explicit music uploads/sidecars take precedence over shared art.
+        // Earlier builds stored an album's and its tracks' covers as shared
+        // copies in `album-covers/` (gl-692, gl-1633), a row upstream never
+        // stores: validation keeps none of them, so the item takes the image
+        // upstream gives it. A locked item keeps them: the dynamic image
+        // pass never draws a locked album's copy, so nothing would replace
+        // them. The files stay where they are.
+        let music = matches!(short, "Audio" | "MusicAlbum");
+        let shared =
+            |i: &ItemImageInfo| music && i.is_local_file() && is_shared_album_artwork(&i.path);
+        let unshared: Vec<ItemImageInfo>;
+        let keepable = match stored {
+            Some(rows) if !locked && rows.iter().any(shared) => {
+                unshared = rows.iter().filter(|i| !shared(i)).cloned().collect();
+                Some(unshared.as_slice())
+            }
+            rows => rows,
+        };
+        // A track's or an album's own art (an upload, its extracted cover)
+        // takes precedence over its providers.
         if fetch != ImageFetch::All || matches!(short, "Audio" | "MusicAlbum") {
             self.append_art_dir_images(entity, &mut images);
-            // Shared album references must follow the album's current cover;
-            // importing the previous reference here would block that refresh.
-            if !matches!(short, "Audio" | "MusicAlbum") {
-                keep_stored_images(&mut images, stored, &self.virtual_paths);
-            }
+            keep_stored_images(&mut images, keepable, &self.virtual_paths);
         }
         // `ValidateImages`' set: an image full refresh adds the art dir and
         // the kept images only after its fetch, so they are added here.
@@ -13891,15 +13665,15 @@ impl LibraryScanner {
                 let mut local = images.clone();
                 if fetch == ImageFetch::All {
                     self.append_art_dir_images(entity, &mut local);
-                    keep_stored_images(&mut local, stored, &self.virtual_paths);
+                    keep_stored_images(&mut local, keepable, &self.virtual_paths);
                 }
                 image_files_changed(&local, stored)
             });
         // The NFO's artwork URLs, before any image provider runs.
         // TODO(parity, open work item — gl-1818): an album's or an artist's
         // are not saved. Un-defer path: save them in the music pass, before
-        // `music_images`, keeping an NFO Primary ahead of an album's shared
-        // embedded cover (which replaces the Primary below).
+        // `music_images`, keeping an NFO Primary ahead of the copy of a
+        // track's cover the closing dynamic image pass gives an album.
         if !nfo_images.is_empty() && !music::owns_providers(short) {
             let saved = self.save_nfo_images(entity, nfo_images, &mut images);
             cut_short |= cancel.unless_cancelled(Box::pin(saved)).await.is_none();
@@ -13918,7 +13692,7 @@ impl LibraryScanner {
         if fetch == ImageFetch::All
             && let Some(root) = &self.metadata_dir
         {
-            artwork::prune_old_backdrops_in(&written_art_dirs(&root.resolve(), entity), &images);
+            artwork::prune_replaced_in(&written_art_dirs(&root.resolve(), entity), &images);
         }
         // The art folders again, for what the providers wrote there. Without a
         // remote fetch only the extractors run, and they add what they write
@@ -13927,25 +13701,8 @@ impl LibraryScanner {
         if remote || cut_short {
             self.append_art_dir_images(entity, &mut images);
         }
-        // An album's Primary is stored as its shared, content-addressed cover
-        // (what `finish_album_artwork` publishes after the walk). Storing the
-        // source file here instead made the two passes rewrite each other's
-        // row on every scan.
-        if image_item_kind(&entity.type_) == ImageItemKind::MusicAlbum
-            && let Some(cover) = art_cache.album_covers.get(&item_id)
-        {
-            images.retain(|image| image.image_type != ImageType::Primary);
-            images.push(cover.clone());
-        }
         if !remote {
-            keep_stored_images(&mut images, stored, &self.virtual_paths);
-        }
-        if !images
-            .iter()
-            .any(|image| image.image_type == ImageType::Primary)
-            && let Some(album) = art_cache.track_albums.get(&item_id)
-        {
-            art_cache.albums_needing_backfill.insert(*album);
+            keep_stored_images(&mut images, keepable, &self.virtual_paths);
         }
         adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
         cut_short |= self
@@ -13958,9 +13715,10 @@ impl LibraryScanner {
         // them (`ValidateImages` drops the deleted ones and saves), so an
         // empty set is stored then, as it is after `RemoveImages` removed
         // them (`item.RemoveImages`, then the save); a fetch that found
-        // nothing still writes nothing.
-        let stale_rows =
-            (!remote || remove_existing) && stored.is_some_and(|stored| !stored.is_empty());
+        // nothing still writes nothing, but a shared album cover it let go.
+        let stale_rows = ((!remote || remove_existing)
+            && stored.is_some_and(|stored| !stored.is_empty()))
+            || stored.map(<[_]>::len) != keepable.map(<[_]>::len);
         (
             (!images.is_empty() || stale_rows).then_some(images),
             cut_short,
@@ -14001,7 +13759,8 @@ impl LibraryScanner {
         let (Some(client), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
             return;
         };
-        let item_dir = meta_root.join(&entity.id);
+        let item_dir = own_art_dir_of(&meta_root.resolve(), entity);
+        let kind = short_type(entity);
         for (url, image_type) in urls {
             if images.iter().any(|image| image.image_type == image_type) {
                 continue;
@@ -14020,7 +13779,9 @@ impl LibraryScanner {
                 content_type,
                 content_length: None,
             };
-            match off_runtime(|| artwork::write_acquired_image(&item_dir, image_type, &download)) {
+            match off_runtime(|| {
+                artwork::write_acquired_image(&item_dir, kind, image_type, &download)
+            }) {
                 Ok(image) => images.push(image),
                 Err(err) => {
                     tracing::warn!(%err, item_id = %entity.id, ?image_type, "failed to write NFO artwork");
@@ -14259,8 +14020,8 @@ impl LibraryScanner {
             }
         };
         let dest = match store_extracted_art(
-            &meta_root.join(&entity.id),
-            image_type_file_stem(ImageType::Primary),
+            &own_art_dir_of(&meta_root.resolve(), entity),
+            &art_stem(entity, ImageType::Primary),
             ".jpg",
             &frame,
         ) {
@@ -14319,9 +14080,8 @@ impl LibraryScanner {
         }
     }
 
-    /// The embedded-cover provider for an item with no Primary: a track's
-    /// album cover, the album's shared cover, or the cover extracted from
-    /// the item's own file.
+    /// The embedded-cover provider for an item with no Primary: the cover
+    /// its own file embeds ([`extract_embedded_cover`](Self::extract_embedded_cover)).
     async fn embedded_primary(
         &self,
         item_id: Uuid,
@@ -14356,19 +14116,15 @@ impl LibraryScanner {
         } else {
             fetcher_names::EMBEDDED_IMAGES
         };
-        let enabled = policy.image_enabled(short, provider);
-        if let Some(album) = art_cache.track_albums.get(&item_id).copied() {
-            if enabled {
-                return self
-                    .album_track_cover(album, entity, streams, art_cache)
-                    .await;
-            }
-        } else if let Some(cover) = art_cache.album_covers.get(&item_id) {
-            return vec![cover.clone()];
-        } else if enabled {
-            return self.extract_embedded_cover(item_id, entity, streams).await;
+        if !policy.image_enabled(short, provider) {
+            return Vec::new();
         }
-        Vec::new()
+        let share = art_cache
+            .track_albums
+            .get(&item_id)
+            .and_then(|&album| album_cover_key(album, entity));
+        self.extract_embedded_cover(item_id, entity, streams, share, art_cache)
+            .await
     }
 
     /// The remote image providers, when this refresh runs them
@@ -14398,8 +14154,8 @@ impl LibraryScanner {
     /// slots the built-in chain left empty, ask each dynamic provider for
     /// image BYTES (the plugin host downloads candidates through the
     /// plugin's declared egress — the scanner never sees a URL) and write
-    /// them exactly like the built-in downloads (`{metadata}/library/{id}/
-    /// {stem}.jpg`). First provider to fill a slot wins; art already on
+    /// them exactly like the built-in downloads (the item's own folder, under
+    /// [`art_stem`]). First provider to fill a slot wins; art already on
     /// disk (an earlier scan or a user upload) always wins. Best-effort per
     /// provider — one bad plugin never fails a scan.
     async fn apply_dynamic_images(
@@ -14414,7 +14170,7 @@ impl LibraryScanner {
         let Some(meta_root) = &self.metadata_dir else {
             return;
         };
-        let item_dir = meta_root.join(&entity.id);
+        let item_dir = own_art_dir_of(&meta_root.resolve(), entity);
         let kind = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
         let preferences =
             ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(policy.options, kind);
@@ -14424,7 +14180,7 @@ impl LibraryScanner {
             .filter(|kind| !images.iter().any(|i| i.image_type == *kind))
             .filter(|kind| {
                 policy.replace_images
-                    || existing_art_file(&item_dir, image_type_file_stem(*kind)).is_none()
+                    || existing_art_file(&item_dir, &art_stem(entity, *kind)).is_none()
             })
             .collect();
         if wanted.is_empty() {
@@ -14494,8 +14250,8 @@ impl LibraryScanner {
                     );
                     continue;
                 };
-                let stem = image_type_file_stem(kind);
-                let previous = existing_art_file(&item_dir, stem);
+                let stem = art_stem(entity, kind);
+                let previous = existing_art_file(&item_dir, &stem);
                 let dest = item_dir.join(format!("{stem}.{ext}"));
                 if let Err(err) =
                     off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
@@ -14658,7 +14414,13 @@ impl LibraryScanner {
             });
         }
         let out_dir = crate::dynamic_images::own_art_dir(meta_root, cf);
-        let out = out_dir.join("primary.png");
+        let out = out_dir.join(format!(
+            "{}.png",
+            ferrofin_providers::local_images::internal_image_stem(
+                "CollectionFolder",
+                ImageType::Primary
+            )
+        ));
         if let Err(err) = std::fs::create_dir_all(&out_dir) {
             tracing::warn!(%err, library = %cf, "failed to create the library art dir");
             return Ok(failed);
@@ -14702,11 +14464,16 @@ impl LibraryScanner {
                 return Ok(failed);
             }
         };
+        let replaced =
+            off_runtime(|| crate::dynamic_images::replaced_primary(meta_root, cf, &images, &out));
         images.retain(|i| i.image_type != ImageType::Primary);
         images.insert(0, info);
         if let Err(err) = self.persistence.save_item_images(cf, &images).await {
             tracing::warn!(%err, library = %cf, "failed to persist the library image");
             return Ok(failed);
+        }
+        if let Some(file) = replaced {
+            off_runtime(|| crate::dynamic_images::remove_replaced_file(cf, &file));
         }
         Ok(PassOutcome {
             changed: true,
@@ -14957,7 +14724,7 @@ impl LibraryScanner {
     }
 
     /// Appends rows for art files already sitting in the item's metadata art
-    /// dir (`{meta}/library/{id}` — user uploads and previously downloaded
+    /// folders ([`written_art_dirs`] — user uploads and previously downloaded
     /// artwork) whose image type discovery did not produce, so an uploaded
     /// image of any type survives the scan's image rewrite. Types discovery
     /// did produce are left alone (media-adjacent files outrank the metadata
@@ -14972,8 +14739,11 @@ impl LibraryScanner {
         // files of one type (backdrop.jpg, backdrop1.jpg, …) all append.
         let discovered: std::collections::HashSet<ImageType> =
             images.iter().map(|i| i.image_type).collect();
-        // The item's own folder first. The legacy folder adds only the types
-        // the own folder has none of, so art present in both lists once.
+        // The item's own folder first. The folders earlier builds wrote add
+        // only the singular types the ones before them have none of, so art
+        // present in two lists once; every backdrop (and screenshot) is the
+        // item's, wherever a build saved it: none is in `ItemImageProvider`'s
+        // `_singularImages`.
         let mut found = std::collections::HashSet::new();
         // Folder listings and a file time per image: off the runtime workers,
         // which a slow metadata share would otherwise stall.
@@ -14988,7 +14758,11 @@ impl LibraryScanner {
                     let Some(image_type) = parse_art_file_stem(&path) else {
                         continue;
                     };
-                    if discovered.contains(&image_type) || found.contains(&image_type) {
+                    let multiple =
+                        matches!(image_type, ImageType::Backdrop | ImageType::Screenshot);
+                    if discovered.contains(&image_type)
+                        || (!multiple && found.contains(&image_type))
+                    {
                         continue;
                     }
                     here.insert(image_type);
@@ -15039,7 +14813,7 @@ impl LibraryScanner {
         };
         let language =
             ferrofin_providers::tmdb::normalize_language(Some(&locale.0), Some(&locale.1));
-        let item_dir = meta_root.join(&entity.id);
+        let item_dir = own_art_dir_of(&meta_root.resolve(), entity);
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
 
         // Image providers resolve recorded ids independently of metadata
@@ -15140,9 +14914,7 @@ impl LibraryScanner {
                     .flatten();
                 let mut sources = vec![(
                     fetcher_names::TVDB,
-                    tvdb_art
-                        .map(ferrofin_providers::TvdbSeriesDetails::download_images)
-                        .unwrap_or_default(),
+                    tvdb_art.map_or_default(ferrofin_providers::TvdbSeriesDetails::download_images),
                 )];
                 let images = if policy.image_enabled(short, fetcher_names::TMDB) {
                     Self::series_tmdb_images(tmdb, entity, cache, language.as_deref()).await
@@ -15711,14 +15483,13 @@ impl LibraryScanner {
             .await
             .and_then(|details| details.image_url)
             .filter(|url| !url.is_empty())
-            .map(|url| {
+            .map_or_default(|url| {
                 vec![RemoteImage {
                     image_type: ImageType::Primary,
                     url,
                     ..Default::default()
                 }]
             })
-            .unwrap_or_default()
     }
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
@@ -15778,11 +15549,7 @@ impl LibraryScanner {
         dirs: Option<&Arc<DirectoryCache>>,
     ) -> PlanOutput {
         let naming = NamingOptions::shared();
-        let content_types = self
-            .content_types
-            .as_ref()
-            .map(|read| read())
-            .unwrap_or_default();
+        let content_types = self.content_types.as_ref().map_or_default(|read| read());
         let mut ctx = PlanCtx::new(naming, scope)
             .with_locations(plan_folders)
             .with_key_folders(key_folders)
@@ -18872,17 +18639,16 @@ impl LibraryScanner {
         let Some(meta_root) = &self.metadata_dir else {
             return Vec::new();
         };
-        let item_dir = meta_root.join(&entity.id);
-        if let Some(existing) = existing_art_file(&item_dir, "primary") {
-            return vec![ItemImageInfo {
-                path: existing.to_string_lossy().into_owned(),
-                image_type: ImageType::Primary,
-                date_modified: file_date_modified(&existing),
-                width: 0,
-                height: 0,
-                blur_hash: None,
-            }];
+        let root = meta_root.resolve();
+        if let Ok(item_id) = Uuid::parse_str(&entity.id)
+            && let Some(existing) = existing_art_image(&root, item_id, entity, ImageType::Primary)
+        {
+            return vec![existing];
         }
+        let (dir, stem) = (
+            own_art_dir_of(&root, entity),
+            art_stem(entity, ImageType::Primary),
+        );
         // Inflating a comic archive can run to hundreds of megabytes; that is
         // blocking work and must not sit on an async worker thread.
         let owned = path.to_owned();
@@ -18902,10 +18668,10 @@ impl LibraryScanner {
             .and_then(|e| e.to_str())
             .unwrap_or("jpg")
             .to_ascii_lowercase();
-        if tokio::fs::create_dir_all(&item_dir).await.is_err() {
+        if tokio::fs::create_dir_all(&dir).await.is_err() {
             return Vec::new();
         }
-        let out = item_dir.join(format!("primary.{extension}"));
+        let out = dir.join(format!("{stem}.{extension}"));
         if let Err(err) = tokio::fs::write(&out, &bytes).await {
             tracing::warn!(%err, item = %entity.id, "failed to write book cover");
             return Vec::new();
@@ -19925,6 +19691,8 @@ struct PersonLock {
 
 /// One item's inputs to the artwork pass, grouped so
 /// [`LibraryScanner::collect_artwork`] keeps a readable signature.
+// Each flag is an independent fact of the item's refresh, not a state.
+#[allow(clippy::struct_excessive_bools)]
 struct ArtworkPass<'a> {
     /// The scanned row (already enriched, not yet re-read from the DB).
     entity: &'a BaseItemEntity,
@@ -19951,6 +19719,8 @@ struct ArtworkPass<'a> {
     dynamic_images: bool,
     /// The item's stored image rows, when known.
     stored: Option<&'a [ItemImageInfo]>,
+    /// The item is locked: it keeps an earlier build's shared album cover.
+    locked: bool,
     /// Whether to work out if the local image validation changed the stored
     /// images: only the season premiere-date gate reads it, for a stored,
     /// unlocked season outside a full refresh.
@@ -21947,9 +21717,9 @@ fn file_stem(path: &str) -> String {
         .map_or_else(|| path.to_owned(), ToOwned::to_owned)
 }
 
-/// Maps a stored `BaseItems.Type` string to the local-image-provider item kind.
-/// The on-disk filename stem a downloaded image of `image_type` is stored under.
-fn image_type_file_stem(image_type: ImageType) -> &'static str {
+/// The file name, without its extension, earlier builds saved an image of
+/// `image_type` under in the item's folder; art they saved is found by it.
+fn earlier_art_stem(image_type: ImageType) -> &'static str {
     match image_type {
         ImageType::Backdrop => "backdrop",
         ImageType::Logo => "logo",
@@ -22166,6 +21936,10 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
     merge_multi_value(&mut entity.genres, &n.genres);
     merge_multi_value(&mut entity.studios, &n.studios);
     merge_multi_value(&mut entity.tags, &n.tags);
+    // `<country>` (`BaseNfoParser.cs:397-410`) into the provider result;
+    // `merge_union_lists` applies the lock, a full refresh's replace and the
+    // union with the stored row (`MergeBaseItemData`).
+    merge_multi_value(&mut entity.production_locations, &n.production_locations);
     // `<status>` (`SeriesNfoParser.cs:75-90`, via `TvParserHelpers.
     // TryParseSeriesStatus`) — `Series.Status`, which lives in the `Data`
     // blob (`"Status":"Ended"`) and comes back out as the DTO's `Status`.
@@ -23465,28 +23239,79 @@ fn overlay_shortcut_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
     }
 }
 
+/// The streams a probe saves. FFProbeVideoInfo filters after numbering the
+/// combined external and embedded streams. Keep those indexes, including holes
+/// left by a removed subtitle, and leave the audio prober and all externals
+/// alone.
+fn saved_streams<'a>(
+    streams: &'a [ferrofin_model::entities_media::MediaStream],
+    media_is_audio: bool,
+    policy: FetcherPolicy<'_>,
+) -> Vec<&'a ferrofin_model::entities_media::MediaStream> {
+    use ferrofin_model::configuration::EmbeddedSubtitleOptions;
+    let allowed = policy
+        .options
+        .map_or(EmbeddedSubtitleOptions::AllowAll, |o| {
+            o.allow_embedded_subtitles
+        });
+    streams
+        .iter()
+        .filter(|s| {
+            media_is_audio
+                || s.stream_type != ferrofin_model::entities::MediaStreamType::Subtitle
+                || s.is_external
+                || match allowed {
+                    EmbeddedSubtitleOptions::AllowText => s.is_text_subtitle_stream(),
+                    EmbeddedSubtitleOptions::AllowImage => !s.is_text_subtitle_stream(),
+                    EmbeddedSubtitleOptions::AllowNone => false,
+                    EmbeddedSubtitleOptions::AllowAll
+                    | EmbeddedSubtitleOptions::Unrecognized(_) => true,
+                }
+        })
+        .collect()
+}
+
+/// `video.HasSubtitles = mediaStreams.Any(i => i.Type == Subtitle)` over the
+/// streams a video probe saves (`FFProbeVideoInfo.cs:270`). Upstream keeps it in
+/// `Data` alone, so a return to Jellyfin reads it from there (gl-1632).
+fn set_has_subtitles(
+    entity: &mut BaseItemEntity,
+    streams: &[&ferrofin_model::entities_media::MediaStream],
+) {
+    let has_subtitles = streams
+        .iter()
+        .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Subtitle);
+    if let Some(data) = crate::item_data::merge_data_fields(
+        entity.data.as_deref(),
+        &[("HasSubtitles", Some(serde_json::json!(has_subtitles)))],
+    ) {
+        entity.data = Some(data);
+    }
+}
+
 /// Restores direct probe properties after the provider metadata merge. A
-/// completed video probe owns its nullable stream index regardless of the
-/// metadata replacement choice (FFProbeVideoInfo.cs:268); metadata fill rules
-/// must not restore an index from the previous probe. An audio probe owns
-/// `LyricFiles` the same way (`AudioFileProber.AddExternalLyrics`), so the
-/// lyric files that are gone do not survive as "existing" data.
+/// completed video probe owns its nullable stream index and `HasSubtitles`
+/// regardless of the metadata replacement choice (FFProbeVideoInfo.cs:268,
+/// 270); metadata fill rules must not restore either from the previous
+/// probe. An audio probe owns `LyricFiles` the same way
+/// (`AudioFileProber.AddExternalLyrics`), so the lyric files that are gone
+/// do not survive as "existing" data.
 fn overlay_probe_data(row: &mut BaseItemEntity, scanned: &BaseItemEntity) {
     let data = crate::item_data::parse_data(scanned.data.as_deref());
     if let Some(container) = crate::item_data::read_data_string(&data, "Container") {
         row.data = crate::item_data::set_data_field(row.data.as_deref(), "Container", &container);
     }
-    let field = match scanned.media_type.as_deref() {
-        Some("Video") => data
-            .get("DefaultVideoStreamIndex")
-            .cloned()
-            .map(|index| ("DefaultVideoStreamIndex", Some(index))),
+    let fields: Vec<_> = match scanned.media_type.as_deref() {
+        Some("Video") => ["DefaultVideoStreamIndex", "HasSubtitles"]
+            .into_iter()
+            .filter_map(|key| data.get(key).cloned().map(|value| (key, Some(value))))
+            .collect(),
         // No key: the track has no lyric files now, and the stored list goes.
-        Some("Audio") => Some(("LyricFiles", data.get("LyricFiles").cloned())),
-        _ => None,
+        Some("Audio") => vec![("LyricFiles", data.get("LyricFiles").cloned())],
+        _ => Vec::new(),
     };
-    if let Some(field) = field
-        && let Some(data) = crate::item_data::merge_data_fields(row.data.as_deref(), &[field])
+    if !fields.is_empty()
+        && let Some(data) = crate::item_data::merge_data_fields(row.data.as_deref(), &fields)
     {
         row.data = Some(data);
     }
@@ -23506,7 +23331,8 @@ fn is_path_less(item: &BaseItemEntity) -> bool {
 ///
 /// Planner-owned: `Path`, the parent/top-parent/owner links, the
 /// series/season links and names (a `Book`'s series name is a provider
-/// field, see [`ResolverGuesses`]), `IsFolder`, `IsInMixedFolder`,
+/// field, see [`ResolverGuesses`]), `IsFolder`, a season's `IsVirtualItem`
+/// (none the scan plans is virtual), `IsInMixedFolder`,
 /// `MediaType`, `IsMovie`, `ExtraType`, the series presentation key a child
 /// inherits, and `Data`'s `VideoType`, `AdditionalParts` and
 /// `LocalAlternateVersions`. `IsInMixedFolder` and the three `Data` fields
@@ -23543,6 +23369,14 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
     row.owner_id.clone_from(&scanned.owner_id);
     row.extra_type = scanned.extra_type;
     row.is_folder = scanned.is_folder;
+    if is_season(scanned) {
+        // A season the scan plans has a folder or real episode files, so it
+        // is no virtual season: `CreateSeasonsAsync` turns a virtual one with
+        // real episodes non-virtual (`SeriesMetadataService.cs:404-411`), and
+        // `SaveIsVirtualItem` one with a path (`SeasonMetadataService.cs:
+        // 105-114`) (gl-1593).
+        row.is_virtual_item = false;
+    }
     if !is_stacked_part(scanned) {
         row.is_in_mixed_folder = scanned.is_in_mixed_folder;
     }
@@ -23680,7 +23514,13 @@ fn is_stacked_part(entity: &BaseItemEntity) -> bool {
 /// `RefreshMetadataForVersions`, `Video.cs:528-700`), and that refresh only
 /// fills an empty `Name` — `copyTitleMetadata` (`BaseItem.cs:2805-2858`)
 /// never copies the name, and an alternate refreshes without it
-/// (`Video.cs:565`) — so its saved name stands.
+/// (`Video.cs:565`) — so its saved name stands. The exception is a local
+/// alternate version a boot handed back to the scan
+/// ([`crate::adoption_repairs::rederive_adopted_versions`]): it stands in for
+/// the row Jellyfin 12.x creates in place of a 10.11 one
+/// (`LibraryManager.ResolveAlternateVersion`, named by the resolver), so
+/// until its first refresh the name 10.11 gave it is a generated one too
+/// ([`adopted_version_name`]).
 fn renamed_extra(
     stored: &BaseItemEntity,
     planned: &Planned,
@@ -23691,12 +23531,17 @@ fn renamed_extra(
         .name
         .as_deref()
         .filter(|name| !name.is_empty())?;
+    let adopted = adopted_version_name(stored);
     let generated = match stored.name.as_deref() {
         // A row with no name has none to keep.
         None | Some("") => true,
-        Some(current) => current != name && planned.generated_names.iter().any(|g| g == current),
+        Some(current) => {
+            current != name
+                && (planned.generated_names.iter().any(|g| g == current)
+                    || adopted.as_deref() == Some(current))
+        }
     };
-    if planned.generated_names.is_empty()
+    if (planned.generated_names.is_empty() && adopted.is_none())
         || locked_fields.contains(&MetadataField::Name)
         || !generated
     {
@@ -23706,6 +23551,29 @@ fn renamed_extra(
     row.name = Some(name.to_owned());
     settle_sort_name(&mut row);
     Some(row)
+}
+
+/// Whether `stored` is a local alternate version not refreshed since a boot
+/// handed it back to be derived afresh
+/// ([`crate::adoption_repairs::rederive_adopted_versions`]): it stands in for
+/// the row upstream's scan creates in place of a 10.11 one.
+fn handed_back_version(stored: &BaseItemEntity) -> bool {
+    stored.owner_id.is_some()
+        && stored.primary_version_id.is_some()
+        && stored.extra_type.is_none()
+        && stored.date_last_refreshed.is_none()
+}
+
+/// The name Jellyfin 10.11 gave a local alternate version, its file's name
+/// (it resolved the file with no parent, so unparsed:
+/// `RefreshMetadataForOwnedVideo`, 10.11.8 `BaseItem.cs:2513-2541`), when
+/// `stored` is a version still to be derived afresh
+/// ([`handed_back_version`]) and not locked.
+fn adopted_version_name(stored: &BaseItemEntity) -> Option<String> {
+    if !handed_back_version(stored) || stored.is_locked {
+        return None;
+    }
+    stored.path.as_deref().map(file_stem)
 }
 
 /// Maps an NFO-parsed [`PersonInfo`](ferrofin_providers::container_types::PersonInfo)
@@ -23864,6 +23732,7 @@ struct ProbeRows {
     people: Option<Vec<PeopleEntity>>,
     /// Whether the attachment rows are authoritative: a probe ran and the item
     /// is a video (`false` — no probe, or an audio file — leaves stored rows alone).
+    /// It also has the stream save store the video's `HasSubtitles` from its rows.
     save_attachments: bool,
 }
 
@@ -24772,10 +24641,9 @@ fn chapter_to_entity(
         start_position_ticks: chapter.start_position_ticks,
         name: chapter.name.clone(),
         image_path: chapter.image_path.clone(),
-        image_date_modified: chapter
-            .image_path
-            .as_ref()
-            .map(|_| chapter.image_date_modified),
+        // Upstream's `Map` stores the date whether or not there is an image:
+        // `MinValue` for a chapter without one.
+        image_date_modified: Some(chapter.image_date_modified),
     }
 }
 
@@ -26189,67 +26057,6 @@ mod tests {
         assert_eq!(kept(&none, &row(Some(owner), Some(1))), None);
     }
 
-    /// An album's cover is read and hashed into the shared, content-addressed
-    /// store once: while the file keeps its size and mtime (and the shared
-    /// copy is still there), a later scan reuses that copy without reading the
-    /// cover again. A change its metadata shows is read and hashed afresh.
-    #[tokio::test]
-    async fn an_unchanged_album_cover_is_not_read_and_hashed_again() {
-        use ferrofin_model::entities::ImageType;
-        use ferrofin_traits::library::VirtualFolderManager;
-        use ferrofin_traits::options::ItemImageInfo;
-
-        let db = crate::test_support::test_db().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let persistence = std::sync::Arc::new(FerrofinItemPersistenceService::new(db));
-        let vf: std::sync::Arc<dyn VirtualFolderManager> = std::sync::Arc::new(
-            crate::FerrofinVirtualFolderManager::new(tmp.path().join("views"))
-                .with_item_store(persistence.clone()),
-        );
-        let scanner = LibraryScanner::new(
-            vf,
-            std::sync::Arc::new(FerrofinFileSystem::new()),
-            persistence,
-        )
-        .with_metadata_dir(tmp.path().join("metadata"));
-        let album = uuid::Uuid::new_v4();
-        let cover = tmp.path().join("folder.jpg");
-        std::fs::write(&cover, b"first cover").unwrap();
-        let image = ItemImageInfo {
-            path: cover.to_string_lossy().into_owned(),
-            image_type: ImageType::Primary,
-            date_modified: super::file_date_modified(&cover),
-            width: 0,
-            height: 0,
-            blur_hash: None,
-        };
-        let first = scanner.shared_album_cover(album, &image).expect("shared");
-
-        // Other bytes, the same size and mtime: only a re-read would notice.
-        let modified = std::fs::metadata(&cover).unwrap().modified().unwrap();
-        std::fs::write(&cover, b"other cover").unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&cover)
-            .unwrap()
-            .set_modified(modified)
-            .unwrap();
-        let again = scanner.shared_album_cover(album, &image).expect("shared");
-        assert_eq!(again.path, first.path, "the shared copy is reused unread");
-
-        // A shared copy that is gone is published again.
-        std::fs::remove_file(&first.path).unwrap();
-        let republished = scanner.shared_album_cover(album, &image).expect("shared");
-        assert!(
-            std::path::Path::new(&republished.path).is_file(),
-            "{republished:?}"
-        );
-
-        std::fs::write(&cover, b"a new, longer cover").unwrap();
-        let changed = scanner.shared_album_cover(album, &image).expect("shared");
-        assert_ne!(changed.path, first.path, "a changed cover is hashed afresh");
-    }
-
     /// After the walk, each planned primary's local versions are written
     /// under it — their ids derived with the primary's kind — and a version
     /// a later walk released from the group is unlinked. A stopped walk
@@ -26928,6 +26735,19 @@ mod tests {
         assert_eq!(
             super::frequency_ordered_distinct(rows.iter().copied()),
             vec!["B".to_owned(), "a".to_owned()]
+        );
+    }
+
+    /// gl-1590: a chapter without an image is stored with its date, .NET's
+    /// `DateTime.MinValue`, as upstream's `ChapterRepository.Map` stores it,
+    /// not NULL.
+    #[test]
+    fn an_imageless_chapter_entity_keeps_its_min_value_date() {
+        let chapter = ferrofin_model::entities_media::ChapterInfo::default();
+        let entity = crate::library_scan::chapter_to_entity("id", 0, &chapter);
+        assert_eq!(
+            entity.image_date_modified,
+            Some(ferrofin_model::json::datetime::dotnet_min())
         );
     }
 
@@ -27775,6 +27595,36 @@ mod tests {
         assert_eq!(e.genres.as_deref(), Some("Action|Drama"));
         assert_eq!(e.studios.as_deref(), Some("ACME"));
         assert_eq!(e.community_rating, Some(7.5));
+    }
+
+    /// gl-1587: an NFO's `<country>` values reach the provider result's
+    /// `ProductionLocations`, filled when empty, else a case-insensitive
+    /// distinct union with what it already holds (`MetadataService.cs:1295-1304`'s
+    /// rule; the lock and the replace against the stored row are
+    /// `merge_union_lists`').
+    #[test]
+    fn apply_nfo_stores_the_production_locations() {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
+        let mut n = NfoBaseItem::new(NfoItemKind::Movie);
+        n.production_locations = vec!["United Kingdom".into(), "France".into()];
+
+        let mut empty = BaseItemEntity::default();
+        super::apply_nfo(&mut empty, &n);
+        assert_eq!(
+            empty.production_locations.as_deref(),
+            Some("United Kingdom|France")
+        );
+
+        let mut known = BaseItemEntity {
+            production_locations: Some("france|Japan".into()),
+            ..Default::default()
+        };
+        super::apply_nfo(&mut known, &n);
+        assert_eq!(
+            known.production_locations.as_deref(),
+            Some("france|Japan|United Kingdom")
+        );
     }
 
     /// An NFO episode range (`<episodenumberend>`, or the last of several
@@ -29358,40 +29208,54 @@ mod tests {
         );
     }
 
-    /// A writer reuses art an older scan left in the legacy folder rather than
-    /// fetch it again; with none there, or one in the own folder, it writes to
-    /// the own folder.
+    /// A writer reuses art an earlier build left in the `{ID}` folder or an
+    /// older scan in the legacy folder, under the name it gave it, rather
+    /// than fetch it again; with none there, or one in the own folder, it
+    /// writes to the own folder under upstream's name.
     #[test]
-    fn a_writer_reuses_legacy_art_before_fetching_again() {
+    fn a_writer_reuses_earlier_art_before_fetching_again() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let id = uuid::Uuid::from_u128(0xABCD_EF03);
         let own = crate::dynamic_images::own_art_dir(root, id);
+        let earlier = crate::dynamic_images::earlier_art_dir(root, id);
         let legacy = crate::dynamic_images::legacy_art_dir(root, id);
+        let thumb = || {
+            super::art_dir_for(
+                root,
+                id,
+                "Studio",
+                ferrofin_model::entities::ImageType::Thumb,
+            )
+        };
         assert_eq!(
-            super::art_dir_for(root, id, "thumb"),
-            own,
+            thumb(),
+            (own.clone(), "landscape".into()),
             "nothing anywhere"
         );
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("thumb.png"), b"x").unwrap();
+        assert_eq!(thumb(), (legacy, "thumb".into()), "reused in place");
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::write(earlier.join("thumb.png"), b"x").unwrap();
         assert_eq!(
-            super::art_dir_for(root, id, "thumb"),
-            legacy,
-            "reused in place"
+            thumb(),
+            (earlier, "thumb".into()),
+            "the earlier folder first"
         );
         assert_eq!(
-            super::art_dir_for(root, id, "primary"),
-            own,
-            "another stem is written to the own folder"
+            super::art_dir_for(
+                root,
+                id,
+                "Person",
+                ferrofin_model::entities::ImageType::Primary
+            ),
+            (own.clone(), "folder".into()),
+            "another type is written to the own folder"
         );
         std::fs::create_dir_all(&own).unwrap();
-        std::fs::write(own.join("thumb.jpg"), b"x").unwrap();
-        assert_eq!(
-            super::art_dir_for(root, id, "thumb"),
-            own,
-            "the own folder wins"
-        );
+        std::fs::write(own.join("landscape.jpg"), b"x").unwrap();
+        assert_eq!(thumb(), (own, "landscape".into()), "the own folder wins");
     }
 
     /// Phase 3L: a person's biography fetch is a remote provider, so it
@@ -29733,17 +29597,56 @@ mod tests {
         let local = image(movie_dir.join("poster.jpg"), ImageType::Primary);
         let published = image(meta.join("heat").join("backdrop.jpg"), ImageType::Backdrop);
         saver
-            .save_all(&movie, &mut [local, published.clone()], &[published])
+            .save_all(
+                &movie,
+                &mut [local, published.clone()],
+                std::slice::from_ref(&published),
+            )
             .await
             .expect("nothing to publish");
         assert_eq!(folders.counts(), (0, 0), "no destination asked for");
+        // The stored image listed again from its art folder: the file's own
+        // nanoseconds, which its row keeps at the database's 100 ns, and no
+        // size yet. A generated album copy is one (gl-1633).
+        let listed = ItemImageInfo {
+            date_modified: published.date_modified + chrono::Duration::nanoseconds(37),
+            ..published.clone()
+        };
+        let measured = ItemImageInfo {
+            width: 1280,
+            height: 720,
+            ..published.clone()
+        };
+        saver
+            .save_all(&movie, &mut [listed], std::slice::from_ref(&measured))
+            .await
+            .expect("nothing to publish");
+        assert_eq!(
+            folders.counts(),
+            (0, 0),
+            "an unchanged file is no acquisition"
+        );
+        // The same file written again, at a new time, is one.
+        let rewritten = ItemImageInfo {
+            date_modified: published.date_modified + chrono::Duration::seconds(1),
+            ..published
+        };
+        saver
+            .save_all(&movie, &mut [rewritten], &[measured])
+            .await
+            .expect("no library saves beside the media");
+        assert_eq!(
+            folders.counts(),
+            (0, 1),
+            "a rewritten file is an acquisition"
+        );
 
         let fetched = image(meta.join("heat").join("logo.png"), ImageType::Logo);
         saver
             .save_all(&movie, &mut [fetched], &[])
             .await
             .expect("no library saves beside the media");
-        assert_eq!(folders.counts(), (0, 1), "the snapshot, once");
+        assert_eq!(folders.counts(), (0, 2), "the snapshot, once a save");
     }
 
     /// gl-1084: the NFO saver refuses a scan's `MetadataImport` of an episode
@@ -29856,7 +29759,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let meta_root = tmp.path().join("People");
-        // Pre-place the profile art under the name `download_images` looks for,
+        // Pre-place the profile art under the name `download_image` looks for,
         // so it reuses the on-disk file and the test never needs the network.
         let art_dir = crate::dynamic_images::own_art_dir(&meta_root, person_id);
         std::fs::create_dir_all(&art_dir).unwrap();
@@ -29868,7 +29771,7 @@ mod tests {
                 image::Rgb([40, 40, 200])
             };
         }
-        profile.save(art_dir.join("primary.jpg")).unwrap();
+        profile.save(art_dir.join("folder.jpg")).unwrap();
 
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
             FerrofinVirtualFolderManager::new(tmp.path().join("default"))
@@ -29953,11 +29856,11 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let meta_root = tmp.path().join("People");
-        // Pre-place the profile art where `download_images` looks, so the test
+        // Pre-place the profile art where `download_image` looks, so the test
         // never reaches the network.
         let art_dir = crate::dynamic_images::own_art_dir(&meta_root, person_id);
         std::fs::create_dir_all(&art_dir).unwrap();
-        write_poster(&art_dir.join("primary.jpg"), 48, 64);
+        write_poster(&art_dir.join("folder.jpg"), 48, 64);
 
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
             FerrofinVirtualFolderManager::new(tmp.path().join("default"))
@@ -30154,12 +30057,9 @@ mod tests {
 
         // An answering repository; Mosfilm's thumb cannot be written (its
         // folder is a file).
-        std::fs::create_dir_all(tmp.path().join("metadata")).unwrap();
-        std::fs::write(
-            crate::dynamic_images::own_art_dir(&tmp.path().join("metadata"), mosfilm),
-            b"x",
-        )
-        .unwrap();
+        let blocked = crate::dynamic_images::own_art_dir(&tmp.path().join("metadata"), mosfilm);
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(blocked, b"x").unwrap();
         let base = spawn_art_server("Mosfilm\nLenfilm", b"GIF89aDATA");
         scanner(&base)
             .enrich_studio_images(super::ScanRun::defaults())
@@ -30172,6 +30072,207 @@ mod tests {
             "no thumb in the repository: an answer"
         );
         assert_eq!(items.get_image_infos(lenfilm).await.unwrap().len(), 1);
+    }
+
+    /// The first-refresh pass stamps the new genres, music genres, root and
+    /// user root once, and leaves alone a studio (its own pass stamps it), a
+    /// person (which upstream never refreshes there) and a genre made on
+    /// demand, which upstream's validator finds existing (gl-1586).
+    #[tokio::test]
+    async fn the_first_refresh_pass_stamps_genres_and_the_root_folders_once() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use crate::test_support::{fetch_item, seed_item, test_db};
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(items);
+        let on_demand = uuid::Uuid::new_v4();
+        seed_item(&db, on_demand, BaseItemKind::Genre).await;
+        let mut row: BaseItemEntity = fetch_item(&db, on_demand).await;
+        row.date_modified = Some(chrono::Utc::now());
+        crate::test_support::save_item(&db, &row).await;
+        let stamped = [
+            BaseItemKind::Genre,
+            BaseItemKind::MusicGenre,
+            BaseItemKind::AggregateFolder,
+            BaseItemKind::UserRootFolder,
+        ];
+        let mut ids = Vec::new();
+        for kind in stamped
+            .into_iter()
+            .chain([BaseItemKind::Studio, BaseItemKind::Person])
+        {
+            let id = uuid::Uuid::new_v4();
+            seed_item(&db, id, kind).await;
+            ids.push((id, kind));
+        }
+
+        scanner.stamp_first_refreshes().await.expect("first pass");
+        let row: BaseItemEntity = fetch_item(&db, on_demand).await;
+        assert_eq!(row.date_last_refreshed, None, "made on demand");
+        let mut first = Vec::new();
+        for (id, kind) in &ids {
+            let row: BaseItemEntity = fetch_item(&db, *id).await;
+            if stamped.contains(kind) {
+                assert!(row.date_last_refreshed.is_some(), "{kind:?}");
+                assert_eq!(row.date_last_saved, row.date_last_refreshed, "{kind:?}");
+            } else {
+                assert_eq!(row.date_last_refreshed, None, "{kind:?}");
+            }
+            first.push(row.date_last_refreshed);
+        }
+        // A later validation finds them refreshed: nothing is stamped again.
+        scanner.stamp_first_refreshes().await.expect("second pass");
+        for ((id, kind), before) in ids.iter().zip(first) {
+            let row: BaseItemEntity = fetch_item(&db, *id).await;
+            assert_eq!(row.date_last_refreshed, before, "{kind:?}");
+        }
+    }
+
+    /// Where the roots' opening refresh runs (a collage-capable processor),
+    /// the first-refresh pass leaves the roots to it: that refresh stamps
+    /// them, or leaves one whose refresh failed unstamped (gl-950, gl-1586).
+    #[tokio::test]
+    async fn the_first_refresh_pass_leaves_the_roots_to_their_opening_refresh() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use crate::test_support::{fetch_item, seed_item, test_db};
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        use ferrofin_drawing::{ImageCrateEncoder, ImageProcessor};
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(items)
+                .with_image_processor(Arc::new(ImageProcessor::new(
+                    Arc::new(ImageCrateEncoder::new()),
+                    tmp.path().join("cache"),
+                )))
+                .with_metadata_dir(tmp.path().join("metadata"));
+        let (root, user_root, genre) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        seed_item(&db, root, BaseItemKind::AggregateFolder).await;
+        seed_item(&db, user_root, BaseItemKind::UserRootFolder).await;
+        seed_item(&db, genre, BaseItemKind::Genre).await;
+
+        scanner.stamp_first_refreshes().await.expect("pass");
+        for id in [root, user_root] {
+            let row: BaseItemEntity = fetch_item(&db, id).await;
+            assert_eq!(
+                row.date_last_refreshed, None,
+                "a root is its refresh's to stamp"
+            );
+        }
+        let row: BaseItemEntity = fetch_item(&db, genre).await;
+        assert!(
+            row.date_last_refreshed.is_some(),
+            "a new genre is still stamped"
+        );
+    }
+
+    /// The Playlists folder gets its first refresh once its directory holds
+    /// an entry, as upstream's validation skips an empty top parent: the
+    /// save restats the directory, so `DateModified` goes, and the refresh
+    /// and the save are stamped, once (gl-1625).
+    #[tokio::test]
+    async fn the_playlists_folder_is_first_refreshed_once_its_directory_holds_a_playlist() {
+        use crate::item_persistence_service::FerrofinItemPersistenceService;
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use crate::test_support::{fetch_item, save_item, seed_item, test_db};
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let db = test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(items);
+        let dir = tmp.path().join("playlists");
+        std::fs::create_dir_all(&dir).unwrap();
+        let folder = uuid::Uuid::new_v4();
+        seed_item(&db, folder, BaseItemKind::PlaylistsFolder).await;
+        let mut row = fetch_item(&db, folder).await;
+        let created = chrono::DateTime::parse_from_rfc3339("2026-11-01T02:03:04Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        row.path = Some(dir.to_string_lossy().into_owned());
+        row.is_folder = true;
+        row.date_modified = Some(created);
+        save_item(&db, &row).await;
+        let saved = fetch_item(&db, folder).await.date_last_saved;
+
+        scanner.stamp_first_refreshes().await.expect("empty");
+        let row = fetch_item(&db, folder).await;
+        assert_eq!(
+            (
+                row.date_modified,
+                row.date_last_refreshed,
+                row.date_last_saved
+            ),
+            (Some(created), None, saved),
+            "an empty directory is skipped"
+        );
+
+        std::fs::create_dir(dir.join("Mix")).unwrap();
+        scanner
+            .stamp_first_refreshes()
+            .await
+            .expect("with a playlist");
+        let row = fetch_item(&db, folder).await;
+        assert_eq!(row.date_modified, None, "the directory's restat");
+        let refreshed = row.date_last_refreshed.expect("refreshed");
+        let saved = row.date_last_saved.expect("saved");
+        assert!(saved >= refreshed, "{saved} {refreshed}");
+
+        scanner.stamp_first_refreshes().await.expect("again");
+        let row = fetch_item(&db, folder).await;
+        assert_eq!(
+            (row.date_last_refreshed, row.date_last_saved),
+            (Some(refreshed), Some(saved)),
+            "refreshed once"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -31786,6 +31887,36 @@ mod tests {
         assert_eq!(row.normalization_gain, Some(-9.0));
     }
 
+    /// A stored virtual season the scan plans (its number's episode files
+    /// appeared, or it has a folder) is no virtual season any more, as
+    /// `CreateSeasonsAsync` and `SaveIsVirtualItem` make it; a virtual
+    /// episode, which the scan never plans over, keeps its flag (gl-1593).
+    #[test]
+    fn a_planned_season_is_never_virtual() {
+        let kind_row = |kind: BaseItemKind| BaseItemEntity {
+            type_: crate::item_type_lookup::stored_type_name(kind)
+                .expect("type")
+                .to_owned(),
+            ..BaseItemEntity::default()
+        };
+        let mut stored = BaseItemEntity {
+            is_virtual_item: true,
+            ..kind_row(BaseItemKind::Season)
+        };
+        super::overlay_file_facts(&mut stored, &kind_row(BaseItemKind::Season), false);
+        assert!(!stored.is_virtual_item, "the planned season is real");
+
+        let mut episode = BaseItemEntity {
+            is_virtual_item: true,
+            ..kind_row(BaseItemKind::Episode)
+        };
+        super::overlay_file_facts(&mut episode, &kind_row(BaseItemKind::Episode), false);
+        assert!(
+            episode.is_virtual_item,
+            "only a season's flag is the planner's"
+        );
+    }
+
     #[test]
     fn audio_probe_applies_current_library_artist_and_delimiter_options_to_raw_tags() {
         let first_id = "11111111-1111-4111-8111-111111111111";
@@ -33017,7 +33148,10 @@ mod tests {
             parent_id: Some("PARENT".into()),
             owner_id: Some("PRIMARY".into()),
             extra_type: (shape == "extra").then_some(2),
-            primary_version_id: (shape == "alternate").then(|| "PRIMARY".into()),
+            primary_version_id: shape.ends_with("alternate").then(|| "PRIMARY".into()),
+            is_locked: shape == "locked alternate",
+            date_last_refreshed: (shape == "refreshed alternate")
+                .then_some(chrono::DateTime::UNIX_EPOCH),
             data: Some(r#"{"VideoType":"VideoFile"}"#.into()),
             ..BaseItemEntity::default()
         }
@@ -33058,9 +33192,12 @@ mod tests {
     /// stored name the scan gave it (`PrepareExtra` / `IsGeneratedExtraName`,
     /// v12.2): a number of its type, the resolver's name for its file, or
     /// the raw file stem Ferrofin stored before it named a movie's extras.
-    /// Any other name — an NFO title, an edit — stands. A stacked part or a
-    /// local alternate keeps its stored name, locked or not. The rename
-    /// lands on the merge's base, so it survives a locked item's save.
+    /// Any other name — an NFO title, an edit — stands. A stacked part keeps
+    /// its stored name, locked or not, and so does a local alternate, unless
+    /// a boot handed it back to be derived afresh (never refreshed since)
+    /// and its name is still its file's, as Jellyfin 10.11 named it, and
+    /// neither it nor its name is locked. The rename lands on the merge's
+    /// base, so it survives a locked item's save.
     #[rstest::rstest]
     #[case::numbered("extra", "Trailer 2", &[], true)]
     #[case::resolver_name("extra", "Heat", &[], true)]
@@ -33072,7 +33209,12 @@ mod tests {
     #[case::other_lock("extra", "Trailer 2", &[ferrofin_model::entities::MetadataField::Overview], true)]
     #[case::part("part", "Trailer 2", &[], false)]
     #[case::alternate("alternate", "Trailer 2", &[], false)]
-    fn only_an_extra_with_a_generated_name_takes_the_planners_name(
+    #[case::adopted_alternate("alternate", "Heat cd2", &[], true)]
+    #[case::adopted_alternate_name_locked("alternate", "Heat cd2", &[ferrofin_model::entities::MetadataField::Name], false)]
+    #[case::locked_adopted_alternate("locked alternate", "Heat cd2", &[], false)]
+    #[case::refreshed_alternate("refreshed alternate", "Heat cd2", &[], false)]
+    #[case::part_named_by_its_file("part", "Heat cd2", &[], false)]
+    fn an_owned_row_takes_the_planners_name_only_where_its_name_was_generated(
         #[case] shape: &str,
         #[case] stored_name: &str,
         #[case] locked_fields: &[ferrofin_model::entities::MetadataField],
@@ -34805,6 +34947,110 @@ mod tests {
         assert!(media_streams.is_empty(), "{media_streams:?}");
     }
 
+    /// A video probe's stream save leaves the video's `HasSubtitles` agreeing
+    /// with the rows it saved (gl-1914): the item's row went first, with the
+    /// probe snapshot's flag, and a subtitle a download attached in between
+    /// (whose flag the row overwrote) or one the save replaced must not leave
+    /// them apart, on the plain save and on the download gate's, which keeps a
+    /// subtitle the snapshot lacked. Every other key of `Data` stays, and an
+    /// audio probe's save gives a track no flag.
+    #[rstest::rstest]
+    #[case::a_subtitle_saved(
+        "subtitle",
+        r#"{"VideoType":"VideoFile","HasSubtitles":false}"#,
+        Some(true)
+    )]
+    #[case::none_saved(
+        "video",
+        r#"{"VideoType":"VideoFile","HasSubtitles":true}"#,
+        Some(false)
+    )]
+    #[case::a_download_kept(
+        "download",
+        r#"{"VideoType":"VideoFile","HasSubtitles":false}"#,
+        Some(true)
+    )]
+    #[case::an_audio_probe("audio", r#"{"VideoType":"VideoFile"}"#, None)]
+    #[tokio::test]
+    async fn a_video_probes_stream_save_keeps_has_subtitles_with_its_rows(
+        #[case] probe_kind: &str,
+        #[case] saved: &str,
+        #[case] expected: Option<bool>,
+    ) {
+        use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+        use ferrofin_traits::persistence::MediaStreamRepository;
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let id = uuid::Uuid::new_v4();
+        let row = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            parent_id: None,
+            data: Some(saved.to_owned()),
+            ..planned_movie()
+        };
+        persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let folders = Arc::new(FerrofinVirtualFolderManager::new(tmp.path().join("views")));
+        let mut scanner =
+            LibraryScanner::new(folders, Arc::new(FerrofinFileSystem::new()), persistence);
+        let streams: Arc<dyn MediaStreamRepository> =
+            Arc::new(crate::FerrofinMediaStreamRepository::new(db.clone()));
+        scanner.media_streams = Some(Arc::clone(&streams));
+        let stream = |stream_index, stream_type| MediaStreamInfoEntity {
+            stream_index,
+            stream_type,
+            codec: Some("subrip".to_owned()),
+            ..Default::default()
+        };
+        let mut probe = super::ProbeRows {
+            save_attachments: probe_kind != "audio",
+            ..super::ProbeRows::default()
+        };
+        let own = if probe_kind == "audio" {
+            ferrofin_model::entities::MediaStreamType::Audio
+        } else {
+            ferrofin_model::entities::MediaStreamType::Video
+        };
+        probe
+            .streams
+            .push(stream(0, crate::db_error::media_stream_type_disc(own)));
+        if probe_kind == "subtitle" {
+            probe.streams.push(stream(1, 2));
+        }
+        // What a download attached after the probe's snapshot: its sidecar
+        // and row, the row the gate's save keeps.
+        let manager: Arc<dyn ferrofin_traits::subtitles::SubtitleManager> =
+            Arc::new(crate::FerrofinSubtitleManager::new(
+                db.clone(),
+                crate::test_support::library_manager_over(db.clone()),
+                Arc::clone(&streams),
+                Vec::new(),
+                tmp.path().join("metadata"),
+            ));
+        let downloader =
+            crate::subtitle_downloader::SubtitleDownloader::new(&manager, Arc::clone(&streams));
+        if probe_kind == "download" {
+            let sidecar = tmp.path().join("Heat (1995).eng.srt");
+            std::fs::write(&sidecar, b"1\n").unwrap();
+            let mut attached = stream(1, 2);
+            attached.is_external = true;
+            attached.path = Some(sidecar.to_string_lossy().into_owned());
+            streams.save_media_streams(id, &[attached]).await.unwrap();
+        }
+        let gated = (probe_kind == "download").then_some(&downloader);
+
+        scanner.persist_probe_rows(id, &probe, gated).await.unwrap();
+
+        let data = crate::test_support::fetch_item(&db, id).await.data;
+        let data: serde_json::Value =
+            serde_json::from_str(data.as_deref().expect("data")).expect("json");
+        assert_eq!(data["HasSubtitles"].as_bool(), expected, "{data}");
+        assert_eq!(data["VideoType"], "VideoFile", "{data}");
+    }
+
     /// `FFProbeVideoInfo.Fetch` (`FFProbeVideoInfo.cs:263-266`): a video's
     /// `Width`/`Height` are its first video stream's, else 0 — so a re-probe
     /// that finds no video stream replaces what an earlier probe stored. A
@@ -36078,7 +36324,7 @@ mod tests {
         let scanner = scanner.with_tvdb(Arc::new(
             ferrofin_providers::TvdbClient::new().with_cache_duration(duration),
         ));
-        let (mut cache, _, _) = scanner.scan_prereads(&[], super::ScanRun::defaults()).await;
+        let (mut cache, _) = scanner.scan_prereads(&[], super::ScanRun::defaults()).await;
         let series = "SERIES".to_owned();
         cache.series_tvdb.insert(
             series.clone(),
@@ -38946,8 +39192,72 @@ mod tests {
         assert_eq!(PersonKind::from_stored("27"), PersonKind::Unrecognized(27));
     }
 
-    // A track's embedded cover becomes its Primary image, stored in the
-    // metadata dir (never next to the user's media), and the album inherits it.
+    // `GetAudioImagePath`'s key: a track shares its album's extraction only
+    // with a non-blank `Album` tag and first album artist.
+    #[rstest::rstest]
+    #[case::tagged(Some("Kind of Blue"), Some("Miles Davis|Bill Evans"), true)]
+    #[case::no_album_tag(None, Some("Miles Davis"), false)]
+    #[case::blank_album_tag(Some("  "), Some("Miles Davis"), false)]
+    #[case::no_album_artist(Some("Kind of Blue"), None, false)]
+    #[case::blank_first_album_artist(Some("Kind of Blue"), Some(" |Bill Evans"), false)]
+    fn a_track_shares_an_extraction_only_with_its_album_tag_and_artist(
+        #[case] album_tag: Option<&str>,
+        #[case] album_artists: Option<&str>,
+        #[case] shared: bool,
+    ) {
+        let album = uuid::Uuid::from_u128(7);
+        let track = super::BaseItemEntity {
+            album: album_tag.map(str::to_owned),
+            album_artists: album_artists.map(str::to_owned),
+            ..Default::default()
+        };
+        let key = super::album_cover_key(album, &track);
+        assert_eq!(key.is_some(), shared, "{key:?}");
+        if shared {
+            assert_eq!(
+                key,
+                Some((album, "Kind of Blue".to_owned(), "Miles Davis".to_owned()))
+            );
+        }
+    }
+
+    // `AudioImageProvider.GetImage`'s choice: a picture whose comment names
+    // the front cover (any case), else one naming a cover, else the first in
+    // stream order; none without a picture.
+    #[rstest::rstest]
+    #[case::front_over_cover(&[(2, Some("Cover (back)")), (3, Some("Cover (front)"))], Some(3))]
+    #[case::cover_over_first(&[(2, Some("Other")), (3, Some("cover"))], Some(3))]
+    #[case::first_by_index(&[(4, None), (2, Some("Artist"))], Some(2))]
+    #[case::front_in_any_case(&[(1, Some("cover")), (2, Some("FRONT"))], Some(2))]
+    #[case::no_picture(&[], None)]
+    fn the_audio_cover_is_the_front_then_a_cover_then_the_first_picture(
+        #[case] pictures: &[(i64, Option<&str>)],
+        #[case] chosen: Option<i32>,
+    ) {
+        let mut streams = vec![super::MediaStreamInfoEntity {
+            stream_index: 0,
+            stream_type: 1,
+            comment: Some("front".into()),
+            ..Default::default()
+        }];
+        streams.extend(
+            pictures
+                .iter()
+                .map(|&(index, comment)| super::MediaStreamInfoEntity {
+                    stream_index: index,
+                    stream_type: super::EMBEDDED_IMAGE_STREAM_TYPE,
+                    comment: comment.map(str::to_owned),
+                    ..Default::default()
+                }),
+        );
+        assert_eq!(super::audio_cover_stream(&streams), chosen);
+    }
+
+    // A track's embedded cover becomes its own Primary image, stored in the
+    // metadata dir (never next to the user's media). The album takes a copy
+    // of it in its own art folder (`MusicAlbumImageProvider`), never in its
+    // media folder, whatever "Save artwork into media folders" says
+    // (gl-1633), and keeps that copy on later refreshes.
     #[rstest::rstest]
     #[case(false)]
     #[case(true)]
@@ -39068,8 +39378,9 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let mut cache = super::ArtworkCache::default();
         let images = scanner
-            .extract_embedded_cover(track_id, &track, &streams)
+            .extract_embedded_cover(track_id, &track, &streams, None, &mut cache)
             .await;
         assert_eq!(images.len(), 1);
         assert_eq!(
@@ -39085,44 +39396,78 @@ mod tests {
         // ffmpeg's scratch file next to the media is cleaned up.
         assert!(!tmp.path().join("01 - So What.flac.image.jpg").exists());
 
-        // Persist it, then the album inherits it (upstream AlbumImageProvider).
+        // Persist it, then the album's provider copies it.
         persistence
             .save_item_images(track_id, &images)
             .await
             .expect("save track image");
-        scanner.inherit_album_cover(album_id, items.as_ref()).await;
+        let providers = crate::dynamic_images::DynamicImageProviders::new(
+            Arc::clone(&items),
+            persistence.clone(),
+            Arc::new(crate::test_support::FakeImages),
+            meta.clone(),
+        );
+        let album = items.retrieve_item(album_id).await.unwrap().unwrap();
+        assert_eq!(
+            providers.refresh_item(&album, false).await.unwrap(),
+            ferrofin_traits::providers::ItemUpdateType::ImageUpdate
+        );
         let album_images = items.get_image_infos(album_id).await.unwrap();
         assert_eq!(album_images.len(), 1);
-        assert_ne!(album_images[0].path, images[0].path);
-        assert_eq!(std::fs::read(&album_images[0].path).unwrap(), b"COVER");
-        // Pin the content-addressed filename across digest crate upgrades.
         assert_eq!(
-            std::path::Path::new(&album_images[0].path)
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            if save_local {
-                "folder.jpg"
-            } else {
-                "2864716a6e437019a72d7dada2f071b83b2113cf85005475a5d228b6a73cf54a.jpg"
-            }
+            std::path::Path::new(&album_images[0].path),
+            crate::dynamic_images::own_art_dir(&meta, album_id).join("folder.jpg"),
+            "the album's copy is in its own art folder"
         );
-
+        assert_eq!(std::fs::read(&album_images[0].path).unwrap(), b"COVER");
+        assert!(
+            !tmp.path().join("folder.jpg").exists(),
+            "nothing is written into the album's media folder"
+        );
         assert!(
             stored.is_file(),
             "the track retains its internal embedded cover"
         );
-        scanner.inherit_album_cover(album_id, items.as_ref()).await;
+        // `HasChangedByDate` is false for an album: its copy is not drawn
+        // again, even once its file's time moved; a forced refresh draws it.
+        std::fs::File::options()
+            .write(true)
+            .open(&album_images[0].path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
         assert_eq!(
-            items.get_image_infos(album_id).await.unwrap(),
-            album_images,
-            "an unchanged inherited cover keeps its destination and mtime"
+            providers.refresh_item(&album, false).await.unwrap(),
+            ferrofin_traits::providers::ItemUpdateType::None
+        );
+        assert_eq!(items.get_image_infos(album_id).await.unwrap(), album_images);
+        assert_eq!(
+            providers.refresh_item(&album, true).await.unwrap(),
+            ferrofin_traits::providers::ItemUpdateType::ImageUpdate
+        );
+
+        // An audiobook (`item is Audio` upstream) extracts its own.
+        let book_id = uuid::Uuid::new_v4();
+        let book = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(book_id),
+            type_: stored_type_name(BaseItemKind::AudioBook)
+                .unwrap()
+                .to_owned(),
+            ..track.clone()
+        };
+        let covers = scanner
+            .extract_embedded_cover(book_id, &book, &streams, None, &mut cache)
+            .await;
+        assert_eq!(covers.len(), 1, "{covers:?}");
+        assert!(
+            std::path::Path::new(&covers[0].path)
+                .starts_with(crate::dynamic_images::own_art_dir(&meta, book_id)),
+            "{covers:?}"
         );
 
         // A track with no image stream extracts nothing.
         let none = scanner
-            .extract_embedded_cover(track_id, &track, &streams[..1])
+            .extract_embedded_cover(track_id, &track, &streams[..1], None, &mut cache)
             .await;
         assert!(none.is_empty(), "{none:?}");
     }
@@ -39490,6 +39835,18 @@ mod tests {
                 ..Default::default()
             })
         }
+        async fn get_media_info_full(
+            &self,
+            request: &MediaInfoRequest,
+        ) -> Result<ferrofin_model::media_info::MediaInfo, ServiceError> {
+            // One album tag and album artist: the tracks share one extraction.
+            Ok(ferrofin_model::media_info::MediaInfo {
+                media_source: self.get_media_info(request).await?,
+                album: Some("Album".to_owned()),
+                album_artists: vec!["Artist".to_owned()],
+                ..Default::default()
+            })
+        }
         async fn extract_audio_image(
             &self,
             path: &str,
@@ -39527,7 +39884,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn album_artwork_is_shared_across_discs_rescans_and_image_edits() {
+    async fn album_artwork_follows_discs_rescans_and_image_edits() {
         use ferrofin_model::data::BaseItemKind;
         use ferrofin_model::entities::ImageType;
         use ferrofin_traits::options::InternalItemsQuery;
@@ -39601,92 +39958,99 @@ mod tests {
         assert_eq!(tracks.len(), 12);
         assert_eq!(albums.len(), 1);
         let album = Uuid::parse_str(&albums[0].id).unwrap();
-        let cover = items.get_image_infos(album).await.unwrap().remove(0);
+        // One extraction for the album's two discs; each track with a
+        // picture has its own copy, measured, and the two without have none.
         assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut covered = 0;
+        for track in &tracks {
+            let id = Uuid::parse_str(&track.id).unwrap();
+            let images = items.get_image_infos(id).await.unwrap();
+            if track
+                .path
+                .as_deref()
+                .unwrap_or_default()
+                .ends_with("00.flac")
+            {
+                assert!(images.is_empty(), "{images:?}");
+                continue;
+            }
+            covered += 1;
+            assert_eq!(images.len(), 1);
+            assert!(
+                Path::new(&images[0].path)
+                    .starts_with(crate::dynamic_images::own_art_dir(&meta, id))
+            );
+            assert_eq!((images[0].width, images[0].height), (4, 4));
+            assert!(images[0].blur_hash.is_some());
+        }
+        assert_eq!(covered, 10);
+        // The album copies its first track's cover into its own folder.
+        let cover = items.get_image_infos(album).await.unwrap().remove(0);
+        assert!(
+            Path::new(&cover.path).starts_with(crate::dynamic_images::own_art_dir(&meta, album))
+        );
         assert_eq!((cover.width, cover.height), (4, 4));
         assert!(cover.blur_hash.is_some());
-        for track in &tracks {
-            let image = items
-                .get_image_infos(Uuid::parse_str(&track.id).unwrap())
-                .await
-                .unwrap()
-                .remove(0);
-            assert_eq!(image.path, cover.path);
-            assert_eq!(image.blur_hash, cover.blur_hash);
-        }
         Box::pin(scanner.scan_all()).await.unwrap();
         assert_eq!(
             probe.calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "rescan must not extract again"
         );
-        let current = Arc::new(std::sync::RwLock::new(meta.clone()));
-        let source = Arc::clone(&current);
+        assert_eq!(
+            items.get_image_infos(album).await.unwrap(),
+            vec![cover.clone()]
+        );
         let manager = ferrofin_providers::LocalProviderManager::default().with_image_store(
             persistence.clone(),
-            ferrofin_util::directory_path::DirectoryPath::live(move || {
-                source.read().unwrap().clone()
-            }),
+            ferrofin_util::directory_path::DirectoryPath::from(meta.clone()),
         );
-        *current.write().unwrap() = tmp.path().join("replacement-metadata");
+        // An upload to a track or to the album is that item's own, and stays
+        // through a rescan; the album's leaves every track's cover alone.
         let first = Uuid::parse_str(&tracks[0].id).unwrap();
-        manager
-            .delete_image(first, ImageType::Primary, None)
-            .await
+        let replacement = tmp.path().join("new-cover.png");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([20, 160, 90]))
+            .save(&replacement)
             .unwrap();
-        assert!(
-            Path::new(&cover.path).is_file(),
-            "deleting one reference must not delete shared art"
-        );
-        *current.write().unwrap() = meta;
-        let bytes = std::fs::read(&cover.path).unwrap();
+        let bytes = std::fs::read(replacement).unwrap();
         manager
             .save_image(first, &bytes, "image/png", ImageType::Primary, None)
             .await
             .unwrap();
         let uploaded = items.get_image_infos(first).await.unwrap().remove(0);
-        assert_ne!(uploaded.path, cover.path, "upload must use copy-on-write");
+        // The rows' files; the rescan measures the upload (this manager has no
+        // image processor, so the upload is stored 0x0).
+        let paths = |images: Vec<ferrofin_traits::options::ItemImageInfo>| -> Vec<String> {
+            images.into_iter().map(|image| image.path).collect()
+        };
+        let before: Vec<_> = {
+            let mut images = Vec::new();
+            for track in &tracks {
+                let id = Uuid::parse_str(&track.id).unwrap();
+                images.push(paths(items.get_image_infos(id).await.unwrap()));
+            }
+            images
+        };
+        manager
+            .save_image(album, &bytes, "image/png", ImageType::Primary, None)
+            .await
+            .unwrap();
+        let album_upload = items.get_image_infos(album).await.unwrap().remove(0);
+        assert_ne!(album_upload.path, cover.path);
         Box::pin(scanner.scan_all()).await.unwrap();
         assert_eq!(
             items.get_image_infos(first).await.unwrap()[0].path,
             uploaded.path
         );
-        assert!(Path::new(&cover.path).is_file());
-        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        // Replacing album art propagates to shared references, not explicit tracks.
-        let replacement = tmp.path().join("new-cover.png");
-        image::RgbImage::from_pixel(8, 8, image::Rgb([20, 160, 90]))
-            .save(&replacement)
-            .unwrap();
-        manager
-            .save_image(
-                album,
-                &std::fs::read(replacement).unwrap(),
-                "image/png",
-                ImageType::Primary,
-                None,
-            )
-            .await
-            .unwrap();
-        Box::pin(scanner.scan_all()).await.unwrap();
-        let new_cover = items.get_image_infos(album).await.unwrap().remove(0);
-        assert_ne!(new_cover.path, cover.path);
-        for track in &tracks {
-            let id = Uuid::parse_str(&track.id).unwrap();
-            let image = items.get_image_infos(id).await.unwrap().remove(0);
-            assert_eq!(
-                image.path,
-                if id == first {
-                    uploaded.path.clone()
-                } else {
-                    new_cover.path.clone()
-                }
-            );
-        }
-        assert!(
-            Path::new(&cover.path).is_file(),
-            "old shared assets remain safe for in-flight readers"
+        assert_eq!(
+            items.get_image_infos(album).await.unwrap()[0].path,
+            album_upload.path
         );
+        for (track, images) in tracks.iter().zip(before) {
+            let id = Uuid::parse_str(&track.id).unwrap();
+            assert_eq!(paths(items.get_image_infos(id).await.unwrap()), images);
+        }
+        assert_eq!(probe.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -40515,14 +40879,15 @@ mod tests {
         scanner.scan_all().await.unwrap();
 
         // The bytes landed under the SNIFFED extension — PNG magic ⇒
-        // primary.png, not a mislabeled primary.jpg.
+        // poster.png, not a mislabeled poster.jpg — in Jellyfin's `{xx}/{idN}`.
         let primary = std::fs::read_dir(&meta_dir)
             .expect("metadata dir exists")
-            .map(|e| e.unwrap().path().join("primary.png"))
+            .flat_map(|shard| std::fs::read_dir(shard.unwrap().path()).unwrap())
+            .map(|e| e.unwrap().path().join("poster.png"))
             .find(|p| p.exists())
             .expect("dynamic Primary written to disk as .png");
         assert!(
-            !primary.with_file_name("primary.jpg").exists(),
+            !primary.with_file_name("poster.jpg").exists(),
             "PNG bytes must not be stored under a .jpg name"
         );
         assert_eq!(std::fs::read(&primary).unwrap(), PNG_FIRST);
@@ -40694,7 +41059,11 @@ mod tests {
             )
             .await;
         assert_eq!(images.len(), usize::try_from(limit).unwrap());
-        let dest = tmp.path().join("metadata").join(SERIES).join("primary.jpg");
+        let dest = crate::dynamic_images::own_art_dir(
+            &tmp.path().join("metadata"),
+            Uuid::parse_str(SERIES).unwrap(),
+        )
+        .join("poster.jpg");
         assert_eq!(dest.exists(), limit > 0);
         if limit > 0 {
             assert_eq!(std::fs::read(dest).unwrap(), b"cover");
@@ -41605,16 +41974,15 @@ mod tests {
     }
 
     // A planned item's recorded provider ids and stored image probes are read
-    // by its own visit, a series' ids by its seasons and episodes too, and an
-    // album's probes by the cover pass before the walk. So only those are
-    // read before the walk; every other item's are read with its stored-row
-    // window, never the whole library's at once (gl-234).
+    // by its own visit, and a series' ids by its seasons and episodes too. So
+    // only those are read before the walk; every other item's are read with
+    // its stored-row window, never the whole library's at once (gl-234).
     #[tokio::test]
     async fn the_scan_prereads_only_what_items_further_on_read() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (scanner, planned) = two_windows_of_episodes(tmp.path()).await;
 
-        let (cache, _, _) = scanner
+        let (cache, _) = scanner
             .scan_prereads(&planned, super::ScanRun::defaults())
             .await;
         let series = ferrofin_db::store::guid_to_db(planned[0].id);
@@ -41627,37 +41995,35 @@ mod tests {
             "only the series' ids, which its episodes read, of {} planned items",
             planned.len()
         );
-        assert_eq!(
-            cache.stored_images.len(),
-            0,
-            "no item's image probes: the plan holds no album"
-        );
+        assert_eq!(cache.stored_images.len(), 0, "no item's image probes");
     }
 
-    // An album's cover is adopted before the walk from the probe its own row
-    // stores: so the albums' probes are read up front, and only theirs, not
-    // their tracks' (gl-234).
+    // An album's images are read with its stored-row window like any item's,
+    // not up front: nothing copies its cover to its tracks any more (gl-692).
+    // What the walk takes from the plan is each track's album, the one its
+    // embedded cover is extracted once for.
     #[tokio::test]
-    async fn the_albums_stored_probes_are_read_before_the_walk() {
+    async fn an_albums_probes_are_not_read_before_the_walk() {
         use ferrofin_model::data::BaseItemKind;
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let album = uuid::Uuid::from_u128(1);
         let track = uuid::Uuid::from_u128(2);
-        let planned = vec![
+        let mut planned = vec![
             planned_row(album, BaseItemKind::MusicAlbum, None),
             planned_row(track, BaseItemKind::Audio, None),
         ];
+        planned[1].ancestors = vec![album];
         let (scanner, _) = preread_scanner(tmp.path(), &planned).await;
 
-        let (cache, _, _) = scanner
+        let (cache, _) = scanner
             .scan_prereads(&planned, super::ScanRun::defaults())
             .await;
-        assert!(
-            cache.stored_images.contains_key(&stored_poster(album)),
-            "the album's stored probe, for its cover"
+        assert!(cache.stored_images.is_empty(), "{:?}", cache.stored_images);
+        assert_eq!(
+            cache.track_albums,
+            std::collections::HashMap::from([(track, album)])
         );
-        assert_eq!(cache.stored_images.len(), 1, "not the track's");
     }
 
     // Entering a stored-row window replaces the previous window's recorded
@@ -41671,7 +42037,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (scanner, planned) = two_windows_of_episodes(tmp.path()).await;
         let run = super::ScanRun::defaults();
-        let (mut cache, _, _) = scanner.scan_prereads(&planned, run).await;
+        let (mut cache, _) = scanner.scan_prereads(&planned, run).await;
         let refresh = super::RefreshContext::of(run);
         let mut probes = scanner.probe_pipeline(&planned, run);
         let mut window = super::StoredRows::default();
@@ -41987,9 +42353,8 @@ mod tests {
             .with_item_data_cleanup(cleanup);
 
         // More rows than one batch reads.
-        let many: Vec<uuid::Uuid> = (0..=ferrofin_db::BATCH_BIND_CHUNK)
-            .map(|_| uuid::Uuid::new_v4())
-            .collect();
+        let many: Vec<uuid::Uuid> =
+            Vec::from_fn(ferrofin_db::BATCH_BIND_CHUNK + 1, |_| uuid::Uuid::new_v4());
         for id in &many {
             crate::test_support::seed_item(&db, *id, BaseItemKind::Movie).await;
         }
@@ -43530,6 +43895,34 @@ mod tests {
         assert!(!bytes.is_empty(), "{bytes:?}");
         assert_eq!(primary.width, 960);
         assert_eq!(primary.height, 540);
+        // In the library's own folder, as Jellyfin names a CollectionFolder's.
+        let meta = tmp.path().join("meta");
+        let own = crate::dynamic_images::own_art_dir(&meta, cf).join("poster.png");
+        assert_eq!(std::path::Path::new(&primary.path), own);
+
+        // A tile an earlier build drew in the library's `{ID}` folder, older
+        // than seven days, is drawn again in its own folder, and the earlier
+        // file goes once the new row is saved.
+        let earlier = crate::dynamic_images::earlier_art_dir(&meta, cf).join("primary.png");
+        std::fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+        std::fs::copy(&primary.path, &earlier).unwrap();
+        std::fs::remove_file(&primary.path).unwrap();
+        let mut stale = primary.clone();
+        stale.path = earlier.to_string_lossy().into_owned();
+        stale.date_modified = chrono::Utc::now() - chrono::TimeDelta::days(8);
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_item_images(cf, &[stale])
+            .await
+            .unwrap();
+        scanner.scan_all().await.unwrap();
+        let infos = repo.get_image_infos(cf).await.unwrap();
+        let redrawn = infos
+            .iter()
+            .find(|i| i.image_type == ImageType::Primary)
+            .expect("library tile image row");
+        assert_eq!(std::path::Path::new(&redrawn.path), own);
+        assert!(own.is_file());
+        assert!(!earlier.exists(), "the earlier tile is removed");
     }
 
     // Extras (suffix- and directory-classified) become OWNED rows attached to
@@ -45145,7 +45538,7 @@ mod tests {
         rows.into_iter()
             .map(|row| {
                 let path = row.path.unwrap_or_default();
-                let rel = path.strip_prefix(root).unwrap_or(&path).to_owned();
+                let rel = path.trim_prefix(root).to_owned();
                 (rel, row.name, row.extra_type, row.parent_id)
             })
             .collect()
@@ -45333,6 +45726,22 @@ mod tests {
             super::parse_art_file_stem(Path::new("/m/ID/logo.webp")),
             Some(ferrofin_model::entities::ImageType::Logo)
         );
+        // Upstream's names (`GetStandardSavePath`), which the art is saved
+        // under now, beside the ones earlier builds gave it.
+        for (file, image_type) in [
+            ("poster.png", ferrofin_model::entities::ImageType::Primary),
+            ("folder.jpg", ferrofin_model::entities::ImageType::Primary),
+            ("clearart.png", ferrofin_model::entities::ImageType::Art),
+            ("back.jpg", ferrofin_model::entities::ImageType::BoxRear),
+            ("landscape.jpg", ferrofin_model::entities::ImageType::Thumb),
+            ("cdart.png", ferrofin_model::entities::ImageType::Disc),
+        ] {
+            assert_eq!(
+                super::parse_art_file_stem(&Path::new("/m/0c/0c6e").join(file)),
+                Some(image_type),
+                "{file}"
+            );
+        }
         // Unrecognized stems and non-image files parse to nothing.
         assert_eq!(
             super::parse_art_file_stem(Path::new("/m/ID/chapter1.jpg")),
@@ -46300,15 +46709,15 @@ mod tests {
             (&running, false, "failed"),
             (&cancelled, true, "cancelled"),
         ] {
-            super::post_scan_pass("years", 3, cancel, async move {
-                tracing::warn!("year pass work");
+            super::post_scan_pass("artists", 3, cancel, async move {
+                tracing::warn!("artist pass work");
                 succeeded
             })
             .await;
             let text = logs.text();
             let last = text.lines().last().unwrap_or_default();
             assert!(
-                last.contains("post_scan_pass{pass=\"years\"}")
+                last.contains("post_scan_pass{pass=\"artists\"}")
                     && last.contains("post-scan pass finished")
                     && last.contains(&format!("outcome=\"{outcome}\"")),
                 "{outcome}: {last}"
@@ -46317,8 +46726,8 @@ mod tests {
         assert!(
             logs.text()
                 .lines()
-                .any(|line| line.contains("post_scan_pass{pass=\"years\"}")
-                    && line.contains("year pass work")),
+                .any(|line| line.contains("post_scan_pass{pass=\"artists\"}")
+                    && line.contains("artist pass work")),
             "{}",
             logs.text()
         );
@@ -47040,6 +47449,99 @@ mod chapter_image_refresh_tests {
                     );
                     assert_eq!(data["Retained"], true);
                 }
+            }
+        }
+    }
+
+    /// `FFProbeVideoInfo.cs:270`: a completed video probe stores `HasSubtitles`
+    /// in `Data`, true when a subtitle stream it keeps exists (an external one,
+    /// or an embedded one the library allows), and the metadata merge keeps
+    /// the probe's value over the stored one, locked or not (gl-1632). The
+    /// scan save keeps it on a locked row too, as every probe-owned key
+    /// (`crate::item_data::PROBE_OWNED_KEYS`, gl-1913).
+    #[rstest::rstest]
+    #[case::embedded(
+        false,
+        ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowAll,
+        true
+    )]
+    #[case::embedded_not_allowed(
+        false,
+        ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowNone,
+        false
+    )]
+    #[case::external(
+        true,
+        ferrofin_model::configuration::EmbeddedSubtitleOptions::AllowNone,
+        true
+    )]
+    fn a_video_probe_stores_has_subtitles(
+        #[case] external: bool,
+        #[case] allowed: ferrofin_model::configuration::EmbeddedSubtitleOptions,
+        #[case] expected: bool,
+    ) {
+        use ferrofin_model::entities::MediaStreamType;
+        use ferrofin_model::entities_media::MediaStream;
+        let stream = |stream_type, is_external| MediaStream {
+            stream_type,
+            is_external,
+            codec: Some("subrip".to_owned()),
+            ..Default::default()
+        };
+        let mut with = MediaInfo::default();
+        with.media_source.media_streams = vec![
+            stream(MediaStreamType::Video, false),
+            stream(MediaStreamType::Subtitle, external),
+        ];
+        let mut without = MediaInfo::default();
+        without.media_source.media_streams = vec![stream(MediaStreamType::Video, false)];
+        let options = ferrofin_model::configuration::LibraryOptions {
+            allow_embedded_subtitles: allowed,
+            ..Default::default()
+        };
+        let policy = FetcherPolicy {
+            options: Some(&options),
+            ..Default::default()
+        };
+        let mut track = BaseItemEntity::default();
+        LibraryScanner::apply_probe(&mut track, Some(&with), true, policy);
+        assert!(
+            crate::item_data::parse_data(track.data.as_deref())
+                .get("HasSubtitles")
+                .is_none(),
+            "an audio probe stores no HasSubtitles"
+        );
+        for (probed, expected) in [(&with, expected), (&without, false)] {
+            for locked in [false, true] {
+                let stored = BaseItemEntity {
+                    media_type: Some("Video".to_owned()),
+                    data: Some(format!(r#"{{"HasSubtitles":{}}}"#, !expected)),
+                    ..Default::default()
+                };
+                let mut scanned = stored.clone();
+                LibraryScanner::apply_probe(&mut scanned, Some(probed), false, policy);
+                let saved = merge_onto_stored(
+                    &stored,
+                    &scanned,
+                    SaveFacts {
+                        locked,
+                        probe_ran: true,
+                        locked_fields: &[],
+                        merge: MergeMode::DEFAULT,
+                        before_refresh: false,
+                        replace_all: false,
+                        naming: crate::library_scan::EpisodeNaming::default(),
+                        remote_answered: false,
+                        redated: None,
+                    },
+                    None,
+                );
+                assert_eq!(
+                    crate::item_data::parse_data(saved.data.as_deref())["HasSubtitles"],
+                    expected,
+                    "locked={locked}, streams={}",
+                    probed.media_source.media_streams.len()
+                );
             }
         }
     }

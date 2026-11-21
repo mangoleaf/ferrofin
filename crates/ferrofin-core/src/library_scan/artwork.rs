@@ -1,5 +1,5 @@
 //! Automatic acquisition: per-type limits, width checks and lazy replacement.
-use super::{ItemImageInfo, RemoteImage, TmdbClient, file_date_modified, image_type_file_stem};
+use super::{ItemImageInfo, RemoteImage, TmdbClient, file_date_modified};
 use ferrofin_model::entities::ImageType;
 use ferrofin_providers::image_policy::ImageAcquisitionPolicy;
 use std::path::{Path, PathBuf};
@@ -62,7 +62,7 @@ pub(super) async fn acquire_images(
         {
             continue;
         }
-        match write_acquired_image(directory, kind, &download) {
+        match write_acquired_image(directory, policy.kind(), kind, &download) {
             Ok(image) => images.push(image),
             Err(err) => {
                 tracing::warn!(%err, directory = %directory.display(), "failed to write acquired artwork");
@@ -74,19 +74,22 @@ pub(super) async fn acquire_images(
 
 /// Backdrops use a free slot so a failed replacement cannot destroy an old
 /// image. Singular images are atomically replaced only after a full download.
+/// The file is named for an item of `item_kind`
+/// ([`internal_image_stem`](ferrofin_providers::local_images::internal_image_stem)).
 pub(super) fn write_acquired_image(
     directory: &Path,
+    item_kind: &str,
     kind: ImageType,
     download: &ferrofin_providers::ArtworkDownload,
 ) -> std::io::Result<ItemImageInfo> {
-    let base = image_type_file_stem(kind);
+    let base = ferrofin_providers::local_images::internal_image_stem(item_kind, kind);
     let ext = ferrofin_model::net::mime_types::to_extension(&download.content_type)
         .unwrap_or(".jpg")
         .trim_start_matches('.');
     let stem = if kind == ImageType::Backdrop {
         unused_backdrop_stem(directory)
     } else {
-        base.to_owned()
+        base
     };
     let dest = directory.join(format!("{stem}.{ext}"));
     std::fs::create_dir_all(directory)?;
@@ -124,22 +127,29 @@ fn unused_backdrop_stem(directory: &Path) -> String {
     }
 }
 
-/// Once at least one new backdrop exists in an item's art `directories`,
-/// removes the old internal backdrops in any of them that the caller did not
-/// retain. This never deletes a media sidecar. The directories are judged
-/// together: a refresh writes its backdrops to the item's own folder, so the
-/// ones it replaced may sit in the legacy folder older scans wrote to.
-pub(super) fn prune_old_backdrops_in(directories: &[PathBuf], current: &[ItemImageInfo]) {
+/// Under "Replace existing images", once the item keeps an image of a type in
+/// one of its art `directories`, removes the other files of that type in any
+/// of them that the caller did not retain: the backdrops a refresh replaced,
+/// and a singular type's file an earlier build saved under its own name in
+/// the `{ID}` or `{id}` folder, which would otherwise come back once the new
+/// image is deleted (`ImageSaver.SaveImage`'s "Delete the current path"). The
+/// directories are judged together, as a refresh writes to the item's own
+/// folder only. This never deletes a media sidecar.
+pub(super) fn prune_replaced_in(directories: &[PathBuf], current: &[ItemImageInfo]) {
     let kept: Vec<PathBuf> = current
         .iter()
-        .filter(|image| image.image_type == ImageType::Backdrop)
         .map(|image| PathBuf::from(&image.path))
         .collect();
-    if !kept.iter().any(|path| {
-        directories
-            .iter()
-            .any(|directory| path.starts_with(directory))
-    }) {
+    let replaced: std::collections::HashSet<ImageType> = current
+        .iter()
+        .filter(|image| {
+            directories
+                .iter()
+                .any(|directory| Path::new(&image.path).starts_with(directory))
+        })
+        .map(|image| image.image_type)
+        .collect();
+    if replaced.is_empty() {
         return;
     }
     for directory in directories {
@@ -148,11 +158,11 @@ pub(super) fn prune_old_backdrops_in(directories: &[PathBuf], current: &[ItemIma
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if super::parse_art_file_stem(&path) == Some(ImageType::Backdrop)
+            if super::parse_art_file_stem(&path).is_some_and(|kind| replaced.contains(&kind))
                 && !kept.contains(&path)
                 && let Err(err) = std::fs::remove_file(&path)
             {
-                tracing::warn!(%err, path = %path.display(), "failed to prune replaced backdrop");
+                tracing::warn!(%err, path = %path.display(), "failed to prune a replaced image");
             }
         }
     }
@@ -324,7 +334,7 @@ mod tests {
         assert_eq!(images.len(), 2);
         assert_eq!(*requests.lock().unwrap(), ["/poster", "/disc"]);
         assert_eq!(
-            std::fs::read(tmp.path().join("primary.png")).unwrap(),
+            std::fs::read(tmp.path().join("poster.png")).unwrap(),
             image("/poster")
         );
         assert_eq!(
@@ -396,7 +406,7 @@ mod tests {
             true,
         )
         .await;
-        prune_old_backdrops_in(std::slice::from_ref(&dir), &failed);
+        prune_replaced_in(std::slice::from_ref(&dir), &failed);
         assert_eq!(std::fs::read(&old).unwrap(), b"old");
         let local = tmp.path().join("sidecar.png");
         std::fs::write(&local, b"sidecar").unwrap();
@@ -417,7 +427,7 @@ mod tests {
         );
         assert_eq!(current.len(), 2);
         assert!(old.exists(), "old files remain until acquisition succeeds");
-        prune_old_backdrops_in(std::slice::from_ref(&dir), &current);
+        prune_replaced_in(std::slice::from_ref(&dir), &current);
         assert!(!old.exists());
         assert_eq!(std::fs::read(local).unwrap(), b"sidecar");
         assert_eq!(std::fs::read(&current[1].path).unwrap(), image("/new"));
@@ -439,16 +449,49 @@ mod tests {
         std::fs::write(&new, b"new").unwrap();
         std::fs::write(&old, b"old").unwrap();
         let folders = [own, legacy];
-        prune_old_backdrops_in(&folders, &[]);
+        prune_replaced_in(&folders, &[]);
         assert!(
             old.exists() && new.exists(),
             "no kept backdrop: nothing pruned"
         );
-        prune_old_backdrops_in(&folders, &[stored(&new, ImageType::Backdrop)]);
+        prune_replaced_in(&folders, &[stored(&new, ImageType::Backdrop)]);
         assert!(new.exists());
         assert!(
             !old.exists(),
             "the replaced backdrop in the legacy folder goes"
         );
+    }
+
+    /// A singular type's file an earlier build saved in the `{ID}` folder
+    /// under its own name goes once the refresh keeps a new one in the own
+    /// folder; a type the refresh kept nothing of in the folders stays, and
+    /// so does every kept file.
+    #[test]
+    fn a_replaced_earlier_singular_image_is_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = tmp.path().join("0c").join("0c6e");
+        let earlier = tmp.path().join("0C6E");
+        for dir in [&own, &earlier] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let poster = own.join("poster.jpg");
+        let old_primary = earlier.join("primary.jpg");
+        let old_logo = earlier.join("logo.png");
+        let kept_thumb = earlier.join("thumb.jpg");
+        for file in [&poster, &old_primary, &old_logo, &kept_thumb] {
+            std::fs::write(file, b"x").unwrap();
+        }
+        let media = tmp.path().join("media-logo.png");
+        prune_replaced_in(
+            &[own, earlier],
+            &[
+                stored(&poster, ImageType::Primary),
+                stored(&kept_thumb, ImageType::Thumb),
+                stored(&media, ImageType::Logo),
+            ],
+        );
+        assert!(poster.exists() && kept_thumb.exists());
+        assert!(!old_primary.exists(), "the replaced Primary goes");
+        assert!(old_logo.exists(), "no Logo kept in the folders: it stays");
     }
 }

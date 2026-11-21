@@ -621,9 +621,7 @@ esac
 
 /// The lines of a stub's call log (none before its first call).
 fn lines(path: &Path) -> Vec<String> {
-    std::fs::read_to_string(path)
-        .map(|s| s.lines().map(str::to_owned).collect())
-        .unwrap_or_default()
+    std::fs::read_to_string(path).map_or_default(|s| s.lines().map(str::to_owned).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -897,7 +895,7 @@ impl Writes {
 
     /// How an item is named in the write log: its path under the media root
     /// (`live/Lantern/Season 01`), which tells two "Season 1" rows apart, or
-    /// `Type:Name` for an item outside it (a person, a genre, a year).
+    /// `Type:Name` for an item outside it (a person, a genre).
     fn key(&self, path: Option<&str>, name: Option<&str>, kind: Option<&str>) -> String {
         let root = format!("{}/", self.media.display());
         match path.and_then(|p| p.strip_prefix(&root)) {
@@ -937,12 +935,13 @@ impl Writes {
     }
 
     /// Moves the `BaseItems` row named `name`'s `DateLastSaved` ten minutes
-    /// into the past (in the server's own `datetime_to_db` format).
+    /// into the past, to a whole second, written as the server's own
+    /// `datetime_to_db` writes one (no fraction).
     async fn backdate_last_saved(&self, name: &str) {
         self.assert_quiet("before the backdate").await;
         let done = sqlx::query(
             r#"UPDATE "BaseItems"
-               SET "DateLastSaved" = strftime('%Y-%m-%d %H:%M:%S', 'now', '-10 minutes') || '.0000000'
+               SET "DateLastSaved" = strftime('%Y-%m-%d %H:%M:%S', 'now', '-10 minutes')
                WHERE "Name" = ?1"#,
         )
         .bind(name)
@@ -3177,7 +3176,7 @@ fn assert_full_pass(seen: &Seen, movies: f64, keys: &[String], row: &str) {
             && written
                 .iter()
                 .all(|w| w == "movies" || w.starts_with("movies/") || w.contains(':')),
-        "row {row}: the three movies, the location (and their people, genres, years) {written:?}"
+        "row {row}: the three movies, the location (and their people, genres) {written:?}"
     );
 }
 

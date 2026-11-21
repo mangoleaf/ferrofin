@@ -5,9 +5,9 @@
 //! ([`ExternalIdentityKey`]). LDAP-Auth's uid map, which upstream keeps in its
 //! plugin configuration (`LdapUsers`, jellyfin-plugin-ldapauth v24
 //! `Config/PluginConfiguration.cs`), is the provider id, an empty issuer and the
-//! LDAP uid; OIDC later uses its issuer and `sub`. One identity belongs to at
-//! most one user, a user has at most one link per provider, and a user's links
-//! go when the user is deleted. The links live in the Ferrofin-owned
+//! LDAP uid; OIDC uses its issuer and `sub`. One identity belongs to at most
+//! one user, a user has at most one link per provider and issuer, and a
+//! user's links go when the user is deleted. The links live in the Ferrofin-owned
 //! `FerrofinExternalIdentities` table (migration 0048). The trait is
 //! object-safe and carries an `_assert_object_safe` assertion.
 
@@ -82,11 +82,20 @@ pub trait ExternalIdentityStore: Send + Sync {
     /// [`find`](Self::find) never returns.
     async fn list(&self, provider_id: &str) -> Result<Vec<ExternalIdentity>, ServiceError>;
 
+    /// Every link of `user_id` at the provider, oldest first: one per issuer.
+    async fn list_for_user(
+        &self,
+        provider_id: &str,
+        user_id: Uuid,
+    ) -> Result<Vec<ExternalIdentity>, ServiceError>;
+
     /// Links `identity` to `user_id` with `avatar_hash`, and returns the new
     /// link. In one transaction it first removes the user's link for that
-    /// provider and any link of that identity, so an identity belongs to one
-    /// user and a user has one link per provider, and a second link for the
-    /// same identity replaces the first (`PluginConfiguration.AddUser`). An
+    /// provider and issuer and any link of that identity, so an identity
+    /// belongs to one user and a user has one link per provider and issuer (a
+    /// user linked at two OIDC issuers keeps both; LDAP's issuer is always
+    /// empty), and a second link for the same identity replaces the first
+    /// (`PluginConfiguration.AddUser`). An
     /// empty subject is stored as upstream stores it, but [`find`](Self::find)
     /// never returns it; an empty `avatar_hash` is stored as `None`.
     ///

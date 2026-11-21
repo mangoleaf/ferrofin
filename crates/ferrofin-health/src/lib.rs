@@ -125,12 +125,7 @@ mod tests {
     /// The release version is the build's `git describe` less the tag's `v`.
     #[test]
     fn the_user_agent_names_the_build_without_its_tag_v() {
-        assert_eq!(
-            build_version()
-                .strip_prefix('v')
-                .unwrap_or_else(build_version),
-            RELEASE_VERSION
-        );
+        assert_eq!(build_version().trim_prefix('v'), RELEASE_VERSION);
         assert_eq!(USER_AGENT, format!("Ferrofin/{RELEASE_VERSION}"));
     }
 

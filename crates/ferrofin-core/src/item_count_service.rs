@@ -257,6 +257,9 @@ pub struct FerrofinItemCountService {
     /// The `IsVisible` evaluator the count's library scope asks about
     /// playlists and box sets (see [`FerrofinItemCountService::with_visibility`]).
     visibility: crate::item_repository::VisibilitySlot,
+    /// The user-view manager the count's library scope runs `GetUserViews`
+    /// through (see [`FerrofinItemCountService::with_user_views`]).
+    user_views: crate::item_repository::UserViewsSlot,
     /// Expands a library row stored tokenised before its options are read
     /// (see [`FerrofinItemCountService::with_virtual_paths`]).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
@@ -277,6 +280,7 @@ impl FerrofinItemCountService {
             db,
             roots: None,
             visibility: crate::item_repository::VisibilitySlot::default(),
+            user_views: crate::item_repository::UserViewsSlot::default(),
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
         }
     }
@@ -304,6 +308,16 @@ impl FerrofinItemCountService {
         self
     }
 
+    /// Installs the slot the composition root binds to the server's user-view
+    /// manager, the same one the item repository holds, so a count's library
+    /// scope writes the user's views exactly when a query's does
+    /// (`AddUserToQuery`'s `GetUserViews`). Left empty, it writes none.
+    #[must_use]
+    pub fn with_user_views(mut self, slot: crate::item_repository::UserViewsSlot) -> Self {
+        self.user_views = slot;
+        self
+    }
+
     /// Injects the two root-folder ids resolved once at startup, so the
     /// played/total and whole-server leaf counts can count the
     /// `AggregateFolder`'s leaves by their roots. Both are process constants.
@@ -325,6 +339,7 @@ impl FerrofinItemCountService {
             &self.db,
             &self.virtual_paths,
             visibility.as_deref(),
+            &self.user_views,
             filter,
         )
         .await
@@ -1843,9 +1858,8 @@ mod tests {
         let svc = FerrofinItemCountService::new(db.clone());
         assert!(svc.get_extra_counts_batch(&[]).await.unwrap().is_empty());
         // Distinct fillers, so the list still spans two chunks once deduplicated.
-        let mut owners: Vec<Uuid> = (0..=ferrofin_db::BATCH_BIND_CHUNK)
-            .map(|_| Uuid::new_v4())
-            .collect();
+        let mut owners: Vec<Uuid> =
+            Vec::from_fn(ferrofin_db::BATCH_BIND_CHUNK + 1, |_| Uuid::new_v4());
         owners[0] = owner;
         owners[ferrofin_db::BATCH_BIND_CHUNK] = owner;
         let counts = svc.get_extra_counts_batch(&owners).await.unwrap();

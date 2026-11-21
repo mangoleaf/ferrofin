@@ -353,6 +353,7 @@ stops seeing, so add one only with a migration or server behaviour to point at:
 | GUIDs compare as 32 lowercase hex digits | casing and dashes: 0007, 0032 |
 | `ItemId` is the item's path when the item has an owner and no other item shares the path | the rehome repair re-keys a local alternate version (an owned item) to the id its primary's type derives, as Jellyfin 12.2 does; an unowned item re-keyed still fails |
 | that item's id in its metadata folder (`/<2>/<id>/`) in `Chapters.ImagePath` | the same repair moves the item's metadata folder, chapter images included, to the new id, as Jellyfin 12.2 does; any other path change still fails |
+| on a 10.11 source, the `MediaStreamInfos`, `AttachmentStreamInfos` and `Chapters` rows of a local alternate version whose type is not its owner's (a row at a path in its owner's `LocalAlternateVersions`) are not compared | Jellyfin 12.x deletes that row with them (`CleanupWrongTypeAlternateVersions`) and probes the version its scan creates; the boot repair `rederive_adopted_versions` hands the kept row back to the scan, which probes it again. A home video's version, which has its owner's type, is kept by both and still compared, as are the version's other rows and every other item's |
 | the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
 | `ItemValues.CleanValue` is checked on its own: it must stay what it was or become what `Value` derives to | 0031 and the boot repair `repair_clean_values` (12.0's `RefreshCleanNamesAsync`) re-derive it with `get_clean_value`, ported in `clean_value.py` (needs PyICU) and proven against the Rust oracle; a value NULLed or corrupted by adoption still fails |
 | a `Devices` row's `AppName`, `AppVersion`, `DeviceName`, `DateModified` and `DateLastActivity` are not compared, as is `ApiKeys.DateLastActivity` | every authenticated request re-announces them |
@@ -507,12 +508,17 @@ directories are not mounted. Its smoke answers the fresh-install oracle like the
 runs (no probe names a stored path). Before the first boot, `program_data_move.py snapshot`
 records every stored path under an old directory (`BaseItems.Path`, `BaseItemImageInfos.Path`,
 `Chapters.ImagePath`, `MediaStreamInfos.Path`, `ImageInfos.Path`) with what it must read after
-the move, the libraries by name, which have a Primary image, and the users with a profile image;
+the move, the item and image type of each such image row, the libraries by name, which have a
+Primary image, and the users with a profile image;
 it refuses a fixture that would move no library folder, image or profile image. After adoption,
 after the restart and after the scan, `program_data_move.py check` fails when:
 
 - a recorded path does not read its place in the copy (or, for a file the copy lacks, what it was),
-  or a row written since names an old directory although the copy holds its file;
+  or a row written since names an old directory although the copy holds its file. An image row
+  saved again since passes at a new id: the scan redraws a library tile once it is 7 days old, at
+  Ferrofin's own path, and Jellyfin gives every image row a new id on each save. A recorded image
+  row that is gone passes only when its item now has, at ids the baseline did not record, as many
+  rows of that image type as went, each a file the copy holds under a new directory;
 - a `CollectionFolder` row was added or lost, or its `Data` still names an old directory
   (`PhysicalLocationsList`, which the boot's virtual-folder sync rewrites);
 - `/Library/VirtualFolders` lists a library with another id than its `CollectionFolder` row, leaves
@@ -702,6 +708,8 @@ $FIXTURES/
   oracle/smoke-jellyfin-12.{1,2,4}.txt  built: each release's own smoke answers (12.4's on 12.4-from-123, the default)
   oracle/smoke-jellyfin-12.{2,4}-fresh.txt  built: Jellyfin 12.2's and 12.4's answers on their fresh-install library
   oracle/user.txt              built: the account those answers were probed as
+  oracle/first-start-12.4/<fixture>.server.log  built: Jellyfin 12.4's first start on a throwaway copy of each older
+                               fixture no 12.4 fixture is built from (synthetic.py FIRST_STARTS), for gates/roundtrip/
   jellyfin-12.2-schema.sql     built: the 12.2 schema every other 12.2, 12.3 and 12.4 upgrade route is diffed against
   jellyfin-12.{3,4}-schema.sql built: the same dump of 12.3-from-122 and 12.4-from-123
   work/                        scratch: synthetic.py's copies (and run.sh's in work/run/ when no output root is set); failures stay here
@@ -779,7 +787,9 @@ Python tests, so CI runs them too. `tests/test_watch_history.py` checks unchange
 history, changes to each playback field, deleted provider-keyed rows, progress for
 another user, unwatched-to-watched changes, missing API history, hidden versions,
 date/GUID normalization, private baselines, fixtures missing watched/resume data, and
-failure reporting. Its fixtures contain only invented IDs and playback data.
+failure reporting, and that its model of migration 0050's date rewrite matches the
+migration's own statement and leaves Jellyfin's form alone. Its fixtures contain only
+invented IDs and playback data.
 `tests/test_table_digests.py` checks a lost row in each listed table, a changed column, a
 lost and an added column, and a case per normaliser rule (each with the unrewritten change
 next to it that must still fail). `tests/test_messy.py` checks each shape's seeder and end-state
@@ -794,7 +804,8 @@ substituted files, the boot-log timing and the record that names what it could n
 moves only where the copy holds its file, a directory matches whole components and the longest
 wins), the refusal of a fixture that moves nothing, and each failure on a scratch database and a
 local HTTP server: paths left where Jellyfin wrote them (the gl-1165 class, with no repair
-snapshot), a path rewritten without its file, a row written since under an old directory, a
+snapshot), a path rewritten without its file, a row written since under an old directory, an
+image row gone with no new row of its item and type in the copy (and one redrawn there passing), a
 library added or lost, a stale `Data`, a wrong `/Library/VirtualFolders`, artwork not served,
 and a snapshot taken or rewritten after the first boot; and that the table digests expect the
 moved paths. `tests/test_adoption_report.py` checks the recorder (a new run forgets the last, bad verdicts refused, a
@@ -835,6 +846,8 @@ generation: add its rows the same way with its counterpart's count, a pair to th
 - the seeds' oracle: `ORACLE_RELEASE`, `ORACLE` and `UPGRADED_FROM_10` in `preservation.py`;
 - the messy-shape oracle: `ORACLE_RELEASE` and the 12.x copy in `DERIVED` in `messy.py`, and the
   release its `DIVERGENCES` reasons name, once the new oracle's record confirms each.
+- the round trip's first starts: `RETURN_RELEASE` in `synthetic.py`, and the first-start logs
+  `gates/roundtrip/routes.sh` names.
 
 `tests/adoption.bats` checks that they all name the same release. `JELLYFIN_GENERATIONS` stays as
 it is; a fixture whose set is not its counterpart's fails the build instead.
@@ -1086,6 +1099,14 @@ Both sides are Ferrofin, so every comparison is exact, with these exceptions:
   These are the seeded ratings' visibility, the harmonized conflicting user data, and the
   re-keyed id of the local alternate version, for which only the version count is
   compared. `synthetic.py run` holds each of these against Jellyfin 12.4.
+- **The date form of migration 0050.** It rewrites every stored date from Ferrofin's
+  seven-digit text (and the RFC 3339 form of some rows) into the text Jellyfin writes,
+  the same instant: `2026-01-01 12:00:00.0000000` becomes `2026-01-01 12:00:00`. The
+  start release's watch history is expected in that form: its `LastPlayedDate` and
+  `RetentionDate` are rewritten as the migration does (`watch_history.ef_text`). The
+  candidate's rows are compared as stored, so a build that wrote seven digits again
+  still fails. Jellyfin's own form is left as it is, so `synthetic.py run` expects
+  Jellyfin's rows unchanged.
 - **Avatars.** They are fetched with the admin's token, because v1.0.0 serves them to no
   anonymous client.
 - **A start release with a known API bug.** v1.0.0 lets a restricted user download an

@@ -76,7 +76,7 @@ impl FakeSd {
 
 /// The API path of `url`, query dropped.
 fn route_path(url: &str) -> &str {
-    let rest = url.strip_prefix(API_URL).unwrap_or(url);
+    let rest = url.trim_prefix(API_URL);
     rest.split('?').next().unwrap_or(rest)
 }
 
@@ -824,7 +824,7 @@ async fn a_login_attempt_ban_sets_both_daily_limits() {
 async fn image_batches_stop_once_the_image_limit_is_hit() {
     let (fake, dir, sd) = setup();
     fake.login_ok();
-    let ids: Vec<String> = (0..501).map(|i| format!("EP{i:012}")).collect();
+    let ids: Vec<String> = Vec::from_fn(501, |i| format!("EP{i:012}"));
     fake.answer(
         RequestMethod::Post,
         "/metadata/programs/",

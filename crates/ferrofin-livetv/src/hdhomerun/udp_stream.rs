@@ -260,7 +260,7 @@ async fn copy_datagrams_to_temp_file(
 
     // Whatever ended the loop, the buffer stops growing here, so the stream
     // stops being joinable at the same moment (the shared HTTP path's
-    // `SharingGuard`).
+    // sharing guard in `copy_to_temp_file`).
     alive.store(false, Ordering::SeqCst);
     if let Some(tx) = first_packet.take() {
         let _ = tx.send(false);

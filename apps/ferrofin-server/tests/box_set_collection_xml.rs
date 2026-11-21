@@ -205,20 +205,17 @@ async fn a_box_sets_collection_xml_follows_its_members_and_edits_and_is_read_bac
             None,
         )
         .await;
-        movies = found["Items"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| {
-                        (
-                            Uuid::parse_str(item["Id"].as_str().unwrap()).unwrap(),
-                            item["Path"].as_str().unwrap_or_default().to_owned(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        movies = found["Items"].as_array().map_or_default(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    (
+                        Uuid::parse_str(item["Id"].as_str().unwrap()).unwrap(),
+                        item["Path"].as_str().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        });
         if movies.len() == 2 {
             break;
         }

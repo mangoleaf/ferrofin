@@ -169,9 +169,7 @@ fn pts_normalizer(rate: f32) -> String {
 /// (`MediaEncoder.cs:925-932`): "Force the video stream, otherwise ffmpeg may
 /// pick a cover image." Empty when no video stream was handed over.
 fn map_argument(map_index: Option<i32>) -> String {
-    map_index
-        .map(|index| format!(" -map 0:{index}"))
-        .unwrap_or_default()
+    map_index.map_or_default(|index| format!(" -map 0:{index}"))
 }
 
 /// One width's trickplay ffmpeg run, in its parts: the input and the encoder
@@ -228,7 +226,7 @@ fn filters_of(graph: &str) -> Vec<&str> {
         } else if c == '\\' {
             escaped = true;
         } else if c == '\'' {
-            quoted = !quoted;
+            quoted.toggle();
         } else if c == ',' && !quoted {
             filters.push(&graph[start..at]);
             start = at + 1;
@@ -539,7 +537,7 @@ fn software_command(
     } else {
         ""
     };
-    let setpts = pts_frame_rate.map(pts_normalizer).unwrap_or_default();
+    let setpts = pts_frame_rate.map_or_default(pts_normalizer);
     let sample = format!("{setpts}fps=1000/{interval_ms}");
     let scale = format!("scale=trunc(min(max(iw\\,ih*dar)\\,{max_width})/2)*2:trunc(ow/dar/2)*2");
     // The JPEG's matrix, BT.601, read from the frame's tag (the module's
@@ -2944,15 +2942,6 @@ mod tests {
         }
     }
 
-    /// Counts a dropped (abandoned) run.
-    struct Abandoned(Arc<std::sync::atomic::AtomicUsize>);
-
-    impl Drop for Abandoned {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
     #[async_trait]
     impl Transcoder for PacedTranscoder {
         async fn get_process_output(
@@ -2981,7 +2970,10 @@ mod tests {
                 std::fs::write(dir.join(format!("{i:08}.jpg")), b"jpg").expect("write frame");
             }
             if pace.hang {
-                let _abandoned = Abandoned(Arc::clone(&self.abandoned));
+                // Counts a dropped (abandoned) run.
+                let _abandoned = std::mem::DropGuard::new(Arc::clone(&self.abandoned), |n| {
+                    n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
                 std::future::pending::<()>().await;
             }
             Ok(ProcessOutput {

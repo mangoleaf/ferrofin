@@ -282,7 +282,7 @@ fn read_event(
     };
     let body = match (body, variant) {
         // The SSA loader also drops one space after the colon.
-        (Some(body), Variant::Ssa) => body.strip_prefix(' ').unwrap_or(body),
+        (Some(body), Variant::Ssa) => body.trim_prefix(' '),
         (Some(body), Variant::Ass) => body,
         (None, _) => line,
     };

@@ -759,7 +759,7 @@ impl StreamPattern {
             Self::Level => {
                 let digits =
                     |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
-                let unsigned = value.strip_prefix('-').unwrap_or(value);
+                let unsigned = value.trim_prefix('-');
                 match unsigned.split_once('.') {
                     Some((whole, fraction)) => digits(whole) && digits(fraction),
                     None => digits(unsigned),

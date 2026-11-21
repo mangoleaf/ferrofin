@@ -4490,7 +4490,7 @@ mod tests {
             row.presentation_unique_key = Some("one-film".to_owned());
             crate::test_support::save_item(&db, &row).await;
         }
-        let films: Vec<String> = (0..6).map(|i| format!("Film {i}")).collect();
+        let films: Vec<String> = Vec::from_fn(6, |i| format!("Film {i}"));
         for (i, name) in (0..).zip(&films) {
             seed_movie(&db, Uuid::from_u128(0xE120 + i), name, "SciFi").await;
         }
@@ -4874,7 +4874,7 @@ mod tests {
         seed_movie(&db, film, "Film", "Drama").await;
         crate::test_support::seed_library_over(&db, &[film]).await;
         credit_person(&db, film, "Actor 0", "Actor").await;
-        let actors: Vec<String> = (0..10).map(|i| format!("Actor {i}")).collect();
+        let actors: Vec<String> = Vec::from_fn(10, |i| format!("Actor {i}"));
         let mut directors =
             PersonCursor::new(&[], RecommendationType::HasDirectorFromRecentlyPlayed);
         let mut actor_cursor =

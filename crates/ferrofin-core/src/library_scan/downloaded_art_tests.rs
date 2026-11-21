@@ -222,8 +222,7 @@ fn stored(images: &[ItemImageInfo], image_type: ImageType) -> Vec<(String, Vec<u
             let path = std::path::Path::new(&image.path);
             (
                 path.extension()
-                    .map(|ext| ext.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                    .map_or_default(|ext| ext.to_string_lossy().into_owned()),
                 std::fs::read(path).expect("stored file"),
             )
         })
@@ -395,7 +394,7 @@ async fn a_photo_is_not_written_into_a_media_folder_without_the_librarys_opt_in(
         .collect();
     assert_eq!(
         paths,
-        [art_dir.join("primary.png").to_string_lossy().into_owned()]
+        [art_dir.join("folder.png").to_string_lossy().into_owned()]
     );
     assert_eq!(files_in(&folder), Vec::<std::path::PathBuf>::new());
 }

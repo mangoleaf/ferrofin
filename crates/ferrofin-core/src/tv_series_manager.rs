@@ -195,8 +195,7 @@ impl FerrofinTvSeriesManager {
             .get_user_dto(user, None)
             .await?
             .configuration
-            .map(|c| c.latest_items_excludes)
-            .unwrap_or_default();
+            .map_or_default(|c| c.latest_items_excludes);
 
         scope.top_parent_ids = children
             .iter()
@@ -715,6 +714,13 @@ mod tests {
         ) -> Result<Option<UserEntity>, ServiceError> {
             Ok(Some(self.user.clone()))
         }
+        async fn ensure_sign_in_allowed(
+            &self,
+            _user: &UserEntity,
+            _remote_endpoint: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
         async fn get_authentication_providers(
             &self,
         ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {
@@ -1074,7 +1080,7 @@ mod tests {
                 batch_result(None, Some(episode(Uuid::new_v4(), 1, 1))),
             );
         }
-        let keys: Vec<String> = (0..n).map(|i| format!("series-{i}")).collect();
+        let keys: Vec<String> = Vec::from_fn(n, |i| format!("series-{i}"));
         (keys, batch)
     }
 
@@ -1194,7 +1200,7 @@ mod tests {
 
         // Five series played a day apart, newest first; the keys run the
         // other way, so the page comes off the sorted picks.
-        let picks: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let picks: Vec<Uuid> = Vec::from_fn(5, |_| Uuid::new_v4());
         let mut batch = HashMap::new();
         let mut keys = Vec::new();
         for (days_ago, pick) in (0_i64..).zip(&picks) {

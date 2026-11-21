@@ -975,7 +975,7 @@ fn tree(fanout: usize, depth: usize) -> Network {
         let children: Vec<String> = if depth == 0 {
             Vec::new()
         } else {
-            (0..fanout).map(|i| format!("{name}{i}")).collect()
+            Vec::from_fn(fanout, |i| format!("{name}{i}"))
         };
         let answer = SearchOutcome {
             entries: vec![LdapEntry {
@@ -1055,9 +1055,9 @@ async fn exactly_the_referral_budget_of_referrals_is_chased() {
 /// so it counts toward the budget; a referral counts once whatever its URLs.
 #[tokio::test]
 async fn skipped_referrals_count_toward_the_budget_once_each() {
-    let gone: Vec<String> = (0..REFERRAL_BUDGET)
-        .map(|i| format!("ldap://gone{i}.example/{BASE_DN}"))
-        .collect();
+    let gone: Vec<String> = Vec::from_fn(REFERRAL_BUDGET, |i| {
+        format!("ldap://gone{i}.example/{BASE_DN}")
+    });
     let mut references: Vec<Vec<&str>> = gone.iter().map(|url| vec![url.as_str()]).collect();
     references.push(vec!["ldap://dc2.example/ou=partners,dc=example,dc=org"]);
     let references: Vec<&[&str]> = references.iter().map(Vec::as_slice).collect();
@@ -1086,14 +1086,12 @@ async fn skipped_referrals_count_toward_the_budget_once_each() {
     );
 
     // Two URLs each, every one failing: still one referral each.
-    let pairs: Vec<[String; 2]> = (0..REFERRAL_BUDGET)
-        .map(|i| {
-            [
-                format!("ldap://gone{i}a.example/{BASE_DN}"),
-                format!("ldap://gone{i}b.example/{BASE_DN}"),
-            ]
-        })
-        .collect();
+    let pairs: Vec<[String; 2]> = Vec::from_fn(REFERRAL_BUDGET, |i| {
+        [
+            format!("ldap://gone{i}a.example/{BASE_DN}"),
+            format!("ldap://gone{i}b.example/{BASE_DN}"),
+        ]
+    });
     let pairs: Vec<[&str; 2]> = pairs
         .iter()
         .map(|[a, b]| [a.as_str(), b.as_str()])

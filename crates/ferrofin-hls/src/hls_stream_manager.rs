@@ -1303,8 +1303,7 @@ where
         }
         let ext = path
             .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
+            .map_or_default(|e| format!(".{}", e.to_string_lossy()));
         let mut file = served(&path, &ext);
         file.progress = progress;
         Ok(file)
@@ -1322,8 +1321,7 @@ where
         let output = plan.state.output_file_path.clone();
         let ext = Path::new(&output)
             .extension()
-            .map(|ext| format!(".{}", ext.to_string_lossy()))
-            .unwrap_or_default();
+            .map_or_default(|ext| format!(".{}", ext.to_string_lossy()));
         // Source GetTranscodedFile answers HEAD before starting ffmpeg.
         if request.is_head_request {
             return Ok(served(Path::new(&output), &ext));
@@ -1529,8 +1527,7 @@ fn live_playlist_text(text: &str, playlist_path: &Path, segment_container: &str)
     }
     let stem = playlist_path
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|s| s.to_string_lossy().into_owned());
     let init_file_name = format!("{stem}-1.mp4");
     let routed_init = format!("hls/{stem}/{init_file_name}");
     text.replace(&init_file_name, &routed_init)
@@ -1541,8 +1538,7 @@ fn segment_file(playlist: &Path, index: i32, extension: &str) -> PathBuf {
     let folder = playlist.parent().unwrap_or_else(|| Path::new(""));
     let stem = playlist
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|s| s.to_string_lossy().into_owned());
     folder.join(format!("{stem}{index}{extension}"))
 }
 

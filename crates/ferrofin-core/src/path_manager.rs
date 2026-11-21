@@ -92,8 +92,7 @@ impl PathManager for FerrofinPathManager {
     ) -> String {
         if save_with_media {
             return trickplay_folder_beside(media)
-                .map(|folder| folder.to_string_lossy().into_owned())
-                .unwrap_or_default();
+                .map_or_default(|folder| folder.to_string_lossy().into_owned());
         }
         let hyphenated = id_hyphenated(item_id);
         PathBuf::from(self.paths.trickplay_path())

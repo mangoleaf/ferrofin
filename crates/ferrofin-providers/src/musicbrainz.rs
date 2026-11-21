@@ -780,10 +780,7 @@ impl MusicBrainzClient {
             (None, None) => return None,
         };
         let voted = |of_group: Option<&Vec<VotedWire>>, of_release: Option<&Vec<VotedWire>>| {
-            of_group
-                .or(of_release)
-                .map(|v| by_votes(v))
-                .unwrap_or_default()
+            of_group.or(of_release).map_or_default(|v| by_votes(v))
         };
         // `.Distinct(StringComparer.OrdinalIgnoreCase)`: non-ASCII letters
         // folded too, the long `ſ` kept apart from `s`.
@@ -853,8 +850,8 @@ impl MusicBrainzClient {
             // : artist.Area!.Name`.
             location: non_empty(artist.area.and_then(|a| a.name))
                 .or_else(|| non_empty(artist.country)),
-            genres: artist.genres.as_deref().map(by_votes).unwrap_or_default(),
-            tags: artist.tags.as_deref().map(by_votes).unwrap_or_default(),
+            genres: artist.genres.as_deref().map_or_default(by_votes),
+            tags: artist.tags.as_deref().map_or_default(by_votes),
         })
     }
 

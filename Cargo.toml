@@ -178,6 +178,11 @@ ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-
 # The system's trusted roots for an LDAP-Auth TLS configuration Ferrofin builds
 # itself (a client certificate, or the default checks): what ldap3 reads too.
 rustls-native-certs = "0.8.5"
+# The Single Sign-On extension's OpenID Connect client. No default features: they
+# bring a second reqwest (0.12) with ring, which deny.toml bans; its HTTP goes
+# through the extension's own adapter over the reqwest above. It needs rsa 0.9
+# (RUSTSEC-2023-0071, ignored in deny.toml with its reason).
+openidconnect = { version = "4.1.0", default-features = false, features = ["timing-resistant-secret-traits"] }
 # A certificate's validity period, for LDAP-Auth's check of a server certificate
 # given as its own root CA (already built for ldap3 and p12-keystore).
 x509-parser = "0.18.1"
@@ -280,6 +285,11 @@ icu_collections = "2.4.0"
 icu_locale_fallback = "2.4.0"
 icu_normalizer = "2.4.0"
 icu_provider = "2.4.0"
+# `Script` of each character: the script runs of upstream's `Any-Latin` sort-name step.
+icu_properties = "2.4.0"
+# CLDR's `<Script>-Latin` and `Latin-ASCII` transforms for the sort name's transliteration
+# (upstream's ICU `Any-Latin; Latin-Ascii; …`). Unstable 0.x: it moves with the ICU4X 2.4 above.
+icu_experimental = "0.7.0"
 zerovec = "0.11.9"
 fancy-regex = "0.20.1"    # for C# regexes that use lookaround
 quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)

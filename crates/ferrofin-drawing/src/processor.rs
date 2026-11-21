@@ -1730,9 +1730,9 @@ mod tests {
             // stats on the blocking pool before it takes a slot, so requests
             // spawned together take the slots in no fixed order, and the one
             // aborted below could be the queued one rather than an encode.
-            let mut tasks: Vec<_> = (0..limit)
-                .map(|i| request(Arc::clone(&processor), 100 + i32::try_from(i).unwrap()))
-                .collect();
+            let mut tasks: Vec<_> = Vec::from_fn(limit, |i| {
+                request(Arc::clone(&processor), 100 + i32::try_from(i).unwrap())
+            });
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 work.entered.acquire_many(u32::try_from(limit).unwrap()),
@@ -1824,7 +1824,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .forget();
-        let mut waiters: Vec<_> = (0..WAITERS).map(|_| request(100)).collect();
+        let mut waiters: Vec<_> = Vec::from_fn(WAITERS, |_| request(100));
         let mut first = Some(first);
         if drop_first {
             let first = first.take().unwrap();

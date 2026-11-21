@@ -332,6 +332,24 @@ fn list_backups_in(dir: &Path) -> std::io::Result<Vec<BackupManifest>> {
     Ok(manifests)
 }
 
+/// Jellyfin's backup engine version (`BackupService._backupEngineVersion`),
+/// the only one its restore accepts.
+const JELLYFIN_BACKUP_ENGINE_VERSION: &str = "0.2.0";
+
+/// How many archives in the backups directory `dir` Jellyfin cannot restore,
+/// for the export's loss report: those with a manifest whose engine version
+/// is not Jellyfin's (`RestoreBackupAsync` refuses them), which is every one
+/// Ferrofin wrote. An archive Jellyfin wrote before adoption is not counted.
+///
+/// # Errors
+/// When `dir` exists and cannot be read.
+pub fn archives_jellyfin_cannot_restore(dir: &Path) -> std::io::Result<usize> {
+    Ok(list_backups_in(dir)?
+        .iter()
+        .filter(|manifest| manifest.backup_engine_version != JELLYFIN_BACKUP_ENGINE_VERSION)
+        .count())
+}
+
 /// The file name `BackupController.SanitizePath` keeps of a requested archive:
 /// `Path.GetFileName(Path.GetFullPath(path))`. The value is resolved lexically
 /// against the working directory, as .NET does on Unix, and its last component
@@ -354,8 +372,7 @@ fn sanitized_file_name(path: &str) -> String {
         }
     }
     full.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|name| name.to_string_lossy().into_owned())
 }
 
 /// Recursively adds a directory's files to the zip under `prefix/…`. A file
@@ -1102,9 +1119,9 @@ mod tests {
         let names: Vec<String> = {
             let file = std::fs::File::open(&archive).unwrap();
             let mut zip = zip::ZipArchive::new(file).unwrap();
-            (0..zip.len())
-                .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
-                .collect()
+            Vec::from_fn(zip.len(), |i| {
+                zip.by_index(i).unwrap().name().unwrap().into_owned()
+            })
         };
         assert!(
             names.contains(&"config/system.json".to_owned()),
@@ -1652,6 +1669,18 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // Jellyfin would restore none of Ferrofin's archives, and one of its
+        // own that the directory kept from before adoption.
+        std::fs::copy(&foreign, backups.join("jellyfin-backup.zip")).unwrap();
+        assert_eq!(list_backups_in(&backups).unwrap().len(), 3);
+        assert_eq!(
+            super::archives_jellyfin_cannot_restore(&backups).unwrap(),
+            2
+        );
+        assert_eq!(
+            super::archives_jellyfin_cannot_restore(&tmp.path().join("nope")).unwrap(),
+            0
+        );
     }
 
     /// `CreateBackupAsync` always archives the library definitions (`Root`)
@@ -1939,13 +1968,11 @@ mod tests {
         let roots = small_roots(&tmp.path().join("pd"));
         let backups = tmp.path().join("backups");
         let now = "2024-05-06T07:08:09Z".parse().unwrap();
-        let written: Vec<String> = (0..3)
-            .map(|_| {
-                let manifest =
-                    super::write_backup(&backups, &roots, no_database(), now, None, TEST_VERSION);
-                manifest.unwrap().path
-            })
-            .collect();
+        let written: Vec<String> = Vec::from_fn(3, |_| {
+            let manifest =
+                super::write_backup(&backups, &roots, no_database(), now, None, TEST_VERSION);
+            manifest.unwrap().path
+        });
         assert_eq!(
             file_names(&backups),
             [

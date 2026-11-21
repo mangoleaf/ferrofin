@@ -10,16 +10,21 @@ use std::path::Path;
 use ferrofin_traits::system::PathManager;
 use uuid::Uuid;
 
+use crate::virtual_paths::VirtualPathExpander;
+
 /// Renames the folders named after item `from` — its art directory, its
 /// internal metadata, trickplay, extracted subtitle and attachment
 /// folders — to `to`'s names ([`move_folders`]). Also returns the path
-/// prefixes stored paths under them take: each renamed folder, resolved
-/// and in the `%MetadataPath%` form adopted Jellyfin rows store. When
-/// `to` is stored (a fold: the stored target folds into `from` first),
+/// prefixes stored paths under them take: each renamed folder resolved, in
+/// the form saves store it (`virtual_paths`' [`VirtualPathExpander::reverse`]:
+/// `%AppDataPath%/…` when the metadata directory lies inside the data
+/// directory) and in the `%MetadataPath%` form adopted Jellyfin rows store.
+/// When `to` is stored (a fold: the stored target folds into `from` first),
 /// the folders at `to`'s names are its own, never an earlier attempt's
 /// rename ([`move_folders`]). `art_root` is the item art root
 /// (`{metadata}/library`).
 pub(crate) fn move_item_folders(
+    virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
     (from, to): (Uuid, Uuid),
@@ -67,15 +72,19 @@ pub(crate) fn move_item_folders(
     let root = art_root
         .and_then(Path::parent)
         .map(|root| root.to_string_lossy().into_owned());
+    let virtual_form = |path: &str| {
+        path.strip_prefix(root.as_deref()?)
+            .map(|rest| format!("%MetadataPath%{rest}"))
+    };
     let mut prefixes = folders.renamed.clone();
-    if let Some(root) = root {
-        let virtual_form = |path: &str| {
-            path.strip_prefix(root.as_str())
-                .map(|rest| format!("%MetadataPath%{rest}"))
-        };
-        for (old, new) in &folders.renamed {
-            if let (Some(old), Some(new)) = (virtual_form(old), virtual_form(new)) {
-                prefixes.push((old, new));
+    for (old, new) in &folders.renamed {
+        let forms = [
+            Some((virtual_paths.reverse(old), virtual_paths.reverse(new))),
+            virtual_form(old).zip(virtual_form(new)),
+        ];
+        for pair in forms.into_iter().flatten() {
+            if !prefixes.contains(&pair) {
+                prefixes.push(pair);
             }
         }
     }
@@ -83,11 +92,11 @@ pub(crate) fn move_item_folders(
 }
 
 /// The folders an item's art and internal metadata live in under the item
-/// art root `art_root` (`{metadata}/library`): Ferrofin's `{art_root}/{GUID}`,
-/// the lower-cased spelling older scans also wrote art to
-/// ([`crate::dynamic_images::legacy_art_dir`]), and Jellyfin's
-/// `{art_root}/{idN[..2]}/{idN}` (`BaseItem.GetInternalMetadataPath`), which an
-/// adopted item carries.
+/// art root `art_root` (`{metadata}/library`): its own
+/// `{art_root}/{idN[..2]}/{idN}` (`BaseItem.GetInternalMetadataPath`), then the
+/// `{art_root}/{GUID}` earlier builds saved art in and the lower-cased spelling
+/// older scans also wrote art to
+/// ([`internal_metadata_dirs`](crate::dynamic_images::internal_metadata_dirs)).
 pub(crate) fn item_art_folders(art_root: &Path, id: Uuid) -> [std::path::PathBuf; 3] {
     crate::dynamic_images::internal_metadata_dirs(art_root, id)
 }
@@ -283,9 +292,69 @@ mod tests {
         assert!(!tmp.path().join("art/MOVING").exists());
     }
 
-    /// A re-key moves the lower-cased art folder older scans wrote, too, to
-    /// the new id's: an item's art folders are its own, that legacy one and
-    /// Jellyfin's `{xx}/{id:N}`.
+    /// The prefixes a moved folder's stored paths take: resolved, in the form
+    /// `reverse` stores (`%AppDataPath%/…` when the metadata directory lies
+    /// inside the data directory), and `%MetadataPath%/…`; each pair once.
+    #[test]
+    fn a_moved_folders_prefixes_are_every_form_a_path_is_stored_in() {
+        use std::sync::Arc;
+        let (from, to) = (
+            uuid::Uuid::from_u128(0xABCD_0003),
+            uuid::Uuid::from_u128(0xABCD_0004),
+        );
+        for (metadata, saved) in [
+            ("metadata", "%MetadataPath%"),
+            ("data/meta", "%AppDataPath%/meta"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().to_string_lossy().into_owned();
+            let paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+                &root,
+                format!("{root}/log"),
+                format!("{root}/config"),
+                format!("{root}/cache"),
+                format!("{root}/web"),
+            ));
+            paths.set_internal_metadata_path(Some(format!("{root}/{metadata}").as_str()));
+            let art = tmp.path().join(metadata).join("library");
+            let [old, ..] = super::item_art_folders(&art, from);
+            let [new, ..] = super::item_art_folders(&art, to);
+            std::fs::create_dir_all(&old).unwrap();
+            let (moved, prefixes) = super::move_item_folders(
+                &super::VirtualPathExpander::from_paths(paths),
+                Some(&art),
+                None,
+                (from, to),
+                "",
+                false,
+            );
+            moved.commit();
+            let tail = |folder: &std::path::Path| {
+                folder
+                    .strip_prefix(&art)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let form = |prefix: &str| {
+                (
+                    format!("{prefix}/library/{}", tail(&old)),
+                    format!("{prefix}/library/{}", tail(&new)),
+                )
+            };
+            let resolved = (
+                old.to_string_lossy().into_owned(),
+                new.to_string_lossy().into_owned(),
+            );
+            let mut expected = vec![resolved, form(saved), form("%MetadataPath%")];
+            expected.dedup();
+            assert_eq!(prefixes, expected, "metadata at {metadata}");
+        }
+    }
+
+    /// A re-key moves the `{ID}` art folder earlier builds wrote and the
+    /// lower-cased one older scans wrote, too, to the new id's: an item's art
+    /// folders are its own `{xx}/{id:N}` and those two.
     #[test]
     fn a_rekey_moves_the_legacy_art_folder() {
         let tmp = tempfile::tempdir().unwrap();
@@ -296,14 +365,24 @@ mod tests {
         );
         let folders = super::item_art_folders(&art, from);
         assert_eq!(
-            folders[1],
+            folders[2],
             crate::dynamic_images::legacy_art_dir(&art, from),
             "{folders:?}"
         );
         let legacy = crate::dynamic_images::legacy_art_dir(&art, from);
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("thumb.jpg"), b"x").unwrap();
-        let (moved, _) = super::move_item_folders(Some(&art), None, (from, to), "", false);
+        let earlier = crate::dynamic_images::earlier_art_dir(&art, from);
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::write(earlier.join("primary.png"), b"x").unwrap();
+        let (moved, _) = super::move_item_folders(
+            &super::VirtualPathExpander::identity(),
+            Some(&art),
+            None,
+            (from, to),
+            "",
+            false,
+        );
         moved.commit();
         assert!(
             crate::dynamic_images::legacy_art_dir(&art, to)
@@ -311,5 +390,11 @@ mod tests {
                 .is_file()
         );
         assert!(!legacy.exists());
+        assert!(
+            crate::dynamic_images::earlier_art_dir(&art, to)
+                .join("primary.png")
+                .is_file()
+        );
+        assert!(!earlier.exists());
     }
 }

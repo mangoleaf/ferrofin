@@ -890,9 +890,7 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
         // Frames: per-call cap, then a clamped happy path.
         let req = |n: usize, dim: u32| FrameRequest {
             item_id: ITEM.to_owned(),
-            timestamps_ticks: (0..i64::try_from(n).unwrap())
-                .map(|i| i * 10_000_000)
-                .collect(),
+            timestamps_ticks: Vec::from_fn(n, |i| i64::try_from(i).unwrap() * 10_000_000),
             max_dimension: dim,
             format: FrameFormat::Gray8,
         };

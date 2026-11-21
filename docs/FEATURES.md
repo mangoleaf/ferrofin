@@ -220,6 +220,17 @@ Wired and working, with a documented limitation or lighter verification:
   divergences (off by default, an outage not counted toward lockout, the last administrator
   never demoted, timeouts, a blank reset refused, among others) are listed in
   [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md#ldap-auth).
+- **Single Sign-On (OpenID Connect)** — Ferrofin's own internal plugin, compiled in and off
+  until an administrator enables it under Dashboard → Plugins ([`SINGLE_SIGN_ON.md`](SINGLE_SIGN_ON.md)).
+  Jellyfin has no counterpart, so there is nothing to compare against. A "Sign in with" button on
+  jellyfin-web's login page for each provider; accounts created at a first sign-in or linked by
+  hand, matched by issuer and subject; a required role, and role sync for the administrator flag,
+  libraries and Live TV; linking at `/sso/link`; profile pictures from the `picture` claim; native
+  apps signed in by approving their Quick Connect code at `/sso/quickconnect`. Proven against
+  Keycloak 26.7 by the `#[ignore]`d live test and from jellyfin-web 12.4. **Not tried yet: other
+  identity providers, a real native app approving its Quick Connect code (only the requests an app
+  makes), native apps' login screens, the Android app, and a private certificate authority.**
+  Nothing of the community SSO-Auth plugin is imported.
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
@@ -286,14 +297,24 @@ Wired and working, with a documented limitation or lighter verification:
 - **Playlist files are read, never written** — a library scan makes a playlist of each
   `.m3u`/`.m3u8`/`.pls`/`.wpl`/`.zpl` file in a music or untyped library and of each folder
   named `… [playlist]` or holding a `playlist.xml` (members from the file, or from the
-  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. Of a folder's
-  `playlist.xml` only the members and the media type are read so far — its title, overview,
-  shares and lock are not — and Ferrofin does not write it back after a refresh, as Jellyfin
-  does where it saves XML metadata. Such a playlist belongs to nobody and is open to everyone,
-  so, as on Jellyfin, nobody may edit it and the file is never rewritten. Where Jellyfin 12.2
-  saves XML metadata into the library (a library whose metadata savers are unset), the
-  `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
-  playlist stays empty; Ferrofin always reads the entries and never that sidecar.
+  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. A playlist file belongs to
+  nobody and is open to everyone, so, as on Jellyfin, nobody may edit it and the file is never
+  rewritten. Where Jellyfin 12.2 saves XML metadata into the library (a library whose metadata
+  savers are unset), the `<name>.xml` sidecar it writes beside a playlist file hides the
+  file's entries and the playlist stays empty; Ferrofin always reads the entries and neither
+  reads nor writes that sidecar.
+- **A playlist folder's `playlist.xml`** is read as Jellyfin reads it, when it changes or on a
+  full refresh: its title, overview, lock, locked fields, genres, studios, tags, dates and
+  ratings, its media type, its shares (who may see and edit the playlist) and, for a folder in
+  a media library, its members. Shares merge as Jellyfin merges them: a scan or refresh that
+  replaces takes the file's (an empty `<Shares />` removes every share), "Search for missing
+  metadata" adds the file's to the stored ones. Ferrofin writes the file as Jellyfin writes it,
+  with the owner, the members and the shares, on every change to the playlist and every
+  refresh that saves it: always for a playlist made in Ferrofin (`{data}/playlists`), and for a
+  playlist folder in a media library only when that library opts in, as for a box set below.
+  The first start of a version with this writes the file of every playlist in `{data}/playlists`
+  from the database, so a file Jellyfin wrote before the database was adopted cannot bring back
+  a share, name or lock changed in Ferrofin since.
   A collection made in Ferrofin gets
   Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before 1.4.0 get it, and the
   id it derives, at the first boot of 1.5.2 or later), and its membership lives in the

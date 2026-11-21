@@ -589,16 +589,12 @@ pub(crate) fn summarize(
             .and_then(|p| Uuid::parse_str(p).ok())
             .map(|u| u.to_string()),
         run_time_ticks: e.run_time_ticks,
-        genres: e
-            .genres
-            .as_deref()
-            .map(|g| {
-                g.split('|')
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        genres: e.genres.as_deref().map_or_default(|g| {
+            g.split('|')
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        }),
         premiere_date: e.premiere_date.map(|d| d.to_rfc3339()),
         date_created: e.date_created.map(|d| d.to_rfc3339()),
         community_rating: e.community_rating,

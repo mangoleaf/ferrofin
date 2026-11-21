@@ -186,10 +186,7 @@ fn files_with_extension(
 
 /// The header check of `TSStreamClipFile.Scan`.
 fn check_clip_info(name: &str, data: &[u8]) -> Result<(), String> {
-    let file_type = data
-        .get(..8)
-        .map(String::from_utf8_lossy)
-        .unwrap_or_default();
+    let file_type = data.get(..8).map_or_default(String::from_utf8_lossy);
     if matches!(&*file_type, "HDMV0100" | "HDMV0200" | "HDMV0300") {
         Ok(())
     } else {

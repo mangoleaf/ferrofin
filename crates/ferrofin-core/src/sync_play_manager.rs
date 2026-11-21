@@ -272,9 +272,7 @@ impl PlayQueue {
 
     /// The `PlaylistItemId` of the current item (nil if the queue is empty).
     fn playing_item_id(&self) -> Uuid {
-        self.current()
-            .map(|i| i.playlist_item_id)
-            .unwrap_or_default()
+        self.current().map_or_default(|i| i.playlist_item_id)
     }
 
     /// `GetPlayingItem` (PlayQueueManager.cs:557-570).
@@ -510,8 +508,7 @@ impl PlayQueue {
             let playing = usize::try_from(self.playing_index)
                 .ok()
                 .and_then(|i| self.shuffled.get(i))
-                .map(|i| i.playlist_item_id)
-                .unwrap_or_default();
+                .map_or_default(|i| i.playlist_item_id);
             self.playing_index = index_of(&self.sorted, playing);
         }
         self.shuffled.clear();
@@ -2096,24 +2093,6 @@ fn sweep_group_waits(
     )
 }
 
-/// Marks the sweep stopped if its task unwinds, so the next new group starts
-/// it again, and makes the panic visible (LOGGING.md: panics must be visible).
-struct SweepPanicGuard(Weak<Mutex<Registry>>);
-
-impl Drop for SweepPanicGuard {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            tracing::error!(
-                task = SWEEP_TASK,
-                "sync-play group-wait sweep panicked; the next new group restarts it"
-            );
-            if let Some(registry) = self.0.upgrade() {
-                lock_registry(&registry).sweeping = false;
-            }
-        }
-    }
-}
-
 /// The group-wait sweep task (`SyncPlayManager._groupWaitTimer`, 12.1). It
 /// holds the registry weakly, so it ends with the manager, and it delivers
 /// after releasing the lock, as the request paths do.
@@ -2122,7 +2101,20 @@ async fn run_group_wait_sweep(
     bus: Arc<dyn SessionMessageBus>,
     every: StdDuration,
 ) {
-    let _panic_guard = SweepPanicGuard(registry.clone());
+    // Marks the sweep stopped if its task unwinds, so the next new group
+    // starts it again, and makes the panic visible (LOGGING.md: panics must be
+    // visible).
+    let _panic_guard = std::mem::DropGuard::new(registry.clone(), |weak| {
+        if std::thread::panicking() {
+            tracing::error!(
+                task = SWEEP_TASK,
+                "sync-play group-wait sweep panicked; the next new group restarts it"
+            );
+            if let Some(registry) = weak.upgrade() {
+                lock_registry(&registry).sweeping = false;
+            }
+        }
+    });
     let mut ticker = tokio::time::interval(every);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick completes at once; the first sweep is one interval in.
@@ -2454,8 +2446,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                     } else {
                         group_id
                             .and_then(|id| reg.groups.get(&id))
-                            .map(Group::member_user_ids)
-                            .unwrap_or_default()
+                            .map_or_default(Group::member_user_ids)
                             .into_iter()
                             .filter(|id| !checked.contains(id))
                             .collect()
@@ -2757,7 +2748,7 @@ mod tests {
 
     fn play(items: usize) -> PlaybackRequest {
         PlaybackRequest::Play {
-            playing_queue: (0..items).map(|_| Uuid::new_v4()).collect(),
+            playing_queue: Vec::from_fn(items, |_| Uuid::new_v4()),
             playing_item_position: 0,
             start_position_ticks: 0,
         }
@@ -4202,7 +4193,7 @@ mod tests {
     /// `len` queued items with the one at `playing` playing — `CreateQueue`
     /// plus `SetPlayingItemByIndex` in v12.2 `PlayQueueManagerTests`.
     fn queue_playing(len: usize, playing: i32) -> PlayQueue {
-        let ids: Vec<Uuid> = (0..len).map(|_| Uuid::new_v4()).collect();
+        let ids: Vec<Uuid> = Vec::from_fn(len, |_| Uuid::new_v4());
         let mut q = PlayQueue::default();
         q.set(&ids, playing);
         q
@@ -4445,7 +4436,7 @@ mod tests {
         m.handle_request(
             &a,
             PlaybackRequest::Play {
-                playing_queue: (0..3).map(|_| Uuid::new_v4()).collect(),
+                playing_queue: Vec::from_fn(3, |_| Uuid::new_v4()),
                 playing_item_position: 2,
                 start_position_ticks: 0,
             },
@@ -4648,7 +4639,7 @@ mod tests {
         m.handle_request(
             a,
             PlaybackRequest::Play {
-                playing_queue: (0..len).map(|_| Uuid::new_v4()).collect(),
+                playing_queue: Vec::from_fn(len, |_| Uuid::new_v4()),
                 playing_item_position: position,
                 start_position_ticks: 0,
             },

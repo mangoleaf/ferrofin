@@ -25,6 +25,7 @@ pub mod config;
 mod connection_limits;
 mod encoding_options;
 mod existing_database;
+pub mod export_cmd;
 pub mod listen;
 mod log_file;
 mod log_lines;
@@ -1247,9 +1248,7 @@ impl Serving {
                                     request
                                 })
                                 .service(app);
-                            Ok::<_, std::convert::Infallible>(connection_limits::track_requests(
-                                requests, service,
-                            ))
+                            Ok::<_, !>(connection_limits::track_requests(requests, service))
                         }
                     },
                 );
@@ -1392,18 +1391,16 @@ fn listen_addresses(
     network: Option<&ferrofin_networking::NetworkManager>,
     port: u16,
 ) -> Vec<SocketAddr> {
-    let interfaces: Vec<listen::BindInterface> = network
-        .map(|network| {
-            network
-                .get_all_bind_interfaces(false)
-                .into_iter()
-                .map(|interface| listen::BindInterface {
-                    address: interface.address,
-                    index: u32::try_from(interface.index).unwrap_or(0),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let interfaces: Vec<listen::BindInterface> = network.map_or_default(|network| {
+        network
+            .get_all_bind_interfaces(false)
+            .into_iter()
+            .map(|interface| listen::BindInterface {
+                address: interface.address,
+                index: u32::try_from(interface.index).unwrap_or(0),
+            })
+            .collect()
+    });
     listen::plan_addresses(
         config.bind_addr_explicit.then_some(config.bind_addr),
         port,

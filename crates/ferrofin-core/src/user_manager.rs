@@ -325,8 +325,24 @@ impl FerrofinUserManager {
 
     /// Records a failed login: increments the invalid-attempt counter, locks the
     /// account out once the threshold is hit, and logs the security-audit `warn!`
-    /// lines (never the attempted password).
+    /// lines (never the attempted password). An account whose provider never
+    /// counts its refusals ([`AuthenticationManager::counts_failed_passwords`],
+    /// read whether the provider is enabled or not) only gets the `warn!`.
     async fn record_login_failure(&self, user: &UserEntity) -> Result<(), ServiceError> {
+        if self.registered_providers().any(|provider| {
+            !provider.counts_failed_passwords()
+                && provider
+                    .id()
+                    .eq_ignore_ascii_case(&user.authentication_provider_id)
+        }) {
+            tracing::warn!(
+                username = %user.username,
+                user_id = %user.id,
+                reason = "no_password_account",
+                "login failed"
+            );
+            return Ok(());
+        }
         // Count the failure and lock the account out once the threshold is
         // reached (C# increments then disables).
         let attempts = user.invalid_login_attempt_count + 1;
@@ -1336,6 +1352,15 @@ impl UserManager for FerrofinUserManager {
         setup: &ExternalUserSetup,
     ) -> Result<UserEntity, ServiceError> {
         require_valid_username(name)?;
+        // Hashed before the transaction opens, so PBKDF2 never holds the
+        // writer; the secret itself is dropped here.
+        let password = if setup.unusable_password {
+            self.default_provider
+                .format_password_hash(&ferrofin_common::cryptography::unusable_password())
+                .await?
+        } else {
+            None
+        };
         // Set up inside the insert's transaction: committed first and set up
         // after, the row would for a moment be a passwordless local account,
         // which the built-in provider signs in with an empty password.
@@ -1343,6 +1368,11 @@ impl UserManager for FerrofinUserManager {
         let user = self
             .insert_user(name, move |tx, id| {
                 Box::pin(async move {
+                    if let Some(hash) = password.as_deref() {
+                        user_repository::set_password(&mut **tx, id, Some(hash))
+                            .await
+                            .map_err(db_err)?;
+                    }
                     user_repository::set_providers(
                         &mut **tx,
                         id,
@@ -1522,29 +1552,7 @@ impl UserManager for FerrofinUserManager {
             return Err(ServiceError::unauthorized(INVALID_CREDENTIALS_MESSAGE));
         };
 
-        if has_permission(self.db.pool(), &user.id, PermissionKind::IsDisabled).await? {
-            tracing::warn!(username, user_id = %user.id, reason = "disabled", "login failed");
-            return Err(ServiceError::Forbidden(format!(
-                "The {} account is currently disabled. Please consult with your administrator.",
-                user.username
-            )));
-        }
-
-        if !self.is_local_client(remote_endpoint)
-            && !has_permission(self.db.pool(), &user.id, PermissionKind::EnableRemoteAccess).await?
-        {
-            tracing::warn!(username, user_id = %user.id, reason = "remote_access", "login failed");
-            return Err(ServiceError::Forbidden(
-                "remote access is not permitted for this user".to_owned(),
-            ));
-        }
-
-        if !is_parental_schedule_allowed(self.db.pool(), &user.id, chrono::Local::now()).await? {
-            tracing::warn!(username, user_id = %user.id, reason = "parental_schedule", "login failed");
-            return Err(ServiceError::Forbidden(
-                "User is not allowed access at this time.".to_owned(),
-            ));
-        }
+        self.ensure_sign_in_allowed(&user, remote_endpoint).await?;
 
         if !success {
             self.record_login_failure(&user).await?;
@@ -1600,6 +1608,38 @@ impl UserManager for FerrofinUserManager {
         // The writes above touch this user's row only.
         self.user_changed(&user.id);
         Ok(Some(user))
+    }
+
+    async fn ensure_sign_in_allowed(
+        &self,
+        user: &UserEntity,
+        remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        // The account's name: a sign-in without a password has no typed one.
+        let username = user.username.as_str();
+        if has_permission(self.db.pool(), &user.id, PermissionKind::IsDisabled).await? {
+            tracing::warn!(username, user_id = %user.id, reason = "disabled", "login failed");
+            return Err(ServiceError::Forbidden(format!(
+                "The {username} account is currently disabled. Please consult with your administrator."
+            )));
+        }
+
+        if !self.is_local_client(remote_endpoint)
+            && !has_permission(self.db.pool(), &user.id, PermissionKind::EnableRemoteAccess).await?
+        {
+            tracing::warn!(username, user_id = %user.id, reason = "remote_access", "login failed");
+            return Err(ServiceError::Forbidden(
+                "remote access is not permitted for this user".to_owned(),
+            ));
+        }
+
+        if !is_parental_schedule_allowed(self.db.pool(), &user.id, chrono::Local::now()).await? {
+            tracing::warn!(username, user_id = %user.id, reason = "parental_schedule", "login failed");
+            return Err(ServiceError::Forbidden(
+                "User is not allowed access at this time.".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
@@ -1838,8 +1878,7 @@ impl UserManager for FerrofinUserManager {
             .get_user_dto(user, None)
             .await?
             .configuration
-            .map(|c| c.latest_items_excludes)
-            .unwrap_or_default())
+            .map_or_default(|c| c.latest_items_excludes))
     }
 
     async fn update_configuration(
@@ -3821,6 +3860,10 @@ mod tests {
 #[cfg(test)]
 #[path = "user_manager/provider_tests.rs"]
 mod provider_tests;
+
+#[cfg(test)]
+#[path = "user_manager/sign_in_rules_tests.rs"]
+mod sign_in_rules_tests;
 
 #[cfg(test)]
 #[path = "user_manager/password_reset_tests.rs"]

@@ -127,35 +127,74 @@ fn refresh_found(current: &mut ItemImageInfo, new: &ItemImageInfo) -> bool {
     false
 }
 
-/// An item's own art folders under the metadata `root`: Ferrofin's
-/// `{root}/{ID}` ([`own_art_dir`]), the [`legacy_art_dir`] older scans wrote
-/// some art to, and the `{root}/{xx}/{id:N}` folder Jellyfin's
-/// `BaseItem.GetInternalMetadataPath` uses (`BaseItem.cs:927-937`), which an
-/// adopted database's images keep.
+/// An item's own art folders under the metadata `root`, the one art is saved
+/// in first: [`own_art_dir`], which an adopted database's images keep too,
+/// then the [`earlier_art_dir`] and the [`legacy_art_dir`] earlier builds
+/// saved art in.
 #[must_use]
 pub fn internal_metadata_dirs(root: &Path, item_id: Uuid) -> [PathBuf; 3] {
-    let simple = item_id.simple().to_string();
     [
         own_art_dir(root, item_id),
+        earlier_art_dir(root, item_id),
         legacy_art_dir(root, item_id),
-        root.join(&simple[..2]).join(&simple),
     ]
 }
 
-/// The folder Ferrofin draws an item's art into: `{root}/{ID}`.
+/// The folder an item's art is saved in, `BaseItem.GetInternalMetadataPath`
+/// (`BaseItem.cs:951-961`): `{root}/{idN[..2]}/{idN}`, the layout its
+/// chapter images, subtitles and lyrics use too. The channel and Live TV
+/// overrides are not ported, as in `PathManager`.
 #[must_use]
 pub fn own_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
-    root.join(guid_to_db(item_id))
+    let simple = item_id.simple().to_string();
+    root.join(&simple[..2]).join(&simple)
 }
 
-/// `{root}/{id}`, the item's id lower-cased: where older scans wrote music,
-/// person, studio and embedded-cover art, beside [`own_art_dir`]. Nothing is
+/// `{root}/{ID}`, where earlier builds saved an item's art. Nothing is
 /// written there any more. It is read and cleaned so that art already there
 /// is found, pruned and removed with the item, and its stored paths keep
 /// working.
 #[must_use]
+pub fn earlier_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
+    root.join(guid_to_db(item_id))
+}
+
+/// `{root}/{id}`, the item's id lower-cased: where older scans wrote music,
+/// person, studio and embedded-cover art. Nothing is written there any more;
+/// it is read and cleaned as the [`earlier_art_dir`] is.
+#[must_use]
 pub fn legacy_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
     root.join(item_id.hyphenated().to_string())
+}
+
+/// The file name, without its extension, `ImageSaver.GetStandardSavePath`
+/// gives an image saved in the item's own folder ([`own_art_dir`];
+/// `saveLocally` false, `ImageSaver.cs:396-566`) for an item of `kind`, its
+/// short type name: `folder` for a music album's, a music artist's, a photo
+/// album's or a person's Primary and `poster` for any other; `clearart`,
+/// `back`, `landscape`; `cdart` for a music album's disc and `disc` for any
+/// other; `backdrop` for the first backdrop (a later one's `backdropN` is the
+/// caller's, `GetBackdropSaveFilename`); else the type's name lower-cased.
+/// A stored type name (`MediaBrowser.Controller.Entities.Audio.MusicAlbum`)
+/// is read by its last part.
+#[must_use]
+pub fn internal_image_stem(kind: &str, image_type: ImageType) -> String {
+    let kind = kind.rsplit('.').next().unwrap_or(kind);
+    match image_type {
+        ImageType::Primary
+            if matches!(kind, "MusicAlbum" | "MusicArtist" | "PhotoAlbum" | "Person") =>
+        {
+            "folder".into()
+        }
+        ImageType::Primary => "poster".into(),
+        ImageType::Art => "clearart".into(),
+        ImageType::BoxRear => "back".into(),
+        ImageType::Thumb => "landscape".into(),
+        ImageType::Disc if kind == "MusicAlbum" => "cdart".into(),
+        // `ToString()` of a value the enum does not name is its number.
+        ImageType::Unrecognized(value) => value.to_string(),
+        other => format!("{other:?}").to_ascii_lowercase(),
+    }
 }
 
 /// Port of `ItemImageProvider.RemoveImages` (`ItemImageProvider.cs:74-103`,

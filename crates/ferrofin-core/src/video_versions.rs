@@ -60,13 +60,12 @@ fn data_paths(data: Option<&str>, key: &str) -> Vec<String> {
     crate::item_data::parse_data(data)
         .get(key)
         .and_then(serde_json::Value::as_array)
-        .map(|list| {
+        .map_or_default(|list| {
             list.iter()
                 .filter_map(serde_json::Value::as_str)
                 .map(ToOwned::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// A stacked video's other parts' paths (`Video.AdditionalParts`).
@@ -99,8 +98,7 @@ pub fn additional_part_count(data: Option<&str>) -> usize {
     let value = text[at + "\"AdditionalParts\"".len()..]
         .trim_start()
         .strip_prefix(':')
-        .map(str::trim_start)
-        .unwrap_or_default();
+        .map_or_default(str::trim_start);
     let empty = value.starts_with("null")
         || value
             .strip_prefix('[')
@@ -849,8 +847,7 @@ fn source_order(own: bool, video_type: Option<VideoType>, is_3d: bool) -> (bool,
 fn file_stem(path: &str) -> String {
     std::path::Path::new(path)
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|s| s.to_string_lossy().into_owned())
 }
 
 /// The folder an item lives in — `BaseItem.ContainingFolderPath`
@@ -886,8 +883,7 @@ pub(crate) fn containing_folder_path_at(video: &BaseItemEntity, path: &str) -> S
     }
     std::path::Path::new(path)
         .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|p| p.to_string_lossy().into_owned())
 }
 
 /// The name of the folder a video lives in (`Path.GetFileName(
@@ -895,8 +891,7 @@ pub(crate) fn containing_folder_path_at(video: &BaseItemEntity, path: &str) -> S
 fn containing_folder_name(video: &BaseItemEntity) -> String {
     std::path::Path::new(&containing_folder_path(video))
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|n| n.to_string_lossy().into_owned())
 }
 
 /// `text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)`, on chars.

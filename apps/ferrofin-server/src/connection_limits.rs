@@ -856,19 +856,12 @@ impl HttpBody for TrackedBody {
 pub fn track_requests<S>(
     tracker: RequestTracker,
     service: S,
-) -> impl tower::Service<
-    Request,
-    Response = Response,
-    Error = std::convert::Infallible,
-    Future: Send + 'static,
-> + Clone
+) -> impl tower::Service<Request, Response = Response, Error = !, Future: Send + 'static>
++ Clone
 + Send
 + 'static
 where
-    S: tower::Service<Request, Response = Response, Error = std::convert::Infallible>
-        + Clone
-        + Send
-        + 'static,
+    S: tower::Service<Request, Response = Response, Error = !> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
     tower::service_fn(move |request: Request| {
@@ -877,7 +870,7 @@ where
         let service = service.clone();
         async move {
             let response = tower::ServiceExt::oneshot(service, request).await?;
-            Ok::<_, std::convert::Infallible>(running.finish(response))
+            Ok::<_, !>(running.finish(response))
         }
     })
 }

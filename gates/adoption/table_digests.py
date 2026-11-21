@@ -66,7 +66,8 @@ TIMESTAMPS = {
 }
 # Bumped when the baseline's shape changes so a stale file is rejected, not mis-read. 2: rows
 # sharing a key became a list (multiset). 3: a re-derived column carries a `clean` map (DERIVED).
-SNAPSHOT_VERSION = 3
+# 4: a baseline names the probed-afresh 10.11 local versions (`rederived`, PROBED).
+SNAPSHOT_VERSION = 4
 KEYS = {"Devices": ("UserId", "DeviceId")}
 # Tables whose ItemId names a library item. The rehome repair re-keys a local alternate version
 # to the id its primary's type derives, as Jellyfin 12.2 does, so an item is identified by its
@@ -78,6 +79,12 @@ ITEM_KEYED = ("MediaStreamInfos", "AttachmentStreamInfos", "Chapters", "Trickpla
 # the folder to the new id, as Jellyfin 12.2 does, so the id in it compares as the item. Any other
 # change to the path still shows.
 FOLDER_COLUMNS = {"Chapters": ("ImagePath",)}
+# The tables a probe writes. Jellyfin 12.x deletes a 10.11 local alternate version with these rows
+# (MigrateLinkedChildren.CleanupWrongTypeAlternateVersions) and its scan probes the version it
+# creates; Ferrofin keeps the row, and the boot repair rederive_adopted_versions hands it back to
+# the scan, whose first refresh probes it again. So a version's rows here may change or go after a
+# 10.11 source's scan; every other item's still fail.
+PROBED = ("MediaStreamInfos", "AttachmentStreamInfos", "Chapters")
 # Only an owned item (a version or extra) is re-identified, so a library-wide re-key still fails.
 # These two ids mean "no owner" (0032).
 NO_OWNER = ("00000000000000000000000000000000", "00000000000000000000000000000001")
@@ -118,6 +125,34 @@ def identities(conn, moves=()):
     counts = Counter(path for _, path, _ in items)
     return {item: "path:" + path for item, path, owner in items
             if path and counts[path] == 1 and owner and owner not in NO_OWNER}
+
+
+def rederived(conn, identity):
+    """The identities of the local alternate versions whose PROBED rows a first scan rewrites: those
+    of a Jellyfin 10.11 database (12.0 added the LinkedChildren table), none of any other. A
+    version 12.x re-creates is a row at a path in its owner's LocalAlternateVersions whose type is
+    not its owner's (10.11 stored every one as a Video; a home video's stays). One pass over the
+    owners and one over the owned rows: 10.11 spells an owner's id in another case than its own."""
+    tables = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    columns = {row[1] for row in conn.execute('PRAGMA table_info("BaseItems")')}
+    if "LinkedChildren" in tables or not {"Type", "ExtraType", "Data"} <= columns:
+        return []
+    owners = {}
+    for item, kind, data in conn.execute(
+            'SELECT "Id", "Type", "Data" FROM "BaseItems" WHERE "Data" LIKE \'%LocalAlternateVersions%\''):
+        try:
+            paths = json.loads(data).get("LocalAlternateVersions") or []
+        except (ValueError, AttributeError):
+            continue
+        owners[normalize(item)] = (kind, set(paths))
+    found = []
+    for item, kind, owner, path in conn.execute(
+            'SELECT "Id", "Type", "OwnerId", "Path" FROM "BaseItems" '
+            'WHERE "OwnerId" IS NOT NULL AND "ExtraType" IS NULL'):
+        owner_kind, paths = owners.get(normalize(owner), (None, ()))
+        if path in paths and kind != owner_kind and normalize(item) in identity:
+            found.append(identity[normalize(item)])
+    return sorted(found)
 
 
 def table_rows(conn, table, only=None, identity=None, users=None, reauthenticated=frozenset(), moves=()):
@@ -184,15 +219,16 @@ def snapshot(db, baseline=None, reauthenticated=frozenset(), moves=()):
         conn.execute("BEGIN")
         identity = identities(conn, moves)
         users = {normalize(user) for (user,) in conn.execute('SELECT "Id" FROM "Users"')}
-        return {"version": SNAPSHOT_VERSION, "tables": {
-            table: dict(zip(("columns", "rows", "clean"), table_rows(
-                conn, table, baseline and baseline["tables"][table]["columns"], identity, users,
-                reauthenticated, moves))) for table in TABLES}}
+        return {"version": SNAPSHOT_VERSION, "rederived": [] if baseline else rederived(conn, identity),
+                "tables": {table: dict(zip(("columns", "rows", "clean"), table_rows(
+                    conn, table, baseline and baseline["tables"][table]["columns"], identity, users,
+                    reauthenticated, moves))) for table in TABLES}}
 
 
 def compare(before, after):
     """Failures naming table and key; a column the baseline holds that is gone is named once."""
     failures = []
+    probed_afresh = tuple(identity + "/" for identity in before.get("rederived", ()))
     for table, was in before["tables"].items():
         now = after["tables"][table]
         gone = [name for name in was["columns"] if name not in now["columns"]]
@@ -200,6 +236,8 @@ def compare(before, after):
             failures.append(f"{table} lost column {', '.join(gone)}")
             continue
         for key, before_digests in was["rows"].items():
+            if table in PROBED and probed_afresh and key.startswith(probed_afresh):
+                continue
             after_digests = now["rows"].get(key)
             if after_digests is None:
                 failures.append(f"{table} row {key} is gone")

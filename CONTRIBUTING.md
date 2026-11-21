@@ -8,7 +8,7 @@ By contributing you agree your work is licensed under the same terms.
 
 ## Development setup
 
-Rust workspace, edition 2024, toolchain pinned to **1.99.1** (stable — see
+Rust workspace, edition 2024, toolchain pinned to **1.100.0** (stable — see
 `rust-toolchain.toml`, which rustup honors automatically).
 
 ```bash
@@ -54,9 +54,10 @@ parity runs and benchmark shape checks are supporting evidence; they never add a
 reference it as `dep.workspace = true`; `scripts/check-workspace-deps.py` refuses an inline
 version, and cargo-deny a workspace entry nothing uses. When `cargo deny` reports an
 advisory, even one published after your change, upgrade the crate if a fixed version exists
-(`cargo update -p <crate> --precise <version>`, or a manifest bump for a new major). An
-advisory with no fix, or one that does not reach Ferrofin's use of the crate, goes into
-`deny.toml`'s `[advisories] ignore` with its reason, and leaves it once the crate is fixed.
+(`cargo update -p <crate> --precise <version>`, or a manifest bump for a new major; for a
+release younger than 7 days, see **Dependency cooldown** below). An advisory with no fix, or
+one that does not reach Ferrofin's use of the crate, goes into `deny.toml`'s
+`[advisories] ignore` with its reason, and leaves it once the crate is fixed.
 The release workflow's `cargo audit bin` on the built binaries (`scripts/audit-bin.py`) applies
 the same `[advisories]` rules and ignores, so an ignore entry names the advisory by its `id`.
 A version yanked from crates.io fails `cargo deny` too: `cargo update -p <crate>` moves off
@@ -65,6 +66,24 @@ it, or a manifest bump when no compatible release is left. The WASM guest
 finding there with `cargo update --manifest-path examples/wasm-hello/Cargo.toml -p <crate>`
 or a bump in its `Cargo.toml`.
 A new license is a compatibility decision against GPL-3.0-only, not a fix.
+
+**Dependency cooldown.** `.cargo/config.toml` holds Cargo's dependency cooldown:
+`cargo update`, and resolving a newly added dependency, never pick a crate version published
+less than 7 days ago, in the workspace and in the WASM guest, so a compromised release has a
+week to be found and yanked first. `--locked` builds and `cargo install` are unaffected. A
+version that young is refused when named with `--precise` and passed over otherwise, so an
+advisory's fix, or the release that replaces a yanked one, is often out of reach. Take it on
+purpose with the override on that one command:
+`CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate> --precise <version>`
+(add `--manifest-path examples/wasm-hello/Cargo.toml` for the WASM guest). Never set the
+override on a full `cargo update`: it lifts the hold for every crate. Until that release is 7
+days old, a plain update that includes the crate (a full `cargo update`, or `-p <crate>`)
+moves it back to the newest older release and undoes the fix. For a direct dependency, also
+raise its requirement to that version (in the root `[workspace.dependencies]`, or the guest's
+own `Cargo.toml`), so such an update fails with `version … is too new` instead. That error
+stops every full `cargo update` while any requirement names a release younger than the
+window: update other crates with `-p` until it is 7 days old. A version taken with the
+override still needs its cargo-vet audit or exemption (below).
 
 **Audits (cargo-vet).** `cargo vet --locked` blocks merging (it is part of GitHub's required
 `lint` check, and GitLab's `vet` job): every crate in `Cargo.lock` needs an audit or an

@@ -524,12 +524,17 @@ pub async fn build_app_state(
     // scope (`AddUserToQuery`'s playlists and box-set gate) reaches it through
     // this late slot, filled once the evaluator exists.
     let scope_visibility = ferrofin_core::VisibilitySlot::default();
+    // The user-view manager is built over the repository too, so the scope's
+    // `GetUserViews` call (`AddUserToQuery` writes the user's views) reaches it
+    // through this late slot.
+    let scope_user_views = ferrofin_core::UserViewsSlot::default();
     let item_repository_impl = Arc::new(
         FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup))
             .with_root_ids(root_folder_ids)
             .with_virtual_paths(virtual_paths.clone())
             .with_active_recordings(Arc::clone(&active_recordings))
-            .with_visibility(Arc::clone(&scope_visibility)),
+            .with_visibility(Arc::clone(&scope_visibility))
+            .with_user_views(Arc::clone(&scope_user_views)),
     );
     let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
         Arc::clone(&item_repository_impl) as _;
@@ -537,10 +542,23 @@ pub async fn build_app_state(
         FerrofinItemCountService::new(db.clone())
             .with_root_ids(root_folder_ids)
             .with_visibility(Arc::clone(&scope_visibility))
+            .with_user_views(Arc::clone(&scope_user_views))
             .with_virtual_paths(virtual_paths.clone()),
     );
+    // Genre, music genre, studio and new artist rows take the ids Jellyfin
+    // derives from their metadata paths (gl-1597, gl-1624); a pre-parity
+    // database keeps its own.
+    let by_name_identity = ferrofin_core::item_type_lookup::ByNameIdentity::new(
+        &id_derivation,
+        paths.genre_path(),
+        paths.music_genre_path(),
+        paths.studio_path(),
+        paths.artists_path(),
+    );
     let item_persistence_impl = Arc::new(
-        FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(virtual_paths.clone()),
+        FerrofinItemPersistenceService::new(db.clone())
+            .with_virtual_paths(virtual_paths.clone())
+            .with_by_name_identity(by_name_identity.clone()),
     );
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
         Arc::clone(&item_persistence_impl) as _;
@@ -571,6 +589,20 @@ pub async fn build_app_state(
             tracing::warn!(%err, "forced sort-name repair failed; items with a sort-title override may sort by the 10.11.8 key until the next boot retries it");
         }
     }
+    // One-shot: sort keys earlier builds stored for non-Latin names were not
+    // romanised; move them to upstream's (`ModifySortChunks` → `Transliterated`).
+    match item_persistence_impl
+        .repair_transliterated_sort_names()
+        .await
+    {
+        Ok(0) => {}
+        Ok(repaired) => {
+            tracing::info!(repaired, "romanised the sort names of non-Latin titles");
+        }
+        Err(err) => {
+            tracing::warn!(%err, "sort-name transliteration repair failed; non-Latin titles may sort as written until the next boot retries it");
+        }
+    }
     // One-shot: box sets and playlists an older build created had no dates,
     // and a renamed playlist kept its old name's `CleanName`/`SortName`, so a
     // search for its new name missed it.
@@ -587,7 +619,8 @@ pub async fn build_app_state(
         }
     }
     // One-shot: the Playlists folder and the Collections library an older
-    // build created were left without some of their dates.
+    // build created were left without some of their dates, and an older
+    // build filled the `DateModified` a refreshed folder has none of.
     match item_persistence_impl
         .repair_container_dates(&format!("{}/collections", paths.data_path()))
         .await
@@ -596,7 +629,7 @@ pub async fn build_app_state(
         Ok(repaired) => {
             tracing::info!(
                 repaired,
-                "backfilled dates of the playlists folder and the collections library"
+                "repaired dates of the playlists folder and the collections library"
             );
         }
         Err(err) => {
@@ -626,7 +659,8 @@ pub async fn build_app_state(
     }
     let people_repository_impl = Arc::new(
         FerrofinPeopleRepository::new(db.clone())
-            .with_identity(id_derivation.clone(), paths.people_path()),
+            .with_identity(id_derivation.clone(), paths.people_path())
+            .with_virtual_paths(virtual_paths.clone()),
     );
     // One-shot: collapse pre-unification per-(name, type) person items onto
     // the deterministic per-name id (repointing favorites/images), so a
@@ -659,7 +693,10 @@ pub async fn build_app_state(
     let people_repository: Arc<dyn ferrofin_traits::persistence::PeopleRepository> =
         people_repository_impl;
     let media_stream_repository: Arc<dyn ferrofin_traits::persistence::MediaStreamRepository> =
-        Arc::new(FerrofinMediaStreamRepository::new(db.clone()));
+        Arc::new(
+            FerrofinMediaStreamRepository::new(db.clone())
+                .with_virtual_paths(virtual_paths.clone()),
+        );
     let media_attachment_repository: Arc<
         dyn ferrofin_traits::persistence::MediaAttachmentRepository,
     > = Arc::new(FerrofinMediaAttachmentRepository::new(db.clone()));
@@ -673,8 +710,11 @@ pub async fn build_app_state(
             FerrofinLinkedChildrenService::new(db.clone())
                 .with_entry_edits(item_persistence_impl.playlist_entry_edits()),
         );
-    let next_up_service: Arc<dyn ferrofin_traits::persistence::NextUpService> =
-        Arc::new(FerrofinNextUpService::new(db.clone()).with_virtual_paths(virtual_paths.clone()));
+    let next_up_service: Arc<dyn ferrofin_traits::persistence::NextUpService> = Arc::new(
+        FerrofinNextUpService::new(db.clone())
+            .with_virtual_paths(virtual_paths.clone())
+            .with_user_views(Arc::clone(&scope_user_views)),
+    );
 
     let image_encoding_limit = parallel_image_encoding_limit(
         server_config.parallel_image_encoding_limit,
@@ -913,14 +953,17 @@ pub async fn build_app_state(
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
     // The one boot repair that re-keys items: a Jellyfin 10.11 local version
     // or stacked part takes the shape 12.x's scanner stores, so the first
-    // scan writes nothing for it. It needs the id derivation, the folders
-    // named after an item and the localization that scores the ratings a
-    // primary copies to its versions, so it runs here rather than with the
-    // others in `open_database`; nothing has scanned yet.
+    // scan moves nothing; then the local versions 12.x re-creates are handed
+    // back to that scan to probe and name afresh. It needs the id
+    // derivation, the folders named after an item and the localization that
+    // scores the ratings a primary copies to its versions, so it runs here
+    // rather than with the others in `open_database`; nothing has scanned
+    // yet.
     let metadata_library_now = metadata_library.resolve();
     ferrofin_core::adoption_repairs::run_rehome_local_versions(
         db,
         &id_derivation,
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
         item_persistence_service.as_ref(),
@@ -932,6 +975,7 @@ pub async fn build_app_state(
     ferrofin_core::adoption_repairs::run_rekey_virtual_seasons(
         db,
         &id_derivation,
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
     )
@@ -943,11 +987,24 @@ pub async fn build_app_state(
         db,
         &id_derivation,
         &format!("{}/playlists", paths.data_path()),
+        &virtual_paths,
         Some(metadata_library_now.as_path()),
         Some(path_manager.as_ref()),
     )
     .await
     .context("failed to give playlists their folders")?;
+    // Every boot (gl-1597): genre, music genre and studio rows an earlier
+    // version wrote under its own ids move to the ids Jellyfin derives, their
+    // art folders with them. Rows the version beside this one in a rolling
+    // update writes after this point move on the next boot.
+    ferrofin_core::adoption_repairs::run_rekey_by_name_rows(
+        db,
+        by_name_identity.as_ref(),
+        &virtual_paths,
+        Some(metadata_library_now.as_path()),
+        Some(path_manager.as_ref()),
+    )
+    .await;
     let client_event_logger: Arc<dyn ferrofin_traits::events::ClientEventLogger> =
         Arc::new(FerrofinClientEventLogger::new(
             Arc::clone(&paths) as Arc<dyn ferrofin_traits::system::ServerApplicationPaths>
@@ -1426,8 +1483,8 @@ pub async fn build_app_state(
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
     // A box set's `collection.xml`: written by the metadata save, read by
     // the box set's refresh.
-    let box_set_xml = Arc::new(
-        ferrofin_providers::box_set_xml::BoxSetXmlSaver::new(
+    let container_xml = Arc::new(
+        ferrofin_providers::container_xml::ContainerXmlSaver::new(
             Arc::clone(&item_repository),
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
@@ -1453,8 +1510,9 @@ pub async fn build_app_state(
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
+            .with_image_processor(Arc::clone(&image_processor))
             .with_nfo_saver(Arc::clone(&nfo_saver))
-            .with_box_set_xml(box_set_xml)
+            .with_container_xml(Arc::clone(&container_xml))
             .with_image_store(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
@@ -1535,6 +1593,18 @@ pub async fn build_app_state(
             .with_metadata_country({
                 let config_mgr = Arc::clone(&config_mgr);
                 Arc::new(move || config_mgr.snapshot_shared().metadata_country_code.clone())
+            })
+            // `GetRebasedPath` of the by-name kinds the item refresh moves
+            // (`Genre`/`MusicGenre`/`Person`/`Studio`/`Year.RequiresRefresh`).
+            .with_by_name_rebase({
+                let paths = Arc::clone(&paths);
+                move |kind, path: &str| {
+                    ferrofin_core::item_type_lookup::rebased_by_name_path(
+                        paths.as_ref(),
+                        kind,
+                        path,
+                    )
+                }
             }),
     );
 
@@ -1559,6 +1629,7 @@ pub async fn build_app_state(
             .with_users(Arc::clone(&users))
             .with_database(db.clone()),
     );
+    scope_user_views.bind(&user_views);
 
     // Close the Live TV <-> item-layer cycle: the guide refresh mirrors the
     // channel lineup into `BaseItems` (C# `GuideManager.GetChannel` ->
@@ -1604,9 +1675,9 @@ pub async fn build_app_state(
             .with_configuration(Arc::clone(&config_trait)),
     );
     // The by-name `Year` provisioner (`GetYear`): one row per production year
-    // at `{metadata}/Year/{year}` with Jellyfin's normalized by-name id. Shared
-    // by the scan's post-pass (every scanned year) and the library manager's
-    // on-demand `/Years/{year}` resolution.
+    // at `{metadata}/Year/{year}` with Jellyfin's normalized by-name id,
+    // created on demand by the library manager when `/Years` resolves a year.
+    // A scan creates none, as upstream's does not.
     let year_store = ferrofin_core::YearStore::new(
         Arc::clone(&item_persistence_service),
         id_derivation.clone(),
@@ -1656,8 +1727,7 @@ pub async fn build_app_state(
         Arc::new(move || {
             live_tv
                 .upgrade()
-                .map(|live_tv| live_tv.paths_being_recorded())
-                .unwrap_or_default()
+                .map_or_default(|live_tv| live_tv.paths_being_recorded())
         })
     })
     .with_trickplay(Arc::clone(&trickplay), {
@@ -1676,9 +1746,6 @@ pub async fn build_app_state(
     // Each library location is the `Folder` row Jellyfin keeps for it, under
     // the aggregate root, and what it holds hangs off it (owner decision D1).
     .with_root_folder(root_folder_ids.aggregate)
-    // Materialize a `Year` item per distinct ProductionYear at the end of
-    // every scan (needs the item repository wired via `with_music` below).
-    .with_years(year_store.clone())
     .with_by_name_store(by_name_store.clone())
     // OfficialRating → numeric parental score on each scanned row (the
     // Parental Rating sort and max-rating filters read the numeric column).
@@ -1920,7 +1987,8 @@ pub async fn build_app_state(
         )
         // A box set takes its members' rating when they change.
         .with_visibility(Arc::clone(&item_visibility))
-        // …and its metadata and artwork, through a queued refresh.
+        // …and its metadata and artwork, through a queued refresh (the first
+        // collection's runs at once, ahead of its library's scan).
         .with_providers(Arc::clone(&providers))
         .with_self_writes(Arc::clone(&self_writes_guard))
         // …and names a new Collections library in the server's language.
@@ -2357,6 +2425,20 @@ pub async fn build_app_state(
         extension_cx.external_identities.as_ref(),
     )
     .await;
+    // Likewise the settings of the metadata plugins Jellyfin builds in, from
+    // their `PluginConfiguration` documents, so an adopted server does not come
+    // up with TMDb, OMDb, MusicBrainz, AudioDB and Studio Images at the
+    // defaults (gl-1574).
+    ferrofin_core::plugin_config_adoption::import_adopted_plugin_configs(
+        &std::path::Path::new(&paths.plugins_path()).join("configurations"),
+        &plugin_state_dir,
+        plugins.as_ref(),
+        &ferrofin_providers::builtin_plugins::ALL
+            .iter()
+            .map(|p| (p.id, p.configuration_file_name))
+            .collect::<Vec<_>>(),
+    )
+    .await;
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
     subscribe_intro_skipper(&event_bus, &intro_skipper_analysis);
     // Register actual loaded producers before the core "Media Segment Scan"
@@ -2410,6 +2492,16 @@ pub async fn build_app_state(
     // the playlist manager's expansion, so it runs here, before the scheduler
     // can start a scan.
     ferrofin_core::adoption_repairs::run_expand_saved_playlist_containers(db, &playlists).await;
+    // The playlists folder's playlist.xml files, which no earlier Ferrofin
+    // wrote, written from the database before a refresh reads one (gl-341).
+    // Boxed: inlined, its future puts startup's over `large_futures`.
+    Box::pin(ferrofin_core::adoption_repairs::run_save_playlist_xml_once(
+        db,
+        &playlists,
+        &container_xml,
+        item_persistence_service.as_ref(),
+    ))
+    .await;
     let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> = playlists;
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
@@ -2532,7 +2624,12 @@ pub async fn build_app_state(
             .await,
         ));
     }
-    let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
+    let task_registry = Arc::new(task_manager.clone());
+    // A library change's scan (a library added or removed, the first
+    // collection's library, the seeded libraries) is a "Scan Media Library"
+    // run, as upstream's `QueueLibraryScan` queues it.
+    library_impl.attach_refresh_task(&task_registry);
+    let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = task_registry;
     // Every item delete and scan removal removes the deleted rows' extracted
     // data (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the
     // library manager and the scanner are built before the chapter and
@@ -2583,6 +2680,11 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to remove extracted data of items that no longer exist")?;
+    // Once per database (gl-1616): the item and stream paths an earlier
+    // version stored resolved under the data and metadata directories take
+    // the `%AppDataPath%`/`%MetadataPath%` form every save writes. Last of the
+    // repairs, after every one that stores a path, and before a scan.
+    ferrofin_core::adoption_repairs::run_reverse_stored_virtual_paths(db, &virtual_paths).await;
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
@@ -2605,6 +2707,9 @@ pub async fn build_app_state(
         .with_musicbrainz_server(&config.musicbrainz_base_url)
         .with_virtual_paths(virtual_paths)
         .with_metadata_root(metadata_root.clone())
+        // A genre or studio link to a name with no row yet carries the id its
+        // row is created with (gl-1597).
+        .with_by_name_identity(by_name_identity.clone())
         // The `MediaSources`' default-stream selection normalizes languages
         // through the same localization the media-source manager does.
         .with_localization(Arc::clone(&localization))
@@ -3293,6 +3398,30 @@ pub async fn build_app_state(
             Arc::clone(&plugins),
             Arc::new(ferrofin_extensions::ldap_auth::directory::Ldap3Directory::default()),
         ));
+    // The Single Sign-On extension's service behind the `/sso` routes, gated
+    // the same way. Its callback URLs fall back to the published URL, never
+    // to a request's Host header. It finds or creates the account a sign-in
+    // ends at through the extensions' user manager and identity links, opens
+    // its session through the session manager, ties a link flow to the
+    // session that started it through the devices holding the tokens, and
+    // writes a refused sign-in and each link change to the activity log; a
+    // native app's Quick Connect code it approves through the Quick Connect
+    // manager. These exist only long after the extension context, so they
+    // come from the state, not from it.
+    let sso: Arc<dyn ferrofin_traits::sso::SsoManager> = Arc::new(
+        ferrofin_extensions::sso::SsoService::new(
+            Arc::clone(&plugins),
+            Arc::clone(&extension_cx.users),
+            Arc::clone(&extension_cx.external_identities),
+            Arc::clone(&state.sessions),
+            Arc::clone(&state.devices),
+            Arc::clone(&state.activity),
+            config.published_url.clone(),
+        )
+        .with_quick_connect(Arc::clone(&state.quick_connect))
+        // A `picture` claim's URL is downloaded under the image limits.
+        .with_remote_images(Arc::clone(&extension_cx.remote_images)),
+    );
     // The backup engine behind `/Backup*`: archives come from and go back to
     // the live application paths, and each manifest records this release.
     let backup_paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
@@ -3313,6 +3442,7 @@ pub async fn build_app_state(
         .with_file_transformations(Arc::clone(&file_transformations))
         .with_merge_versions(merge_versions)
         .with_ldap(ldap)
+        .with_sso(sso)
         .with_backup(backup)
         .with_playback_metrics(playback_metrics);
 

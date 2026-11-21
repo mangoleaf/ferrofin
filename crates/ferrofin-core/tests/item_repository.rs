@@ -930,7 +930,7 @@ async fn named_item_id_lookup_seeks_the_type_clean_name_index() {
     for n in (0..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
         let filter = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Studio],
-            names: (0..n).map(|i| format!("Studio {i}")).collect(),
+            names: Vec::from_fn(n, |i| format!("Studio {i}")),
             ..Default::default()
         };
         let mut builder = build_query(&filter, QueryShape::IdAndCleanName);
@@ -1636,12 +1636,17 @@ async fn child_counts_exclude_merged_alternate_versions() {
     let alternate = Uuid::from_u128(0xD03);
     let mut season_row = item(season, BaseItemKind::Season, "Season 1");
     season_row.id = season_row.id.to_uppercase();
+    // Episodes filed under their season carry its id, as both scanners set it
+    // (`Episode.FindSeasonId`); one without stores the zero GUID, which no
+    // child count includes (`ItemCountService.cs:499,509`).
     let mut primary_row = item(primary, BaseItemKind::Episode, "Pilot");
     primary_row.id = primary_row.id.to_uppercase();
     primary_row.parent_id = Some(season.to_string().to_uppercase());
+    primary_row.season_id = primary_row.parent_id.clone();
     let mut alternate_row = item(alternate, BaseItemKind::Episode, "Pilot");
     alternate_row.id = alternate_row.id.to_uppercase();
     alternate_row.parent_id = Some(season.to_string().to_uppercase());
+    alternate_row.season_id = alternate_row.parent_id.clone();
     // The merge-versions link: the duplicate points at its primary.
     alternate_row.primary_version_id = Some(primary.to_string().to_uppercase());
     persist

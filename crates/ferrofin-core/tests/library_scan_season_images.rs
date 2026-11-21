@@ -110,8 +110,9 @@ impl Library {
             .find(|image| image.image_type == image_type)
             .map(|image| {
                 Path::new(&image.path)
-                    .strip_prefix(&self.show)
-                    .map_or_else(|_| image.path.clone(), |p| p.to_string_lossy().into_owned())
+                    .trim_prefix(&self.show)
+                    .to_string_lossy()
+                    .into_owned()
             })
     }
 

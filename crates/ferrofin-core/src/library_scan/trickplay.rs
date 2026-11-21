@@ -314,13 +314,6 @@ mod tests {
         fail: bool,
     }
 
-    struct Dropped(Arc<AtomicBool>);
-    impl Drop for Dropped {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
     impl HeldManager {
         async fn held(
             &self,
@@ -329,7 +322,9 @@ mod tests {
             options: &LibraryOptions,
             with_row: bool,
         ) -> Result<(), ServiceError> {
-            let _dropped = Dropped(Arc::clone(&self.dropped));
+            let _dropped = std::mem::DropGuard::new(Arc::clone(&self.dropped), |dropped| {
+                dropped.store(true, Ordering::SeqCst);
+            });
             self.calls.lock().unwrap().push((
                 id,
                 replace,

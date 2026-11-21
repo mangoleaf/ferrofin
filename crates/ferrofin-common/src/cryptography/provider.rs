@@ -174,6 +174,17 @@ impl CryptoProvider for CryptographyProvider {
     }
 }
 
+/// A password no one knows: 32 bytes from the thread-local CSPRNG, as hex.
+/// Hashed and stored for an account that must never sign in with a password,
+/// it leaves the account no empty password to fall back to under any
+/// provider. Ferrofin's own: upstream has no such account.
+#[must_use]
+pub fn unusable_password() -> String {
+    let mut secret = [0u8; 32];
+    rand::fill(&mut secret[..]);
+    crate::cryptography::password_hash::to_hex_string(&secret)
+}
+
 /// Length-checked constant-time byte comparison (mirrors `SequenceEqual`).
 ///
 /// Unequal lengths return `false` at once, so only the contents of
@@ -282,7 +293,7 @@ mod tests {
     #[test]
     fn salt_bytes_are_uniform_and_non_zero() {
         let provider = CryptographyProvider::new();
-        let salts: Vec<Vec<u8>> = (0..4096).map(|_| provider.generate_salt()).collect();
+        let salts: Vec<Vec<u8>> = Vec::from_fn(4096, |_| provider.generate_salt());
         let zero = salts.iter().find(|s| s.contains(&0));
         assert!(zero.is_none(), "{zero:?}");
         let fixed = |i: usize, shift: u8, bits: u8| salts.iter().all(|s| s[i] >> shift == bits);
@@ -312,5 +323,13 @@ mod tests {
             provider.verify(&hash, "x"),
             Err(CryptoError::Format(_))
         ));
+    }
+
+    #[test]
+    fn each_unusable_password_is_32_fresh_random_bytes() {
+        let (first, second) = (unusable_password(), unusable_password());
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|c| c.is_ascii_hexdigit()), "{first}");
+        assert_ne!(first, second);
     }
 }

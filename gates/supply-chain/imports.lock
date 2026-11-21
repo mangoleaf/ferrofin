@@ -632,6 +632,12 @@ criteria = "safe-to-deploy"
 delta = "0.2.3 -> 0.3.0"
 notes = "Nothing out of the ordinary, virtually no unsafe code."
 
+[[audits.bytecode-alliance.audits.der]]
+who = "Chris Fallin <chris@cfallin.org>"
+criteria = "safe-to-deploy"
+version = "0.7.10"
+notes = "No unsafe code aside from transmutes for transparent newtypes."
+
 [[audits.bytecode-alliance.audits.embedded-io]]
 who = "Alex Crichton <alex@alexcrichton.com>"
 criteria = "safe-to-deploy"
@@ -848,6 +854,12 @@ criteria = "safe-to-deploy"
 version = "2.2.1"
 notes = "forbid-unsafe crate with straightforward imports."
 
+[[audits.bytecode-alliance.audits.pem-rfc7468]]
+who = "Chris Fallin <chris@cfallin.org>"
+criteria = "safe-to-deploy"
+version = "0.7.0"
+notes = "Only `unsafe` around a `from_utf8_unchecked`, and no IO."
+
 [[audits.bytecode-alliance.audits.percent-encoding]]
 who = "Alex Crichton <alex@alexcrichton.com>"
 criteria = "safe-to-deploy"
@@ -877,6 +889,12 @@ change.
 who = "Chris Fallin <chris@cfallin.org>"
 criteria = "safe-to-deploy"
 delta = "0.3.29 -> 0.3.32"
+
+[[audits.bytecode-alliance.audits.portable-atomic-util]]
+who = "Alex Crichton <alex@alexcrichton.com>"
+criteria = "safe-to-deploy"
+version = "0.2.8"
+notes = "Lots of unsafe code, as to be expected, but mostly a copy of the standard library's `arc.rs` and otherwise nothing awry here."
 
 [[audits.bytecode-alliance.audits.postcard]]
 who = "Alex Crichton <alex@alexcrichton.com>"
@@ -1000,11 +1018,35 @@ criteria = "safe-to-deploy"
 version = "0.1.1"
 notes = "No unsafe usage or ambient capabilities"
 
+[[audits.embark-studios.audits.ident_case]]
+who = "Johan Andersson <opensource@embark-studios.com>"
+criteria = "safe-to-deploy"
+version = "1.0.1"
+notes = "No unsafe usage or ambient capabilities"
+
 [[audits.embark-studios.audits.idna]]
 who = "Johan Andersson <opensource@embark-studios.com>"
 criteria = "safe-to-deploy"
 delta = "0.3.0 -> 0.4.0"
 notes = "No unsafe usage or ambient capabilities"
+
+[[audits.embark-studios.audits.schemars]]
+who = "Johan Andersson <opensource@embark-studios.com>"
+criteria = "safe-to-deploy"
+version = "0.8.12"
+notes = "No unsafe usage (forbidden) or ambient capabilities"
+
+[[audits.embark-studios.audits.thiserror]]
+who = "Johan Andersson <opensource@embark-studios.com>"
+criteria = "safe-to-deploy"
+version = "1.0.40"
+notes = "Wrapper over implementation crate, found no unsafe or ambient capabilities used"
+
+[[audits.embark-studios.audits.thiserror-impl]]
+who = "Johan Andersson <opensource@embark-studios.com>"
+criteria = "safe-to-deploy"
+version = "1.0.40"
+notes = "Found no unsafe or ambient capabilities used"
 
 [[audits.embark-studios.audits.valuable]]
 who = "Johan Andersson <opensource@embark-studios.com>"
@@ -1137,6 +1179,13 @@ version = "7.1.3"
 notes = """
 Reviewed in https://chromium-review.googlesource.com/c/chromium/src/+/5046153
 """
+aggregated-from = "https://chromium.googlesource.com/chromium/src/+/main/third_party/rust/chromium_crates_io/supply-chain/audits.toml?format=TEXT"
+
+[[audits.google.audits.num-rational]]
+who = "Manish Goregaokar <manishearth@google.com>"
+criteria = "safe-to-deploy"
+version = "0.4.2"
+notes = "Contains no unsafe"
 aggregated-from = "https://chromium.googlesource.com/chromium/src/+/main/third_party/rust/chromium_crates_io/supply-chain/audits.toml?format=TEXT"
 
 [[audits.google.audits.num-traits]]
@@ -1327,6 +1376,92 @@ who = "David Cook <dcook@divviup.org>"
 criteria = "safe-to-deploy"
 version = "0.10.0"
 
+[[audits.isrg.audits.fiat-crypto]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+version = "0.1.17"
+notes = """
+This crate does not contain any unsafe code, and does not use any items from
+the standard library or other crates, aside from operations backed by
+`std::ops`. All paths with array indexing use integer literals for indexes, so
+there are no panics due to indexes out of bounds (as rustc would catch an
+out-of-bounds literal index). I did not check whether arithmetic overflows
+could cause a panic, and I am relying on the Coq code having satisfied the
+necessary preconditions to ensure panics due to overflows are unreachable.
+"""
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "Brandon Pitman <bran@bran.land>"
+criteria = "safe-to-deploy"
+delta = "0.1.17 -> 0.1.18"
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "0.1.18 -> 0.1.19"
+notes = """
+This release renames many items and adds a new module. The code in the new
+module is entirely composed of arithmetic and array accesses.
+"""
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "0.1.19 -> 0.1.20"
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "0.1.20 -> 0.2.0"
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "Brandon Pitman <bran@bran.land>"
+criteria = "safe-to-deploy"
+delta = "0.2.0 -> 0.2.1"
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "Tim Geoghegan <timg@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "0.2.1 -> 0.2.2"
+notes = "No changes to `unsafe` code, or any functional changes that I can detect at all."
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "Brandon Pitman <bran@bran.land>"
+criteria = "safe-to-deploy"
+delta = "0.2.2 -> 0.2.4"
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "0.2.4 -> 0.2.5"
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "Brandon Pitman <bran@bran.land>"
+criteria = "safe-to-deploy"
+delta = "0.2.5 -> 0.2.6"
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "Brandon Pitman <bran@bran.land>"
+criteria = "safe-to-deploy"
+delta = "0.2.6 -> 0.2.7"
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "0.2.7 -> 0.2.8"
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "Tim Geoghegan <timg@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "0.2.8 -> 0.2.9"
+notes = "No changes to Rust code between 0.2.8 and 0.2.9"
+
+[[audits.isrg.audits.fiat-crypto]]
+who = "Tim Geoghegan <timg@divviup.org>"
+criteria = "safe-to-deploy"
+delta = "0.2.9 -> 0.3.0"
+notes = "The diff is huge, but that's because it introduces a wrapper around indexing into arrays which is used in many many places. There is no new unsafe code and no change to build scripts I can detect."
+
 [[audits.isrg.audits.getrandom]]
 who = "David Cook <dcook@divviup.org>"
 criteria = "safe-to-deploy"
@@ -1336,6 +1471,11 @@ delta = "0.3.4 -> 0.4.0"
 who = "David Cook <dcook@divviup.org>"
 criteria = "safe-to-deploy"
 delta = "0.4.0 -> 0.4.1"
+
+[[audits.isrg.audits.hmac]]
+who = "David Cook <dcook@divviup.org>"
+criteria = "safe-to-deploy"
+version = "0.12.1"
 
 [[audits.isrg.audits.rand]]
 who = "David Cook <dcook@divviup.org>"
@@ -1396,6 +1536,16 @@ delta = "0.10.8 -> 0.10.9"
 who = "David Cook <dcook@divviup.org>"
 criteria = "safe-to-deploy"
 delta = "2.5.0 -> 2.6.1"
+
+[[audits.isrg.audits.thiserror]]
+who = "Brandon Pitman <bran@bran.land>"
+criteria = "safe-to-deploy"
+delta = "1.0.40 -> 1.0.43"
+
+[[audits.isrg.audits.thiserror-impl]]
+who = "Brandon Pitman <bran@bran.land>"
+criteria = "safe-to-deploy"
+delta = "1.0.40 -> 1.0.43"
 
 [[audits.isrg.audits.untrusted]]
 who = "David Cook <dcook@divviup.org>"
@@ -1634,6 +1784,13 @@ delta = "0.4.2 -> 0.4.3"
 aggregated-from = "https://raw.githubusercontent.com/mozilla/cargo-vet/main/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.hashbrown]]
+who = "Mike Hommey <mh+mozilla@glandium.org>"
+criteria = "safe-to-deploy"
+version = "0.12.3"
+notes = "This version is used in rust's libstd, so effectively we're already trusting it"
+aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.hashbrown]]
 who = "Erich Gubler <erichdongubler@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.16.1 -> 0.17.0"
@@ -1855,6 +2012,13 @@ criteria = "safe-to-deploy"
 delta = "1.0.17 -> 1.0.16"
 aggregated-from = "https://raw.githubusercontent.com/mozilla-firefox/firefox/main/supply-chain/audits.toml"
 
+[[audits.mozilla.audits.serde-value]]
+who = "Nika Layzell <nika@thelayzells.com>"
+criteria = "safe-to-deploy"
+version = "0.7.0"
+notes = "Basic implementation of a serde value type. No use of unsafe code."
+aggregated-from = "https://raw.githubusercontent.com/mozilla/cargo-vet/main/supply-chain/audits.toml"
+
 [[audits.mozilla.audits.sha2]]
 who = "Mike Hommey <mh+mozilla@glandium.org>"
 criteria = "safe-to-deploy"
@@ -1948,6 +2112,18 @@ who = "Nika Layzell <nika@thelayzells.com>"
 criteria = "safe-to-deploy"
 delta = "0.13.1 -> 0.13.2"
 aggregated-from = "https://raw.githubusercontent.com/mozilla/cargo-vet/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.thiserror]]
+who = "Jan-Erik Rediger <jrediger@mozilla.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.43 -> 1.0.69"
+aggregated-from = "https://raw.githubusercontent.com/mozilla/glean/main/supply-chain/audits.toml"
+
+[[audits.mozilla.audits.thiserror-impl]]
+who = "Jan-Erik Rediger <jrediger@mozilla.com>"
+criteria = "safe-to-deploy"
+delta = "1.0.43 -> 1.0.69"
+aggregated-from = "https://raw.githubusercontent.com/mozilla/glean/main/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.time-core]]
 who = "Kershaw Chang <kershaw@mozilla.com>"
@@ -2121,6 +2297,33 @@ criteria = "safe-to-deploy"
 delta = "0.2.1 -> 0.2.2"
 notes = "No changes to unsafe code, straightforward refactoring and cleanup."
 aggregated-from = "https://raw.githubusercontent.com/zcash/librustzcash/main/supply-chain/audits.toml"
+
+[[audits.zcash.audits.schemars]]
+who = "Schell Carl Scivally <efsubenovex@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.8.12 -> 0.9.0"
+notes = """
+The changes are primarily API refactoring and simplification, dependency updates, new type implementations, and feature flag reorganization.
+The crate changed from #![forbid(unsafe_code)] (line 9347) to #![deny(unsafe_code)] (line 9348), to accommodate the ref-cast crate integration which requires #[allow(unsafe_code)] on specific functions.
+The only notable change is the ref-cast usage which is a sound pattern for creating transparent newtype wrappers.
+"""
+aggregated-from = "https://raw.githubusercontent.com/zcash/librustzcash/main/supply-chain/audits.toml"
+
+[[audits.zcash.audits.signature]]
+who = "Daira Emma Hopwood <daira@jacaranda.org>"
+criteria = "safe-to-deploy"
+version = "2.1.0"
+notes = """
+This crate uses `#![forbid(unsafe_code)]`, has no build script, and only provides traits with some trivial default implementations.
+I did not review whether implementing these APIs would present any undocumented cryptographic hazards.
+"""
+aggregated-from = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
+
+[[audits.zcash.audits.signature]]
+who = "Jack Grigg <jack@electriccoin.co>"
+criteria = "safe-to-deploy"
+delta = "2.1.0 -> 2.2.0"
+aggregated-from = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
 
 [[audits.zcash.audits.time-core]]
 who = "Kris Nuttycombe <kris@nutty.land>"

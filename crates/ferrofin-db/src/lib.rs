@@ -13,6 +13,7 @@ pub mod database;
 pub mod entities;
 pub mod enums;
 pub mod error;
+pub mod export;
 pub mod item_data;
 pub mod normalized_usernames;
 mod placeholders;

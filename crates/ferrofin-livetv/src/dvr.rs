@@ -25,6 +25,7 @@ use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::live_tv::{LiveTvOptions, TimerInfoDto};
 use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_util::string_extensions::zero_padded;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use uuid::Uuid;
 
@@ -640,7 +641,12 @@ pub fn recording_name(timer: &TimerRecordingInfo) -> String {
         let mut add_hyphen = true;
         match (timer.season_number, timer.episode_number) {
             (Some(season), Some(episode)) => {
-                let _ = write!(name, " S{season:02}E{episode:02}");
+                let _ = write!(
+                    name,
+                    " S{}E{}",
+                    zero_padded(i64::from(season), 2),
+                    zero_padded(i64::from(episode), 2)
+                );
                 add_hyphen = false;
             }
             _ => {
@@ -658,11 +664,12 @@ pub fn recording_name(timer: &TimerRecordingInfo) -> String {
                 }
             }
         }
+        // `!string.IsNullOrWhiteSpace(info.EpisodeTitle)`, then appended as
+        // written.
         if let Some(episode_title) = timer
             .episode_title
             .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
+            .filter(|t| !t.trim().is_empty())
         {
             let mut candidate = name.clone();
             if add_hyphen {
@@ -873,6 +880,10 @@ mod tests {
             recording_name(&t),
             "Parity Show S02E07 The One With The Port"
         );
+        // A negative number pads its digits, sign in front: `(-4).ToString("00")`.
+        t.season_number = Some(-4);
+        t.episode_title = None;
+        assert_eq!(recording_name(&t), "Parity Show S-04E07");
     }
 
     #[test]
@@ -883,6 +894,20 @@ mod tests {
         let name = recording_name(&t);
         assert!(name.starts_with("Parity Show 2026_08_23_"), "{name}");
         assert!(name.ends_with(" - Untitled"), "{name}");
+    }
+
+    /// `GetRecordingName` appends `" " + info.EpisodeTitle` as written, and
+    /// skips only a blank one (gl-1631).
+    #[test]
+    fn a_padded_episode_title_is_appended_as_written() {
+        let mut t = timer("Parity Show");
+        t.is_program_series = true;
+        t.season_number = Some(1);
+        t.episode_number = Some(2);
+        t.episode_title = Some(" Pilot ".to_owned());
+        assert_eq!(recording_name(&t), "Parity Show S01E02  Pilot ");
+        t.episode_title = Some("   ".to_owned());
+        assert_eq!(recording_name(&t), "Parity Show S01E02");
     }
 
     #[test]

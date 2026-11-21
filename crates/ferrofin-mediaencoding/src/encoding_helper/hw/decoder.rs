@@ -257,6 +257,10 @@ impl HwaccelFlags {
 /// Port of the HEVC/VP9 depth block inside `GetHwaccelType`. VideoToolbox is
 /// exempt throughout: its decoders fall back to software internally rather than
 /// failing, so upstream does not gate them.
+#[allow(
+    clippy::needless_bool,
+    reason = "the last of a chain of `return false` guards ported from GetHwaccelType; folding only that one into the return hides the chain"
+)]
 fn colour_depth_gates_pass(
     ctx: &DecodeContext<'_>,
     video_codec: &str,
