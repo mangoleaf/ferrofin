@@ -2818,7 +2818,17 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             return Ok(Vec::new());
         }
         let _edits = self.playlist_entry_edits.lock().await;
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // It reads the closure before it writes, so it takes the write lock
+        // first: a deferred transaction's upgrade fails at once, whatever the
+        // busy timeout, with SQLITE_BUSY while another connection (the previous
+        // version during a rolling update) holds the lock, or
+        // SQLITE_BUSY_SNAPSHOT when one committed since the read.
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         // Two BaseItems references have no `ON DELETE CASCADE`: an extra's
         // `OwnerId`, and `LinkedChildren` (the item as a playlist or
         // collection and as a member). The closure holds every row either
@@ -8678,6 +8688,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owners, vec![guid_to_db(item)]);
+    }
+
+    /// A delete reads the rows it removes before it writes, so it takes the
+    /// write lock first: another process's write (the previous version in a
+    /// rolling update) makes it wait. A deferred transaction failed at once:
+    /// with SQLITE_BUSY while the other held the lock, which this reproduces,
+    /// or SQLITE_BUSY_SNAPSHOT when it committed after the read, which the
+    /// same lock-first order prevents.
+    #[tokio::test]
+    async fn a_delete_waits_for_another_processes_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A file database opened twice: two processes' connections.
+        let url = format!("sqlite://{}", tmp.path().join("delete.db").display());
+        let db = ferrofin_db::Database::connect(&url).await.expect("connect");
+        db.run_migrations().await.expect("migrations apply");
+        let other = ferrofin_db::Database::connect(&url).await.expect("connect");
+        let svc = std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let (gone, kept) = (Uuid::new_v4(), Uuid::new_v4());
+        for item in [gone, kept] {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+        }
+        let mut held = other
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("the other process writes");
+        sqlx::query(r#"UPDATE "BaseItems" SET "Name" = 'renamed' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(kept))
+            .execute(&mut *held)
+            .await
+            .expect("rename");
+        let delete = tokio::spawn({
+            let svc = std::sync::Arc::clone(&svc);
+            async move { svc.delete_items(&[gone]).await }
+        });
+        // Long enough for a deferred delete to read before the commit.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !delete.is_finished(),
+            "the delete went on while another process held the write lock"
+        );
+        held.commit().await.expect("commit");
+        tokio::time::timeout(std::time::Duration::from_secs(20), delete)
+            .await
+            .expect("the delete finishes")
+            .expect("join")
+            .expect("the delete waits for the other write, then removes the row");
+        let left: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN (?1, ?2)"#)
+                .bind(guid_to_db(gone))
+                .bind(guid_to_db(kept))
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(left, vec![guid_to_db(kept)]);
     }
 
     /// With nothing detached, a save's reattach takes no writer: it finishes
