@@ -130,10 +130,10 @@ impl ByNameStore {
 
     /// Fills in the metadata `Path` of by-name rows that have none.
     ///
-    /// A scan materializes `Genre`/`MusicGenre`/`Studio` rows under the ids
-    /// Jellyfin derives from their paths (gl-1597; an older version under their
-    /// `ItemValues` id or a name-derived one) and `MusicArtist` rows under their
-    /// `ItemValues` id, and neither insert writes a `Path`. But Jellyfin's
+    /// A scan materializes `Genre`/`MusicGenre`/`Studio`/`MusicArtist` rows
+    /// under the ids Jellyfin derives from their paths (gl-1597, gl-1624; an
+    /// older version under their `ItemValues` id or a name-derived one), and
+    /// its insert writes no `Path`. But Jellyfin's
     /// equivalent row always has one
     /// (`/config/metadata/MusicGenre/Jazz`) and `DtoService` emits it
     /// unconditionally, so the field was missing from every by-name DTO.

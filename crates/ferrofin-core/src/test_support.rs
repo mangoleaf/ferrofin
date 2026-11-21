@@ -1066,6 +1066,7 @@ pub fn by_name_identity() -> crate::item_type_lookup::ByNameIdentity {
         "/config/metadata/Genre",
         "/config/metadata/MusicGenre",
         "/config/metadata/Studio",
+        "/config/metadata/artists",
     )
     .expect("a Jellyfin-mode identity")
 }
