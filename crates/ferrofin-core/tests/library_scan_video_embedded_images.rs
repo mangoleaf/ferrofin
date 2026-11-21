@@ -235,7 +235,7 @@ async fn a_video_gets_primary_backdrop_and_logo_from_its_embedded_pictures() {
     assert_eq!(
         stored,
         [
-            (0, "primary.jpg".to_owned(), "IMG-2".to_owned()),
+            (0, "poster.jpg".to_owned(), "IMG-2".to_owned()),
             (2, "backdrop.png".to_owned(), "IMG-3".to_owned()),
             (4, "logo.png".to_owned(), "IMG-4".to_owned()),
         ],

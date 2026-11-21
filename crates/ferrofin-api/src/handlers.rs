@@ -1665,7 +1665,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    profile photo (the credit's URL from TheMovieDb, TheTVDB, or an NFO \
                    actor's <thumb> through library_scan.rs person_to_entity) and a studio's \
                    thumb (ferrofin-core library_scan.rs \
-                   download_images and studio_thumb, named from the resolved type through \
+                   download_image and studio_thumb, named from the resolved type through \
                    tmdb.rs TmdbClient::download and studios.rs StudiosClient::download; \
                    enrich_people and enrich_studio_images hand the file to ferrofin-providers \
                    image_save.rs ImageFileSaver through finish_artwork, which puts a person's \
@@ -1679,6 +1679,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    per-type limits, as upstream; downloaded through tmdb.rs \
                    TmdbClient::download, written by artwork.rs write_acquired_image and \
                    published by finish_artwork's image saver), \
+                   and where every image the server keeps is saved: the item's \
+                   GetInternalMetadataPath, {metadata}/library/{idN[..2]}/{idN}, under \
+                   GetStandardSavePath's name for a save that is not local (ferrofin-providers \
+                   local_images/merge.rs own_art_dir and internal_image_stem; used by \
+                   provider_manager.rs write_image_file and write_automatic_image for an \
+                   upload, a chosen remote image, a refresh's downloads and a plugin's \
+                   images; ferrofin-core dynamic_images.rs refresh_item for a collage or a \
+                   copy, and library_scan.rs refresh_library_image, art_dir_for, \
+                   own_art_dir_of and art_stem for the library tiles and the scan's \
+                   downloads, extractions and grabbed frames), with the replaced file \
+                   deleted (provider_manager.rs remove_replaced_internal_file, \
+                   dynamic_images.rs replaced_primary), \
                    compared with \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    MediaBrowser.Providers/Manager/ItemImageProvider.cs (EnableImageStub, \
@@ -1687,6 +1699,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    RefreshImages), \
                    MediaBrowser.Providers/Manager/ImageSaver.cs (SaveImage, \
                    GetStandardSavePath), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (GetInternalMetadataPath), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler), \
                    MediaBrowser.Controller/Extensions/XmlReaderExtensions.cs \
                    (GetPersonFromXmlNode), \
@@ -1695,8 +1708,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    local-provider loop, MergePeople) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs \
                    (SavePeopleMetadataAsync, UpdateImagesAsync, ConvertImageToLocal)",
-        date: "2026-11-14",
+        date: "2026-11-20",
         divergences: &[
+            "Art an earlier build saved in the item's {metadata}/library/{ID} folder (and an \
+             older scan's lower-cased {id} one), under Ferrofin's own names, stays there: the \
+             scan finds it and its rows keep naming it, until a new image of its type replaces it \
+             (an upload, a chosen or downloaded image, a redrawn collage or tile, or a \
+             \"Replace existing images\" refresh) and its file is deleted, while Jellyfin counts \
+             only GetInternalMetadataPath as the item's. Fix path: gl-1916, an owner decision.",
+            "A channel's, a Live TV channel's or programme's and a channel-supplied item's art is \
+             saved in the library layout, where GetInternalMetadataPath's overrides use \
+             channels/ and livetv/ (Channel.cs, LiveTvChannel.cs, LiveTvProgram.cs). Fix path: \
+             gl-1917.",
             "A stored blurhash that is not UTF-8 reads as none, and the scan computes it \
              again, where MapImageFromEntity's Encoding.UTF8.GetString replaces the \
              invalid bytes with U+FFFD and sends the garbled hash. An empty one reads as \
@@ -2583,14 +2606,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    first album artist (none when either is blank, nor for an audiobook), \
                    copied into each such track's own art folder as GetAudioImagePath shares \
                    it, and ItemImageProvider.RefreshFromProvider \
-                   saves it as the track's own image), with the stored pictures \
+                   saves it as the track's own image, poster.jpg in its \
+                   GetInternalMetadataPath as ImageSaver names it), with the stored pictures \
                    (StoredItemLinks.embedded_images, item_persistence_service.rs \
                    scan_stored_links; GetMediaStreams) when the pass probes nothing. An album: \
                    collect_artwork's local discovery (LocalImageProvider, which supports no \
                    song) and kept rows (ValidateImages), then dynamic_images.rs \
                    DynamicImageKind::MusicAlbum (MusicAlbumImageProvider: the first child \
                    that is no folder with a Primary, CreateSingleImage into the album's own \
-                   folder whatever SaveLocalMetadata says, HasChangedByDate false, FetchAsync \
+                   folder as folder.<ext> whatever SaveLocalMetadata says, \
+                   HasChangedByDate false, FetchAsync \
                    never replacing an image outside it), drawn by the closing dynamic image \
                    pass, whose windows read their rows' images in one statement; the next \
                    scan lists the copy in the album's art folder, and ferrofin-providers \
@@ -2612,10 +2637,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    one that does not.",
         date: "2026-11-20",
         divergences: &[
-            "A track's cover and an album's copy are stored in the item's own {ID} art \
-             folder as primary.<ext>, where upstream saves them as poster.jpg and \
-             folder.<ext> in library/{xx}/{idN}, so a returned Jellyfin counts an album's \
-             copy as the user's and never redraws it. Fix path: gl-1575.",
             "A locked album or track keeps a row naming an earlier build's shared \
              album-covers copy, as its lock keeps the stored row (and refuses an album's \
              copy), \
