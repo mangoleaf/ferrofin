@@ -40,7 +40,9 @@
 //! - [`login_buttons`]: the "Sign in with" buttons jellyfin-web's login page
 //!   shows under its form;
 //! - [`quick_connect`]: a native app's Quick Connect code approved through a
-//!   sign-in and a confirmation page, under the account rules of a sign-in.
+//!   sign-in and a confirmation page, under the account rules of a sign-in;
+//! - [`pacing`]: the pace of the routes that create a pending flow or take a
+//!   one-time value, per address or IPv6 /64.
 //!
 //! An identity provider is contacted only when an admin saves a provider or a
 //! user signs in with it (B1).
@@ -61,7 +63,9 @@ use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
 use ferrofin_traits::security::{AuthenticationManager, QuickConnect};
 use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
-use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, OidcLinkAt, SsoManager, SsoReply};
+use ferrofin_traits::sso::{
+    OidcCallback, OidcExchangeReply, OidcLinkAt, OidcPacedRoute, SsoManager, SsoReply,
+};
 use ferrofin_traits::tasks::ScheduledTask;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -78,6 +82,7 @@ pub mod flows;
 pub mod links;
 pub mod login_buttons;
 pub mod oidc_http;
+pub mod pacing;
 pub mod quick_connect;
 pub mod roles;
 pub mod sign_in;
@@ -85,6 +90,7 @@ pub mod sign_in;
 use discovery::MetadataCache;
 use flows::{ExchangeCodes, PendingFlows};
 use oidc_http::OidcHttpClient;
+use pacing::{PaceLimits, Pacing};
 
 /// The Single Sign-On plugin's id in `/Plugins`: Ferrofin's own, generated
 /// once and fixed for good, so its enabled flag, configuration and private
@@ -377,6 +383,9 @@ pub struct SsoService {
     /// The sign-ins called back whose completion page has not yet swapped
     /// its exchange code.
     exchanges: ExchangeCodes,
+    /// The pace of the routes that create a pending flow or take a one-time
+    /// value ([`pacing`]).
+    pacing: Pacing,
     /// Approves a native app's Quick Connect code ([`quick_connect`]), once
     /// [`with_quick_connect`](Self::with_quick_connect) gives it.
     quick_connect: Option<Arc<dyn QuickConnect>>,
@@ -413,8 +422,18 @@ impl SsoService {
             metadata: MetadataCache::default(),
             flows: PendingFlows::default(),
             exchanges: ExchangeCodes::default(),
+            pacing: Pacing::new(PaceLimits::DEFAULT),
             quick_connect: None,
         }
+    }
+
+    /// The service paced under `limits` instead of [`PaceLimits::DEFAULT`]:
+    /// for a test that makes more requests from one address than a person
+    /// would. No address is exempt from the pace.
+    #[must_use]
+    pub fn with_pace_limits(mut self, limits: PaceLimits) -> Self {
+        self.pacing = Pacing::new(limits);
+        self
     }
 
     /// The plugin's current configuration.
@@ -522,6 +541,11 @@ impl SsoManager for SsoService {
         Ok(sign_in::flow_cookie_name(
             self.public_url(&config).ok().flatten().as_deref(),
         ))
+    }
+
+    fn pace_oidc(&self, route: OidcPacedRoute, client: std::net::IpAddr) -> Option<SsoReply> {
+        (!self.pacing.admit(route, client, std::time::Instant::now()))
+            .then(|| pacing::paced_page(route))
     }
 
     async fn oidc_providers(&self) -> Result<OidcProviderList, ServiceError> {

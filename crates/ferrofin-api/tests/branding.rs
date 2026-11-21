@@ -35,7 +35,9 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::session::AuthenticationRequest;
-use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, OidcLinkAt, SsoManager, SsoReply};
+use ferrofin_traits::sso::{
+    OidcCallback, OidcExchangeReply, OidcLinkAt, OidcPacedRoute, SsoManager, SsoReply,
+};
 use ferrofin_traits::system::ServerApplicationPaths;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -701,6 +703,9 @@ impl SsoManager for LoginButtons {
     }
     async fn flow_cookie_name(&self) -> Result<&'static str, ServiceError> {
         Err(unused())
+    }
+    fn pace_oidc(&self, _route: OidcPacedRoute, _client: std::net::IpAddr) -> Option<SsoReply> {
+        unreachable!("not used by the branding routes")
     }
     async fn oidc_providers(&self) -> Result<OidcProviderList, ServiceError> {
         Err(unused())

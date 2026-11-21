@@ -26,7 +26,7 @@ use ferrofin_model::sso::{
     OidcAdminLink, OidcLinkRequest, OidcLinkStart, OidcLinkStartRequest, OidcUserLinks,
 };
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::sso::OidcLinkAt;
+use ferrofin_traits::sso::{OidcLinkAt, OidcPacedRoute};
 use uuid::Uuid;
 
 use super::{browser_reply, enabled_service, private_reply, sign_in_provider};
@@ -111,6 +111,7 @@ async fn my_links(
         (status = 403, description = "A wrong password (counted and paced as at sign-in), an account that signs in through Single Sign-On only (an administrator links it), an API key, or an account the access policy refuses"),
         (status = 404, description = "No such enabled provider, or the Single Sign-On plugin is disabled or not available"),
         (status = 409, description = "The account is linked at the provider's issuer already: that link is removed first"),
+        (status = 429, description = "Too many starts from the caller's address or IPv6 /64 this minute: a page saying so, and no link started"),
         (status = 502, description = "The identity provider could not be reached: a page saying so"),
         (status = 503, description = "No public URL is set to build the callback URL on: a page naming the setting")
     ),
@@ -125,19 +126,18 @@ async fn start_link(
 ) -> Result<Response, ApiError> {
     let sso = enabled_service(&state).await?;
     let (user, session) = caller_session(auth)?;
+    // Paced with the sign-in starts: it creates a pending flow in their store.
+    let client = state.client_address(&parts);
+    if let Some(page) = sso.pace_oidc(OidcPacedRoute::Start, client) {
+        return browser_reply(page);
+    }
     let provider = sign_in_provider(provider)?;
     let request = match body {
         Ok(JsonBody(request)) => request,
         Err(problem) => return Ok(problem.into_response()),
     };
     let mut reply = sso
-        .start_oidc_link(
-            &provider,
-            user,
-            &request.password,
-            &session,
-            state.client_address(&parts),
-        )
+        .start_oidc_link(&provider, user, &request.password, &session, client)
         .await?;
     let Some(url) = reply.location.take() else {
         // Not started: the page that says why.

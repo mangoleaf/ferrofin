@@ -45,6 +45,11 @@
             failed('Sign-in refused', await response.text());
             return;
         }
+        if (response.status === 429) {
+            failed('Too many sign-in attempts',
+                'Too many sign-in attempts came from your network. Wait a minute, then try again.');
+            return;
+        }
         if (!response.ok) {
             failed('Sign-in failed', 'Sign-in failed. Try again.');
             return;

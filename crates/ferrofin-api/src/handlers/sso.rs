@@ -29,13 +29,19 @@
 //! disabled, or the extension is not wired, every route answers `404` to
 //! every caller, before it looks at the credentials, the body or the query: a
 //! server without the plugin has no such route (B1).
+//!
+//! The routes that create a pending flow or take a one-time value are paced
+//! per caller address (D23, [`SsoManager::pace_oidc`]) right after that
+//! check, before they parse the query, look at the body their extractor read,
+//! read the flow cookie or the plugin configuration, or call the plugin: a
+//! paced request answers `429` and reaches nothing else.
 
 use std::sync::Arc;
 
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -43,7 +49,7 @@ use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcExchangeRequest, OidcProvider, OidcProviderInfo, OidcProviderList};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::session::AuthenticationRequest;
-use ferrofin_traits::sso::{OidcCallback, SsoManager, SsoReply};
+use ferrofin_traits::sso::{OidcCallback, OidcPacedRoute, SsoManager, SsoReply};
 
 use crate::auth::RequireAdmin;
 use crate::error::{ApiError, FailureLogged};
@@ -261,6 +267,7 @@ async fn flow_cookie(
         (status = 302, description = "To the identity provider, with the flow cookie set"),
         (status = 400, description = "The quickConnect parameter holds a value (a code is typed after the sign-in): a page saying so"),
         (status = 403, description = "With quickConnect, Quick Connect is turned off: a page saying so"),
+        (status = 429, description = "Too many starts from the caller's address or IPv6 /64 this minute: a page saying so, and no sign-in started"),
         (status = 502, description = "The identity provider could not be reached: a page saying so"),
         (status = 503, description = "No public URL is set to build the callback URL on: a page naming the setting"),
         (status = 404, description = "No such enabled provider, or the Single Sign-On plugin is disabled or not available")
@@ -273,8 +280,11 @@ async fn start_oidc_sign_in(
     parts: Parts,
 ) -> Result<Response, ApiError> {
     let sso = enabled_service(&state).await?;
-    let provider = sign_in_provider(provider)?;
     let client = state.client_address(&parts);
+    if let Some(page) = sso.pace_oidc(OidcPacedRoute::Start, client) {
+        return browser_reply(page);
+    }
+    let provider = sign_in_provider(provider)?;
     // Of repeated ones, one that holds something, which the start refuses.
     let quick_connect = form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
         .filter(|(name, _)| name == "quickConnect")
@@ -315,6 +325,7 @@ async fn start_oidc_sign_in(
         (status = 400, description = "Refused: the sign-in failed a check, or a link flow's starting session has ended"),
         (status = 403, description = "Refused: no account is linked to the identity and none can be created; the page says what to ask an administrator"),
         (status = 409, description = "A link flow refused: another account is linked to the identity, or the account was linked at the issuer since the flow started"),
+        (status = 429, description = "Too many one-time values from the caller's address or IPv6 /64 this minute: a page saying so, and the pending sign-in kept"),
         (status = 502, description = "Refused: the identity provider could not be reached"),
         (status = 404, description = "No such enabled provider, or the Single Sign-On plugin is disabled or not available")
     ),
@@ -323,13 +334,15 @@ async fn start_oidc_sign_in(
 async fn finish_oidc_sign_in(
     State(state): State<AppState>,
     provider: Result<Path<String>, PathRejection>,
-    uri: Uri,
-    headers: HeaderMap,
+    parts: Parts,
 ) -> Result<Response, ApiError> {
     let sso = enabled_service(&state).await?;
+    if let Some(page) = sso.pace_oidc(OidcPacedRoute::Callback, state.client_address(&parts)) {
+        return browser_reply(page);
+    }
     let provider = sign_in_provider(provider)?;
     let pairs: Vec<(String, String)> =
-        form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+        form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
             .into_owned()
             .collect();
     // A callback that repeats one of its parameters is no answer to trust:
@@ -350,7 +363,7 @@ async fn finish_oidc_sign_in(
         code: once("code").map(Secret::new),
         iss: once("iss"),
         error: once("error"),
-        flow_cookie: flow_cookie(sso.as_ref(), &headers).await?,
+        flow_cookie: flow_cookie(sso.as_ref(), &parts.headers).await?,
     };
     browser_reply(sso.finish_oidc_sign_in(&provider, callback).await?)
 }
@@ -374,6 +387,7 @@ async fn finish_oidc_sign_in(
         (status = 200, description = "Signed in (AuthenticationResult)"),
         (status = 400, description = "Refused: the code is unknown, used, expired, not this browser's or a Quick Connect confirmation, its identity is no longer linked to the account, or the body does not bind"),
         (status = 403, description = "Refused: the account is disabled, outside its schedule or remote access, on a device it may not use, or at its session limit"),
+        (status = 429, description = "Too many one-time values from the caller's address or IPv6 /64 this minute: a page saying so, and the code kept"),
         (status = 404, description = "The Single Sign-On plugin is disabled or not available")
     ),
     tag = "ferrofin"
@@ -384,6 +398,10 @@ async fn exchange_oidc_sign_in(
     body: Result<JsonBody<OidcExchangeRequest>, ProblemDetails>,
 ) -> Result<Response, ApiError> {
     let sso = enabled_service(&state).await?;
+    let client = state.client_address(&parts);
+    if let Some(page) = sso.pace_oidc(OidcPacedRoute::Exchange, client) {
+        return browser_reply(page);
+    }
     let request = match body {
         Ok(JsonBody(request)) => request,
         Err(problem) => return Ok(problem.into_response()),
@@ -394,7 +412,7 @@ async fn exchange_oidc_sign_in(
         app_version: auth.version,
         device_id: auth.device_id,
         device_name: auth.device,
-        remote_endpoint: Some(state.client_address(&parts).to_string()),
+        remote_endpoint: Some(client.to_string()),
         ..AuthenticationRequest::default()
     };
     let cookie = flow_cookie(sso.as_ref(), &parts.headers).await?;
@@ -450,6 +468,7 @@ async fn quick_connect_page(State(state): State<AppState>) -> Result<Response, A
         (status = 200, description = "The app is signed in: a page saying so"),
         (status = 400, description = "Refused: the confirmation is unknown, used, expired or not this browser's, its identity is no longer linked to the account, or the code is not one, or is unknown, expired or approved already"),
         (status = 403, description = "Refused: Quick Connect is turned off, or a sign-in rule refuses the account"),
+        (status = 429, description = "Too many one-time values from the caller's address or IPv6 /64 this minute: a page saying so, and the confirmation kept"),
         (status = 404, description = "The Single Sign-On plugin is disabled or not available")
     ),
     tag = "ferrofin"
@@ -460,6 +479,10 @@ async fn confirm_quick_connect(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let sso = enabled_service(&state).await?;
+    let client = state.client_address(&parts);
+    if let Some(page) = sso.pace_oidc(OidcPacedRoute::QuickConnectConfirmation, client) {
+        return browser_reply(page);
+    }
     let form: Vec<(String, String)> = form_urlencoded::parse(&body).into_owned().collect();
     let field = |wanted: &str| {
         form.iter()
@@ -468,7 +491,6 @@ async fn confirm_quick_connect(
     };
     let confirmation = field("confirmation").map(Secret::new);
     let cookie = flow_cookie(sso.as_ref(), &parts.headers).await?;
-    let client = state.client_address(&parts);
     browser_reply(
         sso.confirm_oidc_quick_connect(confirmation, field("code"), cookie, client)
             .await?,

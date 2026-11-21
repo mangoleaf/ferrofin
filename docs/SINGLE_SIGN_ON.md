@@ -76,6 +76,24 @@ on Debian) and your authority's certificate. This was read from the HTTP client 
 (reqwest 0.13 with `rustls-platform-verifier`, which reads the store through
 `rustls-native-certs` 0.8), not run against a private authority.
 
+## Known proxies
+
+Ferrofin counts sign-ins by the address of the user's browser, as the server resolves it: the
+address the connection comes from, or, when that is a proxy listed in **Known proxies**
+(Dashboard → Networking), the address that proxy passes on in `X-Forwarded-For`. Pending
+sign-ins are capped per address, and each address is paced ([Limits](#limits)).
+
+**Behind a reverse proxy, list the proxy in Known proxies.** Otherwise every user has the proxy's
+address, so all of them share one cap and one pace: ten sign-ins a minute between them, and
+anyone who can reach the proxy can make everyone else wait, or push out a sign-in someone else
+started more than a minute ago and has not finished. The server log then shows the line `repeated Single Sign-On requests from one
+address` with the proxy's address as `remote_ip`. Users who really share one address, such as a
+household behind one router, share its cap and pace too.
+
+An address is an IPv4 address, or an IPv6 address's /64: the addresses of one IPv6 network count
+as one. An IPv4 address written as an IPv6 one (`::ffff:192.0.2.7`) counts as the IPv4 address.
+The server's own address and loopback count like any other.
+
 ## Enable the plugin and add a provider
 
 1. Dashboard → Plugins → **Single Sign-On**: enable it, then open its settings.
@@ -338,7 +356,19 @@ These are fixed; none is a setting:
 - A browser holds one sign-in at a time (one cookie): starting a second, in another tab, ends the
   first.
 - Pending sign-ins are capped at 10 per address (a new one drops that address's oldest) and 1000
-  in all.
+  in all. An address is an IPv4 address or an IPv6 /64 ([Known proxies](#known-proxies)).
+- Each address may start at most 10 sign-ins in any minute: a sign-in, a Quick Connect approval
+  and a link count together. It may bring back at most 30 one-time values in any minute: the
+  identity provider's callback, the page after it handing over its code, and the Quick Connect
+  confirmation count together. A sign-in takes one start and two one-time values. Past either
+  limit the route answers a page with status `429`, "Too many sign-in attempts … Wait a minute,
+  then try again", and does nothing else: no sign-in is started and nothing is used up. The
+  address may go on once its earliest counted request is a minute old, so within a minute of the
+  first refusal. The page after the identity provider and the link page show the same words. The
+  server logs a warning naming the address at its first refusal in each minute. Pacing by any
+  minute, not by a minute on the clock, means that someone sharing an address cannot start ten
+  sign-ins of their own within a minute of another user's, which is what pushing that user's
+  sign-in out takes.
 - Calls to the identity provider: 5 seconds to connect, 10 seconds per request, answers up to
   1 MiB. Discovery and keys are cached for an hour, and fetched again for an unknown key.
 - Pending sign-ins are kept in memory: a restart, or a rolling update that sends the callback to
@@ -373,7 +403,7 @@ same.
 ## Known limits
 
 - While a provider cannot be reached, every start of a sign-in fetches its discovery document
-  again.
+  again, up to the pace's ten a minute per address.
 - A browser that cannot store the session (storage blocked or full) sees "Sign-in failed" on the
   page after the identity provider, although a session was opened. It ends at the next sign-in
   from that browser, or when an administrator revokes it under Dashboard → Devices.
