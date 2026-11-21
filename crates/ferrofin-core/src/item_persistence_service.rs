@@ -3357,43 +3357,51 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), ServiceError> {
+        const READ: &str = r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#;
         let id = guid_to_db(item_id);
+        // Merge into whatever the blob already holds, which replacing it
+        // wholesale would drop; `None` when nothing changes.
+        let fields: Vec<(&str, Option<serde_json::Value>)> = fields
+            .iter()
+            .map(|(key, value)| (key.as_str(), Some(value.clone())))
+            .collect();
+        let merged = |stored: Option<Option<String>>| {
+            stored.and_then(|data| crate::item_data::merge_data_fields(data.as_deref(), &fields))
+        };
         // Read on the pool first: the steady state (already recorded) must not
         // touch the single writer connection.
-        let current: Option<Option<String>> =
-            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&id)
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        let Some(stored) = current else {
-            return Ok(()); // no such row
-        };
-        // Merge into whatever the blob already holds, which replacing it
-        // wholesale would drop.
-        let mut data = stored
-            .as_deref()
-            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        let Some(obj) = data.as_object_mut() else {
-            return Ok(());
-        };
-        if fields
-            .iter()
-            .all(|(key, value)| obj.get(key) == Some(value))
-        {
-            return Ok(());
-        }
-        for (key, value) in fields {
-            obj.insert(key.clone(), value.clone());
-        }
-        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+        let current: Option<Option<String>> = sqlx::query_scalar(READ)
             .bind(&id)
-            .bind(data.to_string())
-            .execute(self.db.writer())
+            .fetch_optional(self.db.pool())
             .await
             .map_err(db_err)?;
+        if merged(current).is_none() {
+            return Ok(());
+        }
+        // Read again under the write lock, so a save landing between the two
+        // reads is merged into, not overwritten (CONTRIBUTING.md, "Migrations
+        // and one-shot repairs").
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
+        let current: Option<Option<String>> = sqlx::query_scalar(READ)
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let Some(data) = merged(current) else {
+            return Ok(());
+        };
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(&id)
+            .bind(data)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         note_written(&self.db, std::slice::from_ref(&id), false);
         Ok(())
     }
@@ -8745,6 +8753,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owners, vec![guid_to_db(new)]);
+    }
+
+    /// A `Data` merge that waits for the writer merges into the blob as it is
+    /// once it holds the writer: a key a save wrote meanwhile stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_data_merge_behind_a_held_writer_keeps_the_save_before_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A file database: an in-memory one reads through its writer too.
+        let url = format!("sqlite://{}", tmp.path().join("merge.db").display());
+        let db = ferrofin_db::Database::connect(&url).await.expect("connect");
+        db.run_migrations().await.expect("migrations apply");
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Folder).await;
+
+        let mut held = db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold the writer");
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = '{"Before":1}' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(item))
+            .execute(&mut *held)
+            .await
+            .expect("the earlier save");
+        let fields = serde_json::Map::from_iter([("Merged".to_owned(), serde_json::json!(1))]);
+        let merge = tokio::spawn(async move { svc.merge_data_fields(item, &fields).await });
+        // Time for the merge to read the blob and wait for the writer.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        held.commit().await.expect("release the writer");
+        merge.await.expect("joined").expect("merge");
+        let data = stored_text(&db, item, "Data").await.expect("data");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&data).expect("json"),
+            serde_json::json!({ "Before": 1, "Merged": 1 })
+        );
     }
 
     #[tokio::test]
