@@ -325,10 +325,12 @@ pub fn year_item_id(mode: &IdDerivation, year_root: &str, name: &str) -> Option<
     by_name_item_id(mode, BaseItemKind::Year, &year_path(year_root, name))
 }
 
-/// How the by-name `Genre`, `MusicGenre` and `Studio` rows take their ids:
-/// Jellyfin's `GetItemByNameId<T>(T.GetPath(name))`, the kind and the name's
-/// path under the kind's metadata directory (gl-1597), the same way `Year`
-/// and `Person` ids derive ([`year_item_id`], [`person_item_id`]).
+/// How the by-name `Genre`, `MusicGenre`, `Studio` and `MusicArtist` rows
+/// take their ids: Jellyfin's `GetItemByNameId<T>(T.GetPath(name))`, the kind
+/// and the name's path under the kind's metadata directory (gl-1597; an
+/// artist's, gl-1624, `CreateItemByName<MusicArtist>` with no row of that
+/// name), the same way `Year` and `Person` ids derive ([`year_item_id`],
+/// [`person_item_id`]).
 #[derive(Debug, Clone)]
 pub struct ByNameIdentity {
     /// The database's id derivation.
@@ -339,10 +341,12 @@ pub struct ByNameIdentity {
     music_genre_root: String,
     /// `ApplicationPaths.StudioPath`.
     studio_root: String,
+    /// `ApplicationPaths.ArtistsPath`.
+    artists_root: String,
 }
 
 impl ByNameIdentity {
-    /// The identity under `mode`, with the three kinds' metadata directories,
+    /// The identity under `mode`, with the four kinds' metadata directories,
     /// or [`None`] under [`IdDerivation::LegacyLowercase`]: a pre-parity
     /// database's ids are not Jellyfin's anyway, and its by-name rows keep the
     /// ids they were written with.
@@ -352,23 +356,26 @@ impl ByNameIdentity {
         genre_root: impl Into<String>,
         music_genre_root: impl Into<String>,
         studio_root: impl Into<String>,
+        artists_root: impl Into<String>,
     ) -> Option<Self> {
         matches!(mode, IdDerivation::Jellyfin { .. }).then(|| Self {
             mode: mode.clone(),
             genre_root: genre_root.into(),
             music_genre_root: music_genre_root.into(),
             studio_root: studio_root.into(),
+            artists_root: artists_root.into(),
         })
     }
 
     /// The id Jellyfin derives for `name`'s `kind` row, or [`None`] for a
-    /// kind other than `Genre`, `MusicGenre` and `Studio`.
+    /// kind other than `Genre`, `MusicGenre`, `Studio` and `MusicArtist`.
     #[must_use]
     pub fn id(&self, kind: BaseItemKind, name: &str) -> Option<uuid::Uuid> {
         let root = match kind {
             BaseItemKind::Genre => &self.genre_root,
             BaseItemKind::MusicGenre => &self.music_genre_root,
             BaseItemKind::Studio => &self.studio_root,
+            BaseItemKind::MusicArtist => &self.artists_root,
             _ => return None,
         };
         by_name_item_id(&self.mode, kind, &by_name_path(root, name.trim()))
@@ -745,11 +752,11 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::persistence::ItemTypeLookup as _;
 
-    /// gl-1597: the by-name genre, music genre and studio ids are Jellyfin's
-    /// `GetItemByNameId<T>(T.GetPath(name))`. The vector is a stock Jellyfin
-    /// 12.4's `Adventure` genre (program data `/config`).
+    /// gl-1597, gl-1624: the by-name genre, music genre, studio and artist ids
+    /// are Jellyfin's `GetItemByNameId<T>(T.GetPath(name))`. The vectors are a
+    /// stock Jellyfin 12.4's (program data `/config`).
     #[test]
-    fn by_name_identity_derives_jellyfins_genre_id() {
+    fn by_name_identity_derives_jellyfins_ids() {
         let identity = super::ByNameIdentity::new(
             &IdDerivation::Jellyfin {
                 program_data_path: Some("/config".to_owned()),
@@ -757,9 +764,11 @@ mod tests {
             "/config/metadata/Genre",
             "/config/metadata/MusicGenre",
             "/config/metadata/Studio",
+            "/config/metadata/artists",
         )
         .expect("a Jellyfin-mode identity");
-        // A stock Jellyfin 12.4's ids for the same names.
+        // A stock Jellyfin 12.4's ids for the same names; the artist is a
+        // track's featured artist with no folder of its own.
         for (kind, name, id) in [
             (
                 BaseItemKind::Genre,
@@ -781,6 +790,11 @@ mod tests {
                 "Pixar",
                 "A1384420-050B-89EA-581E-04C0DD9A83A8",
             ),
+            (
+                BaseItemKind::MusicArtist,
+                "Featured Guy",
+                "2AECBA0A-30F8-F506-A5A2-19B8A978C384",
+            ),
         ] {
             assert_eq!(
                 identity.id(kind, name),
@@ -788,10 +802,11 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(identity.id(BaseItemKind::MusicArtist, "Adventure"), None);
+        assert_eq!(identity.id(BaseItemKind::Person, "Adventure"), None);
         // A pre-parity database keeps its by-name ids.
         assert!(
-            super::ByNameIdentity::new(&IdDerivation::LegacyLowercase, "g", "m", "s").is_none()
+            super::ByNameIdentity::new(&IdDerivation::LegacyLowercase, "g", "m", "s", "a")
+                .is_none()
         );
     }
 

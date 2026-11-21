@@ -234,8 +234,9 @@ fn item_value_ids_sql(count: usize) -> String {
 /// A real 10.11.8 leaves the column NULL for exactly ONE kind —
 /// `LiveTvProgram` — and the column is what `GetItemValues` groups on.
 ///
-/// The existence guard is by **type and name**, and by id: a genre, music genre
-/// or studio's id derives from its name's path, so a row stored under it with
+/// The existence guard is by **type and name**, and by id: a genre, music
+/// genre, studio or by-name artist's id derives from its name's path, so a row
+/// stored under it with
 /// another clean name (one an older version spelled differently) must not fail
 /// the insert. A `MusicArtist` the scanner resolved from an artist DIRECTORY
 /// already carries that `CleanName` under its path-derived id, and
@@ -400,11 +401,13 @@ async fn write_item_values(
         // Genres/Studios tabs list it, the /Genres/{name} lookup resolves it,
         // and a `GenreIds=<id>` filter (which resolves the id →
         // BaseItems.CleanName) matches. Faithful to Jellyfin, where
-        // genres/studios are BaseItems with the id `GetItemByNameId<T>` derives
-        // from their path (`identity`, gl-1597); a by-name artist, and a row
-        // when no identity is wired, borrows the shared value id. The DTO's
-        // genre/studio links find the row by type and name
-        // (`item_repository::by_name_ids_by_clean_name`), whatever its id.
+        // genres, studios and by-name artists are BaseItems with the id
+        // `GetItemByNameId<T>` derives from their path (`identity`, gl-1597,
+        // gl-1624); a row when no identity is wired borrows the shared value
+        // id. A row already stored keeps its id, whatever it is (the insert's
+        // guard is by type and clean name), and the DTO's links find the row
+        // by type and name (`item_repository::by_name_ids_by_clean_name`,
+        // `FindArtists`).
         // A music item's genre materializes ONLY as a `MusicGenre` row.
         // Upstream keeps the two disjoint — `LibraryManager.GetMusicGenre`
         // for audio, `GetGenre` otherwise — so a real 10.11.8 library has
@@ -1282,11 +1285,12 @@ impl FerrofinItemPersistenceService {
         }
     }
 
-    /// Installs how by-name `Genre`, `MusicGenre` and `Studio` rows take their
-    /// ids: Jellyfin's, derived from the kind and the name's metadata path
-    /// (gl-1597). Called once by the composition root; with none (no call, or
-    /// a pre-parity database's [`None`]) a genre or studio row borrows its
-    /// `ItemValues` id and a music genre's derives from the bare name.
+    /// Installs how by-name `Genre`, `MusicGenre`, `Studio` and `MusicArtist`
+    /// rows take their ids: Jellyfin's, derived from the kind and the name's
+    /// metadata path (gl-1597, gl-1624). Called once by the composition root;
+    /// with none (no call, or a pre-parity database's [`None`]) a genre,
+    /// studio or artist row borrows its `ItemValues` id and a music genre's
+    /// derives from the bare name.
     #[must_use]
     pub fn with_by_name_identity(
         mut self,
@@ -2818,7 +2822,17 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             return Ok(Vec::new());
         }
         let _edits = self.playlist_entry_edits.lock().await;
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // It reads the closure before it writes, so it takes the write lock
+        // first: a deferred transaction's upgrade fails at once, whatever the
+        // busy timeout, with SQLITE_BUSY while another connection (the previous
+        // version during a rolling update) holds the lock, or
+        // SQLITE_BUSY_SNAPSHOT when one committed since the read.
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         // Two BaseItems references have no `ON DELETE CASCADE`: an extra's
         // `OwnerId`, and `LinkedChildren` (the item as a playlist or
         // collection and as a member). The closure holds every row either
@@ -3448,13 +3462,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         // Mint the id the SCANNER would mint for this name, not a fresh one, so
         // that a later scan of content carrying this value converges on THIS
         // row instead of inserting a second one beside it: Jellyfin's
-        // path-derived id where the identity covers the kind (gl-1597), else
-        // the `ItemValues` id for the value-backed kinds (what
+        // path-derived id where the identity covers the kind (gl-1597,
+        // gl-1624), else the `ItemValues` id for the value-backed kinds (what
         // `save_item_values` uses) and the name-derived id for `MusicGenre`
         // (what `music_genre_row` uses).
-        // With the derived id, no `ItemValues` row is made for a genre or
-        // studio, as upstream's `GetGenre` makes none: a row no item tags is
-        // dead, and the next validation's dead by-name sweep removes it.
+        // With the derived id, no `ItemValues` row is made for a genre, studio
+        // or artist, as upstream's `GetGenre`/`GetArtist` make none: a row no
+        // item tags is dead, and the next validation's dead by-name sweep
+        // removes it.
         let derived = self
             .by_name_identity
             .as_ref()
@@ -8698,6 +8713,61 @@ mod tests {
         assert_eq!(owners, vec![guid_to_db(item)]);
     }
 
+    /// A delete reads the rows it removes before it writes, so it takes the
+    /// write lock first: another process's write (the previous version in a
+    /// rolling update) makes it wait. A deferred transaction failed at once:
+    /// with SQLITE_BUSY while the other held the lock, which this reproduces,
+    /// or SQLITE_BUSY_SNAPSHOT when it committed after the read, which the
+    /// same lock-first order prevents.
+    #[tokio::test]
+    async fn a_delete_waits_for_another_processes_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A file database opened twice: two processes' connections.
+        let url = format!("sqlite://{}", tmp.path().join("delete.db").display());
+        let db = ferrofin_db::Database::connect(&url).await.expect("connect");
+        db.run_migrations().await.expect("migrations apply");
+        let other = ferrofin_db::Database::connect(&url).await.expect("connect");
+        let svc = std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let (gone, kept) = (Uuid::new_v4(), Uuid::new_v4());
+        for item in [gone, kept] {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+        }
+        let mut held = other
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("the other process writes");
+        sqlx::query(r#"UPDATE "BaseItems" SET "Name" = 'renamed' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(kept))
+            .execute(&mut *held)
+            .await
+            .expect("rename");
+        let delete = tokio::spawn({
+            let svc = std::sync::Arc::clone(&svc);
+            async move { svc.delete_items(&[gone]).await }
+        });
+        // Long enough for a deferred delete to read before the commit.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !delete.is_finished(),
+            "the delete went on while another process held the write lock"
+        );
+        held.commit().await.expect("commit");
+        tokio::time::timeout(std::time::Duration::from_secs(20), delete)
+            .await
+            .expect("the delete finishes")
+            .expect("join")
+            .expect("the delete waits for the other write, then removes the row");
+        let left: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN (?1, ?2)"#)
+                .bind(guid_to_db(gone))
+                .bind(guid_to_db(kept))
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(left, vec![guid_to_db(kept)]);
+    }
+
     /// With nothing detached, a save's reattach takes no writer: it finishes
     /// while another writer holds the database. History a writer detached just
     /// before is still seen through the reader pool, and reattached.
@@ -9901,7 +9971,8 @@ mod tests {
     }
 
     // Every artist name — a performer (Artist, 0) and an album artist (1) alike —
-    // materializes one browsable MusicArtist row sharing an ItemValueId, so the
+    // materializes one browsable MusicArtist row (with no identity wired, under
+    // an ItemValueId), so the
     // track's `ArtistItems` can link to it; a name that is both has ONE row.
     #[tokio::test]
     async fn save_item_values_materializes_music_artist_items() {
@@ -9938,8 +10009,9 @@ mod tests {
             vec!["John Coltrane", "Miles Davis", "Various Artists"]
         );
         for (name, id) in &rows {
-            // The id is the ItemValueId of whichever value of that name wrote
-            // the row first (the performer, for a name that is both).
+            // With no identity wired, the id is the ItemValueId of whichever
+            // value of that name wrote the row first (the performer, for a
+            // name that is both).
             let value_ids: Vec<String> = sqlx::query_scalar(
                 r#"SELECT "ItemValueId" FROM "ItemValues"
                    WHERE "Type" IN (0, 1) AND "Value" = ?1"#,
@@ -10281,6 +10353,88 @@ mod tests {
             .expect("rescan");
         let rows: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE '%.Genre' AND "Name" = 'Comedy'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(rows, 1, "the scan converges on the row the lookup created");
+    }
+
+    /// gl-1624: a track's featured artist with no folder, and an artist a
+    /// lookup creates, take the id `CreateItemByName<MusicArtist>` derives
+    /// from `{metadata}/artists/<name>` (a stock Jellyfin 12.4's for the same
+    /// name), not an `ItemValues` id; the lookup makes no `ItemValues` row, as
+    /// `GetArtist` makes none, and a later scan converges on its row. An
+    /// artist row stored before under its value id keeps it: nothing moves.
+    #[tokio::test]
+    async fn a_by_name_artist_takes_the_id_jellyfin_derives() {
+        let db = test_db().await;
+        let (song, older) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, song, BaseItemKind::Audio).await;
+        seed_item(&db, older, BaseItemKind::Audio).await;
+        // As an earlier version wrote it: no identity wired.
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_item_values(older, &[(0, "Old Guest".to_owned())])
+            .await
+            .expect("older values");
+        let old_guest: String = sqlx::query_scalar(
+            r#"SELECT "ItemValueId" FROM "ItemValues" WHERE "Type" = 0 AND "Value" = 'Old Guest'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("value id");
+        let identity = crate::test_support::by_name_identity();
+        let svc = FerrofinItemPersistenceService::new(db.clone())
+            .with_by_name_identity(Some(identity.clone()));
+        svc.save_item_values(
+            song,
+            &[
+                (0, "Featured Guy".to_owned()),
+                (1, "Featured Guy".to_owned()),
+                (0, "Old Guest".to_owned()),
+                (1, "Album Artist".to_owned()),
+            ],
+        )
+        .await
+        .expect("song values");
+        assert_eq!(
+            by_name_row_id(&db, "MusicArtist", "Featured Guy")
+                .await
+                .as_deref(),
+            Some("2AECBA0A-30F8-F506-A5A2-19B8A978C384")
+        );
+        assert_eq!(
+            by_name_row_id(&db, "MusicArtist", "Album Artist").await,
+            identity
+                .id(BaseItemKind::MusicArtist, "Album Artist")
+                .map(guid_to_db)
+        );
+        assert_eq!(
+            by_name_row_id(&db, "MusicArtist", "Old Guest").await,
+            Some(old_guest),
+            "a stored artist keeps its id"
+        );
+
+        let created = svc
+            .ensure_by_name_item(
+                BaseItemKind::MusicArtist,
+                "Guest",
+                "/config/metadata/artists/Guest",
+            )
+            .await
+            .expect("ensure");
+        assert_eq!(created, identity.id(BaseItemKind::MusicArtist, "Guest"));
+        let values: i64 =
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "ItemValues" WHERE "Value" = 'Guest'"#)
+                .fetch_one(db.pool())
+                .await
+                .expect("values");
+        assert_eq!(values, 0, "the lookup makes no ItemValues row");
+        svc.save_item_values(song, &[(0, "Guest".to_owned())])
+            .await
+            .expect("rescan");
+        let rows: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE '%.MusicArtist' AND "Name" = 'Guest'"#,
         )
         .fetch_one(db.pool())
         .await

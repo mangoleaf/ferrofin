@@ -240,8 +240,7 @@ def number(value):
 
 
 def image_types(server, item):
-    """The types of one item's images. Not their sizes: an uploaded image is stored 0x0 until gl-1054 is fixed,
-    which Jellyfin measures after the return."""
+    """The types of one item's images. Not their sizes, which Jellyfin measures again on its own saves."""
     status, images = server.send("GET", f"/Items/{item}/Images")
     if status != 200 or not isinstance(images, list):
         return f"error={status}"

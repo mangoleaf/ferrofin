@@ -545,13 +545,15 @@ pub async fn build_app_state(
             .with_user_views(Arc::clone(&scope_user_views))
             .with_virtual_paths(virtual_paths.clone()),
     );
-    // Genre, music genre and studio rows take the ids Jellyfin derives from
-    // their metadata paths (gl-1597); a pre-parity database keeps its own.
+    // Genre, music genre, studio and new artist rows take the ids Jellyfin
+    // derives from their metadata paths (gl-1597, gl-1624); a pre-parity
+    // database keeps its own.
     let by_name_identity = ferrofin_core::item_type_lookup::ByNameIdentity::new(
         &id_derivation,
         paths.genre_path(),
         paths.music_genre_path(),
         paths.studio_path(),
+        paths.artists_path(),
     );
     let item_persistence_impl = Arc::new(
         FerrofinItemPersistenceService::new(db.clone())
@@ -1508,6 +1510,7 @@ pub async fn build_app_state(
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
+            .with_image_processor(Arc::clone(&image_processor))
             .with_nfo_saver(Arc::clone(&nfo_saver))
             .with_container_xml(Arc::clone(&container_xml))
             .with_image_store(

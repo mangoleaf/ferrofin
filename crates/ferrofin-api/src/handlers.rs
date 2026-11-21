@@ -1700,6 +1700,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    downloads, extractions and grabbed frames), with the replaced file \
                    deleted (provider_manager.rs remove_replaced_internal_file, \
                    dynamic_images.rs replaced_primary), \
+                   and what a save through the provider manager records of its images: \
+                   ferrofin-providers provider_manager.rs update_images, run by \
+                   update_to_repository (an upload, a chosen image, a delete, a reorder, \
+                   a collection's edit) and by a refresh's save: it measures each local \
+                   image that image_metadata.rs image_needs_refresh flags, or every one for \
+                   a save from ImageUpdate up in upstream's order (an image, download or \
+                   edit save), with image_metadata.rs fill_image_metadata (the scan's too: \
+                   0x0 when the size cannot be read, an empty blurhash when it cannot be \
+                   computed), dating it by its file and dropping one whose file is gone, \
                    compared with \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    MediaBrowser.Providers/Manager/ItemImageProvider.cs (EnableImageStub, \
@@ -1716,9 +1725,21 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Manager/MetadataService.cs (RefreshWithProviders' \
                    local-provider loop, MergePeople) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs \
-                   (SavePeopleMetadataAsync, UpdateImagesAsync, ConvertImageToLocal)",
+                   (SavePeopleMetadataAsync, UpdateImagesAsync, ImageNeedsRefresh, \
+                   RunMetadataSavers, UpdateItemsAsync, ConvertImageToLocal), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (ValidateImages) and \
+                   src/Jellyfin.Drawing/ImageProcessor.cs (GetImageBlurHash)",
         date: "2026-11-20",
         divergences: &[
+            "The metadata editor's save (POST /Items/{itemId}, and its cascade to the \
+             children) runs the savers only, so it neither measures nor validates the item's \
+             images, where UpdateItem's UpdateToRepositoryAsync(MetadataEdit) forces \
+             UpdateImagesAsync. Fix path: gl-1922.",
+            "A remote image row is not downloaded into a local file when its item is saved \
+             (UpdateImagesAsync's ConvertImageToLocal): it stays a URL, downloaded when it is \
+             served (cached_remote_image). Upstream's rows of that kind are a Live TV \
+             channel's logo, which gl-1560 proposes as an accepted divergence (its P8), \
+             pending the owner's decision.",
             "Art an earlier build saved in the item's {metadata}/library/{ID} folder (and an \
              older scan's lower-cased {id} one), under Ferrofin's own names, stays there: the \
              scan finds it and its rows keep naming it, until a new image of its type replaces it \
