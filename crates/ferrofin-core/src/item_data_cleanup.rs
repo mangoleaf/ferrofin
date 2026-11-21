@@ -78,18 +78,19 @@ impl ItemDataCleanup {
     }
 
     /// `GetMetadataPaths(item, children)` (`:558-580`, `:714-743`): each
-    /// row's internal metadata folder (`{metadata}/library/{id2}/{id}`),
-    /// Ferrofin's own `{metadata}/library/{GUID}`, and the lower-cased one
-    /// older scans also wrote art to ([`crate::item_folders::item_art_folders`]).
+    /// row's internal metadata folder (`{metadata}/library/{id2}/{id}`), where
+    /// its art is saved, the `{metadata}/library/{GUID}` earlier builds saved
+    /// art in, and the lower-cased one older scans also wrote art to
+    /// ([`crate::item_folders::item_art_folders`]).
     ///
     /// Upstream's list also names a video's internal extracted data
     /// (trickplay tiles, chapter images, subtitle and attachment caches);
     /// those go with [`Self::delete_extracted_data`], which removes every one
     /// of them.
     pub(crate) async fn delete_metadata_folders(&self, rows: &[&BaseItemEntity]) {
-        // Every layout: Ferrofin's `{metadata}/library/{GUID}` (and its older
-        // lower-cased spelling) and Jellyfin's `{metadata}/library/{xx}/{idN}`
-        // an adopted item has.
+        // Every layout: `{metadata}/library/{xx}/{idN}`, and the
+        // `{metadata}/library/{GUID}` (and its older lower-cased spelling)
+        // earlier builds saved art in.
         let art_root = std::path::Path::new(&self.paths.internal_metadata_path()).join("library");
         let folders: Vec<std::path::PathBuf> = rows
             .iter()

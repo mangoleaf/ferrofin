@@ -32,7 +32,7 @@
 //! whatever its id.
 //!
 //! A box set's `collection.xml` is read by its refresh and written by its
-//! saves (`ferrofin_providers::box_set_xml`).
+//! saves (`ferrofin_providers::container_xml`).
 //!
 //! TODO(parity, open work item): the resolver runs only here, in the folder
 //! box sets are made in: not in other libraries, not for legacy box sets

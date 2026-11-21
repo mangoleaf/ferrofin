@@ -2008,8 +2008,10 @@ impl LibraryScanner {
             }
         }
         if fetch.images == ImageFetch::All {
-            let legacy = crate::dynamic_images::legacy_art_dir(&meta_root, work.id);
-            super::artwork::prune_old_backdrops_in(&[dir.clone(), legacy], &images);
+            super::artwork::prune_replaced_in(
+                &crate::dynamic_images::internal_metadata_dirs(&meta_root, work.id),
+                &images,
+            );
             let acquired: HashSet<_> = images.iter().map(|image| image.image_type).collect();
             images.extend(
                 stored

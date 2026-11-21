@@ -874,6 +874,20 @@ async fn a_thousand_new_files_are_one_scan_of_their_series_only() {
     let mut listed = fx.fs.take();
     listed.sort();
     listed.dedup();
+    // An item's internal metadata folder, where its art is saved, is read
+    // for its external files as upstream's `GetExternalFiles` reads it.
+    let metadata = tmp.path().join("metadata");
+    listed.retain(|dir| {
+        let Ok(rest) = Path::new(dir).strip_prefix(&metadata) else {
+            return true;
+        };
+        let parts: Vec<_> = rest.iter().filter_map(|part| part.to_str()).collect();
+        assert!(
+            matches!(parts.as_slice(), [shard, id] if id.len() == 32 && id.starts_with(shard)),
+            "only an item's own folder under the metadata root: {dir}"
+        );
+        false
+    });
     let root = fx.media.to_string_lossy().into_owned();
     let series_dir = series.to_string_lossy().into_owned();
     assert!(
@@ -1183,10 +1197,22 @@ async fn a_sidecar_beside_a_movie_in_the_library_root_refreshes_that_movie() {
         assert_eq!(after.get(&key), before.get(&key), "{other} is untouched");
     }
     // The library root was listed once, to resolve the movie; no other
-    // folder was.
+    // folder was but the movie's internal metadata folder, where its art is
+    // saved, which upstream's `GetExternalFiles` reads for external files too.
     let listed = fx.fs.take();
+    let internal = derive_item_id(BaseItemKind::Movie, &heat.to_string_lossy())
+        .expect("id")
+        .simple()
+        .to_string();
+    let internal = tmp
+        .path()
+        .join("metadata")
+        .join(&internal[..2])
+        .join(&internal);
     assert!(
-        listed.iter().all(|d| Path::new(d) == media.as_path()),
+        listed
+            .iter()
+            .all(|d| Path::new(d) == media.as_path() || Path::new(d) == internal),
         "{listed:?}"
     );
 

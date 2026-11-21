@@ -1350,7 +1350,7 @@ async fn a_locked_item_asks_no_provider_but_discovers_a_new_local_poster() {
     // The first scan grabbed a frame for the Primary (the Screen Grabber).
     let grabbed = images().await;
     assert!(
-        grabbed.len() == 1 && grabbed[0].ends_with("primary.jpg"),
+        grabbed.len() == 1 && grabbed[0].ends_with("poster.jpg"),
         "{grabbed:?}"
     );
 
@@ -1362,8 +1362,11 @@ async fn a_locked_item_asks_no_provider_but_discovers_a_new_local_poster() {
         "no remote provider runs for a locked item"
     );
     let found = images().await;
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert!(found[0].ends_with("poster.jpg"));
+    assert_eq!(
+        found,
+        [fx.heat.with_file_name("poster.jpg").to_string_lossy()],
+        "the poster beside the movie, not the grabbed frame"
+    );
 }
 
 /// Phase 3L: a `Cast` field lock keeps the stored credits through a

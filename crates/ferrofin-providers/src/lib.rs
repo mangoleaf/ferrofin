@@ -10,11 +10,11 @@
 
 pub mod audiodb;
 pub mod books;
-pub mod box_set_xml;
 pub mod builtin_plugins;
 pub mod cached_media_segment_provider;
 pub mod chapter_names;
 pub mod container_types;
+pub mod container_xml;
 pub mod destination;
 pub mod episode;
 pub mod error;
@@ -60,8 +60,8 @@ pub use books::{BookMetadata, read_book_cover, read_book_metadata};
 pub use error::ProvidersError;
 pub use external_ids::{ExternalIdItem, external_id_infos, external_urls};
 pub use local_xml::{
-    LocalContainerXml, LocalLinkedChild, parse_container_xml, save_collection_xml,
-    save_playlist_xml,
+    LocalContainerXml, LocalLinkedChild, parse_container_xml, playlist_media_type,
+    save_collection_xml, save_playlist_xml,
 };
 pub use playlist_file::{
     decode_playlist, is_playlist_file, playlist_xml_path, read_playlist_file, write_playlist_file,

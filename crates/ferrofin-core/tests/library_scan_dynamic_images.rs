@@ -112,7 +112,7 @@ async fn scan_generates_the_genre_collage_from_the_library_posters() {
         .expect("the scan generated a Primary for the genre");
     assert_eq!(
         Path::new(&primary.path),
-        meta_root.join(guid_to_db(genre_id)).join("primary.png"),
+        jellyfin_art_dir(tmp.path(), genre_id).join("poster.png"),
         "written into the genre's own art folder"
     );
     let decoded = image::open(&primary.path).expect("a decodable PNG");
@@ -604,12 +604,7 @@ async fn uploads_save_beside_their_path_for_the_overriding_kinds(
     let images = lib.items.get_image_infos(id).await.expect("images");
     let want = match beside {
         Some(name) => path.join(name),
-        None => lib
-            .tmp
-            .path()
-            .join("metadata/library")
-            .join(guid_to_db(id))
-            .join("primary.png"),
+        None => jellyfin_art_dir(lib.tmp.path(), id).join("poster.png"),
     };
     assert_eq!(
         images
@@ -1595,7 +1590,7 @@ async fn a_media_subfolder_image_is_not_the_librarys() {
             .expect("id");
     let primary = primary_of(&lib.items, library).await.path;
     assert!(
-        primary.ends_with("primary.png") && !primary.contains("Trip"),
+        primary.ends_with("poster.png") && !primary.contains("Trip"),
         "the library keeps its collage: {primary}"
     );
 }

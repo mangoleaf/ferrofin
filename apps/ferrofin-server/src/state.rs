@@ -1481,8 +1481,8 @@ pub async fn build_app_state(
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
     // A box set's `collection.xml`: written by the metadata save, read by
     // the box set's refresh.
-    let box_set_xml = Arc::new(
-        ferrofin_providers::box_set_xml::BoxSetXmlSaver::new(
+    let container_xml = Arc::new(
+        ferrofin_providers::container_xml::ContainerXmlSaver::new(
             Arc::clone(&item_repository),
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
@@ -1509,7 +1509,7 @@ pub async fn build_app_state(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
             .with_nfo_saver(Arc::clone(&nfo_saver))
-            .with_box_set_xml(box_set_xml)
+            .with_container_xml(Arc::clone(&container_xml))
             .with_image_store(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
@@ -2489,6 +2489,16 @@ pub async fn build_app_state(
     // the playlist manager's expansion, so it runs here, before the scheduler
     // can start a scan.
     ferrofin_core::adoption_repairs::run_expand_saved_playlist_containers(db, &playlists).await;
+    // The playlists folder's playlist.xml files, which no earlier Ferrofin
+    // wrote, written from the database before a refresh reads one (gl-341).
+    // Boxed: inlined, its future puts startup's over `large_futures`.
+    Box::pin(ferrofin_core::adoption_repairs::run_save_playlist_xml_once(
+        db,
+        &playlists,
+        &container_xml,
+        item_persistence_service.as_ref(),
+    ))
+    .await;
     let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> = playlists;
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),

@@ -767,3 +767,204 @@ async fn a_scanned_playlist_is_saved_with_its_ownership_row() {
         .expect("rescan");
     assert_eq!(meta().await, Some((owner, false)));
 }
+
+/// The playlist folder `rel`'s shares, in share order, and the `Data` copy
+/// of them, which must agree.
+async fn shares(f: &Fixture, rel: &str) -> Vec<(Uuid, bool)> {
+    let id = guid_to_db(f.id(BaseItemKind::Playlist, rel));
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
+           WHERE "PlaylistId" = ?1 ORDER BY rowid"#,
+    )
+    .bind(&id)
+    .fetch_all(f.db.pool())
+    .await
+    .expect("shares");
+    let rows: Vec<(Uuid, bool)> = rows
+        .into_iter()
+        .map(|(user, can_edit)| (Uuid::parse_str(&user).expect("uuid"), can_edit))
+        .collect();
+    let data: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&id)
+            .fetch_one(f.db.pool())
+            .await
+            .expect("data");
+    let data: serde_json::Value = serde_json::from_str(&data.expect("Data")).expect("json");
+    let copy: Vec<(Uuid, bool)> = data["Shares"]
+        .as_array()
+        .expect("Shares")
+        .iter()
+        .map(|share| {
+            (
+                Uuid::parse_str(share["UserId"].as_str().expect("UserId")).expect("uuid"),
+                share["CanEdit"].as_bool().expect("CanEdit"),
+            )
+        })
+        .collect();
+    assert_eq!(copy, rows, "Data copies the share rows");
+    rows
+}
+
+/// `Road Trip [playlist]/playlist.xml` with `shares` and `extra` elements,
+/// its mtime a minute ahead so every scan after it sees it changed.
+fn write_playlist_xml(f: &Fixture, extra: &str, shares: &[(Uuid, bool)]) {
+    let shares = shares
+        .iter()
+        .fold(String::new(), |mut out, (user, can_edit)| {
+            let _ = write!(
+                out,
+                "<Share><UserId>{user}</UserId><CanEdit>{can_edit}</CanEdit></Share>"
+            );
+            out
+        });
+    f.rewrite(
+        &format!("{ROAD_TRIP}/playlist.xml"),
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<Item>{extra}\
+             <OwnerUserId>{}</OwnerUserId><Shares>{shares}</Shares></Item>",
+            Uuid::new_v4().simple()
+        ),
+    );
+}
+
+/// `PlaylistXmlProvider` reads the whole `BaseItemXmlParser` set from a
+/// playlist folder's `playlist.xml`: the title names the playlist, the
+/// overview describes it, `<LockData>` locks it, and its shares are the
+/// playlist's on the first refresh (none stored). `<OwnerUserId>` is read
+/// but merged nowhere: the scanned playlist stays owned by nobody.
+#[tokio::test]
+async fn a_playlist_folders_xml_names_describes_and_shares_it() {
+    let f = Fixture::new().await;
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    write_playlist_xml(
+        &f,
+        "<LocalTitle>Summer Mix</LocalTitle><Overview>Songs for the road</Overview>\
+         <Genres><Genre>Pop</Genre></Genres>",
+        &[(a, true), (b, false)],
+    );
+    f.scan().await;
+    let id = f.id(BaseItemKind::Playlist, ROAD_TRIP);
+    let row = f.row(id).await.expect("row");
+    assert_eq!(row.name.as_deref(), Some("Summer Mix"));
+    assert_eq!(row.overview.as_deref(), Some("Songs for the road"));
+    assert_eq!(row.genres.as_deref(), Some("Pop"));
+    assert!(!row.is_locked);
+    assert_eq!(shares(&f, ROAD_TRIP).await, [(a, true), (b, false)]);
+    let owner: (String, bool) = sqlx::query_as(
+        r#"SELECT "OwnerUserId", "OpenAccess" FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#,
+    )
+    .bind(guid_to_db(id))
+    .fetch_one(f.db.pool())
+    .await
+    .expect("owner row");
+    assert_eq!(owner, (guid_to_db(Uuid::nil()), true));
+
+    // Unchanged since: the name stays the file's, not the folder's.
+    f.scan().await;
+    assert_eq!(
+        f.row(id).await.expect("row").name.as_deref(),
+        Some("Summer Mix")
+    );
+
+    // `<LockData>`: the item locks, and a locked item reads nothing more.
+    write_playlist_xml(
+        &f,
+        "<LocalTitle>Locked Mix</LocalTitle><LockData>true</LockData>",
+        &[],
+    );
+    f.scan().await;
+    let row = f.row(id).await.expect("row");
+    assert!(row.is_locked);
+    assert_eq!(row.name.as_deref(), Some("Locked Mix"));
+    assert_eq!(
+        shares(&f, ROAD_TRIP).await,
+        [],
+        "LockData merges as a replace"
+    );
+    write_playlist_xml(&f, "<LocalTitle>Ignored</LocalTitle>", &[(a, true)]);
+    f.scan().await;
+    assert_eq!(
+        f.row(id).await.expect("row").name.as_deref(),
+        Some("Locked Mix")
+    );
+    assert_eq!(shares(&f, ROAD_TRIP).await, []);
+}
+
+/// Shares are access control: `PlaylistMetadataService.MergeData` takes the
+/// file's whole on a refresh that replaces — a Default scan that saw the
+/// file change, or "Replace all metadata" where no saver writes the file —
+/// an empty `<Shares />` removing every share; a full refresh that keeps
+/// metadata puts the file's first (its `CanEdit` wins) and keeps the stored
+/// shares of the users it does not name. "Replace all metadata" where the
+/// library saves the file does not read it: the stored shares stand.
+#[tokio::test]
+async fn a_playlist_folders_shares_merge_as_upstream_merges_them() {
+    let f = Fixture::new().await;
+    let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    write_playlist_xml(&f, "", &[(a, true), (b, false)]);
+    f.scan().await;
+    assert_eq!(shares(&f, ROAD_TRIP).await, [(a, true), (b, false)]);
+
+    // A Default scan of a changed file: the file wins, a removal included.
+    write_playlist_xml(&f, "", &[(b, true)]);
+    f.scan().await;
+    assert_eq!(shares(&f, ROAD_TRIP).await, [(b, true)]);
+
+    // A full refresh that keeps metadata: the file's first, then the stored
+    // shares of the users it does not name; a user in both takes the file's.
+    write_playlist_xml(&f, "", &[(c, false), (b, false)]);
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    f.scanner
+        .scan_with(None, &full)
+        .await
+        .expect("full refresh");
+    assert_eq!(shares(&f, ROAD_TRIP).await, [(c, false), (b, false)]);
+    write_playlist_xml(&f, "", &[]);
+    f.scanner
+        .scan_with(None, &full)
+        .await
+        .expect("full refresh");
+    assert_eq!(
+        shares(&f, ROAD_TRIP).await,
+        [(c, false), (b, false)],
+        "a merge that keeps metadata removes no share"
+    );
+
+    // Every share removed: a changed file with `<Shares />` on a Default scan.
+    write_playlist_xml(&f, "", &[]);
+    f.scan().await;
+    assert_eq!(shares(&f, ROAD_TRIP).await, []);
+
+    // "Replace all metadata" in a library whose saver does not write the
+    // file reads it and replaces.
+    write_playlist_xml(&f, "", &[(a, false)]);
+    let replace_all = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: true,
+        ..MetadataRefreshOptions::default()
+    };
+    f.scanner
+        .scan_with(None, &replace_all)
+        .await
+        .expect("replace all");
+    assert_eq!(shares(&f, ROAD_TRIP).await, [(a, false)]);
+
+    // …and in one whose saver writes it (`isSavingMetadata`) does not read
+    // it: the database wins.
+    let folders = f.vf.get_virtual_folders().await.expect("folders");
+    let mut options = folders[0].library_options.clone().expect("options");
+    options.save_local_metadata = true;
+    f.vf.update_library_options("Music", &options)
+        .await
+        .expect("opt in");
+    write_playlist_xml(&f, "", &[(c, true)]);
+    f.scanner
+        .scan_with(None, &replace_all)
+        .await
+        .expect("replace all");
+    assert_eq!(shares(&f, ROAD_TRIP).await, [(a, false)]);
+}

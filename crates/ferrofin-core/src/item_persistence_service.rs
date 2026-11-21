@@ -3149,6 +3149,17 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
+            // `PlaylistMetadataService.MergeData`'s shares, into the row the
+            // playlist has by now.
+            if let Some(shares) = &playlist.shares {
+                crate::item_data::merge_playlist_shares_in(
+                    &mut tx,
+                    playlist.id,
+                    shares,
+                    playlist.replace,
+                )
+                .await?;
+            }
             if let Some(ids) = resolved {
                 let written = write_scanned_members(&mut tx, &id, ids, playlist.replace)
                     .await
@@ -3170,6 +3181,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             tx.commit().await.map_err(db_err)?;
         }
         Ok(())
+    }
+
+    async fn playlist_ownership(
+        &self,
+        playlist: Uuid,
+    ) -> Result<Option<ferrofin_traits::persistence::PlaylistOwnership>, ServiceError> {
+        crate::item_data::playlist_ownership(&self.db, playlist).await
     }
 
     async fn merge_box_set_members(
@@ -16156,8 +16174,8 @@ mod tests {
         let (movie, to) = (Uuid::from_u128(0xB1), Uuid::from_u128(0xB2));
         seed_item(&db, movie, BaseItemKind::Movie).await;
         // Jellyfin's `{xx}/{id:N}` folder, where a subtitle saved for the item lives.
-        let [.., old_folder] = crate::item_folders::item_art_folders(&art, movie);
-        let [.., new_folder] = crate::item_folders::item_art_folders(&art, to);
+        let [old_folder, ..] = crate::item_folders::item_art_folders(&art, movie);
+        let [new_folder, ..] = crate::item_folders::item_art_folders(&art, to);
         std::fs::create_dir_all(&old_folder).expect("folder");
         let subtitle =
             |folder: &std::path::Path| paths.reverse(&folder.join("A.en.srt").to_string_lossy());
