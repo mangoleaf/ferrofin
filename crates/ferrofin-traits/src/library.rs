@@ -3317,6 +3317,27 @@ pub trait VirtualFolderManager: Send + Sync {
         Ok(self.get_virtual_folders().await?.into())
     }
 
+    /// Every location the libraries list, read afresh, for deleting the folder
+    /// of a location no library lists any more (`AggregateFolder.ValidateChildren`);
+    /// `None` while that list cannot be known whole. A location left out of it
+    /// reads as removed and takes every item under it, so `None` covers no
+    /// library configured, a shortcut that did not resolve, and a library
+    /// listing no location without readable options that list none either.
+    /// A library created with no folder adds no location, as upstream's root
+    /// reads it.
+    ///
+    /// The default lists the folders afresh and answers `None` while any
+    /// library lists no location, since it cannot tell those cases apart.
+    async fn locations_for_removal(&self) -> Result<Option<Vec<String>>, ServiceError> {
+        let folders = self.get_virtual_folders().await?;
+        if folders.is_empty() || folders.iter().any(|f| f.locations.is_empty()) {
+            return Ok(None);
+        }
+        Ok(Some(
+            folders.into_iter().flat_map(|f| f.locations).collect(),
+        ))
+    }
+
     /// Adds a virtual folder with the given name, optional collection type,
     /// media paths, and library options.
     ///
