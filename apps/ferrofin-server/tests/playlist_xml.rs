@@ -800,3 +800,89 @@ async fn the_first_boot_writes_the_playlists_folders_files_from_the_database() {
     boot(&db, &config).await;
     assert!(!xml.exists(), "the repair runs once");
 }
+
+/// gl-1648: on the first boot of a database adopted from 10.11, a playlist
+/// its `Data` import leaves with no entries is restored from the
+/// `playlist.xml` Jellyfin wrote (12.0's `RestorePlaylistChildrenFromMetadata`)
+/// before the boot rewrites that file from the database
+/// (`save_playlist_xml_once`, which would otherwise leave it listing nothing).
+#[tokio::test]
+async fn the_first_boot_restores_an_emptied_10_11_playlist_before_rewriting_its_file() {
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_traits::persistence::ItemPersistenceService as _;
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config::test_stub(temp.path());
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    std::fs::create_dir_all(temp.path().join("config")).unwrap();
+    let db = Database::connect(&config.database_url()).await.unwrap();
+    db.run_migrations().await.unwrap();
+    db.record_adoption("10.11.8").await.unwrap();
+    let (playlist, alpha, beta) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let media = temp.path().join("media");
+    let (alpha_path, beta_path) = (
+        media.join("Alpha.mkv").to_string_lossy().into_owned(),
+        media.join("Beta.mkv").to_string_lossy().into_owned(),
+    );
+    let movie = |id: Uuid, path: &str| BaseItemEntity {
+        id: guid_to_db(id),
+        type_: "MediaBrowser.Controller.Entities.Movies.Movie".into(),
+        name: Some(path.into()),
+        path: Some(path.into()),
+        ..Default::default()
+    };
+    ferrofin_core::FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[
+            movie(alpha, &alpha_path),
+            movie(beta, &beta_path),
+            BaseItemEntity {
+                id: guid_to_db(playlist),
+                type_: "MediaBrowser.Controller.Playlists.Playlist".into(),
+                name: Some("Mix".into()),
+                is_folder: true,
+                media_type: Some("Video".into()),
+                path: Some("%AppDataPath%/playlists/Mix".into()),
+                // Every entry removed in 10.11 before its queued save wrote
+                // the file.
+                data: Some(json!({ "LinkedChildren": [] }).to_string()),
+                ..Default::default()
+            },
+        ])
+        .await
+        .unwrap();
+    let folder = config.data_dir.join("data/playlists/Mix");
+    std::fs::create_dir_all(&folder).unwrap();
+    let xml = folder.join("playlist.xml");
+    std::fs::write(
+        &xml,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n<Item>\n  \
+             <LocalTitle>Mix</LocalTitle>\n  <PlaylistItems>\n    <PlaylistItem>\n      \
+             <Path>{alpha_path}</Path>\n    </PlaylistItem>\n    <PlaylistItem>\n      \
+             <Path>{beta_path}</Path>\n    </PlaylistItem>\n  </PlaylistItems>\n</Item>\n"
+        ),
+    )
+    .unwrap();
+    drop(db);
+
+    // As the server starts: the database opens (and its repairs run), then
+    // the app state is built.
+    let db = ferrofin_server::bootstrap::open_database(&config)
+        .await
+        .unwrap();
+    boot(&db, &config).await;
+
+    let children: Vec<String> = sqlx::query_scalar(
+        r#"SELECT "ChildId" FROM "LinkedChildren" WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
+    )
+    .bind(guid_to_db(playlist))
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(children, [guid_to_db(alpha), guid_to_db(beta)]);
+    let text = std::fs::read_to_string(&xml).unwrap();
+    assert_eq!(
+        member_paths(&text),
+        [alpha_path.as_str(), beta_path.as_str()],
+        "{text}"
+    );
+}
