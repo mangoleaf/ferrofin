@@ -2450,7 +2450,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ReplaceAllMetadata, a FullRefresh, or a first or required refresh at Default \
                    or above, else the change-monitored ones; for a locked item \
                    CanRefreshMetadata keeps the forced providers and RefreshWithProviders \
-                   returns after them, so only the probe runs), scan_item's run_local gate \
+                   returns after them, so only the probe runs, and the Data keys it owns, \
+                   item_data.rs PROBE_OWNED_KEYS, are saved whatever the lock through \
+                   item_persistence_service.rs locked_data_sql), scan_item's run_local gate \
                    (RefreshWithProviders runs \
                    no local reader when SearchResult is set (the NFO, and a book's embedded \
                    readers in enrich_from_file), nor under ReplaceAllMetadata for an item a \

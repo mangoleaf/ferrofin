@@ -9027,8 +9027,10 @@ impl LibraryScanner {
         // Scan-variant save: its SQL guards back the merge above up for a
         // row it could not read (and for a writer that raced this scan):
         // `PrimaryVersionId`, the first-import `DateCreated`, the refresh
-        // dates and a locked row's metadata and `Data` are never lost. A
-        // re-dated file, or a date a reader supplied, writes its
+        // dates and a locked row's metadata and `Data` are never lost (its
+        // probe-owned keys follow the probe, and are kept when the probe
+        // could not send them, `LyricFiles` excepted: `PROBE_OWNED_KEYS`).
+        // A re-dated file, or a date a reader supplied, writes its
         // `DateCreated` over the stored one, which the first-import guard
         // would otherwise keep.
         state.save_attempted = true;
@@ -47343,8 +47345,8 @@ mod chapter_image_refresh_tests {
     /// in `Data`, true when a subtitle stream it keeps exists (an external one,
     /// or an embedded one the library allows), and the metadata merge keeps
     /// the probe's value over the stored one, locked or not (gl-1632). The
-    /// scan save then keeps a locked row's stored `Data`, as it does every
-    /// probe-owned key (TODO(gl-1913): a locked row keeps them).
+    /// scan save keeps it on a locked row too, as every probe-owned key
+    /// (`crate::item_data::PROBE_OWNED_KEYS`, gl-1913).
     #[rstest::rstest]
     #[case::embedded(
         false,
