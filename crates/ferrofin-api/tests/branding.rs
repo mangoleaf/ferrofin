@@ -699,6 +699,9 @@ impl SsoManager for LoginButtons {
     async fn ensure_enabled(&self) -> Result<(), ServiceError> {
         Err(unused())
     }
+    async fn flow_cookie_name(&self) -> Result<&'static str, ServiceError> {
+        Err(unused())
+    }
     async fn oidc_providers(&self) -> Result<OidcProviderList, ServiceError> {
         Err(unused())
     }
@@ -752,13 +755,14 @@ impl SsoManager for LoginButtons {
         &self,
         _key: &str,
         _client: std::net::IpAddr,
-        _code: &str,
+        _quick_connect: &str,
     ) -> Result<SsoReply, ServiceError> {
         Err(unused())
     }
     async fn confirm_oidc_quick_connect(
         &self,
         _confirmation: Option<Secret>,
+        _code: Option<&str>,
         _flow_cookie: Option<Secret>,
         _client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {

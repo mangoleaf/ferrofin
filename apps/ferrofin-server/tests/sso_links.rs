@@ -320,12 +320,14 @@ async fn a_user_links_signs_in_through_the_provider_and_unlinks() {
     );
 
     // The link page starts a link with the token and the account's password,
-    // and goes where the answer says, the flow cookie set.
+    // and goes where the answer says, the flow cookie set: host-only on this
+    // `https` public URL (D23).
     let started = start_link(&server, "fake", &token, Some(PASSWORD)).await;
     assert_eq!(started.status(), StatusCode::OK);
     let set_cookie = header_text(&started, header::SET_COOKIE);
     assert!(
-        set_cookie.ends_with("; Path=/jf/sso; Max-Age=600; HttpOnly; SameSite=Lax; Secure"),
+        set_cookie.starts_with("__Host-ferrofin_sso_flow=")
+            && set_cookie.ends_with("; Path=/; Max-Age=600; HttpOnly; SameSite=Lax; Secure"),
         "{set_cookie}"
     );
     let url = json(started).await["Url"]

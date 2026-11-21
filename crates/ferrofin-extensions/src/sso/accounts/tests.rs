@@ -128,7 +128,7 @@ async fn with_create_users_off_an_unlinked_identity_is_refused_and_no_account_is
     assert!(reply.html.contains(r#"<a href="../../../web/">"#));
     assert_eq!(
         reply.set_cookies,
-        ["ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
+        ["__Host-ferrofin_sso_flow=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
     );
     assert_eq!(user_count(&harness).await, 0);
 

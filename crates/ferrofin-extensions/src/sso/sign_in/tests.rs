@@ -269,11 +269,7 @@ impl Harness {
     /// its flow cookie.
     pub(in crate::sso) fn started(reply: SsoReply) -> Started {
         assert_eq!(reply.status, 302, "{reply:?}");
-        let cookie = reply.set_cookies[0]
-            .strip_prefix("ferrofin_sso_flow=")
-            .and_then(|rest| rest.split(';').next())
-            .expect("the flow cookie")
-            .to_owned();
+        let cookie = flow_cookie_value(&reply.set_cookies[0]);
         Started {
             location: reply.location.expect("a redirect"),
             cookie,
@@ -373,6 +369,17 @@ impl Harness {
     }
 }
 
+/// The value a flow cookie's `Set-Cookie` carries, under either name.
+pub(in crate::sso) fn flow_cookie_value(set_cookie: &str) -> String {
+    set_cookie
+        .split(';')
+        .next()
+        .and_then(|pair| pair.split_once('='))
+        .filter(|(name, _)| [OIDC_FLOW_COOKIE, OIDC_HOST_FLOW_COOKIE].contains(name))
+        .map(|(_, value)| value.to_owned())
+        .expect("the flow cookie")
+}
+
 /// The query parameters of `url`.
 fn query(url: &str) -> HashMap<String, String> {
     url::Url::parse(url)
@@ -436,11 +443,27 @@ async fn start_sends_the_browser_to_the_provider_with_pkce_a_state_and_a_nonce()
     assert!(started.cookie.len() >= 43, "32 random bytes");
 }
 
+/// D23: on an `https` public URL the cookie is `__Host-` prefixed, `Secure`,
+/// for the whole host and with no `Domain`, and only that name is read; on an
+/// `http` one it is as before, scoped to `/sso` below the public URL's path.
 #[tokio::test]
-async fn the_cookie_is_http_only_lax_scoped_to_sso_and_secure_on_https() {
-    for (published, path, secure) in [
-        (PUBLIC_URL, "/jf/sso", "; Secure"),
-        ("http://127.0.0.1:8096", "/sso", ""),
+async fn the_cookie_is_host_only_on_https_and_scoped_to_sso_on_http() {
+    for (published, name, attributes) in [
+        (
+            PUBLIC_URL,
+            "__Host-ferrofin_sso_flow",
+            " Path=/; Max-Age=600; HttpOnly; SameSite=Lax; Secure",
+        ),
+        (
+            "http://127.0.0.1:8096/jf",
+            "ferrofin_sso_flow",
+            " Path=/jf/sso; Max-Age=600; HttpOnly; SameSite=Lax",
+        ),
+        (
+            "http://127.0.0.1:8096",
+            "ferrofin_sso_flow",
+            " Path=/sso; Max-Age=600; HttpOnly; SameSite=Lax",
+        ),
     ] {
         let harness = Harness::with(Some(published), |_| {}).await;
         let reply = harness
@@ -448,12 +471,43 @@ async fn the_cookie_is_http_only_lax_scoped_to_sso_and_secure_on_https() {
             .start_oidc_sign_in("fake", CLIENT)
             .await
             .expect("starts");
-        let cookie = &reply.set_cookies[0];
-        let attributes = cookie.split_once(';').expect("attributes").1;
+        let (pair, set) = reply.set_cookies[0].split_once(';').expect("attributes");
         assert_eq!(
-            attributes,
-            format!(" Path={path}; Max-Age=600; HttpOnly; SameSite=Lax{secure}"),
+            pair.split_once('=').expect("name=value").0,
+            name,
             "{published}"
+        );
+        assert_eq!(set, attributes, "{published}");
+        assert_eq!(
+            harness.sso.flow_cookie_name().await.expect("a name"),
+            name,
+            "read under the name it is set with: {published}"
+        );
+    }
+    // The plugin's Public URL wins over the published URL, both ways; one
+    // that is refused, or none known, reads as on `http`.
+    for (published, setting, name) in [
+        (
+            Some(PUBLIC_URL),
+            "http://lan.example.org:8096",
+            OIDC_FLOW_COOKIE,
+        ),
+        (
+            Some("http://127.0.0.1:8096"),
+            PUBLIC_URL,
+            OIDC_HOST_FLOW_COOKIE,
+        ),
+        (Some(PUBLIC_URL), "not a URL", OIDC_FLOW_COOKIE),
+        (None, "", OIDC_FLOW_COOKIE),
+    ] {
+        let harness = Harness::with(published, |_| {}).await;
+        let mut config = harness.sso.config().await.expect("config");
+        setting.clone_into(&mut config.public_url);
+        harness.sso.save_config(&config).await.expect("saved");
+        assert_eq!(
+            harness.sso.flow_cookie_name().await.expect("a name"),
+            name,
+            "{published:?}, {setting:?}"
         );
     }
 }
@@ -535,7 +589,7 @@ async fn every_refusal_is_one_generic_page_that_clears_the_cookie() {
     assert!(!reply.html.contains("cookie"), "says nothing of why");
     assert_eq!(
         reply.set_cookies,
-        ["ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
+        ["__Host-ferrofin_sso_flow=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
     );
     assert_eq!(
         reply.content_security_policy.as_deref(),
@@ -781,11 +835,11 @@ async fn an_id_token_with_wrong_claims_is_refused() {
     for (claim, value, reason) in [
         ("iss", json!("https://evil.example.org"), "id_token_issuer"),
         ("aud", json!("another-client"), "id_token_audience"),
-        // Another audience beside the client's, with no `azp` naming it.
+        // Another audience beside the client's (D23).
         (
             "aud",
             json!([CLIENT_ID, "another-client"]),
-            "id_token_audience",
+            "id_token_extra_audience",
         ),
         ("azp", json!("another-client"), "id_token_azp"),
         ("exp", json!(now - 60), "id_token_expired"),
@@ -798,18 +852,31 @@ async fn an_id_token_with_wrong_claims_is_refused() {
         });
         assert_eq!(harness.refused().await, reason, "{claim}: {value}");
     }
-    // An `azp` naming the client is fine, and lets another audience in.
+    // An `azp` naming the client is fine, and so is the client id alone in
+    // a list, or twice; another audience is refused whatever the `azp`
+    // (D23, OpenID Connect Core 1.0, 3.1.3.7, step 3).
     let harness = Harness::new().await;
+    harness.sign_in().await.expect("verified without an azp");
     harness.fake.sign_in(|sign_in| {
         sign_in.claims.insert("azp".to_owned(), json!(CLIENT_ID));
     });
-    harness.sign_in().await.expect("verified");
-    harness.fake.sign_in(|sign_in| {
-        sign_in
-            .claims
-            .insert("aud".to_owned(), json!([CLIENT_ID, "an-api"]));
-    });
     harness.sign_in().await.expect("verified with an azp");
+    for audience in [json!([CLIENT_ID]), json!([CLIENT_ID, CLIENT_ID])] {
+        harness.fake.sign_in(|sign_in| {
+            sign_in.claims.insert("aud".to_owned(), audience.clone());
+        });
+        harness.sign_in().await.expect("one audience");
+    }
+    for audience in [json!([CLIENT_ID, "an-api"]), json!(["an-api", CLIENT_ID])] {
+        harness.fake.sign_in(|sign_in| {
+            sign_in.claims.insert("aud".to_owned(), audience.clone());
+        });
+        assert_eq!(
+            harness.refused().await,
+            "id_token_extra_audience",
+            "{audience}"
+        );
+    }
 }
 
 #[tokio::test]

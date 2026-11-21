@@ -1,7 +1,8 @@
-//! Quick Connect approval through a sign-in (B13): the code-entry page, the
-//! start's code check, the callback's confirmation page and the confirmation
-//! itself, against the fake identity provider and the server's own Quick
-//! Connect manager over the harness's sessions.
+//! Quick Connect approval through a sign-in (B13, D23): the page of sign-in
+//! links, the start's refusal of a link carrying a value, the callback's
+//! confirmation page, where the code is typed, and the confirmation itself,
+//! against the fake identity provider and the server's own Quick Connect
+//! manager over the harness's sessions.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,7 +36,8 @@ const ADMINS: &str = "ferrofin-admins";
 type Rule = fn(&mut UserPolicy);
 
 /// The flow cookie, cleared.
-const CLEARED: &str = "ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure";
+const CLEARED: &str =
+    "__Host-ferrofin_sso_flow=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure";
 
 /// The server configuration the Quick Connect manager reads: the defaults,
 /// with Quick Connect on while the flag is.
@@ -126,13 +128,13 @@ impl Approval {
             .authenticated
     }
 
-    /// A sign-in at `fake` started to approve `code` and called back: the
+    /// A sign-in at `fake` started to approve a code and called back: the
     /// callback's page, and the browser's flow cookie.
-    async fn called_back(&self, code: &str) -> (SsoReply, String) {
+    async fn called_back(&self) -> (SsoReply, String) {
         let started = Harness::started(
             self.harness
                 .sso
-                .start_oidc_quick_connect("fake", CLIENT, code)
+                .start_oidc_quick_connect("fake", CLIENT, "")
                 .await
                 .expect("starts"),
         );
@@ -146,22 +148,31 @@ impl Approval {
         (page, started.cookie)
     }
 
-    /// The confirmation page's form posted, from [`CLIENT`].
-    async fn confirm(&self, confirmation: Option<&str>, cookie: Option<&str>) -> SsoReply {
-        self.confirm_from(CLIENT, confirmation, cookie).await
+    /// The confirmation page's form posted with the typed `code`, from
+    /// [`CLIENT`].
+    async fn confirm(
+        &self,
+        confirmation: Option<&str>,
+        code: Option<&str>,
+        cookie: Option<&str>,
+    ) -> SsoReply {
+        self.confirm_from(CLIENT, confirmation, code, cookie).await
     }
 
-    /// The confirmation page's form posted, from `client`.
+    /// The confirmation page's form posted with the typed `code`, from
+    /// `client`.
     async fn confirm_from(
         &self,
         client: IpAddr,
         confirmation: Option<&str>,
+        code: Option<&str>,
         cookie: Option<&str>,
     ) -> SsoReply {
         self.harness
             .sso
             .confirm_oidc_quick_connect(
                 confirmation.map(Secret::new),
+                code,
                 cookie.map(Secret::new),
                 client,
             )
@@ -173,10 +184,14 @@ impl Approval {
     /// the confirmation's page.
     async fn approved(&self) -> (String, SsoReply) {
         let (code, secret) = self.initiate().await;
-        let (page, cookie) = self.called_back(&code).await;
+        let (page, cookie) = self.called_back().await;
         assert_eq!(page.status, 200, "{}", page.html);
         let reply = self
-            .confirm(Some(&confirmation_of(&page.html)), Some(&cookie))
+            .confirm(
+                Some(&confirmation_of(&page.html)),
+                Some(&code),
+                Some(&cookie),
+            )
             .await;
         (secret, reply)
     }
@@ -276,7 +291,7 @@ fn a_code_is_six_digits_and_its_debug_hides_them() {
 }
 
 #[tokio::test]
-async fn the_code_entry_page_has_a_button_for_each_provider_that_signs_users_in() {
+async fn the_page_links_a_sign_in_for_each_provider_and_asks_for_no_code() {
     let approval = Approval::new().await;
     let page = approval
         .harness
@@ -286,24 +301,20 @@ async fn the_code_entry_page_has_a_button_for_each_provider_that_signs_users_in(
         .expect("a page");
     assert_eq!(page.status, 200, "{}", page.html);
     for part in [
-        "<form method=\"get\">",
-        "<input id=\"code\" name=\"quickConnect\" required inputmode=\"numeric\" \
-         pattern=\"[0-9]{6}\" maxlength=\"6\" autocomplete=\"off\" autofocus>",
+        "Sign in, then type the code your app shows.",
         // The name is the admin's text, escaped.
-        "<button type=\"submit\" formaction=\"oidc/fake/start\">Sign in with Fake \
-         &lt;IdP&gt;</button>",
+        "<p><a href=\"oidc/fake/start?quickConnect\">Sign in with Fake &lt;IdP&gt;</a></p>",
         "<a href=\"../web/\">Back to Ferrofin</a>",
     ] {
         assert!(page.html.contains(part), "{part}: {}", page.html);
     }
-    // The start the form goes to sends the browser on to the provider, whose
-    // issuer here is `http`.
+    // The code is typed after the sign-in (D23): no field for it here.
+    assert!(!page.html.contains("<input"), "{}", page.html);
+    assert!(!page.html.contains("<form"), "{}", page.html);
+    // Links: nothing posts a form, and nothing is loaded.
     assert_eq!(
         page.content_security_policy.as_deref(),
-        Some(
-            "default-src 'none'; base-uri 'none'; form-action 'self' https: http:; \
-             frame-ancestors 'none'"
-        )
+        Some("default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
     );
     assert_eq!(page.set_cookies, Vec::<String>::new());
 
@@ -331,24 +342,34 @@ async fn the_code_entry_page_has_a_button_for_each_provider_that_signs_users_in(
     );
 }
 
+/// D23: a start link carrying a code (or anything else) is refused before the
+/// identity provider, so no link can come with a code to confirm.
 #[tokio::test]
-async fn start_refuses_what_is_not_a_code_and_quick_connect_turned_off_before_the_provider() {
+async fn start_refuses_a_value_in_the_link_and_quick_connect_turned_off_before_the_provider() {
     let approval = Approval::new().await;
     let sso = &approval.harness.sso;
-    for code in ["12345", "<b>123456</b>", ""] {
+    let (code, _) = approval.initiate().await;
+    for value in [code.as_str(), " 123456 ", "x", " ", "<b>123456</b>"] {
         let reply = sso
-            .start_oidc_quick_connect("fake", CLIENT, code)
+            .start_oidc_quick_connect("fake", CLIENT, value)
             .await
             .expect("an answer");
-        assert_eq!(reply.status, 400, "{code:?}");
-        assert_eq!(reply.location, None, "{code:?}");
-        assert!(reply.set_cookies.is_empty(), "{code:?}");
-        assert!(reply.html.contains("six digits"), "{}", reply.html);
+        assert_eq!(reply.status, 400, "{value:?}");
+        assert_eq!(reply.location, None, "{value:?}");
+        assert!(reply.set_cookies.is_empty(), "{value:?}");
+        assert!(reply.html.contains("carries no code"), "{}", reply.html);
+        assert!(
+            reply.html.contains("<a href=\"../../quickconnect\">"),
+            "{}",
+            reply.html
+        );
+        // What the link held is never shown back.
+        assert!(!reply.html.contains(&code), "{}", reply.html);
         assert!(!reply.html.contains("<b>"), "{}", reply.html);
     }
     approval.quick_connect(false);
     let off = sso
-        .start_oidc_quick_connect("fake", CLIENT, "123456")
+        .start_oidc_quick_connect("fake", CLIENT, "")
         .await
         .expect("an answer");
     assert_eq!(off.status, 403);
@@ -358,18 +379,19 @@ async fn start_refuses_what_is_not_a_code_and_quick_connect_turned_off_before_th
         off.html
     );
     assert!(sso.flows.is_empty(), "no flow started");
+    assert!(approval.harness.fake.requests().is_empty(), "nothing sent");
 
-    // An unknown provider is no such route, whatever the code.
-    let unknown = sso.start_oidc_quick_connect("nope", CLIENT, "x").await;
+    // An unknown provider is no such route, whatever the parameter.
+    let unknown = sso.start_oidc_quick_connect("nope", CLIENT, "").await;
     assert!(
         matches!(unknown, Err(ServiceError::NotFound(_))),
         "{unknown:?}"
     );
 
-    // A code starts a flow for it.
+    // An empty one starts a flow that holds no code.
     approval.quick_connect(true);
     let started = Harness::started(
-        sso.start_oidc_quick_connect("fake", CLIENT, " 123456 ")
+        sso.start_oidc_quick_connect("fake", CLIENT, "")
             .await
             .expect("starts"),
     );
@@ -380,37 +402,31 @@ async fn start_refuses_what_is_not_a_code_and_quick_connect_turned_off_before_th
         .map(|(_, state)| state.into_owned())
         .expect("a state");
     let flow = sso.flows.take(&state).expect("a flow");
-    assert_eq!(
-        flow.purpose,
-        FlowPurpose::QuickConnect(QuickConnectCode::parse("123456").expect("a code"))
-    );
+    assert_eq!(flow.purpose, FlowPurpose::QuickConnect);
 }
 
 #[tokio::test]
-async fn only_the_confirmation_with_its_cookie_approves_the_code_and_only_once() {
+async fn only_the_confirmation_with_its_cookie_approves_the_typed_code_and_only_once() {
     let approval = Approval::new().await;
     let (code, secret) = approval.initiate().await;
 
-    let (page, cookie) = approval.called_back(&code).await;
+    // The page names the account and asks for the code: it knows none.
+    let (page, cookie) = approval.called_back().await;
     assert_eq!(page.status, 200, "{}", page.html);
-    assert!(
-        page.html.contains(&format!(
-            "Sign in the device showing code <strong>{code}</strong> as \
-             <strong>{USERNAME}</strong>?"
-        )),
-        "{}",
-        page.html
-    );
-    assert!(
-        page.html
-            .contains("<form method=\"post\" action=\"../../quickconnect\">"),
-        "{}",
-        page.html
-    );
+    for part in [
+        format!("You are signed in as <strong>{USERNAME}</strong>."),
+        "<form method=\"post\" action=\"../../quickconnect\">".to_owned(),
+        "<input id=\"code\" name=\"code\" required inputmode=\"numeric\" pattern=\"[0-9]{6}\" \
+         maxlength=\"6\" autocomplete=\"off\" autofocus>"
+            .to_owned(),
+    ] {
+        assert!(page.html.contains(&part), "{part}: {}", page.html);
+    }
+    assert!(!page.html.contains(&code), "{}", page.html);
     assert_eq!(
         page.set_cookies,
         [format!(
-            "ferrofin_sso_flow={cookie}; Path=/jf/sso; Max-Age=60; HttpOnly; SameSite=Lax; Secure"
+            "__Host-ferrofin_sso_flow={cookie}; Path=/; Max-Age=60; HttpOnly; SameSite=Lax; Secure"
         )]
     );
     assert_eq!(
@@ -422,19 +438,30 @@ async fn only_the_confirmation_with_its_cookie_approves_the_code_and_only_once()
 
     // Another browser's cookie is refused, and that uses the confirmation up.
     let elsewhere = approval
-        .confirm(Some(&confirmation), Some("another-browser"))
+        .confirm(Some(&confirmation), Some(&code), Some("another-browser"))
         .await;
     assert_eq!(elsewhere.status, 400, "{}", elsewhere.html);
+    assert!(
+        elsewhere
+            .html
+            .contains("<a href=\"quickconnect\">start again</a>"),
+        "{}",
+        elsewhere.html
+    );
     assert_eq!(elsewhere.set_cookies, [CLEARED]);
-    let after = approval.confirm(Some(&confirmation), Some(&cookie)).await;
+    let after = approval
+        .confirm(Some(&confirmation), Some(&code), Some(&cookie))
+        .await;
     assert_eq!(after.status, 400);
     assert!(!approval.authorized(&secret).await);
 
-    // Signed in again and confirmed with its cookie, the code is approved
-    // as the account, on the app's device.
-    let (page, cookie) = approval.called_back(&code).await;
+    // Signed in again and the code typed with its cookie, the code is
+    // approved as the account, on the app's device.
+    let (page, cookie) = approval.called_back().await;
     let confirmation = confirmation_of(&page.html);
-    let approved = approval.confirm(Some(&confirmation), Some(&cookie)).await;
+    let approved = approval
+        .confirm(Some(&confirmation), Some(&code), Some(&cookie))
+        .await;
     assert_eq!(approved.status, 200, "{}", approved.html);
     assert!(
         approved
@@ -452,9 +479,17 @@ async fn only_the_confirmation_with_its_cookie_approves_the_code_and_only_once()
     assert_eq!(session.session.device_id.as_deref(), Some("qc-app"));
 
     // A replay does nothing, and a form without a confirmation neither.
-    let replayed = approval.confirm(Some(&confirmation), Some(&cookie)).await;
+    let replayed = approval
+        .confirm(Some(&confirmation), Some(&code), Some(&cookie))
+        .await;
     assert_eq!(replayed.status, 400);
-    assert_eq!(approval.confirm(None, Some(&cookie)).await.status, 400);
+    assert_eq!(
+        approval
+            .confirm(None, Some(&code), Some(&cookie))
+            .await
+            .status,
+        400
+    );
     let sessions = approval
         .harness
         .sessions
@@ -468,7 +503,7 @@ async fn only_the_confirmation_with_its_cookie_approves_the_code_and_only_once()
 async fn a_confirmation_opens_no_browser_session_and_an_exchange_code_approves_nothing() {
     let approval = Approval::new().await;
     let (code, secret) = approval.initiate().await;
-    let (page, cookie) = approval.called_back(&code).await;
+    let (page, cookie) = approval.called_back().await;
     let confirmation = confirmation_of(&page.html);
     let exchanged = approval
         .harness
@@ -487,7 +522,7 @@ async fn a_confirmation_opens_no_browser_session_and_an_exchange_code_approves_n
     // A browser sign-in's exchange code is no confirmation either.
     let (page, cookie) = approval.harness.completed().await;
     let refused = approval
-        .confirm(Some(&exchange_code(&page.html)), Some(&cookie))
+        .confirm(Some(&exchange_code(&page.html)), Some(&code), Some(&cookie))
         .await;
     assert_eq!(refused.status, 400, "{}", refused.html);
     assert!(!approval.authorized(&secret).await);
@@ -526,10 +561,12 @@ async fn each_account_rule_refuses_the_approval_and_is_logged() {
         ),
     ];
     for (edit, message) in rules {
-        let (page, cookie) = approval.called_back(&code).await;
+        let (page, cookie) = approval.called_back().await;
         let confirmation = confirmation_of(&page.html);
         let allowed = approval.edit_policy(edit).await;
-        let refused = approval.confirm(Some(&confirmation), Some(&cookie)).await;
+        let refused = approval
+            .confirm(Some(&confirmation), Some(&code), Some(&cookie))
+            .await;
         assert_eq!(refused.status, 403, "{}", refused.html);
         assert!(
             refused.html.contains(&escape_html(message)),
@@ -551,33 +588,76 @@ async fn each_account_rule_refuses_the_approval_and_is_logged() {
     }
 }
 
+/// A typed code that is not one, or that no app is waiting with, is refused
+/// with a page saying so, approves nothing, and spends the confirmation: the
+/// user starts again.
 #[tokio::test]
-async fn an_unknown_or_approved_code_and_quick_connect_turned_off_are_refused_at_the_confirmation()
-{
+async fn a_typed_code_that_is_not_one_or_is_wrong_is_refused_and_spends_the_confirmation() {
     let approval = Approval::new().await;
-
-    // No app waits with this code.
-    let (page, cookie) = approval.called_back("111111").await;
-    let unknown = approval
-        .confirm(Some(&confirmation_of(&page.html)), Some(&cookie))
+    let (code, secret) = approval.initiate().await;
+    let wrong = if code == "111111" { "222222" } else { "111111" };
+    for (typed, says) in [
+        (None, "That is not a Quick Connect code"),
+        (Some("12a456"), "That is not a Quick Connect code"),
+        (Some("<b>1</b>"), "That is not a Quick Connect code"),
+        (Some(wrong), "No app is waiting with this code"),
+    ] {
+        let (page, cookie) = approval.called_back().await;
+        let confirmation = confirmation_of(&page.html);
+        let refused = approval
+            .confirm(Some(&confirmation), typed, Some(&cookie))
+            .await;
+        assert_eq!(refused.status, 400, "{typed:?}: {}", refused.html);
+        assert!(refused.html.contains(says), "{typed:?}: {}", refused.html);
+        assert!(
+            refused.html.contains("<a href=\"quickconnect\">"),
+            "starts again: {}",
+            refused.html
+        );
+        assert!(!refused.html.contains("<b>"), "{}", refused.html);
+        assert_eq!(refused.set_cookies, [CLEARED]);
+        // Spent: the right code after it is too late.
+        let late = approval
+            .confirm(Some(&confirmation), Some(&code), Some(&cookie))
+            .await;
+        assert_eq!(late.status, 400, "{typed:?}");
+        assert!(!approval.authorized(&secret).await, "{typed:?}");
+    }
+    // Typed as the app shows it, with spaces around, it is the code.
+    let (page, cookie) = approval.called_back().await;
+    let approved = approval
+        .confirm(
+            Some(&confirmation_of(&page.html)),
+            Some(&format!(" {code} ")),
+            Some(&cookie),
+        )
         .await;
-    assert_eq!(unknown.status, 400);
-    assert!(
-        unknown.html.contains("No app is waiting with this code"),
-        "{}",
-        unknown.html
-    );
+    assert_eq!(approved.status, 200, "{}", approved.html);
+    assert!(approval.authorized(&secret).await);
+}
+
+#[tokio::test]
+async fn an_approved_code_and_quick_connect_turned_off_are_refused_at_the_confirmation() {
+    let approval = Approval::new().await;
 
     // Two sign-ins for one code: the second finds it approved.
     let (code, _) = approval.initiate().await;
-    let (first, first_cookie) = approval.called_back(&code).await;
-    let (second, second_cookie) = approval.called_back(&code).await;
+    let (first, first_cookie) = approval.called_back().await;
+    let (second, second_cookie) = approval.called_back().await;
     let approved = approval
-        .confirm(Some(&confirmation_of(&first.html)), Some(&first_cookie))
+        .confirm(
+            Some(&confirmation_of(&first.html)),
+            Some(&code),
+            Some(&first_cookie),
+        )
         .await;
     assert_eq!(approved.status, 200, "{}", approved.html);
     let again = approval
-        .confirm(Some(&confirmation_of(&second.html)), Some(&second_cookie))
+        .confirm(
+            Some(&confirmation_of(&second.html)),
+            Some(&code),
+            Some(&second_cookie),
+        )
         .await;
     assert_eq!(again.status, 400);
     assert!(
@@ -588,10 +668,14 @@ async fn an_unknown_or_approved_code_and_quick_connect_turned_off_are_refused_at
 
     // Quick Connect turned off since the callback.
     let (code, secret) = approval.initiate().await;
-    let (page, cookie) = approval.called_back(&code).await;
+    let (page, cookie) = approval.called_back().await;
     approval.quick_connect(false);
     let off = approval
-        .confirm(Some(&confirmation_of(&page.html)), Some(&cookie))
+        .confirm(
+            Some(&confirmation_of(&page.html)),
+            Some(&code),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(off.status, 403);
     assert!(off.html.contains("<a href=\"../web/\">"), "{}", off.html);
@@ -602,8 +686,8 @@ async fn an_unknown_or_approved_code_and_quick_connect_turned_off_are_refused_at
 #[tokio::test]
 async fn an_identity_without_an_account_is_refused_before_any_confirmation() {
     let approval = Approval::with(|provider| provider.create_users = false).await;
-    let (code, _) = approval.initiate().await;
-    let (page, _) = approval.called_back(&code).await;
+    approval.initiate().await;
+    let (page, _) = approval.called_back().await;
     assert_eq!(page.status, 403, "{}", page.html);
     assert!(
         page.html.contains("does not create accounts"),
@@ -619,9 +703,9 @@ async fn without_a_quick_connect_manager_there_is_no_approval() {
     let harness = Harness::new().await;
     let sso = &harness.sso;
     let page = sso.quick_connect_page().await;
-    let start = sso.start_oidc_quick_connect("fake", CLIENT, "123456").await;
+    let start = sso.start_oidc_quick_connect("fake", CLIENT, "").await;
     let confirm = sso
-        .confirm_oidc_quick_connect(Some(Secret::new("c")), None, CLIENT)
+        .confirm_oidc_quick_connect(Some(Secret::new("c")), Some("123456"), None, CLIENT)
         .await;
     for answer in [page, start, confirm] {
         assert!(
@@ -635,7 +719,7 @@ async fn without_a_quick_connect_manager_there_is_no_approval() {
 async fn an_account_without_remote_access_approves_from_the_local_network() {
     let approval = Approval::new().await;
     let (code, secret) = approval.initiate().await;
-    let (page, cookie) = approval.called_back(&code).await;
+    let (page, cookie) = approval.called_back().await;
     approval
         .edit_policy(|policy| policy.enable_remote_access = false)
         .await;
@@ -643,6 +727,7 @@ async fn an_account_without_remote_access_approves_from_the_local_network() {
         .confirm_from(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             Some(&confirmation_of(&page.html)),
+            Some(&code),
             Some(&cookie),
         )
         .await;
@@ -659,24 +744,30 @@ async fn what_changed_since_the_callback_refuses_the_approval() {
     let sso = &approval.harness.sso;
     let (code, secret) = approval.initiate().await;
 
-    let (page, cookie) = approval.called_back(&code).await;
+    let (page, cookie) = approval.called_back().await;
     let confirmation = confirmation_of(&page.html);
     let mut pending = sso.exchanges.take(&confirmation).expect("pending");
     pending.created = Instant::now()
         .checked_sub(EXCHANGE_CODE_LIFETIME + Duration::from_secs(1))
         .expect("the clock reaches back");
     sso.exchanges.insert(confirmation.clone(), pending);
-    let late = approval.confirm(Some(&confirmation), Some(&cookie)).await;
+    let late = approval
+        .confirm(Some(&confirmation), Some(&code), Some(&cookie))
+        .await;
     assert_eq!(late.status, 400, "{}", late.html);
 
-    let (page, cookie) = approval.called_back(&code).await;
+    let (page, cookie) = approval.called_back().await;
     let mut provider = approval.harness.provider("fake").await;
     provider.enabled = false;
     sso.save_oidc_provider("fake", provider.clone())
         .await
         .expect("saved");
     let disabled = approval
-        .confirm(Some(&confirmation_of(&page.html)), Some(&cookie))
+        .confirm(
+            Some(&confirmation_of(&page.html)),
+            Some(&code),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(disabled.status, 400, "{}", disabled.html);
     provider.enabled = true;
@@ -684,7 +775,7 @@ async fn what_changed_since_the_callback_refuses_the_approval() {
         .await
         .expect("saved");
 
-    let (page, cookie) = approval.called_back(&code).await;
+    let (page, cookie) = approval.called_back().await;
     let user = approval.account().await;
     // The last account cannot be deleted.
     approval
@@ -700,7 +791,11 @@ async fn what_changed_since_the_callback_refuses_the_approval() {
         .await
         .expect("deleted");
     let deleted = approval
-        .confirm(Some(&confirmation_of(&page.html)), Some(&cookie))
+        .confirm(
+            Some(&confirmation_of(&page.html)),
+            Some(&code),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(deleted.status, 400, "{}", deleted.html);
     assert!(!approval.authorized(&secret).await);
@@ -713,7 +808,7 @@ async fn without_the_required_role_no_code_is_approved_and_no_account_made() {
     let approval = Approval::with(|provider| USERS.clone_into(&mut provider.required_role)).await;
     let (code, secret) = approval.initiate().await;
     approval.groups(json!(["someone-else"]));
-    let (page, cookie) = approval.called_back(&code).await;
+    let (page, cookie) = approval.called_back().await;
     assert_eq!(page.status, 403, "{}", page.html);
     assert!(
         page.html
@@ -731,12 +826,18 @@ async fn without_the_required_role_no_code_is_approved_and_no_account_made() {
         .expect("lookup");
     assert!(account.is_none(), "no account");
     // Nothing was offered to confirm.
-    assert_eq!(approval.confirm(None, Some(&cookie)).await.status, 400);
+    assert_eq!(
+        approval
+            .confirm(None, Some(&code), Some(&cookie))
+            .await
+            .status,
+        400
+    );
     assert!(!approval.authorized(&secret).await);
 
-    // With the role, the same code is asked about.
+    // With the role, the code is asked for.
     approval.groups(json!([USERS]));
-    let (page, _) = approval.called_back(&code).await;
+    let (page, _) = approval.called_back().await;
     assert_eq!(page.status, 200, "{}", page.html);
 }
 
@@ -826,7 +927,7 @@ async fn role_sync_applies_when_a_code_is_approved() {
 async fn a_link_removed_since_the_callback_refuses_the_approval() {
     let approval = Approval::new().await;
     let (code, secret) = approval.initiate().await;
-    let (page, cookie) = approval.called_back(&code).await;
+    let (page, cookie) = approval.called_back().await;
     assert_eq!(page.status, 200, "{}", page.html);
     let user = approval.account().await;
     approval
@@ -841,7 +942,11 @@ async fn a_link_removed_since_the_callback_refuses_the_approval() {
         .expect("removed");
 
     let reply = approval
-        .confirm(Some(&confirmation_of(&page.html)), Some(&cookie))
+        .confirm(
+            Some(&confirmation_of(&page.html)),
+            Some(&code),
+            Some(&cookie),
+        )
         .await;
     assert_eq!(reply.status, 400, "{}", reply.html);
     assert!(!approval.authorized(&secret).await);
@@ -854,7 +959,7 @@ async fn a_link_removed_since_the_callback_refuses_the_approval() {
 async fn a_removal_during_an_approval_signs_the_app_out() {
     let approval = Approval::new().await;
     let (code, _secret) = approval.initiate().await;
-    let (page, cookie) = approval.called_back(&code).await;
+    let (page, cookie) = approval.called_back().await;
     assert_eq!(page.status, 200, "{}", page.html);
     let user = Uuid::parse_str(&approval.account().await.id).expect("an id");
     // The session's success event stalls the approval after the app's
@@ -895,7 +1000,7 @@ async fn a_removal_during_an_approval_signs_the_app_out() {
         removing.await
     };
     let (reply, removed) = tokio::join!(
-        approval.confirm(Some(&confirmation), Some(&cookie)),
+        approval.confirm(Some(&confirmation), Some(&code), Some(&cookie)),
         removal
     );
     removed.expect("removed");

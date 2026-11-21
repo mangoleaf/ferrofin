@@ -67,8 +67,8 @@ static COMPLETE_POLICY: LazyLock<String> = LazyLock::new(|| {
 const FAILED: &str = "Sign-in failed. Try again.";
 
 /// The completion page for the exchange `code`, bound to the flow `cookie`,
-/// which it sets again to live as long as the code (when a public URL names
-/// its path).
+/// which it sets again to live as long as the code (when a public URL is
+/// known).
 pub(super) fn completion_page(code: &str, cookie: &Secret, public_url: Option<&str>) -> SsoReply {
     let mut reply = page(
         200,

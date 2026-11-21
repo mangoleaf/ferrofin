@@ -16,8 +16,8 @@
 //! - `POST /sso/oidc/exchange` — the completion page's script swaps its
 //!   one-time code for the session there, for anyone;
 //! - `GET /sso/quickconnect` and `POST /sso/quickconnect` — a native app's
-//!   Quick Connect code entered, approved through a sign-in started with
-//!   `?quickConnect=CODE`, and confirmed, for anyone;
+//!   Quick Connect code approved through a sign-in started with an empty
+//!   `?quickConnect`, then typed on the confirmation page, for anyone;
 //! - the account-link routes, in [`links`].
 //!
 //! Not Jellyfin contract operations, so they are listed in
@@ -43,7 +43,7 @@ use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcExchangeRequest, OidcProvider, OidcProviderInfo, OidcProviderList};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::session::AuthenticationRequest;
-use ferrofin_traits::sso::{OIDC_FLOW_COOKIE, OidcCallback, SsoManager, SsoReply};
+use ferrofin_traits::sso::{OidcCallback, SsoManager, SsoReply};
 
 use crate::auth::RequireAdmin;
 use crate::error::{ApiError, FailureLogged};
@@ -222,33 +222,44 @@ fn private_reply(response: &mut Response, cookies: Vec<String>) -> Result<(), Ap
     Ok(())
 }
 
-/// The browser's [`OIDC_FLOW_COOKIE`], from every `Cookie` header.
-fn flow_cookie(headers: &HeaderMap) -> Option<Secret> {
-    headers
+/// The browser's flow cookie, from every `Cookie` header, under the one name
+/// `sso` reads it by ([`SsoManager::flow_cookie_name`]): on an `https` public
+/// URL a cookie under the other name, which another host could have planted,
+/// is never read.
+async fn flow_cookie(
+    sso: &dyn SsoManager,
+    headers: &HeaderMap,
+) -> Result<Option<Secret>, ApiError> {
+    if !headers.contains_key(header::COOKIE) {
+        return Ok(None);
+    }
+    let wanted = sso.flow_cookie_name().await?;
+    Ok(headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(';'))
         .find_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
-            (name == OIDC_FLOW_COOKIE).then(|| Secret::new(value))
-        })
+            (name == wanted).then(|| Secret::new(value))
+        }))
 }
 
 /// `GET /sso/oidc/{provider}/start` — sends the browser to the provider's
-/// sign-in page, binding the attempt to it with the [`OIDC_FLOW_COOKIE`].
-/// Anonymous: this is how a user signs in. With `quickConnect`, the sign-in
-/// approves that Quick Connect code once the browser confirms it.
+/// sign-in page, binding the attempt to it with the flow cookie. Anonymous:
+/// this is how a user signs in. With an empty `quickConnect`, the sign-in
+/// approves a Quick Connect code typed after it; a `quickConnect` holding
+/// anything, a code included, is refused.
 #[utoipa::path(
     get,
     path = "/sso/oidc/{provider}/start",
     params(
         ("provider" = String, Path, description = "The provider's key"),
-        ("quickConnect" = Option<String>, Query, description = "The Quick Connect code the sign-in approves, once confirmed")
+        ("quickConnect" = Option<String>, Query, description = "Present and empty: the sign-in approves a Quick Connect code, typed once it passes")
     ),
     responses(
         (status = 302, description = "To the identity provider, with the flow cookie set"),
-        (status = 400, description = "The quickConnect value is not a Quick Connect code: a page saying so"),
+        (status = 400, description = "The quickConnect parameter holds a value (a code is typed after the sign-in): a page saying so"),
         (status = 403, description = "With quickConnect, Quick Connect is turned off: a page saying so"),
         (status = 502, description = "The identity provider could not be reached: a page saying so"),
         (status = 503, description = "No public URL is set to build the callback URL on: a page naming the setting"),
@@ -264,12 +275,14 @@ async fn start_oidc_sign_in(
     let sso = enabled_service(&state).await?;
     let provider = sign_in_provider(provider)?;
     let client = state.client_address(&parts);
+    // Of repeated ones, one that holds something, which the start refuses.
     let quick_connect = form_urlencoded::parse(parts.uri.query().unwrap_or_default().as_bytes())
-        .find(|(name, _)| name == "quickConnect")
-        .map(|(_, code)| code.into_owned());
+        .filter(|(name, _)| name == "quickConnect")
+        .map(|(_, value)| value.into_owned())
+        .min_by_key(String::is_empty);
     browser_reply(match quick_connect {
-        Some(code) => {
-            sso.start_oidc_quick_connect(&provider, client, &code)
+        Some(value) => {
+            sso.start_oidc_quick_connect(&provider, client, &value)
                 .await?
         }
         None => sso.start_oidc_sign_in(&provider, client).await?,
@@ -337,7 +350,7 @@ async fn finish_oidc_sign_in(
         code: once("code").map(Secret::new),
         iss: once("iss"),
         error: once("error"),
-        flow_cookie: flow_cookie(&headers),
+        flow_cookie: flow_cookie(sso.as_ref(), &headers).await?,
     };
     browser_reply(sso.finish_oidc_sign_in(&provider, callback).await?)
 }
@@ -384,8 +397,9 @@ async fn exchange_oidc_sign_in(
         remote_endpoint: Some(state.client_address(&parts).to_string()),
         ..AuthenticationRequest::default()
     };
+    let cookie = flow_cookie(sso.as_ref(), &parts.headers).await?;
     let reply = sso
-        .exchange_oidc_sign_in(request.code, flow_cookie(&parts.headers), session)
+        .exchange_oidc_sign_in(request.code, cookie, session)
         .await?;
     let mut response = match reply.outcome {
         Ok(result) => Json(super::users::authentication_result(result)).into_response(),
@@ -405,15 +419,15 @@ async fn exchange_oidc_sign_in(
     Ok(response)
 }
 
-/// `GET /sso/quickconnect` — the page where a native app's Quick Connect code
-/// is entered, with a button for each provider that can sign users in, each
-/// starting a sign-in that approves it once confirmed. Anonymous: whoever
-/// signs in approves the code as themselves.
+/// `GET /sso/quickconnect` — the page that starts a native app's Quick
+/// Connect approval: a link for each provider that can sign users in, each
+/// starting a sign-in whose confirmation page asks for the code. Anonymous:
+/// whoever signs in approves the code they type as themselves.
 #[utoipa::path(
     get,
     path = "/sso/quickconnect",
     responses(
-        (status = 200, description = "The code-entry page"),
+        (status = 200, description = "The page with a sign-in link per provider"),
         (status = 403, description = "Quick Connect is turned off: a page saying so"),
         (status = 404, description = "No provider can sign users in, or the Single Sign-On plugin is disabled or not available")
     ),
@@ -424,17 +438,17 @@ async fn quick_connect_page(State(state): State<AppState>) -> Result<Response, A
     browser_reply(sso.quick_connect_page().await?)
 }
 
-/// `POST /sso/quickconnect` — the confirmation page's form: approves its
-/// Quick Connect code, once, with the flow cookie its `confirmation` is bound
-/// to, as the account the sign-in found, from the caller's address. Answers a
-/// page either way, and clears the flow cookie.
+/// `POST /sso/quickconnect` — the confirmation page's form: approves the
+/// Quick Connect `code` typed on it, once, with the flow cookie its
+/// `confirmation` is bound to, as the account the sign-in found, from the
+/// caller's address. Answers a page either way, and clears the flow cookie.
 #[utoipa::path(
     post,
     path = "/sso/quickconnect",
-    request_body(content = String, content_type = "application/x-www-form-urlencoded", description = "confirmation=…, from the confirmation page"),
+    request_body(content = String, content_type = "application/x-www-form-urlencoded", description = "confirmation=…&code=…, from the confirmation page"),
     responses(
         (status = 200, description = "The app is signed in: a page saying so"),
-        (status = 400, description = "Refused: the confirmation is unknown, used, expired or not this browser's, its identity is no longer linked to the account, or the code is unknown, expired or approved already"),
+        (status = 400, description = "Refused: the confirmation is unknown, used, expired or not this browser's, its identity is no longer linked to the account, or the code is not one, or is unknown, expired or approved already"),
         (status = 403, description = "Refused: Quick Connect is turned off, or a sign-in rule refuses the account"),
         (status = 404, description = "The Single Sign-On plugin is disabled or not available")
     ),
@@ -446,12 +460,17 @@ async fn confirm_quick_connect(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     let sso = enabled_service(&state).await?;
-    let confirmation = form_urlencoded::parse(&body)
-        .find(|(name, _)| name == "confirmation")
-        .map(|(_, value)| Secret::new(value.into_owned()));
+    let form: Vec<(String, String)> = form_urlencoded::parse(&body).into_owned().collect();
+    let field = |wanted: &str| {
+        form.iter()
+            .find(|(name, _)| name == wanted)
+            .map(|(_, value)| value.as_str())
+    };
+    let confirmation = field("confirmation").map(Secret::new);
+    let cookie = flow_cookie(sso.as_ref(), &parts.headers).await?;
     let client = state.client_address(&parts);
     browser_reply(
-        sso.confirm_oidc_quick_connect(confirmation, flow_cookie(&parts.headers), client)
+        sso.confirm_oidc_quick_connect(confirmation, field("code"), cookie, client)
             .await?,
     )
 }

@@ -1175,12 +1175,11 @@ async fn devices(server: &SsoServer) -> Vec<String> {
         .collect()
 }
 
-/// The browser's part of a Quick Connect approval of `code` by `user`, up to
-/// the confirmation page: its confirmation value and the flow cookie's
-/// `name=value`.
+/// The browser's part of a Quick Connect approval by `user`, up to the
+/// confirmation page, where the code is typed: its confirmation value and the
+/// flow cookie's `name=value`.
 async fn confirmation_for(
     server: &SsoServer,
-    code: &str,
     (user, password): &(String, String),
     seen: &Captured,
 ) -> (String, String) {
@@ -1189,13 +1188,10 @@ async fn confirmation_for(
     assert!(
         text(page)
             .await
-            .contains("formaction=\"oidc/keycloak/start\"")
+            .contains("<a href=\"oidc/keycloak/start?quickConnect\">")
     );
     let start = server
-        .get(
-            &format!("/sso/oidc/keycloak/start?quickConnect={code}"),
-            None,
-        )
+        .get("/sso/oidc/keycloak/start?quickConnect", None)
         .await;
     assert_eq!(start.status(), StatusCode::FOUND);
     let (callback, flow) = callback_of(&start, user, password, seen).await;
@@ -1204,7 +1200,7 @@ async fn confirmation_for(
     let html = text(page).await;
     assert!(
         html.contains(&format!(
-            "Sign in the device showing code <strong>{code}</strong> as <strong>{user}</strong>?"
+            "You are signed in as <strong>{user}</strong>. Type the code your app shows"
         )),
         "{html}"
     );
@@ -1217,10 +1213,11 @@ async fn confirmation_for(
     (confirmation, flow)
 }
 
-/// B13 and D8: a native app's Quick Connect code is approved by a browser
-/// that signs in at Keycloak through `/sso/quickconnect` and confirms; the
-/// app is then signed in as the account the realm user signs in to, on its
-/// own device, and the browser gets no session.
+/// B13, and D8 as D23 amends it: a native app's Quick Connect code is
+/// approved by a browser that signs in at Keycloak through
+/// `/sso/quickconnect` and then types the code; the app is then signed in as
+/// the account the realm user signs in to, on its own device, and the browser
+/// gets no session. A start link carrying the code is refused.
 #[tokio::test]
 #[ignore = "needs a Keycloak holding the ferrofin-test realm; run with --ignored"]
 async fn a_native_apps_quick_connect_code_is_approved_through_keycloak() {
@@ -1253,15 +1250,25 @@ async fn a_native_apps_quick_connect_code_is_approved_through_keycloak() {
             .clone()
     };
 
-    // The browser enters it on the code-entry page and signs in.
-    let (confirmation, flow) = confirmation_for(&server, &code, &member, &seen).await;
+    // A link carrying the code is refused before Keycloak is asked.
+    let carried = server
+        .get(
+            &format!("/sso/oidc/keycloak/start?quickConnect={code}"),
+            None,
+        )
+        .await;
+    assert_eq!(carried.status(), StatusCode::BAD_REQUEST);
+    assert!(carried.headers().get(header::SET_COOKIE).is_none());
+
+    // The browser signs in through the page's link.
+    let (confirmation, flow) = confirmation_for(&server, &member, &seen).await;
     assert_eq!(
         authorized().await,
         false,
-        "nothing approved before confirming"
+        "nothing approved before the code is typed"
     );
 
-    // The browser confirms: the app is authorized.
+    // The browser types the code: the app is authorized.
     let approved = server
         .send(
             Request::builder()
@@ -1269,7 +1276,9 @@ async fn a_native_apps_quick_connect_code_is_approved_through_keycloak() {
                 .uri("/sso/quickconnect")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(header::COOKIE, &flow)
-                .body(Body::from(format!("confirmation={confirmation}")))
+                .body(Body::from(format!(
+                    "confirmation={confirmation}&code={code}"
+                )))
                 .expect("request"),
         )
         .await;
@@ -1301,7 +1310,7 @@ async fn a_native_apps_quick_connect_code_is_approved_through_keycloak() {
         "only the app is signed in"
     );
     println!(
-        "verified: the app's Quick Connect code was approved through Keycloak, and only the app is signed in"
+        "verified: the app's Quick Connect code, typed after a Keycloak sign-in, was approved, a link carrying it was refused, and only the app is signed in"
     );
     identity_secrets(&server, &seen).await;
     seen.assert_no_secret_logged(&realm);
