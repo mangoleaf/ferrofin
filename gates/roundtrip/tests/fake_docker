@@ -12,11 +12,15 @@
 # container"); each removal is logged by name in $FAKE_STATE/removed.
 # Knobs: FAKE_RUN_DELAY (seconds a run takes), FAKE_EXIT_CODE (what a stopped container exited with),
 # FAKE_JELLYFIN=loses (Jellyfin's copy has lost a favorite), =reshares (its playlist refresh shares a playlist
-# again, as a stale playlist.xml would), =hang (it answers 503 and never logs why),
-# =exits (it stops with status 3 before it answers) or =setup (its setup server answers first);
-# FAKE_EXPORT=fails (the export exits 1), =hangs (it never ends), =history-kept (no fake-ran),
-# =all-recorded (an empty fake-ran: every id recorded, so Jellyfin runs no migration) or =stale-paths (the
-# exported database still names the library folder where Ferrofin ran).
+# again, as a stale playlist.xml would), =churns (its scan deletes an item), =hang (it answers 503 and never
+# logs why), =exits (it stops with status 3 before it answers), =setup (its setup server answers first),
+# =killed (it exits 137 when stopped), =errs (a log read after its first one has an ERR entry more) or
+# =migrates-again (its second start logs a migration); FAKE_EXPORT=fails (the export exits 1), =hangs (it never
+# ends), =history-kept (no fake-ran), =all-recorded (an empty fake-ran: every id recorded, so Jellyfin runs no
+# migration), =stale-paths (the exported database still names the library folder where Ferrofin ran), or one
+# fake_server.py's export breaks (=unreported, =extra-table, =drops-config). The export drops the tables of
+# Ferrofin's and writes the loss report (fake_server.py export). A Jellyfin started a second time on one copy
+# (the container <...>-jellyfin-again) logs no migration.
 set -uo pipefail
 state=${FAKE_STATE:?}
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -57,10 +61,11 @@ case "$1" in
       if [ "${FAKE_EXPORT:-}" = hangs ]; then   # a container that ignores TERM, as the export's process 1 does
         trap '' TERM; sleep 120 & echo $! > "$state/$name.pid"; wait; exit 137
       fi
-      cp -a "$config" "$out" || exit 1
+      cp -a "$config" "$out" && python3 "$here/fake_server.py" export "$out" || exit 1
       case ${FAKE_EXPORT:-} in
-        stale-paths) sqlite3 "$out/data/jellyfin.db" \
-          "INSERT INTO BaseItems (Path) VALUES ('$data/root/default/Movies')" || exit 1;;&
+        stale-paths) sqlite3 "$out/data/jellyfin.db" "INSERT INTO BaseItems (Id, Type, IsFolder, IsInMixedFolder, IsLocked,
+          IsMovie, IsRepeat, IsSeries, IsVirtualItem, Path) VALUES ('EEEEEEEE-EEEE-EEEE-EEEE-EEEEEEEEEEEE',
+          'MediaBrowser.Controller.Entities.Folder', 1, 0, 0, 0, 0, 0, 0, '$data/root/default/Movies')" || exit 1;;&
         history-kept) ;;
         all-recorded) : > "$out/fake-ran";;
         *) if [ -f "$config/fake-left-to-run" ]; then cp "$config/fake-left-to-run" "$out/fake-ran"; else : > "$out/fake-ran"; fi;;
@@ -69,13 +74,14 @@ case "$1" in
     fi
     case $image in *dead*) exit 0;; esac
     role=ferrofin behaviour=ok log=ok
-    if [ "${name%-jellyfin}" != "$name" ]; then
+    if [ "${name%-jellyfin}" != "$name" ] || [ "${name%-jellyfin-again}" != "$name" ]; then
       role=jellyfin
       case $config in */10.11.8/*) [ -f "$config/fake-ran" ] || behaviour=start-failed log=start-failed;; esac
       case ${FAKE_JELLYFIN:-} in
-        loses) behaviour=loses;; reshares) behaviour=reshares;; hang) behaviour=start-failed;; setup) behaviour=setup;;
-        exits) behaviour=exits; echo 3 > "$state/$name.exit";;
+        loses) behaviour=loses;; reshares) behaviour=reshares;; churns) behaviour=churns;; hang) behaviour=start-failed;;
+        setup) behaviour=setup;; exits) behaviour=exits; echo 3 > "$state/$name.exit";;
       esac
+      [ "${name%-jellyfin-again}" = "$name" ] || [ "$log" != ok ] || log=again
     fi
     echo "$role $log $config" > "$state/$name.role"
     setsid python3 "$here/fake_server.py" serve "$state/$name.port" "$role" "$config" "$behaviour" >/dev/null 2>&1 &
@@ -95,17 +101,26 @@ case "$1" in
       printf '{"level":"INFO","fields":{"message":"adopted an existing Jellyfin database in place","generation":"%s"}}\n' \
         "$(cat "$config/fake-generation")"
       echo '{"level":"INFO","fields":{"message":"database migrations applied","migrations":49,"head":49}}'
-    elif [ "$log" = ok ]; then   # jellyfin-ok.log without its migrations, and those fake-ran lists
+    elif [ "$log" = ok ] || [ "$log" = again ]; then   # jellyfin-ok.log without its migrations, and those fake-ran lists
       head -n 1 "$here/jellyfin-ok.log"
-      while read -r ran; do
+      { [ "$log" = ok ] && cat "$config/fake-ran" 2>/dev/null; } | while read -r ran; do
         printf '[07:53:39] [INF] [10] InternalCodeMigration: %s\n' "Perform migration $ran" "Migration $ran was successfully applied"
-      done < <(cat "$config/fake-ran" 2>/dev/null)
+      done
+      [ "$log" != again ] || [ "${FAKE_JELLYFIN:-}" != migrates-again ] ||
+        printf '[07:53:39] [INF] [10] InternalCodeMigration: Perform migration %s\n' 20260729120000_RestorePlaylistChildrenFromMetadata
       grep -v Migration "$here/jellyfin-ok.log" | tail -n +2
+      reads=$(cat "$state/$last.reads" 2>/dev/null || echo 0); echo $((reads + 1)) > "$state/$last.reads"
+      [ "$reads" = 0 ] || [ "${FAKE_JELLYFIN:-}" != errs ] ||
+        echo '[07:53:40] [ERR] [10] Emby.Server.Implementations.Library.LibraryManager: Error validating the library'
     else
       cat "$here/jellyfin-$log.log"
     fi
     exit 0;;
-  stop) ! alive "$last" || kill "$(cat "$state/$last.pid")"; exit 0;;
+  stop)
+    ! alive "$last" || kill "$(cat "$state/$last.pid")"
+    read -r role _ < "$state/$last.role" 2>/dev/null
+    [ "${role:-}" != jellyfin ] || [ "${FAKE_JELLYFIN:-}" != killed ] || echo 137 > "$state/$last.exit"
+    exit 0;;
   rm)
     [ -f "$state/$last.id" ] || { echo "Error response from daemon: No such container: $last" >&2; exit 1; }
     name=$(cat "$state/$last.id")

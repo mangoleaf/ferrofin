@@ -3,7 +3,11 @@
 
     checks_boot.py migrations LOG      a line per migration Jellyfin began and never finished, with the error it
                                        died of (the SQLite error when there is one)
-    checks_boot.py errors LOG          ERR and FTL entries outside ALLOWED: how many, and the first few
+    checks_boot.py errors LOG [EARLIER]
+                                       ERR and FTL entries outside ALLOWED: how many, and the first few; with
+                                       EARLIER, an earlier capture of the same log, only the entries after it
+    checks_boot.py quiet LOG           a line per migration Jellyfin began: a start on a database it has started on
+                                       before must run none
     checks_boot.py ran LOG ORACLE DB   the schema migrations Jellyfin began (the exported history should record
                                        every one), and the code migrations it ran that differ from those ORACLE,
                                        the log of its own first start on the route's source, shows it running,
@@ -28,11 +32,16 @@ ENTRY = re.compile(r"^\[\d\d:\d\d:\d\d(?:\.\d+)?\] \[(VRB|DBG|INF|WRN|ERR|FTL)\]
 BEGUN = re.compile(r"^Perform migration (\S+)$")
 DONE = re.compile(r"^Migration (\S+) was successfully applied$")
 SQLITE = re.compile(r"SQLite Error \d+: '[^\n]*?'")
-#: The errors a round trip expects, each with why: (pattern on "<source>: <first line>", reason). Only what a
-#: live run has logged is here: a provider call behind the proxy gets an entry once one is seen, not before.
+#: The errors a round trip expects, each with why: (pattern on "<source>: <first line>", pattern the whole entry must
+#: also match or None, reason). Only what a live run has logged is here: a provider gets an entry once one is seen.
 ALLOWED = (
     (re.compile(r"^Emby\.Server\.Implementations\.Updates\.InstallationManager: An error occurred while accessing "
-                r"the plugin manifest"), "the plugin repository, behind the unreachable proxy"),
+                r"the plugin manifest"), None, "the plugin repository, behind the unreachable proxy"),
+    (re.compile(r"^Jellyfin\.Api\.Middleware\.ExceptionMiddleware: Error processing request: Invalid username or "
+                r"password entered\. URL POST /Users/AuthenticateByName\.$"), None,
+     "answers.py's badlogin probe, which signs in with a wrong password on purpose"),
+    (re.compile(r"^MediaBrowser\.Providers\.[\w.]+: Error in [\w ]+ for "), re.compile(r"\(127\.0\.0\.1:9\)"),
+     "a remote metadata provider, behind the unreachable proxy (rt_start's HTTP_PROXY)"),
 )
 #: How many unexpected errors a reason quotes before it only counts the rest.
 MAX_SHOWN = 3
@@ -103,18 +112,33 @@ def shown(names):
     return ", ".join(names[:MAX_SHOWN]) + more
 
 
-def errors(log):
-    unexpected = [f"[{level}] {source}: {first}" for level, source, first, _ in entries(log)
-                  if level in ("ERR", "FTL") and not any(p.match(f"{source}: {first}") for p, _ in ALLOWED)]
+def allowed(source, first, whole):
+    return any(p.match(f"{source}: {first}") and (also is None or also.search(whole)) for p, also, _ in ALLOWED)
+
+
+def errors(log, earlier=None):
+    found, before = entries(log), len(entries(earlier)) if earlier is not None else 0
+    if len(found) < before:
+        return [f"the log has {len(found)} entries, fewer than the {before} of the earlier capture it continues"]
+    found = found[before:]
+    unexpected = [f"[{level}] {source}: {first}" for level, source, first, whole in found
+                  if level in ("ERR", "FTL") and not allowed(source, first, whole)]
     if not unexpected:
         return []
     more = f"; and {len(unexpected) - MAX_SHOWN} more" if len(unexpected) > MAX_SHOWN else ""
     return [f"{len(unexpected)} unexpected error(s): {'; '.join(e[:200] for e in unexpected[:MAX_SHOWN])}{more}"]
 
 
+def quiet(log):
+    code, schema = performed(log)
+    if not code + schema:
+        return []
+    return [f"it began {len(code + schema)} migration(s) on a database it had started on: {shown(schema + code)}"]
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if not argv or len(argv) != {"migrations": 2, "errors": 2, "ran": 4}.get(argv[0], 0):
+    if not argv or len(argv) not in {"migrations": (2,), "errors": (2, 3), "quiet": (2,), "ran": (4,)}.get(argv[0], ()):
         print(__doc__.split("\n\n")[1], file=sys.stderr)
         return 2
     logs = []
@@ -134,7 +158,7 @@ def main(argv=None):
         except sqlite3.Error as error:
             print(f"cannot read the source's history in {argv[3]}: {error}")
             return 2
-    reasons = {"migrations": migrations, "errors": errors, "ran": ran}[argv[0]](*logs)
+    reasons = {"migrations": migrations, "errors": errors, "quiet": quiet, "ran": ran}[argv[0]](*logs)
     for reason in reasons:
         print(reason)
     return int(bool(reasons))

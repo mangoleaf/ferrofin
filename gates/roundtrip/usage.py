@@ -22,7 +22,8 @@ user changes:
 The library is then scanned and the server left to settle: the metadata refresh each new playlist and
 collection queued is no scheduled task, and one that saves an item after a change to it would undo the
 change (or bring a deleted item back). Then
-  6. the playlist is renamed, a movie's metadata edited and locked, and the collection given a primary image;
+  6. the playlist is renamed, a movie's metadata edited and locked, the collection given a primary image, and one
+     setting of each configuration document answers.py compares changed from its default (SETTINGS);
   7. the second playlist and collection are deleted. The copy's media is read-only, so the items the stage
      deletes are these, whose files live in the data directory;
   8. every share of the playlist answers.SHARE_OWNER shared in Jellyfin is removed, as its owner.
@@ -55,6 +56,17 @@ DOOMED_PLAYLIST, DOOMED_COLLECTION = "Round trip deleted playlist", "Round trip 
 PLAYER, RESTRICTED = "roundtrip-user", "roundtrip-passwordless"   # both in answers.GATE_USERS
 DEVICE_NAME, API_KEY_APP, ADDED_LIBRARY = "Round trip device", "Round trip", "Round trip library"
 REMOVED_KIND, EDITED, OVERVIEW = "homevideos", "Round trip edited movie", "Edited by the round-trip usage stage."
+#: (document, setting, value): one setting of each document answers.CONFIGURATION compares, away from Jellyfin's
+#: default, so an export that loses a document, or a Jellyfin that cannot read one and falls back to its defaults,
+#: answers otherwise. Each changes little the gate does: the library monitor's delay, a transcode quality, the UDP
+#: discovery answer, the sign-in page's disclaimer, NFO savers' extra thumbs (no library saves NFO here), and the
+#: metadata document's only setting, whether a scan reads a file's date added from its creation time. With that one
+#: off, Jellyfin's refresh no longer resets a re-detected file's DateCreated (MetadataService.cs:383-388), so the
+#: counts' "another DateCreated" and the library rows' DateCreated cannot fire on that; the row diff still sees
+#: DateModified and any other column.
+SETTINGS = (("system", "LibraryMonitorDelay", 75), ("encoding", "H264Crf", 21), ("network", "AutoDiscovery", False),
+            ("branding", "LoginDisclaimer", "Round-trip"), ("metadata", "UseFileCreationTimeForDateAdded", False),
+            ("xbmcmetadata", "EnableExtraThumbsDuplication", True))
 #: Every request the stage made, "<action>  <HTTP status>", in order: FILE.actions.
 RECORD = []
 
@@ -287,6 +299,10 @@ def run(base_url, data_dir, oracle_out, timeout):
         **item, "Name": EDITED, "Overview": OVERVIEW, "LockData": True, "LockedFields": ["Name", "Overview"]})
     act(server, "give the collection a primary image", "POST", f"/Items/{collection}/Images/Primary",
         base64.b64encode(png(120, 180, (255, 165, 0))), content_type="image/png")
+    for document, setting, wanted in SETTINGS:
+        path = "/System/Configuration" + ("" if document == "system" else f"/{document}")
+        current = act(server, f"read the {document} settings", "GET", path) or {}
+        act(server, f"change {setting} in the {document} settings", "POST", path, {**current, setting: wanted})
     act(server, f"delete the playlist {DOOMED_PLAYLIST}", "DELETE", f"/Items/{doomed_playlist}")
     act(server, f"delete the collection {DOOMED_COLLECTION}", "DELETE", f"/Items/{doomed_collection}")
     unshared = unshare(server, data_dir)
@@ -344,7 +360,14 @@ def run(base_url, data_dir, oracle_out, timeout):
             (f"unshare {unshared}", f"shares {answers.SHARE_OWNER} {unshared} = -",
              f"shares {answers.SHARE_OWNER} {unshared} = -" in lines),
             *((f"create the user {n}", f"login {n} 200 token=yes", f"login {n} 200 token=yes" in lines)
-              for n in sorted(answers.GATE_USERS))):
+              for n in sorted(answers.GATE_USERS)),
+            ("add a library", f"virtualfolder {ADDED_LIBRARY} with EnableRealtimeMonitor=False",
+             "EnableRealtimeMonitor=False" in (after_the_prefix(lines, f"virtualfolder {ADDED_LIBRARY} ") or "").split(" ")),
+            ("play a movie directly", "stream <the first movie> 200 with bytes above 0",
+             any(re.fullmatch(r"stream .+ 200 bytes=[1-9][0-9]* sha256=[0-9a-f]+", line) for line in lines)),
+            *((f"change {setting} in the {document} settings", f"config {document} with {setting}={wanted}",
+               f"{setting}={wanted}" in (after_the_prefix(lines, f"config {document} ") or "").split(" "))
+              for document, setting, wanted in SETTINGS)):
         shown(action, wanted, found)
     answers.write(oracle_out, lines)
 

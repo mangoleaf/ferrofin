@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The export stage of a round-trip route, sourced by run.sh: `ferrofin-server export-jellyfin` from the image
 # under test, run as an operator runs it once the server has stopped, writes the copy Jellyfin boots on, and
-# its stored paths are checked before Jellyfin opens it. It uses run.sh's state: route, ran_at, config_at,
+# its stored paths, its schema and its loss report are checked before Jellyfin opens it (checks_paths.py stored,
+# checks_db.py export). It uses run.sh's state: route, ran_at, config_at,
 # SERVER_DIRS, media, dst, the settings, TAG, FIXTURES, MADE, and why[] through check and mark.
 # shellcheck disable=SC2154  # run.sh sets what this reads
 
@@ -35,6 +36,9 @@ export_stage() {
     check reasons python3 "$HERE/checks_paths.py" stored --db "$dst/jellyfin/data/jellyfin.db" --out "$dst/jellyfin" \
       --media "$FIXTURES/$media" --before "$dst/ferrofin/data/jellyfin.db" "${copies[@]}"
     mark Export "every stored path is in the export, none under the directory Ferrofin ran at"
+    check reasons python3 "$HERE/checks_db.py" export --db "$dst/jellyfin/data/jellyfin.db" \
+      --source "$dst/ferrofin/data/jellyfin.db" --report "$dst/jellyfin/$RT_LOSS_REPORT" --schema "$RT_SCHEMA"
+    mark Export "its database has Jellyfin's schema, and its loss report every table of Ferrofin's that held rows"
   fi
   [ "${#why[@]}" = 0 ]
 }

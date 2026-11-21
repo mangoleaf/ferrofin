@@ -37,6 +37,14 @@ rt_new_run_id() { printf '%s-%s\n' "$(date +%Y%m%d-%H%M%S)" "$$"; }
 # rt_valid_run_id <id>: whether <id> can name containers, an image tag and a directory.
 rt_valid_run_id() { [[ $1 =~ ^[a-z0-9][a-z0-9.-]{0,47}$ ]]; }
 
+# The Jellyfin schema an exported database must have: the 12.2 pin, as the export's own test has it (12.3 and 12.4
+# add no schema migration). Relative to the repository, where run.sh runs.
+# shellcheck disable=SC2034  # read by run.sh and stage_export.sh
+RT_SCHEMA=crates/ferrofin-db/tests/data/jellyfin-12.2-schema.sql
+# The loss report the export writes into its output (ferrofin_db::export::LOSS_REPORT).
+# shellcheck disable=SC2034
+RT_LOSS_REPORT=ferrofin-export-report.txt
+
 # rt_name <run id> <route> <role>: the container of one server of one route of one run.
 rt_name() { printf 'rt-%s-%s-%s\n' "$1" "$2" "$3"; }
 

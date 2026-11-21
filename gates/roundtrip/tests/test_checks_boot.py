@@ -105,6 +105,37 @@ class Errors(unittest.TestCase):
         log = "[01:00:00] [INF] [1] Main: starting\n[ERR] looks like a level but continues the entry above\n"
         self.assertEqual(checks_boot.errors(log), [])
 
+    def test_the_answers_wrong_password_and_a_provider_behind_the_proxy_are_expected(self):
+        # as Jellyfin 12.4 logged them in a round trip
+        log = ("[01:15:28] [ERR] [16] Jellyfin.Api.Middleware.ExceptionMiddleware: Error processing request: Invalid "
+               "username or password entered. URL POST /Users/AuthenticateByName.\n"
+               "[01:15:31] [ERR] [26] MediaBrowser.Providers.BoxSets.BoxSetMetadataService: Error in TheMovieDb for "
+               "/config/data/collections/Round trip collection [boxset]\n"
+               "System.Net.Http.HttpRequestException: All connection attempts failed. (Connection refused) (127.0.0.1:9)\n")
+        self.assertEqual(checks_boot.errors(log), [])
+
+    def test_a_provider_error_that_is_not_the_proxy_s_refusal_is_not_expected(self):
+        log = ("[01:15:31] [ERR] [26] MediaBrowser.Providers.Movies.MovieMetadataService: Error in TheMovieDb for /media/x\n"
+               "System.NullReferenceException: Object reference not set to an instance of an object.\n")
+        self.assertEqual(len(checks_boot.errors(log)), 1)
+
+    def test_with_an_earlier_capture_only_the_entries_after_it_count(self):
+        earlier = "[01:00:00] [INF] [1] Main: starting\n[01:00:01] [ERR] [1] Main: before\n"
+        later = earlier + "[01:00:02] [INF] [1] Main: scanning\n[01:00:03] [ERR] [1] Main: after\n"
+        self.assertEqual(checks_boot.errors(later, earlier), ["1 unexpected error(s): [ERR] Main: after"])
+        self.assertEqual(checks_boot.errors(earlier, earlier), [])
+        self.assertEqual(checks_boot.errors(earlier, later), [   # a log that does not continue the earlier one
+            "the log has 2 entries, fewer than the 4 of the earlier capture it continues"])
+
+
+class Quiet(unittest.TestCase):
+    def test_a_start_that_runs_no_migration_is_quiet(self):
+        self.assertEqual(checks_boot.quiet(boot()), [])
+
+    def test_any_migration_it_began_is_named(self):
+        self.assertEqual(checks_boot.quiet(boot((CODE, "2026_Repair"), (SCHEMA, "2026_AddTable"))),
+                         ["it began 2 migration(s) on a database it had started on: 2026_AddTable, 2026_Repair"])
+
 
 class CommandLine(unittest.TestCase):
     def run_on(self, mode, text, *oracle):
@@ -137,6 +168,12 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(self.run_on("migrations", CLEAN), 0)
         self.assertEqual(self.run_on("migrations", FAILED), 1)
         self.assertEqual(self.run_on("errors", FAILED), 1)
+        self.assertEqual(self.run_on("quiet", boot()), 0)
+        self.assertEqual(self.run_on("quiet", boot((CODE, "2026_Repair"))), 1)
+        with tempfile.NamedTemporaryFile("w", suffix=".log") as earlier:
+            earlier.write(FAILED)
+            earlier.flush()
+            self.assertEqual(self.run_on("errors", FAILED, earlier.name), 0)   # nothing after the earlier capture
         self.assertEqual(self.run_on("migrations", ""), 2)   # an empty capture never passes
         self.assertEqual(self.run_on("errors", "\x1b[32minfo\x1b[0m: not Jellyfin's format\n"), 2)
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
