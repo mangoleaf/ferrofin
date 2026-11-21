@@ -16,8 +16,9 @@
 //!    bound to the flow cookie, which the page keeps as long.
 //! 4. Only the page's `POST /sso/quickconnect`
 //!    ([`SsoService::confirm_quick_connect`]), with that cookie, uses the
-//!    confirmation up, applies role sync and the account rules of a password
-//!    sign-in for the approving browser's address, and approves the code with
+//!    confirmation up, checks the identity is still linked to the account,
+//!    applies role sync and the account rules of a password sign-in for the
+//!    approving browser's address, and approves the code with
 //!    `QuickConnect::authorize_request`, which signs the app's device in
 //!    through `authenticate_direct` (device access, the session limit and the
 //!    `AuthenticationSucceeded` entry).
@@ -314,8 +315,9 @@ impl SsoService {
     }
 
     /// Uses `confirmation` up and approves its code through `quick_connect`
-    /// as its account, from the browser at `client`: the page saying the app
-    /// is signed in, or why not.
+    /// as its account, while its identity is still linked to it, from the
+    /// browser at `client`: the page saying the app is signed in, or why
+    /// not.
     async fn approve(
         &self,
         config: &SsoConfig,
@@ -347,6 +349,17 @@ impl SsoService {
         let Some(user) = self.users.get_user_by_id(pending.user_id).await? else {
             return Ok(failed(Some(key), "no_account"));
         };
+        // Unlinked or linked elsewhere since the callback (B12), as at a
+        // browser exchange: held until the code is approved, so a removal,
+        // which unlinks under this lock and then signs the account out,
+        // either signs the app out or refuses it.
+        let _linked = self.provisioning.lock().await;
+        if !self
+            .still_linked(&pending.identity, pending.user_id)
+            .await?
+        {
+            return Ok(failed(Some(key), "unlinked"));
+        }
         // Approving a code signs the account in on the app's device, so it
         // gets what a browser sign-in applies: role sync first, as
         // `open_session` runs it, so no route skips an administrator flag or
@@ -371,6 +384,8 @@ impl SsoService {
         {
             Ok(_) => {
                 tracing::info!(oidc_provider = %key, user_id = %user.id, "OIDC Quick Connect approval completed");
+                // Not awaited: the picture never holds the sign-in (B16).
+                self.start_avatar_sync(&provider, &pending.identity, pending.user_id);
                 Ok(at_home(
                     200,
                     "Your app is signed in",

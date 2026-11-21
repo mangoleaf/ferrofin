@@ -39,6 +39,9 @@ pub const MAX_PENDING_FLOWS: usize = 1000;
 pub enum FlowPurpose {
     /// Signing in to Ferrofin.
     SignIn,
+    /// Linking the identity to this account, the one signed in when the
+    /// flow started ([`links`](super::links)): it opens no session.
+    Link(Uuid),
     /// Approving a native app's Quick Connect code
     /// ([`quick_connect`](super::quick_connect)): it ends on a confirmation
     /// page, and opens no browser session.
@@ -107,6 +110,15 @@ impl PendingFlows {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(state)
+    }
+
+    /// Drops every pending link flow of the account `user_id`, so none links
+    /// once a removal has signed the account out ([`links`](super::links)).
+    pub fn drop_link_flows_of(&self, user_id: Uuid) {
+        self.flows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|_, flow| flow.purpose != FlowPurpose::Link(user_id));
     }
 
     /// How many flows are pending.

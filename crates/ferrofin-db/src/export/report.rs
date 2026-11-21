@@ -13,7 +13,7 @@ const TABLE_NOTES: [(&str, &str); 20] = [
     ),
     (
         "FerrofinExternalIdentities",
-        "the links from LDAP-Auth identities to users, not exported; Jellyfin's LDAP-Auth plugin keeps them in its own settings",
+        "the links from LDAP-Auth and Single Sign-On identities to users, not exported; Jellyfin's LDAP-Auth plugin keeps its own in its settings. Jellyfin does not know Single Sign-On's provider, so an account Single Sign-On created cannot sign in there until it has the default provider, which saving its profile page in Jellyfin's dashboard gives it; from then on it signs in with an empty password until one is set, so set one right after saving (one set before is ignored)",
     ),
     (
         "FerrofinIntroSkipperDisabledEpisodes",
@@ -233,6 +233,12 @@ mod tests {
             );
         }
         assert_eq!(table_note("FerrofinNew"), "a table of Ferrofin's own");
+        // The identity links are LDAP-Auth's and Single Sign-On's.
+        let links = table_note("FerrofinExternalIdentities");
+        assert!(
+            links.contains("LDAP-Auth") && links.contains("Single Sign-On"),
+            "{links}"
+        );
     }
 
     /// Every code migration a supported source can lack has an effect to

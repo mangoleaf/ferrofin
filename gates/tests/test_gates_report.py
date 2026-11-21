@@ -146,7 +146,8 @@ class SessionReportTests(unittest.TestCase):
         rows = self.rows(s)
         self.assertEqual(list(rows), list(report.GATES))
         self.assertEqual({g: r["verdict"] for g, r in rows.items()},
-                         {"verify": "not run", "adoption": "passed", "parity": "not run", "bench": "not run"})
+                         {"verify": "not run", "adoption": "passed", "roundtrip": "not run", "parity": "not run",
+                          "bench": "not run"})
         self.assertIn("not requested", Path(report.write(str(s))).read_text(encoding="utf-8"))
 
     def test_adoption_is_judged_by_its_own_rules_a_killed_fixture_and_a_failed_check_fail_it(self):
@@ -180,6 +181,24 @@ class SessionReportTests(unittest.TestCase):
         (s / "adoption/result.json").unlink()
         self.assertIn("a run from before adoption wrote one (python3 gates/adoption/adoption_report.py build DIR",
                       self.rows(s)["adoption"]["problem"])
+
+    def test_a_round_trip_counts_its_routes_from_its_result_and_links_its_report(self):
+        s = self.session(["roundtrip"], {"roundtrip": ("failed", 1)})
+        d = s / "roundtrip"
+        recorder = adoption_report.Recorder(str(d))   # as gates/roundtrip/run.sh records, a route being a row
+        recorder.start("gates/roundtrip/run.sh", "ferrofin:v9", "jellyfin/jellyfin:12.4")
+        for route, kind, verdict in (("10.11.8", "path", "PASS"), ("12.4-messy", "messy", "FAIL")):
+            recorder.begin(route, kind, "12.2.0")
+            recorder.row(route, kind, "12.2.0", verdict)
+        recorder.begin("10.11.11-scale", "scale", "10.11.11")   # stopped on it
+        adoption_report.build(str(d), gate="roundtrip")
+        row = self.rows(s)["roundtrip"]
+        self.assertEqual((row["verdict"], row["counts"], row["problem"], row["bad"]),
+                         ("failed", [("routes passed", 1), ("failed", 1), ("unfinished", 1), ("skipped", 0)], None, True))
+        self.assertEqual(row["links"][0], ("round-trip report", "roundtrip/report.html"))
+        (d / "result.json").unlink()
+        self.assertEqual(self.rows(s)["roundtrip"]["problem"],
+                         "no result.json: the gate ended before it recorded anything")
 
     def test_a_bench_run_from_before_result_json_says_how_to_add_one(self):
         s = self.session(["bench"], {"bench": ("passed", 0)})
@@ -281,7 +300,7 @@ class SessionReportTests(unittest.TestCase):
         session.gate(str(s), "verify", "running")
         session.gate(str(s), "adoption", "failed", note="the image ferrofin:v9 moved off sha256:aaa")
         rows = self.rows(s)
-        self.assertEqual({g: r["verdict"] for g, r in rows.items() if g != "parity"},
+        self.assertEqual({g: r["verdict"] for g, r in rows.items() if g not in ("roundtrip", "parity")},
                          {"verify": "running", "adoption": "not started", "bench": "not run"})
         self.assertEqual((report.status_word(rows["adoption"]), rows["adoption"]["problem"]),
                          ("failed, the image ferrofin:v9 moved off sha256:aaa", None))

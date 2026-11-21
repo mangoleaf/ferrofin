@@ -708,6 +708,8 @@ $FIXTURES/
   oracle/smoke-jellyfin-12.{1,2,4}.txt  built: each release's own smoke answers (12.4's on 12.4-from-123, the default)
   oracle/smoke-jellyfin-12.{2,4}-fresh.txt  built: Jellyfin 12.2's and 12.4's answers on their fresh-install library
   oracle/user.txt              built: the account those answers were probed as
+  oracle/first-start-12.4/<fixture>.server.log  built: Jellyfin 12.4's first start on a throwaway copy of each older
+                               fixture no 12.4 fixture is built from (synthetic.py FIRST_STARTS), for gates/roundtrip/
   jellyfin-12.2-schema.sql     built: the 12.2 schema every other 12.2, 12.3 and 12.4 upgrade route is diffed against
   jellyfin-12.{3,4}-schema.sql built: the same dump of 12.3-from-122 and 12.4-from-123
   work/                        scratch: synthetic.py's copies (and run.sh's in work/run/ when no output root is set); failures stay here
@@ -844,6 +846,8 @@ generation: add its rows the same way with its counterpart's count, a pair to th
 - the seeds' oracle: `ORACLE_RELEASE`, `ORACLE` and `UPGRADED_FROM_10` in `preservation.py`;
 - the messy-shape oracle: `ORACLE_RELEASE` and the 12.x copy in `DERIVED` in `messy.py`, and the
   release its `DIVERGENCES` reasons name, once the new oracle's record confirms each.
+- the round trip's first starts: `RETURN_RELEASE` in `synthetic.py`, and the first-start logs
+  `gates/roundtrip/routes.sh` names.
 
 `tests/adoption.bats` checks that they all name the same release. `JELLYFIN_GENERATIONS` stays as
 it is; a fixture whose set is not its counterpart's fails the build instead.

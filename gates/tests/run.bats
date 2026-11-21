@@ -11,7 +11,7 @@ setup() {
   cd "$TMP" || exit 1
   mkdir -p repo bin
   cp -r "$GATES" repo/gates
-  for gate in verify adoption parity bench; do fake_gate "repo/gates/$gate/run.sh"; done
+  for gate in verify adoption roundtrip parity bench; do fake_gate "repo/gates/$gate/run.sh"; done
   cat > repo/gates/bench/gate.py <<'EOS'
 import os, sys
 with open(os.environ["FAKE_CALLS"], "a") as calls:
@@ -58,7 +58,7 @@ EOS
   ORACLE=$(cat repo/gates/bench/testdata/jellyfin-image.txt)
   local released=ghcr.io/mangoleaf/ferrofin   # the releases the A/B baseline tests name
   export FAKE_CALLS="$TMP/calls" FAKE_REVISION=$COMMIT \
-    FAKE_IMAGES="ferrofin:test ferrofin:old $ORACLE $released:v1.3.2 $released:v1.3.2@sha256:abc $released:v1.4.0 ferrofin:v1.4.2"
+    FAKE_IMAGES="ferrofin:test ferrofin:old $ORACLE jellyfin/jellyfin:12.2 $released:v1.3.2 $released:v1.3.2@sha256:abc $released:v1.4.0 ferrofin:v1.4.2"
   export FAKE_LATEST_TAG=v12.2   # the pin is the latest Jellyfin release unless a test says otherwise
   export FERROFIN_GATES_DIR="$TMP/root"
   ROOT=$FERROFIN_GATES_DIR
@@ -67,7 +67,7 @@ EOS
   mkdir -p "$fixtures/oracle" "$fixtures/media" "$ROOT/fixtures/bench-testdata/jellyfin"
   touch "$fixtures/oracle/smoke-jellyfin-12.4.txt" "$ROOT/fixtures/bench-testdata/ids.json" \
     "$ROOT/fixtures/bench-testdata/jellyfin/preparation.json"
-  unset FAKE_RC_verify FAKE_RC_adoption FAKE_RC_parity FAKE_RC_bench FAKE_SLEEP FAKE_IDLE FAKE_LEFT FAKE_DOCKER_DOWN FAKE_MOVE \
+  unset FAKE_RC_verify FAKE_RC_adoption FAKE_RC_roundtrip FAKE_RC_parity FAKE_RC_bench FAKE_SLEEP FAKE_IDLE FAKE_LEFT FAKE_DOCKER_DOWN FAKE_MOVE \
     FERROFIN_ADOPTION_FIXTURES ADOPTION_ORACLE ADOPTION_WORK_DIR FERROFIN_BENCH_IMAGE PARITY_PIN   # a developer's own exports
 }
 
@@ -108,8 +108,9 @@ session() { # the one session directory made under the root
   [[ "${lines[0]}" == "preflight: passed; image ferrofin:test"* ]]
   [[ "${lines[1]}" == "verify: gates/verify/run.sh --image ferrofin:test "* ]]
   [[ "${lines[2]}" == "adoption: env ADOPTION_WORK_DIR="*" gates/adoption/run.sh --fixtures $fixtures --image ferrofin:test" ]]
-  [[ "${lines[3]}" == "parity: gates/parity/run.sh --oracle "*" --ferrofin ferrofin:test "*"--requests gates/parity/requests/sweep --requests gates/parity/requests/edge" ]]
-  [[ "${lines[4]}" == "bench: env FERROFIN_BENCH_IMAGE=ferrofin:test gates/bench/run.sh "* ]]
+  [[ "${lines[3]}" == "roundtrip: gates/roundtrip/run.sh --fixtures $fixtures --image ferrofin:test --work \$FERROFIN_GATES_DIR/runs/<session>/roundtrip" ]]
+  [[ "${lines[4]}" == "parity: gates/parity/run.sh --oracle "*" --ferrofin ferrofin:test "*"--requests gates/parity/requests/sweep --requests gates/parity/requests/edge" ]]
+  [[ "${lines[5]}" == "bench: env FERROFIN_BENCH_IMAGE=ferrofin:test gates/bench/run.sh "* ]]
   run repo/gates/run bench --image ferrofin:test --previous ferrofin:old --dry-run
   [[ "${lines[1]}" == "bench: python3 gates/bench/gate.py ab ferrofin:old ferrofin:test "* ]]
   [ ! -e "$FAKE_CALLS" ]
@@ -223,10 +224,10 @@ session() { # the one session directory made under the root
   cd repo/gates
   run ./run -h
   [ "$status" -eq 0 ]
-  [[ "${lines[0]}" == "gates/run <verify|adoption|parity|bench|all>"* ]]
+  [[ "${lines[0]}" == "gates/run <verify|adoption|roundtrip|parity|bench|all>"* ]]
   run ./run
   [ "$status" -eq 2 ]
-  [[ "${lines[0]}" == "gates/run <verify|adoption|parity|bench|all>"* ]]
+  [[ "${lines[0]}" == "gates/run <verify|adoption|roundtrip|parity|bench|all>"* ]]
   run bash -c 'cd "$1/verify" && ./run.sh -h' _ "$GATES"   # the real one: the copy's is a fake
   [ "$status" -eq 0 ]
   [[ "${lines[0]}" == "gates/verify/run.sh "* ]]
@@ -309,6 +310,27 @@ session() { # the one session directory made under the root
   [[ "$output" == *"the adoption fixtures are not built in $fixtures (no media)"* ]]
   ADOPTION_ORACLE=12.1 run repo/gates/run adoption --image ferrofin:test --dry-run
   [[ "$output" == *"(no oracle/smoke-jellyfin-12.1.txt)"* ]]
+}
+
+@test "gates/run: the round trip runs on the adoption fixtures into the session; its Jellyfin image and fixtures are named" {
+  run repo/gates/run roundtrip --image ferrofin:test
+  [ "$status" -eq 0 ]
+  s=$(session)
+  grep -qx "roundtrip --fixtures $fixtures --image ferrofin:test --work $s/roundtrip work= bench_image=" "$FAKE_CALLS"
+  [ "$(jq -r .gates.roundtrip.status "$s/session.json")" = passed ]
+  # its containers are named for their run, which shares nothing with another: one left is not a refusal
+  FAKE_LEFT=rt- run repo/gates/run roundtrip --image ferrofin:test --dry-run
+  [ "$status" -eq 0 ]
+  FAKE_IMAGES=ferrofin:test run repo/gates/run roundtrip --image ferrofin:test --dry-run
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"the Jellyfin image the round trip returns to is missing: docker pull jellyfin/jellyfin:12.2"* ]]
+  rm -r "${fixtures:?}/media"
+  run repo/gates/run roundtrip --image ferrofin:test --dry-run
+  [[ "$output" == *"the adoption fixtures the round trip runs on are not built in $fixtures (no media)"* ]]
+  echo 'no pin here' > repo/crates/ferrofin-api/src/handlers.rs
+  run repo/gates/run roundtrip --image ferrofin:test --dry-run
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"run: roundtrip: cannot read UPSTREAM_TAG from crates/ferrofin-api/src/handlers.rs"* ]]
 }
 
 @test "gates/run: the adoption gate runs on the fixtures the preflight checked, whatever FERROFIN_ADOPTION_FIXTURES says" {

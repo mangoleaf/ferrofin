@@ -31,6 +31,15 @@ setup() {
 }
 
 CODE_MIGRATIONS=(20260113120000_MigrateLinkedChildren 20260915104305_FixNullEncoderPreset)
+# The routes a whole run here runs, the two setup fakes fixtures for: test_routes.py checks the others
+# against the fixtures gates/adoption builds.
+ROUTES=10.11.8,12.4-from-123
+
+fake_fixture() { # fake_fixture <fixture> <generation> [first-start log]: one more fake fixture, and its first start
+  python3 "$BATS_TEST_DIRNAME/fake_server.py" copy "fixtures/$1"
+  echo "$2" > "fixtures/$1/fake-generation"
+  [ -z "${3:-}" ] || { mkdir -p "$(dirname "fixtures/$3")"; head -n 1 "$BATS_TEST_DIRNAME/jellyfin-ok.log" > "fixtures/$3.server.log"; }
+}
 
 teardown() { # no fake server outlives its test
   local pid
@@ -120,6 +129,7 @@ removed() { [ ! -f "$TMP/state/removed" ] || grep "^${1:-}" "$TMP/state/removed"
 
 @test "start failed: Jellyfin's critical start line matches, an ordinary error does not" {
   grep -qE -- "$RT_JELLYFIN_START_FAILED" <<<'[16:44:10] [FTL] [7] Main: Error while starting server'
+  grep -qE -- "$RT_JELLYFIN_START_FAILED" <<<'[16:44:10.252] [FTL] [7] Main: Error while starting server'
   run ! grep -qE -- "$RT_JELLYFIN_START_FAILED" <<<'[16:44:10] [ERR] [7] Main: Error while starting server'
   run ! grep -qE -- "$RT_JELLYFIN_START_FAILED" <<<'[16:44:10] [FTL] [7] InternalDatabaseMigration: Error: SQLite Error 1'
 }
@@ -182,6 +192,8 @@ EOS
   [ "$status" -eq 2 ]
   # shellcheck disable=SC2154  # $stderr is set by bats' run --separate-stderr
   [[ "$stderr" == *"no route 9.9 in routes.sh"* ]]
+  run --separate-stderr run_gate "$TMP/w1" --only 10.11.8,9.9
+  [ "$status" -eq 2 ]; [[ "$stderr" == *"no route 9.9 in routes.sh"* ]]
   run --separate-stderr run_gate "$TMP/w2" --run-id 'Bad Id'
   [ "$status" -eq 2 ]; [[ "$stderr" == *"--run-id must be"* ]]
   mkdir "$TMP/w3"
@@ -199,10 +211,86 @@ EOS
   [ ! -e "$TMP/w5" ]
 }
 
+@test "run.sh: no route to run is refused, and nothing starts" {
+  mkdir -p repo/gates
+  gates=$(cd "$ROUNDTRIP/.." && pwd)
+  cp -r "$gates/lib.sh" "$gates/result.py" "$gates/adoption" "$gates/roundtrip" repo/gates/
+  echo 'ROUNDTRIP_ROUTES=()' > repo/gates/roundtrip/routes.sh
+  run --separate-stderr repo/gates/roundtrip/run.sh --image ferrofin:test --jellyfin-image jellyfin/jellyfin:test \
+    --fixtures "$TMP/fixtures" --work "$TMP/w"
+  [ "$status" -eq 2 ]
+  [[ "$stderr" == *"no route to run: routes.sh lists none"* ]]
+  [ ! -e "$TMP/w" ]
+  run ! grep -q '^run ' state/calls
+}
+
+@test "run.sh: a route record names a data directory, a configuration directory and a kind it knows" {
+  mkdir -p repo/gates
+  gates=$(cd "$ROUNDTRIP/.." && pwd)
+  cp -r "$gates/lib.sh" "$gates/result.py" "$gates/adoption" "$gates/roundtrip" repo/gates/
+  for record in 'x|f|g|s|data|-|path' 'x|f|g|s|/data|etc|path' 'x|f|g|s|/data|-|odd'; do
+    echo "ROUNDTRIP_ROUTES=('$record')" > repo/gates/roundtrip/routes.sh
+    run --separate-stderr repo/gates/roundtrip/run.sh --image ferrofin:test --jellyfin-image jellyfin/jellyfin:test \
+      --fixtures "$TMP/fixtures" --work "$TMP/w"
+    [ "$status" -eq 2 ]
+    [[ "$stderr" == *"route x in routes.sh "* ]]
+  done
+  [ ! -e "$TMP/w" ]
+}
+
 # --- whole runs ------------------------------------------------------------------------------------
 
+@test "run.sh: the Debian-layout route runs Ferrofin and its export with the configuration apart, and returns to /config" {
+  fake_fixture jellyfin-12.4-debian 12.2.0 jellyfin-12.4-debian
+  mkdir fixtures/jellyfin-12.4-debian/config && echo '<ServerConfiguration/>' > fixtures/jellyfin-12.4-debian/config/system.xml
+  run run_gate "$TMP/w" --run-id deb --only 12.4-debian
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS  12.4-debian    "* ]]
+  dirs="-e FERROFIN_DATA_DIR=/var/lib/ferrofin -v $TMP/w/12.4-debian/ferrofin:/var/lib/ferrofin -e FERROFIN_CONFIG_DIR=/etc/ferrofin -v $TMP/w/12.4-debian/ferrofin-config:/etc/ferrofin"
+  grep -qF -- "--name rt-deb-12.4-debian-ferrofin --user $(id -u):$(id -g) -p 127.0.0.1::8096 -e HTTP_PROXY=http://127.0.0.1:9 -e HTTPS_PROXY=http://127.0.0.1:9 -e ALL_PROXY=http://127.0.0.1:9 -e NO_PROXY=127.0.0.1,localhost $dirs -e FERROFIN_CACHE_DIR=/cache " state/calls
+  grep -qF -- "--name rt-deb-12.4-debian-export --user $(id -u):$(id -g) --network none $dirs -v $TMP/w/12.4-debian:/route " state/calls
+  grep -E -- "^run .*--name rt-deb-12.4-debian-jellyfin .*-v $TMP/w/12.4-debian/jellyfin:/config " state/calls
+  grep -q '^Exported /var/lib/ferrofin into /route/jellyfin$' "$TMP/w/12.4-debian/export.log"
+  [ -f fixtures/jellyfin-12.4-debian/config/system.xml ]   # moved in the copy, never in the fixture
+  [ ! -e "$TMP/w/12.4-debian/ferrofin-config" ]   # a passed route keeps no copy
+}
+
+@test "run.sh: a messy route mounts its own media tree, and fails without it" {
+  fake_fixture jellyfin-12.4-messy 12.2.0
+  mkdir fixtures/media-messy
+  run run_gate "$TMP/w1" --run-id messy --only 12.4-messy
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"PASS  12.4-messy     "* ]]
+  grep -E -- "^run .*--name rt-messy-12.4-messy-ferrofin .*-v $TMP/fixtures/media-messy:/media:ro " state/calls
+  grep -E -- "^run .*--name rt-messy-12.4-messy-jellyfin .*-v $TMP/fixtures/media-messy:/media:ro " state/calls
+  run ! grep -q -- "-v $TMP/fixtures/media:/media:ro" state/calls
+  [ "$(jq -r 'select(.event == "row") | .kind' "$TMP/w1/results.jsonl")" = messy ]
+  rmdir fixtures/media-messy
+  run run_gate "$TMP/w2" --only 12.4-messy
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  12.4-messy     fixture media-messy missing"* ]]
+}
+
+@test "run.sh: the scale route records on its line the time each stage took and the export's size" {
+  fake_fixture jellyfin-10.11.11-scale 10.11.11 oracle/first-start-12.4/jellyfin-10.11.11
+  mkdir fixtures/media-scale
+  run run_gate "$TMP/w" --only 10.11.11-scale
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "PASS  10.11.11-scale took: Ferrofin "[0-9]+" s, export "[0-9]+" s, Jellyfin "[0-9]+" s; the export "[0-9.]+[KMG]? ]]
+  [ "$(jq -r 'select(.event == "row") | "\(.kind) \(.verdict)"' "$TMP/w/results.jsonl")" = "scale PASS" ]
+  [[ "$(jq -r '.detail.rows[0].detail' "$TMP/w/result.json")" == "took: Ferrofin "* ]]
+  # no scan, no usage stage and nothing compared: the clones would measure the fixture
+  [ ! -e "$TMP/w/10.11.11-scale/oracle.txt" ]
+  [ ! -e "$TMP/w/10.11.11-scale/answers.txt" ]
+  run ! jq -e 'select(.event == "check" and (.check | test("scan|usage|answers")))' "$TMP/w/results.jsonl"
+  # a failed export: what did not run says so
+  FAKE_EXPORT=fails run run_gate "$TMP/w2" --only 10.11.11-scale
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "FAIL  10.11.11-scale the export failed with status 1: the database is damaged; took: Ferrofin "[0-9]+" s, export "[0-9]+" s, Jellyfin not run; the export not written" ]]
+}
+
 @test "run.sh: both routes pass on the export, Jellyfin running on the 10.11.8 route the code migrations it left to run" {
-  run run_gate "$TMP/w" --run-id both
+  run run_gate "$TMP/w" --run-id both --only "$ROUTES"
   [ "$status" -eq 0 ]
   [[ "$output" == *"PASS  10.11.8        "* ]]
   [[ "$output" == *"PASS  12.4-from-123  "* ]]
@@ -232,6 +320,10 @@ EOS
   [ ! -e "$TMP/w/10.11.8/jellyfin" ]
   [ ! -e "$TMP/w/12.4-from-123/ferrofin" ]
   [ -f "$TMP/w/report.html" ]
+  [[ "$output" == *"roundtrip: 2 of 2 route(s) passed"* ]]
+  # the result a gates/run session reads: the round trip's, in the gates' envelope
+  [ "$(jq -r '"\(.gate) \(.verdict) \(.counts.pass) \(.counts.fail) \(.detail.rows | map(.kind) | join(","))"' "$TMP/w/result.json")" = \
+    "roundtrip passed 2 0 path,path" ]
   [ "$(started rt-both-)" = "$(removed rt-both-)" ]
   [ "$(started rt-both- | wc -l)" -eq 6 ]
   grep -qx 'rmi ferrofin-roundtrip:both' state/calls
@@ -245,6 +337,8 @@ EOS
          | .verdict == "FAIL"' "$TMP/w/results.jsonl" >/dev/null
   # the failing route keeps its copies to look into
   [ -d "$TMP/w/10.11.8/jellyfin" ]
+  [[ "$output" == *"roundtrip: 0 of 1 route(s) passed"* ]]
+  [ "$(jq -r '"\(.gate) \(.verdict) \(.counts.fail)"' "$TMP/w/result.json")" = "roundtrip failed 1" ]
   grep -q 'AddLinkedChildrenTable' "$TMP/w/report.html"
   [ "$(started rt-kept-)" = "$(removed rt-kept-)" ]
 }
@@ -336,12 +430,12 @@ EOS
   # the gates go to a repository of their own here, as gates/adoption/tests/adoption.bats has them.
   mkdir -p repo/gates
   gates=$(cd "$ROUNDTRIP/.." && pwd)   # resolved: a source ending in .. would copy into repo/ itself
-  cp -r "$gates/lib.sh" "$gates/adoption" "$gates/roundtrip" repo/gates/
+  cp -r "$gates/lib.sh" "$gates/result.py" "$gates/adoption" "$gates/roundtrip" repo/gates/
   git -C repo init -q
   pids=()
   for side in a b; do
     FERROFIN_GATES_DIR=$TMP/gates FAKE_RUN_DELAY=1 repo/gates/roundtrip/run.sh --image ferrofin:test \
-      --jellyfin-image jellyfin/jellyfin:test --fixtures "$TMP/fixtures" > "$side.out" 2>&1 &
+      --jellyfin-image jellyfin/jellyfin:test --fixtures "$TMP/fixtures" --only "$ROUTES" > "$side.out" 2>&1 &
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do wait "$pid" || true; done

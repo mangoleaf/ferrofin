@@ -105,9 +105,10 @@ rt_wait_up() {
 }
 
 # What Jellyfin logs when its start failed (Jellyfin.Server/Program.cs, LogCritical): it keeps serving
-# 503 from its setup server, so the wait gives up on this line instead of waiting out its deadline.
+# 503 from its setup server, so the wait gives up on this line instead of waiting out its deadline. Its time
+# has milliseconds when the configuration's logging template asks for them (a fresh install of 12.2 or later).
 # shellcheck disable=SC2034  # read by run.sh
-RT_JELLYFIN_START_FAILED='^\[[0-9:]+\] \[FTL\] \[[0-9]+\] Main: Error while starting server'
+RT_JELLYFIN_START_FAILED='^\[[0-9:.]+\] \[FTL\] \[[0-9]+\] Main: Error while starting server'
 
 # rt_stop <name> <seconds>: stop the server as `docker stop` does (TERM, then KILL after <seconds>); a
 # reason when it did not exit by itself with status 0. The docker call may take <seconds> more than any other.

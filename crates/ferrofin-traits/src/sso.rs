@@ -10,7 +10,10 @@ use std::net::IpAddr;
 
 use async_trait::async_trait;
 use ferrofin_model::secret::Secret;
-use ferrofin_model::sso::{OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList};
+use ferrofin_model::sso::{
+    OidcAdminLink, OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList, OidcUserLinks,
+};
+use uuid::Uuid;
 
 use crate::error::ServiceError;
 use crate::session::{AuthenticationRequest, AuthenticationResultData};
@@ -187,7 +190,9 @@ pub trait SsoManager: Send + Sync {
     /// [`start_oidc_quick_connect`](Self::start_oidc_quick_connect) answers
     /// its confirmation page instead. With no account, a `403` page says
     /// what to ask an administrator; a failed check is the refusal page; both
-    /// clear the cookie. Either way the pending sign-in is used up.
+    /// clear the cookie. Either way the pending sign-in is used up. A link
+    /// flow's callback ends on its own page instead
+    /// ([`start_oidc_link`](Self::start_oidc_link)).
     ///
     /// [`ServiceError::NotFound`] as for
     /// [`start_oidc_sign_in`](Self::start_oidc_sign_in), and an error when
@@ -201,10 +206,11 @@ pub trait SsoManager: Send + Sync {
 
     /// Swaps the exchange code of a completion page for a session, once:
     /// `flow_cookie` must be the [`OIDC_FLOW_COOKIE`] the code is bound to,
-    /// and the code at most a minute old. The account must pass the sign-in
-    /// rules of a password sign-in (disabled, remote access from
-    /// `request.remote_endpoint`, parental schedule), then the session is
-    /// opened with `request`'s device as
+    /// and the code at most a minute old. The identity must still be linked
+    /// to the account (a link removed since the callback refuses it). The
+    /// account must pass the sign-in rules of a password sign-in (disabled,
+    /// remote access from `request.remote_endpoint`, parental schedule), then
+    /// the session is opened with `request`'s device as
     /// [`SessionManager::authenticate_direct`](crate::session::SessionManager::authenticate_direct)
     /// opens one, which applies device access and the session limit. A
     /// refusal of a known account writes an `AuthenticationFailed` activity
@@ -267,14 +273,17 @@ pub trait SsoManager: Send + Sync {
 
     /// Approves the Quick Connect code of a confirmation page's
     /// `confirmation`, once: `flow_cookie` must be the [`OIDC_FLOW_COOKIE`] it
-    /// is bound to, and it at most a minute old. The account must pass the
-    /// sign-in rules of a password sign-in (disabled, remote access from the
-    /// approving browser at `client`, parental schedule); then
-    /// `QuickConnect::authorize_request` signs the app's device in, which
-    /// applies device access and the session limit. No browser session is
-    /// opened. Every answer is a page and clears the cookie: the app signed
-    /// in, or why not (`400` for a confirmation or cookie that does not check
-    /// out, and for a code that is unknown, expired or approved already;
+    /// is bound to, and it at most a minute old. The identity must still be
+    /// linked to the account (a link removed since the callback refuses it).
+    /// The account must pass the sign-in rules of a password sign-in
+    /// (disabled, remote access from the approving browser at `client`,
+    /// parental schedule); then `QuickConnect::authorize_request` signs the
+    /// app's device in, which applies device access and the session limit. No
+    /// browser session is opened. Every answer is a page and clears the
+    /// cookie: the app signed in, or why not (`400` for a confirmation or
+    /// cookie that does not check out, for an identity no longer linked to
+    /// the account, and for a code that is unknown, expired or approved
+    /// already;
     /// `403` for Quick Connect turned off, and for an account a sign-in rule
     /// refuses, which writes an `AuthenticationFailed` activity entry). The
     /// confirmation is used up by any attempt that reaches it.
@@ -288,6 +297,76 @@ pub trait SsoManager: Send + Sync {
         flow_cookie: Option<Secret>,
         client: IpAddr,
     ) -> Result<SsoReply, ServiceError>;
+
+    // Linking an account and an identity (B12). Linking never changes the
+    // account's authentication provider or password (D5).
+
+    /// The link page, `GET /sso/link`: anonymous, its script reads the
+    /// session jellyfin-web keeps in the browser and calls the link routes
+    /// with it.
+    async fn oidc_link_page(&self) -> Result<SsoReply, ServiceError>;
+
+    /// The links of `user_id`, the enabled providers it can link at, and
+    /// whether the account signs in through Single Sign-On only.
+    async fn oidc_links(&self, user_id: Uuid) -> Result<OidcUserLinks, ServiceError>;
+
+    /// Starts a link of `user_id` at the provider `key`, for the browser at
+    /// `client`: as [`start_oidc_sign_in`](Self::start_oidc_sign_in) starts a
+    /// sign-in, a redirect that sets the [`OIDC_FLOW_COOKIE`], or a page saying
+    /// why not. Its callback links the verified identity to `user_id`, unless
+    /// another account has it, and ends on a page saying which; it opens no
+    /// session.
+    ///
+    /// [`ServiceError::NotFound`] as for
+    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in).
+    async fn start_oidc_link(
+        &self,
+        key: &str,
+        user_id: Uuid,
+        client: IpAddr,
+    ) -> Result<SsoReply, ServiceError>;
+
+    /// Every link of every account, with the account's name and the link's
+    /// subject.
+    async fn all_oidc_links(&self) -> Result<Vec<OidcAdminLink>, ServiceError>;
+
+    /// Links `user_id` to the subject `subject` at the provider `key`'s
+    /// issuer, replacing the account's earlier link at that issuer.
+    ///
+    /// [`ServiceError::NotFound`] for an unknown account or provider,
+    /// [`ServiceError::InvalidInput`] for an empty subject, one longer than
+    /// 255 characters, holding a control character or starting or ending with
+    /// a space, and [`ServiceError::Conflict`] when another account has the
+    /// identity: nothing is moved.
+    async fn add_oidc_link(
+        &self,
+        user_id: Uuid,
+        key: &str,
+        subject: &str,
+    ) -> Result<OidcAdminLink, ServiceError>;
+
+    /// Removes the link of `user_id` `at` a provider or an issuer, then signs
+    /// every session of that account out. An exchange code or a Quick
+    /// Connect confirmation issued before the removal is refused at
+    /// [`exchange_oidc_sign_in`](Self::exchange_oidc_sign_in) or
+    /// [`confirm_oidc_quick_connect`](Self::confirm_oidc_quick_connect),
+    /// which look the link up again. An account that signs in through
+    /// Single Sign-On only cannot sign in again until it is linked again or
+    /// given another authentication provider.
+    ///
+    /// [`ServiceError::NotFound`] when there is no such provider or link.
+    async fn remove_oidc_link(&self, user_id: Uuid, at: OidcLinkAt<'_>)
+    -> Result<(), ServiceError>;
+}
+
+/// Which of an account's links: the one at a provider's issuer, named by the
+/// provider's key, or the one at an issuer no provider may have any more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OidcLinkAt<'a> {
+    /// The provider's key.
+    Provider(&'a str),
+    /// The issuer.
+    Issuer(&'a str),
 }
 
 fn _assert_object_safe_sso_manager(_: &dyn SsoManager) {}

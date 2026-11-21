@@ -793,6 +793,13 @@ pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
     ("post", "/sso/oidc/exchange", "sso"),
     ("get", "/sso/quickconnect", "sso"),
     ("post", "/sso/quickconnect", "sso"),
+    ("get", "/sso/link", "sso"),
+    ("get", "/sso/links", "sso"),
+    ("delete", "/sso/links/{provider}", "sso"),
+    ("post", "/sso/oidc/{provider}/link", "sso"),
+    ("get", "/sso/admin/links", "sso"),
+    ("post", "/sso/admin/links", "sso"),
+    ("delete", "/sso/admin/links", "sso"),
 ];
 
 /// Every path a handler registers that is neither a contract route nor in
@@ -1077,11 +1084,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              artwork loads; upstream's UpdateImage stores the padded path, which does not. \
              Jellyfin bug not ported.",
             "A programme is saved only when a field GetProgram assigns changed. Upstream skips \
-             only an XMLTV airing whose etag equals the stored one; every other airing (each \
-             Schedules Direct one, whose md5 is compared after its ids were replaced, and an \
-             XMLTV one with no etag) is saved on every refresh, which moves its \
-             DateLastSaved and the DTO Etag derived from it. Fix path: gl-1628 (owner \
-             decision).",
+             only an XMLTV airing whose etag equals the stored one; every other airing is \
+             saved on every refresh, which moves its DateLastSaved and the DTO Etag derived \
+             from it: each Schedules Direct one, because GetProgram overwrites the stored \
+             provider ids before it compares the md5, and an XMLTV one with no etag, which \
+             counts as updated. No known client reads either, and keeping the save to a \
+             changed programme avoids one full-row write per airing per refresh (owner \
+             decision 2026-11-20, gl-1628).",
         ],
     },
     VerifiedSubsystem {
@@ -2536,7 +2545,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    the MaxCastMembers and MaxCrewMembers caps, HideMissingCastMembers and \
                    HideMissingCrewMembers), series_people (the creators, outside the caps), \
                    season_details_for_language and season_details_from, \
-                   episode_extras_for_language and episode_people_from (guest stars); \
+                   episode_extras_for_language and episode_people_from (guest stars), and \
+                   people_entities, which folds every credit in order through \
+                   container_types.rs add_person, as each provider's MetadataResult.AddPerson \
+                   runs PeopleHelper.AddPerson (gl-1651); \
                    ferrofin-core library_scan.rs fetch_tmdb_metadata (a pinned TMDb id, else \
                    find_tmdb_id's /find by an IMDb id, a series also by its TVDB id, else the \
                    parsed-name search and find_best_match, for a movie only without an IMDb \
@@ -2557,7 +2569,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
                    TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
                    this row.",
-        date: "2026-11-15",
+        date: "2026-11-20",
         divergences: &[
             "A movie, series, season or episode TMDb has no overview for answers the \
              refresh no Overview, so Identify → Apply and a Replace all metadata refresh \

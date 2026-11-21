@@ -3,10 +3,11 @@ name: Adoption
 # The full synthetic adoption validation (gates/adoption/README.md): gates/adoption/run.sh (eighteen Jellyfin
 # paths, including the fresh-install 12.2, 12.3 and 12.4 rows and a 12.4 first run adopted into other directories) and the synthetic preservation matrix
 # (fourteen paths; the seedless fresh-install rows are validated by run.sh alone), against an image built from this
-# commit. A green run on the frozen release commit is the release's adoption evidence
-# (RELEASE.md, "Validate adoption"). Every push to a release branch queues it; a patch
-# release from main runs it by hand (workflow_dispatch). Not on PRs: it is long, and the
-# release branch is where the evidence is needed.
+# commit; then the round-trip gate (gates/roundtrip/README.md) over every route of gates/roundtrip/routes.sh on
+# the same fixtures and image. A green run on the frozen release commit is the release's adoption evidence
+# (RELEASE.md, "Validate adoption"), and a failure in any of the three blocks the release. Every push to a
+# release branch queues it; a patch release from main runs it by hand (workflow_dispatch). Not on PRs: it is
+# long, and the release branch is where the evidence is needed.
 on:
   push:
     branches: ["release/**"]
@@ -93,6 +94,17 @@ jobs:
       - name: synthetic preservation matrix
         if: ${{ !cancelled() && steps.run-sh.conclusion != 'skipped' }}
         run: python3 gates/adoption/synthetic.py run --fixtures "$RUNNER_TEMP/adoption" --image ferrofin:adoption-ci
+      # Every route of gates/roundtrip/routes.sh, back to the Jellyfin release UPSTREAM_TAG names, which no
+      # step pulls on a cache hit (the gate never pulls). Runs even when an adoption step failed, so one run
+      # reports all three; it exits 1 when a route failed (a missing fixture fails its route, never skips it).
+      - name: round-trip gate
+        if: ${{ !cancelled() && steps.run-sh.conclusion != 'skipped' }}
+        run: |
+          set -euo pipefail
+          jellyfin=$(bash -c '. gates/roundtrip/lib.sh && rt_jellyfin_image crates/ferrofin-api/src/handlers.rs')
+          docker pull -q "$jellyfin"
+          gates/roundtrip/run.sh --fixtures "$RUNNER_TEMP/adoption" --image ferrofin:adoption-ci --run-id ci \
+            --work "$RUNNER_TEMP/adoption/work/roundtrip"
       # The report of each run (gates/adoption/adoption_report.py): one self-contained page, whatever the
       # verdict. Open it from disk, or list the downloaded directory in the viewer's Adoption tab.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -107,8 +119,17 @@ jobs:
           name: adoption-matrix-report
           path: ${{ runner.temp }}/adoption/work/report.html
           if-no-files-found: ignore
-      # Server logs, smoke diffs and reports of the disposable copies, and each fixture build's server
-      # log, which alone holds the exception behind a refused request. All synthetic data.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ !cancelled() }}
+        with:
+          name: roundtrip-report
+          path: |
+            ${{ runner.temp }}/adoption/work/roundtrip/report.html
+            ${{ runner.temp }}/adoption/work/roundtrip/result.json
+          if-no-files-found: ignore
+      # Server logs, smoke diffs and reports of the disposable copies (a failed round-trip route's copies and
+      # logs under work/roundtrip), and each fixture build's server log, which alone holds the exception behind
+      # a refused request. All synthetic data.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:

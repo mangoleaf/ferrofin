@@ -230,7 +230,10 @@ from.
    that commit and runs the full adoption validation in
    [`gates/adoption/README.md`](gates/adoption/README.md): `gates/adoption/run.sh` (eighteen paths, including the
    fresh-install 12.2, 12.3 and 12.4 rows and a 12.4 first run adopted into other directories) **and** the synthetic preservation matrix (fourteen paths; the
-   seedless fresh-install rows are validated by `run.sh` alone). Every push to `release/**` starts it; for a patch
+   seedless fresh-install rows are validated by `run.sh` alone), then the round-trip gate
+   ([`gates/roundtrip/README.md`](gates/roundtrip/README.md)) over every route of `gates/roundtrip/routes.sh` on
+   the same fixtures and image; a failing route (a missing fixture fails its route, never skips it) fails the
+   workflow and blocks the release as an adoption failure does. Every push to `release/**` starts it; for a patch
    release from `main`, start it with **Actions → Adoption → Run workflow** on `main`. Keep
    the run's link for step 5. A manual run of the same commands is for debugging only and
    does not replace the CI run. An adoption failure is never waived; fix it, which means

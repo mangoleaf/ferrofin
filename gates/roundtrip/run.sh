@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gates/roundtrip/run.sh [--image IMAGE] [--jellyfin-image IMAGE] [--fixtures DIR] [--only ROUTE] [--run-id ID] [--work DIR]
+# gates/roundtrip/run.sh [--image IMAGE] [--jellyfin-image IMAGE] [--fixtures DIR] [--only ROUTE[,ROUTE…]] [--run-id ID] [--work DIR]
 #
 # The way back to Jellyfin, proved on real Jellyfin: for each route in routes.sh, on a FRESH copy of a
 # pristine synthetic fixture (gates/adoption/build-fixtures.sh), each stage records each of its checks:
@@ -28,10 +28,14 @@
 #              library folder row Ferrofin stopped with is still there after that scan, with its
 #              DateCreated (checks_paths.py libraries).
 # The errors check reads the log up to the probes: an error a probe causes is judged by the answers.
-# One PASS/FAIL line per route; the exit status is 1 if any failed, 2 if the run was refused. Every
-# check's verdict goes to WORK/results.jsonl as it runs, and WORK/report.html is built from it however
-# the run ends (report.py). A failed route keeps its copies under WORK; a passed one keeps only its logs
-# and answers. The stages are stage_ferrofin.sh, stage_export.sh and stage_jellyfin.sh.
+# Each route is a record in routes.sh: its fixture, the directories Ferrofin runs in, the media tree it mounts
+# and its kind (a scale route's time and size are recorded on its line, not gated). One PASS/FAIL line per
+# route listed (a missing fixture is a FAIL line too, never a skip), then how many passed; the exit status is
+# 1 if any failed, 2 if the run was refused (an unknown route in --only, or no route to run). Every check's verdict goes to WORK/results.jsonl
+# as it runs, and WORK/report.html and WORK/result.json (the gates' envelope, gates/result.py, which a
+# gates/run session reads) are built from it however the run ends (report.py). A failed route keeps its
+# copies under WORK; a passed one keeps only its logs and answers. The stages are stage_ferrofin.sh,
+# stage_export.sh and stage_jellyfin.sh.
 #
 # Several runs can share one host: a run has an id (--run-id, default <time>-<pid>), and its containers
 # (rt-<id>-<route>-<server>), the tag it runs IMAGE as (ferrofin-roundtrip:<id>) and its work directory
@@ -85,12 +89,19 @@ done
 for t in docker sqlite3 jq curl python3 timeout; do command -v "$t" >/dev/null || die "$t not installed"; done
 RUN_ID=${RUN_ID:-$(rt_new_run_id)}
 rt_valid_run_id "$RUN_ID" || die "--run-id must be lower-case letters, digits, dots and dashes (at most 48), not '$RUN_ID'"
-if [ -n "$ONLY" ]; then
-  printf '%s\n' "${ROUNDTRIP_ROUTES[@]}" | cut -d'|' -f1 | grep -qxF -- "$ONLY" || die "no route $ONLY in routes.sh"
-fi
-for spec in "${ROUNDTRIP_ROUTES[@]}"; do   # the fifth field: where Ferrofin runs, an absolute directory
-  [[ "$(cut -d'|' -f5 <<<"$spec")" == /?* ]] || die "route ${spec%%|*} in routes.sh names no absolute data directory for Ferrofin"
+IFS=, read -ra WANTED <<<"$ONLY"
+for want in "${WANTED[@]}"; do
+  printf '%s\n' "${ROUNDTRIP_ROUTES[@]}" | cut -d'|' -f1 | grep -qxF -- "$want" || die "no route $want in routes.sh"
 done
+SELECTED=()
+for spec in "${ROUNDTRIP_ROUTES[@]}"; do   # the fields routes.sh describes
+  IFS='|' read -r route _ _ _ ran_at config_at kind <<<"$spec"
+  [[ $ran_at == /?* ]] || die "route $route in routes.sh names no absolute data directory for Ferrofin"
+  [[ $config_at == - || $config_at == /?* ]] || die "route $route in routes.sh names a configuration directory that is neither - nor absolute"
+  [[ $kind =~ ^(path|messy|scale)$ ]] || die "route $route in routes.sh is of kind '$kind', not path, messy or scale"
+  [ -z "$ONLY" ] || [[ ",$ONLY," == *",$route,"* ]] && SELECTED+=("$spec")
+done
+(( ${#SELECTED[@]} )) || die "no route to run: routes.sh lists none"
 [ -n "$FIXTURES" ] || FIXTURES=$(adoption_fixtures_dir roundtrip) || exit 2
 [ -d "$FIXTURES/media" ] || die "$FIXTURES has no media/: run gates/adoption/build-fixtures.sh first"
 if [ -z "$WORK" ]; then WORK=$(gates_dir roundtrip "runs/roundtrip-$RUN_ID") || exit 2; fi
@@ -135,6 +146,7 @@ record start "$WORK" --title "gates/roundtrip/run.sh" --image "$IMAGE" --oracle 
   --image-id "$IMAGE_ID" --commit "$COMMIT"
 
 # mark <stage> <check>: record the verdict of the check that just ran, from the reasons it added to why[].
+# shellcheck disable=SC2317,SC2329  # called by the stages, which the loop runs through timed (SC2317 before shellcheck 0.11)
 mark() {
   local detail='' verdict=PASS i
   for ((i = mark_from; i < ${#why[@]}; i++)); do detail+="${detail:+; }${why[i]}"; verdict=FAIL; done
@@ -142,6 +154,7 @@ mark() {
   record_detail check "$WORK" "$route" "$1" "$2" "$verdict" "$detail"
 }
 # check <reason-producing command…>: add each line it prints to why[].
+# shellcheck disable=SC2317,SC2329  # called by the stages (SC2317 before shellcheck 0.11)
 check() { mapfile -t -O "${#why[@]}" why < <("$@"); }
 # reasons <command…>: the command's output as reasons when it fails, nothing when it succeeds.
 # shellcheck disable=SC2317,SC2329  # called through check (SC2317 is the code before shellcheck 0.11)
@@ -154,26 +167,39 @@ reasons() { local out; out=$("$@" 2>&1) || printf '%s\n' "${out:-$1 failed}"; }
 . "$HERE/stage_jellyfin.sh"   # jellyfin_stage
 
 
-MEDIA=(-v "$FIXTURES/media:/media:ro")
-failed=0
-for spec in "${ROUNDTRIP_ROUTES[@]}"; do
-  IFS='|' read -r route fixture generation first_start ran_at <<<"$spec"
-  [ -z "$ONLY" ] || [ "$ONLY" = "$route" ] || continue
+# timed <stage function>: run it, adding its wall time to took[].
+timed() { local from=$SECONDS rc=0; "$@" || rc=$?; took+=("$((SECONDS - from)) s"); return "$rc"; }
+failed=0 passed=0
+for spec in "${SELECTED[@]}"; do
+  IFS='|' read -r route fixture generation first_start ran_at config_at kind <<<"$spec"
   dst=$WORK/$route
-  for needed in "$fixture" "$first_start.server.log"; do
+  case $kind in path) media=media;; *) media=media-$kind;; esac
+  MEDIA=(-v "$FIXTURES/$media:/media:ro")
+  # where Ferrofin runs, for its server and its export: the data directory, and the configuration apart from it
+  SERVER_DIRS=(-e FERROFIN_DATA_DIR="$ran_at" -v "$dst/ferrofin:$ran_at")
+  [ "$config_at" = - ] || SERVER_DIRS+=(-e FERROFIN_CONFIG_DIR="$config_at" -v "$dst/ferrofin-config:$config_at")
+  for needed in "$fixture" "$first_start.server.log" "$media"; do
     [ ! -e "$FIXTURES/$needed" ] || continue
     printf '%-5s %-14s %s\n' FAIL "$route" "fixture $needed missing: build the fixtures again into a new directory (gates/adoption/build-fixtures.sh)"
-    record_detail row "$WORK" "$route" path "$generation" FAIL "fixture $needed missing"; failed=1; continue 2
+    record_detail row "$WORK" "$route" "$kind" "$generation" FAIL "fixture $needed missing"; failed=1; continue 2
   done
   mkdir -p "$dst"
-  record begin "$WORK" "$route" path "$generation"
-  why=(); mark_from=0
-  ferrofin_stage && export_stage && jellyfin_stage
+  record begin "$WORK" "$route" "$kind" "$generation"
+  why=(); mark_from=0; took=(); size=''
+  if timed ferrofin_stage && timed export_stage; then
+    [ "$kind" != scale ] || size=$(du -sh "$dst/jellyfin" 2>/dev/null | cut -f1)   # as written, before Jellyfin's start
+    timed jellyfin_stage
+  fi
   verdict=PASS; [ "${#why[@]}" = 0 ] || { verdict=FAIL; failed=1; }
   detail=$(printf '%s; ' "${why[@]}"); detail=${detail%; }
+  if [ "$kind" = scale ]; then   # recorded, not gated
+    detail+="${detail:+; }took: Ferrofin ${took[0]:-not run}, export ${took[1]:-not run}, Jellyfin ${took[2]:-not run}; the export ${size:-not written}"
+  fi
   printf '%-5s %-14s %s\n' "$verdict" "$route" "$detail"
-  record_detail row "$WORK" "$route" path "$generation" "$verdict" "$detail"
+  record_detail row "$WORK" "$route" "$kind" "$generation" "$verdict" "$detail"
+  [ "$verdict" = FAIL ] || passed=$((passed + 1))
   # a passed route keeps its logs and answers; its copies go (a failed one keeps them to look into)
-  [ "$verdict" = FAIL ] || rm -rf -- "${dst:?}/ferrofin" "${dst:?}/ferrofin-cache" "${dst:?}/jellyfin" "${dst:?}/jellyfin-cache"
+  [ "$verdict" = FAIL ] || rm -rf -- "${dst:?}/ferrofin" "${dst:?}/ferrofin-config" "${dst:?}/ferrofin-cache" "${dst:?}/jellyfin" "${dst:?}/jellyfin-cache"
 done
+echo "roundtrip: $passed of ${#SELECTED[@]} route(s) passed"
 exit "$failed"

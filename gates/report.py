@@ -18,7 +18,7 @@ import json
 import os
 import sys
 
-GATES = ("verify", "adoption", "parity", "bench")
+GATES = ("verify", "adoption", "roundtrip", "parity", "bench")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -102,10 +102,20 @@ def adoption(d, record):
     if result is None and os.path.exists(os.path.join(d, "results.jsonl")):
         return found(problems=["no result.json: a run from before adoption wrote one (python3 "
                                "gates/adoption/adoption_report.py build DIR writes it)"], bad=True)
+    return recorded_rows(result, "rows passed")
+
+
+def roundtrip(d, record):
+    result = gate_result(d, "roundtrip")   # the adoption report's reading, a route being one of its rows
+    return recorded_rows(result, "routes passed")
+
+
+def recorded_rows(result, passed):
+    """What adoption_report.py's result says, its rows counted as `passed`, failed, unfinished and skipped."""
     if result is None:
         return found(problems=["no result.json: the gate ended before it recorded anything"], bad=True)
     counts, skipped = result["counts"], result["detail"].get("skipped_lines", 0)
-    return found(result["verdict"], [("rows passed", counts.get("pass", 0)), ("failed", counts.get("fail", 0)),
+    return found(result["verdict"], [(passed, counts.get("pass", 0)), ("failed", counts.get("fail", 0)),
                                      ("unfinished", counts.get("incomplete", 0)), ("skipped", counts.get("skip", 0))],
                  [skipped and f"{plural(skipped, 'unreadable line')} in results.jsonl skipped"],
                  bad=result["verdict"] != "passed")
@@ -152,13 +162,14 @@ def bench(d, record):
                  bad=verdict != "measured")
 
 
-READERS = {"verify": verify, "adoption": adoption, "parity": parity, "bench": bench}
+READERS = {"verify": verify, "adoption": adoption, "roundtrip": roundtrip, "parity": parity, "bench": bench}
 #: Each gate's own pages in its folder, linked whenever they exist, whatever its result says. The first
 #: page is the gate's report: a gate that ended without one says so. The rest are its raw files.
 OWN_PAGES = {"verify": (("report.html", "verify report"), ("scan-behaviour-movies.txt", "movies rows"),
                         ("scan-behaviour-tvshows.txt", "tvshows rows"), ("result.json", "result.json"),
                         ("verify.json", "verify.json"), ("server.log", "server log")),
              "adoption": (("report.html", "adoption report"),),
+             "roundtrip": (("report.html", "round-trip report"),),
              "parity": (("report.html", "parity report"),),
              "bench": (("report.html", "benchmark report"),)}
 

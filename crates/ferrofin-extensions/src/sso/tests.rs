@@ -144,6 +144,10 @@ fn the_settings_page_reads_the_admin_routes_and_holds_no_setting() {
     assert!(html.contains("ssoHttpWarning"), "{html}");
     assert!(html.contains("CallbackUrl"), "{html}");
     assert!(html.contains("Published server URL"), "{html}");
+    // Ferrofin Settings shows the published URL read-only, so the field's
+    // description and the provider row's message name where it is set.
+    assert_eq!(html.matches("FERROFIN_PUBLISHED_URL").count(), 2, "{html}");
+    assert!(!html.contains("set the Published server URL"), "{html}");
     assert!(html.contains("PublicUrlError"), "{html}");
     assert!(html.contains("already exists: edit it instead"), "{html}");
     // A save's discovery test is shown in the provider's row.
@@ -171,7 +175,19 @@ fn the_settings_page_reads_the_admin_routes_and_holds_no_setting() {
         ),
         "{html}"
     );
-    assert_eq!(html.matches("Dashboard.confirm(").count(), 2, "{html}");
+    for (at, call) in html.match_indices("Dashboard.confirm(") {
+        let rest = &html[at + call.len()..];
+        let message = &rest[..rest.find(',').unwrap_or(rest.len())];
+        assert!(
+            [
+                "DELETE_MESSAGE",
+                "NO_ACCESS_MESSAGE",
+                "last ? LAST_LINK_MESSAGE : REMOVE_MESSAGE"
+            ]
+            .contains(&message),
+            "a confirm message that is not a constant: {message}"
+        );
+    }
     assert!(!html.contains("Dashboard.alert("), "{html}");
     // Every string from a response is set as text, never parsed as HTML.
     for sink in [

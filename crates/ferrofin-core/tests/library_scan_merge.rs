@@ -525,6 +525,87 @@ async fn an_nfo_id_replaces_the_recorded_one_except_when_filling(
     assert_eq!(ids, [("Tmdb".to_owned(), expected.to_owned())]);
 }
 
+/// "Replace all metadata" with an NFO that no longer names any genre, studio
+/// or tag clears the item's columns, and the save drops its `ItemValuesMap`
+/// links with them, as upstream's `UpdateOrInsertItems` removes every link
+/// the item's values no longer hold (`ItemPersistenceService.cs:364-422`,
+/// gl-1636). A locked item keeps its values and so its links. A locked row
+/// the scan could not read (a scanner without an item repository, which
+/// cannot tell it is locked) keeps both too: the save keeps its columns, and
+/// the links stay with them.
+#[rstest::rstest]
+#[case::read(false, true, 0)]
+#[case::locked(true, true, 3)]
+#[case::unread_locked(true, false, 3)]
+#[tokio::test]
+async fn a_replace_that_leaves_no_values_drops_the_items_value_links(
+    #[case] locked: bool,
+    #[case] reads_rows: bool,
+    #[case] expected: i64,
+) {
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("movies");
+    let folder = media.join("Heat (1995)");
+    std::fs::create_dir_all(&folder).expect("mkdir");
+    let file = folder.join("Heat (1995).mkv");
+    std::fs::write(&file, b"").expect("write");
+    let nfo = file.with_extension("nfo");
+    std::fs::write(
+        &nfo,
+        "<movie><title>Heat</title><genre>Crime</genre><studio>Warner</studio>\
+         <tag>heist</tag></movie>",
+    )
+    .expect("nfo");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::movies).await;
+    let scanner = if reads_rows {
+        fx.scanner()
+    } else {
+        LibraryScanner::new(
+            Arc::clone(&fx.vf),
+            Arc::new(FerrofinFileSystem::new()),
+            fx.persistence.clone(),
+        )
+    };
+    scanner.scan_all().await.expect("first scan");
+    let id = derive_item_id(BaseItemKind::Movie, &file.to_string_lossy()).expect("id");
+    let links = || async {
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM "ItemValuesMap" WHERE "ItemId" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .fetch_one(fx.db.pool())
+            .await
+            .expect("links")
+    };
+    assert_eq!(links().await, 3, "genre, studio and tag are linked");
+    if locked {
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .execute(fx.db.writer())
+            .await
+            .expect("lock");
+    }
+
+    std::fs::write(&nfo, "<movie><title>Heat</title></movie>").expect("nfo");
+    touch(&nfo, 3_600);
+    let replace = MetadataRefreshOptions::for_item_refresh(
+        MetadataRefreshMode::FullRefresh,
+        MetadataRefreshMode::FullRefresh,
+        true,
+        false,
+        false,
+    );
+    scanner.scan_with(None, &replace).await.expect("replace");
+
+    let row = fx.row(BaseItemKind::Movie, &file).await;
+    let columns = [&row.genres, &row.studios, &row.tags].map(|c| c.as_deref().unwrap_or(""));
+    if locked {
+        assert_eq!(columns, ["Crime", "Warner", "heist"]);
+    } else {
+        assert_eq!(columns, ["", "", ""]);
+    }
+    assert_eq!(links().await, expected);
+}
+
 /// "Replace all metadata" erases only what something re-supplies: upstream
 /// merges nothing at all when no provider answered
 /// (`if (refreshResult.UpdateType > ItemUpdateType.None)`,

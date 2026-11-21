@@ -3,8 +3,9 @@
 # the export wrote, read its log (checks_boot.py), refresh every playlist's metadata in full (api.py
 # refresh-playlists), compare its answers with Ferrofin's oracle, probe the files
 # it serves (probes.py), scan its libraries, and check the file and its library rows (checks_paths.py) once it
-# has stopped. It uses run.sh's state: route, dst, first_start, the settings, FIXTURES, JELLYFIN_ID, MADE, and
-# why[] through check and mark.
+# has stopped. On the scale route, where Ferrofin captured no answers, only its start and its file are checked
+# (stage_ferrofin.sh says why). It uses run.sh's state: route, kind, dst, first_start, the settings, FIXTURES,
+# JELLYFIN_ID, MADE, and why[] through check and mark.
 # shellcheck disable=SC2154  # run.sh sets what this reads
 
 # jellyfin_stage: the Jellyfin checks of one route, each recorded.
@@ -37,13 +38,17 @@ jellyfin_stage() {
     rt_docker logs "$name" > "$dst/jellyfin-boot.log" 2>&1
     check reasons python3 "$HERE/checks_boot.py" migrations "$dst/jellyfin-boot.log"
     mark Jellyfin "every migration it began finished"
-    # what Jellyfin's own first start on this route's source ran, as build-fixtures.sh logged it
-    check reasons python3 "$HERE/checks_boot.py" ran "$dst/jellyfin-boot.log" "$FIXTURES/$first_start.server.log"
+    # what Jellyfin's own first start on this route's source ran, as build-fixtures.sh logged it, less what the
+    # source's history (as Ferrofin stopped with it) records
+    check reasons python3 "$HERE/checks_boot.py" ran "$dst/jellyfin-boot.log" "$FIXTURES/$first_start.server.log" \
+      "$dst/ferrofin/data/jellyfin.db"
     mark Jellyfin "it ran the code migrations it runs on the source, and no schema migration"
     check reasons python3 "$HERE/checks_boot.py" errors "$dst/jellyfin-boot.log"
     mark Jellyfin "no ERR or FTL outside the allowlist"
   fi
-  if [ -n "$ready" ]; then
+  local full=$ready
+  [ "$kind" != scale ] || full=''   # nothing Ferrofin captured to compare, and no scan (stage_ferrofin.sh)
+  if [ -n "$full" ]; then
     # Before the answers: a refresh that merged a stale playlist.xml back would show in them (a removed share).
     check reasons python3 "$HERE/api.py" refresh-playlists --base-url "$url" --data-dir "$dst/jellyfin" \
       --timeout "$SCAN_TIMEOUT"
@@ -66,7 +71,7 @@ jellyfin_stage() {
   rt_remove "$cid"
   check adoption_check_db "$dst/jellyfin/data/jellyfin.db"
   mark Jellyfin "integrity_check and foreign_key_check"
-  if [ -n "$ready" ]; then
+  if [ -n "$full" ]; then
     check reasons python3 "$HERE/checks_paths.py" libraries --before "$dst/ferrofin/data/jellyfin.db" \
       --after "$dst/jellyfin/data/jellyfin.db"
     mark Jellyfin "every library keeps its folder row and DateCreated through its scan"

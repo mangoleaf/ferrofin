@@ -173,9 +173,10 @@ impl SsoService {
     /// between the read and the save is overwritten, as with two dashboard
     /// saves.
     ///
-    /// No lock is held here: a sign-in through SSO never takes the user's
-    /// login lock, which the save takes, and the flag's transaction above is
-    /// over.
+    /// No user lock is held here (only the service's provisioning lock,
+    /// which the save never takes): a sign-in through SSO never takes the
+    /// user's login lock, which the save takes, and the flag's transaction
+    /// above is over.
     async fn sync_access(
         &self,
         provider: &OidcProvider,
