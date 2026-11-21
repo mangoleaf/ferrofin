@@ -23,6 +23,7 @@ pub mod fanart;
 mod guarded_http;
 mod http_client;
 mod image_download;
+pub mod image_metadata;
 pub mod image_policy;
 pub mod image_save;
 pub mod library_options;

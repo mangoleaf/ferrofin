@@ -211,8 +211,8 @@ config <system|encoding|network> <setting>=<value> …           settings a dash
 collection <Playlist|BoxSet> <item count> <name>               the probed account's playlists and collections
 members <Playlist|BoxSet> <name> = <item names>                their items: a playlist's in order, a collection's
                                                                 by name
-image <Playlist|BoxSet> <name> <image types>                   which images they have (not their sizes: an
-                                                                upload is stored 0x0 until gl-1054 is fixed)
+image <Playlist|BoxSet> <name> <image types>                   which images they have (not their sizes,
+                                                                which Jellyfin measures again on its saves)
 shares <owner> <playlist> = <user>:<can edit 0|1>,…            synthetic-adult's playlists (answers.SHARE_OWNER,
                                                                 through its own web session in the copy), each with
                                                                 the accounts it is shared with, "-" for none,
