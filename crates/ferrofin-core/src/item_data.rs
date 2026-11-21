@@ -304,6 +304,76 @@ pub fn with_resolved_video_fields(stored: Option<&str>, resolved: Option<&str>) 
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
+/// The `Data` keys the media probe owns: `Container` (`FFProbeVideoInfo.cs:206`,
+/// `AudioFileProber.cs:138`), a video's `DefaultVideoStreamIndex` and
+/// `HasSubtitles` (`FFProbeVideoInfo.cs:268-270`), a track's `LyricFiles`
+/// (`AudioFileProber.cs:584`) and a `.strm` item's `ShortcutPath`
+/// (`ProbeProvider.FetchShortcutInfo`). Upstream's probe is a pre-refresh
+/// provider, run before a refresh's lock check (`MetadataService.cs:780-788`),
+/// and the item is saved whole after it, so a locked item's keys follow its
+/// file too. No user edits any of them. Each holds a scalar or a list: a
+/// locked row's save sets them whole with a merge patch, which would merge an
+/// object instead.
+pub const PROBE_OWNED_KEYS: [&str; 5] = [
+    "Container",
+    "DefaultVideoStreamIndex",
+    "HasSubtitles",
+    "LyricFiles",
+    "ShortcutPath",
+];
+
+/// The one [`PROBE_OWNED_KEYS`] entry a probe removes when it finds none: a
+/// track with no lyric file stores no `LyricFiles`.
+pub const PROBE_CLEARED_KEY: &str = "LyricFiles";
+
+/// `stored` as a locked row's scan save leaves it: the resolver's video
+/// fields ([`with_resolved_video_fields`]), then each of the
+/// [`PROBE_OWNED_KEYS`] `incoming` carries, as it holds it (a JSON `null`
+/// reads as absent and is stored absent). A key `incoming` does not carry is
+/// kept as stored, since a scan that could not read the stored row sends the
+/// planner's blob, which a failed probe leaves without them; except the
+/// [`PROBE_CLEARED_KEY`], whose absence is the probe's answer (a row a scan
+/// read carries its stored list unless the probe cleared it, and one it could
+/// not read loses the list only until the lyric check re-probes it). Every
+/// other key is kept.
+///
+/// `None` when that changes nothing, or either blob is not a JSON object (an
+/// empty or absent `stored` is an empty object). The SQL twin is the
+/// persistence service's `locked_data_sql`, whose changed-or-not answer this
+/// is; its text can differ (it stores no probe key as a JSON `null`).
+#[must_use]
+pub fn with_locked_scan_fields(stored: Option<&str>, incoming: Option<&str>) -> Option<String> {
+    let Value::Object(probed) = serde_json::from_str::<Value>(incoming?).ok()? else {
+        return None;
+    };
+    let resolved = with_resolved_video_fields(stored, incoming);
+    let mut object = match resolved.as_deref().or(stored).filter(|d| !d.is_empty()) {
+        None => Map::new(),
+        Some(text) => match serde_json::from_str::<Value>(text).ok()? {
+            Value::Object(map) => map,
+            _ => return None,
+        },
+    };
+    let mut changed = resolved.is_some();
+    for key in PROBE_OWNED_KEYS {
+        if key != PROBE_CLEARED_KEY && !probed.contains_key(key) {
+            continue;
+        }
+        let value = probed.get(key).filter(|value| !value.is_null());
+        if object.get(key).filter(|value| !value.is_null()) != value {
+            match value {
+                Some(value) => object.insert(key.to_owned(), value.clone()),
+                None => object.remove(key),
+            };
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::to_string(&Value::Object(object)).ok()
+}
+
 /// The `Data` key a series' status lives under — C# `Series.Status`
 /// (`SeriesStatus?`), serialized by name (`"Status":"Ended"`) into the blob
 /// like every other non-column property (`BaseItemMapper.cs:234`).

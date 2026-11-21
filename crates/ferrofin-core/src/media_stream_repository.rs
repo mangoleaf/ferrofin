@@ -199,6 +199,36 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         Ok(map)
     }
 
+    async fn sync_has_subtitles(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let id = guid_to_db(item_id);
+        // The JSON functions read `Data` only once `json_valid` passed: they
+        // raise on malformed input, which would fail the statement.
+        let written = sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "Data" = json_set(coalesce(nullif("Data", ''), '{}'), '$.HasSubtitles',
+                   json(CASE WHEN EXISTS (SELECT 1 FROM "MediaStreamInfos"
+                                          WHERE "ItemId" = ?1 AND "StreamType" = ?2)
+                        THEN 'true' ELSE 'false' END))
+               WHERE "Id" = ?1
+                 AND CASE WHEN json_valid(coalesce(nullif("Data", ''), '{}'))
+                     THEN json_type(coalesce(nullif("Data", ''), '{}')) = 'object'
+                          AND json_extract(coalesce(nullif("Data", ''), '{}'), '$.HasSubtitles')
+                              IS NOT EXISTS (SELECT 1 FROM "MediaStreamInfos"
+                                             WHERE "ItemId" = ?1 AND "StreamType" = ?2)
+                     ELSE 0 END"#,
+        )
+        .bind(&id)
+        .bind(i64::from(media_stream_type_disc(MediaStreamType::Subtitle)))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if written > 0 {
+            self.db.note_items_written([id.as_str()]);
+        }
+        Ok(())
+    }
+
     async fn get_item_ids_with_subtitles(
         &self,
         item_ids: &[Uuid],
@@ -331,6 +361,73 @@ mod tests {
     use ferrofin_model::entities::MediaStreamType;
     use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
     use uuid::Uuid;
+
+    /// `sync_has_subtitles` stores `Data.HasSubtitles` from the item's rows in
+    /// one statement: a `NULL` or empty blob becomes an object holding it, a
+    /// missing, `null` or disagreeing key is written, and an agreeing key or a
+    /// blob that is no JSON object is left as it was, byte for byte.
+    #[rstest::rstest]
+    #[case::null(None, true, Some(r#"{"HasSubtitles":true}"#))]
+    #[case::empty(Some(""), false, Some(r#"{"HasSubtitles":false}"#))]
+    #[case::missing(Some(r#"{"A":1}"#), false, Some(r#"{"A":1,"HasSubtitles":false}"#))]
+    #[case::null_value(
+        Some(r#"{"HasSubtitles":null}"#),
+        true,
+        Some(r#"{"HasSubtitles":true}"#)
+    )]
+    #[case::disagrees(
+        Some(r#"{"HasSubtitles":true,"A":1}"#),
+        false,
+        Some(r#"{"HasSubtitles":false,"A":1}"#)
+    )]
+    #[case::agrees(
+        Some(r#"{"HasSubtitles": true, "A" : 1}"#),
+        true,
+        Some(r#"{"HasSubtitles": true, "A" : 1}"#)
+    )]
+    #[case::invalid(Some("not json"), true, Some("not json"))]
+    #[case::array(Some("[1]"), true, Some("[1]"))]
+    #[tokio::test]
+    async fn sync_has_subtitles_stores_the_flag_the_rows_hold(
+        #[case] data: Option<&str>,
+        #[case] subtitle: bool,
+        #[case] expected: Option<&str>,
+    ) {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_item(&db, id, BaseItemKind::Movie).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .bind(data)
+            .execute(db.writer())
+            .await
+            .expect("seed data");
+        let repo = FerrofinMediaStreamRepository::new(db.clone());
+        let mut rows = vec![stream(0, 1, None)];
+        if subtitle {
+            rows.push(stream(1, 2, Some("eng")));
+        }
+        repo.save_media_streams(id, &rows).await.expect("rows");
+
+        repo.sync_has_subtitles(id).await.expect("sync");
+
+        let stored: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(ferrofin_db::store::guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("data");
+        assert_eq!(stored.as_deref(), expected);
+    }
+
+    /// No row, nothing to write, and no error.
+    #[tokio::test]
+    async fn sync_has_subtitles_without_a_row_writes_nothing() {
+        FerrofinMediaStreamRepository::new(test_db().await)
+            .sync_has_subtitles(Uuid::new_v4())
+            .await
+            .expect("sync");
+    }
 
     fn stream(index: i64, stream_type: i32, language: Option<&str>) -> MediaStreamInfoEntity {
         MediaStreamInfoEntity {

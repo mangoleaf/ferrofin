@@ -19,8 +19,9 @@
 //! - `Self::delete_subtitles` deletes an external subtitle's file; the item
 //!   refresh the route then awaits drops its stream.
 //! - `Self::drop_missing_subtitle_rows` drops the external subtitle rows whose
-//!   file is gone; the route runs it after that refresh, for one that cannot
-//!   probe.
+//!   file is gone and, when it drops one, stores the video's `HasSubtitles`
+//!   from the rows left; the route runs it after that refresh, for one that
+//!   cannot probe.
 //! - `Self::get_supported_providers` lists the registered providers for an item.
 
 use ferrofin_util::directory_path::DirectoryPath;
@@ -37,9 +38,7 @@ use uuid::Uuid;
 use ferrofin_traits::activity::{ActivityLogCreate, ActivityManager};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, SelfWrite, SelfWriteGuard, VirtualFolderManager};
-use ferrofin_traits::persistence::{
-    ItemPersistenceService as _, MediaStreamQuery, MediaStreamRepository,
-};
+use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::subtitles::{
     ProviderLogin, SubtitleManager, SubtitleMediaType, SubtitleProvider, SubtitleResponse,
     SubtitleSearchRequest, is_rate_limit_exceeded,
@@ -323,13 +322,7 @@ impl FerrofinSubtitleManager {
         // `FFProbeVideoInfo.cs:270` counts the new subtitle in `HasSubtitles`,
         // which only `Data` holds (gl-1632). Here the row just saved matches
         // the sidecar on disk, so the next scan sees no change to re-probe.
-        let fields = serde_json::Map::from_iter([(
-            "HasSubtitles".to_owned(),
-            serde_json::Value::Bool(true),
-        )]);
-        crate::item_persistence_service::FerrofinItemPersistenceService::new(self.db.clone())
-            .merge_data_fields(item_id, &fields)
-            .await
+        self.media_streams.sync_has_subtitles(item_id).await
     }
 }
 
@@ -713,7 +706,12 @@ impl SubtitleManager for FerrofinSubtitleManager {
         if kept.len() == before {
             return Ok(());
         }
-        self.media_streams.save_media_streams(item_id, &kept).await
+        self.media_streams
+            .save_media_streams(item_id, &kept)
+            .await?;
+        // The refresh that could not probe left the flag too: a video whose
+        // last subtitle went has none (`FFProbeVideoInfo.cs:270`).
+        self.media_streams.sync_has_subtitles(item_id).await
     }
 
     async fn get_supported_providers(
@@ -789,13 +787,13 @@ mod tests {
     use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::entities::MediaStreamType;
-    use ferrofin_traits::persistence::MediaStreamRepository;
+    use ferrofin_traits::persistence::{ItemPersistenceService as _, MediaStreamRepository};
     use ferrofin_traits::subtitles::{SubtitleProvider, SubtitleResponse, SubtitleSearchRequest};
     use uuid::Uuid;
 
     use crate::db_error::media_stream_type_disc;
     use crate::media_stream_repository::FerrofinMediaStreamRepository;
-    use crate::test_support::{library_manager_over, seed_item, test_db};
+    use crate::test_support::{library_manager_over, seed_item, seed_item_with_data, test_db};
 
     use super::*;
 
@@ -2291,6 +2289,58 @@ mod tests {
             .await
             .expect("sweep again");
         assert_eq!(indexes(&repo, item).await, [0, 1, 3, 4, 5, 6, 7]);
+    }
+
+    /// The sweep after a refresh that could not probe keeps the video's
+    /// `HasSubtitles` in step with the rows it leaves (gl-1914): false once
+    /// its last subtitle went, true while another stays; every other key of
+    /// `Data` stays.
+    #[rstest::rstest]
+    #[case::last_one_gone(false, false)]
+    #[case::another_stays(true, true)]
+    #[tokio::test]
+    async fn the_sweep_keeps_has_subtitles_in_step_with_the_rows(
+        #[case] embedded: bool,
+        #[case] expected: bool,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item_with_data(
+            &db,
+            item,
+            BaseItemKind::Movie,
+            "Movie",
+            r#"{"HasSubtitles":true,"Container":"matroska"}"#,
+        )
+        .await;
+        let repo = FerrofinMediaStreamRepository::new(db.clone());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let gone = tmp.path().join("movie.eng.srt");
+        let mut rows = vec![
+            MediaStreamInfoEntity {
+                stream_index: 0,
+                stream_type: media_stream_type_disc(MediaStreamType::Video),
+                ..Default::default()
+            },
+            subtitle_stream(1, true, gone.to_str()),
+        ];
+        if embedded {
+            rows.push(subtitle_stream(2, false, None));
+        }
+        repo.save_media_streams(item, &rows)
+            .await
+            .expect("save streams");
+
+        manager(db.clone(), Vec::new())
+            .drop_missing_subtitle_rows(item)
+            .await
+            .expect("sweep");
+
+        let data = crate::test_support::fetch_item(&db, item).await.data;
+        let data: serde_json::Value =
+            serde_json::from_str(data.as_deref().expect("data")).expect("json");
+        assert_eq!(data["HasSubtitles"], expected, "{data}");
+        assert_eq!(data["Container"], "matroska", "{data}");
     }
 
     /// gl-1875, with no refresh that probes between the steps: a second delete

@@ -2453,6 +2453,25 @@ pub trait MediaStreamRepository: Send + Sync {
         Ok(map)
     }
 
+    /// Stores in item `item_id`'s `Data` the `HasSubtitles` its stream rows
+    /// hold now: whether one is a subtitle, as `FFProbeVideoInfo.cs:270` sets
+    /// it over the streams the probe saves. Only `Data` keeps it, which a
+    /// returned Jellyfin reads. The rows are read and the flag written in one
+    /// statement, so it agrees with the rows whatever wrote them before. A
+    /// `NULL` or empty `Data` becomes an object holding the flag, and a blob
+    /// without the key gains it. Writes nothing when the flag already agrees,
+    /// when `Data` is not a JSON object, or when there is no such row.
+    ///
+    /// The default (a stub/fake repository) writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn sync_has_subtitles(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let _ = item_id;
+        Ok(())
+    }
+
     /// The subset of `item_ids` with at least one subtitle stream row.
     ///
     /// Backs the DTO builder's per-page `HasSubtitles` (C# stores the flag on
