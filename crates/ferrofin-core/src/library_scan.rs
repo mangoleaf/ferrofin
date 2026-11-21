@@ -5665,30 +5665,32 @@ impl LibraryScanner {
     /// are compared expanded (`%AppDataPath%/collections`, as Jellyfin stores
     /// the Collections folder) and `OrdinalIgnoreCase`.
     ///
-    /// Nothing without a root folder and an item repository, with no library
-    /// configured, or while any library lists no location: an unreadable
-    /// configuration or a shortcut that did not resolve must not read as a
-    /// removed location, which would take every item under it with it.
-    async fn prune_orphan_locations(
-        &self,
-        folders: &[VirtualFolderInfo],
-    ) -> Vec<(Uuid, Vec<Uuid>)> {
+    /// Nothing without a root folder and an item repository, or while the
+    /// libraries' locations cannot be known whole
+    /// ([`VirtualFolderManager::locations_for_removal`]): no library
+    /// configured, an unreadable configuration or a shortcut that did not
+    /// resolve must not read as a removed location, which would take every
+    /// item under it with it. A library created with no folder adds none.
+    ///
+    /// The locations it prunes by are first stored on the root
+    /// ([`Self::record_root_locations`]); when it holds back, the root keeps
+    /// the list it has.
+    async fn prune_orphan_locations(&self) -> Vec<(Uuid, Vec<Uuid>)> {
         let (Some(aggregate), Some(items)) = (self.root_folder, &self.item_repository) else {
             return Vec::new();
         };
-        if folders.is_empty() {
-            return Vec::new();
-        }
-        if let Some(empty) = folders.iter().find(|f| f.locations.is_empty()) {
-            tracing::warn!(
-                library = empty.name.as_deref().unwrap_or_default(),
-                "a library lists no location; not pruning removed locations' folders"
-            );
-            return Vec::new();
-        }
-        let configured: std::collections::HashSet<String> = folders
+        let locations = match self.virtual_folders.locations_for_removal().await {
+            Ok(Some(locations)) => locations,
+            Ok(None) => return Vec::new(),
+            Err(err) => {
+                tracing::warn!(%err, "failed to read the libraries' locations");
+                return Vec::new();
+            }
+        };
+        self.record_root_locations(aggregate, items.as_ref(), &locations)
+            .await;
+        let configured: std::collections::HashSet<String> = locations
             .iter()
-            .flat_map(|f| &f.locations)
             .map(|location| trimmed_dir(location).to_lowercase())
             .collect();
         // The browse repository projects the aggregate root as user views.
@@ -5743,6 +5745,47 @@ impl LibraryScanner {
                 tracing::warn!(%err, "failed to prune the folders of removed locations");
                 Vec::new()
             }
+        }
+    }
+
+    /// Stores the aggregate root's `PhysicalLocationsList` as
+    /// `AggregateFolder.CreateResolveArgs` computes it: the root's own path,
+    /// then `locations`, every library's in the order their folders list them,
+    /// expanded. Merged into the root's `Data`, which keeps its `IsRoot`, and
+    /// written only when it changed. Upstream saves the list one validation
+    /// late (its opening `RootFolder.RefreshMetadata` saves what the previous
+    /// `ValidateChildren` computed); this stores the list the scan prunes by,
+    /// which a returned Jellyfin computes alike, once the export has carried
+    /// its paths onto Jellyfin's layout (gl-1924) and while its folders list in
+    /// the same order (gl-1933), and so does not save again. A failure is
+    /// logged.
+    async fn record_root_locations(
+        &self,
+        aggregate: Uuid,
+        items: &dyn ItemRepository,
+        locations: &[String],
+    ) {
+        let root = match items.retrieve_item(aggregate).await {
+            Ok(Some(root)) => root,
+            Ok(None) => return,
+            Err(err) => {
+                tracing::warn!(%err, "failed to read the root folder");
+                return;
+            }
+        };
+        let Some(path) = root.path.as_deref().map(|p| self.virtual_paths.expand(p)) else {
+            return;
+        };
+        let list = std::iter::once(path)
+            .chain(locations.iter().cloned())
+            .map(serde_json::Value::String)
+            .collect();
+        let fields = serde_json::Map::from_iter([(
+            "PhysicalLocationsList".to_owned(),
+            serde_json::Value::Array(list),
+        )]);
+        if let Err(err) = self.persistence.merge_data_fields(aggregate, &fields).await {
+            tracing::warn!(%err, "failed to record the root folder's locations");
         }
     }
 
@@ -5804,7 +5847,7 @@ impl LibraryScanner {
         let all_folders = self.virtual_folders.get_virtual_folders().await?;
         // `AggregateFolder.ValidateChildren` likewise drops a location's
         // folder once no library lists the location.
-        let orphaned = self.prune_orphan_locations(&all_folders).await;
+        let orphaned = self.prune_orphan_locations().await;
         if !orphaned.is_empty() {
             self.announce_changes(&[], &[], &orphaned);
         }

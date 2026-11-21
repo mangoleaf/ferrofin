@@ -403,8 +403,9 @@ impl DynamicImageProviders {
     /// every root's plan is taken with `locations_changed` false, where
     /// upstream's `AggregateFolder.RequiresRefresh` also fires when its
     /// physical locations (every library's) differ from the stored list. Fix
-    /// path: record the aggregate's `PhysicalLocationsList` as upstream does
-    /// and pass the comparison for the `AggregateFolder` row.
+    /// path: pass the comparison for the `AggregateFolder` row, against the
+    /// `PhysicalLocationsList` the previous scan stored (gl-1930,
+    /// `LibraryScanner::record_root_locations`, which runs after this pass).
     ///
     /// # Errors
     ///
