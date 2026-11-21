@@ -1340,10 +1340,20 @@ impl FerrofinPlaylistManager {
     }
 
     /// `UpdatePlaylistInternal` → `UpdateToRepositoryAsync(MetadataEdit)`:
-    /// stamps the playlist's `DateLastSaved` (its Etag moves) and announces
-    /// `ItemUpdated`. The change is committed by now, so a failure is logged,
-    /// not returned.
+    /// runs the metadata savers (`PlaylistXmlSaver` writes the folder's
+    /// `playlist.xml`), stamps the playlist's `DateLastSaved` (its Etag
+    /// moves) and announces `ItemUpdated`. The change is committed by now, so
+    /// a failure is logged, not returned.
     async fn announce_updated(&self, playlist_id: Uuid) {
+        if let Some(providers) = &self.providers {
+            if let Err(err) = providers
+                .update_to_repository(playlist_id, ItemUpdateType::MetadataEdit)
+                .await
+            {
+                tracing::warn!(item_id = %playlist_id, %err, "could not save a playlist change");
+            }
+            return;
+        }
         let Some(persistence) = &self.persistence else {
             return;
         };
@@ -1985,13 +1995,20 @@ impl PlaylistManager for FerrofinPlaylistManager {
         }
         item_data::sync_container_data_in(&mut tx, request.id).await?;
         tx.commit().await.map_err(db_err)?;
+        let refreshes = entries.as_ref().is_some_and(|entries| !entries.is_empty());
+        let rated = if refreshes {
+            self.update_rating_to_items(request.id).await
+        } else {
+            Ok(())
+        };
+        // The save, its savers' file write included, and the queued refresh
+        // run after the edit guard is released, so neither holds it; the
+        // committed change is saved even when the re-rate failed.
+        drop(edit);
         self.announce_updated(request.id).await;
-        if entries.as_ref().is_some_and(|entries| !entries.is_empty()) {
-            self.update_rating_to_items(request.id).await?;
-            // `AddToPlaylistInternal`'s refresh, reached from `UpdatePlaylist`,
-            // queued after the edit guard is released, so the queue call never
-            // runs under it.
-            drop(edit);
+        rated?;
+        if refreshes {
+            // `AddToPlaylistInternal`'s refresh, reached from `UpdatePlaylist`.
             queue_refresh(self.providers.as_deref(), request.id, force_save_refresh()).await?;
         }
         Ok(())
@@ -2214,7 +2231,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // Same ordering the read path uses (`get_linked_children_ids`), so the
         // relocation matches what the client sees.
         let playlist = self.require_playlist_argument(playlist_id).await?;
-        let _edit = self.entry_edits.lock().await;
+        let edit = self.entry_edits.lock().await;
         let pid = guid_to_db(playlist);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
 
@@ -2253,6 +2270,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         };
         entries.insert(target, entry);
         write_entries(self.db.writer(), &pid, &entries).await?;
+        // The save and its savers' file write run after the edit guard.
+        drop(edit);
         self.announce_updated(playlist).await;
         Ok(())
     }
@@ -5547,6 +5566,7 @@ mod tests {
             }]),
             from_file: false,
             replace: true,
+            shares: None,
         }];
         let sync = persistence.sync_scanned_playlists(&scanned);
         let gone = [a];
@@ -6361,6 +6381,79 @@ mod tests {
                 .expect("again")
         );
         assert_eq!(rows(&db, set).await, vec![c, b, a]);
+    }
+
+    /// `UpdatePlaylistInternal` → `UpdateToRepositoryAsync(MetadataEdit)`:
+    /// an update, a share added or removed, a move that moves an entry and a
+    /// hand-over to a share each run the metadata savers once
+    /// (`PlaylistXmlSaver` writes the folder's `playlist.xml`).
+    #[tokio::test]
+    async fn playlist_changes_run_the_metadata_savers() {
+        use ferrofin_model::playlists::PlaylistUserUpdateRequest;
+        let edit = ferrofin_traits::providers::ItemUpdateType::MetadataEdit;
+        let db = test_db().await;
+        let (track_a, track_b) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, track_a, BaseItemKind::Audio).await;
+        seed_item(&db, track_b, BaseItemKind::Audio).await;
+        let (owner, friend) = (Uuid::new_v4(), Uuid::new_v4());
+        crate::test_support::seed_named_user(&db, owner, "owner").await;
+        crate::test_support::seed_named_user(&db, friend, "friend").await;
+        let queued = Arc::new(QueuedRefreshes::default());
+        let (mgr, _root) = playlist_manager(&db).await;
+        let mgr = mgr.with_providers(Arc::clone(&queued) as Arc<_>);
+        let mix = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                item_id_list: vec![track_a, track_b],
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let mix = Uuid::parse_str(&mix.id).expect("uuid");
+        queued.take_saved();
+        mgr.update_playlist(&PlaylistUpdateRequest {
+            id: mix,
+            name: Some("Mix 2".to_owned()),
+            ..PlaylistUpdateRequest::default()
+        })
+        .await
+        .expect("rename");
+        assert_eq!(queued.take_saved(), vec![(mix, edit)]);
+        mgr.add_user_to_shares(&PlaylistUserUpdateRequest {
+            id: mix,
+            user_id: friend,
+            can_edit: Some(true),
+        })
+        .await
+        .expect("share");
+        assert_eq!(queued.take_saved(), vec![(mix, edit)]);
+        mgr.move_item(&mix.to_string(), &track_b.simple().to_string(), 0, owner)
+            .await
+            .expect("move");
+        assert_eq!(queued.take_saved(), vec![(mix, edit)]);
+        mgr.move_item(&mix.to_string(), &track_b.simple().to_string(), 0, owner)
+            .await
+            .expect("no move");
+        assert_eq!(
+            queued.take_saved(),
+            Vec::new(),
+            "a move that moves nothing saves nothing"
+        );
+        mgr.remove_playlists(owner).await.expect("hand over");
+        assert_eq!(
+            queued.take_saved(),
+            vec![(mix, edit)],
+            "handed to the share"
+        );
+        mgr.remove_user_from_shares(
+            mix,
+            friend,
+            &ferrofin_model::entities_media::PlaylistUserPermissions::new(friend, true),
+        )
+        .await
+        .expect("unshare");
+        assert_eq!(queued.take_saved(), vec![(mix, edit)]);
     }
 
     /// `PlaylistManager.AddToPlaylistInternal` (reached from create, update
