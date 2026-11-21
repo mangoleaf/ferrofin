@@ -7,8 +7,8 @@
 //! matches the ported test oracle exactly. Transliteration runs ICU4X's CLDR
 //! transforms (see [`transliterated`]).
 //!
-//! [`zero_padded`] is not from that file: it is .NET's zero-placeholder
-//! integer format, which the user-data keys are built with.
+//! [`zero_padded`] is not from that file: it is .NET's zero-placeholder custom
+//! format of an integer (`ToString("000")`).
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, OnceLock};

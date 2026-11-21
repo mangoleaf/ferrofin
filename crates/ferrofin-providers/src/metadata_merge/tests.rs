@@ -18,9 +18,10 @@ use rstest::rstest;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 use super::{
-    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, language_subtag,
-    matches_preferred_language, merge_data, merge_people, merge_provider_ids, merge_refresh,
-    pass_credits, set_provider_ids, settle_sort_name,
+    MetadataResult, RefreshAnswers, RefreshMerge, audio_sort_name, episode_sort_name,
+    is_valid_provider_id, language_subtag, matches_preferred_language, merge_data, merge_people,
+    merge_provider_ids, merge_refresh, pass_credits, season_sort_name, set_provider_ids,
+    settle_sort_name,
 };
 
 /// The stored `Type` name for `kind`.
@@ -1923,6 +1924,26 @@ fn refresh_with_providers_foreign_person_provider_id_not_stored(
     assert_eq!(people.len(), 1, "{people:?}");
     assert_eq!(people[0].name, "Some Actor");
     assert_eq!(people[0].provider_id, None);
+}
+
+/// A negative number in a season's, an episode's or a track's sort name is
+/// padded as C#'s `"000 - "` and `"0000 - "` formats pad it: its digits to the
+/// width, the sign in front (`Season.cs:157`, `Episode.cs:244-245`,
+/// `Audio.cs:96-97`).
+#[rstest]
+#[case(Some(-1), Some(-2), "-001 - -0002 - Pilot", "-0001 - -0002 - Pilot", "-0002")]
+#[case(Some(1), Some(12), "001 - 0012 - Pilot", "0001 - 0012 - Pilot", "0012")]
+#[case(None, Some(-12345), "-12345 - Pilot", "-12345 - Pilot", "-12345")]
+fn a_negative_number_sorts_as_csharp_formats_it(
+    #[case] parent_index: Option<i64>,
+    #[case] index: Option<i64>,
+    #[case] episode: &str,
+    #[case] track: &str,
+    #[case] season: &str,
+) {
+    assert_eq!(episode_sort_name(parent_index, index, "Pilot"), episode);
+    assert_eq!(audio_sort_name(parent_index, index, "Pilot"), track);
+    assert_eq!(season_sort_name(index, "Pilot"), season);
 }
 
 /// The sort key a refresh settles, by kind: a forced one wins, an episode, a
