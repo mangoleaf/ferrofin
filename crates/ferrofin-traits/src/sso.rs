@@ -121,9 +121,11 @@ impl std::fmt::Debug for OidcCallback {
 
 /// The Single Sign-On plugin's operations.
 ///
-/// Every method self-gates on the plugin's enabled flag, reporting
-/// [`ServiceError::NotFound`] while it is disabled, so a disabled plugin's
-/// routes answer as if they did not exist (B1).
+/// Every method but [`pace_oidc`](Self::pace_oidc), which a route calls
+/// once [`ensure_enabled`](Self::ensure_enabled) has passed, self-gates on
+/// the plugin's enabled flag, reporting [`ServiceError::NotFound`] while it
+/// is disabled, so a disabled plugin's routes answer as if they did not
+/// exist (B1).
 #[async_trait]
 pub trait SsoManager: Send + Sync {
     /// Succeeds while the plugin is enabled, and is
@@ -136,6 +138,20 @@ pub trait SsoManager: Send + Sync {
     /// [`OIDC_FLOW_COOKIE`]. The plugin sets the cookie under the same name,
     /// and a cookie under the other name is never read.
     async fn flow_cookie_name(&self) -> Result<&'static str, ServiceError>;
+
+    /// Counts a request to the paced `route` from `client`, the address the
+    /// server resolved for the caller through its known proxies (D23):
+    /// `None` lets it go on, else the `429` page to answer instead, which
+    /// reflects nothing from the request. An IPv4 address is counted as
+    /// itself, an IPv6 address by its /64, and an IPv4-mapped IPv6 address
+    /// as its IPv4 address. Starts and one-time values are paced apart.
+    ///
+    /// A route calls it once [`ensure_enabled`](Self::ensure_enabled) has
+    /// passed and before it reads the flow cookie, the configuration or
+    /// anything of the request beyond what its extractors took, so a paced
+    /// request costs no configuration read, creates no pending flow, spends
+    /// no one-time value and sends nothing to the identity provider.
+    fn pace_oidc(&self, route: OidcPacedRoute, client: IpAddr) -> Option<SsoReply>;
 
     /// The stored OIDC providers, each with whether a client secret is stored
     /// and its callback URL, and never a secret.
@@ -406,6 +422,21 @@ pub trait SsoManager: Send + Sync {
         user_id: Uuid,
         at: OidcLinkAt<'_>,
     ) -> Result<(), ServiceError>;
+}
+
+/// A paced Single Sign-On route ([`SsoManager::pace_oidc`]): one that creates
+/// a pending flow, or one that takes a one-time value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OidcPacedRoute {
+    /// Creates a pending flow: `GET /sso/oidc/{provider}/start`, a sign-in
+    /// or a Quick Connect approval, and `POST /sso/oidc/{provider}/link`.
+    Start,
+    /// Takes the flow's `state`: `GET /sso/oidc/{provider}/callback`.
+    Callback,
+    /// Takes an exchange code: `POST /sso/oidc/exchange`.
+    Exchange,
+    /// Takes a Quick Connect confirmation: `POST /sso/quickconnect`.
+    QuickConnectConfirmation,
 }
 
 /// Which of an account's links: the one at a provider's issuer, named by the

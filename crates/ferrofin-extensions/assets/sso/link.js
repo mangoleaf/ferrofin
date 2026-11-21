@@ -69,6 +69,10 @@
                 show('The identity provider could not be reached. Try again later.');
                 return;
             }
+            if (response.status === 429) {
+                show('Too many sign-in attempts came from your network. Wait a minute, then try again.');
+                return;
+            }
             if (!response.ok) {
                 failed(response, 'Linking could not start');
                 return;

@@ -46,7 +46,7 @@ const SECRET: &str = "fake-client-secret-91c2";
 const CLIENT_ID: &str = "ferrofin";
 pub(in crate::sso) const PUBLIC_URL: &str = "https://media.example.org/jf";
 const CALLBACK: &str = "https://media.example.org/jf/sso/oidc/fake/callback";
-const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
+pub(in crate::sso) const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
 
 /// The service with the plugin enabled and the provider `fake` saved at the
 /// fake identity provider, and what they run on: the accounts, with the

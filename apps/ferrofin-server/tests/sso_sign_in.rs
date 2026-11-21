@@ -9,7 +9,9 @@
 //! every password at `POST /Users/AuthenticateByName` without its lockout
 //! counter moving. It still does after a save of its user page gives it the
 //! default provider (the plugin disabled, every extension off, or an admin's
-//! choice), until an admin sets it a password.
+//! choice), until an admin sets it a password. One address is paced (D23):
+//! past ten starts or thirty one-time values in a minute it gets a `429`
+//! page, and its own first sign-in is not pushed out.
 
 #[path = "support/sso.rs"]
 mod sso;
@@ -700,4 +702,91 @@ async fn each_account_rule_refuses_the_sign_in_through_the_router() {
     let again = sign_in(&server, &fake, "sso-second-device", remote).await;
     assert_eq!(again.status(), StatusCode::OK);
     assert_eq!(devices(&server).await, 2);
+}
+
+/// The `429` page a paced route answers: the same whatever the request held.
+async fn assert_paced(response: axum::response::Response, what: &str) {
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{what}");
+    assert!(
+        response.headers().get(header::SET_COOKIE).is_none(),
+        "{what}"
+    );
+    assert!(response.headers().get(header::LOCATION).is_none(), "{what}");
+    let page = text(response).await;
+    assert!(page.contains("Too many sign-in attempts"), "{what}: {page}");
+    assert!(
+        !page.contains("state=") && !page.contains("fake"),
+        "{what}: {page}"
+    );
+}
+
+/// D23 through the router, the security review's measurement: a sign-in
+/// started, then ten more starts from the same address. The tenth start is
+/// the address's last this minute: the eleventh and later answer the `429`
+/// page and start nothing, so the first sign-in is not pushed out and
+/// finishes. Quick Connect's start counts with them; another address is
+/// another client. Then the thirty-first one-time value in the minute is
+/// refused the same way, by whichever route brings it.
+#[tokio::test]
+async fn one_address_is_paced_and_cannot_push_out_its_first_sign_in() {
+    let fake = FakeIdentityProvider::start().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = server_with_provider(&fake, &temp).await;
+
+    let (callback, cookie) = signed_in_at(&server, &fake).await;
+    for n in 1..10 {
+        let start = server.get("/sso/oidc/fake/start", None).await;
+        assert_eq!(start.status(), StatusCode::FOUND, "start {n}");
+    }
+    for n in 10..15 {
+        let paced = server.get("/sso/oidc/fake/start", None).await;
+        assert_paced(paced, &format!("start {n}")).await;
+    }
+    let quick_connect = server.get("/sso/oidc/fake/start?quickConnect", None).await;
+    assert_paced(quick_connect, "Quick Connect's start").await;
+    let elsewhere = server
+        .send(
+            Request::builder()
+                .uri("/sso/oidc/fake/start")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+                    50_000,
+                )))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+    assert_eq!(elsewhere.status(), StatusCode::FOUND, "another address");
+
+    // The first sign-in is still pending: its callback is the address's
+    // first one-time value.
+    let page = server.get(&callback, Some(&cookie)).await;
+    assert_eq!(page.status(), StatusCode::OK, "the first sign-in finishes");
+    for n in 1..30 {
+        let refused = server
+            .get("/sso/oidc/fake/callback?state=unknown&code=c", None)
+            .await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "value {n}");
+    }
+    let callback = server
+        .get("/sso/oidc/fake/callback?state=unknown&code=c", None)
+        .await;
+    assert_paced(callback, "the callback").await;
+    let code = exchange_code(&text(page).await);
+    let exchange = server
+        .exchange(&code, Some(&cookie), "sso-paced-device", None)
+        .await;
+    assert_paced(exchange, "the exchange").await;
+    let confirmation = server
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri("/sso/quickconnect")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::COOKIE, &cookie)
+                .body(Body::from("confirmation=c&code=123456"))
+                .expect("request"),
+        )
+        .await;
+    assert_paced(confirmation, "the Quick Connect confirmation").await;
 }
