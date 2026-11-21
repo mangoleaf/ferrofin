@@ -10973,7 +10973,7 @@ impl LibraryScanner {
     /// DTO layer can surface Width/Height and ImageBlurHashes. Dimensions are read once and
     /// reused for the blurhash. Best-effort per image; a no-op when no processor is wired
     /// (unit tests), and a failure is logged with `item_id`, the item owning the images;
-    /// the image stays browsable with 0×0 / no hash.
+    /// the image stays browsable, stored as upstream stores it (0×0, an empty hash).
     ///
     /// The file read is the expanded path, as upstream's `ItemImageInfo.Path`
     /// is once the row is read (`ExpandVirtualPath`): a kept row an adopted
@@ -39871,7 +39871,8 @@ mod tests {
             .await
             .unwrap();
         let uploaded = items.get_image_infos(first).await.unwrap().remove(0);
-        // The rows' files; the rescan measures the upload (stored 0x0, gl-1054).
+        // The rows' files; the rescan measures the upload (this manager has no
+        // image processor, so the upload is stored 0x0).
         let paths = |images: Vec<ferrofin_traits::options::ItemImageInfo>| -> Vec<String> {
             images.into_iter().map(|image| image.path).collect()
         };

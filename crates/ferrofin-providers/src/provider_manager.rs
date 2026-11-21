@@ -1173,6 +1173,10 @@ pub struct LocalProviderManager {
     /// box set's refresh reads the file too (`BoxSetXmlProvider`).
     box_set_xml: Option<Arc<crate::box_set_xml::BoxSetXmlSaver>>,
     image_saver: Option<Arc<crate::image_save::ImageFileSaver>>,
+    /// Measures a saved image's size and blurhash
+    /// ([`update_images`](Self::update_images)). Absent → saved images keep
+    /// what they were stored with.
+    image_processor: Option<Arc<dyn ferrofin_traits::drawing::ImageProcessor>>,
     external_id_infos: Vec<ExternalIdInfo>,
     /// Runtime-registered named metadata providers (WASM plugins) as
     /// (name, supported kinds), surfaced in library options.
@@ -1359,6 +1363,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_nfo_saver", &self.nfo_saver.is_some())
             .field("has_box_set_xml", &self.box_set_xml.is_some())
             .field("has_image_saver", &self.image_saver.is_some())
+            .field("has_image_processor", &self.image_processor.is_some())
             .field("has_image_store", &self.image_store.is_some())
             .field("metadata_dir", &self.metadata_dir)
             .field("has_by_name_rebase", &self.by_name_rebase.is_some())
@@ -1392,6 +1397,17 @@ impl LocalProviderManager {
     #[must_use]
     pub fn with_image_saver(mut self, saver: Arc<crate::image_save::ImageFileSaver>) -> Self {
         self.image_saver = Some(saver);
+        self
+    }
+
+    /// Attaches the image processor every save measures the item's images
+    /// with ([`update_images`](Self::update_images)).
+    #[must_use]
+    pub fn with_image_processor(
+        mut self,
+        processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor>,
+    ) -> Self {
+        self.image_processor = Some(processor);
         self
     }
 
@@ -1444,6 +1460,7 @@ impl LocalProviderManager {
             nfo_saver: None,
             box_set_xml: None,
             image_saver: None,
+            image_processor: None,
             external_id_infos,
             dynamic_fetchers: Vec::new(),
             dynamic_image_providers: Vec::new(),
@@ -3297,8 +3314,101 @@ impl LocalProviderManager {
         };
         if decision.save {
             self.save_metadata(item_id, update).await?;
+            self.update_images(item_id, update).await?;
         }
         Ok(update)
+    }
+
+    /// `LibraryManager.UpdateImagesAsync`, which upstream runs on every save of
+    /// an item (`RunMetadataSavers`), here on `update_to_repository` and a
+    /// refresh's save (not yet the metadata editor's, gl-1922): each local
+    /// image whose size or blurhash is missing or whose file changed or is gone
+    /// (`ImageNeedsRefresh`), or every one for a save from `ImageUpdate` up (an
+    /// image, download or edit save, in upstream's order), is measured and
+    /// dated by its file; a local image whose file is gone is dropped
+    /// (`ValidateImages`), and the rows are saved when anything changed. A
+    /// guide programme's are left alone (`isLiveTvShow`), and a Live TV
+    /// channel's file is read only in the metadata directory, as everywhere
+    /// else. A remote image is not downloaded here: it stays a URL, unmeasured.
+    ///
+    /// The measuring reads files, so the rows are read again before they are
+    /// written, and only the measured and dropped ones still as they were read
+    /// change: an image saved before that second read stays.
+    async fn update_images(
+        &self,
+        item_id: Uuid,
+        update_type: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        use crate::image_metadata::{fill_image_metadata, image_needs_refresh};
+        let (Some(processor), Some(store)) = (&self.image_processor, &self.image_store) else {
+            return Ok(());
+        };
+        let force = matches!(
+            update_type,
+            ItemUpdateType::ImageUpdate
+                | ItemUpdateType::MetadataDownload
+                | ItemUpdateType::MetadataEdit
+        );
+        let Some(images) = self.stored_images(item_id).await else {
+            return Ok(());
+        };
+        let outdated: Vec<ItemImageInfo> = images
+            .into_iter()
+            .filter(|image| image.is_local_file() && (force || image_needs_refresh(image)))
+            .collect();
+        if outdated.is_empty() {
+            return Ok(());
+        }
+        let kind = match &self.items {
+            Some(items) => items
+                .retrieve_item(item_id)
+                .await?
+                .and_then(|row| BaseItemKind::from_stored_type_name(&row.type_)),
+            None => None,
+        };
+        if kind == Some(BaseItemKind::LiveTvProgram) {
+            return Ok(());
+        }
+        // Each row as read, with what it becomes: measured, or none when its
+        // file is gone.
+        let mut changes: Vec<(ItemImageInfo, Option<ItemImageInfo>)> = Vec::new();
+        for original in outdated {
+            let path = original.path.clone();
+            if kind == Some(BaseItemKind::LiveTvChannel) && !self.in_metadata_directory(&path).await
+            {
+                continue;
+            }
+            if !std::path::Path::new(&path).is_file() {
+                tracing::warn!(item_id = %item_id, image_type = ?original.image_type, path = %path, "image not found");
+                changes.push((original, None));
+                continue;
+            }
+            let mut image = original.clone();
+            fill_image_metadata(processor.as_ref(), item_id, &path, &mut image).await;
+            image.date_modified = file_date_modified(std::path::Path::new(&path));
+            changes.push((original, Some(image)));
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+        // A row saved meanwhile, or changed since it was read, is not one
+        // measured here: it stays as it is now.
+        let Some(stored) = self.stored_images(item_id).await else {
+            return Ok(());
+        };
+        let images: Vec<ItemImageInfo> = stored
+            .iter()
+            .filter_map(|row| {
+                changes
+                    .iter()
+                    .find(|(original, _)| original == row)
+                    .map_or_else(|| Some(row.clone()), |(_, new)| new.clone())
+            })
+            .collect();
+        if images != stored {
+            store.save_item_images(item_id, &images).await?;
+        }
+        Ok(())
     }
 
     /// [`remove_images`](crate::local_images::remove_images) over the item's
@@ -5555,6 +5665,7 @@ impl ProviderManager for LocalProviderManager {
         self.save_box_set_xml(item_id, update_type).await;
         if let Some(store) = &self.image_store {
             store.touch_item_updated(item_id).await?;
+            self.update_images(item_id, update_type).await?;
             // A video's save gives its local versions its images and
             // metadata (`Video.UpdateToRepositoryAsync`, `Video.cs:704-726`).
             store
@@ -11597,6 +11708,389 @@ mod tests {
         assert_eq!(std::fs::read(existing.path).unwrap(), b"earlier");
     }
 
+    /// An image processor that measures every file `size` (or fails to,
+    /// `None`) and gives it the blurhash `hash` (or fails to), running
+    /// `during` once, at its first measure.
+    struct MeasuringProcessor {
+        size: Option<(i32, i32)>,
+        hash: Option<&'static str>,
+        during: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl MeasuringProcessor {
+        fn new(size: Option<(i32, i32)>, hash: Option<&'static str>) -> Self {
+            Self {
+                size,
+                hash,
+                during: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ferrofin_traits::drawing::ImageProcessor for MeasuringProcessor {
+        fn supported_input_formats(&self) -> Vec<String> {
+            vec![]
+        }
+        fn supports_image_collage_creation(&self) -> bool {
+            false
+        }
+        fn supported_image_output_formats(&self) -> Vec<ferrofin_model::drawing::ImageFormat> {
+            vec![]
+        }
+        async fn get_image_dimensions(
+            &self,
+            _path: &str,
+        ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+            if let Some(during) = self.during.lock().unwrap().take() {
+                during();
+            }
+            self.size
+                .map(|(width, height)| ferrofin_model::drawing::ImageDimensions { width, height })
+                .ok_or_else(|| ServiceError::backend("undecodable"))
+        }
+        async fn get_item_image_dimensions(
+            &self,
+            _item_id: Uuid,
+            info: &ItemImageInfo,
+        ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+            self.get_image_dimensions(&info.path).await
+        }
+        async fn get_image_blur_hash(&self, _path: &str) -> Result<String, ServiceError> {
+            self.hash
+                .map(str::to_owned)
+                .ok_or_else(|| ServiceError::backend("no hash"))
+        }
+        async fn get_image_blur_hash_sized(
+            &self,
+            path: &str,
+            size: ferrofin_model::drawing::ImageDimensions,
+        ) -> Result<String, ServiceError> {
+            if size.width <= 0 || size.height <= 0 {
+                return Ok(String::new());
+            }
+            self.get_image_blur_hash(path).await
+        }
+        async fn get_image_cache_tag(
+            &self,
+            _item_path: Option<&str>,
+            _image: &ItemImageInfo,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_image_cache_tag_for_path(
+            &self,
+            _base_item_path: &str,
+            _image_date_modified: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+        async fn process_image(
+            &self,
+            _options: &ferrofin_traits::options::ImageProcessingOptions,
+        ) -> Result<ferrofin_traits::drawing::ProcessedImage, ServiceError> {
+            Err(ServiceError::backend("not drawn"))
+        }
+        async fn create_image_collage(
+            &self,
+            _options: &ferrofin_traits::options::ImageCollageOptions,
+            _library_name: Option<&str>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// A manager over `store` whose saves measure images with `processor`.
+    fn measuring(
+        store: &Arc<RecordingStore>,
+        dir: &std::path::Path,
+        size: Option<(i32, i32)>,
+        hash: Option<&'static str>,
+    ) -> LocalProviderManager {
+        LocalProviderManager::default()
+            .with_image_store(Arc::clone(store) as _, dir.to_path_buf())
+            .with_image_processor(Arc::new(MeasuringProcessor::new(size, hash)))
+    }
+
+    /// A stored row for a file written under `dir`, recorded with `size` and
+    /// `hash` and dated by its file.
+    fn stored_image(
+        dir: &std::path::Path,
+        name: &str,
+        image_type: ImageType,
+        (width, height): (i32, i32),
+        hash: Option<&str>,
+    ) -> ItemImageInfo {
+        let path = dir.join(name);
+        std::fs::write(&path, b"art").unwrap();
+        ItemImageInfo {
+            date_modified: ferrofin_traits::options::file_date_modified(&path),
+            path: path.to_string_lossy().into_owned(),
+            image_type,
+            width,
+            height,
+            blur_hash: hash.map(str::to_owned),
+        }
+    }
+
+    /// gl-1054: an upload, like every image save (`UpdateItemAsync` with
+    /// `ImageUpdate`, `RunMetadataSavers` → `UpdateImagesAsync(force)`), stores
+    /// the new image measured, and measures the item's other images again.
+    #[tokio::test]
+    async fn an_image_save_measures_the_items_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let item = Uuid::from_u128(0x1054);
+        let logo = stored_image(dir.path(), "logo.png", ImageType::Logo, (0, 0), None);
+        store.images.lock().unwrap().push((item, logo.clone()));
+        measuring(&store, dir.path(), Some((120, 180)), Some("LKO2"))
+            .save_image(item, b"art", "image/png", ImageType::Primary, None)
+            .await
+            .expect("upload");
+        let saved: Vec<_> = store
+            .images
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, image)| {
+                (
+                    image.image_type,
+                    image.width,
+                    image.height,
+                    image.blur_hash.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                (ImageType::Logo, 120, 180, Some("LKO2".to_owned())),
+                (ImageType::Primary, 120, 180, Some("LKO2".to_owned())),
+            ]
+        );
+    }
+
+    /// A save that is no image or edit save measures only what
+    /// `ImageNeedsRefresh` flags: a missing size or blurhash, or a file whose
+    /// time moved; a local image whose file is gone is dropped
+    /// (`ValidateImages`), and a remote one is left as it is.
+    #[tokio::test]
+    async fn a_plain_save_measures_only_the_images_that_need_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let item = Uuid::from_u128(0x1055);
+        let current = stored_image(
+            dir.path(),
+            "poster.png",
+            ImageType::Primary,
+            (10, 20),
+            Some("OLD"),
+        );
+        let unmeasured = stored_image(dir.path(), "logo.png", ImageType::Logo, (0, 0), None);
+        // Complete, but its file is gone.
+        let gone = stored_image(
+            dir.path(),
+            "landscape.png",
+            ImageType::Thumb,
+            (10, 20),
+            Some("OLD"),
+        );
+        std::fs::remove_file(&gone.path).unwrap();
+        let remote = ItemImageInfo {
+            path: "https://img.example/backdrop.jpg".into(),
+            image_type: ImageType::Backdrop,
+            ..ItemImageInfo::default()
+        };
+        store.images.lock().unwrap().extend(
+            [&current, &unmeasured, &gone, &remote]
+                .into_iter()
+                .map(|image| (item, image.clone())),
+        );
+        measuring(&store, dir.path(), Some((120, 180)), Some("NEW"))
+            .update_to_repository(item, ItemUpdateType::MetadataImport)
+            .await
+            .expect("save");
+        let saved: Vec<_> = store
+            .images
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, image)| (image.image_type, image.width, image.blur_hash.clone()))
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                (ImageType::Primary, 10, Some("OLD".to_owned())),
+                (ImageType::Logo, 120, Some("NEW".to_owned())),
+                (ImageType::Backdrop, 0, None),
+            ]
+        );
+    }
+
+    /// A save from `ImageUpdate` up in upstream's order (`ImageUpdate`,
+    /// `MetadataDownload`, `MetadataEdit`) measures every local image, current
+    /// or not; a lower one measures only what needs it.
+    #[rstest::rstest]
+    #[case(ItemUpdateType::ImageUpdate, 120)]
+    #[case(ItemUpdateType::MetadataDownload, 120)]
+    #[case(ItemUpdateType::MetadataEdit, 120)]
+    #[case(ItemUpdateType::MetadataImport, 10)]
+    #[tokio::test]
+    async fn an_image_download_or_edit_save_measures_every_image(
+        #[case] update: ItemUpdateType,
+        #[case] width: i32,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let item = Uuid::from_u128(0x1057);
+        let current = stored_image(
+            dir.path(),
+            "poster.png",
+            ImageType::Primary,
+            (10, 20),
+            Some("OLD"),
+        );
+        store.images.lock().unwrap().push((item, current));
+        measuring(&store, dir.path(), Some((120, 180)), Some("NEW"))
+            .update_to_repository(item, update)
+            .await
+            .expect("save");
+        assert_eq!(store.images.lock().unwrap()[0].1.width, width);
+    }
+
+    /// A guide programme's images are left alone (`isLiveTvShow`), and a Live
+    /// TV channel's file outside the metadata directory is never read.
+    #[rstest::rstest]
+    #[case(BaseItemKind::LiveTvProgram, "metadata", 0)]
+    #[case(BaseItemKind::LiveTvChannel, "elsewhere", 0)]
+    #[case(BaseItemKind::LiveTvChannel, "metadata", 120)]
+    #[tokio::test]
+    async fn live_tv_images_are_measured_only_where_they_may_be_read(
+        #[case] kind: BaseItemKind,
+        #[case] folder: &str,
+        #[case] width: i32,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let art_root = dir.path().join("metadata").join("library");
+        let files = dir.path().join(folder).join("library");
+        std::fs::create_dir_all(&files).unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let mut row = row("Folder", "Channel 4");
+        row.type_ = kind.stored_type_name().expect("stored type").to_owned();
+        let item = Uuid::parse_str(&row.id).unwrap();
+        let logo = stored_image(&files, "logo.png", ImageType::Primary, (0, 0), None);
+        store.images.lock().unwrap().push((item, logo));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item, row)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, art_root)
+            .with_image_processor(Arc::new(MeasuringProcessor::new(
+                Some((120, 180)),
+                Some("NEW"),
+            )))
+            .update_to_repository(item, ItemUpdateType::ImageUpdate)
+            .await
+            .expect("save");
+        assert_eq!(store.images.lock().unwrap()[0].1.width, width);
+    }
+
+    /// The rows are read again before they are written: an image saved while
+    /// the others are measured stays, and so does a row saved again at the
+    /// same path (a new upload) in the meantime; only the rows still as they
+    /// were read take their measure.
+    #[tokio::test]
+    async fn an_image_saved_while_measuring_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let item = Uuid::from_u128(0x1058);
+        let poster = stored_image(dir.path(), "poster.png", ImageType::Primary, (0, 0), None);
+        let logo = stored_image(dir.path(), "logo.png", ImageType::Logo, (0, 0), None);
+        let thumb = stored_image(
+            dir.path(),
+            "landscape.png",
+            ImageType::Thumb,
+            (7, 7),
+            Some("T"),
+        );
+        let reuploaded = ItemImageInfo {
+            date_modified: logo.date_modified + chrono::TimeDelta::seconds(5),
+            ..logo.clone()
+        };
+        store
+            .images
+            .lock()
+            .unwrap()
+            .extend([(item, poster), (item, logo)]);
+        let processor = MeasuringProcessor::new(Some((120, 180)), Some("NEW"));
+        let meanwhile = Arc::clone(&store);
+        let (added, replaced) = (thumb.clone(), reuploaded.clone());
+        *processor.during.lock().unwrap() = Some(Box::new(move || {
+            let mut images = meanwhile.images.lock().unwrap();
+            images[1].1 = replaced;
+            images.push((item, added));
+        }));
+        LocalProviderManager::default()
+            .with_image_store(Arc::clone(&store) as _, dir.path().to_path_buf())
+            .with_image_processor(Arc::new(processor))
+            .update_to_repository(item, ItemUpdateType::MetadataImport)
+            .await
+            .expect("save");
+        let saved: Vec<_> = store
+            .images
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, image)| image.clone())
+            .collect();
+        assert_eq!(saved.len(), 3, "{saved:?}");
+        assert_eq!(
+            (saved[0].width, saved[0].blur_hash.as_deref()),
+            (120, Some("NEW"))
+        );
+        assert_eq!(
+            saved[1], reuploaded,
+            "the row saved again keeps its new date"
+        );
+        assert_eq!(saved[2], thumb, "the image saved meanwhile stays");
+    }
+
+    /// As upstream, a size that cannot be read is stored 0x0, and a blurhash
+    /// that cannot be computed is empty (as a 0x0 image's is).
+    #[rstest::rstest]
+    #[case::no_size(None, Some("LKO2"), (0, 0))]
+    #[case::no_hash(Some((120, 180)), None, (120, 180))]
+    #[tokio::test]
+    async fn a_failed_measure_stores_upstreams_values(
+        #[case] size: Option<(i32, i32)>,
+        #[case] hash: Option<&'static str>,
+        #[case] stored: (i32, i32),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let item = Uuid::from_u128(0x1056);
+        let image = stored_image(
+            dir.path(),
+            "poster.png",
+            ImageType::Primary,
+            (10, 20),
+            Some("OLD"),
+        );
+        store.images.lock().unwrap().push((item, image));
+        measuring(&store, dir.path(), size, hash)
+            .update_to_repository(item, ItemUpdateType::ImageUpdate)
+            .await
+            .expect("save");
+        let (_, saved) = store.images.lock().unwrap()[0].clone();
+        assert_eq!((saved.width, saved.height), stored);
+        assert_eq!(saved.blur_hash.as_deref(), Some(""));
+    }
+
     /// `ImageSaver.GetStandardSavePath` with `saveLocally` false: an upload, a
     /// chosen image or a refresh download is saved in the item's
     /// `GetInternalMetadataPath()` (`{root}/{xx}/{idN}`) under upstream's
@@ -13272,6 +13766,73 @@ mod tests {
             .last()
             .is_some_and(|row| row.date_last_refreshed.is_some_and(|at| at > before));
         assert_eq!(restamped, stamped);
+    }
+
+    /// gl-1054: a refresh that saves the item measures its images, as its save
+    /// runs `UpdateImagesAsync`: here "Replace all metadata" with "Replace
+    /// existing images" removes the own Primary, an image update, and the logo
+    /// it keeps is measured.
+    #[tokio::test]
+    async fn a_refresh_save_measures_the_items_images() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let item_id = Uuid::new_v4();
+        let own = crate::local_images::own_art_dir(tmp.path(), item_id);
+        let elsewhere = tmp.path().join("Genre").join("Crime");
+        for dir in [&own, &elsewhere] {
+            std::fs::create_dir_all(dir).expect("dir");
+        }
+        let poster = stored_image(
+            &own,
+            "poster.jpg",
+            ImageType::Primary,
+            (10, 20),
+            Some("OLD"),
+        );
+        let logo = stored_image(&elsewhere, "logo.png", ImageType::Logo, (0, 0), None);
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        store
+            .images
+            .lock()
+            .expect("lock")
+            .extend([(item_id, poster), (item_id, logo.clone())]);
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, tmp.path().to_path_buf())
+            .with_image_processor(Arc::new(MeasuringProcessor::new(
+                Some((120, 180)),
+                Some("NEW"),
+            )));
+        let update = mgr
+            .refresh_single_item(
+                item_id,
+                &Opts {
+                    remove_old_metadata: true,
+                    replace_all_images: true,
+                    ..Opts::default()
+                },
+            )
+            .await
+            .expect("refresh");
+        assert_eq!(update, ItemUpdateType::ImageUpdate);
+        let kept: Vec<_> = store
+            .images
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, image)| (image.path.clone(), image.width, image.blur_hash.clone()))
+            .collect();
+        assert_eq!(kept, [(logo.path, 120, Some("NEW".to_owned()))]);
     }
 
     /// gl-592: "Replace all metadata" with "Replace existing images" removes

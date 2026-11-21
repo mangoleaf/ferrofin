@@ -1508,6 +1508,7 @@ pub async fn build_app_state(
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
+            .with_image_processor(Arc::clone(&image_processor))
             .with_nfo_saver(Arc::clone(&nfo_saver))
             .with_box_set_xml(box_set_xml)
             .with_image_store(
