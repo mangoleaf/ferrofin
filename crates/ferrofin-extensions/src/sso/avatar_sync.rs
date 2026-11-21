@@ -68,7 +68,7 @@ pub(super) fn wants_userinfo(
     claims: &Map<String, Value>,
 ) -> bool {
     provider.sync_profile_pictures
-        && !matches!(purpose, FlowPurpose::Link(_))
+        && !matches!(purpose, FlowPurpose::Link { .. })
         && !claims.contains_key(PICTURE_CLAIM)
 }
 

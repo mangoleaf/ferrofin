@@ -32,7 +32,18 @@ pub struct SsoServer {
 /// The server over a fresh database in `temp`, published at `published_url`,
 /// with the Single Sign-On plugin enabled and no provider.
 pub async fn server(temp: &tempfile::TempDir, published_url: &str) -> SsoServer {
-    let server = boot(&config(temp, published_url)).await;
+    server_with(temp, published_url, |_| {}).await
+}
+
+/// [`server`], with `edit` applied to its configuration first.
+pub async fn server_with(
+    temp: &tempfile::TempDir,
+    published_url: &str,
+    edit: impl FnOnce(&mut Config),
+) -> SsoServer {
+    let mut config = config(temp, published_url);
+    edit(&mut config);
+    let server = boot(&config).await;
     // The admin's step, through the manager: `sso_settings` covers the route.
     server
         .state

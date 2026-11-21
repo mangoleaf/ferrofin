@@ -177,7 +177,7 @@ pub(in crate::sso) fn exchange_code(html: &str) -> String {
 }
 
 /// The provider `fake` as saved, `edit`ed.
-fn fake_provider(
+pub(in crate::sso) fn fake_provider(
     fake: &FakeIdentityProvider,
     edit: impl FnOnce(&mut OidcProvider),
 ) -> OidcProvider {
@@ -227,12 +227,13 @@ impl Harness {
         ))]);
         let identities = Arc::new(FerrofinExternalIdentityStore::new(db.clone()));
         let sessions = sessions(&db, &users, &events);
-        let activity = Arc::new(FerrofinActivityManager::new(db));
+        let activity = Arc::new(FerrofinActivityManager::new(db.clone()));
         let sso = SsoService::new(
             plugins as Arc<dyn PluginManager>,
             Arc::clone(&users) as Arc<dyn UserManager>,
             Arc::clone(&identities) as Arc<dyn ExternalIdentityStore>,
             Arc::clone(&sessions) as Arc<dyn SessionManager>,
+            Arc::new(FerrofinDeviceManager::new(db.clone())),
             Arc::clone(&activity) as Arc<dyn ActivityManager>,
             published_url.map(str::to_owned),
         );

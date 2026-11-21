@@ -54,6 +54,7 @@ use ferrofin_model::sso::{
     OidcAdminLink, OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList, OidcUserLinks,
 };
 use ferrofin_traits::activity::ActivityManager;
+use ferrofin_traits::devices::DeviceManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::ExternalIdentityStore;
 use ferrofin_traits::library::UserManager;
@@ -345,8 +346,11 @@ pub struct SsoService {
     identities: Arc<dyn ExternalIdentityStore>,
     /// Opens a signed-in account's session and mints its token.
     sessions: Arc<dyn SessionManager>,
+    /// The devices that hold each live session's token: a link flow links
+    /// only while the session that started it is still one of them.
+    devices: Arc<dyn DeviceManager>,
     /// The dashboard's activity log, for a refused sign-in of a known
-    /// account.
+    /// account, and each link made or removed.
     activity: Arc<dyn ActivityManager>,
     /// Held while an account is created and linked, so two first sign-ins of
     /// one identity end at one account, while a link is checked and made or
@@ -381,15 +385,16 @@ pub struct SsoService {
 impl SsoService {
     /// A service over the plugin manager (the enabled flag, the configuration
     /// and the private data), the accounts and their identity links, the
-    /// sessions a sign-in opens, the activity log, and the server's published
-    /// URL, which the callback URLs fall back to. Never the request's `Host`
-    /// header.
+    /// sessions a sign-in opens and the devices holding them, the activity
+    /// log, and the server's published URL, which the callback URLs fall back
+    /// to. Never the request's `Host` header.
     #[must_use]
     pub fn new(
         plugins: Arc<dyn PluginManager>,
         users: Arc<dyn UserManager>,
         identities: Arc<dyn ExternalIdentityStore>,
         sessions: Arc<dyn SessionManager>,
+        devices: Arc<dyn DeviceManager>,
         activity: Arc<dyn ActivityManager>,
         published_url: Option<String>,
     ) -> Self {
@@ -398,6 +403,7 @@ impl SsoService {
             users,
             identities,
             sessions,
+            devices,
             activity,
             provisioning: tokio::sync::Mutex::new(()),
             published_url,
@@ -745,9 +751,11 @@ impl SsoManager for SsoService {
         &self,
         key: &str,
         user_id: Uuid,
+        password: &Secret,
+        session_token: &Secret,
         client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {
-        self.start_sign_in(key, client, flows::FlowPurpose::Link(user_id))
+        self.start_link(key, user_id, password, session_token, client)
             .await
     }
 
@@ -757,19 +765,21 @@ impl SsoManager for SsoService {
 
     async fn add_oidc_link(
         &self,
+        by: Uuid,
         user_id: Uuid,
         key: &str,
         subject: &str,
     ) -> Result<OidcAdminLink, ServiceError> {
-        self.add_link(user_id, key, subject).await
+        self.add_link(by, user_id, key, subject).await
     }
 
     async fn remove_oidc_link(
         &self,
+        by: Uuid,
         user_id: Uuid,
         at: OidcLinkAt<'_>,
     ) -> Result<(), ServiceError> {
-        self.remove_link(user_id, at).await
+        self.remove_link(by, user_id, at).await
     }
 }
 

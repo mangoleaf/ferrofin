@@ -293,6 +293,7 @@ fn over(harness: &mut Harness, store: LateLinks) {
         Arc::clone(&harness.users) as Arc<dyn UserManager>,
         Arc::new(store),
         Arc::clone(&harness.sso.sessions),
+        Arc::clone(&harness.sso.devices),
         Arc::clone(&harness.sso.activity),
         Some(PUBLIC_URL.to_owned()),
     );

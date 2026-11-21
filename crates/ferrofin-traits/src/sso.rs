@@ -298,31 +298,54 @@ pub trait SsoManager: Send + Sync {
         client: IpAddr,
     ) -> Result<SsoReply, ServiceError>;
 
-    // Linking an account and an identity (B12). Linking never changes the
-    // account's authentication provider or password (D5).
+    // Linking an account and an identity (B12, D22). Linking never changes
+    // the account's authentication provider or password (D5). Each link made
+    // and removed writes a `UserIdentityLinked` or `UserIdentityUnlinked`
+    // activity entry naming the account, the provider and who did it.
 
     /// The link page, `GET /sso/link`: anonymous, its script reads the
     /// session jellyfin-web keeps in the browser and calls the link routes
     /// with it.
     async fn oidc_link_page(&self) -> Result<SsoReply, ServiceError>;
 
-    /// The links of `user_id`, the enabled providers it can link at, and
+    /// The links of `user_id`, the enabled providers it can link at (each
+    /// with whether the account is linked at its issuer already), and
     /// whether the account signs in through Single Sign-On only.
     async fn oidc_links(&self, user_id: Uuid) -> Result<OidcUserLinks, ServiceError>;
 
     /// Starts a link of `user_id` at the provider `key`, for the browser at
-    /// `client`: as [`start_oidc_sign_in`](Self::start_oidc_sign_in) starts a
-    /// sign-in, a redirect that sets the [`OIDC_FLOW_COOKIE`], or a page saying
-    /// why not. Its callback links the verified identity to `user_id`, unless
-    /// another account has it, and ends on a page saying which; it opens no
+    /// `client`, from the session whose access token is `session_token`: as
+    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in) starts a sign-in, a
+    /// redirect that sets the [`OIDC_FLOW_COOKIE`], or a page saying why not.
+    ///
+    /// Refused first, with no flow and no cookie:
+    /// [`ServiceError::Forbidden`] for an account whose provider is Single
+    /// Sign-On's (it has no password to confirm with: an administrator adds
+    /// its links), [`ServiceError::Conflict`] for one linked at the
+    /// provider's issuer already (a link is never replaced here: it is
+    /// removed first), [`ServiceError::InvalidInput`] for an empty
+    /// `password`, and [`ServiceError::Forbidden`] for a `password` that does
+    /// not sign the account in. That check goes through the account's own
+    /// authentication provider without opening a session, so a wrong one
+    /// counts as a failed sign-in does and the login backoff paces it.
+    ///
+    /// The flow keeps the session token's hash, never the token. Its callback
+    /// links the verified identity to `user_id` only while that session is
+    /// still one of the account's (a sign-out by any route before the
+    /// callback's session check ends the flow),
+    /// unless another account has the identity or the account was linked at
+    /// that issuer since, and ends on a page saying which; it opens no
     /// session.
     ///
     /// [`ServiceError::NotFound`] as for
-    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in).
+    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in), and for an account
+    /// that no longer exists.
     async fn start_oidc_link(
         &self,
         key: &str,
         user_id: Uuid,
+        password: &Secret,
+        session_token: &Secret,
         client: IpAddr,
     ) -> Result<SsoReply, ServiceError>;
 
@@ -331,7 +354,8 @@ pub trait SsoManager: Send + Sync {
     async fn all_oidc_links(&self) -> Result<Vec<OidcAdminLink>, ServiceError>;
 
     /// Links `user_id` to the subject `subject` at the provider `key`'s
-    /// issuer, replacing the account's earlier link at that issuer.
+    /// issuer, replacing the account's earlier link at that issuer, as the
+    /// administrator `by` (nil for an API key).
     ///
     /// [`ServiceError::NotFound`] for an unknown account or provider,
     /// [`ServiceError::InvalidInput`] for an empty subject, one longer than
@@ -340,13 +364,15 @@ pub trait SsoManager: Send + Sync {
     /// identity: nothing is moved.
     async fn add_oidc_link(
         &self,
+        by: Uuid,
         user_id: Uuid,
         key: &str,
         subject: &str,
     ) -> Result<OidcAdminLink, ServiceError>;
 
-    /// Removes the link of `user_id` `at` a provider or an issuer, then signs
-    /// every session of that account out. An exchange code or a Quick
+    /// Removes the link of `user_id` `at` a provider or an issuer, as `by`
+    /// (the account itself, an administrator, or nil for an API key), then
+    /// signs every session of that account out. An exchange code or a Quick
     /// Connect confirmation issued before the removal is refused at
     /// [`exchange_oidc_sign_in`](Self::exchange_oidc_sign_in) or
     /// [`confirm_oidc_quick_connect`](Self::confirm_oidc_quick_connect),
@@ -355,8 +381,12 @@ pub trait SsoManager: Send + Sync {
     /// given another authentication provider.
     ///
     /// [`ServiceError::NotFound`] when there is no such provider or link.
-    async fn remove_oidc_link(&self, user_id: Uuid, at: OidcLinkAt<'_>)
-    -> Result<(), ServiceError>;
+    async fn remove_oidc_link(
+        &self,
+        by: Uuid,
+        user_id: Uuid,
+        at: OidcLinkAt<'_>,
+    ) -> Result<(), ServiceError>;
 }
 
 /// Which of an account's links: the one at a provider's issuer, named by the

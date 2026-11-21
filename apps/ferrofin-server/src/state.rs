@@ -3399,16 +3399,19 @@ pub async fn build_app_state(
     // the same way. Its callback URLs fall back to the published URL, never
     // to a request's Host header. It finds or creates the account a sign-in
     // ends at through the extensions' user manager and identity links, opens
-    // its session through the session manager, and writes a refused one to
-    // the activity log; a native app's Quick Connect code it approves through
-    // the Quick Connect manager. These exist only long after the extension
-    // context, so they come from the state, not from it.
+    // its session through the session manager, ties a link flow to the
+    // session that started it through the devices holding the tokens, and
+    // writes a refused sign-in and each link change to the activity log; a
+    // native app's Quick Connect code it approves through the Quick Connect
+    // manager. These exist only long after the extension context, so they
+    // come from the state, not from it.
     let sso: Arc<dyn ferrofin_traits::sso::SsoManager> = Arc::new(
         ferrofin_extensions::sso::SsoService::new(
             Arc::clone(&plugins),
             Arc::clone(&extension_cx.users),
             Arc::clone(&extension_cx.external_identities),
             Arc::clone(&state.sessions),
+            Arc::clone(&state.devices),
             Arc::clone(&state.activity),
             config.published_url.clone(),
         )
