@@ -73,11 +73,7 @@ fn season_filename(item: &BaseItemEntity, name: &str, extension: &str) -> Option
     let marker = if season == 0 {
         "-specials".to_owned()
     } else {
-        format!(
-            "{}{:02}",
-            if season < 0 { "-" } else { "" },
-            season.unsigned_abs()
-        )
+        ferrofin_util::string_extensions::zero_padded(season, 2)
     };
     Some(format!("season{marker}-{name}{extension}"))
 }

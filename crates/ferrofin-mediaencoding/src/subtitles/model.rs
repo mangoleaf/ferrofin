@@ -143,11 +143,7 @@ impl TimeCode {
 /// `{0:000}`): zero-padded, a negative value keeping its sign before the padding.
 #[must_use]
 pub fn dotnet_int(value: i32, digits: usize) -> String {
-    if value < 0 {
-        format!("-{:0digits$}", value.unsigned_abs())
-    } else {
-        format!("{value:0digits$}")
-    }
+    ferrofin_util::string_extensions::zero_padded(i64::from(value), digits)
 }
 
 /// A single subtitle cue.

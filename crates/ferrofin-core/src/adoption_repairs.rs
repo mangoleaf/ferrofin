@@ -9278,8 +9278,8 @@ mod tests {
     }
 }
 
-// Rebases the absolute paths a database stores under a previous program-data
-// directory onto this server's directories (gl-1165).
+// Rebases the paths a database stores under a previous program-data directory
+// onto this server's directories (gl-1165), relative ones included (gl-1668).
 //
 // Jellyfin stores `{program data}/root`, its library folders and every image
 // path absolute: `ReverseVirtualPath` tokenises only `{program data}/data` and
@@ -9299,7 +9299,7 @@ mod tests {
 // written under the new directories, and writes nothing on a server that did
 // not move.
 
-/// The columns that can hold an absolute program-data path.
+/// The columns that can hold a program-data path.
 const PATH_COLUMNS: [(&str, &str); 7] = [
     ("BaseItems", "Path"),
     ("BaseItemImageInfos", "Path"),
@@ -9539,10 +9539,13 @@ async fn rewrite_paths(
 /// root's `ensure()` re-paths it on the first start after a move (since
 /// v1.4.0), and the user root's `ensure()` re-paths that one, so on a database
 /// started since, the libraries are what still name the old directory. Both
-/// run after this pass, which reads them first. Empty when no row names a
-/// directory other than this server's program data, and for a database with
-/// [`IdDerivation::LegacyLowercase`] ids: they embed the absolute path, so
-/// after a move none is the id derived here.
+/// run after this pass, which reads them first. A relative directory counts:
+/// a server started with a relative data directory before every directory was
+/// made absolute (gl-1151) stored its paths relative, and they move like any
+/// others: onto this server's directories, where the file exists. Empty when
+/// no row names a directory other than this server's program data, and for a
+/// database with [`IdDerivation::LegacyLowercase`] ids: they embed the path as
+/// it was stored, so after a move none is the id derived here.
 async fn previous_program_data_dirs(
     db: &Database,
     derivation: &IdDerivation,
@@ -9590,11 +9593,13 @@ async fn previous_program_data_dirs(
             }
             Path::new("root/default").join(name)
         };
+        // A relative directory is one a server started with a relative data
+        // directory stored (gl-1668); an empty one would name every path.
         if let Some(old) = path
             .ends_with(&place)
             .then(|| path.ancestors().nth(place.components().count()))
             .flatten()
-            .filter(|old| old.is_absolute() && *old != program_data)
+            .filter(|old| !old.as_os_str().is_empty() && *old != program_data)
         {
             previous.insert(old.to_string_lossy().into_owned());
         }
@@ -10260,6 +10265,11 @@ mod program_data_tests {
         /// A child of this one: the deb's old `/var/lib/ferrofin/data` moved to
         /// `/var/lib/ferrofin`.
         Child,
+        /// `--data-dir dB`, stored relative before every directory was made
+        /// absolute (gl-1668).
+        Relative,
+        /// `--data-dir ./data`, the README's quick start, stored the same way.
+        RelativeDot,
     }
 
     /// One row under `old` in each path column besides the item and image
@@ -10337,6 +10347,8 @@ mod program_data_tests {
                 .to_string_lossy()
                 .into_owned(),
             Previous::Child => program_data.join("data").to_string_lossy().into_owned(),
+            Previous::Relative => "dB".to_owned(),
+            Previous::RelativeDot => "./data".to_owned(),
         };
         let mode = derivation(&program_data);
         let root = program_data.join("root");
@@ -10423,6 +10435,8 @@ mod program_data_tests {
     #[case::elsewhere(Previous::Elsewhere)]
     #[case::into_a_subdirectory(Previous::Parent)]
     #[case::out_of_a_subdirectory(Previous::Child)]
+    #[case::relative(Previous::Relative)]
+    #[case::relative_dot(Previous::RelativeDot)]
     #[tokio::test]
     async fn rewrites_each_moved_path_once_where_its_file_is(#[case] previous: Previous) {
         let moved = moved(previous).await;
@@ -10493,6 +10507,7 @@ mod program_data_tests {
         ];
         expected.sort();
         assert_eq!(image_paths(&moved.db).await, expected);
+        assert_eq!(moved.rebase().await, None, "a second start writes nothing");
     }
 
     #[tokio::test]
@@ -10667,6 +10682,39 @@ mod program_data_tests {
 
         assert_eq!(moved.rebase().await, None);
         assert_eq!(item_path(&moved.db, moved.aggregate).await, "/srv/library");
+    }
+
+    /// A data directory of `""` stored `root/default/…`: its previous
+    /// directory is empty, which would put every stored path under it.
+    #[tokio::test]
+    async fn an_empty_previous_directory_is_no_evidence_of_a_move() {
+        let moved = moved(Previous::Elsewhere).await;
+        for (id, path) in [
+            (moved.aggregate, "root"),
+            (moved.user_root, "root/default"),
+            (moved.library, "root/default/Movies"),
+        ] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(path)
+                .execute(moved.db.writer())
+                .await
+                .unwrap();
+        }
+
+        let previous = previous_program_data_dirs(
+            &moved.db,
+            &derivation(&moved.program_data),
+            &dirs(&moved.program_data),
+        )
+        .await
+        .unwrap();
+        assert!(previous.is_empty(), "{previous:?}");
+        assert_eq!(moved.rebase().await, None);
+        assert_eq!(
+            item_path(&moved.db, moved.library).await,
+            "root/default/Movies"
+        );
     }
 
     #[tokio::test]

@@ -1850,7 +1850,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/Movies/BoxSet.cs (MarkPlayed, MarkUnplayed), \
                    MediaBrowser.Controller/Entities/TV/Episode.cs and \
                    MediaBrowser.Controller/Entities/TV/Season.cs (Series, FindSeriesId, \
-                   GetUserDataKeys), \
+                   GetUserDataKeys), MediaBrowser.Controller/Entities/Audio/Audio.cs \
+                   (GetUserDataKeys; the keys themselves from user_data_keys.rs \
+                   user_data_keys), \
                    MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
                    Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
                    UpdateUserItemRatingInternal). The version groups: dto_service.rs prefetch's \
@@ -1875,7 +1877,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Jellyfin.Database.Implementations/DescendantQueryHelper.cs \
                    (GetAllDescendantIds) and MediaBrowser.Controller/Entities/Folder.cs \
                    (IsPlayed)",
-        date: "2026-11-11",
+        date: "2026-11-20",
         divergences: &[
             "After a scan or boot-repair fold, which upstream does not have (it deletes the \
              duplicate, and ReconcileUserDataAsync gives the user's rows the most recent play when \
