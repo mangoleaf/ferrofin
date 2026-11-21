@@ -27,6 +27,8 @@ playlist.xml listing the share, as the fixtures' Synthetic mixed order is. synth
 stage makes, whose shares it is refused (403), as upstream refuses a playlist's shares to anyone but its owner. A full
 refresh of SHARED (POST /Items/SHARED/Refresh?metadataRefreshMode=FullRefresh) moves its DateLastRefreshed in
 CONFIG/data/jellyfin.db a moment later, as Jellyfin's queued refresh does; a refresh of another mode moves nothing.
+Live TV answers as livetv.py asks it: a tuner and a guide, whose guide refresh (the RefreshGuide task) gives two
+channels and their programmes, timers, series timers and favourite channels.
 """
 
 import base64
@@ -59,7 +61,9 @@ SETUP_SECONDS = 3
 REFRESH_SECONDS = 0.2
 #: What the stub keeps, and saves to CONFIG/fake-state.json.
 FIELDS = ("refreshes", "users", "data", "collections", "accounts", "prefs", "keys", "devices", "libraries", "items",
-          "images", "plays", "shares")
+          "images", "plays", "shares", "livetv")
+#: The id of the RefreshGuide task.
+GUIDE_TASK = "6c5d7b3a2e1f4a0b9c8d7e6f5a4b3c2d"
 
 
 def fresh():
@@ -78,6 +82,8 @@ def fresh():
         "images": {},        # item id: image types
         "plays": {},         # user id (not ADMIN): movies played to the end
         "shares": [CHILD],   # whom SHARED is shared with
+        "livetv": {"tuner": False, "guide": False, "refreshes": 0, "channels": [], "programmes": [], "timers": [],
+                   "series": [], "favourites": []},
     }
 
 
@@ -129,8 +135,56 @@ class Stub:
     def collection(self, key):
         return next((c for c in self.collections if c[2] == key), None)
 
+    def guide_task(self):
+        return {"Key": "RefreshGuide", "Id": GUIDE_TASK, "State": "Idle",
+                "LastExecutionResult": {"Status": "Completed", "EndTimeUtc": str(self.livetv["refreshes"])}}
+
+    def livetv_get(self, path, query):
+        """The answer to a Live TV read, or None for another path."""
+        tv = self.livetv
+        if path == "/LiveTv/Channels":
+            favourite = query.get("IsFavorite") == ["true"]
+            channels = [c for c in tv["channels"] if not favourite or c["Id"] in tv["favourites"]]
+            return 200, {"Items": channels, "TotalRecordCount": len(channels)}
+        if path == "/LiveTv/Programs":
+            return 200, {"Items": tv["programmes"], "TotalRecordCount": len(tv["programmes"])}
+        if path == "/LiveTv/Timers":
+            return 200, {"Items": tv["timers"], "TotalRecordCount": len(tv["timers"])}
+        if path == "/LiveTv/SeriesTimers":
+            return 200, {"Items": tv["series"], "TotalRecordCount": len(tv["series"])}
+        if path == "/LiveTv/Timers/Defaults":
+            return 200, {"ProgramId": query["programId"][0]}
+        if path == f"/ScheduledTasks/{GUIDE_TASK}":
+            return 200, self.guide_task()
+        return None
+
+    def livetv_post(self, path, body):
+        """The answer to a Live TV write, or None for another path."""
+        tv = self.livetv
+        if path in ("/LiveTv/TunerHosts", "/LiveTv/ListingProviders"):
+            tv["tuner" if path.endswith("TunerHosts") else "guide"] = True
+            return 200, {"Id": path.rsplit("/", 1)[1]}
+        if path == f"/ScheduledTasks/Running/{GUIDE_TASK}":
+            tv["refreshes"] += 1
+            if tv["tuner"]:
+                tv["channels"] = [{"Id": "e" * 32, "Name": "Test News"}, {"Id": "f" * 32, "Name": "Test Films"}]
+            if tv["tuner"] and tv["guide"]:
+                tv["programmes"] = [{"Id": f"{n:032x}"[::-1], "Name": name}
+                                    for n, name in enumerate(["Quiz Night", "The Long Road"], start=1)]
+            return 204, None
+        if path in ("/LiveTv/Timers", "/LiveTv/SeriesTimers"):
+            timers = tv["timers" if path.endswith("/Timers") else "series"]
+            timers.append({"Id": f"timer-{len(tv['timers']) + len(tv['series'])}", "ProgramId": body["ProgramId"]})
+            return 204, None
+        if path.startswith("/UserFavoriteItems/") and any(path.endswith(c["Id"]) for c in tv["channels"]):
+            tv["favourites"].append(path.rsplit("/", 1)[1])
+            return 200, {}
+        return None
+
     def get(self, path, query):
         parts = path.strip("/").split("/")
+        if (live := self.livetv_get(path, query)) is not None:
+            return live
         if path == "/System/Info/Public":
             return 200, {"Version": "12.4.0", "ProductName": self.product}
         if path == "/System/Ping":
@@ -141,7 +195,8 @@ class Stub:
             return 200, self.user(parts[1])
         if path == "/ScheduledTasks":
             return 200, [{"Key": "RefreshLibrary", "State": "Idle",
-                          "LastExecutionResult": {"Status": "Completed", "EndTimeUtc": str(self.refreshes)}}]
+                          "LastExecutionResult": {"Status": "Completed", "EndTimeUtc": str(self.refreshes)}},
+                         self.guide_task()]
         if parts[0] == "Playlists" and len(parts) == 3 and parts[2] == "Users":
             if parts[1] != SHARED:
                 return 403, None
@@ -195,6 +250,8 @@ class Stub:
 
     def post(self, path, query, body, auth):
         parts = path.strip("/").split("/")
+        if (live := self.livetv_post(path, body)) is not None:
+            return live
         if parts[0] == "UserPlayedItems":
             self.data[parts[1]]["Played"] = True
         elif parts[0] == "UserFavoriteItems":

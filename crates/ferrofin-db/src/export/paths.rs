@@ -87,6 +87,20 @@ pub struct PathRewrite {
     /// The stored paths rewritten, across every column and every `Data`
     /// document.
     pub rewritten: u64,
+    /// `(from, to)` for every directory a stored path moves from, longest
+    /// first: what [`PathRewrite::moved`] applies to the paths the export
+    /// writes into files rather than the database.
+    pub moves: Vec<(String, String)>,
+}
+
+impl PathRewrite {
+    /// Where `path` moves in the output's layout: under the longest directory
+    /// of [`Self::moves`] that holds it, by whole components. `None` for a
+    /// path under none of them (media, a token, a relative path).
+    #[must_use]
+    pub fn moved(&self, path: &str) -> Option<String> {
+        moved(path, &self.moves)
+    }
 }
 
 /// Rewrites every path the staged database stores under one of the source's
@@ -168,6 +182,7 @@ pub(super) async fn rewrite(
         stored,
         ran_at,
         rewritten,
+        moves,
     })
 }
 
@@ -332,7 +347,11 @@ async fn update(
 }
 
 /// Whether the database has the table `table` with the column `column`.
-async fn has_column(conn: &mut SqliteConnection, table: &str, column: &str) -> Result<bool> {
+pub(super) async fn has_column(
+    conn: &mut SqliteConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
     Ok(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2")
             .bind(table)

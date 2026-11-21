@@ -1,6 +1,6 @@
 What the export to Jellyfin left behind
 
-Ferrofin-only data in the database, removed from the export:
+Ferrofin's own tables, removed from the exported database (what each held, and where it went):
   FerrofinIntroSkipperSegments (3 rows): Intro Skipper's segments as detected and edited; those it published stay in Jellyfin's MediaSegments.
   FerrofinMeta (1 row): Ferrofin's settings for this database and the one-time repairs it ran; nothing Jellyfin needs.
   FerrofinNew (0 rows): a table of Ferrofin's own.
@@ -15,7 +15,25 @@ What Jellyfin will change on its first start, running the code migrations its hi
 
 Settings Jellyfin is not given:
   CertificatePath in config/network.xml: a path in Ferrofin's filesystem.
-  Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported.
+  Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported, but for the MusicBrainz server and the Studio Images repository, which outrank those plugins' own settings and are written into them.
+
+Live TV:
+  Written for Jellyfin: 2 tuners and 1 guide provider in config/livetv.xml, 3 timers (1 completed recording among them) in data/livetv/timers.json, 1 series timer in data/livetv/seriestimers.json.
+  Kept in the database: 2 channels and 8 guide programmes, which Jellyfin reads as its own, with the users' data on them (1 favourite channel). Jellyfin's guide refresh updates them in place where it derives the same ids, which was checked for an M3U tuner with an XMLTV guide; for an HDHomeRun tuner or a Schedules Direct guide it was not, and a channel or programme whose id Jellyfin derives differently is replaced at the refresh, its favourites and the timers on it with it.
+  Before Jellyfin's first guide refresh (its schedule runs one an hour after its start at the earliest; run Refresh Guide in its scheduled tasks to have it at once), make sure every tuner answers from inside Jellyfin's container: a refresh that cannot read a tuner's channels deletes them, with their favourites, their guide and every timer on them, as Jellyfin does on any refresh. A guide it cannot read leaves the channels, the guide and the timers as they are.
+  2 timers and 1 series timer that Jellyfin kept before adoption, which Ferrofin never read, are replaced by Ferrofin's.
+  MovieRecordingPath: /mnt/films is outside the data directory, so it is written as it is: Jellyfin's container must reach it at that path.
+  Tuner Attic: its playlist /srv/ferrofin/tuner.m3u is a file, written as it is because every channel's id is derived from it: make it readable at that path in Jellyfin's container, or Jellyfin's guide refresh finds no channels and deletes them.
+  Tuner Lounge: it is at http://127.0.0.1:5004, a loopback address, which inside Jellyfin's container is the container itself: written as it is because every channel's id is derived from it, so give the container that address (host networking), or Jellyfin's guide refresh finds no channels and deletes them.
+  Not written, as their stored settings could not be read: a timer.
+
+Plugins:
+  Settings written for Jellyfin in plugins/configurations: TMDb, LDAP-Auth, Intro Skipper.
+  Not part of Jellyfin, so read only once installed from its plugin catalogue: LDAP-Auth, Intro Skipper.
+  LDAP-Auth: 2 links from directory uids to users in its settings; until the plugin is installed, the users who sign in through it cannot sign in.
+  LDAP-Auth's LdapRootCaPath names a file on Ferrofin's server, written as it is: Jellyfin's container must reach it at that path.
+  Kept as Jellyfin left them before adoption, as Ferrofin never held settings for them: the settings of Merge Versions.
+  No Jellyfin counterpart, so their settings are not carried: Single Sign-On, a WASM plugin (5f0e8d1c-0000-4000-8000-000000000001).
 
 Files and stored paths:
   cache: left out of the copy; the server's cache, log or web client, which Jellyfin does not read.

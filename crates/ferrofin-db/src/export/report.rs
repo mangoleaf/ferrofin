@@ -13,7 +13,7 @@ const TABLE_NOTES: [(&str, &str); 20] = [
     ),
     (
         "FerrofinExternalIdentities",
-        "the links from LDAP-Auth and Single Sign-On identities to users, not exported; Jellyfin's LDAP-Auth plugin keeps its own in its settings. Jellyfin does not know Single Sign-On's provider, so an account Single Sign-On created cannot sign in there until it has the default provider, which saving its profile page in Jellyfin's dashboard gives it; from then on it signs in with a password an administrator sets after saving (one set before is ignored), and with no other, an empty one included",
+        "the links from LDAP-Auth and Single Sign-On identities to users. LDAP-Auth's are written into its settings for Jellyfin's LDAP-Auth plugin (LdapUsers in plugins/configurations/LDAP-Auth.xml). Jellyfin does not know Single Sign-On's provider, so an account Single Sign-On created cannot sign in there until it has the default provider, which saving its profile page in Jellyfin's dashboard gives it; from then on it signs in with a password an administrator sets after saving (one set before is ignored), and with no other, an empty one included",
     ),
     (
         "FerrofinIntroSkipperDisabledEpisodes",
@@ -29,31 +29,31 @@ const TABLE_NOTES: [(&str, &str); 20] = [
     ),
     (
         "FerrofinLiveTvChannels",
-        "Live TV channels; Jellyfin makes them again from its tuners, once those are added again",
+        "Ferrofin's own copy of the Live TV channels; the channel items Jellyfin reads, which hold the users' favourites, are kept, and Jellyfin's guide refresh rebuilds the rest from the tuners",
     ),
     (
         "FerrofinLiveTvListingProviders",
-        "Live TV guide providers, not exported; Jellyfin keeps them in config/livetv.xml",
+        "Live TV guide providers, written to config/livetv.xml, where Jellyfin keeps them",
     ),
     (
         "FerrofinLiveTvPrograms",
-        "the Live TV guide; Jellyfin downloads it again once its guide providers are added again",
+        "Ferrofin's own copy of the Live TV guide; the programme items Jellyfin reads are kept, and Jellyfin's guide refresh downloads the guide again",
     ),
     (
         "FerrofinLiveTvRecordings",
-        "Ferrofin's records of DVR recordings; the recorded files stay where they were written",
+        "Ferrofin's records of DVR recordings; each completed one's file and programme facts are written into its timer in data/livetv/timers.json, as Jellyfin keeps them, and the recorded files are where they were written",
     ),
     (
         "FerrofinLiveTvSeriesTimers",
-        "series recording rules, not exported; Jellyfin keeps them in data/livetv/seriestimers.json",
+        "series recording rules, written to data/livetv/seriestimers.json, where Jellyfin keeps them",
     ),
     (
         "FerrofinLiveTvTimers",
-        "scheduled recordings, not exported; Jellyfin keeps them in data/livetv/timers.json",
+        "scheduled and completed recordings, written to data/livetv/timers.json, where Jellyfin keeps them",
     ),
     (
         "FerrofinLiveTvTunerHosts",
-        "Live TV tuners, not exported; Jellyfin keeps them in config/livetv.xml",
+        "Live TV tuners, written to config/livetv.xml, where Jellyfin keeps them",
     ),
     (
         "FerrofinMeta",

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The Jellyfin stage of a round-trip route, sourced by run.sh: boot the Jellyfin release under test on what
 # the export wrote, read its log (checks_boot.py), refresh every playlist's metadata in full (api.py
-# refresh-playlists), compare its answers with Ferrofin's oracle, probe the files
+# refresh-playlists), compare its answers with Ferrofin's oracle, compare its Live TV with Ferrofin's before and
+# after its first guide refresh (livetv.py), probe the files
 # it serves (probes.py), scan its libraries, and check the file and its library rows (checks_paths.py) once it
 # has stopped. On the scale route, where Ferrofin captured no answers, only its start and its file are checked
 # (stage_ferrofin.sh says why). It uses run.sh's state: route, kind, dst, first_start, the settings, FIXTURES,
@@ -17,7 +18,7 @@ jellyfin_stage() {
   fi
   MADE+=("$cid")
   if port=$(rt_start "$name" "$cid" "$JELLYFIN_ID" -v "$dst/jellyfin:/config" -v "$dst/jellyfin-cache:/cache" \
-      "${MEDIA[@]}" 2>"$dst/jellyfin-start.err"); then
+      -v "$dst/livetv:/livetv:ro" "${MEDIA[@]}" 2>"$dst/jellyfin-start.err"); then
     url=http://127.0.0.1:$port
     if ! rt_wait_up "$name" "$port" "$READY_TIMEOUT" "$RT_JELLYFIN_START_FAILED"; then
       ready=''
@@ -57,6 +58,10 @@ jellyfin_stage() {
       python3 "$HERE/answers.py" --base-url "$url" --data-dir "$dst/jellyfin" --out "$dst/answers.txt"
     [ ! -f "$dst/answers.txt" ] || check rt_compare_answers "$dst/oracle.txt" "$dst/answers.txt"
     mark Jellyfin "answers equal Ferrofin's before the stop"
+    # twice the script's own bound, so its own reason comes first
+    check reasons_within $((2 * SCAN_TIMEOUT)) "the Live TV check" python3 "$HERE/livetv.py" check --base-url "$url" \
+      --data-dir "$dst/jellyfin" --ferrofin "$dst/livetv-ferrofin.json" --timeout "$SCAN_TIMEOUT"
+    mark Jellyfin "Live TV: timers, a favourite channel and the guide equal Ferrofin's before and after its first guide refresh"
     check reasons_within "$SCAN_TIMEOUT" "the probes" \
       python3 "$HERE/probes.py" --base-url "$url" --data-dir "$dst/jellyfin" --before "$dst/ferrofin/data/jellyfin.db" \
       --out "$dst/probes.txt"
