@@ -256,7 +256,7 @@ fn print_paths(config: &Config, target: &Path, summary: &ExportSummary) {
     println!(
         "It is in the layout of Jellyfin's docker image, for a volume mounted at {}: {} rewritten onto it{}.",
         DOCKER.program_data,
-        count(paths.rows, "stored path was", "stored paths were"),
+        count(paths.rewritten, "stored path was", "stored paths were"),
         if paths.stored.is_empty() {
             String::new()
         } else {

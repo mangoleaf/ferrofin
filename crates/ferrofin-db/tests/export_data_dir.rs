@@ -439,7 +439,8 @@ async fn the_database_directory_keeps_its_mode_and_time_after_the_snapshot() {
 /// docker image (gl-1557): its metadata directory becomes the output's
 /// `metadata`, the cache and the data directory's own stale `metadata` are
 /// left out, every stored path under a directory of the source is rewritten
-/// onto `/config`, and every one of those resolves in the output.
+/// onto `/config`, a library's and the root's locations in `Data` included
+/// (gl-1924), and every one of those resolves in the output.
 #[tokio::test]
 async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it() {
     let scratch = tempfile::tempdir().unwrap();
@@ -447,15 +448,17 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
     let image = format!("{}/library/ab/poster.jpg", meta.display());
     let statements = [
         "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
-        r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT)"#.to_owned(),
+        r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT, "Data" TEXT)"#.to_owned(),
         r#"CREATE TABLE "BaseItemImageInfos" ("Path" TEXT NOT NULL)"#.to_owned(),
         r#"CREATE TABLE "ImageInfos" ("Path" TEXT)"#.to_owned(),
         r#"INSERT INTO "BaseItems" VALUES
-           ('MediaBrowser.Controller.Entities.AggregateFolder', '/data/root'),
-           ('MediaBrowser.Controller.Entities.UserRootFolder', '/data/root/default'),
-           ('MediaBrowser.Controller.Entities.CollectionFolder', '/data/root/default/Movies'),
-           ('MediaBrowser.Controller.Entities.Person', '%MetadataPath%/People/A/Actor'),
-           ('MediaBrowser.Controller.Entities.Movies.Movie', '/media/movies/a.mkv')"#
+           ('MediaBrowser.Controller.Entities.AggregateFolder', '/data/root',
+            '{"PhysicalLocationsList":["/data/root","/media/movies"]}'),
+           ('MediaBrowser.Controller.Entities.UserRootFolder', '/data/root/default', NULL),
+           ('MediaBrowser.Controller.Entities.CollectionFolder', '/data/root/default/Movies',
+            '{"PhysicalLocationsList":["/data/root/default/Movies","/media/movies"]}'),
+           ('MediaBrowser.Controller.Entities.Person', '%MetadataPath%/People/A/Actor', NULL),
+           ('MediaBrowser.Controller.Entities.Movies.Movie', '/media/movies/a.mkv', NULL)"#
             .to_owned(),
         format!(r#"INSERT INTO "BaseItemImageInfos" VALUES ('{image}')"#),
         r#"INSERT INTO "ImageInfos" VALUES ('/data/config/users/a/profile.png')"#.to_owned(),
@@ -512,9 +515,14 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
     );
     assert_eq!(summary.edits.paths.stored, ["/data"]);
     assert_eq!(summary.edits.paths.ran_at.as_deref(), Some("/data"));
-    assert_eq!(summary.edits.paths.rows, 5);
+    assert_eq!(summary.edits.paths.rewritten, 7);
     let stored = exported_paths(&out).await;
-    assert!(stored.contains(&"/config/metadata/library/ab/poster.jpg".to_owned()));
+    for path in [
+        "/config/metadata/library/ab/poster.jpg",
+        "/config/root/default/Movies",
+    ] {
+        assert!(stored.contains(&path.to_owned()), "{path}");
+    }
     for path in &stored {
         let source_dirs = [source.as_path(), meta.as_path(), Path::new("/data")];
         assert!(
@@ -535,7 +543,8 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
 }
 
 /// Every path the exported database under `out` stores in `BaseItems`,
-/// `BaseItemImageInfos` and `ImageInfos`.
+/// `BaseItemImageInfos` and `ImageInfos`, and every string value of an
+/// item's `Data`.
 async fn exported_paths(out: &Path) -> Vec<String> {
     let mut conn = SqliteConnectOptions::new()
         .filename(out.join(EXPORTED_DATABASE))
@@ -546,7 +555,9 @@ async fn exported_paths(out: &Path) -> Vec<String> {
     let stored = sqlx::query_scalar(
         r#"SELECT "Path" FROM "BaseItems" WHERE "Path" IS NOT NULL
            UNION ALL SELECT "Path" FROM "BaseItemImageInfos"
-           UNION ALL SELECT "Path" FROM "ImageInfos""#,
+           UNION ALL SELECT "Path" FROM "ImageInfos"
+           UNION ALL SELECT j.value FROM "BaseItems", json_tree("Data") AS j
+                     WHERE "Data" IS NOT NULL AND j.type = 'text'"#,
     )
     .fetch_all(&mut conn)
     .await

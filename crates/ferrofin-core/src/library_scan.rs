@@ -9027,8 +9027,10 @@ impl LibraryScanner {
         // Scan-variant save: its SQL guards back the merge above up for a
         // row it could not read (and for a writer that raced this scan):
         // `PrimaryVersionId`, the first-import `DateCreated`, the refresh
-        // dates and a locked row's metadata and `Data` are never lost. A
-        // re-dated file, or a date a reader supplied, writes its
+        // dates and a locked row's metadata and `Data` are never lost (its
+        // probe-owned keys follow the probe, and are kept when the probe
+        // could not send them, `LyricFiles` excepted: `PROBE_OWNED_KEYS`).
+        // A re-dated file, or a date a reader supplied, writes its
         // `DateCreated` over the stored one, which the first-import guard
         // would otherwise keep.
         state.save_attempted = true;
@@ -9476,7 +9478,7 @@ impl LibraryScanner {
     ///
     /// # Errors
     ///
-    /// Propagates a storage failure from the stream or chapter write.
+    /// Propagates a storage failure from the stream, flag or attachment write.
     async fn persist_probe_rows(
         &self,
         item_id: Uuid,
@@ -9495,6 +9497,12 @@ impl LibraryScanner {
                     .await?;
             } else {
                 repo.save_media_streams(item_id, &probe.streams).await?;
+            }
+            // The item's row went first, with the flag the probe's snapshot
+            // gave (`FFProbeVideoInfo.cs:270`); a subtitle a download attached
+            // since, kept above or replaced, must not leave the two apart.
+            if probe.save_attachments {
+                repo.sync_has_subtitles(item_id).await?;
             }
         }
         // Attachments are replaced whenever a video probe ran (an empty set clears
@@ -23724,6 +23732,7 @@ struct ProbeRows {
     people: Option<Vec<PeopleEntity>>,
     /// Whether the attachment rows are authoritative: a probe ran and the item
     /// is a video (`false` — no probe, or an audio file — leaves stored rows alone).
+    /// It also has the stream save store the video's `HasSubtitles` from its rows.
     save_attachments: bool,
 }
 
@@ -34936,6 +34945,110 @@ mod tests {
         scanner.persist_probe_rows(id, &rows, None).await.unwrap();
         let media_streams = streams.get_media_streams(&query).await.unwrap();
         assert!(media_streams.is_empty(), "{media_streams:?}");
+    }
+
+    /// A video probe's stream save leaves the video's `HasSubtitles` agreeing
+    /// with the rows it saved (gl-1914): the item's row went first, with the
+    /// probe snapshot's flag, and a subtitle a download attached in between
+    /// (whose flag the row overwrote) or one the save replaced must not leave
+    /// them apart, on the plain save and on the download gate's, which keeps a
+    /// subtitle the snapshot lacked. Every other key of `Data` stays, and an
+    /// audio probe's save gives a track no flag.
+    #[rstest::rstest]
+    #[case::a_subtitle_saved(
+        "subtitle",
+        r#"{"VideoType":"VideoFile","HasSubtitles":false}"#,
+        Some(true)
+    )]
+    #[case::none_saved(
+        "video",
+        r#"{"VideoType":"VideoFile","HasSubtitles":true}"#,
+        Some(false)
+    )]
+    #[case::a_download_kept(
+        "download",
+        r#"{"VideoType":"VideoFile","HasSubtitles":false}"#,
+        Some(true)
+    )]
+    #[case::an_audio_probe("audio", r#"{"VideoType":"VideoFile"}"#, None)]
+    #[tokio::test]
+    async fn a_video_probes_stream_save_keeps_has_subtitles_with_its_rows(
+        #[case] probe_kind: &str,
+        #[case] saved: &str,
+        #[case] expected: Option<bool>,
+    ) {
+        use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+        use ferrofin_traits::persistence::MediaStreamRepository;
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let id = uuid::Uuid::new_v4();
+        let row = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            parent_id: None,
+            data: Some(saved.to_owned()),
+            ..planned_movie()
+        };
+        persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let folders = Arc::new(FerrofinVirtualFolderManager::new(tmp.path().join("views")));
+        let mut scanner =
+            LibraryScanner::new(folders, Arc::new(FerrofinFileSystem::new()), persistence);
+        let streams: Arc<dyn MediaStreamRepository> =
+            Arc::new(crate::FerrofinMediaStreamRepository::new(db.clone()));
+        scanner.media_streams = Some(Arc::clone(&streams));
+        let stream = |stream_index, stream_type| MediaStreamInfoEntity {
+            stream_index,
+            stream_type,
+            codec: Some("subrip".to_owned()),
+            ..Default::default()
+        };
+        let mut probe = super::ProbeRows {
+            save_attachments: probe_kind != "audio",
+            ..super::ProbeRows::default()
+        };
+        let own = if probe_kind == "audio" {
+            ferrofin_model::entities::MediaStreamType::Audio
+        } else {
+            ferrofin_model::entities::MediaStreamType::Video
+        };
+        probe
+            .streams
+            .push(stream(0, crate::db_error::media_stream_type_disc(own)));
+        if probe_kind == "subtitle" {
+            probe.streams.push(stream(1, 2));
+        }
+        // What a download attached after the probe's snapshot: its sidecar
+        // and row, the row the gate's save keeps.
+        let manager: Arc<dyn ferrofin_traits::subtitles::SubtitleManager> =
+            Arc::new(crate::FerrofinSubtitleManager::new(
+                db.clone(),
+                crate::test_support::library_manager_over(db.clone()),
+                Arc::clone(&streams),
+                Vec::new(),
+                tmp.path().join("metadata"),
+            ));
+        let downloader =
+            crate::subtitle_downloader::SubtitleDownloader::new(&manager, Arc::clone(&streams));
+        if probe_kind == "download" {
+            let sidecar = tmp.path().join("Heat (1995).eng.srt");
+            std::fs::write(&sidecar, b"1\n").unwrap();
+            let mut attached = stream(1, 2);
+            attached.is_external = true;
+            attached.path = Some(sidecar.to_string_lossy().into_owned());
+            streams.save_media_streams(id, &[attached]).await.unwrap();
+        }
+        let gated = (probe_kind == "download").then_some(&downloader);
+
+        scanner.persist_probe_rows(id, &probe, gated).await.unwrap();
+
+        let data = crate::test_support::fetch_item(&db, id).await.data;
+        let data: serde_json::Value =
+            serde_json::from_str(data.as_deref().expect("data")).expect("json");
+        assert_eq!(data["HasSubtitles"].as_bool(), expected, "{data}");
+        assert_eq!(data["VideoType"], "VideoFile", "{data}");
     }
 
     /// `FFProbeVideoInfo.Fetch` (`FFProbeVideoInfo.cs:263-266`): a video's
@@ -47344,8 +47457,8 @@ mod chapter_image_refresh_tests {
     /// in `Data`, true when a subtitle stream it keeps exists (an external one,
     /// or an embedded one the library allows), and the metadata merge keeps
     /// the probe's value over the stored one, locked or not (gl-1632). The
-    /// scan save then keeps a locked row's stored `Data`, as it does every
-    /// probe-owned key (TODO(gl-1913): a locked row keeps them).
+    /// scan save keeps it on a locked row too, as every probe-owned key
+    /// (`crate::item_data::PROBE_OWNED_KEYS`, gl-1913).
     #[rstest::rstest]
     #[case::embedded(
         false,

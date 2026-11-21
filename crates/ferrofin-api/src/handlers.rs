@@ -2471,7 +2471,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ReplaceAllMetadata, a FullRefresh, or a first or required refresh at Default \
                    or above, else the change-monitored ones; for a locked item \
                    CanRefreshMetadata keeps the forced providers and RefreshWithProviders \
-                   returns after them, so only the probe runs), scan_item's run_local gate \
+                   returns after them, so only the probe runs, and the Data keys it owns, \
+                   item_data.rs PROBE_OWNED_KEYS, are saved whatever the lock through \
+                   item_persistence_service.rs locked_data_sql), scan_item's run_local gate \
                    (RefreshWithProviders runs \
                    no local reader when SearchResult is set (the NFO, and a book's embedded \
                    readers in enrich_from_file), nor under ReplaceAllMetadata for an item a \
@@ -6132,13 +6134,16 @@ pub const VERIFIED: &[Verified] = &[
                queued instead for an item outside every library, as for the lyrics delete) → \
                subtitle_manager.rs drop_missing_subtitle_rows (the item's external subtitle \
                rows whose absolute path is gone dropped, the rest kept with their indexes; \
-               nothing to drop after a refresh that probed). \
+               nothing to drop after a refresh that probed; when it drops one, \
+               media_stream_repository.rs sync_has_subtitles stores Data's HasSubtitles from \
+               the rows left, the rule FFProbeVideoInfo.cs:270 applies to the streams it \
+               saves). \
                The parity sweep's request (the corpus movie's stream 0, its video) expects \
                the 400. Measured on 12.4: an embedded, a \
                missing and a video stream's index, a nil id, an unknown id and an external \
                sidecar's index; and that sidecar's row pointed at a missing file (204), a \
                missing folder (404, row kept) and an http URL (404, row kept)",
-        date: "2026-11-17",
+        date: "2026-11-21",
         divergences: &[
             "A hex (0x, #, &h) or padded index is a 400; upstream's route binder reads it as \
          a number. Fix path: gl-1664.",
@@ -6157,7 +6162,8 @@ pub const VERIFIED: &[Verified] = &[
          (gl-1875); the indexes keep the gap until a refresh that probes renumbers them. \
          After a refresh that probed there is nothing to drop and the rows are upstream's. \
          Upstream keeps the row after a failed probe (read in FFProbeVideoInfo.ProbeVideo, \
-         not measured): a Jellyfin bug, deliberately not ported.",
+         not measured), and the video's stored HasSubtitles with it; here the flag follows \
+         the rows left: a Jellyfin bug, deliberately not ported.",
         ],
         refs: &["access-filtering"],
     },

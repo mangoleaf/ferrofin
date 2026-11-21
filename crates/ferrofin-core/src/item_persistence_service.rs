@@ -2552,9 +2552,10 @@ fn columns_of(
 /// `PrimaryVersionId` is never written, `DateCreated` only fills a gap,
 /// `IsLocked` only rises, the never-cleared columns keep the stored value
 /// over a `NULL`, and a locked row keeps its user-owned columns (its `Data`
-/// taking only the resolver's video fields, [`locked_data_sql`]). With
-/// `writes_date_created` it evaluates [`scan_upsert_date_created_sql`]
-/// instead, whose `DateCreated` is never cleared but otherwise written.
+/// taking only the resolver's video fields and the probe's keys,
+/// [`locked_data_sql`]). With `writes_date_created` it evaluates
+/// [`scan_upsert_date_created_sql`] instead, whose `DateCreated` is never
+/// cleared but otherwise written.
 pub(crate) fn scan_save_changes_row(
     saved: &BaseItemEntity,
     stored: &BaseItemEntity,
@@ -2596,9 +2597,10 @@ pub(crate) fn scan_save_changes_row(
                 // (`Folder.AddChild`), which the saved row carries over.
                 "DateModified" if crate::item_data::date_modified_follows_save(saved) => new,
                 col if SCAN_NEVER_CLEARED_COLUMNS.contains(&col) && is_null(new) => old,
-                // `locked_data_sql`: only the resolver's video fields move.
+                // `locked_data_sql`: only the resolver's video fields and
+                // the probe's keys move.
                 "Data" if stored.is_locked => {
-                    return crate::item_data::with_resolved_video_fields(
+                    return crate::item_data::with_locked_scan_fields(
                         stored.data.as_deref(),
                         saved.data.as_deref(),
                     )
@@ -6376,11 +6378,21 @@ const LOCKED_FILLABLE_COLUMNS: &[&str] = &[
 /// is `[]`; one the incoming blob does not carry is left as stored, until
 /// the planner writes both, PLAN_ITEM_FILE_DELETION step 12 S4) — and every other key kept
 /// with its value and place (`json_patch` re-renders the document
-/// minified). Left as stored when the incoming blob names no `VideoType`
-/// (it is no `Video`), nothing differs, or either is not valid JSON (the
-/// stored one must be an object; `NULL` or empty is `{}`).
-/// [`with_resolved_video_fields`] is the same rule in Rust, which the scan's
-/// merge and [`scan_save_changes_row`] apply; the lists compare there as
+/// minified). The video fields move only when the incoming blob names a
+/// `VideoType` (it is a `Video`). Then each of the [`PROBE_OWNED_KEYS`] the
+/// incoming blob carries takes its value (a JSON `null` reads as absent and
+/// is stored absent), and the [`PROBE_CLEARED_KEY`] goes when it does not
+/// carry it: upstream's probe runs before a refresh's lock check and saves
+/// the item whole. A key the incoming blob does not carry is otherwise kept,
+/// as a failed probe on a row the scan could not read sends none. Left as
+/// stored when nothing differs, or either is not a JSON object (`NULL` or
+/// empty stored is `{}`). The probe keys compare here as their `->` text and
+/// in Rust as values, so one stored with a JSON escape the other side spells
+/// out (an adopted `ShortcutPath` with `&`) is rewritten here when another
+/// difference saves the row, the same value either way.
+/// [`with_resolved_video_fields`] is the video rule in Rust, which the scan's
+/// merge applies, and [`with_locked_scan_fields`] the whole rule, which
+/// [`scan_save_changes_row`] applies; the lists compare there as
 /// JSON values and here as their minified text. Those differ for a path
 /// stored with a JSON escape the other side spells out — an adopted blob
 /// does: Jellyfin's `JsonDefaults` keeps the default `JavaScriptEncoder`,
@@ -6394,12 +6406,16 @@ const LOCKED_FILLABLE_COLUMNS: &[&str] = &[
 /// raise an error on malformed input, which would fail the whole save.
 ///
 /// [`RESOLVED_VIDEO_PATH_LISTS`]: crate::item_data::RESOLVED_VIDEO_PATH_LISTS
+/// [`PROBE_OWNED_KEYS`]: crate::item_data::PROBE_OWNED_KEYS
+/// [`PROBE_CLEARED_KEY`]: crate::item_data::PROBE_CLEARED_KEY
 /// [`with_resolved_video_fields`]: crate::item_data::with_resolved_video_fields
+/// [`with_locked_scan_fields`]: crate::item_data::with_locked_scan_fields
 fn locked_data_sql() -> &'static str {
     static SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         const STORED: &str = r#"coalesce(nullif("Data", ''), '{}')"#;
         const INCOMING: &str = r#"excluded."Data""#;
-        // (differs, the one-key patch applied when it does)
+        // The resolver's video fields: (differs, the one-key patch applied
+        // when it does).
         let mut fields = vec![(
             format!(
                 "json_extract({STORED}, '$.VideoType') \
@@ -6428,20 +6444,50 @@ fn locked_data_sql() -> &'static str {
                 format!("json_object('{key}', json({resolved}))"),
             ));
         }
-        let any_differs = fields
-            .iter()
-            .map(|(differs, _)| format!("({differs})"))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        let patched = fields
+        // The video fields speak only for a `Video`.
+        for (differs, _) in &mut fields {
+            *differs = format!("json_type({INCOMING}, '$.VideoType') = 'text' AND ({differs})");
+        }
+        let video_patched = fields
             .iter()
             .fold(STORED.to_owned(), |doc, (differs, patch)| {
                 format!("json_patch({doc}, CASE WHEN {differs} THEN {patch} ELSE '{{}}' END)")
             });
+        // `->` reads an absent key as NULL and a JSON `null` as 'null': both
+        // are absent here, and a merge patch's `null` removes the key.
+        let probe_value = |doc: &str, key: &str| format!("nullif({doc} -> '$.{key}', 'null')");
+        let mut differs = fields
+            .iter()
+            .map(|(differs, _)| differs.clone())
+            .collect::<Vec<_>>();
+        let mut probe_patch = Vec::new();
+        for key in crate::item_data::PROBE_OWNED_KEYS {
+            let (stored, incoming) = (probe_value(STORED, key), probe_value(INCOMING, key));
+            if key == crate::item_data::PROBE_CLEARED_KEY {
+                differs.push(format!("{stored} IS NOT {incoming}"));
+                probe_patch.push(format!("'{key}', json({incoming})"));
+            } else {
+                // A key the incoming blob does not carry keeps its stored value.
+                let carried = format!("{INCOMING} -> '$.{key}' IS NOT NULL");
+                differs.push(format!("{carried} AND {stored} IS NOT {incoming}"));
+                probe_patch.push(format!(
+                    "'{key}', json(CASE WHEN {carried} THEN {incoming} ELSE {stored} END)"
+                ));
+            }
+        }
+        let any_differs = differs
+            .iter()
+            .map(|differs| format!("({differs})"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let patched = format!(
+            "json_patch({video_patched}, json_object({}))",
+            probe_patch.join(", ")
+        );
         format!(
             r#"CASE WHEN json_valid({INCOMING}) = 1
             AND json_valid({STORED}) = 1
-        THEN CASE WHEN json_type({INCOMING}, '$.VideoType') = 'text'
+        THEN CASE WHEN json_type({INCOMING}) = 'object'
                 AND json_type({STORED}) = 'object'
                 AND ({any_differs})
             THEN {patched}
@@ -6482,8 +6528,9 @@ const SCAN_NEVER_CLEARED_COLUMNS: &[&str] = &[
 ///   row is locked (in the `CASE`, the unqualified `"IsLocked"` reads the
 ///   existing row, so the guard sees the pre-write lock state) — an empty
 ///   [`LOCKED_FILLABLE_COLUMNS`] entry excepted, which the save may fill,
-///   `Data`, whose video fields alone follow the resolver
-///   ([`locked_data_sql`]), and an extra's name, which `FindExtras` sets.
+///   `Data`, whose video fields alone follow the resolver and whose
+///   probe-owned keys the probe ([`locked_data_sql`]), and an extra's name,
+///   which `FindExtras` sets.
 ///
 /// Derived from [`UPSERT_SQL`] by text substitution so the column/bind layout
 /// cannot drift between the two statements; the substitutions are asserted in
@@ -12406,12 +12453,16 @@ mod tests {
     /// `Video.cs:500-526`, whatever the lock) — its `VideoType`, and its
     /// `AdditionalParts`/`LocalAlternateVersions` the incoming blob carries
     /// when they differ as ordinal sequences, a stored list absent or `null`
-    /// being `[]` (one the incoming blob does not carry stays); every other key keeps
-    /// its value and its place, though `json_patch` re-renders the document
-    /// minified. A blob that is not a JSON object, an incoming blob with no
-    /// `VideoType` (no `Video`), or one that already matches leave the
-    /// stored text as it is. `scan_save_changes_row` agrees with the SQL in
-    /// every case.
+    /// being `[]` (one the incoming blob does not carry stays) — and the
+    /// probe's keys (`PROBE_OWNED_KEYS`, the pre-refresh probe's) the
+    /// incoming blob carries, a `null` being absent, and `LyricFiles` absent
+    /// when it does not carry them; every other key keeps its value and its
+    /// place, though `json_patch` re-renders the document minified. A blob
+    /// that is not a JSON object, video fields in an incoming blob with no
+    /// `VideoType` (no `Video`), or one that already matches leave the stored
+    /// text as it is. `scan_save_changes_row` agrees with the SQL in every
+    /// case here (a value that differs only by a JSON escape it does not:
+    /// `locked_data_sql`).
     #[rstest::rstest]
     #[case::replaced(
         Some(r#"{"VideoType":"Dvd", "RemoteTrailers":[{"Url":"u"}],"IsoType":"Dvd"}"#),
@@ -12529,8 +12580,73 @@ mod tests {
         Some(r#"{"VideoType":"VideoFile","LocalAlternateVersions":["/m/x.mkv"]}"#),
         Some(r#"{"VideoType":"VideoFile","LocalAlternateVersions":["/m/x.mkv"]}"#)
     )]
+    #[case::probe_keys_follow_the_file(
+        Some(
+            r#"{"Container":"avi","DefaultVideoStreamIndex":2,"HasSubtitles":true,"RemoteTrailers":[{"Url":"u"}],"VideoType":"VideoFile"}"#
+        ),
+        Some(
+            r#"{"Container":"matroska","DefaultVideoStreamIndex":0,"HasSubtitles":false,"RemoteTrailers":[],"VideoType":"VideoFile"}"#
+        ),
+        Some(
+            r#"{"Container":"matroska","DefaultVideoStreamIndex":0,"HasSubtitles":false,"RemoteTrailers":[{"Url":"u"}],"VideoType":"VideoFile"}"#
+        )
+    )]
+    #[case::probe_keys_without_a_video_type(
+        Some(r#"{"Container":"mp3","LyricFiles":["/m/a.lrc"],"Status":"Ended"}"#),
+        Some(r#"{"Container":"flac"}"#),
+        Some(r#"{"Container":"flac","Status":"Ended"}"#)
+    )]
+    #[case::probe_key_added(
+        Some(r#"{"Status":"Ended"}"#),
+        Some(r#"{"HasSubtitles":false,"LyricFiles":["/m/a.lrc"]}"#),
+        Some(r#"{"Status":"Ended","HasSubtitles":false,"LyricFiles":["/m/a.lrc"]}"#)
+    )]
+    #[case::probe_null_is_absent(
+        Some(r#"{"DefaultVideoStreamIndex":0,"VideoType":"VideoFile"}"#),
+        Some(r#"{"DefaultVideoStreamIndex":null,"VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#)
+    )]
+    #[case::probe_null_and_absent_match(
+        Some(r#"{"DefaultVideoStreamIndex":null, "VideoType":"VideoFile"}"#),
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some(r#"{"DefaultVideoStreamIndex":null, "VideoType":"VideoFile"}"#)
+    )]
+    #[case::probe_keys_same(
+        Some(r#"{"HasSubtitles":true, "Container":"mkv","ShortcutPath":"http://a/1"}"#),
+        Some(r#"{"Container":"mkv","HasSubtitles":true,"ShortcutPath":"http://a/1"}"#),
+        Some(r#"{"HasSubtitles":true, "Container":"mkv","ShortcutPath":"http://a/1"}"#)
+    )]
+    #[case::shortcut_path_follows(
+        Some(r#"{"IsShortcut":true,"ShortcutPath":"http://a/1"}"#),
+        Some(r#"{"IsShortcut":true,"ShortcutPath":"http://a/2"}"#),
+        Some(r#"{"IsShortcut":true,"ShortcutPath":"http://a/2"}"#)
+    )]
+    #[case::probe_keys_not_carried_stay(
+        Some(
+            r#"{"Container":"mkv","DefaultVideoStreamIndex":1,"HasSubtitles":true,"ShortcutPath":"http://a/1","VideoType":"VideoFile"}"#
+        ),
+        Some(r#"{"VideoType":"VideoFile"}"#),
+        Some(
+            r#"{"Container":"mkv","DefaultVideoStreamIndex":1,"HasSubtitles":true,"ShortcutPath":"http://a/1","VideoType":"VideoFile"}"#
+        )
+    )]
+    #[case::probe_key_over_no_blob(
+        None,
+        Some(r#"{"HasSubtitles":true}"#),
+        Some(r#"{"HasSubtitles":true}"#)
+    )]
+    #[case::probe_keys_in_no_object(
+        Some(r#"{"HasSubtitles":true}"#),
+        Some(r#"[{"HasSubtitles":false}]"#),
+        Some(r#"{"HasSubtitles":true}"#)
+    )]
+    #[case::probe_keys_with_the_video_fields(
+        Some(r#"{"VideoType":"Dvd","HasSubtitles":true,"Status":"Ended"}"#),
+        Some(r#"{"VideoType":"VideoFile","HasSubtitles":false}"#),
+        Some(r#"{"VideoType":"VideoFile","HasSubtitles":false,"Status":"Ended"}"#)
+    )]
     #[tokio::test]
-    async fn a_locked_rows_data_takes_only_the_resolvers_video_fields(
+    async fn a_locked_rows_data_takes_only_the_resolvers_and_the_probes_fields(
         #[case] stored: Option<&str>,
         #[case] incoming: Option<&str>,
         #[case] expected: Option<&str>,

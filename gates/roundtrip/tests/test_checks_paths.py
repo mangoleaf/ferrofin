@@ -63,6 +63,19 @@ class Stored(unittest.TestCase):
         self.assertEqual(self.check(("BaseItems", str(self.media / "movies/a.mkv"))),
                          [f"BaseItems.Path: 1 of 1 path(s) not in the export, first: {self.media}/movies/a.mkv"])
 
+    def test_a_path_under_the_source_in_item_data_is_named(self):
+        # a library's locations and a video's subtitle; keys, other paths and a document that is no JSON are not
+        db = database(self.dir / "jellyfin.db", [
+            'CREATE TABLE "BaseItems" ("Path" TEXT, "Data" TEXT)',
+            """INSERT INTO "BaseItems" VALUES ('/config/root/default/Movies',
+               '{"PhysicalLocationsList":["/data/root/default/Movies","/media/movies"],"/data/k":["/database/x"]}')""",
+            """INSERT INTO "BaseItems" VALUES ('/media/movies/a.mkv',
+               '{"SubtitleFiles":["/config/metadata/a.srt","/data/metadata/b.srt"],"IsHD":false}')""",
+            """INSERT INTO "BaseItems" VALUES ('/media/movies/a.mkv', '/data/not json')"""])
+        self.assertEqual(checks_paths.stored(db, self.out, self.media, ["/data"]), [
+            "BaseItems.Data: 2 path(s) under the source's directory, first: "
+            "/data/root/default/Movies, /data/metadata/b.srt"])
+
     def test_a_directory_named_like_the_source_is_not_under_it(self):
         self.assertEqual(self.check(("BaseItems", "/database/x"), sources=("/data",)),
                          ["BaseItems.Path: 1 of 1 path(s) not in the export, first: /database/x"])
