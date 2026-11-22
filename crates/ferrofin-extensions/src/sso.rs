@@ -56,7 +56,6 @@ use ferrofin_model::sso::{
     OidcAdminLink, OidcDiscovery, OidcProvider, OidcProviderInfo, OidcProviderList, OidcUserLinks,
 };
 use ferrofin_traits::activity::ActivityManager;
-use ferrofin_traits::devices::DeviceManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::ExternalIdentityStore;
 use ferrofin_traits::library::UserManager;
@@ -352,18 +351,16 @@ pub struct SsoService {
     identities: Arc<dyn ExternalIdentityStore>,
     /// Opens a signed-in account's session and mints its token.
     sessions: Arc<dyn SessionManager>,
-    /// The devices that hold each live session's token: a link flow links
-    /// only while the session that started it is still one of them.
-    devices: Arc<dyn DeviceManager>,
     /// The dashboard's activity log, for a refused sign-in of a known
     /// account, and each link made or removed.
     activity: Arc<dyn ActivityManager>,
     /// Held while an account is created and linked, so two first sign-ins of
-    /// one identity end at one account, while a link is checked and made or
-    /// removed ([`links`]), so a refusal and a link never interleave, and
-    /// while an exchange or a Quick Connect approval checks its link and
-    /// mints its session, so a removal cannot fall between the two.
-    provisioning: tokio::sync::Mutex<()>,
+    /// one identity end at one account, while a link is made, and while a
+    /// removal unlinks and signs the account out ([`links`]), so no link
+    /// falls between the two on this server, and while an exchange or a Quick Connect approval checks its link and
+    /// mints its session, so a removal cannot fall between the two. Shared
+    /// with the task a link change or a removal runs in ([`links`]).
+    provisioning: Arc<tokio::sync::Mutex<()>>,
     /// The server's published URL (`--published-url`,
     /// `FERROFIN_PUBLISHED_URL`), the public URL when the plugin sets none.
     published_url: Option<String>,
@@ -379,7 +376,7 @@ pub struct SsoService {
     /// Each provider's discovery document and key set, for sign-in.
     metadata: MetadataCache,
     /// The sign-ins started and not yet called back.
-    flows: PendingFlows,
+    flows: Arc<PendingFlows>,
     /// The sign-ins called back whose completion page has not yet swapped
     /// its exchange code.
     exchanges: ExchangeCodes,
@@ -394,16 +391,14 @@ pub struct SsoService {
 impl SsoService {
     /// A service over the plugin manager (the enabled flag, the configuration
     /// and the private data), the accounts and their identity links, the
-    /// sessions a sign-in opens and the devices holding them, the activity
-    /// log, and the server's published URL, which the callback URLs fall back
-    /// to. Never the request's `Host` header.
+    /// sessions a sign-in opens, the activity log, and the server's published
+    /// URL, which the callback URLs fall back to. Never the request's `Host` header.
     #[must_use]
     pub fn new(
         plugins: Arc<dyn PluginManager>,
         users: Arc<dyn UserManager>,
         identities: Arc<dyn ExternalIdentityStore>,
         sessions: Arc<dyn SessionManager>,
-        devices: Arc<dyn DeviceManager>,
         activity: Arc<dyn ActivityManager>,
         published_url: Option<String>,
     ) -> Self {
@@ -412,15 +407,14 @@ impl SsoService {
             users,
             identities,
             sessions,
-            devices,
             activity,
-            provisioning: tokio::sync::Mutex::new(()),
+            provisioning: Arc::default(),
             published_url,
             saving: tokio::sync::Mutex::new(()),
             http: OidcHttpClient::new(),
             avatars: None,
             metadata: MetadataCache::default(),
-            flows: PendingFlows::default(),
+            flows: Arc::default(),
             exchanges: ExchangeCodes::default(),
             pacing: Pacing::new(PaceLimits::DEFAULT),
             quick_connect: None,

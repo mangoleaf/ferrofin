@@ -3419,7 +3419,6 @@ pub async fn build_app_state(
             Arc::clone(&extension_cx.users),
             Arc::clone(&extension_cx.external_identities),
             Arc::clone(&state.sessions),
-            Arc::clone(&state.devices),
             Arc::clone(&state.activity),
             config.published_url.clone(),
         )
