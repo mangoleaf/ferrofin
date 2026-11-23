@@ -73,6 +73,12 @@ jobs:
       # df/du steps record the margin, so a future overflow shows in the log.
       - name: disk at start
         run: df -h /
+      # turbojpeg-sys builds its vendored libjpeg-turbo with cmake and assembles the
+      # x86-64 SIMD with nasm, which require-simd makes a hard requirement. lint-tests
+      # and coverage-shard reuse this step (*install-cmake-nasm).
+      - &install-cmake-nasm
+        name: install cmake and nasm
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         # A master commit, deliberately without a ref comment: dtolnay rebuilds
         # the 1.100.0 branch on every master merge (orphaning its SHAs) and moves
@@ -150,6 +156,7 @@ jobs:
           # Builds the WASM example guest for the end-to-end plugin-host test.
           targets: wasm32-wasip2
       - run: rustup toolchain uninstall stable # keeps rust-cache's key stable (see clippy)
+      - *install-cmake-nasm # the vendored libjpeg-turbo (see clippy)
       # Before rust-cache and install-action, so `sccache` is on PATH for any cargo they run.
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11 # zizmor: ignore[cache-poisoning] -- CI publishes no artifact; the cache only speeds up checks
         with:
@@ -351,6 +358,7 @@ jobs:
           toolchain: 1.100.0 # = rust-toolchain.toml
           components: llvm-tools-preview
       - run: rustup toolchain uninstall stable # keeps rust-cache's key stable (see clippy)
+      - *install-cmake-nasm # the vendored libjpeg-turbo (see clippy)
       # Before rust-cache and install-action, so `sccache` is on PATH for any cargo they run.
       # The version matches GitLab's SCCACHE_VERSION. rust-cache (kept, D5) restores the
       # registry and compiled dependencies; sccache serves the workspace crates it discards.

@@ -9,7 +9,9 @@ By contributing you agree your work is licensed under the same terms.
 ## Development setup
 
 Rust workspace, edition 2024, toolchain pinned to **1.100.0** (stable — see
-`rust-toolchain.toml`, which rustup honors automatically).
+`rust-toolchain.toml`, which rustup honors automatically). The build also needs a C
+compiler, **cmake**, and on x86-64 **nasm**: `turbojpeg-sys` builds the libjpeg-turbo it
+vendors, and refuses to build it without its SIMD code.
 
 ```bash
 cargo build --workspace

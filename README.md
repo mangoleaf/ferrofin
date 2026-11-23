@@ -113,8 +113,8 @@ apt repository, ships a systemd unit): add the repository, then
 `apt-get install ./ferrofin_<version>_<arch>.deb` from the releases page. The full walk-through,
 including the plain release tarball, is [`docs/INSTALL.md`](docs/INSTALL.md).
 
-**From source** (needs the pinned Rust toolchain; ffmpeg is optional and its absence only
-disables transcoding):
+**From source** (needs the pinned Rust toolchain, a C compiler, cmake, and on x86-64 nasm;
+ffmpeg is optional and its absence only disables transcoding):
 
 ```sh
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
@@ -379,3 +379,8 @@ Releasing: [`RELEASE.md`](RELEASE.md).
 `LICENSE` is GPL-2.0, and the library `.csproj` packages that Ferrofin ports declare
 `GPL-3.0-only`. Ferrofin follows the `GPL-3.0-only` metadata of the packages it derives from.
 See [`LICENSE`](LICENSE).
+
+The server binary links libjpeg-turbo, so this software is based in part on the work of the
+Independent JPEG Group. libjpeg-turbo's own licence is in
+[`contrib/debian/copyright`](contrib/debian/copyright), which the `.deb` and the release
+archives carry.
