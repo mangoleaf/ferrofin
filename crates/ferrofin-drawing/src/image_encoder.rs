@@ -369,24 +369,26 @@ impl ImageCrateEncoder {
         Ok(bytes)
     }
 
-    /// Resizes `image` to exactly `size` with a Lanczos3 filter, the size
-    /// `SkiaEncoder.ResizeImage` draws.
+    /// Resizes `image` to exactly `size`, the size `SkiaEncoder.ResizeImage`
+    /// draws: with Mitchell (B = C = 1/3, Skia's `SKCubicResampler.Mitchell`)
+    /// where neither side shrinks, as upstream's `!isDownscale` branch and
+    /// `SplashscreenBuilder` draw an enlargement, and with Lanczos3 for any
+    /// shrink, one side growing beside one that shrinks included.
+    /// `EncodeImage` never enlarges (`GetNewImageSize` caps the size at the
+    /// source); a collage cell (`StripCollageBuilder`, through `ResizeImage`)
+    /// and a splashscreen tile are drawn at a fixed size, so a small image is
+    /// enlarged there.
     ///
-    /// The filter is an accepted divergence (owner decision 2026-11-05,
-    /// gl-1345). Upstream shrinks with bilinear sampling over mipmaps
-    /// (`SKFilterMode.Linear`, `SKMipmapMode.Linear`), then sharpens with
-    /// `SharpenInPlace`'s 3x3 cross (centre 1.4, neighbours -0.1), and
-    /// enlarges with Mitchell. `EncodeImage` never enlarges (`GetNewImageSize`
-    /// caps the size at the source), but a collage cell
-    /// (`StripCollageBuilder`, through `ResizeImage`) and a splashscreen tile
-    /// (`SplashscreenBuilder`'s `ScalePixels`, which shrinks without the
-    /// sharpening) are drawn at a fixed size, so a small image is enlarged
-    /// there; Ferrofin draws all of them with Lanczos3. Measured against
-    /// Jellyfin 12.4's own output for a shrink, Lanczos3 keeps the same detail
-    /// without the aliasing and halos: a 2000 px zone plate shrunk to 300, 600
-    /// and 1000 px keeps its passband (1.01 against 1.02-1.10) and leaks 2-8%
-    /// of its stopband against 15-51% (from the full decode), and a step edge
-    /// overshoots by 2 grey levels against 9.
+    /// The shrink's filter is an accepted divergence (owner decisions
+    /// 2026-11-05 and 2026-11-23, gl-1345). Upstream shrinks with bilinear
+    /// sampling over mipmaps (`SKFilterMode.Linear`, `SKMipmapMode.Linear`),
+    /// then `ResizeImage` sharpens with `SharpenInPlace`'s 3x3 cross (centre
+    /// 1.4, neighbours -0.1; `SplashscreenBuilder`'s `ScalePixels` does not).
+    /// Measured against Jellyfin 12.4's own output, Lanczos3 keeps the same
+    /// detail without the aliasing and halos: a 2000 px zone plate shrunk to
+    /// 300, 600 and 1000 px keeps its passband (1.01 against 1.02-1.10) and
+    /// leaks 2-8% of its stopband against 15-51% (from the full decode), and a
+    /// step edge overshoots by 2 grey levels against 9.
     ///
     /// `DrawingUtils.Resize` can round one axis to 0 (an ordinary `width=100` on a
     /// 10000x10 source, or an extreme `width`x`height` shrunk by `maxWidth`/
@@ -402,7 +404,13 @@ impl ImageCrateEncoder {
     ) -> Result<DynamicImage, ServiceError> {
         match (u32::try_from(size.width), u32::try_from(size.height)) {
             (Ok(width @ 1..), Ok(height @ 1..)) => {
-                memory.resize_exact(image, width, height, imageops::FilterType::Lanczos3)
+                let shrinks = image.width() > width || image.height() > height;
+                let filter = if shrinks {
+                    fast_image_resize::FilterType::Lanczos3
+                } else {
+                    fast_image_resize::FilterType::Mitchell
+                };
+                memory.resize_exact(image, width, height, filter)
             }
             _ => Err(ServiceError::invalid_input(format!(
                 "cannot resize to {}x{}",
@@ -513,7 +521,8 @@ impl ImageCrateEncoder {
     /// `GetScaledDimensions`), so a photo never builds its full-size bitmap. Any
     /// other input, or a JPEG too small to reduce, decodes in full as before.
     fn blur_hash_pixels(memory: &ImageMemory, path: &str) -> Result<RgbaImage, ServiceError> {
-        let filter = imageops::FilterType::Triangle;
+        // The `image` crate's Triangle, the tent filter.
+        let filter = fast_image_resize::FilterType::Bilinear;
         if let Some(jpeg) = ScalableJpeg::open(path, memory.limits()) {
             let (width, height) = jpeg.dimensions();
             let (fit_width, fit_height) = fit_within(width, height, BLUR_HASH_MAX_SIDE);
@@ -531,7 +540,7 @@ impl ImageCrateEncoder {
     }
 
     /// The build + write body of [`ImageEncoder::create_image_collage`]: several
-    /// decodes, Lanczos3 resizes and an encode. CPU-bound, so it runs on the
+    /// decodes, resizes and an encode. CPU-bound, so it runs on the
     /// blocking pool. Assumes the caller has validated `width`/`height`.
     fn create_image_collage_blocking(
         memory: &ImageMemory,
@@ -739,9 +748,10 @@ impl EncodeSource {
         full_decode(memory, path, orientation.is_some()).map(full_size)
     }
 
-    /// The image resized with Lanczos3 to the size `target_of` gives for its
-    /// upright size, decoded through [`Self::decode_covering`]; the decoded
-    /// image itself when `target_of` gives its own size.
+    /// The image resized ([`ImageCrateEncoder::resize_exact`]) to the size
+    /// `target_of` gives for its upright size, decoded through
+    /// [`Self::decode_covering`]; the decoded image itself when `target_of`
+    /// gives its own size.
     ///
     /// A full decode measures the upright image itself. When it differs from
     /// what the header read planned with (an EXIF orientation stored after the
@@ -773,8 +783,8 @@ impl EncodeSource {
 
 /// The image at `path` as stored (no EXIF orientation, as upstream's
 /// `SkiaEncoder.Decode(path, false, null, out _)` decodes collage and
-/// splashscreen sources), resized with Lanczos3 to the target `target_of`
-/// gives for its size.
+/// splashscreen sources), resized ([`ImageCrateEncoder::resize_exact`]) to
+/// the target `target_of` gives for its size.
 ///
 /// A JPEG is sized from its header and decoded at the smallest DCT scale that
 /// still covers [`THUMBNAIL_DECODE_FACTOR`] times the target, as
@@ -1388,7 +1398,7 @@ impl ImageEncoder for ImageCrateEncoder {
             ));
         }
 
-        // Several poster decodes, Lanczos3 resizes and a final encode are
+        // Several poster decodes, resizes and a final encode are
         // CPU-bound synchronous work; offload under the shared encode permit so
         // it never pins an async worker (see `encode_image`).
         let _permit = encode_permits()
@@ -2255,6 +2265,64 @@ mod tests {
                 channel(90.0 + ripple),
             ])
         })
+    }
+
+    /// `image` resized by `fast_image_resize` itself with `filter`, as the
+    /// encoder's resize is configured (alpha premultiplied).
+    fn resized_with(
+        image: &DynamicImage,
+        (width, height): (u32, u32),
+        filter: fast_image_resize::FilterType,
+    ) -> DynamicImage {
+        let mut resized = DynamicImage::new(width, height, image.color());
+        fast_image_resize::Resizer::new()
+            .resize(
+                image,
+                &mut resized,
+                &fast_image_resize::ResizeOptions::new()
+                    .resize_alg(fast_image_resize::ResizeAlg::Convolution(filter))
+                    .use_alpha(true),
+            )
+            .expect("resizes");
+        resized
+    }
+
+    /// gl-1345 (owner decision 2026-11-23): where neither side shrinks the
+    /// image is enlarged with Mitchell (B = C = 1/3), as
+    /// `SkiaEncoder.ResizeImage`'s `!isDownscale` branch and
+    /// `SplashscreenBuilder` draw one with `SKCubicResampler.Mitchell`; any
+    /// shrink, one side growing beside one that shrinks included, keeps
+    /// Lanczos3 (the accepted divergence from upstream's bilinear sampling and
+    /// sharpening).
+    #[rstest]
+    #[case::both_sides_grow((60, 40), true)]
+    #[case::one_side_grows((24, 40), true)]
+    #[case::both_sides_shrink((12, 8), false)]
+    #[case::one_grows_one_shrinks((60, 8), false)]
+    fn an_enlargement_is_drawn_with_mitchell_and_a_shrink_with_lanczos3(
+        #[case] size: (u32, u32),
+        #[case] enlarged: bool,
+    ) {
+        use fast_image_resize::FilterType::{Lanczos3, Mitchell};
+        // Fine detail, so the two filters draw different pixels.
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_fn(24, 16, |x, y| {
+            let level = |seed: u32| u8::try_from((x * 73 + y * 151 + seed) % 256).expect("a level");
+            image::Rgb([level(0), level(85) ^ 0x5a, level(170)])
+        }));
+        let (chosen, other) = if enlarged {
+            (Mitchell, Lanczos3)
+        } else {
+            (Lanczos3, Mitchell)
+        };
+        let target = ImageDimensions::new(
+            i32::try_from(size.0).expect("fits"),
+            i32::try_from(size.1).expect("fits"),
+        );
+        let drawn = ImageCrateEncoder::resize_exact(&ImageMemory::default(), &image, target)
+            .expect("resizes")
+            .to_rgb8();
+        assert_eq!(drawn, resized_with(&image, size, chosen).to_rgb8());
+        assert_ne!(drawn, resized_with(&image, size, other).to_rgb8());
     }
 
     /// The mean absolute difference between two same-sized images, per

@@ -2818,11 +2818,13 @@ const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
      bug not ported.",
     "A remote image that cannot be downloaded is a 404; upstream's ConvertImageToLocal \
      throws, a 500. Jellyfin bug not ported.",
-    "A resized image is drawn with Lanczos3 and no sharpening (owner decision \
-     2026-11-05, gl-1345), where SkiaEncoder.ResizeImage shrinks with bilinear sampling \
-     over mipmaps and then runs SharpenInPlace's 3x3 kernel: measured against 12.4's \
-     output it keeps the same detail without the aliasing and halos, so its pixels differ \
-     from upstream's.",
+    "A shrunk image is drawn with Lanczos3 and no sharpening (owner decisions \
+     2026-11-05 and 2026-11-23, gl-1345), where SkiaEncoder.ResizeImage shrinks with \
+     bilinear sampling over mipmaps and then runs SharpenInPlace's 3x3 kernel: measured \
+     against 12.4's output it keeps the same detail without the aliasing and halos, so its \
+     pixels differ from upstream's. These rows never enlarge (GetNewImageSize caps the size \
+     at the source); where Ferrofin does, neither side shrinking (a collage cell or \
+     splashscreen tile drawn from a smaller image), it uses upstream's Mitchell.",
     "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
 ];
 
