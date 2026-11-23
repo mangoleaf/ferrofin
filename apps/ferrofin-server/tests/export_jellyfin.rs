@@ -1484,7 +1484,7 @@ async fn export_jellyfin_writes_live_tv_and_plugin_settings() {
     for line in [
         "  Written for Jellyfin: 1 tuner and 1 guide provider in config/livetv.xml, 1 timer (1 completed recording among them) in data/livetv/timers.json, 1 series timer in data/livetv/seriestimers.json.\n",
         "  Kept in the database: 1 channel and 0 guide programmes, which Jellyfin reads as its own, with the users' data on them (1 favourite channel).",
-        "  1 timer and 0 series timers that Jellyfin kept before adoption, which Ferrofin never read, are replaced by Ferrofin's.\n",
+        "  1 timer and 0 series timers that Jellyfin kept before adoption and Ferrofin does not hold are replaced by Ferrofin's.\n",
         "  Settings written for Jellyfin in plugins/configurations: TMDb, LDAP-Auth.\n",
         "  LDAP-Auth: 1 link from directory uids to users in its settings;",
         "  Kept as Jellyfin left them before adoption, as Ferrofin never held settings for them: the settings of Intro Skipper.\n",

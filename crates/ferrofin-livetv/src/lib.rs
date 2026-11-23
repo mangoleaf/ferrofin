@@ -46,7 +46,7 @@ mod xmltv_etag;
 pub use dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
 pub use error::LiveTvError;
 pub use fetch::{ReqwestFetcher, SourceFetcher};
-pub use manager::{FerrofinLiveTvManager, LiveTvPaths};
+pub use manager::{FerrofinLiveTvManager, ImportedTimers, LiveTvPaths, import_jellyfin_timers};
 pub use schedules_direct::SchedulesDirect;
 pub use stream::{ReqwestTunerSource, TunerStreamBody, TunerStreamSource};
 pub use tuner_host::{M3uTunerHost, TunerChannel, TunerHost};

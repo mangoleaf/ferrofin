@@ -20,6 +20,9 @@ use ferrofin_traits::error::ServiceError;
 ///
 /// Once only: an operator who deletes an imported tuner means it, and a boot
 /// that re-created it would be arguing with them.
+///
+/// `ferrofin_livetv`'s timer import, which runs earlier in the boot, reads it
+/// as "a Ferrofin booted this database before".
 const META_KEY: &str = "livetv_config_imported_v1";
 
 /// Imports the tuners and listing providers from `{config}/livetv.xml`, once.
