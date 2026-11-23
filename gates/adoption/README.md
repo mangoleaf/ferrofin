@@ -1067,9 +1067,9 @@ earlier Ferrofin release: the previous release and v1.0.0, the oldest. The previ
 release moves with each release. The release workflow (`release.yml`, step "upgrade a
 populated install from earlier releases") runs it on every tag: it builds the
 `jellyfin-10.11.8` fixture on the runner and upgrades from the latest published release
-and from v1.0.0 to the pushed image (about two minutes). A failure (after the image is
-pushed) blocks the GitHub Release and the chart, and uploads `work/` as the `upgrade-work`
-artifact.
+and from v1.0.0 to the pushed image (about two minutes). It runs on the amd64 image, which
+is pushed by digest and has no tag yet. A failure leaves the image without a tag, blocks the
+GitHub Release and the chart, and uploads `work/` as the `upgrade-work` artifact.
 
 ```bash
 python3 gates/adoption/synthetic.py build --fixtures /path/to/fixtures --only jellyfin-10.11.8
