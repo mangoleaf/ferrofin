@@ -1695,19 +1695,24 @@ struct LiteralTransform {
     warned: AtomicBool,
 }
 
-#[async_trait]
-impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
-    async fn transform(&self, path: &str, contents: String) -> String {
-        // Checked per serve, like the host's other surfaces: Disable or
-        // uninstall stops the injection at once, and Enable starts it.
-        let enabled = self
-            .plugins
+impl LiteralTransform {
+    /// Whether its plugin is installed and enabled. Checked per serve, like
+    /// the host's other surfaces: Disable or uninstall stops the injection at
+    /// once, and Enable starts it.
+    async fn enabled(&self) -> bool {
+        self.plugins
             .get_plugin(self.plugin)
             .await
             .ok()
             .flatten()
-            .is_some_and(|d| d.enabled);
-        if !enabled {
+            .is_some_and(|d| d.enabled)
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
+    async fn transform(&self, path: &str, contents: String) -> String {
+        if !self.enabled().await {
             return contents;
         }
         // Output is bounded, not just input: a common `search` with a large
@@ -1734,6 +1739,12 @@ impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
             return contents;
         }
         contents.replace(&self.search, &self.replace)
+    }
+
+    /// A disabled or uninstalled plugin's transform changes nothing, so the
+    /// files it matches are served from disk instead of the pipeline.
+    async fn would_transform(&self, _path: &str) -> bool {
+        self.enabled().await
     }
 }
 
@@ -2386,23 +2397,30 @@ mod tests {
             ours.transform("index.html", "</head>".into()).await,
             injected
         );
+        assert!(ours.would_transform("index.html").await);
         plugins.disable_plugin(id).await.unwrap();
         assert_eq!(
             ours.transform("index.html", "</head>".into()).await,
             "</head>",
             "disabled: served unchanged"
         );
+        assert!(
+            !ours.would_transform("index.html").await,
+            "disabled: the file skips the pipeline"
+        );
         plugins.enable_plugin(id).await.unwrap();
         assert_eq!(
             ours.transform("index.html", "</head>".into()).await,
             injected
         );
+        assert!(ours.would_transform("index.html").await);
         let gone = transform(Uuid::from_u128(8));
         assert_eq!(
             gone.transform("index.html", "</head>".into()).await,
             "</head>",
             "uninstalled (unknown to the manager): served unchanged"
         );
+        assert!(!gone.would_transform("index.html").await);
     }
 
     #[tokio::test]
