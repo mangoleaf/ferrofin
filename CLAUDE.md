@@ -551,14 +551,15 @@ The real remaining gaps are **by design**, not un-ported routes:
   supported set, so an idle GPU is never a silent mystery. Supporting one means porting
   its chain **and** its `GetEncoderParam`/`GetVideoBitrateParam` arms, verifying on real
   hardware, and adding it to `hardware_path_is_ported`.
-- **Images are resized with Lanczos3, not Skia's filters** — owner decision (2026-11-05). Upstream's
-  `SkiaEncoder.ResizeImage` shrinks with bilinear sampling over mipmaps and then sharpens with a 3×3
-  kernel (`SharpenInPlace`), and enlarges a collage cell or splashscreen tile with Mitchell; Ferrofin
-  resizes all of them with Lanczos3 (`fast_image_resize`, premultiplied alpha) and does not sharpen.
-  Measured against Jellyfin 12.4's output for a shrink, it keeps the same detail without the aliasing
-  and halos (a zone plate shrunk by Lanczos3 from the full decode leaks 2–8 % of its stopband against
-  15–51 %, a step edge overshoots by 2 grey levels against 9), so the pixels differ from Jellyfin's on
-  purpose.
+- **Images are shrunk with Lanczos3, not Skia's filters** — owner decisions (2026-11-05, narrowed to
+  shrinks 2026-11-23). Upstream's `SkiaEncoder.ResizeImage` shrinks with bilinear sampling over mipmaps
+  and then sharpens with a 3×3 kernel (`SharpenInPlace`); Ferrofin shrinks with Lanczos3
+  (`fast_image_resize`, premultiplied alpha) and does not sharpen. Measured against Jellyfin 12.4's
+  output, it keeps the same detail without the aliasing and halos (a zone plate shrunk by Lanczos3 from
+  the full decode leaks 2–8 % of its stopband against 15–51 %, a step edge overshoots by 2 grey levels
+  against 9), so a shrunk image's pixels differ from Jellyfin's on purpose. Where neither side shrinks
+  (a collage cell or splashscreen tile drawn from a smaller image), Ferrofin follows upstream: Mitchell,
+  B = C = 1/3.
 - **OMDb** uses Jellyfin's shared key by default; `FERROFIN_OMDB_KEY` / config
   `omdb_api_key` optionally overrides it. Remote providers use built-in keys where
   needed and are gated per library by "Metadata downloaders" / "Image fetchers".

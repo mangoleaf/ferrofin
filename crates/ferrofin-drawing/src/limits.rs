@@ -19,9 +19,10 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
-use fast_image_resize::{IntoImageView, MulDiv, PixelType, ResizeAlg, ResizeOptions, Resizer};
+use fast_image_resize::{
+    FilterType, IntoImageView, MulDiv, PixelType, ResizeAlg, ResizeOptions, Resizer,
+};
 use ferrofin_traits::error::ServiceError;
-use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageError, ImageReader};
 
@@ -37,7 +38,7 @@ const MEGAPIXEL: u64 = 1_000_000;
 /// The bounds of image work, in the units the code compares against.
 ///
 /// A file's header is enough to check the first two, so an image over them
-/// costs no memory. The third covers what a Lanczos3 or Triangle resize
+/// costs no memory. The third covers what a resize
 /// allocates on top of the decoded image, and what an image request's
 /// compositing (`backgroundColor`, `blur`, `foregroundLayer`) draws and
 /// writes it with.
@@ -254,7 +255,8 @@ impl ImageMemory {
     /// neighbours. [`ServiceError::InvalidInput`] when its scratch alone is
     /// over the resize budget. A resize the budget holds waits here for any
     /// others it does not fit beside. A copy has no scratch, so it waits for
-    /// nothing.
+    /// nothing. `filter`'s support must be at most 3 (Lanczos3's), the width
+    /// [`weight_bytes`] counts.
     pub(crate) fn resize_exact(
         &self,
         image: &DynamicImage,
@@ -360,20 +362,11 @@ impl Drop for HeldScratch<'_> {
     }
 }
 
-/// `filter` as `fast_image_resize` names it, with alpha premultiplied while
-/// resampling.
+/// A convolution with `filter`, alpha premultiplied while resampling.
 fn resize_options(filter: FilterType) -> ResizeOptions {
-    // Only Lanczos3 (encodes, collages, the splashscreen) and Triangle (blur
-    // hashes) are passed; the other arms keep the match total.
-    let algorithm = match filter {
-        FilterType::Nearest => ResizeAlg::Nearest,
-        // The image crate's Triangle is the tent filter fast_image_resize calls Bilinear.
-        FilterType::Triangle => ResizeAlg::Convolution(fast_image_resize::FilterType::Bilinear),
-        FilterType::CatmullRom => ResizeAlg::Convolution(fast_image_resize::FilterType::CatmullRom),
-        FilterType::Gaussian => ResizeAlg::Convolution(fast_image_resize::FilterType::Gaussian),
-        FilterType::Lanczos3 => ResizeAlg::Convolution(fast_image_resize::FilterType::Lanczos3),
-    };
-    ResizeOptions::new().resize_alg(algorithm).use_alpha(true)
+    ResizeOptions::new()
+        .resize_alg(ResizeAlg::Convolution(filter))
+        .use_alpha(true)
 }
 
 /// What resizing `source` to `target` (both width by height) in `pixel`s
@@ -436,7 +429,8 @@ fn resizer_buffer_bytes(source: (u32, u32), target: (u32, u32), pixel: PixelType
 /// At most what `fast_image_resize` holds for the weights of resampling one
 /// side from `from` pixels to `to`: per output pixel a window of
 /// `2 * ceil(3 * max(from / to, 1)) + 1` weights, 3 being the widest support
-/// passed (Lanczos3's), each as an `f64` and again in fixed point (at most 4
+/// passed (Lanczos3's; Mitchell's is 2 and Bilinear's 1, so this bounds them
+/// too), each as an `f64` and again in fixed point (at most 4
 /// bytes), plus 40 bytes of bounds and chunk headers. A shrink by a large
 /// factor makes the window wide: a strip 20 million pixels long shrunk to 128
 /// takes about 1.4 GB. A side that keeps its size takes no pass.
@@ -622,7 +616,8 @@ mod tests {
         )]
         color: image::ColorType,
         #[values((7, 5), (12, 5), (7, 9), (12, 9), (30, 20))] target: (u32, u32),
-        #[values(FilterType::Lanczos3, FilterType::Triangle)] filter: FilterType,
+        #[values(FilterType::Lanczos3, FilterType::Mitchell, FilterType::Bilinear)]
+        filter: FilterType,
     ) {
         let image = DynamicImage::new(12, 9, color);
         let mut resized = DynamicImage::new(target.0, target.1, color);
@@ -659,13 +654,13 @@ mod tests {
         let scratch = 100 * 50 + 1 + 2 * 50 * (13 * 12 + 40) + 100 * 4;
         let on_budget = memory_with_budget(scratch);
         let resized = on_budget
-            .resize_exact(&image, 50, 50, FilterType::Triangle)
+            .resize_exact(&image, 50, 50, FilterType::Bilinear)
             .expect("the budget holds it");
         assert_eq!((resized.width(), resized.height()), (50, 50));
         assert_eq!(on_budget.lock_resizes().held, 0, "given back");
 
         let error = memory_with_budget(scratch - 1)
-            .resize_exact(&image, 50, 50, FilterType::Triangle)
+            .resize_exact(&image, 50, 50, FilterType::Bilinear)
             .expect_err("one byte over");
         assert!(
             matches!(&error, ServiceError::InvalidInput(message) if message.contains("image_resize_budget_mb")),
@@ -698,7 +693,8 @@ mod tests {
             image::ColorType::Rgba32F
         )]
         color: image::ColorType,
-        #[values(FilterType::Lanczos3, FilterType::Triangle)] filter: FilterType,
+        #[values(FilterType::Lanczos3, FilterType::Mitchell, FilterType::Bilinear)]
+        filter: FilterType,
     ) {
         let resized = ImageMemory::default()
             .resize_exact(&DynamicImage::new(12, 9, color), 5, 4, filter)
@@ -715,7 +711,8 @@ mod tests {
     /// crate does, the red bled into it.
     #[rstest]
     fn a_clear_pixels_colour_does_not_bleed_into_its_neighbours(
-        #[values(FilterType::Lanczos3, FilterType::Triangle)] filter: FilterType,
+        #[values(FilterType::Lanczos3, FilterType::Mitchell, FilterType::Bilinear)]
+        filter: FilterType,
     ) {
         let image = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(16, 16, |x, _| {
             if x < 8 {
