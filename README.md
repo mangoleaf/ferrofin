@@ -75,7 +75,8 @@ PRs or plugin development are welcome too if anyone wants to get involved!
 
 ## Quickstart
 
-**Docker** (the release image bundles ffmpeg and the jellyfin-web client at `/web`):
+**Docker** (the release image bundles ffmpeg and the jellyfin-web client at `/web`; it is
+published for `linux/amd64` and, from v1.6.0, `linux/arm64`):
 
 ```sh
 docker run -d --name ferrofin \
