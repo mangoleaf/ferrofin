@@ -22,6 +22,7 @@ webp.workspace = true
 jpeg-encoder.workspace = true
 jpeg-decoder.workspace = true
 blurhash.workspace = true
+fast_image_resize.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true

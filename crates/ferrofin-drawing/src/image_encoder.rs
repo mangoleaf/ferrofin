@@ -369,9 +369,24 @@ impl ImageCrateEncoder {
         Ok(bytes)
     }
 
-    /// Resizes `image` to exactly `size` using a high-quality Lanczos3 filter
-    /// (the `image` crate's nearest analogue to Skia's Mitchell/linear
-    /// resamplers). Mirrors `SkiaEncoder.ResizeImage` at the dimensional level.
+    /// Resizes `image` to exactly `size` with a Lanczos3 filter, the size
+    /// `SkiaEncoder.ResizeImage` draws.
+    ///
+    /// The filter is an accepted divergence (owner decision 2026-11-05,
+    /// gl-1345). Upstream shrinks with bilinear sampling over mipmaps
+    /// (`SKFilterMode.Linear`, `SKMipmapMode.Linear`), then sharpens with
+    /// `SharpenInPlace`'s 3x3 cross (centre 1.4, neighbours -0.1), and
+    /// enlarges with Mitchell. `EncodeImage` never enlarges (`GetNewImageSize`
+    /// caps the size at the source), but a collage cell
+    /// (`StripCollageBuilder`, through `ResizeImage`) and a splashscreen tile
+    /// (`SplashscreenBuilder`'s `ScalePixels`, which shrinks without the
+    /// sharpening) are drawn at a fixed size, so a small image is enlarged
+    /// there; Ferrofin draws all of them with Lanczos3. Measured against
+    /// Jellyfin 12.4's own output for a shrink, Lanczos3 keeps the same detail
+    /// without the aliasing and halos: a 2000 px zone plate shrunk to 300, 600
+    /// and 1000 px keeps its passband (1.01 against 1.02-1.10) and leaks 2-8%
+    /// of its stopband against 15-51% (from the full decode), and a step edge
+    /// overshoots by 2 grey levels against 9.
     ///
     /// `DrawingUtils.Resize` can round one axis to 0 (an ordinary `width=100` on a
     /// 10000x10 source, or an extreme `width`x`height` shrunk by `maxWidth`/
@@ -2285,6 +2300,8 @@ mod tests {
             .expect("encode");
         assert_eq!(written, output);
         let thumb = image::open(&output).expect("decodes").to_rgb8();
+        // The image crate's resize, kept as an independent oracle: within a
+        // level of fast_image_resize's for an opaque image.
         let full = image::open(&input)
             .expect("decodes")
             .resize_exact(200, 150, imageops::FilterType::Lanczos3)
@@ -2330,6 +2347,7 @@ mod tests {
             .await
             .expect("encode");
         let thumb = image::open(&output).expect("decodes").to_rgb8();
+        // The image crate's resize, kept as an independent oracle.
         let expected = imageops::resize(&photo, 80, 60, imageops::FilterType::Lanczos3);
         assert_eq!(thumb.dimensions(), (80, 60));
         let diff = mean_abs_diff(thumb.as_raw(), expected.as_raw());
@@ -2400,6 +2418,8 @@ mod tests {
         })
         .expect("decodes")
         .to_rgb8();
+        // The image crate's resize, kept as an independent oracle: within a
+        // level of fast_image_resize's for an opaque image.
         let full = image::open(&input)
             .expect("decodes")
             .resize_exact(200, 150, imageops::FilterType::Lanczos3)

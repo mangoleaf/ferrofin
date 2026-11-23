@@ -2797,7 +2797,7 @@ macro_rules! item_image_tail {
          without no-cache), Cache-Control spellings, If-Unmodified-Since, \
          If-Match, backgroundColor (valid and not), foregroundLayer, blur from 1 to \
          2147483647, a hex imageIndex and a malformed percentPlayed; the images match in \
-         format and size, and in pixels within rounding and the blur's box approximation \
+         format and size, and, unresized, in pixels within rounding and the blur's box approximation \
          of Skia's Gaussian (with its Decal edges and premultiplied JPEG), not in bytes \
          (the image crate, not Skia)"
     };
@@ -2818,6 +2818,11 @@ const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
      bug not ported.",
     "A remote image that cannot be downloaded is a 404; upstream's ConvertImageToLocal \
      throws, a 500. Jellyfin bug not ported.",
+    "A resized image is drawn with Lanczos3 and no sharpening (owner decision \
+     2026-11-05, gl-1345), where SkiaEncoder.ResizeImage shrinks with bilinear sampling \
+     over mipmaps and then runs SharpenInPlace's 3x3 kernel: measured against 12.4's \
+     output it keeps the same detail without the aliasing and halos, so its pixels differ \
+     from upstream's.",
     "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
 ];
 
