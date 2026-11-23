@@ -1711,9 +1711,9 @@ impl LiteralTransform {
 
 #[async_trait]
 impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
-    async fn transform(&self, path: &str, contents: String) -> String {
+    async fn transform(&self, path: &str, contents: &str) -> Option<String> {
         if !self.enabled().await {
-            return contents;
+            return None;
         }
         // Output is bounded, not just input: a common `search` with a large
         // `replace` multiplies the file, recomputed on every anonymous /web
@@ -1736,9 +1736,9 @@ impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
                      serving it unchanged"
                 );
             }
-            return contents;
+            return None;
         }
-        contents.replace(&self.search, &self.replace)
+        Some(contents.replace(&self.search, &self.replace))
     }
 
     /// A disabled or uninstalled plugin's transform changes nothing, so the
@@ -2394,14 +2394,14 @@ mod tests {
         let injected = "<script></script></head>";
         let ours = transform(id);
         assert_eq!(
-            ours.transform("index.html", "</head>".into()).await,
-            injected
+            ours.transform("index.html", "</head>").await.as_deref(),
+            Some(injected)
         );
         assert!(ours.would_transform("index.html").await);
         plugins.disable_plugin(id).await.unwrap();
         assert_eq!(
-            ours.transform("index.html", "</head>".into()).await,
-            "</head>",
+            ours.transform("index.html", "</head>").await,
+            None,
             "disabled: served unchanged"
         );
         assert!(
@@ -2410,14 +2410,14 @@ mod tests {
         );
         plugins.enable_plugin(id).await.unwrap();
         assert_eq!(
-            ours.transform("index.html", "</head>".into()).await,
-            injected
+            ours.transform("index.html", "</head>").await.as_deref(),
+            Some(injected)
         );
         assert!(ours.would_transform("index.html").await);
         let gone = transform(Uuid::from_u128(8));
         assert_eq!(
-            gone.transform("index.html", "</head>".into()).await,
-            "</head>",
+            gone.transform("index.html", "</head>").await,
+            None,
             "uninstalled (unknown to the manager): served unchanged"
         );
         assert!(!gone.would_transform("index.html").await);
@@ -2445,7 +2445,7 @@ mod tests {
         // A common search amplified by a large replace: 1000 matches × ~1 KiB.
         let file = "<".repeat(1000);
         let amplifier = transform("<", "x".repeat(1024));
-        assert_eq!(amplifier.transform("index.html", file.clone()).await, file);
+        assert_eq!(amplifier.transform("index.html", &file).await, None);
         assert!(
             amplifier.warned.load(Ordering::Relaxed),
             "the skip is logged"
@@ -2454,12 +2454,15 @@ mod tests {
         let insert = "y".repeat(MAX_TRANSFORM_TEXT);
         let injector = transform("</head>", format!("{insert}</head>"));
         assert_eq!(
-            injector.transform("index.html", "</head>".into()).await,
-            format!("{insert}</head>")
+            injector.transform("index.html", "</head>").await,
+            Some(format!("{insert}</head>"))
         );
         // Shrinking or same-size rewrites are never capped.
         let shrinker = transform("<", String::new());
-        assert_eq!(shrinker.transform("index.html", file).await, "");
+        assert_eq!(
+            shrinker.transform("index.html", &file).await.as_deref(),
+            Some("")
+        );
     }
 
     fn descriptor() -> PluginDescriptor {
