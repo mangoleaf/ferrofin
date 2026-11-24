@@ -127,7 +127,9 @@ class CommandLine(unittest.TestCase):
             self.assertEqual(self.run_on("ran", boot(), oracle.name, Path(tmp) / "missing.db"), 2)
             with closing(sqlite3.connect(Path(tmp) / "no-history.db")) as db:
                 db.execute("CREATE TABLE Users (Id TEXT)")
-            self.assertEqual(self.run_on("ran", boot(), oracle.name, Path(tmp) / "no-history.db"), 2)
+            # a source with no history (native): its export records a fresh install's, so Jellyfin runs nothing
+            self.assertEqual(self.run_on("ran", boot(), oracle.name, Path(tmp) / "no-history.db"), 0)
+            self.assertEqual(self.run_on("ran", boot((CODE, "2026_Fix")), oracle.name, Path(tmp) / "no-history.db"), 1)
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(self.run_on("ran", boot(), oracle.name), 2)   # no source given
             with tempfile.NamedTemporaryFile("w", suffix=".log") as empty:

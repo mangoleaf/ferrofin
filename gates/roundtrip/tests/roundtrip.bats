@@ -88,6 +88,18 @@ removed() { [ ! -f "$TMP/state/removed" ] || grep "^${1:-}" "$TMP/state/removed"
   [[ "$(rt_jellyfin_image "$ROUNDTRIP/../../crates/ferrofin-api/src/handlers.rs")" =~ ^jellyfin/jellyfin:[0-9]+\.[0-9]+$ ]]
 }
 
+@test "http port: an exported network.xml's InternalHttpPort, else 8096, is the one a start publishes" {
+  printf '<?xml version="1.0"?>\n<NetworkConfiguration>\n  <InternalHttpPort>8097</InternalHttpPort>\n</NetworkConfiguration>\n' > network.xml
+  [ "$(rt_http_port network.xml)" = 8097 ]
+  [ "$(rt_http_port missing.xml)" = 8096 ]
+  echo '<NetworkConfiguration />' > empty.xml
+  [ "$(rt_http_port empty.xml)" = 8096 ]
+  port=$(RT_HTTP_PORT=8097 rt_start rt-x-route-jellyfin "$TMP/x.cid" jellyfin/jellyfin:test)
+  [[ "$port" =~ ^[0-9]+$ ]]
+  grep -q -- '-p 127.0.0.1::8097 ' state/calls
+  rt_remove "$TMP/x.cid"
+}
+
 @test "start: the port is one docker picked, never a fixed one, and the container is the cidfile's" {
   port=$(rt_start rt-x-route-ferrofin "$TMP/x.cid" ferrofin:test -v "$TMP/fixtures/jellyfin-10.11.8:/config")
   [[ "$port" =~ ^[0-9]+$ ]]
@@ -269,6 +281,57 @@ EOS
   run run_gate "$TMP/w2" --only 12.4-messy
   [ "$status" -eq 1 ]
   [[ "$output" == *"FAIL  12.4-messy     fixture media-messy missing"* ]]
+}
+
+@test "run.sh: the native route starts Ferrofin on an empty directory with no fixture, and records its row as native" {
+  head -n 1 "$BATS_TEST_DIRNAME/jellyfin-ok.log" > fixtures/jellyfin-12.4-fresh.server.log
+  # the fake server plays none of the API the seeding drives, so the route stops at its seeding
+  run run_gate "$TMP/w" --run-id nat --only native
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  native         "*"seed: "* ]]
+  [[ "$output" != *"fixture"*"missing"* ]]
+  grep -qF -- "--name rt-nat-native-ferrofin --user $(id -u):$(id -g) -p 127.0.0.1::8096 " state/calls
+  grep -qF -- "-e FERROFIN_DATA_DIR=/data -v $TMP/w/native/ferrofin:/data " state/calls
+  run ! grep -q -- '--name rt-nat-native-export' state/calls   # nothing to export from a source not built
+  [ "$(jq -r 'select(.event == "row") | "\(.kind) \(.expected) \(.verdict)"' "$TMP/w/results.jsonl")" = "native - FAIL" ]
+  [ "$(jq -r '"\(.verdict) \(.counts.fail) \(.counts.incomplete) \(.detail.rows[0].kind)"' "$TMP/w/result.json")" = \
+    "failed 1 0 native" ]
+}
+
+@test "drift guard: a fresh install's history equal to the export's passes; an id it records that the export lacks fails, named" {
+  # shellcheck source=gates/roundtrip/stage_drift.sh
+  . "$ROUNDTRIP/stage_drift.sh"
+  check() { mapfile -t -O "${#why[@]}" why < <("$@"); }   # run.sh's
+  reasons() { local out; out=$("$@" 2>&1) || printf '%s\n' "${out:-$1 failed}"; }
+  mark() { marked+=("$1: $2: $([ "${#why[@]}" = "$mark_from" ] && echo PASS || echo FAIL)"); mark_from=${#why[@]}; }
+  history() { # history <db> <ids…>: a database holding only a history of those ids
+    local db=$1 id; shift
+    mkdir -p "$(dirname "$db")"
+    sqlite3 "$db" 'CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT PRIMARY KEY, "ProductVersion" TEXT)'
+    for id in "$@"; do sqlite3 "$db" "INSERT INTO \"__EFMigrationsHistory\" VALUES ('$id', '10.0.14')"; done
+  }
+  HERE=$ROUNDTRIP RUN_ID=drift route=native READY_TIMEOUT=10 STOP_TIMEOUT=5 JELLYFIN_ID=jellyfin/jellyfin:test MADE=()
+  for case in same extra; do
+    dst=$TMP/$case why=() mark_from=0 marked=()
+    history "$dst/jellyfin/data/jellyfin.db" 1_A 2_B
+    if [ "$case" = same ]; then history "$dst/fresh/data/jellyfin.db" 1_A 2_B
+    else history "$dst/fresh/data/jellyfin.db" 1_A 2_B 3_New; fi
+    drift_stage
+    [ "${#marked[@]}" = 1 ]
+    if [ "$case" = same ]; then
+      [ "${marked[0]}" = "Export: a fresh Jellyfin records the history the export wrote, no id more or less (the drift guard): PASS" ]
+      [ ! -e "$dst/fresh" ]   # a passed guard keeps only its log
+      [ ! -e "$dst/fresh-cache" ]
+    else
+      [[ "${marked[0]}" == *": FAIL" ]]
+      [[ "${why[*]}" == *"1 id(s) a fresh install records are not in the export's history"*"3_New"* ]]
+      [ -f "$dst/fresh/data/jellyfin.db" ]   # a failed one keeps the fresh install to look into
+    fi
+    [ -f "$dst/fresh.log" ]
+    grep -qF -- "--name rt-drift-native-fresh " state/calls
+    grep -qF -- "-v $dst/fresh:/config -v $dst/fresh-cache:/cache " state/calls
+    [ ! -e "$dst/fresh.cid" ]   # the container is removed
+  done
 }
 
 @test "run.sh: the scale route records on its line the time each stage took and the export's size" {

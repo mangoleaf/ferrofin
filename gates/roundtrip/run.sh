@@ -98,7 +98,7 @@ for spec in "${ROUNDTRIP_ROUTES[@]}"; do   # the fields routes.sh describes
   IFS='|' read -r route _ _ _ ran_at config_at kind <<<"$spec"
   [[ $ran_at == /?* ]] || die "route $route in routes.sh names no absolute data directory for Ferrofin"
   [[ $config_at == - || $config_at == /?* ]] || die "route $route in routes.sh names a configuration directory that is neither - nor absolute"
-  [[ $kind =~ ^(path|messy|scale)$ ]] || die "route $route in routes.sh is of kind '$kind', not path, messy or scale"
+  [[ $kind =~ ^(path|messy|scale|native)$ ]] || die "route $route in routes.sh is of kind '$kind', not path, messy, scale or native"
   [ -z "$ONLY" ] || [[ ",$ONLY," == *",$route,"* ]] && SELECTED+=("$spec")
 done
 (( ${#SELECTED[@]} )) || die "no route to run: routes.sh lists none"
@@ -165,6 +165,8 @@ reasons() { local out; out=$("$@" 2>&1) || printf '%s\n' "${out:-$1 failed}"; }
 . "$HERE/stage_export.sh"     # export_stage
 # shellcheck source=gates/roundtrip/stage_jellyfin.sh
 . "$HERE/stage_jellyfin.sh"   # jellyfin_stage
+# shellcheck source=gates/roundtrip/stage_drift.sh
+. "$HERE/stage_drift.sh"      # drift_stage
 
 
 # timed <stage function>: run it, adding its wall time to took[].
@@ -173,13 +175,13 @@ failed=0 passed=0
 for spec in "${SELECTED[@]}"; do
   IFS='|' read -r route fixture generation first_start ran_at config_at kind <<<"$spec"
   dst=$WORK/$route
-  case $kind in path) media=media;; *) media=media-$kind;; esac
+  case $kind in path|native) media=media;; *) media=media-$kind;; esac
   MEDIA=(-v "$FIXTURES/$media:/media:ro")
   # where Ferrofin runs, for its server and its export: the data directory, and the configuration apart from it
   SERVER_DIRS=(-e FERROFIN_DATA_DIR="$ran_at" -v "$dst/ferrofin:$ran_at")
   [ "$config_at" = - ] || SERVER_DIRS+=(-e FERROFIN_CONFIG_DIR="$config_at" -v "$dst/ferrofin-config:$config_at")
   for needed in "$fixture" "$first_start.server.log" "$media"; do
-    [ ! -e "$FIXTURES/$needed" ] || continue
+    [ "$needed" != - ] && [ ! -e "$FIXTURES/$needed" ] || continue   # "-": the native route's source is built here
     printf '%-5s %-14s %s\n' FAIL "$route" "fixture $needed missing: build the fixtures again into a new directory (gates/adoption/build-fixtures.sh)"
     record_detail row "$WORK" "$route" "$kind" "$generation" FAIL "fixture $needed missing"; failed=1; continue 2
   done
@@ -188,7 +190,9 @@ for spec in "${SELECTED[@]}"; do
   why=(); mark_from=0; took=(); size=''
   if timed ferrofin_stage && timed export_stage; then
     [ "$kind" != scale ] || size=$(du -sh "$dst/jellyfin" 2>/dev/null | cut -f1)   # as written, before Jellyfin's start
-    timed jellyfin_stage
+    [ "$kind" != native ] || drift_stage   # the history as the export wrote it, before Jellyfin opens it
+    # Jellyfin serves on the port the export carried over from Ferrofin's settings
+    RT_HTTP_PORT=$(rt_http_port "$dst/jellyfin/config/network.xml") timed jellyfin_stage
   fi
   verdict=PASS; [ "${#why[@]}" = 0 ] || { verdict=FAIL; failed=1; }
   detail=$(printf '%s; ' "${why[@]}"); detail=${detail%; }

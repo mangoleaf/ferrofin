@@ -15,9 +15,12 @@
 #      wrote in another layout (synthetic-ready.json's "layout") has its config/ moved there, as a package
 #      migration does (gates/adoption/lib.sh ADOPTION_MOVED_*)
 #   7. its kind, as the adoption gate's report names it: path (an upgrade path or a fresh install, on the
-#      fixtures' media/), messy (messy.py's copies, on media-messy/) or scale (scale.py's copy, on
+#      fixtures' media/), messy (messy.py's copies, on media-messy/), scale (scale.py's copy, on
 #      media-scale/: adopted, exported and started on with no scan or usage stage, stage_ferrofin.sh says why;
-#      its time and size are recorded, not gated)
+#      its time and size are recorded, not gated) or native (a database Ferrofin created itself, on media/: no
+#      fixture and no generation ("-"), its source built by Ferrofin's first start (stage_ferrofin.sh), and the
+#      first start of the fresh install whose history its export records, on which Jellyfin runs nothing; its
+#      route also runs the version-drift guard, stage_drift.sh)
 # A route is named for its source, and every route returns to the same Jellyfin release (rt_jellyfin_image),
 # always at /config: a route whose Ferrofin runs elsewhere is one whose stored paths the export must rewrite.
 # shellcheck disable=SC2034  # read by run.sh
@@ -40,6 +43,7 @@ ROUNDTRIP_ROUTES=(
   "12.4-from-10|jellyfin-12.4-from-10|12.2.0|jellyfin-12.4-from-10|/data|-|path"
   "12.4-fresh|jellyfin-12.4-fresh|12.2.0|jellyfin-12.4-fresh|/data|-|path"
   "12.4-debian|jellyfin-12.4-debian|12.2.0|jellyfin-12.4-debian|/var/lib/ferrofin|/etc/ferrofin|path"
+  "native|-|-|jellyfin-12.4-fresh|/data|-|native"
   "10.11.11-messy|jellyfin-10.11.11-messy|10.11.11|oracle/first-start-12.4/jellyfin-10.11.11|/data|-|messy"
   "12.4-messy|jellyfin-12.4-messy|12.2.0|jellyfin-12.4-from-123|/data|-|messy"
   "10.11.11-scale|jellyfin-10.11.11-scale|10.11.11|oracle/first-start-12.4/jellyfin-10.11.11|/data|-|scale"

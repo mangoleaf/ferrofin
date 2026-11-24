@@ -7,7 +7,8 @@
     checks_boot.py ran LOG ORACLE DB   the schema migrations Jellyfin began (the exported history should record
                                        every one), and the code migrations it ran that differ from those ORACLE,
                                        the log of its own first start on the route's source, shows it running,
-                                       less those the source's history (the database DB) records
+                                       less those the source's history (the database DB) records; with no history
+                                       in DB (a database Ferrofin created), every migration it began
 
 Exit status 0 when there is nothing to say, 1 with the reasons on stdout, 2 when a log cannot be read or
 holds no entry at all (an empty capture, or a format this no longer parses, must never pass), or DB's
@@ -76,8 +77,11 @@ def performed(log):
 
 
 def recorded(path):
-    """The ids the `__EFMigrationsHistory` of the database at path records."""
+    """The ids the `__EFMigrationsHistory` of the database at path records; None when it has no such table, as a
+    database Ferrofin created itself has none."""
     with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'").fetchone():
+            return None
         return {row[0] for row in db.execute('SELECT "MigrationId" FROM "__EFMigrationsHistory"')}
 
 
@@ -86,7 +90,8 @@ def ran(log, oracle, source=frozenset()):
     # A routine the source records ran there only because a schema migration applied before it reverted the one
     # whose Down() drops its row (on 10.11.10 and 10.11.11, AddNormalizedUsername's drops UpdateNormalizedUsername's,
     # JellyfinMigrationService.MigrateStepAsync): the export applies no schema migration, so it stays recorded.
-    expected = [m for m in performed(oracle)[0] if m not in source]
+    # A source with no history (None) is exported with a fresh install's whole history: Jellyfin runs nothing.
+    expected = [] if source is None else [m for m in performed(oracle)[0] if m not in source]
     reasons = []
     if schema:
         reasons.append(f"it began {len(schema)} schema migration(s) the history should have recorded: "
