@@ -686,8 +686,13 @@ where
             // false` — the restart below re-opens ffmpeg on the SAME live stream,
             // so releasing the tuner here would make it read a closed source.
             plan = Some(self.segment_plan(request, is_audio, segment_id).await?);
-            self.kill_for_restart(&handle, &playlist_path, ext, start)
-                .await?;
+            // A superseded job is stopped already, and stays the owner of the
+            // files it keeps until the job started below registers on its
+            // output: a start that is refused or fails leaves them one.
+            if !self.manager.is_superseded(&handle) {
+                self.kill_for_restart(&handle, &playlist_path, ext, start, false)
+                    .await?;
+            }
         }
         let plan = match plan {
             Some(plan) => plan,
@@ -709,7 +714,7 @@ where
             )));
         }
 
-        let starting = self.stop_play_session_jobs(request).await;
+        let starting = self.stop_play_session_jobs(request).await?;
 
         // (Re)start the transcode from this segment and wait for it.
         let state = self.labelled(&plan.state, request.item_id).await;
@@ -891,11 +896,12 @@ where
                             .await
                         && init_is_complete(&init_path, &start_segment).await;
                 }
-                if !delivered {
-                    // A seek, or the job exited without those segments, or its
-                    // init is still empty: drop it and start afresh, as a
-                    // segment request does, or every retry waits on it.
-                    self.kill_for_restart(&handle, &plan.playlist_path, ext, first)
+                // A seek, or the job exited without those segments, or its
+                // init is still empty: drop it and start afresh, as a
+                // segment request does, or every retry waits on it. A
+                // superseded job is not killed, as on the segment path.
+                if !delivered && !self.manager.is_superseded(&handle) {
+                    self.kill_for_restart(&handle, &plan.playlist_path, ext, first, false)
                         .await?;
                 }
             }
@@ -925,7 +931,7 @@ where
                         )));
                     }
                 }
-                let _starting = self.stop_play_session_jobs(request).await;
+                let _starting = self.stop_play_session_jobs(request).await?;
                 // NEVER a select!/cancellation over the start: a cancelled
                 // spawn can orphan an unregistered ffmpeg, and the next segment
                 // request then starts a second writer onto the same segment
@@ -989,26 +995,37 @@ where
     /// which a later backward seek serves straight from disk, and deletes the
     /// one its exit cut short (gl-1396). The live stream stays open
     /// (`closeLiveStream: false`): the restart re-opens ffmpeg on it.
+    ///
+    /// `superseded` is for a job on another output than the one about to
+    /// start: it stays registered, the owner of the files it keeps
+    /// ([`TranscodeManagerImpl::supersede`]).
     async fn kill_for_restart(
         &self,
         handle: &TranscodingJobHandle,
         playlist_path: &Path,
-        ext: &'static str,
+        ext: &str,
         job_start: i32,
+        superseded: bool,
     ) -> Result<(), ServiceError> {
         // Listed just before the kill, so what its exit finalises shows.
-        let listed = playlist_path.to_path_buf();
-        let before = tokio::task::spawn_blocking(move || segment_writes(&listed, ext, job_start))
-            .await
-            .map_err(|error| ServiceError::backend(format!("list transcode segments: {error}")))?;
-        self.manager.kill_and_remove(handle, false, false).await;
-        let listed = playlist_path.to_path_buf();
-        let cut_short =
-            tokio::task::spawn_blocking(move || cut_short_segment(&listed, ext, job_start, before))
+        let (listed, extension) = (playlist_path.to_path_buf(), ext.to_owned());
+        let before =
+            tokio::task::spawn_blocking(move || segment_writes(&listed, &extension, job_start))
                 .await
                 .map_err(|error| {
-                    ServiceError::backend(format!("find a cut-short segment: {error}"))
+                    ServiceError::backend(format!("list transcode segments: {error}"))
                 })?;
+        if superseded {
+            self.manager.supersede(handle).await;
+        } else {
+            self.manager.kill_and_remove(handle, false, false).await;
+        }
+        let (listed, extension) = (playlist_path.to_path_buf(), ext.to_owned());
+        let cut_short = tokio::task::spawn_blocking(move || {
+            cut_short_segment(&listed, &extension, job_start, before)
+        })
+        .await
+        .map_err(|error| ServiceError::backend(format!("find a cut-short segment: {error}")))?;
         if let Some(path) = cut_short {
             delete_cut_short_segment(&path).await;
         }
@@ -1021,10 +1038,12 @@ where
     /// `StartFfMpeg`, so a play session runs one at a time (gl-1942). The job
     /// on the request's own output is gone by now
     /// ([`Self::kill_for_restart`]); what is left wrote another output, which
-    /// upstream never has (gl-860). Nothing would delete that output once its
-    /// job is out of the registry, so its files go as on a stop, where
-    /// upstream keeps them for the job it starts on the same one. Returns
-    /// once each ffmpeg has exited; the files are deleted after.
+    /// upstream never has (gl-860). Its files are kept, as upstream's
+    /// `p => false` keeps them, but for the segment its exit cut short, and
+    /// the stopped job stays registered as their owner: they go when the play
+    /// session's jobs are stopped, or with the job once it sits idle
+    /// ([`TranscodeManagerImpl::supersede`]). Returns once each ffmpeg has
+    /// exited.
     ///
     /// A request with neither a play session nor a `DeviceId` leaves the jobs
     /// without a `DeviceId` running: upstream's `string.Equals(null, null)`
@@ -1046,7 +1065,7 @@ where
     async fn stop_play_session_jobs(
         &self,
         request: &HlsStreamRequest,
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, ServiceError> {
         // The jobs `kill_matching` selects, as a lock key no playlist path is.
         let scope = match request.play_session_id.as_deref() {
             Some(id) if !id.trim().is_empty() => Some(format!("play session {id}")),
@@ -1065,10 +1084,25 @@ where
             None => None,
         };
         let device = request.device_id.as_deref().unwrap_or_default();
-        self.manager
-            .stop_transcoding_jobs(device, request.play_session_id.as_deref())
-            .await;
-        starting
+        let play_session = request.play_session_id.as_deref();
+        for job in self.manager.unfinished_jobs_of(device, play_session) {
+            // Only an HLS job with its ffmpeg attached has segments to look at.
+            let segments = (job.job_type == TranscodingJobType::Hls)
+                .then(|| {
+                    self.manager
+                        .segment_extension(&job)
+                        .zip(self.manager.segment_start_number(&job))
+                })
+                .flatten();
+            match segments {
+                Some((ext, start)) => {
+                    self.kill_for_restart(&job, Path::new(&job.path), &ext, start, true)
+                        .await?;
+                }
+                None => self.manager.supersede(&job).await,
+            }
+        }
+        Ok(starting)
     }
 
     /// The transcode cache directory (`GetTranscodePath`), prepared on the
@@ -3035,6 +3069,18 @@ mod tests {
         play_session: &str,
         device: Option<&str>,
     ) -> ferrofin_traits::media_encoding::TranscodingJobHandle {
+        hold_the_slot_with(mgr, dir, user, play_session, device, capped_script()).await
+    }
+
+    /// [`hold_the_slot`], its fake ffmpeg following `script`.
+    async fn hold_the_slot_with(
+        mgr: &Mgr,
+        dir: &Path,
+        user: Option<uuid::Uuid>,
+        play_session: &str,
+        device: Option<&str>,
+        script: FakeScript,
+    ) -> ferrofin_traits::media_encoding::TranscodingJobHandle {
         let plan = mgr
             .planner
             .plan(&req(), false, Some(0), PlaylistKind::Vod)
@@ -3047,7 +3093,7 @@ mod tests {
         let output_path = dir.join("held").join("out.m3u8");
         mgr.manager
             .start_ffmpeg(
-                &FakeSegmentTranscoder::new(capped_script()),
+                &FakeSegmentTranscoder::new(script),
                 StartFfMpegRequest {
                     program: "ffmpeg",
                     state: &state,
@@ -3203,7 +3249,8 @@ mod tests {
     /// a job first stops the jobs of its play session, or of its device when
     /// it names no play session, so a play session never runs two (gl-1942).
     /// With one slot and its job being read, the start is admitted only when
-    /// that job was stopped first. A request with neither a play session nor
+    /// that job's ffmpeg was stopped first; the job stays registered, the
+    /// owner of the files it keeps. A request with neither a play session nor
     /// a device leaves a job without a device running, where upstream's null
     /// `DeviceId` equals the job's null one.
     #[rstest::rstest]
@@ -3251,43 +3298,173 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("{path:?}: the start hung"));
 
-            let left = {
+            let registered = {
                 use ferrofin_traits::media_encoding::TranscodeManager as _;
                 mgr.manager
                     .get_transcoding_job_by_path(&held.path, held.job_type)
                     .await
                     .unwrap()
             };
+            assert!(registered.is_some(), "{path:?}: its job was removed");
+            let running = running_jobs(&mgr, &held).contains(&held.path);
             if stopped {
                 result.unwrap_or_else(|error| panic!("{path:?}: {error}"));
-                assert!(left.is_none(), "{path:?}: its job was left running");
+                assert!(!running, "{path:?}: its job was left running");
             } else {
                 assert_refused(path, &result);
-                assert!(left.is_some(), "{path:?}: another playback's job stopped");
+                assert!(running, "{path:?}: another playback's job stopped");
             }
         }
     }
 
-    /// The stopped job wrote another output, which nothing would delete once
-    /// it is out of the registry: its files are deleted, as on a stop.
+    /// The outputs of the jobs of `job`'s play session whose ffmpeg runs.
+    fn running_jobs(
+        mgr: &Mgr,
+        job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
+    ) -> Vec<String> {
+        mgr.manager
+            .unfinished_jobs_of("", job.play_session_id.as_deref())
+            .into_iter()
+            .map(|job| job.path)
+            .collect()
+    }
+
+    /// The stopped job wrote another output, which upstream never has: it
+    /// keeps its files, as upstream's `p => false` does, and stays registered
+    /// as their owner. They go with the play session's jobs at its stop.
     #[tokio::test(start_paused = true)]
-    async fn the_job_a_segment_start_stops_loses_its_files() {
+    async fn the_job_a_segment_start_stops_keeps_its_files_until_its_play_session_stops() {
         let tmp = tempfile::tempdir().unwrap();
         let (mgr, _) = manager_with(tmp.path(), capped_script(), "ts");
         let held = hold_the_slot(&mgr, tmp.path(), None, "sess", Some("dev")).await;
         let playlist = PathBuf::from(&held.path);
-        assert!(playlist.exists());
 
         mgr.dynamic_segment(&req(), 0, false).await.unwrap();
 
-        for _ in 0..100 {
-            if !playlist.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assert!(!playlist.exists(), "the stopped job's files were kept");
-        assert!(tmp.path().join("out0.ts").exists());
+        // Well past the delay a stop's deletion waits out.
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        assert!(playlist.exists(), "the stopped job's files were deleted");
+        assert_eq!(
+            running_jobs(&mgr, &held),
+            [tmp.path().join("out.m3u8").to_string_lossy()]
+        );
+
+        mgr.stop_encoding_awaiting_deletion(&req()).await.unwrap();
+        assert!(!playlist.exists(), "the stop left the stopped job's files");
+        assert!(!tmp.path().join("out0.ts").exists());
+    }
+
+    /// The stopped job's graceful `q` exit finalises the segment it was
+    /// writing, cut short; kept, it would be served from disk when the player
+    /// returns to that shape. It is deleted, as on a seek restart (gl-1396).
+    #[tokio::test]
+    async fn the_job_a_segment_start_stops_loses_the_segment_its_exit_cut_short() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(tmp.path(), capped_script(), "ts");
+        let script = FakeScript {
+            kill_files: vec!["out1.ts".to_owned()],
+            ..capped_script()
+        };
+        let held = hold_the_slot_with(&mgr, tmp.path(), None, "sess", Some("dev"), script).await;
+        let output = PathBuf::from(&held.path);
+        let output = output.parent().unwrap();
+
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+
+        assert!(
+            output.join("out0.ts").exists(),
+            "a whole segment was deleted"
+        );
+        assert!(
+            !output.join("out1.ts").exists(),
+            "the cut-short one was kept"
+        );
+    }
+
+    /// The player returns to the shape whose job was stopped. A segment that
+    /// job wrote is served from disk; one past them restarts it, which stops
+    /// the other shape's in turn.
+    #[tokio::test]
+    async fn a_return_to_the_stopped_shape_is_served_from_disk_or_restarts_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out-h2640.ts".to_owned(), "out-hevc0.ts".to_owned()],
+            extra_files: vec!["out-h264.m3u8".to_owned(), "out-hevc.m3u8".to_owned()],
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "ts");
+        let shape = |codec: &str| HlsStreamRequest {
+            video_codec: Some(codec.to_owned()),
+            ..req()
+        };
+        let (h264, hevc) = (shape("h264"), shape("hevc"));
+        let running = || -> Vec<String> {
+            let jobs = mgr.manager.unfinished_jobs_of("dev", Some("sess"));
+            jobs.into_iter().map(|job| job.path).collect()
+        };
+        let playlist = |codec: &str| {
+            let path = tmp.path().join(format!("out-{codec}.m3u8"));
+            path.to_string_lossy().into_owned()
+        };
+
+        mgr.dynamic_segment(&h264, 0, false).await.unwrap();
+        // Every fake ffmpeg writes both outputs: the other shape must start one.
+        std::fs::remove_file(tmp.path().join("out-hevc0.ts")).unwrap();
+        mgr.dynamic_segment(&hevc, 0, false).await.unwrap();
+        assert_eq!(running(), [playlist("hevc")]);
+
+        mgr.dynamic_segment(&h264, 0, false).await.unwrap();
+        assert_eq!(spawns.requests.lock().unwrap().len(), 2, "not from disk");
+        assert_eq!(running(), [playlist("hevc")]);
+
+        // Past what the stopped job wrote: it restarts at 10, whose segment
+        // never appears.
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            mgr.dynamic_segment(&h264, 10, false),
+        )
+        .await;
+        assert!(parked.is_err(), "segment 10 was answered: {parked:?}");
+        assert_eq!(spawns.requests.lock().unwrap().len(), 3, "no restart");
+        assert_eq!(running(), [playlist("h264")]);
+    }
+
+    /// A restart on a superseded job's output that is refused leaves that job
+    /// registered: the files it keeps still have the owner a stop or the idle
+    /// reaper deletes them with.
+    #[tokio::test]
+    async fn a_refused_restart_leaves_a_superseded_job_the_owner_of_its_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let limits = TranscodeLimits {
+            server: 1,
+            per_user: 0,
+        };
+        let (mgr, ..) = manager_limited(tmp.path(), capped_script(), "ts", None, limits);
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        let job = mgr
+            .manager
+            .unfinished_jobs_of("dev", Some("sess"))
+            .remove(0);
+        mgr.manager.supersede(&job).await;
+        // Another playback takes the only slot, and is being read.
+        let held = take_the_slot(&mgr, tmp.path(), None).await;
+        let _reading = mgr.manager.begin_request_guard(&held.path, held.job_type);
+
+        let refused = mgr.dynamic_segment(&req(), 10, false).await.map(drop);
+        assert_refused(StartPath::Segment, &refused);
+        assert!(
+            mgr.manager.is_superseded(&job),
+            "its files lost their owner"
+        );
+
+        // The init path starts a job once the init that job wrote is gone.
+        std::fs::remove_file(tmp.path().join("out-1.ts")).unwrap();
+        let refused = start_through(&mgr, StartPath::InitSegment, &req()).await;
+        assert_refused(StartPath::InitSegment, &refused);
+        assert!(
+            mgr.manager.is_superseded(&job),
+            "its files lost their owner"
+        );
     }
 
     /// Two shapes of one play session write two outputs (gl-860), each under
@@ -3335,7 +3512,7 @@ mod tests {
         second.unwrap();
         assert_eq!(spawns.requests.lock().unwrap().len(), 2);
         assert_eq!(
-            mgr.manager.active_job_count(),
+            mgr.manager.unfinished_jobs_of("dev", Some("sess")).len(),
             1,
             "both shapes' jobs were left running"
         );
