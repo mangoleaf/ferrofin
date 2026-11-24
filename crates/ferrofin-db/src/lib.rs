@@ -18,6 +18,7 @@ pub mod item_data;
 pub mod normalized_usernames;
 mod placeholders;
 pub mod presentation_key;
+pub mod repair_markers;
 pub mod row_cache;
 mod sqlite_casing;
 pub mod sqlite_random;

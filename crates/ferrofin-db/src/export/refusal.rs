@@ -451,11 +451,12 @@ pub(super) fn damaged_or(error: sqlx::Error) -> DbError {
 
 /// Refuses a database the export cannot vouch for, on the staged copy the
 /// snapshot opens: one that fails `integrity_check` or `foreign_key_check`,
-/// one that is not Ferrofin's (no `_sqlx_migrations`), and an adopted one
-/// whose Jellyfin history matches no release Ferrofin adopts, so the export
-/// cannot tell which Jellyfin it came from. Returns that history, for the
-/// steps that change the copy; `None` for a Ferrofin-native database, which
-/// has no Jellyfin history.
+/// one that is not Ferrofin's (no `_sqlx_migrations`), an adopted one whose
+/// Jellyfin history matches no release Ferrofin adopts, so the export cannot
+/// tell which Jellyfin it came from, and an adopted one lacking the proof that
+/// Ferrofin did the work of a code migration the export records as applied
+/// ([`super::proof`]). Returns that history, for the steps that change the
+/// copy; `None` for a Ferrofin-native database, which has no Jellyfin history.
 pub(super) async fn database(
     conn: &mut sqlx::SqliteConnection,
 ) -> Result<Option<super::history::SourceHistory>> {
@@ -518,7 +519,9 @@ pub(super) async fn database(
             ids.len()
         )));
     };
-    Ok(Some(super::history::SourceHistory { generation, ids }))
+    let history = super::history::SourceHistory { generation, ids };
+    super::proof::require(conn, &history).await?;
+    Ok(Some(history))
 }
 
 /// Refuses a write-ahead log the snapshot would not fold in whole.

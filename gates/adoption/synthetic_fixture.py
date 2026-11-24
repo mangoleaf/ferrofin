@@ -18,6 +18,7 @@ import uuid
 from PIL import Image
 
 from metadata import Api as MetadataApi, CheckError
+from synthetic_media import MERGED_PAIRS, RATED_SERIES, STACKED
 
 
 EPISODE_TYPE = "MediaBrowser.Controller.Entities.TV.Episode"
@@ -34,6 +35,8 @@ CONFLICT = (("Tmdb", "2023-08-14 00:00:00", 9, 0, 1), ("Imdb", "2021-12-31 00:00
 # The play state on the second item of the dangling parent chain.
 ORPHAN_PLAY = {"LastPlayedDate": "2025-05-05 00:00:00", "PlayCount": 3, "PlaybackPositionTicks": 0, "Played": 1}
 PASSWORD = "Synthetic-adoption-only-123!"
+#: synthetic-adult's playlist of the stacked movie and the movie with local versions.
+VERSIONS_PLAYLIST = "Synthetic versions playlist"
 USERS = ("synthetic-admin", "synthetic-adult", "synthetic-child")
 LIBRARIES = (("Synthetic Movies", "movies", "movies"),
              ("Synthetic Private", "movies", "private"),
@@ -203,10 +206,11 @@ def seed(base):
     rows = api.get("/Items", userId=api.user, recursive="true", limit=1000,
                    fields="Path,ProviderIds,MediaSources,Genres,Studios,Tags")["Items"]
     movies = {r["Name"]: r for r in rows if r["Type"] == "Movie"}
-    episodes = sorted((r for r in rows if r["Type"] == "Episode"),
+    episodes = sorted((r for r in rows if r["Type"] == "Episode" and r.get("SeriesName") == "Clockwork Garden"),
                       key=lambda r: (r["ParentIndexNumber"], r["IndexNumber"]))
+    rated = [r for r in rows if r["Type"] == "Episode" and r.get("SeriesName") == RATED_SERIES]
     tracks = sorted((r for r in rows if r["Type"] == "Audio"), key=lambda r: r["Path"])
-    if len(episodes) != 6 or len(tracks) != 6 or len(movies) < 8:
+    if len(episodes) != 6 or len(rated) != 2 or len(tracks) != 6 or len(movies) < 14:
         raise CheckError("synthetic media was not fully scanned")
 
     adult = users[USERS[1]]["Id"]
@@ -266,6 +270,12 @@ def seed(base):
     linked_collection = api.post("/Collections", name="Synthetic linked collection",
                                  ids=movies["Crimson Signal"]["Id"], isLocked="true")["Id"]
     api.post(f"/Collections/{linked_collection}/Items", ids=movies["Crimson Signal"]["Id"])
+    # Versions merged by hand (10.11 keeps them in the primary's LinkedAlternateVersions), which the round
+    # trip splits; and the stacked movie and the movie with local versions in one playlist.
+    for pair in MERGED_PAIRS:
+        api.post("/Videos/MergeVersions", ids=f"{movies[pair]['Id']},{movies[pair + ' Extended']['Id']}")
+    api.post("/Playlists", {"Name": VERSIONS_PLAYLIST, "MediaType": "Video", "UserId": adult, "IsPublic": False,
+                            "Ids": [movies[STACKED]["Id"], movies["Twin Horizon"]["Id"]]})
     api.idle()
     manifest = {"version": 1, "users": {name: users[name]["Id"] for name in USERS},
             "libraries": {name: row["ItemId"] for name, row in libraries.items()},
