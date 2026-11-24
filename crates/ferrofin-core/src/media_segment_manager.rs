@@ -169,10 +169,7 @@ impl FerrofinMediaSegmentManager {
         provider: Option<&str>,
     ) -> Result<Vec<MediaSegmentEntity>, ServiceError> {
         let (sql, identifier) = if let Some(item) = item {
-            (
-                r#"SELECT * FROM "MediaSegments" WHERE "ItemId" = ?1 ORDER BY "StartTicks""#,
-                guid_to_db(item),
-            )
+            (media_segment_repository::ITEM_ROWS, guid_to_db(item))
         } else if let Some(provider) = provider {
             (
                 r#"SELECT * FROM "MediaSegments" WHERE "SegmentProviderId" = ?1 ORDER BY "StartTicks""#,
@@ -814,12 +811,11 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
             .collect()
     }
     async fn has_segments(&self, item: Uuid) -> Result<bool, ServiceError> {
-        let count: i64 =
-            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "MediaSegments" WHERE "ItemId" = ?1"#)
-                .bind(guid_to_db(item))
-                .fetch_one(self.db.pool())
-                .await
-                .map_err(db_err)?;
+        let count: i64 = sqlx::query_scalar(media_segment_repository::ITEM_ROW_COUNT)
+            .bind(guid_to_db(item))
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)?;
         Ok(count > 0)
     }
     async fn get_supported_providers(
