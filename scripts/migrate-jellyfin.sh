@@ -22,11 +22,12 @@ keeps its relative position:
   JELLYFIN/metadata/            -> DATA_DIR/metadata/       (images)
   JELLYFIN_CONFIG/              -> CONFIG_DIR/              (XML configuration)
   JELLYFIN/plugins/configurations/LDAP-Auth.xml, Jellyfin.Plugin.{Tmdb,Omdb,
-    MusicBrainz,AudioDb,StudioImages}.xml
+    MusicBrainz,AudioDb,StudioImages}.xml, IntroSkipper.xml,
+    Jellyfin.Plugin.{MergeVersions,FileTransformation,OpenSubtitles}.xml
                                 -> DATA_DIR/plugins/configurations/
-                                   (the settings of LDAP-Auth and of the metadata
-                                   plugins Jellyfin builds in, imported on the
-                                   first start)
+                                   (the settings of the metadata plugins Jellyfin
+                                   builds in and of the plugins Ferrofin has a
+                                   counterpart of, imported on the first start)
 
 The rest of Jellyfin's data/ holds caches Ferrofin rebuilds or does not read, and
 the rest of its plugins/ (.NET plugins) and "Subtitle Edit/" cannot run in
@@ -133,12 +134,15 @@ fi
 if [[ -d "$source_config" ]]; then
     copy "$source_config" "$destination_config"
 fi
-# The plugin files Ferrofin reads, each imported once on the first start:
-# LDAP-Auth's, and those of the metadata plugins Jellyfin builds in. LDAP-Auth's
-# holds the directory's bind password and TMDb's may hold an API key, so only the
-# service user may read them.
+# The plugin files Ferrofin reads, each imported once on the first start: those of
+# the metadata plugins Jellyfin builds in, and of LDAP-Auth, Intro Skipper, Merge
+# Versions, File Transformation and OpenSubtitles. LDAP-Auth's holds the
+# directory's bind password, OpenSubtitles' an account's and TMDb's may hold an API
+# key, so only the service user may read them.
 for plugin_xml in LDAP-Auth.xml Jellyfin.Plugin.Tmdb.xml Jellyfin.Plugin.Omdb.xml \
-        Jellyfin.Plugin.MusicBrainz.xml Jellyfin.Plugin.AudioDb.xml Jellyfin.Plugin.StudioImages.xml; do
+        Jellyfin.Plugin.MusicBrainz.xml Jellyfin.Plugin.AudioDb.xml Jellyfin.Plugin.StudioImages.xml \
+        IntroSkipper.xml Jellyfin.Plugin.MergeVersions.xml Jellyfin.Plugin.FileTransformation.xml \
+        Jellyfin.Plugin.OpenSubtitles.xml; do
     source_xml=$source_data/plugins/configurations/$plugin_xml
     if [[ -f "$source_xml" ]]; then
         mkdir -p "$destination/plugins/configurations"

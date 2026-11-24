@@ -8,12 +8,14 @@
 //! Each one's members are its `PluginConfiguration`'s, at the release
 //! `docs/PLUGINS_UPSTREAM.md` pins (the bundled five: `UPSTREAM_TAG`).
 //!
+//! The same table names the files adoption imports ([`adopted_documents`]).
+//!
 //! A file is written only for a plugin Ferrofin holds settings for: a saved
 //! or imported `config.json`, or a server setting that outranks the plugin's
 //! (MusicBrainz's server, Studio Images' repository). Otherwise a file the
-//! source still holds (Jellyfin's, from before adoption, which Ferrofin never
-//! read) is kept as it is, and none is written: Ferrofin ran on the plugin's
-//! defaults, which are the counterpart's too. A plugin with settings and no
+//! source still holds (Jellyfin's, from before adoption, which Ferrofin could
+//! not import) is kept as it is, and none is written: Ferrofin ran on the
+//! plugin's defaults, which are the counterpart's too. A plugin with settings and no
 //! counterpart (Single Sign-On, Ferrofin Settings, a WASM plugin) is reported.
 
 use std::path::Path;
@@ -302,6 +304,20 @@ fn counterparts() -> [Counterpart; 10] {
             ),
         },
     ]
+}
+
+/// The settings file of each plugin with a Jellyfin counterpart, by plugin id,
+/// for adoption to import on the first start
+/// (`ferrofin_core::plugin_config_adoption`): every counterpart but LDAP-Auth,
+/// whose document also holds the uid map and has an import of its own
+/// (`ferrofin_extensions::ldap_auth::adoption`).
+#[must_use]
+pub fn adopted_documents() -> Vec<(Uuid, &'static str)> {
+    counterparts()
+        .into_iter()
+        .filter(|c| c.id != ferrofin_extensions::ldap_auth::EXTENSION_ID)
+        .map(|c| (c.id, c.document.file))
+        .collect()
 }
 
 /// Every plugin the server registers, as `(id, name, default settings)`.

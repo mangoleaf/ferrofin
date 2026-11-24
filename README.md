@@ -175,11 +175,13 @@ support for every 10.11.x or 12.x release.
 > 3. Copy Jellyfin's `data/jellyfin.db`, `data/playlists/`, `data/collections/`,
 >    `root/default/`, `metadata/`, the metadata plugins' settings
 >    (`plugins/configurations/Jellyfin.Plugin.{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages}.xml`)
->    and, if Jellyfin used LDAP-Auth,
->    `plugins/configurations/LDAP-Auth.xml` to the same relative paths under Ferrofin's data
->    directory, and its XML configuration into Ferrofin's config directory, **before
->    Ferrofin's first startup**. [`scripts/migrate-jellyfin.sh`](scripts/migrate-jellyfin.sh)
->    does this for the Debian layout. Keep the originals and backup intact. An existing
+>    and those of the plugins Jellyfin used that Ferrofin has a counterpart of
+>    (`plugins/configurations/LDAP-Auth.xml`, `IntroSkipper.xml` and
+>    `Jellyfin.Plugin.{MergeVersions,FileTransformation,OpenSubtitles}.xml`) to the same
+>    relative paths under Ferrofin's data directory, and its XML configuration into
+>    Ferrofin's config directory, **before Ferrofin's first startup**.
+>    [`scripts/migrate-jellyfin.sh`](scripts/migrate-jellyfin.sh) does this for the Debian
+>    layout. Keep the originals and backup intact. An existing
 >    `ferrofin.db` or Ferrofin JSON configuration takes precedence over copied Jellyfin
 >    files.
 >

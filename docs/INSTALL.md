@@ -166,6 +166,7 @@ holds the database, playlists and collections:
 | `/etc/jellyfin/` | `{config_dir}/` | XML configuration |
 | `/var/lib/jellyfin/plugins/configurations/LDAP-Auth.xml` | `{data_dir}/plugins/configurations/` | LDAP-Auth's settings, if Jellyfin used it |
 | `/var/lib/jellyfin/plugins/configurations/Jellyfin.Plugin.{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages}.xml` | `{data_dir}/plugins/configurations/` | the settings of the metadata plugins Jellyfin builds in |
+| `/var/lib/jellyfin/plugins/configurations/IntroSkipper.xml`, `Jellyfin.Plugin.{MergeVersions,FileTransformation,OpenSubtitles}.xml` | `{data_dir}/plugins/configurations/` | the settings of Intro Skipper, Merge Versions, File Transformation and OpenSubtitles, if Jellyfin used them |
 
 The script reads `data_dir` and `config_dir` from `/etc/ferrofin/config.toml`. The package
 sets only `data_dir`, so `config_dir` is `{data_dir}/config`; `/etc/ferrofin` keeps just
@@ -174,9 +175,12 @@ sets only `data_dir`, so `config_dir` is `{data_dir}/config`; `/etc/ferrofin` ke
 The rest of Jellyfin's `data/` (subtitle and attachment extraction caches, backups, task
 history) is not copied, nor are `plugins/` and `Subtitle Edit/`, except the plugin
 settings Ferrofin imports on the first start from `plugins/configurations/`:
-`LDAP-Auth.xml`, the LDAP-Auth plugin's, and the `Jellyfin.Plugin.*.xml` files of the
-metadata plugins Jellyfin builds in (TMDb, OMDb, MusicBrainz, AudioDB, Studio Images).
-An import never replaces settings already saved in Ferrofin. The community SSO-Auth plugin's
+`LDAP-Auth.xml`, the LDAP-Auth plugin's, the `Jellyfin.Plugin.*.xml` files of the
+metadata plugins Jellyfin builds in (TMDb, OMDb, MusicBrainz, AudioDB, Studio Images), and
+those of Intro Skipper (`IntroSkipper.xml`), Merge Versions, File Transformation and
+OpenSubtitles. An import never replaces settings already saved in Ferrofin. OpenSubtitles'
+mark of an account the service refused (`CredentialsInvalid`) is not imported: Ferrofin
+finds that out again at its first sign-in. The community SSO-Auth plugin's
 `SSO-Auth.xml` is not imported: Ferrofin's Single Sign-On starts off, and its providers are added
 again ([`SINGLE_SIGN_ON.md`](SINGLE_SIGN_ON.md#adopting-a-jellyfin-that-used-the-sso-auth-plugin)).
 `root/default/` holds only the library definitions (`.mblink` files naming each media path);
