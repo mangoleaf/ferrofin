@@ -3114,13 +3114,16 @@ pub const VERIFIED: &[Verified] = &[
                    check_parent_visibility (GetParentItem, IsVisible, and a UserView parent's \
                    UserViewBuilder through LibraryManager apply_user_view_builder, \
                    ferrofin-core library_manager/user_view_builder.rs), redirect_container_browse \
-                   (the BoxSet and Playlist re-root), list_playlists_folder_as_playlists, \
-                   apply_library_browse_defaults (recursive ??= true for a typed library \
-                   browse), apply_albums_by_artist_order, order_search_by_sort_name, the \
-                   UserRootFolder and HasFilters dispatch, retain_visible_ids, \
-                   sort_items_by_request (Folder.GetItems' request order) → LibraryManager \
-                   query_items and DtoService get_base_item_dtos, or get_linked_children_dtos \
-                   for a box set's or playlist's own non-recursive listing",
+                   (the BoxSet and Playlist re-root), list_playlists_folder_as_playlists \
+                   (the playlists collection type's recursive [Playlist] listing, and with no \
+                   user PlaylistsFolder.GetItemsInternal's own children unless the browse is \
+                   typed exactly [Playlist]), apply_library_browse_defaults (recursive ??= \
+                   true for a typed library browse), apply_albums_by_artist_order, \
+                   order_search_by_sort_name, the UserRootFolder and HasFilters dispatch, \
+                   retain_visible_ids, sort_items_by_request (Folder.GetItems' request order) \
+                   → LibraryManager query_items and DtoService get_base_item_dtos, or \
+                   get_linked_children_dtos for a box set's or playlist's own non-recursive \
+                   listing",
         date: "2026-11-15",
         divergences: TRAILERS_DIVERGENCES,
         refs: &["access-filtering", "images", "paging-sort", "user-data"],
