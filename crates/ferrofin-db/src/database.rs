@@ -1531,8 +1531,8 @@ pub struct JellyfinGeneration {
 /// generation already has; `0010` (which dates the played rows an early
 /// Ferrofin left undated) is baselined everywhere, because Jellyfin leaves a
 /// played row undated on purpose (`Video.PropagatePlayedState`, a
-/// `Played`-only `POST /UserItems/{id}/UserData`, the NFO `watched` import) and the
-/// adoption time is no play date; `0030` (the `NormalizedUsername` column and index)
+/// `Played`-only `POST /UserItems/{id}/UserData`) and the adoption time is no
+/// play date; `0030` (the `NormalizedUsername` column and index)
 /// is baselined wherever the database already owns it, `0032` (the 12.0
 /// shape) for 12.0, 12.1 and 12.2, and `0040` (12.2's partial `OwnerId`
 /// indexes) for 12.2 only. `0031`, `0033`, `0034`, `0039`, `0041`, `0042` and
@@ -4074,10 +4074,10 @@ mod tests {
 
     /// Jellyfin leaves a played row without a date on purpose: marking one
     /// version played marks its alternates played without a date
-    /// (`Video.PropagatePlayedState`), as do a `Played`-only
-    /// `POST /UserItems/{id}/UserData` and the NFO `watched` import. Adoption keeps the
-    /// `NULL`: `0010`, which dates Ferrofin's own early watch history, is
-    /// recorded for an adopted database without running.
+    /// (`Video.PropagatePlayedState`), as does a `Played`-only
+    /// `POST /UserItems/{id}/UserData`. Adoption keeps the `NULL`: `0010`,
+    /// which dates Ferrofin's own early watch history, is recorded for an
+    /// adopted database without running.
     #[tokio::test]
     async fn adoption_keeps_a_played_row_without_a_date() {
         let dir = tempfile::tempdir().expect("tempdir");
