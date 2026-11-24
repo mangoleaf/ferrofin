@@ -178,12 +178,16 @@ async fn a_blur_hash_runs_under_the_limits(
 }
 
 /// A blur hash resizes to a fit of 128 px, and the source's width is what its
-/// scratch buffer depends on.
+/// scratch depends on: a first pass of 20000 by the fit's height of 1, 3 bytes
+/// an RGB pixel and one more pixel to align it, and the weights of each side,
+/// 12 bytes for each of a window of 2 * ceil(3 * 20000 / 128) + 1 = 939 per
+/// output pixel and 40 more (the height's window, from 2 to 1, is 13), and a
+/// row of 20000 accumulators, 4 times a pixel's size each.
 #[tokio::test]
 async fn a_blur_hash_of_a_long_image_runs_under_the_budget() {
     let fixture = Fixture::new();
-    let input = fixture.color("in.png", 20_000, 1);
-    let scratch = 20_000 * 16;
+    let input = fixture.color("in.png", 20_000, 2);
+    let scratch = (20_000 + 1) * 3 + 128 * (939 * 12 + 40) + (13 * 12 + 40) + 20_000 * 3 * 4;
     let refused = ImageCrateEncoder::new().with_limits(ImageLimits {
         resize_budget: scratch - 1,
         ..ROOMY
@@ -203,8 +207,11 @@ async fn a_blur_hash_of_a_long_image_runs_under_the_budget() {
         .expect("the budget holds it");
 }
 
-/// A resize needs 16 bytes for each pixel of the source's width by the
-/// output's height, whatever the file's format.
+/// An RGB resize that changes both sides needs 3 bytes for each pixel of the
+/// source's width by the output's height and one more pixel to align them,
+/// each side's weights, a window of 9 (2 * ceil(3 * 200 / 199) + 1) for each
+/// output pixel, 12 bytes each, and 40 bytes more, and a row of 200
+/// accumulators, 4 times a pixel's size each.
 #[rstest]
 #[tokio::test]
 async fn a_resize_past_the_budget_is_refused_and_one_on_it_runs(
@@ -213,8 +220,8 @@ async fn a_resize_past_the_budget_is_refused_and_one_on_it_runs(
     let fixture = Fixture::new();
     let input = fixture.color("in.png", 200, 200);
     let output = fixture.path("out.jpg");
-    let scratch = 200 * 199 * 16;
-    let options = resize_to(200, 199);
+    let scratch = (200 * 199 + 1) * 3 + 2 * 199 * (9 * 12 + 40) + 200 * 3 * 4;
+    let options = resize_to(199, 199);
 
     let past = ImageCrateEncoder::new().with_limits(ImageLimits {
         resize_budget: scratch - 1,
@@ -438,8 +445,10 @@ async fn a_collage_skips_an_image_the_limits_refuse(
 #[rstest]
 #[case::decode("big.png", 2000, 2000, ImageLimits { max_pixels: 1_000_000, ..ROOMY })]
 #[case::decode_jpeg("big.jpg", 2000, 2000, ImageLimits { max_pixels: 1_000_000, ..ROOMY })]
-// 360 is the wall's row height.
-#[case::resize("wide.png", 4000, 100, ImageLimits { resize_budget: 4000 * 360 * 16 - 1, ..ROOMY })]
+// 360 is the wall's row height. The budget is a byte under the wide image's
+// first pass alone, (4000 * 360 + 1) * 3 bytes; the poster's and the
+// backdrop's whole resizes fit in it.
+#[case::resize("wide.png", 4000, 100, ImageLimits { resize_budget: (4000 * 360 + 1) * 3 - 1, ..ROOMY })]
 #[tokio::test]
 async fn a_splashscreen_skips_an_image_the_limits_refuse(
     #[case] name: &str,
