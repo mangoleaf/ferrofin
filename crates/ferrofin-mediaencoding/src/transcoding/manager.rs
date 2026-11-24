@@ -813,20 +813,27 @@ fn take_job_to_admit(
 
 /// Whether `KillTranscodingJobs(deviceId, playSessionId, _)` selects `job`: by
 /// its play session, or by its device when `play_session_id` is blank.
+///
+/// No `device_id` is a request without a `DeviceId`: it selects the jobs
+/// without one, as upstream's `string.Equals(deviceId, j.DeviceId)` is true
+/// of two nulls. Only a start passes it (owner decision 2026-11-24). The stop
+/// routes name a device, as upstream's require one, and select no such job.
 fn kill_selects(
     job: &TranscodingJobHandle,
-    device_id: &str,
+    device_id: Option<&str>,
     play_session_id: Option<&str>,
 ) -> bool {
-    match play_session_id {
-        Some(psid) if !psid.trim().is_empty() => job
+    match (play_session_id, device_id) {
+        (Some(psid), _) if !psid.trim().is_empty() => job
             .play_session_id
             .as_deref()
             .is_some_and(|s| s.eq_ignore_ascii_case(psid)),
-        _ => job
+        (_, Some(device)) => job
             .device_id
             .as_deref()
-            .is_some_and(|d| d.eq_ignore_ascii_case(device_id)),
+            .is_some_and(|d| d.eq_ignore_ascii_case(device)),
+        // A blank one is none: the binder reads an empty `DeviceId` as null.
+        (_, None) => job.device_id.as_deref().is_none_or(|d| d.trim().is_empty()),
     }
 }
 
@@ -1734,7 +1741,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         let killed: Vec<TranscodingJobHandle> = {
             let jobs = self.jobs.lock().expect("jobs lock poisoned");
             jobs.iter()
-                .filter(|j| kill_selects(&j.handle, device_id, play_session_id))
+                .filter(|j| kill_selects(&j.handle, Some(device_id), play_session_id))
                 .map(|j| j.handle.clone())
                 .collect()
         };
@@ -1752,9 +1759,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         deletions
     }
 
-    /// The jobs [`Self::stop_transcoding_jobs`] would stop, those of
-    /// `play_session_id` or of `device_id` when it is blank, whose ffmpeg has
-    /// not exited: running, or still starting.
+    /// The jobs `KillTranscodingJobs(deviceId, playSessionId, _)` selects,
+    /// those of `play_session_id` or of `device_id` when it is blank, whose
+    /// ffmpeg has not exited: running, or still starting. No `device_id`
+    /// selects the jobs without one, which [`Self::stop_transcoding_jobs`]
+    /// never does.
     ///
     /// # Panics
     ///
@@ -1762,7 +1771,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     #[must_use]
     pub fn unfinished_jobs_of(
         &self,
-        device_id: &str,
+        device_id: Option<&str>,
         play_session_id: Option<&str>,
     ) -> Vec<TranscodingJobHandle> {
         let jobs = self.jobs.lock().expect("jobs lock poisoned");
@@ -1823,7 +1832,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
             device_id = handle.device_id.as_deref().unwrap_or(""),
             playing = %playing_label,
-            "transcode job stopped for another of its play session; its files stay until that ends"
+            "transcode job superseded by a later start; its files stay until a stop or its idle timeout"
         );
         Self::stop_process(handle, &child, &controller).await;
     }
@@ -3776,12 +3785,12 @@ mod start_ffmpeg_tests {
         let tmp = tempfile::tempdir().unwrap();
         let m = manager();
         let playlist = start_in(&m, tmp.path()).await;
-        let job = m.unfinished_jobs_of("dev", Some("sess")).remove(0);
+        let job = m.unfinished_jobs_of(Some("dev"), Some("sess")).remove(0);
 
         m.supersede(&job).await;
 
         assert!(
-            m.unfinished_jobs_of("dev", Some("sess")).is_empty(),
+            m.unfinished_jobs_of(Some("dev"), Some("sess")).is_empty(),
             "its ffmpeg still runs"
         );
         assert_eq!(m.active_job_count(), 1, "the job was removed");
@@ -3796,6 +3805,45 @@ mod start_ffmpeg_tests {
         assert!(!playlist.exists(), "the stop left its files");
     }
 
+    /// `KillTranscodingJobs` with no play session compares the device ids, and
+    /// two nulls are equal: a start without a `DeviceId` selects the jobs
+    /// without one. A stop route names a device, as upstream's require one,
+    /// and a blank one selects no such job.
+    #[tokio::test]
+    async fn only_a_start_selects_the_jobs_without_a_device() {
+        let m = manager();
+        m.register_job(ferrofin_traits::media_encoding::TranscodingJobHandle {
+            play_session_id: Some("sess".to_owned()),
+            path: "/t/out.m3u8".to_owned(),
+            job_type: TranscodingJobType::Hls,
+            device_id: None,
+            live_stream_id: None,
+        });
+
+        // A blank device is none, as the binder reads it.
+        m.register_job(ferrofin_traits::media_encoding::TranscodingJobHandle {
+            play_session_id: Some("sess".to_owned()),
+            path: "/t/blank.m3u8".to_owned(),
+            job_type: TranscodingJobType::Hls,
+            device_id: Some(" ".to_owned()),
+            live_stream_id: None,
+        });
+        m.register_job(ferrofin_traits::media_encoding::TranscodingJobHandle {
+            play_session_id: Some("sess".to_owned()),
+            path: "/t/tv.m3u8".to_owned(),
+            job_type: TranscodingJobType::Hls,
+            device_id: Some("tv".to_owned()),
+            live_stream_id: None,
+        });
+
+        assert_eq!(m.unfinished_jobs_of(None, None).len(), 2);
+        assert_eq!(m.unfinished_jobs_of(None, Some(" ")).len(), 2);
+        assert_eq!(m.unfinished_jobs_of(Some(""), None).len(), 0);
+        assert_eq!(m.unfinished_jobs_of(Some("dev"), None).len(), 0);
+        m.kill_transcoding_jobs("", None, true).await.unwrap();
+        assert_eq!(m.active_job_count(), 3, "a stop route took a job");
+    }
+
     /// A job whose start is still in flight has no process to stop: it is
     /// removed, as a kill removes it.
     #[tokio::test]
@@ -3808,7 +3856,7 @@ mod start_ffmpeg_tests {
             device_id: Some("dev".to_owned()),
             live_stream_id: None,
         });
-        assert_eq!(m.unfinished_jobs_of("dev", Some("sess")).len(), 1);
+        assert_eq!(m.unfinished_jobs_of(Some("dev"), Some("sess")).len(), 1);
 
         m.supersede(&job).await;
 

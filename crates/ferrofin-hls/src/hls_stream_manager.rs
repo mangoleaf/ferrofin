@@ -1045,9 +1045,10 @@ where
     /// ([`TranscodeManagerImpl::supersede`]). Returns once each ffmpeg has
     /// exited.
     ///
-    /// A request with neither a play session nor a `DeviceId` leaves the jobs
-    /// without a `DeviceId` running: upstream's `string.Equals(null, null)`
-    /// would stop every one of them, whoever plays it.
+    /// A request with neither a play session nor a `DeviceId` stops the jobs
+    /// without a `DeviceId`, whoever plays them, as upstream's
+    /// `string.Equals(null, null)` does (owner decision 2026-11-24). A blank
+    /// one counts as none, as the binder reads it.
     ///
     /// The caller holds the guard until its start has returned, by when the
     /// segment it asked for exists or its ffmpeg has exited. Upstream's two
@@ -1059,32 +1060,26 @@ where
     /// counts towards the output's restart breaker. The live-playlist and
     /// progressive starts stop nothing, as upstream's, and take no lock.
     ///
-    /// shortcut: a request without a play session locks its device, so it is
-    /// not serialised with a play session's on that device; lock both when a
-    /// client is seen mixing the two.
+    /// shortcut: a request without a play session locks its device, or one
+    /// lock for those without a device, so it is not serialised with a play
+    /// session's start that selects the same job; lock both when a client is
+    /// seen mixing the two.
     async fn stop_play_session_jobs(
         &self,
         request: &HlsStreamRequest,
-    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, ServiceError> {
-        // The jobs `kill_matching` selects, as a lock key no playlist path is.
-        let scope = match request.play_session_id.as_deref() {
-            Some(id) if !id.trim().is_empty() => Some(format!("play session {id}")),
-            _ => request
-                .device_id
-                .as_deref()
-                .map(|id| format!("device {id}")),
-        };
-        let starting = match scope {
-            Some(scope) => Some(
-                self.segment_locks
-                    .get(&scope.to_ascii_lowercase())
-                    .lock_owned()
-                    .await,
-            ),
-            None => None,
-        };
-        let device = request.device_id.as_deref().unwrap_or_default();
-        let play_session = request.play_session_id.as_deref();
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, ServiceError> {
+        fn named(id: Option<&str>) -> Option<&str> {
+            id.filter(|id| !id.trim().is_empty())
+        }
+        let play_session = named(request.play_session_id.as_deref());
+        let device = named(request.device_id.as_deref());
+        // The jobs the stop selects, as a lock key no playlist path is.
+        let scope = match play_session {
+            Some(id) => format!("play session {id}"),
+            None => format!("device {}", device.unwrap_or_default()),
+        }
+        .to_ascii_lowercase();
+        let starting = self.segment_locks.get(&scope).lock_owned().await;
         for job in self.manager.unfinished_jobs_of(device, play_session) {
             // Only an HLS job with its ffmpeg attached has segments to look at.
             let segments = (job.job_type == TranscodingJobType::Hls)
@@ -3251,8 +3246,8 @@ mod tests {
     /// With one slot and its job being read, the start is admitted only when
     /// that job's ffmpeg was stopped first; the job stays registered, the
     /// owner of the files it keeps. A request with neither a play session nor
-    /// a device leaves a job without a device running, where upstream's null
-    /// `DeviceId` equals the job's null one.
+    /// a device stops the jobs without a device, as upstream's null `DeviceId`
+    /// equals a job's null one, and no job that has one.
     #[rstest::rstest]
     #[case::its_play_sessions_on_any_device(Some("sess"), Some("dev"), "SESS", Some("tv"), true)]
     #[case::not_another_play_sessions(Some("sess"), Some("dev"), "other", Some("dev"), false)]
@@ -3271,7 +3266,15 @@ mod tests {
         Some("tv"),
         false
     )]
-    #[case::nothing_without_a_play_session_or_a_device(None, None, "other", None, false)]
+    #[case::the_device_less_without_a_play_session_or_a_device(None, None, "other", None, true)]
+    #[case::the_device_less_with_a_blank_device(None, Some(" "), "other", None, true)]
+    #[case::not_a_devices_without_a_play_session_or_a_device(
+        None,
+        None,
+        "other",
+        Some("dev"),
+        false
+    )]
     #[tokio::test]
     async fn a_segment_start_first_stops_the_jobs_of_its_play_session(
         #[case] play_session: Option<&str>,
@@ -3323,7 +3326,7 @@ mod tests {
         job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
     ) -> Vec<String> {
         mgr.manager
-            .unfinished_jobs_of("", job.play_session_id.as_deref())
+            .unfinished_jobs_of(None, job.play_session_id.as_deref())
             .into_iter()
             .map(|job| job.path)
             .collect()
@@ -3399,7 +3402,7 @@ mod tests {
         };
         let (h264, hevc) = (shape("h264"), shape("hevc"));
         let running = || -> Vec<String> {
-            let jobs = mgr.manager.unfinished_jobs_of("dev", Some("sess"));
+            let jobs = mgr.manager.unfinished_jobs_of(Some("dev"), Some("sess"));
             jobs.into_iter().map(|job| job.path).collect()
         };
         let playlist = |codec: &str| {
@@ -3443,7 +3446,7 @@ mod tests {
         mgr.dynamic_segment(&req(), 0, false).await.unwrap();
         let job = mgr
             .manager
-            .unfinished_jobs_of("dev", Some("sess"))
+            .unfinished_jobs_of(Some("dev"), Some("sess"))
             .remove(0);
         mgr.manager.supersede(&job).await;
         // Another playback takes the only slot, and is being read.
@@ -3512,7 +3515,9 @@ mod tests {
         second.unwrap();
         assert_eq!(spawns.requests.lock().unwrap().len(), 2);
         assert_eq!(
-            mgr.manager.unfinished_jobs_of("dev", Some("sess")).len(),
+            mgr.manager
+                .unfinished_jobs_of(Some("dev"), Some("sess"))
+                .len(),
             1,
             "both shapes' jobs were left running"
         );
