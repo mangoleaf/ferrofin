@@ -544,22 +544,19 @@ impl FileTransformationService for WebFileTransformationService {
         let mut contents = contents;
         for (id, pattern, step) in steps {
             contents = match step {
-                TransformStep::Builtin(t) => {
-                    // ponytail: a copy of the file per in-process step, to
-                    // fall back to; a transformer that reported its growth
-                    // up front (as `LiteralTransform` computes it) would not
-                    // need it (gl-1816).
-                    let transformed = t.transform(&path, contents.clone()).await;
-                    if transformed.len() > MAX_TRANSFORMED_BYTES
-                        && transformed.len() > contents.len()
+                TransformStep::Builtin(t) => match t.transform(&path, &contents).await {
+                    Some(transformed)
+                        if transformed.len() > MAX_TRANSFORMED_BYTES
+                            && transformed.len() > contents.len() =>
                     {
                         self.step_over_cap(id, &pattern, transformed.len());
                         contents
-                    } else {
-                        self.step_worked(id, &pattern);
-                        transformed
                     }
-                }
+                    transformed => {
+                        self.step_worked(id, &pattern);
+                        transformed.unwrap_or(contents)
+                    }
+                },
                 TransformStep::Endpoint(url) => match self.call_endpoint(&url, &contents).await {
                     Ok(transformed) => {
                         self.step_worked(id, &pattern);
@@ -819,11 +816,8 @@ impl SkipButtonTransformer {
 
 #[async_trait]
 impl FileTransformer for SkipButtonTransformer {
-    async fn transform(&self, _path: &str, contents: String) -> String {
-        match self.hide_delay().await {
-            Some(delay) => Self::apply(&contents, delay),
-            None => contents,
-        }
+    async fn transform(&self, _path: &str, contents: &str) -> Option<String> {
+        Some(Self::apply(contents, self.hide_delay().await?))
     }
 
     async fn would_transform(&self, _path: &str) -> bool {
@@ -976,8 +970,8 @@ mod tests {
     struct Upper;
     #[async_trait]
     impl FileTransformer for Upper {
-        async fn transform(&self, _path: &str, contents: String) -> String {
-            contents.to_uppercase()
+        async fn transform(&self, _path: &str, contents: &str) -> Option<String> {
+            Some(contents.to_uppercase())
         }
     }
 
@@ -1167,9 +1161,9 @@ mod tests {
         });
         let t = SkipButtonTransformer::new(plugins);
         let out = t
-            .transform("main.jellyfin.bundle.js", TIMEOUT_SNIPPET.to_owned())
+            .transform("main.jellyfin.bundle.js", TIMEOUT_SNIPPET)
             .await;
-        assert_eq!(out, TIMEOUT_SNIPPET);
+        assert_eq!(out, None, "left unchanged");
 
         // Opted in → patched.
         let plugins = Arc::new(FakePlugins {
@@ -1179,8 +1173,9 @@ mod tests {
         });
         let t = SkipButtonTransformer::new(plugins);
         let out = t
-            .transform("main.jellyfin.bundle.js", TIMEOUT_SNIPPET.to_owned())
-            .await;
+            .transform("main.jellyfin.bundle.js", TIMEOUT_SNIPPET)
+            .await
+            .expect("patched");
         assert!(out.contains("5000"), "expected patched timeout: {out}");
     }
 
@@ -1477,8 +1472,8 @@ mod tests {
     struct Huge;
     #[async_trait]
     impl FileTransformer for Huge {
-        async fn transform(&self, _path: &str, _contents: String) -> String {
-            "x".repeat(MAX_TRANSFORMED_BYTES + 1)
+        async fn transform(&self, _path: &str, _contents: &str) -> Option<String> {
+            Some("x".repeat(MAX_TRANSFORMED_BYTES + 1))
         }
     }
 
@@ -1502,6 +1497,36 @@ mod tests {
         let out = svc.run_transformation("main.js", input).await;
 
         assert_eq!(out, format!("{}c", "A".repeat(20_000)));
+    }
+
+    /// A transformer that leaves every file unchanged.
+    struct Unchanged;
+    #[async_trait]
+    impl FileTransformer for Unchanged {
+        async fn transform(&self, _path: &str, _contents: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// A step answering `None` passes the contents on as they were, and the
+    /// steps after it still run.
+    #[tokio::test]
+    async fn an_unchanged_step_passes_the_contents_on() {
+        let svc = service_with(r#"{"Transformations":[]}"#, true);
+        svc.add_transformation(Uuid::from_u128(5), "main.js", Arc::new(Unchanged))
+            .await;
+        assert_eq!(
+            svc.run_transformation("main.js", "original".to_owned())
+                .await,
+            "original"
+        );
+        svc.add_transformation(Uuid::from_u128(6), "main.js", Arc::new(Upper))
+            .await;
+        assert_eq!(
+            svc.run_transformation("main.js", "original".to_owned())
+                .await,
+            "ORIGINAL"
+        );
     }
 
     /// A callback endpoint that accepts each connection and reads the request,
