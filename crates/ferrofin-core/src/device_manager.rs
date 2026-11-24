@@ -421,7 +421,8 @@ impl DeviceManager for FerrofinDeviceManager {
         let mut devices = self.repo.all_by_last_activity().await?;
         sort_by_activity(&mut devices);
 
-        let user = match user_id {
+        // C# `!userId.IsNullOrEmpty()`: the nil id (an API key's caller) filters nothing.
+        let user = match user_id.filter(|id| !id.is_nil()) {
             Some(id) => {
                 let row = sqlx::query_as::<_, UserEntity>(
                     r#"SELECT * FROM "Users" WHERE "Id" = ?1 LIMIT 1"#,
@@ -908,6 +909,14 @@ mod tests {
 
         assert_eq!(
             ids(&mgr.get_devices_for_user(None).await.expect("list")),
+            vec!["dev-a", "dev-b"]
+        );
+        // The nil id (an API key's caller) is "no user" too, as C# `IsNullOrEmpty`.
+        assert_eq!(
+            ids(&mgr
+                .get_devices_for_user(Some(Uuid::nil()))
+                .await
+                .expect("list")),
             vec!["dev-a", "dev-b"]
         );
     }

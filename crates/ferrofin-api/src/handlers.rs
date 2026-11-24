@@ -6561,6 +6561,42 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/Devices",
+        upstream_file: "Jellyfin.Api/Controllers/DevicesController.cs",
+        upstream_method: "GetDevices",
+        ferrofin: "handlers/devices.rs get_devices (RequireAdmin, Policies.RequiresElevation, \
+               which an API key passes as its Administrator role claim does upstream; userId as \
+               Guid? through empty_as_none_uuid: trimmed, an empty value null, a malformed one \
+               400; undeclared parameters ignored) → items.rs effective_user_id \
+               (RequestHelpers.GetUserId: an absent or nil userId is the caller, the nil id for \
+               an API key; another account's id is admitted for the elevated caller) → \
+               ferrofin-core device_manager.rs get_devices_for_user (DeviceManager.\
+               GetDevicesForUser: every Devices row, DateLastActivity descending, then DeviceId \
+               in the current culture as Comparer<string>.Default; a nil or absent id filters \
+               nothing, as !userId.IsNullOrEmpty(); any other id must name an account, else \
+               404 as ResourceNotFoundException, and keeps the devices resolve_access and \
+               access_allows admit, as CanAccessDevice: an empty DeviceId is 400 first, then \
+               EnableAllDevices or IsAdministrator, else EnabledDevices ignoring case or a device \
+               not reporting SupportsPersistentIdentifier) → device_infos_for (ToDeviceInfo: the \
+               DeviceOptions CustomName, a device whose user is gone a 404, raised in device \
+               order with that 400) → to_device_info_dto (ToDeviceInfoDto; AccessToken is never \
+               set) → QueryResult::from_items. Live on a scratch server (gl-1578): an API key \
+               with no or a nil userId lists every device, an unknown userId is 404",
+        date: "2026-11-24",
+        divergences: &[
+            "Capabilities carries what the device last reported (SaveCapabilities); upstream's \
+         ToDeviceInfo never assigns it, so Jellyfin always answers a new ClientCapabilities \
+         (empty lists, SupportsPersistentIdentifier true) beside the reported top-level \
+         IconUrl. Kept: a parity fix does not remove data Ferrofin answers (owner, gl-1662, \
+         2026-11-11).",
+            "The 400 (a malformed userId, an empty device id), 401 (no or bad token), 403 (not \
+         an administrator) and 404 (a userId naming no account, a device whose user is gone) \
+         bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/Devices/Options",
         upstream_file: "Jellyfin.Api/Controllers/DevicesController.cs",
