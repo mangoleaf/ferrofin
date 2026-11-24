@@ -147,8 +147,9 @@ Ferrofin reads Jellyfin's database directly. Point it at a data directory contai
 **10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0, 12.3.0 or 12.4.0** `jellyfin.db` and
 on first boot it detects the database, validates its migration set (and refuses loudly rather than
 half-adopting an unexpected version), and adopts it in place: **no re-scan, no re-import**. Users,
-watch state, playlists, and Live TV configuration carry forward. A 10.11 database also loses the
-items whose files are gone (see [below](#items-whose-files-are-gone-1011-databases)). Ferrofin
+watch state, playlists, and Live TV configuration and recording schedule carry forward. A 10.11
+database also loses the items whose files are gone (see
+[below](#items-whose-files-are-gone-1011-databases)). Ferrofin
 retains the `Users.NormalizedUsername` column and unique index from Jellyfin 10.11.10/10.11.11 and
 adds them to older databases. Login, creation, and renaming use Unicode-aware invariant uppercase
 keys compatible with Jellyfin, while the original spelling remains visible. If existing usernames
