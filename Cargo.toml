@@ -230,7 +230,7 @@ wat = "1.263.0"            # dev-only in practice: inline-WAT test fixtures (no 
 
 # ── domain helpers ─────────────────────────────────────────────────
 uuid = { version = "1.29.2", features = ["v4", "serde"] }
-url = "2.5.8"
+url = "2.5.9"
 # Unmaintained (RUSTSEC-2026-0543, no fixed release): gl-1860 replaces it, then drops that
 # advisory from deny.toml's ignores.
 chrono = { version = "0.4", features = ["serde"] }
