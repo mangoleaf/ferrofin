@@ -2155,7 +2155,9 @@ pub async fn build_app_state(
                 enabled: true,
                 has_image: false,
                 can_uninstall: false,
-                configuration_file_name: None,
+                configuration_file_name: Some(
+                    ferrofin_providers::opensubtitles::CONFIGURATION_FILE_NAME.to_owned(),
+                ),
             },
             None,
         )

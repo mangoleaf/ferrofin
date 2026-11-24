@@ -235,3 +235,31 @@ fn the_migration_script_copies_every_document_adoption_imports() {
         );
     }
 }
+
+/// `/Plugins` reports each counterpart's settings file, as upstream's
+/// `BasePlugin<T>.GetPluginInfo` does (`BasePluginOfT.cs:179`): the file
+/// adoption imports and the export writes.
+#[tokio::test]
+async fn each_counterpart_reports_its_settings_file() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (_config, wired) = boot(temp.path(), &[]).await;
+    let mut documents = ferrofin_server::export_cmd::plugins::adopted_documents();
+    documents.push((
+        ferrofin_extensions::ldap_auth::EXTENSION_ID,
+        ferrofin_extensions::ldap_auth::adoption::CONFIGURATION_FILE_NAME,
+    ));
+    for (id, file) in documents {
+        let plugin = wired
+            .state
+            .plugins
+            .get_plugin(id)
+            .await
+            .expect("lookup")
+            .unwrap_or_else(|| panic!("{file}: no plugin {id}"));
+        assert_eq!(
+            plugin.configuration_file_name.as_deref(),
+            Some(file),
+            "{id}"
+        );
+    }
+}

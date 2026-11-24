@@ -265,7 +265,7 @@ fn counterparts() -> [Counterpart; 10] {
                     ),
                 ],
                 ..document(
-                    "IntroSkipper.xml",
+                    ferrofin_extensions::intro_skipper::CONFIGURATION_FILE_NAME,
                     INTRO_SKIPPER,
                     &[],
                     &["FileTransformationPluginEnabled"],
@@ -275,7 +275,7 @@ fn counterparts() -> [Counterpart; 10] {
         Counterpart {
             id: ferrofin_extensions::merge_versions::EXTENSION_ID,
             document: document(
-                "Jellyfin.Plugin.MergeVersions.xml",
+                ferrofin_extensions::merge_versions::CONFIGURATION_FILE_NAME,
                 &["LocationsExcluded"],
                 &[],
                 &[],
@@ -286,7 +286,7 @@ fn counterparts() -> [Counterpart; 10] {
             document: PluginDocument {
                 enums: &[("DebugLoggingState", &["Disabled", "Enabled"])],
                 ..document(
-                    "Jellyfin.Plugin.FileTransformation.xml",
+                    ferrofin_extensions::file_transformation::CONFIGURATION_FILE_NAME,
                     &["DebugLoggingState", "Transformations"],
                     &[("Transformations", "PluginDefinedTransformation")],
                     &[],
@@ -296,7 +296,7 @@ fn counterparts() -> [Counterpart; 10] {
         Counterpart {
             id: ferrofin_providers::opensubtitles::PLUGIN_ID,
             document: document(
-                "Jellyfin.Plugin.OpenSubtitles.xml",
+                ferrofin_providers::opensubtitles::CONFIGURATION_FILE_NAME,
                 &["Username", "Password", "CredentialsInvalid"],
                 &[],
                 // Set by the plugin when a sign-in fails; it starts false.
