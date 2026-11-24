@@ -3168,10 +3168,16 @@ pub const VERIFIED: &[Verified] = &[
                more; similar_items_repository.rs people_names_of over the first 6 played, \
                GetPeopleNamesByItems in ListOrder per item, distinct, with equal ListOrders \
                on two films in ItemId order, the order SQLite returns for upstream's \
-               statement; each baseline capped to categoryLimit and scored by \
-               similar_category through local_similar, the \
-               MovieSimilarItemsProvider path of the similar-items rows for every baseline, \
-               whatever its kind, with the user and Limit = itemLimit, no remote provider; \
+               statement; each stream's baselines capped to categoryLimit and scored together \
+               by similar_categories, GetSimilarItemsRecommendationsAsync's one \
+               IBatchLocalSimilarItemsProvider and MovieSimilarItemsProvider's \
+               GetBatchSimilarItemsAsync for every baseline, whatever its kind, with the user \
+               and Limit = itemLimit, no remote provider: similar_items_repository.rs \
+               weighted_scores for all of them, each baseline's top itemLimit * 3 by score then \
+               Id, one score_filter_query get_item_list over the union of those windows, and \
+               each category picked from the rows of that union its baseline scored \
+               (scores.ContainsKey), best_scoring_per_key's PrimaryVersionId tie-break and \
+               DistinctBy(PresentationUniqueKey), Take(itemLimit), an empty category skipped; \
                next_person_category, the lazy GetPersonRecommendations: Person = name, \
                Limit = itemLimit + 2 grouped by metadata key, PersonTypes \
                Director for the director stream and none for the \
@@ -3179,15 +3185,10 @@ pub const VERIFIED: &[Verified] = &[
                CategoryId = name.GetMD5(); round_robin_categories: recently played, recently \
                played, liked, liked, directors, actors until categoryLimit or a pass adds \
                nothing, then a stable OrderBy RecommendationType)",
-        date: "2026-11-15",
+        date: "2026-11-24",
         divergences: &[
             SIMILAR_SCORE_WINDOW_DIVERGENCE,
             SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
-            "Each baseline is scored and access-filtered on its own and fills its category \
-         from its own limit * 3 window; upstream's IBatchLocalSimilarItemsProvider scores \
-         every baseline of a stream in one pass, filters the union of their windows once and \
-         fills each category from any candidate in that union its baseline scored, so a \
-         category the filter left short can be longer upstream. Fix path: gl-1357.",
             "An itemLimit above 715827882 overflows upstream's limit * 3 to a negative Take, so \
          every similar-to category is empty; the oversample saturates here. Jellyfin bug not \
          ported.",
