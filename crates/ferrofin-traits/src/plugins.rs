@@ -478,13 +478,16 @@ fn _assert_object_safe_plugin_offered_item_store(_: &dyn PluginOfferedItemStore)
 ///
 /// Port of the File Transformation plugin's `TransformFile` delegate: given the
 /// served file's (web-root-relative) path and its current textual contents,
-/// returns the transformed contents. Implementations must be pure over their
-/// inputs plus their own configuration — the pipeline may run them on every
-/// request of a matching file.
+/// returns the transformed contents, or `None` for no change. Implementations
+/// must be pure over their inputs plus their own configuration — the pipeline
+/// may run them on every request of a matching file.
 #[async_trait]
 pub trait FileTransformer: Send + Sync {
-    /// Transforms `contents` for the file at `path`.
-    async fn transform(&self, path: &str, contents: String) -> String;
+    /// Transforms `contents` for the file at `path`: the new contents, or
+    /// `None` to leave them unchanged. The contents are borrowed so that the
+    /// pipeline keeps them, without a copy, for a result it refuses (one past
+    /// its output cap).
+    async fn transform(&self, path: &str, contents: &str) -> Option<String>;
 
     /// Whether [`transform`](Self::transform) could change the file at `path`
     /// now. `false` promises that it would return the contents unchanged; a

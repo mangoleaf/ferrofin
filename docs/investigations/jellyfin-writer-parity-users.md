@@ -104,11 +104,11 @@ Ferrofin: `crates/ferrofin-core/src/user_data_manager.rs` (udm), `user_data_keys
 | PlayCount, PlaybackPositionTicks, Played | udm:1412-1520, 2123-2130 | UDM:455-529; `BaseItem.cs:2252-2302` | match | same thresholds |
 | Played, PlayCount, PlaybackPositionTicks, LastPlayedDate (container unplay) | `user_data_manager.rs:1066-1084` clears the container's own rows | `MarkUnplayed` leaves them | owner? (gl-1064) | awaiting the owner on gl-1064 (`crates/ferrofin-api/src/handlers.rs:1393-1395`) |
 | all (concurrent saves) | each save reads inside the write transaction, so both land | the later save overwrites the earlier one | owner? (documented) | `crates/ferrofin-api/src/handlers.rs:1390-1392` (P6) |
-| LastPlayedDate | udm:1419-1456, 1516-1518, 2126 | `BaseItem.cs:2266, 2301`; `SessionManager.cs:852-855, 982-985` | fix (gl-1565, gl-1604) | datetime form. **Migration `0010_hermit_backfill_last_played.sql:14-16` runs on every adopted database** (not baselined: `crates/ferrofin-db/src/database.rs:1529-1557`). It sets `LastPlayedDate` to the adoption time on every `Played=1` row that has none, rows upstream writes on purpose (`MediaBrowser.Controller/Entities/Video.cs:388`, an NFO `watched` import). That invents play dates |
+| LastPlayedDate | udm:1419-1456, 1516-1518, 2126 | `BaseItem.cs:2266, 2301`; `SessionManager.cs:852-855, 982-985` | fix (gl-1565, gl-1604) | datetime form. **Migration `0010_hermit_backfill_last_played.sql:14-16` runs on every adopted database** (not baselined: `crates/ferrofin-db/src/database.rs:1529-1557`). It sets `LastPlayedDate` to the adoption time on every `Played=1` row that has none, rows upstream writes on purpose (`MediaBrowser.Controller/Entities/Video.cs:388`). That invents play dates |
 | RetentionDate | detach ips:2183; recover `user_data_retention_repository.rs:121`; migration 0042:99-101 | `ItemPersistenceService.cs:61, 129-132`; UDM:69 writes NULL on every save | fix (gl-1565, gl-1605) | datetime form. Ferrofin's update leg keeps an existing value (udm:719-720); upstream clears it. No practical effect: a live row holding one should not exist |
 
 Also:
-- **NFO user-data import is not ported** (gl-1606). `crates/ferrofin-providers/src/xbmc/base_parser.rs:309-316` says "User-data import is out of scope for the local parse; consume". Upstream saves `Played`, `PlayCount` and `LastPlayedDate` from an NFO when its configuration names a user (`MediaBrowser.XbmcMetadata/Parsers/BaseNfoParser.cs:308-370`), so Ferrofin writes no row where upstream does.
+- **NFO user data: match, no import on either side** (gl-1606). Upstream's `watched`, `playcount` and `lastplayed` arms (`MediaBrowser.XbmcMetadata/Parsers/BaseNfoParser.cs:308-370`) save for the configured NFO user only when `!item.Id.IsEmpty()`. `BaseNfoProvider.GetMetadata` parses into a fresh `new T { IndexNumber }`, whose id is always empty, so the save never runs. A stock 12.4 with an NFO user set scanned and refreshed an NFO holding all three and wrote no `UserData` row. Ferrofin reads the three elements and drops them (`crates/ferrofin-providers/src/xbmc/base_parser.rs:309-320`). Only the export half writes them: the NFO saver, for the configured user.
 - **No upstream equivalent:**
   - the user-data retention reattach and recovery semantics (`docs/reviews/user-data-retention.md`; `ips:2237, 2247-2248`): owner? (documented), P6;
   - the scan rekeys and folds (`crates/ferrofin-traits/src/persistence.rs:1563-1566`, owner decisions D4 and D9b): recorded;
@@ -189,7 +189,7 @@ Filed or extended by this audit. None of the issues filed here is in the milesto
 | gl-1603 | A device's new custom name reaches its live sessions (`DeviceOptionsUpdated`) |
 | gl-1604 | Migration `0010` invents play dates on adopted databases |
 | gl-1605 | `UserData` edges: `RetentionDate` cleared on a save, negative-index key padding |
-| gl-1606 | NFO user-data import |
+| gl-1606 | NFO user-data import (re-checked: upstream imports nothing either, so the finding was a stale comment) |
 | gl-1607 | `RowVersion` on `Users`, `Permissions`, `Preferences` |
 | gl-1608 | User rows: `CastReceiverId` at creation and the seeded admin's bitrate limit |
 | gl-1190 (evidence added) | The startup wizard's case fold |

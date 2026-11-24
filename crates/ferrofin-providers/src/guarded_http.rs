@@ -30,6 +30,12 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 /// ([`crate::http_client`]) keeps.
 pub(crate) const MAX_REDIRECTS: usize = 10;
 
+/// Why a URL, or a redirect, whose scheme is not http or https is not sent.
+const OTHER_SCHEME: &str = "a URL with a scheme other than http or https";
+
+/// The gate of each origin [`limiter_for`] was asked for.
+static LIMITERS: OnceLock<Mutex<HashMap<String, RateLimiter>>> = OnceLock::new();
+
 /// Image/CDN quotas are independent of metadata API quotas. Share a gate by
 /// origin across download callers, never one gate across unrelated hosts.
 ///
@@ -39,7 +45,6 @@ pub(crate) const MAX_REDIRECTS: usize = 10;
 /// every caller of one origin shares its pacing and cooldowns whatever it is
 /// counted as (METRICS.md rule 6).
 pub(crate) fn limiter_for(url: &str, label: &'static str) -> RateLimiter {
-    static LIMITERS: OnceLock<Mutex<HashMap<String, RateLimiter>>> = OnceLock::new();
     let origin = reqwest::Url::parse(url).map_or_default(|url| url.origin().ascii_serialization());
     LIMITERS
         .get_or_init(Mutex::default)
@@ -143,10 +148,10 @@ pub(crate) enum SendError {
     /// The request through the origin's limiter failed: a transport failure
     /// or a cooldown.
     Request(RequestError),
-    /// No request could be made: a URL that does not parse, a redirect to
-    /// another scheme, from https to http or past [`MAX_REDIRECTS`], a name a
-    /// proxy would resolve that the server cannot, or a client that could not
-    /// be built.
+    /// No request could be made: a URL that does not parse or whose scheme
+    /// is not http or https, a redirect to another scheme, from https to
+    /// http or past [`MAX_REDIRECTS`], a name a proxy would resolve that the
+    /// server cannot, or a client that could not be built.
     Failed(&'static str),
 }
 
@@ -228,9 +233,13 @@ impl GuardedHttp {
     /// GETs `url` through its origin's limiter, following redirects up to
     /// [`MAX_REDIRECTS`] and vetting the destination of each.
     pub(crate) async fn send(&self, url: &str) -> Result<Fetched, SendError> {
-        let limiter = limiter_for(url, self.kind.label);
         let mut current =
             reqwest::Url::parse(url).map_err(|_| SendError::Failed("a URL that does not parse"))?;
+        // Before the limiter: a gate is only ever picked for an http or https URL.
+        if !matches!(current.scheme(), "http" | "https") {
+            return Err(self.kind.unsent(OTHER_SCHEME));
+        }
+        let limiter = limiter_for(url, self.kind.label);
         // Every URL asked for so far, as reqwest's redirect policy sees them.
         let mut previous = vec![current.clone()];
         loop {
@@ -269,7 +278,7 @@ impl GuardedHttp {
     async fn client_for(&self, url: &reqwest::Url) -> Result<reqwest::Client, SendError> {
         let kind = self.kind;
         if !matches!(url.scheme(), "http" | "https") {
-            return Err(kind.unsent("a URL with a scheme other than http or https"));
+            return Err(kind.unsent(OTHER_SCHEME));
         }
         let host = url
             .host_str()
@@ -360,6 +369,33 @@ mod tests {
         assert!(!artwork.shares_gate_with(&other));
         assert_eq!(artwork.metric_label(), "image");
         assert_eq!(subtitle.metric_label(), "opensubtitles");
+    }
+
+    /// A URL whose scheme is not http or https is refused before a limiter
+    /// is picked for it: no gate is made for the origin it names.
+    #[tokio::test]
+    async fn a_url_of_another_scheme_is_refused_before_a_limiter_is_picked() {
+        let http = super::GuardedHttp::open(&KIND);
+        for (url, origin) in [
+            ("ftp://unpicked.example/a.png", "ftp://unpicked.example"),
+            (
+                "blob:https://unpicked.example/a.png",
+                "https://unpicked.example",
+            ),
+        ] {
+            let Err(error) = http.send(url).await else {
+                panic!("{url} was sent");
+            };
+            assert!(
+                matches!(error, super::SendError::Failed(super::OTHER_SCHEME)),
+                "{url}: {error:?}"
+            );
+            let limiters = super::LIMITERS
+                .get_or_init(std::sync::Mutex::default)
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(!limiters.contains_key(origin), "{url} picked a limiter");
+        }
     }
 
     /// gl-1270: with a proxy configured, the requests to a named host go

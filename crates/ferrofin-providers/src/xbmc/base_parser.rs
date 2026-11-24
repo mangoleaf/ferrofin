@@ -306,12 +306,16 @@ impl<'a> BaseNfoParser<'a> {
             "language" => {
                 result.item.preferred_metadata_language = Some(read_normalized_string(reader));
             }
+            // Read and dropped, as upstream does in effect. Its arms save the
+            // value for `XbmcMetadataOptions.UserId` only when
+            // `!item.Id.IsEmpty()`, but `BaseNfoProvider.GetMetadata` parses
+            // into a fresh `new T { IndexNumber }` whose id is always empty, so
+            // the save never runs. A stock 12.4 with an NFO user set scanned and
+            // refreshed an NFO carrying all three and wrote no `UserData` row.
             "watched" => {
-                // User-data import is out of scope for the local parse; consume.
                 let _ = read_element_content_as_bool(reader);
             }
             "playcount" | "lastplayed" => {
-                // User-data import is out of scope for the local parse; consume.
                 let _ = reader.read_element_content_as_string();
             }
             "countrycode" => {

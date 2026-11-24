@@ -69,6 +69,9 @@ use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
 use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_each};
 use crate::xmltv_cache::XmlTvDocument;
 
+mod jellyfin_timers;
+pub use jellyfin_timers::{ImportedTimers, import_jellyfin_timers};
+
 /// How many programme item rows one `save_items`/`delete_items`/
 /// `save_item_values_for_items` call carries.
 ///
@@ -8941,6 +8944,7 @@ mod tests {
     mod channel_list;
     mod channel_rekey;
     mod guide_mirror;
+    mod jellyfin_timers;
     mod keep_up_to;
     mod program_list;
     mod programme_listing;
