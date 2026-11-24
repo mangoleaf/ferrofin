@@ -34,7 +34,8 @@ impl DeviceRepository {
     }
 
     /// Every device row, most recently active first (C# `GetDevices` ordering),
-    /// with `DeviceId` as the tiebreak so equal activity stamps stay stable.
+    /// with an ordinal `DeviceId` tiebreak; the device manager's
+    /// `sort_by_activity` then breaks ties in the current culture, as C# does.
     pub(crate) async fn all_by_last_activity(&self) -> Result<Vec<DeviceEntity>, ServiceError> {
         sqlx::query_as::<_, DeviceEntity>(
             r#"SELECT * FROM "Devices" ORDER BY "DateLastActivity" DESC, "DeviceId""#,
