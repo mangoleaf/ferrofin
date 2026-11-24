@@ -28,7 +28,8 @@ pub enum Disposition {
     Schema,
     /// A code migration Jellyfin runs itself: it repairs data and
     /// configuration in the shapes earlier releases left. Kept when the
-    /// source's history has it (it ran before adoption), never added.
+    /// source's history has it (it ran before adoption), never added to an
+    /// adopted database's (a Ferrofin-native one gets a fresh install's).
     CodeLeftToRun,
     /// A code migration recorded as applied even where the source's history
     /// lacks it, because Ferrofin already did its work or running it would

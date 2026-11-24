@@ -1,8 +1,9 @@
-//! The `__EFMigrationsHistory` an export records (gl-1549, gl-1551): every id
-//! of the target Jellyfin release classified once, as that release records it,
-//! and the history written through `ferrofin_db::export::export_data_dir` for a
-//! source of every generation Ferrofin adopts, with each combination of the
-//! ids it may or may not carry.
+//! The `__EFMigrationsHistory` an export records (gl-1549, gl-1551, gl-1552):
+//! every id of the target Jellyfin release classified once, as that release
+//! records it, and the history written through
+//! `ferrofin_db::export::export_data_dir` for a source of every generation
+//! Ferrofin adopts, with each combination of the ids it may or may not carry,
+//! and for a database Ferrofin created itself, which gets a fresh install's.
 
 use std::path::{Path, PathBuf};
 
@@ -402,6 +403,85 @@ async fn a_database_without_a_lock_table_is_rewritten_without_one() {
     )
     .await;
     assert_eq!(lock, []);
+}
+
+/// The text of `statement` without its whitespace, its `IF NOT EXISTS` and
+/// its closing `;`, to compare a `CREATE TABLE` as SQLite stores it with one
+/// as the `.schema` of a real database prints it.
+fn squashed(statement: &str) -> String {
+    statement
+        .replace("IF NOT EXISTS", "")
+        .split_whitespace()
+        .collect::<String>()
+        .trim_end_matches(';')
+        .to_owned()
+}
+
+/// gl-1552: a database Ferrofin created itself has no Jellyfin history. The
+/// export gives it Jellyfin's two bookkeeping tables, as a real Jellyfin
+/// database has them, holding exactly the history a fresh Jellyfin 12.4
+/// install records, each id with its `ProductVersion`, and no lock: Jellyfin's
+/// first start on it runs no migration.
+#[tokio::test]
+async fn a_native_database_gets_exactly_a_fresh_install_s_history() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = scratch.path().join("source");
+    let database = source.join(EXPORTED_DATABASE);
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let mut conn = SqliteConnectOptions::new()
+        .filename(&database)
+        .create_if_missing(true)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)")
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::Connection::close(conn).await.unwrap();
+    let out = scratch.path().join("out");
+
+    let summary = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+        .await
+        .unwrap();
+
+    let fresh: Vec<(String, String)> = FRESH_12_4_HISTORY
+        .lines()
+        .map(|line| {
+            let (id, version) = line.split_once('\t').expect("id and version");
+            (id.to_owned(), version.to_owned())
+        })
+        .collect();
+    assert_eq!(exported_history(&out).await, fresh);
+    assert_eq!(exported_locks(&out).await, 0);
+    let rewrite = &summary.edits.history;
+    assert_eq!(rewrite.generation, None);
+    assert_eq!(
+        rewrite.recorded,
+        fresh.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(rewrite.left_to_run, Vec::<&str>::new());
+    // The tables as Jellyfin's own schema has them.
+    let pinned = include_str!("data/jellyfin-12.2-schema.sql");
+    let created: Vec<(String,)> = exported(
+        &out,
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name LIKE '\\_\\_EFMigrations%' ESCAPE '\\'",
+    )
+    .await;
+    assert_eq!(created.len(), 2);
+    for table in ["__EFMigrationsHistory", "__EFMigrationsLock"] {
+        let ours = created
+            .iter()
+            .map(|(sql,)| squashed(sql))
+            .find(|sql| sql.starts_with(&format!("CREATETABLE\"{table}\"")))
+            .unwrap_or_else(|| panic!("no {table} in the export"));
+        let theirs = pinned
+            .split_inclusive(";\n")
+            .map(squashed)
+            .find(|sql| sql.starts_with(&format!("CREATETABLE\"{table}\"")))
+            .unwrap();
+        assert_eq!(ours, theirs, "{table}");
+    }
 }
 
 #[test]

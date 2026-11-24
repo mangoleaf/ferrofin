@@ -232,6 +232,13 @@ async fn export_jellyfin_copies_a_stopped_data_directory_and_leaves_it_untouched
         String::from_utf8_lossy(&run.stderr)
     );
     assert!(stdout.contains("The source is unchanged."), "{stdout}");
+    // a database Ferrofin created has no Jellyfin history: it gets a fresh install's (gl-1552)
+    assert!(
+        stdout.contains(
+            "the 105 migrations a fresh install of Jellyfin records, so Jellyfin runs none"
+        ),
+        "{stdout}"
+    );
     assert_eq!(
         files(&source),
         before,
