@@ -709,7 +709,7 @@ where
             )));
         }
 
-        self.stop_play_session_jobs(request).await;
+        let starting = self.stop_play_session_jobs(request).await;
 
         // (Re)start the transcode from this segment and wait for it.
         let state = self.labelled(&plan.state, request.item_id).await;
@@ -728,6 +728,7 @@ where
             Ok(handle) => handle,
             Err(e) => return Err(self.failed_start(&playlist_key, e)),
         };
+        drop(starting);
 
         // Consumer mark for the wait on the freshly-started job (see above).
         let _guard = self
@@ -924,7 +925,7 @@ where
                         )));
                     }
                 }
-                self.stop_play_session_jobs(request).await;
+                let _starting = self.stop_play_session_jobs(request).await;
                 // NEVER a select!/cancellation over the start: a cancelled
                 // spawn can orphan an unregistered ffmpeg, and the next segment
                 // request then starts a second writer onto the same segment
@@ -1029,15 +1030,45 @@ where
     /// without a `DeviceId` running: upstream's `string.Equals(null, null)`
     /// would stop every one of them, whoever plays it.
     ///
-    /// A request waiting on a job this stops restarts it, or fails when it had
-    /// started the job itself. That failure counts towards the output's
-    /// restart breaker, as any job stopped under its start does, which ends
-    /// two shapes of one play session stopping each other.
-    async fn stop_play_session_jobs(&self, request: &HlsStreamRequest) {
+    /// The caller holds the guard until its start has returned, by when the
+    /// segment it asked for exists or its ffmpeg has exited. Upstream's two
+    /// shapes of a play session share one playlist and so its lock; here each
+    /// has its own, and two starts arriving together would both find nothing
+    /// to stop, or one would stop the other's job under its start. A request
+    /// waiting on a job this stops restarts it, behind that start. A stop
+    /// report can still stop a job under its start: that start fails and
+    /// counts towards the output's restart breaker. The live-playlist and
+    /// progressive starts stop nothing, as upstream's, and take no lock.
+    ///
+    /// shortcut: a request without a play session locks its device, so it is
+    /// not serialised with a play session's on that device; lock both when a
+    /// client is seen mixing the two.
+    async fn stop_play_session_jobs(
+        &self,
+        request: &HlsStreamRequest,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        // The jobs `kill_matching` selects, as a lock key no playlist path is.
+        let scope = match request.play_session_id.as_deref() {
+            Some(id) if !id.trim().is_empty() => Some(format!("play session {id}")),
+            _ => request
+                .device_id
+                .as_deref()
+                .map(|id| format!("device {id}")),
+        };
+        let starting = match scope {
+            Some(scope) => Some(
+                self.segment_locks
+                    .get(&scope.to_ascii_lowercase())
+                    .lock_owned()
+                    .await,
+            ),
+            None => None,
+        };
         let device = request.device_id.as_deref().unwrap_or_default();
         self.manager
             .stop_transcoding_jobs(device, request.play_session_id.as_deref())
             .await;
+        starting
     }
 
     /// The transcode cache directory (`GetTranscodePath`), prepared on the
@@ -1962,6 +1993,20 @@ mod tests {
         runtime_ticks: PlanTicks,
         /// How often the manager asked for display names.
         labels: std::sync::atomic::AtomicUsize,
+        /// Held by a test to park a start where it asks for display names:
+        /// after it stopped its play session's jobs, before it registers its own.
+        label_gate: tokio::sync::Mutex<()>,
+    }
+
+    impl FakePlanner {
+        /// The stem of the output `request` plans: one per `VideoCodec` list,
+        /// as the real planner's output id varies with the shape (gl-860).
+        fn stem(request: &HlsStreamRequest) -> String {
+            request
+                .video_codec
+                .as_ref()
+                .map_or_else(|| "out".to_owned(), |codec| format!("out-{codec}"))
+        }
     }
 
     #[async_trait]
@@ -1981,11 +2026,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((segment_id, request.current_runtime_ticks));
-            let playlist = self.dir.join(if kind == PlaylistKind::Progressive {
-                "out.ts"
+            let extension = if kind == PlaylistKind::Progressive {
+                "ts"
             } else {
-                "out.m3u8"
-            });
+                "m3u8"
+            };
+            let playlist = self
+                .dir
+                .join(format!("{}.{extension}", Self::stem(request)));
             let state = EncodingJobInfo {
                 display: TranscodeDisplayNames::default(),
                 base_request: BaseEncodingJobOptions::default(),
@@ -2050,15 +2098,19 @@ mod tests {
 
         async fn hls_output(
             &self,
-            _request: &HlsStreamRequest,
+            request: &HlsStreamRequest,
             _is_audio: bool,
         ) -> Result<(PathBuf, String), ServiceError> {
-            Ok((self.dir.join("out.m3u8"), self.segment_container.clone()))
+            Ok((
+                self.dir.join(format!("{}.m3u8", Self::stem(request))),
+                self.segment_container.clone(),
+            ))
         }
 
         async fn display_names(&self, _item_id: uuid::Uuid) -> TranscodeDisplayNames {
             self.labels
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(self.label_gate.lock().await);
             TranscodeDisplayNames::default()
         }
     }
@@ -2127,6 +2179,7 @@ mod tests {
             remux: keyframes.is_some(),
             runtime_ticks: Arc::clone(&runtime_ticks),
             labels: std::sync::atomic::AtomicUsize::new(0),
+            label_gate: tokio::sync::Mutex::new(()),
         };
         let transcoder = FakeSegmentTranscoder::new(script);
         let spawns = transcoder.clone();
@@ -3235,6 +3288,57 @@ mod tests {
         }
         assert!(!playlist.exists(), "the stopped job's files were kept");
         assert!(tmp.path().join("out0.ts").exists());
+    }
+
+    /// Two shapes of one play session write two outputs (gl-860), each under
+    /// its own playlist lock, where upstream's share one playlist and its
+    /// lock. Starts of both that arrive together still leave one job: neither
+    /// misses the other's between its stop and its own registration.
+    #[tokio::test(start_paused = true)]
+    async fn two_shapes_of_a_play_session_starting_together_leave_one_job() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Every fake ffmpeg writes both outputs; each request is past its
+        // "already on disk" checks before the other's job starts.
+        let script = FakeScript {
+            segment_files: vec!["out-h2640.ts".to_owned(), "out-hevc0.ts".to_owned()],
+            extra_files: vec!["out-h264.m3u8".to_owned(), "out-hevc.m3u8".to_owned()],
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "ts");
+        let shape = |codec: &str| HlsStreamRequest {
+            video_codec: Some(codec.to_owned()),
+            ..req()
+        };
+        let (h264, hevc) = (shape("h264"), shape("hevc"));
+
+        let parked = mgr.planner.label_gate.lock().await;
+        let (first, second, ()) = tokio::join!(
+            mgr.dynamic_segment(&h264, 0, false),
+            mgr.dynamic_segment(&hevc, 0, false),
+            async {
+                // Without the lock both starts park here, past their stops.
+                // With it the second waits for the first's, and this gives up
+                // after a second of paused time.
+                for _ in 0..100 {
+                    if mgr.planner.labels.load(Ordering::SeqCst) == 2 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                drop(parked);
+            },
+        );
+
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(spawns.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            mgr.manager.active_job_count(),
+            1,
+            "both shapes' jobs were left running"
+        );
     }
 
     #[tokio::test]
