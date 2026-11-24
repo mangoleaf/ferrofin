@@ -443,6 +443,9 @@ EOS
   mkdir -p repo/gates
   gates=$(cd "$ROUNDTRIP/.." && pwd)   # resolved: a source ending in .. would copy into repo/ itself
   cp -r "$gates/lib.sh" "$gates/result.py" "$gates/adoption" "$gates/roundtrip" repo/gates/
+  # the export's classification, which checks_boot.py reads from the repository the gate runs in
+  mkdir -p repo/crates/ferrofin-db/src/export
+  cp "$gates/../crates/ferrofin-db/src/export/classify.rs" repo/crates/ferrofin-db/src/export/
   git -C repo init -q
   pids=()
   for side in a b; do
