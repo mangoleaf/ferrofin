@@ -493,6 +493,11 @@ criteria = "safe-to-deploy"
 version = "0.12.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.form_urlencoded]]
+version = "1.2.3"
+criteria = "safe-to-deploy"
+notes = "2026-11-23: required by url 2.5.9, the RUSTSEC-2026-0592 bump (gl-1940); no imported audit covers 1.2.3 yet; lifted by an imported or Ferrofin audit of form_urlencoded 1.2.3"
+
 [[exemptions.fs_extra]]
 version = "1.3.0"
 criteria = "safe-to-deploy"
@@ -1728,8 +1733,9 @@ version = "0.6.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.url]]
-version = "2.5.8"
+version = "2.5.9"
 criteria = "safe-to-deploy"
+notes = "2026-11-23: urgent security bump for RUSTSEC-2026-0592 (gl-1940), no imported audit covers 2.5.9 yet; lifted by an imported or Ferrofin audit of url 2.5.9"
 
 [[exemptions.utoipa]]
 version = "6.0.0"
