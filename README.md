@@ -44,14 +44,16 @@ the clients that connect to it, and the server code it ports. Thank you.
 - **Plugins cannot own your server.** Jellyfin loads plugins as full-trust .NET code inside
   the server process. Ferrofin does not, and will not. Third-party plugins run as
   sandboxed WASM with no filesystem or network access of their own. This is the one place
-  Ferrofin deliberately diverges from Jellyfin; see [Plugins](#plugins-the-one-deliberate-divergence).
+  Ferrofin deliberately diverges from Jellyfin; see [Plugins](#plugins-the-primary-deliberate-divergence).
 - **Every route ported.** All 412 operations in the Jellyfin API contract are wired to
   working handlers, developed by cross-checking responses against a real Jellyfin server.
   No `501` stubs, no fake `200`s.
 
 ## About this project
 
-Ferrofin began as a personal experiment in agentic engineering: a large Rust project taken from start to
+Ferrofin began for two reasons. After close to two years of hosting Jellyfin I was never happy
+with its performance, and I was looking for a large project to experiment with agentic
+engineering: a Rust project taken from start to
 release with AI agents writing most of the code and me, a software engineer of 15+ years,
 steering the architecture, decisions, reviewing, and testing. I expect the first thing people will call
 this is an "AI slop fork", and I understand the skepticism. I had a working server after two
@@ -60,13 +62,14 @@ media server, testing features, fixing performance issues and bugs, reshaping th
 gates, benchmarking, and closing the parity gap against Jellyfin. I fully intend to continue
 using Ferrofin personally and to improve it over time.
 
-I will not claim 100% parity with Jellyfin or that Ferrofin is bug free. At ~360k lines of
-Rust there was more code than I could read, and the agents made questionable decisions at
+I will not claim 100% parity with Jellyfin or that Ferrofin is bug free. At ~850k lines of
+Rust there is more code than I can read, and the agents have made questionable decisions at
 times without asking. The performance gains over Jellyfin have been verified and the benchmarks back them
 up, but there is still room for improvement.
 
-Up until this first public release I have worked on Ferrofin solo. Most of my attention was on my
-personal definition of the golden path. Areas that could use more attention include Live TV and the large number of settings.
+Ferrofin is still largely my own work, with a handful of PRs and issues opened by the community.
+Most of my early attention was on my personal definition of the golden path. Areas outside it,
+such as Live TV and the large number of settings, have had a lot more attention since.
 If something does not behave the way Jellyfin does, opening an issue describing the current and expected behaviour would be appreciated.
 PRs or plugin development are welcome too if anyone wants to get involved!
 
@@ -159,7 +162,7 @@ repairs after restart. See the [support matrix and tested build](gates/adoption/
 Support is determined by the exact migration history; these version numbers do not imply
 support for every 10.11.x or 12.x release.
 
-> ### ⚠ Migration is one-way. Back up first.
+> ### ⚠ Migration is one-way until v1.6.0. Back up first.
 >
 > Adopting the database runs Ferrofin's own migrations on it. Some of those rebuild
 > Jellyfin's tables and normalise stored values, so the result is a Ferrofin database that
@@ -195,6 +198,9 @@ support for every 10.11.x or 12.x release.
 >
 > If you decide to go back to Jellyfin, restore that backup. Anything that happened in
 > Ferrofin after the switch (watch state, new users, playlists) stays in Ferrofin.
+>
+> An export back to Jellyfin is planned and in progress for the v1.6.0 release. Until it
+> ships, migration stays one-way and restoring that backup is the only way back.
 
 Existing Ferrofin databases upgrade in place across releases; steps that need operator
 action are listed in [`docs/UPGRADING.md`](docs/UPGRADING.md).
@@ -258,7 +264,7 @@ The same headline numbers for every release published so far (v1.4.0, v1.5.0), e
 
 <!-- END GENERATED RESULTS -->
 
-## Plugins: the one deliberate divergence
+## Plugins: the primary deliberate divergence
 
 Everything else in Ferrofin aims at parity with Jellyfin. Plugins are where it breaks
 rank, on purpose.
@@ -372,6 +378,23 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md); the deeper operating guide is [`CLAUDE
 
 Security policy: [`SECURITY.md`](SECURITY.md). Release notes: [GitHub Releases](https://github.com/mangoleaf/ferrofin/releases).
 Releasing: [`RELEASE.md`](RELEASE.md).
+
+## Sponsoring
+
+Ferrofin is a hobby project, and **I am not looking to make money from it**. My workflow
+includes heavy use of AI coding agents (see [About this project](#about-this-project)), and
+any sponsorship through [GitHub Sponsors](https://github.com/sponsors/mangoleaf) will simply go
+toward that AI spend to help offset the costs. At peak, I was paying for two Claude Max 20
+(now Ultra) subscriptions primarily for this project.
+
+A few things to know before you sponsor:
+
+- Sponsoring is entirely optional. Ferrofin is free and open source (GPL-3.0).
+- It buys no priority, features or support.
+- Ferrofin is not affiliated with the Jellyfin project, and sponsoring me does not support it.
+  To support Jellyfin, [donate to them directly](https://opencollective.com/jellyfin).
+
+Thank you for the consideration.
 
 ## License
 
