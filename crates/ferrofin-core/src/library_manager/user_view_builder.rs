@@ -77,9 +77,16 @@ impl FerrofinLibraryManager {
             && let Some(query_parent) = self.get_item_by_id(parent_id).await?
         {
             let (kind, folder_policy) = (kind_from(&query_parent), !is_channel(&query_parent));
-            if !query.recursive || kind == Some(BaseItemKind::Season) {
+            let lists_own_children = query.user.is_none()
+                && matches!(
+                    kind,
+                    Some(BaseItemKind::PlaylistsFolder | BaseItemKind::ManualPlaylistsFolder)
+                );
+            if !query.recursive || kind == Some(BaseItemKind::Season) || lists_own_children {
                 // A default view delegates to that Season's GetItemsInternal even
                 // for recursive requests; its aired selection needs the real row.
+                // So does a playlists folder's with no user, which lists the
+                // folder's own children (PlaylistsFolder.GetItemsInternal).
                 query.parent_id = parent_id;
                 query.user_root_children = false;
                 query.parent_row = Some(Arc::new(query_parent));
@@ -179,7 +186,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::test_support::{library_manager_over, save_item, test_db};
+    use crate::test_support::{library_manager_over, save_item, seed_user, test_db};
 
     const VIEW: Uuid = Uuid::from_u128(0x7E57_0001);
     const SHOWN: Uuid = Uuid::from_u128(0x7E57_0002);
@@ -391,6 +398,46 @@ mod tests {
             assert_eq!(query.parent_id, SHOWN);
             assert!(query.known_parent_row().is_some());
             assert!(!query.folder_query_recursive && !query.user_root_children);
+        }
+    }
+
+    /// The Playlists view delegates to the playlists folder, whose
+    /// `GetItemsInternal` lists its own children when there is no user (an
+    /// API key): a recursive browse moves onto the folder too, as a direct
+    /// one does. A user's recursive browse stays on the view.
+    #[tokio::test]
+    async fn the_default_builder_moves_a_userless_browse_onto_the_playlists_folder() {
+        for kind in [
+            BaseItemKind::PlaylistsFolder,
+            BaseItemKind::ManualPlaylistsFolder,
+        ] {
+            let db = test_db().await;
+            save_item(&db, &row(SHOWN, kind)).await;
+            let user = Arc::new(seed_user(&db, Uuid::from_u128(0x7E57_0004)).await);
+            let manager = library_manager_over(db);
+            let shown = view(&json!({ "ViewType": "playlists", "DisplayParentId": SHOWN }));
+
+            let mut userless = browse(true, &[]);
+            let answer = manager
+                .apply_user_view_builder(&mut userless, &shown)
+                .await
+                .expect("builder");
+            assert_eq!(answer, (Some(kind), true), "{kind:?}");
+            assert_eq!(userless.parent_id, SHOWN, "{kind:?}");
+            assert!(userless.known_parent_row().is_some(), "{kind:?}");
+            assert!(!userless.user_root_children, "{kind:?}");
+
+            let before = InternalItemsQuery {
+                user: Some(user),
+                ..browse(true, &[])
+            };
+            let mut signed_in = before.clone();
+            let answer = manager
+                .apply_user_view_builder(&mut signed_in, &shown)
+                .await
+                .expect("builder");
+            assert_eq!(answer, (Some(kind), true), "{kind:?}");
+            assert_eq!(signed_in, before, "{kind:?}");
         }
     }
 

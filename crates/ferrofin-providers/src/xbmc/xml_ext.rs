@@ -33,7 +33,12 @@ pub fn try_read_int(reader: &mut XmlCursor) -> Option<i32> {
 /// Reads a boolean from the current node
 /// (`XmlReader.ReadElementContentAsBoolean`).
 ///
-/// .NET accepts `true`/`false`/`1`/`0` (case-insensitively for the words).
+/// .NET's `XmlConvert.ToBoolean` accepts only `true`/`false`/`1`/`0` (trimmed,
+/// case-sensitive); on anything else the read throws an `XmlException`, which
+/// ends the NFO read. This matches the words case-insensitively and returns
+/// `None` for anything else.
+/// TODO(parity, open work item — gl-1943): port the case-sensitive match and the
+/// read error.
 pub fn read_element_content_as_bool(reader: &mut XmlCursor) -> Option<bool> {
     match reader.read_element_content_as_string().trim() {
         s if s.eq_ignore_ascii_case("true") || s == "1" => Some(true),

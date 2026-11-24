@@ -487,6 +487,39 @@ pub async fn build_app_state(
         paths.root_folder_path(),
         paths.data_path(),
     );
+    // One-shot, on a database's first boot: Jellyfin's timers and series
+    // timers (`data/livetv/*.json`), which nothing else reads. Before the path
+    // rebase below, which moves a completed recording's file onto this
+    // server's directories as it moves the library's; before the DVR's start
+    // arms the stored timers; and before the Live TV configuration import
+    // further down marks the database as booted.
+    match ferrofin_livetv::import_jellyfin_timers(
+        db,
+        &server_id,
+        std::path::Path::new(&paths.data_path()),
+    )
+    .await
+    {
+        Ok(ferrofin_livetv::ImportedTimers {
+            timers: 0,
+            series_timers: 0,
+            ..
+        }) => {}
+        Ok(ferrofin_livetv::ImportedTimers {
+            timers,
+            recordings,
+            series_timers,
+        }) => tracing::info!(
+            timers,
+            recordings,
+            series_timers,
+            "imported jellyfin's live tv timers"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "live tv timer import failed; it runs again at the next start"
+        ),
+    }
     // A database whose program-data directory moved (an adopted Debian
     // `/var/lib/jellyfin`, or a relocated data_dir) keeps its ids but stores
     // stale absolute paths for the library root and artwork. Before `ensure()`,
@@ -3236,7 +3269,8 @@ pub async fn build_app_state(
     // config file, so nothing else would pick them up — and with no tuner
     // configured Live TV is OFF (`live_tv_enabled_for`), which means adopting a
     // server that had Live TV would silently lose the tuner, the guide and the
-    // view.
+    // view. It stays after the timer import above, which reads its marker as
+    // "a Ferrofin booted this database before".
     match ferrofin_core::live_tv_import::import_live_tv_config(
         db,
         std::path::Path::new(&paths.configuration_directory_path()),

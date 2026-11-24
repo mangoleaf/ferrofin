@@ -2797,7 +2797,7 @@ macro_rules! item_image_tail {
          without no-cache), Cache-Control spellings, If-Unmodified-Since, \
          If-Match, backgroundColor (valid and not), foregroundLayer, blur from 1 to \
          2147483647, a hex imageIndex and a malformed percentPlayed; the images match in \
-         format and size, and in pixels within rounding and the blur's box approximation \
+         format and size, and, unresized, in pixels within rounding and the blur's box approximation \
          of Skia's Gaussian (with its Decal edges and premultiplied JPEG), not in bytes \
          (the image crate, not Skia)"
     };
@@ -2818,6 +2818,13 @@ const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
      bug not ported.",
     "A remote image that cannot be downloaded is a 404; upstream's ConvertImageToLocal \
      throws, a 500. Jellyfin bug not ported.",
+    "A shrunk image is drawn with Lanczos3 and no sharpening (owner decisions \
+     2026-11-05 and 2026-11-23, gl-1345), where SkiaEncoder.ResizeImage shrinks with \
+     bilinear sampling over mipmaps and then runs SharpenInPlace's 3x3 kernel: measured \
+     against 12.4's output it keeps the same detail without the aliasing and halos, so its \
+     pixels differ from upstream's. These rows never enlarge (GetNewImageSize caps the size \
+     at the source); where Ferrofin does, neither side shrinking (a collage cell or \
+     splashscreen tile drawn from a smaller image), it uses upstream's Mitchell.",
     "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
 ];
 
@@ -3107,13 +3114,16 @@ pub const VERIFIED: &[Verified] = &[
                    check_parent_visibility (GetParentItem, IsVisible, and a UserView parent's \
                    UserViewBuilder through LibraryManager apply_user_view_builder, \
                    ferrofin-core library_manager/user_view_builder.rs), redirect_container_browse \
-                   (the BoxSet and Playlist re-root), list_playlists_folder_as_playlists, \
-                   apply_library_browse_defaults (recursive ??= true for a typed library \
-                   browse), apply_albums_by_artist_order, order_search_by_sort_name, the \
-                   UserRootFolder and HasFilters dispatch, retain_visible_ids, \
-                   sort_items_by_request (Folder.GetItems' request order) → LibraryManager \
-                   query_items and DtoService get_base_item_dtos, or get_linked_children_dtos \
-                   for a box set's or playlist's own non-recursive listing",
+                   (the BoxSet and Playlist re-root), list_playlists_folder_as_playlists \
+                   (the playlists collection type's recursive [Playlist] listing, and with no \
+                   user PlaylistsFolder.GetItemsInternal's own children unless the browse is \
+                   typed exactly [Playlist]), apply_library_browse_defaults (recursive ??= \
+                   true for a typed library browse), apply_albums_by_artist_order, \
+                   order_search_by_sort_name, the UserRootFolder and HasFilters dispatch, \
+                   retain_visible_ids, sort_items_by_request (Folder.GetItems' request order) \
+                   → LibraryManager query_items and DtoService get_base_item_dtos, or \
+                   get_linked_children_dtos for a box set's or playlist's own non-recursive \
+                   listing",
         date: "2026-11-15",
         divergences: TRAILERS_DIVERGENCES,
         refs: &["access-filtering", "images", "paging-sort", "user-data"],

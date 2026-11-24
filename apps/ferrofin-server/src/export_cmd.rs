@@ -464,9 +464,10 @@ async fn live_tv_and_plugins(
 
 /// How many timers and series timers the output's copies of the source's
 /// `data/livetv/timers.json` and `seriestimers.json` (Jellyfin's, kept since
-/// before adoption) hold that `exported`'s do not: Ferrofin never imported
-/// them, and the export replaces the files. A file that is not there, or
-/// that Jellyfin could not read either, holds none.
+/// before adoption) hold that `exported`'s do not: ones Ferrofin did not
+/// import (an adoption by a version before the import) or has removed since,
+/// and the export replaces the files. A file that is not there, or that
+/// Jellyfin could not read either, holds none.
 async fn adopted_timers(out: &Path, exported: &ConfigExport) -> anyhow::Result<(usize, usize)> {
     let ids = |json: &[u8]| -> Vec<String> {
         serde_json::from_slice::<Vec<serde_json::Value>>(json)
@@ -722,7 +723,7 @@ fn live_tv(report: &mut String, edits: &DatabaseEdits, inputs: &ReportInputs) {
     if timers + series > 0 {
         let _ = writeln!(
             report,
-            "  {} and {} that Jellyfin kept before adoption, which Ferrofin never read, are replaced by Ferrofin's.",
+            "  {} and {} that Jellyfin kept before adoption and Ferrofin does not hold are replaced by Ferrofin's.",
             count(timers as u64, "timer", "timers"),
             count(series as u64, "series timer", "series timers"),
         );

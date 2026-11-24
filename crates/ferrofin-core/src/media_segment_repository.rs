@@ -1,6 +1,9 @@
 //! The `MediaSegments` writes of
 //! [`FerrofinMediaSegmentManager`](crate::media_segment_manager::FerrofinMediaSegmentManager)
-//! that replace or clear a provider's rows.
+//! that replace or clear a provider's rows, and the SQL of its per-item reads.
+//!
+//! Every per-item statement seeks `FerrofinIX_MediaSegments_ItemId_StartTicks`
+//! (migration 0052); without it each one scanned the whole table (gl-1409).
 
 use ferrofin_db::Database;
 use ferrofin_db::store::guid_to_db;
@@ -9,6 +12,25 @@ use ferrofin_traits::error::ServiceError;
 use uuid::Uuid;
 
 use crate::db_error::db_err;
+
+/// An item's rows in playback order: the index gives the order, so there is no sort.
+pub(crate) const ITEM_ROWS: &str =
+    r#"SELECT * FROM "MediaSegments" WHERE "ItemId" = ?1 ORDER BY "StartTicks""#;
+
+/// How many rows an item has, counted in the index alone.
+pub(crate) const ITEM_ROW_COUNT: &str =
+    r#"SELECT COUNT(*) FROM "MediaSegments" WHERE "ItemId" = ?1"#;
+
+/// The DELETE [`replace_rows`] runs per namespace, with `"Type" = ?3` when `typed`.
+fn replace_delete_sql(typed: bool) -> String {
+    let mut delete = String::from(
+        r#"DELETE FROM "MediaSegments" WHERE "ItemId" = ?1 AND "SegmentProviderId" = ?2"#,
+    );
+    if typed {
+        delete.push_str(r#" AND "Type" = ?3"#);
+    }
+    delete
+}
 
 /// Deletes `item`'s rows stored under each of `namespaces` (only those of
 /// `type_filter`, when given) and inserts `segments` under `provider_id`, in one
@@ -38,12 +60,7 @@ pub(crate) async fn replace_rows(
             "segment end precedes its start",
         ));
     }
-    let mut delete = String::from(
-        r#"DELETE FROM "MediaSegments" WHERE "ItemId" = ?1 AND "SegmentProviderId" = ?2"#,
-    );
-    if type_filter.is_some() {
-        delete.push_str(r#" AND "Type" = ?3"#);
-    }
+    let delete = replace_delete_sql(type_filter.is_some());
     let mut tx = db.writer().begin().await.map_err(db_err)?;
     for namespace in namespaces {
         let mut query = sqlx::query(sqlx::AssertSqlSafe(delete.clone()))
@@ -107,4 +124,45 @@ pub(crate) async fn clear_rows(
     }
     tx.commit().await.map_err(db_err)?;
     Ok(items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ITEM_ROW_COUNT, ITEM_ROWS, replace_delete_sql};
+    use crate::test_support::test_db;
+
+    const INDEX: &str = "FerrofinIX_MediaSegments_ItemId_StartTicks (ItemId=?)";
+
+    /// `EXPLAIN QUERY PLAN` for `sql`, one `detail` per step.
+    async fn query_plan(db: &ferrofin_db::Database, sql: &str) -> Vec<String> {
+        sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {sql}"
+        )))
+        .fetch_all(db.pool())
+        .await
+        .expect("explain query plan")
+        .into_iter()
+        .map(|(_, _, _, detail)| detail)
+        .collect()
+    }
+
+    /// `GET /MediaSegments/{itemId}` and `PlaybackInfo`'s `HasSegments` read one
+    /// item's rows at every playback start, and a provider's replace deletes them
+    /// inside the writer's transaction: each seeks the item on the index (the read
+    /// in index order, the count in the index alone), never scanning the table or
+    /// sorting.
+    #[tokio::test]
+    async fn per_item_statements_seek_the_item_index() {
+        let db = test_db().await;
+        let seek = format!("SEARCH MediaSegments USING INDEX {INDEX}");
+        let count = format!("SEARCH MediaSegments USING COVERING INDEX {INDEX}");
+        for (sql, plan) in [
+            (ITEM_ROWS.to_owned(), &seek),
+            (ITEM_ROW_COUNT.to_owned(), &count),
+            (replace_delete_sql(false), &seek),
+            (replace_delete_sql(true), &seek),
+        ] {
+            assert_eq!(query_plan(&db, &sql).await, [plan.as_str()], "{sql}");
+        }
+    }
 }
