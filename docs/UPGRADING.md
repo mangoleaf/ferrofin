@@ -47,6 +47,119 @@ database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
 
+## 1.5.2
+
+**Before you upgrade**
+
+- **Networking page Base URL.** A Base URL saved on Dashboard → Networking (typed there when it did
+  nothing, or imported from an adopted Jellyfin `network.xml`) now takes effect unless
+  `FERROFIN_BASE_URL` is set, and wins over a different `config.toml` `base_url`. Every URL moves
+  under it, so clients and reverse-proxy rules must use it; `/health/live` and `/health/ready` stay
+  at the root. Clear the field, or set `FERROFIN_BASE_URL`, to keep the current mount.
+- **Networking page ports.** A non-default **Local HTTP port number** saved there now applies unless
+  `FERROFIN_PORT` or `--port` is set, and a non-default **Local HTTPS port number** applies with
+  HTTPS on unless `FERROFIN_HTTPS_PORT` is set. The container image sets `FERROFIN_PORT=8096`, so
+  only its HTTPS port can move.
+- **Old numeric IPv4 spellings** in network settings (`10.6`, `0x0a000005`, an octal part such as
+  `010`), ignored with a warning until now, take effect. Check `KnownProxies`,
+  `LocalNetworkSubnets` and `RemoteIPFilter`: a `RemoteIPFilter` allow list that held only such
+  entries starts filtering, and such a block-list entry starts blocking.
+- **A blank directory value** (`FERROFIN_DATA_DIR=""`, `FERROFIN_CACHE_DIR=""`, `cache_dir = ""`)
+  stops the server at startup with an error naming the setting, where it used the working directory.
+  Unset it or give it a path. Docker, the Helm chart and the Debian package are not affected.
+- **Windows:** the free-space floors now apply, as in Jellyfin. The server refuses to start or apply
+  a restore with less than 2 GiB free on the data, cache or program-data folder, and
+  `POST /Backup/Create` is refused with less than 5 GB free in the backups folder.
+- **DVR series timers with a Keep up to limit** now enforce it: when one of the series' recordings
+  starts, the finished recordings past the limit are deleted, and so are other video files in that
+  series' recording folder past the same count, as in Jellyfin. Raise or clear the limit first to
+  keep them.
+- **HDHomeRun tuners:** channel mappings made in Ferrofin stop applying (mappings Jellyfin saved
+  now do), and the first guide refresh removes one-off recordings scheduled on HDHomeRun airings.
+  Note both first, then re-make the mappings and re-schedule those recordings. Series timers
+  schedule again by themselves, and M3U tuners are not affected.
+- **One-time repairs at the first start.** Each runs only where it finds work, after copying the
+  database to the snapshot named below. That copy is the only way back, and it is safe to delete
+  once the server runs well. On Kubernetes, upgrading from 1.3.x,
+  [stop the old pod first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
+  - Playlists made before 1.4.0 that hold an album, series or other container as one entry get it
+    replaced by its tracks or episodes, under new entry ids (`<database>.pre-playlist-containers`).
+  - Playlists whose owner was deleted go to a user they were shared with, or are deleted if private
+    (`<database>.pre-orphaned-playlists`).
+  - Collections made by Ferrofin 1.3.2 or older get new ids, so a client holding an old id must look
+    the collection up again (`<database>.pre-box-set-folders`).
+- **A WASM plugin set aside by moving or renaming its `.wasm`** loses its segment output at the
+  first start, and so does one taken out that way later. To keep the output, put the file back and
+  disable the plugin from the dashboard instead.
+- **Server name.** An install that never named itself (no name under Dashboard → General, no
+  `FERROFIN_SERVER_NAME`) now advertises its machine name instead of `ferrofin`, or instead of a
+  container's full dotted host name. Clients keep a saved server by its id; set a name to keep the
+  old one.
+- New similar-items cache entries are written `0600`: a job that reads the server's cache directory
+  as another user can no longer read them.
+
+**If scripts or other API clients use the server**
+
+- The OpenSubtitles provider is now named `Open Subtitles`, as the plugin names it. A library that
+  disabled it through the API as `opensubtitles` must use `Open Subtitles`, and a subtitle search
+  made before the upgrade cannot be downloaded after it (`400`): search again.
+
+**Monitoring and reverse proxies**
+
+- Behind a proxy listed under **Known proxies** with **Enable published server URI by request** on,
+  published addresses take the proxy's `X-Forwarded-Host`: check that the proxy sends the right host.
+  `GET /System/Endpoint` now tells forwarded clients `IsLocal: false`.
+- Request headers over 32 KB in total, or more than 100 header lines, are refused with `431` and the
+  connection closed, as on Jellyfin. Check a reverse proxy that forwards very large cookies. Request
+  lines up to 64 KB are still accepted.
+- The server log is now `log_yyyyMMdd.log` by the local date (it was `log.yyyy-MM-dd.log` by the UTC
+  date). Log shippers and scripts that read `{data_dir}/log/log.*.log` must read `log_*.log`.
+- Helm chart with `networkPolicy.enabled`, `networkPolicy.ingress.allowExternal: false`, ingress
+  selectors, metrics and the ServiceMonitor: only pods labelled `app.kubernetes.io/name=prometheus`
+  may scrape. An override of `networkPolicy.metrics.podSelector` must put its labels under
+  `matchLabels:`, and null the default's label (`app.kubernetes.io/name: null`) unless your
+  Prometheus pods carry it.
+
+**Libraries**
+
+- **Photos:** the next scan of a Home Videos & Photos library adds `.tif`, `.avif` and camera raw
+  files as photos, and removes the photo entries of `.svg` files and, on a database adopted from
+  Jellyfin 10.11, of `.aiff` files, with their favourite and played state. The files stay on disk.
+- **TV:** the first scan removes the episodes earlier scans made from sample-named videos beside real
+  episodes (`Show S01E01 sample.mkv`), with their played state.
+- **One-time scan cost:** the first scan opens each `.cbz`, `.cb7`, `.cbt` and PDF book once to count
+  its pages, and probes each DVD folder rip that has no media info yet (one ffprobe per `.vob` of its
+  main feature). On network storage that scan takes longer. A Blu-ray ISO that never probed is tried
+  again, which needs an ffprobe built with libbluray.
+- **RAR comics (`.cbr`)** on a bare-metal or `.deb` install need `7z` with its RAR plugin
+  (`7zip-rar` or `p7zip-rar`) or `bsdtar` (`libarchive-tools`) on `PATH` for their covers; restart
+  after installing one. The Docker image carries `7z` with its RAR plugin.
+- **Collections:** a Collections folder that exists but is empty, such as an empty bind mount,
+  removes every box set at the next scan, as in Jellyfin. A box set whose
+  `{data}/collections/<name> [boxset]` folder was deleted by hand is removed too.
+- **Encoding thread count:** a positive count under Playback → Transcoding now also limits
+  library-scan probes and frame extractions, so a large scan can take longer. Set it to Auto to keep
+  the old behaviour.
+- **Alternate versions:** where no file is named after the folder and the version labels differ only
+  in case or punctuation, the next scan may make a different version the primary, once. A favourite
+  on the old primary stays on that version: set it again on the movie or episode.
+- **NFO libraries** download the artwork and actor photos their NFOs name by URL, from the hosts
+  named, the next time each NFO is read (a first scan, a changed NFO, a full refresh), whatever the
+  library's image fetchers are set to.
+- **Existing `.nfo` files:** a library with no metadata saver list (seeded from
+  `FERROFIN_LIBRARY_ROOTS` or `library_roots`, created through the API without `MetadataSavers`, or
+  adopted from an `options.xml` without `<MetadataSavers>`) no longer rewrites the `.nfo` files
+  already in its media folders when an item is edited. To keep them in step, turn on "Save artwork
+  into media folders" or tick the Nfo saver for that library.
+
+**After you upgrade**
+
+- Run the **Refresh People** scheduled task once, or wait for its weekly run. Two spellings with the
+  same clean name (`H. Jon Benjamin`, `H Jon Benjamin`) are now two people; until the run, the second
+  spelling's credits are missing from `People[]` and `/Persons`. The run deletes a shared person item
+  whose own spelling is no longer credited, with any favourite or played state on it, unless the item
+  is locked.
+
 ## 1.5.1
 
 **Before you upgrade**
