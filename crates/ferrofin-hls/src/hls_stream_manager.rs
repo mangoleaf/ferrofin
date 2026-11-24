@@ -709,6 +709,8 @@ where
             )));
         }
 
+        self.stop_play_session_jobs(request).await;
+
         // (Re)start the transcode from this segment and wait for it.
         let state = self.labelled(&plan.state, request.item_id).await;
         let start = StartFfMpegRequest {
@@ -922,6 +924,7 @@ where
                         )));
                     }
                 }
+                self.stop_play_session_jobs(request).await;
                 // NEVER a select!/cancellation over the start: a cancelled
                 // spawn can orphan an unregistered ffmpeg, and the next segment
                 // request then starts a second writer onto the same segment
@@ -1009,6 +1012,32 @@ where
             delete_cut_short_segment(&path).await;
         }
         Ok(())
+    }
+
+    /// Stops the transcodes of `request`'s play session, or of its device when
+    /// it names no play session, before one starts: `GetDynamicSegment` awaits
+    /// `KillTranscodingJobs(DeviceId, PlaySessionId, p => false)` before
+    /// `StartFfMpeg`, so a play session runs one at a time (gl-1942). The job
+    /// on the request's own output is gone by now
+    /// ([`Self::kill_for_restart`]); what is left wrote another output, which
+    /// upstream never has (gl-860). Nothing would delete that output once its
+    /// job is out of the registry, so its files go as on a stop, where
+    /// upstream keeps them for the job it starts on the same one. Returns
+    /// once each ffmpeg has exited; the files are deleted after.
+    ///
+    /// A request with neither a play session nor a `DeviceId` leaves the jobs
+    /// without a `DeviceId` running: upstream's `string.Equals(null, null)`
+    /// would stop every one of them, whoever plays it.
+    ///
+    /// A request waiting on a job this stops restarts it, or fails when it had
+    /// started the job itself. That failure counts towards the output's
+    /// restart breaker, as any job stopped under its start does, which ends
+    /// two shapes of one play session stopping each other.
+    async fn stop_play_session_jobs(&self, request: &HlsStreamRequest) {
+        let device = request.device_id.as_deref().unwrap_or_default();
+        self.manager
+            .stop_transcoding_jobs(device, request.play_session_id.as_deref())
+            .await;
     }
 
     /// The transcode cache directory (`GetTranscodePath`), prepared on the
@@ -2932,13 +2961,26 @@ mod tests {
         mgr
     }
 
-    /// Starts a job of `user` that takes the only slot, on another playlist.
-    /// It runs through its own fake ffmpeg, not the manager's, which exits:
-    /// this one keeps running, so the job keeps the slot.
+    /// Starts a job of `user` that takes the only slot, on another playlist
+    /// and of another play session than [`req`]'s.
     async fn take_the_slot(
         mgr: &Mgr,
         dir: &Path,
         user: Option<uuid::Uuid>,
+    ) -> ferrofin_traits::media_encoding::TranscodingJobHandle {
+        hold_the_slot(mgr, dir, user, "held", Some("dev")).await
+    }
+
+    /// Starts a job of `user`, `play_session` and `device` that takes the only
+    /// slot, on another playlist. It runs through its own fake ffmpeg, not the
+    /// manager's, which exits: this one keeps running, so the job keeps the
+    /// slot.
+    async fn hold_the_slot(
+        mgr: &Mgr,
+        dir: &Path,
+        user: Option<uuid::Uuid>,
+        play_session: &str,
+        device: Option<&str>,
     ) -> ferrofin_traits::media_encoding::TranscodingJobHandle {
         let plan = mgr
             .planner
@@ -2947,6 +2989,8 @@ mod tests {
             .unwrap();
         let mut state = plan.state;
         state.wait_for_path = None;
+        state.play_session_id = Some(play_session.to_owned());
+        state.device_id = device.map(str::to_owned);
         let output_path = dir.join("held").join("out.m3u8");
         mgr.manager
             .start_ffmpeg(
@@ -3099,6 +3143,98 @@ mod tests {
             .unwrap_or_else(|_| panic!("{path:?}: the admitted start hung"))
             .unwrap_or_else(|error| panic!("{path:?}: {error}"));
         }
+    }
+
+    /// `GetDynamicSegment` awaits `KillTranscodingJobs(DeviceId, PlaySessionId,
+    /// p => false)` before `StartFfMpeg`: a segment or init request that starts
+    /// a job first stops the jobs of its play session, or of its device when
+    /// it names no play session, so a play session never runs two (gl-1942).
+    /// With one slot and its job being read, the start is admitted only when
+    /// that job was stopped first. A request with neither a play session nor
+    /// a device leaves a job without a device running, where upstream's null
+    /// `DeviceId` equals the job's null one.
+    #[rstest::rstest]
+    #[case::its_play_sessions_on_any_device(Some("sess"), Some("dev"), "SESS", Some("tv"), true)]
+    #[case::not_another_play_sessions(Some("sess"), Some("dev"), "other", Some("dev"), false)]
+    #[case::its_devices_without_a_play_session(None, Some("dev"), "other", Some("DEV"), true)]
+    #[case::its_devices_with_a_blank_play_session(
+        Some(" "),
+        Some("dev"),
+        "other",
+        Some("dev"),
+        true
+    )]
+    #[case::not_another_devices_without_a_play_session(
+        None,
+        Some("dev"),
+        "sess",
+        Some("tv"),
+        false
+    )]
+    #[case::nothing_without_a_play_session_or_a_device(None, None, "other", None, false)]
+    #[tokio::test]
+    async fn a_segment_start_first_stops_the_jobs_of_its_play_session(
+        #[case] play_session: Option<&str>,
+        #[case] device: Option<&str>,
+        #[case] held_play_session: &str,
+        #[case] held_device: Option<&str>,
+        #[case] stopped: bool,
+    ) {
+        for path in [StartPath::Segment, StartPath::InitSegment] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_capped_at_one(tmp.path());
+            let held = hold_the_slot(&mgr, tmp.path(), None, held_play_session, held_device).await;
+            let _reading = mgr.manager.begin_request_guard(&held.path, held.job_type);
+            let request = HlsStreamRequest {
+                play_session_id: play_session.map(str::to_owned),
+                device_id: device.map(str::to_owned),
+                ..req()
+            };
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                start_through(&mgr, path, &request),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{path:?}: the start hung"));
+
+            let left = {
+                use ferrofin_traits::media_encoding::TranscodeManager as _;
+                mgr.manager
+                    .get_transcoding_job_by_path(&held.path, held.job_type)
+                    .await
+                    .unwrap()
+            };
+            if stopped {
+                result.unwrap_or_else(|error| panic!("{path:?}: {error}"));
+                assert!(left.is_none(), "{path:?}: its job was left running");
+            } else {
+                assert_refused(path, &result);
+                assert!(left.is_some(), "{path:?}: another playback's job stopped");
+            }
+        }
+    }
+
+    /// The stopped job wrote another output, which nothing would delete once
+    /// it is out of the registry: its files are deleted, as on a stop.
+    #[tokio::test(start_paused = true)]
+    async fn the_job_a_segment_start_stops_loses_its_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(tmp.path(), capped_script(), "ts");
+        let held = hold_the_slot(&mgr, tmp.path(), None, "sess", Some("dev")).await;
+        let playlist = PathBuf::from(&held.path);
+        assert!(playlist.exists());
+
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+
+        for _ in 0..100 {
+            if !playlist.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(!playlist.exists(), "the stopped job's files were kept");
+        assert!(tmp.path().join("out0.ts").exists());
     }
 
     #[tokio::test]
