@@ -61,9 +61,9 @@ until you choose the fresh-install or migration procedure in step 4 below.
 
 ### Without the package: the release tarball
 
-The tarball carries only the binary. Do step 1, install the two packages by hand
-(`sudo apt-get install -y jellyfin-ffmpeg8 jellyfin-web`), and with a checkout of this
-repository for the `contrib/` files:
+The tarball carries the binary and its licence files (`LICENSE`, `copyright`). Do step 1,
+install the two packages by hand (`sudo apt-get install -y jellyfin-ffmpeg8 jellyfin-web`),
+and with a checkout of this repository for the `contrib/` files:
 
 ```sh
 V=v1.0.1; T=x86_64-unknown-linux-gnu             # or aarch64-unknown-linux-gnu

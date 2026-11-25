@@ -14,7 +14,11 @@ Comment: Ferrofin is derived from the Jellyfin media server
  /usr/bin/ferrofin-server statically links third-party Rust crates and C
  libraries, which keep their own permissive licenses (among them MIT,
  Apache-2.0, BSD and ISC); SQLite is public domain and jemalloc is
- BSD-2-Clause.
+ BSD-2-Clause. libjpeg-turbo is under the IJG, BSD-3-Clause and Zlib
+ licenses: this software is based in part on the work of the Independent
+ JPEG Group, and libjpeg-turbo's Modified BSD License, which its TurboJPEG
+ API asks binary distributions to reproduce, is the libjpeg-turbo-BSD-3-Clause
+ paragraph below.
 
 Files: crates/ferrofin-extensions/assets/introskipper/*
 Copyright: Intro Skipper contributors
@@ -86,3 +90,31 @@ License: Expat
 License: Apache-2.0
  On Debian systems, the complete text of the Apache License, Version 2.0
  can be found in "/usr/share/common-licenses/Apache-2.0".
+
+License: libjpeg-turbo-BSD-3-Clause
+ Copyright (C)2009-2024 D. R. Commander.  All Rights Reserved.
+ Copyright (C)2015 Viktor Szathmáry.  All Rights Reserved.
+ .
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are met:
+ .
+ - Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+ - Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+ - Neither the name of the libjpeg-turbo Project nor the names of its
+   contributors may be used to endorse or promote products derived from this
+   software without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS",
+ AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE
+ LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ POSSIBILITY OF SUCH DAMAGE.

@@ -2799,7 +2799,8 @@ macro_rules! item_image_tail {
          2147483647, a hex imageIndex and a malformed percentPlayed; the images match in \
          format and size, and, unresized, in pixels within rounding and the blur's box approximation \
          of Skia's Gaussian (with its Decal edges and premultiplied JPEG), not in bytes \
-         (the image crate, not Skia)"
+         (decoded and resized by libraries other than Skia's; a JPEG is written by \
+         libjpeg-turbo, the codec inside Skia, with SkJpegEncoder's settings)"
     };
 }
 
