@@ -2721,8 +2721,12 @@ pub async fn build_app_state(
     // Once per database (gl-1616): the item and stream paths an earlier
     // version stored resolved under the data and metadata directories take
     // the `%AppDataPath%`/`%MetadataPath%` form every save writes. Last of the
-    // repairs, after every one that stores a path, and before a scan.
+    // repairs that store a path, and before a scan.
     ferrofin_core::adoption_repairs::run_reverse_stored_virtual_paths(db, &virtual_paths).await;
+    // Once per database (gl-1911): the videos an earlier version probed get the
+    // `HasSubtitles` a probe stores in `Data` since gl-1632, from their stored
+    // subtitle streams, before a scan.
+    ferrofin_core::adoption_repairs::run_store_has_subtitles(db).await;
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
