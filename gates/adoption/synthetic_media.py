@@ -12,6 +12,13 @@ from PIL import Image
 
 # Credited on every movie and episode NFO, so Peoples and PeopleBaseItemMap hold rows.
 ACTORS = (("Synthetic Actor One", "Lead"), ("Synthetic Actor Two", "Support"))
+# The movies synthetic_fixture.seed merges as versions with "<name> Extended", the third copy the round
+# trip merges into the second once it split it, the movie in two parts, and the series rated above
+# synthetic-child's limit whose season and episodes have no rating of their own.
+MERGED_PAIRS = ("Rowan Ferry", "Saffron Gate")
+THIRD_VERSION = "Saffron Gate Remastered"
+STACKED = "Stacked Relay"
+RATED_SERIES = "Velvet Static"
 # The x265 HDR10 parameters of gates/bench/testdata/gen.py's hevc_2160p_hdr10_51 template.
 HDR10 = ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
          "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
@@ -74,6 +81,10 @@ def generate(root, image):
     encode([*video, *silence, *chapters, "-map", "0:v", "-map", "1:a", "-map_chapters", "2",
             "-t", "600", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "35", "-c:a", "aac", "-b:a", "8k",
             "-metadata:s:a:0", "language=eng", "/media/template.mkv"])
+    # The template at a quarter of its size: a version every merge ranks below a template-sized one.
+    encode([*video[:-1], "color=c=blue:s=160x90:r=1", *silence, *chapters, "-map", "0:v", "-map", "1:a",
+            "-map_chapters", "2", "-t", "600", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "35",
+            "-c:a", "aac", "-b:a", "8k", "-metadata:s:a:0", "language=eng", "/media/narrow.mkv"])
     # HDR10 video (bench's hevc_2160p_hdr10_51 parameters, at the template's size).
     encode([*video, *silence, *chapters, "-map", "0:v", "-map", "1:a", "-map_chapters", "2",
             "-t", "600", *HDR10, "-crf", "35", "-c:a", "aac", "-b:a", "8k",
@@ -93,10 +104,11 @@ def generate(root, image):
         Image.new("RGB", (100, 150), "orange").save(directory / "poster.jpg")
         Image.new("RGB", (200, 100), "navy").save(directory / "fanart.jpg")
 
-    def movie(name, rating, library="movies", versions=False, template="template.mkv"):
+    def movie(name, rating, library="movies", versions=False, template="template.mkv", parts=False):
         directory = root / library / name
         directory.mkdir(parents=True)
-        names = [name + " - 1080p", name + " - 720p"] if versions else [name]
+        names = ([name + " - 1080p", name + " - 720p"] if versions else
+                 [name + " - part1", name + " - part2"] if parts else [name])
         for stem in names:
             shutil.copyfile(root / template, directory / (stem + ".mkv"))
             (directory / (stem + ".eng.srt")).write_text(
@@ -120,6 +132,15 @@ def generate(root, image):
     movie("Quiet Chorus", "G", template="multitrack.mkv")
     # A non-ASCII path: accented Latin and CJK, NFC-encoded ("Café Ünïcode 東京").
     movie("Caf\u00e9 \u00dcn\u00efcode \u6771\u4eac", "G")
+    # Two pairs synthetic_fixture.seed merges as versions, and a third copy the round trip's usage stage
+    # merges into the second pair once it split it (gates/roundtrip/usage.py), narrower so it ranks below
+    # it; and a movie in two parts, which Jellyfin stacks. Named to sort between the movies the usage
+    # stage picks by position and the last one.
+    for pair in MERGED_PAIRS:
+        movie(pair, "G")
+        movie(pair + " Extended", "G")
+    movie(THIRD_VERSION, "G", template="narrow.mkv")
+    movie(STACKED, "G", parts=True)
     extra = root / "movies/Amber Harbor/behind the scenes"
     extra.mkdir()
     shutil.copyfile(root / "template.mkv", extra / "Synthetic making of.mkv")
@@ -144,6 +165,22 @@ def generate(root, image):
                 "1\n00:00:01,000 --> 00:00:04,000\nSynthetic English subtitle.\n")
             art_path = folder / (stem + "-thumb.jpg")
             Image.new("RGB", (160, 90), "green").save(art_path)
+
+    # A series rated above synthetic-child's limit whose season and episodes carry no rating of their
+    # own: they inherit the series' score, which hides them from the child.
+    series = root / "shows" / RATED_SERIES
+    folder = series / "Season 01"
+    folder.mkdir(parents=True)
+    nfo(series / "tvshow.nfo", "tvshow", [("title", RATED_SERIES), ("plot", "An invented series."),
+                                          ("mpaa", "TV-MA"), ("year", 2021)])
+    nfo(folder / "season.nfo", "season", [("title", "Season 1"), ("seasonnumber", 1)])
+    for episode in (1, 2):
+        stem = f"{RATED_SERIES} S01E{episode:02}"
+        shutil.copyfile(root / "template.mkv", folder / (stem + ".mkv"))
+        nfo(folder / (stem + ".nfo"), "episodedetails", [
+            ("title", f"Unrated episode 1-{episode}"), ("season", 1), ("episode", episode),
+            ("plot", "An invented episode."), ("aired", f"2021-01-0{episode}")])
+        (folder / (stem + ".eng.srt")).write_text("1\n00:00:01,000 --> 00:00:04,000\nSynthetic English subtitle.\n")
 
     for artist, album, tracks in [
         ("Synthetic Ensemble", "First Album", [(1, 1), (1, 2), (2, 1), (2, 2)]),
@@ -172,5 +209,5 @@ def generate(root, image):
     for name, color in (("Synthetic sunrise", "gold"), ("Synthetic dusk", "indigo")):
         Image.new("RGB", (320, 240), color).save(photos / (name + ".jpg"))
 
-    for scratch in ("template.mkv", "hdr10.mkv", "multitrack.mkv", "chapters.txt", "Synthetic Sans.ttf"):
+    for scratch in ("template.mkv", "narrow.mkv", "hdr10.mkv", "multitrack.mkv", "chapters.txt", "Synthetic Sans.ttf"):
         (root / scratch).unlink()

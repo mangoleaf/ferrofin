@@ -40,7 +40,7 @@ jellyfin_stage() {
     check reasons python3 "$HERE/checks_boot.py" migrations "$dst/jellyfin-boot.log"
     mark Jellyfin "every migration it began finished"
     # what Jellyfin's own first start on this route's source ran, as build-fixtures.sh logged it, less what the
-    # source's history (as Ferrofin stopped with it) records
+    # source's history (as Ferrofin stopped with it) records and what the export records as applied (classify.rs)
     check reasons python3 "$HERE/checks_boot.py" ran "$dst/jellyfin-boot.log" "$FIXTURES/$first_start.server.log" \
       "$dst/ferrofin/data/jellyfin.db"
     mark Jellyfin "it ran the code migrations it runs on the source, and no schema migration"

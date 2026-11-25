@@ -11,10 +11,10 @@ are compared with Ferrofin's.
 
 | Route | Source (adopted as) | Ferrofin runs at | Jellyfin on the export |
 |---|---|---|---|
-| `10.11.8`, `10.11.9` | `jellyfin-10.11.8`, `jellyfin-10.11.9` (10.11.8) | `/data` | applies no schema migration (the exported history records the 20 that Ferrofin's own migrations already applied) and runs the 19 code migrations it runs on a database of that release of its own |
-| `10.11.10`, `10.11.11` | `jellyfin-10.11.10`, `jellyfin-10.11.11` (10.11.11) | `/data` | applies none (the history records 18) and runs 18 code migrations; its own first start there runs `UpdateNormalizedUsername` too, which the source records: there the first schema migration it applies reverts the later ones, and `AddNormalizedUsername`'s `Down` drops that routine's row |
-| `12.0` | `jellyfin-12.0` (12.0.0) | `/data` | applies none (the history records `MakeOwnerIdIndexesPartial`) and runs 5 code migrations |
-| `12.1-from-10`, `12.1-from-12` | `jellyfin-12.1-from-10`, `jellyfin-12.1-from-12` (12.1.0) | `/data` | applies none (the history records `MakeOwnerIdIndexesPartial`) and runs 3 code migrations |
+| `10.11.8`, `10.11.9` | `jellyfin-10.11.8`, `jellyfin-10.11.9` (10.11.8) | `/data` | applies no schema migration (the exported history records the 20 that Ferrofin's own migrations already applied) and runs 16 of the 19 code migrations it runs on a database of that release of its own: the history records the other 3 as applied (below) |
+| `10.11.10`, `10.11.11` | `jellyfin-10.11.10`, `jellyfin-10.11.11` (10.11.11) | `/data` | applies none (the history records 18) and runs 15 code migrations (it records 3 as applied); its own first start there runs `UpdateNormalizedUsername` too, which the source records: there the first schema migration it applies reverts the later ones, and `AddNormalizedUsername`'s `Down` drops that routine's row |
+| `12.0` | `jellyfin-12.0` (12.0.0) | `/data` | applies none (the history records `MakeOwnerIdIndexesPartial`) and runs 4 code migrations (it records `MigrateRatingLevels` as applied) |
+| `12.1-from-10`, `12.1-from-12` | `jellyfin-12.1-from-10`, `jellyfin-12.1-from-12` (12.1.0) | `/data` | applies none (the history records `MakeOwnerIdIndexesPartial`) and runs 2 code migrations (it records `MigrateRatingLevels` as applied) |
 | `12.2-from-10`, `12.2-from-12`, `12.2-from-121`, `12.3-from-122`, `12.3-from-10`, `12.4-from-10` | the fixture of that name (12.2.0) | `/data` | runs no migration: the history is already the 12.2 set, which 12.3 and 12.4 keep |
 | `12.4-from-123` | `jellyfin-12.4-from-123` (12.2.0) | `/config` | runs no migration, as above |
 | `12.2-fresh`, `12.3-fresh`, `12.4-fresh` | that release's first run, not upgraded (12.2.0) | `/data` | runs no migration: the history is the fresh-install set (105 ids), which the export keeps as it is |
@@ -36,7 +36,23 @@ Jellyfin always runs at `/config`, its image's layout. Ferrofin runs at
 it there, so the export must rewrite every stored path from `/data` onto `/config`: with source and output both
 at `/config`, a missed rewrite could not show. The Debian-layout route is a source layout: Ferrofin adopts that
 fixture into its own package directories, its configuration apart, as the adoption gate does, and the export
-still writes the docker layout. Without the history rewrite, Jellyfin's start fails on the 10.11 routes:
+still writes the docker layout.
+
+The code migrations the exported history records as applied are those this gate showed damage a database
+Ferrofin maintained when Jellyfin runs them (gl-1902, owner decision 2026-11-24):
+- `MigrateRatingLevels` takes the parental rating each season and episode inherits from its series (`rated`);
+- `MigrateLinkedChildren` merges back the versions split in Ferrofin and deletes the additional parts of a movie
+  in parts (`video`), and once another version took the split one's place, its insert clashes with
+  `LinkedChildren`'s primary key and Jellyfin's start fails;
+- `FixIncorrectOwnerIdRelationships` takes its owner from each additional part, which then lists as a video of its
+  own (`videos`).
+
+`RestorePlaylistChildrenFromMetadata` did not reproduce for a playlist in the data directory (an emptied adopted
+playlist stays empty: the export leaves its stale `playlist.xml` out, gl-1903), so Jellyfin runs it, with the
+other code migrations. A playlist in a media library keeps its `playlist.xml`, which the fixtures do not hold;
+Jellyfin's own metadata refresh merges that file back anyway (`PlaylistMetadataService.MergeData`).
+
+Without the history rewrite, Jellyfin's start fails on the 10.11 routes:
 `migration 20260113102337_AddLinkedChildrenTable failed: SQLite Error 1: 'table "LinkedChildren" already exists'`;
 on the 12.0 and 12.1 routes it applies `20261002210711_MakeOwnerIdIndexesPartial`, which the check below fails;
 the 12.2 and later routes have nothing to rewrite.
@@ -114,7 +130,7 @@ Settings (environment), each a whole number of seconds:
 | Jellyfin | ready | its start failed (`Main: Error while starting server`; it keeps answering 503, so the wait stops at that line), it exited (named with its status), or it is not ready within `ROUNDTRIP_READY_TIMEOUT`. Ready is `/System/Ping` and then `/System/Info/Public` answering: Jellyfin's setup server answers `/System/Info/Public` while Jellyfin still runs its last migrations and optimises the database, and 503 to everything else; the real server then answers only `/System/Ping` until its core startup completes |
 | | its startup tasks finish | no scheduled task runs on two polls in a row, within `ROUNDTRIP_SCAN_TIMEOUT` |
 | | every migration it began finished | a `Perform migration` with no `was successfully applied`, named with its SQLite error ([`checks_boot.py`](checks_boot.py)); a log with no entry at all fails too |
-| | it ran the code migrations it runs on the source, and no schema migration | it applied a schema migration, which the exported history should record; or the code migrations it ran differ from those its own first start on the route's source ran, which `build-fixtures.sh` logged (the route's fourth field in `routes.sh`, `<it>.server.log` under the fixtures: a 12.4 fixture's build on that source, or the first start it gives the source, `oracle/first-start-12.4/<fixture>.server.log`), less those the source's history records (they ran there only after a revert, as on the 10.11.10 route), so the fixtures must have been built with the Jellyfin image the gate runs. A history that records too much shows here: the code migrations it left out do not run |
+| | it ran the code migrations it runs on the source, and no schema migration | it applied a schema migration, which the exported history should record; or the code migrations it ran differ from those its own first start on the route's source ran, which `build-fixtures.sh` logged (the route's fourth field in `routes.sh`, `<it>.server.log` under the fixtures: a 12.4 fixture's build on that source, or the first start it gives the source, `oracle/first-start-12.4/<fixture>.server.log`), less those the source's history records (they ran there only after a revert, as on the 10.11.10 route) and those the export records as applied (the `CodeRecordedAsApplied` rows of `crates/ferrofin-db/src/export/classify.rs` in the checkout the gate runs from, so the image must be built from it), so the fixtures must have been built with the Jellyfin image the gate runs. A history that records too much shows here: the code migrations it left out do not run; and one that records too little: a code migration recorded as applied runs |
 | | no ERR or FTL outside the allowlist | an error entry other than the blocked plugin repository, up to the probes; an error a probe causes is judged by the answers instead |
 | | every playlist's full metadata refresh completes | a playlist's `DateLastRefreshed` in its database has not moved within `ROUNDTRIP_SCAN_TIMEOUT` of `POST /Items/{id}/Refresh?metadataRefreshMode=FullRefresh` (jellyfin-web's "Refresh metadata", replacing nothing, for the metadata only), sent for every playlist its database holds ([`api.py`](api.py) `refresh-playlists`); or its database holds no playlist (the check would refresh nothing); or a refresh request is refused or unanswered. A full refresh runs every metadata reader whatever the file's time, so a stale `playlist.xml` in the export would merge its shares back (`PlaylistMetadataService.MergeData`), which the answers then show |
 | | answers equal Ferrofin's before the stop | `answers.txt` differs from `oracle.txt` through `adoption_normalise`, which leaves out ids, image sizes and the probes that differ by design; or the `userdata` lines differ with their item ids kept; or no answers came within `ROUNDTRIP_SCAN_TIMEOUT` |
@@ -142,6 +158,16 @@ by hand when the history rule or the checks above change:
 - **Stored paths left as the source had them:** run the gate with `--image` of a build whose export does
   not rewrite the stored paths. On the `10.11.8` route "every stored path is in the export, none under the
   directory Ferrofin ran at" fails, naming `/data/…` paths.
+- **A code migration recorded as applied left to run:** in a scratch copy of `gates/`, beside a copy of
+  `crates/ferrofin-db/src/export/classify.rs` with that row's disposition set back to `CodeLeftToRun`, have
+  `export_stage` delete its id from `$dst/jellyfin/data/jellyfin.db`'s history after the export. On the `10.11.8`
+  route: `MigrateRatingLevels` fails "answers equal Ferrofin's before the stop" on the `rated synthetic-child`
+  lines (`Velvet Static`'s season and episodes listed); `MigrateLinkedChildren` fails "ready", naming
+  `20260113120000_MigrateLinkedChildren` (`UNIQUE constraint failed: LinkedChildren.ParentId,
+  LinkedChildren.SortOrder`), and with the usage stage's merge of the third copy left out, the answers on the
+  `video` lines (both pairs merged again, `Stacked Relay` with no part); `FixIncorrectOwnerIdRelationships` fails
+  the answers on the `videos` line (`Stacked Relay - part2`). On the `12.0` and `12.1` routes `MigrateRatingLevels`
+  fails as on `10.11.8`.
 - **Every id recorded:** in a scratch copy of the repository's `gates/`, never in a commit, have
   `export_stage` insert every row of `crates/ferrofin-db/tests/data/jellyfin-12.4-fresh-history.tsv` the
   history lacks into `$dst/jellyfin/data/jellyfin.db` after the export (`INSERT OR IGNORE`). Jellyfin then runs none of its code migrations, and
@@ -198,10 +224,18 @@ The answers file has one answer per line:
 ```
 <status>  <metric>  <path>                                     smoke.sh's probes, as it prints them
 userdata <user> <item id> played=<0|1> fav=<0|1> resume=<ticks>   what the IsPlayed, IsFavorite and IsResumable
-                                                                filters return, for every user, sorted
+                                                                filters return, for every user, sorted; a playlist
+                                                                only through IsFavorite: what the other two say of
+                                                                it derives from its items, and upstream lists
+                                                                another user's private playlist there once it is
+                                                                empty, which Ferrofin does not
 userplays <user> <item id> count=<n> likes=<true|false|->        what the IsPlayed and Likes filters return, for
                                                                 every user, sorted
 user <name> admin=<0|1> disabled=… folders=… sessions=… …      every account's policy and settings, by name
+rated <user> <Season|Episode> <series>/<name>,…                 what each account limited by parental rating lists
+                                                                of them, "-" for none: /Items filters on the scores
+                                                                stored on each row, so a season or an episode that
+                                                                lost the score it inherits from its series shows
 badlogin <user> <status>                                       each account the stage creates with a password,
                                                                 signing in with a wrong one first
 login <user> <status> token=<yes|no>                           each account the stage creates (answers.GATE_USERS)
@@ -221,7 +255,14 @@ shares <owner> <playlist> = <user>:<can edit 0|1>,…            synthetic-adult
                                                                 "error=<status>" when refused (one it sees but does
                                                                 not own); "shares <owner> no session" when the copy
                                                                 has no web session of the owner's
+entries <owner> <playlist> = <item names>                      those playlists' items in their order, as the owner
+                                                                asks, "-" for none
 item <name> lock=<0|1> fields=<locked fields> overview=<n>     the probed account's movies, by name
+video <name> sources=<n> parts=<n>                             each of them: its media sources (its versions) and
+                                                                its additional parts
+videos <names>                                                 the videos the probed account lists that are no
+                                                                movie or episode, "-" for none: an additional part
+                                                                or a version that lost its owner or its primary
 ```
 
 Lists inside a line are sorted unless they say otherwise. The sign-in probes write device rows, tokens and
@@ -251,7 +292,19 @@ times `ROUNDTRIP_SCAN_TIMEOUT`. The actions, each checked in the answers it lead
   order`, shared with synthetic-child), as its owner: its `playlist.xml` still lists the share (the stage
   fails when it does not, as the scenario would test nothing), and the export must not carry the file to
   Jellyfin (gl-1903);
+- split both pairs of versions the fixtures merged in Jellyfin (gates/adoption/synthetic_media.py
+  `MERGED_PAIRS`: `Rowan Ferry` and `Saffron Gate`, each with its `Extended` copy), then merge the third copy
+  (`Saffron Gate Remastered`, narrower, so it ranks below) into the second pair's primary: from a 10.11 source
+  that primary's item data still lists the version split off, at the place the new link takes (gl-1902);
+- empty synthetic-adult's `Synthetic private playlist`, which the fixtures filled in Jellyfin, as its owner;
 - scan the library again, then capture.
+
+The fixtures also hold, for the probes above, a series rated above synthetic-child's limit whose season and
+episodes have no rating of their own (`Velvet Static`), a movie in two parts (`Stacked Relay`), and
+synthetic-adult's `Synthetic versions playlist` of it and the movie with local versions (`Twin Horizon`): what
+Jellyfin's code migrations `MigrateRatingLevels`, `MigrateLinkedChildren` and `FixIncorrectOwnerIdRelationships`
+were found to change on a database Ferrofin maintained (the emptied playlist is for
+`RestorePlaylistChildrenFromMetadata`, which was not).
 
 A new action keeps this command line and these line kinds, and adds the probe that shows it to
 `answers.py`.
@@ -313,5 +366,8 @@ The gate reuses the adoption gate's parts: its fixtures, `smoke.sh`, `lib.sh` (`
 - [`tests/test_livetv.py`](tests/test_livetv.py) checks the Live TV fixture's times and how `livetv.py` judges
   Jellyfin's answers; the fake server answers its Live TV calls, so every route above runs it.
 - The same fake server, in process, exercises `usage.py` and `answers.py` (a lost write included, a copy
-  with no shared playlist or no stale `playlist.xml`, an owner with no session) and `api.py`'s settle and
-  playlist refresh (waited for, never landing, another mode, no playlist at all).
+  with no shared playlist or no stale `playlist.xml`, an owner with no session, the versions split and merged,
+  the emptied playlist, a playlist the played filter returns) and `api.py`'s settle and playlist refresh (waited
+  for, never landing, another mode, no playlist at all).
+- `tests/roundtrip.bats` also runs the 10.11.8 route with an export that leaves to run a code migration the
+  export records as applied: it fails, naming it.

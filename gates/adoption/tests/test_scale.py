@@ -194,17 +194,23 @@ class TemplateTest(unittest.TestCase):
         db = Path(dir_.name) / "t.db"
         with closing(sqlite3.connect(db)) as conn:
             conn.executescript(SCHEMA)
-            for ident, kind, path, owner, primary, extra in [
-                    ("A1", MOVIE, "/m/a/a.mkv", None, None, None),             # a template: no owner at all
-                    ("A2", EPISODE, "/m/b/b.mkv", ZERO, None, 0),              # a template: dashed zero Guid, ExtraType 0
-                    ("A3", MOVIE, "/m/c/c.mkv", self.ZERO32, None, None),      # a template: undashed zero Guid
-                    ("B1", FOLDER, "/m/d", None, None, None),                  # not media
-                    ("B2", MOVIE, None, None, None, None),                     # no path
-                    ("B3", MOVIE, "/m/e/e.mkv", "A1", None, None),             # owned by another item
-                    ("B4", MOVIE, "/m/f/f.mkv", ZERO, "A1", None),             # a version of another item
-                    ("B5", MOVIE, "/m/g/g.mkv", ZERO, None, 1)]:               # an extra
-                conn.execute("INSERT INTO BaseItems (Id, Type, Path, OwnerId, PrimaryVersionId, ExtraType, Name) "
-                             "VALUES (?,?,?,?,?,?,?)", (ident, kind, path, owner, primary, extra, ident))
+            conn.execute("ALTER TABLE BaseItems ADD COLUMN Data TEXT")   # only templates() reads it
+            merged = '{"LinkedAlternateVersions":[{"Path":"/m/f/f.mkv"}],"AdditionalParts":[]}'
+            for ident, kind, path, owner, primary, extra, data in [
+                    ("A1", MOVIE, "/m/a/a.mkv", None, None, None, None),        # a template: no owner at all
+                    ("A2", EPISODE, "/m/b/b.mkv", ZERO, None, 0, "{}"),         # a template: dashed zero Guid, ExtraType 0
+                    ("A3", MOVIE, "/m/c/c.mkv", self.ZERO32, None, None,        # a template: undashed zero Guid,
+                     '{"LinkedAlternateVersions":[],"AdditionalParts":[]}'),   # nothing in either list
+                    ("B1", FOLDER, "/m/d", None, None, None, None),             # not media
+                    ("B2", MOVIE, None, None, None, None, None),                # no path
+                    ("B3", MOVIE, "/m/e/e.mkv", "A1", None, None, None),        # owned by another item
+                    ("B4", MOVIE, "/m/f/f.mkv", ZERO, "A1", None, None),        # a version of another item
+                    ("B5", MOVIE, "/m/g/g.mkv", ZERO, None, 1, None),           # an extra
+                    ("B6", MOVIE, "/m/h/h.mkv", ZERO, None, None, merged),      # versions merged by hand
+                    ("B7", MOVIE, "/m/i/i - part1.mkv", ZERO, None, None,       # a movie in parts
+                     '{"AdditionalParts":["/m/i/i - part2.mkv"]}')]:
+                conn.execute("INSERT INTO BaseItems (Id, Type, Path, OwnerId, PrimaryVersionId, ExtraType, Name, Data) "
+                             "VALUES (?,?,?,?,?,?,?,?)", (ident, kind, path, owner, primary, extra, ident, data))
             self.assertEqual([row["Id"] for row in scale.templates(conn)], ["A1", "A2", "A3"])
 
 

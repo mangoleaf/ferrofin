@@ -14,7 +14,7 @@
 //! carry: Jellyfin compares ids exactly and never looks up one it does not
 //! know, so they are harmless.
 
-use Disposition::{CodeLeftToRun, Retired, Schema};
+use Disposition::{CodeLeftToRun, CodeRecordedAsApplied, Retired, Schema};
 
 /// What the export does with one `__EFMigrationsHistory` id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +31,11 @@ pub enum Disposition {
     /// source's history has it (it ran before adoption), never added.
     CodeLeftToRun,
     /// A code migration recorded as applied even where the source's history
-    /// lacks it, because Ferrofin already did its work or running it would
-    /// damage what Ferrofin maintains.
+    /// lacks it: Ferrofin did its work when it adopted the database, and the
+    /// round-trip gate showed that running it on a database Ferrofin
+    /// maintained damages it (owner decision on gl-1902: only those). The
+    /// export refuses a database without the proof of that work
+    /// (`super::proof`).
     CodeRecordedAsApplied,
     /// The id of a routine an earlier release retired or re-dated, which the
     /// target no longer knows. Kept when the source's history has it, never
@@ -120,12 +123,12 @@ pub const JELLYFIN_MIGRATIONS: [(&str, Disposition); 109] = [
     ("20250925203415_ExtendPeopleMapKey", Schema),
     ("20251009200000_CleanMusicArtist", CodeLeftToRun),
     ("20260113102337_AddLinkedChildrenTable", Schema),
-    ("20260113120000_MigrateLinkedChildren", CodeLeftToRun),
+    ("20260113120000_MigrateLinkedChildren", CodeRecordedAsApplied),
     ("20260113203012_ChangeOwnerIdToGuid", Schema),
     ("20260113230000_CleanupOrphanedExtras", CodeLeftToRun),
     ("20260113233000_AddForeignKeyToOwnerId", Schema),
     ("20260113233500_DropExtraIdsColumn", Schema),
-    ("20260115120000_FixIncorrectOwnerIdRelationships", CodeLeftToRun),
+    ("20260115120000_FixIncorrectOwnerIdRelationships", CodeRecordedAsApplied),
     ("20260116114245_AddLatestItemsDateCreatedIndexes", Schema),
     ("20260118182305_AddIndicesToImageInfo", Schema),
     ("20260130232147_AddBaseItemNameIndex", Schema),
@@ -159,6 +162,6 @@ pub const JELLYFIN_MIGRATIONS: [(&str, Disposition); 109] = [
     ("20260911120000_StripEmbeddedLinkedChildren", CodeLeftToRun),
     ("20260912120000_HarmonizeConflictingUserData", CodeLeftToRun),
     ("20260915104305_FixNullEncoderPreset", CodeLeftToRun),
-    ("20260915120000_MigrateRatingLevels", CodeLeftToRun),
+    ("20260915120000_MigrateRatingLevels", CodeRecordedAsApplied),
     ("20261002210711_MakeOwnerIdIndexesPartial", Schema),
 ];

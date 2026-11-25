@@ -18,9 +18,10 @@ setup() {
     python3 "$BATS_TEST_DIRNAME/fake_server.py" copy "fixtures/${spec%%:*}"
     echo "${spec#*:}" > "fixtures/${spec%%:*}/fake-generation"
   done
-  # The code migrations the export leaves to run on a 10.11.8 source, and the build logs of Jellyfin's own
-  # first start on each route's source: on 10.11.8 it applied a schema migration too, on 12.3 nothing.
-  printf '%s\n' "${CODE_MIGRATIONS[@]}" > fixtures/jellyfin-10.11.8/fake-left-to-run
+  # The code migrations the export leaves to run on a 10.11.8 source (not the one it records as applied), and the
+  # build logs of Jellyfin's own first start on each route's source: on 10.11.8 it applied a schema migration and
+  # ran both code migrations, on 12.3 nothing.
+  printf '%s\n' "${CODE_MIGRATIONS[@]:1}" > fixtures/jellyfin-10.11.8/fake-left-to-run
   { head -n 1 "$BATS_TEST_DIRNAME/jellyfin-ok.log"
     echo '[07:53:39] [INF] [10] InternalDatabaseMigration: Perform migration 20260113102337_AddLinkedChildrenTable'
     for ran in "${CODE_MIGRATIONS[@]}"; do echo "[07:53:39] [INF] [10] InternalCodeMigration: Perform migration $ran"; done
@@ -30,6 +31,8 @@ setup() {
     FAKE_JELLYFIN FAKE_EXPORT
 }
 
+# The code migrations Jellyfin's own first start runs on a 10.11.8 source: the first one the export records as
+# applied (crates/ferrofin-db/src/export/classify.rs, gl-1902), so it must not run on the export.
 CODE_MIGRATIONS=(20260113120000_MigrateLinkedChildren 20260915104305_FixNullEncoderPreset)
 # The routes a whole run here runs, the two setup fakes fixtures for: test_routes.py checks the others
 # against the fixtures gates/adoption builds.
@@ -317,7 +320,7 @@ EOS
   # the export ran from the image under test, as the calling user, on the server's data directory at its path
   grep -E -- "^run --pull never --cidfile $TMP/w/10.11.8/export.cid --name rt-both-10.11.8-export --user $(id -u):$(id -g) --network none -e FERROFIN_DATA_DIR=/data -v $TMP/w/10.11.8/ferrofin:/data -v $TMP/w/10.11.8:/route ferrofin-roundtrip:both export-jellyfin --out /route/jellyfin$" \
     state/calls
-  grep -c 'InternalCodeMigration: Perform migration' "$TMP/w/10.11.8/jellyfin.log" | grep -qx 2
+  grep -c 'InternalCodeMigration: Perform migration' "$TMP/w/10.11.8/jellyfin.log" | grep -qx 1
   # a passing route keeps its logs and answers, not its copies
   [ ! -e "$TMP/w/10.11.8/jellyfin" ]
   [ ! -e "$TMP/w/12.4-from-123/ferrofin" ]
@@ -348,11 +351,18 @@ EOS
 @test "run.sh: an export that records every id fails the 10.11.8 route: the code migrations Jellyfin runs on the source did not run" {
   FAKE_EXPORT=all-recorded run run_gate "$TMP/w" --only 10.11.8
   [ "$status" -eq 1 ]
-  [[ "$output" == *"FAIL  10.11.8        2 code migration(s) it runs on the source did not run: ${CODE_MIGRATIONS[0]}, ${CODE_MIGRATIONS[1]}"* ]]
+  [[ "$output" == *"FAIL  10.11.8        1 code migration(s) it runs on the source did not run: ${CODE_MIGRATIONS[1]}"* ]]
   check="it ran the code migrations it runs on the source, and no schema migration"
   [ "$(jq -r --arg c "$check" 'select(.event == "check" and .check == $c) | .verdict' "$TMP/w/results.jsonl")" = FAIL ]
   # the one check that failed: Jellyfin started and answered as Ferrofin did
   [ "$(jq -r 'select(.event == "check" and .verdict == "FAIL") | .check' "$TMP/w/results.jsonl")" = "$check" ]
+}
+
+@test "run.sh: an export that leaves to run a code migration it should record as applied fails the 10.11.8 route, naming it" {
+  printf '%s\n' "${CODE_MIGRATIONS[@]}" > fixtures/jellyfin-10.11.8/fake-left-to-run   # the history as before gl-1902
+  run run_gate "$TMP/w" --only 10.11.8
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  10.11.8        1 code migration(s) ran that it does not run on the source: ${CODE_MIGRATIONS[0]}"* ]]
 }
 
 @test "run.sh: an export that fails fails its route, Jellyfin is never booted, and the export's container is removed" {
@@ -433,6 +443,9 @@ EOS
   mkdir -p repo/gates
   gates=$(cd "$ROUNDTRIP/.." && pwd)   # resolved: a source ending in .. would copy into repo/ itself
   cp -r "$gates/lib.sh" "$gates/result.py" "$gates/adoption" "$gates/roundtrip" repo/gates/
+  # the export's classification, which checks_boot.py reads from the repository the gate runs in
+  mkdir -p repo/crates/ferrofin-db/src/export
+  cp "$gates/../crates/ferrofin-db/src/export/classify.rs" repo/crates/ferrofin-db/src/export/
   git -C repo init -q
   pids=()
   for side in a b; do

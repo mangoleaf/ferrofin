@@ -1980,7 +1980,7 @@ impl FerrofinItemPersistenceService {
         // being split as one country-prefixed rating. Earlier keys:
         // `rating_levels_v121` (12.1) and `rating_levels_all_countries` (the
         // first pass with every country's table loaded).
-        const META_KEY: &str = "rating_levels_v122";
+        const META_KEY: &str = ferrofin_db::repair_markers::RATING_LEVELS;
         // The upstream routine this key ports. Jellyfin runs a routine only
         // while its id is missing from `__EFMigrationsHistory`, and on an
         // adopted 12.2 database it is there: the routine ran and Jellyfin's
