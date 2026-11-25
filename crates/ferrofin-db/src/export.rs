@@ -20,6 +20,8 @@
 //!   records as applied;
 //! - `drop_objects`: removing Ferrofin's own tables and indexes from the copy;
 //! - `paths`: the stored paths, rewritten onto the output's layout;
+//! - `earlier_art`: the art earlier builds saved in an item's `{ID}` folder,
+//!   moved into the item's own folder in the output, its rows with it;
 //! - `carried`: what Ferrofin's own tables hold that Jellyfin keeps in files
 //!   (Live TV tuners, guides and timers, LDAP-Auth's uid map), read before
 //!   they are removed;
@@ -50,6 +52,7 @@ pub use classify::{
 pub use containers::{ContainerFile, LibraryContainer};
 pub use counts::FirstStartCounts;
 pub use drop_objects::{DroppedObjects, DroppedTable};
+pub use earlier_art::ArtRelocation;
 pub use history::HistoryRewrite;
 pub use layout::{DOCKER, Layout, LeftOut, SourceDirs};
 pub use paths::PathRewrite;
@@ -61,6 +64,7 @@ mod classify;
 mod containers;
 mod counts;
 mod drop_objects;
+mod earlier_art;
 mod history;
 mod layout;
 mod paths;
@@ -190,6 +194,9 @@ pub struct DatabaseEdits {
     pub carried: CarriedRows,
     /// The rows Jellyfin's code migrations change on its first start.
     pub counts: FirstStartCounts,
+    /// The art earlier builds saved in an item's `{ID}` or `{id}` folder,
+    /// moved into the item's own folder in the output, with its rows.
+    pub art: ArtRelocation,
 }
 
 /// The export's changes to its staged copy of the database, in order, on the
@@ -198,10 +205,13 @@ pub struct DatabaseEdits {
 /// INTO` writes the snapshot, so the snapshot holds no free pages from them
 /// and two exports of one source stay equal. Each step is a file of its own; a
 /// step added later goes here, with its field in [`DatabaseEdits`]. The paths
-/// are rewritten onto `layout` from `dirs` and the directories the rows name.
+/// are rewritten onto `layout` from `dirs` and the directories the rows name,
+/// and the art earlier builds saved is moved in `out`, the output the source
+/// is copied into.
 async fn edit_staged(
     conn: &mut SqliteConnection,
     history: Option<&history::SourceHistory>,
+    out: &Path,
     (dirs, layout): (&SourceDirs, &Layout),
 ) -> Result<DatabaseEdits> {
     let mut tx = sqlx::Connection::begin(conn).await?;
@@ -214,6 +224,8 @@ async fn edit_staged(
         paths: paths::rewrite(&mut tx, dirs, layout).await?,
         carried,
         counts: counts::read(&mut tx).await?,
+        // After the paths' rewrite, which spells them on the layout.
+        art: earlier_art::relocate(&mut tx, out, layout).await?,
     };
     tx.commit().await?;
     Ok(edits)
@@ -248,7 +260,9 @@ async fn edit_staged(
 /// what Ferrofin's own tables hold that Jellyfin keeps in files is read
 /// ([`CarriedRows`]) before those tables and Ferrofin's indexes are removed
 /// from it ([`DroppedObjects`]), and its stored paths are rewritten onto the
-/// layout ([`PathRewrite`]).
+/// layout ([`PathRewrite`]). The art earlier builds saved in an item's `{ID}`
+/// or `{id}` folder is then moved in the output into the item's own folder,
+/// where Jellyfin keeps it, and its rows follow ([`ArtRelocation`]).
 ///
 /// What is copied is digested while it is copied and again once the database
 /// snapshot is written, and so are the files SQLite keeps beside the
@@ -326,8 +340,18 @@ pub async fn export_data_dir(
     .await?;
     let exported = out.join(EXPORTED_DATABASE);
     let (edits, library_containers) =
-        snapshot::snapshot_database(&resolved, &exported, (dirs, layout)).await?;
+        snapshot::snapshot_database(&resolved, &exported, out, (dirs, layout)).await?;
     let mut dirs_copied = copied.dirs;
+    // The folders the art's move made take the mode and time of the folder
+    // the art came from; those it left empty are no longer there to finish.
+    for (made, like) in &edits.art.made {
+        let like = out.join(like);
+        let from = dirs_copied.iter().find(|(to, _)| *to == like);
+        if let Some(from) = from.map(|(_, from)| from.clone()) {
+            dirs_copied.push((out.join(made), from));
+        }
+    }
+    dirs_copied.retain(|(to, _)| !edits.art.removed.iter().any(|dir| *to == out.join(dir)));
     // A source with no `data/` (a native one) has none to take the mode from:
     // the snapshot's directory takes the source's own.
     let data = exported.parent().map(Path::to_owned);

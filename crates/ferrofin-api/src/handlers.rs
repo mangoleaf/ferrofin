@@ -1690,8 +1690,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    published by finish_artwork's image saver), \
                    and where every image the server keeps is saved: the item's \
                    GetInternalMetadataPath, {metadata}/library/{idN[..2]}/{idN}, under \
-                   GetStandardSavePath's name for a save that is not local (ferrofin-providers \
-                   local_images/merge.rs own_art_dir and internal_image_stem; used by \
+                   GetStandardSavePath's name for a save that is not local (ferrofin-db \
+                   art.rs own_art_dir and internal_image_stem, re-exported by \
+                   ferrofin-providers local_images/merge.rs; used by \
                    provider_manager.rs write_image_file and write_automatic_image for an \
                    upload, a chosen remote image, a refresh's downloads and a plugin's \
                    images; ferrofin-core dynamic_images.rs refresh_item for a collage or a \

@@ -266,6 +266,14 @@ fn print_paths(config: &Config, target: &Path, summary: &ExportSummary) {
             )
         }
     );
+    let moved = summary.edits.art.moved.len() as u64;
+    if moved > 0 {
+        println!(
+            "{} that earlier Ferrofin builds saved in an item's {}/library/{{ID}} or {{id}} folder moved into the item's own folder, where Jellyfin keeps its art, each under the name Jellyfin gives it.",
+            count(moved, "image", "images"),
+            DOCKER.metadata()
+        );
+    }
     let elsewhere = ran_elsewhere(config, summary);
     if !elsewhere.is_empty() {
         println!(
@@ -565,10 +573,19 @@ fn loss_report(
             "  The database's root and library rows name another data directory than the one exported: the server ran at another path, or the directory moved since. The stored paths under it were rewritten for Jellyfin too; the export printed both directories.\n",
         );
     }
+    let kept = &edits.art.kept;
+    if let Some(first) = kept.first() {
+        let _ = writeln!(
+            report,
+            "  {} that earlier Ferrofin builds saved in an item's {{ID}} or {{id}} folder stayed there (the first: {first}): the name Jellyfin gives each in the item's own folder is another stored image's. Jellyfin serves each, but does not count it as the item's own art: a collage or a library tile there is never drawn again, and the folder is left behind when the item is deleted.",
+            count(kept.len() as u64, "image", "images")
+        );
+    }
     container_files(&mut report, inputs);
     if inputs.left_out.is_empty()
         && !inputs.metadata_missing
         && !inputs.ran_elsewhere
+        && kept.is_empty()
         && inputs.container_files.is_empty()
         && inputs.library_containers.is_empty()
     {
@@ -1139,8 +1156,8 @@ async fn write_configuration(export: &ConfigExport, out: &Path) -> anyhow::Resul
 mod tests {
     use ferrofin_core::config_export::{ConfigExport, LiveTvExport, NotExported};
     use ferrofin_db::export::{
-        CarriedRows, ContainerFile, DatabaseEdits, DroppedObjects, DroppedTable, FirstStartCounts,
-        HistoryRewrite, LibraryContainer, MirroredLiveTv,
+        ArtRelocation, CarriedRows, ContainerFile, DatabaseEdits, DroppedObjects, DroppedTable,
+        FirstStartCounts, HistoryRewrite, LibraryContainer, MirroredLiveTv,
     };
 
     use super::{ReportInputs, amount, loss_report, mebibytes, plugins};
@@ -1229,6 +1246,15 @@ mod tests {
                 credits: 3,
                 play_states: 1,
                 ..FirstStartCounts::default()
+            },
+            art: ArtRelocation {
+                kept: vec![
+                    "/config/metadata/library/CCCCCCCC-0000-4000-8000-000000000003/primary.jpg"
+                        .to_owned(),
+                    "/config/metadata/library/DDDDDDDD-0000-4000-8000-000000000004/thumb.jpg"
+                        .to_owned(),
+                ],
+                ..ArtRelocation::default()
             },
             ..DatabaseEdits::default()
         }
