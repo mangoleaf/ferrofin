@@ -82,6 +82,47 @@ impl SimilarItemsRepository {
         Ok(rows.into_iter().map(|row| (row.item, row.score)).collect())
     }
 
+    /// Phase 1 of C# `GetBatchSimilarItemsAsync` (`ComputeBatchScoresAsync`):
+    /// every seed's weighted-overlap score of every candidate of the stored
+    /// `candidate_types` other than the seed itself, as
+    /// `(seed, candidate, score)`, in one statement for all `seed_ids`. The
+    /// weights and the seed-side person de-dup are
+    /// [`Self::weighted_similar_items`]'s.
+    ///
+    /// Unranked and uncut: the manager takes each seed's top `limit * 3` and
+    /// their union itself, because a SQL window function cost more than the
+    /// per-seed statements this replaces. An empty `seed_ids` or
+    /// `candidate_types` matches nothing.
+    pub(crate) async fn weighted_scores(
+        &self,
+        seed_ids: &[Uuid],
+        candidate_types: &[&str],
+    ) -> Result<Vec<(Uuid, Uuid, i64)>, ServiceError> {
+        if seed_ids.is_empty() || candidate_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let seeds = ferrofin_db::padded_in_list(seed_ids);
+        let sql = weighted_scores_sql(seeds.len(), candidate_types.len());
+        let mut query = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
+        for seed in seeds {
+            query = query.bind(guid_to_db(*seed));
+        }
+        for type_name in candidate_types {
+            query = query.bind((*type_name).to_owned());
+        }
+        let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(seed, candidate, score)| {
+                Some((
+                    Uuid::parse_str(&seed).ok()?,
+                    Uuid::parse_str(&candidate).ok()?,
+                    score,
+                ))
+            })
+            .collect())
+    }
+
     /// One item's provider ids, keyed by provider name.
     ///
     /// A remote similarity provider is keyed by the seed's external id (TMDB,
@@ -298,6 +339,15 @@ impl SimilarItemsRepository {
     }
 }
 
+/// `MovieSimilarItemsProvider`'s item-value weights over `ItemValues` row
+/// `iv0`: a shared genre 10, studio 5, tag 5 (`Type` 2, 3, 4).
+const ITEM_VALUE_WEIGHT: &str =
+    r#"CASE iv0."Type" WHEN 2 THEN 10 WHEN 3 THEN 5 WHEN 4 THEN 5 ELSE 0 END"#;
+
+/// Its people weights over `Peoples` row `p0`: a shared director 50, an actor
+/// or guest star 15.
+const PERSON_WEIGHT: &str = r#"CASE p0."PersonType" WHEN 'Director' THEN 50 ELSE 15 END"#;
+
 /// The weighted-overlap statement of [`SimilarItemsRepository::weighted_similar_items`]
 /// for `type_count` candidate types and `exclude_count` excluded ids. Binds:
 /// `?1` the seed, then the types, then the excludes, then the limit.
@@ -307,18 +357,16 @@ fn weighted_similar_sql(type_count: usize, exclude_count: usize) -> String {
     // with `Id`+`Type` any more) walks every row of the candidate types
     // and builds an automatic index over `s` — `detail:similar` went from
     // 4.9 ms to 7.8 ms p50 on the bench corpus before the pin.
-    let mut sql = String::from(
+    let mut sql = format!(
         r#"SELECT bi.*, s.score AS "_Score" FROM (
                SELECT scored."cand" AS id, SUM(scored."w") AS score FROM (
-                   SELECT ivm2."ItemId" AS "cand",
-                          CASE iv0."Type" WHEN 2 THEN 10 WHEN 3 THEN 5 WHEN 4 THEN 5 ELSE 0 END AS "w"
+                   SELECT ivm2."ItemId" AS "cand", {ITEM_VALUE_WEIGHT} AS "w"
                    FROM "ItemValuesMap" ivm0
                    JOIN "ItemValues" iv0 ON iv0."ItemValueId" = ivm0."ItemValueId"
                    JOIN "ItemValuesMap" ivm2 ON ivm2."ItemValueId" = ivm0."ItemValueId"
                    WHERE ivm0."ItemId" = ?1 AND iv0."Type" IN (2, 3, 4)
                    UNION ALL
-                   SELECT pm2."ItemId" AS "cand",
-                          CASE p0."PersonType" WHEN 'Director' THEN 50 ELSE 15 END AS "w"
+                   SELECT pm2."ItemId" AS "cand", {PERSON_WEIGHT} AS "w"
                    FROM (SELECT DISTINCT "PeopleId" FROM "PeopleBaseItemMap"
                          WHERE "ItemId" = ?1) pm0
                    JOIN "Peoples" p0 ON p0."Id" = pm0."PeopleId"
@@ -360,6 +408,42 @@ fn weighted_similar_sql(type_count: usize, exclude_count: usize) -> String {
     sql.push_str(r#" ORDER BY s.score DESC, bi."Id" ASC LIMIT ?"#);
     sql.push_str(&next.to_string());
     sql
+}
+
+/// The statement of [`SimilarItemsRepository::weighted_scores`] for
+/// `seed_count` seeds and `type_count` candidate types. Binds: the seeds
+/// (`?1`…, both arms read them), then the types.
+fn weighted_scores_sql(seed_count: usize, type_count: usize) -> String {
+    let seeds = ferrofin_db::numbered_placeholders(1..=seed_count);
+    let types = ferrofin_db::numbered_placeholders(seed_count + 1..=seed_count + type_count);
+    // `CROSS JOIN`: each seed's own values drive the genre arm. From 8
+    // (padded) seeds on, the planner otherwise starts from every genre, tag
+    // and studio row and probes the map for each seed. The type set filters
+    // the grouped pairs, outside `s`: written into the arms' `WHERE`, it
+    // became an `ItemId` seek per movie for every shared value, about 5x
+    // slower on 3,000 movies. The plan test catches both shapes.
+    format!(
+        r#"SELECT s."seed", s."cand", s."score" FROM (
+               SELECT scored."seed", scored."cand", SUM(scored."w") AS "score" FROM (
+                   SELECT ivm0."ItemId" AS "seed", ivm2."ItemId" AS "cand",
+                          {ITEM_VALUE_WEIGHT} AS "w"
+                   FROM "ItemValuesMap" ivm0
+                   CROSS JOIN "ItemValues" iv0 ON iv0."ItemValueId" = ivm0."ItemValueId"
+                   CROSS JOIN "ItemValuesMap" ivm2 ON ivm2."ItemValueId" = ivm0."ItemValueId"
+                   WHERE ivm0."ItemId" IN ({seeds}) AND iv0."Type" IN (2, 3, 4)
+                   UNION ALL
+                   SELECT pm0."ItemId", pm2."ItemId", {PERSON_WEIGHT}
+                   FROM (SELECT DISTINCT "ItemId", "PeopleId" FROM "PeopleBaseItemMap"
+                         WHERE "ItemId" IN ({seeds})) pm0
+                   JOIN "Peoples" p0 ON p0."Id" = pm0."PeopleId"
+                   JOIN "PeopleBaseItemMap" pm2 ON pm2."PeopleId" = pm0."PeopleId"
+                   WHERE p0."PersonType" IN ('Director', 'Actor', 'GuestStar')
+               ) scored
+               WHERE scored."cand" <> scored."seed"
+               GROUP BY scored."seed", scored."cand"
+           ) s
+           WHERE s."cand" IN (SELECT "Id" FROM "BaseItems" WHERE "Type" IN ({types}))"#
+    )
 }
 
 /// Test hooks for the manager's tests.
@@ -424,6 +508,48 @@ mod tests {
         }
         assert!(
             !plan.iter().any(|d| d.contains("FOR DISTINCT")),
+            "{plan:#?}"
+        );
+    }
+
+    /// The batched score pass seeks each seed's values and people by
+    /// `ItemId`, fans out by value and person id alone, and reads the type
+    /// set off the covering `Type` index once: no `BaseItems` row per pair and
+    /// no `ItemId` seek per candidate.
+    #[tokio::test]
+    async fn the_batched_scores_start_from_each_seed_and_read_the_types_once() {
+        let db = Database::connect_in_memory().await.expect("db");
+        db.run_migrations().await.expect("migrations");
+        // Eight seeds: the padded list a default request (5 + 5 baselines)
+        // binds, and the size from which an unpinned join order flips.
+        let explain = format!("EXPLAIN QUERY PLAN {}", super::weighted_scores_sql(8, 3));
+        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
+        for seed in 0..8 {
+            query = query.bind(format!("seed-{seed}"));
+        }
+        for kind in ["Movie", "Trailer", "LiveTvProgram"] {
+            query = query.bind(kind);
+        }
+        let plan: Vec<String> = query
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .into_iter()
+            .map(|(_, _, _, detail)| detail)
+            .collect();
+        for step in [
+            "SEARCH ivm0 USING INDEX IX_ItemValuesMap_ItemId (ItemId=?)",
+            "SEARCH ivm2 USING COVERING INDEX sqlite_autoindex_ItemValuesMap_1 (ItemValueId=?)",
+            "SEARCH PeopleBaseItemMap USING COVERING INDEX sqlite_autoindex_PeopleBaseItemMap_1 (ItemId=?)",
+            "SEARCH pm2 USING COVERING INDEX IX_PeopleBaseItemMap_PeopleId_ItemId (PeopleId=?)",
+            "SEARCH BaseItems USING COVERING INDEX IX_BaseItems_Type_TopParentId_Id (Type=?)",
+        ] {
+            assert!(plan.iter().any(|d| d == step), "{step} not in {plan:#?}");
+        }
+        assert!(
+            !plan
+                .iter()
+                .any(|d| d.contains("FOR DISTINCT") || d.contains("SCAN BaseItems")),
             "{plan:#?}"
         );
     }
