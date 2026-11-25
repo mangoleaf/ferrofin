@@ -40185,18 +40185,25 @@ mod tests {
                     )),
                 )
                 .with_recording_paths(Arc::new(move || read.lock().unwrap().clone()));
-        let probed = async || -> (Option<i64>, i64) {
-            let ticks: Option<i64> = sqlx::query_scalar(
-                r#"SELECT "RunTimeTicks" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
-            )
-            .fetch_one(db.pool())
-            .await
-            .expect("the recording's item");
-            let streams: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "MediaStreamInfos""#)
-                .fetch_one(db.pool())
+        let probed = async || -> (Option<i64>, usize) {
+            use ferrofin_traits::persistence::MediaStreamRepository as _;
+            let item = crate::test_support::item_repository_over(db.clone())
+                .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                    path: Some(file.to_string_lossy().into_owned()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .pop()
+                .expect("the recording's item");
+            let streams = FerrofinMediaStreamRepository::new(db.clone())
+                .get_media_streams(&ferrofin_traits::persistence::MediaStreamQuery {
+                    item_id: uuid::Uuid::parse_str(&item.id).unwrap(),
+                    ..Default::default()
+                })
                 .await
                 .unwrap();
-            (ticks, streams)
+            (item.run_time_ticks, streams.len())
         };
 
         scanner.scan_all().await.unwrap();
