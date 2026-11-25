@@ -278,10 +278,13 @@ async fn export_jellyfin_copies_a_stopped_data_directory_and_leaves_it_untouched
     assert!(!stdout.contains(CERTIFICATE_PASSWORD) && !stderr.contains(CERTIFICATE_PASSWORD));
     assert!(!configuration["config/network.xml"].contains(CERTIFICATE_PASSWORD));
     // Every other file is a copy; the stale copies of Jellyfin's files were
-    // replaced above.
+    // replaced above, and a library's options.json is left out: the export
+    // wrote the options.xml beside it (gl-1931).
     let mut expected = before.clone();
     expected.retain(|path, _| {
-        !path.starts_with("data") && !CONFIGURATION.iter().any(|c| path == Path::new(c))
+        !path.starts_with("data")
+            && !CONFIGURATION.iter().any(|c| path == Path::new(c))
+            && path != Path::new("root/default/Movies/options.json")
     });
     assert_eq!(copied, expected);
     assert_eq!(exported_names(&out).await, ["one", "two", "three"]);

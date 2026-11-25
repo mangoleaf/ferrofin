@@ -233,7 +233,10 @@ async fn edit_staged(
 /// `data/playlists` and the `collection.xml` of each `[boxset]` folder in its
 /// `data/collections`, which may hold what Jellyfin last wrote rather than
 /// the database's changes since, and which Jellyfin's metadata refresh would
-/// merge back ([`ExportSummary::container_files`]).
+/// merge back ([`ExportSummary::container_files`]). So is each library's
+/// `options.json` in the data directory's `root/default`, Ferrofin's own file:
+/// the export writes the `options.xml` Jellyfin reads beside it, and a later
+/// adoption by Ferrofin would take the stale copy over that.
 /// The snapshot's `__EFMigrationsHistory` is rewritten ([`HistoryRewrite`]),
 /// what Ferrofin's own tables hold that Jellyfin keeps in files is read
 /// ([`CarriedRows`]) before those tables and Ferrofin's indexes are removed
