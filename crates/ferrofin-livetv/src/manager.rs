@@ -44,9 +44,7 @@ use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, ParentalRestrictions};
 use ferrofin_traits::providers::{ParentalRatingScorer, ProviderManager};
-use ferrofin_traits::stubs::{
-    LiveStreamFile, LiveTvChannelQuery, LiveTvManager, RecordingVisibility,
-};
+use ferrofin_traits::stubs::{LiveStreamFile, LiveTvChannelQuery, LiveTvManager};
 use ferrofin_traits::system::LocalApiAccess;
 use serde::de::DeserializeOwned;
 
@@ -4863,97 +4861,6 @@ impl LiveTvManager for FerrofinLiveTvManager {
         .await
     }
 
-    async fn get_recordings(&self) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        self.get_recordings_matching(
-            &ferrofin_model::live_tv::RecordingQuery::default(),
-            None,
-            &DtoOptions::default(),
-            None,
-        )
-        .await
-    }
-
-    async fn get_recordings_matching(
-        &self,
-        query: &ferrofin_model::live_tv::RecordingQuery,
-        user: Option<&UserEntity>,
-        options: &DtoOptions,
-        visible: Option<&dyn RecordingVisibility>,
-    ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        use futures_util::StreamExt as _;
-        // Read once: `usable_cores` reads the cgroup files on every call.
-        static CHECKS_AT_ONCE: OnceLock<usize> = OnceLock::new();
-
-        let mut rows = crate::dvr_repository::recording_rows(&self.db, query).await?;
-        // Every row is checked, not just the page's: the files that have gone
-        // decide `TotalRecordCount` and where the page starts. On a network
-        // share each check is a round trip, so they overlap, as many at a time
-        // as the server has usable cores.
-        // Collected first: a stream `map` closure over borrowed rows makes the
-        // returned future not provably `Send` (higher-ranked lifetime).
-        let checks: Vec<_> = rows
-            .iter()
-            .map(|row| async move {
-                Self::recording_file_is_gone(row)
-                    .await
-                    .then(|| row.id.clone())
-            })
-            .collect();
-        let gone: HashSet<String> = futures_util::stream::iter(checks)
-            .buffer_unordered(*CHECKS_AT_ONCE.get_or_init(|| {
-                usize::try_from(ferrofin_db::database::usable_cores()).unwrap_or(1)
-            }))
-            .filter_map(std::future::ready)
-            .collect()
-            .await;
-        rows.retain(|row| !gone.contains(&row.id));
-        let rows = Self::visible_recording_rows(rows, visible).await?;
-        let start_index = query.start_index.unwrap_or(0);
-        let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
-        let page: Vec<crate::projection::RecordingRow> = rows
-            .into_iter()
-            .skip(usize::try_from(start_index).unwrap_or(0))
-            .take(
-                query
-                    .limit
-                    .and_then(|l| usize::try_from(l).ok())
-                    .unwrap_or(usize::MAX),
-            )
-            .collect();
-
-        // `RemoveFields(options)` on the list path, as the channel and
-        // programme lists do.
-        let mut list_options = options.clone();
-        remove_fields(&mut list_options);
-        let dtos = self.recording_dtos(&page, &list_options, user).await?;
-        Ok(QueryResult::new(Some(start_index), Some(total), dtos))
-    }
-
-    async fn get_recording_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok(crate::dvr_repository::recording_row(&self.db, id)
-            .await?
-            .map(|row| crate::projection::recording_entity(&row, parse_dt)))
-    }
-
-    async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
-        let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
-            return Ok(None);
-        };
-        if Self::recording_file_is_gone(&row).await {
-            return Ok(None);
-        }
-        // The single-recording path keeps every requested field (upstream's
-        // `GetRecording` uses `new DtoOptions()` and never strips).
-        Ok(self
-            .recording_dtos(
-                std::slice::from_ref(&row),
-                &DtoOptions::with_all_fields(true),
-                None,
-            )
-            .await?
-            .pop())
-    }
-
     async fn get_active_recording_path(
         &self,
         timer_id: &str,
@@ -4993,90 +4900,109 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // MediaType.Audio : MediaType.Video` — the same mapping
         // `projection::channel_media_type` stores and `apply_program_info`
         // gives a programme.
-        if let Some(row) = crate::guide_repository::channel_row(&self.db, id).await? {
-            return Ok(Some(radio_or_tv_media_type(&row.channel_type).to_owned()));
-        }
-        // A recording is `MediaType.Video` whatever its channel: upstream
-        // writes every capture as a `.ts` file (`RecordingsManager`,
-        // `EncodedRecorder`), which the library resolves as a video item, a
-        // radio programme's too. Its entity says the same
-        // (`projection::recording_entity`).
-        Ok(crate::dvr_repository::recording_row(&self.db, id)
+        Ok(crate::guide_repository::channel_row(&self.db, id)
             .await?
-            .map(|_| "Video".to_owned()))
+            .map(|row| radio_or_tv_media_type(&row.channel_type).to_owned()))
     }
 
     async fn get_recording_media_sources(
         &self,
-        recording_id: Uuid,
+        path: &str,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        let Some(row) = crate::dvr_repository::recording_row(&self.db, recording_id).await? else {
+        let Some(active) = self.active_recording_at(path).await? else {
             return Ok(Vec::new());
         };
-        let active = row
-            .timer_id
-            .as_deref()
-            .and_then(|id| self.active_recordings_lock().get(id).cloned());
-
-        if let Some(active) = active {
-            // Port of `MediaSourceManager.GetRecordingStreamMediaSources`: the
-            // growing file is the path, and `EncoderPath` is how a transcode
-            // reads it — progressively, back through this server.
-            let base_url = self.local_api_url().await?;
-            return Ok(vec![MediaSourceInfo {
-                id: Some(active.timer_id.clone()),
-                encoder_path: Some(format!(
-                    "{base_url}/LiveTv/LiveRecordings/{}/stream",
-                    active.timer_id
-                )),
-                encoder_protocol: Some(MediaProtocol::Http),
-                path: Some(active.path.display().to_string()),
-                protocol: MediaProtocol::File,
-                supports_direct_play: false,
-                supports_direct_stream: true,
-                supports_transcoding: true,
-                is_infinite_stream: true,
-                requires_opening: false,
-                requires_closing: false,
-                buffer_ms: Some(0),
-                ignore_dts: true,
-                ignore_index: true,
-                ..MediaSourceInfo::default()
-            }]);
-        }
-
-        // A finished recording is an ordinary file.
-        let Some(path) = row.path.as_deref().filter(|p| !p.is_empty()) else {
-            return Ok(Vec::new());
-        };
+        // Port of `MediaSourceManager.GetRecordingStreamMediaSources`: the
+        // growing file is the path, and `EncoderPath` is how a transcode reads
+        // it — progressively, back through this server.
+        let base_url = self.local_api_url().await?;
         Ok(vec![MediaSourceInfo {
-            id: Some(recording_id.simple().to_string()),
-            path: Some(path.to_owned()),
+            id: Some(active.timer_id.clone()),
+            encoder_path: Some(format!(
+                "{base_url}/LiveTv/LiveRecordings/{}/stream",
+                active.timer_id
+            )),
+            encoder_protocol: Some(MediaProtocol::Http),
+            path: Some(active.path.display().to_string()),
             protocol: MediaProtocol::File,
-            container: Some(LIVE_STREAM_BUFFER_CONTAINER.to_owned()),
-            name: Some(row.name.clone()),
+            supports_direct_play: false,
+            supports_direct_stream: true,
+            supports_transcoding: true,
+            is_infinite_stream: true,
+            requires_opening: false,
+            requires_closing: false,
+            buffer_ms: Some(0),
+            ignore_dts: true,
+            ignore_index: true,
             ..MediaSourceInfo::default()
         }])
     }
 
-    async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError> {
-        // A capture still running has to stop before its file can go.
-        let row = crate::dvr_repository::recording_row(&self.db, id).await?;
-        if let Some(timer_id) = row.as_ref().and_then(|row| row.timer_id.as_deref()) {
-            self.cancel_recording(timer_id);
-        }
-        let path = row.and_then(|row| row.path);
-        if let Some(path) = &path {
-            // Best-effort: a row whose file has already gone still deletes.
-            let _ = tokio::fs::remove_file(path).await;
-        }
-        crate::dvr_repository::delete_recording(&self.db, id).await?;
-        // The library item goes with the file, as upstream's `DeleteItem`
-        // removes it. The refresh of a path that has gone drops its row.
-        if let Some(path) = &path {
-            self.refresh_recording_path(path).await;
+    async fn add_info_to_recording_dto(
+        &self,
+        path: &str,
+        dto: &mut BaseItemDto,
+    ) -> Result<(), ServiceError> {
+        let Some(active) = self.active_recording_at(path).await? else {
+            return Ok(());
+        };
+        let info = &active.info;
+        dto.series_timer_id = info.series_timer_id.clone().filter(|id| !id.is_empty());
+        dto.timer_id = Some(info.id.clone()).filter(|id| !id.is_empty());
+        dto.start_date = Some(info.start_date);
+        dto.end_date = Some(info.end_date);
+        // `info.Status`: `GetActiveRecordingInfo` answers only while the
+        // timer is `InProgress`.
+        dto.status = Some(crate::dvr_repository::status_name(
+            RecordingStatus::InProgress,
+        ));
+        dto.is_repeat = Some(info.is_repeat);
+        dto.episode_title.clone_from(&info.episode_title);
+        dto.is_movie = Some(info.is_movie);
+        dto.is_series = Some(info.is_program_series);
+        dto.is_sports = Some(info.is_sports);
+        dto.is_live = Some(info.is_live);
+        dto.is_news = Some(info.is_news);
+        dto.is_kids = Some(info.is_kids);
+        dto.is_premiere = Some(info.is_premiere);
+        dto.completion_percentage = completion_percentage(info);
+        if !info.channel_id.is_nil()
+            && let Some(channel) =
+                crate::guide_repository::channel_row(&self.db, info.channel_id).await?
+        {
+            dto.channel_name = Some(channel.name);
+            dto.channel_primary_image_tag = self
+                .channel_image_tags(&[info.channel_id])
+                .await
+                .remove(&info.channel_id);
         }
         Ok(())
+    }
+
+    async fn delete_recording_file(&self, path: &str) -> Result<(), ServiceError> {
+        let timer = self
+            .active_recordings_lock()
+            .values()
+            .find(|recording| recording.path.to_string_lossy() == path)
+            .map(|recording| recording.timer_id.clone());
+        let in_a_folder = self
+            .get_recording_folders()
+            .await?
+            .iter()
+            .flat_map(|folder| &folder.locations)
+            .any(|location| std::path::Path::new(path).starts_with(location));
+        if let Some(timer) = &timer {
+            self.cancel_recording(timer);
+        } else if !in_a_folder {
+            // Not a recording: the route deletes its item only, as upstream.
+            return Ok(());
+        }
+        match tokio::fs::remove_file(path).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(crate::error::LiveTvError::io(format!("delete {path}"), error).into())
+            }
+            _ => Ok(()),
+        }
     }
 
     async fn forget_recordings(&self, path: &str) -> Result<(), ServiceError> {
@@ -5919,29 +5845,28 @@ impl FerrofinLiveTvManager {
         .map_err(|e| failed(&e))
     }
 
-    /// Whether a finished recording's file has gone from under the server. A
-    /// recording is a library item upstream, so that ends it.
-    /// ([`forget_recordings`](LiveTvManager::forget_recordings) is the same for
-    /// a library delete, which can take the folder too.)
-    ///
-    /// A capture still has a file to come, a file that cannot be checked is
-    /// taken to be there, and so is one whose folder has gone too, which is
-    /// what an unmounted share looks like: upstream keeps an offline library's
-    /// items.
-    async fn recording_file_is_gone(row: &crate::projection::RecordingRow) -> bool {
-        let path = match row.path.as_deref() {
-            Some(path) if !path.is_empty() && row.status != "InProgress" => {
-                std::path::Path::new(path)
-            }
-            _ => return false,
+    /// `RecordingsManager.GetActiveRecordingInfo(path)`: the capture writing
+    /// `path` (compared as upstream does, `Ordinal`), unless it was told to
+    /// stop or its timer is no longer `InProgress`.
+    async fn active_recording_at(
+        &self,
+        path: &str,
+    ) -> Result<Option<ActiveRecording>, ServiceError> {
+        if path.trim().is_empty() {
+            return Ok(None);
+        }
+        let Some(active) = self
+            .active_recordings_lock()
+            .values()
+            .find(|recording| !recording.is_cancelled() && recording.path.to_string_lossy() == path)
+            .cloned()
+        else {
+            return Ok(None);
         };
-        if tokio::fs::try_exists(path).await.unwrap_or(true) {
-            return false;
-        }
-        match path.parent() {
-            Some(folder) => tokio::fs::try_exists(folder).await.unwrap_or(false),
-            None => false,
-        }
+        let timer = self.get_timer(&active.timer_id).await?;
+        Ok(timer
+            .is_some_and(|timer| timer.status == RecordingStatus::InProgress)
+            .then_some(active))
     }
 
     /// Port of `RecordingsManager.TriggerRefresh`. A failure is logged: the
@@ -6917,9 +6842,8 @@ impl FerrofinLiveTvManager {
         if crate::dvr::is_empty_file(&target).await {
             let _ = tokio::fs::remove_file(&target).await;
         }
-        // `TriggerRefresh(recordingPath)`: scans leave a file being written
-        // alone (`paths_being_recorded`), so this is what makes the recording
-        // a library item.
+        // `TriggerRefresh(recordingPath)`: the capture has been deregistered,
+        // so the item made as it started is now complete media, and probed.
         self.refresh_recording_path(&target.to_string_lossy()).await;
         let recorded = tokio::fs::try_exists(&target).await.unwrap_or(false);
         // External post-processors must not remain inside our own-write span.
@@ -6978,8 +6902,9 @@ impl FerrofinLiveTvManager {
         Ok((recording_id, outcome))
     }
 
-    /// C# `OnStarted`: the recording row, the active-recording registry and the
-    /// timer's status all move together, before the first byte is written.
+    /// C# `OnStarted`: the timer's record of its file, the active-recording
+    /// registry and the timer's status all move together, before the first
+    /// byte is written.
     async fn start_capture(
         &self,
         timer: &mut TimerInfoDto,
@@ -6990,7 +6915,8 @@ impl FerrofinLiveTvManager {
     ) -> Result<(Uuid, Arc<std::sync::atomic::AtomicBool>), ServiceError> {
         let _ = opened;
         let recording_id = Uuid::new_v4();
-        let recording = ActiveRecording::new(info.id.clone(), target.to_path_buf());
+        let recording =
+            ActiveRecording::new(info.id.clone(), target.to_path_buf()).with_info(info.clone());
         let cancel = recording.cancellation();
         crate::dvr_repository::insert_recording(
             &self.db,
@@ -7004,62 +6930,40 @@ impl FerrofinLiveTvManager {
             .insert(info.id.clone(), recording);
         timer.status = RecordingStatus::InProgress;
         self.persist_timer(timer).await?;
-        // `SaveRecordingMetadata`, which upstream's `async void OnStarted`
-        // runs without the recorder waiting on it: the NFO, then the images.
-        // A failure is logged, as its catch-all logs it: a sidecar never fails
-        // a recording, and a failed NFO leaves the images unsaved.
-        let (save_nfo, save_images) = (options.save_recording_nfo, options.save_recording_images);
-        if save_nfo || save_images {
-            let manager = self.clone();
-            let info = info.clone();
-            let target = target.to_path_buf();
-            let series = series.map(std::path::Path::to_path_buf);
-            let span = tracing::info_span!(
-                parent: None,
-                "recording_metadata",
-                trigger = "schedule",
-                timer_id = %info.id
-            );
-            tokio::spawn(tracing::Instrument::instrument(
-                async move {
-                    if save_nfo
-                        && let Err(error) = crate::recording_metadata::save_recording_nfo(
-                            &info,
-                            &target,
-                            series.as_deref(),
-                            &manager.release_date_format,
-                            Utc::now(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            path = %target.display(),
-                            %error,
-                            "live tv: could not save the recording's NFO"
-                        );
-                        return;
-                    }
-                    if save_images {
-                        manager.save_recording_images(&info, &target).await;
-                    }
-                },
-                span,
-            ));
-        }
-        // `OnStarted`'s `CreateRecordingFolders`, which is what makes a first
-        // recording's directory a library, and which upstream's `async void`
-        // keeps from holding the recorder up. The recorder makes the directory
-        // upstream before this runs, so it is made here first; failing to make
-        // it is the recorder's to report.
+        // The recorder makes the directory upstream before `OnStarted` runs,
+        // so it is made here first; failing to make it is the recorder's to
+        // report.
         if let Err(error) = crate::dvr::create_target_dir(target).await {
             tracing::debug!(path = %target.display(), %error, "live tv: no recording directory yet");
         }
+        // The rest of upstream's `async void OnStarted`, in its order and
+        // without the recorder waiting on it: `SaveRecordingMetadata` (the
+        // NFO, then the images), `CreateRecordingFolders` (which makes a first
+        // recording's directory a library), then `TriggerRefresh`, which gives
+        // the file its library item while it is still being written.
         let manager = self.clone();
+        let started = info.clone();
+        let target_path = target.to_path_buf();
+        let series_path = series.map(std::path::Path::to_path_buf);
+        let (save_nfo, save_images) = (options.save_recording_nfo, options.save_recording_images);
         tokio::spawn(tracing::Instrument::instrument(
-            async move { manager.create_recording_folders().await },
+            async move {
+                manager
+                    .save_recording_metadata(
+                        &started,
+                        &target_path,
+                        series_path.as_deref(),
+                        (save_nfo, save_images),
+                    )
+                    .await;
+                manager.create_recording_folders().await;
+                manager
+                    .refresh_recording_path(&target_path.to_string_lossy())
+                    .await;
+            },
             tracing::info_span!(
                 parent: None,
-                "recording_folders",
+                "recording_started",
                 trigger = "schedule",
                 timer_id = %info.id
             ),
@@ -7086,6 +6990,38 @@ impl FerrofinLiveTvManager {
             ),
         ));
         Ok((recording_id, cancel))
+    }
+
+    /// `SaveRecordingMetadata`: the NFO, then the images, as `save` asks. A
+    /// failure is logged, as its catch-all logs it: a sidecar never fails a
+    /// recording, and a failed NFO leaves the images unsaved.
+    async fn save_recording_metadata(
+        &self,
+        info: &TimerRecordingInfo,
+        target: &std::path::Path,
+        series: Option<&std::path::Path>,
+        (save_nfo, save_images): (bool, bool),
+    ) {
+        if save_nfo
+            && let Err(error) = crate::recording_metadata::save_recording_nfo(
+                info,
+                target,
+                series,
+                &self.release_date_format,
+                Utc::now(),
+            )
+            .await
+        {
+            tracing::warn!(
+                path = %target.display(),
+                %error,
+                "live tv: could not save the recording's NFO"
+            );
+            return;
+        }
+        if save_images {
+            self.save_recording_images(info, target).await;
+        }
     }
 
     /// `SaveRecordingImages`: the guide programme's artwork copied beside the
@@ -7514,90 +7450,6 @@ impl FerrofinLiveTvManager {
         // `TimerManager.Delete`: the row, and any fire still armed.
         self.disarm_timer(timer_id);
         self.delete_by_id(DELETE_TIMER_SQL, timer_id).await
-    }
-
-    /// The rows `visible` keeps, in order; every row when there is no filter.
-    ///
-    /// Each row is asked about as the entity [`Self::get_recording_item`]
-    /// builds for it, which is what the caller's own read of one checks.
-    async fn visible_recording_rows(
-        rows: Vec<crate::projection::RecordingRow>,
-        visible: Option<&dyn RecordingVisibility>,
-    ) -> Result<Vec<crate::projection::RecordingRow>, ServiceError> {
-        let Some(visible) = visible else {
-            return Ok(rows);
-        };
-        let mut kept = Vec::with_capacity(rows.len());
-        for row in rows {
-            if visible
-                .is_visible(&crate::projection::recording_entity(&row, parse_dt))
-                .await?
-            {
-                kept.push(row);
-            }
-        }
-        Ok(kept)
-    }
-
-    /// Projects recording rows through the DTO service and applies the
-    /// recording post-pass.
-    async fn recording_dtos(
-        &self,
-        rows: &[crate::projection::RecordingRow],
-        options: &DtoOptions,
-        user: Option<&UserEntity>,
-    ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        let entities: Vec<_> = rows
-            .iter()
-            .map(|row| crate::projection::recording_entity(row, parse_dt))
-            .collect();
-        let mut dtos = self
-            .dto_service()?
-            .get_base_item_dtos(&entities, options, user, None, true)
-            .await?;
-        Self::add_info_to_recording_dtos(&mut dtos, rows);
-        Ok(dtos)
-    }
-
-    /// Port of `LiveTvManager.AddInfoToRecordingDto`: the timer link, the
-    /// status, the programme flags, the channel name and how far through the
-    /// capture is.
-    ///
-    /// Upstream reaches this only for an item with an ACTIVE recording
-    /// (`DtoService` gates it on `GetActiveRecordingInfo(item.Path)`), and that
-    /// same branch re-types the item as a `Recording` with no runtime and no
-    /// download. A finished recording is an ordinary library `Video` and gets
-    /// none of it — so neither does one here.
-    fn add_info_to_recording_dtos(
-        dtos: &mut [BaseItemDto],
-        rows: &[crate::projection::RecordingRow],
-    ) {
-        for (dto, row) in dtos.iter_mut().zip(rows) {
-            if row.status != "InProgress" {
-                continue;
-            }
-            // The in-progress shape: jellyfin-web keys its recording card and
-            // its progress bar off `Type === "Recording"`.
-            dto.type_ = BaseItemKind::Recording;
-            dto.can_download = Some(false);
-            dto.run_time_ticks = None;
-            dto.series_timer_id = row.series_timer_id.clone().filter(|id| !id.is_empty());
-            dto.timer_id = row.timer_id.clone().filter(|id| !id.is_empty());
-            dto.start_date = parse_dt(&row.start_date);
-            dto.end_date = row.end_date.as_deref().and_then(parse_dt);
-            dto.status = Some(row.status.clone());
-            dto.is_repeat = Some(row.is_repeat);
-            dto.episode_title.clone_from(&row.episode_title);
-            dto.is_movie = Some(row.is_movie);
-            dto.is_series = Some(row.is_series);
-            dto.is_sports = Some(row.is_sports);
-            dto.is_live = Some(row.is_live);
-            dto.is_news = Some(row.is_news);
-            dto.is_kids = Some(row.is_kids);
-            dto.is_premiere = Some(row.is_premiere);
-            dto.channel_name.clone_from(&row.channel_name);
-            dto.completion_percentage = completion_percentage(row, parse_dt);
-        }
     }
 
     /// The open-live-stream map, locked. The guard never spans an `.await`.
@@ -8908,14 +8760,9 @@ fn apply_program_to_recording_info(program: &GuideProgramRow, info: &mut TimerRe
 ///
 /// Port of `AddInfoToRecordingDto`'s `InProgress` branch: the padded window is
 /// what is being recorded, so it is the window the percentage is of.
-fn completion_percentage(
-    row: &crate::projection::RecordingRow,
-    parse: fn(&str) -> Option<DateTime<Utc>>,
-) -> Option<f64> {
-    let start =
-        parse(&row.start_date)? - chrono::Duration::seconds(i64::from(row.pre_padding_seconds));
-    let end = row.end_date.as_deref().and_then(parse)?
-        + chrono::Duration::seconds(i64::from(row.post_padding_seconds));
+fn completion_percentage(info: &TimerRecordingInfo) -> Option<f64> {
+    let start = info.start_date - chrono::Duration::seconds(i64::from(info.pre_padding_seconds));
+    let end = info.recording_end_date();
     let total = (end - start).num_milliseconds();
     if total <= 0 {
         return None;
@@ -12126,45 +11973,9 @@ mod tests {
             Some("Audio".to_owned()),
             "a radio channel is MediaType.Audio"
         );
-        // A recording of that radio channel is a `.ts` capture, which upstream's
-        // library resolves as a video item: `MediaType.Video`, not the channel's.
-        let recording = Uuid::new_v4();
-        crate::dvr_repository::insert_recording(
-            &radio_mgr.db,
-            recording,
-            &crate::dvr::TimerRecordingInfo {
-                channel_id: radio,
-                ..crate::dvr::TimerRecordingInfo::default()
-            },
-            std::path::Path::new("/recordings/Jazz FM.ts"),
-            Utc::now(),
-        )
-        .await
-        .expect("recording");
-        assert_eq!(
-            radio_mgr.live_tv_media_type(recording).await.expect("type"),
-            Some("Video".to_owned()),
-            "a radio channel's recording is MediaType.Video"
-        );
-        // Its channel is not consulted: a recording whose channel is gone is a
-        // video item all the same.
-        let orphan = Uuid::new_v4();
-        crate::dvr_repository::insert_recording(
-            &radio_mgr.db,
-            orphan,
-            &crate::dvr::TimerRecordingInfo::default(),
-            std::path::Path::new("/recordings/Gone.ts"),
-            Utc::now(),
-        )
-        .await
-        .expect("recording");
-        assert_eq!(
-            radio_mgr.live_tv_media_type(orphan).await.expect("type"),
-            Some("Video".to_owned()),
-            "a recording of no stored channel is MediaType.Video"
-        );
-        // An id that is neither a channel nor a recording has no media type,
-        // and the caller must then leave the source as it was built.
+        // An id that is no channel has no media type, and the caller must
+        // then leave the source as it was built. A recording is a library
+        // item, with its own.
         assert_eq!(
             mgr.live_tv_media_type(Uuid::from_u128(0xfeed))
                 .await
@@ -12933,20 +12744,10 @@ mod tests {
         // finishes the async database writes. Wait for that second phase too:
         // seeing no active path does not yet mean the recording row has settled.
         let settled = wait_for(|| async {
-            mgr.get_recordings_matching(
-                &ferrofin_model::live_tv::RecordingQuery {
-                    is_in_progress: Some(true),
-                    ..ferrofin_model::live_tv::RecordingQuery::default()
-                },
-                None,
-                &DtoOptions::default(),
-                None,
-            )
-            .await
-            .expect("recordings")
-            .items
-            .is_empty()
-            .then_some(())
+            recording_rows(&mgr, Some(true))
+                .await
+                .is_empty()
+                .then_some(())
         })
         .await;
         assert!(
@@ -13052,186 +12853,9 @@ mod tests {
             status(&timers, &timer_ids[1]),
             Some(RecordingStatus::InProgress)
         );
-        let recordings = mgr
-            .get_recordings_matching(
-                &ferrofin_model::live_tv::RecordingQuery::default(),
-                None,
-                &DtoOptions::default(),
-                None,
-            )
-            .await
-            .expect("recordings");
-        assert_eq!(recordings.items.len(), 1, "{:?}", recordings.items);
+        let recordings = recording_rows(&mgr, None).await;
+        assert_eq!(recordings.len(), 1, "{recordings:?}");
         let _ = tokio::fs::remove_file(path).await;
-    }
-
-    /// Keeps the recordings whose file is not under `/hidden`, and records the
-    /// path of each entity it is asked about.
-    #[derive(Default)]
-    struct HidesFolder(std::sync::Mutex<Vec<String>>);
-
-    #[async_trait::async_trait]
-    impl ferrofin_traits::stubs::RecordingVisibility for HidesFolder {
-        async fn is_visible(&self, recording: &BaseItemEntity) -> Result<bool, ServiceError> {
-            let path = recording.path.clone().unwrap_or_default();
-            let visible = !path.starts_with("/hidden/");
-            self.0.lock().expect("lock").push(path);
-            Ok(visible)
-        }
-    }
-
-    /// The listing filter runs over every row the query selects, each as the
-    /// entity the recording's own read resolves, before paging, so
-    /// `TotalRecordCount` counts only what it keeps.
-    #[tokio::test]
-    async fn recordings_are_filtered_before_paging() {
-        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
-        let start = Utc::now();
-        let mut ids = HashMap::new();
-        for (minutes, path) in [
-            (5, "/hidden/e.ts"),
-            (4, "/open/d.ts"),
-            (3, "/hidden/c.ts"),
-            (2, "/open/b.ts"),
-            (1, "/hidden/a.ts"),
-        ] {
-            let id = Uuid::new_v4();
-            let timer = crate::dvr::TimerRecordingInfo {
-                id: format!("timer-{minutes}"),
-                name: path.to_owned(),
-                ..crate::dvr::TimerRecordingInfo::default()
-            };
-            crate::dvr_repository::insert_recording(
-                &mgr.db,
-                id,
-                &timer,
-                std::path::Path::new(path),
-                start + chrono::Duration::minutes(minutes),
-            )
-            .await
-            .expect("insert");
-            ids.insert(path, id);
-            assert_eq!(
-                mgr.get_recording_item(id)
-                    .await
-                    .expect("item")
-                    .expect("row")
-                    .path
-                    .as_deref(),
-                Some(path)
-            );
-        }
-        let filter = HidesFolder::default();
-        let page = mgr
-            .get_recordings_matching(
-                &ferrofin_model::live_tv::RecordingQuery {
-                    start_index: Some(1),
-                    limit: Some(1),
-                    ..ferrofin_model::live_tv::RecordingQuery::default()
-                },
-                None,
-                &DtoOptions::default(),
-                Some(&filter),
-            )
-            .await
-            .expect("recordings");
-        assert_eq!(page.total_record_count, 2, "the filtered total");
-        assert_eq!(page.start_index, 1);
-        let listed: Vec<Uuid> = page.items.iter().map(|dto| dto.id).collect();
-        assert_eq!(listed, vec![ids["/open/b.ts"]]);
-        assert_eq!(
-            *filter.0.lock().expect("lock"),
-            [
-                "/hidden/e.ts",
-                "/open/d.ts",
-                "/hidden/c.ts",
-                "/open/b.ts",
-                "/hidden/a.ts"
-            ],
-            "every row, once, newest first"
-        );
-
-        let everything = mgr
-            .get_recordings_matching(
-                &ferrofin_model::live_tv::RecordingQuery::default(),
-                None,
-                &DtoOptions::default(),
-                None,
-            )
-            .await
-            .expect("recordings");
-        assert_eq!(everything.total_record_count, 5, "no filter, every row");
-    }
-
-    /// Every row's file is checked before paging, so a recording whose file
-    /// has gone leaves `TotalRecordCount` and moves the pages after it, on
-    /// whichever page it would have been. One whose folder has gone too (an
-    /// unmounted share) and a capture still being written stay.
-    #[tokio::test]
-    async fn recordings_whose_file_has_gone_leave_every_page_and_the_count() {
-        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
-        let dir = tempfile::tempdir().expect("temp dir");
-        let unmounted = dir.path().join("unmounted");
-        let done = Some(RecordingStatus::Completed);
-        let start = Utc::now();
-        let mut listed = Vec::new();
-        for n in 0..64_i64 {
-            let (folder, written, status) = match n % 4 {
-                0 => (dir.path(), true, done),
-                1 => (dir.path(), false, done),
-                2 => (unmounted.as_path(), false, done),
-                _ => (dir.path(), false, None),
-            };
-            let path = folder.join(format!("{n}.ts"));
-            if written {
-                std::fs::write(&path, b"recorded").expect("file");
-            }
-            let id = Uuid::new_v4();
-            let timer = crate::dvr::TimerRecordingInfo {
-                id: format!("timer-{n}"),
-                name: format!("recording {n}"),
-                ..crate::dvr::TimerRecordingInfo::default()
-            };
-            crate::dvr_repository::insert_recording(
-                &mgr.db,
-                id,
-                &timer,
-                &path,
-                start + chrono::Duration::minutes(n),
-            )
-            .await
-            .expect("insert");
-            if let Some(status) = status {
-                crate::dvr_repository::finish_recording(&mgr.db, id, status, path.to_str())
-                    .await
-                    .expect("finish");
-            }
-            if n % 4 != 1 {
-                listed.push(id);
-            }
-        }
-        listed.reverse(); // newest first
-
-        let list = async |start_index: Option<i32>, limit: Option<i32>| {
-            let page = mgr
-                .get_recordings_matching(
-                    &ferrofin_model::live_tv::RecordingQuery {
-                        start_index,
-                        limit,
-                        ..ferrofin_model::live_tv::RecordingQuery::default()
-                    },
-                    None,
-                    &DtoOptions::default(),
-                    None,
-                )
-                .await
-                .expect("recordings");
-            let ids: Vec<Uuid> = page.items.iter().map(|dto| dto.id).collect();
-            (page.total_record_count, ids)
-        };
-        assert_eq!(list(None, None).await, (48, listed.clone()));
-        assert_eq!(list(Some(5), Some(7)).await, (48, listed[5..12].to_vec()));
-        assert_eq!(list(Some(45), Some(10)).await, (48, listed[45..].to_vec()));
     }
 
     #[tokio::test]
@@ -13274,11 +12898,7 @@ mod tests {
         );
         // …and no ghost recording is left behind for it.
         assert!(
-            mgr.get_recordings()
-                .await
-                .expect("recordings")
-                .items
-                .is_empty(),
+            recording_rows(&mgr, None).await.is_empty(),
             "a failed attempt leaves no fileless recording"
         );
         mgr.cancel_timer(&timer_id).await.expect("cancel");
@@ -13456,39 +13076,19 @@ mod tests {
             .await
             .expect("create");
 
-        // The capture registers itself before the first byte is written.
-        let recording = wait_for(|| async {
-            let recordings = mgr
-                .get_recordings_matching(
-                    &ferrofin_model::live_tv::RecordingQuery {
-                        is_in_progress: Some(true),
-                        ..ferrofin_model::live_tv::RecordingQuery::default()
-                    },
-                    None,
-                    &DtoOptions::default(),
-                    None,
-                )
+        // The capture registers itself before the first byte is written, and
+        // is an active recording once its timer says `InProgress`. It is keyed
+        // by the TIMER's id, which is what `/LiveTv/LiveRecordings/{id}/stream`
+        // takes.
+        let active_path = wait_for(|| async {
+            let path = mgr.get_active_recording_path(&timer_id).await.ok()??;
+            mgr.is_active_recording(&path)
                 .await
-                .expect("recordings");
-            recordings.items.into_iter().next()
+                .expect("lookup")
+                .then_some(path)
         })
         .await
         .expect("the timer must have started a recording");
-
-        assert_eq!(recording.name.as_deref(), Some("Now Playing"));
-        assert_eq!(recording.status.as_deref(), Some("InProgress"));
-        assert_eq!(recording.timer_id.as_deref(), Some(timer_id.as_str()));
-        assert!(
-            recording.completion_percentage.is_some_and(|p| p >= 0.0),
-            "an in-progress recording reports how far through it is"
-        );
-        // The capture is keyed by the TIMER's id, which is what
-        // `/LiveTv/LiveRecordings/{id}/stream` takes.
-        let active_path = mgr
-            .get_active_recording_path(&timer_id)
-            .await
-            .expect("path")
-            .expect("a capture is in progress");
         assert!(
             std::path::Path::new(&active_path)
                 .extension()
@@ -13500,9 +13100,36 @@ mod tests {
             "the recording must land under the data directory: {active_path}"
         );
 
+        // `AddInfoToRecordingDto`: the library item of that file carries the
+        // capture's timer, status and progress, and its channel.
+        let mut recording = BaseItemDto::default();
+        mgr.add_info_to_recording_dto(&active_path, &mut recording)
+            .await
+            .expect("recording info");
+        assert_eq!(recording.status.as_deref(), Some("InProgress"));
+        assert_eq!(recording.timer_id.as_deref(), Some(timer_id.as_str()));
+        assert!(recording.start_date.is_some() && recording.end_date.is_some());
+        assert!(
+            recording.completion_percentage.is_some_and(|p| p >= 0.0),
+            "an in-progress recording reports how far through it is"
+        );
+        assert!(recording.channel_name.is_some(), "{recording:?}");
+        // Any other file is left as it is.
+        let mut other = BaseItemDto::default();
+        mgr.add_info_to_recording_dto("/elsewhere/other.ts", &mut other)
+            .await
+            .expect("recording info");
+        assert_eq!(other.status, None);
+        assert_eq!(
+            mgr.get_recording_media_sources("/elsewhere/other.ts")
+                .await
+                .expect("sources"),
+            []
+        );
+
         // PlaybackInfo on the recording reaches it through the EncoderPath.
         let sources = mgr
-            .get_recording_media_sources(recording.id)
+            .get_recording_media_sources(&active_path)
             .await
             .expect("sources");
         assert_eq!(sources.len(), 1);
@@ -13514,8 +13141,12 @@ mod tests {
         assert!(sources[0].is_infinite_stream);
         assert!(!sources[0].supports_direct_play);
 
-        // Deleting the timer stops the capture and, with it, the tuner.
-        mgr.cancel_timer(&timer_id).await.expect("cancel");
+        // Deleting the recording stops the capture writing it and, with it,
+        // the tuner, and takes the file.
+        mgr.delete_recording_file(&active_path)
+            .await
+            .expect("delete the file");
+        assert!(!std::path::Path::new(&active_path).exists());
         let stopped = wait_for(|| async {
             mgr.get_active_recording_path(&timer_id)
                 .await
@@ -13524,20 +13155,18 @@ mod tests {
                 .then_some(())
         })
         .await;
-        assert!(
-            stopped.is_some(),
-            "cancelling the timer must stop the capture"
-        );
-
-        // …and deleting the recording removes both the row and the file.
-        mgr.delete_recording(recording.id).await.expect("delete");
-        assert!(
-            mgr.get_recording(recording.id)
-                .await
-                .expect("get")
-                .is_none(),
-            "the deleted recording must be gone"
-        );
+        assert!(stopped.is_some(), "the delete must stop the capture");
+        assert!(!mgr.is_active_recording(&active_path).await.expect("lookup"));
+        mgr.delete_recording_file(&active_path)
+            .await
+            .expect("a file already gone is no error");
+        // A file outside the recording folders is no recording's.
+        let elsewhere = dir.path().join("elsewhere.ts");
+        std::fs::write(&elsewhere, b"not recorded").expect("file");
+        mgr.delete_recording_file(&elsewhere.to_string_lossy())
+            .await
+            .expect("delete");
+        assert!(elsewhere.exists());
     }
 
     /// The timer a client creates from `Timers/Defaults` — the same JSON the
@@ -13545,6 +13174,23 @@ mod tests {
     fn timer_from_defaults(defaults: &SeriesTimerInfoDto) -> TimerInfoDto {
         let json = serde_json::to_string(defaults).expect("serialize");
         serde_json::from_str(&json).expect("a SeriesTimerInfoDto body binds as a TimerInfoDto")
+    }
+
+    /// The timers' records of their captures, those in progress or not as
+    /// `in_progress` asks (every one for `None`).
+    async fn recording_rows(
+        mgr: &FerrofinLiveTvManager,
+        in_progress: Option<bool>,
+    ) -> Vec<crate::projection::RecordingRow> {
+        crate::dvr_repository::recording_rows(
+            &mgr.db,
+            &ferrofin_model::live_tv::RecordingQuery {
+                is_in_progress: in_progress,
+                ..ferrofin_model::live_tv::RecordingQuery::default()
+            },
+        )
+        .await
+        .expect("recording rows")
     }
 
     /// Polls `f` until it yields a value, up to a few seconds.

@@ -979,20 +979,6 @@ impl ferrofin_traits::stubs::LiveTvManager for ScriptedLiveTv {
     async fn cancel_series_timer(&self, _id: &str) -> Result<(), ServiceError> {
         unreachable!()
     }
-    async fn get_recordings(
-        &self,
-    ) -> Result<QueryResult<ferrofin_model::dto::BaseItemDto>, ServiceError> {
-        unreachable!()
-    }
-    async fn get_recording(
-        &self,
-        _id: Uuid,
-    ) -> Result<Option<ferrofin_model::dto::BaseItemDto>, ServiceError> {
-        unreachable!()
-    }
-    async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
-        unreachable!()
-    }
     async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
         unreachable!()
     }

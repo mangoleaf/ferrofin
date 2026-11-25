@@ -216,15 +216,6 @@ impl LiveTvManager for CountingLiveTv {
     async fn cancel_series_timer(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!("not probed by the gate tests")
     }
-    async fn get_recordings(&self) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        unimplemented!("not probed by the gate tests")
-    }
-    async fn get_recording(&self, _id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
-        unimplemented!("not probed by the gate tests")
-    }
-    async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
-        unimplemented!("not probed by the gate tests")
-    }
     async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
         unimplemented!("not probed by the gate tests")
     }

@@ -5020,15 +5020,11 @@ impl LibraryScanner {
         self
     }
 
-    /// Reads the files Live TV is recording to right now, which the walk leaves
-    /// out until the capture's own refresh finds them.
-    ///
-    /// TODO(parity, open work item — NOT an accepted divergence; gl-1077):
-    /// upstream gives such a file an item from `OnStarted`, which
-    /// `Video.SourceType` (`LiveTV`), `IsCompleteMedia` and `DtoService`'s
-    /// `Type: Recording` keep away from everything a finished video reaches.
-    /// None of that is ported, so an item here would be a partial file posing
-    /// as a finished one. Un-defer path: port those, then remove this.
+    /// Reads the files Live TV is recording to right now. Such a file gets
+    /// its item, as upstream's `OnStarted` refresh gives it one, but is not
+    /// probed while it grows: `Video.IsCompleteMedia` is false while it is an
+    /// active recording, which keeps `ProbeProvider` off it. The capture's
+    /// closing refresh probes the finished file.
     ///
     /// Called once by the composition root.
     #[must_use]
@@ -9224,6 +9220,8 @@ impl LibraryScanner {
                 None
             }
         };
+        // `Video.IsCompleteMedia`, read once per window.
+        let recording = self.recording_paths.as_ref().map_or_default(|read| read());
         // Each item's plan stats its file and lists its sidecars.
         window.plans = off_runtime(|| {
             let mut plans: Vec<ItemRefreshPlan> = Vec::with_capacity(end - start);
@@ -9242,8 +9240,15 @@ impl LibraryScanner {
                     window.links(item.id),
                 );
                 // A superseded copy is skipped by the walk: it must not reach
-                // the probe pipeline, whose results are taken in order.
-                if refresh.superseded.contains(&(start + offset)) {
+                // the probe pipeline, whose results are taken in order. A file
+                // a capture is writing is no complete media yet.
+                if refresh.superseded.contains(&(start + offset))
+                    || item
+                        .entity
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| recording.contains(path))
+                {
                     plan.probe = false;
                 }
                 // An undecodable row runs nothing (`Stored::Undecodable`).
@@ -15750,17 +15755,12 @@ impl LibraryScanner {
                 // walk comes through here, `FindExtras`' own filter included.
                 let mut dot_ignore = ctx.dot_ignore.borrow_mut();
                 dot_ignore.begin_listing();
-                // Read after the listing: a capture registers before it
-                // creates its file, so a file listed here is never missed.
-                let recording = self.recording_paths.as_ref().map(|read| read());
-                let recording = recording.as_deref().unwrap_or_default();
                 entries
                     .into_iter()
                     .filter(|entry| {
                         let is_dir = entry.type_ == FileSystemEntryType::Directory;
                         if crate::resolvers::should_ignore_path(&entry.path)
                             || dot_ignore.should_ignore(&entry.path, is_dir)
-                            || recording.contains(&entry.path)
                         {
                             ctx.excluded.borrow_mut().push(entry.path.clone());
                             false
@@ -40138,6 +40138,87 @@ mod tests {
         assert_eq!(
             rows[0].mime_type.as_deref(),
             Some("application/x-truetype-font")
+        );
+    }
+
+    /// A file a capture is writing gets its item, unprobed
+    /// (`Video.IsCompleteMedia` keeps `ProbeProvider` off it), and the scan
+    /// once the capture has ended probes it.
+    #[tokio::test]
+    async fn a_file_being_recorded_is_not_probed_until_its_capture_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("recordings");
+        std::fs::create_dir_all(&media).unwrap();
+        let file = media.join("Evening News (2026).ts");
+        std::fs::write(&file, b"recording").unwrap();
+
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Recorded Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let recording = Arc::new(std::sync::Mutex::new(vec![
+            file.to_string_lossy().into_owned(),
+        ]));
+        let read = Arc::clone(&recording);
+        let scanner =
+            LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
+                .with_probe(
+                    Arc::new(FakeProbe),
+                    Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
+                    Arc::new(crate::chapter_repository::FerrofinChapterRepository::new(
+                        db.clone(),
+                    )),
+                )
+                .with_recording_paths(Arc::new(move || read.lock().unwrap().clone()));
+        let probed = async || -> (Option<i64>, i64) {
+            let ticks: Option<i64> = sqlx::query_scalar(
+                r#"SELECT "RunTimeTicks" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("the recording's item");
+            let streams: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "MediaStreamInfos""#)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            (ticks, streams)
+        };
+
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            probed().await,
+            (None, 0),
+            "the capture's file is not probed"
+        );
+
+        recording.lock().unwrap().clear();
+        std::fs::write(&file, b"recording, finished").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        scanner.scan_all().await.unwrap();
+        assert_eq!(
+            probed().await,
+            (Some(30_000_000), 2),
+            "the finished file is"
         );
     }
 

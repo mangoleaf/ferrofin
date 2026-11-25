@@ -277,24 +277,36 @@ async fn a_folder_inside_a_library_is_answered_with_that_library() {
     );
 }
 
-/// `DELETE /Items/{id}` of a movie in its own folder takes the folder, which
-/// must end the recording too, where nothing else would: no file and no
-/// folder is what an unmounted share looks like.
+/// A recording is the library item of its file (`GetEmbyRecordingsAsync`):
+/// `GET /LiveTv/Recordings` lists the scanned files under the recording
+/// folders, a file no timer made included (an adopted Jellyfin database's, a
+/// partial one), by the item's own id, which every item route answers. A user
+/// the recording folder's library is not granted to sees none of them, and
+/// `DELETE /LiveTv/Recordings/{id}` takes the item and its file.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one recording, through every route that reaches it"
+)]
 #[tokio::test]
-async fn a_library_delete_ends_the_recording() {
+async fn a_recording_is_its_library_item() {
     let temp = tempfile::tempdir().expect("temp dir");
     let wired = boot(temp.path()).await;
     let router = ferrofin_api::create_router(wired.state.clone());
     let token = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
-    let movies = made(temp.path(), "dvr");
+    let dvr = made(temp.path(), "dvr");
+    save_live_tv(&router, &token, &json!({ "RecordingPath": dvr })).await;
     let file = temp.path().join("dvr/Evening Movie/Evening Movie.ts");
     std::fs::create_dir_all(file.parent().expect("a folder")).expect("dir");
     std::fs::write(&file, b"recorded").expect("file");
+    let film_library = made(temp.path(), "films");
+    let movie_file = temp.path().join("films/A Film (2001)/A Film (2001).mkv");
+    std::fs::create_dir_all(movie_file.parent().expect("a folder")).expect("dir");
+    std::fs::write(&movie_file, b"a film").expect("file");
     let (status, body) = call(
         &router,
         "POST",
         &format!(
-            "/Library/VirtualFolders?name=Films&collectionType=movies&paths={movies}\
+            "/Library/VirtualFolders?name=Films&collectionType=movies&paths={film_library}\
              &refreshLibrary=false"
         ),
         Some(&token),
@@ -303,34 +315,16 @@ async fn a_library_delete_ends_the_recording() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
-    let db = Database::connect(&Config::test_stub(temp.path()).database_url())
-        .await
-        .expect("open db");
-    let id = uuid::Uuid::new_v4();
-    let info = ferrofin_livetv::TimerRecordingInfo {
-        id: "timer".to_owned(),
-        name: "Evening Movie".to_owned(),
-        ..ferrofin_livetv::TimerRecordingInfo::default()
-    };
-    let created = "2026-10-30T00:00:00Z".parse().expect("a date");
-    ferrofin_livetv::dvr_repository::insert_recording(&db, id, &info, &file, created)
-        .await
-        .expect("insert");
-    ferrofin_livetv::dvr_repository::finish_recording(
-        &db,
-        id,
-        ferrofin_model::live_tv::RecordingStatus::Completed,
-        file.to_str(),
-    )
-    .await
-    .expect("finish");
-
-    let recordings = async |router: &axum::Router| -> usize {
-        let (status, body) = call(router, "GET", "/LiveTv/Recordings", Some(&token), None).await;
+    let recordings = async |token: &str| -> Value {
+        let (status, body) = call(&router, "GET", "/LiveTv/Recordings", Some(token), None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        body["Items"].as_array().expect("items").len()
+        body
     };
-    assert_eq!(recordings(&router).await, 1);
+    assert_eq!(
+        recordings(&token).await["TotalRecordCount"],
+        0,
+        "not scanned yet"
+    );
 
     assert!(
         wired
@@ -341,29 +335,125 @@ async fn a_library_delete_ends_the_recording() {
             .expect("scan"),
         "the scan ran to its end"
     );
+    let listed = recordings(&token).await;
+    assert_eq!(listed["TotalRecordCount"], 1, "{listed}");
+    let id = listed["Items"][0]["Id"].as_str().expect("an id").to_owned();
     let (status, body) = call(
         &router,
         "GET",
-        "/Items?recursive=true&includeItemTypes=Movie",
+        "/Items?recursive=true&mediaTypes=Video&fields=Path",
         Some(&token),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let item = body["Items"][0]["Id"].as_str().expect("the scanned item");
+    let by_path = |path: &Path| {
+        body["Items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["Path"] == path.display().to_string())
+            .and_then(|item| item["Id"].as_str())
+            .expect("an item")
+            .to_owned()
+    };
+    assert_eq!(by_path(&file), id, "one id for one recording");
+    let movie_id = by_path(&movie_file);
+    for route in [
+        format!("/LiveTv/Recordings/{id}"),
+        format!("/Items/{id}"),
+        format!("/Items/{id}/PlaybackInfo"),
+    ] {
+        let (status, body) = call(&router, "GET", &route, Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK, "{route}: {body}");
+    }
+    let (_, in_progress) = call(
+        &router,
+        "GET",
+        "/LiveTv/Recordings?isInProgress=true",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        in_progress["TotalRecordCount"], 0,
+        "nothing is being recorded"
+    );
 
+    // A user with Live TV but not the recording library sees no recording.
+    let (status, created) = call(
+        &router,
+        "POST",
+        "/Users/New",
+        Some(&token),
+        Some(&json!({ "Name": "viewer", "Password": "viewer-pw" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let mut policy = created["Policy"].clone();
+    policy["EnableAllFolders"] = json!(false);
+    policy["EnabledFolders"] = json!([]);
+    policy["EnableLiveTvAccess"] = json!(true);
+    let viewer = created["Id"].as_str().expect("id");
+    let (status, body) = call(
+        &router,
+        "POST",
+        &format!("/Users/{viewer}/Policy"),
+        Some(&token),
+        Some(&policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    // One device: this sign-in ends the administrator's session.
+    let viewer_token = login(&router, "viewer", "viewer-pw").await;
+    let hidden = recordings(&viewer_token).await;
+    assert_eq!(hidden["TotalRecordCount"], 0, "{hidden}");
+    let (status, _) = call(
+        &router,
+        "GET",
+        &format!("/LiveTv/Recordings/{id}"),
+        Some(&viewer_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let token = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
     let (status, body) = call(
         &router,
         "DELETE",
-        &format!("/Items/{item}"),
+        &format!("/LiveTv/Recordings/{id}"),
         Some(&token),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
-
     assert!(!file.exists());
-    assert_eq!(recordings(&router).await, 0);
+    assert_eq!(recordings(&token).await["TotalRecordCount"], 0);
+    let (status, _) = call(&router, "GET", &format!("/Items/{id}"), Some(&token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Any other item it names goes as upstream deletes it: the item, not its
+    // file.
+    let (status, body) = call(
+        &router,
+        "DELETE",
+        &format!("/LiveTv/Recordings/{movie_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(movie_file.exists(), "a film is no recording");
+    let (status, _) = call(
+        &router,
+        "GET",
+        &format!("/Items/{movie_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 /// `RecordingsHost.StartAsync`: the pass runs at boot, for a directory that

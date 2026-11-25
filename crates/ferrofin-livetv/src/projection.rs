@@ -25,14 +25,6 @@ pub const CHANNEL_TYPE_NAME: &str = "MediaBrowser.Controller.LiveTv.LiveTvChanne
 /// The stored `BaseItems.Type` name of a Live TV programme.
 pub const PROGRAM_TYPE_NAME: &str = "MediaBrowser.Controller.LiveTv.LiveTvProgram";
 
-/// The stored `BaseItems.Type` name of a DVR recording.
-///
-/// Jellyfin's recordings are ordinary library `Video` items scanned out of the
-/// recordings folder (`LiveTvManager.GetEmbyRecordingsAsync` queries
-/// `BaseItemKind.Video`), so a recording DTO's `Type` is `"Video"` — not
-/// `"Recording"`, which is a timer-side concept.
-pub const RECORDING_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Video";
-
 /// One `FerrofinLiveTvChannels` row, as the query paths read it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
@@ -753,7 +745,8 @@ pub fn program_images_update(
     (updated || (removed && item_updated)).then_some(images)
 }
 
-/// One `FerrofinLiveTvRecordings` row, as the recording query paths read it.
+/// One `FerrofinLiveTvRecordings` row: a timer's record of the file its
+/// capture wrote.
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[sqlx(rename_all = "PascalCase")]
 #[allow(clippy::struct_excessive_bools)] // the upstream TimerInfo flags
@@ -815,50 +808,6 @@ pub struct RecordingRow {
     pub is_premiere: bool,
     /// The owning channel's display name (joined).
     pub channel_name: Option<String>,
-}
-
-/// Builds the synthetic `BaseItems` row a recording projects from.
-///
-/// Jellyfin scans its recordings folder and projects the resulting `Video`
-/// items; Ferrofin keeps the recordings in its own table (the library-folder
-/// end state is a follow-up — see the module docs on
-/// [`crate::dvr`]) and builds the equivalent row here, so a recording DTO
-/// carries the same `UserData`, image maps, `SortName` and `MediaSources` as
-/// any other video.
-#[must_use]
-pub fn recording_entity(
-    row: &RecordingRow,
-    parse_dt: fn(&str) -> Option<DateTime<Utc>>,
-) -> BaseItemEntity {
-    let start_date = parse_dt(&row.start_date);
-    let end_date = row.end_date.as_deref().and_then(parse_dt);
-    let run_time_ticks = match (start_date, end_date) {
-        (Some(start), Some(end)) => Some((end - start).num_milliseconds() * 10_000),
-        _ => None,
-    };
-    BaseItemEntity {
-        id: row.id.clone(),
-        type_: RECORDING_TYPE_NAME.to_owned(),
-        name: Some(row.name.clone()),
-        overview: row.overview.clone(),
-        episode_title: row.episode_title.clone(),
-        channel_id: Some(row.channel_id.clone()),
-        path: row.path.clone(),
-        start_date,
-        end_date,
-        run_time_ticks,
-        production_year: row.production_year.map(i64::from),
-        index_number: row.episode_number.map(i64::from),
-        parent_index_number: row.season_number.map(i64::from),
-        sort_name: Some(item_sort_name(&row.name)),
-        media_type: Some("Video".to_owned()),
-        date_created: row.date_created.as_deref().and_then(parse_dt),
-        is_movie: row.is_movie,
-        is_series: row.is_series,
-        is_repeat: row.is_repeat,
-        is_folder: false,
-        ..BaseItemEntity::default()
-    }
 }
 
 /// Builds the synthetic `BaseItems` row a programme projects from.
@@ -1943,55 +1892,6 @@ mod tests {
             ids.sort();
             assert_eq!(ids, ["a", "b", "c", "d", "e"]);
         }
-    }
-
-    #[test]
-    fn a_recording_projects_as_a_video_item() {
-        let row = RecordingRow {
-            id: "11111111-2222-3333-4444-555555555555".to_owned(),
-            channel_id: "66666666-7777-8888-9999-000000000000".to_owned(),
-            timer_id: Some("t1".to_owned()),
-            series_timer_id: None,
-            name: "The Late Show".to_owned(),
-            overview: Some("Tonight".to_owned()),
-            start_date: "2026-08-23T17:00:00Z".to_owned(),
-            end_date: Some("2026-08-23T18:00:00Z".to_owned()),
-            status: "Completed".to_owned(),
-            path: Some("/data/livetv/recordings/Other/The Late Show/x.ts".to_owned()),
-            date_created: Some("2026-08-23T17:00:00Z".to_owned()),
-            episode_title: Some("Pilot".to_owned()),
-            production_year: Some(2026),
-            season_number: Some(1),
-            episode_number: Some(2),
-            program_id: None,
-            external_program_id: None,
-            pre_padding_seconds: 0,
-            post_padding_seconds: 0,
-            is_movie: false,
-            is_series: true,
-            is_news: false,
-            is_kids: false,
-            is_sports: false,
-            is_live: false,
-            is_repeat: false,
-            is_premiere: false,
-            channel_name: Some("Parity One".to_owned()),
-        };
-        let entity = recording_entity(&row, parse);
-
-        // Jellyfin's recordings are library `Video` items scanned out of the
-        // recordings folder — not a `Recording` type of their own.
-        assert_eq!(entity.type_, RECORDING_TYPE_NAME);
-        assert_eq!(entity.media_type.as_deref(), Some("Video"));
-        assert_eq!(entity.name.as_deref(), Some("The Late Show"));
-        assert_eq!(entity.path, row.path);
-        assert!(!entity.is_folder);
-        assert_eq!(entity.index_number, Some(2));
-        assert_eq!(entity.parent_index_number, Some(1));
-        assert_eq!(entity.production_year, Some(2026));
-        // One hour, in ticks.
-        assert_eq!(entity.run_time_ticks, Some(36_000_000_000));
-        assert_eq!(entity.sort_name.as_deref(), Some("late show"));
     }
 
     #[test]
