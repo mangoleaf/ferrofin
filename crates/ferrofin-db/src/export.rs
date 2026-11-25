@@ -188,7 +188,8 @@ pub struct DatabaseEdits {
     /// What Ferrofin's own tables held that Jellyfin keeps in files, read
     /// before they were removed.
     pub carried: CarriedRows,
-    /// The rows Jellyfin's code migrations change on its first start.
+    /// The rows Jellyfin's code migrations change on its first start, for the
+    /// report of an adopted source (on a native one Jellyfin runs none).
     pub counts: FirstStartCounts,
 }
 

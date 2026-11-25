@@ -5,9 +5,10 @@
 #   2. the fixture directory: one gates/adoption/build-fixtures.sh builds
 #   3. the generation Ferrofin adopts it as (the boot log's, as in gates/adoption/run.sh's FIXTURE_TABLE)
 #   4. the build log, as <it>.server.log under the fixtures, of that Jellyfin release's own first start on the
-#      route's source: the code migrations it ran, less those the source's history records, are the ones
-#      Jellyfin must run on the export. It is the log of the fixture of that release built from the source
-#      where there is one, the first start build-fixtures.sh gives the source
+#      route's source: the code migrations it ran, less those the source's history records and those the export
+#      records as applied (checks_boot.py), are the ones Jellyfin must run on the export (none on the native
+#      route). It is the log of the fixture of that release built from the source where there is one, the first
+#      start build-fixtures.sh gives the source
 #      (oracle/first-start-12.4/<fixture>; gates/adoption/synthetic.py FIRST_STARTS), or, for a source that
 #      release wrote itself, that source's own build log. A messy or scale copy has its source's.
 #   5. the data directory Ferrofin runs at, and the export reads it at

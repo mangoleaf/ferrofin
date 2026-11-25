@@ -39,14 +39,17 @@ at `/config`, a missed rewrite could not show. The Debian-layout route is a sour
 fixture into its own package directories, its configuration apart, as the adoption gate does, and the export
 still writes the docker layout.
 
-The code migrations the exported history records as applied are those this gate showed damage a database
-Ferrofin maintained when Jellyfin runs them (gl-1902, owner decision 2026-11-24):
+For an adopted source whose history lacks them, the code migrations the exported history records as applied are
+only those this gate showed damage a database Ferrofin maintained when Jellyfin runs them (gl-1902, owner decision
+2026-11-24):
 - `MigrateRatingLevels` takes the parental rating each season and episode inherits from its series (`rated`);
 - `MigrateLinkedChildren` merges back the versions split in Ferrofin and deletes the additional parts of a movie
   in parts (`video`), and once another version took the split one's place, its insert clashes with
   `LinkedChildren`'s primary key and Jellyfin's start fails;
 - `FixIncorrectOwnerIdRelationships` takes its owner from each additional part, which then lists as a video of its
   own (`videos`).
+
+A native database gets all 49, as a fresh install records them (gl-1552).
 
 `RestorePlaylistChildrenFromMetadata` did not reproduce for a playlist in the data directory (an emptied adopted
 playlist stays empty: the export leaves its stale `playlist.xml` out, gl-1903), so Jellyfin runs it, with the
@@ -56,7 +59,9 @@ Jellyfin's own metadata refresh merges that file back anyway (`PlaylistMetadataS
 Without the history rewrite, Jellyfin's start fails on the 10.11 routes:
 `migration 20260113102337_AddLinkedChildrenTable failed: SQLite Error 1: 'table "LinkedChildren" already exists'`;
 on the 12.0 and 12.1 routes it applies `20261002210711_MakeOwnerIdIndexesPartial`, which the check below fails;
-the 12.2 and later routes have nothing to rewrite.
+the 12.2 and later routes have nothing to rewrite. On the native route, with no history written, Jellyfin refuses
+to start a set-up server whose database has none; with only the schema migrations recorded, `RemoveDuplicateExtras`
+fails its start on the missing `library.db`.
 
 ### When to run it
 
