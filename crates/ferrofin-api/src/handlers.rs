@@ -2548,8 +2548,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              path. Both measured on Jellyfin 12.4.0; Jellyfin bugs not ported.",
             "A playlist FILE's <name>.xml sidecar (PlaylistXmlSaver.GetSavePath) is neither \
              written nor read: upstream writes it with no members and then reads it before \
-             the playlist file, which empties the playlist. Whether to port either half is \
-             an owner decision. Fix path: gl-1915.",
+             the playlist file, which empties the playlist. Jellyfin bug not ported, and \
+             Ferrofin writes no such file into a media folder for a Jellyfin to read back \
+             (owner decision 2026-11-24, gl-1915).",
         ],
     },
     VerifiedSubsystem {
