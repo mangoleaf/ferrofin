@@ -18,6 +18,7 @@ keeps its relative position:
   JELLYFIN/data/jellyfin.db*    -> DATA_DIR/data/
   JELLYFIN/data/playlists/      -> DATA_DIR/data/playlists/
   JELLYFIN/data/collections/    -> DATA_DIR/data/collections/
+  JELLYFIN/data/trickplay/      -> DATA_DIR/data/trickplay/ (seek previews)
   JELLYFIN/root/default/        -> DATA_DIR/root/default/   (library definitions)
   JELLYFIN/metadata/            -> DATA_DIR/metadata/       (images)
   JELLYFIN_CONFIG/              -> CONFIG_DIR/              (XML configuration)
@@ -154,3 +155,9 @@ for plugin_xml in LDAP-Auth.xml Jellyfin.Plugin.Tmdb.xml Jellyfin.Plugin.Omdb.xm
 done
 
 chown ferrofin:ferrofin "$destination" "$destination/data" "$destination/root"
+
+# Last: often the largest part of data/, so running out of room here leaves
+# everything above copied and owned by the service user.
+if [[ -d "$source_data/data/trickplay" ]]; then
+    copy "$source_data/data/trickplay" "$destination/data/trickplay"
+fi
