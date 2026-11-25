@@ -5241,7 +5241,12 @@ pub const VERIFIED: &[Verified] = &[
          PhysicalLocationsList as it is, while no library is configured, or while a library \
          lists no location and its options are missing, cannot be read or name a path no \
          shortcut gives; upstream reads no options there, lists what the shortcuts give and \
-         deletes every folder no shortcut lists. Fix path: gl-1929 (owner decision).",
+         deletes every folder no shortcut lists. Accepted divergence (owner decision \
+         2026-11-24, gl-1929): a restore that lacks the libraries folder would otherwise read \
+         as every location removed; after the last library is deleted its rows stay, unseen \
+         by clients, until another library exists. A scan warns about a library that lists no \
+         location and whose options do not read as empty, and says nothing while no library \
+         is configured.",
             "The root's PhysicalLocationsList is stored by the scan alone, as the list that \
          scan computes. Upstream's ValidateTopLibraryFolders (a scan's opening, a library \
          added, a library removed with refreshLibrary) saves the list its previous \
