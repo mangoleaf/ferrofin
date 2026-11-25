@@ -21,7 +21,7 @@ use ferrofin_db::export::{
 
 use crate::config::Config;
 
-mod plugins;
+pub mod plugins;
 
 /// The `export-jellyfin` subcommand's arguments. The source is the data
 /// directory the server would use (`--data-dir`, `FERROFIN_DATA_DIR`,
