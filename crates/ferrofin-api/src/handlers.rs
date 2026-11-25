@@ -1700,6 +1700,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    downloads, extractions and grabbed frames), with the replaced file \
                    deleted (provider_manager.rs remove_replaced_internal_file, \
                    dynamic_images.rs replaced_primary), \
+                   and what a save through the provider manager records of its images: \
+                   ferrofin-providers provider_manager.rs update_images, run by \
+                   update_to_repository (an upload, a chosen image, a delete, a reorder, \
+                   a collection's edit) and by a refresh's save: it measures each local \
+                   image that image_metadata.rs image_needs_refresh flags, or every one for \
+                   a save from ImageUpdate up in upstream's order (an image, download or \
+                   edit save), with image_metadata.rs fill_image_metadata (the scan's too: \
+                   0x0 when the size cannot be read, an empty blurhash when it cannot be \
+                   computed), dating it by its file and dropping one whose file is gone, \
                    compared with \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    MediaBrowser.Providers/Manager/ItemImageProvider.cs (EnableImageStub, \
@@ -1716,9 +1725,21 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Manager/MetadataService.cs (RefreshWithProviders' \
                    local-provider loop, MergePeople) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs \
-                   (SavePeopleMetadataAsync, UpdateImagesAsync, ConvertImageToLocal)",
+                   (SavePeopleMetadataAsync, UpdateImagesAsync, ImageNeedsRefresh, \
+                   RunMetadataSavers, UpdateItemsAsync, ConvertImageToLocal), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (ValidateImages) and \
+                   src/Jellyfin.Drawing/ImageProcessor.cs (GetImageBlurHash)",
         date: "2026-11-20",
         divergences: &[
+            "The metadata editor's save (POST /Items/{itemId}, and its cascade to the \
+             children) runs the savers only, so it neither measures nor validates the item's \
+             images, where UpdateItem's UpdateToRepositoryAsync(MetadataEdit) forces \
+             UpdateImagesAsync. Fix path: gl-1922.",
+            "A remote image row is not downloaded into a local file when its item is saved \
+             (UpdateImagesAsync's ConvertImageToLocal): it stays a URL, downloaded when it is \
+             served (cached_remote_image). Upstream's rows of that kind are a Live TV \
+             channel's logo, which gl-1560 proposes as an accepted divergence (its P8), \
+             pending the owner's decision.",
             "Art an earlier build saved in the item's {metadata}/library/{ID} folder (and an \
              older scan's lower-cased {id} one), under Ferrofin's own names, stays there: the \
              scan finds it and its rows keep naming it, until a new image of its type replaces it \
@@ -2450,7 +2471,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ReplaceAllMetadata, a FullRefresh, or a first or required refresh at Default \
                    or above, else the change-monitored ones; for a locked item \
                    CanRefreshMetadata keeps the forced providers and RefreshWithProviders \
-                   returns after them, so only the probe runs), scan_item's run_local gate \
+                   returns after them, so only the probe runs, and the Data keys it owns, \
+                   item_data.rs PROBE_OWNED_KEYS, are saved whatever the lock through \
+                   item_persistence_service.rs locked_data_sql), scan_item's run_local gate \
                    (RefreshWithProviders runs \
                    no local reader when SearchResult is set (the NFO, and a book's embedded \
                    readers in enrich_from_file), nor under ReplaceAllMetadata for an item a \
@@ -2775,7 +2798,7 @@ macro_rules! item_image_tail {
          without no-cache), Cache-Control spellings, If-Unmodified-Since, \
          If-Match, backgroundColor (valid and not), foregroundLayer, blur from 1 to \
          2147483647, a hex imageIndex and a malformed percentPlayed; the images match in \
-         format and size, and in pixels within rounding and the blur's box approximation \
+         format and size, and, unresized, in pixels within rounding and the blur's box approximation \
          of Skia's Gaussian (with its Decal edges and premultiplied JPEG), not in bytes \
          (the image crate, not Skia)"
     };
@@ -2796,6 +2819,13 @@ const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
      bug not ported.",
     "A remote image that cannot be downloaded is a 404; upstream's ConvertImageToLocal \
      throws, a 500. Jellyfin bug not ported.",
+    "A shrunk image is drawn with Lanczos3 and no sharpening (owner decisions \
+     2026-11-05 and 2026-11-23, gl-1345), where SkiaEncoder.ResizeImage shrinks with \
+     bilinear sampling over mipmaps and then runs SharpenInPlace's 3x3 kernel: measured \
+     against 12.4's output it keeps the same detail without the aliasing and halos, so its \
+     pixels differ from upstream's. These rows never enlarge (GetNewImageSize caps the size \
+     at the source); where Ferrofin does, neither side shrinking (a collage cell or \
+     splashscreen tile drawn from a smaller image), it uses upstream's Mitchell.",
     "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
 ];
 
@@ -3085,13 +3115,16 @@ pub const VERIFIED: &[Verified] = &[
                    check_parent_visibility (GetParentItem, IsVisible, and a UserView parent's \
                    UserViewBuilder through LibraryManager apply_user_view_builder, \
                    ferrofin-core library_manager/user_view_builder.rs), redirect_container_browse \
-                   (the BoxSet and Playlist re-root), list_playlists_folder_as_playlists, \
-                   apply_library_browse_defaults (recursive ??= true for a typed library \
-                   browse), apply_albums_by_artist_order, order_search_by_sort_name, the \
-                   UserRootFolder and HasFilters dispatch, retain_visible_ids, \
-                   sort_items_by_request (Folder.GetItems' request order) → LibraryManager \
-                   query_items and DtoService get_base_item_dtos, or get_linked_children_dtos \
-                   for a box set's or playlist's own non-recursive listing",
+                   (the BoxSet and Playlist re-root), list_playlists_folder_as_playlists \
+                   (the playlists collection type's recursive [Playlist] listing, and with no \
+                   user PlaylistsFolder.GetItemsInternal's own children unless the browse is \
+                   typed exactly [Playlist]), apply_library_browse_defaults (recursive ??= \
+                   true for a typed library browse), apply_albums_by_artist_order, \
+                   order_search_by_sort_name, the UserRootFolder and HasFilters dispatch, \
+                   retain_visible_ids, sort_items_by_request (Folder.GetItems' request order) \
+                   → LibraryManager query_items and DtoService get_base_item_dtos, or \
+                   get_linked_children_dtos for a box set's or playlist's own non-recursive \
+                   listing",
         date: "2026-11-15",
         divergences: TRAILERS_DIVERGENCES,
         refs: &["access-filtering", "images", "paging-sort", "user-data"],
@@ -6144,13 +6177,16 @@ pub const VERIFIED: &[Verified] = &[
                queued instead for an item outside every library, as for the lyrics delete) → \
                subtitle_manager.rs drop_missing_subtitle_rows (the item's external subtitle \
                rows whose absolute path is gone dropped, the rest kept with their indexes; \
-               nothing to drop after a refresh that probed). \
+               nothing to drop after a refresh that probed; when it drops one, \
+               media_stream_repository.rs sync_has_subtitles stores Data's HasSubtitles from \
+               the rows left, the rule FFProbeVideoInfo.cs:270 applies to the streams it \
+               saves). \
                The parity sweep's request (the corpus movie's stream 0, its video) expects \
                the 400. Measured on 12.4: an embedded, a \
                missing and a video stream's index, a nil id, an unknown id and an external \
                sidecar's index; and that sidecar's row pointed at a missing file (204), a \
                missing folder (404, row kept) and an http URL (404, row kept)",
-        date: "2026-11-17",
+        date: "2026-11-21",
         divergences: &[
             "A hex (0x, #, &h) or padded index is a 400; upstream's route binder reads it as \
          a number. Fix path: gl-1664.",
@@ -6169,7 +6205,8 @@ pub const VERIFIED: &[Verified] = &[
          (gl-1875); the indexes keep the gap until a refresh that probes renumbers them. \
          After a refresh that probed there is nothing to drop and the rows are upstream's. \
          Upstream keeps the row after a failed probe (read in FFProbeVideoInfo.ProbeVideo, \
-         not measured): a Jellyfin bug, deliberately not ported.",
+         not measured), and the video's stored HasSubtitles with it; here the flag follows \
+         the rows left: a Jellyfin bug, deliberately not ported.",
         ],
         refs: &["access-filtering"],
     },

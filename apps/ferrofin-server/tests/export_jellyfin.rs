@@ -6,7 +6,9 @@
 //! be unsafe or meaningless (gl-1550), naming the cause, and a failed export
 //! leaves no output. The exported database holds Jellyfin's schema and nothing
 //! of Ferrofin's, and the loss report it writes and prints names every
-//! Ferrofin table that held rows (gl-1553).
+//! Ferrofin table that held rows (gl-1553). Live TV and plugin settings are
+//! written as Jellyfin keeps them, the Live TV items kept, and no secret
+//! printed (gl-1556).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -139,7 +141,7 @@ async fn source(scratch: &Path) -> PathBuf {
 }
 
 /// Jellyfin's configuration as the export writes it, relative to the output.
-const CONFIGURATION: [&str; 8] = [
+const CONFIGURATION: [&str; 11] = [
     "config/system.xml",
     "config/encoding.xml",
     "config/branding.xml",
@@ -148,6 +150,9 @@ const CONFIGURATION: [&str; 8] = [
     "config/xbmcmetadata.xml",
     "data/device.txt",
     "root/default/Movies/options.xml",
+    "config/livetv.xml",
+    "data/livetv/timers.json",
+    "data/livetv/seriestimers.json",
 ];
 
 /// Runs `ferrofin-server export-jellyfin --data-dir <source> --out <out>` with
@@ -1291,4 +1296,225 @@ async fn export_jellyfin_reports_every_ferrofin_table_and_leaves_jellyfins_schem
     );
     sqlx::Connection::close(exported).await.unwrap();
     sqlx::Connection::close(pinned).await.unwrap();
+}
+
+/// The LDAP-Auth bind password the export writes into the plugin's settings
+/// and must never print.
+const BIND_PASSWORD: &str = "bind-secret-1556";
+
+/// An adopted data directory ([`adopted_source`]) where Ferrofin ran Live TV
+/// (a tuner, a guide, a timer that recorded, a series timer, a channel item a
+/// user made a favourite) and plugins: LDAP-Auth with a directory user's
+/// link and its bind password, TMDb with a changed setting, a WASM plugin's
+/// settings, and Jellyfin's own Intro Skipper settings and timer files from
+/// before adoption, which Ferrofin never read.
+async fn live_tv_source(scratch: &Path) -> PathBuf {
+    let source = adopted_source(scratch).await;
+    let user = "5D1E2C3B-4A59-4687-9C8B-7A6F5E4D3C2B";
+    let channel = "714EE2D0-C390-F438-28ED-AFC33B39CC9A";
+    let recording = source.join("data/livetv/recordings/Quiz Night/Round 1.ts");
+    let statements = [
+            format!(
+                r#"INSERT INTO "BaseItems" ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked",
+                    "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem", "Name")
+                   VALUES ('{channel}', 'MediaBrowser.Controller.LiveTv.LiveTvChannel', 0, 0, 0, 0, 0, 0, 0,
+                           'Test News')"#
+            ),
+            format!(
+                r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+                    "PlayCount", "PlaybackPositionTicks", "Played")
+                   VALUES ('{channel}', '{user}', 'channel', 1, 0, 0, 0)"#
+            ),
+            r#"INSERT INTO "FerrofinLiveTvTunerHosts" ("Id", "Url", "Type", "Data")
+               VALUES ('t', 'http://tuner.lan/a.m3u', 'm3u',
+                       '{"Id":"t","Url":"http://tuner.lan/a.m3u","Type":"m3u","FriendlyName":"Attic"}')"#.to_owned(),
+            r#"INSERT INTO "FerrofinLiveTvListingProviders" ("Id", "Type", "Path", "Data")
+               VALUES ('g', 'xmltv', 'http://tuner.lan/guide.xml',
+                       '{"Id":"g","Type":"xmltv","Path":"http://tuner.lan/guide.xml","Password":"sd-secret"}')"#.to_owned(),
+            format!(
+                r#"INSERT INTO "FerrofinLiveTvTimers" ("Id", "ChannelId", "StartDate", "Status", "Data", "IsManual")
+                   VALUES ('timer', '{channel}', '2026-11-22 20:00:00', 'Completed',
+                           '{{"ExternalId":"ferrofin-timer","ExternalChannelId":"m3u_x","Name":"Quiz Night","Status":"Completed"}}', 1)"#
+            ),
+            format!(
+                r#"INSERT INTO "FerrofinLiveTvRecordings" ("Id", "ChannelId", "TimerId", "StartDate",
+                    "Status", "Path", "EpisodeTitle")
+                   VALUES ('rec', '{channel}', 'timer', '2026-11-22 20:00:00', 'Completed', '{}', 'Round 1')"#,
+                recording.display()
+            ),
+            r#"INSERT INTO "FerrofinLiveTvSeriesTimers" ("Id", "Data", "ExternalId", "SeriesId")
+               VALUES ('series', '{"Name":"Quiz Night","RecordAnyTime":true}', 'ferrofin-series', 'quiz')"#.to_owned(),
+            format!(
+                r#"INSERT INTO "FerrofinExternalIdentities" ("UserId", "ProviderId", "Subject", "DateCreated")
+                   VALUES ('{user}', 'Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin', 'ann',
+                           '2026-11-21 00:00:00')"#
+            ),
+    ];
+    alter(
+        &source,
+        &statements.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    std::fs::create_dir_all(recording.parent().unwrap()).unwrap();
+    std::fs::write(&recording, b"ts").unwrap();
+    let plugins = source.join("config/plugins");
+    for (id, settings) in [
+        (
+            "958aad66-3784-4d2a-b89a-a7b6fab6e25c",
+            format!(r#"{{"LdapServer":"ldap.lan","LdapBindPassword":"{BIND_PASSWORD}"}}"#),
+        ),
+        (
+            "b8715ed1-6c47-4528-9ad3-f72deb539cd4",
+            r#"{"MaxCastMembers":9}"#.to_owned(),
+        ),
+        (
+            "5f0e8d1c-0000-4000-8000-000000000001",
+            r#"{"Anything":1}"#.to_owned(),
+        ),
+    ] {
+        std::fs::create_dir_all(plugins.join(id)).unwrap();
+        std::fs::write(plugins.join(id).join("config.json"), settings).unwrap();
+    }
+    std::fs::create_dir_all(source.join("plugins/configurations")).unwrap();
+    std::fs::write(
+        source.join("plugins/configurations/IntroSkipper.xml"),
+        "<PluginConfiguration><MaxParallelism>4</MaxParallelism></PluginConfiguration>",
+    )
+    .unwrap();
+    std::fs::create_dir_all(source.join("data/livetv")).unwrap();
+    std::fs::write(
+        source.join("data/livetv/timers.json"),
+        r#"[{"Id":"jellyfin-timer","Name":"Before adoption"}]"#,
+    )
+    .unwrap();
+    source
+}
+
+/// Live TV goes out as Jellyfin keeps it, with the channel item and its
+/// favourite kept in the database; each plugin with a counterpart and
+/// settings in Ferrofin gets its settings file, private, LDAP-Auth's with its
+/// uid map; Jellyfin's own settings of a plugin Ferrofin never held settings
+/// for stay as they were; and the source is left byte for byte as it was,
+/// with no secret printed.
+#[tokio::test]
+async fn export_jellyfin_writes_live_tv_and_plugin_settings() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let source = live_tv_source(scratch.path()).await;
+    let before = files(&source);
+    let out = scratch.path().join("out");
+
+    let run = export(&source, &out);
+
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert!(run.status.success(), "{stderr}\n{stdout}");
+    assert_eq!(
+        files(&source),
+        before,
+        "the source is left byte for byte as it was"
+    );
+    for secret in [BIND_PASSWORD, "sd-secret"] {
+        assert!(
+            !stdout.contains(secret) && !stderr.contains(secret),
+            "{secret}"
+        );
+    }
+    let read = |path: &str| std::fs::read_to_string(out.join(path)).unwrap();
+    let mode = |path: &str| {
+        std::fs::metadata(out.join(path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    let livetv = read("config/livetv.xml");
+    assert!(
+        livetv.contains("<Url>http://tuner.lan/a.m3u</Url>"),
+        "{livetv}"
+    );
+    assert!(
+        livetv.contains("<Password>sd-secret</Password>"),
+        "{livetv}"
+    );
+    assert_eq!(mode("config/livetv.xml"), 0o600);
+    let timers: serde_json::Value = serde_json::from_str(&read("data/livetv/timers.json")).unwrap();
+    assert_eq!(timers.as_array().unwrap().len(), 1, "{timers}");
+    assert_eq!(timers[0]["Id"], "ferrofin-timer");
+    assert_eq!(timers[0]["IsManual"], true);
+    assert_eq!(
+        timers[0]["RecordingPath"],
+        "/config/data/livetv/recordings/Quiz Night/Round 1.ts"
+    );
+    let series: serde_json::Value =
+        serde_json::from_str(&read("data/livetv/seriestimers.json")).unwrap();
+    assert_eq!(series[0]["Id"], "ferrofin-series");
+    assert_eq!(series[0]["SeriesId"], "quiz");
+
+    let ldap = read("plugins/configurations/LDAP-Auth.xml");
+    assert!(ldap.contains("<LdapServer>ldap.lan</LdapServer>"), "{ldap}");
+    assert!(
+        ldap.contains(&format!(
+            "<LdapBindPassword>{BIND_PASSWORD}</LdapBindPassword>"
+        )),
+        "{ldap}"
+    );
+    assert!(
+        ldap.contains(
+            "<LdapUser>\n      <LdapUid>ann</LdapUid>\n      <LinkedJellyfinUserId>5d1e2c3b-4a59-4687-9c8b-7a6f5e4d3c2b</LinkedJellyfinUserId>"
+        ),
+        "{ldap}"
+    );
+    assert_eq!(mode("plugins/configurations/LDAP-Auth.xml"), 0o600);
+    assert!(
+        read("plugins/configurations/Jellyfin.Plugin.Tmdb.xml")
+            .contains("<MaxCastMembers>9</MaxCastMembers>")
+    );
+    assert_eq!(
+        read("plugins/configurations/IntroSkipper.xml"),
+        "<PluginConfiguration><MaxParallelism>4</MaxParallelism></PluginConfiguration>",
+        "Jellyfin's own, which Ferrofin never read, is kept"
+    );
+
+    let report = read(LOSS_REPORT);
+    for line in [
+        "  Written for Jellyfin: 1 tuner and 1 guide provider in config/livetv.xml, 1 timer (1 completed recording among them) in data/livetv/timers.json, 1 series timer in data/livetv/seriestimers.json.\n",
+        "  Kept in the database: 1 channel and 0 guide programmes, which Jellyfin reads as its own, with the users' data on them (1 favourite channel).",
+        "  1 timer and 0 series timers that Jellyfin kept before adoption and Ferrofin does not hold are replaced by Ferrofin's.\n",
+        "  Settings written for Jellyfin in plugins/configurations: TMDb, LDAP-Auth.\n",
+        "  LDAP-Auth: 1 link from directory uids to users in its settings;",
+        "  Kept as Jellyfin left them before adoption, as Ferrofin never held settings for them: the settings of Intro Skipper.\n",
+        "  No Jellyfin counterpart, so their settings are not carried: a WASM plugin (5f0e8d1c-0000-4000-8000-000000000001).\n",
+    ] {
+        assert!(report.contains(line), "{line}\nnot in:\n{report}");
+    }
+
+    assert_eq!(
+        channel_favourite(&out).await,
+        1,
+        "the channel and its favourite are kept"
+    );
+}
+
+/// The favourite flag on the channel item of the database exported into `out`.
+async fn channel_favourite(out: &Path) -> i64 {
+    let mut exported = SqliteConnectOptions::new()
+        .filename(out.join("data/jellyfin.db"))
+        .read_only(true)
+        .connect()
+        .await
+        .unwrap();
+    let favourite: i64 = sqlx::query_scalar(
+        r#"SELECT u."IsFavorite" FROM "UserData" u JOIN "BaseItems" b ON b."Id" = u."ItemId"
+           WHERE b."Type" = 'MediaBrowser.Controller.LiveTv.LiveTvChannel'"#,
+    )
+    .fetch_one(&mut exported)
+    .await
+    .unwrap();
+    sqlx::Connection::close(exported).await.unwrap();
+    favourite
 }

@@ -8,10 +8,12 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::secret::Secret;
-use ferrofin_traits::activity::{ActivityLogQuery, ActivityManager as _};
-use ferrofin_traits::external_identities::ExternalIdentityStore as _;
+use ferrofin_traits::activity::ActivityLogQuery;
+use ferrofin_traits::devices::DeviceManager as _;
+use ferrofin_traits::external_identities::ExternalIdentityStore;
 use ferrofin_traits::session::{AuthenticationRequest, SessionManager as _};
 use ferrofin_traits::sso::{OidcCallback, OidcExchangeRefusal, OidcExchangeReply};
 
@@ -69,11 +71,7 @@ async fn signed_in(harness: &Harness, user: &UserEntity) -> (Secret, String) {
 /// cookie's value.
 fn started(reply: SsoReply) -> (String, String) {
     assert_eq!(reply.status, 302, "{reply:?}");
-    let cookie = reply.set_cookies[0]
-        .strip_prefix("ferrofin_sso_flow=")
-        .and_then(|rest| rest.split(';').next())
-        .expect("the flow cookie")
-        .to_owned();
+    let cookie = crate::sso::sign_in::tests::flow_cookie_value(&reply.set_cookies[0]);
     (reply.location.expect("a redirect"), cookie)
 }
 
@@ -223,7 +221,7 @@ async fn a_user_links_their_account_then_signs_in_to_it_and_keeps_their_password
     assert!(harness.sso.exchanges.is_empty());
     assert_eq!(
         page.set_cookies,
-        ["ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
+        ["__Host-ferrofin_sso_flow=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
     );
     assert_eq!(owner(&harness, SUBJECT).await, Some(id(&alice)));
 
@@ -554,7 +552,6 @@ async fn a_link_flow_ends_with_the_session_that_started_it() {
                 .expect("signed out"),
             "device removed" => {
                 let devices = harness
-                    .sso
                     .devices
                     .get_devices(&ferrofin_traits::devices::DeviceQuery {
                         user_id: Some(id(&alice)),
@@ -1381,21 +1378,48 @@ async fn a_link_flow_called_back_during_a_removal_waits_and_links_nothing() {
     assert_eq!(harness.sso.all_oidc_links().await.expect("links"), []);
 }
 
+/// The newest activity entry of `kind`, once one is written.
+async fn entry_written(
+    harness: &Harness,
+    kind: &str,
+) -> ferrofin_model::activity::ActivityLogEntry {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if let Some(entry) = entries(harness, kind).await.into_iter().next() {
+                return entry;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the entry is written")
+}
+
 /// A removal whose request is dropped while it signs the account out still
-/// leaves its activity entry: the entry's task starts before the sign-out
-/// and outlives the request.
+/// signs every session out and leaves its activity entry: the removal runs
+/// in a task of its own, which outlives the request, and its entry does not
+/// wait for the sign-out.
 #[tokio::test]
-async fn a_removal_dropped_during_its_sign_out_still_leaves_its_entry() {
+async fn a_removal_dropped_during_its_sign_out_still_signs_every_session_out() {
     let harness = Harness::new().await;
     let alice = local(&harness, "alice").await;
     assert_eq!(link(&harness, &alice).await.status, 200);
-    let _session = harness.session("browser-1").await.expect("signed in");
-    // The sign-out's `SessionEnded` never completes: the request is dropped
-    // there.
+    let tokens = [
+        harness.session("browser-1").await.expect("signed in"),
+        harness.session("browser-2").await.expect("signed in"),
+    ];
+    // Each of the sign-out's `SessionEnded` stalls until released: the
+    // request is dropped at the first.
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let waiting = Arc::clone(&gate);
     harness.events.subscribe(
         "SessionEnded",
-        Arc::new(|_: &str| -> ferrofin_traits::events::EventFuture {
-            Box::pin(std::future::pending())
+        Arc::new(move |_: &str| -> ferrofin_traits::events::EventFuture {
+            let waiting = Arc::clone(&waiting);
+            Box::pin(async move {
+                drop(waiting.acquire().await);
+                Ok(())
+            })
         }),
     );
     let removing =
@@ -1408,20 +1432,299 @@ async fn a_removal_dropped_during_its_sign_out_still_leaves_its_entry() {
             .is_err(),
         "the removal stalls in its sign-out, and is dropped"
     );
-    let entry = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        loop {
-            if let Some(entry) = entries(&harness, UNLINKED_ENTRY).await.pop() {
-                return entry;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the entry is written");
     assert_eq!(
-        entry.name,
+        entry_written(&harness, UNLINKED_ENTRY).await.name,
         "A sign-in at Fake <IdP> was unlinked from alice"
     );
+
+    gate.add_permits(16);
+    let signed_out = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let mut live = 0;
+            for (session, device_id) in tokens.iter().zip(["browser-1", "browser-2"]) {
+                let found = harness
+                    .sessions
+                    .get_session_by_authentication_token(
+                        session.access_token.expose(),
+                        device_id,
+                        "192.0.2.9",
+                    )
+                    .await;
+                live += usize::from(found.is_ok());
+            }
+            if live == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        signed_out.is_ok(),
+        "every session of the account is signed out"
+    );
+    assert_eq!(owner(&harness, SUBJECT).await, None);
+}
+
+/// What a test runs as the identity store works: before and after a link is
+/// written (`"write"`, `"written"`).
+type Step = Arc<dyn Fn(&'static str) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// The identity store with a test's [`Step`] at each of those points: what
+/// another server, or a sign-out by a route that takes no lock, does there.
+struct Interleaved {
+    inner: Arc<FerrofinExternalIdentityStore>,
+    step: Step,
+}
+
+#[async_trait::async_trait]
+impl ExternalIdentityStore for Interleaved {
+    async fn find(
+        &self,
+        identity: ExternalIdentityKey<'_>,
+    ) -> Result<Option<ExternalIdentity>, ServiceError> {
+        self.inner.find(identity).await
+    }
+    async fn list(&self, provider_id: &str) -> Result<Vec<ExternalIdentity>, ServiceError> {
+        self.inner.list(provider_id).await
+    }
+    async fn list_for_user(
+        &self,
+        provider_id: &str,
+        user_id: Uuid,
+    ) -> Result<Vec<ExternalIdentity>, ServiceError> {
+        self.inner.list_for_user(provider_id, user_id).await
+    }
+    async fn link(
+        &self,
+        user_id: Uuid,
+        identity: ExternalIdentityKey<'_>,
+        avatar_hash: Option<&str>,
+    ) -> Result<ExternalIdentity, ServiceError> {
+        (self.step)("write").await;
+        let link = self.inner.link(user_id, identity, avatar_hash).await;
+        (self.step)("written").await;
+        link
+    }
+    async fn link_unless_taken(
+        &self,
+        user_id: Uuid,
+        identity: ExternalIdentityKey<'_>,
+        by: LinkBy,
+    ) -> Result<ConditionalLink, ServiceError> {
+        (self.step)("write").await;
+        let outcome = self.inner.link_unless_taken(user_id, identity, by).await;
+        (self.step)("written").await;
+        outcome
+    }
+    async fn set_avatar_hash(
+        &self,
+        identity: ExternalIdentityKey<'_>,
+        avatar_hash: Option<&str>,
+    ) -> Result<bool, ServiceError> {
+        self.inner.set_avatar_hash(identity, avatar_hash).await
+    }
+    async fn unlink(&self, identity: ExternalIdentityKey<'_>) -> Result<bool, ServiceError> {
+        self.inner.unlink(identity).await
+    }
+}
+
+/// Another server on the harness's database (a second pod in a rolling
+/// update): its own service, lock and pending flows over the same accounts,
+/// links, sessions and log, with `step` in its identity store.
+fn server(harness: &Harness, step: &Step) -> SsoService {
+    SsoService::new(
+        Arc::clone(&harness.sso.plugins),
+        Arc::clone(&harness.users) as Arc<dyn UserManager>,
+        Arc::new(Interleaved {
+            inner: Arc::clone(&harness.identities),
+            step: Arc::clone(step),
+        }),
+        Arc::clone(&harness.sso.sessions),
+        Arc::clone(&harness.sso.activity),
+        Some(PUBLIC_URL.to_owned()),
+    )
+}
+
+/// A [`Step`] that does nothing but at `at`, where it runs `then`.
+fn at<F>(name: &'static str, then: impl Fn() -> F + Send + Sync + 'static) -> Step
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    Arc::new(move |point| {
+        if point == name {
+            Box::pin(then())
+        } else {
+            Box::pin(std::future::ready(()))
+        }
+    })
+}
+
+/// The fake's identity `subject`, verified.
+fn verified(harness: &Harness, subject: &str) -> VerifiedIdentity {
+    VerifiedIdentity {
+        provider_key: "fake".to_owned(),
+        issuer: harness.fake.issuer(),
+        subject: subject.to_owned(),
+        username: None,
+        claims: serde_json::Map::new(),
+    }
+}
+
+/// Two servers, each with its own lock, link two flows of one account at
+/// once: one links, the other is refused, and nothing is replaced. The
+/// store holds each at its write until both are there, so any check made
+/// before the write has passed on both.
+#[tokio::test]
+async fn two_servers_link_one_of_an_accounts_two_flows() {
+    let harness = Harness::new().await;
+    let alice = local(&harness, "alice").await;
+    let (token, _) = signed_in(&harness, &alice).await;
+    let session = session_hash(token.expose());
+    let provider = harness.provider("fake").await;
+    let together = Arc::new(tokio::sync::Barrier::new(2));
+    let step = at("write", move || {
+        let together = Arc::clone(&together);
+        async move {
+            together.wait().await;
+        }
+    });
+    let (one, two) = (server(&harness, &step), server(&harness, &step));
+
+    let (a, b) = tokio::join!(
+        one.link_verified(
+            &provider,
+            id(&alice),
+            &session,
+            verified(&harness, "alice-first")
+        ),
+        two.link_verified(
+            &provider,
+            id(&alice),
+            &session,
+            verified(&harness, "alice-second")
+        )
+    );
+    let mut statuses = [a.expect("an answer").status, b.expect("an answer").status];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 409]);
+    let links = harness.sso.all_oidc_links().await.expect("links");
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert_eq!(entries(&harness, LINKED_ENTRY).await.len(), 1);
+    assert_eq!(
+        entries(&harness, UNLINKED_ENTRY).await.len(),
+        0,
+        "nothing replaced"
+    );
+}
+
+/// Two servers link one identity to two accounts at once, a flow on one and
+/// an administrator on the other, held together as above: one links, the
+/// other is refused, and the identity never moves.
+#[tokio::test]
+async fn two_servers_never_move_an_identity_between_accounts() {
+    let harness = Harness::new().await;
+    let alice = local(&harness, "alice").await;
+    let bob = local(&harness, "bob").await;
+    let (token, _) = signed_in(&harness, &alice).await;
+    let session = session_hash(token.expose());
+    let provider = harness.provider("fake").await;
+    let together = Arc::new(tokio::sync::Barrier::new(2));
+    let step = at("write", move || {
+        let together = Arc::clone(&together);
+        async move {
+            together.wait().await;
+        }
+    });
+    let (one, two) = (server(&harness, &step), server(&harness, &step));
+
+    let (flow, admin) = tokio::join!(
+        one.link_verified(&provider, id(&alice), &session, verified(&harness, SUBJECT)),
+        two.add_oidc_link(Uuid::nil(), id(&bob), "fake", SUBJECT)
+    );
+    let flow = flow.expect("an answer");
+    let linked_to = match admin {
+        Ok(_) => {
+            assert_eq!(flow.status, 409, "{}", flow.html);
+            id(&bob)
+        }
+        Err(refused) => {
+            assert!(matches!(refused, ServiceError::Conflict(_)), "{refused:?}");
+            assert_eq!(flow.status, 200, "{}", flow.html);
+            id(&alice)
+        }
+    };
+    assert_eq!(owner(&harness, SUBJECT).await, Some(linked_to));
+    assert_eq!(entries(&harness, LINKED_ENTRY).await.len(), 1);
+    assert_eq!(
+        entries(&harness, UNLINKED_ENTRY).await.len(),
+        0,
+        "nothing moved"
+    );
+}
+
+/// A sign-out by a route that takes no lock, landing just before a link
+/// flow's link is written, links nothing: the session check is part of the
+/// write.
+#[tokio::test]
+async fn a_sign_out_just_before_the_write_links_nothing() {
+    let harness = Harness::new().await;
+    let alice = local(&harness, "alice").await;
+    let (token, _) = signed_in(&harness, &alice).await;
+    let session = session_hash(token.expose());
+    let provider = harness.provider("fake").await;
+    let sessions = Arc::clone(&harness.sessions);
+    let signed_out = token.expose().to_owned();
+    let step = at("write", move || {
+        let (sessions, token) = (Arc::clone(&sessions), signed_out.clone());
+        async move {
+            sessions.logout(&token).await.expect("signed out");
+        }
+    });
+
+    let page = server(&harness, &step)
+        .link_verified(&provider, id(&alice), &session, verified(&harness, SUBJECT))
+        .await
+        .expect("an answer");
+    assert_eq!(page.status, 400, "{}", page.html);
+    assert!(page.html.contains("has ended"), "{}", page.html);
+    assert_eq!(owner(&harness, SUBJECT).await, None);
+    assert_eq!(entries(&harness, LINKED_ENTRY).await.len(), 0);
+}
+
+/// A link whose request is dropped after its write, before its activity
+/// entry, still ends with the entry: the write and the entry run in a task
+/// of their own, which outlives the request.
+#[tokio::test]
+async fn a_link_dropped_after_its_write_still_leaves_its_entry() {
+    let harness = Harness::new().await;
+    let alice = local(&harness, "alice").await;
+    let (token, _) = signed_in(&harness, &alice).await;
+    let session = session_hash(token.expose());
+    let provider = harness.provider("fake").await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let waiting = Arc::clone(&gate);
+    let step = at("written", move || {
+        let waiting = Arc::clone(&waiting);
+        async move {
+            drop(waiting.acquire().await);
+        }
+    });
+
+    let sso = server(&harness, &step);
+    let linking = sso.link_verified(&provider, id(&alice), &session, verified(&harness, SUBJECT));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), linking)
+            .await
+            .is_err(),
+        "the link stalls after its write, and is dropped"
+    );
+    gate.add_permits(1);
+    assert_eq!(
+        entry_written(&harness, LINKED_ENTRY).await.name,
+        "A sign-in at Fake <IdP> was linked to alice"
+    );
+    assert_eq!(owner(&harness, SUBJECT).await, Some(id(&alice)));
 }
 
 /// B8 applies to a link as to a sign-in: an identity without the provider's
@@ -1499,4 +1802,66 @@ async fn an_unlinked_exchange_syncs_no_roles() {
         .policy
         .expect("a policy");
     assert!(!policy.is_administrator, "no role was synced");
+}
+
+/// A link change whose request is still waiting answers its failure, which
+/// the request's error boundary logs; once the request is dropped, the task
+/// logs a failure itself (here a sign-out that failed), but not a link that
+/// was not there to remove. A panic is answered as a failure.
+#[tokio::test]
+async fn a_link_change_logs_its_own_failure_once_its_request_is_gone() {
+    let logs = crate::tests::CapturedLogs::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let user_id = Uuid::from_u128(0x1936);
+    let answered = in_own_task("oidc_unlink", user_id, async {
+        Err::<(), _>(ServiceError::backend("the store is gone"))
+    })
+    .await;
+    assert!(
+        matches!(answered, Err(ServiceError::Backend(_))),
+        "{answered:?}"
+    );
+    let panicked = in_own_task("oidc_unlink", user_id, async move {
+        if user_id.is_nil() {
+            return Ok(());
+        }
+        panic!("the task panics");
+    })
+    .await;
+    assert!(
+        matches!(panicked, Err(ServiceError::Backend(_))),
+        "{panicked:?}"
+    );
+    assert!(!logs.text().contains("after its request was dropped"));
+
+    for error in [
+        ServiceError::not_found("no such OIDC link"),
+        ServiceError::backend("the sign-out failed"),
+    ] {
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (finished, done) = tokio::sync::oneshot::channel::<()>();
+        let request = in_own_task("oidc_unlink", user_id, async move {
+            drop(released.await);
+            finished.send(()).expect("the test waits");
+            Err::<(), _>(error)
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), request)
+                .await
+                .is_err(),
+            "the request is dropped"
+        );
+        release.send(()).expect("the task waits");
+        done.await.expect("the task finishes");
+        tokio::task::yield_now().await;
+    }
+    let text = logs.text();
+    assert!(text.contains("the sign-out failed"), "{text}");
+    assert!(text.contains("oidc_unlink"), "{text}");
+    assert!(!text.contains("no such OIDC link"), "{text}");
 }

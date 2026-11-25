@@ -9,7 +9,9 @@
 //! every password at `POST /Users/AuthenticateByName` without its lockout
 //! counter moving. It still does after a save of its user page gives it the
 //! default provider (the plugin disabled, every extension off, or an admin's
-//! choice), until an admin sets it a password.
+//! choice), until an admin sets it a password. One address is paced (D23):
+//! past ten starts or thirty one-time values in a minute it gets a `429`
+//! page, and its own first sign-in is not pushed out.
 
 #[path = "support/sso.rs"]
 mod sso;
@@ -36,11 +38,21 @@ use uuid::Uuid;
 const PUBLISHED_URL: &str = "https://media.example.org/jf";
 
 /// The flow cookie, cleared.
-const CLEARED: &str = "ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure";
+const CLEARED: &str =
+    "__Host-ferrofin_sso_flow=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure";
 
 /// The server with `fake` saved as the provider `fake`.
 async fn server_with_provider(fake: &FakeIdentityProvider, temp: &tempfile::TempDir) -> SsoServer {
-    let server = sso::server(temp, PUBLISHED_URL).await;
+    server_at(fake, temp, PUBLISHED_URL).await
+}
+
+/// [`server_with_provider`], published at `published_url`.
+async fn server_at(
+    fake: &FakeIdentityProvider,
+    temp: &tempfile::TempDir,
+    published_url: &str,
+) -> SsoServer {
+    let server = sso::server(temp, published_url).await;
     // The admin's step, through the manager: `sso_settings` covers the route.
     server
         .state
@@ -65,22 +77,37 @@ async fn server_with_provider(fake: &FakeIdentityProvider, temp: &tempfile::Temp
 
 /// A browser starts a sign-in, signs in at `fake` and is sent back: the
 /// callback's path under the published URL's base path, as the router sees
-/// it, and the flow cookie's `name=value`.
+/// it, and the flow cookie's `name=value`, `__Host-` prefixed (D23).
 async fn signed_in_at(server: &SsoServer, fake: &FakeIdentityProvider) -> (String, String) {
+    let (callback, set_cookie) = started_at(server, fake, PUBLISHED_URL).await;
+    assert!(
+        set_cookie.starts_with("__Host-ferrofin_sso_flow=")
+            && set_cookie.ends_with("; Path=/; Max-Age=600; HttpOnly; SameSite=Lax; Secure"),
+        "{set_cookie}"
+    );
+    (
+        callback,
+        set_cookie.split(';').next().expect("name=value").to_owned(),
+    )
+}
+
+/// A browser starts a sign-in at a server published at `published_url`,
+/// signs in at `fake` and is sent back: the callback's path, and the start's
+/// whole `Set-Cookie`.
+async fn started_at(
+    server: &SsoServer,
+    fake: &FakeIdentityProvider,
+    published_url: &str,
+) -> (String, String) {
     let start = server.get("/sso/oidc/fake/start", None).await;
     assert_eq!(start.status(), StatusCode::FOUND);
-    let cookie = header_text(&start, header::SET_COOKIE);
-    assert!(
-        cookie.ends_with("; Path=/jf/sso; Max-Age=600; HttpOnly; SameSite=Lax; Secure"),
-        "{cookie}"
-    );
-    let cookie = cookie.split(';').next().expect("name=value").to_owned();
+    let set_cookie = header_text(&start, header::SET_COOKIE);
     let back = fake.authorize(&header_text(&start, header::LOCATION)).await;
     let callback = back
-        .strip_prefix(PUBLISHED_URL)
+        .strip_prefix(published_url)
         .unwrap_or_else(|| panic!("back to the published URL: {back}"))
         .to_owned();
-    (callback, cookie)
+    (callback, set_cookie)
 }
 
 /// A whole sign-in at `fake` through the completion page's exchange, by the
@@ -152,7 +179,7 @@ async fn a_browser_signs_in_through_the_router_once_and_only_with_its_cookie() {
     assert!(page.headers().get(header::LOCATION).is_none());
     assert_eq!(
         header_text(&page, header::SET_COOKIE),
-        format!("{cookie}; Path=/jf/sso; Max-Age=60; HttpOnly; SameSite=Lax; Secure")
+        format!("{cookie}; Path=/; Max-Age=60; HttpOnly; SameSite=Lax; Secure")
     );
     let policy = header_text(&page, header::CONTENT_SECURITY_POLICY);
     assert!(
@@ -233,6 +260,64 @@ async fn a_browser_signs_in_through_the_router_once_and_only_with_its_cookie() {
     let stolen = server.exchange(&code, None, "elsewhere", None).await;
     assert_eq!(stolen.status(), StatusCode::BAD_REQUEST);
     assert_eq!(devices(&server).await, 1, "no other session");
+}
+
+/// D23: on an `https` public URL only the `__Host-` cookie is read, so the
+/// same value under the old name, which a sibling host could set, is refused
+/// at the callback and at the exchange.
+#[tokio::test]
+async fn on_https_a_cookie_under_the_old_name_is_refused() {
+    let fake = FakeIdentityProvider::start().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = server_with_provider(&fake, &temp).await;
+    let (callback, cookie) = signed_in_at(&server, &fake).await;
+    let old_name = cookie.strip_prefix("__Host-").expect("prefixed").to_owned();
+    let refused = server.get(&callback, Some(&old_name)).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(text(refused).await.contains("Sign-in failed. Try again."));
+
+    let (callback, cookie) = signed_in_at(&server, &fake).await;
+    let page = server.get(&callback, Some(&cookie)).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let code = exchange_code(&text(page).await);
+    let old_name = cookie.strip_prefix("__Host-").expect("prefixed");
+    let stolen = server
+        .exchange(&code, Some(old_name), "elsewhere", None)
+        .await;
+    assert_eq!(stolen.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(devices(&server).await, 0, "no session");
+}
+
+/// On an `http` public URL (a LAN-only server) the prefix cannot be used: the
+/// cookie is as before, scoped to `/sso`, and a browser signs in with it.
+#[tokio::test]
+async fn on_http_the_cookie_is_scoped_to_sso_and_signs_in_as_before() {
+    const HTTP: &str = "http://127.0.0.1:8096";
+    let fake = FakeIdentityProvider::start().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = server_at(&fake, &temp, HTTP).await;
+    let (callback, set_cookie) = started_at(&server, &fake, HTTP).await;
+    let (cookie, attributes) = set_cookie.split_once(';').expect("attributes");
+    assert!(cookie.starts_with("ferrofin_sso_flow="), "{set_cookie}");
+    assert_eq!(
+        attributes,
+        " Path=/sso; Max-Age=600; HttpOnly; SameSite=Lax"
+    );
+    let page = server.get(&callback, Some(cookie)).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert_eq!(
+        header_text(&page, header::SET_COOKIE),
+        format!("{cookie}; Path=/sso; Max-Age=60; HttpOnly; SameSite=Lax")
+    );
+    let code = exchange_code(&text(page).await);
+    let exchanged = server
+        .exchange(&code, Some(cookie), "lan-browser", None)
+        .await;
+    assert_eq!(exchanged.status(), StatusCode::OK);
+    assert_eq!(
+        header_text(&exchanged, header::SET_COOKIE),
+        "ferrofin_sso_flow=; Path=/sso; Max-Age=0; HttpOnly; SameSite=Lax"
+    );
 }
 
 #[tokio::test]
@@ -617,4 +702,91 @@ async fn each_account_rule_refuses_the_sign_in_through_the_router() {
     let again = sign_in(&server, &fake, "sso-second-device", remote).await;
     assert_eq!(again.status(), StatusCode::OK);
     assert_eq!(devices(&server).await, 2);
+}
+
+/// The `429` page a paced route answers: the same whatever the request held.
+async fn assert_paced(response: axum::response::Response, what: &str) {
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{what}");
+    assert!(
+        response.headers().get(header::SET_COOKIE).is_none(),
+        "{what}"
+    );
+    assert!(response.headers().get(header::LOCATION).is_none(), "{what}");
+    let page = text(response).await;
+    assert!(page.contains("Too many sign-in attempts"), "{what}: {page}");
+    assert!(
+        !page.contains("state=") && !page.contains("fake"),
+        "{what}: {page}"
+    );
+}
+
+/// D23 through the router, the security review's measurement: a sign-in
+/// started, then ten more starts from the same address. The tenth start is
+/// the address's last this minute: the eleventh and later answer the `429`
+/// page and start nothing, so the first sign-in is not pushed out and
+/// finishes. Quick Connect's start counts with them; another address is
+/// another client. Then the thirty-first one-time value in the minute is
+/// refused the same way, by whichever route brings it.
+#[tokio::test]
+async fn one_address_is_paced_and_cannot_push_out_its_first_sign_in() {
+    let fake = FakeIdentityProvider::start().await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let server = server_with_provider(&fake, &temp).await;
+
+    let (callback, cookie) = signed_in_at(&server, &fake).await;
+    for n in 1..10 {
+        let start = server.get("/sso/oidc/fake/start", None).await;
+        assert_eq!(start.status(), StatusCode::FOUND, "start {n}");
+    }
+    for n in 10..15 {
+        let paced = server.get("/sso/oidc/fake/start", None).await;
+        assert_paced(paced, &format!("start {n}")).await;
+    }
+    let quick_connect = server.get("/sso/oidc/fake/start?quickConnect", None).await;
+    assert_paced(quick_connect, "Quick Connect's start").await;
+    let elsewhere = server
+        .send(
+            Request::builder()
+                .uri("/sso/oidc/fake/start")
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+                    50_000,
+                )))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+    assert_eq!(elsewhere.status(), StatusCode::FOUND, "another address");
+
+    // The first sign-in is still pending: its callback is the address's
+    // first one-time value.
+    let page = server.get(&callback, Some(&cookie)).await;
+    assert_eq!(page.status(), StatusCode::OK, "the first sign-in finishes");
+    for n in 1..30 {
+        let refused = server
+            .get("/sso/oidc/fake/callback?state=unknown&code=c", None)
+            .await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "value {n}");
+    }
+    let callback = server
+        .get("/sso/oidc/fake/callback?state=unknown&code=c", None)
+        .await;
+    assert_paced(callback, "the callback").await;
+    let code = exchange_code(&text(page).await);
+    let exchange = server
+        .exchange(&code, Some(&cookie), "sso-paced-device", None)
+        .await;
+    assert_paced(exchange, "the exchange").await;
+    let confirmation = server
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri("/sso/quickconnect")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::COOKIE, &cookie)
+                .body(Body::from("confirmation=c&code=123456"))
+                .expect("request"),
+        )
+        .await;
+    assert_paced(confirmation, "the Quick Connect confirmation").await;
 }

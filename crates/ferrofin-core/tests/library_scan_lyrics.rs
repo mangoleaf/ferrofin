@@ -709,3 +709,37 @@ async fn an_unreadable_file_falls_back_to_the_probes_tags() {
     let saved = h.metadata_folder().await.join("01 - Song.lrc");
     assert_eq!(std::fs::read_to_string(&saved).expect("saved lrc"), SAVED);
 }
+
+/// A locked track's `LyricFiles` follow its sidecars, as Jellyfin's
+/// pre-refresh probe saves them whatever the lock: a lyric deleted re-probes
+/// the track once and the list goes, so the next scan probes nothing. A lock
+/// that kept the stale list would re-probe the track on every scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_tracks_lyric_files_follow_its_sidecars() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness(tmp.path()).await;
+    let lyric = h.track.with_extension("lrc");
+    std::fs::write(&lyric, "[00:01.00]hi").expect("lrc");
+    h.scanner.scan_all().await.expect("scan");
+    assert_eq!(h.lyric_files().await, ["01 - Song.lrc"]);
+    sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Type" LIKE '%Audio.Audio'"#)
+        .execute(h.db.writer())
+        .await
+        .expect("lock");
+    h.probe.take();
+    h.scanner.scan_all().await.expect("unchanged rescan");
+    assert!(h.probe.take().is_empty(), "nothing changed");
+    assert_eq!(h.lyric_files().await, ["01 - Song.lrc"], "kept unprobed");
+    std::fs::remove_file(&lyric).expect("remove lrc");
+
+    h.scanner.scan_all().await.expect("rescan");
+    assert_eq!(h.probe.take(), ["01 - Song.flac"]);
+    assert!(
+        h.lyric_files().await.is_empty(),
+        "the list follows the file"
+    );
+
+    h.scanner.scan_all().await.expect("scan again");
+    let probe_requests = h.probe.take();
+    assert!(probe_requests.is_empty(), "settled: {probe_requests:?}");
+}

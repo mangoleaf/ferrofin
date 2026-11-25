@@ -1,33 +1,33 @@
 //! Approving a native app's Quick Connect code by signing in through Single
-//! Sign-On (B13, D8): the app shows its code, the user approves it in any
-//! browser, and no client changes.
+//! Sign-On (B13, D8 as D23 amends it): the app shows its code, the user signs
+//! in in any browser and types it, and no client changes.
 //!
-//! 1. `GET /sso/quickconnect` ([`SsoService::code_entry_page`]): a form for
-//!    the code, with a button for each provider that can sign users in, each
-//!    starting `GET /sso/oidc/{provider}/start?quickConnect=CODE`.
-//! 2. That start ([`SsoService::start_quick_connect`]) takes only a code as
-//!    the server draws them ([`QuickConnectCode`]), and starts a sign-in whose
-//!    purpose is [`FlowPurpose::QuickConnect`].
+//! 1. `GET /sso/quickconnect` ([`SsoService::sign_in_links_page`]): a link for
+//!    each provider that can sign users in, each to
+//!    `GET /sso/oidc/{provider}/start?quickConnect`.
+//! 2. That start ([`SsoService::start_quick_connect`]) refuses a
+//!    `quickConnect` that holds anything, and starts a sign-in whose purpose
+//!    is [`FlowPurpose::QuickConnect`]: the flow holds no code.
 //! 3. Its callback is checked as a sign-in's, refused without the provider's
 //!    required role, and the account found or created as for one
 //!    ([`SsoService::quick_connect_verified`]). It answers
-//!    the confirmation page, which names the code and the account and holds a
-//!    one-time confirmation: an exchange code of the browser sign-in's kind,
-//!    bound to the flow cookie, which the page keeps as long.
+//!    the confirmation page, which names the account, asks for the code, and
+//!    holds a one-time confirmation: an exchange code of the browser
+//!    sign-in's kind, bound to the flow cookie, which the page keeps as long.
 //! 4. Only the page's `POST /sso/quickconnect`
 //!    ([`SsoService::confirm_quick_connect`]), with that cookie, uses the
-//!    confirmation up, checks the identity is still linked to the account,
-//!    applies role sync and the account rules of a password sign-in for the
-//!    approving browser's address, and approves the code with
-//!    `QuickConnect::authorize_request`, which signs the app's device in
+//!    confirmation up, takes the typed code only as the server draws them
+//!    ([`QuickConnectCode`]), checks the identity is still linked to the
+//!    account, applies role sync and the account rules of a password
+//!    sign-in for the approving browser's address, and approves the code
+//!    with `QuickConnect::authorize_request`, which signs the app's device in
 //!    through `authenticate_direct` (device access, the session limit and the
 //!    `AuthenticationSucceeded` entry).
 //!
-//! The confirmation is not optional: a start link carrying a code can be sent
-//! to someone else, and approving it as soon as their identity provider let
-//! them through would sign the sender's device in as them. They see the code
-//! and the account on a Ferrofin page, after signing in, and agree to it, as
-//! jellyfin-web has its user type the code.
+//! The code is typed, never carried: a start link holding a code could be
+//! sent to someone else, who would only have to confirm it after signing in,
+//! and that would sign the sender's device in as them. Typing the code the
+//! app shows is what jellyfin-web's own Quick Connect asks of its user.
 //!
 //! No browser session is opened: the exchange refuses a confirmation. A
 //! service built without a Quick Connect manager
@@ -64,14 +64,19 @@ const HOME: &str = "../web/";
 const CONFIRMATION_POLICY: &str =
     "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
-/// What the start answers for a `quickConnect` that is not a code.
+/// What the start answers for a `quickConnect` that holds anything.
+const VALUE_IN_LINK: &str = "<p>A Quick Connect sign-in link carries no code: you type the code \
+                             your app shows after you sign in.</p>\n<p><a \
+                             href=\"../../quickconnect\">Start Quick Connect</a></p>";
+
+/// What the approval answers for a typed code that is not one.
 const NOT_A_CODE: &str = "<p>That is not a Quick Connect code: the code is the six digits your \
-                          app shows.</p>\n<p><a href=\"../../quickconnect\">Enter the code \
-                          again</a></p>";
+                          app shows.</p>\n<p><a href=\"quickconnect\">Start again</a></p>";
 
 /// What the approval answers for a code no app is waiting with.
-const UNKNOWN_CODE: &str = "<p>No app is waiting with this code: it may have expired. Start \
-                            Quick Connect again in your app, and enter its new code.</p>";
+const UNKNOWN_CODE: &str = "<p>No app is waiting with this code: it may be mistyped or expired. \
+                            Check the code your app shows, then <a href=\"quickconnect\">start \
+                            again</a>.</p>";
 
 /// What the approval answers for a code approved already.
 const APPROVED_ALREADY: &str = "<p>This code is approved already. If your app is not signed in, \
@@ -133,7 +138,7 @@ fn failed(provider: Option<&str>, reason: &'static str) -> SsoReply {
         "Approval failed",
         &format!(
             "<p>{}</p>\n<p>If your app is signed in already, you can close this page. If not, \
-             <a href=\"quickconnect\">enter its code again</a>.</p>",
+             <a href=\"quickconnect\">start again</a>.</p>",
             escape_html(&refusal.message)
         ),
     )
@@ -167,7 +172,7 @@ impl SsoService {
     }
 
     /// [`SsoManager::quick_connect_page`](ferrofin_traits::sso::SsoManager::quick_connect_page).
-    pub(super) async fn code_entry_page(&self) -> Result<SsoReply, ServiceError> {
+    pub(super) async fn sign_in_links_page(&self) -> Result<SsoReply, ServiceError> {
         self.ensure_enabled().await?;
         let quick_connect = self.quick_connect_manager()?;
         let providers = sign_in_providers(&self.config().await?);
@@ -180,42 +185,27 @@ impl SsoService {
         if !quick_connect.is_enabled().await? {
             return Ok(turned_off(HOME));
         }
-        let mut buttons = String::new();
+        let mut links = String::new();
         for provider in &providers {
             // The key passed `validate_key`: lowercase letters, digits and
             // `-`. Writing to a `String` cannot fail.
             let _ = writeln!(
-                buttons,
-                "<p><button type=\"submit\" formaction=\"oidc/{key}/start\">Sign in with \
-                 {name}</button></p>",
+                links,
+                "<p><a href=\"oidc/{key}/start?quickConnect\">Sign in with {name}</a></p>",
                 key = provider.key,
                 name = escape_html(&provider.name),
             );
         }
-        let mut reply = at_home(
+        // Links, not a form: a navigation is no form submission, so the
+        // page's `form-action 'none'` holds.
+        Ok(at_home(
             200,
             "Sign in an app with Quick Connect",
             &format!(
-                "<p>Enter the code your app shows, then sign in. You confirm the code before \
-                 the app is signed in.</p>\n<form method=\"get\">\n<p><label \
-                 for=\"code\">Code</label> <input id=\"code\" name=\"quickConnect\" required \
-                 inputmode=\"numeric\" pattern=\"[0-9]{{{CODE_LENGTH}}}\" \
-                 maxlength=\"{CODE_LENGTH}\" autocomplete=\"off\" autofocus></p>\n{buttons}</form>"
+                "<p>Sign in, then type the code your app shows. The app is signed in as \
+                 you.</p>\n{links}"
             ),
-        );
-        // A button's start sends the browser on to the identity provider, and
-        // browsers hold a form's redirects to its `form-action` too: `https`,
-        // or `http` where a provider's issuer may be (D11).
-        let http = if providers.iter().any(|p| p.allow_http_issuer) {
-            " http:"
-        } else {
-            ""
-        };
-        reply.content_security_policy = Some(format!(
-            "default-src 'none'; base-uri 'none'; form-action 'self' https:{http}; \
-             frame-ancestors 'none'"
-        ));
-        Ok(reply)
+        ))
     }
 
     /// [`SsoManager::start_oidc_quick_connect`](ferrofin_traits::sso::SsoManager::start_oidc_quick_connect).
@@ -223,36 +213,36 @@ impl SsoService {
         &self,
         key: &str,
         client: IpAddr,
-        code: &str,
+        quick_connect_parameter: &str,
     ) -> Result<SsoReply, ServiceError> {
         self.ensure_enabled().await?;
         let quick_connect = self.quick_connect_manager()?;
-        // An unknown provider is no such route, whatever the code.
+        // An unknown provider is no such route, whatever the parameter.
         sign_in_provider(&self.config().await?, key)?;
-        // User input: only a code goes on, and it is never shown back.
-        let Some(code) = QuickConnectCode::parse(code) else {
-            log_refusal(key, "quick_connect_code");
-            return Ok(page(400, "Not a Quick Connect code", NOT_A_CODE));
-        };
+        // The code is typed after the sign-in, never carried by a link (D23);
+        // what the link holds is never shown back.
+        if !quick_connect_parameter.is_empty() {
+            log_refusal(key, "quick_connect_parameter");
+            return Ok(page(400, "Not a Quick Connect link", VALUE_IN_LINK));
+        }
         if !quick_connect.is_enabled().await? {
             log_refusal(key, "quick_connect_off");
             return Ok(turned_off("../../../web/"));
         }
-        self.start_sign_in(key, client, FlowPurpose::QuickConnect(code))
+        self.start_sign_in(key, client, FlowPurpose::QuickConnect)
             .await
     }
 
     /// Finds or creates the account a verified Quick Connect sign-in at
-    /// `provider` approves the `code` as, and answers the confirmation page:
-    /// it names the code and the account, and holds a one-time confirmation
-    /// bound to the flow `cookie`, which it sets again for as long (when a
-    /// `public_url` names its path). `Ok(Err(refusal))` when there is no
-    /// account to approve as.
+    /// `provider` approves a code as, and answers the confirmation page: it
+    /// names the account, asks for the code the app shows, and holds a
+    /// one-time confirmation bound to the flow `cookie`, which it sets again
+    /// for as long (when a `public_url` is known). `Ok(Err(refusal))`
+    /// when there is no account to approve as.
     pub(super) async fn quick_connect_verified(
         &self,
         provider: &OidcProvider,
         identity: VerifiedIdentity,
-        code: QuickConnectCode,
         cookie: &Secret,
         public_url: Option<&str>,
     ) -> Result<Result<SsoReply, Refusal>, ServiceError> {
@@ -266,19 +256,20 @@ impl SsoService {
         };
         tracing::info!(oidc_provider = %provider.key, "OIDC Quick Connect sign-in verified");
         let confirmation =
-            self.issue_exchange_code(&user, identity, cookie, FlowPurpose::QuickConnect(code))?;
+            self.issue_exchange_code(&user, identity, cookie, FlowPurpose::QuickConnect)?;
         let mut reply = page(
             200,
-            "Sign in your app?",
+            "Sign in your app",
             &format!(
-                "<p>Sign in the device showing code <strong>{code}</strong> as \
-                 <strong>{name}</strong>?</p>\n<p>Confirm only if you started Quick Connect on \
-                 that device yourself and it shows this code. This page works for one \
-                 minute.</p>\n<form method=\"post\" \
-                 action=\"../../quickconnect\"><input type=\"hidden\" name=\"confirmation\" \
-                 value=\"{confirmation}\"><button type=\"submit\">Sign in the \
-                 device</button></form>",
-                code = escape_html(code.as_str()),
+                "<p>You are signed in as <strong>{name}</strong>. Type the code your app shows \
+                 to sign the app in as this account.</p>\n<p>Type only a code your own device \
+                 shows: the device showing it is signed in as you. This page works for one \
+                 minute.</p>\n<form method=\"post\" action=\"../../quickconnect\"><input \
+                 type=\"hidden\" name=\"confirmation\" value=\"{confirmation}\">\n<p><label \
+                 for=\"code\">Code</label> <input id=\"code\" name=\"code\" required \
+                 inputmode=\"numeric\" pattern=\"[0-9]{{{CODE_LENGTH}}}\" \
+                 maxlength=\"{CODE_LENGTH}\" autocomplete=\"off\" autofocus></p>\n<p><button \
+                 type=\"submit\">Sign in the app</button></p></form>",
                 name = escape_html(&user.username),
                 confirmation = escape_html(&confirmation),
             ),
@@ -295,6 +286,7 @@ impl SsoService {
     pub(super) async fn confirm_quick_connect(
         &self,
         confirmation: Option<&Secret>,
+        code: Option<&str>,
         flow_cookie: Option<&Secret>,
         client: IpAddr,
     ) -> Result<SsoReply, ServiceError> {
@@ -306,6 +298,7 @@ impl SsoService {
                 &config,
                 quick_connect.as_ref(),
                 confirmation,
+                code,
                 flow_cookie,
                 client,
             )
@@ -314,15 +307,16 @@ impl SsoService {
         Ok(reply)
     }
 
-    /// Uses `confirmation` up and approves its code through `quick_connect`
-    /// as its account, while its identity is still linked to it, from the
-    /// browser at `client`: the page saying the app is signed in, or why
-    /// not.
+    /// Uses `confirmation` up and approves the typed `code` through
+    /// `quick_connect` as its account, while its identity is still linked to
+    /// it, from the browser at `client`: the page saying the app is signed
+    /// in, or why not.
     async fn approve(
         &self,
         config: &SsoConfig,
         quick_connect: &dyn QuickConnect,
         confirmation: Option<&Secret>,
+        code: Option<&str>,
         flow_cookie: Option<&Secret>,
         client: IpAddr,
     ) -> Result<SsoReply, ServiceError> {
@@ -335,8 +329,14 @@ impl SsoService {
         };
         let key = pending.identity.provider_key.as_str();
         // A browser sign-in's code is no confirmation.
-        let FlowPurpose::QuickConnect(code) = pending.purpose else {
+        if pending.purpose != FlowPurpose::QuickConnect {
             return Ok(failed(Some(key), "wrong_purpose"));
+        }
+        // User input: only a code goes on, and it is never shown back. The
+        // confirmation is spent either way: the user starts again.
+        let Some(code) = code.and_then(QuickConnectCode::parse) else {
+            log_refusal(key, "quick_connect_code");
+            return Ok(at_home(400, "Approval failed", NOT_A_CODE));
         };
         if !quick_connect.is_enabled().await? {
             log_refusal(key, "quick_connect_off");

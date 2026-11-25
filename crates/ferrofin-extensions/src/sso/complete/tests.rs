@@ -20,7 +20,8 @@ use crate::sso::sign_in::tests::{Harness, device, exchange_code};
 const GENERIC: &str = "Sign-in failed. Try again.";
 
 /// The flow cookie, cleared.
-const CLEARED: &str = "ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure";
+const CLEARED: &str =
+    "__Host-ferrofin_sso_flow=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure";
 
 /// The account the fake's identity signs in to, once one sign-in made it.
 async fn account(harness: &Harness) -> UserEntity {
@@ -97,7 +98,7 @@ async fn the_completion_page_holds_a_code_bound_to_the_cookie_and_may_run_its_sc
     assert_eq!(
         page.set_cookies,
         [format!(
-            "ferrofin_sso_flow={cookie}; Path=/jf/sso; Max-Age=60; HttpOnly; SameSite=Lax; Secure"
+            "__Host-ferrofin_sso_flow={cookie}; Path=/; Max-Age=60; HttpOnly; SameSite=Lax; Secure"
         )]
     );
     let hash = STANDARD.encode(Sha256::digest(COMPLETE_SCRIPT));

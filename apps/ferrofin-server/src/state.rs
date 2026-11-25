@@ -208,6 +208,11 @@ fn num_cpus_for_analysis() -> usize {
 /// The package name reported in system info (`IStartupOptions.PackageName`).
 const PACKAGE_NAME: &str = "ferrofin-server";
 
+/// The OpenSubtitles plugin's settings before an admin saves them; the export
+/// reads them too.
+pub(crate) const OPENSUBTITLES_DEFAULT_CONFIG: &[u8] =
+    br#"{"ApiKey":"","Username":"","Password":""}"#;
+
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
 /// name refresh, and the lifecycle controller's restart flag).
@@ -482,6 +487,39 @@ pub async fn build_app_state(
         paths.root_folder_path(),
         paths.data_path(),
     );
+    // One-shot, on a database's first boot: Jellyfin's timers and series
+    // timers (`data/livetv/*.json`), which nothing else reads. Before the path
+    // rebase below, which moves a completed recording's file onto this
+    // server's directories as it moves the library's; before the DVR's start
+    // arms the stored timers; and before the Live TV configuration import
+    // further down marks the database as booted.
+    match ferrofin_livetv::import_jellyfin_timers(
+        db,
+        &server_id,
+        std::path::Path::new(&paths.data_path()),
+    )
+    .await
+    {
+        Ok(ferrofin_livetv::ImportedTimers {
+            timers: 0,
+            series_timers: 0,
+            ..
+        }) => {}
+        Ok(ferrofin_livetv::ImportedTimers {
+            timers,
+            recordings,
+            series_timers,
+        }) => tracing::info!(
+            timers,
+            recordings,
+            series_timers,
+            "imported jellyfin's live tv timers"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "live tv timer import failed; it runs again at the next start"
+        ),
+    }
     // A database whose program-data directory moved (an adopted Debian
     // `/var/lib/jellyfin`, or a relocated data_dir) keeps its ids but stores
     // stale absolute paths for the library root and artwork. Before `ensure()`,
@@ -545,13 +583,15 @@ pub async fn build_app_state(
             .with_user_views(Arc::clone(&scope_user_views))
             .with_virtual_paths(virtual_paths.clone()),
     );
-    // Genre, music genre and studio rows take the ids Jellyfin derives from
-    // their metadata paths (gl-1597); a pre-parity database keeps its own.
+    // Genre, music genre, studio and new artist rows take the ids Jellyfin
+    // derives from their metadata paths (gl-1597, gl-1624); a pre-parity
+    // database keeps its own.
     let by_name_identity = ferrofin_core::item_type_lookup::ByNameIdentity::new(
         &id_derivation,
         paths.genre_path(),
         paths.music_genre_path(),
         paths.studio_path(),
+        paths.artists_path(),
     );
     let item_persistence_impl = Arc::new(
         FerrofinItemPersistenceService::new(db.clone())
@@ -1508,6 +1548,7 @@ pub async fn build_app_state(
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
+            .with_image_processor(Arc::clone(&image_processor))
             .with_nfo_saver(Arc::clone(&nfo_saver))
             .with_container_xml(Arc::clone(&container_xml))
             .with_image_store(
@@ -2151,7 +2192,7 @@ pub async fn build_app_state(
             },
             None,
         )
-        .with_default_config(br#"{"ApiKey":"","Username":"","Password":""}"#.to_vec()),
+        .with_default_config(OPENSUBTITLES_DEFAULT_CONFIG.to_vec()),
     ];
     // Jellyfin's five IN-TREE provider plugins (TMDb, Studio Images, OMDb,
     // MusicBrainz, AudioDB). They are compiled into `MediaBrowser.Providers`
@@ -3228,7 +3269,8 @@ pub async fn build_app_state(
     // config file, so nothing else would pick them up — and with no tuner
     // configured Live TV is OFF (`live_tv_enabled_for`), which means adopting a
     // server that had Live TV would silently lose the tuner, the guide and the
-    // view.
+    // view. It stays after the timer import above, which reads its marker as
+    // "a Ferrofin booted this database before".
     match ferrofin_core::live_tv_import::import_live_tv_config(
         db,
         std::path::Path::new(&paths.configuration_directory_path()),
@@ -3411,7 +3453,6 @@ pub async fn build_app_state(
             Arc::clone(&extension_cx.users),
             Arc::clone(&extension_cx.external_identities),
             Arc::clone(&state.sessions),
-            Arc::clone(&state.devices),
             Arc::clone(&state.activity),
             config.published_url.clone(),
         )

@@ -30,8 +30,8 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::DisabledPluginManager;
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use ferrofin_traits::sso::{
-    OIDC_FLOW_COOKIE, OidcCallback, OidcExchangeRefusal, OidcExchangeReply, OidcLinkAt, SsoManager,
-    SsoReply,
+    OIDC_FLOW_COOKIE, OIDC_HOST_FLOW_COOKIE, OidcCallback, OidcExchangeRefusal, OidcExchangeReply,
+    OidcLinkAt, OidcPacedRoute, SsoManager, SsoReply,
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -41,15 +41,23 @@ const SECRET: &str = "route-client-secret-31";
 /// Where [`FakeSso`] sends a started sign-in.
 const AUTHORIZE: &str = "https://id.example.org/authorize?state=s1";
 
-/// What a confirmation posted: its confirmation, flow cookie and caller.
-type Confirmed = (Option<Secret>, Option<Secret>, IpAddr);
+/// What a confirmation posted: its confirmation, typed code, flow cookie and
+/// caller.
+type Confirmed = (Option<Secret>, Option<String>, Option<Secret>, IpAddr);
 
 /// An [`SsoManager`] fake: enabled or not, refusing a save with `refusal`
-/// when set, answering a discovery test with `discovery_error` when set, and
-/// keeping what it was given.
+/// when set, answering a discovery test with `discovery_error` when set,
+/// naming the flow cookie as on an `https` public URL with `host_only`,
+/// pacing every request with `paced`, and keeping what it was given.
 #[derive(Default)]
 struct FakeSso {
     enabled: bool,
+    host_only: bool,
+    paced: bool,
+    /// Each request counted against the pace: its route and caller.
+    paces: Mutex<Vec<(OidcPacedRoute, IpAddr)>>,
+    /// How many times the flow cookie's name was asked for.
+    cookie_name_reads: Mutex<usize>,
     refusal: Option<String>,
     discovery_error: Option<String>,
     saved: Mutex<Vec<(String, OidcProvider)>>,
@@ -177,6 +185,27 @@ impl SsoManager for FakeSso {
                 "the Single Sign-On plugin is disabled",
             ))
         }
+    }
+
+    async fn flow_cookie_name(&self) -> Result<&'static str, ServiceError> {
+        self.ensure_enabled().await?;
+        *self.cookie_name_reads.lock().expect("cookie name reads") += 1;
+        Ok(if self.host_only {
+            OIDC_HOST_FLOW_COOKIE
+        } else {
+            OIDC_FLOW_COOKIE
+        })
+    }
+
+    fn pace_oidc(&self, route: OidcPacedRoute, client: IpAddr) -> Option<SsoReply> {
+        self.paces.lock().expect("paces").push((route, client));
+        self.paced.then(|| SsoReply {
+            status: 429,
+            location: None,
+            html: PACED_PAGE.to_owned(),
+            set_cookies: Vec::new(),
+            content_security_policy: Some("default-src 'none'".to_owned()),
+        })
     }
 
     async fn oidc_providers(&self) -> Result<OidcProviderList, ServiceError> {
@@ -335,7 +364,7 @@ impl SsoManager for FakeSso {
         &self,
         key: &str,
         client: IpAddr,
-        code: &str,
+        quick_connect: &str,
     ) -> Result<SsoReply, ServiceError> {
         self.ensure_enabled().await?;
         if key != "pocket" {
@@ -344,7 +373,7 @@ impl SsoManager for FakeSso {
         self.quick_connect_started
             .lock()
             .expect("quick connect started")
-            .push((key.to_owned(), client, code.to_owned()));
+            .push((key.to_owned(), client, quick_connect.to_owned()));
         Ok(SsoReply {
             status: 302,
             location: Some(AUTHORIZE.to_owned()),
@@ -357,14 +386,17 @@ impl SsoManager for FakeSso {
     async fn confirm_oidc_quick_connect(
         &self,
         confirmation: Option<Secret>,
+        code: Option<&str>,
         flow_cookie: Option<Secret>,
         client: IpAddr,
     ) -> Result<SsoReply, ServiceError> {
         self.ensure_enabled().await?;
-        self.confirmed
-            .lock()
-            .expect("confirmed")
-            .push((confirmation, flow_cookie, client));
+        self.confirmed.lock().expect("confirmed").push((
+            confirmation,
+            code.map(str::to_owned),
+            flow_cookie,
+            client,
+        ));
         Ok(SsoReply {
             status: 200,
             location: None,
@@ -477,8 +509,12 @@ const ALICE: Uuid = Uuid::from_u128(0xA11CE);
 /// The plain user [`as_user`] signs in as (`test_support::sample_user`).
 const SIGNED_IN: Uuid = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
 
-/// The code-entry page [`FakeSso`] answers.
-const QUICK_CONNECT_PAGE: &str = "<form method=\"get\"><input name=\"quickConnect\"></form>";
+/// The page [`FakeSso`] answers a paced request with.
+const PACED_PAGE: &str = "<p>Too many sign-in attempts came from your network.</p>";
+
+/// The Quick Connect page [`FakeSso`] answers.
+const QUICK_CONNECT_PAGE: &str =
+    "<p><a href=\"oidc/pocket/start?quickConnect\">Sign in with Pocket ID</a></p>";
 
 /// The session [`FakeSso`] answers the exchange code `good` with.
 fn signed_in() -> AuthenticationResultData {
@@ -1188,11 +1224,12 @@ async fn a_page_runs_only_what_its_policy_names_and_is_never_sniffed() {
     );
 }
 
-/// B13's routes: the code-entry page as the plugin answers it, the start's
-/// `quickConnect` to the Quick Connect start (never the sign-in's), and the
-/// confirmation's form, cookie and caller to the plugin.
+/// B13's routes: the page as the plugin answers it, the start's
+/// `quickConnect` to the Quick Connect start (never the sign-in's) with what
+/// it holds, and the confirmation's form, typed code, cookie and caller to
+/// the plugin.
 #[tokio::test]
-async fn the_quick_connect_routes_hand_the_code_the_confirmation_and_the_cookie_to_the_plugin() {
+async fn the_quick_connect_routes_hand_the_parameter_the_code_and_the_cookie_to_the_plugin() {
     let fake = FakeSso::new(true);
     let page = respond(
         fake_state().with_sso(fake.clone()),
@@ -1213,12 +1250,7 @@ async fn the_quick_connect_routes_hand_the_code_the_confirmation_and_the_cookie_
 
     let start = respond(
         fake_state().with_sso(fake.clone()),
-        request(
-            "GET",
-            "/sso/oidc/pocket/start?quickConnect=123456",
-            "",
-            false,
-        ),
+        request("GET", "/sso/oidc/pocket/start?quickConnect", "", false),
     )
     .await;
     assert_eq!(start.status(), StatusCode::FOUND);
@@ -1226,13 +1258,28 @@ async fn the_quick_connect_routes_hand_the_code_the_confirmation_and_the_cookie_
         header(&start, "set-cookie"),
         ["ferrofin_sso_flow=b2; Path=/sso; HttpOnly"]
     );
+    // What a `quickConnect` holds reaches the plugin, which refuses it; of
+    // repeated ones, one that holds something.
+    for query in [
+        "quickConnect=123456",
+        "quickConnect&quickConnect=123456",
+        "quickConnect=123456&quickConnect",
+    ] {
+        respond(
+            fake_state().with_sso(fake.clone()),
+            request("GET", &format!("/sso/oidc/pocket/start?{query}"), "", false),
+        )
+        .await;
+    }
+    let loopback = IpAddr::from([127, 0, 0, 1]);
     assert_eq!(
         fake.quick_connect_started(),
-        [(
-            "pocket".to_owned(),
-            IpAddr::from([127, 0, 0, 1]),
-            "123456".to_owned()
-        )]
+        [
+            ("pocket".to_owned(), loopback, String::new()),
+            ("pocket".to_owned(), loopback, "123456".to_owned()),
+            ("pocket".to_owned(), loopback, "123456".to_owned()),
+            ("pocket".to_owned(), loopback, "123456".to_owned()),
+        ]
     );
     assert!(fake.started().is_empty(), "no plain sign-in");
 
@@ -1241,7 +1288,7 @@ async fn the_quick_connect_routes_hand_the_code_the_confirmation_and_the_cookie_
         .uri("/sso/quickconnect")
         .header("content-type", "application/x-www-form-urlencoded")
         .header("cookie", "theme=dark; ferrofin_sso_flow=b2")
-        .body(Body::from("other=1&confirmation=c%2B1"))
+        .body(Body::from("other=1&confirmation=c%2B1&code=+123456"))
         .expect("request");
     let confirmed = respond(fake_state().with_sso(fake.clone()), confirm).await;
     assert_eq!(confirmed.status(), StatusCode::OK);
@@ -1250,21 +1297,75 @@ async fn the_quick_connect_routes_hand_the_code_the_confirmation_and_the_cookie_
         ["ferrofin_sso_flow=; Path=/sso; Max-Age=0"]
     );
     assert_eq!(header(&confirmed, "referrer-policy"), ["no-referrer"]);
-    let (confirmation, cookie, client) = fake.confirmed().remove(0);
+    let (confirmation, code, cookie, client) = fake.confirmed().remove(0);
     assert_eq!(confirmation.as_ref().map(Secret::expose), Some("c+1"));
+    // As typed: the plugin decides what is a code.
+    assert_eq!(code.as_deref(), Some(" 123456"));
     assert_eq!(cookie.as_ref().map(Secret::expose), Some("b2"));
-    assert_eq!(client, IpAddr::from([127, 0, 0, 1]));
+    assert_eq!(client, loopback);
 
-    // A form without the confirmation still reaches the plugin, which
-    // refuses it.
+    // A form without the confirmation or the code still reaches the plugin,
+    // which refuses it.
     let bare = Request::builder()
         .method("POST")
         .uri("/sso/quickconnect")
         .body(Body::empty())
         .expect("request");
     respond(fake_state().with_sso(fake.clone()), bare).await;
-    let (confirmation, cookie, _) = fake.confirmed().remove(1);
-    assert!(confirmation.is_none() && cookie.is_none());
+    let (confirmation, code, cookie, _) = fake.confirmed().remove(1);
+    assert!(confirmation.is_none() && code.is_none() && cookie.is_none());
+}
+
+/// D23: on an `https` public URL the routes read the flow cookie under its
+/// `__Host-` name only, so one under the old name, which a sibling host could
+/// have set, reaches the plugin as no cookie.
+#[tokio::test]
+async fn under_the_host_only_name_a_cookie_under_the_old_name_is_not_read() {
+    let fake = Arc::new(FakeSso {
+        enabled: true,
+        host_only: true,
+        ..FakeSso::default()
+    });
+    let state = || fake_state().with_sso(fake.clone());
+    let planted = "ferrofin_sso_flow=planted";
+    let both = "ferrofin_sso_flow=planted; __Host-ferrofin_sso_flow=b1";
+    let confirm = |cookie: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/sso/quickconnect")
+            .header("cookie", cookie)
+            .body(Body::from("confirmation=c1&code=123456"))
+            .expect("request")
+    };
+    for cookie in [planted, both] {
+        let callback = Request::builder()
+            .uri("/sso/oidc/pocket/callback?state=s1&code=c1")
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .expect("request");
+        respond(state(), callback).await;
+        respond(state(), exchange("good", Some(cookie))).await;
+        respond(state(), confirm(cookie)).await;
+    }
+    let read = |cookie: Option<Secret>| cookie.map(|cookie| cookie.expose().to_owned());
+    let finished: Vec<_> = fake
+        .finished()
+        .into_iter()
+        .map(|(_, callback)| read(callback.flow_cookie))
+        .collect();
+    let exchanged: Vec<_> = fake
+        .exchanged()
+        .into_iter()
+        .map(|(_, cookie, _)| read(cookie))
+        .collect();
+    let confirmed: Vec<_> = fake
+        .confirmed()
+        .into_iter()
+        .map(|(_, _, cookie, _)| read(cookie))
+        .collect();
+    for seen in [finished, exchanged, confirmed] {
+        assert_eq!(seen, [None, Some("b1".to_owned())]);
+    }
 }
 
 /// B1 for the Quick Connect routes: no such route while disabled or without
@@ -1273,8 +1374,8 @@ async fn the_quick_connect_routes_hand_the_code_the_confirmation_and_the_cookie_
 async fn the_quick_connect_routes_answer_not_found_while_disabled() {
     for (method, path, body) in [
         ("GET", "/sso/quickconnect", ""),
-        ("POST", "/sso/quickconnect", "confirmation=c1"),
-        ("GET", "/sso/oidc/pocket/start?quickConnect=123456", ""),
+        ("POST", "/sso/quickconnect", "confirmation=c1&code=123456"),
+        ("GET", "/sso/oidc/pocket/start?quickConnect", ""),
     ] {
         let fake = FakeSso::new(false);
         let (status, _) = send(
@@ -1636,4 +1737,160 @@ async fn the_link_routes_answer_not_found_while_disabled() {
             assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
         }
     }
+}
+
+// ---- the pace (D23) ------------------------------------------------------------
+
+/// Each paced route as a browser or the link page sends it, with a flow
+/// cookie where the route reads one, from `peer`, and the pace it counts
+/// against.
+fn paced_requests(peer: IpAddr) -> Vec<(OidcPacedRoute, Request<Body>)> {
+    let build = |method: &str, uri: &str, content_type: &str, body: &str, token: bool| {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("cookie", "ferrofin_sso_flow=b1")
+            .extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                peer, 50_000,
+            )));
+        if !content_type.is_empty() {
+            builder = builder.header("content-type", content_type);
+        }
+        if token {
+            builder = builder.header(
+                "authorization",
+                format!(r#"MediaBrowser Token="{SESSION_TOKEN}""#),
+            );
+        }
+        builder.body(Body::from(body.to_owned())).expect("request")
+    };
+    vec![
+        (
+            OidcPacedRoute::Start,
+            build("GET", "/sso/oidc/pocket/start", "", "", false),
+        ),
+        (
+            OidcPacedRoute::Start,
+            build("GET", "/sso/oidc/pocket/start?quickConnect", "", "", false),
+        ),
+        (
+            OidcPacedRoute::Start,
+            build(
+                "POST",
+                "/sso/oidc/pocket/link",
+                "application/json",
+                START_BODY,
+                true,
+            ),
+        ),
+        (
+            OidcPacedRoute::Callback,
+            build(
+                "GET",
+                "/sso/oidc/pocket/callback?state=s1&code=c1",
+                "",
+                "",
+                false,
+            ),
+        ),
+        (
+            OidcPacedRoute::Exchange,
+            build(
+                "POST",
+                "/sso/oidc/exchange",
+                "application/json",
+                r#"{"Code":"good"}"#,
+                false,
+            ),
+        ),
+        (
+            OidcPacedRoute::QuickConnectConfirmation,
+            build(
+                "POST",
+                "/sso/quickconnect",
+                "application/x-www-form-urlencoded",
+                "confirmation=c1&code=123456",
+                false,
+            ),
+        ),
+    ]
+}
+
+/// D23: past its pace, every route that creates a pending flow or takes a
+/// one-time value answers the plugin's `429` page and reaches nothing else:
+/// no start, callback, exchange or confirmation, no cookie set, and not even
+/// the flow cookie's name, which reads the configuration. The pace is asked
+/// with the route and the caller's address.
+#[tokio::test]
+async fn a_paced_route_answers_the_plugins_page_and_reaches_nothing_else() {
+    let peer: IpAddr = "2001:db8:1:2::7".parse().expect("an address");
+    for (route, request) in paced_requests(peer) {
+        let what = format!("{} {}", request.method(), request.uri());
+        let fake = Arc::new(FakeSso {
+            enabled: true,
+            paced: true,
+            ..FakeSso::default()
+        });
+        let response = respond(as_user(fake.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{what}");
+        assert_eq!(
+            header(&response, "set-cookie"),
+            Vec::<&str>::new(),
+            "{what}"
+        );
+        assert_eq!(header(&response, "cache-control"), ["no-store"], "{what}");
+        assert_eq!(
+            header(&response, "content-security-policy"),
+            ["default-src 'none'"],
+            "{what}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], PACED_PAGE.as_bytes(), "{what}");
+        assert!(fake.untouched(), "{what}");
+        assert_eq!(*fake.cookie_name_reads.lock().expect("reads"), 0, "{what}");
+        assert_eq!(
+            *fake.paces.lock().expect("paces"),
+            [(route, peer)],
+            "{what}"
+        );
+    }
+}
+
+/// Within its pace, each of those routes goes on to the plugin, counted once;
+/// the routes that create nothing are not paced, and a disabled plugin
+/// answers `404` before any pace is counted (B1).
+#[tokio::test]
+async fn a_route_within_its_pace_reaches_the_plugin_and_others_are_not_paced() {
+    let peer = IpAddr::from([198, 51, 100, 7]);
+    for (route, request) in paced_requests(peer) {
+        let what = format!("{} {}", request.method(), request.uri());
+        let fake = FakeSso::new(true);
+        let response = respond(as_user(fake.clone()), request).await;
+        assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{what}");
+        assert!(!fake.untouched(), "{what}");
+        assert_eq!(
+            *fake.paces.lock().expect("paces"),
+            [(route, peer)],
+            "{what}"
+        );
+    }
+    for (_, request) in paced_requests(peer) {
+        let what = format!("{} {}", request.method(), request.uri());
+        let fake = FakeSso::new(false);
+        let response = respond(as_user(fake.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{what}");
+        assert!(fake.paces.lock().expect("paces").is_empty(), "{what}");
+    }
+    let fake = Arc::new(FakeSso {
+        enabled: true,
+        paced: true,
+        ..FakeSso::default()
+    });
+    for path in ["/sso/quickconnect", "/sso/link", "/sso/links"] {
+        let response = respond(as_user(fake.clone()), request("GET", path, "", true)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+    }
+    assert!(fake.paces.lock().expect("paces").is_empty(), "not paced");
 }

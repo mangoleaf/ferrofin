@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use serde_json::{Map, Number, Value};
+use serde_json::{Number, Value};
 
 use ferrofin_traits::error::ServiceError;
 
@@ -18,23 +18,26 @@ const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
 /// The schema namespace `XmlSerializer` declares beside it.
 const XSD: &str = "http://www.w3.org/2001/XMLSchema";
 
-/// Writes `fields` as the document `<root>`.
+/// Writes `fields` as the document `<root>`, its members in the order given.
 ///
 /// `entries` names the element of each entry of a collection of objects,
 /// keyed by the collection's member name. Entries of primitives are named
 /// after their type, as `XmlSerializer` names them.
 ///
-/// shortcut: members are written in key order, not the C# declaration order
-/// Jellyfin writes. `XmlSerializer` reads a class's members in any order;
-/// write them in declaration order if a reader ever depends on it.
+/// shortcut: the configuration documents pass a JSON object, so their members
+/// come in key order, not the C# declaration order Jellyfin writes.
+/// `XmlSerializer` reads a class's members in any order, but sets them in
+/// document order, so a setter that reads another member (MusicBrainz's
+/// `RateLimit` reads `Server`) needs declaration order: the plugin documents
+/// pass their members in it.
 ///
 /// # Errors
 ///
 /// Returns [`ServiceError::Backend`] for a collection of objects `entries`
 /// does not name, or a string holding a character XML 1.0 cannot carry.
-pub(super) fn document(
+pub(super) fn document<'a>(
     root: &str,
-    fields: &Map<String, Value>,
+    fields: impl IntoIterator<Item = (&'a String, &'a Value)>,
     entries: &[(&str, &str)],
 ) -> Result<String, ServiceError> {
     let mut out = format!(

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # The Ferrofin stage of a round-trip route, sourced by run.sh: adopt a fresh copy of the fixture, scan it,
+# set up Live TV on the tuner and guide livetv.py writes into the route (mounted at /livetv, as for Jellyfin),
 # run the usage stage (usage.py, which captures Ferrofin's answers as the route's oracle) and stop. The scale
 # route only adopts it, waits for its startup tasks and stops: its 40,000 clones' files are hard links to their
 # templates' (scale.py), so a scan re-identifies and re-extracts every clone, which measures the fixture, not the
@@ -15,13 +16,16 @@ ferrofin_stage() {
   if ! { cp -a "$FIXTURES/$fixture" "$dst/ferrofin" && mkdir -p "$dst/ferrofin-cache"; }; then
     why+=("cannot copy $fixture"); mark Ferrofin ready; return 1
   fi
+  if ! python3 "$HERE/livetv.py" fixture "$dst/livetv"; then
+    why+=("cannot write the Live TV fixture"); mark Ferrofin ready; return 1
+  fi
   # a configuration directory of its own: the copy's config/ moves there, as a package migration moves it
   if [ "$config_at" != - ] && ! mv "$dst/ferrofin/config" "$dst/ferrofin-config"; then
     why+=("$fixture has no config/ to run at $config_at"); mark Ferrofin ready; return 1
   fi
   MADE+=("$cid")
   if port=$(rt_start "$name" "$cid" "$TAG" "${SERVER_DIRS[@]}" -e FERROFIN_CACHE_DIR=/cache \
-      -v "$dst/ferrofin-cache:/cache" "${MEDIA[@]}" 2>"$dst/ferrofin-start.err"); then
+      -v "$dst/ferrofin-cache:/cache" -v "$dst/livetv:/livetv:ro" "${MEDIA[@]}" 2>"$dst/ferrofin-start.err"); then
     url=http://127.0.0.1:$port
     rt_wait_up "$name" "$port" "$READY_TIMEOUT" || why+=("$(rt_not_up "$name" "$READY_TIMEOUT")")
   else
@@ -41,6 +45,11 @@ ferrofin_stage() {
     rt_docker logs "$name" > "$dst/ferrofin-boot.log" 2>&1
     check adoption_check_boot_log "$dst/ferrofin-boot.log" "$generation"
     mark Ferrofin "boot log (generation, migrations, no ERROR)"
+    # before the usage stage, so its answers (the oracle) hold the channels too
+    # twice the script's own bound, so its own reason comes first
+    check reasons_within $((2 * SCAN_TIMEOUT)) "the Live TV setup" python3 "$HERE/livetv.py" setup --base-url "$url" \
+      --data-dir "$dst/ferrofin" --out "$dst/livetv-ferrofin.json" --timeout "$SCAN_TIMEOUT"
+    mark Ferrofin "Live TV: a tuner, a guide, a timer, a series timer and a favourite channel"
     # its actions, two scans each followed by a settle (each wait within SCAN_TIMEOUT) and the probes: five times that
     check reasons_within $((5 * SCAN_TIMEOUT)) "the usage stage" env ROUNDTRIP_SCAN_TIMEOUT="$SCAN_TIMEOUT" \
       python3 "$HERE/usage.py" --base-url "$url" --data-dir "$dst/ferrofin" --oracle-out "$dst/oracle.txt"

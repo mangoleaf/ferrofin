@@ -1050,53 +1050,7 @@ fn folder_sources_query(folder_id: Uuid) -> InternalItemsQuery {
     }
 }
 
-/// Dimensions + blurhash for a written image file, the way the scanner records
-/// every other image (so the DTO carries `Width`/`Height`/`ImageBlurHashes`):
-/// what `LibraryManager.UpdateImagesAsync` fills for a saved image. `path` is
-/// the file to read: `image.path` itself, or its expansion when the row stores
-/// a virtual path.
-///
-/// Best-effort: an error reading the size leaves the size the caller set,
-/// and an error computing the blurhash leaves no hash. Each failure is logged
-/// with the item, the image type and the path, the events `UpdateImagesAsync`
-/// and its encoder log, at levels set by LOGGING.md rule 1: a missing file, an
-/// error reading the size and a failed blurhash at `warn!` (upstream: Warning,
-/// Error, Error), a file measured 0x0 at `debug!` (upstream: Debug when empty
-/// or unsupported, Warning when undecodable, which this encoder cannot tell
-/// apart).
-pub(crate) async fn fill_image_metadata(
-    processor: &dyn ImageProcessor,
-    item_id: Uuid,
-    path: &str,
-    image: &mut ItemImageInfo,
-) {
-    let image_type = image.image_type;
-    let dims = match processor.get_image_dimensions(path).await {
-        Ok(dims) => dims,
-        Err(ServiceError::NotFound(_)) => {
-            tracing::warn!(item_id = %item_id, ?image_type, path = %path, "image not found");
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(%error, item_id = %item_id, ?image_type, path = %path, "cannot get image dimensions");
-            return;
-        }
-    };
-    if dims.width <= 0 || dims.height <= 0 {
-        // The encoder answers an empty, unsupported or undecodable file 0x0,
-        // and cannot say which: debug, as an SVG logo (no decoder, gl-802) is
-        // one per movie, measured again on every scan.
-        tracing::debug!(item_id = %item_id, ?image_type, path = %path, "unable to determine image dimensions");
-    }
-    image.width = dims.width;
-    image.height = dims.height;
-    match processor.get_image_blur_hash_sized(path, dims).await {
-        Ok(hash) => image.blur_hash = Some(hash),
-        Err(error) => {
-            tracing::warn!(%error, item_id = %item_id, ?image_type, path = %path, "cannot compute blurhash");
-        }
-    }
-}
+pub(crate) use ferrofin_providers::image_metadata::fill_image_metadata;
 
 /// `BaseDynamicImageProvider.HasChangedByDate`: the recorded `DateModified`
 /// differs from the file's current modification time. A file that can no
@@ -2698,7 +2652,8 @@ mod tests {
     /// cannot be decoded as unmeasurable (`debug!`), and a truncated one whose
     /// header still gives its size as having no blurhash (`warn!`), each with
     /// the item, the image type and the path (gl-384,
-    /// `LibraryManager.UpdateImagesAsync`); none gets a hash.
+    /// `LibraryManager.UpdateImagesAsync`); the unreadable ones get an empty
+    /// hash, as upstream stores, and the missing one none.
     #[tokio::test]
     async fn an_unreadable_image_is_logged_with_its_item_type_and_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2747,8 +2702,11 @@ mod tests {
             let mut info = image_info(image_type, path, None);
             fill_image_metadata(&processor, item, path, &mut info).await;
             assert_eq!((info.width, info.height), size, "{path}");
-            assert!(
-                info.blur_hash.as_deref().is_none_or(str::is_empty),
+            // A missing file is left as it is; an unreadable one gets
+            // upstream's empty blurhash.
+            assert_eq!(
+                info.blur_hash.as_deref(),
+                (*path != missing).then_some(""),
                 "{path}"
             );
 

@@ -19,9 +19,17 @@
 //! `%MetadataPath%`) are left as they are: Jellyfin expands them onto its own
 //! directories.
 //!
-//! This is the inverse of Ferrofin's boot repair `rebase_program_data_paths`
-//! over the same Jellyfin-owned columns; Ferrofin's own are dropped from the
+//! Over those columns this is the inverse of Ferrofin's boot repair
+//! `rebase_program_data_paths`; Ferrofin's own columns are dropped from the
 //! export.
+//!
+//! `BaseItems.Data` holds paths too: each item's own path lists, which
+//! Jellyfin serialises with the item (`BaseItemMapper.Map`): a library's and
+//! the root's `PhysicalLocationsList`, a video's `AdditionalParts`,
+//! `LocalAlternateVersions`, `LinkedAlternateVersions[].Path`, `SubtitleFiles`
+//! and `AudioFiles`, a song's `LyricFiles`, and `ShortcutPath`. Every string
+//! value there that lies under a source directory moves the same way, and
+//! every other byte of the document stays as it was.
 
 use std::path::Path;
 
@@ -38,6 +46,11 @@ const PATH_COLUMNS: [(&str, &str); 5] = [
     ("MediaStreamInfos", "Path"),
     ("ImageInfos", "Path"),
 ];
+
+/// The Jellyfin JSON columns whose string values can hold such a path. Its
+/// free text (names, overviews) lives in columns of its own, so a string
+/// value here that a source directory holds is a path.
+const JSON_PATH_COLUMNS: [(&str, &str); 1] = [("BaseItems", "Data")];
 
 /// The stored types of the rows whose path has a fixed place under program
 /// data, with that place: the aggregate root (`root`), the user root
@@ -71,8 +84,23 @@ pub struct PathRewrite {
     /// The one the aggregate root names, which the server sets at each start:
     /// where it last ran. `None` when the database has no such row.
     pub ran_at: Option<String>,
-    /// The rows whose path was rewritten, across every column.
-    pub rows: u64,
+    /// The stored paths rewritten, across every column and every `Data`
+    /// document.
+    pub rewritten: u64,
+    /// `(from, to)` for every directory a stored path moves from, longest
+    /// first: what [`PathRewrite::moved`] applies to the paths the export
+    /// writes into files rather than the database.
+    pub moves: Vec<(String, String)>,
+}
+
+impl PathRewrite {
+    /// Where `path` moves in the output's layout: under the longest directory
+    /// of [`Self::moves`] that holds it, by whole components. `None` for a
+    /// path under none of them (media, a token, a relative path).
+    #[must_use]
+    pub fn moved(&self, path: &str) -> Option<String> {
+        moved(path, &self.moves)
+    }
 }
 
 /// Rewrites every path the staged database stores under one of the source's
@@ -81,8 +109,9 @@ pub struct PathRewrite {
 /// [`Layout::program_data`] (`config` to [`Layout::config`], `metadata` to
 /// [`Layout::metadata`]); under `dirs.config` to [`Layout::config`]; under
 /// `dirs.metadata` to [`Layout::metadata`]. The longest directory that holds a
-/// path decides, matched by whole components. A table the database lacks is
-/// skipped.
+/// path decides, matched by whole components, in the path columns and in
+/// every string value of an item's `Data`. A table or `Data` column the
+/// database lacks is skipped.
 pub(super) async fn rewrite(
     conn: &mut SqliteConnection,
     dirs: &SourceDirs,
@@ -94,19 +123,19 @@ pub(super) async fn rewrite(
         (Vec::new(), None)
     };
     let moves = moves(&stored, dirs, layout);
-    let mut rows = 0;
+    // One pass over each table for every directory; the directories are bound.
+    let froms = serde_json::Value::from(
+        moves
+            .iter()
+            .map(|(from, _)| from.clone())
+            .collect::<Vec<_>>(),
+    )
+    .to_string();
+    let mut rewritten = 0;
     for (table, column) in PATH_COLUMNS {
         if !has_table(conn, table).await? {
             continue;
         }
-        // One pass over the table for every directory; the directories are bound.
-        let froms = serde_json::Value::from(
-            moves
-                .iter()
-                .map(|(from, _)| from.clone())
-                .collect::<Vec<_>>(),
-        )
-        .to_string();
         // Table and column names come from `PATH_COLUMNS`. The column is named
         // with its table: `json_each` has a `path` column of its own.
         let found: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -116,27 +145,44 @@ pub(super) async fn rewrite(
                                 OR substr("{table}"."{column}", 1, length(d.value) + 1)
                                    = d.value || '/')"#
         )))
-        .bind(froms)
+        .bind(&froms)
         .fetch_all(&mut *conn)
         .await?;
         for (rowid, path) in found {
             let Some(to) = moved(&path, &moves).filter(|to| *to != path) else {
                 continue;
             };
-            rows += sqlx::query(sqlx::AssertSqlSafe(format!(
-                r#"UPDATE "{table}" SET "{column}" = ?1 WHERE rowid = ?2"#
-            )))
-            .bind(to)
-            .bind(rowid)
-            .execute(&mut *conn)
-            .await?
-            .rows_affected();
+            rewritten += update(conn, table, column, &to, rowid).await?;
+        }
+    }
+    for (table, column) in JSON_PATH_COLUMNS {
+        if !has_column(conn, table, column).await? {
+            continue;
+        }
+        // The documents holding a string that starts with `/`, however it is
+        // spelled (`/`, `\/`, `\u002F`): every directory a path moves from
+        // is absolute. Which of them moves is `moved_json`'s to say.
+        let found: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            r#"SELECT rowid, "{column}" FROM "{table}"
+               WHERE "{column}" IS NOT NULL
+                 AND (instr("{column}", '"/') > 0 OR instr("{column}", '"\/') > 0
+                      OR instr(lower("{column}"), '"\u002f') > 0)"#
+        )))
+        .fetch_all(&mut *conn)
+        .await?;
+        for (rowid, json) in found {
+            if let Some((to, paths)) = moved_json(&json, &moves)
+                && update(conn, table, column, &to, rowid).await? > 0
+            {
+                rewritten += paths;
+            }
         }
     }
     Ok(PathRewrite {
         stored,
         ran_at,
-        rows,
+        rewritten,
+        moves,
     })
 }
 
@@ -221,10 +267,99 @@ fn spellings(dir: &Path) -> Vec<String> {
 
 /// Where `path` moves: under the longest `from` of `moves` that holds it.
 fn moved(path: &str, moves: &[(String, String)]) -> Option<String> {
-    moves.iter().find_map(|(from, to)| {
-        let rest = path.strip_prefix(from.as_str())?;
-        (rest.is_empty() || rest.starts_with('/')).then(|| format!("{to}{rest}"))
+    let (from, to) = move_of(path, moves)?;
+    Some(format!("{to}{}", &path[from.len()..]))
+}
+
+/// The longest `(from, to)` of `moves` whose `from` holds `path`, by whole
+/// components.
+fn move_of<'a>(path: &str, moves: &'a [(String, String)]) -> Option<&'a (String, String)> {
+    moves.iter().find(|(from, _)| {
+        path.strip_prefix(from.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     })
+}
+
+/// `json` with every string value [`moved`] moves replaced, every other byte
+/// as it was, and how many moved; `None` when none does. Object keys are
+/// never values. A value that spells the directory plainly keeps its own
+/// text past it, escapes included; one that escapes it is written afresh.
+fn moved_json(json: &str, moves: &[(String, String)]) -> Option<(String, u64)> {
+    let bytes = json.as_bytes();
+    let (mut out, mut copied, mut at, mut count) = (String::new(), 0, 0, 0);
+    while let Some(offset) = json[at..].find('"') {
+        let start = at + offset;
+        // The closing quote: the first one no backslash escapes. A document
+        // that ends inside a string is left as it is.
+        let mut end = start + 1;
+        while *bytes.get(end)? != b'"' {
+            end += if bytes[end] == b'\\' { 2 } else { 1 };
+        }
+        at = end + 1;
+        if json[at..].trim_start().starts_with(':') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<String>(&json[start..at]) else {
+            continue;
+        };
+        let Some((from, to)) = move_of(&value, moves).filter(|(from, to)| from != to) else {
+            continue;
+        };
+        let raw = &json[start + 1..end];
+        let rest = match raw.strip_prefix(from.as_str()) {
+            Some(rest) => rest.to_owned(),
+            None => escaped(&value[from.len()..])?,
+        };
+        out.push_str(&json[copied..start]);
+        out.push('"');
+        out.push_str(&escaped(to)?);
+        out.push_str(&rest);
+        out.push('"');
+        copied = at;
+        count += 1;
+    }
+    (count > 0).then(|| (out + &json[copied..], count))
+}
+
+/// `text` as a JSON string's content, without its quotes.
+fn escaped(text: &str) -> Option<String> {
+    let quoted = serde_json::to_string(text).ok()?;
+    Some(quoted[1..quoted.len() - 1].to_owned())
+}
+
+/// Sets `table`.`column` of the row `rowid` to `value`: the rows it changed.
+async fn update(
+    conn: &mut SqliteConnection,
+    table: &str,
+    column: &str,
+    value: &str,
+    rowid: i64,
+) -> Result<u64> {
+    // Table and column names come from the column lists above.
+    Ok(sqlx::query(sqlx::AssertSqlSafe(format!(
+        r#"UPDATE "{table}" SET "{column}" = ?1 WHERE rowid = ?2"#
+    )))
+    .bind(value)
+    .bind(rowid)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected())
+}
+
+/// Whether the database has the table `table` with the column `column`.
+pub(super) async fn has_column(
+    conn: &mut SqliteConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2")
+            .bind(table)
+            .bind(column)
+            .fetch_one(&mut *conn)
+            .await?
+            > 0,
+    )
 }
 
 /// Whether the database has the table `name`.
@@ -245,8 +380,47 @@ mod tests {
     use sqlx::ConnectOptions as _;
     use sqlx::sqlite::SqliteConnectOptions;
 
-    use super::{moved, moves, program_data_of, rewrite};
+    use super::{moved, moved_json, moves, program_data_of, rewrite};
     use crate::export::layout::{DOCKER, SourceDirs};
+
+    /// A document's string values under a source directory move, Jellyfin's
+    /// escapes past the directory kept; keys, other strings and every other
+    /// byte stay as they were.
+    #[test]
+    fn a_documents_paths_move_and_every_other_byte_stays() {
+        let moves = moves(
+            &["/data".to_owned()],
+            &SourceDirs::new(Path::new("/srv/x")),
+            &DOCKER,
+        );
+        let json = concat!(
+            r#"{"PhysicalLocationsList":["/data/root/default/Caf\u00E9 \u0026 Bar","/media/movies"],"#,
+            r#""/data":1, "SubtitleFiles" : [ "/data/metadata/library/ab/x.srt" ],"#,
+            r#""RemoteTrailers":[{"Url":"https://x/data/y"}],"ShortcutPath":"%MetadataPath%/x","#,
+            r#""LinkedAlternateVersions":[{"Path":"\/data\/root"},{"Path":"/data"}],"#,
+            r#""Note":"a \"quoted\" /data/x","IsHD":false}"#
+        );
+        assert_eq!(
+            moved_json(json, &moves),
+            Some((
+                concat!(
+                r#"{"PhysicalLocationsList":["/config/root/default/Caf\u00E9 \u0026 Bar","/media/movies"],"#,
+                r#""/data":1, "SubtitleFiles" : [ "/config/metadata/library/ab/x.srt" ],"#,
+                r#""RemoteTrailers":[{"Url":"https://x/data/y"}],"ShortcutPath":"%MetadataPath%/x","#,
+                r#""LinkedAlternateVersions":[{"Path":"/config/root"},{"Path":"/config"}],"#,
+                r#""Note":"a \"quoted\" /data/x","IsHD":false}"#
+                )
+                .to_owned(),
+                4
+            ))
+        );
+        for unmoved in [
+            r#"{"A":["/media/a"],"B":"/database/x","/data/c":true}"#,
+            r#"{"A":"/data/x"#,
+        ] {
+            assert_eq!(moved_json(unmoved, &moves), None, "{unmoved}");
+        }
+    }
 
     #[test]
     fn a_placed_row_names_its_program_data_directory() {
@@ -345,7 +519,7 @@ mod tests {
 
         assert_eq!(rewrite.stored, ["/data", "/moved"]);
         assert_eq!(rewrite.ran_at.as_deref(), Some("/data"));
-        assert_eq!(rewrite.rows, 8);
+        assert_eq!(rewrite.rewritten, 8);
         let paths: Vec<Option<String>> =
             sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" ORDER BY rowid"#)
                 .fetch_all(&mut conn)
@@ -392,6 +566,66 @@ mod tests {
         );
     }
 
+    /// The paths a library's, the root's and a video's `Data` store under the
+    /// source move with the columns, each counted; a document holding none is
+    /// left byte for byte.
+    #[tokio::test]
+    async fn rewrites_the_paths_items_store_in_their_data() {
+        let mut conn = SqliteConnectOptions::new()
+            .in_memory(true)
+            .connect()
+            .await
+            .unwrap();
+        for statement in [
+            r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT, "Data" TEXT)"#,
+            r#"INSERT INTO "BaseItems" VALUES
+               ('MediaBrowser.Controller.Entities.AggregateFolder', '/data/root',
+                '{"PhysicalLocationsList":["/data/root","/data/data/collections","/media/movies"]}'),
+               ('MediaBrowser.Controller.Entities.CollectionFolder', '/media/elsewhere',
+                '{"PhysicalLocationsList":["/data/root/default/Collections","/data/data/collections"],"IsRoot":false}'),
+               ('MediaBrowser.Controller.Entities.Movies.Movie', '/media/movies/a.mkv',
+                '{"SubtitleFiles":["/data/metadata/library/ab/ab12/a.en.srt"],"AdditionalParts":[]}'),
+               ('MediaBrowser.Controller.Entities.Movies.Movie', '/media/movies/b.mkv',
+                '{"SubtitleFiles":["/media/movies/b.en.srt"],"Note":"\u0026 /data"}'),
+               ('MediaBrowser.Controller.Entities.CollectionFolder', '/media/esc',
+                '{"PhysicalLocationsList":["\/data\/root\/default\/Esc","/data/root/default/Café","\u002Fdata/root/Uni"],"Name":"日本"}'),
+               ('MediaBrowser.Controller.Entities.Video', '/media/v.mkv',
+                '{"SubtitleFiles":["\u002Fdata/metadata/v.srt"]}'),
+               ('MediaBrowser.Controller.Entities.Folder', NULL, NULL)"#,
+        ] {
+            sqlx::query(statement).execute(&mut conn).await.unwrap();
+        }
+
+        let rewrite = rewrite(&mut conn, &SourceDirs::new(Path::new("/data")), &DOCKER)
+            .await
+            .unwrap();
+
+        // The root's path, and nine paths in five documents, three of them
+        // spelling their directory with escapes (one only so: the pre-filter
+        // must still find it).
+        assert_eq!(rewrite.rewritten, 10);
+        let data: Vec<Option<String>> =
+            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" ORDER BY rowid"#)
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(
+            data,
+            [
+                Some(r#"{"PhysicalLocationsList":["/config/root","/config/data/collections","/media/movies"]}"#),
+                Some(r#"{"PhysicalLocationsList":["/config/root/default/Collections","/config/data/collections"],"IsRoot":false}"#),
+                Some(r#"{"SubtitleFiles":["/config/metadata/library/ab/ab12/a.en.srt"],"AdditionalParts":[]}"#),
+                Some(r#"{"SubtitleFiles":["/media/movies/b.en.srt"],"Note":"\u0026 /data"}"#),
+                Some(
+                    r#"{"PhysicalLocationsList":["/config/root/default/Esc","/config/root/default/Café","/config/root/Uni"],"Name":"日本"}"#
+                ),
+                Some(r#"{"SubtitleFiles":["/config/metadata/v.srt"]}"#),
+                None,
+            ]
+            .map(|data| data.map(str::to_owned))
+        );
+    }
+
     /// A database at `/config` already is left as it is.
     #[tokio::test]
     async fn a_source_at_config_changes_nothing() {
@@ -414,6 +648,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(rewrite.stored, ["/config"]);
-        assert_eq!(rewrite.rows, 0);
+        assert_eq!(rewrite.rewritten, 0);
     }
 }

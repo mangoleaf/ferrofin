@@ -298,8 +298,10 @@ EOS
   for route in 10.11.8 12.4-from-123; do
     checks=$(jq -r --arg r "$route" 'select(.event == "check" and .fixture == $r) | "\(.stage)|\(.check)|\(.verdict)"' \
       "$TMP/w/results.jsonl")
-    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 18 ]
+    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 20 ]
     grep -qx "Export|the export completes|PASS" <<<"$checks"
+    grep -qx "Ferrofin|Live TV: a tuner, a guide, a timer, a series timer and a favourite channel|PASS" <<<"$checks"
+    grep -qx "Jellyfin|Live TV: timers, a favourite channel and the guide equal Ferrofin's before and after its first guide refresh|PASS" <<<"$checks"
     grep -qx "Export|every stored path is in the export, none under the directory Ferrofin ran at|PASS" <<<"$checks"
     grep -qx "Jellyfin|every playlist's full metadata refresh completes|PASS" <<<"$checks"
     grep -qx "Jellyfin|answers equal Ferrofin's before the stop|PASS" <<<"$checks"

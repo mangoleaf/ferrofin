@@ -19,8 +19,10 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
+use fast_image_resize::{
+    FilterType, IntoImageView, MulDiv, PixelType, ResizeAlg, ResizeOptions, Resizer,
+};
 use ferrofin_traits::error::ServiceError;
-use image::imageops::FilterType;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageError, ImageReader};
 
@@ -33,14 +35,10 @@ const MIB: u64 = 1024 * 1024;
 /// Pixels in a megapixel, the unit of the pixel setting.
 const MEGAPIXEL: u64 = 1_000_000;
 
-/// What the scratch buffer of a resize holds per pixel: `imageops::resize`
-/// samples every input, whatever its colour type, into an `Rgba32FImage`.
-const RESIZE_BYTES_PER_PIXEL: u64 = 16;
-
 /// The bounds of image work, in the units the code compares against.
 ///
 /// A file's header is enough to check the first two, so an image over them
-/// costs no memory. The third covers what a Lanczos3 or Triangle resize
+/// costs no memory. The third covers what a resize
 /// allocates on top of the decoded image, and what an image request's
 /// compositing (`backgroundColor`, `blur`, `foregroundLayer`) draws and
 /// writes it with.
@@ -51,8 +49,11 @@ pub struct ImageLimits {
     /// The most bytes one decode may allocate, the `image` crate's `max_alloc`.
     pub max_alloc: u64,
     /// The most bytes of scratch memory the resizes and compositing in flight
-    /// hold between them. A resize needs 16 bytes per pixel of the source's
-    /// width by the output's height, whatever the image's format; compositing
+    /// hold between them. A resize needs, in the image's own pixels, a copy of
+    /// the source when it has alpha and, when it changes both sides, the
+    /// source's width by the output's height (16-bit and float pixels: the
+    /// output's width by the source's height), plus its filter's weights, which
+    /// grow with how far a side shrinks, and a row of accumulators; compositing
     /// (`backgroundColor`, `blur`, `foregroundLayer`) 4 per output pixel, 3
     /// more when the output is a JPEG, and for a blur 64 more per pixel of the
     /// output's longest side. The encoders' own working memory is outside it,
@@ -248,10 +249,14 @@ impl ImageMemory {
         Ok(image)
     }
 
-    /// `image.resize_exact`, or [`ServiceError::InvalidInput`] when its
-    /// scratch buffer alone is over the resize budget. A resize the budget
-    /// holds waits here for any others it does not fit beside. A copy has no
-    /// scratch buffer, so it waits for nothing.
+    /// `image.resize_exact`, run by `fast_image_resize` (the same separable
+    /// convolution with SIMD picked at runtime) with premultiplied alpha, as
+    /// Skia resamples, so a clear pixel's colour does not bleed into its
+    /// neighbours. [`ServiceError::InvalidInput`] when its scratch alone is
+    /// over the resize budget. A resize the budget holds waits here for any
+    /// others it does not fit beside. A copy has no scratch, so it waits for
+    /// nothing. `filter`'s support must be at most 3 (Lanczos3's), the width
+    /// [`weight_bytes`] counts.
     pub(crate) fn resize_exact(
         &self,
         image: &DynamicImage,
@@ -259,7 +264,13 @@ impl ImageMemory {
         height: u32,
         filter: FilterType,
     ) -> Result<DynamicImage, ServiceError> {
-        let scratch = resize_scratch_bytes((image.width(), image.height()), (width, height));
+        let Some(pixel) = image.pixel_type() else {
+            return Err(ServiceError::invalid_input(format!(
+                "cannot resize a {:?} image",
+                image.color()
+            )));
+        };
+        let scratch = resize_scratch_bytes((image.width(), image.height()), (width, height), pixel);
         if scratch > self.limits.resize_budget {
             return Err(ServiceError::invalid_input(format!(
                 "cannot resize {}x{} to {width}x{height}: it takes {scratch} bytes, over the \
@@ -270,7 +281,17 @@ impl ImageMemory {
             )));
         }
         let _held = (scratch > 0).then(|| self.hold(scratch));
-        Ok(image.resize_exact(width, height, filter))
+        let mut resized = DynamicImage::new(width, height, image.color());
+        Resizer::new()
+            .resize(image, &mut resized, &resize_options(filter))
+            .map_err(|e| {
+                ServiceError::backend(format!(
+                    "resize {}x{} to {width}x{height}: {e}",
+                    image.width(),
+                    image.height()
+                ))
+            })?;
+        Ok(resized)
     }
 
     /// Runs `draw` while holding `bytes` of the resize budget, as
@@ -341,16 +362,87 @@ impl Drop for HeldScratch<'_> {
     }
 }
 
-/// The scratch buffer of resizing `source` to `target`, both width by height:
-/// its vertical pass, the source's width by the output's height. The same size
-/// is a plain copy, which builds none.
-fn resize_scratch_bytes(source: (u32, u32), target: (u32, u32)) -> u64 {
+/// A convolution with `filter`, alpha premultiplied while resampling.
+fn resize_options(filter: FilterType) -> ResizeOptions {
+    ResizeOptions::new()
+        .resize_alg(ResizeAlg::Convolution(filter))
+        .use_alpha(true)
+}
+
+/// What resizing `source` to `target` (both width by height) in `pixel`s
+/// holds beside the source and the output: the `Resizer`'s buffers, the
+/// weights of each side's pass, and for a vertical pass one row of
+/// accumulators, which the NEON kernels (aarch64) allocate at 4 bytes a
+/// component of an 8-bit pixel and 8 of a 16-bit one. The row is at most the
+/// wider of the two images, and 4 times a pixel's size bounds it for every
+/// type; it is counted on every CPU, so the budget does not depend on one.
+/// The same size is a plain copy, which builds none of them. All of it is read
+/// from `fast_image_resize` 6.1.0 (`resizer.rs`, `convolution/mod.rs`,
+/// `convolution/filters.rs`, `convolution/optimisations.rs`,
+/// `convolution/vertical_*/neon.rs`): read them again when the crate moves.
+fn resize_scratch_bytes(source: (u32, u32), target: (u32, u32), pixel: PixelType) -> u64 {
+    let accumulators = if source.1 == target.1 {
+        0
+    } else {
+        u64::from(source.0.max(target.0))
+            .saturating_mul(u64::try_from(pixel.size()).unwrap_or(u64::MAX))
+            .saturating_mul(4)
+    };
+    resizer_buffer_bytes(source, target, pixel)
+        .saturating_add(weight_bytes(source.0, target.0))
+        .saturating_add(weight_bytes(source.1, target.1))
+        .saturating_add(accumulators)
+}
+
+/// The buffers `fast_image_resize`'s `Resizer` allocates to resize `source`
+/// to `target` in `pixel`s, each with one pixel more to align it: the
+/// premultiplied copy of the source, for a type with alpha; and, when both
+/// sides change, the first pass's output. 8-bit components run the vertical
+/// pass first (the source's width by the output's height), the others the
+/// horizontal one (the output's width by the source's height). A nearest
+/// resize builds none, so for it this is an upper bound.
+fn resizer_buffer_bytes(source: (u32, u32), target: (u32, u32), pixel: PixelType) -> u64 {
     if source == target {
         return 0;
     }
-    u64::from(source.0)
-        .saturating_mul(u64::from(target.1))
-        .saturating_mul(RESIZE_BYTES_PER_PIXEL)
+    let pixels = |(width, height): (u32, u32)| u64::from(width) * u64::from(height) + 1;
+    let premultiplied = if MulDiv::default().is_supported(pixel) {
+        pixels(source)
+    } else {
+        0
+    };
+    let first_pass = if source.0 == target.0 || source.1 == target.1 {
+        0
+    } else if matches!(
+        pixel,
+        PixelType::U8 | PixelType::U8x2 | PixelType::U8x3 | PixelType::U8x4
+    ) {
+        pixels((source.0, target.1))
+    } else {
+        pixels((target.0, source.1))
+    };
+    premultiplied
+        .saturating_add(first_pass)
+        .saturating_mul(u64::try_from(pixel.size()).unwrap_or(u64::MAX))
+}
+
+/// At most what `fast_image_resize` holds for the weights of resampling one
+/// side from `from` pixels to `to`: per output pixel a window of
+/// `2 * ceil(3 * max(from / to, 1)) + 1` weights, 3 being the widest support
+/// passed (Lanczos3's; Mitchell's is 2 and Bilinear's 1, so this bounds them
+/// too), each as an `f64` and again in fixed point (at most 4
+/// bytes), plus 40 bytes of bounds and chunk headers. A shrink by a large
+/// factor makes the window wide: a strip 20 million pixels long shrunk to 128
+/// takes about 1.4 GB. A side that keeps its size takes no pass.
+fn weight_bytes(from: u32, to: u32) -> u64 {
+    if from == to || to == 0 {
+        return 0;
+    }
+    let scale = (f64::from(from) / f64::from(to)).max(1.0);
+    // At most 3 * u32::MAX, which u64 holds.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let window = (3.0 * scale).ceil() as u64 * 2 + 1;
+    u64::from(to).saturating_mul(window.saturating_mul(8 + 4).saturating_add(40))
 }
 
 /// The error of a file the decoder refuses or fails on.
@@ -446,25 +538,106 @@ mod tests {
     }
 
     #[rstest]
-    // Width of the source by height of the output, 16 bytes each.
-    #[case((100, 100), (100, 50), 80_000)]
-    #[case((100, 100), (10, 50), 80_000)]
-    #[case((100, 100), (50, 10), 16_000)]
+    // 8-bit: the vertical pass first, the source's width by the output's
+    // height, plus a pixel to align it.
+    #[case((100, 100), (50, 10), PixelType::U8x3, (100 * 10 + 1) * 3)]
+    #[case((100, 100), (10, 50), PixelType::U8, 100 * 50 + 1)]
     // The output's height, not the source's, even when enlarging.
-    #[case((4, 4), (300, 450), 28_800)]
+    #[case((4, 4), (300, 450), PixelType::U8x3, (4 * 450 + 1) * 3)]
+    // Alpha adds the premultiplied copy of the source.
+    #[case((100, 100), (50, 10), PixelType::U8x4, (100 * 100 + 1 + 100 * 10 + 1) * 4)]
+    // 16-bit and float: the horizontal pass first, the output's width by the
+    // source's height.
+    #[case((100, 100), (50, 10), PixelType::U16, (50 * 100 + 1) * 2)]
+    #[case((100, 100), (50, 10), PixelType::F32x4, (100 * 100 + 1 + 50 * 100 + 1) * 16)]
+    // One side changed is one pass, straight into the output.
+    #[case((100, 100), (100, 50), PixelType::U8x3, 0)]
+    #[case((100, 100), (50, 100), PixelType::U16x4, (100 * 100 + 1) * 8)]
     // The same size is a copy.
-    #[case((100, 100), (100, 100), 0)]
-    fn a_resize_needs_the_source_width_by_the_output_height(
+    #[case((100, 100), (100, 100), PixelType::U8x4, 0)]
+    fn a_resize_needs_its_first_pass_and_a_premultiplied_copy(
         #[case] source: (u32, u32),
         #[case] target: (u32, u32),
+        #[case] pixel: PixelType,
         #[case] bytes: u64,
     ) {
-        assert_eq!(resize_scratch_bytes(source, target), bytes);
+        assert_eq!(resizer_buffer_bytes(source, target, pixel), bytes);
+    }
+
+    #[rstest]
+    // A window of 2 * ceil(3 * 2) + 1 = 13 weights for each of 50 pixels.
+    #[case(100, 50, 50 * (13 * 12 + 40))]
+    // Enlarging keeps the narrowest window, 7.
+    #[case(4, 300, 300 * (7 * 12 + 40))]
+    // A long strip shrunk to a blur hash's 128 needs a wide window.
+    #[case(20_000_000, 128, 128 * (937_501 * 12 + 40))]
+    #[case(100, 100, 0)]
+    fn a_pass_needs_its_weights(#[case] from: u32, #[case] to: u32, #[case] bytes: u64) {
+        assert_eq!(weight_bytes(from, to), bytes);
+    }
+
+    /// The count adds both sides' weights and a row of accumulators, as wide
+    /// as the source, to the `Resizer`'s buffers.
+    #[test]
+    fn the_scratch_is_the_buffers_the_weights_and_a_row() {
+        assert_eq!(
+            resize_scratch_bytes((100, 100), (50, 10), PixelType::U8x3),
+            (100 * 10 + 1) * 3 + 50 * (13 * 12 + 40) + 10 * (61 * 12 + 40) + 100 * 3 * 4
+        );
+        // A horizontal pass alone needs no row.
+        assert_eq!(
+            resize_scratch_bytes((100, 100), (50, 100), PixelType::U8x3),
+            50 * (13 * 12 + 40)
+        );
+        assert_eq!(
+            resize_scratch_bytes((100, 100), (100, 100), PixelType::U8x4),
+            0
+        );
+    }
+
+    /// The count is what a fresh `Resizer` holds after the resize
+    /// `resize_exact` runs, for every colour type a decoder produces, with
+    /// both sides changed, one side, the same size and an enlargement, so a
+    /// `fast_image_resize` release that changes its passes or buffers fails
+    /// here before the budget stops bounding the memory.
+    #[rstest]
+    fn the_count_is_what_the_resizer_allocates(
+        #[values(
+            image::ColorType::L8,
+            image::ColorType::La8,
+            image::ColorType::Rgb8,
+            image::ColorType::Rgba8,
+            image::ColorType::L16,
+            image::ColorType::La16,
+            image::ColorType::Rgb16,
+            image::ColorType::Rgba16,
+            image::ColorType::Rgb32F,
+            image::ColorType::Rgba32F
+        )]
+        color: image::ColorType,
+        #[values((7, 5), (12, 5), (7, 9), (12, 9), (30, 20))] target: (u32, u32),
+        #[values(FilterType::Lanczos3, FilterType::Mitchell, FilterType::Bilinear)]
+        filter: FilterType,
+    ) {
+        let image = DynamicImage::new(12, 9, color);
+        let mut resized = DynamicImage::new(target.0, target.1, color);
+        let mut resizer = Resizer::new();
+        resizer
+            .resize(&image, &mut resized, &resize_options(filter))
+            .expect("resizes");
+        let pixel = image.pixel_type().expect("a pixel type");
+        assert_eq!(
+            u64::try_from(resizer.size_of_internal_buffers()).expect("fits"),
+            resizer_buffer_bytes((12, 9), target, pixel)
+        );
     }
 
     #[test]
     fn the_scratch_size_saturates() {
-        assert_eq!(resize_scratch_bytes((u32::MAX, 1), (1, u32::MAX)), u64::MAX);
+        assert_eq!(
+            resize_scratch_bytes((u32::MAX, u32::MAX), (1, 1), PixelType::F32x4),
+            u64::MAX
+        );
     }
 
     fn memory_with_budget(resize_budget: u64) -> Arc<ImageMemory> {
@@ -477,15 +650,17 @@ mod tests {
     #[test]
     fn a_resize_over_the_budget_is_refused_and_one_on_it_runs() {
         let image = DynamicImage::new_luma8(100, 100);
-        let on_budget = memory_with_budget(80_000);
+        // The first pass, both sides' weights and a row of accumulators.
+        let scratch = 100 * 50 + 1 + 2 * 50 * (13 * 12 + 40) + 100 * 4;
+        let on_budget = memory_with_budget(scratch);
         let resized = on_budget
-            .resize_exact(&image, 100, 50, FilterType::Triangle)
+            .resize_exact(&image, 50, 50, FilterType::Bilinear)
             .expect("the budget holds it");
-        assert_eq!((resized.width(), resized.height()), (100, 50));
+        assert_eq!((resized.width(), resized.height()), (50, 50));
         assert_eq!(on_budget.lock_resizes().held, 0, "given back");
 
-        let error = memory_with_budget(79_999)
-            .resize_exact(&image, 100, 50, FilterType::Triangle)
+        let error = memory_with_budget(scratch - 1)
+            .resize_exact(&image, 50, 50, FilterType::Bilinear)
             .expect_err("one byte over");
         assert!(
             matches!(&error, ServiceError::InvalidInput(message) if message.contains("image_resize_budget_mb")),
@@ -500,6 +675,67 @@ mod tests {
             .resize_exact(&image, 100, 100, FilterType::Lanczos3)
             .expect("a copy");
         assert_eq!((resized.width(), resized.height()), (100, 100));
+    }
+
+    /// Every colour type a decoder produces resizes in its own type.
+    #[rstest]
+    fn every_colour_type_resizes_as_itself(
+        #[values(
+            image::ColorType::L8,
+            image::ColorType::La8,
+            image::ColorType::Rgb8,
+            image::ColorType::Rgba8,
+            image::ColorType::L16,
+            image::ColorType::La16,
+            image::ColorType::Rgb16,
+            image::ColorType::Rgba16,
+            image::ColorType::Rgb32F,
+            image::ColorType::Rgba32F
+        )]
+        color: image::ColorType,
+        #[values(FilterType::Lanczos3, FilterType::Mitchell, FilterType::Bilinear)]
+        filter: FilterType,
+    ) {
+        let resized = ImageMemory::default()
+            .resize_exact(&DynamicImage::new(12, 9, color), 5, 4, filter)
+            .expect("resizes");
+        assert_eq!(
+            (resized.width(), resized.height(), resized.color()),
+            (5, 4, color)
+        );
+    }
+
+    /// Alpha is premultiplied while resampling, as Skia resamples: the colour
+    /// of a clear pixel has no weight, so the edge of an opaque white shape on
+    /// clear red stays white as it fades. Resampled straight, as the `image`
+    /// crate does, the red bled into it.
+    #[rstest]
+    fn a_clear_pixels_colour_does_not_bleed_into_its_neighbours(
+        #[values(FilterType::Lanczos3, FilterType::Mitchell, FilterType::Bilinear)]
+        filter: FilterType,
+    ) {
+        let image = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(16, 16, |x, _| {
+            if x < 8 {
+                image::Rgba([255, 255, 255, 255])
+            } else {
+                image::Rgba([255, 0, 0, 0])
+            }
+        }));
+        let resized = ImageMemory::default()
+            .resize_exact(&image, 5, 5, filter)
+            .expect("resizes")
+            .to_rgba8();
+        let mut faded = 0;
+        for pixel in resized.pixels() {
+            let [_, green, blue, alpha] = pixel.0;
+            if alpha > 0 {
+                assert!(green >= 254 && blue >= 254, "{:?}", pixel.0);
+            }
+            if (1..255).contains(&alpha) {
+                faded += 1;
+            }
+        }
+        assert!(faded > 0, "the edge fades");
     }
 
     /// Waits until `turns` resizes have arrived, so a test knows their order.

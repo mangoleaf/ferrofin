@@ -60,7 +60,7 @@ injects them into the API's `AppState`.
 | `ferrofin-traits` | MediaBrowser.Controller (interfaces) | `#[async_trait]` traits; the DI seam |
 | `ferrofin-mediaencoding` | MediaBrowser.MediaEncoding | ffmpeg/ffprobe: probing, transcode arg-building (pure), the live transcode runtime behind a `Transcoder` seam trait |
 | `ferrofin-hls` | Jellyfin.MediaEncoding.Hls | HLS playlist generation + stream manager |
-| `ferrofin-drawing` | Jellyfin.Drawing + Emby.Photos | image resize/crop/format via the `image` crate |
+| `ferrofin-drawing` | Jellyfin.Drawing + Emby.Photos | image resize/crop/format via the `image` crate, resizes via `fast_image_resize` |
 | `ferrofin-providers` | MediaBrowser.Providers + Xbmc/LocalMetadata | local NFO always on; remote providers (TMDB/TVDB/OMDb/MusicBrainz/fanart) compiled in, gated by the per-library fetcher checkboxes |
 | `ferrofin-livetv` | Jellyfin.LiveTv | M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
 | `ferrofin-extensions` | (new — Tier 1a of the plugin design) | compiled-in extensions behind an `Extension` trait; see `docs/PLUGINS_UPSTREAM.md` |

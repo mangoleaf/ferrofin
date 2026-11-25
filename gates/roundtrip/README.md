@@ -106,10 +106,11 @@ Settings (environment), each a whole number of seconds:
 | | the library scan completes | `POST /Library/Refresh` does not end `Completed` |
 | | its startup tasks finish | the scale route only, in place of the scan and the usage stage: no scheduled task runs on two polls in a row within `ROUNDTRIP_SCAN_TIMEOUT` |
 | | boot log (generation, migrations, no ERROR) | as in the adoption gate (`adoption_check_boot_log`) |
+| | Live TV: a tuner, a guide, a timer, a series timer and a favourite channel | adding the M3U tuner and the XMLTV guide [`livetv.py`](livetv.py) writes into the route (mounted at `/livetv` in both servers, so the tuner's path, which every channel's and programme's id is derived from, is the same), its guide refresh, a timer on the film, a series timer on the series or the favourite on a channel is refused, or the refresh stores no such programme or channel; before the usage stage, so the answers hold the channels |
 | | usage stage, then Ferrofin's answers | an action fails (named), an action does not show in the answers, or no answers were written |
 | | clean stop | the server does not exit 0 on TERM (judged only when every check before it passed) |
 | Export | the export completes | `export-jellyfin`, run from the image under test in a container of its own on the stopped server's data directory, exits non-zero (its last line is the reason) or runs past `ROUNDTRIP_SCAN_TIMEOUT` |
-| | every stored path is in the export, none under the directory Ferrofin ran at | a path in `BaseItems.Path`, `BaseItemImageInfos.Path`, `Chapters.ImagePath`, `MediaStreamInfos.Path` or `ImageInfos.Path` of the exported database does not resolve as Jellyfin's image reads it (`/config/…` in the export, `%AppDataPath%` and `%MetadataPath%` under its `data` and `metadata`, `/media/…` in the route's media tree), or lies under a directory Ferrofin ran at (`/data`, and its configuration directory where it is apart) or the copy's own path ([`checks_paths.py`](checks_paths.py) `stored`). A path the same column of the database Ferrofin stopped with already stored without a file where it points, in the copy or the media (a person whose folder Jellyfin never made, a file gone from the media), is not the export's to resolve and is left out of that half of the check; an absolute path outside both never is. Checked before Jellyfin opens the file |
+| | every stored path is in the export, none under the directory Ferrofin ran at | a path in `BaseItems.Path`, `BaseItemImageInfos.Path`, `Chapters.ImagePath`, `MediaStreamInfos.Path` or `ImageInfos.Path` of the exported database does not resolve as Jellyfin's image reads it (`/config/…` in the export, `%AppDataPath%` and `%MetadataPath%` under its `data` and `metadata`, `/media/…` in the route's media tree), or lies under a directory Ferrofin ran at (`/data`, and its configuration directory where it is apart) or the copy's own path; and no string value of an item's `BaseItems.Data` (a library's `PhysicalLocationsList`, a video's `SubtitleFiles`, ...) may lie under one either, though those are not checked for resolving ([`checks_paths.py`](checks_paths.py) `stored`). A path the same column of the database Ferrofin stopped with already stored without a file where it points, in the copy or the media (a person whose folder Jellyfin never made, a file gone from the media), is not the export's to resolve and is left out of that half of the check; an absolute path outside both never is. Checked before Jellyfin opens the file |
 | Jellyfin | ready | its start failed (`Main: Error while starting server`; it keeps answering 503, so the wait stops at that line), it exited (named with its status), or it is not ready within `ROUNDTRIP_READY_TIMEOUT`. Ready is `/System/Ping` and then `/System/Info/Public` answering: Jellyfin's setup server answers `/System/Info/Public` while Jellyfin still runs its last migrations and optimises the database, and 503 to everything else; the real server then answers only `/System/Ping` until its core startup completes |
 | | its startup tasks finish | no scheduled task runs on two polls in a row, within `ROUNDTRIP_SCAN_TIMEOUT` |
 | | every migration it began finished | a `Perform migration` with no `was successfully applied`, named with its SQLite error ([`checks_boot.py`](checks_boot.py)); a log with no entry at all fails too |
@@ -117,6 +118,7 @@ Settings (environment), each a whole number of seconds:
 | | no ERR or FTL outside the allowlist | an error entry other than the blocked plugin repository, up to the probes; an error a probe causes is judged by the answers instead |
 | | every playlist's full metadata refresh completes | a playlist's `DateLastRefreshed` in its database has not moved within `ROUNDTRIP_SCAN_TIMEOUT` of `POST /Items/{id}/Refresh?metadataRefreshMode=FullRefresh` (jellyfin-web's "Refresh metadata", replacing nothing, for the metadata only), sent for every playlist its database holds ([`api.py`](api.py) `refresh-playlists`); or its database holds no playlist (the check would refresh nothing); or a refresh request is refused or unanswered. A full refresh runs every metadata reader whatever the file's time, so a stale `playlist.xml` in the export would merge its shares back (`PlaylistMetadataService.MergeData`), which the answers then show |
 | | answers equal Ferrofin's before the stop | `answers.txt` differs from `oracle.txt` through `adoption_normalise`, which leaves out ids, image sizes and the probes that differ by design; or the `userdata` lines differ with their item ids kept; or no answers came within `ROUNDTRIP_SCAN_TIMEOUT` |
+| | Live TV: timers, a favourite channel and the guide equal Ferrofin's before and after its first guide refresh | the timers' and series timers' ids, names and times, the channels' ids, the favourite channels or the programmes' ids differ from what Ferrofin answered after its setup, before Jellyfin's first guide refresh (the export keeps the channel and programme items) or after it ([`livetv.py`](livetv.py) `check`; one guide programme is in `+01:00`, whose id embeds the offset) |
 | | it serves every image, trickplay tile, subtitle and attachment its database lists | one of the files its database lists is not answered with 200: each item's each image type, each chapter image, each profile image, the first tile of each trickplay width, each external text subtitle and each attachment; or a file the database Ferrofin stopped with lists is no longer listed for an item or user Jellyfin still holds (a row Jellyfin dropped because the file was missing; an item it removed whole is judged by the answers and the library check instead); or neither database lists a file at all while Jellyfin's has an image table ([`probes.py`](probes.py), which writes `probes.txt`) |
 | | its library scan completes | `POST /Library/Refresh` does not end `Completed` |
 | | integrity_check and foreign_key_check | as in the adoption gate (`adoption_check_db`), after Jellyfin stopped |
@@ -211,8 +213,8 @@ config <system|encoding|network> <setting>=<value> …           settings a dash
 collection <Playlist|BoxSet> <item count> <name>               the probed account's playlists and collections
 members <Playlist|BoxSet> <name> = <item names>                their items: a playlist's in order, a collection's
                                                                 by name
-image <Playlist|BoxSet> <name> <image types>                   which images they have (not their sizes: an
-                                                                upload is stored 0x0 until gl-1054 is fixed)
+image <Playlist|BoxSet> <name> <image types>                   which images they have (not their sizes,
+                                                                which Jellyfin measures again on its saves)
 shares <owner> <playlist> = <user>:<can edit 0|1>,…            synthetic-adult's playlists (answers.SHARE_OWNER,
                                                                 through its own web session in the copy), each with
                                                                 the accounts it is shared with, "-" for none,
@@ -272,6 +274,7 @@ One file per stage and per check family, so later work adds files instead of gro
 | [`checks_boot.py`](checks_boot.py) | Jellyfin's log |
 | [`checks_paths.py`](checks_paths.py) | the exported database's stored paths, and the library rows after Jellyfin's scan |
 | [`probes.py`](probes.py) | the files Jellyfin serves from the export |
+| [`livetv.py`](livetv.py) | the Live TV fixture, its setup in Ferrofin and the comparison in Jellyfin |
 | [`report.py`](report.py) | `report.html` |
 
 The gate reuses the adoption gate's parts: its fixtures, `smoke.sh`, `lib.sh` (`adoption_normalise`,
@@ -307,6 +310,8 @@ The gate reuses the adoption gate's parts: its fixtures, `smoke.sh`, `lib.sh` (`
   layout, and its kind (a messy or the scale copy, or a path).
 - Canned Jellyfin logs exercise `checks_boot.py`.
 - Databases shaped as Jellyfin's tables exercise `checks_paths.py` and what `probes.py` probes.
+- [`tests/test_livetv.py`](tests/test_livetv.py) checks the Live TV fixture's times and how `livetv.py` judges
+  Jellyfin's answers; the fake server answers its Live TV calls, so every route above runs it.
 - The same fake server, in process, exercises `usage.py` and `answers.py` (a lost write included, a copy
   with no shared playlist or no stale `playlist.xml`, an owner with no session) and `api.py`'s settle and
   playlist refresh (waited for, never landing, another mode, no playlist at all).

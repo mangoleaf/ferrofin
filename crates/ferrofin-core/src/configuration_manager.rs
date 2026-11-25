@@ -326,7 +326,7 @@ impl FerrofinServerConfigurationManager {
     /// The on-disk Live TV configuration file name (Jellyfin's named `livetv`
     /// configuration): its scalar options, the tuners and listing providers
     /// being kept in the database.
-    const LIVE_TV_FILE_NAME: &'static str = "livetv.json";
+    pub(crate) const LIVE_TV_FILE_NAME: &'static str = "livetv.json";
 
     /// Loads (or initializes) the configuration for the given paths.
     ///

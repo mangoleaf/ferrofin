@@ -58,7 +58,7 @@ pub use automatic::Runtime;
 /// The Intro Skipper's stable plugin id (also its `/Plugins` id) — the
 /// **upstream plugin's GUID**, because the vendored dashboard app and third-party
 /// client integrations address the plugin by that id.
-const EXTENSION_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
+pub const EXTENSION_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
 
 /// The Intro Skipper extension.
 #[derive(Debug, Default, Clone, Copy)]

@@ -650,9 +650,10 @@ pub trait LibraryManager: Send + Sync {
     ///   policy;
     /// - any other view reports the kind of the folder it shows, with Folder
     ///   policy unless that folder is a channel or in one. A non-recursive
-    ///   browse, and any browse of a Season, moves `query` onto that folder
-    ///   (`parent_id` and `parent_row`, clearing `user_root_children`); a
-    ///   recursive one stays on the view.
+    ///   browse, any browse of a Season, and any browse of a playlists folder
+    ///   with no user (which lists its own children) moves `query` onto that
+    ///   folder (`parent_id` and `parent_row`, clearing `user_root_children`);
+    ///   any other recursive one stays on the view.
     ///   With no such folder, or one that is gone, the view is left as asked
     ///   and reports itself, with no Folder policy.
     ///

@@ -34,6 +34,18 @@ published server URIs are not used. Ferrofin never builds it from the request's 
 With neither set, a sign-in is refused, and the settings page says where to set one. The settings
 page shows each provider's callback URL: register exactly that URL at the identity provider.
 
+**An `https` public URL protects the sign-in cookie.** A sign-in is bound to the browser that
+started it by a cookie that lives at most ten minutes and holds a random value; the server keeps
+only its hash, and no log records it. On an `https` public URL the cookie is
+`__Host-ferrofin_sso_flow`, with `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/` and no `Domain`.
+Browsers let no other host set a cookie with that prefix, so a page on a sibling subdomain
+(`evil.example.org` beside `media.example.org`) cannot plant one to tie a user's browser to a
+sign-in of its own. Only that name is read there. On an `http` public URL, which a server on a
+trusted network may use, browsers refuse the prefix, so the cookie is `ferrofin_sso_flow`, scoped
+to `/sso` below the public URL's path, without that protection. `Path=/` also means that, under a
+public URL with a path (`https://example.org/jellyfin`), the browser sends the cookie to every
+other site on that host while it lives.
+
 `{key}` is the short name you give the provider when you add it, such as `keycloak`. It is part
 of the registered callback URL, so it cannot be changed once the provider is saved. To change
 it, add the provider again under a new key and register the new callback URL.
@@ -44,8 +56,12 @@ container). Over `http`, codes and tokens travel unencrypted and can be read or 
 way. No check on the sign-in itself can be switched off. Ferrofin always uses the authorization
 code flow with PKCE (`S256`), a `state` bound to the browser by a cookie, and a nonce. It always
 checks the ID token's signature, issuer, audience, `azp`, expiry and nonce, and the `iss` of the
-callback when the provider sends one. It accepts only ID tokens signed with an asymmetric algorithm the
-provider advertises (such as `RS256`), never `none` or an HMAC keyed with the client secret.
+callback when the provider sends one. The ID token's audience must be the provider's client id and
+nothing else: one that also names another audience is refused, whatever its `azp` (OpenID Connect
+Core 1.0, 3.1.3.7). An identity provider set up to add audiences to its ID tokens (an API, another
+client) cannot sign anyone in until that is removed. It accepts only ID tokens signed with an
+asymmetric algorithm the provider advertises (such as `RS256`), never `none` or an HMAC keyed with
+the client secret.
 Ferrofin follows no redirect from the identity provider.
 
 **A private certificate authority.** Ferrofin trusts the system's certificate store. An
@@ -59,6 +75,24 @@ authorities as well as yours: concatenate the system bundle (`/etc/ssl/certs/ca-
 on Debian) and your authority's certificate. This was read from the HTTP client as built
 (reqwest 0.13 with `rustls-platform-verifier`, which reads the store through
 `rustls-native-certs` 0.8), not run against a private authority.
+
+## Known proxies
+
+Ferrofin counts sign-ins by the address of the user's browser, as the server resolves it: the
+address the connection comes from, or, when that is a proxy listed in **Known proxies**
+(Dashboard → Networking), the address that proxy passes on in `X-Forwarded-For`. Pending
+sign-ins are capped per address, and each address is paced ([Limits](#limits)).
+
+**Behind a reverse proxy, list the proxy in Known proxies.** Otherwise every user has the proxy's
+address, so all of them share one cap and one pace: ten sign-ins a minute between them, and
+anyone who can reach the proxy can make everyone else wait, or push out a sign-in someone else
+started more than a minute ago and has not finished. The server log then shows the line `repeated Single Sign-On requests from one
+address` with the proxy's address as `remote_ip`. Users who really share one address, such as a
+household behind one router, share its cap and pace too.
+
+An address is an IPv4 address, or an IPv6 address's /64: the addresses of one IPv6 network count
+as one. An IPv4 address written as an IPv6 one (`::ffff:192.0.2.7`) counts as the IPv4 address.
+The server's own address and loopback count like any other.
 
 ## Enable the plugin and add a provider
 
@@ -222,8 +256,7 @@ not enough to add one:
 - **An attempt ends with its session.** A link attempt the user started and has not finished at
   the identity provider links nothing once the session that started it has ended, however it
   ended: signing out, Dashboard → Devices, a password change made from another session (which
-  signs every other session out), or a link removed. (A sign-out in the very instant the link is
-  made, while the server is writing it, can still let it through; a link removed cannot.)
+  signs every other session out), or a link removed.
 
 Linking never changes the account's provider or password.
 
@@ -238,9 +271,11 @@ from …", with who did it, and the identity's issuer and subject in the entry's
 types are `UserIdentityLinked` and `UserIdentityUnlinked`.
 
 Removing a link signs out every session of the account, and ends every attempt to link a sign-in
-that the account started and has not finished at the identity provider. An account Single Sign-On
-created whose last link is removed cannot sign in at all, until an administrator links it again
-or gives it another authentication provider. Deleting a user removes their links.
+that the account started and has not finished at the identity provider. A removal finishes, sign-out
+included, even when the browser leaves the page or the connection drops before the answer. An
+account Single Sign-On created whose last link is removed cannot sign in at all, until an
+administrator links it again or gives it another authentication provider. Deleting a user removes
+their links.
 
 ## Native apps: Quick Connect
 
@@ -249,18 +284,19 @@ read from their code). With Quick Connect enabled on the server (Dashboard → G
 Quick Connect on this server"), a user signs an app in like this:
 
 1. In the app, choose Quick Connect: it shows a six-digit code.
-2. In a browser, open `{public URL}/sso/quickconnect`, enter the code, and choose **Sign in with
-   `{name}`**.
-3. Sign in at the identity provider. The page asks "Sign in the device showing code ... as ...?":
-   confirm it within one minute.
+2. In a browser, open `{public URL}/sso/quickconnect` and choose **Sign in with `{name}`**.
+3. Sign in at the identity provider. The page that follows names the account and asks for the
+   code: type the code the app shows within one minute.
 
-The app is then signed in as that account, and the browser is not. Nothing is approved without
-the confirmation, so a link carrying a code that someone sends you signs nothing in unless you
-confirm it. The required role and role sync apply as at a browser sign-in, and so do the account
-rules (a disabled account, and device access and the session limit for the app's device), except
-that remote access is judged for the browser that confirms, and the parental schedule at the
-moment it confirms: the approval is not given the app's address, and Jellyfin's own approval
-judges none (read from the code).
+The app is then signed in as that account, and the browser is not. The code is typed only on
+Ferrofin's page after the sign-in, never carried by a link: a sign-in link with a code in it
+(`/sso/oidc/{key}/start?quickConnect=…`) is refused, so no link someone sends you can sign their
+device in as you. A mistyped code, or one no app is waiting with, is refused and approves nothing;
+that page is then spent, and you start again at `/sso/quickconnect`. The required role and role
+sync apply as at a browser sign-in, and so do the account rules (a disabled account, and device
+access and the session limit for the app's device), except that remote access is judged for the
+browser that types the code, and the parental schedule at the moment it does: the approval is not
+given the app's address, and Jellyfin's own approval judges none (read from the code).
 This was run with the requests an app makes (`POST /QuickConnect/Initiate`, its poll and
 `POST /Users/AuthenticateWithQuickConnect`), not yet with a real app.
 
@@ -321,7 +357,19 @@ These are fixed; none is a setting:
 - A browser holds one sign-in at a time (one cookie): starting a second, in another tab, ends the
   first.
 - Pending sign-ins are capped at 10 per address (a new one drops that address's oldest) and 1000
-  in all.
+  in all. An address is an IPv4 address or an IPv6 /64 ([Known proxies](#known-proxies)).
+- Each address may start at most 10 sign-ins in any minute: a sign-in, a Quick Connect approval
+  and a link count together. It may bring back at most 30 one-time values in any minute: the
+  identity provider's callback, the page after it handing over its code, and the Quick Connect
+  confirmation count together. A sign-in takes one start and two one-time values. Past either
+  limit the route answers a page with status `429`, "Too many sign-in attempts … Wait a minute,
+  then try again", and does nothing else: no sign-in is started and nothing is used up. The
+  address may go on once its earliest counted request is a minute old, so within a minute of the
+  first refusal. The page after the identity provider and the link page show the same words. The
+  server logs a warning naming the address at its first refusal in each minute. Pacing by any
+  minute, not by a minute on the clock, means that someone sharing an address cannot start ten
+  sign-ins of their own within a minute of another user's, which is what pushing that user's
+  sign-in out takes.
 - Calls to the identity provider: 5 seconds to connect, 10 seconds per request, answers up to
   1 MiB. Discovery and keys are cached for an hour, and fetched again for an unknown key.
 - Pending sign-ins are kept in memory: a restart, or a rolling update that sends the callback to
@@ -356,7 +404,7 @@ same.
 ## Known limits
 
 - While a provider cannot be reached, every start of a sign-in fetches its discovery document
-  again.
+  again, up to the pace's ten a minute per address.
 - A browser that cannot store the session (storage blocked or full) sees "Sign-in failed" on the
   page after the identity provider, although a session was opened. It ends at the next sign-in
   from that browser, or when an administrator revokes it under Dashboard → Devices.

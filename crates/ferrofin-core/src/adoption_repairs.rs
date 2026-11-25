@@ -114,6 +114,10 @@ pub async fn run_all(db: &Database, paths: &VirtualPathExpander) -> Result<(), S
     if people > 0 {
         tracing::info!(items = people, "merged case-only duplicate people");
     }
+    // Upstream's 20260729, after the duplicate-path fold and the 20260508
+    // merges, on the boot that imported a 10.11 database; before the state's
+    // `save_playlist_xml_once` rewrites a `playlist.xml` from the database.
+    restore_playlist_children_once(db, paths).await?.log();
     // After the merges, which fold rows of one item under several keys (as
     // upstream's 20260508 merges run before its 20260912 harmonize); it logs
     // its own summary, which needs the group count too.
@@ -204,9 +208,11 @@ type ImportRow = (String, String, Option<String>, bool, Option<String>);
 /// 10.11.11). A 12.0 adoption, a Ferrofin-native database and an install
 /// adopted before the record existed have no such record and are skipped.
 /// `paths` expands a container's stored `%AppDataPath%` path, which entries
-/// relative to the container resolve against.
+/// relative to the container resolve against. Its commit also leaves
+/// [`restore_playlist_children_once`] owed, which fills a playlist left with no
+/// rows from its `playlist.xml`.
 ///
-/// Returns the number of rows written.
+/// Returns the number of rows written from `Data`.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -277,6 +283,14 @@ pub async fn import_membership_once(
             written += import_video_alternate_versions(&mut tx, &id, &map, paths).await?;
         }
     }
+    // Upstream's `RestorePlaylistChildrenFromMetadata` runs later in the same
+    // migration pass: [`run_all`] runs it at that point on this boot, keyed by
+    // this marker, which commits with the flag.
+    sqlx::query(r#"INSERT OR REPLACE INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')"#)
+        .bind(RESTORE_PLAYLISTS_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
     sqlx::query(r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#)
         .execute(&mut *tx)
         .await
@@ -286,6 +300,263 @@ pub async fn import_membership_once(
         tracing::warn!(dropped, "dropped unresolvable LinkedChildren entries");
     }
     Ok(written)
+}
+
+/// The `FerrofinMeta` key [`import_membership_once`] sets for
+/// [`restore_playlist_children_once`], which clears it.
+const RESTORE_PLAYLISTS_KEY: &str = "restore_playlist_children_pending_v1";
+
+/// What [`restore_playlist_children_once`] did, for its two log lines.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RestoredPlaylists {
+    /// Playlists given entries, and the entries written.
+    playlists: usize,
+    entries: usize,
+    /// `playlist.xml` paths no item has.
+    unresolved: usize,
+    /// Playlists left as they are with fewer entries than their file lists.
+    short: usize,
+    /// Files that could not be read or do not parse.
+    unreadable: usize,
+}
+
+impl RestoredPlaylists {
+    fn log(&self) {
+        if self.entries > 0 {
+            tracing::info!(
+                entries = self.entries,
+                playlists = self.playlists,
+                "restored the entries of empty playlists from their playlist.xml"
+            );
+        }
+        if self.unresolved + self.short + self.unreadable > 0 {
+            tracing::warn!(
+                unresolved = self.unresolved,
+                short = self.short,
+                unreadable = self.unreadable,
+                "playlist.xml entries not restored: paths no item has, playlists that still hold \
+                 fewer entries than their file lists (check them by hand), files that do not \
+                 read (each one is logged at debug)"
+            );
+        }
+    }
+}
+
+/// `RestorePlaylistChildrenFromMetadata.ReadEntryPaths`: the `<Path>` that
+/// first follows each `<PlaylistItem>` element anywhere in the document,
+/// trimmed, blank ones left out, read as a stream up to the first malformed
+/// spot (a truncated file keeps the entries before it); and whether the whole
+/// document read.
+fn playlist_entry_paths(xml: &str) -> (Vec<String>, bool) {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let (mut paths, mut in_entry, mut open, mut root) = (Vec::new(), false, 0_usize, false);
+    loop {
+        let (element, empty) = match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                open += 1;
+                root = true;
+                (e, false)
+            }
+            Ok(Event::Empty(e)) => {
+                root = true;
+                (e, true)
+            }
+            Ok(Event::End(_)) => {
+                open = open.saturating_sub(1);
+                continue;
+            }
+            // No root, or an element left open: `XmlReader`'s unexpected end
+            // of file.
+            Ok(Event::Eof) => return (paths, root && open == 0),
+            // An entity XML does not define.
+            Ok(Event::GeneralRef(e))
+                if quick_xml::escape::unescape(&format!("&{};", e.as_ref())).is_err() =>
+            {
+                return (paths, false);
+            }
+            // `DtdProcessing.Prohibit`.
+            Ok(Event::DocType(_)) | Err(_) => return (paths, false),
+            Ok(_) => continue,
+        };
+        // `XmlReader` checks an element's attributes as it reads it.
+        if element.attributes().any(|attribute| attribute.is_err()) {
+            return (paths, false);
+        }
+        match element.name().as_ref() {
+            "PlaylistItem" => in_entry = true,
+            "Path" if in_entry => {
+                in_entry = false;
+                // shortcut: the text is read raw, so a CDATA section, a
+                // comment or a child element in `<Path>` is kept as markup
+                // where `XmlReader` would read or refuse it; Jellyfin's
+                // `XmlWriter` writes only escaped text, so upgrade only if a
+                // writer ever does.
+                let value = if empty {
+                    String::new()
+                } else {
+                    // Through its end tag.
+                    open -= 1;
+                    let Ok(raw) = reader.read_text(element.name()) else {
+                        return (paths, false);
+                    };
+                    let Ok(text) = quick_xml::escape::unescape(&raw) else {
+                        return (paths, false);
+                    };
+                    text.into_owned()
+                };
+                if !value.trim().is_empty() {
+                    paths.push(value.trim().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The playlists [`restore_playlist_children_once`] may fill: each one's id,
+/// `playlist.xml` and the paths it lists, read before the write. A file that
+/// does not read, or not whole, counts in `done`.
+async fn listed_playlist_entries(
+    db: &Database,
+    paths: &VirtualPathExpander,
+    done: &mut RestoredPlaylists,
+) -> Result<Vec<(String, PathBuf, Vec<String>)>, ServiceError> {
+    let playlists: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ?1 AND "Path" IS NOT NULL
+           ORDER BY rowid"#,
+    )
+    .bind(stored_type_name(BaseItemKind::Playlist).unwrap_or_default())
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let mut listed = Vec::new();
+    for (id, path) in playlists {
+        let folder = paths.expand(&path);
+        let file = ferrofin_providers::playlist_xml_path(&folder, false);
+        if !Path::new(&folder).is_dir() || !file.is_file() {
+            continue;
+        }
+        let item_id = id.to_ascii_lowercase();
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::debug!(%err, %item_id, path = %file.display(), "could not read playlist.xml");
+                done.unreadable += 1;
+                continue;
+            }
+        };
+        // Upstream keeps the entries read before a malformed spot.
+        let (entries, clean) = playlist_entry_paths(&ferrofin_providers::decode_playlist(&bytes));
+        if !clean {
+            tracing::debug!(%item_id, path = %file.display(), "playlist.xml does not read whole");
+            done.unreadable += 1;
+        }
+        if !entries.is_empty() {
+            listed.push((id, file, entries));
+        }
+    }
+    Ok(listed)
+}
+
+/// 12.0's `RestorePlaylistChildrenFromMetadata`
+/// (`20260729120000_RestorePlaylistChildrenFromMetadata.cs`), once, on the
+/// boot whose [`import_membership_once`] imported a 10.11 database, at
+/// upstream's point in [`run_all`] (after the duplicate-path fold and the
+/// merges, before `save_playlist_xml_once` rewrites a file from the database):
+/// a playlist whose folder holds a `playlist.xml` and which has no
+/// `LinkedChildren` row gets a `Manual` row per `<PlaylistItem><Path>` that is
+/// exactly an item's `Path`, in file order from 0. A playlist that still has
+/// rows is left alone (merging could bring back what a user removed), and so
+/// is a playlist file (`.m3u`), which the scan reads. The files are read
+/// before the write; the rows and the marker's removal commit together.
+///
+/// Upstream's `MigrateLinkedChildren` also removes the 10.11 items whose files
+/// are gone before this runs; here that sweep (`sweep_missing_items`) runs
+/// later in the boot, so an entry naming such an item is restored and then
+/// deleted with it, leaving a gap in `SortOrder` where upstream counts the
+/// entry as unresolved.
+async fn restore_playlist_children_once(
+    db: &Database,
+    paths: &VirtualPathExpander,
+) -> Result<RestoredPlaylists, ServiceError> {
+    let mut done = RestoredPlaylists::default();
+    if db.meta_get(RESTORE_PLAYLISTS_KEY).await?.is_none() {
+        return Ok(done);
+    }
+    let listed = listed_playlist_entries(db, paths, &mut done).await?;
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
+    for (id, file, entries) in listed {
+        // `None`: the other version deleted the playlist since it was read.
+        let children: Option<i64> = sqlx::query_scalar(
+            r#"SELECT (SELECT COUNT(*) FROM "LinkedChildren" WHERE "ParentId" = p."Id")
+               FROM "BaseItems" p WHERE p."Id" = ?1"#,
+        )
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some(children) = children else {
+            continue;
+        };
+        if children > 0 {
+            if entries.len() > usize::try_from(children).unwrap_or(usize::MAX) {
+                tracing::debug!(
+                    item_id = %id.to_ascii_lowercase(),
+                    children,
+                    listed = entries.len(),
+                    path = %file.display(),
+                    "a playlist holds fewer entries than its playlist.xml lists; not restored"
+                );
+                done.short += 1;
+            }
+            continue;
+        }
+        let mut order = 0_i64;
+        for entry in &entries {
+            // Upstream's map takes the first row of each `Path`, as stored.
+            let child: Option<String> = sqlx::query_scalar(
+                r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1 ORDER BY rowid LIMIT 1"#,
+            )
+            .bind(entry)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let Some(child) = child else {
+                tracing::debug!(item_id = %id.to_ascii_lowercase(), path = %entry, "no item has this playlist.xml path");
+                done.unresolved += 1;
+                continue;
+            };
+            sqlx::query(
+                r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+                   VALUES (?1, ?2, ?3, ?4)"#,
+            )
+            .bind(&id)
+            .bind(order)
+            .bind(child)
+            .bind(i32::from(ferrofin_db::enums::LinkedChildType::Manual))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            order += 1;
+        }
+        if order > 0 {
+            tracing::debug!(item_id = %id.to_ascii_lowercase(), entries = order, "restored a playlist's entries");
+            done.playlists += 1;
+            done.entries += usize::try_from(order).unwrap_or_default();
+        }
+    }
+    sqlx::query(r#"DELETE FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+        .bind(RESTORE_PLAYLISTS_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok(done)
 }
 
 /// `MigrateLinkedChildren.ProcessVideoAlternateVersions`: `LocalAlternateVersions`
@@ -5091,6 +5362,304 @@ mod tests {
         );
         let found = links(&db).await;
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A playlist folder's `playlist.xml` as 10.11 writes it, listing `paths`.
+    fn write_playlist_xml(folder: &Path, paths: &[&str]) {
+        let items = paths
+            .iter()
+            .map(|p| format!("    <PlaylistItem>\n      <Path>{p}</Path>\n    </PlaylistItem>\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        std::fs::create_dir_all(folder).expect("folder");
+        std::fs::write(
+            folder.join("playlist.xml"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n<Item>\n  \
+                 <LocalTitle>Mix</LocalTitle>\n  <PlaylistItems>\n{items}  </PlaylistItems>\n  \
+                 <PlaylistMediaType>Video</PlaylistMediaType>\n</Item>\n"
+            ),
+        )
+        .expect("playlist.xml");
+    }
+
+    /// A 10.11 playlist at `%AppDataPath%/playlists/<name>` whose `Data`
+    /// lists `children` (`None`: no `LinkedChildren` key).
+    async fn seed_10_11_playlist(db: &Database, name: &str, children: Option<&[Uuid]>) -> Uuid {
+        let id = Uuid::new_v4();
+        seed_folder_item(db, id, BaseItemKind::Playlist, name, None).await;
+        set_path(db, id, &format!("%AppDataPath%/playlists/{name}")).await;
+        let entries: Vec<String> = children
+            .unwrap_or_default()
+            .iter()
+            .map(|c| format!(r#"{{"Type":"Manual","ItemId":"{}"}}"#, c.simple()))
+            .collect();
+        let data = match children {
+            Some(_) => format!(r#"{{"LinkedChildren":[{}]}}"#, entries.join(",")),
+            None => "{}".to_owned(),
+        };
+        set_data(db, id, &data).await;
+        id
+    }
+
+    /// gl-1648, 12.0's `RestorePlaylistChildrenFromMetadata`: on the boot that
+    /// imports a 10.11 database's membership, a playlist left with no rows
+    /// (its `Data` empty, unresolvable or keyless) takes a `Manual` row per
+    /// `playlist.xml` path that is exactly an item's, in file order (a repeat
+    /// kept, an unknown path skipped; a malformed file gives the entries
+    /// before its error). A playlist that still has rows, has no file, lists
+    /// nothing or is a playlist file keeps what it has; and it runs once.
+    #[tokio::test]
+    async fn an_empty_10_11_playlist_is_restored_from_its_playlist_xml() {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let root = tempfile::tempdir().expect("program data");
+        let lists = root.path().join("data/playlists");
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                root.path(),
+                "/pd/log",
+                "/pd/c",
+                "/pd/k",
+                "/pd/w",
+            ),
+        ));
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, path) in [(a, "/m/a.mkv"), (b, "/m/b.mkv"), (c, "/m/c.mkv")] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_path(&db, id, path).await;
+        }
+        // Its one `Data` entry names an item that is gone: the import drops it.
+        let emptied = seed_10_11_playlist(&db, "Emptied", Some(&[Uuid::new_v4()])).await;
+        write_playlist_xml(
+            &lists.join("Emptied"),
+            &["/m/a.mkv", "/m/gone.mkv", " /m/b.mkv ", "/m/a.mkv"],
+        );
+        // No `LinkedChildren` key at all: no rows either.
+        let keyless = seed_10_11_playlist(&db, "Keyless", None).await;
+        write_playlist_xml(&lists.join("Keyless"), &["/m/c.mkv"]);
+        // Rows from `Data`: neither restored nor, listing no more, counted.
+        let short = seed_10_11_playlist(&db, "Short", Some(&[c])).await;
+        write_playlist_xml(&lists.join("Short"), &["/m/c.mkv", "/m/a.mkv"]);
+        let even = seed_10_11_playlist(&db, "Even", Some(&[b])).await;
+        write_playlist_xml(&lists.join("Even"), &["/m/c.mkv"]);
+        let no_file = seed_10_11_playlist(&db, "No File", Some(&[])).await;
+        std::fs::create_dir_all(lists.join("No File")).expect("folder");
+        let blank = seed_10_11_playlist(&db, "Blank", Some(&[])).await;
+        write_playlist_xml(&lists.join("Blank"), &["  "]);
+        // Malformed after its first entry: that entry is restored.
+        let broken = seed_10_11_playlist(&db, "Broken", Some(&[])).await;
+        std::fs::create_dir_all(lists.join("Broken")).expect("folder");
+        std::fs::write(
+            lists.join("Broken/playlist.xml"),
+            "<Item><PlaylistItems><PlaylistItem><Path>/m/c.mkv</Path></PlaylistItem>\
+             <PlaylistItem a=></PlaylistItem></PlaylistItems></Item>",
+        )
+        .expect("xml");
+        // A playlist file: the scan's.
+        let m3u = seed_10_11_playlist(&db, "Road.m3u", Some(&[])).await;
+        std::fs::write(lists.join("Road.m3u"), "/m/a.mkv\n").expect("m3u");
+
+        import_membership_once(&db, &paths).await.expect("import");
+        assert_eq!(
+            restore_playlist_children_once(&db, &paths)
+                .await
+                .expect("restore"),
+            RestoredPlaylists {
+                playlists: 3,
+                entries: 5,
+                unresolved: 1,
+                short: 1,
+                unreadable: 1,
+            }
+        );
+
+        let g = guid_to_db;
+        assert_eq!(
+            links(&db)
+                .await
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                (g(emptied), g(a), 0, 0),
+                (g(emptied), g(b), 0, 1),
+                (g(emptied), g(a), 0, 2),
+                (g(keyless), g(c), 0, 0),
+                (g(short), g(c), 0, 0),
+                (g(even), g(b), 0, 0),
+                (g(broken), g(c), 0, 0),
+            ]
+            .into_iter()
+            .collect()
+        );
+        // Once: emptied again, it stays empty.
+        sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
+            .bind(g(keyless))
+            .execute(db.writer())
+            .await
+            .expect("emptied");
+        assert_eq!(
+            restore_playlist_children_once(&db, &paths)
+                .await
+                .expect("again"),
+            RestoredPlaylists::default()
+        );
+        for untouched in [no_file, blank, m3u] {
+            assert!(
+                links(&db).await.iter().all(|l| l.0 != g(untouched)),
+                "{untouched}"
+            );
+        }
+    }
+
+    /// `ReadEntryPaths`: the first `<Path>` after each `<PlaylistItem>`,
+    /// wherever it sits, trimmed, blanks left out.
+    #[rstest::rstest]
+    #[case::one_path_per_entry(
+        "<Item><PlaylistItems><PlaylistItem><Path> /a </Path><Path>/b</Path></PlaylistItem>\
+         <PlaylistItem><ItemId>x</ItemId></PlaylistItem></PlaylistItems></Item>",
+        &["/a"],
+        true
+    )]
+    #[case::outside_playlist_items(
+        "<Item><Path>/x</Path><PlaylistItem><Path>/a</Path></PlaylistItem></Item>",
+        &["/a"],
+        true
+    )]
+    #[case::blank_skipped(
+        "<Item><PlaylistItem><Path>  </Path></PlaylistItem><PlaylistItem><Path/></PlaylistItem>\
+         <PlaylistItem><Path>/b</Path></PlaylistItem></Item>",
+        &["/b"],
+        true
+    )]
+    #[case::entities_unescaped(
+        "<Item><PlaylistItem><Path>/m/Tom &amp; Jerry.mkv</Path></PlaylistItem></Item>",
+        &["/m/Tom & Jerry.mkv"],
+        true
+    )]
+    #[case::up_to_a_bad_attribute(
+        "<Item><PlaylistItems><PlaylistItem><Path>/a</Path></PlaylistItem><PlaylistItem x=>\
+         </PlaylistItem></PlaylistItems></Item>",
+        &["/a"],
+        false
+    )]
+    #[case::truncated_in_a_tag(
+        "<Item><PlaylistItems><PlaylistItem><Path>/a</Path></PlaylistItem><PlaylistItem><Pa",
+        &["/a"],
+        false
+    )]
+    #[case::doctype_prohibited(
+        "<!DOCTYPE Item><Item><PlaylistItem><Path>/a</Path></PlaylistItem></Item>",
+        &[],
+        false
+    )]
+    #[case::undefined_entity(
+        "<Item><PlaylistItem><Path>/a</Path></PlaylistItem><Title>&nbsp;</Title>\
+         <PlaylistItem><Path>/b</Path></PlaylistItem></Item>",
+        &["/a"],
+        false
+    )]
+    #[case::no_root("", &[], false)]
+    #[case::truncated_after_a_tag("<Item><PlaylistItem><Path>/a</Path></PlaylistItem>", &["/a"], false)]
+    fn playlist_xml_entries_read_like_upstream(
+        #[case] xml: &str,
+        #[case] expected: &[&str],
+        #[case] clean: bool,
+    ) {
+        assert_eq!(
+            playlist_entry_paths(xml),
+            (expected.iter().map(|p| (*p).to_owned()).collect(), clean)
+        );
+    }
+
+    /// Upstream runs the routine once, in the pass that imports a 10.11
+    /// database. A 12.x adoption ran it in Jellyfin, a database adopted from
+    /// 10.11 by an earlier Ferrofin has been edited here since (its
+    /// `playlist.xml` is the stale one Jellyfin left), and a Ferrofin
+    /// database never had `Data` membership to lose: none is restored.
+    #[rstest::rstest]
+    #[case::not_adopted(None, false)]
+    #[case::adopted_from_12(Some("12.0.0"), false)]
+    #[case::imported_by_an_earlier_boot(Some("10.11.8"), true)]
+    #[tokio::test]
+    async fn no_playlist_is_restored_outside_a_new_10_11_import(
+        #[case] generation: Option<&str>,
+        #[case] imported: bool,
+    ) {
+        let db = test_db().await;
+        if let Some(generation) = generation {
+            db.record_adoption(generation).await.expect("record");
+        }
+        if imported {
+            sqlx::query(r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#)
+                .execute(db.writer())
+                .await
+                .expect("imported");
+        }
+        let root = tempfile::tempdir().expect("program data");
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                root.path(),
+                "/pd/log",
+                "/pd/c",
+                "/pd/k",
+                "/pd/w",
+            ),
+        ));
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        set_path(&db, item, "/m/a.mkv").await;
+        seed_10_11_playlist(&db, "Emptied", Some(&[])).await;
+        write_playlist_xml(&root.path().join("data/playlists/Emptied"), &["/m/a.mkv"]);
+
+        run_all(&db, &paths).await.expect("repairs");
+
+        let found = links(&db).await;
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// Upstream restores after `FixIncorrectOwnerIdRelationships` folds the
+    /// items sharing a path, so an entry whose path two rows held lands on the
+    /// keeper (the newest), not on the first row, which the fold deletes with
+    /// its playlist entries.
+    #[tokio::test]
+    async fn a_restored_entry_lands_on_the_row_the_duplicate_path_fold_keeps() {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let root = tempfile::tempdir().expect("program data");
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                root.path(),
+                "/pd/log",
+                "/pd/c",
+                "/pd/k",
+                "/pd/w",
+            ),
+        ));
+        let (older, newer) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, created) in [
+            (older, "2025-01-01 00:00:00"),
+            (newer, "2026-01-01 00:00:00"),
+        ] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_path(&db, id, "/m/dup.mkv").await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "DateCreated" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(created)
+                .execute(db.writer())
+                .await
+                .expect("created");
+        }
+        let playlist = seed_10_11_playlist(&db, "Dup", Some(&[])).await;
+        write_playlist_xml(&root.path().join("data/playlists/Dup"), &["/m/dup.mkv"]);
+
+        run_all(&db, &paths).await.expect("repairs");
+
+        assert!(!exists(&db, older).await, "the fold keeps the newest row");
+        assert_eq!(
+            links(&db).await,
+            [(guid_to_db(playlist), guid_to_db(newer), 0, 0)]
+        );
     }
 
     /// `MigrateLinkedChildren.ResolveChildId`: a cached `ItemId` counts only

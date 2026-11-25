@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LiveTvOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <GuideDays xsi:nil="true" />
+  <EnableRecordingSubfolders>false</EnableRecordingSubfolders>
+  <EnableOriginalAudioWithEncodedRecordings>false</EnableOriginalAudioWithEncodedRecordings>
+  <TunerHosts>
+    <TunerHostInfo>
+      <Id>7828db49a7354bbd8f7a9ce459351840</Id>
+      <Url>http://172.17.0.1:19561/tuner.m3u</Url>
+      <Type>m3u</Type>
+      <FriendlyName>Trial tuner</FriendlyName>
+      <ImportFavoritesOnly>false</ImportFavoritesOnly>
+      <AllowHWTranscoding>false</AllowHWTranscoding>
+      <AllowFmp4TranscodingContainer>false</AllowFmp4TranscodingContainer>
+      <AllowStreamSharing>true</AllowStreamSharing>
+      <FallbackMaxStreamingBitrate>30000000</FallbackMaxStreamingBitrate>
+      <EnableStreamLooping>false</EnableStreamLooping>
+      <TunerCount>2</TunerCount>
+      <IgnoreDts>true</IgnoreDts>
+      <ReadAtNativeFramerate>false</ReadAtNativeFramerate>
+    </TunerHostInfo>
+  </TunerHosts>
+  <ListingProviders>
+    <ListingsProviderInfo>
+      <Id>c5cd9f7673b74fcd9fee294448f4a52c</Id>
+      <Type>xmltv</Type>
+      <Path>http://172.17.0.1:19561/guide.xml</Path>
+      <EnabledTuners />
+      <EnableAllTuners>true</EnableAllTuners>
+      <NewsCategories>
+        <string>news</string>
+        <string>journalism</string>
+        <string>documentary</string>
+        <string>current affairs</string>
+      </NewsCategories>
+      <SportsCategories>
+        <string>sports</string>
+        <string>basketball</string>
+        <string>baseball</string>
+        <string>football</string>
+      </SportsCategories>
+      <KidsCategories>
+        <string>kids</string>
+        <string>family</string>
+        <string>children</string>
+        <string>childrens</string>
+        <string>disney</string>
+      </KidsCategories>
+      <MovieCategories>
+        <string>movie</string>
+      </MovieCategories>
+      <ChannelMappings />
+    </ListingsProviderInfo>
+  </ListingProviders>
+  <PrePaddingSeconds>0</PrePaddingSeconds>
+  <PostPaddingSeconds>0</PostPaddingSeconds>
+  <MediaLocationsCreated />
+  <RecordingPostProcessorArguments>"{path}"</RecordingPostProcessorArguments>
+  <SaveRecordingNFO>true</SaveRecordingNFO>
+  <SaveRecordingImages>true</SaveRecordingImages>
+</LiveTvOptions>

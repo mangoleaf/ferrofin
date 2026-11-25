@@ -1,6 +1,6 @@
 //! The pending-flow store's bounds (D19).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use super::*;
 
@@ -76,6 +76,52 @@ fn an_address_keeps_its_newest_flows_up_to_its_cap() {
         flows.take("other").is_some(),
         "another address keeps its own"
     );
+}
+
+/// D23: every address of one IPv6 /64 counts toward one cap, so a host with
+/// a whole /64 cannot fill the server's cap, and another /64's pending
+/// sign-in is never pushed out by it.
+#[test]
+fn one_ipv6_64_shares_a_cap_and_cannot_push_out_anothers_flow() {
+    let flows = PendingFlows::default();
+    let victim = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 0, 0, 0, 1));
+    flows.insert("victim".to_owned(), flow(victim, Duration::from_secs(5)));
+    let cap = u64::try_from(MAX_PENDING_FLOWS).expect("small");
+    for n in 0..cap {
+        // A server's worth of starts, each from its own address of one /64.
+        let address = Ipv6Addr::from_bits(0x2001_0db8_0001_0002_u128 << 64 | u128::from(n));
+        flows.insert(
+            format!("state-{n}"),
+            flow(IpAddr::V6(address), Duration::from_millis(cap - n)),
+        );
+    }
+    assert_eq!(flows.len(), MAX_PENDING_FLOWS_PER_ADDRESS + 1);
+    assert!(flows.take("victim").is_some(), "another /64 keeps its own");
+    assert!(flows.take(&format!("state-{}", cap - 1)).is_some());
+    assert!(flows.take("state-0").is_none(), "the /64's oldest went");
+}
+
+/// An IPv4-mapped IPv6 address counts with its IPv4 address.
+#[test]
+fn an_ipv4_mapped_address_counts_with_its_ipv4_address() {
+    let flows = PendingFlows::default();
+    let cap = u64::try_from(MAX_PENDING_FLOWS_PER_ADDRESS).expect("small");
+    for n in 0..cap {
+        flows.insert(
+            format!("state-{n}"),
+            flow(address(1), Duration::from_secs(cap + 1 - n)),
+        );
+    }
+    let IpAddr::V4(v4) = address(1) else {
+        unreachable!("an IPv4 address")
+    };
+    flows.insert(
+        "mapped".to_owned(),
+        flow(IpAddr::V6(v4.to_ipv6_mapped()), Duration::ZERO),
+    );
+    assert_eq!(flows.len(), MAX_PENDING_FLOWS_PER_ADDRESS);
+    assert!(flows.take("state-0").is_none(), "the oldest went");
+    assert!(flows.take("mapped").is_some());
 }
 
 #[test]

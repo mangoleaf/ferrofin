@@ -5,7 +5,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore;
-use ferrofin_traits::external_identities::{ExternalIdentity, ExternalIdentityStore};
+use ferrofin_traits::external_identities::{
+    ConditionalLink, ExternalIdentity, ExternalIdentityStore, LinkBy,
+};
 use ferrofin_traits::library::UserManager;
 use ferrofin_traits::sso::SsoManager as _;
 use serde_json::{Value, json};
@@ -128,7 +130,7 @@ async fn with_create_users_off_an_unlinked_identity_is_refused_and_no_account_is
     assert!(reply.html.contains(r#"<a href="../../../web/">"#));
     assert_eq!(
         reply.set_cookies,
-        ["ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
+        ["__Host-ferrofin_sso_flow=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
     );
     assert_eq!(user_count(&harness).await, 0);
 
@@ -293,7 +295,6 @@ fn over(harness: &mut Harness, store: LateLinks) {
         Arc::clone(&harness.users) as Arc<dyn UserManager>,
         Arc::new(store),
         Arc::clone(&harness.sso.sessions),
-        Arc::clone(&harness.sso.devices),
         Arc::clone(&harness.sso.activity),
         Some(PUBLIC_URL.to_owned()),
     );
@@ -334,6 +335,14 @@ impl ExternalIdentityStore for LateLinks {
             return Err(ServiceError::backend("the store is busy"));
         }
         self.inner.link(user_id, identity, avatar_hash).await
+    }
+    async fn link_unless_taken(
+        &self,
+        user_id: Uuid,
+        identity: ExternalIdentityKey<'_>,
+        by: LinkBy,
+    ) -> Result<ConditionalLink, ServiceError> {
+        self.inner.link_unless_taken(user_id, identity, by).await
     }
     async fn set_avatar_hash(
         &self,

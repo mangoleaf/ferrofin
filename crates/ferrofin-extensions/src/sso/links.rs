@@ -20,14 +20,13 @@
 //!   provider is Single Sign-On's has a password no one knows (D21) and
 //!   cannot link itself: an administrator links it.
 //! - A self-service link never replaces one: an account linked at the
-//!   provider's issuer is refused at the start, and again at the callback
-//!   under the lock every link write holds, so of two flows only one links.
-//!   The admin's link still replaces the account's link at that issuer (the
-//!   store's rule).
-//! - A link flow ends with the session that started it: the callback links
-//!   only while that session's token is still one of the account's devices,
-//!   so a sign-out by any route before the callback's session check ends it
-//!   (one inside the callback is a known window: see `link_identity`).
+//!   provider's issuer is refused at the start, and again by the callback's
+//!   write, which checks it in its own transaction, so of two flows only one
+//!   links, on whichever servers they finish. The admin's link still
+//!   replaces the account's link at that issuer.
+//! - A link flow ends with the session that started it: the callback's write
+//!   links only while that session's token is still one of the account's
+//!   devices, so a sign-out by any route before the write ends it.
 //! - An identity without the provider's required role is refused, as at a
 //!   sign-in (B8). An identity another account has is refused, and nothing
 //!   moves.
@@ -39,27 +38,32 @@
 //!   pages say before the removal.
 //! - Each link made and removed, by the user or an admin, writes a
 //!   `UserIdentityLinked` or `UserIdentityUnlinked` activity entry.
+//! - A link change runs with its entries, and a removal with its sign-out
+//!   and its entry, in a task of its own that the request waits for, so a
+//!   request dropped midway leaves neither half done.
 //!
 //! The account a user's route acts for comes from the authenticated request,
 //! never from a parameter: only the admin routes name one.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, LazyLock};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use ferrofin_common::cryptography::constant_time_eq;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::activity::LogLevel;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::{OidcAdminLink, OidcLink, OidcLinkProvider, OidcProvider, OidcUserLinks};
-use ferrofin_traits::activity::ActivityLogCreate;
-use ferrofin_traits::devices::DeviceQuery;
+use ferrofin_traits::activity::{ActivityLogCreate, ActivityManager};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::external_identities::{ExternalIdentity, ExternalIdentityKey};
+use ferrofin_traits::external_identities::{
+    ConditionalLink, ExternalIdentity, ExternalIdentityKey, LinkBy,
+};
 use ferrofin_traits::library::UserManager;
 use ferrofin_traits::sso::{OidcLinkAt, SsoManager as _, SsoReply};
+use futures_util::FutureExt as _;
 use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
 use uuid::Uuid;
@@ -116,41 +120,6 @@ const LINKED_ENTRY: &str = "UserIdentityLinked";
 
 /// The activity entry type of a link removed.
 const UNLINKED_ENTRY: &str = "UserIdentityUnlinked";
-
-/// Why an identity was not linked to an account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NotLinked {
-    /// Another account has the identity.
-    Taken,
-    /// The account no longer exists.
-    NoAccount,
-    /// The account has a link at the issuer, which a self-service link never
-    /// replaces.
-    AlreadyLinked,
-    /// The session that started the link flow has ended.
-    SessionEnded,
-}
-
-/// Whose link write it is, and what it may do.
-#[derive(Clone, Copy)]
-enum Linking<'a> {
-    /// A link flow's callback: it links only while the session whose token
-    /// hashes to this is the account's, and never replaces a link.
-    Flow(&'a [u8; 32]),
-    /// An administrator: it replaces the account's link at the issuer.
-    Admin,
-}
-
-/// What a link write changed.
-enum Change {
-    /// Nothing: the account had the identity already.
-    Kept,
-    /// The link is new.
-    Added,
-    /// The link replaced the account's earlier one at the issuer (the
-    /// admin's route only).
-    Replaced(ExternalIdentity),
-}
 
 /// What a link flow keeps of the session that started it: the SHA-256 of its
 /// access token, which the request authenticated with as stored.
@@ -273,18 +242,90 @@ async fn user_name(users: &dyn UserManager, id: Uuid, role: &'static str) -> Opt
     }
 }
 
-/// Waits for the entries [`SsoService::spawn_link_entries`] started for the
-/// account `user_id`; a task that panicked is logged, as LOGGING.md rule 7
-/// asks of a spawned task.
-async fn entries_written(written: tokio::task::JoinHandle<()>, user_id: Uuid) {
-    if let Err(error) = written.await {
-        tracing::error!(
-            %error,
-            task = "oidc_link_entries",
-            user_id = %user_id,
-            "the link's activity entries were not all written"
-        );
+/// Writes the activity entries of a change to the links of the account
+/// `user_id` at the provider `provider` (its name), made by `by`: the account
+/// itself, an administrator, or nil for an API key. Each of `changes` is a
+/// link and whether it was added ([`LINKED_ENTRY`]) or removed
+/// ([`UNLINKED_ENTRY`]), written in order; the subject is in the overview
+/// only. Best-effort, as the sign-in's entries: the log never fails a link.
+async fn write_link_entries(
+    users: &dyn UserManager,
+    activity: &dyn ActivityManager,
+    user_id: Uuid,
+    by: Uuid,
+    provider: &str,
+    changes: &[(&ExternalIdentity, bool)],
+) {
+    let account = user_name(users, user_id, "account")
+        .await
+        .unwrap_or_else(|| user_id.to_string());
+    let short_overview = if by == user_id {
+        format!("By {account}")
+    } else if by.is_nil() {
+        "By an API key".to_owned()
+    } else {
+        match user_name(users, by, "administrator").await {
+            Some(admin) => format!("By the administrator {admin}"),
+            None => "By an administrator".to_owned(),
+        }
+    };
+    for (link, linked) in changes {
+        let (kind, name) = if *linked {
+            (
+                LINKED_ENTRY,
+                format!("A sign-in at {provider} was linked to {account}"),
+            )
+        } else {
+            (
+                UNLINKED_ENTRY,
+                format!("A sign-in at {provider} was unlinked from {account}"),
+            )
+        };
+        let entry = ActivityLogCreate {
+            name,
+            type_: kind.to_owned(),
+            user_id: Some(user_id),
+            overview: Some(format!(
+                "Issuer: {}\nSubject: {}",
+                link.issuer, link.subject
+            )),
+            short_overview: Some(short_overview.clone()),
+            severity: LogLevel::Information,
+            ..ActivityLogCreate::default()
+        };
+        if let Err(error) = activity.create_entry(entry).await {
+            tracing::warn!(%error, activity_type = kind, "could not write the activity entry");
+        }
     }
+}
+
+/// Runs `work`, the `task` changing the links of the account `user_id` with
+/// what goes with it, in a task of its own, and waits for it: a request
+/// dropped midway leaves the task to finish. A failure reaches the request,
+/// whose error boundary logs it; once the request is gone, the task logs it
+/// itself (LOGGING.md, rules 2 and 7), but not a link that was not there
+/// to remove. A panic (which the panic hook logs too) is such a failure.
+async fn in_own_task<T: Send + 'static>(
+    task: &'static str,
+    user_id: Uuid,
+    work: impl Future<Output = Result<T, ServiceError>> + Send + 'static,
+) -> Result<T, ServiceError> {
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    let run = async move {
+        let outcome = AssertUnwindSafe(work)
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err(ServiceError::backend("the link change panicked")));
+        if let Err(Err(error)) = answer.send(outcome)
+            && !matches!(error, ServiceError::NotFound(_))
+        {
+            tracing::error!(%error, task, user_id = %user_id, "a link change failed after its request was dropped");
+        }
+    };
+    tokio::spawn(run.instrument(tracing::Span::current()));
+    answered
+        .await
+        .unwrap_or_else(|_| Err(ServiceError::backend("the link change did not finish")))
 }
 
 impl SsoService {
@@ -405,23 +446,6 @@ impl SsoService {
             .any(|link| link.issuer == issuer))
     }
 
-    /// Whether the session whose token hashes to `session` is still one of
-    /// `user_id`'s: a sign-out by any route deletes its device's token (the
-    /// user's, the Devices page's, a password change's, a link removal's).
-    async fn session_live(&self, user_id: Uuid, session: &[u8; 32]) -> Result<bool, ServiceError> {
-        let devices = self
-            .devices
-            .get_devices(&DeviceQuery {
-                user_id: Some(user_id),
-                ..DeviceQuery::default()
-            })
-            .await?;
-        Ok(devices
-            .items
-            .iter()
-            .any(|device| constant_time_eq(&session_hash(&device.access_token), session)))
-    }
-
     /// The callback of a link flow whose checks all passed: links `identity`
     /// to the flow's account `user_id` while the flow's `session` is live,
     /// and answers the page saying so, or why not. No session is opened.
@@ -464,62 +488,60 @@ impl SsoService {
             issuer: &identity.issuer,
             subject: &identity.subject,
         };
-        Ok(
-            match self
-                .link_identity(user_id, identity, Linking::Flow(session))
-                .await?
-            {
-                Ok((link, change)) => {
-                    if matches!(change, Change::Added) {
-                        tracing::info!(oidc_provider = %key, user_id = %user_id, "OIDC identity linked");
-                        let written = self.spawn_link_entries(
-                            user_id,
-                            user_id,
-                            &provider.name,
-                            &[(&link, true)],
-                        );
-                        entries_written(written, user_id).await;
-                    }
-                    page(
-                        200,
-                        "Sign-in linked",
-                        &format!(
-                            "<p>Your Ferrofin account is now linked to your sign-in at {}, which \
+        let linked = self
+            .link_identity(
+                user_id,
+                identity,
+                LinkBy::Session(*session),
+                user_id,
+                &provider.name,
+            )
+            .await;
+        Ok(match linked {
+            Ok(outcome @ (ConditionalLink::Linked { .. } | ConditionalLink::Kept(_))) => {
+                if matches!(outcome, ConditionalLink::Linked { .. }) {
+                    tracing::info!(oidc_provider = %key, user_id = %user_id, "OIDC identity linked");
+                }
+                page(
+                    200,
+                    "Sign-in linked",
+                    &format!(
+                        "<p>Your Ferrofin account is now linked to your sign-in at {}, which \
                          signs in to it from now on.</p>\n\
                          <p><a href=\"../../link\">Back to your linked sign-ins</a></p>",
-                            escape_html(&provider.name)
-                        ),
-                    )
-                }
-                Err(NotLinked::Taken) => refused(
-                    "linked_elsewhere",
-                    409,
-                    "This sign-in is already linked to another Ferrofin account. Ask an administrator \
+                        escape_html(&provider.name)
+                    ),
+                )
+            }
+            Ok(ConditionalLink::Taken) => refused(
+                "linked_elsewhere",
+                409,
+                "This sign-in is already linked to another Ferrofin account. Ask an administrator \
                  to remove that link first.",
-                ),
-                // Linked at the issuer since the start, by another flow or an
-                // administrator.
-                Err(NotLinked::AlreadyLinked) => refused(
-                    "already_linked",
-                    409,
-                    "Your Ferrofin account is already linked to a sign-in at this provider, and a \
+            ),
+            // Linked at the issuer since the start, by another flow or an
+            // administrator.
+            Ok(ConditionalLink::AlreadyLinked) => refused(
+                "already_linked",
+                409,
+                "Your Ferrofin account is already linked to a sign-in at this provider, and a \
                  link is never replaced here. Remove it first on your linked sign-ins page, then \
                  link this one.",
-                ),
-                // A link flow ends with its session (D22): one signed out since
-                // the start links nothing, whoever signed in at the provider.
-                Err(NotLinked::SessionEnded) => refused(
-                    "session_ended",
-                    400,
-                    "The Ferrofin session that started this link has ended, so nothing was linked. \
+            ),
+            // A link flow ends with its session (D22): one signed out since
+            // the start links nothing, whoever signed in at the provider.
+            Ok(ConditionalLink::SessionEnded) => refused(
+                "session_ended",
+                400,
+                "The Ferrofin session that started this link has ended, so nothing was linked. \
                  Sign in to Ferrofin again, then start the link again.",
-                ),
-                // Deleted since the flow started.
-                Err(NotLinked::NoAccount) => {
-                    refused("no_account", 400, "Linking failed. Try again.")
-                }
-            },
-        )
+            ),
+            // Deleted since the flow started.
+            Err(ServiceError::NotFound(_)) => {
+                refused("no_account", 400, "Linking failed. Try again.")
+            }
+            Err(error) => return Err(error),
+        })
     }
 
     /// Whether `identity` is still linked to `user_id`: a sign-in verified
@@ -542,131 +564,62 @@ impl SsoService {
             .is_some_and(|link| link.user_id == user_id))
     }
 
-    /// Links `identity` to `user_id`, unless another account has it, or, for
-    /// a link flow, its session has ended or the account has a link at the
-    /// issuer already: then nothing changes. A link it already has is kept as
-    /// it is.
+    /// Links `identity` to `user_id` as `by` may, and writes the change's
+    /// activity entries, made by `actor` at the provider named `provider`, in
+    /// a task of its own ([`in_own_task`]). The rules are checked by the
+    /// store, inside its write
+    /// ([`link_unless_taken`](ferrofin_traits::external_identities::ExternalIdentityStore::link_unless_taken)),
+    /// so they hold whatever another server links or a sign-out ends
+    /// meanwhile.
     async fn link_identity(
         &self,
         user_id: Uuid,
         identity: ExternalIdentityKey<'_>,
-        linking: Linking<'_>,
-    ) -> Result<Result<(ExternalIdentity, Change), NotLinked>, ServiceError> {
-        // Held as provisioning holds it, and as a removal holds it until its
-        // sign-out, so the checks and the link are one step on this server: of
-        // two flows of one account one links, and none links once a removal
-        // has signed its session out.
-        // shortcut: two servers (pods in a rolling update) linking at the same
-        // instant can both pass the checks: one identity can move to the second
-        // account, and two flows of one account can both link, the second
-        // replacing the first (the store's rule). Each needs a flow started
-        // with the account's password, or an administrator's link, in the same
-        // moment. A sign-out by a route that takes no such lock (the user's,
-        // the Devices page, a password change) can also land between the
-        // session check and the write, a few awaits apart, and the link then
-        // stands. The upgrade for both is a store method that links unless the
-        // identity is taken, the account is linked at the issuer or the
-        // session's device row is gone, in one transaction.
-        let _linking = self.provisioning.lock().await;
-        // Before the write, so a check that fails, or a request dropped
-        // midway, leaves nothing written.
-        if let Linking::Flow(session) = linking
-            && !self.session_live(user_id, session).await?
-        {
-            return Ok(Err(NotLinked::SessionEnded));
-        }
-        match self.identities.find(identity).await? {
-            Some(link) if link.user_id == user_id => return Ok(Ok((link, Change::Kept))),
-            Some(_) => return Ok(Err(NotLinked::Taken)),
-            None => {}
-        }
-        let earlier = self
-            .identities
-            .list_for_user(PROVIDER_ID, user_id)
-            .await?
-            .into_iter()
-            .find(|link| link.issuer == identity.issuer);
-        if earlier.is_some() && matches!(linking, Linking::Flow(_)) {
-            return Ok(Err(NotLinked::AlreadyLinked));
-        }
-        match self.identities.link(user_id, identity, None).await {
-            Ok(link) => Ok(Ok((link, earlier.map_or(Change::Added, Change::Replaced)))),
-            Err(ServiceError::NotFound(_)) => Ok(Err(NotLinked::NoAccount)),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Starts writing the activity entries of a change to the links of the
-    /// account `user_id` at the provider `provider` (its name), made by `by`:
-    /// the account itself, an administrator, or nil for an API key. Each of
-    /// `changes` is a link and whether it was added ([`LINKED_ENTRY`]) or
-    /// removed ([`UNLINKED_ENTRY`]), written in order; the subject is in the
-    /// overview only. A task of its own writes them, started before any
-    /// await of the caller's, so a request dropped once the change is made
-    /// still leaves them; the caller awaits it last ([`entries_written`]).
-    /// Best-effort, as the sign-in's entries: the log never fails a link.
-    // shortcut: a request dropped during the change's own commit (one await)
-    // can leave the change without its entries; the upgrade is to run the
-    // change itself in the task.
-    fn spawn_link_entries(
-        &self,
-        user_id: Uuid,
-        by: Uuid,
+        by: LinkBy,
+        actor: Uuid,
         provider: &str,
-        changes: &[(&ExternalIdentity, bool)],
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Result<ConditionalLink, ServiceError> {
+        let (identities, provisioning) =
+            (Arc::clone(&self.identities), Arc::clone(&self.provisioning));
         let (users, activity) = (Arc::clone(&self.users), Arc::clone(&self.activity));
+        let (provider_id, issuer, subject) = (
+            identity.provider_id.to_owned(),
+            identity.issuer.to_owned(),
+            identity.subject.to_owned(),
+        );
         let provider = provider.to_owned();
-        let changes: Vec<(String, bool)> = changes
-            .iter()
-            .map(|(link, linked)| {
-                (
-                    format!("Issuer: {}\nSubject: {}", link.issuer, link.subject),
-                    *linked,
-                )
-            })
-            .collect();
-        let write = async move {
-            let account = user_name(users.as_ref(), user_id, "account")
-                .await
-                .unwrap_or_else(|| user_id.to_string());
-            let short_overview = if by == user_id {
-                format!("By {account}")
-            } else if by.is_nil() {
-                "By an API key".to_owned()
-            } else {
-                match user_name(users.as_ref(), by, "administrator").await {
-                    Some(admin) => format!("By the administrator {admin}"),
-                    None => "By an administrator".to_owned(),
-                }
+        in_own_task("oidc_link", user_id, async move {
+            let identity = ExternalIdentityKey {
+                provider_id: &provider_id,
+                issuer: &issuer,
+                subject: &subject,
             };
-            for (overview, linked) in changes {
-                let (kind, name) = if linked {
-                    (
-                        LINKED_ENTRY,
-                        format!("A sign-in at {provider} was linked to {account}"),
-                    )
-                } else {
-                    (
-                        UNLINKED_ENTRY,
-                        format!("A sign-in at {provider} was unlinked from {account}"),
-                    )
-                };
-                let entry = ActivityLogCreate {
-                    name,
-                    type_: kind.to_owned(),
-                    user_id: Some(user_id),
-                    overview: Some(overview),
-                    short_overview: Some(short_overview.clone()),
-                    severity: LogLevel::Information,
-                    ..ActivityLogCreate::default()
-                };
-                if let Err(error) = activity.create_entry(entry).await {
-                    tracing::warn!(%error, activity_type = kind, "could not write the activity entry");
-                }
+            let outcome = {
+                // Held as provisioning holds it, and as a removal holds it
+                // until its sign-out, so none links on this server between a
+                // removal's unlink and its sign-out.
+                let _linking = provisioning.lock().await;
+                identities.link_unless_taken(user_id, identity, by).await?
+            };
+            if let ConditionalLink::Linked { link, replaced } = &outcome {
+                let changes: Vec<(&ExternalIdentity, bool)> = replaced
+                    .iter()
+                    .map(|earlier| (earlier, false))
+                    .chain([(link, true)])
+                    .collect();
+                write_link_entries(
+                    users.as_ref(),
+                    activity.as_ref(),
+                    user_id,
+                    actor,
+                    &provider,
+                    &changes,
+                )
+                .await;
             }
-        };
-        tokio::spawn(write.instrument(tracing::Span::current()))
+            Ok(outcome)
+        })
+        .await
     }
 
     /// [`SsoManager::all_oidc_links`](ferrofin_traits::sso::SsoManager::all_oidc_links).
@@ -725,30 +678,20 @@ impl SsoService {
         };
         // The admin's route replaces the account's link at the issuer.
         let link = match self
-            .link_identity(user_id, identity, Linking::Admin)
+            .link_identity(user_id, identity, LinkBy::Administrator, by, &provider_name)
             .await?
         {
-            Ok((link, change)) => {
-                // One task for both entries of a replacement, in order.
-                let changes: &[(&ExternalIdentity, bool)] = match &change {
-                    Change::Kept => &[],
-                    Change::Added => &[(&link, true)],
-                    Change::Replaced(earlier) => &[(earlier, false), (&link, true)],
-                };
-                if !changes.is_empty() {
-                    let written = self.spawn_link_entries(user_id, by, &provider_name, changes);
-                    entries_written(written, user_id).await;
-                }
-                link
-            }
-            Err(NotLinked::Taken) => {
+            ConditionalLink::Linked { link, .. } | ConditionalLink::Kept(link) => link,
+            ConditionalLink::Taken => {
                 return Err(ServiceError::Conflict(
                     "another account is linked to this identity: remove that link first".to_owned(),
                 ));
             }
-            // `AlreadyLinked` and `SessionEnded` answer link flows only.
-            Err(NotLinked::NoAccount | NotLinked::AlreadyLinked | NotLinked::SessionEnded) => {
-                return Err(ServiceError::not_found(format!("user {user_id}")));
+            // A session's refusals, never an administrator's.
+            ConditionalLink::AlreadyLinked | ConditionalLink::SessionEnded => {
+                return Err(ServiceError::backend(
+                    "the store refused an administrator's link as a session's",
+                ));
             }
         };
         tracing::info!(oidc_provider = %key, user_id = %user_id, "OIDC identity linked by an administrator");
@@ -769,47 +712,68 @@ impl SsoService {
             OidcLinkAt::Provider(key) => named(&providers, key)?.issuer.as_str(),
             OidcLinkAt::Issuer(issuer) => issuer,
         };
-        let (revoked, written) = {
-            let _linking = self.provisioning.lock().await;
-            let link = self
-                .identities
-                .list_for_user(PROVIDER_ID, user_id)
-                .await?
-                .into_iter()
-                .find(|link| link.issuer == issuer)
-                .ok_or_else(|| ServiceError::not_found("no such OIDC link"))?;
-            if !self.identities.unlink(link.key()).await? {
-                return Err(ServiceError::not_found("no such OIDC link"));
-            }
-            // Started with no await between it and the unlink, nor between
-            // the unlink and the sign-out below, and awaited after both.
-            // shortcut: a request dropped during the unlink's own commit, or
-            // part-way through the sign-out (one device at a time), leaves
-            // some of the account's sessions signed in, and a retry finds no
-            // link to remove; the upgrade is to run the unlink, the sign-out
-            // and the entry in one task of their own.
-            let provider = at_issuer(&providers, issuer).map_or(issuer, |provider| &provider.name);
-            let written = self.spawn_link_entries(user_id, by, provider, &[(&link, false)]);
-            // The identity no longer signs in to the account: neither does
-            // any session it, or anyone, opened (B12). The link is removed
-            // first, under the lock an exchange or a Quick Connect approval
-            // holds from its lookup of the link to its session: a sign-in it
-            // finished whose code or confirmation is not used yet is refused
-            // there, and one already minted is signed out here. The sign-out
-            // is under the lock too, which a link flow's callback holds from
-            // its session check to its link, so none links in between. A
-            // failed sign-out is an error for a removal that stands; the
-            // dashboard's Devices page signs the sessions out too.
-            (self.sessions.revoke_user_tokens(user_id, "").await, written)
-        };
-        // After the sign-out, so no session of the account is left to start
-        // another. Every link flow is tied to its session too, which the
-        // sign-out ended, so this drop only frees the flows early.
-        self.flows.drop_link_flows_of(user_id);
-        entries_written(written, user_id).await;
-        revoked?;
-        tracing::info!(user_id = %user_id, "OIDC identity unlinked and the account's sessions signed out");
-        Ok(())
+        let provider = at_issuer(&providers, issuer).map_or(issuer, |provider| &provider.name);
+        let (issuer, provider) = (issuer.to_owned(), provider.to_owned());
+        let (identities, sessions) = (Arc::clone(&self.identities), Arc::clone(&self.sessions));
+        let (provisioning, flows) = (Arc::clone(&self.provisioning), Arc::clone(&self.flows));
+        let (users, activity) = (Arc::clone(&self.users), Arc::clone(&self.activity));
+        in_own_task("oidc_unlink", user_id, async move {
+            let revoked = {
+                let _linking = provisioning.lock().await;
+                let link = identities
+                    .list_for_user(PROVIDER_ID, user_id)
+                    .await?
+                    .into_iter()
+                    .find(|link| link.issuer == issuer)
+                    .ok_or_else(|| ServiceError::not_found("no such OIDC link"))?;
+                if !identities.unlink(link.key()).await? {
+                    return Err(ServiceError::not_found("no such OIDC link"));
+                }
+                // The identity no longer signs in to the account: neither
+                // does any session it, or anyone, opened (B12). The link is
+                // removed first, under the lock an exchange or a Quick Connect
+                // approval holds from its lookup of the link to its session: a
+                // sign-in it finished whose code or confirmation is not used
+                // yet is refused there, and one already minted is signed out
+                // here. The sign-out is under the lock too, which a link
+                // change holds for its write, so none links in between. A
+                // failed sign-out is an error for a removal that stands; the
+                // dashboard's Devices page signs the sessions out too.
+                // shortcut: the lock is this server's: on another server
+                // sharing the database (a rolling update's second pod), a link
+                // flow called back between the unlink and the sign-out of its
+                // session still links, its session then signed out, and an
+                // exchange or a Quick Connect approval that looked the link up
+                // before the unlink can mint its session after the sign-out.
+                // The flow needed the account's password, which links again
+                // after a removal anyway. The upgrade is a sign-out before the
+                // unlink as well as after it, and a minted session signed out
+                // again when its link is gone by then.
+                // The entry is written beside the sign-out, which may fail or
+                // take a while: the removal stands either way.
+                let removed = [(&link, false)];
+                let ((), revoked) = tokio::join!(
+                    write_link_entries(
+                        users.as_ref(),
+                        activity.as_ref(),
+                        user_id,
+                        by,
+                        &provider,
+                        &removed,
+                    ),
+                    sessions.revoke_user_tokens(user_id, "")
+                );
+                revoked
+            };
+            // After the sign-out, so no session of the account is left to
+            // start another. Every link flow is tied to its session too, which
+            // the sign-out ended, so this drop only frees the flows early.
+            flows.drop_link_flows_of(user_id);
+            revoked?;
+            tracing::info!(user_id = %user_id, "OIDC identity unlinked and the account's sessions signed out");
+            Ok(())
+        })
+        .await
     }
 }
 
