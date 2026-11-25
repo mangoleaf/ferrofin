@@ -712,7 +712,7 @@ pub async fn cleanup_orphaned_extras(db: &Database) -> Result<usize, ServiceErro
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
 pub async fn fix_owner_id_relationships(db: &Database) -> Result<usize, ServiceError> {
-    const KEY: &str = "owner_id_relationships_v12";
+    const KEY: &str = ferrofin_db::repair_markers::OWNER_ID_RELATIONSHIPS;
     if !once(db, KEY).await? {
         return Ok(0);
     }
@@ -1666,7 +1666,7 @@ pub async fn rehome_local_versions(
     path_manager: Option<&dyn PathManager>,
     persistence: &dyn ItemPersistenceService,
 ) -> Result<RehomedVersions, ServiceError> {
-    const KEY: &str = "rehome_local_versions_v12";
+    const KEY: &str = ferrofin_db::repair_markers::REHOME_LOCAL_VERSIONS;
     if !once(db, KEY).await? {
         return Ok(RehomedVersions::default());
     }
@@ -1848,8 +1848,8 @@ fn uuid_of(id: &str) -> Result<Uuid, ServiceError> {
 /// Returns [`ServiceError`] if a query fails; the repair is not marked done
 /// then, and the next boot runs it again.
 pub async fn rederive_adopted_versions(db: &Database) -> Result<u64, ServiceError> {
-    const KEY: &str = "rederive_adopted_versions_v160";
-    const REHOME_KEY: &str = "rehome_local_versions_v12";
+    const KEY: &str = ferrofin_db::repair_markers::REDERIVE_ADOPTED_VERSIONS;
+    const REHOME_KEY: &str = ferrofin_db::repair_markers::REHOME_LOCAL_VERSIONS;
     if once(db, REHOME_KEY).await? || !once(db, KEY).await? || !adopted_from_10_11(db).await? {
         return Ok(0);
     }
@@ -3120,7 +3120,7 @@ pub async fn sweep_missing_items(
     internal_metadata: &str,
     user_views: &str,
 ) -> Result<SweptItems, ServiceError> {
-    const KEY: &str = "missing_item_sweeps_v12";
+    const KEY: &str = ferrofin_db::repair_markers::MISSING_ITEM_SWEEPS;
     let Some(adoption) = db.adoption_state().await? else {
         return Ok(SweptItems::default());
     };

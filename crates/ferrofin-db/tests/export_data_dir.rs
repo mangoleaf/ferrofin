@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 use ferrofin_db::export::{
     CarriedRows, ContainerFile, DOCKER, DatabaseEdits, DroppedObjects, DroppedTable,
-    EXPORTED_DATABASE, HistoryRewrite, IdentityLink, LeftOut, LibraryContainer, MirroredLiveTv,
-    PathRewrite, RecordingRow, SeriesTimerRow, SourceDirs, TimerRow, export_data_dir,
+    EXPORTED_DATABASE, FirstStartCounts, HistoryRewrite, IdentityLink, LeftOut, LibraryContainer,
+    MirroredLiveTv, PathRewrite, RecordingRow, SeriesTimerRow, SourceDirs, TimerRow,
+    export_data_dir,
 };
 use ferrofin_db::{Database, DbError};
 use sqlx::ConnectOptions as _;
@@ -188,6 +189,7 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
             },
             // (the moves themselves are checked below)
             carried: CarriedRows::default(),
+            counts: FirstStartCounts::default(),
         }
     );
     assert_eq!(summary.left_out.len(), 0);

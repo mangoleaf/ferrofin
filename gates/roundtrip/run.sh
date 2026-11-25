@@ -16,8 +16,8 @@
 #   Jellyfin   the Jellyfin release UPSTREAM_TAG names (jellyfin/jellyfin:<minor>, or --jellyfin-image)
 #              boots on the export. Checks: ready within ROUNDTRIP_READY_TIMEOUT; every migration it
 #              began finished (a failure names the migration and its SQLite error); it ran the code
-#              migrations its own first start on the route's source ran (routes.sh) and no schema
-#              migration; no ERR or FTL entry outside checks_boot.py's allowlist up to that
+#              migrations its own first start on the route's source ran (routes.sh), but those the export
+#              records as applied, and no schema migration; no ERR or FTL entry outside checks_boot.py's allowlist up to that
 #              point; a full metadata refresh of every playlist completes (api.py refresh-playlists),
 #              then its answers equal Ferrofin's (adoption_normalise: ids, image sizes and the probes
 #              that differ by design left out), so everything answers.py captures came back: users and

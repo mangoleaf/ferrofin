@@ -864,7 +864,8 @@ async fn alter(source: &Path, statements: &[&str]) {
 /// A database the export cannot vouch for is refused, and the export leaves
 /// no output: what it had staged is removed. Not Ferrofin's, a broken foreign
 /// key, a Jellyfin history from no release Ferrofin adopts, a damaged file,
-/// and a write-ahead log damaged before its end.
+/// a write-ahead log damaged before its end, and an adopted one without the
+/// proof of the work of a code migration the history records as applied.
 #[tokio::test]
 async fn export_jellyfin_refuses_a_database_it_cannot_vouch_for() {
     let scratch = tempfile::tempdir().unwrap();
@@ -940,6 +941,22 @@ async fn export_jellyfin_refuses_a_database_it_cannot_vouch_for() {
     bytes[32 + 24 + 100] ^= 0xff;
     std::fs::write(&log, bytes).unwrap();
     expect(&source, "write-ahead log is damaged at frame 1");
+
+    // Adopted, and last started by a Ferrofin release before a boot repair:
+    // no proof of the work of a routine the history records as applied
+    // (gl-1902).
+    let dir = scratch.path().join("no-proof");
+    std::fs::create_dir(&dir).unwrap();
+    let source = adopted_source(&dir).await;
+    alter(
+        &source,
+        &[r#"DELETE FROM "FerrofinMeta" WHERE "Key" = 'rating_levels_v122'"#],
+    )
+    .await;
+    expect(
+        &source,
+        "lacks the proof of that work for: MigrateRatingLevels (rating_levels_v122)",
+    );
 }
 
 /// Whether permissions bind this process (they do not bind root): a file
@@ -1127,6 +1144,13 @@ async fn adopted_source(scratch: &Path) -> PathBuf {
            VALUES ('B1C2D3E4-F5A6-4B7C-8D9E-0F1A2B3C4D5E', ?1, 'tmdb-603', 1, 2, 0, 1,
                    '2026-11-01 00:00:00.0000000')"#,
         r#"INSERT INTO "FerrofinUserDataRetentionKeys" VALUES (1, 'identity', 'tmdb-603')"#,
+        // What the boot repairs leave once they ran, which the export asks for
+        // before it records their routines as applied (gl-1902).
+        r#"INSERT OR REPLACE INTO "FerrofinMeta" ("Key", "Value") VALUES
+            ('rehome_local_versions_v12', '1'), ('rederive_adopted_versions_v160', '1'),
+            ('owner_id_relationships_v12', '1'),
+            ('rating_levels_v122', '1'), ('missing_item_sweeps_v12', '1')"#,
+        r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#,
     ] {
         let query = sqlx::query(statement);
         // Only the user and the snapshot name the user.

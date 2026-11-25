@@ -7,12 +7,13 @@
     checks_boot.py ran LOG ORACLE DB   the schema migrations Jellyfin began (the exported history should record
                                        every one), and the code migrations it ran that differ from those ORACLE,
                                        the log of its own first start on the route's source, shows it running,
-                                       less those the source's history (the database DB) records; with no history
-                                       in DB (a database Ferrofin created), every migration it began
+                                       less those the source's history (the database DB) records and those the
+                                       export records as applied (CLASSIFY's CodeRecordedAsApplied rows); with no
+                                       history in DB (a database Ferrofin created), every migration it began
 
 Exit status 0 when there is nothing to say, 1 with the reasons on stdout, 2 when a log cannot be read or
 holds no entry at all (an empty capture, or a format this no longer parses, must never pass), or DB's
-history cannot be read.
+history or the export's classification (CLASSIFY) cannot be read.
 The log is the container's output: entries such as `[07:53:39] [INF] [10] Main: Jellyfin version: 12.4.0`,
 a multi-line entry continuing on the lines that do not start one. The time has milliseconds
 (`[07:53:39.252]`) where the configuration's logging.default.json asks for them, as the one a fresh install of
@@ -37,6 +38,10 @@ ALLOWED = (
 )
 #: How many unexpected errors a reason quotes before it only counts the rest.
 MAX_SHOWN = 3
+#: The export's classification of Jellyfin's migrations, in the checkout the gate runs from: the code migrations it
+#: records as applied are not Jellyfin's to run (gl-1902).
+CLASSIFY = Path(__file__).resolve().parents[2] / "crates/ferrofin-db/src/export/classify.rs"
+RECORDED_ROW = re.compile(r'^\s*\("(\d{14}_\w+)", CodeRecordedAsApplied\),', re.MULTILINE)
 
 
 def entries(text):
@@ -85,13 +90,18 @@ def recorded(path):
         return {row[0] for row in db.execute('SELECT "MigrationId" FROM "__EFMigrationsHistory"')}
 
 
-def ran(log, oracle, source=frozenset()):
+def recorded_as_applied(path=CLASSIFY):
+    """The code migrations the export's classification table records as applied."""
+    return frozenset(RECORDED_ROW.findall(Path(path).read_text(encoding="utf-8")))
+
+
+def ran(log, oracle, source=frozenset(), applied=frozenset()):
     code, schema = performed(log)
     # A routine the source records ran there only because a schema migration applied before it reverted the one
     # whose Down() drops its row (on 10.11.10 and 10.11.11, AddNormalizedUsername's drops UpdateNormalizedUsername's,
     # JellyfinMigrationService.MigrateStepAsync): the export applies no schema migration, so it stays recorded.
     # A source with no history (None) is exported with a fresh install's whole history: Jellyfin runs nothing.
-    expected = [] if source is None else [m for m in performed(oracle)[0] if m not in source]
+    expected = [] if source is None else [m for m in performed(oracle)[0] if m not in source and m not in applied]
     reasons = []
     if schema:
         reasons.append(f"it began {len(schema)} schema migration(s) the history should have recorded: "
@@ -138,6 +148,11 @@ def main(argv=None):
             logs.append(recorded(argv[3]))
         except sqlite3.Error as error:
             print(f"cannot read the source's history in {argv[3]}: {error}")
+            return 2
+        try:
+            logs.append(recorded_as_applied())
+        except OSError as error:
+            print(f"cannot read the export's classification: {error}")
             return 2
     reasons = {"migrations": migrations, "errors": errors, "ran": ran}[argv[0]](*logs)
     for reason in reasons:

@@ -77,6 +77,27 @@ class Ran(unittest.TestCase):
         self.assertEqual(checks_boot.ran(boot(), oracle, source),
                          ["1 code migration(s) it runs on the source did not run: 2026_Repair"])
 
+    def test_a_code_migration_the_export_records_as_applied_is_not_expected(self):
+        # gl-1902: Jellyfin runs it on its own first start on the source, not on the export
+        self.assertEqual(checks_boot.ran(boot((CODE, "2026_Fix")), self.ORACLE, applied={"2026_Repair"}), [])
+        self.assertEqual(checks_boot.ran(boot((CODE, "2026_Fix"), (CODE, "2026_Repair")), self.ORACLE,
+                                         applied={"2026_Repair"}),
+                         ["1 code migration(s) ran that it does not run on the source: 2026_Repair"])
+
+    def test_the_ids_recorded_as_applied_are_read_from_the_classification_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = Path(tmp) / "classify.rs"
+            table.write_text('    ("20200514181226_AddActivityLog", Schema),\n'
+                             '    ("20260113120000_MigrateLinkedChildren", CodeRecordedAsApplied),\n'
+                             '    ("20260113230000_CleanupOrphanedExtras", CodeLeftToRun),\n'
+                             '/// ("20260115120000_Commented", CodeRecordedAsApplied),\n')
+            self.assertEqual(checks_boot.recorded_as_applied(table), {"20260113120000_MigrateLinkedChildren"})
+        # the checkout's own table: every id it records as applied, and nothing else
+        text = checks_boot.CLASSIFY.read_text(encoding="utf-8")
+        applied = checks_boot.recorded_as_applied()
+        self.assertTrue(applied, "no row parsed: has the table's format changed?")
+        self.assertEqual(len(applied), text.count(", CodeRecordedAsApplied),\n"))
+
     def test_a_long_list_is_cut_short(self):
         oracle = boot(*((CODE, f"2026_R{n}") for n in range(5)))
         self.assertEqual(checks_boot.ran(boot(), oracle),
