@@ -325,6 +325,11 @@ fn print_summary(
             history.recorded.len(),
             history.left_to_run.len()
         );
+    } else {
+        println!(
+            "Its Jellyfin migration history (the database was never adopted from Jellyfin): the {} migrations a fresh install of Jellyfin records, so Jellyfin runs none on its first start.",
+            history.recorded.len()
+        );
     }
     if replaced {
         println!(
@@ -837,7 +842,7 @@ fn first_start(report: &mut String, edits: &DatabaseEdits, database_bytes: u64) 
     report.push_str("\nWhat Jellyfin will change on its first start");
     let Some(generation) = history.generation else {
         report.push_str(
-            ":\n  Not known: the database was never adopted from Jellyfin, so it has no Jellyfin migration history.\n",
+            ":\n  None: the database was never adopted from Jellyfin, so its history is the one a fresh install of Jellyfin records, and Jellyfin runs no migration.\n",
         );
         return;
     };
@@ -1307,9 +1312,9 @@ mod tests {
         );
     }
 
-    /// A Ferrofin-native database has no Jellyfin history to tell what
-    /// Jellyfin runs from, and a source without backups or task state leaves
-    /// nothing outside the database.
+    /// A Ferrofin-native database is given a fresh install's history, on
+    /// which Jellyfin runs nothing, and a source without backups or task
+    /// state leaves nothing outside the database.
     #[test]
     fn an_empty_section_says_so() {
         let edits = DatabaseEdits {
@@ -1323,7 +1328,7 @@ mod tests {
         let report = loss_report(&edits, &ConfigExport::default(), &ReportInputs::default());
         assert!(
             report.contains(
-                "What Jellyfin will change on its first start:\n  Not known: the database was never adopted from Jellyfin, so it has no Jellyfin migration history.\n\nSettings Jellyfin is not given:\n  Settings given"
+                "What Jellyfin will change on its first start:\n  None: the database was never adopted from Jellyfin, so its history is the one a fresh install of Jellyfin records, and Jellyfin runs no migration.\n\nSettings Jellyfin is not given:\n  Settings given"
             ),
             "{report}"
         );

@@ -3,7 +3,7 @@
 run's result.json in the envelope every gate writes (gates/result.py), which a gates/run session reads.
 
 run.sh records as it goes with gates/adoption/adoption_report.py (start, begin, check, row: one JSON line
-per event in WORK/results.jsonl, a route being a fixture row of its kind, path, messy or scale), and builds
+per event in WORK/results.jsonl, a route being a fixture row of its kind, path, messy, scale or native), and builds
 both with
 
     report.py build WORK        write WORK/report.html and WORK/result.json; prints the page's path

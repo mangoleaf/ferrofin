@@ -28,14 +28,16 @@ pub enum Disposition {
     Schema,
     /// A code migration Jellyfin runs itself: it repairs data and
     /// configuration in the shapes earlier releases left. Kept when the
-    /// source's history has it (it ran before adoption), never added.
+    /// source's history has it (it ran before adoption), never added to an
+    /// adopted database's (a Ferrofin-native one gets a fresh install's).
     CodeLeftToRun,
     /// A code migration recorded as applied even where the source's history
     /// lacks it: Ferrofin did its work when it adopted the database, and the
     /// round-trip gate showed that running it on a database Ferrofin
     /// maintained damages it (owner decision on gl-1902: only those). The
-    /// export refuses a database without the proof of that work
-    /// (`super::proof`).
+    /// export refuses an adopted database without the proof of that work
+    /// (`super::proof`); a Ferrofin-native one records it, as a fresh install
+    /// does.
     CodeRecordedAsApplied,
     /// The id of a routine an earlier release retired or re-dated, which the
     /// target no longer knows. Kept when the source's history has it, never
