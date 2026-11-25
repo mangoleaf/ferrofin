@@ -625,6 +625,51 @@ async fn a_configuration_directory_kept_elsewhere_is_copied_without_its_migratio
     assert!(etc.join("migrations.xml").exists(), "the source keeps it");
 }
 
+/// The files `not_needed_files` names are left out of every tree copied, the
+/// data directory's and a configuration directory kept elsewhere, and the
+/// source keeps them (gl-1949).
+#[tokio::test]
+async fn files_not_needed_are_left_out_of_every_tree_copied() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source(scratch.path()).await;
+    let etc = scratch.path().join("etc");
+    std::fs::create_dir_all(etc.join("users/named")).unwrap();
+    for file in ["system.json", "system_id", "users/named/network.json"] {
+        std::fs::write(etc.join(file), file).unwrap();
+    }
+    std::fs::write(source.join("task_results.json"), b"{}").unwrap();
+    // Of the same name, elsewhere: copied.
+    std::fs::write(source.join("metadata/system.json"), b"metadata's").unwrap();
+    let dirs = SourceDirs {
+        config: etc.clone(),
+        not_needed_files: vec![
+            etc.join("system.json"),
+            etc.join("users/named/network.json"),
+            etc.join("users/named/encoding.json"),
+            source.join("task_results.json"),
+        ],
+        ..SourceDirs::new(&source)
+    };
+    let (out, before) = (scratch.path().join("out"), files(&etc));
+
+    export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out)
+        .await
+        .unwrap();
+
+    let copied = files(&out);
+    for left_out in [
+        "config/system.json",
+        "config/users/named/network.json",
+        "task_results.json",
+    ] {
+        assert!(!copied.contains_key(Path::new(left_out)), "{left_out}");
+    }
+    assert_eq!(copied[Path::new("config/system_id")], b"system_id");
+    assert_eq!(copied[Path::new("metadata/system.json")], b"metadata's");
+    assert_eq!(files(&etc), before, "the source keeps them");
+    assert!(source.join("task_results.json").exists());
+}
+
 /// A database with `statements` run on it, at `data/jellyfin.db` of a new
 /// source under `scratch`.
 async fn source_with_database(scratch: &Path, statements: &[&str]) -> PathBuf {

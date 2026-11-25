@@ -236,7 +236,8 @@ async fn edit_staged(
 /// source. Left out are the database files: `database`, the file it links to,
 /// the source's own [`EXPORTED_DATABASE`] (a native database's leftover would
 /// otherwise sit under the snapshot), and the `-wal`, `-shm` and `-journal`
-/// files of each. The snapshot holds what they do. Also left out is a
+/// files of each. The snapshot holds what they do. So are the files of
+/// [`SourceDirs::not_needed_files`], in every tree copied. Also left out is a
 /// `migrations.xml` in the configuration directory (the data directory's own,
 /// or the one copied to the layout's), which Jellyfin would read again: from
 /// one listing migrations it writes history rows, or stops its start. So are
@@ -306,6 +307,7 @@ pub async fn export_data_dir(
         .collect::<Vec<_>>();
     skipped.push(source.join(LEGACY_MIGRATIONS_FILE));
     skipped.push(dirs.config.join(LEGACY_MIGRATIONS_NAME));
+    skipped.extend(dirs.not_needed_files.iter().cloned());
     let (to, files, copied_trees, left_out) = (
         out.to_owned(),
         companions.clone(),

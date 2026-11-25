@@ -155,6 +155,14 @@ const CONFIGURATION: [&str; 11] = [
     "data/livetv/seriestimers.json",
 ];
 
+/// Ferrofin's configuration in [`source`] that the export writes as
+/// [`CONFIGURATION`]'s XML, relative to the source.
+const EXPORTED_JSON: [&str; 3] = [
+    "config/system.json",
+    "config/users/named/encoding.json",
+    "config/users/named/network.json",
+];
+
 /// Runs `ferrofin-server export-jellyfin --data-dir <source> --out <out>` with
 /// no `FERROFIN_*` variable from the test's environment.
 fn export(source: &Path, out: &Path) -> Output {
@@ -290,7 +298,16 @@ async fn export_jellyfin_copies_a_stopped_data_directory_and_leaves_it_untouched
     expected.retain(|path, _| {
         !path.starts_with("data") && !CONFIGURATION.iter().any(|c| path == Path::new(c))
     });
+    // Ferrofin's JSON the XML was written from is left out: a later adoption
+    // by Ferrofin would read it over the XML Jellyfin keeps (gl-1949).
+    expected.retain(|path, _| !EXPORTED_JSON.iter().any(|json| path == Path::new(json)));
     assert_eq!(copied, expected);
+    assert!(
+        !files(&out).values().any(|bytes| bytes
+            .windows(CERTIFICATE_PASSWORD.len())
+            .any(|window| window == CERTIFICATE_PASSWORD.as_bytes())),
+        "no file of the output holds the certificate password"
+    );
     assert_eq!(exported_names(&out).await, ["one", "two", "three"]);
 
     // B10: the same stopped source exports to the same database and the same
@@ -1528,6 +1545,59 @@ async fn export_jellyfin_writes_live_tv_and_plugin_settings() {
         channel_favourite(&out).await,
         1,
         "the channel and its favourite are kept"
+    );
+}
+
+/// The settings each plugin's XML is written from, and the task results, are
+/// left out of the copy, as a later adoption by Ferrofin would read them over
+/// what Jellyfin kept; a plugin's with no counterpart, and the task triggers,
+/// which nothing written replaces, are copied (gl-1949).
+#[tokio::test]
+async fn export_jellyfin_leaves_out_the_plugin_settings_its_xml_is_written_from() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = live_tv_source(scratch.path()).await;
+    let out = scratch.path().join("out");
+
+    let run = export(&source, &out);
+
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    for (path, copied) in [
+        (
+            "config/plugins/958aad66-3784-4d2a-b89a-a7b6fab6e25c/config.json",
+            false,
+        ),
+        (
+            "config/plugins/b8715ed1-6c47-4528-9ad3-f72deb539cd4/config.json",
+            false,
+        ),
+        (
+            "config/plugins/5f0e8d1c-0000-4000-8000-000000000001/config.json",
+            true,
+        ),
+        ("task_results.json", false),
+        ("config/task_triggers.json", true),
+    ] {
+        assert_eq!(out.join(path).exists(), copied, "{path}");
+        assert!(source.join(path).exists(), "the source keeps {path}");
+    }
+    let holds = |bytes: &Vec<u8>| {
+        bytes
+            .windows(BIND_PASSWORD.len())
+            .any(|window| window == BIND_PASSWORD.as_bytes())
+    };
+    let holding: Vec<_> = files(&out)
+        .into_iter()
+        .filter(|(_, bytes)| holds(bytes))
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(
+        holding,
+        [Path::new("plugins/configurations/LDAP-Auth.xml")],
+        "the bind password is only in the settings written for Jellyfin"
     );
 }
 

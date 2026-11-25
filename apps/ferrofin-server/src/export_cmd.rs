@@ -46,6 +46,10 @@ const PROBE_ANSWER_LIMIT: usize = 64 * 1024;
 /// Jellyfin's backups directory under the output (`{DataPath}/backups`).
 const JELLYFIN_BACKUPS: &str = "data/backups";
 
+/// Where Ferrofin keeps its scheduled tasks' last results, relative to its
+/// data directory.
+const TASK_RESULTS: &str = "task_results.json";
+
 /// Exports `config`'s data directory into `args.out`, in the layout of
 /// Jellyfin's docker image ([`DOCKER`]), writes the loss report into it
 /// ([`LOSS_REPORT`]) and prints what it wrote and the report.
@@ -206,8 +210,11 @@ async fn library_options(
 
 /// The directories of `config`'s server, as the export reads them: its
 /// metadata directory as its settings name it (the default when they cannot
-/// be read, which the configuration's read then refuses), and its cache, log
-/// and web client directories, which hold nothing Jellyfin reads.
+/// be read, which the configuration's read then refuses), its cache, log
+/// and web client directories, which hold nothing Jellyfin reads, and its own
+/// files Jellyfin does not read: the configuration the export writes as
+/// Jellyfin's XML, which a later adoption by Ferrofin would read over the XML
+/// Jellyfin kept, and the scheduled tasks' last results.
 fn source_dirs(config: &Config) -> SourceDirs {
     SourceDirs {
         program_data: config.data_dir.clone(),
@@ -219,6 +226,11 @@ fn source_dirs(config: &Config) -> SourceDirs {
             config.data_dir.join("log"),
             config.web_dir.clone(),
         ],
+        not_needed_files: config_export::exported_sources(&config.config_dir)
+            .into_iter()
+            .chain(plugins::exported_sources(config))
+            .chain([config.data_dir.join(TASK_RESULTS)])
+            .collect(),
     }
 }
 
@@ -403,7 +415,7 @@ async fn report_inputs(
     let mut task_state = false;
     for file in [
         config.config_dir.join("task_triggers.json"),
-        config.data_dir.join("task_results.json"),
+        config.data_dir.join(TASK_RESULTS),
     ] {
         task_state |= tokio::fs::try_exists(&file)
             .await
@@ -551,6 +563,9 @@ fn loss_report(
     }
     report.push_str(
         "  Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported, but for the MusicBrainz server and the Studio Images repository, which outrank those plugins' own settings and are written into them.\n",
+    );
+    report.push_str(
+        "  Ferrofin's own files for the documents and plugin settings written as XML (system.json, the documents in config/users/named, a written plugin's config.json) are left out of the copy, so the settings listed above from those documents and plugins are not in the output in any form.\n",
     );
 
     live_tv(&mut report, edits, inputs);

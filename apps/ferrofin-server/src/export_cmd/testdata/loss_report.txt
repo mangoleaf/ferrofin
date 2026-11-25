@@ -25,6 +25,7 @@ What Jellyfin does not run, as Ferrofin already did it (its history marks it don
 Settings Jellyfin is not given:
   CertificatePath in config/network.xml: a path in Ferrofin's filesystem.
   Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported, but for the MusicBrainz server and the Studio Images repository, which outrank those plugins' own settings and are written into them.
+  Ferrofin's own files for the documents and plugin settings written as XML (system.json, the documents in config/users/named, a written plugin's config.json) are left out of the copy, so the settings listed above from those documents and plugins are not in the output in any form.
 
 Live TV:
   Written for Jellyfin: 2 tuners and 1 guide provider in config/livetv.xml, 3 timers (1 completed recording among them) in data/livetv/timers.json, 1 series timer in data/livetv/seriestimers.json.
