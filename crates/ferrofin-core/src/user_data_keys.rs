@@ -64,12 +64,15 @@
 //!   leads) while the extra branch inserts tmdb then imdb (**imdb** leads).
 //!   Reading one and assuming the other is a silent mis-key.
 //!
-//! **Known omission:** `BaseItem.cs:1472` prepends `ExternalId` when
-//! `SourceType == Channel`. The pinned 10.11.8 schema has no `SourceType`
-//! column — it lives inside the `Data` blob — and Ferrofin has no channel
-//! plugin that would set it, so there is nothing to read and no row that could
-//! carry such a key. Stated rather than left invisible; if channel items ever
-//! land, this is where their key belongs.
+//! **The `ExternalId` key reaches no item Ferrofin has.** The base list
+//! (v12.4 `BaseItem.cs:1766-1779`) prepends `ExternalId` when
+//! `SourceType == Channel`, and the base property answers `Channel` for any
+//! item with a `ChannelId` (`BaseItem.cs:290-301`). But a Live TV programme
+//! and a Live TV channel override it to `LiveTV` (`LiveTv/LiveTvProgram.cs:34`,
+//! `LiveTv/LiveTvChannel.cs:27`), so their keys never carry it, though a
+//! programme stores both values. Only a channel plugin's items take that key,
+//! and Ferrofin has no channel provider. If channel items ever land, this is
+//! where their key belongs.
 
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_util::string_extensions::{remove_diacritics, zero_padded};

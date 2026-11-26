@@ -98,7 +98,7 @@ Ferrofin: `crates/ferrofin-core/src/user_data_manager.rs` (udm), `user_data_keys
 | Column | Ferrofin writer | Upstream writer | Verdict | Note |
 |---|---|---|---|---|
 | ItemId, UserId | udm:743-744 | UDM:66, 174 | match | user deletion cascades on both |
-| CustomDataKey | `user_data_keys.rs:195-363`; udm:666-668 | UDM:58-75; `BaseItem.cs:1766-1779` and overrides | fix (gl-1610); edge fix (gl-1605) | upstream prepends the item's `ExternalId` for a channel source, which is every item with a `ChannelId`, Live TV programs included (`BaseItem.cs:288-299, 1768-1776`). Ferrofin's note at `crates/ferrofin-core/src/user_data_keys.rs:67-72` takes it for a channel-plugin case only, so a program's user data lacks that key. Edge: a negative index pads with the sign: `{:03}` gives `-01` where C#'s `"000"` gives `-001`, and disc and track `{:04}` likewise |
+| CustomDataKey | `user_data_keys.rs:195-363`; udm:666-668 | UDM:58-75; `BaseItem.cs:1766-1779` and overrides | match; edge fix (gl-1605) | upstream prepends the item's `ExternalId` for a channel source (`BaseItem.cs:1766-1779`), but a Live TV program overrides `SourceType` to `LiveTV` (`MediaBrowser.Controller/LiveTv/LiveTvProgram.cs:34`), so only a channel plugin's items take that key, and Ferrofin has none (re-checked in gl-1610). Edge: a negative index pads with the sign: `{:03}` gives `-01` where C#'s `"000"` gives `-001`, and disc and track `{:04}` likewise |
 | AudioStreamIndex, SubtitleStreamIndex | `crates/ferrofin-traits/src/library.rs:2027-2041` via udm:813-829 | `SessionManager.cs:990, 1016-1055` | match | |
 | IsFavorite, Rating, Likes | udm:1822-1852, 2007-2008 | UDM:130-153; `UserItemData.cs:96-118` | match | Likes derives from Rating (6.5 threshold) on both |
 | PlayCount, PlaybackPositionTicks, Played | udm:1412-1520, 2123-2130 | UDM:455-529; `BaseItem.cs:2252-2302` | match | same thresholds |
@@ -194,7 +194,7 @@ Filed or extended by this audit. None of the issues filed here is in the milesto
 | gl-1608 | User rows: `CastReceiverId` at creation and the seeded admin's bitrate limit |
 | gl-1190 (evidence added) | The startup wizard's case fold |
 | gl-1609 | Item deletion removes display preferences |
-| gl-1610 | Live TV programs' `ExternalId` user-data key |
+| gl-1610 | Live TV programs' `ExternalId` user-data key (re-checked: `LiveTvProgram` overrides `SourceType` to `LiveTV`, so upstream adds no such key either; closed as invalid) |
 
 Already open before this audit: gl-410 (skip lengths, owner-decided), gl-429, gl-430 and gl-908 (activity log), and gl-1064 (container unplay, awaiting the owner).
 
