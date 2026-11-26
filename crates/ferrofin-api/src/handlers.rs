@@ -2616,6 +2616,20 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              writes, nothing else in a media folder), which extends the owner decision \
              of 2026-10-17 on media-library writes to deletes; the owner has not yet \
              ruled on the narrower deletes.",
+            "An item edited over the API after the library scan read its row, while the \
+             scan refreshes it, is left as the edit wrote it: library_scan.rs scan_item \
+             checks PriorityLane::edited_since before the row's save, under \
+             ProviderManager::lock_item_metadata, which the port of \
+             ItemUpdateController.UpdateItem holds too, so neither saves over the other (a \
+             collection's member edits take no lock and get the check alone); an item \
+             refresh the scan serves checks the same. It saves only the artwork its pass \
+             changed on disk and keeps the stored DateLastRefreshed, so the providers' \
+             answers wait for the item's next due refresh (an album's or artist's music \
+             pass still refreshes and stamps it, from its own read). Upstream's edit and \
+             refresh change the one cached BaseItem (LibraryManager.GetItemById): an edit \
+             made after RefreshWithProviders' MergeData is saved with what the refresh \
+             merged, and one made before it is merged by that rule, so an unlocked field \
+             the providers answer can replace it. Fix path: gl-1961.",
             "In a library with no metadata saver list and SaveLocalMetadata off, \
              ReplaceAllMetadata reads an item's existing NFO, a box set's existing \
              collection.xml or a playlist folder's existing playlist.xml; upstream's \

@@ -779,7 +779,8 @@ impl LibraryScanner {
                     if cancel.is_cancelled() {
                         return;
                     }
-                    self.persist_people(id, Some(credits)).await;
+                    let written = self.persist_people(id, Some(credits)).await;
+                    self.enrich_written_people(written).await;
                 }
             }
         }

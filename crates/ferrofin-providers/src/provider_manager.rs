@@ -2740,7 +2740,7 @@ impl LocalProviderManager {
         // Held from the id write and the load below to the last save, so an
         // edit made meanwhile waits and then applies to the saved row. It
         // spans the remote fetches too, so the edit waits for them, minutes at
-        // worst under `rate_limit.rs`'s timeouts and retries; gl-1504 has the
+        // worst under `rate_limit.rs`'s timeouts and retries; gl-1961 has the
         // re-read-under-the-lock shape that would end that wait.
         let _metadata = self.lock_item_metadata(item_id).await;
         // "Identify → Apply": the chosen result's ids become the item's, and
