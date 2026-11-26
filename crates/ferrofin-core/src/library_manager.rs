@@ -27,7 +27,8 @@
 //!   (`crate::item_deletion`; the first path's failure stops the delete
 //!   with every row in place), then the extracted data, then the rows and
 //!   everything the persistence delete takes with them (`ParentId`
-//!   descendants, the extras and stacked parts it owns).
+//!   descendants, the extras and stacked parts it owns). Unlike upstream,
+//!   it first waits for a running refresh of the item (gl-1577).
 //! - The `IProgress` scan plumbing is dropped. A scan runs on the scan
 //!   queue's own worker task and is cancelled cooperatively, between two
 //!   items, through a [`ScanCancel`] (the `CancellationToken`'s role).
@@ -3366,6 +3367,16 @@ impl LibraryManager for FerrofinLibraryManager {
         if id.is_nil() {
             return Err(ServiceError::invalid_input("item id can't be empty"));
         }
+        // A refresh holds the item from loading its row to its last save
+        // (`ProviderManager::lock_item_metadata`), and its save inserts a row
+        // that is gone: wait it out, and hold the next one off until the row
+        // and folder are deleted, so no provider refresh writes them back
+        // (gl-1577).
+        // Upstream has the same window; its scan later drops the orphan.
+        let _metadata = match &self.providers {
+            Some(providers) => Some(providers.lock_item_metadata(id).await),
+            None => None,
+        };
         let Some(row) = self.items.retrieve_item(id).await? else {
             // Already gone — deletion is idempotent.
             return Ok(());
@@ -6999,6 +7010,46 @@ mod tests {
             .await
             .expect("delete");
         assert!(mgr.get_item_by_id(id).await.expect("read").is_none());
+    }
+
+    /// gl-1577: a refresh holds its item from loading the row to its last
+    /// save (`ProviderManager::lock_item_metadata`). A delete made meanwhile
+    /// waits for it, so the refresh cannot save the deleted item back.
+    #[tokio::test]
+    async fn delete_item_waits_for_a_running_refresh_of_the_item() {
+        use ferrofin_traits::providers::ProviderManager as _;
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x1577);
+        seed_named_item(&db, id, BaseItemKind::BoxSet, "Collection").await;
+        let providers = Arc::new(ferrofin_providers::LocalProviderManager::default());
+        let mgr = Arc::new(manager(&db).with_providers(providers.clone()));
+
+        // The refresh loads the row, the delete is made while it runs…
+        let refresh = providers.lock_item_metadata(id).await;
+        let loaded = mgr.get_item_by_id(id).await.expect("read").expect("row");
+        let mut delete = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            async move { mgr.delete_item(id, &DeleteOptions::default()).await }
+        });
+        let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut delete).await;
+        // …then the refresh saves the row it loaded and lets go.
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(std::slice::from_ref(&loaded))
+            .await
+            .expect("the refresh's save");
+        drop(refresh);
+        let waited = early.is_err();
+        match early {
+            Ok(joined) => joined,
+            Err(_) => delete.await,
+        }
+        .expect("join")
+        .expect("delete");
+        assert!(
+            mgr.get_item_by_id(id).await.expect("read").is_none(),
+            "the refresh's save brought the deleted item back"
+        );
+        assert!(waited, "the delete ran while the refresh held the item");
     }
 
     #[tokio::test]
