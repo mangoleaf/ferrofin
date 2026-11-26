@@ -53,13 +53,17 @@ fn containing_folder(item: &BaseItemEntity) -> Option<PathBuf> {
 }
 
 /// The folder every one of [`DestinationPolicy::destinations`] lies in: a
-/// season's series folder (`seasonNN-…`), otherwise the containing folder.
+/// season's series folder (`seasonNN-…`), an episode's own directory (its
+/// thumb's), otherwise the containing folder.
 pub(super) fn art_folder(
     item: &BaseItemEntity,
     series: Option<&BaseItemEntity>,
 ) -> Option<PathBuf> {
     match series.and_then(|series| series.path.as_deref()) {
         Some(series) if short_kind(item) == "Season" => Some(PathBuf::from(series)),
+        _ if short_kind(item) == "Episode" => Path::new(item.path.as_deref()?)
+            .parent()
+            .map(Path::to_path_buf),
         _ => containing_folder(item).or_else(|| series.and_then(containing_folder)),
     }
 }
@@ -207,10 +211,15 @@ impl DestinationPolicy<'_> {
             let Some(path) = item.path.as_deref().map(Path::new) else {
                 return Vec::new();
             };
-            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            // `Path.GetDirectoryName(item.Path)`, not `ContainingFolderPath`:
+            // a disc rip's thumb sits beside the rip, where it is read.
+            let (Some(parent), Some(stem)) = (
+                path.parent(),
+                path.file_stem().and_then(|stem| stem.to_str()),
+            ) else {
                 return Vec::new();
             };
-            return vec![folder.join(format!("{stem}-thumb{extension}"))];
+            return vec![parent.join(format!("{stem}-thumb{extension}"))];
         }
         if compatible
             && kind == ImageType::Primary
@@ -451,6 +460,27 @@ mod tests {
             ]
         );
         assert_eq!(art_folder(&movie, None), Some(PathBuf::from("/media/Set")));
+    }
+    /// An episode's thumb goes beside its path (`Path.GetDirectoryName(
+    /// item.Path)`), not in its containing folder, which for a disc rip is
+    /// the rip's own: `EpisodeLocalImageProvider` reads it there.
+    #[test]
+    fn a_disc_episodes_thumb_saves_beside_it() {
+        let mut episode = row("Episode", "/tv/Show/Season 1/S01E01", false);
+        episode.data = Some(r#"{"VideoType":"Dvd"}"#.into());
+        for convention in [
+            ImageSavingConvention::Legacy,
+            ImageSavingConvention::Compatible,
+        ] {
+            assert_eq!(
+                destination(&episode, convention, ImageType::Primary),
+                vec![PathBuf::from("/tv/Show/Season 1/S01E01-thumb.png")]
+            );
+        }
+        assert_eq!(
+            art_folder(&episode, None),
+            Some(PathBuf::from("/tv/Show/Season 1"))
+        );
     }
     #[test]
     fn physical_and_virtual_seasons_publish_series_art_and_specials() {
