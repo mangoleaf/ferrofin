@@ -5324,7 +5324,7 @@ pub const VERIFIED: &[Verified] = &[
                scan_progress for RefreshProgress and RefreshStatus) → ferrofin-model \
                entities_media.rs VirtualFolderInfo, configuration.rs LibraryOptions, \
                TypeOptions, ImageOption, MediaPathInfo",
-        date: "2026-11-14",
+        date: "2026-11-26",
         divergences: &[
             "An unreadable shortcut is logged at error the first time a listing meets it and \
          at debug while it stays unreadable; upstream logs it at error on every listing. \
@@ -5355,6 +5355,12 @@ pub const VERIFIED: &[Verified] = &[
          took over is gone). Upstream logs a parse or permission failure at error once per fill of its \
          options cache, which a library-structure change clears, and any other I/O failure \
          not at all; the same LOGGING.md rule applies.",
+            "An adopted options.xml that converts is saved as options.json by a listing \
+         outside a library-structure change; upstream reads options.xml and never writes on \
+         a read. A save that fails (a read-only library folder) serves the converted options \
+         and is retried on every listing, logged at warn the first time and at debug while \
+         it keeps failing, until a save succeeds or an options.json appears; the same \
+         LOGGING.md rule applies.",
             "The 401 and 403 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
