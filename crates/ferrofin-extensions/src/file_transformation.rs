@@ -29,13 +29,12 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferrofin_core::event_manager::FerrofinEventManager;
-use ferrofin_core::plugin_manager::PLUGIN_CONFIGURATION_CHANGED;
-use ferrofin_core::{PluginConfigPage, ScheduledTask};
+use ferrofin_traits::events::{EventSubscriber, PLUGIN_CONFIGURATION_CHANGED};
 use ferrofin_traits::plugins::{
-    FileTransformationService, FileTransformer, PluginDescriptor, PluginManager,
+    FileTransformationService, FileTransformer, PluginConfigPage, PluginDescriptor, PluginManager,
 };
 use ferrofin_traits::system::LocalApiAccess;
+use ferrofin_traits::tasks::ScheduledTask;
 use ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -852,7 +851,7 @@ pub async fn register_skip_button_transformer(
 /// what it saved applies from the next `/web` request. Any plugin's save
 /// does: saves are rare, and the next request reads the file once. Called
 /// once by the composition root.
-pub fn subscribe(events: &FerrofinEventManager, service: &Arc<WebFileTransformationService>) {
+pub fn subscribe(events: &dyn EventSubscriber, service: &Arc<WebFileTransformationService>) {
     let service = Arc::clone(service);
     events.subscribe(
         PLUGIN_CONFIGURATION_CHANGED,

@@ -390,9 +390,7 @@ pub struct FerrofinPluginManager {
     completed: Mutex<Vec<InstallationInfo>>,
 }
 
-/// The in-process event a plugin configuration save publishes, with
-/// `{"Id": "<plugin id>"}`; never forwarded to clients.
-pub const PLUGIN_CONFIGURATION_CHANGED: &str = "PluginConfigurationChanged";
+pub use ferrofin_traits::events::PLUGIN_CONFIGURATION_CHANGED;
 
 impl std::fmt::Debug for FerrofinPluginManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
