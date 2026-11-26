@@ -167,14 +167,20 @@ pub(crate) async fn update_item(
             if let Ok(id) = Uuid::parse_str(&child.id) {
                 state
                     .providers
-                    .save_metadata(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
+                    .update_to_repository(
+                        id,
+                        ferrofin_traits::providers::ItemUpdateType::MetadataEdit,
+                    )
                     .await?;
             }
         }
     }
+    // `item.UpdateToRepositoryAsync(MetadataEdit)`: the savers, then
+    // `UpdateImagesAsync` measures every image and drops one whose file is
+    // gone, and a video's local versions take the measured rows.
     state
         .providers
-        .save_metadata(
+        .update_to_repository(
             item_id,
             ferrofin_traits::providers::ItemUpdateType::MetadataEdit,
         )
@@ -949,7 +955,7 @@ async fn cascade_to_children(
     for id in ids {
         state
             .providers
-            .save_metadata(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
+            .update_to_repository(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
             .await?;
     }
     Ok(())

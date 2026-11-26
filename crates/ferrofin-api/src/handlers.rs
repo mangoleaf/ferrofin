@@ -1703,7 +1703,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and what a save through the provider manager records of its images: \
                    ferrofin-providers provider_manager.rs update_images, run by \
                    update_to_repository (an upload, a chosen image, a delete, a reorder, \
-                   a collection's edit) and by a refresh's save: it measures each local \
+                   a collection's edit, the metadata editor's save of the item and of each \
+                   child its lock, rating or tag cascade saves, handlers/item_update.rs) \
+                   and by a refresh's save: it measures each local \
                    image that image_metadata.rs image_needs_refresh flags, or every one for \
                    a save from ImageUpdate up in upstream's order (an image, download or \
                    edit save), with image_metadata.rs fill_image_metadata (the scan's too: \
@@ -1727,14 +1729,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Library/LibraryManager.cs \
                    (SavePeopleMetadataAsync, UpdateImagesAsync, ImageNeedsRefresh, \
                    RunMetadataSavers, UpdateItemsAsync, ConvertImageToLocal), \
-                   MediaBrowser.Controller/Entities/BaseItem.cs (ValidateImages) and \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (ValidateImages, \
+                   UpdateToRepositoryAsync), MediaBrowser.Controller/Entities/Video.cs \
+                   (UpdateToRepositoryAsync), Jellyfin.Api/Controllers/ItemUpdateController.cs \
+                   (UpdateItem and its cascades' UpdateToRepositoryAsync(MetadataEdit)) and \
                    src/Jellyfin.Drawing/ImageProcessor.cs (GetImageBlurHash)",
-        date: "2026-11-20",
+        date: "2026-11-26",
         divergences: &[
-            "The metadata editor's save (POST /Items/{itemId}, and its cascade to the \
-             children) runs the savers only, so it neither measures nor validates the item's \
-             images, where UpdateItem's UpdateToRepositoryAsync(MetadataEdit) forces \
-             UpdateImagesAsync. Fix path: gl-1922.",
             "A remote image row is not downloaded into a local file when its item is saved \
              (UpdateImagesAsync's ConvertImageToLocal): it stays a URL, downloaded when it is \
              served (cached_remote_image). Upstream's rows of that kind are a Live TV \
