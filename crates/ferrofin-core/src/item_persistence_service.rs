@@ -4269,22 +4269,42 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         version: Uuid,
         version_path: Option<&str>,
     ) -> Result<(), ServiceError> {
-        let primary = guid_to_db(primary);
+        let primary_db = guid_to_db(primary);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"DELETE FROM "LinkedChildren"
                WHERE "ParentId" = ?1 AND "ChildId" = ?2 AND "ChildType" = ?3"#,
         )
-        .bind(&primary)
+        .bind(&primary_db)
         .bind(guid_to_db(version))
         .bind(LINKED_ALTERNATE_VERSION)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        // The primary's save rewrites its version rows from 0
+        // (`ItemPersistenceService.cs:702-724`), here in their stored order,
+        // which the scan keeps local first (gl-1637).
+        let own = links_under(&mut tx, &[primary])
+            .await
+            .map_err(db_err)?
+            .remove(&primary)
+            .unwrap_or_default();
+        let versions = own
+            .iter()
+            .filter(|(_, child_type, _)| is_version_link(*child_type))
+            .map(|&(child, child_type, _)| (child, child_type))
+            .collect();
+        let writes = LocalVersionWrites {
+            rows: renumbered_version_rows(versions, &own),
+            ..LocalVersionWrites::default()
+        };
+        apply_local_version_writes(&mut tx, primary, &writes)
+            .await
+            .map_err(db_err)?;
         if let Some(path) = version_path.filter(|p| !p.is_empty()) {
             let data: Option<Option<String>> =
                 sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
-                    .bind(&primary)
+                    .bind(&primary_db)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(db_err)?;
@@ -4297,7 +4317,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                         .collect();
                     if let Some(text) = with_local_versions(data.as_deref(), &kept) {
                         sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
-                            .bind(&primary)
+                            .bind(&primary_db)
                             .bind(text)
                             .execute(&mut *tx)
                             .await
@@ -5843,7 +5863,7 @@ impl LocalVersionWrites {
 
 /// Every `LinkedChildren` row under each of `parents`, by parent:
 /// `(ChildId, ChildType, SortOrder)` in `SortOrder` order.
-async fn links_under(
+pub(crate) async fn links_under(
     conn: &mut sqlx::SqliteConnection,
     parents: &[Uuid],
 ) -> Result<HashMap<Uuid, Vec<(Uuid, i64, i64)>>, sqlx::Error> {
