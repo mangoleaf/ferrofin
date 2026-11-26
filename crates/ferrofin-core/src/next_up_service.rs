@@ -37,7 +37,12 @@
 //!   when specials were requested ([`next_up_specials_sql`]);
 //! * 1 query for the full rows of the episodes, specials included, on the page
 //!   the manager settled on ([`get_next_up_episode_rows`]), none when no
-//!   episode is on it.
+//!   episode is on it;
+//! * only when a pick on that page follows a last watched episode played as
+//!   an alternate version, `GetPreferredVersion`'s reads
+//!   ([`get_preferred_versions`]): 1 for the rows of those picks and their
+//!   last watched episodes, then their version groups (`VersionRows::load`,
+//!   one read per level of versions, usually one or two).
 //!
 //! So 4 round-trips in the default configuration, 3 while the library set is
 //! cached; with none cached, a scope holding a parent other than a library
@@ -49,12 +54,13 @@
 //! C#, the batch loads no full row: its picks and last watched episodes come
 //! from the projection and its specials from their own narrow statement, so an
 //! episode or special picked outside the requested page never has its row
-//! read, and a last watched row is never read.
+//! read, and a last watched row is read only for `GetPreferredVersion`.
 //!
 //! [`get_next_up_episode_rows`]: NextUpService::get_next_up_episode_rows
+//! [`get_preferred_versions`]: NextUpService::get_preferred_versions
 //! [`get_next_up_series_keys`]: NextUpService::get_next_up_series_keys
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -64,6 +70,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::airs_numbers;
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -80,11 +87,13 @@ use crate::item_repository::{
     has_linked_children, library_top_parents_by_view, resolve_descendant_query,
     scope_to_user_libraries, view_top_parent_ids,
 };
-use crate::item_type_lookup::stored_type_name;
+use crate::item_type_lookup::{kind_from_type_name, stored_type_name};
+use crate::media_source_manager::FerrofinMediaSourceManager;
 use crate::translate_query::{
     LINKED_DESCENDANT_IDS, PLACEHOLDER_ID, TopParentTerm, linked_descendant_binds,
     push_access_filter,
 };
+use crate::video_versions::{DbVersionReader, VersionRows};
 
 /// The concrete next-up service.
 #[derive(Clone)]
@@ -341,6 +350,7 @@ type ProjectionRow = (
 /// One episode of the projection after the per-id merge (a Jellyfin database
 /// holds one `UserData` row per user-data *key* — id, provider id, series
 /// position — so the join yields the same episode two or three times).
+#[allow(clippy::struct_excessive_bools)] // one flag per upstream test the batch makes of a row
 struct ProjectedEpisode {
     key: String,
     pos: EpisodePos,
@@ -351,6 +361,9 @@ struct ProjectedEpisode {
     /// AND the local versions of each, which point at the version they sit
     /// beside, further down ([`version_groups`]).
     version_group: Uuid,
+    /// Whether the row names a `PrimaryVersionId`: `GetPreferredVersion`
+    /// continues in a played version only when it does.
+    is_version: bool,
     /// Whether the row may be picked at all — it passes C#
     /// `ApplyAccessFiltering` ([`push_access`]). Rows that do not (a version
     /// behind its primary, an owned non-extra, a row over the user's rating)
@@ -559,6 +572,72 @@ impl NextUpService for FerrofinNextUpService {
     ) -> Result<HashMap<Uuid, BaseItemEntity>, ServiceError> {
         self.episodes_by_ids(ids).await
     }
+
+    async fn get_preferred_versions(
+        &self,
+        picks: &[(Uuid, Uuid, Uuid)],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        if picks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids: Vec<Uuid> = picks
+            .iter()
+            .flat_map(|(next, last, _)| [*next, *last])
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let rows = self.episodes_by_ids(&ids).await?;
+        let queried: Vec<&BaseItemEntity> = rows.values().collect();
+        let versions = VersionRows::load(&DbVersionReader(&self.db), &queried).await?;
+        Ok(picks
+            .iter()
+            .map(|(next, last, played)| {
+                preferred_version(&versions, rows.get(next)?, rows.get(last)?, *played)
+            })
+            .collect())
+    }
+}
+
+/// Port of `TVSeriesManager.GetPreferredVersion` (`TVSeriesManager.cs:
+/// 284-321`) for a last watched episode played as the alternate version
+/// `played`: the version of `next` whose media source has the name `last`'s
+/// sources give `played` (compared `OrdinalIgnoreCase`), when that is another
+/// episode; `None` keeps `next`, as does a played version with no name. Both
+/// lists are `GetMediaSources(false)`'s: every version of the episode, named
+/// over the group's common prefix and in upstream's order.
+fn preferred_version(
+    versions: &VersionRows,
+    next: &BaseItemEntity,
+    last: &BaseItemEntity,
+    played: Uuid,
+) -> Option<Uuid> {
+    let sources = |row| {
+        versions.media_sources(row, |version| {
+            FerrofinMediaSourceManager::static_source(version, Vec::new(), Vec::new())
+        })
+    };
+    let played_id = played.simple().to_string();
+    let played_name = sources(last)
+        .into_iter()
+        .find(|source| {
+            source
+                .id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&played_id))
+        })?
+        .name
+        .filter(|name| !name.is_empty())?;
+    let matching = sources(next).into_iter().find(|source| {
+        source
+            .name
+            .as_deref()
+            .is_some_and(|name| equals_ordinal_ignore_case(name, &played_name))
+    })?;
+    let id = Uuid::parse_str(matching.id.as_deref()?).ok()?;
+    let version = versions.alternate_version(next, id)?;
+    (Uuid::parse_str(&next.id).ok() != Some(id)
+        && kind_from_type_name(&version.type_) == Some(BaseItemKind::Episode))
+    .then_some(id)
 }
 
 impl FerrofinNextUpService {
@@ -658,6 +737,8 @@ impl FerrofinNextUpService {
                 played: played.unwrap_or(false),
                 playback_position_ticks: ticks.unwrap_or(0),
                 last_played_date: last_played,
+                // Named over the version group (`merge_version_groups`).
+                played_version: None,
             };
             // `PrimaryVersionId ?? Id`: the row's own Played rows are credited
             // to it only when it is no version.
@@ -689,6 +770,7 @@ impl FerrofinNextUpService {
                     last_played: own_date.max(version_last_played.filter(|_| version_played)),
                 },
                 version_group,
+                is_version: primary.is_some(),
                 is_candidate: accessible,
                 played_by: user_data.played || linked_version_played,
                 rewatch_played: own_played || version_played,
@@ -964,6 +1046,7 @@ fn merge_user_data(a: NextUpEpisodeUserData, b: NextUpEpisodeUserData) -> NextUp
         played: a.played || b.played,
         playback_position_ticks: a.playback_position_ticks.max(b.playback_position_ticks),
         last_played_date: a.last_played_date.max(b.last_played_date),
+        played_version: a.played_version.or(b.played_version),
     }
 }
 
@@ -971,28 +1054,50 @@ fn merge_user_data(a: NextUpEpisodeUserData, b: NextUpEpisodeUserData) -> NextUp
 /// taken over each episode's whole version group — C# `GetAllVersions()`:
 /// `DetermineNextEpisode` drops a pick whose resume progress lives on an
 /// alternate version, and `GetMostRecentlyPlayedVersion` dates the last
-/// watched episode by whichever version was played last. `played` stays the
-/// episode's own row, as `GetUserData(user, episode)` reads it.
+/// watched episode by whichever version was played last
+/// (`VersionPlaybackSelector.SelectMostRecentlyPlayed`: the first dated
+/// version wins a tie, and `GetAllVersions` lists the episode first; a tie
+/// between two of its other versions goes to the one the projection read
+/// first). That version is kept too when it is an alternate. `played` stays
+/// the episode's own row, as `GetUserData(user, episode)` reads it.
 fn merge_version_groups(projected: &[ProjectedEpisode]) -> HashMap<Uuid, NextUpEpisodeUserData> {
-    let mut group_max: HashMap<Uuid, (i64, Option<DateTime<Utc>>)> = HashMap::new();
+    type GroupFacts = (i64, Option<(DateTime<Utc>, Uuid)>);
+    let mut group_max: HashMap<Uuid, GroupFacts> = HashMap::new();
     for ep in projected {
         let entry = group_max.entry(ep.version_group).or_insert((0, None));
         entry.0 = entry.0.max(ep.user_data.playback_position_ticks);
-        entry.1 = entry.1.max(ep.user_data.last_played_date);
+        if let Some(date) = ep.user_data.last_played_date
+            && entry.1.is_none_or(|(latest, _)| date > latest)
+        {
+            entry.1 = Some((date, ep.pos.id));
+        }
     }
+    let versions: HashSet<Uuid> = projected
+        .iter()
+        .filter(|ep| ep.is_version)
+        .map(|ep| ep.pos.id)
+        .collect();
     projected
         .iter()
         .map(|ep| {
-            let (ticks, date) = group_max
+            let (ticks, latest) = group_max
                 .get(&ep.version_group)
                 .copied()
                 .unwrap_or((0, None));
+            let played_version = latest.map(|(date, id)| {
+                if ep.user_data.last_played_date == Some(date) {
+                    ep.pos.id
+                } else {
+                    id
+                }
+            });
             (
                 ep.pos.id,
                 NextUpEpisodeUserData {
                     played: ep.user_data.played,
                     playback_position_ticks: ticks,
-                    last_played_date: date,
+                    last_played_date: latest.map(|(date, _)| date),
+                    played_version: played_version.filter(|id| versions.contains(id)),
                 },
             )
         })
@@ -1535,6 +1640,114 @@ mod tests {
         assert!(!next.played);
         assert_eq!(next.playback_position_ticks, 0);
         assert!(next.last_played_date.is_none());
+    }
+
+    /// `GetMostRecentlyPlayedVersion` and `GetPreferredVersion`
+    /// (`TVSeriesManager.cs:142-143`, `:258-321`): episode 1 was watched in
+    /// its 2160p version (the primary carries only the propagated Played), so
+    /// the batch names that version for the last watched episode, and episode
+    /// 2 continues in its own 2160p version, matched by the name the shared
+    /// file-name prefix leaves, in any case; the rewatching pick's last watched
+    /// episode names it too. The primary's source name, or one the pick has no
+    /// version of, keeps the pick; so does the primary played at the same
+    /// moment, which wins the tie.
+    #[tokio::test]
+    async fn next_up_continues_in_the_version_played_last() {
+        async fn batch(
+            svc: &FerrofinNextUpService,
+            query: &InternalItemsQuery,
+        ) -> ferrofin_traits::persistence::NextUpEpisodeBatchResult {
+            svc.get_next_up_episodes_batch(query, &["series-a".to_owned()], false, false)
+                .await
+                .expect("batch")
+                .remove("series-a")
+                .expect("series present")
+        }
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+
+        let (e1, e1_uhd, e2, e2_uhd, e3) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        for (id, episode, file) in [
+            (e1, 1, "Show S01E01 - 1080p.mkv"),
+            (e1_uhd, 1, "Show S01E01 - 2160p.mkv"),
+            (e2, 2, "Show S01E02 - 1080p.mkv"),
+            (e2_uhd, 2, "Show S01E02 - 2160P.mkv"),
+            (e3, 3, "Show S01E03.mkv"),
+        ] {
+            seed_episode(&db, id, "series-a", 1, episode, false, Some(top)).await;
+            let path = format!("/tv/Show/Season 1/{file}");
+            exec(
+                &db,
+                r#"UPDATE "BaseItems" SET "Path" = ?1 WHERE "Id" = ?2"#,
+                &[&path, &guid_to_db(id)],
+            )
+            .await;
+        }
+        set_primary_version(&db, e1_uhd, e1).await;
+        set_primary_version(&db, e2_uhd, e2).await;
+        seed_user_data(&db, user_id, e1, true, None).await;
+        seed_user_data(&db, user_id, e1_uhd, true, Some(ts("2021-01-02T00:00:00Z"))).await;
+
+        let svc = FerrofinNextUpService::new(db.clone());
+        let query = query_for(user, top);
+        let series = batch(&svc, &query).await;
+        assert_eq!(
+            series.last_watched.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e1))
+        );
+        assert_eq!(
+            series.next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+        let last = series
+            .user_data
+            .get(&guid_to_db(e1))
+            .expect("last watched facts");
+        assert_eq!(last.played_version, Some(e1_uhd));
+        assert_eq!(last.last_played_date, Some(ts("2021-01-02T00:00:00Z")));
+
+        let preferred = svc
+            .get_preferred_versions(&[(e2, e1, e1_uhd), (e2, e1, e1), (e3, e1, e1_uhd)])
+            .await
+            .expect("preferred versions");
+        assert_eq!(preferred, vec![Some(e2_uhd), None, None]);
+
+        // Rewatching: the last watched episode by date carries it too.
+        let series = svc
+            .get_next_up_episodes_batch(&query, &["series-a".to_owned()], false, true)
+            .await
+            .expect("batch")
+            .remove("series-a")
+            .expect("series present");
+        let last = series
+            .last_watched_for_rewatching
+            .as_ref()
+            .and_then(|e| series.user_data.get(&e.id))
+            .expect("last watched for rewatching facts");
+        assert_eq!(last.played_version, Some(e1_uhd));
+
+        // The primary played at the same moment: the episode itself wins the
+        // tie, so there is no alternate to continue in.
+        exec(
+            &db,
+            r#"UPDATE "UserData" SET "LastPlayedDate" = ?1 WHERE "ItemId" = ?2"#,
+            &[&datetime_to_db(ts("2021-01-02T00:00:00Z")), &guid_to_db(e1)],
+        )
+        .await;
+        let series = batch(&svc, &query).await;
+        let last = series
+            .user_data
+            .get(&guid_to_db(e1))
+            .expect("last watched facts");
+        assert_eq!(last.played_version, None);
     }
 
     /// `DetermineNextEpisode` walks `nextEpisode.GetAllVersions()` for resume
