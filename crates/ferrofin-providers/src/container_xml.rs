@@ -439,12 +439,8 @@ impl ContainerXmlSaver {
             .await?
             .remove(&item_id)
             .unwrap_or_default();
-        let people = self
-            .people
-            .get_people_batch(&[item_id])
-            .await?
-            .remove(&item_id)
-            .unwrap_or_default();
+        let people =
+            crate::metadata_merge::stored_people(self.people.as_ref(), item_id, &row).await?;
         let links = self
             .linked_children
             .get_linked_children_ids(item_id, Some(MANUAL_LINK))

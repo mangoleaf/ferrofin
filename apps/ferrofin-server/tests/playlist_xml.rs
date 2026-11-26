@@ -12,8 +12,9 @@
 //!   on media-library writes).
 //! - the first boot of this version writes the file of every playlist in the
 //!   playlists folder from the database, once;
-//! - the people a file lists are never stored: a playlist supports none
-//!   (`BaseItem.SupportsPeople`, checked by `SaveItemAsync`).
+//! - the people a file lists are never stored, nor stored ones written: a
+//!   playlist supports none (`BaseItem.SupportsPeople`, checked by
+//!   `SaveItemAsync` and `GetPeople`).
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -24,6 +25,7 @@ use axum::{
 use ferrofin_db::Database;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_server::{config::Config, state::build_app_state};
+use ferrofin_traits::persistence::PeopleRepository as _;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
@@ -573,6 +575,19 @@ async fn a_playlists_xml_follows_its_changes_and_is_read_back() {
     );
 
     // A locked playlist reads nothing (`RefreshWithProviders` returns first).
+    // And a credit an earlier build stored for it is not written back: the
+    // saver writes what `GetPeople(item)` reads, none for a playlist.
+    ferrofin_core::FerrofinPeopleRepository::new(db.clone())
+        .update_people(
+            playlist,
+            &[ferrofin_db::entities::base_items::PeopleEntity {
+                name: "Stored Narrator".to_owned(),
+                person_type: Some("Actor".to_owned()),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
     let (status, body) = call(
         &router,
         token,
@@ -583,6 +598,7 @@ async fn a_playlists_xml_follows_its_changes_and_is_read_back() {
     .await;
     assert!(status.is_success(), "{status} {body}");
     let locked = wait_for_file(&xml, |text| text.contains("<LockData>true</LockData>")).await;
+    assert!(!locked.contains("<Persons>"), "{locked}");
     edit(
         &xml,
         &locked.replace(

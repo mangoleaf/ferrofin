@@ -2523,10 +2523,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    settles are saved only for a kind that supports people (SaveItemAsync's \
                    SupportsPeople check, repeated by LibraryManager.UpdatePeopleAsync): kinds.rs \
                    supports_people in scan_item and library_manager.rs update_people, \
-                   provider_manager.rs supports_people in refresh_item, so an artist.nfo's or a \
-                   playlist.xml's credits are read and dropped (credits an earlier build \
-                   stored for such a kind stay: gl-1955). Compared with RefreshMetadata, \
-                   SaveItemAsync, LibraryManager.UpdatePeopleAsync, ApplySearchResult, \
+                   ferrofin-providers metadata_merge.rs supports_people in provider_manager.rs \
+                   refresh_item, so an artist.nfo's or a playlist.xml's credits are read and \
+                   dropped (credits an earlier build stored for such a kind stay: gl-1955); \
+                   and the NFO and XML savers write the credits LibraryManager.GetPeople(item) \
+                   reads, none for such a kind (metadata_merge.rs stored_people from nfo_save.rs \
+                   and container_xml.rs). Compared with RefreshMetadata, \
+                   SaveItemAsync, LibraryManager.UpdatePeopleAsync, LibraryManager.GetPeople, \
+                   BaseNfoSaver.AddCommonNodes, BaseXmlSaver.AddCommonNodesAsync, \
+                   ApplySearchResult, \
                    GetProviders, RefreshWithProviders, \
                    GetNonLocalImageProviders, ProviderManager.RefreshItem, \
                    GetMetadataProvidersInternal and GetImageProvidersInternal, and \

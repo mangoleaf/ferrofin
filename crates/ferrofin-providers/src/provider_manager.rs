@@ -2734,7 +2734,9 @@ impl LocalProviderManager {
         item_id: Uuid,
         options: &MetadataRefreshOptions,
     ) -> Result<ItemUpdateType, ServiceError> {
-        use crate::metadata_merge::{MetadataResult, RefreshAnswers, RefreshMerge};
+        use crate::metadata_merge::{
+            MetadataResult, RefreshAnswers, RefreshMerge, supports_people,
+        };
         // Held from the id write and the load below to the last save, so an
         // edit made meanwhile waits and then applies to the saved row. It
         // spans the remote fetches too, so the edit waits for them, minutes at
@@ -5234,31 +5236,6 @@ fn owns_videos(data: Option<&str>) -> bool {
         })
 }
 
-/// `BaseItem.SupportsPeople` and its overrides, which `SaveItemAsync` checks
-/// before it writes a refresh's credits (`MetadataService.cs:320`): every
-/// video, audio and audiobook, book, series, season, box set and music album.
-/// This crate's copy of `ferrofin_core::kinds::supports_people`, which it
-/// cannot reach.
-fn supports_people(kind: Option<BaseItemKind>) -> bool {
-    matches!(
-        kind,
-        Some(
-            BaseItemKind::Video
-                | BaseItemKind::Movie
-                | BaseItemKind::Episode
-                | BaseItemKind::MusicVideo
-                | BaseItemKind::Trailer
-                | BaseItemKind::Audio
-                | BaseItemKind::AudioBook
-                | BaseItemKind::Book
-                | BaseItemKind::Series
-                | BaseItemKind::Season
-                | BaseItemKind::BoxSet
-                | BaseItemKind::MusicAlbum
-        )
-    )
-}
-
 /// The file name, without its extension, of the backdrop saved at file
 /// `index` (`GetBackdropSaveFilename`): `backdrop`, then `backdrop1`, ….
 fn backdrop_stem(index: Option<i32>) -> String {
@@ -6059,39 +6036,6 @@ mod tests {
     #[case("/media/Album/folder.jpg", false)]
     fn a_shared_album_cover_is_told_by_its_layout(#[case] path: &str, #[case] shared: bool) {
         assert_eq!(super::is_shared_album_artwork(path), shared);
-    }
-
-    /// `SupportsPeople`, as `ferrofin_core::kinds::supports_people` answers
-    /// it: true where a class overrides it so, false on `BaseItem` and the
-    /// playlist, by-name and person kinds a refresh reaches.
-    #[rstest::rstest]
-    #[case(Some(BaseItemKind::Movie), true)]
-    #[case(Some(BaseItemKind::Episode), true)]
-    #[case(Some(BaseItemKind::MusicVideo), true)]
-    #[case(Some(BaseItemKind::Trailer), true)]
-    #[case(Some(BaseItemKind::Video), true)]
-    #[case(Some(BaseItemKind::Series), true)]
-    #[case(Some(BaseItemKind::Season), true)]
-    #[case(Some(BaseItemKind::Audio), true)]
-    #[case(Some(BaseItemKind::AudioBook), true)]
-    #[case(Some(BaseItemKind::Book), true)]
-    #[case(Some(BaseItemKind::BoxSet), true)]
-    #[case(Some(BaseItemKind::MusicAlbum), true)]
-    #[case(Some(BaseItemKind::Playlist), false)]
-    #[case(Some(BaseItemKind::Person), false)]
-    #[case(Some(BaseItemKind::Genre), false)]
-    #[case(Some(BaseItemKind::MusicGenre), false)]
-    #[case(Some(BaseItemKind::Studio), false)]
-    #[case(Some(BaseItemKind::MusicArtist), false)]
-    #[case(Some(BaseItemKind::Year), false)]
-    #[case(Some(BaseItemKind::Folder), false)]
-    #[case(Some(BaseItemKind::LiveTvProgram), false)]
-    #[case(None, false)]
-    fn supports_people_follows_the_class_overrides(
-        #[case] kind: Option<BaseItemKind>,
-        #[case] expected: bool,
-    ) {
-        assert_eq!(super::supports_people(kind), expected, "{kind:?}");
     }
     use ferrofin_model::entities::MetadataField;
     use ferrofin_traits::persistence::OwnerExtrasRefresh;
