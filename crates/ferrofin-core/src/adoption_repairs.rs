@@ -9867,6 +9867,325 @@ pub async fn run_reverse_stored_virtual_paths(db: &Database, paths: &VirtualPath
     }
 }
 
+// Stores `HasSubtitles` in the `Data` of the videos an earlier Ferrofin probed
+// (gl-1911). Since gl-1632 a probe stores it there, as `FFProbeVideoInfo`
+// does (`video.HasSubtitles = mediaStreams.Any(subtitle)`, the only place
+// Jellyfin keeps it), but a video is probed again only when its file changes,
+// and Jellyfin 12.4 does not re-probe an unchanged file either, so a database
+// returned to Jellyfin read every such video as having none.
+
+/// The `FerrofinMeta` key of [`store_has_subtitles`].
+const HAS_SUBTITLES_STORED: &str = "has_subtitles_stored_v160";
+
+/// Sets `HasSubtitles` in the `Data` of every video row (`Video` and its
+/// subclasses) that has no such key: `true` when the row has a stored
+/// subtitle stream, else `false`, which is what Jellyfin's save writes for a
+/// video it probed with none (`JsonDefaults` skips nulls only). The stream
+/// rows are the ones the probe saved, after the library's embedded-subtitle
+/// filter, and the external subtitle files, so the value is the one the probe
+/// would have stored. A row that holds the key (an adopted Jellyfin row, or
+/// one a probe wrote since gl-1632) is left alone, and so is a `Data` that is
+/// not a JSON object; a row with no (or an empty) `Data` gets one holding just
+/// the key, and a key holding `null` is set, as
+/// `MediaStreamRepository::sync_has_subtitles` treats them.
+///
+/// Ferrofin's DTOs and its `HasSubtitles` filter take subtitle presence from
+/// the stream rows, so nothing Ferrofin serves changes and no snapshot is
+/// taken. Each partition
+/// of `REPAIR_PARTITION` rowids is one `UPDATE`, which takes the write lock
+/// before it reads and re-checks each row, so a row the previous version saves
+/// meanwhile is never overwritten; one it saves without the key after this
+/// ran waits for its next probe. Runs once per database (`FerrofinMeta`); an
+/// interrupted pass runs again from the start on the next boot.
+///
+/// Returns the rows written.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a read or a partition's write fails; the
+/// partitions written before stay, and the next boot runs it again.
+pub async fn store_has_subtitles(db: &Database) -> Result<u64, ServiceError> {
+    store_has_subtitles_in_partitions(db, REPAIR_PARTITION).await
+}
+
+/// One partition of [`store_has_subtitles`]: the video rows with a rowid in
+/// `[?1, ?2]` whose `Data` has no `HasSubtitles` value, `?3` being the
+/// subtitle `StreamType`. `+"Type"` keeps it on a rowid range seek, never a
+/// scan of the `Type` indexes (`EXPLAIN QUERY PLAN` pinned by
+/// `the_partition_update_seeks_the_rowid_range`). The `CASE` reads the key
+/// only from a `Data` that parses as an object: the JSON functions raise on
+/// malformed input, which would fail the statement.
+fn has_subtitles_update_sql() -> String {
+    let videos = crate::extra_owners_repository::VIDEO_TYPES;
+    format!(
+        r#"UPDATE "BaseItems"
+           SET "Data" = json_set(coalesce(nullif("Data", ''), '{{}}'), '$.HasSubtitles',
+                 json(CASE WHEN EXISTS (SELECT 1 FROM "MediaStreamInfos" s
+                                        WHERE s."ItemId" = "BaseItems"."Id"
+                                          AND s."StreamType" = ?3)
+                           THEN 'true' ELSE 'false' END))
+           WHERE rowid BETWEEN ?1 AND ?2 AND +"Type" IN ({videos})
+             AND CASE WHEN json_valid(coalesce(nullif("Data", ''), '{{}}'))
+                 THEN json_type(coalesce(nullif("Data", ''), '{{}}')) = 'object'
+                      AND coalesce(json_type(coalesce(nullif("Data", ''), '{{}}'),
+                                             '$.HasSubtitles'), 'null') = 'null'
+                 ELSE 0 END"#
+    )
+}
+
+/// [`store_has_subtitles`], `partition` rowids per write.
+async fn store_has_subtitles_in_partitions(
+    db: &Database,
+    partition: i64,
+) -> Result<u64, ServiceError> {
+    if !once(db, HAS_SUBTITLES_STORED).await? {
+        return Ok(0);
+    }
+    let (first, last): (Option<i64>, Option<i64>) = sqlx::query_as(
+        r#"SELECT (SELECT min(rowid) FROM "BaseItems"), (SELECT max(rowid) FROM "BaseItems")"#,
+    )
+    .fetch_one(db.pool())
+    .await
+    .map_err(db_err)?;
+    let sql = has_subtitles_update_sql();
+    let mut stored = 0;
+    if let (Some(mut from), Some(last)) = (first, last) {
+        loop {
+            let to = from.saturating_add(partition - 1).min(last);
+            stored += sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .bind(from)
+                .bind(to)
+                .bind(i32::from(
+                    ferrofin_db::enums::MediaStreamTypeEntity::Subtitle,
+                ))
+                .execute(db.writer())
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+            if to >= last {
+                break;
+            }
+            from = to + 1;
+        }
+    }
+    done(db, HAS_SUBTITLES_STORED).await?;
+    Ok(stored)
+}
+
+/// [`store_has_subtitles`] and its log line, for the composition root. A
+/// failure is a warning and never stops the boot: Ferrofin reads subtitle
+/// presence from the stream rows, and the next boot runs it again.
+pub async fn run_store_has_subtitles(db: &Database) {
+    match store_has_subtitles(db).await {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!(
+            rows,
+            "backfilled HasSubtitles on videos an earlier version probed, from their stored \
+             subtitle streams"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not store HasSubtitles on videos an earlier version probed; the next boot \
+             runs it again"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod has_subtitles_tests {
+    use ferrofin_db::enums::MediaStreamTypeEntity;
+    use ferrofin_model::data::BaseItemKind;
+
+    use super::*;
+    use crate::test_support::{seed_item, test_db};
+
+    async fn seed(db: &Database, kind: BaseItemKind, data: Option<&str>) -> Uuid {
+        let id = Uuid::new_v4();
+        seed_item(db, id, kind).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(data)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        id
+    }
+
+    /// A stream row of `stream_type` (`MediaStreamTypeEntity`'s value).
+    async fn seed_stream(db: &Database, item: Uuid, index: i64, stream_type: i32, external: bool) {
+        sqlx::query(
+            r#"INSERT INTO "MediaStreamInfos"
+               ("ItemId", "StreamIndex", "StreamType", "IsDefault", "IsExternal", "IsForced")
+               VALUES (?1, ?2, ?3, 0, ?4, 0)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(index)
+        .bind(stream_type)
+        .bind(external)
+        .execute(db.writer())
+        .await
+        .unwrap();
+    }
+
+    async fn data(db: &Database, id: Uuid) -> Option<String> {
+        sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    const SUBTITLE: i32 = 2;
+    const AUDIO: i32 = 0;
+
+    /// Every video kind without the key (or with it `null`, or with an empty
+    /// `Data`) gets it from its stream rows (an embedded or an external
+    /// subtitle, or none), keeping every other key and value of its `Data`;
+    /// rows that hold the key, other kinds, and a `Data` that is not a JSON
+    /// object are left as they are. Partitions of two rowids cover rows spread
+    /// over several of them.
+    #[tokio::test]
+    async fn videos_without_the_key_get_it_from_their_subtitle_rows() {
+        assert_eq!(i32::from(MediaStreamTypeEntity::Subtitle), SUBTITLE);
+        assert_eq!(i32::from(MediaStreamTypeEntity::Audio), AUDIO);
+        let db = test_db().await;
+        let movie = seed(
+            &db,
+            BaseItemKind::Movie,
+            Some(r#"{"VideoType":"VideoFile","IsHD":true}"#),
+        )
+        .await;
+        seed_stream(&db, movie, 0, AUDIO, false).await;
+        seed_stream(&db, movie, 1, SUBTITLE, false).await;
+        let episode = seed(&db, BaseItemKind::Episode, Some("{}")).await;
+        seed_stream(&db, episode, 3, SUBTITLE, true).await;
+        let video = seed(
+            &db,
+            BaseItemKind::Video,
+            Some(r#"{"VideoType":"VideoFile"}"#),
+        )
+        .await;
+        seed_stream(&db, video, 0, AUDIO, false).await;
+        let music_video = seed(&db, BaseItemKind::MusicVideo, None).await;
+        seed_stream(&db, music_video, 2, SUBTITLE, false).await;
+        let trailer = seed(&db, BaseItemKind::Trailer, None).await;
+        let empty = seed(&db, BaseItemKind::Episode, Some("")).await;
+        seed_stream(&db, empty, 0, SUBTITLE, true).await;
+        let null = seed(&db, BaseItemKind::Movie, Some(r#"{"HasSubtitles":null}"#)).await;
+        // Jellyfin's own value, even where the stream rows say otherwise.
+        let adopted = seed(&db, BaseItemKind::Movie, Some(r#"{"HasSubtitles":false}"#)).await;
+        seed_stream(&db, adopted, 0, SUBTITLE, false).await;
+        let audio = seed(&db, BaseItemKind::Audio, Some("{}")).await;
+        seed_stream(&db, audio, 0, SUBTITLE, false).await;
+        let broken = seed(&db, BaseItemKind::Movie, Some("{not json")).await;
+        let array = seed(&db, BaseItemKind::Movie, Some("[]")).await;
+
+        let stored = store_has_subtitles_in_partitions(&db, 2).await.unwrap();
+
+        assert_eq!(stored, 7);
+        let expected = [
+            (
+                movie,
+                Some(r#"{"VideoType":"VideoFile","IsHD":true,"HasSubtitles":true}"#),
+            ),
+            (episode, Some(r#"{"HasSubtitles":true}"#)),
+            (
+                video,
+                Some(r#"{"VideoType":"VideoFile","HasSubtitles":false}"#),
+            ),
+            (music_video, Some(r#"{"HasSubtitles":true}"#)),
+            (trailer, Some(r#"{"HasSubtitles":false}"#)),
+            (empty, Some(r#"{"HasSubtitles":true}"#)),
+            (null, Some(r#"{"HasSubtitles":false}"#)),
+            (adopted, Some(r#"{"HasSubtitles":false}"#)),
+            (audio, Some("{}")),
+            (broken, Some("{not json")),
+            (array, Some("[]")),
+        ];
+        for (id, want) in expected {
+            assert_eq!(data(&db, id).await.as_deref(), want, "{id}");
+        }
+    }
+
+    /// The repair runs once per database: a video saved without the key
+    /// after it ran waits for its next probe.
+    #[tokio::test]
+    async fn it_runs_once() {
+        let db = test_db().await;
+        let first = seed(&db, BaseItemKind::Movie, Some("{}")).await;
+        assert_eq!(store_has_subtitles(&db).await.unwrap(), 1);
+        assert_eq!(
+            data(&db, first).await.as_deref(),
+            Some(r#"{"HasSubtitles":false}"#)
+        );
+        let later = seed(&db, BaseItemKind::Movie, Some("{}")).await;
+        assert_eq!(store_has_subtitles(&db).await.unwrap(), 0);
+        assert_eq!(data(&db, later).await.as_deref(), Some("{}"));
+    }
+
+    /// A database with no video writes nothing and is marked done.
+    #[tokio::test]
+    async fn a_database_without_videos_writes_nothing_and_is_marked_done() {
+        let db = test_db().await;
+        seed(&db, BaseItemKind::Audio, Some("{}")).await;
+        assert_eq!(store_has_subtitles(&db).await.unwrap(), 0);
+        assert!(!once(&db, HAS_SUBTITLES_STORED).await.unwrap());
+    }
+
+    /// A partition whose write fails stops the pass with the error and
+    /// leaves the repair due, so the next boot runs it again.
+    #[tokio::test]
+    async fn a_failed_write_leaves_the_repair_due() {
+        let db = test_db().await;
+        let movie = seed(&db, BaseItemKind::Movie, Some("{}")).await;
+        sqlx::query(
+            r#"CREATE TRIGGER "refuse" BEFORE UPDATE ON "BaseItems"
+               BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        assert!(store_has_subtitles(&db).await.is_err());
+        assert!(once(&db, HAS_SUBTITLES_STORED).await.unwrap());
+        assert_eq!(data(&db, movie).await.as_deref(), Some("{}"));
+    }
+
+    /// Each partition's `UPDATE` seeks the rowid range, never a `Type` index,
+    /// and probes each row's subtitle rows through the stream table's
+    /// `(ItemId, StreamType)` index.
+    #[tokio::test]
+    async fn the_partition_update_seeks_the_rowid_range() {
+        let db = test_db().await;
+        let explain = format!("EXPLAIN QUERY PLAN {}", has_subtitles_update_sql());
+        let plan: Vec<String> =
+            sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain.as_str()))
+                .bind(1_i64)
+                .bind(2_i64)
+                .bind(SUBTITLE)
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step
+                    == "SEARCH BaseItems USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)"),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().any(|step| step
+                == "SEARCH s USING COVERING INDEX \
+                    FerrofinIX_MediaStreamInfos_ItemId_StreamType (ItemId=? AND StreamType=?)"),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.starts_with("SCAN")),
+            "{plan:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod virtual_path_tests {
     use std::sync::Arc;
