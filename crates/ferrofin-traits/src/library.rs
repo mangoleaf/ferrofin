@@ -2912,6 +2912,11 @@ pub trait MediaSourceManager: Send + Sync {
     }
 
     /// Gets the static (non-probed) media sources for an item.
+    ///
+    /// An item that cannot have any (one that is not a video, an audio item
+    /// or a Live TV channel: a folder, a by-name item, a photo, a book) is
+    /// [`ServiceError::InvalidInput`], as upstream's `GetStaticMediaSources`
+    /// throws `ArgumentException` for an item that is not `IHasMediaSources`.
     async fn get_static_media_sources(
         &self,
         item_id: Uuid,

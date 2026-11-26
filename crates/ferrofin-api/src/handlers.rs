@@ -6604,7 +6604,9 @@ pub const VERIFIED: &[Verified] = &[
                ExtractAttachment, ExtractAttachmentInternal) → apps/ferrofin-server \
                media_encoding.rs MediaSourceManagerResolver (GetPlaybackMediaSources(item, \
                null, true, false): ferrofin-core media_source_manager.rs \
-               get_playback_media_sources, playback_sources, playback_probe_path: a .strm \
+               get_playback_media_sources, playback_sources over static_sources \
+               (GetStaticMediaSources: an item that is not IHasMediaSources, a series or a \
+               genre, is its ArgumentException, a 400), playback_probe_path: a .strm \
                item, or one whose first non-placeholder source lacks its main stream, is \
                refreshed through item_refresh_remote_probe, EnableRemoteContentProbe and a \
                FullRefresh, before its sources are read again; resolve_symlink_paths, \
@@ -6621,12 +6623,10 @@ pub const VERIFIED: &[Verified] = &[
          parses it) is a 500 upstream. Here it is sent as stored, or as \
          application/octet-stream, as a missing one is, when no header can carry it (a \
          control or non-ASCII character). Jellyfin bug not ported.",
-            "An item that cannot have media sources (a series, a box set) is a 404 (no \
-         attachment with that index); upstream's GetStaticMediaSources throws \
-         ArgumentException, a 400. Fix path: gl-397.",
             "The 400, 404 and 500 bodies have Ferrofin's error shape, not upstream's: a missing \
-         item is NotFound()'s problem details there, a cached file gone before it is opened \
-         the exception middleware's text. Fix path: gl-666.",
+         item is NotFound()'s problem details there, an item that cannot have media sources \
+         (GetStaticMediaSources' ArgumentException) and a cached file gone before it is \
+         opened the exception middleware's text. Fix path: gl-666.",
         ],
         refs: &["access-filtering"],
     },
