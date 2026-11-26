@@ -607,9 +607,10 @@ Where Ferrofin is written to differ (`DIVERGENCES`, each with its reason): every
 is deleted on both lineages (migration 0044); on 12.x it removes a dangling-owner extra as on 10.11,
 collapses a duplicate path with the ported routine, merges case-only duplicates (the routines Jellyfin
 ran when it upgraded that database), re-spells an owner id in another case and nulls a 32-character
-one (0045), and recomputes every user's normalised name; and on both lineages it deletes the
-`AncestorIds` rows that name a missing item (0044: what the key's cascade would have removed).
-`PrimaryVersionId` is left as written on 12.x, as Jellyfin leaves it; whether Ferrofin should re-spell it (its own lookups of it are byte-exact) is gl-752.
+one (0045), converts a primary-version id as on the 10.11 lineage (0053: Ferrofin's lookups of it are
+byte-exact, and Jellyfin writes it upper-case dashed on its next save of the item), and recomputes
+every user's normalised name; and on both lineages it deletes the `AncestorIds` rows that name a
+missing item (0044: what the key's cascade would have removed).
 
 ### The stale-file sweep
 
