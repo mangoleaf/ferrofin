@@ -71,8 +71,8 @@ pub(crate) async fn update_item(
 ) -> Result<StatusCode, ApiError> {
     // Upstream edits the cached item a running refresh also holds, so that
     // refresh's save carries the edit. Here each loads its own row: wait out
-    // the provider manager's refresh of this item, and keep it out until the
-    // edit is written. TODO(gl-1504): the library scan's refresh too.
+    // the provider manager's refresh of this item and the library scan's save
+    // of it, and keep them out until the edit is written.
     let metadata = state.providers.lock_item_metadata(item_id).await;
     let mut item = state
         .library
@@ -139,7 +139,7 @@ pub(crate) async fn update_item(
             .update_item_locked_fields(item_id, fields)
             .await?;
     }
-    // The item's own writes are done. TODO(gl-1504): the cascade rewrites
+    // The item's own writes are done. TODO(gl-1961): the cascade rewrites
     // whole child rows with no lock of theirs.
     drop(metadata);
     cascade_to_children(&state, &item, &previous_ratings, &request, &current_tags).await?;

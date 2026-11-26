@@ -20,24 +20,33 @@
 //! A lock, an unlock or an edit made while the scan runs
 //! (`PriorityLane::edited`) is seen by the walk before it reaches the item:
 //! upstream's metadata editor changes the cached item the refresh merges
-//! onto.
+//! onto. One made while the walk refreshes the item leaves it as the edit
+//! wrote it (`PriorityLane::edited_since`).
 
+use std::io::{Read as _, Write as _};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ferrofin_core::item_type_lookup::ItemTypeLookup;
-use ferrofin_core::library_scan::{LaneRefresh, PriorityLane, ScanCancel, ScanOutcome, ScanRun};
+use ferrofin_core::library_scan::{
+    LaneRefresh, PriorityLane, ScanCancel, ScanOutcome, ScanPasses, ScanRun,
+};
 use ferrofin_core::{
     FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
     LibraryScanner,
 };
 use ferrofin_db::Database;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
-use ferrofin_model::entities::CollectionTypeOptions;
+use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
+use ferrofin_providers::TmdbClient;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{ScanTarget, VirtualFolderManager};
 use ferrofin_traits::persistence::ItemRepository;
-use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use ferrofin_traits::providers::{
+    DynamicMetadataLookup, DynamicMetadataProvider, DynamicMetadataResult, ItemUpdateType,
+    MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
+};
 use uuid::Uuid;
 
 /// Builds a one-movie library (media file + a poster beside it) and wires a
@@ -411,4 +420,479 @@ async fn an_unlock_applied_mid_scan_lets_the_item_not_reached_yet_read_its_nfo()
     let mut ids = tmdb_ids(&db).await;
     ids.sort();
     assert_eq!(ids, ["601", "602"]);
+}
+
+/// A priority lane that records an edit made over the API at the TheMovieDb
+/// stand-in's first request once armed: inside the walk's refresh of the
+/// movie, after the walk read its row. It serves `serve`, if set, as the
+/// running scan's one lane refresh.
+struct EditDuringFetch {
+    db: Database,
+    runtime: tokio::runtime::Handle,
+    /// Edits the movie at the stand-in's next request.
+    armed: AtomicBool,
+    /// The edited ids, in order; a mark is how many there were.
+    edits: Mutex<Vec<Uuid>>,
+    serve: Mutex<Option<LaneRefresh>>,
+}
+
+impl EditDuringFetch {
+    /// Overwrites the movie's overview as the metadata editor's save does,
+    /// and records the edit.
+    async fn edit(&self) {
+        let ids: Vec<String> = sqlx::query_scalar(
+            r#"UPDATE "BaseItems" SET "Overview" = 'Typed mid-pass'
+               WHERE "Type" LIKE '%Movies.Movie' RETURNING "Id""#,
+        )
+        .fetch_all(self.db.writer())
+        .await
+        .expect("edit");
+        let mut edits = self.edits.lock().expect("edits");
+        edits.extend(ids.iter().map(|id| id.parse::<Uuid>().expect("id")));
+    }
+}
+
+impl PriorityLane for EditDuringFetch {
+    fn next(&self) -> Option<LaneRefresh> {
+        self.serve.lock().expect("serve").take()
+    }
+
+    fn done(&self, _refresh: LaneRefresh, outcome: &Result<ScanOutcome, ServiceError>) {
+        outcome.as_ref().expect("the served refresh");
+    }
+
+    fn edit_mark(&self) -> u64 {
+        self.edits.lock().expect("edits").len() as u64
+    }
+
+    fn edited_since(&self, id: Uuid, mark: u64) -> bool {
+        let edits = self.edits.lock().expect("edits");
+        let mark = usize::try_from(mark).expect("mark");
+        edits.get(mark..).is_some_and(|since| since.contains(&id))
+    }
+}
+
+/// A TheMovieDb stand-in on a local port that knows the movie as id 20, with
+/// an overview, and runs `lane`'s edit before it answers once armed.
+fn tmdb_stand_in(lane: Arc<EditDuringFetch>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            if lane.armed.swap(false, Ordering::SeqCst) {
+                lane.runtime.block_on(lane.edit());
+            }
+            let (status, payload) = if request.contains("/search/movie") {
+                (
+                    "200 OK",
+                    r#"{"results": [{"id": 20, "title": "Movie 0001", "release_date": "2020-01-01"}]}"#,
+                )
+            } else if request.contains("/movie/20?") {
+                (
+                    "200 OK",
+                    r#"{"id": 20, "title": "Movie 0001", "overview": "From TMDB.", "release_date": "2020-01-01"}"#,
+                )
+            } else {
+                ("404 Not Found", "{}")
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// The movie's overview and refresh stamp.
+async fn overview_and_stamp(db: &Database) -> (Option<String>, Option<String>) {
+    sqlx::query_as(
+        r#"SELECT "Overview", "DateLastRefreshed" FROM "BaseItems"
+           WHERE "Type" LIKE '%Movies.Movie'"#,
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("movie")
+}
+
+/// [`one_movie_library`] with TheMovieDb on a stand-in that edits the movie
+/// at its first request once armed, scanned once (unarmed).
+async fn movie_with_tmdb(root: &Path) -> (LibraryScanner, Database, Arc<EditDuringFetch>) {
+    let (scanner, db) = one_movie_library(root).await;
+    let lane = Arc::new(EditDuringFetch {
+        db: db.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        armed: AtomicBool::new(false),
+        edits: Mutex::new(Vec::new()),
+        serve: Mutex::new(None),
+    });
+    let scanner = scanner.with_metadata(
+        Arc::new(TmdbClient::new().with_base_url(&tmdb_stand_in(Arc::clone(&lane)))),
+        root.join("metadata"),
+    );
+    scanner.scan_all().await.expect("first scan");
+    assert_eq!(
+        overview_and_stamp(&db).await.0.as_deref(),
+        Some("From TMDB."),
+        "the first scan takes TheMovieDb's overview"
+    );
+    (scanner, db, lane)
+}
+
+/// A full refresh: the walk asks TheMovieDb again and saves the movie.
+fn full_refresh() -> MetadataRefreshOptions {
+    MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    }
+}
+
+/// Rescans every library with a full refresh, serving `lane`.
+async fn full_rescan(scanner: &LibraryScanner, lane: &EditDuringFetch) {
+    let options = full_refresh();
+    let cancel = ScanCancel::new();
+    scanner
+        .scan_target(
+            &ScanTarget::All,
+            ScanRun::new(&options, &options, &cancel).with_lane(lane),
+        )
+        .await
+        .expect("rescan");
+}
+
+/// An edit made over the API while the walk refreshes that same item (here
+/// while it waits on TheMovieDb) is not saved over: the walk leaves the item
+/// as the edit wrote it, its refresh stamp too.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_made_while_the_walk_refreshes_the_item_is_not_saved_over() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, lane) = movie_with_tmdb(tmp.path()).await;
+    let (_, first) = overview_and_stamp(&db).await;
+
+    // Control: with no edit, the same rescan saves the movie and stamps it.
+    full_rescan(&scanner, &lane).await;
+    let (_, stamp) = overview_and_stamp(&db).await;
+    assert_ne!(stamp, first, "an unedited movie is saved");
+
+    lane.armed.store(true, Ordering::SeqCst);
+    full_rescan(&scanner, &lane).await;
+
+    assert_eq!(lane.edit_mark(), 1, "the edit landed inside the refresh");
+    assert_eq!(
+        overview_and_stamp(&db).await,
+        (Some("Typed mid-pass".to_owned()), stamp)
+    );
+}
+
+/// The same for an item refresh the running scan serves between its items
+/// (a refresh asked for over the API): the walk it runs checks the running
+/// scan's record of edits too.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_edit_made_while_a_served_refresh_refreshes_the_item_is_not_saved_over() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, lane) = movie_with_tmdb(tmp.path()).await;
+    let (_, stamp) = overview_and_stamp(&db).await;
+
+    let movie = tmp
+        .path()
+        .join("movies")
+        .join("Movie 0001 (2020)")
+        .join("Movie 0001 (2020).mkv");
+    *lane.serve.lock().expect("serve") = Some(LaneRefresh {
+        target: ScanTarget::Items(vec![movie.to_string_lossy().into_owned()]),
+        options: full_refresh(),
+        ancestors: MetadataRefreshOptions::default(),
+        passes: ScanPasses::Touched,
+        cancel: ScanCancel::new(),
+        key: 1,
+    });
+    lane.armed.store(true, Ordering::SeqCst);
+    // The running scan's own pass refreshes nothing that is not due.
+    let options = MetadataRefreshOptions::default();
+    let cancel = ScanCancel::new();
+    scanner
+        .scan_target(
+            &ScanTarget::All,
+            ScanRun::new(&options, &options, &cancel).with_lane(&*lane),
+        )
+        .await
+        .expect("rescan");
+
+    assert!(lane.serve.lock().expect("serve").is_none(), "served");
+    assert_eq!(lane.edit_mark(), 1, "the edit landed inside the refresh");
+    assert_eq!(
+        overview_and_stamp(&db).await,
+        (Some("Typed mid-pass".to_owned()), stamp)
+    );
+}
+
+/// A provider manager whose metadata lock for `movie` is `lock`, announcing
+/// each time the scan asks for it; every other item's lock is its own.
+struct LockingProviders {
+    movie: Uuid,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    asked: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl ProviderManager for LockingProviders {
+    async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        if item_id != self.movie {
+            return Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        }
+        self.asked.notify_one();
+        Arc::clone(&self.lock).lock_owned().await
+    }
+    async fn queue_refresh(
+        &self,
+        _item_id: Uuid,
+        _options: &MetadataRefreshOptions,
+        _priority: RefreshPriority,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn refresh_full_item(
+        &self,
+        _item_id: Uuid,
+        _options: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn refresh_single_item(
+        &self,
+        _item_id: Uuid,
+        _options: &MetadataRefreshOptions,
+    ) -> Result<ItemUpdateType, ServiceError> {
+        Ok(ItemUpdateType::None)
+    }
+    async fn save_image_from_url(
+        &self,
+        _item_id: Uuid,
+        _url: &str,
+        _image_type: ImageType,
+        _image_index: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn save_image(
+        &self,
+        _item_id: Uuid,
+        _content: &[u8],
+        _mime_type: &str,
+        _image_type: ImageType,
+        _image_index: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn get_available_remote_images(
+        &self,
+        _item_id: Uuid,
+        _query: &ferrofin_model::providers::RemoteImageQuery,
+    ) -> Result<Vec<ferrofin_model::providers::RemoteImageInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn get_remote_image_provider_info(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::providers::ImageProviderInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn save_metadata(
+        &self,
+        _item_id: Uuid,
+        _update_type: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    async fn get_external_id_infos(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::providers::ExternalIdInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn get_all_metadata_plugins(
+        &self,
+    ) -> Result<Vec<ferrofin_model::configuration::MetadataPluginSummary>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn get_metadata_options(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<ferrofin_model::configuration::MetadataOptions, ServiceError> {
+        Ok(ferrofin_model::configuration::MetadataOptions::default())
+    }
+    async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(Vec::new())
+    }
+}
+
+/// [`LockingProviders`] for the one movie in `db`.
+async fn locking_providers(db: &Database) -> Arc<LockingProviders> {
+    let movie: String =
+        sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#)
+            .fetch_one(db.pool())
+            .await
+            .expect("movie");
+    Arc::new(LockingProviders {
+        movie: movie.parse().expect("id"),
+        lock: Arc::new(tokio::sync::Mutex::new(())),
+        asked: tokio::sync::Notify::new(),
+    })
+}
+
+/// The walk checks for an edit only once it holds the item's metadata lock,
+/// which the metadata editor holds across its writes: an edit that holds the
+/// lock when the walk reaches the save is waited for and kept, though it is
+/// recorded only after the walk asked for the lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_walk_waits_for_an_edit_holding_the_items_lock_and_keeps_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, lane) = movie_with_tmdb(tmp.path()).await;
+    let (_, stamp) = overview_and_stamp(&db).await;
+    let providers = locking_providers(&db).await;
+    let scanner = scanner.with_metadata_savers(providers.clone());
+
+    // The editor holds the movie's lock while it writes.
+    let editing = Arc::clone(&providers.lock).lock_owned().await;
+    let edit = async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            providers.asked.notified(),
+        )
+        .await
+        .expect("the walk asks for the movie's lock before its save");
+        lane.edit().await;
+        drop(editing);
+    };
+    tokio::join!(full_rescan(&scanner, &lane), edit);
+
+    assert_eq!(
+        overview_and_stamp(&db).await,
+        (Some("Typed mid-pass".to_owned()), stamp)
+    );
+}
+
+/// A scan cancelled while it waits for an item's metadata lock (held by an
+/// edit, or by a provider refresh waiting on a slow provider) stops there
+/// instead of waiting the holder out, and leaves the item unsaved.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_cancelled_while_it_waits_for_an_items_lock_stops_without_saving_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, lane) = movie_with_tmdb(tmp.path()).await;
+    let stored = overview_and_stamp(&db).await;
+    let providers = locking_providers(&db).await;
+    let scanner = scanner.with_metadata_savers(providers.clone());
+
+    // Held for the whole test: only the cancel can end the walk's wait.
+    let _holder = Arc::clone(&providers.lock).lock_owned().await;
+    let options = full_refresh();
+    let cancel = ScanCancel::new();
+    let stop = async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            providers.asked.notified(),
+        )
+        .await
+        .expect("the walk asks for the movie's lock before its save");
+        cancel.cancel();
+    };
+    let scan = Box::pin(scanner.scan_target(
+        &ScanTarget::All,
+        ScanRun::new(&options, &options, &cancel).with_lane(&*lane),
+    ));
+    let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(scan, stop)
+    })
+    .await
+    .expect("the cancel ends the walk's wait for the lock");
+
+    assert!(outcome.expect("scan").stopped, "the scan stopped");
+    assert_eq!(
+        overview_and_stamp(&db).await,
+        stored,
+        "the movie is unsaved"
+    );
+}
+
+/// A plugin image source that cancels the running scan when asked for
+/// artwork: a cancel that lands in an item's artwork pass.
+struct CancelOnArt(ScanCancel);
+
+#[async_trait::async_trait]
+impl DynamicMetadataProvider for CancelOnArt {
+    fn name(&self) -> &'static str {
+        "cancel-on-art"
+    }
+    fn library_gated(&self) -> bool {
+        true
+    }
+    async fn lookup(
+        &self,
+        _item: &DynamicMetadataLookup,
+    ) -> Result<Option<DynamicMetadataResult>, ServiceError> {
+        Ok(None)
+    }
+    async fn images(
+        &self,
+        _item: &DynamicMetadataLookup,
+        _wanted: &[ImageType],
+    ) -> Result<Vec<(ImageType, Vec<u8>)>, ServiceError> {
+        self.0.cancel();
+        Ok(Vec::new())
+    }
+}
+
+/// The movie's `DateLastSaved`, which every save of its row moves.
+async fn date_last_saved(db: &Database) -> Option<String> {
+    sqlx::query_scalar(
+        r#"SELECT "DateLastSaved" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("movie")
+}
+
+/// A cancel that lands in a stored item's artwork pass still saves the item
+/// with what the pass has (`ScanCancel`'s promise), its refresh stamp
+/// cleared so the next scan repeats it: the lock is free, so the cancel
+/// gives up no wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_in_the_artwork_pass_still_saves_an_item_whose_lock_is_free() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, lane) = movie_with_tmdb(tmp.path()).await;
+    let saved = date_last_saved(&db).await;
+    let providers = locking_providers(&db).await;
+    let cancel = ScanCancel::new();
+    let scanner = scanner
+        .with_metadata_savers(providers)
+        .with_dynamic_providers(vec![Arc::new(CancelOnArt(cancel.clone()))]);
+
+    let options = MetadataRefreshOptions {
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..full_refresh()
+    };
+    scanner
+        .scan_target(
+            &ScanTarget::All,
+            ScanRun::new(&options, &options, &cancel).with_lane(&*lane),
+        )
+        .await
+        .expect("rescan");
+
+    assert!(cancel.is_cancelled(), "the artwork pass asked the plugin");
+    assert_ne!(date_last_saved(&db).await, saved, "the movie was saved");
+    assert_eq!(
+        overview_and_stamp(&db).await.1,
+        None,
+        "left for the next scan"
+    );
 }
