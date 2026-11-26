@@ -2865,9 +2865,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             for sql in [
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({ids})"#),
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#),
-                // No foreign key reaches these two, so nothing cascades:
-                // upstream deletes them with the rows (`:151`, `:155`), and a
-                // segment provider's scan must not find them published.
+                // No foreign key from these four reaches `BaseItems`, so
+                // nothing cascades: upstream deletes them with the rows
+                // (`:142-143`, `:151`, `:155`), and a segment provider's scan
+                // must not find the segments published.
+                format!(r#"DELETE FROM "CustomItemDisplayPreferences" WHERE "ItemId" IN ({ids})"#),
+                format!(r#"DELETE FROM "ItemDisplayPreferences" WHERE "ItemId" IN ({ids})"#),
                 format!(r#"DELETE FROM "MediaSegments" WHERE "ItemId" IN ({ids})"#),
                 format!(r#"DELETE FROM "TrickplayInfos" WHERE "ItemId" IN ({ids})"#),
             ] {
@@ -16209,14 +16212,36 @@ mod tests {
     }
 
     /// `delete_items` takes the rows no foreign key reaches with the item —
-    /// its published media segments and trickplay
-    /// (`ItemPersistenceService.cs:151,155`) — and leaves another item's.
+    /// its display preferences, published media segments and trickplay
+    /// (`ItemPersistenceService.cs:142-143,151,155`) — and leaves another
+    /// item's.
     #[tokio::test]
-    async fn delete_items_takes_the_segments_and_trickplay_with_the_item() {
+    async fn delete_items_takes_the_rows_no_foreign_key_reaches_with_the_item() {
         let (gone, kept) = (Uuid::from_u128(0xD401), Uuid::from_u128(0xD402));
+        let user = Uuid::from_u128(0xD4AA);
         let db = test_db().await;
+        crate::test_support::seed_user(&db, user).await;
         for item in [gone, kept] {
             seed_item(&db, item, BaseItemKind::Episode).await;
+            sqlx::query(
+                r#"INSERT INTO "ItemDisplayPreferences" ("Client", "ItemId", "RememberIndexing",
+                   "RememberSorting", "SortBy", "SortOrder", "UserId", "ViewType")
+                   VALUES ('c', ?1, 0, 0, 'SortName', 0, ?2, 0)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .execute(db.writer())
+            .await
+            .expect("display preferences");
+            sqlx::query(
+                r#"INSERT INTO "CustomItemDisplayPreferences" ("Client", "ItemId", "Key",
+                   "UserId", "Value") VALUES ('c', ?1, 'k', ?2, 'v')"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .execute(db.writer())
+            .await
+            .expect("custom display preferences");
             sqlx::query(
                 r#"INSERT INTO "MediaSegments" ("Id", "EndTicks", "ItemId", "SegmentProviderId",
                    "StartTicks", "Type") VALUES (?1, 10, ?2, 'p', 0, 5)"#,
@@ -16238,7 +16263,12 @@ mod tests {
         }
         let svc = FerrofinItemPersistenceService::new(db.clone());
         assert_eq!(svc.delete_items(&[gone]).await.expect("delete"), vec![gone]);
-        for table in ["MediaSegments", "TrickplayInfos"] {
+        for table in [
+            "ItemDisplayPreferences",
+            "CustomItemDisplayPreferences",
+            "MediaSegments",
+            "TrickplayInfos",
+        ] {
             let owners: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 r#"SELECT "ItemId" FROM "{table}""#
             )))
