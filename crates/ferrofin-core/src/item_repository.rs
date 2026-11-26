@@ -3215,7 +3215,9 @@ pub(crate) fn images_of_items_sql(placeholders: &str) -> String {
 ///
 /// The stored `Blurhash` is a UTF-8 byte blob; an empty blob (or one that is not
 /// valid UTF-8) becomes [`None`]. A zero/negative width or height (the "unknown"
-/// sentinel) is preserved as-is; the API layer nulls those out per Jellyfin.
+/// sentinel) is preserved as-is; the API layer nulls those out per Jellyfin. A
+/// row with no `DateModified` reads as `DateTime.MinValue`, as upstream's
+/// `e.DateModified ?? DateTime.MinValue` does.
 pub(crate) fn image_info_from_row(
     row: BaseItemImageInfoEntity,
     virtual_paths: &VirtualPathExpander,
@@ -3227,17 +3229,13 @@ pub(crate) fn image_info_from_row(
     ItemImageInfo {
         path: virtual_paths.expand(&row.path),
         image_type: image_type_from_disc(row.image_type),
-        date_modified: row.date_modified.unwrap_or_else(default_epoch),
+        date_modified: row
+            .date_modified
+            .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
         width: i32::try_from(row.width).unwrap_or(0),
         height: i32::try_from(row.height).unwrap_or(0),
         blur_hash,
     }
-}
-
-/// The Unix epoch as a UTC timestamp — the placeholder for a row with no stored
-/// `DateModified` (C# leaves the `default(DateTime)`).
-fn default_epoch() -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
 }
 
 /// Loads the user snapshot needed by repository count queries.
@@ -5268,8 +5266,8 @@ mod tests {
     use ferrofin_util::string_extensions::lower_invariant;
 
     /// `MapImageFromEntity`: the type is cast as stored, an unknown one kept;
-    /// an empty or non-UTF-8 blurhash reads as none; no stored date is the
-    /// epoch.
+    /// an empty or non-UTF-8 blurhash reads as none; no stored date is
+    /// `DateTime.MinValue` (`e.DateModified ?? MinValue`), not the epoch.
     #[rstest::rstest]
     #[case::known_type(1, Some(b"LKO2".to_vec()), ImageType::Art, Some("LKO2"))]
     #[case::unknown_type_kept(99, None, ImageType::Unrecognized(99), None)]
@@ -5294,7 +5292,10 @@ mod tests {
         let image = image_info_from_row(row, &VirtualPathExpander::identity());
         assert_eq!(image.image_type, image_type);
         assert_eq!(image.blur_hash.as_deref(), blur_hash);
-        assert_eq!(image.date_modified, default_epoch());
+        assert_eq!(
+            image.date_modified,
+            ferrofin_model::json::datetime::dotnet_min()
+        );
         assert_eq!(
             (image.path.as_str(), image.width, image.height),
             ("/m/poster.jpg", 3, 2)

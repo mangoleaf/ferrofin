@@ -1627,7 +1627,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    PrimaryImageTag); image serving and processing are compared per \
                    operation, apart from the Live TV artwork rule below (ferrofin-livetv \
                    projection.rs is_artwork_url, channel_images_update, \
-                   program_images_update, manager.rs add_provider_metadata; ferrofin-traits \
+                   program_images_update and remote_image, whose URL row is dated \
+                   DateTime.MinValue as UpdateImage's and SetImagePath's new ItemImageInfo \
+                   leaves it, manager.rs add_provider_metadata; ferrofin-traits \
                    item_image_info.rs live_tv_image_is_internal, read by handlers/images.rs \
                    live_tv_image_is_servable, ferrofin-providers provider_manager.rs \
                    delete_image and ferrofin-core dto_service.rs primary_image_aspect_ratio, \
@@ -1649,7 +1651,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    image row through item_repository.rs image_info_from_row (the DTO page \
                    read, GET /Items/{itemId}/Images and the scan's change detection; \
                    BaseItemMapper.MapImageFromEntity: the path expanded, the type cast as \
-                   stored). Compared with \
+                   stored, a missing date read as DateTime.MinValue). Compared with \
                    Jellyfin.Server.Implementations/Item/BaseItemMapper.cs \
                    (MapImageFromEntity), \
                    Emby.Server.Implementations/Dto/DtoService.cs (GetImageCacheTag, \
@@ -1690,8 +1692,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    published by finish_artwork's image saver), \
                    and where every image the server keeps is saved: the item's \
                    GetInternalMetadataPath, {metadata}/library/{idN[..2]}/{idN}, under \
-                   GetStandardSavePath's name for a save that is not local (ferrofin-providers \
-                   local_images/merge.rs own_art_dir and internal_image_stem; used by \
+                   GetStandardSavePath's name for a save that is not local (ferrofin-db \
+                   art.rs own_art_dir and internal_image_stem, re-exported by \
+                   ferrofin-providers local_images/merge.rs; used by \
                    provider_manager.rs write_image_file and write_automatic_image for an \
                    upload, a chosen remote image, a refresh's downloads and a plugin's \
                    images; ferrofin-core dynamic_images.rs refresh_item for a collage or a \
@@ -1729,7 +1732,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    RunMetadataSavers, UpdateItemsAsync, ConvertImageToLocal), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (ValidateImages) and \
                    src/Jellyfin.Drawing/ImageProcessor.cs (GetImageBlurHash)",
-        date: "2026-11-20",
+        date: "2026-11-26",
         divergences: &[
             "The metadata editor's save (POST /Items/{itemId}, and its cascade to the \
              children) runs the savers only, so it neither measures nor validates the item's \
@@ -1909,9 +1912,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Each change reads the row inside its write transaction, so two overlapping saves of \
              one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
              writes every column back, so there the later save undoes the earlier one.",
-            "Marking a container unplayed also clears the play state on the container's own rows, \
-             which earlier Ferrofin builds wrote; upstream's MarkUnplayed leaves them, so a Played \
-             set on a container through the UserData API survives it there. Fix path: gl-1064.",
+            "Marking a series, season, box set, playlist, album or folder unplayed also resets \
+             the play state on the container's own rows, where upstream's MarkUnplayed only walks \
+             the members, so a Played set on a container through the UserData API survives it \
+             there. The clear resets the play state versions before 1.4.0 wrote on containers, which \
+             would otherwise show an album or a library as played for good. Deliberate divergence \
+             (owner decision 2026-11-20, gl-1064).",
             "A container's members are saved a chunk at a time, each chunk in one write \
              transaction, where upstream's Folder.MarkPlayed commits each member's SaveUserData \
              alone and stops at the first that fails: here a member's write that fails also rolls \
@@ -2571,8 +2577,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              path. Both measured on Jellyfin 12.4.0; Jellyfin bugs not ported.",
             "A playlist FILE's <name>.xml sidecar (PlaylistXmlSaver.GetSavePath) is neither \
              written nor read: upstream writes it with no members and then reads it before \
-             the playlist file, which empties the playlist. Whether to port either half is \
-             an owner decision. Fix path: gl-1915.",
+             the playlist file, which empties the playlist. Jellyfin bug not ported, and \
+             Ferrofin writes no such file into a media folder for a Jellyfin to read back \
+             (owner decision 2026-11-24, gl-1915).",
         ],
     },
     VerifiedSubsystem {
@@ -3923,7 +3930,10 @@ pub const VERIFIED: &[Verified] = &[
                authenticate_internal signed in, as upstream's is GetUserDto of the user it \
                holds; it reads the database where upstream's reads memory, so it is built \
                before the token is minted and a read error fails the sign-in with nothing \
-               minted, as a store error elsewhere in the sign-in fails it upstream",
+               minted, as a store error elsewhere in the sign-in fails it upstream. The \
+               minted Devices row, compared on 2026-11-26 (gl-1600), is the Device \
+               constructor's: one instant in DateCreated, DateModified and \
+               DateLastActivity, and IsActive never set (0)",
         date: "2026-11-05",
         divergences: &[
             "User reads the database (the user's permissions, preferences, access schedules \
@@ -5060,6 +5070,27 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "post",
+        path: "/Auth/Keys",
+        upstream_file: "Jellyfin.Api/Controllers/ApiKeyController.cs",
+        upstream_method: "CreateKey",
+        ferrofin: "handlers/api_key.rs create_key (RequireAdmin, Policies.RequiresElevation; \
+               the query binder's non_nullable and required tables refuse an absent, empty \
+               or blank app, as [FromQuery, Required] string does, and keep any other as \
+               sent) → ferrofin-core api_key_manager.rs create_api_key \
+               (AuthenticationManager.CreateApiKey). Compared: the ApiKey(name) row (Name \
+               as sent, AccessToken Guid.NewGuid().ToString(\"N\"), DateCreated now, \
+               DateLastActivity default(DateTime), stored as 0001-01-01 00:00:00), the 204, \
+               and on a live 12.4 the 400 for an absent, empty or blank app, the first of \
+               repeated app values, and an undeclared parameter ignored",
+        date: "2026-11-26",
+        divergences: &[
+            "The 400 (an absent, empty or blank app), 401 (no or bad token) and 403 (not an \
+         administrator) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "get",
         path: "/Auth/Providers",
         upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
@@ -5241,8 +5272,12 @@ pub const VERIFIED: &[Verified] = &[
                items go at the scan's library_scan.rs prune_orphan_locations \
                (AggregateFolder.ValidateChildren over the root's PhysicalLocations, the \
                union of the libraries' resolved locations, read by virtual_folder_manager.rs \
-               locations_for_removal, where a library created with no folder adds none)",
-        date: "2026-11-20",
+               locations_for_removal, where a library created with no folder adds none), \
+               which first stores that list after the root's own path as the root's \
+               PhysicalLocationsList (record_root_locations: CreateResolveArgs with \
+               setPhysicalLocations, the libraries and their shortcuts in the order their \
+               folders list them, expanded; merged into Data, written when it changed)",
+        date: "2026-11-21",
         divergences: &[
             "Without refreshLibrary, upstream waits 1000 ms (Task.Delay) inside the request before \
          LibraryMonitor.Start, so its directory watchers miss the removal; Ferrofin answers at \
@@ -5263,14 +5298,30 @@ pub const VERIFIED: &[Verified] = &[
             "A change the monitor was still settling when the restart came is refreshed after it; \
          upstream's Stop disposes its FileRefreshers, so that change waits for the next scan. \
          Jellyfin bug not ported.",
-            "A scan deletes no removed location's folder while a library shortcut resolves to \
-         no location (it cannot be read, or it is empty); upstream's root leaves such a \
-         shortcut's location out and deletes its folder with every item under it, so one \
-         damaged shortcut file deletes a library's items. Jellyfin bug not ported.",
-            "A scan deletes no removed location's folder while no library is configured, or \
-         while a library lists no location and its options are missing, cannot be read or \
-         name a path no shortcut gives; upstream reads no options there and deletes every \
-         folder no shortcut lists. Fix path: gl-1929 (owner decision).",
+            "A scan deletes no removed location's folder, and leaves the root's stored \
+         PhysicalLocationsList as it is, while a library shortcut resolves to no location (it \
+         cannot be read, or it is empty); upstream's root leaves such a shortcut's location \
+         out of its list and deletes its folder with every item under it, so one damaged \
+         shortcut file deletes a library's items. Jellyfin bug not ported.",
+            "A scan deletes no removed location's folder, and leaves the root's stored \
+         PhysicalLocationsList as it is, while no library is configured, or while a library \
+         lists no location and its options are missing, cannot be read or name a path no \
+         shortcut gives; upstream reads no options there, lists what the shortcuts give and \
+         deletes every folder no shortcut lists. Accepted divergence (owner decision \
+         2026-11-24, gl-1929): a restore that lacks the libraries folder would otherwise read \
+         as every location removed; after the last library is deleted its rows stay, unseen \
+         by clients, until another library exists. A scan warns about a library that lists no \
+         location and whose options do not read as empty, and says nothing while no library \
+         is configured.",
+            "The root's PhysicalLocationsList is stored by the scan alone, as the list that \
+         scan computes. Upstream's ValidateTopLibraryFolders (a scan's opening, a library \
+         added, a library removed with refreshLibrary) saves the list its previous \
+         validation computed, so its stored list trails the libraries by one validation \
+         (Jellyfin 12.4: the first scan after a library removed without refreshLibrary \
+         still stores its location, the second drops it). Jellyfin bug not ported: a \
+         returned Jellyfin that reads the list's paths in its own layout (the export's \
+         rewrite, gl-1924) and lists the library folders in the same order (gl-1933) \
+         computes the same list, finds it equal and saves nothing.",
             "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
@@ -6428,16 +6479,17 @@ pub const VERIFIED: &[Verified] = &[
                on a task of its own: upstream passes CancellationToken.None), \
                extract_attachment (AttachmentExtractor.GetAttachment, GetAttachmentStream, \
                ExtractAttachment, ExtractAttachmentInternal) → apps/ferrofin-server \
-               media_encoding.rs MediaSourceManagerResolver, FfmpegAttachmentIo open_file, \
+               media_encoding.rs MediaSourceManagerResolver (GetPlaybackMediaSources(item, \
+               null, true, false): ferrofin-core media_source_manager.rs \
+               get_playback_media_sources, playback_sources, playback_probe_path: a .strm \
+               item, or one whose first non-placeholder source lacks its main stream, is \
+               refreshed through item_refresh_remote_probe, EnableRemoteContentProbe and a \
+               FullRefresh, before its sources are read again; resolve_symlink_paths, \
+               ResolveSymlinkPaths: a file source's link to an existing file is read from \
+               its final target), FfmpegAttachmentIo open_file, \
                run_ffmpeg → handlers/streaming.rs opened_file_response (FileStreamResult)",
-        date: "2026-11-11",
+        date: "2026-11-26",
         divergences: &[
-            "The media source comes from GetStaticMediaSources: upstream's \
-         GetPlaybackMediaSources(item, null, true, false) first re-probes a .strm item (and \
-         one with no main stream), so a .strm whose target changed serves its last probe's \
-         attachments here. Fix path: gl-1519. Its dynamic sources, a channel's tuner \
-         streams, are in the static list here, and list no attachments on either side (a \
-         404).",
             "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A mediaSourceId selects its source in any GUID spelling; upstream compares the N \
          form, ignoring case. Clients echo the id they were given, and an adopted database \

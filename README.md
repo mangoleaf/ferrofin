@@ -177,7 +177,7 @@ support for every 10.11.x or 12.x release.
 >    separately, for example in `/etc/jellyfin` on Debian. Include any external state
 >    directories too.
 > 3. Copy Jellyfin's `data/jellyfin.db`, `data/playlists/`, `data/collections/`,
->    `root/default/`, `metadata/`, the metadata plugins' settings
+>    `data/trickplay/`, `root/default/`, `metadata/`, the metadata plugins' settings
 >    (`plugins/configurations/Jellyfin.Plugin.{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages}.xml`)
 >    and those of the plugins Jellyfin used that Ferrofin has a counterpart of
 >    (`plugins/configurations/LDAP-Auth.xml`, `IntroSkipper.xml` and

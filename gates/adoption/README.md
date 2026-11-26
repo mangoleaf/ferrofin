@@ -390,7 +390,9 @@ for every user: watched flags, play counts, resume positions, last-played dates,
 favorites must match the original fixture. Hidden alternate versions are checked
 through their detail endpoints. These checks do not sample watch history.
 Fixtures must include both watched videos and videos with resume progress, so an
-empty history cannot make the gate pass.
+empty history cannot make the gate pass, and a played video with no last-played date
+(the row Jellyfin leaves on a video's other versions, a `Played`-only update and an NFO
+`watched` import), so a change that dates, drops or rewrites one fails.
 
 The private watch-history baseline stores hashes of database rows and provider
 keys, plus user/item UUIDs and the playback fields needed for API checks. It has
@@ -786,10 +788,11 @@ sampling, corrupt image responses and description/rating loss. Bats invokes thes
 Python tests, so CI runs them too. `tests/test_watch_history.py` checks unchanged
 history, changes to each playback field, deleted provider-keyed rows, progress for
 another user, unwatched-to-watched changes, missing API history, hidden versions,
-date/GUID normalization, private baselines, fixtures missing watched/resume data, and
-failure reporting, and that its model of migration 0050's date rewrite matches the
-migration's own statement and leaves Jellyfin's form alone. Its fixtures contain only
-invented IDs and playback data.
+date/GUID normalization, private baselines, fixtures missing watched, resume or
+undated played data, an undated played row given a date, and failure reporting, and
+that its model of migration 0050's date rewrite matches the migration's own statement
+and leaves Jellyfin's form alone. Its fixtures contain only invented IDs and playback
+data.
 `tests/test_table_digests.py` checks a lost row in each listed table, a changed column, a
 lost and an added column, and a case per normaliser rule (each with the unrewritten change
 next to it that must still fail). `tests/test_messy.py` checks each shape's seeder and end-state

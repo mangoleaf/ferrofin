@@ -991,6 +991,15 @@ pub mod test_support {
         .map_err(db_err)
     }
 
+    /// Every stored image row as `(Path, DateModified)`, the date as its stored
+    /// text, path-ordered.
+    pub async fn image_rows(db: &Database) -> Result<Vec<(String, Option<String>)>, ServiceError> {
+        sqlx::query_as(r#"SELECT "Path", "DateModified" FROM "BaseItemImageInfos" ORDER BY "Path""#)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)
+    }
+
     /// Every programme item's genre links as `(Id, genre)`, ordered — the
     /// `ItemValues` the guide refresh's mirror wrote for its airings.
     pub async fn program_genre_links(db: &Database) -> Result<Vec<(String, String)>, ServiceError> {

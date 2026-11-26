@@ -8,7 +8,7 @@ Ledger for phase gl-1559 of the "Backwards migration to Jellyfin" milestone: eve
 - **match:** same value and text form.
 - **fix:** Ferrofin differs. The row names the issue that tracks it, filed by this audit or already open.
 - **recorded:** a divergence an owner decision accepts, or one the code records as a Jellyfin bug not ported; it is cited.
-- **owner?:** a possible accepted divergence the owner has not decided. Each is proposed below (P1 to P6), or waits on its own issue. **owner? (documented)** is a deliberate Ferrofin difference a code comment explains, with no owner decision yet: listed together as P6.
+- **owner?:** a possible accepted divergence the owner has not decided. Each is proposed below (P1 to P6). **owner? (documented)** is a deliberate Ferrofin difference a code comment explains, with no owner decision yet: listed together as P6.
 - **match; edge fix** or **match; recorded edge:** the column matches except in an edge case, which the named issue tracks or the code records as a Jellyfin bug not ported.
 
 ## Method
@@ -102,7 +102,7 @@ Ferrofin: `crates/ferrofin-core/src/user_data_manager.rs` (udm), `user_data_keys
 | AudioStreamIndex, SubtitleStreamIndex | `crates/ferrofin-traits/src/library.rs:2027-2041` via udm:813-829 | `SessionManager.cs:990, 1016-1055` | match | |
 | IsFavorite, Rating, Likes | udm:1822-1852, 2007-2008 | UDM:130-153; `UserItemData.cs:96-118` | match | Likes derives from Rating (6.5 threshold) on both |
 | PlayCount, PlaybackPositionTicks, Played | udm:1412-1520, 2123-2130 | UDM:455-529; `BaseItem.cs:2252-2302` | match | same thresholds |
-| Played, PlayCount, PlaybackPositionTicks, LastPlayedDate (container unplay) | `user_data_manager.rs:1066-1084` clears the container's own rows | `MarkUnplayed` leaves them | owner? (gl-1064) | awaiting the owner on gl-1064 (`crates/ferrofin-api/src/handlers.rs:1393-1395`) |
+| Played, PlayCount, PlaybackPositionTicks, LastPlayedDate (container unplay) | `user_data_manager.rs:1066-1084` clears the container's own rows | `MarkUnplayed` leaves them | recorded | owner decision 2026-11-20 on gl-1064: kept, to clear the play state versions before 1.4.0 wrote on containers (the `user-data` row of `VERIFIED_SUBSYSTEMS`, `crates/ferrofin-api/src/handlers.rs`) |
 | all (concurrent saves) | each save reads inside the write transaction, so both land | the later save overwrites the earlier one | owner? (documented) | `crates/ferrofin-api/src/handlers.rs:1390-1392` (P6) |
 | LastPlayedDate | udm:1419-1456, 1516-1518, 2126 | `BaseItem.cs:2266, 2301`; `SessionManager.cs:852-855, 982-985` | fix (gl-1565, gl-1604) | datetime form. **Migration `0010_hermit_backfill_last_played.sql:14-16` runs on every adopted database** (not baselined: `crates/ferrofin-db/src/database.rs:1529-1557`). It sets `LastPlayedDate` to the adoption time on every `Played=1` row that has none, rows upstream writes on purpose (`MediaBrowser.Controller/Entities/Video.cs:388`). That invents play dates |
 | RetentionDate | detach ips:2183; recover `user_data_retention_repository.rs:121`; migration 0042:99-101 | `ItemPersistenceService.cs:61, 129-132`; UDM:69 writes NULL on every save | fix (gl-1565, gl-1605) | datetime form. Ferrofin's update leg keeps an existing value (udm:719-720); upstream clears it. No practical effect: a live row holding one should not exist |
@@ -196,7 +196,7 @@ Filed or extended by this audit. None of the issues filed here is in the milesto
 | gl-1609 | Item deletion removes display preferences |
 | gl-1610 | Live TV programs' `ExternalId` user-data key |
 
-Already open before this audit: gl-410 (skip lengths, owner-decided), gl-429, gl-430 and gl-908 (activity log), and gl-1064 (container unplay, awaiting the owner).
+Already open before this audit: gl-410 (skip lengths, owner-decided), gl-429, gl-430 and gl-908 (activity log), and gl-1064 (container unplay, owner-decided: kept).
 
 **For the owner (proposed accepted divergences):**
 - **P1: the lockout counter.** Upstream counts the locking attempt twice, a Jellyfin bug.

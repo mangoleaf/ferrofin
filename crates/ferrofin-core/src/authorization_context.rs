@@ -249,7 +249,9 @@ impl FerrofinAuthorizationContext {
             _ => {}
         }
 
-        if (Utc::now() - device.date_last_activity).num_minutes() > DEVICE_ACTIVITY_REFRESH_MINUTES
+        // `TotalMinutes > 3` is fractional: `num_minutes` would truncate to 4.
+        if Utc::now() - device.date_last_activity
+            > chrono::TimeDelta::minutes(DEVICE_ACTIVITY_REFRESH_MINUTES)
         {
             device.date_last_activity = Utc::now();
             update = true;
@@ -270,8 +272,8 @@ impl FerrofinAuthorizationContext {
             ));
         }
 
+        // `UpdateDevice` leaves `DateModified` at the creation instant.
         if update {
-            device.date_modified = Utc::now();
             self.update_device(&device).await?;
         }
         // Cache the row exactly as it now exists (post-refresh), so a hit
@@ -335,15 +337,13 @@ impl FerrofinAuthorizationContext {
     async fn update_device(&self, device: &DeviceEntity) -> Result<(), ServiceError> {
         sqlx::query(
             r#"UPDATE "Devices" SET
-                "DeviceName" = ?2, "AppVersion" = ?3,
-                "DateLastActivity" = ?4, "DateModified" = ?5
+                "DeviceName" = ?2, "AppVersion" = ?3, "DateLastActivity" = ?4
                WHERE "Id" = ?1"#,
         )
         .bind(device.id)
         .bind(&device.device_name)
         .bind(&device.app_version)
         .bind(datetime_to_db(device.date_last_activity))
-        .bind(datetime_to_db(device.date_modified))
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
@@ -1331,23 +1331,114 @@ mod tests {
     /// Seeds the standard device row (`dev-tok` → user `uid`).
     async fn seed_device(db: &Database, uid: Uuid) {
         let now = Utc::now();
+        seed_device_dated(db, uid, now, now).await;
+    }
+
+    /// [`seed_device`] with the row last active at `last_activity` and
+    /// modified at `modified`.
+    async fn seed_device_dated(
+        db: &Database,
+        uid: Uuid,
+        last_activity: chrono::DateTime<Utc>,
+        modified: chrono::DateTime<Utc>,
+    ) {
         sqlx::query(
             r#"INSERT INTO "Devices"
                ("AccessToken", "AppName", "AppVersion", "DateCreated",
                 "DateLastActivity", "DateModified", "DeviceId", "DeviceName",
                 "IsActive", "UserId")
-               VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5, ?6, 1, ?7)"#,
+               VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, 1, ?8)"#,
         )
         .bind("dev-tok")
         .bind("Web")
         .bind("1.0")
-        .bind(datetime_to_db(now))
+        .bind(datetime_to_db(last_activity))
+        .bind(datetime_to_db(modified))
         .bind("dev-1")
         .bind("Firefox")
         .bind(ferrofin_db::store::guid_to_db(uid))
         .execute(db.writer())
         .await
         .expect("insert device");
+    }
+
+    /// The `dev-tok` row's `(DeviceName, AppVersion, DateLastActivity,
+    /// DateModified)`, the dates as stored text.
+    async fn stored_device(db: &Database) -> (String, String, String, String) {
+        use ferrofin_traits::devices::{DeviceManager as _, DeviceQuery};
+        let devices = crate::device_manager::FerrofinDeviceManager::new(db.clone())
+            .get_devices(&DeviceQuery::default())
+            .await
+            .expect("devices");
+        let device = devices
+            .items
+            .into_iter()
+            .find(|d| d.access_token == "dev-tok")
+            .expect("device row");
+        (
+            device.device_name,
+            device.app_version,
+            datetime_to_db(device.date_last_activity),
+            datetime_to_db(device.date_modified),
+        )
+    }
+
+    /// `AuthorizationContext.cs` rewrites a reported device name and app
+    /// version through `UpdateDevice`, which leaves `DateModified` at the
+    /// creation instant the `Device` constructor gave it.
+    #[tokio::test]
+    async fn a_refresh_rewrites_name_and_version_but_not_date_modified() {
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(0x31);
+        crate::test_support::seed_user(&db, uid).await;
+        let modified = Utc::now() - chrono::TimeDelta::days(1);
+        seed_device_dated(&db, uid, Utc::now(), modified).await;
+
+        let request = header_request(
+            "Authorization",
+            r#"MediaBrowser Token="dev-tok", Device="Den TV", Version="2.0""#,
+        );
+        let info = context(db.clone())
+            .get_authorization_info(&request)
+            .await
+            .expect("info");
+        assert!(info.is_authenticated);
+
+        let (name, version, _, stored_modified) = stored_device(&db).await;
+        assert_eq!((name.as_str(), version.as_str()), ("Den TV", "2.0"));
+        assert_eq!(stored_modified, datetime_to_db(modified));
+    }
+
+    /// `(DateTime.UtcNow - device.DateLastActivity).TotalMinutes > 3`: a
+    /// fractional comparison, so a row idle 3½ minutes is refreshed and one
+    /// idle just under 3 is not.
+    #[tokio::test]
+    async fn activity_is_refreshed_once_more_than_three_minutes_have_passed() {
+        for (idle, refreshed) in [
+            (chrono::TimeDelta::seconds(210), true),
+            (chrono::TimeDelta::seconds(170), false),
+        ] {
+            let db = crate::test_support::test_db().await;
+            let uid = Uuid::from_u128(0x32);
+            crate::test_support::seed_user(&db, uid).await;
+            let modified = Utc::now() - chrono::TimeDelta::days(1);
+            let last_activity = Utc::now() - idle;
+            seed_device_dated(&db, uid, last_activity, modified).await;
+
+            let info = context(db.clone())
+                .get_authorization_info(&token_request())
+                .await
+                .expect("info");
+            assert!(info.is_authenticated);
+
+            let (_, _, stored_activity, stored_modified) = stored_device(&db).await;
+            assert_eq!(
+                stored_activity != datetime_to_db(last_activity),
+                refreshed,
+                "idle {idle}"
+            );
+            assert_eq!(stored_modified, datetime_to_db(modified), "idle {idle}");
+        }
     }
 
     fn token_request() -> RequestContext {
