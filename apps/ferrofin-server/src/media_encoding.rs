@@ -14,6 +14,7 @@
 //! ffmpeg/filesystem [`AttachmentIo`]).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
@@ -44,6 +45,7 @@ use ferrofin_traits::media_encoding::{
 };
 use ferrofin_traits::persistence::KeyframeRepository;
 use ferrofin_traits::system::PathManager;
+use ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT;
 use ferrofin_util::source_url::{is_remote_url, redact_url, redact_urls_in};
 use uuid::Uuid;
 
@@ -424,16 +426,18 @@ pub fn build_media_encoding(
 /// The body is read under `image_download_max_mb`, as a provider's is: the
 /// host is someone else's, and a compressed body is decoded, so a few KB
 /// could otherwise expand without bound (gl-1708). Upstream reads it whole.
-async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+/// The response headers must come within `headers_timeout`, as
+/// `HttpClient.Timeout` bounds upstream's `GetStreamAsync`; the body has no
+/// time limit there either.
+async fn http_get_bytes(url: &str, headers_timeout: Duration) -> Result<Vec<u8>, String> {
     use ferrofin_providers::rate_limit::{BodyError, read_capped, request_limits};
     // One client, so the reads share a connection pool; `reqwest::get` builds one per call.
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let source = ferrofin_util::source_url::redact_url(url);
-    let resp = CLIENT
-        .get_or_init(reqwest::Client::new)
-        .get(url)
-        .send()
+    let request = CLIENT.get_or_init(reqwest::Client::new).get(url).send();
+    let resp = tokio::time::timeout(headers_timeout, request)
         .await
+        .map_err(|_| format!("GET {source}: no response headers within {headers_timeout:?}"))?
         .map_err(|e| format!("GET {source}: {}", e.without_url()))?;
     if !resp.status().is_success() {
         return Err(format!("GET {source}: HTTP {}", resp.status()));
@@ -470,7 +474,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
     }
 
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
-        http_get_bytes(url).await
+        http_get_bytes(url, HTTP_CLIENT_DEFAULT_TIMEOUT).await
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
@@ -888,6 +892,7 @@ mod tests {
     async fn a_failed_remote_subtitle_names_only_the_host() {
         let error = http_get_bytes(
             "http://acct-user:info-secret@127.0.0.1:0/path-secret/en.srt?token=query-secret",
+            HTTP_CLIENT_DEFAULT_TIMEOUT,
         )
         .await
         .expect_err("nothing listens there");
@@ -899,9 +904,12 @@ mod tests {
     /// it, and fails there without naming its account or path either.
     #[tokio::test]
     async fn a_subtitle_url_on_another_scheme_names_only_the_host() {
-        let error = http_get_bytes("smb://acct-user:info-secret@nas/path-secret/en.srt")
-            .await
-            .expect_err("no smb client");
+        let error = http_get_bytes(
+            "smb://acct-user:info-secret@nas/path-secret/en.srt",
+            HTTP_CLIENT_DEFAULT_TIMEOUT,
+        )
+        .await
+        .expect_err("no smb client");
 
         assert!(error.starts_with("GET smb://nas"), "{error}");
         assert!(
@@ -932,7 +940,7 @@ mod tests {
     async fn a_remote_subtitle_is_decoded_and_read_whole() {
         let srt = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n";
 
-        let body = http_get_bytes(&gzip_subtitle_url(srt).await).await;
+        let body = http_get_bytes(&gzip_subtitle_url(srt).await, HTTP_CLIENT_DEFAULT_TIMEOUT).await;
 
         assert_eq!(body.as_deref(), Ok(&srt[..]));
     }
@@ -945,7 +953,7 @@ mod tests {
         let url = gzip_subtitle_url(&vec![0; usize::try_from(limit).unwrap() + 1]).await;
 
         // The length only: a failure must not print the body.
-        let error = http_get_bytes(&url)
+        let error = http_get_bytes(&url, HTTP_CLIENT_DEFAULT_TIMEOUT)
             .await
             .map(|body| body.len())
             .expect_err("over the limit");
@@ -956,6 +964,75 @@ mod tests {
             error,
             format!("GET {host}: the subtitle is over image_download_max_mb ({mib} MiB); not read")
         );
+    }
+
+    /// How long the tests below give the response headers.
+    const SHORT_TIMEOUT: Duration = Duration::from_millis(200);
+    /// How long a test waits before it calls a hang a failure.
+    const GUARD: Duration = Duration::from_secs(5);
+
+    /// A subtitle host that accepts one connection, reads the request, then
+    /// sends `head` (nothing when it is empty) and each of `chunks`
+    /// [`SHORT_TIMEOUT`] apart, holding the connection open afterwards.
+    async fn slow_subtitle_host(
+        head: &'static str,
+        chunks: &'static [&'static str],
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = stream.read(&mut [0; 4096]).await;
+            let _ = stream.write_all(head.as_bytes()).await;
+            for chunk in chunks {
+                tokio::time::sleep(SHORT_TIMEOUT).await;
+                let _ = stream.write_all(chunk.as_bytes()).await;
+            }
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    /// A host that never answers is given up on once the response headers are
+    /// late, as `HttpClient.Timeout` gives up on `GetStreamAsync`, and the
+    /// error names only the host.
+    #[tokio::test]
+    async fn a_remote_subtitle_host_that_never_answers_is_given_up_on() {
+        let addr = slow_subtitle_host("", &[]).await;
+        let url =
+            format!("http://acct-user:info-secret@{addr}/path-secret/en.srt?token=query-secret");
+
+        let outcome = tokio::time::timeout(GUARD, http_get_bytes(&url, SHORT_TIMEOUT))
+            .await
+            .expect("gave up");
+
+        assert_eq!(
+            outcome,
+            Err(format!(
+                "GET http://{addr}: no response headers within {SHORT_TIMEOUT:?}"
+            ))
+        );
+    }
+
+    /// Only the headers are timed: `GetStreamAsync` returns at the headers, so
+    /// a body slower than the timeout is still read whole.
+    #[tokio::test]
+    async fn a_remote_subtitle_body_slower_than_the_timeout_is_read_whole() {
+        let addr = slow_subtitle_host(
+            "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n",
+            &["abc", "def", "ghi", "jkl"],
+        )
+        .await;
+
+        let body = tokio::time::timeout(
+            GUARD,
+            http_get_bytes(&format!("http://{addr}/en.srt"), SHORT_TIMEOUT),
+        )
+        .await
+        .expect("read");
+
+        assert_eq!(body.as_deref(), Ok(&b"abcdefghijkl"[..]));
     }
 
     /// A fake [`MediaSourceManager`] returning fixed sources + attachments,
