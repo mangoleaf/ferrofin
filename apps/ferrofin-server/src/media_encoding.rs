@@ -745,13 +745,17 @@ impl MediaEncoder for DynMediaEncoder {
     }
 }
 
-/// Adapts the [`MediaSourceManager`] to the attachment extractor's
-/// [`MediaSourceResolver`] seam.
+/// Adapts the [`MediaSourceManager`] to the [`MediaSourceResolver`] seam of the
+/// subtitle encoder and the attachment extractor.
 ///
-/// Port of the `IMediaSourceManager.GetPlaybackMediaSources` call inside
-/// `GetAttachment`: resolves `(item_id, media_source_id)` to a
-/// [`MediaSourceInfo`]; each static source already carries its own attachment
-/// rows (so a merged alternate version resolves to ITS attachments).
+/// Port of the `GetPlaybackMediaSources(item, null, true, false)` call inside
+/// `SubtitleEncoder.GetSubtitles` and `AttachmentExtractor.GetAttachment`, so
+/// the subtitle and attachment routes only: a `.strm` item, or one whose first
+/// source lacks its main stream, is refreshed with the remote probe before its
+/// sources are read. The transcode planner never comes here: it hands the
+/// encoder and the extractor the source it holds, as `EncodingHelper` and
+/// `TranscodeManager` do. Each source carries its own attachment rows, so a
+/// merged alternate version resolves to ITS attachments.
 struct MediaSourceManagerResolver {
     media_sources: Arc<dyn MediaSourceManager>,
 }
@@ -763,9 +767,10 @@ impl MediaSourceResolver for MediaSourceManagerResolver {
         item_id: Uuid,
         media_source_id: &str,
     ) -> Result<Option<MediaSourceInfo>, ServiceError> {
+        // The nil id is upstream's `null` user.
         let sources = self
             .media_sources
-            .get_static_media_sources(item_id, false, None)
+            .get_playback_media_sources(item_id, Uuid::nil(), true, false)
             .await?;
         Ok(sources.into_iter().find(|s| s.id_matches(media_source_id)))
     }
@@ -953,10 +958,13 @@ mod tests {
         );
     }
 
-    /// A fake [`MediaSourceManager`] returning fixed sources + attachments.
+    /// A fake [`MediaSourceManager`] returning fixed sources + attachments,
+    /// recording each playback lookup's `(user, allow probe, path substitution)`.
+    #[derive(Default)]
     struct FakeSources {
         sources: Vec<MediaSourceInfo>,
         attachments: Vec<MediaAttachment>,
+        playback_calls: std::sync::Mutex<Vec<(Uuid, bool, bool)>>,
     }
 
     #[async_trait]
@@ -976,10 +984,15 @@ mod tests {
         async fn get_playback_media_sources(
             &self,
             _item_id: Uuid,
-            _user_id: Uuid,
-            _allow_media_probe: bool,
-            _enable_path_substitution: bool,
+            user_id: Uuid,
+            allow_media_probe: bool,
+            enable_path_substitution: bool,
         ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+            self.playback_calls.lock().unwrap().push((
+                user_id,
+                allow_media_probe,
+                enable_path_substitution,
+            ));
             Ok(self.sources.clone())
         }
         async fn get_static_media_sources(
@@ -1203,7 +1216,7 @@ mod tests {
     fn build_media_encoding_produces_real_pair() {
         let media_sources: Arc<dyn MediaSourceManager> = Arc::new(FakeSources {
             sources: vec![source("abc")],
-            attachments: Vec::new(),
+            ..FakeSources::default()
         });
         let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
         let tmp = tempfile::tempdir().unwrap();
@@ -1264,7 +1277,7 @@ mod tests {
         let _ = build_media_encoding(
             Arc::new(FakeSources {
                 sources: Vec::new(),
-                attachments: Vec::new(),
+                ..FakeSources::default()
             }),
             Arc::new(RecordingEncoder),
             config,
@@ -1566,7 +1579,7 @@ mod tests {
         vod.run_time_ticks = Some(90 * 60 * 10_000_000);
         let media_sources: Arc<dyn MediaSourceManager> = Arc::new(FakeSources {
             sources: vec![vod],
-            attachments: Vec::new(),
+            ..FakeSources::default()
         });
         let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
         let directory = tempfile::tempdir().expect("owned composition paths");
@@ -1796,7 +1809,7 @@ mod tests {
         let resolver = MediaSourceManagerResolver {
             media_sources: Arc::new(FakeSources {
                 sources: vec![primary, alternate],
-                attachments: Vec::new(),
+                ..FakeSources::default()
             }),
         };
         let outcome = resolver
@@ -1825,11 +1838,30 @@ mod tests {
         let resolver = MediaSourceManagerResolver {
             media_sources: Arc::new(FakeSources {
                 sources: vec![source("abc")],
-                attachments: Vec::new(),
+                ..FakeSources::default()
             }),
         };
         let outcome = resolver.resolve(Uuid::from_u128(1), "nope").await.unwrap();
         assert!(outcome.is_none());
+    }
+
+    /// `GetSubtitles` and `GetAttachment` read `GetPlaybackMediaSources(item,
+    /// null, true, false)`: no user, the probe a `.strm` (or an item with no
+    /// main stream) gets first, no path substitution.
+    #[tokio::test]
+    async fn resolver_reads_playback_sources_with_the_probe_allowed() {
+        let sources = Arc::new(FakeSources {
+            sources: vec![source("abc")],
+            ..FakeSources::default()
+        });
+        let resolver = MediaSourceManagerResolver {
+            media_sources: Arc::clone(&sources) as Arc<dyn MediaSourceManager>,
+        };
+        resolver.resolve(Uuid::from_u128(1), "abc").await.unwrap();
+        assert_eq!(
+            *sources.playback_calls.lock().unwrap(),
+            [(Uuid::nil(), true, false)]
+        );
     }
 
     #[tokio::test]
