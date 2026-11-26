@@ -57,7 +57,8 @@ use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::MediaSourceManager;
 use ferrofin_traits::media_encoding::{
-    AttachmentExtractor, HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
+    AttachmentExtractor, HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodeManager,
+    TranscodingJobType,
 };
 use ferrofin_traits::system::{PathManager, ServerApplicationPaths};
 use ferrofin_util::ticks::TICKS_PER_SECOND;
@@ -184,6 +185,9 @@ pub struct FerrofinStreamStatePlanner {
     /// The `-analyzeduration` / `-probesize` the media file and an external
     /// subtitle read with; Jellyfin's defaults unless configured.
     input_analysis: InputAnalysis,
+    /// The running transcode jobs, whose source a request naming one's play
+    /// session reads. `None` (unit tests) looks up no job.
+    jobs: Option<Arc<dyn TranscodeManager>>,
 }
 
 impl FerrofinStreamStatePlanner {
@@ -222,7 +226,16 @@ impl FerrofinStreamStatePlanner {
             virtual_folders: None,
             attachments: None,
             input_analysis: InputAnalysis::default(),
+            jobs: None,
         }
+    }
+
+    /// Wires the running transcode jobs, so a request naming a job's play
+    /// session reads that job's source (`StreamingHelpers.GetStreamingState`).
+    #[must_use]
+    pub fn with_jobs(mut self, jobs: Arc<dyn TranscodeManager>) -> Self {
+        self.jobs = Some(jobs);
+        self
     }
 
     /// Sets the configured `FFmpeg:analyzeduration` / `FFmpeg:probesize`
@@ -299,16 +312,27 @@ impl FerrofinStreamStatePlanner {
 
     /// Resolves the [`MediaSourceInfo`] for `request` through
     /// [`MediaSourceManager::get_stream_media_source`], the selection the
-    /// direct-play routes share.
+    /// direct-play routes share, with the source of the job running for the
+    /// request's play session.
     async fn resolve_media_source(
         &self,
         request: &HlsStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
+        let session = ferrofin_traits::media_encoding::stream_job_session(
+            request.play_session_id.as_deref(),
+            request.live_stream_id.as_deref(),
+        );
+        let job = match (&self.jobs, session) {
+            (Some(jobs), Some(id)) => jobs.get_transcoding_job_by_session(id).await?,
+            _ => None,
+        };
         self.media_sources
             .get_stream_media_source(
                 request.item_id,
                 request.media_source_id.as_deref(),
                 request.live_stream_id.as_deref(),
+                job.as_ref()
+                    .and_then(|job| job.media_source_for(request.user_id)),
             )
             .await
     }
@@ -4456,6 +4480,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan.media_path, "/media/movie.mkv");
+    }
+
+    #[tokio::test]
+    async fn plan_reads_the_source_of_the_job_running_for_its_play_session() {
+        use ferrofin_traits::media_encoding::TranscodeManager as _;
+        // `StreamingHelpers.GetStreamingState`: with no LiveStreamId, the job
+        // `GetTranscodingJob(PlaySessionId)` finds (ignoring case) supplies the
+        // source, whatever mediaSourceId names. An open live stream still wins;
+        // a blank or another play session, another user's job and a job ended
+        // since resolve the item's sources.
+        let jobs = Arc::new(ferrofin_mediaencoding::TranscodeManagerImpl::new(
+            ferrofin_mediaencoding::NoopSessionReporter,
+        ));
+        let owner = Uuid::from_u128(0x0A);
+        let running = MediaSourceInfo {
+            path: Some("/media/running.mkv".to_owned()),
+            ..source("other", vec![video_stream("h264"), audio_stream("aac")])
+        };
+        jobs.register_job(ferrofin_traits::media_encoding::TranscodingJobHandle {
+            play_session_id: Some("job-session".to_owned()),
+            path: "/transcodes/running.m3u8".to_owned(),
+            job_type: TranscodingJobType::Hls,
+            device_id: Some("dev".to_owned()),
+            live_stream_id: None,
+            media_source: Some(Arc::new(running)),
+            user_id: Some(owner),
+        });
+        let p = planner_with_live_stream(
+            vec![source(
+                "abc",
+                vec![video_stream("h264"), audio_stream("aac")],
+            )],
+            "open",
+            live_source("open"),
+        )
+        .with_jobs(Arc::clone(&jobs) as Arc<dyn TranscodeManager>);
+        let plan_for = |session: &str, user: Uuid, live_stream_id: Option<&str>| {
+            let mut req = request("abc");
+            req.play_session_id = Some(session.to_owned());
+            req.user_id = Some(user);
+            req.live_stream_id = live_stream_id.map(str::to_owned);
+            let p = &p;
+            async move {
+                p.plan(&req, false, None, PlaylistKind::Vod)
+                    .await
+                    .unwrap()
+                    .media_path
+            }
+        };
+
+        assert_eq!(
+            plan_for("JOB-SESSION", owner, None).await,
+            "/media/running.mkv"
+        );
+        assert_eq!(
+            plan_for("job-session", owner, Some("open")).await,
+            "/transcodes/tuner-buffer.ts"
+        );
+        assert_eq!(plan_for("  ", owner, None).await, "/media/movie.mkv");
+        assert_eq!(plan_for("sess", owner, None).await, "/media/movie.mkv");
+        let stranger = Uuid::from_u128(0x0B);
+        assert_eq!(
+            plan_for("job-session", stranger, None).await,
+            "/media/movie.mkv"
+        );
+        jobs.kill_transcoding_jobs("dev", Some("job-session"), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan_for("job-session", owner, None).await,
+            "/media/movie.mkv"
+        );
     }
 
     #[tokio::test]

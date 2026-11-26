@@ -2853,7 +2853,8 @@ pub trait MediaSourceManager: Send + Sync {
         Ok(map)
     }
 
-    /// Gets the playback media sources for an item and user.
+    /// Gets the playback media sources for an item and user. A nil `user_id`
+    /// is no user, upstream's `null` `User`: nothing per-user is applied.
     async fn get_playback_media_sources(
         &self,
         item_id: Uuid,
@@ -2919,30 +2920,33 @@ pub trait MediaSourceManager: Send + Sync {
     /// Port of the selection in `StreamingHelpers.GetStreamingState`: an open
     /// live stream (`live_stream_id`) wins outright, since its source is the
     /// buffered copy of the tuner and the static sources would dial it again.
-    /// Otherwise the item's static sources (unsubstituted: the server reads
-    /// the file itself), taking the one `media_source_id` names, the first when
+    /// Otherwise the source of the transcode job the request's `PlaySessionId`
+    /// names (`job_source`, upstream's `GetTranscodingJob(PlaySessionId)
+    /// .MediaSource`), whatever `media_source_id` says. Otherwise the item's
+    /// playback sources for no user and unsubstituted, as the server reads the
+    /// file itself (`GetPlaybackMediaSources(item, null, false, false)`:
+    /// symlinks resolved, placeholders dropped, the queried version first, then
+    /// widest first), taking the one `media_source_id` names, the first when
     /// none is named, and the first when the named id is the item's own. An id
     /// naming no source is `NotFound`, a deliberate divergence: upstream fails
     /// the request by accident, `400` for an unknown GUID (a null-source
     /// `ArgumentNullException`) and `500` for a non-GUID (`Guid.Parse`).
-    ///
-    /// TODO: two upstream steps are not ported. Upstream picks from
-    /// `GetPlaybackMediaSources`, whose list has symlinked paths resolved and is
-    /// ordered by `SortMediaSources` (placeholders dropped, widest first after
-    /// the preferred version). It also first reuses the source of the
-    /// `PlaySessionId`'s running transcode job. Fix path: select from
-    /// [`Self::get_playback_media_sources`] once it can be called without a
-    /// user, and look the job up through the transcode manager.
     async fn get_stream_media_source(
         &self,
         item_id: Uuid,
         media_source_id: Option<&str>,
         live_stream_id: Option<&str>,
+        job_source: Option<&MediaSourceInfo>,
     ) -> Result<MediaSourceInfo, ServiceError> {
         if let Some(live_stream_id) = live_stream_id.map(str::trim).filter(|id| !id.is_empty()) {
             return self.get_live_stream(live_stream_id).await;
         }
-        let sources = self.get_static_media_sources(item_id, false, None).await?;
+        if let Some(source) = job_source {
+            return Ok(source.clone());
+        }
+        let sources = self
+            .get_playback_media_sources(item_id, Uuid::nil(), false, false)
+            .await?;
         let chosen = match media_source_id.filter(|id| !id.is_empty()) {
             Some(id) => match sources.iter().position(|s| s.id_matches(id)) {
                 Some(i) => sources.into_iter().nth(i),

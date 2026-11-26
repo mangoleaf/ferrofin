@@ -74,7 +74,10 @@ pub enum TranscodingJobType {
 /// Port of the identity/reporting subset of `MediaEncoding/TranscodingJob.cs`.
 /// The full C# type owns the ffmpeg `Process` and mutable progress counters;
 /// the seam only needs to *name* a job (by play-session id, path, and type) and
-/// report its current progress, so this carries just that identifying surface.
+/// report its current progress, so this carries that identifying surface, plus
+/// the source the job reads and the user it was started for, which a later
+/// stream request of the same play session reads
+/// ([`Self::media_source_for`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TranscodingJobHandle {
     /// The playback-session id this job serves, if any.
@@ -90,6 +93,42 @@ pub struct TranscodingJobHandle {
     /// Teardown closes it when no session still needs it, so a client that
     /// vanishes without a `PlaybackStopped` does not hold a tuner open.
     pub live_stream_id: Option<String>,
+    /// The source the job reads (C# `TranscodingJob.MediaSource`), which a
+    /// stream request naming the job's play session reads too
+    /// ([`MediaSourceManager::get_stream_media_source`](crate::library::MediaSourceManager::get_stream_media_source)).
+    /// `None` for a job registered without one.
+    pub media_source: Option<std::sync::Arc<MediaSourceInfo>>,
+    /// The authenticated user the job was started for; `None` for a userless
+    /// API key and for a job registered without one.
+    pub user_id: Option<Uuid>,
+}
+
+impl TranscodingJobHandle {
+    /// The job's source as a stream request for `user_id` reads it
+    /// (`StreamingHelpers.GetStreamingState`'s `currentJob.MediaSource`).
+    ///
+    /// A request naming a user reads only a job started for that user: the
+    /// stream routes hold such a request to what the user may open, which the
+    /// job's own request passed. A request naming none (no credential, an API
+    /// key) reads any job's, as upstream.
+    #[must_use]
+    pub fn media_source_for(&self, user_id: Option<Uuid>) -> Option<&MediaSourceInfo> {
+        self.media_source
+            .as_deref()
+            .filter(|_| user_id.is_none() || self.user_id == user_id)
+    }
+}
+
+/// The play session whose running job a stream request reads its source from
+/// (`StreamingHelpers.GetStreamingState`): its `PlaySessionId` when that is not
+/// blank and no live stream is named, else `None`.
+#[must_use]
+pub fn stream_job_session<'a>(
+    play_session_id: Option<&'a str>,
+    live_stream_id: Option<&str>,
+) -> Option<&'a str> {
+    let named = |id: &str| !id.trim().is_empty();
+    play_session_id.filter(|id| named(id) && !live_stream_id.is_some_and(named))
 }
 
 /// A snapshot of a transcode's progress, reported to the session layer.
@@ -432,7 +471,9 @@ fn _assert_object_safe_keyframe_extractor(_: &dyn KeyframeExtractor) {}
 #[async_trait]
 pub trait TranscodeManager: Send + Sync {
     /// Looks up a running job by its playback-session id. Port of the
-    /// `GetTranscodingJob(string playSessionId)` overload.
+    /// `GetTranscodingJob(string playSessionId)` overload, which
+    /// `StreamingHelpers.GetStreamingState` asks for the source a transcode
+    /// reads.
     async fn get_transcoding_job_by_session(
         &self,
         play_session_id: &str,
@@ -1074,7 +1115,8 @@ pub trait HlsStreamManager: Send + Sync {
     ///
     /// Port of `TranscodeManager.GetTranscodingJob(playSessionId)`, which
     /// `PlaystateController.ValidatePlayMethod` asks before it keeps a
-    /// reported `Transcode`.
+    /// reported `Transcode`, and `StreamingHelpers.GetStreamingState` for the
+    /// source a direct-play request reads.
     ///
     /// # Errors
     ///
@@ -1098,7 +1140,61 @@ fn _assert_object_safe_hls_stream_manager(_: &dyn HlsStreamManager) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{TranscodingJobType, TranscodingProgress};
+    use super::{TranscodingJobHandle, TranscodingJobType, TranscodingProgress};
+    use ferrofin_model::dto::MediaSourceInfo;
+    use uuid::Uuid;
+
+    /// A request naming a user reads only that user's job's source; one naming
+    /// none reads any job's; a job registered without a source has none.
+    #[test]
+    fn a_jobs_source_is_read_by_its_own_user_or_a_request_naming_none() {
+        let (owner, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let job = |user_id, source: bool| TranscodingJobHandle {
+            play_session_id: Some("session".to_owned()),
+            path: "/transcodes/out.m3u8".to_owned(),
+            job_type: TranscodingJobType::Hls,
+            device_id: None,
+            live_stream_id: None,
+            media_source: source.then(|| std::sync::Arc::new(MediaSourceInfo::default())),
+            user_id,
+        };
+        for (job_user, source, request_user, read) in [
+            (Some(owner), true, Some(owner), true),
+            (Some(owner), true, None, true),
+            (None, true, None, true),
+            (Some(owner), true, Some(other), false),
+            (None, true, Some(owner), false),
+            (Some(owner), false, Some(owner), false),
+            (Some(owner), false, None, false),
+        ] {
+            assert_eq!(
+                job(job_user, source)
+                    .media_source_for(request_user)
+                    .is_some(),
+                read,
+                "job {job_user:?} with a source {source}, request {request_user:?}"
+            );
+        }
+    }
+
+    /// `GetStreamingState` asks for the job only with a `PlaySessionId` that is
+    /// not blank and no live stream named.
+    #[test]
+    fn a_stream_reads_a_job_only_for_a_named_session_without_a_live_stream() {
+        for (session, live, expected) in [
+            (Some("s1"), None, Some("s1")),
+            (Some("s1"), Some(" "), Some("s1")),
+            (Some("s1"), Some("live"), None),
+            (Some(" \t"), None, None),
+            (None, None, None),
+        ] {
+            assert_eq!(
+                super::stream_job_session(session, live),
+                expected,
+                "{session:?} {live:?}"
+            );
+        }
+    }
 
     #[test]
     fn transcoding_progress_default_is_all_none() {

@@ -111,7 +111,8 @@ impl HlsStreamManager for FakeHls {
         &self,
         _play_session_id: &str,
     ) -> Result<Option<TranscodingJobHandle>, ServiceError> {
-        unimplemented!("unused")
+        // A static request asks for its play session's job: none runs here.
+        Ok(None)
     }
 }
 

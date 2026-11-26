@@ -970,6 +970,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// whose operations have no row of their own yet, when the progressive body
 /// they answer with ends, and how many jobs ffmpeg may run for them and the
 /// HLS routes;
+/// `stream-media-source` is which media source a request on the stream, HLS
+/// and universal audio routes reads, whose operations have no row of their own
+/// yet;
 /// `stream-parameter-patterns` is which container, codec and level values the
 /// HLS and stream routes refuse before their action runs, whose operations
 /// have no row of their own yet;
@@ -1004,6 +1007,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "websocket-streams",
     "scan-failure-isolation",
     "progressive-transcode",
+    "stream-media-source",
     "stream-parameter-patterns",
     "transcode-arguments",
     "trickplay-extraction",
@@ -2100,6 +2104,55 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the exited job, where upstream adds the new one beside it and \
              OnTranscodeBeginRequest still finds the exited one first. Jellyfin bugs not \
              ported (gl-1373).",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "stream-media-source",
+        upstream_file: "Jellyfin.Api/Helpers/StreamingHelpers.cs",
+        upstream_method: "GetStreamingState",
+        ferrofin: "Which media source a request on the /Videos and /Audio stream routes, the \
+                   HLS routes and /Audio/{itemId}/universal reads; the rest of the streaming \
+                   state is not part of this row. ferrofin-traits library.rs \
+                   MediaSourceManager::get_stream_media_source (GetStreamingState's selection: \
+                   with a LiveStreamId the open live stream, \
+                   GetLiveStreamWithDirectStreamProvider; otherwise the source of the job \
+                   TranscodeManager.GetTranscodingJob(PlaySessionId) finds, \
+                   TranscodingJobHandle::media_source_for; otherwise \
+                   GetPlaybackMediaSources(item, null, false, false) and the source \
+                   MediaSourceId names, the first when none is named or it names the item \
+                   itself), reached from apps/ferrofin-server planner.rs resolve_media_source, \
+                   whose job comes from ferrofin-mediaencoding transcoding/manager.rs \
+                   get_transcoding_job_by_session (GetTranscodingJob(string playSessionId), \
+                   ignoring case) over the source start_ffmpeg records (OnTranscodeBeginning, \
+                   MediaSource = state.MediaSource), and from handlers/streaming.rs \
+                   static_source through HlsStreamManager::get_transcoding_job; ferrofin-core \
+                   media_source_manager.rs playback_sources for the nil user \
+                   (MediaSourceManager.GetPlaybackMediaSources with a null User: \
+                   GetStaticMediaSources without its per-user tail, ResolveSymlinkPaths, the \
+                   channel's tuner sources as GetDynamicMediaSources adds them, \
+                   SortMediaSources)",
+        date: "2026-11-26",
+        divergences: &[
+            "A mediaSourceId that names no source, or an item with no source, answers 404. \
+             Upstream's answer comes from an exception, not a check: a GUID naming no source \
+             is a 400 (AttachMediaSourceInfo's ArgumentNullException), a non-GUID a 500 \
+             (Guid.Parse) and an empty source list a 500 (mediaSources[0]). Jellyfin bug \
+             not ported, kept from the gl-8 fix.",
+            "A mediaSourceId selects its source in any GUID spelling; upstream compares the \
+             string exactly (StringComparison.Ordinal). Clients echo the id they were given, \
+             and an adopted database may hold the hyphenated form.",
+            "A request naming a user reads a running job's source only when the job was \
+             started for that user; with another user's job it reads the sources as if no \
+             job ran. Upstream reads any job's, but here the stream routes hold a request \
+             naming a user to the item and version that user may open (access-filtering, \
+             owner decision 2026-10-31, gl-1090), and another user's job could be for an \
+             item this one may not. A request naming no user reads any job's, as upstream.",
+            "A running job's source is the one the planner resolved. Upstream's StartFfMpeg \
+             first runs AcquireResources, which opens a source that RequiresOpening when no \
+             LiveStreamId is named and re-attaches the job to the opened stream, so a Live TV \
+             transcode started without a LiveStreamId hands later requests of its play \
+             session the opened stream's source there and the unopened tuner source here. \
+             Fix path: gl-1963.",
         ],
     },
     VerifiedSubsystem {

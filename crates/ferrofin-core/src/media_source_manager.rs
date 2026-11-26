@@ -244,6 +244,8 @@ impl FerrofinMediaSourceManager {
         allow_media_probe: bool,
         enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        // A nil id is upstream's null `User`: nothing per-user is read.
+        let user_id = Some(user_id).filter(|id| !id.is_nil());
         // Playback sources build on the user's static sources, which already
         // carry the per-user stream defaults (`SetDefaultAudioAndSubtitleStreamIndices`,
         // over `MediaStreamSelector`) and the playback permissions.
@@ -252,7 +254,7 @@ impl FerrofinMediaSourceManager {
                 item_id,
                 known,
                 enable_path_substitution,
-                Some(user_id),
+                user_id,
                 user,
                 true,
             )
@@ -266,14 +268,7 @@ impl FerrofinMediaSourceManager {
         {
             probe(path).await?;
             sources = self
-                .static_sources(
-                    item_id,
-                    None,
-                    enable_path_substitution,
-                    Some(user_id),
-                    None,
-                    true,
-                )
+                .static_sources(item_id, None, enable_path_substitution, user_id, None, true)
                 .await?;
         }
         resolve_symlink_paths(&mut sources, enable_path_substitution).await;
@@ -292,8 +287,11 @@ impl FerrofinMediaSourceManager {
     /// `GetStaticMediaSources(item, enablePathSubstitution, user)`: the trait's
     /// [`get_static_media_sources`](MediaSourceManager::get_static_media_sources), over the
     /// item's row and the user's row when the caller has read them already (`known`, `user`).
-    /// `read_timestamps` (PlaybackInfo only: nothing on the streaming, session or
-    /// DTO paths reads the value) reads each local TS/M2TS source's `Timestamp`.
+    /// `read_timestamps` (the playback sources only) reads each local TS/M2TS
+    /// source's `Timestamp`, which PlaybackInfo reports.
+    /// shortcut: the stream, subtitle and attachment routes read the playback
+    /// sources too, so they pay for one header read per such file and ignore
+    /// the value; pass the flag through if that read ever shows on slow storage.
     async fn static_sources(
         &self,
         item_id: Uuid,
@@ -2688,8 +2686,7 @@ mod tests {
     /// persists. PlaybackInfo reads it from a local TS/M2TS video's file, before
     /// path substitution rewrites the path, judging the container by the probed
     /// one when the item has it; a remote source (jellyfin/jellyfin#16290), a
-    /// missing file and the static sources the streaming paths read are never
-    /// given one.
+    /// missing file and the static sources are never given one.
     #[tokio::test]
     async fn playback_reports_a_local_m2ts_sources_transport_stream_timestamp() {
         use ferrofin_model::media_info::TransportStreamTimestamp;
@@ -2823,7 +2820,7 @@ mod tests {
             let mgr = &mgr;
             async move {
                 let source = mgr
-                    .get_stream_media_source(id, None, None)
+                    .get_stream_media_source(id, None, None, None)
                     .await
                     .expect("source");
                 mgr.input_container(&source).await.expect("container")
@@ -3071,6 +3068,9 @@ mod tests {
         /// How many consumers to report still watching after each close, in
         /// order (a `false` means "not the last one").
         remaining_consumers: std::sync::Mutex<Vec<bool>>,
+        /// Sources every channel offers after its `source-1`, as a tuner
+        /// appends its profiles.
+        more_sources: Vec<MediaSourceInfo>,
     }
 
     #[async_trait]
@@ -3209,7 +3209,7 @@ mod tests {
             &self,
             id: Uuid,
         ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-            Ok(vec![MediaSourceInfo {
+            let mut sources = vec![MediaSourceInfo {
                 id: Some("source-1".to_owned()),
                 path: Some(FAKE_TUNER_URL.to_owned()),
                 protocol: MediaProtocol::Http,
@@ -3232,7 +3232,9 @@ mod tests {
                     },
                 ],
                 ..Default::default()
-            }])
+            }];
+            sources.extend(self.more_sources.iter().cloned());
+            Ok(sources)
         }
         async fn open_channel_stream(
             &self,
@@ -3558,6 +3560,86 @@ mod tests {
             revoked[0].supports_transcoding,
             "video transcoding is a separate permission"
         );
+    }
+
+    /// `StreamingHelpers.GetStreamingState` with no `LiveStreamId`: the running
+    /// job's source wins, whatever `mediaSourceId` names; without one the
+    /// stream reads `GetPlaybackMediaSources(item, null, false, false)`, so a
+    /// channel's tuner profiles come widest first (`SortMediaSources`), not in
+    /// the order the tuner appended them.
+    #[tokio::test]
+    async fn a_stream_reads_the_running_jobs_source_else_the_widest_tuner_profile() {
+        let db = test_db().await;
+        let wide = MediaSourceInfo {
+            id: Some("source-uhd".to_owned()),
+            path: Some(FAKE_TUNER_URL.to_owned()),
+            protocol: MediaProtocol::Http,
+            media_streams: vec![ferrofin_model::entities_media::MediaStream {
+                stream_type: MediaStreamType::Video,
+                width: Some(3840),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mgr = manager(&db).with_live_tv(Arc::new(FakeLiveTv {
+            more_sources: vec![wide],
+            ..FakeLiveTv::default()
+        }));
+        let channel = Uuid::from_u128(0x778);
+        let streamed = |media_source_id, job: Option<MediaSourceInfo>| {
+            let mgr = &mgr;
+            async move {
+                mgr.get_stream_media_source(channel, media_source_id, None, job.as_ref())
+                    .await
+                    .expect("source")
+                    .id
+            }
+        };
+
+        assert_eq!(streamed(None, None).await.as_deref(), Some("source-uhd"));
+        assert_eq!(
+            streamed(Some("source-1"), None).await.as_deref(),
+            Some("source-1")
+        );
+        let running = MediaSourceInfo {
+            id: Some("the-jobs".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            streamed(Some("source-1"), Some(running)).await.as_deref(),
+            Some("the-jobs")
+        );
+    }
+
+    /// A nil user is upstream's `null` `User`: `GetStaticMediaSources`'
+    /// per-user tail does not run, so an audio item keeps its default-flagged
+    /// stream instead of `SetDefaultAudioAndSubtitleStreamIndices`' first one.
+    #[tokio::test]
+    async fn playback_sources_for_the_nil_user_apply_nothing_per_user() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x779);
+        seed_item(&db, id, BaseItemKind::Audio).await;
+        let mut row = crate::test_support::fetch_item(&db, id).await;
+        row.media_type = Some("Audio".to_owned());
+        crate::test_support::save_item(&db, &row).await;
+        let audio =
+            |stream_index, is_default| ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+                stream_index,
+                stream_type: 0,
+                codec: Some("flac".to_owned()),
+                is_default,
+                ..Default::default()
+            };
+        FerrofinMediaStreamRepository::new(db.clone())
+            .save_media_streams(id, &[audio(0, false), audio(1, true)])
+            .await
+            .unwrap();
+
+        let sources = manager(&db)
+            .get_playback_media_sources(id, Uuid::nil(), false, false)
+            .await
+            .unwrap();
+        assert_eq!(sources[0].default_audio_stream_index, Some(1));
     }
 
     #[tokio::test]

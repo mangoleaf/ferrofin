@@ -268,19 +268,14 @@ impl MediaSourceManager for StreamSources {
     }
     async fn get_playback_media_sources(
         &self,
-        _item_id: Uuid,
+        item_id: Uuid,
         _user_id: Uuid,
         _allow_media_probe: bool,
-        _enable_path_substitution: bool,
+        enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        let mut sources = vec![static_source(&self.path)];
-        if let Some(alternate) = &self.alternate {
-            sources.push(MediaSourceInfo {
-                id: Some(ALT_ID.to_string()),
-                ..static_source(alternate)
-            });
-        }
-        Ok(sources)
+        // The stream routes read these, for no user: the static ones.
+        self.get_static_media_sources(item_id, enable_path_substitution, None)
+            .await
     }
     async fn get_static_media_sources(
         &self,

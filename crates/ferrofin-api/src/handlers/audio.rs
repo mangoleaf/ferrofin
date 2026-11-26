@@ -382,7 +382,15 @@ async fn get_universal_audio_stream(
         // request names (the item's first by default), never a live stream.
         // Upstream passes the query's `mediaSourceId`, not the ranked source's
         // id, so with several versions and none named this is the first.
-        let source = static_source(&state, item_id, req.media_source_id.as_deref(), None).await?;
+        let source = static_source(
+            &state,
+            item_id,
+            req.media_source_id.as_deref(),
+            None,
+            req.play_session_id.as_deref(),
+            req.user_id,
+        )
+        .await?;
         // `UniversalAudioController` passes no container on its static path.
         return serve_static_source(&state, source, None, request).await;
     }

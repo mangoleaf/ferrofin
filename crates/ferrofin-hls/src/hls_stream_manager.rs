@@ -3839,6 +3839,8 @@ mod tests {
                 job_type: TranscodingJobType::Hls,
                 device_id: Some("dev".to_owned()),
                 live_stream_id: None,
+                media_source: None,
+                user_id: None,
             });
 
             let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
@@ -4100,6 +4102,8 @@ mod tests {
             job_type: TranscodingJobType::Hls,
             device_id: Some("dev".to_owned()),
             live_stream_id: None,
+            media_source: None,
+            user_id: None,
         });
         for id in ["play-1", "PLAY-1"] {
             let job = mgr.get_transcoding_job(id).await.unwrap();

@@ -84,7 +84,9 @@ pub(crate) struct StaticSource {
 /// to [`recording_access`]. Anything else is left for the route, which finds an
 /// unmirrored channel's tuner or answers as it always has. An open live stream
 /// is not checked: its id is a capability, as on `PlaybackInfo`, which reads it
-/// by id once the item passes.
+/// by id once the item passes. Nor is the source of a running job a request's
+/// `PlaySessionId` names: it is read only from a job started for this user,
+/// whose own request passed this check ([`static_source`]).
 ///
 /// [`get_item_by_id_for_user`]: ferrofin_traits::library::LibraryManager::get_item_by_id_for_user
 pub(crate) async fn require_streamable_item(
@@ -188,19 +190,37 @@ pub(crate) async fn recording_access(
 ///
 /// The source is chosen by
 /// [`get_stream_media_source`](ferrofin_traits::library::MediaSourceManager::get_stream_media_source),
-/// as for a transcode: the open live stream, else the version
+/// as for a transcode: the open live stream, else the source of the job
+/// running for `play_session_id` (one started for `user_id` when it names a
+/// user, [`TranscodingJobHandle::media_source_for`]), else the version
 /// `media_source_id` names, else the item's first. It is read from its encoder
 /// path when it names one. Returns `404` when there is no such source, or it
 /// has neither an encoder path nor a path (nothing to direct-stream).
+///
+/// [`TranscodingJobHandle::media_source_for`]: ferrofin_traits::media_encoding::TranscodingJobHandle::media_source_for
 pub(crate) async fn static_source(
     state: &AppState,
     item_id: Uuid,
     media_source_id: Option<&str>,
     live_stream_id: Option<&str>,
+    play_session_id: Option<&str>,
+    user_id: Option<Uuid>,
 ) -> Result<StaticSource, ApiError> {
+    let job = match ferrofin_traits::media_encoding::stream_job_session(
+        play_session_id,
+        live_stream_id,
+    ) {
+        Some(id) => state.hls.get_transcoding_job(id).await?,
+        None => None,
+    };
     let source = state
         .media_sources
-        .get_stream_media_source(item_id, media_source_id, live_stream_id)
+        .get_stream_media_source(
+            item_id,
+            media_source_id,
+            live_stream_id,
+            job.as_ref().and_then(|job| job.media_source_for(user_id)),
+        )
         .await?;
     // `EncodingHelper.AttachMediaSourceInfo`: a source that names how it is read
     // (an in-progress recording's `LiveRecordings` URL) is read that way.
@@ -260,6 +280,8 @@ pub(crate) async fn static_or_transcode(
             item_id,
             req.media_source_id.as_deref(),
             req.live_stream_id.as_deref(),
+            req.play_session_id.as_deref(),
+            req.user_id,
         )
         .await?;
         if is_audio || !matches!(source.video_type, Some(VideoType::BluRay | VideoType::Dvd)) {

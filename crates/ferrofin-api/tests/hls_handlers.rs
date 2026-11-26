@@ -52,6 +52,9 @@ struct FakeHls {
     rec: Arc<Recorded>,
     /// When set, every method fails with this error (drives the error paths).
     fail: Option<ServiceError>,
+    /// The transcode job [`HlsStreamManager::get_transcoding_job`] finds for
+    /// its play session.
+    running: Option<TranscodingJobHandle>,
 }
 
 impl FakeHls {
@@ -202,9 +205,13 @@ impl HlsStreamManager for FakeHls {
     }
     async fn get_transcoding_job(
         &self,
-        _play_session_id: &str,
+        play_session_id: &str,
     ) -> Result<Option<TranscodingJobHandle>, ServiceError> {
-        Ok(None)
+        Ok(self.running.clone().filter(|job| {
+            job.play_session_id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(play_session_id))
+        }))
     }
 }
 
@@ -448,7 +455,8 @@ impl ferrofin_traits::library::MediaSourceManager for StaticSources {
         _allow_media_probe: bool,
         _enable_path_substitution: bool,
     ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
-        Ok(Vec::new())
+        // What the stream routes read: the static sources.
+        Ok(self.0.clone())
     }
     async fn get_static_media_sources(
         &self,
@@ -706,6 +714,7 @@ fn ok_hls(served_path: &str, rec: Arc<Recorded>) -> Arc<FakeHls> {
         served_path: served_path.to_owned(),
         rec,
         fail: None,
+        running: None,
     })
 }
 
@@ -873,6 +882,7 @@ async fn a_refused_transcode_answers_503_with_retry_after() {
         served_path: "/unused".to_owned(),
         rec: Arc::new(Recorded::default()),
         fail: Some(ServiceError::busy("at the limit", 10)),
+        running: None,
     });
     let router = router_no_static(hls);
     let starting = starting_routes();
@@ -1855,6 +1865,7 @@ async fn playlist_seam_error_maps_to_status() {
         served_path: "/nope".to_owned(),
         rec: Arc::new(Recorded::default()),
         fail: Some(ServiceError::NotFound("no runtime".to_owned())),
+        running: None,
     });
     let router = router_with(
         hls,
@@ -2328,6 +2339,7 @@ async fn an_anonymous_transcode_of_a_missing_item_is_refused_alike() {
         served_path: "/unused".to_owned(),
         rec: Arc::clone(&rec),
         fail: Some(ServiceError::NotFound("no item".to_owned())),
+        running: None,
     });
     let app = router_no_static_with_auth(hls, Arc::new(DenyAuth));
     let path = format!("/Videos/{ITEM_ID}/stream.mp4");
@@ -2521,6 +2533,63 @@ async fn the_stream_route_literal_matches_in_any_case(
             container,
             "{path}"
         );
+    }
+}
+
+/// `StreamingHelpers.GetStreamingState`: a static request whose
+/// `PlaySessionId` names a running transcode reads that job's source, whatever
+/// `mediaSourceId` names; another play session, or another user's job, leaves
+/// it reading the version it names.
+#[tokio::test]
+async fn a_static_stream_reads_the_source_of_its_play_sessions_running_job() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = |id: &str, bytes: &[u8]| {
+        let file = directory.path().join(format!("{id}.mkv"));
+        std::fs::write(&file, bytes).unwrap();
+        ferrofin_model::dto::MediaSourceInfo {
+            id: Some(id.to_owned()),
+            path: Some(file.to_string_lossy().into_owned()),
+            ..ferrofin_model::dto::MediaSourceInfo::default()
+        }
+    };
+    let named = source("named", b"named version");
+    let running = Arc::new(source("running", b"running version"));
+    let requester = ok_auth_info().user_id();
+    let app = |job_user: Uuid| {
+        let hls = Arc::new(FakeHls {
+            served_path: "/unused".to_owned(),
+            rec: Arc::new(Recorded::default()),
+            fail: None,
+            running: Some(TranscodingJobHandle {
+                play_session_id: Some("job-session".to_owned()),
+                path: "/transcodes/running.m3u8".to_owned(),
+                job_type: ferrofin_traits::media_encoding::TranscodingJobType::Hls,
+                device_id: None,
+                live_stream_id: None,
+                media_source: Some(Arc::clone(&running)),
+                user_id: Some(job_user),
+            }),
+        });
+        router_with_sources(hls, Arc::new(ok_auth()), vec![named.clone()])
+    };
+    for (job_user, session, expected) in [
+        (requester, "JOB-SESSION", &b"running version"[..]),
+        (requester, "another", &b"named version"[..]),
+        (
+            Uuid::from_u128(0x0BE7),
+            "job-session",
+            &b"named version"[..],
+        ),
+    ] {
+        let path = format!(
+            "/Videos/{ITEM_ID}/stream?static=true&mediaSourceId=named&PlaySessionId={session}"
+        );
+        let response = app(job_user).oneshot(authed("GET", &path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], expected, "{job_user} {path}");
     }
 }
 
