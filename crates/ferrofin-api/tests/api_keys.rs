@@ -385,22 +385,36 @@ async fn create_key_passes_app_name() {
         Arc::new(FakeClientEventLogger),
         Arc::new(FakeConfig),
     );
-    let (status, _) = call(app, "POST", "/Auth/Keys?app=my-app").await;
+    let (status, _) = call(app.clone(), "POST", "/Auth/Keys?app=my-app").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(captured.created.lock().unwrap().as_slice(), &["my-app"]);
+    // The string binder does not trim: a padded name is stored as sent.
+    let (status, _) = call(app, "POST", "/Auth/Keys?app=%20padded%20").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        captured.created.lock().unwrap().as_slice(),
+        &["my-app", " padded "]
+    );
 }
 
+/// `[FromQuery, Required] string app`: absent, empty or nothing but white
+/// space is a 400 before the action runs (a live Jellyfin 12.4 answers "The
+/// app field is required." for all three), and no key is created.
 #[tokio::test]
-async fn create_key_missing_app_is_bad_request() {
+async fn create_key_missing_or_blank_app_is_bad_request() {
+    let keys = Arc::new(StubApiKeys::default());
+    let captured = keys.clone();
     let app = state(
         ok_auth(),
         Arc::new(FakeDevices),
-        Arc::new(StubApiKeys::default()),
+        keys,
         Arc::new(FakeClientEventLogger),
         Arc::new(FakeConfig),
     );
-    let (status, _) = call(app, "POST", "/Auth/Keys").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for uri in ["/Auth/Keys", "/Auth/Keys?app=", "/Auth/Keys?app=%20"] {
+        let (status, _) = call(app.clone(), "POST", uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+    assert!(captured.created.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
