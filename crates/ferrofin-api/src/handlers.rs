@@ -7447,9 +7447,6 @@ const RESUME_DIVERGENCES: &[&str] = &[
      count each leaf's own played row; v12.4's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
      alternate-version arm in item_count_service's played statements (gl-441).",
-    "Resume positions that Ferrofin builds before gl-46 saved for songs and for Sample, \
-     ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
-     until they are played again; new plays no longer save one. Fix path: gl-717.",
     SEARCH_TERM_ORIGINAL_TITLE_DIVERGENCE,
     "The 400 (an API key with no userId, or a value the query binder cannot convert), \
      403 (another user's id without the administrator role) and 404 (a userId naming no \

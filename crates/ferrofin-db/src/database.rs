@@ -1505,7 +1505,7 @@ const JELLYFIN_12_2_OPTIONAL_MIGRATIONS: [&str; 4] = [
 /// aside — anything newer, older or partial is
 /// refused rather than half-adopted. `baselined_versions` are the Ferrofin
 /// migrations whose *shape* the database already has, or whose data change it
-/// must not get (`0010`), recorded as applied without executing; every other
+/// must not get (`0010`, `0054`), recorded as applied without executing; every other
 /// migration runs.
 #[derive(Debug, Clone, Copy)]
 pub struct JellyfinGeneration {
@@ -1532,7 +1532,10 @@ pub struct JellyfinGeneration {
 /// Ferrofin left undated) is baselined everywhere, because Jellyfin leaves a
 /// played row undated on purpose (`Video.PropagatePlayedState`, a
 /// `Played`-only `POST /UserItems/{id}/UserData`) and the adoption time is no
-/// play date; `0030` (the `NormalizedUsername` column and index)
+/// play date; so is `0054` (which clears the resume positions builds before
+/// v1.4.0 saved for songs and some video extras), because a Jellyfin database
+/// holds one only where a client set it through that endpoint, and Jellyfin
+/// keeps it; `0030` (the `NormalizedUsername` column and index)
 /// is baselined wherever the database already owns it, `0032` (the 12.0
 /// shape) for 12.0, 12.1 and 12.2, and `0040` (12.2's partial `OwnerId`
 /// indexes) for 12.2 only. `0031`, `0033`, `0034`, `0039`, `0041`, `0042` and
@@ -1548,35 +1551,35 @@ pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 5] = [
         migration_ids: &JELLYFIN_10_11_8_MIGRATIONS,
         additional_ids: &[],
         optional_ids: &[],
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 54],
     },
     JellyfinGeneration {
         name: "10.11.11",
         migration_ids: &JELLYFIN_10_11_8_MIGRATIONS,
         additional_ids: &JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS,
         optional_ids: &[],
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 54],
     },
     JellyfinGeneration {
         name: "12.0.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
         additional_ids: &[],
         optional_ids: &JELLYFIN_12_0_OPTIONAL_MIGRATIONS,
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32, 54],
     },
     JellyfinGeneration {
         name: "12.1.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
         additional_ids: &JELLYFIN_12_1_ADDITIVE_MIGRATIONS,
         optional_ids: &JELLYFIN_12_1_OPTIONAL_MIGRATIONS,
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32, 54],
     },
     JellyfinGeneration {
         name: "12.2.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
         additional_ids: &JELLYFIN_12_2_ADDITIVE_MIGRATIONS,
         optional_ids: &JELLYFIN_12_2_OPTIONAL_MIGRATIONS,
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32, 40],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32, 40, 54],
     },
 ];
 
@@ -3950,6 +3953,12 @@ mod tests {
                 "{}: 0010 must not run on an adopted database",
                 generation.name
             );
+            // `0054` would clear a position a client set on a song through the API.
+            assert!(
+                generation.baselined_versions.contains(&54),
+                "{}: 0054 must not run on an adopted database",
+                generation.name
+            );
         }
         let by_name = |name: &str| {
             JELLYFIN_GENERATIONS
@@ -4149,6 +4158,68 @@ mod tests {
         .await
         .expect("0010 is recorded");
         assert_eq!(ran_for, 0, "0010 is recorded without running");
+    }
+
+    /// A position a client set on a song through `POST /UserItems/{id}/UserData`
+    /// is one Jellyfin keeps, so adoption keeps it: `0054`, which clears the
+    /// positions Ferrofin builds before v1.4.0 saved for songs, is recorded for
+    /// an adopted database without running.
+    #[tokio::test]
+    async fn adoption_keeps_a_songs_position() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture(&path, &JELLYFIN_10_11_8_MIGRATIONS).await;
+        {
+            use sqlx::ConnectOptions;
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .connect()
+                .await
+                .expect("open fixture db");
+            sqlx::raw_sql(
+                r#"INSERT INTO "Users"
+                    ("Id","AuthenticationProviderId","DisplayCollectionsView","DisplayMissingEpisodes",
+                     "EnableAutoLogin","EnableLocalPassword","EnableNextEpisodeAutoPlay",
+                     "EnableUserPreferenceAccess","HidePlayedInLatest","InternalId",
+                     "InvalidLoginAttemptCount","MaxActiveSessions","MustUpdatePassword",
+                     "PasswordResetProviderId","PlayDefaultAudioTrack","RememberAudioSelections",
+                     "RememberSubtitleSelections","RowVersion","SubtitleMode","SyncPlayAccess","Username")
+                   VALUES ('EEF5FFE4-B970-4ED2-8CE8-F1881E032051','auth',0,0,0,0,1,1,1,1,0,0,0,
+                           'reset',1,1,1,0,0,0,'listener');
+                   INSERT INTO "BaseItems" ("Id","IsFolder","IsInMixedFolder","IsLocked","IsMovie",
+                     "IsRepeat","IsSeries","IsVirtualItem","Type")
+                   VALUES ('00000000-0000-0000-0000-0000000000AA',0,0,0,0,0,0,0,
+                           'MediaBrowser.Controller.Entities.Audio.Audio');
+                   INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite",
+                     "PlayCount","PlaybackPositionTicks","Played")
+                   VALUES ('00000000-0000-0000-0000-0000000000AA',
+                           'EEF5FFE4-B970-4ED2-8CE8-F1881E032051','aa',0,1,2000000000,0);"#,
+            )
+            .execute(&mut conn)
+            .await
+            .expect("seed a song with a position");
+            sqlx::Connection::close(conn).await.expect("close");
+        }
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("adoption succeeds");
+        let position: i64 = sqlx::query_scalar(r#"SELECT "PlaybackPositionTicks" FROM "UserData""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("user data");
+        assert_eq!(
+            position, 2_000_000_000,
+            "adoption keeps the song's position"
+        );
+        let ran_for: i64 = sqlx::query_scalar(
+            r#"SELECT execution_time FROM "_sqlx_migrations" WHERE version = 54"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("0054 is recorded");
+        assert_eq!(ran_for, 0, "0054 is recorded without running");
     }
 
     /// A Ferrofin-native database keeps `0010`'s backfill: there a played row
