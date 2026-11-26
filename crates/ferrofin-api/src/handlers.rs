@@ -6428,16 +6428,15 @@ pub const VERIFIED: &[Verified] = &[
                on a task of its own: upstream passes CancellationToken.None), \
                extract_attachment (AttachmentExtractor.GetAttachment, GetAttachmentStream, \
                ExtractAttachment, ExtractAttachmentInternal) → apps/ferrofin-server \
-               media_encoding.rs MediaSourceManagerResolver, FfmpegAttachmentIo open_file, \
+               media_encoding.rs MediaSourceManagerResolver (GetPlaybackMediaSources(item, \
+               null, true, false): ferrofin-core media_source_manager.rs \
+               get_playback_media_sources, playback_sources, playback_probe_path: a .strm \
+               item, or one whose first non-placeholder source lacks its main stream, is \
+               refreshed through item_refresh_remote_probe, EnableRemoteContentProbe and a \
+               FullRefresh, before its sources are read again), FfmpegAttachmentIo open_file, \
                run_ffmpeg → handlers/streaming.rs opened_file_response (FileStreamResult)",
-        date: "2026-11-11",
+        date: "2026-11-26",
         divergences: &[
-            "The media source comes from GetStaticMediaSources: upstream's \
-         GetPlaybackMediaSources(item, null, true, false) first re-probes a .strm item (and \
-         one with no main stream), so a .strm whose target changed serves its last probe's \
-         attachments here. Fix path: gl-1519. Its dynamic sources, a channel's tuner \
-         streams, are in the static list here, and list no attachments on either side (a \
-         404).",
             "A nil videoId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A mediaSourceId selects its source in any GUID spelling; upstream compares the N \
          form, ignoring case. Clients echo the id they were given, and an adopted database \
