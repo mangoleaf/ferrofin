@@ -1778,6 +1778,37 @@ pub trait UserManager: Send + Sync {
     /// Creates a user with the given name and returns the new row.
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError>;
 
+    /// Creates the first-run administrator `name` and returns the new row, as
+    /// upstream's `InitializeAsync` creates its user (`UserManager.cs:745-772`):
+    /// `IsAdministrator`, `EnableContentDeletion` and
+    /// `EnableRemoteControlOfOtherUsers` are set on the new user before its one
+    /// save, and no policy is saved after it. [`Self::initialize`] creates the
+    /// same user under the host user's name.
+    ///
+    /// The default creates the user and then grants the three with
+    /// [`Self::update_policy`], so impls without a store of their own compile
+    /// unchanged; the concrete manager writes them with the user's other rows.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::InvalidInput`] for a name that is not valid or is
+    /// already taken, or whatever the save surfaces.
+    async fn create_first_admin(&self, name: &str) -> Result<UserEntity, ServiceError> {
+        let user = self.create_user(name).await?;
+        let user_id =
+            Uuid::parse_str(&user.id).map_err(|error| ServiceError::backend(error.to_string()))?;
+        let mut policy = self
+            .get_user_dto(&user, None)
+            .await?
+            .policy
+            .unwrap_or_default();
+        policy.is_administrator = true;
+        policy.enable_content_deletion = true;
+        policy.enable_remote_control_of_other_users = true;
+        self.update_policy(user_id, &policy).await?;
+        Ok(user)
+    }
+
     /// Creates a user `name` whose sign-ins belong to an outside
     /// authentication provider, set up as `setup` says, and returns the new
     /// row. Upstream's LDAP plugin calls `CreateUserAsync`, sets the provider

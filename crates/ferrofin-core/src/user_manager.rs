@@ -1068,12 +1068,12 @@ impl FerrofinUserManager {
                ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
                 "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
                 "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
-                "HidePlayedInLatest", "CastReceiverId", "InternalId", "InvalidLoginAttemptCount",
+                "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
                 "MaxActiveSessions", "MustUpdatePassword",
                 "PasswordResetProviderId", "PlayDefaultAudioTrack",
                 "RememberAudioSelections", "RememberSubtitleSelections",
                 "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
-               VALUES (?1, ?2, 0, 0, 0, 0, 1, 1, 1, 'F007D354', ?3, 0, 0, 0, ?4, 1, 1, 1, 0, 0, 0, ?5, ?6)"#,
+               VALUES (?1, ?2, 0, 0, 0, 0, 1, 1, 1, ?3, 0, 0, 0, ?4, 1, 1, 1, 0, 0, 0, ?5, ?6)"#,
         )
         .bind(&id_str)
         .bind(DEFAULT_AUTH_PROVIDER_ID)
@@ -1161,12 +1161,7 @@ impl UserManager for FerrofinUserManager {
             .filter(|n| valid_username(n))
             .unwrap_or_else(|| DEFAULT_BOOTSTRAP_USERNAME.to_owned());
 
-        // Granted on the entity before its `Add`, so inserted at `RowVersion` 0.
-        self.insert_user(&default_name, BOOTSTRAP_PERMISSIONS, |_tx, _uid| {
-            Box::pin(async { Ok(()) })
-        })
-        .await?;
-        Ok(())
+        self.create_first_admin(&default_name).await.map(drop)
     }
 
     async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
@@ -1371,6 +1366,15 @@ impl UserManager for FerrofinUserManager {
         // transaction — see its docs for why it cannot live out here.
         self.insert_user(name, &[], |_tx, _uid| Box::pin(async { Ok(()) }))
             .await
+    }
+
+    async fn create_first_admin(&self, name: &str) -> Result<UserEntity, ServiceError> {
+        require_valid_username(name)?;
+        // Granted on the entity before its `Add`, so inserted at `RowVersion` 0.
+        self.insert_user(name, BOOTSTRAP_PERMISSIONS, |_tx, _uid| {
+            Box::pin(async { Ok(()) })
+        })
+        .await
     }
 
     async fn create_external_user(
@@ -3370,9 +3374,11 @@ mod tests {
         let user = mgr.create_user("alice").await.expect("create");
         assert_eq!(user.username, "alice");
         assert_eq!(user.authentication_provider_id, DEFAULT_AUTH_PROVIDER_ID);
-        // Jellyfin User defaults: Latest hides played, and the default Cast receiver id.
+        // Jellyfin User defaults: Latest hides played, and no Cast receiver id
+        // (the constructor sets none; the DTO resolves it to the first
+        // configured receiver).
         assert!(user.hide_played_in_latest);
-        assert_eq!(user.cast_receiver_id.as_deref(), Some("F007D354"));
+        assert_eq!(user.cast_receiver_id, None);
 
         // Duplicate (case-insensitive) is rejected with Jellyfin's
         // ArgumentException text — a 400, never the index's constraint error.
