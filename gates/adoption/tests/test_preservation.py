@@ -17,8 +17,8 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from metadata import CheckError
-from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, PAGE_SIZE, RUNS_12_2_ROUTINES, UPGRADED_FROM_10,
-                          all_items, before_first_scan, comparable, held_to,
+from preservation import (FROM_ORACLE, GENERATIONS, MERGED_KEYS, ORACLE, PAGE_SIZE, RUNS_12_2_ROUTINES, UPGRADED_FROM_10,
+                          UPGRADED_FROM_12_0, all_items, before_first_scan, comparable, held_to,
                           compare, expectation, normalize, run_matrix, seed_failures, seed_state, validate,
                           validate_oracle, validate_seed_state, same_artwork, verify_database)
 from synthetic import VERSIONS, FRESH_INSTALL
@@ -399,6 +399,59 @@ class OracleExpectationTest(unittest.TestCase):
         upgraded = {'versions': [self.PRIMARY, self.AS_VIDEO]}
         with self.assertRaisesRegex(CheckError, 'serve different versions'):
             expectation('10.11.8', self.baseline, self.oracle, upgraded)
+
+
+class MergedVersionsExpectationTest(unittest.TestCase):
+    """gl-1954: Jellyfin 12.0's scan lists each pair merged by hand apart; 12.1 on that database
+    and 12.4 list one, and so does Ferrofin. Only the merged movies' entries move."""
+    # One merged pair: 12.0 lists both, 12.4 hides the version.
+    PRIMARY, VERSION, OTHER = 'aa' * 16, 'bb' * 16, 'cc' * 16
+    MERGED = [PRIMARY, VERSION]
+
+    def snapshot(self, listed):
+        return {'visibility': {USERS[1]: sorted([*listed, self.OTHER]), USERS[2]: sorted([*listed])},
+                'relationships': {**{item: {'Name': item} for item in listed}, self.OTHER: {'Name': 'other'}},
+                'subtitles': {**{item: [['eng', True, 'subrip']] for item in listed}, self.OTHER: []},
+                'versions': ['own']}
+
+    def setUp(self):
+        self.baseline = self.snapshot([self.PRIMARY, self.VERSION])   # what 12.0 served
+        self.oracle = self.snapshot([self.PRIMARY])                    # what 12.4 serves
+        self.oracle['versions'] = ['oracle']
+
+    def test_a_12_0_source_takes_the_merged_movies_entries_from_the_oracle(self):
+        self.assertEqual(MERGED_KEYS, ('visibility', 'relationships', 'subtitles'))
+        expected = expectation('12.0', self.baseline, self.oracle, {}, merged=self.MERGED, through_12_0=self.oracle)
+        self.assertEqual(compare(expected, self.snapshot([self.PRIMARY])), [])
+        # Listing the version apart, as 12.0 did, is not what 12.1 and later do on that database.
+        self.assertEqual(sorted(compare(expected, self.snapshot([self.PRIMARY, self.VERSION]))),
+                         ['relationships', 'subtitles', 'visibility'])
+        self.assertEqual(self.baseline['visibility'][USERS[1]], sorted([self.PRIMARY, self.VERSION, self.OTHER]),
+                         'the baseline is not modified')
+
+    def test_every_other_entry_stays_the_12_0_baseline(self):
+        expected = expectation('12.0', self.baseline, self.oracle, {}, merged=self.MERGED, through_12_0=self.oracle)
+        self.assertEqual(expected['versions'], ['own'], 'whole keys never come from the oracle')
+        self.assertEqual(expected['relationships'][self.OTHER], {'Name': 'other'})
+        self.assertIn(self.OTHER, expected['visibility'][USERS[1]])
+        # Another movie that only the 12.0 baseline lists is still expected.
+        self.baseline['visibility'][USERS[1]].append('dd' * 16)
+        expected = expectation('12.0', self.baseline, self.oracle, {}, merged=self.MERGED, through_12_0=self.oracle)
+        self.assertIn('dd' * 16, expected['visibility'][USERS[1]])
+
+    def test_the_oracle_must_agree_with_the_real_upgrade_of_the_12_0_database(self):
+        with self.assertRaisesRegex(CheckError, 'merged movies'):
+            expectation('12.0', self.baseline, self.oracle, {}, merged=self.MERGED, through_12_0=self.baseline)
+
+    def test_a_12_0_source_without_the_merged_ids_or_the_upgrade_is_refused(self):
+        for merged, through in (((), self.oracle), (self.MERGED, None)):
+            with self.assertRaisesRegex(CheckError, 'rebuild the fixtures'):
+                expectation('12.0', self.baseline, self.oracle, {}, merged=merged, through_12_0=through)
+
+    def test_other_12_x_sources_keep_their_own_baseline(self):
+        for version in ('12.1', '12.2', '12.4'):
+            self.assertIs(expectation(version, self.baseline, self.oracle, {}, merged=self.MERGED,
+                                      through_12_0=self.baseline), self.baseline)
 
 
 class BeforeFirstScanTest(unittest.TestCase):
@@ -917,6 +970,19 @@ class SeededAdoptionTest(unittest.TestCase):
             run_matrix(self.dir, 'unused-image', None, 0)
         self.assertFalse((self.dir / 'work').exists())
 
+    def test_the_matrix_refuses_a_12_0_source_without_the_real_12_0_upgrade(self):
+        from synthetic import recipe
+        for name in (ORACLE, UPGRADED_FROM_10):
+            ready = self.dir / name
+            ready.mkdir()
+            (ready / 'synthetic-ready.json').write_text(json.dumps({'recipe': recipe()}))
+            (ready / 'preservation.json').write_text('{}')
+        # Checked before any container starts, for a full run and for the 12.0 source alone.
+        for only in (None, 'jellyfin-12.0'):
+            with self.assertRaisesRegex(CheckError, f'build {UPGRADED_FROM_12_0} first'):
+                run_matrix(self.dir, 'unused-image', only, 0)
+            self.assertFalse((self.dir / 'work' / 'jellyfin-10.11.8').exists())
+
     def test_a_refused_matrix_leaves_the_last_report_alone(self):
         # a refusal (no oracle; a recipe change; a previous run's copy still in work/) happens before any fixture starts,
         # and starting a report forgets the previous one: the failure report the error tells the user to inspect must survive
@@ -1032,6 +1098,8 @@ class SeededAdoptionTest(unittest.TestCase):
     def test_the_12_2_to_12_4_paths_upgrade_from_their_contract_parents(self):
         paths = {name: parent for name, _, parent in VERSIONS}
         versions = {name: version for name, version, _ in VERSIONS}
+        # The merged versions' guard (gl-1954) is 12.1 upgrading the 12.0 fixture's own database.
+        self.assertEqual((versions[UPGRADED_FROM_12_0], paths[UPGRADED_FROM_12_0]), ('12.1', 'jellyfin-12.0'))
         # The 12.2, 12.3 and 12.4 upgrade routes derive from their contract parents (12.3 on the
         # fullest 12.2 route, 12.4 on that 12.3 one); each fresh install (FRESH_INSTALL) is a
         # first run of its release with no parent, the Debian-layout one included.

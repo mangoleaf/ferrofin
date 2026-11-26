@@ -232,15 +232,62 @@ def scrub(value, ids):
 
 # The real 10.11.8 -> 12.4 upgrade: the direct evidence for what 12.4 serves from a 10.11 source.
 UPGRADED_FROM_10 = "jellyfin-12.4-from-10"
+# The real upgrade of the 12.0 fixture's database: the direct evidence for what the next release
+# serves of a 12.0 source.
+UPGRADED_FROM_12_0 = "jellyfin-12.1-from-12"
+# Snapshot keys whose entries for the movies merged as versions (manifest "merged_pairs") come from
+# the oracle on a 12.0 source. Jellyfin 12.0's library scan did not see a version merged by hand
+# (hidden from its children query) and took it for a new item, so 12.0 lists each pair apart; 12.1
+# keeps such a version visible to the scan (jellyfin/jellyfin e9dae9ddb2, "Keep merged versions
+# visible to the library scan"), and 12.1 on the same database, 12.4 and Ferrofin list one (gl-1954).
+MERGED_KEYS = ("visibility", "relationships", "subtitles")
 
 
-def expectation(version, baseline, oracle, upgraded):
+def merged_entries(data, key, merged):
+    """`data[key]` restricted to the merged movies: their membership of each user's list, or
+    their own entries."""
+    if key == "visibility":
+        return {user: sorted(set(listed) & merged) for user, listed in data[key].items()}
+    return {item: value for item, value in data[key].items() if item in merged}
+
+
+def with_merged_from(baseline, source, merged):
+    """`baseline` with the merged movies' entries of the MERGED_KEYS taken from `source`; every
+    other entry stays the baseline's."""
+    result = copy.deepcopy(baseline)
+    for key in MERGED_KEYS:
+        taken = merged_entries(source, key, merged)
+        if key == "visibility":
+            result[key] = {user: sorted((set(listed) - merged) | set(taken.get(user, ())))
+                           for user, listed in result[key].items()}
+        else:
+            result[key] = {**{item: value for item, value in result[key].items() if item not in merged},
+                           **taken}
+    return result
+
+
+def expectation(version, baseline, oracle, upgraded, merged=(), through_12_0=None):
     """What Ferrofin must serve after adopting a source of `version` whose own release served
     `baseline`. A 10.11 source takes the FROM_ORACLE keys from the 12.4 oracle (`oracle`),
-    provided the real 10.11 -> 12.4 upgrade (`upgraded`) serves the same; a 12.x source keeps
-    its own release's baseline. Every stage is held to these post-scan values, including the
-    pre-scan ones (but for before_first_scan's allowance): Ferrofin's boot repair re-keys the
-    version in place, where 12.x serves the primary alone until its scan re-creates the version."""
+    provided the real 10.11 -> 12.4 upgrade (`upgraded`) serves the same; a 12.0 source takes the
+    merged movies' (`merged`, normalized ids) entries of the MERGED_KEYS from the oracle, provided
+    the real upgrade of that database (`through_12_0`, UPGRADED_FROM_12_0's baseline) serves the
+    same; any other 12.x source keeps its own release's baseline. Every stage is held to these
+    post-scan values, including the pre-scan ones (but for before_first_scan's allowance):
+    Ferrofin's boot repair re-keys the version in place, where 12.x serves the primary alone until
+    its scan re-creates the version."""
+    if version == "12.0":
+        merged = set(merged)
+        if not merged or through_12_0 is None:
+            raise CheckError("a 12.0 source needs the merged movies' ids and the "
+                             f"{UPGRADED_FROM_12_0} baseline; rebuild the fixtures")
+        differ = [key for key in MERGED_KEYS
+                  if merged_entries(oracle, key, merged) != merged_entries(through_12_0, key, merged)]
+        if differ:
+            raise CheckError(f"{UPGRADED_FROM_12_0} and {ORACLE} serve the merged movies' "
+                             f"{', '.join(differ)} differently, so the oracle cannot stand for the 12.0 "
+                             "upgrade: rebuild the fixtures, and if they still differ, revisit MERGED_KEYS")
+        return with_merged_from(baseline, oracle, merged)
     if not version.startswith("10.11"):
         return baseline
     differ = [key for key in FROM_ORACLE if oracle[key] != upgraded[key]]
@@ -562,6 +609,13 @@ def _run_matrix(root, image, only, port, recorder):
     if not upgraded_ready.exists() or json.loads(upgraded_ready.read_text()).get("recipe") != recipe():
         raise CheckError(f"synthetic Jellyfin {ORACLE_RELEASE} upgrade from 10.11 missing; build {UPGRADED_FROM_10} first")
     upgraded = json.loads((root / UPGRADED_FROM_10 / "preservation.json").read_text())
+    through_12_0 = None
+    if only in (None, "jellyfin-12.0"):
+        # Checked before any fixture starts, as the 10.11 upgrade is: the 12.0 source needs it.
+        through_ready = root / UPGRADED_FROM_12_0 / "synthetic-ready.json"
+        if not through_ready.exists() or json.loads(through_ready.read_text()).get("recipe") != recipe():
+            raise CheckError(f"synthetic Jellyfin 12.1 upgrade of the 12.0 database missing; build {UPGRADED_FROM_12_0} first")
+        through_12_0 = json.loads((root / UPGRADED_FROM_12_0 / "preservation.json").read_text())
     for name, version, _ in VERSIONS:
         if only and only != name:
             continue
@@ -575,7 +629,8 @@ def _run_matrix(root, image, only, port, recorder):
         if json.loads(ready.read_text()).get("recipe") != recipe():
             raise CheckError("synthetic recipe changed; rebuild the fixture before testing")
         manifest = json.loads((source / "synthetic.json").read_text())
-        expected = expectation(version, json.loads((source / "preservation.json").read_text()), oracle, upgraded)
+        expected = expectation(version, json.loads((source / "preservation.json").read_text()), oracle, upgraded,
+                               merged=normalize(manifest.get("merged_pairs", [])), through_12_0=through_12_0)
         seeds = manifest.get("seeds")
         if not seeds or not (source / "seeds.json").exists():
             raise CheckError("synthetic fixture lacks the database seeds; rebuild it")
