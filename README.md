@@ -406,7 +406,9 @@ Thank you for the consideration.
 `GPL-3.0-only`. Ferrofin follows the `GPL-3.0-only` metadata of the packages it derives from.
 See [`LICENSE`](LICENSE).
 
-The server binary links libjpeg-turbo, so this software is based in part on the work of the
-Independent JPEG Group. libjpeg-turbo's own licence is in
-[`contrib/debian/copyright`](contrib/debian/copyright), which the `.deb` and the release
-archives carry.
+The server binary is built with third-party Rust crates and C libraries that keep their own
+licenses. Every artifact carries their notices in `THIRD-PARTY-NOTICES.txt`, generated from
+`Cargo.lock` by [`scripts/third-party-notices.sh`](scripts/third-party-notices.sh), beside
+[`contrib/debian/copyright`](contrib/debian/copyright): in `/usr/share/doc/ferrofin/` in the
+image and the `.deb`, and at the top of a release archive. The binary links libjpeg-turbo, so
+this software is based in part on the work of the Independent JPEG Group.
