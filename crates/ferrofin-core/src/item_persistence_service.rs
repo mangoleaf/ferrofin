@@ -2089,7 +2089,13 @@ impl FerrofinItemPersistenceService {
             .collect();
         let provider_ids = self.provider_ids_for_items(&ids).await?;
 
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         let mut updated: u64 = 0;
         // Every processed series, changed or not — a season whose own key went
         // stale under an unchanged series key is repaired too (upstream fills
@@ -3086,7 +3092,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         if pending.is_empty() {
             return Ok(());
         }
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         // Decided again under the writer: a merge or a refresh may have
         // written between the read and here.
         let decided = local_version_writes(&mut tx, &pending)
@@ -3231,7 +3243,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         if ids.is_empty() {
             return Ok(false);
         }
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         let written = write_scanned_members(&mut tx, &guid_to_db(box_set), ids, false)
             .await
             .map_err(db_err)?;
@@ -3419,7 +3437,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         values: &[(i32, String)],
     ) -> Result<(), ServiceError> {
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         write_item_values(&mut tx, item_id, values, self.by_name_identity.as_ref()).await?;
         tx.commit().await.map_err(db_err)
     }
@@ -3428,13 +3452,20 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         &self,
         items: &[(Uuid, Vec<(i32, String)>)],
     ) -> Result<(), ServiceError> {
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         for (item_id, values) in items {
             write_item_values(&mut tx, *item_id, values, self.by_name_identity.as_ref()).await?;
         }
         tx.commit().await.map_err(db_err)
     }
 
+    #[allow(clippy::too_many_lines)] // one transaction: the lookup, the insert and its read-back
     async fn ensure_by_name_item(
         &self,
         kind: BaseItemKind,
@@ -3446,7 +3477,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             return Ok(None);
         };
         let clean = get_clean_value(name);
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         // An existing row wins, whatever id it carries — Jellyfin's own on an
         // adopted database, or the one a scan materialized.
         let existing: Option<String> = sqlx::query_scalar(
@@ -4142,11 +4179,18 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .collect())
     }
 
+    #[allow(clippy::too_many_lines)] // one transaction: every row the promotion moves
     async fn promote_version(&self, promotion: &VersionPromotion) -> Result<(), ServiceError> {
         let old = guid_to_db(promotion.old_primary);
         let new = guid_to_db(promotion.new_primary);
         let new_key = promotion.new_primary.as_simple().to_string();
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         let data: Option<Option<String>> =
             sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
                 .bind(&new)
@@ -4881,7 +4925,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             return Ok(());
         }
         // The reattach reads what is still detached under the writer.
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         for identity in
             crate::user_data_key_repository::load_identities(&mut tx, &[guid_to_db(id)]).await?
         {
@@ -4934,7 +4984,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         loop {
             // Release the single writer between pages. No metadata read here
             // can become stale before its recovery write in this transaction.
-            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            // Reads before it writes: lock first (see `Database::writer`).
+            let mut tx = self
+                .db
+                .writer()
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(db_err)?;
             // Every row, paged by id; the videos another one owns (local
             // versions, stacked parts: owned, no extra) are no destination —
             // their primary is ([`is_owned_video`]).
@@ -8813,6 +8869,62 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(left, vec![guid_to_db(kept)]);
+    }
+
+    /// An item-value save, on the scan's save path, reads the owner's type
+    /// before it writes, so it takes the write lock first, as a delete does:
+    /// another process's write makes it wait. A deferred transaction failed
+    /// at once with SQLITE_BUSY, whatever the busy timeout.
+    #[tokio::test]
+    async fn an_item_value_save_waits_for_another_processes_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A file database opened twice: two processes' connections.
+        let url = format!("sqlite://{}", tmp.path().join("values.db").display());
+        let db = ferrofin_db::Database::connect(&url).await.expect("connect");
+        db.run_migrations().await.expect("migrations apply");
+        let other = ferrofin_db::Database::connect(&url).await.expect("connect");
+        let svc = std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let movie = Uuid::new_v4();
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let mut held = other
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("the other process writes");
+        sqlx::query(r#"UPDATE "BaseItems" SET "Name" = 'renamed' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(movie))
+            .execute(&mut *held)
+            .await
+            .expect("rename");
+        let mut save = tokio::spawn({
+            let svc = std::sync::Arc::clone(&svc);
+            async move {
+                svc.save_item_values(movie, &[(2, "Drama".to_owned())])
+                    .await
+            }
+        });
+        // Long enough for a deferred save to read and fail its first write.
+        if let Ok(early) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut save).await
+        {
+            panic!("the save went on while another process held the write lock: {early:?}");
+        }
+        held.commit().await.expect("commit");
+        tokio::time::timeout(std::time::Duration::from_secs(20), save)
+            .await
+            .expect("the save finishes")
+            .expect("join")
+            .expect("the save waits for the other write, then links the genre");
+        let genres: Vec<String> = sqlx::query_scalar(
+            r#"SELECT v."Value" FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               WHERE m."ItemId" = ?1"#,
+        )
+        .bind(guid_to_db(movie))
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(genres, vec!["Drama".to_owned()]);
     }
 
     /// With nothing detached, a save's reattach takes no writer: it finishes
