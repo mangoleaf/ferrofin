@@ -177,7 +177,7 @@ support for every 10.11.x or 12.x release.
 >    separately, for example in `/etc/jellyfin` on Debian. Include any external state
 >    directories too.
 > 3. Copy Jellyfin's `data/jellyfin.db`, `data/playlists/`, `data/collections/`,
->    `root/default/`, `metadata/`, the metadata plugins' settings
+>    `data/trickplay/`, `root/default/`, `metadata/`, the metadata plugins' settings
 >    (`plugins/configurations/Jellyfin.Plugin.{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages}.xml`)
 >    and those of the plugins Jellyfin used that Ferrofin has a counterpart of
 >    (`plugins/configurations/LDAP-Auth.xml`, `IntroSkipper.xml` and
@@ -406,7 +406,9 @@ Thank you for the consideration.
 `GPL-3.0-only`. Ferrofin follows the `GPL-3.0-only` metadata of the packages it derives from.
 See [`LICENSE`](LICENSE).
 
-The server binary links libjpeg-turbo, so this software is based in part on the work of the
-Independent JPEG Group. libjpeg-turbo's own licence is in
-[`contrib/debian/copyright`](contrib/debian/copyright), which the `.deb` and the release
-archives carry.
+The server binary is built with third-party Rust crates and C libraries that keep their own
+licenses. Every artifact carries their notices in `THIRD-PARTY-NOTICES.txt`, generated from
+`Cargo.lock` by [`scripts/third-party-notices.sh`](scripts/third-party-notices.sh), beside
+[`contrib/debian/copyright`](contrib/debian/copyright): in `/usr/share/doc/ferrofin/` in the
+image and the `.deb`, and at the top of a release archive. The binary links libjpeg-turbo, so
+this software is based in part on the work of the Independent JPEG Group.

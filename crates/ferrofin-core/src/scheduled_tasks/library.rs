@@ -1353,6 +1353,7 @@ impl ScheduledTask for LyricDownloadTask {
         vec![interval_hours(24)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        use ferrofin_providers::rate_limit::for_item;
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Audio],
             is_virtual_item: Some(false),
@@ -1380,16 +1381,20 @@ impl ScheduledTask for LyricDownloadTask {
                 if with_lyrics.contains(&item_id) {
                     continue;
                 }
-                match self.lyrics.search_lyrics_automatically(item_id).await {
+                // The lyric providers' failures name the item.
+                let search = self.lyrics.search_lyrics_automatically(item_id);
+                match for_item(item_id, search).await {
                     Ok(results) => {
                         if let Some(first) = results.first()
-                            && let Err(e) = self.lyrics.download_lyrics(item_id, &first.id).await
+                            && let Err(e) =
+                                for_item(item_id, self.lyrics.download_lyrics(item_id, &first.id))
+                                    .await
                         {
-                            tracing::warn!(item = %item.id, error = %e, "lyric download failed");
+                            tracing::warn!(%item_id, error = %e, "lyric download failed");
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(item = %item.id, error = %e, "lyric search failed");
+                        tracing::warn!(%item_id, error = %e, "lyric search failed");
                     }
                 }
             }

@@ -399,7 +399,7 @@ seconds (10), whichever comes first. The request that crosses the time limit sti
 nothing is ever topped up (the scrapped v2 suite's per-endpoint top-ups took longer than its
 measurements). The pass uses one keep-alive connection, as the browse role of `screens.js` (its
 token and device). A latency is the time from sending the request to having read the whole body;
-each endpoint records its p50, p95 and p99, every status it was answered with, how many
+each endpoint records its mean, p50, p95 and p99, every status it was answered with, how many
 answers were not the expected one, and how often the server had closed the keep-alive connection.
 `HTTP_TIMEOUT_S` bounds each socket operation of a request (not the whole request), and a request
 that runs past it counts as an answer with no status. The phase drains, checks isolation before and after like the
@@ -426,7 +426,13 @@ python3 gates/bench/gate.py endpoints ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:
 
 Each endpoint is the cell `endpoints/<id>`, judged on each run's p50 by the `[endpoints]` row of
 [`gate.toml`](gate.toml) (more than 15 % **and** more than 0.5 ms, D2) and the D4 rule: the
-candidate slower in at least 2 of the 3 pairs. Only the `gates/bench/screens.js` shapes and the edge-case
+candidate slower in at least 2 of the 3 pairs. An endpoint whose work is drawn at random by design
+(`RANDOM_DRAW` in `endpoints.py`, each with its reason; today only `GetMovieRecommendations`) is judged
+on each run's **mean** instead, by the same row and rule (owner decision 2026-11-26): its latency has
+two modes about equally often, so a p50 of 200 requests lands in either one from run to run, while
+the mean stays put and still moves when either mode does. The report marks such a cell
+`(judged on the mean)` and shows the mean before its percentiles; a session measured before the
+mean was recorded cannot judge it. Only the `gates/bench/screens.js` shapes and the edge-case
 GETs gate (decision DE); every other endpoint is reported, and a regression there is filed as an
 issue rather than blocking. An endpoint whose answers differ between runs (another status, a status
 that changed within a run, or a request filled differently) cannot be judged, and a gated one then

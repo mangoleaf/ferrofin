@@ -103,6 +103,23 @@ impl Fixture {
         Self::new(files, Some(CollectionTypeOptions::movies)).await
     }
 
+    /// The rule the server stores every parental score by (`ItemVisibility`),
+    /// over this library's database and `localization`'s tables.
+    fn visibility(
+        &self,
+        localization: Arc<LocalizationManager>,
+    ) -> Arc<ferrofin_core::item_visibility::ItemVisibility> {
+        Arc::new(ferrofin_core::item_visibility::ItemVisibility::new(
+            self.db.clone(),
+            Arc::new(FerrofinItemRepository::new(
+                self.db.clone(),
+                Arc::new(ItemTypeLookup::new()),
+            )),
+            localization,
+            "/server/data".to_owned(),
+        ))
+    }
+
     fn path(&self, relative: &str) -> String {
         self.media.join(relative).to_string_lossy().into_owned()
     }
@@ -965,7 +982,7 @@ async fn an_adopted_alternate_takes_its_primarys_rating_at_boot() {
     const ALTERNATE: &str = "Twin Horizon/Twin Horizon - 720p.mkv";
     let f = Fixture::movies(&[PRIMARY, ALTERNATE]).await;
     f.store
-        .set_localization(Arc::new(LocalizationManager::new("US")));
+        .set_rating_scorer(f.visibility(Arc::new(LocalizationManager::new("US"))));
     f.scanner.scan_all().await.unwrap();
     let primary = f.row(PRIMARY).await;
     let planned = f.row(ALTERNATE).await;
@@ -1913,7 +1930,8 @@ async fn a_restricted_user_gets_no_parts_of_a_movie_rated_above_them() {
     )
     .unwrap();
     let localization = Arc::new(ferrofin_core::LocalizationManager::new("US"));
-    f.store.set_localization(localization.clone());
+    f.store
+        .set_rating_scorer(f.visibility(localization.clone()));
     let f = Fixture {
         scanner: f.scanner.with_localization(localization),
         ..f
@@ -2086,6 +2104,80 @@ async fn the_scan_scores_the_custom_rating_first_and_clears_a_lost_one() {
     let again = f.scanner.scan_all().await.unwrap();
     assert_eq!((again.created, again.updated), (0, 0), "{again:?}");
     assert_eq!(item_writes(&f.db).await, 0);
+}
+
+/// An owned row's save stores the score `OnMetadataChanged` gives it, as its
+/// owner's save does (`GetParentalRatingScore`, `BaseItem.cs:1949-1964`): the
+/// rating copied from its owner, scored against
+/// `GetPreferredMetadataCountryCode()`, where the library's country (`GB`,
+/// whose `PG` scores 8) comes before the server's (`US`, 10). A local
+/// version, a stacked part and an extra all store 8, and a rescan rewrites
+/// none of them.
+#[tokio::test]
+async fn owned_rows_score_their_rating_against_the_librarys_country() {
+    const PRIMARY: &str = "Heat (1995)/Heat (1995).mkv";
+    const VERSION: &str = "Heat (1995)/Heat (1995) - 1080p.mkv";
+    const EXTRA: &str = "Heat (1995)/Heat (1995)-trailer.mkv";
+    const FIRST: &str = "Ronin (1998)/Ronin (1998) cd1.mkv";
+    const PART: &str = "Ronin (1998)/Ronin (1998) cd2.mkv";
+    const ROWS: [&str; 5] = [PRIMARY, VERSION, EXTRA, FIRST, PART];
+    let f = Fixture::with_options(
+        &ROWS,
+        Some(CollectionTypeOptions::movies),
+        LibraryOptions {
+            metadata_country_code: Some("GB".to_owned()),
+            ..LibraryOptions::default()
+        },
+    )
+    .await;
+    for nfo in [
+        "Heat (1995)/Heat (1995).nfo",
+        "Ronin (1998)/Ronin (1998) cd1.nfo",
+    ] {
+        std::fs::write(
+            f.path(nfo),
+            "<movie><title>Heat</title><mpaa>PG</mpaa></movie>",
+        )
+        .unwrap();
+    }
+    let localization = Arc::new(LocalizationManager::new("US"));
+    let score = |country| {
+        localization
+            .get_rating_score("PG", country)
+            .map(|s| i64::from(s.score))
+    };
+    assert_eq!((score(Some("GB")), score(None)), (Some(8), Some(10)));
+    // One evaluator, as the server shares it between the scan and the copies.
+    let visibility = f.visibility(localization.clone());
+    f.store.set_rating_scorer(visibility.clone());
+    let f = Fixture {
+        scanner: f
+            .scanner
+            .with_localization(localization)
+            .with_rating_resolver(visibility),
+        ..f
+    };
+    f.scanner.scan_all().await.unwrap();
+    let scores = || async {
+        let mut scores = Vec::new();
+        for path in ROWS {
+            let row = f.row(path).await;
+            scores.push((
+                path,
+                row.official_rating,
+                row.inherited_parental_rating_value,
+            ));
+        }
+        scores
+    };
+    let pg = |path| (path, Some("PG".to_owned()), Some(8));
+    assert_eq!(scores().await, ROWS.map(pg).to_vec());
+
+    // No media prober: the primaries refresh and save on every scan, and copy again.
+    let owned = || async { (f.row(VERSION).await, f.row(EXTRA).await, f.row(PART).await) };
+    let before = owned().await;
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(owned().await, before, "the owned rows are not rewritten");
 }
 
 // ── TV episode stacks and versions (step 12 S8) ──────────────────────────

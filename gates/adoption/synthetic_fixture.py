@@ -236,6 +236,10 @@ def seed(base):
                                (child["Id"], movies["Amber Harbor"]["Id"], 1_000_000_000)]:
         api.post(f"/UserItems/{item}/UserData", {"Played": False, "PlaybackPositionTicks": ticks,
                  "LastPlayedDate": "2026-01-06T12:00:00Z"}, userId=user)
+    # Played with no LastPlayedDate: the row shape Jellyfin leaves on a video's other versions (12.0+
+    # Video.PropagatePlayedState), a Played-only update and an NFO watched import. 10.11.8 has no
+    # propagation, so this Played-only update writes it on every lineage (UserDataManager.SaveUserData).
+    api.post(f"/UserItems/{movies['Twin Horizon']['Id']}/UserData", {"Played": True}, userId=adult)
     api.post(f"/UserFavoriteItems/{tracks[0]['Id']}", userId=adult)
 
     # One save writes DisplayPreferences, ItemDisplayPreferences and, for the keys it does not
@@ -285,7 +289,12 @@ def seed(base):
             "versions_movie": movies["Twin Horizon"]["Id"],
             "playlist": playlist, "private_playlist": private_playlist, "collection": collection,
             "linked_playlist": linked_playlist, "linked_collection": linked_collection,
-            "linked_pathless": linked_pathless}
+            "linked_pathless": linked_pathless,
+            # The rated series' unrated season and episodes, which a pre-12.2 source serves to the
+            # child until the first scan (preservation.before_first_scan, gl-1953), and the movies
+            # merged as versions, which 12.0 alone lists apart (preservation.MERGED_KEYS, gl-1954).
+            "rated_series": {"season": rated[0]["SeasonId"], "episodes": sorted(r["Id"] for r in rated)},
+            "merged_pairs": sorted(movies[name]["Id"] for pair in MERGED_PAIRS for name in (pair, pair + " Extended"))}
 
     from user_accounts import seed as seed_accounts
     seed_accounts(api, manifest)

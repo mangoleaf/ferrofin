@@ -424,6 +424,58 @@ async fn a_logo_that_is_no_url_leaves_no_row_and_takes_the_stored_one(
     );
 }
 
+/// gl-1639: artwork that stays at its URL is upstream's `new ItemImageInfo {
+/// Path = url, Type = type }` (`GuideManager.UpdateImage`, `SetImagePath`),
+/// whose `DateModified` is `default(DateTime)`: .NET's `MinValue`, stored as
+/// `0001-01-01 00:00:00`, not chrono's Unix epoch. Both rows read back as that
+/// date.
+#[tokio::test]
+async fn remote_artwork_rows_are_dated_dotnet_min_value() {
+    let lab = item_lab_reading_through(
+        "#EXTM3U\n#EXTINF:-1 tvg-id=\"one.tv\" tvg-chno=\"1\" \
+         tvg-logo=\"http://img/logo.png\",One\nhttp://tuner/one\n",
+        Some(guide(&guide_day(0), &AIRINGS[..1])),
+        |inner| inner,
+    )
+    .await;
+    lab.mgr.refresh_guide().await.expect("refresh");
+
+    let min = || Some("0001-01-01 00:00:00".to_owned());
+    assert_eq!(
+        crate::guide_repository::test_support::image_rows(&lab.mgr.db)
+            .await
+            .expect("image rows"),
+        [
+            ("http://img/logo.png".to_owned(), min()),
+            ("http://img/one-early.png".to_owned(), min())
+        ]
+    );
+    let channels = crate::guide_repository::channel_rows(
+        &lab.mgr.db,
+        &LiveTvChannelQuery::default(),
+        None,
+        false,
+    )
+    .await
+    .expect("channels");
+    let programmes = crate::guide_repository::test_support::stored_program_items(&lab.mgr.db)
+        .await
+        .expect("programme items");
+    for id in [&channels[0].id, &programmes[0].0] {
+        let images = lab
+            .items
+            .get_image_infos(Uuid::parse_str(id).expect("guid"))
+            .await
+            .expect("images");
+        let dates: Vec<_> = images.iter().map(|image| image.date_modified).collect();
+        assert_eq!(
+            dates,
+            [ferrofin_model::json::datetime::dotnet_min()],
+            "{id}"
+        );
+    }
+}
+
 /// A channel whose airings all left the guide has nothing to mirror, so its
 /// turn is skipped and its items go in the `CleanDatabase` at the end; the
 /// other channel's items, images and genres are untouched.
