@@ -971,6 +971,20 @@ pub mod test_support {
         .map_err(db_err)
     }
 
+    /// Every channel item's `AncestorIds` rows as `(ItemId, ParentItemId)`,
+    /// ordered.
+    pub async fn channel_ancestors(db: &Database) -> Result<Vec<(String, String)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT a."ItemId", a."ParentItemId" FROM "AncestorIds" a
+               JOIN "BaseItems" bi ON bi."Id" = a."ItemId"
+               WHERE bi."Type" = ?1 ORDER BY 1, 2"#,
+        )
+        .bind(crate::projection::CHANNEL_TYPE_NAME)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+    }
+
     /// The stored `BaseItems` programme-item rows as
     /// `(Id, ParentId, TopParentId, PresentationUniqueKey)`, id-ordered — what
     /// the guide refresh's `BaseItems` mirror wrote.

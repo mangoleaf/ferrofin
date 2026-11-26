@@ -1718,14 +1718,19 @@ impl FerrofinLiveTvManager {
                 store.persistence.save_items(batch).await?;
             }
         }
-        Self::save_channel_service_ids(store, &rows).await?;
-        Self::reattach_channel_user_data(store, &created).await;
-        // The channel's Primary image (`GetChannel`), once its item exists.
         let channels: Vec<(Uuid, &ChannelRow)> = rows
             .iter()
             .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
             .collect();
         let ids: Vec<Uuid> = channels.iter().map(|(id, _)| *id).collect();
+        // Each channel's ancestor, the Live TV view: upstream's save writes
+        // `GetAncestorIds()` (`ItemPersistenceService.cs:321-322, 424-477`).
+        // Every channel on every refresh, not only the rows saved, so one an
+        // earlier build stored without it gets it (gl-1638).
+        store.persistence.set_parent_ancestors(&ids).await?;
+        Self::save_channel_service_ids(store, &rows).await?;
+        Self::reattach_channel_user_data(store, &created).await;
+        // The channel's Primary image (`GetChannel`), once its item exists.
         let refused = rows
             .iter()
             .filter_map(|row| row.image_url.as_deref())
@@ -10850,6 +10855,54 @@ mod tests {
                 .iter()
                 .any(|(id, ..)| Uuid::parse_str(id).ok() == Some(ghost))
         );
+    }
+
+    /// Each channel item's one ancestor is the Live TV view, as upstream's save
+    /// writes `GetAncestorIds()` (`ItemPersistenceService.cs:321-322,
+    /// 424-477`): the view is the channel's only parent and lies in no library.
+    /// Every refresh writes them, so a channel an earlier build stored without
+    /// them, and unchanged since, gets them; a stale ancestor goes.
+    #[tokio::test]
+    async fn a_guide_refresh_records_the_live_tv_view_as_each_channels_ancestor() {
+        use crate::guide_repository::test_support::channel_ancestors;
+        let lab = channel_item_lab().await;
+        let (mgr, persistence) = (&lab.mgr, &lab.persistence);
+        mgr.refresh_guide().await.expect("refresh");
+        let view = ferrofin_db::store::guid_to_db(lab.view);
+        let channels: Vec<String> = stored_channel_items(mgr)
+            .await
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        assert_eq!(channels.len(), 2);
+        let want: Vec<(String, String)> = channels
+            .iter()
+            .map(|id| (id.clone(), view.clone()))
+            .collect();
+        assert_eq!(channel_ancestors(&mgr.db).await.expect("read"), want);
+
+        // One channel stored without its row, the other under a stale one.
+        let stale = Uuid::new_v4();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(stale),
+                type_: "MediaBrowser.Controller.Entities.Folder".to_owned(),
+                is_folder: true,
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("stale parent");
+        let ids: Vec<Uuid> = channels
+            .iter()
+            .map(|id| Uuid::parse_str(id).expect("guid"))
+            .collect();
+        persistence.set_ancestors(ids[0], &[]).await.expect("clear");
+        persistence
+            .set_ancestors(ids[1], &[stale])
+            .await
+            .expect("stale");
+        mgr.refresh_guide().await.expect("second refresh");
+        assert_eq!(channel_ancestors(&mgr.db).await.expect("read"), want);
     }
 
     /// `TunerHostManager.DeleteTunerHost` queues a guide refresh, and that

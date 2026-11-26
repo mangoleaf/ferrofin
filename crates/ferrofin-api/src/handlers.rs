@@ -991,8 +991,11 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// TheMovieDb's movie, series, season and episode providers write onto an item
 /// from TMDb's answer. `guide-programme-items` is what the guide refresh
 /// stores on each programme item and its external ids, which every programme
-/// operation reads. `music-artwork` is what a library scan stores as a music
-/// album's and a track's Primary, which the item and image operations serve.
+/// operation reads. `guide-channel-items` is where the guide refresh puts each
+/// channel item in the item tree (its parent, top parent and ancestors), which
+/// the recursive queries and folder filters read. `music-artwork` is what a
+/// library scan stores as a music album's and a track's Primary, which the
+/// item and image operations serve.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -1017,6 +1020,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "metadata-refresh",
     "metadata-providers",
     "guide-programme-items",
+    "guide-channel-items",
     "music-artwork",
 ];
 
@@ -1092,6 +1096,31 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              changed programme avoids one full-row write per airing per refresh (owner \
              decision 2026-11-20, gl-1628).",
         ],
+    },
+    VerifiedSubsystem {
+        key: "guide-channel-items",
+        upstream_file: "src/Jellyfin.LiveTv/Guide/GuideManager.cs",
+        upstream_method: "GetChannel",
+        ferrofin: "Where the guide refresh puts each channel item in the item tree, and only \
+                   that: ferrofin-livetv projection.rs channel_entity sets ParentId and \
+                   TopParentId to the Live TV view (manager.rs live_tv_view_id over \
+                   get_internal_live_tv_folder_id), channel_item_update carries both onto a \
+                   stored row, and manager.rs sync_channel_items writes every channel's \
+                   AncestorIds on each refresh through ferrofin-core \
+                   item_persistence_service.rs set_parent_ancestors (the stored ParentId \
+                   chain, missing rows added and the rest removed, a parent with no row \
+                   skipped; gl-1638). Compared with GuideManager.GetChannel's ParentId \
+                   assignment and save, BaseItem.GetAncestorIds, GetTopParent and IsTopParent \
+                   (a livetv view is a top parent), LibraryManager.GetCollectionFolders (the \
+                   parentless view matches no library) and \
+                   ItemPersistenceService.UpdateOrInsertItems (ancestors written on each \
+                   save, the existence filter, stale rows removed) at the pinned v12.4 tag. \
+                   Upstream writes the row only when it saves a channel (new, re-parented or \
+                   changed); every refresh writing it gives the same rows, and fills a \
+                   channel an earlier Ferrofin stored without one. The rest of GetChannel \
+                   (names, tags, external ids, the logo) is not part of this row.",
+        date: "2026-11-26",
+        divergences: &[],
     },
     VerifiedSubsystem {
         key: "paging-sort",

@@ -3645,6 +3645,24 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         tx.commit().await.map_err(db_err)
     }
 
+    async fn set_parent_ancestors(&self, item_ids: &[Uuid]) -> Result<(), ServiceError> {
+        if item_ids.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = item_ids.iter().map(|id| guid_to_db(*id)).collect();
+        let ids = serde_json::to_string(&ids).map_err(|e| ServiceError::Backend(e.to_string()))?;
+        // One transaction: no reader sees an item between the two halves.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        for sql in [REMOVE_STALE_PARENT_ANCESTORS_SQL, ADD_PARENT_ANCESTORS_SQL] {
+            sqlx::query(sql)
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn save_item_images(
         &self,
         item_id: Uuid,
@@ -7255,6 +7273,43 @@ pub(crate) const PRUNE_ORPHAN_ITEM_VALUES_SQL: &str = r#"DELETE FROM "ItemValues
 /// by `the_closure_credits_read_seeks_each_items_credits`.
 const CLOSURE_CREDITS_SQL: &str = r#"SELECT DISTINCT "PeopleId" FROM "PeopleBaseItemMap"
    WHERE "ItemId" IN (SELECT value FROM json_each(?1))"#;
+
+/// `"chain"("ItemId", "ParentItemId")`: the `ParentId` chain of each item in
+/// the JSON id array `?1`, up to the root. The many-item form of
+/// `library_structure_repository::add_parent_chain_in`'s walk.
+macro_rules! parent_chain {
+    () => {
+        r#"WITH RECURSIVE "chain"("ItemId", "ParentItemId") AS (
+               SELECT "Id", "ParentId" FROM "BaseItems"
+                WHERE "Id" IN (SELECT value FROM json_each(?1)) AND "ParentId" IS NOT NULL
+               UNION
+               SELECT c."ItemId", p."ParentId" FROM "chain" c
+                 JOIN "BaseItems" p ON p."Id" = c."ParentItemId"
+                WHERE p."ParentId" IS NOT NULL)
+           "#
+    };
+}
+
+/// `set_parent_ancestors`' first half: the items' ancestor rows their chain
+/// does not hold (upstream's `RemoveRange(existingAncestorIds)`, `:475`). A
+/// `NOT IN`, not a correlated `NOT EXISTS`, so the chain is walked once rather
+/// than once per row; `EXPLAIN QUERY PLAN` pinned by
+/// `the_parent_ancestor_writes_walk_the_chain_once`.
+const REMOVE_STALE_PARENT_ANCESTORS_SQL: &str = concat!(
+    parent_chain!(),
+    r#"DELETE FROM "AncestorIds"
+        WHERE "ItemId" IN (SELECT value FROM json_each(?1))
+          AND ("ItemId", "ParentItemId") NOT IN (SELECT "ItemId", "ParentItemId" FROM "chain")"#
+);
+
+/// `set_parent_ancestors`' second half: the chain's rows not stored yet, each
+/// parent with no row skipped (upstream's existence filter, `:443-455`).
+const ADD_PARENT_ANCESTORS_SQL: &str = concat!(
+    parent_chain!(),
+    r#"INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId")
+       SELECT "ItemId", "ParentItemId" FROM "chain"
+        WHERE "ParentItemId" IN (SELECT "Id" FROM "BaseItems")"#
+);
 
 /// The ids of the `item_type` rows never refreshed (`DateLastRefreshed`
 /// unset), in id order — `PeopleValidator`'s new person items.
@@ -12023,6 +12078,71 @@ mod tests {
         assert_eq!(read, want);
     }
 
+    /// `set_parent_ancestors` makes an item's ancestors its whole parent chain
+    /// (gl-1638): the missing rows added, a stale one removed, an item with no
+    /// parent left with none, and a parent with no row skipped. An item not
+    /// named keeps its rows, even one its chain does not hold.
+    #[tokio::test]
+    async fn set_parent_ancestors_writes_the_parent_chain() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let [root, folder, item, orphan, stale, dangling] = [(); 6].map(|()| Uuid::new_v4());
+        let row = |id: Uuid, parent: Option<Uuid>| super::BaseItemEntity {
+            id: guid_to_db(id),
+            type_: "MediaBrowser.Controller.Entities.Folder".to_owned(),
+            parent_id: parent.map(guid_to_db),
+            is_folder: true,
+            ..super::BaseItemEntity::default()
+        };
+        for (id, parent) in [
+            (root, None),
+            (stale, None),
+            (folder, Some(root)),
+            (item, Some(folder)),
+            (orphan, None),
+            (dangling, None),
+        ] {
+            svc.save_items(&[row(id, parent)]).await.expect("row");
+        }
+        svc.set_ancestors(item, &[folder, stale])
+            .await
+            .expect("earlier");
+        svc.set_ancestors(orphan, &[stale]).await.expect("earlier");
+        svc.set_ancestors(folder, &[stale]).await.expect("unnamed");
+
+        // A parent row gone with foreign keys off, as an adopted database can
+        // hold: its link would fail the key, so it is skipped.
+        let pragma = |on: &'static str| sqlx::query(on).execute(db.writer());
+        pragma("PRAGMA foreign_keys = OFF").await.expect("fk off");
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?1 WHERE "Id" = ?2"#)
+            .bind(guid_to_db(Uuid::new_v4()))
+            .bind(guid_to_db(dangling))
+            .execute(db.writer())
+            .await
+            .expect("dangling parent");
+        pragma("PRAGMA foreign_keys = ON").await.expect("fk on");
+
+        svc.set_parent_ancestors(&[item, orphan, dangling])
+            .await
+            .expect("ancestors");
+        let read = |id: Uuid| {
+            sqlx::query_scalar::<_, String>(
+                r#"SELECT "ParentItemId" FROM "AncestorIds" WHERE "ItemId" = ?1 ORDER BY 1"#,
+            )
+            .bind(guid_to_db(id))
+            .fetch_all(db.pool())
+        };
+        let mut want = vec![guid_to_db(root), guid_to_db(folder)];
+        want.sort();
+        assert_eq!(read(item).await.expect("item"), want);
+        assert_eq!(read(orphan).await.expect("orphan"), Vec::<String>::new());
+        assert_eq!(
+            read(dangling).await.expect("dangling"),
+            Vec::<String>::new()
+        );
+        assert_eq!(read(folder).await.expect("folder"), vec![guid_to_db(stale)]);
+    }
+
     #[tokio::test]
     async fn scan_stored_links_reads_images_ancestors_and_external_streams() {
         let db = test_db().await;
@@ -14904,6 +15024,35 @@ mod tests {
         assert!(
             !plan.iter().any(|s| s.starts_with("SCAN m")),
             "never a scan of the maps, got: {plan:?}"
+        );
+    }
+
+    /// `set_parent_ancestors`' two statements walk the chain once, never once
+    /// per stored row, and seek the items' rows by id.
+    #[tokio::test]
+    async fn the_parent_ancestor_writes_walk_the_chain_once() {
+        let db = test_db().await;
+        for sql in [
+            super::REMOVE_STALE_PARENT_ANCESTORS_SQL,
+            super::ADD_PARENT_ANCESTORS_SQL,
+        ] {
+            let plan = query_plan(&db, sql, 1).await;
+            assert!(
+                !plan.iter().any(|s| s.starts_with("CORRELATED")),
+                "the chain walked once, got: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|s| s.starts_with("SCAN BaseItems") || s.starts_with("SCAN AncestorIds")),
+                "never a scan of the items or the ancestors, got: {plan:?}"
+            );
+        }
+        let plan = query_plan(&db, super::REMOVE_STALE_PARENT_ANCESTORS_SQL, 1).await;
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH AncestorIds") && s.contains("(ItemId=?)")),
+            "the items' ancestor rows sought by ItemId, got: {plan:?}"
         );
     }
 
