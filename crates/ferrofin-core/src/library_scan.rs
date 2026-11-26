@@ -12280,7 +12280,9 @@ impl LibraryScanner {
     /// it found (TVDB's remote ids) spares the search. A movie is searched only
     /// without an IMDb id: one `/find` does not resolve leaves it without
     /// TMDB's metadata (`TmdbMovieProvider.cs:160,178-190`), where a series
-    /// goes on to the search (`TmdbSeriesProvider.cs:178-213`). Its answer
+    /// goes on to the search (`TmdbSeriesProvider.cs:178-213`). A `/find`
+    /// request that fails ends the lookup for either: no TVDB `/find`, no
+    /// search, no guessed id kept, and the next refresh asks again. Its answer
     /// carries the title's IMDb id and, for a series, its TVDB id
     /// (`TmdbSeriesProvider.cs:306-312`), which the providers after it
     /// resolve by.
@@ -12315,9 +12317,10 @@ impl LibraryScanner {
         // `TmdbSeriesProvider.GetMetadata`) before any search by name.
         let pinned = match pinned {
             Some(id) => Some(id),
-            None => {
-                Self::find_tmdb_id(tmdb, kind, known_ids, lookup.tmdb_language().as_deref()).await
-            }
+            // A failed `/find` ends the lookup, as upstream's throws.
+            None => Self::find_tmdb_id(tmdb, kind, known_ids, lookup.tmdb_language().as_deref())
+                .await
+                .ok()?,
         };
         let tmdb_id = if let Some(id) = pinned {
             id
@@ -12395,36 +12398,45 @@ impl LibraryScanner {
     }
 
     /// The TMDB id an IMDb id (or, for a series, a TVDB id) among `known_ids`
-    /// resolves to through `/find`, if any.
+    /// resolves to through `/find`, if any. `Err` when a `/find` request
+    /// failed (a 404 is TMDbLib's `null`, an answer): upstream's
+    /// `FindByExternalIdAsync` throws there, out of `GetMetadata`, so nothing
+    /// after it is asked. The failure stays counted in the caller's
+    /// `count_request_failures` scope, which keeps the refresh unstamped.
     async fn find_tmdb_id(
         tmdb: &TmdbClient,
         kind: TmdbKind,
         known_ids: &[(String, String)],
         language: Option<&str>,
-    ) -> Option<i64> {
+    ) -> Result<Option<i64>, ()> {
+        use ferrofin_providers::rate_limit::{count_request_failures, note_request_failure};
         let id_of = |provider: &str| {
             known_ids
                 .iter()
                 .find(|(key, value)| key.eq_ignore_ascii_case(provider) && !value.trim().is_empty())
                 .map(|(_, value)| value.trim().to_owned())
         };
+        let find = async |source: &str, id: String| {
+            let (hits, failures) =
+                count_request_failures(tmdb.find_by_external_id(kind, source, &id, language)).await;
+            if failures > 0 {
+                // The scope above hides it from the caller's.
+                note_request_failure();
+                return Err(());
+            }
+            Ok(hits.and_then(|hits| hits.first().map(|hit| hit.tmdb_id)))
+        };
         if let Some(imdb) = id_of("Imdb")
-            && let Some(id) = tmdb
-                .find_by_external_id(kind, "imdb_id", &imdb, language)
-                .await
-                .and_then(|hits| hits.first().map(|hit| hit.tmdb_id))
+            && let Some(id) = find("imdb_id", imdb).await?
         {
-            return Some(id);
+            return Ok(Some(id));
         }
         if kind == TmdbKind::Series
             && let Some(tvdb) = id_of("Tvdb")
         {
-            return tmdb
-                .find_by_external_id(kind, "tvdb_id", &tvdb, language)
-                .await
-                .and_then(|hits| hits.first().map(|hit| hit.tmdb_id));
+            return find("tvdb_id", tvdb).await;
         }
-        None
+        Ok(None)
     }
 
     /// The TMDB **episode** provider — port of `TmdbEpisodeProvider`.
