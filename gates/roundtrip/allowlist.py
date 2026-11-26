@@ -6,7 +6,8 @@ Jellyfin runs on the export in windows, and checks_db.py compares a copy of its 
 window with the one taken at its start:
 
     start      the export as written, to Jellyfin started and its startup tasks finished
-    capture    to the gate's playlist refresh, answers and probes done (the gate's own requests)
+    capture    to the gate's playlist refresh, answers, Live TV check (with its guide refresh) and probes done
+               (the gate's own requests)
     scan       to its library scan completed and its queued work finished
     stop       to Jellyfin stopped: after the scan, the gate's answers again; on the scale route, all it did after
                its start
@@ -43,7 +44,8 @@ import sys
 WINDOWS = ("start", "capture", "scan", "stop", "restart")
 CHANGES = ("added", "removed", "changed")
 KINDS = ("timestamp", "session", "gate", "checked", "allowlisted")
-#: The windows the gate's own requests run in: its answers, probes and playlist refresh.
+#: The windows the gate's own requests run in: its playlist refresh, answers, Live TV check and probes, and its
+#: answers again after the scan.
 GATE_WINDOWS = ("capture", "stop")
 #: The windows of Jellyfin's first start, when it saves and refreshes items; a second start must touch none.
 FIRST_RUN = ("start", "capture", "scan", "stop")

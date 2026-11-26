@@ -21,7 +21,7 @@ are compared with Ferrofin's.
 | `12.4-debian` | a 12.4 first run in a Debian package's layout (`/var/lib/jellyfin`, `/etc/jellyfin`; 12.2.0) | `/var/lib/ferrofin`, its configuration at `/etc/ferrofin` | runs no migration; the export reads Ferrofin's two directories and writes the docker layout, the only one it writes |
 | `native` | none: Ferrofin's own first start on an empty directory, which never came from Jellyfin, seeded through the API as each fixture's Jellyfin is (`gates/adoption/synthetic_fixture.py`), with a non-default HTTP port, throttling on and a custom cast receiver, and a decoy `data/library.db.old` written once it stops; its database is `ferrofin.db` | `/data` | runs no migration: a database with no Jellyfin history is exported with exactly the history a fresh install records (105 ids, the code migrations as applied), so the settings and rows Jellyfin's code migrations would reset or import stay as Ferrofin left them; Jellyfin serves on the exported port. Before Jellyfin starts on it, the version-drift guard (`stage_drift.sh`) starts the same release on an empty directory and fails when the history that fresh install records is not the one the export wrote: a release that adds a migration the exporter does not classify fails there, by name |
 | `10.11.11-messy`, `12.4-messy` | `messy.py`'s copies of `jellyfin-10.11.11` and `jellyfin-12.4-from-123`, with the rows of shapes no API makes (10.11.11, 12.2.0), on `media-messy/` | `/data` | as on its source's route |
-| `10.11.11-scale` | `scale.py`'s copy of `jellyfin-10.11.11`, cloned up to 40,000 items (10.11.11), on `media-scale/` | `/data` | as on the `10.11.11` route; the time each stage took and the export's size are on its line, recorded, not gated. Ferrofin adopts it and stops with no scan and no usage stage, and Jellyfin starts, stops and starts again with no playlist refresh, answers, probes or scan ([Stages and checks](#stages-and-checks) lists what runs): the clones' files are hard links to their templates', so a scan re-identifies and re-extracts every clone, which measures the fixture rather than the way back (the adoption gate scans it neither). Jellyfin's time on its line covers both starts and the copies and row diffs of its windows. It needs a few GB free under the run directory (the export alone came to 1.6 GB on the development host, and a failed route keeps four copies of its database, about 270 MB each) and, unlike the adoption gate's scale row, checks no free space first |
+| `10.11.11-scale` | `scale.py`'s copy of `jellyfin-10.11.11`, cloned up to 40,000 items (10.11.11), on `media-scale/` | `/data` | as on the `10.11.11` route; the time each stage took and the export's size are on its line, recorded, not gated. Ferrofin adopts it and stops with no scan and no usage stage, and Jellyfin starts, stops and starts again with no playlist refresh, answers, Live TV check, probes or scan ([Stages and checks](#stages-and-checks) lists what runs): the clones' files are hard links to their templates', so a scan re-identifies and re-extracts every clone, which measures the fixture rather than the way back (the adoption gate scans it neither). Jellyfin's time on its line covers both starts and the copies and row diffs of its windows. It needs a few GB free under the run directory (the export alone came to 1.6 GB on the development host, and a failed route keeps four copies of its database, about 270 MB each) and, unlike the adoption gate's scale row, checks no free space first |
 
 The routes are in [`routes.sh`](routes.sh): one record per route, every fixture `build-fixtures.sh` builds, with
 everything that makes a route differ in its own fields (its fixture, the generation Ferrofin adopts it as, the
@@ -150,7 +150,7 @@ Settings (environment), each a whole number of seconds:
 | | answers equal Ferrofin's before the stop | `answers.txt` differs from `oracle.txt` through `adoption_normalise`, which leaves out ids, image sizes and the probes that differ by design; or the `userdata` lines differ with their item ids kept; or no answers came within `ROUNDTRIP_SCAN_TIMEOUT` |
 | | Live TV: timers, a favourite channel and the guide equal Ferrofin's before and after its first guide refresh | the timers' and series timers' ids, names and times, the channels' ids, the favourite channels or the programmes' ids differ from what Ferrofin answered after its setup, before Jellyfin's first guide refresh (the export keeps the channel and programme items) or after it ([`livetv.py`](livetv.py) `check`; one guide programme is in `+01:00`, whose id embeds the offset) |
 | | it serves every image, trickplay tile, subtitle and attachment its database lists | one of the files its database lists is not answered with 200: each item's each image type, each chapter image, each profile image, the first tile of each trickplay width, each external text subtitle and each attachment; or a file the database Ferrofin stopped with lists is no longer listed for an item or user Jellyfin still holds (a row Jellyfin dropped because the file was missing; an item it removed whole is judged by the answers and the library check instead); or neither database lists a file at all while Jellyfin's has an image table ([`probes.py`](probes.py), which writes `probes.txt`) |
-| | every row the gate's requests changed is explained | the same, from the end of its start to the end of the probes: the playlist refresh, the answers and the probes |
+| | every row the gate's requests changed is explained | the same, from the end of its start to the end of the probes: the playlist refresh, the answers, the Live TV check with its guide refresh, and the probes |
 | | its library scan completes, and its tasks after it | `POST /Library/Refresh` does not end `Completed`, or a scheduled task still runs after `ROUNDTRIP_SCAN_TIMEOUT` |
 | | every row its scan changed is explained | the same, over the scan |
 | | its scan kept every item, and the item counts by type | the number of `BaseItems` rows of a type differs before and after the scan, or an item is gone, or one was re-added: another id at a removed item's type and path, or the same id with another `DateCreated` ([`checks_db.py`](checks_db.py) `counts`) |
@@ -172,8 +172,8 @@ Jellyfin is booted only on an export of a copy Ferrofin finished with: when a Fe
 fails, the route stops there, and only a Jellyfin that answered is started again. On the scale route there are no
 answers of Ferrofin's to compare, and no scan (the scale route's line in the routes table says why), so Jellyfin's
 checks there are its starts, their logs, the rows its start, the rest until its stop and its second start changed,
-its stops and its file; the playlist refresh, the answers, the probes, the scan with its row diff and its counts,
-and the library rows do not run.
+its stops and its file; the playlist refresh, the answers, the Live TV check, the probes, the scan with its row diff
+and its counts, and the library rows do not run.
 
 What a pass covers: after its first start, its playlists' full refresh and its first library scan, and after a
 second start on the same file, the Jellyfin release under test answers as Ferrofin did before its stop, serves the
@@ -181,13 +181,13 @@ files its database lists, keeps every item and library, and changes no row the a
 
 ### The row diff and the allowlist
 
-Jellyfin's database is copied (`checks_db.py snapshot`, SQLite's backup, which a running server does not tear) at
-the end of each window: its start (from the export as written), the gate's requests (playlist refresh, answers,
-probes), its scan, the rest until its stop, and its second start. Each window's copy is compared with the one
-before it, table by table, every column as stored (text byte for byte whatever its collation, numbers by value), so
-a rewrite to another casing or form shows. A row is keyed by its
-primary key: one only before is removed, one only after added, one in both changed, with the columns that changed. `BaseItemImageInfos`, which Jellyfin re-inserts under a new `Id` on every
-save, is also paired by item, type and path (`checks_db.py` `NATURAL`).
+Jellyfin's database is copied (`checks_db.py snapshot`, SQLite's backup, which a running server does not tear) at the
+end of each window: its start (from the export as written), the gate's requests (playlist refresh, answers, the Live
+TV check with its guide refresh, probes), its scan, the rest until its stop, and its second start. Each window's copy
+is compared with the one before it, table by table, every column as stored (text byte for byte whatever its collation,
+numbers by value), so a rewrite to another casing or form shows. A row is keyed by its primary key: one only before is
+removed, one only after added, one in both changed, with the columns that changed. `BaseItemImageInfos`, which
+Jellyfin re-inserts under a new `Id` on every save, is also paired by item, type and path (`checks_db.py` `NATURAL`).
 
 Every change must be explained by an entry of [`allowlist.py`](allowlist.py) `RULES`: the windows it applies in,
 the table, the change, for a changed row the columns it may change (for a number, within a relative tolerance;
@@ -197,13 +197,13 @@ regular expression a column's whole value must match), its kind and its cause. A
 every column it changed is covered. The kinds are `timestamp` (a stamp or key Jellyfin writes anew on every save
 or refresh, whatever changed), `session` (what presenting a token writes), `gate` (what the gate's own requests
 write), `checked` (a change another check judges one by one, the migrations its start records) and `allowlisted`
-(a difference the owner accepted, or an audit verdict). The gate's own writes are told apart from Jellyfin's in
-two ways: by window (the answers, probes and playlist refresh run only in the "gate's requests" and "until its
-stop" windows; the start, scan and second start windows have no request of the gate's but its polls of the
-scheduled tasks and the scan's own `POST /Library/Refresh`), and by the `gate` entries, which apply only in those
-two windows and only to the accounts and devices the answers sign in (`answers.GATE_USERS`, `answers.DEVICE_ID`). A change the gate's requests caused
-Jellyfin to make, such as a playlist refresh rewriting a playlist row, is Jellyfin's and must be explained like
-any other.
+(a difference the owner accepted, or an audit verdict). The gate's own writes are told apart from Jellyfin's in two
+ways: by window (the playlist refresh, answers, Live TV check and probes run only in the "gate's requests" window, and
+the answers again in "until its stop"; the start, scan and second start windows have no request of the gate's but its
+polls of the scheduled tasks and the scan's own `POST /Library/Refresh`), and by the `gate` entries, which apply only
+in those two windows and only to the accounts and devices the answers sign in (`answers.GATE_USERS`,
+`answers.DEVICE_ID`). A change the gate's requests caused Jellyfin to make, such as a playlist refresh rewriting a
+playlist row, is Jellyfin's and must be explained like any other.
 
 The entries today are the artefact rules, each pointing at the upstream code that writes it (the save and refresh
 stamps only in the first start's windows: a second start that saves or refreshes an item fails), and two owner
@@ -278,12 +278,13 @@ the checks above change:
 Runs do not share anything:
 
 - Every run has an id, by default `<date>-<time>-<pid>` and always unique on the host while it runs.
-- Its containers are `rt-<id>-<route>-ferrofin|export|jellyfin`.
+- Its containers are `rt-<id>-<route>-ferrofin|export|jellyfin|jellyfin-again|fresh`.
 - The image under test runs as the tag `ferrofin-roundtrip:<id>`, so a rebuild of `ferrofin:bench`
   mid-run changes nothing the run starts.
 - Its run directory is `runs/roundtrip-<id>/`, claimed with a plain `mkdir`, so one that exists is
   refused. An id whose tag exists (another run holds it) is refused too.
-- Every port is one docker picks (`-p 127.0.0.1::8096`).
+- Every port is one docker picks (`-p 127.0.0.1::<port>`, the port the server serves on: 8096, or the one the
+  export carried over from Ferrofin's settings).
 
 There is no lock. On any exit a run removes only the containers whose ids docker wrote to its own
 cidfiles, never one by a name another run could hold, and only the tag it made. Unlike the adoption gate
