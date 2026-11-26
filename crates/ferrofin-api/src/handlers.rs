@@ -3028,18 +3028,16 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetNextUp",
         ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
                (TVSeriesManager; keys_scope: GetItemById's 400 for a nil parentId, after \
-               the seriesId return; a box set or playlist parent as DescendantOfId) → \
-               next_up_service.rs (NextUpService, top_parent_ids → item_repository.rs \
-               view_top_parent_ids; linked_container_scope: SetTopParentIdsOrAncestors' \
-               LinkedChildren test, DescendantQueryHelper's set, AddUserToQuery's \
-               scope_to_user_libraries)",
-        date: "2026-11-15",
+               the seriesId return; a box set or playlist parent as DescendantOfId; \
+               page_rows: GetPreferredVersion on the page's picks) → next_up_service.rs \
+               (NextUpService, top_parent_ids → item_repository.rs view_top_parent_ids; \
+               linked_container_scope: SetTopParentIdsOrAncestors' LinkedChildren test, \
+               DescendantQueryHelper's set, AddUserToQuery's scope_to_user_libraries; \
+               merge_version_groups: GetMostRecentlyPlayedVersion's played version; \
+               get_preferred_versions: the source names of video_versions.rs \
+               VersionRows::media_sources)",
+        date: "2026-11-26",
         divergences: &[
-            "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
-         has been watching, matched by media-source name) is not ported: the pick is always \
-         the primary episode row. Un-defer path: v12's Video.GetMediaSourceName \
-         common-prefix naming is ported (video_versions::media_source_name); swap by that \
-         name in tv_series_manager (see the TODO there).",
             "parentId naming a non-view item other than a box set or playlist: v12 routes it \
          to AncestorIds, which the keys statement ignores, so the answer is always empty; \
          Ferrofin scopes by TopParentId = that item (a physical library folder answers, \
