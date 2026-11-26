@@ -3424,8 +3424,8 @@ impl LocalProviderManager {
     }
 
     /// `LibraryManager.UpdateImagesAsync`, which upstream runs on every save of
-    /// an item (`RunMetadataSavers`), here on `update_to_repository` and a
-    /// refresh's save (not yet the metadata editor's, gl-1922): each local
+    /// an item (`RunMetadataSavers`), here on `update_to_repository` (the
+    /// metadata editor's save among them) and a refresh's save: each local
     /// image whose size or blurhash is missing or whose file changed or is gone
     /// (`ImageNeedsRefresh`), or every one for a save from `ImageUpdate` up (an
     /// image, download or edit save, in upstream's order), is measured and
