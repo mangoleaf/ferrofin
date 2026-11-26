@@ -17,13 +17,6 @@ fn thread_names() -> Vec<String> {
         .collect()
 }
 
-fn epoch_tickers() -> usize {
-    thread_names()
-        .iter()
-        .filter(|name| name.starts_with("wasm-epoch"))
-        .count()
-}
-
 #[test]
 fn the_wasm_runtime_lives_only_while_a_plugin_or_a_validation_needs_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -44,7 +37,9 @@ fn the_wasm_runtime_lives_only_while_a_plugin_or_a_validation_needs_it() {
     );
 
     // A validation builds an engine for itself; once it returns, its ticker
-    // finds the engine gone at the next tick (1 s) and exits.
+    // finds the engine gone at the next tick (1 s) and exits. The ticker is
+    // counted by the crate, not found in /proc/self/task: a thread exiting
+    // mid-listing (the validation's own) hides the next one, the ticker.
     let component = wat::parse_str(ferrofin_wasm::TEST_FIXTURE_WAT).unwrap();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -53,11 +48,11 @@ fn the_wasm_runtime_lives_only_while_a_plugin_or_a_validation_needs_it() {
         .block_on(validator.validate(&component))
         .expect("fixture is valid");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while epoch_tickers() > 0 && std::time::Instant::now() < deadline {
+    while ferrofin_wasm::live_epoch_tickers_for_test() > 0 && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     assert_eq!(
-        epoch_tickers(),
+        ferrofin_wasm::live_epoch_tickers_for_test(),
         0,
         "the validator must not keep an engine after its validation returns"
     );
