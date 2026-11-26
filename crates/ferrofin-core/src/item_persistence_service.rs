@@ -1768,19 +1768,25 @@ impl FerrofinItemPersistenceService {
     ///
     /// Those rows are the ones with no `DateCreated`. Jellyfin stores NULL
     /// only for `DateTime.MinValue` (`BaseItemMapper.cs:307`), and its create
-    /// paths always date the item (`Folder.AddChild`), so an adopted row is
-    /// selected only if Jellyfin itself left it undated; it then gets what
-    /// Jellyfin's next save of it would store. For each one, in one
-    /// transaction:
+    /// paths always date the item's creation (`Folder.AddChild`), so an
+    /// adopted row is selected only if Jellyfin itself left it undated; it
+    /// then gets what Jellyfin's next save of it would store. For each one,
+    /// in one transaction:
     /// - `CleanName` is re-derived from `Name` (empty for a whitespace-only
     ///   name, as in [`Self::repair_clean_values`]): a playlist renamed by the
     ///   old bare `UPDATE "Name"` still matched its old name, and one the old insert
     ///   wrote after that pass ran had none, so search never found it.
     /// - `SortName` is re-derived from `ForcedSortName`, or else from `Name`,
     ///   the way the C# getter does on every save.
-    /// - `DateCreated`, `DateModified` and `DateLastSaved` are set to now
-    ///   where NULL. The creation time is lost; now is when the row starts
-    ///   being dated.
+    /// - `DateCreated` and `DateLastSaved` are set to now where NULL. The
+    ///   creation time is lost; now is when the row starts being dated.
+    /// - `DateModified` is left as stored (NULL on these rows unless an edit
+    ///   dated it). Every box set and playlist is a folder, and the rekeys
+    ///   later in the same boot (`run_rekey_pathless_playlists`,
+    ///   `run_rekey_pathless_box_sets`) give these path-less rows their
+    ///   directory, which Jellyfin's save restats and finds no
+    ///   `DateModified` on (`MetadataService.cs:244-249`, D2): Jellyfin keeps
+    ///   it NULL, as the create path does (gl-1617).
     ///
     /// Completion is recorded in `FerrofinMeta` under `named_item_rows_v1`.
     /// Returns the number of rows repaired.
@@ -1823,7 +1829,6 @@ impl FerrofinItemPersistenceService {
             let written = sqlx::query(
                 r#"UPDATE "BaseItems" SET "CleanName" = ?2, "SortName" = ?3,
                        "DateCreated" = ?4,
-                       "DateModified" = COALESCE("DateModified", ?4),
                        "DateLastSaved" = COALESCE("DateLastSaved", ?4)
                    WHERE "Id" = ?1 AND "DateCreated" IS NULL"#,
             )
@@ -13359,8 +13364,8 @@ mod tests {
 
     /// The box sets and playlists an older `insert_named_item` wrote (no
     /// `DateCreated`) get the columns a save derives (`CleanName` and
-    /// `SortName` from the current name) and their missing dates; the pass
-    /// runs once.
+    /// `SortName` from the current name) and their missing dates, but no
+    /// `DateModified`, which a folder does not have; the pass runs once.
     #[tokio::test]
     async fn the_named_item_repair_fills_created_box_sets_and_playlists_once() {
         let db = test_db().await;
@@ -13422,7 +13427,9 @@ mod tests {
                     "a stored date is kept"
                 );
             } else {
-                assert_eq!(row.date_modified, Some(created));
+                // A folder's directory has no `DateModified`, so Jellyfin's
+                // save leaves it NULL, as the create path does (gl-1617).
+                assert_eq!(row.date_modified, None);
             }
         }
 
