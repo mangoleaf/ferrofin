@@ -96,7 +96,7 @@ pub struct PhotoItem {
 
     /// Set by [`PhotoProvider::fetch`] when the file was read as TagLib would
     /// open it, with or without EXIF, and for a WebP or an AVIF Ferrofin reads
-    /// (until gl-1614 decides).
+    /// where TagLib cannot (an accepted divergence, gl-1614).
     ///
     /// Not a Jellyfin field: C# expresses the same thing by only entering the
     /// assignment block inside its `try`. A caller must not write the
@@ -358,7 +358,9 @@ pub struct ExifTags {
 ///
 /// Ferrofin reads EXIF from containers TagLib reads none from: WebP and AVIF,
 /// which it cannot open, and a PNG's `eXIf` chunk, which its PNG reader skips.
-/// gl-1614 holds that choice for the owner.
+/// That is an accepted divergence (owner decision, gl-1614): the files hold the
+/// date taken, caption, rating, camera and GPS data, and upstream lists these
+/// formats to read them.
 fn read_exif(path: &str) -> Option<ExifTags> {
     let file = std::fs::File::open(path).ok()?;
     // A failed stat skips the IFD walk and leaves the full read to decide. A
@@ -374,9 +376,8 @@ fn read_exif(path: &str) -> Option<ExifTags> {
     }
     let mut tags = exif_tags(&mut reader, len)?;
     // TagLib#'s combined `ImageTag.Comment` (`CombinedImageTag.cs:621-631`) is
-    // never null: it is "" when no tag holds a comment. Until gl-1614 decides,
-    // a WebP or an AVIF, which TagLib cannot open, keeps only a comment its
-    // EXIF holds.
+    // never null: it is "" when no tag holds a comment. A WebP or an AVIF,
+    // which TagLib cannot open, keeps only a comment its EXIF holds (gl-1614).
     if header.is_some() {
         tags.comment.get_or_insert_default();
     } else {
@@ -2395,8 +2396,8 @@ mod tests {
         jpeg_with_tags(&[], &[(0x9286, 7, b"ASCII\0\0\0".as_slice())]),
         None
     )]
-    // Not upstream's value, which is NULL: Ferrofin reads a WebP's EXIF until
-    // gl-1614 decides.
+    // Not upstream's value, which is NULL: Ferrofin reads a WebP's EXIF, an
+    // accepted divergence (gl-1614).
     #[case::a_webp_with_a_comment(
         "photo.webp",
         jpeg_with_tags(&[], &[(0x9286, 7, b"ASCII\0\0\0hi".as_slice())]),
@@ -2434,5 +2435,72 @@ mod tests {
         provider.fetch(&mut item).await.expect("fetch");
         assert_eq!(item.exif_was_read, expected != Some("stale"));
         assert_eq!(item.overview.as_deref(), expected);
+    }
+
+    /// An EXIF block with a camera make and a comment.
+    fn camera_exif() -> Vec<u8> {
+        let comment = b"ASCII\0\0\0caption".to_vec();
+        let count = u32::try_from(comment.len()).unwrap();
+        tiff_file(
+            true,
+            0,
+            &[(0x010f, 2, 5, b"ACME\0".to_vec())],
+            &[(0x9286, 7, count, comment)],
+            &[],
+            &[],
+        )
+    }
+
+    /// A WebP holding `exif` in its `EXIF` chunk.
+    fn webp_with_exif(exif: &[u8]) -> Vec<u8> {
+        let mut chunk = Vec::from(b"EXIF".as_slice());
+        chunk.extend_from_slice(&u32::try_from(exif.len()).unwrap().to_le_bytes());
+        chunk.extend_from_slice(exif);
+        if exif.len() % 2 == 1 {
+            chunk.push(0); // RIFF pads a chunk to an even size
+        }
+        let mut webp = Vec::from(b"RIFF".as_slice());
+        // The RIFF size counts the "WEBP" form type and the chunks.
+        webp.extend_from_slice(&u32::try_from(4 + chunk.len()).unwrap().to_le_bytes());
+        webp.extend_from_slice(b"WEBP");
+        webp.extend_from_slice(&chunk);
+        webp
+    }
+
+    /// [`png_without_exif`] with `exif` in an `eXIf` chunk before its IEND.
+    /// The chunk's CRC is not computed: kamadak-exif does not check it.
+    fn png_with_exif(exif: &[u8]) -> Vec<u8> {
+        let png = png_without_exif();
+        // IEND is 12 bytes: its length, type and CRC.
+        let (head, iend) = png.split_at(png.len() - 12);
+        let mut out = head.to_vec();
+        out.extend_from_slice(&u32::try_from(exif.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(b"eXIf");
+        out.extend_from_slice(exif);
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(iend);
+        out
+    }
+
+    /// gl-1614: Ferrofin reads the EXIF a WebP or a PNG's `eXIf` chunk holds,
+    /// which Jellyfin 12.4's TagLib# never reads (an accepted divergence).
+    #[rstest::rstest]
+    #[case::webp("photo.webp", webp_with_exif(&camera_exif()))]
+    #[case::png("photo.png", png_with_exif(&camera_exif()))]
+    #[tokio::test]
+    async fn a_webp_or_png_keeps_the_exif_it_holds(#[case] name: &str, #[case] bytes: Vec<u8>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, name, &bytes);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert!(item.exif_was_read);
+        assert_eq!(item.exif.camera_make.as_deref(), Some("ACME"));
+        assert_eq!(item.overview.as_deref(), Some("caption"));
     }
 }

@@ -303,6 +303,11 @@ Wired and working, with a documented limitation or lighter verification:
   UTF-8 only when the text also holds no NUL, and UTF-16 in the EXIF block's byte order
   otherwise, unless a byte-order mark says which. So UTF-8 padded with a NUL under `UNICODE`,
   which Jellyfin reads, comes out garbled.
+- **Photo EXIF in WebP, AVIF and PNG** — **Accepted divergence:** Ferrofin reads the EXIF a
+  WebP, an AVIF or a PNG's `eXIf` chunk holds (date taken, title, caption, rating, camera,
+  GPS, exposure). Jellyfin 12.4 lists these formats as photos, but its tag library cannot
+  open a WebP or an AVIF, so it keeps none of those fields for them, and never reads a PNG's
+  `eXIf` chunk, so a PNG keeps only what its text chunks or XMP hold.
 - **Playlist files are read, never written** — a library scan makes a playlist of each
   `.m3u`/`.m3u8`/`.pls`/`.wpl`/`.zpl` file in a music or untyped library and of each folder
   named `… [playlist]` or holding a `playlist.xml` (members from the file, or from the
