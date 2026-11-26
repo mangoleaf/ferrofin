@@ -679,8 +679,9 @@ pub static SETTINGS: &[SettingSpec] = &[
                 value: "both",
                 label: "Both",
                 note: "Clients pick by screen; Wholphin and the Jellyfin Android and Android \
-                       TV apps take 640, so they fetch 4 times the tiles of 320 (see 640). Two \
-                       ffmpeg passes per video and the disk of both sizes.",
+                       TV apps take 640, so they fetch 4 times the tiles of 320 (see 640). One \
+                       ffmpeg pass per video makes both sizes (one per size when trickplay uses \
+                       a VAAPI or QSV GPU), at the disk cost of both.",
             },
         ],
         store: SettingStore::ServerConfiguration(ConfigurationField {
