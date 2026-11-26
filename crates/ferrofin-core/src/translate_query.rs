@@ -51,9 +51,18 @@ use ferrofin_traits::options::{DescendantQueryRoots, InternalItemsQuery};
 /// excludes it (C# `PlaceholderId`).
 pub(crate) const PLACEHOLDER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
+/// The literal of [`ALTERNATE_VERSION_HIDDEN`], for statements built with
+/// `concat!`.
+macro_rules! alternate_version_hidden {
+    () => {
+        r#" AND (bi."PrimaryVersionId" IS NULL OR NOT EXISTS (SELECT 1 FROM "BaseItems" p WHERE p."Id" = bi."PrimaryVersionId" AND p."TopParentId" IS bi."TopParentId"))"#
+    };
+}
+pub(crate) use alternate_version_hidden;
+
 /// 12.1 `ApplyAlternateVersionFiltering`: keep a row unless it is a version
 /// of a primary that still exists in the same library.
-pub(crate) const ALTERNATE_VERSION_HIDDEN: &str = r#" AND (bi."PrimaryVersionId" IS NULL OR NOT EXISTS (SELECT 1 FROM "BaseItems" p WHERE p."Id" = bi."PrimaryVersionId" AND p."TopParentId" IS bi."TopParentId"))"#;
+pub(crate) const ALTERNATE_VERSION_HIDDEN: &str = alternate_version_hidden!();
 
 /// The "unowned" predicate. C# treats `OwnerId = Guid.Empty` as "no owner": a
 /// real Jellyfin database stores the ZERO GUID on virtually every row
