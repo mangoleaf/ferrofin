@@ -3325,10 +3325,16 @@ pub trait VirtualFolderManager: Send + Sync {
     /// library configured, a shortcut that did not resolve, and a library
     /// listing no location without readable options that list none either.
     /// A library created with no folder adds no location, as upstream's root
-    /// reads it.
+    /// reads it. The same list, after the root's own path, is the root's
+    /// `PhysicalLocationsList`, so it comes in the order upstream's root
+    /// gathers it: each library and each of its shortcuts as its folder lists
+    /// them.
     ///
-    /// The default lists the folders afresh and answers `None` while any
-    /// library lists no location, since it cannot tell those cases apart.
+    /// The default lists the folders afresh through
+    /// [`get_virtual_folders`](Self::get_virtual_folders), each library's
+    /// locations sorted as that listing gives them, so not in upstream's
+    /// order, and answers `None` while any library lists no location, since
+    /// it cannot tell those cases apart.
     async fn locations_for_removal(&self) -> Result<Option<Vec<String>>, ServiceError> {
         let folders = self.get_virtual_folders().await?;
         if folders.is_empty() || folders.iter().any(|f| f.locations.is_empty()) {

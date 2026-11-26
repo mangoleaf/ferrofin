@@ -2571,8 +2571,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              path. Both measured on Jellyfin 12.4.0; Jellyfin bugs not ported.",
             "A playlist FILE's <name>.xml sidecar (PlaylistXmlSaver.GetSavePath) is neither \
              written nor read: upstream writes it with no members and then reads it before \
-             the playlist file, which empties the playlist. Whether to port either half is \
-             an owner decision. Fix path: gl-1915.",
+             the playlist file, which empties the playlist. Jellyfin bug not ported, and \
+             Ferrofin writes no such file into a media folder for a Jellyfin to read back \
+             (owner decision 2026-11-24, gl-1915).",
         ],
     },
     VerifiedSubsystem {
@@ -5241,8 +5242,12 @@ pub const VERIFIED: &[Verified] = &[
                items go at the scan's library_scan.rs prune_orphan_locations \
                (AggregateFolder.ValidateChildren over the root's PhysicalLocations, the \
                union of the libraries' resolved locations, read by virtual_folder_manager.rs \
-               locations_for_removal, where a library created with no folder adds none)",
-        date: "2026-11-20",
+               locations_for_removal, where a library created with no folder adds none), \
+               which first stores that list after the root's own path as the root's \
+               PhysicalLocationsList (record_root_locations: CreateResolveArgs with \
+               setPhysicalLocations, the libraries and their shortcuts in the order their \
+               folders list them, expanded; merged into Data, written when it changed)",
+        date: "2026-11-21",
         divergences: &[
             "Without refreshLibrary, upstream waits 1000 ms (Task.Delay) inside the request before \
          LibraryMonitor.Start, so its directory watchers miss the removal; Ferrofin answers at \
@@ -5263,14 +5268,30 @@ pub const VERIFIED: &[Verified] = &[
             "A change the monitor was still settling when the restart came is refreshed after it; \
          upstream's Stop disposes its FileRefreshers, so that change waits for the next scan. \
          Jellyfin bug not ported.",
-            "A scan deletes no removed location's folder while a library shortcut resolves to \
-         no location (it cannot be read, or it is empty); upstream's root leaves such a \
-         shortcut's location out and deletes its folder with every item under it, so one \
-         damaged shortcut file deletes a library's items. Jellyfin bug not ported.",
-            "A scan deletes no removed location's folder while no library is configured, or \
-         while a library lists no location and its options are missing, cannot be read or \
-         name a path no shortcut gives; upstream reads no options there and deletes every \
-         folder no shortcut lists. Fix path: gl-1929 (owner decision).",
+            "A scan deletes no removed location's folder, and leaves the root's stored \
+         PhysicalLocationsList as it is, while a library shortcut resolves to no location (it \
+         cannot be read, or it is empty); upstream's root leaves such a shortcut's location \
+         out of its list and deletes its folder with every item under it, so one damaged \
+         shortcut file deletes a library's items. Jellyfin bug not ported.",
+            "A scan deletes no removed location's folder, and leaves the root's stored \
+         PhysicalLocationsList as it is, while no library is configured, or while a library \
+         lists no location and its options are missing, cannot be read or name a path no \
+         shortcut gives; upstream reads no options there, lists what the shortcuts give and \
+         deletes every folder no shortcut lists. Accepted divergence (owner decision \
+         2026-11-24, gl-1929): a restore that lacks the libraries folder would otherwise read \
+         as every location removed; after the last library is deleted its rows stay, unseen \
+         by clients, until another library exists. A scan warns about a library that lists no \
+         location and whose options do not read as empty, and says nothing while no library \
+         is configured.",
+            "The root's PhysicalLocationsList is stored by the scan alone, as the list that \
+         scan computes. Upstream's ValidateTopLibraryFolders (a scan's opening, a library \
+         added, a library removed with refreshLibrary) saves the list its previous \
+         validation computed, so its stored list trails the libraries by one validation \
+         (Jellyfin 12.4: the first scan after a library removed without refreshLibrary \
+         still stores its location, the second drops it). Jellyfin bug not ported: a \
+         returned Jellyfin that reads the list's paths in its own layout (the export's \
+         rewrite, gl-1924) and lists the library folders in the same order (gl-1933) \
+         computes the same list, finds it equal and saves nothing.",
             "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
