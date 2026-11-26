@@ -317,7 +317,7 @@ impl PhotoProvider {
     }
 }
 
-/// The EXIF fields read off one file, plus the image dimensions the tags carry.
+/// The EXIF fields read off one file, plus the image size.
 ///
 /// A flat intermediate so the tag→item mapping (`apply_exif`) stays pure and
 /// unit-testable without a file on disk.
@@ -334,9 +334,11 @@ pub struct ExifTags {
     pub rating: Option<f64>,
     /// `DateTimeOriginal` (falling back to `DateTime`) — C# `ImageTag.DateTime`.
     pub date_taken: Option<DateTime<Utc>>,
-    /// `PixelXDimension` — C# `Properties.PhotoWidth`.
+    /// C# `Properties.PhotoWidth`: a JPEG's frame width, else
+    /// `PixelXDimension` (PNG, TIFF and CR2 sizes: gl-1951).
     pub width: Option<i32>,
-    /// `PixelYDimension` — C# `Properties.PhotoHeight`.
+    /// C# `Properties.PhotoHeight`: a JPEG's frame height, else
+    /// `PixelYDimension`.
     pub height: Option<i32>,
 }
 
@@ -427,7 +429,8 @@ fn tiff_header(head: &[u8]) -> bool {
 /// tags are the defaults, and kamadak-exif does not read on through the scan
 /// data; with one, kamadak-exif reads that segment, and its errors leave the
 /// photo alone as a broken EXIF block does. They include every TIFF header
-/// whose magic is not 42, which `ReadAPP1Segment` throws on.
+/// whose magic is not 42, which `ReadAPP1Segment` throws on. The size is the
+/// frame's, as TagLib#'s `Properties` are, whatever the EXIF says.
 ///
 /// Upstream has already assigned the aperture, shutter speed, camera make and
 /// model when it throws at a missing size; such a file is left alone whole
@@ -437,10 +440,13 @@ fn jpeg_tags<R: Read + Seek>(reader: &mut BufReader<R>, len: u64) -> Option<Exif
     if header.width == 0 || header.height == 0 {
         return None;
     }
-    match header.exif {
-        Some(tiff) => tags_or_unopened(exif::Reader::new().read_raw(tiff)),
-        None => Some(ExifTags::default()),
-    }
+    let mut tags = match header.exif {
+        Some(tiff) => tags_or_unopened(exif::Reader::new().read_raw(tiff))?,
+        None => ExifTags::default(),
+    };
+    tags.width = Some(i32::from(header.width));
+    tags.height = Some(i32::from(header.height));
+    Some(tags)
 }
 
 /// What TagLibSharp 2.3.0's `ReadMetadata` (`Jpeg/File.cs`) takes from a
@@ -576,7 +582,7 @@ impl<R: Seek> Seek for Metered<R> {
 /// TIFF that walk turns down, goes through kamadak-exif's own reader. `None`
 /// is a file TagLib would refuse (see `tags_or_unopened`).
 fn exif_tags<R: Read + Seek>(reader: &mut BufReader<Metered<R>>, len: u64) -> Option<ExifTags> {
-    // A peek leaves the reader at the start, so a JPEG, PNG or WebP is read
+    // A peek leaves the reader at the start, so a PNG, WebP or AVIF is read
     // exactly as before.
     let is_tiff = reader.fill_buf().is_ok_and(tiff_header);
     let walked = is_tiff
@@ -2566,5 +2572,35 @@ mod tests {
             "read {}",
             reader.get_ref().read
         );
+    }
+
+    /// A JPEG's size is its frame header's, as TagLib#'s `Properties` are,
+    /// over whatever the row held: what a stock Jellyfin 12.4 stored for each.
+    #[rstest::rstest]
+    #[case::not_the_exif_size(
+        jpeg_with_tags(
+            &[],
+            &[(0xa002, 4, &4032u32.to_le_bytes()), (0xa003, 4, &3024u32.to_le_bytes())],
+        ),
+        (1, 1)
+    )]
+    #[case::without_exif([SOI, SOF_1X1, EOI].concat(), (1, 1))]
+    #[case::a_frame_header_shorter_than_its_fields(
+        [SOI, b"\xff\xc0\x00\x04\x08\x00\xff\xe2\x00\x03\x01", EOI].concat(),
+        (57856, 255)
+    )]
+    #[tokio::test]
+    async fn a_jpegs_size_is_its_frame_headers(#[case] file: Vec<u8>, #[case] size: (i32, i32)) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "photo.jpg", &file);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 640,
+            height: 480,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert_eq!((item.width, item.height), size);
     }
 }
