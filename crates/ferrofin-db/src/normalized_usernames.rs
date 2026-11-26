@@ -47,7 +47,8 @@ pub async fn preflight(conn: &mut SqliteConnection) -> Result<()> {
 /// Returns a collision error without rewriting values when two accounts have
 /// the same final key, or a database error. Callers must stop startup on error.
 pub async fn repair(conn: &mut SqliteConnection) -> Result<()> {
-    let mut tx = conn.begin().await?;
+    // It reads before it writes, beside a previous version that may be writing.
+    let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
     let done: Option<String> =
         sqlx::query_scalar(r#"SELECT "Value" FROM "FerrofinMeta" WHERE "Key" = ?1"#)
             .bind(MARKER)
