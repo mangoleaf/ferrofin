@@ -5250,15 +5250,8 @@ impl LibraryScanner {
             }
         }
         if let Some(localization) = &self.localization {
-            let score = entity
-                .custom_rating
-                .as_deref()
-                .filter(|rating| !rating.is_empty())
-                .or(entity.official_rating.as_deref())
-                .and_then(|rating| {
-                    localization
-                        .get_rating_score(rating, entity.preferred_metadata_country_code.as_deref())
-                });
+            let score =
+                crate::localization_manager::parental_rating_score(entity, localization.as_ref());
             entity.inherited_parental_rating_value = score.map(|score| i64::from(score.score));
             entity.inherited_parental_rating_sub_value =
                 score.and_then(|score| score.sub_score.map(i64::from));
