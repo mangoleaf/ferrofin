@@ -26,12 +26,15 @@ use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
-use ferrofin_providers::TmdbClient;
+use ferrofin_providers::{LocalProviderManager, TmdbClient};
 use ferrofin_traits::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService as _, ItemRepository};
 use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
+use ferrofin_traits::providers::{
+    MetadataRefreshMode, MetadataRefreshOptions, ProviderManager as _,
+};
 use uuid::Uuid;
 
 /// TheMovieDb's series, listing seasons 1 and 2.
@@ -489,4 +492,136 @@ async fn the_upcoming_episodes_task_refreshes_a_continuing_series() {
     task.execute(&TaskProgress::default()).await.expect("run");
 
     assert_eq!(lib.virtual_episodes().await, vec![(1, 2), (1, 3), (2, 1)]);
+}
+
+/// A path-less season left with only missing episodes (gl-1621): season 1's
+/// one file sits loose in the series folder, beside the placeholders TMDb's
+/// other episodes get, and then goes. The scan keeps the season for the
+/// placeholders it still holds, and it stays non-virtual, as upstream's plain
+/// scan leaves it: `SaveIsVirtualItem` runs only past
+/// `UpdateMetadataFromChildren`'s `isFullRefresh || updateType > None`
+/// (`SeasonMetadataService.cs:94-103`). Returns the season and the file.
+async fn season_left_with_only_missing_episodes(
+    lib: &Library,
+    base: &str,
+) -> (Uuid, std::path::PathBuf) {
+    let show = lib.tmp.join("tv").join("Show");
+    std::fs::remove_dir_all(show.join("Season 1")).expect("rm season folder");
+    let file = show.join("Show S01E01.mkv");
+    std::fs::write(&file, b"0123456789").expect("write");
+    lib.set(settings(true, true, &[lib.folder_id.as_str()]));
+    lib.scanner(base).scan_all().await.expect("scan");
+    let seasons = lib
+        .items
+        .get_item_list(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Season],
+            index_number: Some(1),
+            ..Default::default()
+        })
+        .await
+        .expect("seasons");
+    let [season] = seasons.as_slice() else {
+        panic!("one season 1: {seasons:?}");
+    };
+    let season = Uuid::parse_str(&season.id).expect("season id");
+    let before = lib.row(season).await.expect("season 1");
+    assert!(
+        before.path.is_none() && !before.is_virtual_item,
+        "{before:?}"
+    );
+    assert_eq!(lib.virtual_episodes().await, vec![(1, 2), (1, 3), (2, 1)]);
+
+    std::fs::remove_file(&file).expect("rm file");
+    lib.scanner(base).scan_all().await.expect("rescan");
+    let kept = lib.row(season).await.expect("kept for its placeholders");
+    assert!(!kept.is_virtual_item, "a scan leaves the flag");
+    assert_eq!(
+        lib.virtual_episodes().await,
+        vec![(1, 1), (1, 2), (1, 3), (2, 1)]
+    );
+    (season, file)
+}
+
+/// The refresh of a path-less season, which no scan plans: the provider
+/// manager's.
+fn providers(lib: &Library, base: &str) -> LocalProviderManager {
+    LocalProviderManager::new(Vec::new())
+        .with_remote_images(lib.tmdb(base), Arc::clone(&lib.items))
+        .with_image_store(lib.persistence.clone(), lib.tmp.join("metadata"))
+        .with_virtual_folders(Arc::clone(&lib.vf))
+}
+
+/// The season's full refresh makes it virtual (`SaveIsVirtualItem`,
+/// `SeasonMetadataService.cs:105-115`: no path, every episode path-less); a
+/// plain refresh of the refreshed season does not open the gate. Scans keep
+/// it virtual until a file for it makes it real again.
+#[tokio::test]
+async fn a_full_refresh_makes_a_season_left_with_only_missing_episodes_virtual() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lib = Library::new(tmp.path()).await;
+    let base = spawn_tmdb();
+    let (season, file) = season_left_with_only_missing_episodes(&lib, &base).await;
+    let providers = providers(&lib, &base);
+    providers
+        .refresh_full_item(season, &MetadataRefreshOptions::default())
+        .await
+        .expect("default refresh");
+    assert!(
+        !lib.row(season).await.expect("season").is_virtual_item,
+        "a plain refresh does not open the gate"
+    );
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    providers
+        .refresh_full_item(season, &full)
+        .await
+        .expect("full refresh");
+    let refreshed = lib.row(season).await.expect("season");
+    assert!(refreshed.is_virtual_item, "{refreshed:?}");
+    lib.scanner(&base).scan_all().await.expect("scan again");
+    assert!(lib.row(season).await.expect("season").is_virtual_item);
+
+    std::fs::write(&file, b"0123456789").expect("the file returns");
+    lib.scanner(&base)
+        .scan_all()
+        .await
+        .expect("scan with the file");
+    assert!(!lib.row(season).await.expect("season").is_virtual_item);
+}
+
+/// The gate's other half: a plain refresh that registers a new local image
+/// (`season01-poster.jpg` in the series folder, `ValidateImages` before
+/// `BeforeSave`) has `updateType > None`, and the flag is set whatever the
+/// lock (`SeasonMetadataService.UpdateMetadataFromChildren` calls
+/// `SaveIsVirtualItem` past the base's `IsLocked` return).
+#[tokio::test]
+async fn a_refresh_that_finds_new_season_art_makes_a_locked_season_virtual() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lib = Library::new(tmp.path()).await;
+    let base = spawn_tmdb();
+    let (season, _) = season_left_with_only_missing_episodes(&lib, &base).await;
+    let mut row = lib.row(season).await.expect("season");
+    row.is_locked = true;
+    lib.persistence.save_items(&[row]).await.expect("lock");
+    std::fs::write(
+        tmp.path()
+            .join("tv")
+            .join("Show")
+            .join("season01-poster.jpg"),
+        b"0123456789",
+    )
+    .expect("write art");
+
+    providers(&lib, &base)
+        .refresh_full_item(season, &MetadataRefreshOptions::default())
+        .await
+        .expect("default refresh");
+    let refreshed = lib.row(season).await.expect("season");
+    assert!(
+        refreshed.is_locked && refreshed.is_virtual_item,
+        "{refreshed:?}"
+    );
 }

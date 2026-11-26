@@ -49,6 +49,7 @@ pub mod rate_limit;
 pub mod refresh_plan;
 pub mod remote_images;
 pub mod season;
+pub mod season_episodes;
 pub mod similarity;
 pub mod studios;
 #[cfg(test)]

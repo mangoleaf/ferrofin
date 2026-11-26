@@ -1602,6 +1602,12 @@ pub async fn build_app_state(
                 let config_mgr = Arc::clone(&config_mgr);
                 move || config_mgr.snapshot_shared().metadata_options.clone()
             })
+            // A season's refresh reads its episodes (`Season.GetEpisodes`),
+            // with the specials airing within it when the setting is on.
+            .with_display_specials_within_seasons({
+                let config_mgr = Arc::clone(&config_mgr);
+                move || config_mgr.snapshot_shared().display_specials_within_seasons
+            })
             // Enables the kind-filtered built-in external-id descriptors the
             // Identify dialog renders as id input fields.
             .with_item_types(item_type_lookup.as_ref())
