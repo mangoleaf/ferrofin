@@ -1575,7 +1575,7 @@ fn a_row_stored_in_the_server_configuration_is_read_from_it() {
 fn every_stored_option_reads_back_as_itself() {
     let custom = ServerConfiguration {
         trickplay_options: TrickplayOptions {
-            width_resolutions: vec![480],
+            width_resolutions: vec![480, 320],
             qscale: 7,
             full_chroma: true,
             ..TrickplayOptions::default()
@@ -1615,7 +1615,8 @@ fn preview_size_reads_the_widths_in_any_order() {
         (vec![320, 640], "both", false),
         (vec![640, 320], "both", false),
         (vec![320, 320], "320", false),
-        (vec![480], "480", true),
+        (vec![480], "480", false),
+        (vec![480, 320], "320, 480", true),
         (vec![640, 320, 480], "320, 480, 640", true),
         (vec![], "none", true),
     ] {

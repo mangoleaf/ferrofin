@@ -322,7 +322,7 @@ proxy's `X-Forwarded-Proto` and `X-Forwarded-Host`.
 | `FERROFIN_ROW_CACHE_TTL_SECS` | `30` | Seconds the per-user access check serves a user's permissions and preferences, the libraries' rows and options, and the views' and the playlists folder's rows, from memory. Queries scoped to the user's libraries, the home screen's views and every lookup of a library's physical folders read the same cached rows and options. Whether a Live TV tuner is configured, which decides whether Live TV is offered, is cached the same way. As for the auth cache, every change made through the server applies at once, and this only bounds changes made outside it (the database, a library's `options.json`). `5` to `300`. The `config.toml` key is `row_cache_ttl_secs`. |
 | `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` | `300` | Seconds a library scan's directory listings survive unread before they are dropped. The default is Jellyfin's (`DirectoryService.IdleTimeoutMs`). `30` to `3600` (a value outside, `0` included, logs a warning and is clamped). The `config.toml` key is `scan_directory_cache_idle_secs`. |
 | `FERROFIN_BOOK_ARCHIVE_MAX_ENTRIES` | `100000` | The most entries a comic archive (`.cbz`, `.cb7`, `.cbt`) may hold for its pages to set the book's runtime. A book's runtime is its pages × 10000 ticks, which is what jellyfin-web's comic and PDF readers report as the position: a comic counts its archive's entries other than folders, a PDF its pages, as Jellyfin does. The count reads only the archive's directory, never a page; an archive with more entries than this is not counted and its book keeps the runtime it has (one second for a new one). Every entry counts towards the limit, folders included. Jellyfin has no such limit. A book is counted when it is added, when its file changes, when its metadata is refreshed ("Search for missing metadata" or "Replace all metadata"), and on any scan while a `.cbz`, `.cb7`, `.cbt` or PDF still has the one-second runtime (as a book added by an older release does); a counted book whose file has not changed is not opened again, while one whose pages cannot be counted is opened again on each scan but not saved. `1000` to `10000000` (a value outside, `0` included, logs a warning and is clamped). The `config.toml` key is `book_archive_max_entries`. |
-| `FERROFIN_TRICKPLAY_CONCURRENCY` | `auto` | How many videos generate trickplay images at once (each one's selected widths in turn: for each, an ffmpeg frame extraction, then tile packing). A video keeps its place until all of its widths are made, so with **Both** selected a scan makes each video's 320 and 640 sets together. A library scan generates several at once; the **Generate Trickplay Images** task goes one item at a time but shares this cap when it overlaps a scan. `auto` allows as many as the image-encoding limit: **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`), else one per CPU. An integer sets a lower cap; `0`, a negative number, or a value above the auto value means `auto`. Each generation is an ffmpeg process with its own memory, and with hardware acceleration its own GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). Packing its tiles then takes about 60 MiB of server memory at the default tile grid, at 320 or 640, because a wider set packs fewer previews into each tile ([Trickplay](#trickplay)). Jellyfin generates one at a time; `1` does the same. The `config.toml` key `trickplay_concurrency` takes an integer or `"auto"`. |
+| `FERROFIN_TRICKPLAY_CONCURRENCY` | `auto` | How many videos generate trickplay images at once (each one's selected widths in turn: for each, an ffmpeg frame extraction, then tile packing). A video keeps its place until all of its widths are made, so with **Both** selected a scan makes each video's 320 and 640 sets together. A library scan generates several at once; the **Generate Trickplay Images** task goes one item at a time but shares this cap when it overlaps a scan. `auto` allows as many as the image-encoding limit: **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`), else one per CPU. An integer sets a lower cap; `0`, a negative number, or a value above the auto value means `auto`. Each generation is an ffmpeg process with its own memory, and with hardware acceleration its own GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). Packing its tiles then takes about 60 MiB of server memory at the default tile grid, at 320 or 640, because a wider set packs fewer previews into each tile, and about 50 MiB at 480, whose tiles are a little smaller ([Trickplay](#trickplay)). Jellyfin generates one at a time; `1` does the same. The `config.toml` key `trickplay_concurrency` takes an integer or `"auto"`. |
 
 ## Trickplay
 
@@ -336,7 +336,7 @@ images at once, is `FERROFIN_TRICKPLAY_CONCURRENCY` under [Library & database](#
 
 | Setting | Default | Purpose |
 |---|---|---|
-| Preview Size | 320 | How wide the scrubbing previews are, in pixels: `WidthResolutions` `[320]`, `[640]`, or `[320, 640]` (**Both**, in either order). 320 is fast to fetch but small on a 4K screen. 640 is sharper on 4K, and phones and 1080p screens get a large preview too. Both makes the two, so each client picks by its screen, at two ffmpeg passes per video and the disk of both. Packing a tile takes about 60 MiB of server memory at either width, at the default tile grid. |
+| Preview Size | 320 | How wide the scrubbing previews are, in pixels: `WidthResolutions` `[320]`, `[480]`, `[640]`, or `[320, 640]` (**Both**, in either order). 320 is fast to fetch but small on a 4K screen. 480 is sharper than 320 on a TV. 640 is sharper on 4K, and phones and 1080p screens get a large preview too. Both makes 320 and 640, so each client picks by its screen, at two ffmpeg passes per video and the disk of both; Wholphin and the Jellyfin Android and Android TV apps take 640. A wider size costs each client more tiles to fetch and more of its cache ([Tile size and the client's cache](#tile-size-and-the-clients-cache)). Packing a tile takes about 60 MiB of server memory at 320 or 640 and about 50 MiB at 480, at the default tile grid. |
 | Image Quality | Optimize Disk Usage | How much colour detail the previews keep: `Qscale` and the Ferrofin-only `FullChroma`. **Optimize Disk Usage** is Jellyfin's 4:2:0 at `Qscale` 4, with blocky colour around edges; **Optimize Quality** is 4:4:4 at `Qscale` 2, with full colour detail, and takes as long to generate. A video that trickplay's hardware acceleration (**Enable hardware decoding** and **Enable hardware accelerated MJPEG encoding** on the dashboard's Trickplay page) decodes or encodes on the GPU stays 4:2:0, so it costs the disk without the colour; one the GPU neither decodes nor encodes (a source it cannot decode, with a software MJPEG encoder) gets 4:4:4. `FullChroma` is left out of `GET /System/Configuration` while it is off, so the document is Jellyfin's unless an admin picks Optimize Quality. |
 
 A value the dashboard holds that fits no option (a width typed by hand, a `Qscale` changed alone)
@@ -366,20 +366,39 @@ than 0.1 %.
 
 | Width | Optimize Disk Usage | Optimize Quality |
 |---|---|---|
-| 320 | 2.4 to 3.2 MiB | 3.6 to 4.7 MiB |
-| 640 | 6.0 to 7.7 MiB | 10.2 to 13.0 MiB |
+| 320 | 1.7 to 3.4 MiB | 2.5 to 5.1 MiB |
+| 480 | 2.4 to 6.4 MiB | 4.3 to 9.2 MiB |
+| 640 | 5.0 to 7.8 MiB | 7.6 to 13.4 MiB |
 | Both | 320 and 640 together | 320 and 640 together |
 
-Measured with the server's own writer and the release image's jellyfin-ffmpeg 8.1.3, software
-decoding, on 10-minute excerpts of three films scaled to an hour: a 4K HDR HEVC Blu-ray at 2.40:1,
-a 4K HDR AV1 web download at 16:9 (both tone-mapped) and a 1080p SDR HEVC Blu-ray. Another film
-will land somewhere else, and a busier one higher. With **FFmpeg Threads** (`ProcessThreads`) at
-4, a pass at one width over the three excerpts together (30 minutes of video) took about 4 minutes
-on a running server: at 320, Optimize Disk Usage took 238 and 223 seconds and Optimize Quality
-228; at 640, Optimize Disk Usage took 263; and both widths at Optimize Quality took 443 together
-(640 at Optimize Quality was not timed alone). The first pass after the server started (320,
-Optimize Disk Usage) took 358 seconds. FFmpeg Threads defaults to 1, so a stock server's times
-will differ.
+Measured with the server's own writer and the release image's jellyfin-ffmpeg 8.1.3 (v1.5.2's image,
+before the libjpeg-turbo encoder of this version, whose tile bytes measured within 0.4 % of the
+earlier encoder's), software decoding, on 10-minute excerpts of three films scaled to an hour: a 4K
+HDR HEVC Blu-ray at 2.40:1, a 4K HDR AV1 web download at 16:9 (both tone-mapped) and a 1080p SDR
+HEVC Blu-ray. The 2.40:1 film is the low end of each row and the 1080p one the high end. Another
+film will land somewhere else, and a busier one higher. An earlier measurement on other excerpts of
+the same kinds of film landed inside these ranges at 320 and 640. With **FFmpeg Threads**
+(`ProcessThreads`) at 4, on four CPUs, a pass over the three excerpts together (30 minutes of video)
+took 198 to 208 seconds in each of three runs (480 alone, 320 and 640 together, and all three at
+Optimize Quality), because one decode makes every selected width. FFmpeg Threads defaults to 1, so a
+stock server's times will differ.
+
+### Tile size and the client's cache
+
+Each Preview Size wider than 320 costs a client (width / 320)² times the decoded pixels per minute
+of video: 2.25 times at 480 and 4 times at 640. With the scaled tile grid that cost comes as more
+tiles, not larger ones. At the default **Tile width** and **Tile height** of 10 x 10 (**Dashboard →
+Playback → Trickplay**) and the 10-second interval, a 320 tile holds 100 previews (about 17 minutes
+of video), a 480 tile 36 (6 minutes) and a 640 tile 25 (about 4 minutes), so a straight scrub
+fetches about 2.8 times as many tiles at 480 and 4 times as many at 640. A client that keeps decoded
+tiles in a memory cache of a fixed size then holds under half as much of the video at 480 and a
+quarter at 640, so scrubbing back over what it showed misses that cache about 2.25 or 4 times as
+often. A cache counted in bytes, such as a browser's, keeps a little over half as much at 480 and
+two fifths at 640 (the Optimize Disk Usage means were about 2.5, 4.5 and 6 MiB per hour); at the
+same width, Optimize Quality's files are 1.4 to 1.8 times Optimize Disk Usage's, so such a cache
+keeps about a third less again. Wholphin and the Jellyfin Android and Android TV apps take the 640
+set under Both. A smaller Tile width and Tile height make every tile smaller, at every width, but
+not the cost: each tile then covers less video, so the client fetches more of them.
 
 ## Observability
 
