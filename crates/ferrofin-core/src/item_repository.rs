@@ -1935,46 +1935,20 @@ impl FerrofinItemRepository {
         Ok(i32::try_from(count).unwrap_or(i32::MAX))
     }
 
-    /// Distinct `ItemValues.Value`s of the given types, optionally scoped to items
-    /// of certain stored `Type`s (C# `GetItemValueNames`).
+    /// One name per `CleanValue` of the given types, optionally scoped to items
+    /// of certain stored `Type`s (C# `GetItemValueNames`); see
+    /// [`item_value_names_statement`].
     async fn item_value_names(
         &self,
         types: &[ItemValueType],
         with_item_types: &[&str],
         exclude_item_types: &[&str],
     ) -> Result<Vec<String>, ServiceError> {
-        let type_ints: Vec<i64> = types.iter().map(|t| i64::from(i32::from(*t))).collect();
-        let mut sql = String::from(
-            r#"SELECT DISTINCT iv."Value" FROM "ItemValuesMap" ivm
-               JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
-               JOIN "BaseItems" bi ON bi."Id" = ivm."ItemId"
-               WHERE iv."Type" IN ("#,
-        );
-        sql.push_str(&placeholders(type_ints.len()));
-        sql.push(')');
-        if !with_item_types.is_empty() {
-            sql.push_str(r#" AND bi."Type" IN ("#);
-            sql.push_str(&placeholders(with_item_types.len()));
-            sql.push(')');
-        }
-        if !exclude_item_types.is_empty() {
-            sql.push_str(r#" AND bi."Type" NOT IN ("#);
-            sql.push_str(&placeholders(exclude_item_types.len()));
-            sql.push(')');
-        }
-        sql.push_str(r#" ORDER BY iv."Value""#);
-
-        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
-        for t in &type_ints {
-            query = query.bind(*t);
-        }
-        for t in with_item_types {
-            query = query.bind((*t).to_owned());
-        }
-        for t in exclude_item_types {
-            query = query.bind((*t).to_owned());
-        }
-        query.fetch_all(self.db.pool()).await.map_err(db_err)
+        item_value_names_statement(types, with_item_types, exclude_item_types)
+            .build_query_scalar::<String>()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)
     }
 
     /// Total for a by-name page that came back empty — `limit=0`, or an offset
@@ -5143,6 +5117,46 @@ fn item_values_statement(
     qb.push_bind(PLACEHOLDER_ID);
     append_predicates(&mut qb, filter);
     qb.push(r#" GROUP BY iv."CleanValue" ORDER BY MIN(iv."Value")"#);
+    qb
+}
+
+/// The statement [`FerrofinItemRepository::item_value_names`] runs, v12.4
+/// `GetItemValueNames` (`BaseItemRepository.ByName.cs:149-172`): the values of
+/// `types` some item maps (an item of a stored `Type` in `with`, and in none of
+/// `exclude`, when given), one `MIN("Value")` per `CleanValue`. SQLite's `MIN`
+/// on TEXT is the binary order, .NET's ordinal `Min`. Upstream has no
+/// `ORDER BY`, so its order is whatever its grouping yields; the `ORDER BY`
+/// here matches the `GROUP BY`, so SQLite adds no second sort.
+/// `item_value_names_statement_reads_values_by_type_and_probes_the_map` pins
+/// the plan.
+fn item_value_names_statement(
+    types: &[ItemValueType],
+    with: &[&str],
+    exclude: &[&str],
+) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> =
+        QueryBuilder::new(r#"SELECT MIN(iv."Value") FROM "ItemValues" AS iv WHERE iv."Type" IN ("#);
+    let mut sep = qb.separated(", ");
+    for t in types {
+        sep.push_bind(i64::from(i32::from(*t)));
+    }
+    qb.push(r#") AND EXISTS (SELECT 1 FROM "ItemValuesMap" AS ivm"#);
+    if !with.is_empty() || !exclude.is_empty() {
+        qb.push(r#" JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId""#);
+    }
+    qb.push(r#" WHERE ivm."ItemValueId" = iv."ItemValueId""#);
+    for (names, op) in [(with, " IN ("), (exclude, " NOT IN (")] {
+        if names.is_empty() {
+            continue;
+        }
+        qb.push(r#" AND bi."Type""#).push(op);
+        let mut sep = qb.separated(", ");
+        for name in names {
+            sep.push_bind((*name).to_owned());
+        }
+        qb.push(")");
+    }
+    qb.push(r#") GROUP BY iv."CleanValue" ORDER BY iv."CleanValue""#);
     qb
 }
 
@@ -9921,6 +9935,69 @@ mod tests {
         assert!(music_genre_names.is_empty(), "{music_genre_names:?}");
     }
 
+    /// v12.4 `BaseItemRepositoryItemValueTests.GetGenreNames_GroupsAndFiltersMappedItemValues`:
+    /// two spellings of one `CleanValue` are one name, the ordinal-least; a
+    /// value no item maps is none; a music item's genres are the music genres.
+    #[tokio::test]
+    async fn genre_names_group_and_filter_mapped_item_values() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0x9011);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        seed_item_genre(&db, movie, "Movie Genre").await;
+        seed_item_genre(&db, movie, "movie genre").await;
+        let audio = Uuid::from_u128(0x9012);
+        seed_named_item(&db, audio, BaseItemKind::Audio, "Audio").await;
+        seed_item_genre(&db, audio, "Music Genre").await;
+        sqlx::query(
+            r#"INSERT INTO "ItemValues" ("ItemValueId", "CleanValue", "Type", "Value")
+               VALUES (?1, 'orphaned genre', ?2, 'Orphaned Genre')"#,
+        )
+        .bind(guid_to_db(Uuid::from_u128(0x9013)))
+        .bind(i32::from(ItemValueType::Genre))
+        .execute(db.writer())
+        .await
+        .expect("orphaned genre");
+
+        let genres = repository.get_genre_names().await.expect("genres");
+        assert_eq!(genres, ["Movie Genre"]);
+        let music = repository.get_music_genre_names().await.expect("music");
+        assert_eq!(music, ["Music Genre"]);
+    }
+
+    /// Every name list groups as `GetItemValueNames` does: one name per
+    /// `CleanValue` across all the list's types (an artist and an album
+    /// artist of one clean name are one), the ordinal-least spelling, in
+    /// `CleanValue` order.
+    #[tokio::test]
+    async fn value_name_lists_take_the_ordinal_least_spelling_per_clean_value() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0x9021);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let other = Uuid::from_u128(0x9022);
+        seed_named_item(&db, other, BaseItemKind::Movie, "Other").await;
+        for (id, value_type, value) in [
+            (movie, ItemValueType::Genre, "sci-fi"),
+            (other, ItemValueType::Genre, "Sci-Fi"),
+            (movie, ItemValueType::Genre, "Zeta"),
+            (other, ItemValueType::Genre, "alpha"),
+            (movie, ItemValueType::Studios, "warner bros."),
+            (other, ItemValueType::Studios, "Warner Bros"),
+            (movie, ItemValueType::Artist, "abba"),
+            (other, ItemValueType::AlbumArtist, "ABBA"),
+        ] {
+            seed_item_value(&db, id, value_type, value).await;
+        }
+
+        let genres = repository.get_genre_names().await.expect("genres");
+        assert_eq!(genres, ["alpha", "Sci-Fi", "Zeta"]);
+        let studios = repository.get_studio_names().await.expect("studios");
+        assert_eq!(studios, ["Warner Bros"]);
+        let artists = repository.get_all_artist_names().await.expect("artists");
+        assert_eq!(artists, ["ABBA"]);
+    }
+
     #[tokio::test]
     async fn query_filters_legacy_collects_years_ratings_genres_tags() {
         let db = test_db().await;
@@ -10688,6 +10765,54 @@ mod tests {
                 "{plan:#?}"
             );
             assert!(!plan.iter().any(|d| d.starts_with("SCAN ")), "{plan:#?}");
+        }
+    }
+
+    /// Plan pin for the name lists' statement: the values of the list's types
+    /// by a `Type` index, each probed in the map by its own key and, under an
+    /// item-type filter, its items by theirs. No scan, and the `ORDER BY` adds
+    /// no sort of its own.
+    #[tokio::test]
+    async fn item_value_names_statement_reads_values_by_type_and_probes_the_map() {
+        use crate::item_type_lookup::MUSIC_GENRE_TYPES;
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        for (types, with, exclude) in [
+            (GENRE_TYPES, MUSIC_GENRE_TYPES, &[][..]),
+            (GENRE_TYPES, &[][..], MUSIC_GENRE_TYPES),
+            (STUDIO_TYPES, &[][..], &[][..]),
+            (ALL_ARTIST_TYPES, &[][..], &[][..]),
+        ] {
+            let mut qb = item_value_names_statement(types, with, exclude);
+            let mut query = qb.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>();
+            let at = |prefix: &str| {
+                plan.iter()
+                    .position(|d| d.starts_with(prefix))
+                    .unwrap_or_else(|| panic!("no {prefix}: {plan:#?}"))
+            };
+            let (iv, ivm) = (
+                at("SEARCH iv USING INDEX IX_ItemValues_Type_"),
+                at("SEARCH ivm "),
+            );
+            assert!(
+                iv < ivm && plan[ivm].contains("(ItemValueId=?)"),
+                "{plan:#?}"
+            );
+            if !with.is_empty() || !exclude.is_empty() {
+                let bi = at("SEARCH bi ");
+                assert!(ivm < bi && plan[bi].ends_with("(Id=?)"), "{plan:#?}");
+            }
+            assert!(!plan.iter().any(|d| d.starts_with("SCAN ")), "{plan:#?}");
+            assert!(!plan.iter().any(|d| d.contains("ORDER BY")), "{plan:#?}");
         }
     }
 
