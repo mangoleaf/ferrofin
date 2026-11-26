@@ -1627,7 +1627,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    PrimaryImageTag); image serving and processing are compared per \
                    operation, apart from the Live TV artwork rule below (ferrofin-livetv \
                    projection.rs is_artwork_url, channel_images_update, \
-                   program_images_update, manager.rs add_provider_metadata; ferrofin-traits \
+                   program_images_update and remote_image, whose URL row is dated \
+                   DateTime.MinValue as UpdateImage's and SetImagePath's new ItemImageInfo \
+                   leaves it, manager.rs add_provider_metadata; ferrofin-traits \
                    item_image_info.rs live_tv_image_is_internal, read by handlers/images.rs \
                    live_tv_image_is_servable, ferrofin-providers provider_manager.rs \
                    delete_image and ferrofin-core dto_service.rs primary_image_aspect_ratio, \
@@ -1649,7 +1651,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    image row through item_repository.rs image_info_from_row (the DTO page \
                    read, GET /Items/{itemId}/Images and the scan's change detection; \
                    BaseItemMapper.MapImageFromEntity: the path expanded, the type cast as \
-                   stored). Compared with \
+                   stored, a missing date read as DateTime.MinValue). Compared with \
                    Jellyfin.Server.Implementations/Item/BaseItemMapper.cs \
                    (MapImageFromEntity), \
                    Emby.Server.Implementations/Dto/DtoService.cs (GetImageCacheTag, \
@@ -1729,7 +1731,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    RunMetadataSavers, UpdateItemsAsync, ConvertImageToLocal), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (ValidateImages) and \
                    src/Jellyfin.Drawing/ImageProcessor.cs (GetImageBlurHash)",
-        date: "2026-11-20",
+        date: "2026-11-26",
         divergences: &[
             "The metadata editor's save (POST /Items/{itemId}, and its cascade to the \
              children) runs the savers only, so it neither measures nor validates the item's \
