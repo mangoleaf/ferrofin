@@ -348,8 +348,10 @@ pub trait ProviderManager: Send + Sync {
     /// Deletes an item's image of `image_type` at `image_index` (default `0`).
     ///
     /// Port of `BaseItem.DeleteImageAsync(imageType, index)` (the fan-in target of
-    /// `ImageController.DeleteItemImage`/`DeleteItemImageByIndex`): removes the
-    /// stored image row and, for a local row, its on-disk file (best-effort).
+    /// `ImageController.DeleteItemImage`/`DeleteItemImageByIndex`): deletes a
+    /// local image's on-disk file, then removes its stored row; a file that
+    /// cannot be deleted fails the call with the row kept. A Chapter image is
+    /// the file its chapter names, deleted with the chapter row left as it is.
     /// Shared album artwork and a Live TV channel's or programme's file
     /// outside the internal metadata directory stay. The default implementation (for
     /// stub/test managers with no image store) reports the operation as unwired;
