@@ -319,7 +319,7 @@ impl RateLimiter {
         let context = request_context(&self.provider, request.url());
         // One line per outbound provider call (retries excluded): what counts a
         // scan's remote traffic. Debug, because it scales with library size.
-        tracing::debug!(provider = %self.provider, %context, "metadata provider request");
+        tracing::debug!(provider = %self.provider, item_id = request_item(), %context, "metadata provider request");
         let mut original = Some(request);
         let interval = interval.min(Duration::from_secs(u64::from(u32::MAX)));
         let limits = request_limits();
@@ -364,18 +364,19 @@ impl RateLimiter {
                         // A refused redirect names its reason only in its source.
                         let cause =
                             std::error::Error::source(&error).map_or_default(ToString::to_string);
-                        tracing::warn!(provider = %self.provider, %context, %error, %cause, "Metadata provider request failed");
+                        tracing::warn!(provider = %self.provider, item_id = request_item(), %context, %error, %cause, "Metadata provider request failed");
                         return Err(RequestError::Http(error.without_url()));
                     }
                     rate.failed(Duration::ZERO);
                     if rate.failures == 1 {
                         tracing::warn!(
-                            provider = %self.provider, %context, %error,
+                            provider = %self.provider, item_id = request_item(), %context, %error,
                             "Metadata provider connection failed; entering backoff"
                         );
                     }
                     tracing::debug!(
                         provider = %self.provider,
+                        item_id = request_item(),
                         attempt,
                         "Metadata provider request failed; backing off"
                     );
@@ -408,23 +409,23 @@ impl RateLimiter {
         if retryable {
             let delay = rate.failed(server_delay);
             if rate.failures == 1 {
-                tracing::warn!(provider = %self.provider, %context, %status,
+                tracing::warn!(provider = %self.provider, item_id = request_item(), %context, %status,
                     rate_limit_zone = ?headers.get("x-ratelimit-zone"),
                     remaining = ?headers.get("x-ratelimit-remaining"),
                     reset = ?headers.get("x-ratelimit-reset"),
                     retry_after = ?headers.get("retry-after"),
                     "Metadata provider unavailable; entering backoff");
             }
-            tracing::debug!(provider = %self.provider, %context, %status,
+            tracing::debug!(provider = %self.provider, item_id = request_item(), %context, %status,
                 delay_ms = delay.as_millis(), "Metadata provider request rejected; backing off");
         } else {
             if status == reqwest::StatusCode::NOT_FOUND {
                 // Provider clients and request metrics already classify 404
                 // as an empty result, not an authentication or service failure.
-                tracing::debug!(provider = %self.provider, %context, %status,
+                tracing::debug!(provider = %self.provider, item_id = request_item(), %context, %status,
                     "Metadata provider lookup returned no result");
             } else if !status.is_success() && !is_redirect_to_follow(response) {
-                tracing::warn!(provider = %self.provider, %context, %status,
+                tracing::warn!(provider = %self.provider, item_id = request_item(), %context, %status,
                     "Metadata provider request rejected");
             } else if status.is_success() && rate.succeeded() {
                 tracing::info!(provider = %self.provider, "Metadata provider requests recovered");
@@ -448,11 +449,11 @@ impl RateLimiter {
             // As an image past the limit is: at debug, since a library may
             // hold any number of them.
             Err(BodyError::TooLarge) => {
-                tracing::debug!(provider = %self.provider, %context, "Metadata provider response is over the download limit");
+                tracing::debug!(provider = %self.provider, item_id = request_item(), %context, "Metadata provider response is over the download limit");
                 None
             }
             Err(error) => {
-                tracing::warn!(provider = %self.provider, %context, %error, "Metadata provider response could not be parsed");
+                tracing::warn!(provider = %self.provider, item_id = request_item(), %context, %error, "Metadata provider response could not be parsed");
                 None
             }
         }
@@ -486,6 +487,37 @@ tokio::task_local! {
     /// The failed provider requests of the [`count_request_failures`] scope
     /// the current task is running in, if any.
     static REQUEST_FAILURES: std::cell::Cell<u32>;
+    /// The item of the [`for_item`] scope the current task is running in,
+    /// if any.
+    static REQUEST_ITEM: uuid::Uuid;
+}
+
+/// Runs `future` as provider work for the item `item_id`: every per-request
+/// line and request failure a [`RateLimiter`] logs inside it carries
+/// `item_id` (its streak summaries, "recovered" and "cooldown ended", do
+/// not), and so do the provider failures counted beside the limiter (an
+/// artwork response that is no image, a download that could not be sent, an
+/// `OMDb` body or a studio manifest that does not read). The limiter's
+/// events name only the provider and a redacted context, so without it a
+/// warning cannot say which item's refresh failed (upstream's
+/// `Error in {Provider} for {Item}`). A field, not a span: a
+/// span per refreshed item would put one span per item into a scan's trace.
+/// Like [`count_request_failures`], it does not reach a task
+/// `tokio::spawn`ed inside `future`. Not an async function, which would
+/// hold `future` twice.
+pub fn for_item<F: std::future::Future>(
+    item_id: uuid::Uuid,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    REQUEST_ITEM.scope(item_id, future)
+}
+
+/// The item of the enclosing [`for_item`] scope, as a log field: recorded as
+/// `item_id`, and left out outside a scope.
+pub(crate) fn request_item() -> Option<tracing::field::DisplayValue<uuid::Uuid>> {
+    REQUEST_ITEM
+        .try_with(|id| tracing::field::display(*id))
+        .ok()
 }
 
 /// Whether a final response status means the provider failed, rather than
@@ -754,6 +786,7 @@ impl RequestRate {
             if self.skipped == 0 && self.failures == 0 {
                 tracing::warn!(
                     provider,
+                    item_id = request_item(),
                     context,
                     "Metadata provider quota cooldown active; skipping lookups"
                 );
@@ -1253,6 +1286,77 @@ mod tests {
             "missing cooldown summary:\n{logs}"
         );
         assert!(!logs.contains("private-key"));
+    }
+
+    /// A request's warnings name the item of the [`for_item`] scope it runs
+    /// in, and only then (gl-1880): a streak's first failure, a rejection and
+    /// an unreadable body alike.
+    #[tokio::test(start_paused = true)]
+    async fn warnings_inside_an_item_scope_name_the_item() {
+        use tracing::instrument::WithSubscriber as _;
+        init_log_capture();
+        let _clock = TestClock::start();
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let item = uuid::Uuid::from_u128(0x1880);
+        async {
+            let mut script = vec![(503, ""); GET_ATTEMPTS as usize];
+            script.extend([(401, ""), (401, ""), (200, "")]);
+            let (url, server) = scripted_server(script).await;
+            let http = reqwest::Client::new();
+            let unavailable = RateLimiter::new("tmdb").without_backoff();
+            let rejected = RateLimiter::new("fanart");
+            for_item(item, async {
+                assert!(
+                    unavailable
+                        .send_get(http.get(&url), Duration::ZERO)
+                        .await
+                        .is_none()
+                );
+                assert!(
+                    rejected
+                        .send_get(http.get(&url), Duration::ZERO)
+                        .await
+                        .is_none()
+                );
+            })
+            .await;
+            assert!(
+                rejected
+                    .send_get(http.get(&url), Duration::ZERO)
+                    .await
+                    .is_none()
+            );
+            let unparsable = RateLimiter::new("omdb");
+            let parsed = for_item(
+                item,
+                unparsable.get_json::<u64>(http.get(&url), Duration::ZERO),
+            );
+            assert!(parsed.await.is_none());
+            server.await.unwrap();
+        }
+        .with_subscriber(subscriber)
+        .await;
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let named = format!("item_id={item}");
+        for warning in ["unavailable; entering backoff", "could not be parsed"] {
+            assert!(
+                logs.lines()
+                    .any(|line| line.contains(warning) && line.contains(&named)),
+                "{warning}:\n{logs}"
+            );
+        }
+        let rejections: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("request rejected"))
+            .map(|line| line.contains(&named))
+            .collect();
+        assert_eq!(rejections, [true, false], "{logs}");
     }
 
     #[tokio::test(start_paused = true)]

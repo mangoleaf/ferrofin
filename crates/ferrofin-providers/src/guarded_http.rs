@@ -134,7 +134,12 @@ impl FetchKind {
     /// logged at `debug`, since a library can hold any number.
     fn unsent(&self, reason: &'static str) -> SendError {
         crate::rate_limit::note_request_failure();
-        tracing::debug!(reason, "{} not downloaded", self.noun);
+        tracing::debug!(
+            item_id = crate::rate_limit::request_item(),
+            reason,
+            "{} not downloaded",
+            self.noun
+        );
         SendError::Failed(reason)
     }
 }

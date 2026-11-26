@@ -1005,7 +1005,7 @@ impl LibraryScanner {
         skipped: &mut super::SkippedItems,
         locales: &mut super::ArtworkCache,
     ) -> Result<Option<bool>, ServiceError> {
-        use ferrofin_providers::rate_limit::count_request_failures;
+        use ferrofin_providers::rate_limit::{count_request_failures, for_item};
         let Some(items) = &self.item_repository else {
             return Ok(Some(false));
         };
@@ -1142,14 +1142,17 @@ impl LibraryScanner {
                 Vec::new()
             };
             let fetched = cancel
-                .unless_cancelled(count_request_failures(Box::pin(self.fetch_music_answer(
-                    work,
-                    fetch,
-                    &current,
-                    &children,
-                    &child_ids,
-                    &parent_ids,
-                ))))
+                .unless_cancelled(for_item(
+                    work.id,
+                    count_request_failures(Box::pin(self.fetch_music_answer(
+                        work,
+                        fetch,
+                        &current,
+                        &children,
+                        &child_ids,
+                        &parent_ids,
+                    ))),
+                ))
                 .await;
             let Some(fetched) = fetched else {
                 return Ok(None);
@@ -1209,14 +1212,17 @@ impl LibraryScanner {
                 .clone()
                 .or_else(|| valid_id(&ids, "MusicBrainzArtist"));
             let fetched = cancel
-                .unless_cancelled(count_request_failures(Box::pin(self.music_images(
-                    work,
-                    &row,
-                    fetch,
-                    &ids,
-                    artist_key,
-                    answer.audiodb_images,
-                ))))
+                .unless_cancelled(for_item(
+                    work.id,
+                    count_request_failures(Box::pin(self.music_images(
+                        work,
+                        &row,
+                        fetch,
+                        &ids,
+                        artist_key,
+                        answer.audiodb_images,
+                    ))),
+                ))
                 .await;
             let Some(fetched) = fetched else {
                 return Ok(None);
