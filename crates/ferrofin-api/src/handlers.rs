@@ -2519,15 +2519,22 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    only outside the data directory, and its Shares by item_data.rs \
                    merge_playlist_shares_in through sync_scanned_playlists (replace on \
                    replaceData or none stored, else the file's first, DistinctBy UserId); \
-                   OwnerUserId is read and merged nowhere, as upstream. Compared with RefreshMetadata, \
-                   ApplySearchResult, GetProviders, RefreshWithProviders, \
+                   OwnerUserId is read and merged nowhere, as upstream. The credits a refresh \
+                   settles are saved only for a kind that supports people (SaveItemAsync's \
+                   SupportsPeople check, repeated by LibraryManager.UpdatePeopleAsync): kinds.rs \
+                   supports_people in scan_item and library_manager.rs update_people, \
+                   provider_manager.rs supports_people in refresh_item, so an artist.nfo's or a \
+                   playlist.xml's credits are read and dropped (credits an earlier build \
+                   stored for such a kind stay: gl-1955). Compared with RefreshMetadata, \
+                   SaveItemAsync, LibraryManager.UpdatePeopleAsync, ApplySearchResult, \
+                   GetProviders, RefreshWithProviders, \
                    GetNonLocalImageProviders, ProviderManager.RefreshItem, \
                    GetMetadataProvidersInternal and GetImageProvidersInternal, and \
                    ItemImageProvider.RemoveImages and RefreshImages at the pinned v12.4 tag. What TheMovieDb's \
                    movie, series, season and episode providers answer is the \
                    metadata-providers row's; what the other providers answer (gl-1815) and how \
                    the answers merge field by field (gl-1813) are not part of this row.",
-        date: "2026-11-20",
+        date: "2026-11-26",
         divergences: &[
             "An album below an identified artist is looked up by its own ids, name and year; \
              upstream's ApplySearchResult gives every child but a season or an episode the \
