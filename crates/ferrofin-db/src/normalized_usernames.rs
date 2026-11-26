@@ -39,7 +39,8 @@ pub async fn preflight(conn: &mut SqliteConnection) -> Result<()> {
     validate_users(&users)
 }
 
-/// Repairs normalized values in the schema established by migration 0030.
+/// Repairs normalized values in the schema established by migration 0030, and
+/// bumps `RowVersion` where Jellyfin's `UpdateNormalizedUsername` would.
 /// Data and completion marker change atomically; no schema objects are changed.
 ///
 /// # Errors
@@ -67,10 +68,25 @@ pub async fn repair(conn: &mut SqliteConnection) -> Result<()> {
             .collect::<Vec<_>>(),
     )?;
 
+    // Jellyfin's `UpdateNormalizedUsername` sets every key and saves once, so
+    // EF bumps `RowVersion` on each row whose key changes. Until the routine is
+    // in `__EFMigrationsHistory` (a 10.11.8/10.11.9 or a Ferrofin-native
+    // database), the key it replaces is `AddNormalizedUsername`'s '' default,
+    // for which 0030 stores the `Username`.
+    let routine_ran = crate::database::jellyfin_migration_applied(
+        &mut tx,
+        "20260522092304_UpdateNormalizedUsername",
+    )
+    .await?;
     let mut occupied = std::collections::HashSet::new();
     let mut changes = Vec::new();
+    let mut bumped = Vec::new();
     for (id, name, stored) in users {
         let desired = upper_invariant(&name);
+        let replaced = if routine_ran { stored.as_str() } else { "" };
+        if desired != replaced {
+            bumped.push(id.clone());
+        }
         occupied.insert(stored.clone());
         occupied.insert(desired.clone());
         if desired != stored {
@@ -101,6 +117,12 @@ pub async fn repair(conn: &mut SqliteConnection) -> Result<()> {
             .execute(&mut *tx)
             .await?;
     }
+    for id in &bumped {
+        sqlx::query(r#"UPDATE "Users" SET "RowVersion" = "RowVersion" + 1 WHERE "Id" = ?1"#)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query(r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')"#)
         .bind(MARKER)
         .execute(&mut *tx)
@@ -114,15 +136,18 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    /// `has_column`: a database whose history records Jellyfin's
+    /// `UpdateNormalizedUsername`, with stale keys; otherwise one `0030` just
+    /// gave the column (a Ferrofin-native database: no Jellyfin history).
     async fn fixture(has_column: bool) -> SqliteConnection {
         let mut conn = SqliteConnection::connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql(
             r#"
             CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL);
             CREATE TABLE "Users" ("Id" TEXT PRIMARY KEY, "Username" TEXT UNIQUE,
-                "Password" TEXT, "Permission" INTEGER);
-            INSERT INTO "Users" VALUES ('a', 'münchen', 'password-hash-a', 1),
-                ('b', 'ı', 'password-hash-b', 0);
+                "Password" TEXT, "Permission" INTEGER, "RowVersion" INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO "Users" VALUES ('a', 'münchen', 'password-hash-a', 1, 4),
+                ('b', 'ı', 'password-hash-b', 0, 0);
         "#,
         )
         .execute(&mut conn)
@@ -134,6 +159,10 @@ mod tests {
                 ALTER TABLE "Users" ADD COLUMN "NormalizedUsername" TEXT NOT NULL DEFAULT '';
                 UPDATE "Users" SET "NormalizedUsername" = upper("Username");
                 CREATE UNIQUE INDEX "IX_Users_NormalizedUsername" ON "Users" ("NormalizedUsername");
+                CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT PRIMARY KEY,
+                    "ProductVersion" TEXT NOT NULL);
+                INSERT INTO "__EFMigrationsHistory"
+                    VALUES ('20260522092304_UpdateNormalizedUsername', '10.11.11');
             "#,
             )
             .execute(&mut conn)
@@ -146,6 +175,20 @@ mod tests {
                 .unwrap();
         }
         conn
+    }
+
+    async fn row_versions(conn: &mut SqliteConnection) -> Vec<i64> {
+        sqlx::query_scalar(r#"SELECT "RowVersion" FROM "Users" ORDER BY "Id""#)
+            .fetch_all(conn)
+            .await
+            .unwrap()
+    }
+
+    /// The `RowVersion`s after the repair: every account where Jellyfin's
+    /// routine has not run (each key it sets replaces ''), else only those
+    /// whose key changed (`b`'s ASCII `upper()` key is already right).
+    fn bumped(has_column: bool) -> Vec<i64> {
+        if has_column { vec![5, 0] } else { vec![5, 1] }
     }
 
     #[tokio::test]
@@ -181,6 +224,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(keys, ["MÜNCHEN", "ı"]);
+        assert_eq!(row_versions(&mut conn).await, [5, 1], "both keys changed");
     }
 
     #[rstest]
@@ -221,6 +265,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(markers, 1);
+        assert_eq!(
+            row_versions(&mut conn).await,
+            bumped(has_column),
+            "bumped once"
+        );
     }
 
     #[rstest]
@@ -248,11 +297,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+        assert_eq!(row_versions(&mut conn).await, [4, 0]);
         sqlx::query("DROP TRIGGER fail_backfill")
             .execute(&mut conn)
             .await
             .unwrap();
+        // The retry still knows which keys the routine replaces.
         repair(&mut conn).await.unwrap();
+        assert_eq!(row_versions(&mut conn).await, bumped(has_column));
     }
 
     #[rstest]
