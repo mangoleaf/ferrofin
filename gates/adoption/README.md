@@ -969,7 +969,17 @@ Every stage compares against that **source version's Jellyfin responses**:
 initial adoption, restart, a completed scan, and an unchanged second scan. The
 existing database/API metadata, artwork, and watch-history checks also run at
 every stage. Database integrity, expected adoption generation, and repair-free
-restart checks remain in place.
+restart checks remain in place. Two answers differ from the source's post-scan baseline,
+each scoped to the seeded items it concerns:
+
+- A 10.11 source takes the version group's MediaSource ids from the oracle (`FROM_ORACLE`), as
+  every 12.x re-keys a 10.11 alternate version; the real 10.11 to 12.4 upgrade must agree.
+- Before the first scan (the adoption and restart stages), a source older than 12.2 shows the
+  child the rated series' unrated season and episodes (`before_first_scan`, gl-1953). Jellyfin
+  12.2's `MigrateRatingLevels`, which Ferrofin's boot runs on such a source, scores each row from
+  its own rating, so they lose the series' score until the scan. That is read from
+  `MigrateRatingLevels.cs` and observed on Ferrofin's adoption; no fixture records Jellyfin's own
+  pre-scan answer. The scan stages hold them hidden again.
 
 The builder refuses to accept an empty scenario: restricted items must actually
 be hidden, the uploaded image must be the chosen image, both users must have

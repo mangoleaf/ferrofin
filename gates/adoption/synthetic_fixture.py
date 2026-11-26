@@ -285,7 +285,10 @@ def seed(base):
             "versions_movie": movies["Twin Horizon"]["Id"],
             "playlist": playlist, "private_playlist": private_playlist, "collection": collection,
             "linked_playlist": linked_playlist, "linked_collection": linked_collection,
-            "linked_pathless": linked_pathless}
+            "linked_pathless": linked_pathless,
+            # The rated series' unrated season and episodes, which a pre-12.2 source serves to the
+            # child until the first scan (preservation.before_first_scan, gl-1953).
+            "rated_series": {"season": rated[0]["SeasonId"], "episodes": sorted(r["Id"] for r in rated)}}
 
     from user_accounts import seed as seed_accounts
     seed_accounts(api, manifest)

@@ -239,8 +239,8 @@ def expectation(version, baseline, oracle, upgraded):
     `baseline`. A 10.11 source takes the FROM_ORACLE keys from the 12.4 oracle (`oracle`),
     provided the real 10.11 -> 12.4 upgrade (`upgraded`) serves the same; a 12.x source keeps
     its own release's baseline. Every stage is held to these post-scan values, including the
-    pre-scan ones: Ferrofin's boot repair re-keys the version in place, where 12.x serves the
-    primary alone until its scan re-creates the version."""
+    pre-scan ones (but for before_first_scan's allowance): Ferrofin's boot repair re-keys the
+    version in place, where 12.x serves the primary alone until its scan re-creates the version."""
     if not version.startswith("10.11"):
         return baseline
     differ = [key for key in FROM_ORACLE if oracle[key] != upgraded[key]]
@@ -248,6 +248,36 @@ def expectation(version, baseline, oracle, upgraded):
         raise CheckError(f"{UPGRADED_FROM_10} and {ORACLE} serve different {', '.join(differ)}; "
                          "rebuild the fixtures before trusting either as the expectation")
     return {**baseline, **{key: oracle[key] for key in FROM_ORACLE}}
+
+
+def before_first_scan(expected, manifest):
+    """`expected` as a pre-12.2 source serves it before its first scan (gl-1953): Jellyfin 12.2's
+    MigrateRatingLevels, which Ferrofin's boot runs on such a source (repair_rating_levels), scores
+    each row from its own rating only, so the rated series' unrated season and episodes lose the
+    series' score until the scan's parent walk re-derives it (MigrateRatingLevels.cs, a NULL score
+    passes the max-rating filter). The child
+    then sees both episodes, and the season as an unplayed folder; every other value is unchanged.
+    The window is read from MigrateRatingLevels.cs and observed on Ferrofin's adoption; Jellyfin's
+    own pre-scan answer was not recorded. Should the boot close the window (a deviation, the
+    owner's call), this allowance goes with it: the comparison is exact."""
+    rated = manifest.get("rated_series")
+    if not rated:
+        raise CheckError("synthetic fixture lacks the rated series' ids; rebuild it")
+    child = USERS[2]
+    episodes = normalize(rated["episodes"])
+    result = copy.deepcopy(expected)
+    result["visibility"][child] = sorted({*result["visibility"][child], *episodes})
+    result["views"][child]["folders"][normalize(rated["season"])] = {
+        "Played": False, "UnplayedItemCount": len(episodes)}
+    return result
+
+
+def held_to(stage, version, expected, manifest):
+    """What a source of `version` must serve at `stage`: `expected`, but before the first scan
+    (the adoption and restart stages) of a source older than 12.2, before_first_scan's."""
+    if stage in ("adoption", "restart") and version not in RUNS_12_2_ROUTINES:
+        return before_first_scan(expected, manifest)
+    return expected
 
 
 def comparable(data, seeds, orphans):
@@ -600,7 +630,8 @@ def _run_matrix(root, image, only, port, recorder):
                 if stage in ("adoption", "restart"):
                     must("boot log" if stage == "adoption" else "boot runs no repair", verify_boot, work, version, stage, previous_logs)
                 actual = snapshot(api, manifest)
-                changed = record("API answers match Jellyfin's", compare(comparable(expected, seeds, orphans), comparable(actual, seeds, orphans)))
+                held = held_to(stage, version, expected, manifest)
+                changed = record("API answers match Jellyfin's", compare(comparable(held, seeds, orphans), comparable(actual, seeds, orphans)))
                 with closing(metadata.connect(db)) as conn, \
                         closing(metadata.connect(oracle_dir / "data/jellyfin.db")) as oracle_conn:
                     changed += record(f"seeded states end as Jellyfin {ORACLE_RELEASE} left them",

@@ -17,7 +17,8 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from metadata import CheckError
-from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, PAGE_SIZE, RUNS_12_2_ROUTINES, UPGRADED_FROM_10, all_items, comparable,
+from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, PAGE_SIZE, RUNS_12_2_ROUTINES, UPGRADED_FROM_10,
+                          all_items, before_first_scan, comparable, held_to,
                           compare, expectation, normalize, run_matrix, seed_failures, seed_state, validate,
                           validate_oracle, validate_seed_state, same_artwork, verify_database)
 from synthetic import VERSIONS, FRESH_INSTALL
@@ -398,6 +399,52 @@ class OracleExpectationTest(unittest.TestCase):
         upgraded = {'versions': [self.PRIMARY, self.AS_VIDEO]}
         with self.assertRaisesRegex(CheckError, 'serve different versions'):
             expectation('10.11.8', self.baseline, self.oracle, upgraded)
+
+
+class BeforeFirstScanTest(unittest.TestCase):
+    """gl-1953: before its first scan a pre-12.2 source serves the rated series' unrated season and
+    episodes to the child, as MigrateRatingLevels leaves them."""
+    SEASON, EPISODES = str(uuid.UUID('11' * 16)).upper(), [str(uuid.UUID(h * 16)).upper() for h in ('22', '33')]
+    MANIFEST = {'rated_series': {'season': SEASON, 'episodes': EPISODES}}
+
+    def expected(self):
+        return normalize({'visibility': {USERS[1]: ['44' * 16], USERS[2]: ['55' * 16]},
+                          'views': {USERS[1]: {'folders': {'66' * 16: {'Played': True, 'UnplayedItemCount': 0}}},
+                                    USERS[2]: {'resume': [], 'folders': {}}}})
+
+    def test_the_child_sees_the_unrated_episodes_and_the_unplayed_season(self):
+        expected = self.expected()
+        held = before_first_scan(expected, self.MANIFEST)
+        episodes = [uuid.UUID(e).hex for e in self.EPISODES]
+        self.assertEqual(held['visibility'][USERS[2]], sorted(['55' * 16, *episodes]))
+        self.assertEqual(held['views'][USERS[2]]['folders'], {'11' * 16: {'Played': False, 'UnplayedItemCount': 2}})
+        self.assertEqual(held['views'][USERS[2]]['resume'], [])
+        self.assertEqual(held['visibility'][USERS[1]], ['44' * 16], 'the adult is unchanged')
+        self.assertEqual(held['views'][USERS[1]], expected['views'][USERS[1]])
+        self.assertEqual(expected['visibility'][USERS[2]], ['55' * 16], 'the expectation is not modified')
+
+    def test_the_post_scan_expectation_still_fails_the_pre_scan_answer(self):
+        # The allowance belongs to the stages before the scan only: the scan's answer must hide them.
+        expected = self.expected()
+        pre_scan = before_first_scan(expected, self.MANIFEST)
+        self.assertEqual(sorted(compare(expected, pre_scan)), ['views', 'visibility'])
+
+    def test_a_fixture_without_the_rated_series_ids_is_refused(self):
+        with self.assertRaisesRegex(CheckError, 'rebuild it'):
+            before_first_scan(self.expected(), {})
+
+    def test_only_the_pre_scan_stages_of_a_pre_12_2_source_take_the_allowance(self):
+        expected = self.expected()
+        allowed = before_first_scan(expected, self.MANIFEST)
+        for version in ('10.11.8', '10.11.11', '12.0', '12.1'):
+            for stage in ('adoption', 'restart'):
+                self.assertEqual(held_to(stage, version, expected, self.MANIFEST), allowed, (version, stage))
+            for stage in ('scan', 'second scan'):
+                self.assertIs(held_to(stage, version, expected, self.MANIFEST), expected, (version, stage))
+        # A source that already ran 12.2's routines was scored by its own scan: every stage is exact.
+        for version in RUNS_12_2_ROUTINES:
+            for stage in ('adoption', 'restart', 'scan', 'second scan'):
+                self.assertIs(held_to(stage, version, expected, self.MANIFEST), expected, (version, stage))
 
 
 class ServerReadyTest(unittest.TestCase):
