@@ -3743,8 +3743,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             }
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
             // An empty or non-UTF-8 blurhash reads back as none, and a row with
-            // no stored mtime as the epoch, which no file's matches: both fall
-            // through to a recompute, as C# does for a `default(DateTime)` image.
+            // no stored mtime as `DateTime.MinValue`, which no file's matches: both
+            // fall through to a recompute, as C# does for a `default(DateTime)` image.
             out.extend(rows.into_iter().filter_map(|row| {
                 let item_id = Uuid::parse_str(&row.item_id).ok()?;
                 let image = crate::item_repository::image_info_from_row(row, &self.virtual_paths);
