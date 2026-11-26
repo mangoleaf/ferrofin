@@ -2062,7 +2062,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    PingTimer, KillTranscodingJobs; a start whose ffmpeg exits non-zero, with \
                    OnTranscodeBeginRequest, compared 2026-11-11; the ffmpeg log's name, \
                    ffmpeg_log_file_name, with the request's MediaSourceId as sent, compared \
-                   2026-11-14) and \
+                   2026-11-14; a start whose ffmpeg never runs, with OnTranscodeFailedToStart, \
+                   and supersede, the stop of an HLS output's job before its restart, with \
+                   KillTranscodingJob and DynamicHlsController.cs GetDynamicSegment's \
+                   KillTranscodingJobs(.., p => false), compared 2026-11-26) and \
                    Emby.Server.Implementations/Session/SessionManager.cs (MaxActiveSessions)",
         date: "2026-11-02",
         divergences: &[
@@ -2100,6 +2103,17 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the exited job, where upstream adds the new one beside it and \
              OnTranscodeBeginRequest still finds the exited one first. Jellyfin bugs not \
              ported (gl-1373).",
+            "A restart of an HLS output stops its job's ffmpeg and leaves the job registered, \
+             the owner of the segments it keeps for the restart's job, until that job \
+             registers on the output and replaces it, and a start whose ffmpeg never runs \
+             (its log or output directory cannot be created, or the spawn fails) puts the job \
+             it replaced back. A restart refused by a cap, stopped by the restart breaker or \
+             failing to start so leaves those segments to a stop or the idle reaper, and a \
+             Transcode progress report stays one while that job is registered. Upstream's \
+             KillTranscodingJobs(.., p => false) removes the job before StartFfMpeg and \
+             OnTranscodeFailedToStart removes the new one, so the files of a restart that \
+             fails to start wait for a later job of that output or the daily cleanup. \
+             Jellyfin bug not ported (gl-1947).",
         ],
     },
     VerifiedSubsystem {
