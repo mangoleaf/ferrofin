@@ -420,18 +420,32 @@ pub fn build_media_encoding(
 }
 
 /// `GET url`, its body or what went wrong, which names only the URL's host.
+///
+/// The body is read under `image_download_max_mb`, as a provider's is: the
+/// host is someone else's, and a compressed body is decoded, so a few KB
+/// could otherwise expand without bound (gl-1708). Upstream reads it whole.
 async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    use ferrofin_providers::rate_limit::{BodyError, read_capped, request_limits};
+    // One client, so the reads share a connection pool; `reqwest::get` builds one per call.
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let source = ferrofin_util::source_url::redact_url(url);
-    let resp = reqwest::get(url)
+    let resp = CLIENT
+        .get_or_init(reqwest::Client::new)
+        .get(url)
+        .send()
         .await
         .map_err(|e| format!("GET {source}: {}", e.without_url()))?;
     if !resp.status().is_success() {
         return Err(format!("GET {source}: HTTP {}", resp.status()));
     }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("GET {source} body: {}", e.without_url()))
+    read_capped(resp).await.map_err(|error| match error {
+        BodyError::TooLarge => format!(
+            "GET {source}: the subtitle is over image_download_max_mb ({} MiB); not read",
+            request_limits().download_max_bytes / (1024 * 1024)
+        ),
+        BodyError::Read(e) => format!("GET {source} body: {e}"),
+        BodyError::Decode(e) => format!("GET {source} body: {e}"),
+    })
 }
 
 /// The real ffmpeg + filesystem [`SubtitleIo`] for the subtitle encoder.
@@ -888,6 +902,54 @@ mod tests {
         assert!(
             !error.contains("secret") && !error.contains("acct"),
             "{error}"
+        );
+    }
+
+    /// A loopback server answering every request with `decoded`, gzipped and
+    /// sent as `Content-Encoding: gzip`; its `/path-secret/en.srt` URL.
+    async fn gzip_subtitle_url(decoded: &[u8]) -> String {
+        use std::io::Write as _;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(decoded).unwrap();
+        let body = gzip.finish().unwrap();
+        let app = axum::Router::new().fallback(move || {
+            let body = body.clone();
+            async move { ([(axum::http::header::CONTENT_ENCODING, "gzip")], body) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{addr}/path-secret/en.srt")
+    }
+
+    /// A remote subtitle is decoded and read whole.
+    #[tokio::test]
+    async fn a_remote_subtitle_is_decoded_and_read_whole() {
+        let srt = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n";
+
+        let body = http_get_bytes(&gzip_subtitle_url(srt).await).await;
+
+        assert_eq!(body.as_deref(), Ok(&srt[..]));
+    }
+
+    /// A small compressed body that decodes past the download limit is
+    /// refused at the limit, not held whole (gl-1708).
+    #[tokio::test]
+    async fn a_remote_subtitle_that_decodes_past_the_limit_is_refused() {
+        let limit = ferrofin_providers::rate_limit::request_limits().download_max_bytes;
+        let url = gzip_subtitle_url(&vec![0; usize::try_from(limit).unwrap() + 1]).await;
+
+        // The length only: a failure must not print the body.
+        let error = http_get_bytes(&url)
+            .await
+            .map(|body| body.len())
+            .expect_err("over the limit");
+
+        let host = url.trim_end_matches("/path-secret/en.srt");
+        let mib = limit / (1024 * 1024);
+        assert_eq!(
+            error,
+            format!("GET {host}: the subtitle is over image_download_max_mb ({mib} MiB); not read")
         );
     }
 
