@@ -473,6 +473,23 @@ pub trait ProviderManager: Send + Sync {
 
     /// Gets the ids of items currently queued for refresh.
     async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError>;
+
+    /// The image part of TheMovieDb's client configuration
+    /// (`TmdbClientManager.GetClientConfiguration().Images`), which the TMDb
+    /// settings page lists its image sizes from; `None` when TMDb's
+    /// configuration has no images.
+    ///
+    /// # Errors
+    ///
+    /// When TMDb answers with no configuration, or the manager has no TMDb
+    /// client to ask, as the default does.
+    async fn tmdb_image_configuration(
+        &self,
+    ) -> Result<Option<ferrofin_model::dto::ConfigImageTypes>, ServiceError> {
+        Err(ServiceError::backend(
+            "this provider manager has no TheMovieDb client",
+        ))
+    }
 }
 
 fn _assert_object_safe_provider_manager(_: &dyn ProviderManager) {}

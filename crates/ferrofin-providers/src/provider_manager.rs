@@ -6008,6 +6008,17 @@ impl ProviderManager for LocalProviderManager {
             .into_iter()
             .collect())
     }
+
+    async fn tmdb_image_configuration(
+        &self,
+    ) -> Result<Option<ferrofin_model::dto::ConfigImageTypes>, ServiceError> {
+        match &self.tmdb {
+            Some(tmdb) => tmdb.client_image_configuration().await,
+            None => Err(ServiceError::backend(
+                "this provider manager has no TheMovieDb client",
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10769,6 +10780,32 @@ mod tests {
         // A movie or series has a file: the library scan refreshes it.
         assert!(refresh_target_of(&row("Movies.Movie", "Solaris"), None).is_none());
         assert!(refresh_target_of(&row("TV.Series", "Severance"), None).is_none());
+    }
+
+    /// `GET /Tmdb/ClientConfiguration`'s seam: the manager's TMDb client
+    /// answers it; a manager with none fails rather than inventing one.
+    #[tokio::test]
+    async fn the_tmdb_image_configuration_comes_from_the_managers_tmdb_client() {
+        let server =
+            crate::mock_http::MockServer::start_raw(vec![crate::mock_http::MockServer::raw_ok(
+                "Content-Type: application/json\r\n",
+                br#"{"images": {"poster_sizes": ["w92", "original"]}}"#,
+            )])
+            .await;
+        let mut mgr = LocalProviderManager::new(Vec::new());
+        assert!(mgr.tmdb_image_configuration().await.is_err(), "no client");
+        mgr.tmdb = Some(Arc::new(
+            crate::tmdb::TmdbClient::new().with_base_url(&server.base_url),
+        ));
+        let images = mgr
+            .tmdb_image_configuration()
+            .await
+            .expect("configuration")
+            .expect("images");
+        assert_eq!(
+            images.poster_sizes.as_deref(),
+            Some(["w92".to_owned(), "original".to_owned()].as_slice())
+        );
     }
 
     /// C# `ProviderManager.CanRefreshMetadata` ("If locked only allow local

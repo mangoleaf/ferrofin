@@ -642,6 +642,9 @@ struct StubProviders {
     /// asked for. `None` → no copy can be made.
     remote_copy: Option<String>,
     remote_asked: Arc<Mutex<Vec<String>>>,
+    /// What TheMovieDb's client configuration answers; `Err` → TMDb did not
+    /// answer.
+    tmdb_images: Mutex<Result<Option<ferrofin_model::dto::ConfigImageTypes>, &'static str>>,
 }
 
 #[async_trait]
@@ -770,6 +773,15 @@ impl ProviderManager for StubProviders {
     async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
     }
+    async fn tmdb_image_configuration(
+        &self,
+    ) -> Result<Option<ferrofin_model::dto::ConfigImageTypes>, ServiceError> {
+        self.tmdb_images
+            .lock()
+            .expect("lock")
+            .clone()
+            .map_err(ServiceError::backend)
+    }
 }
 
 /// Bundles the image stubs and their recording handles for one test.
@@ -892,6 +904,15 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
             updates: Arc::new(Mutex::new(Vec::new())),
             remote_copy: None,
             remote_asked: Arc::new(Mutex::new(Vec::new())),
+            tmdb_images: Mutex::new(Ok(Some(ferrofin_model::dto::ConfigImageTypes {
+                secure_base_url: Some("https://image.tmdb.org/t/p/".to_owned()),
+                poster_sizes: Some(vec![
+                    "w92".to_owned(),
+                    "w2000".to_owned(),
+                    "original".to_owned(),
+                ]),
+                ..ferrofin_model::dto::ConfigImageTypes::default()
+            }))),
         }),
         elevated: false,
         restricted: false,
@@ -1577,6 +1598,7 @@ async fn remote_image_backdrop_is_served_from_its_local_copy() {
             updates: Arc::new(Mutex::new(Vec::new())),
             remote_copy: Some(copy.path()),
             remote_asked: Arc::clone(&asked),
+            tmdb_images: Mutex::new(Err("TheMovieDb did not answer")),
         }),
         ..stubs(img.path(), String::new())
     };
@@ -1617,6 +1639,7 @@ async fn a_live_tv_items_local_row_is_not_served_outside_the_metadata_directory(
             updates: Arc::new(Mutex::new(Vec::new())),
             remote_copy: Some(copy.path()),
             remote_asked: Arc::new(Mutex::new(Vec::new())),
+            tmdb_images: Mutex::new(Err("TheMovieDb did not answer")),
         }),
         ..stubs(img.path(), String::new())
     };
@@ -2014,8 +2037,11 @@ async fn update_item_image_index_missing_item_is_404() {
 
 // ---- TMDb client configuration ------------------------------------------------
 
+/// `TmdbController.TmdbClientConfiguration`: the images of the client
+/// configuration the provider manager's TMDb client fetched, as TMDb answered
+/// them (here a poster size no fixed list had).
 #[tokio::test]
-async fn tmdb_client_configuration_returns_image_config() {
+async fn tmdb_client_configuration_returns_tmdbs_image_config() {
     let s = stubs(String::new(), String::new());
     let (status, body) = send(&s, "GET", "/Tmdb/ClientConfiguration", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -2025,13 +2051,33 @@ async fn tmdb_client_configuration_returns_image_config() {
         config.secure_base_url.as_deref(),
         Some("https://image.tmdb.org/t/p/")
     );
-    assert!(
-        config
-            .poster_sizes
-            .as_deref()
-            .expect("poster sizes")
-            .contains(&"original".to_owned())
+    assert_eq!(
+        config.poster_sizes.as_deref(),
+        Some(["w92".to_owned(), "w2000".to_owned(), "original".to_owned()].as_slice())
     );
+}
+
+/// A configuration without images is a null result: `204`, as ASP.NET
+/// answers one.
+#[tokio::test]
+async fn tmdb_client_configuration_without_images_is_no_content() {
+    let s = stubs(String::new(), String::new());
+    *s.providers.tmdb_images.lock().expect("lock") = Ok(None);
+    let (status, body) = send(&s, "GET", "/Tmdb/ClientConfiguration", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(&body[..], b"", "no body");
+}
+
+/// TMDb answering no configuration fails the request as upstream's
+/// `GetConfigAsync` throw does through `ExceptionMiddleware` (`500`, the plain
+/// text body the settings page shows): no fixed sizes stand in for TMDb's.
+#[tokio::test]
+async fn tmdb_client_configuration_fails_when_tmdb_does_not_answer() {
+    let s = stubs(String::new(), String::new());
+    *s.providers.tmdb_images.lock().expect("lock") = Err("TheMovieDb did not answer");
+    let (status, body) = send(&s, "GET", "/Tmdb/ClientConfiguration", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(&body[..], b"Error processing request.");
 }
 
 // ---- user image upload --------------------------------------------------------
