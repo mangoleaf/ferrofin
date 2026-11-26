@@ -7160,7 +7160,7 @@ pub const VERIFIED: &[Verified] = &[
                UserUpdated) only when the sent name differs from the stored one under \
                ferrofin-util string_extensions.rs equals_invariant_ignore_case \
                (InvariantCultureIgnoreCase) → change_password (ChangePassword) → 204",
-        date: "2026-11-14",
+        date: "2026-11-26",
         divergences: &[
             "The 403 (a password already set), 400 (no password, or a name the rename refuses \
          as invalid or taken) and, once the wizard is complete, 401 (no or bad token) and 403 \
@@ -7177,8 +7177,6 @@ pub const VERIFIED: &[Verified] = &[
          name then overwrites the renamed user's image. Jellyfin bug not ported.",
             "Setting the password writes no UserPasswordChanged activity entry, where \
          ChangePassword publishes UserPasswordChangedEventArgs. Fix path: gl-1602.",
-            "The save ahead of the rename bumps Users.RowVersion, where UpdateUserAsync saves \
-         the unchanged user without bumping it. Fix path: gl-1607.",
             "Names that differ only in character width or kana type (ｂｏｂ and bob, あき \
          and アキ) compare equal, so the stored name is kept, where .NET's ICU tailoring \
          tells them apart and upstream renames. Fix path: gl-1793.",

@@ -63,7 +63,7 @@ use crate::auth_providers::{
 use crate::db_error::db_err;
 use crate::password_reset::{DEFAULT_PASSWORD_RESET_PROVIDER_NAME, DefaultPasswordResetProvider};
 use crate::user_entity_ext::{
-    has_permission, is_parental_schedule_allowed, seed_defaults, set_permission, set_permission_tx,
+    has_permission, is_parental_schedule_allowed, seed_defaults, set_permission_tx,
     set_preference_tx,
 };
 
@@ -82,6 +82,14 @@ pub(crate) const INVALID_CREDENTIALS_MESSAGE: &str = "Invalid username or passwo
 /// The default username assigned during first-run bootstrap when the host user
 /// name is unusable (C# `"MyJellyfinUser"`).
 const DEFAULT_BOOTSTRAP_USERNAME: &str = "MyJellyfinUser";
+
+/// The permissions `InitializeAsync` grants the first-run user
+/// (`UserManager.cs:765-767`).
+const BOOTSTRAP_PERMISSIONS: &[PermissionKind] = &[
+    PermissionKind::IsAdministrator,
+    PermissionKind::EnableContentDeletion,
+    PermissionKind::EnableRemoteControlOfOtherUsers,
+];
 
 type LoginLocks = Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
 
@@ -350,7 +358,9 @@ impl FerrofinUserManager {
             .login_attempts_before_lockout
             .is_some_and(|max| attempts >= max)
         {
-            set_permission(&self.db, &user.id, PermissionKind::IsDisabled, true).await?;
+            user_repository::lock_out(self.db.writer(), &user.id)
+                .await
+                .map_err(db_err)?;
             // A locked-out account's cached auth must not outlive the lock.
             self.users_changed();
             tracing::warn!(
@@ -1015,17 +1025,23 @@ impl FerrofinUserManager {
         Ok(max.unwrap_or(0) + 1)
     }
 
-    /// Inserts a fully-formed user row plus its default permissions/preferences
-    /// inside one transaction (C# `CreateUserInternalAsync` + `Add`), returning
-    /// the persisted row. `configure` runs against the open transaction so the
-    /// caller can grant bootstrap permissions atomically.
+    /// Inserts a fully-formed user row plus its default permissions/preferences,
+    /// each of `granted` set true, inside one transaction (C#
+    /// `CreateUserInternalAsync` + `Add`), returning the persisted row.
+    /// `configure` runs against the open transaction so the caller can set the
+    /// user up atomically.
     ///
     /// The duplicate-name guard and the `InternalId` high-water read live in
     /// that same transaction. Run outside it they were a check-then-act against
     /// the UNIQUE `IX_Users_Username`: concurrent creates of one name all saw
     /// "absent", all inserted, and every loser turned the contract's `400` into
     /// a `500` (measured live: 15 of 16 concurrent requests).
-    async fn insert_user<F>(&self, name: &str, configure: F) -> Result<UserEntity, ServiceError>
+    async fn insert_user<F>(
+        &self,
+        name: &str,
+        granted: &[PermissionKind],
+        configure: F,
+    ) -> Result<UserEntity, ServiceError>
     where
         F: for<'t> FnOnce(
             &'t mut sqlx::Transaction<'_, Sqlite>,
@@ -1070,7 +1086,7 @@ impl FerrofinUserManager {
         .await
         .map_err(db_err)?;
 
-        seed_defaults(&mut tx, &id_str).await?;
+        seed_defaults(&mut tx, &id_str, granted).await?;
         configure(&mut tx, &id_str).await?;
         tx.commit().await.map_err(db_err)?;
         // A read for this id before it existed may have cached empty policy rows.
@@ -1145,19 +1161,9 @@ impl UserManager for FerrofinUserManager {
             .filter(|n| valid_username(n))
             .unwrap_or_else(|| DEFAULT_BOOTSTRAP_USERNAME.to_owned());
 
-        self.insert_user(&default_name, |tx, uid| {
-            Box::pin(async move {
-                set_permission_tx(tx, uid, PermissionKind::IsAdministrator, true).await?;
-                set_permission_tx(tx, uid, PermissionKind::EnableContentDeletion, true).await?;
-                set_permission_tx(
-                    tx,
-                    uid,
-                    PermissionKind::EnableRemoteControlOfOtherUsers,
-                    true,
-                )
-                .await?;
-                Ok(())
-            })
+        // Granted on the entity before its `Add`, so inserted at `RowVersion` 0.
+        self.insert_user(&default_name, BOOTSTRAP_PERMISSIONS, |_tx, _uid| {
+            Box::pin(async { Ok(()) })
         })
         .await?;
         Ok(())
@@ -1219,7 +1225,10 @@ impl UserManager for FerrofinUserManager {
             return Err(ServiceError::not_found(format!("user {user_id}")));
         }
         sqlx::query(
-            r#"UPDATE "Users" SET "Username" = ?2, "NormalizedUsername" = ?3 WHERE "Id" = ?1"#,
+            // `UpdateUserInternalAsync` marks the user `Modified`, so EF bumps `RowVersion`.
+            r#"UPDATE "Users" SET "Username" = ?2, "NormalizedUsername" = ?3,
+                "RowVersion" = "RowVersion" + 1
+               WHERE "Id" = ?1"#,
         )
         .bind(guid_to_db(user_id))
         .bind(new_name)
@@ -1256,9 +1265,26 @@ impl UserManager for FerrofinUserManager {
         // clears it.
         let id = Uuid::parse_str(&user.id)
             .map_err(|_| ServiceError::invalid_input("user id is not a valid guid"))?;
-        self.require_user(id).await?;
 
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let stored = Self::fetch_user_on(&mut *tx, id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user {id}")))?;
+        // `SetValues` marks the user `Modified`, and EF bumps `RowVersion`, only
+        // when a value differs: the startup wizard saves the unchanged user.
+        let saved = UserEntity {
+            last_activity_date: if user.last_activity_date.is_none()
+                || stored.last_activity_date > user.last_activity_date
+            {
+                stored.last_activity_date
+            } else {
+                user.last_activity_date
+            },
+            normalized_username: upper_invariant(&user.username),
+            row_version: stored.row_version,
+            ..user.clone()
+        };
+        let bump = i64::from(saved != stored);
         if Self::user_id_by_name_on(&mut *tx, &user.username, Some(user.id.clone()))
             .await?
             .is_some()
@@ -1288,7 +1314,7 @@ impl UserManager for FerrofinUserManager {
                 "RememberSubtitleSelections" = ?25, "RemoteClientBitrateLimit" = ?26,
                 "SubtitleLanguagePreference" = ?27, "SubtitleMode" = ?28,
                 "SyncPlayAccess" = ?29, "Username" = ?30, "NormalizedUsername" = ?31,
-                "RowVersion" = "RowVersion" + 1
+                "RowVersion" = "RowVersion" + ?32
                WHERE "Id" = ?1"#,
         )
         .bind(&user.id)
@@ -1320,8 +1346,9 @@ impl UserManager for FerrofinUserManager {
         .bind(&user.subtitle_language_preference)
         .bind(user.subtitle_mode)
         .bind(user.sync_play_access)
-        .bind(&user.username)
-        .bind(upper_invariant(&user.username))
+        .bind(&saved.username)
+        .bind(&saved.normalized_username)
+        .bind(bump)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -1342,7 +1369,7 @@ impl UserManager for FerrofinUserManager {
         require_valid_username(name)?;
         // The "name already taken" guard lives inside `insert_user`'s
         // transaction — see its docs for why it cannot live out here.
-        self.insert_user(name, |_tx, _uid| Box::pin(async { Ok(()) }))
+        self.insert_user(name, &[], |_tx, _uid| Box::pin(async { Ok(()) }))
             .await
     }
 
@@ -1366,7 +1393,7 @@ impl UserManager for FerrofinUserManager {
         // which the built-in provider signs in with an empty password.
         let setup = setup.clone();
         let user = self
-            .insert_user(name, move |tx, id| {
+            .insert_user(name, &[], move |tx, id| {
                 Box::pin(async move {
                     if let Some(hash) = password.as_deref() {
                         user_repository::set_password(&mut **tx, id, Some(hash))
@@ -3868,3 +3895,7 @@ mod sign_in_rules_tests;
 #[cfg(test)]
 #[path = "user_manager/password_reset_tests.rs"]
 mod password_reset_tests;
+
+#[cfg(test)]
+#[path = "user_manager/row_version_tests.rs"]
+mod row_version_tests;
