@@ -236,6 +236,10 @@ def seed(base):
                                (child["Id"], movies["Amber Harbor"]["Id"], 1_000_000_000)]:
         api.post(f"/UserItems/{item}/UserData", {"Played": False, "PlaybackPositionTicks": ticks,
                  "LastPlayedDate": "2026-01-06T12:00:00Z"}, userId=user)
+    # Played with no LastPlayedDate: the row shape Jellyfin leaves on a video's other versions (12.0+
+    # Video.PropagatePlayedState), a Played-only update and an NFO watched import. 10.11.8 has no
+    # propagation, so this Played-only update writes it on every lineage (UserDataManager.SaveUserData).
+    api.post(f"/UserItems/{movies['Twin Horizon']['Id']}/UserData", {"Played": True}, userId=adult)
     api.post(f"/UserFavoriteItems/{tracks[0]['Id']}", userId=adult)
 
     # One save writes DisplayPreferences, ItemDisplayPreferences and, for the keys it does not
