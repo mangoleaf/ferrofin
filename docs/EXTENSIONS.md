@@ -54,8 +54,8 @@ persist media segments, register background tasks — without reaching into impl
 crates. The contracts an extension implements (`Extension`'s `ScheduledTask` and
 `PluginConfigPage`) come from `ferrofin-traits`, and so does every manager an extension calls;
 the helpers it shares with core sit below core (`ferrofin-common`, `ferrofin-db`). A new
-extension adds no `ferrofin-core` import (the two left are listed in
-[`ARCHITECTURE.md`](ARCHITECTURE.md)).
+extension adds no `ferrofin-core` import: the crate takes core only as a dev-dependency, for
+its tests.
 
 The curated set is registered **statically** in one place (`builtin_extensions()`); there is
 no discovery, no filesystem scan, no dynamic loading. Consequences:
