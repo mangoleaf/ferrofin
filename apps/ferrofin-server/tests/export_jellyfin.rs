@@ -68,8 +68,23 @@ async fn source(scratch: &Path) -> PathBuf {
         .connect()
         .await
         .unwrap();
-    // Ferrofin's own bookkeeping table: what makes it a Ferrofin database.
-    sqlx::query("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)")
+    // Ferrofin's own bookkeeping: a Ferrofin database this build's start left,
+    // at its last migration with a start of the server's build recorded, as
+    // the export requires (gl-1910).
+    for statement in [
+        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)",
+        r#"CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL)"#,
+    ] {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+    sqlx::query("INSERT INTO _sqlx_migrations VALUES (?1)")
+        .bind(ferrofin_db::schema_head())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query(r#"INSERT INTO "FerrofinMeta" VALUES (?1, ?2)"#)
+        .bind(ferrofin_db::STARTED_KEY)
+        .bind(ferrofin_health::build_version())
         .execute(&mut conn)
         .await
         .unwrap();
@@ -276,7 +291,7 @@ async fn export_jellyfin_copies_a_stopped_data_directory_and_leaves_it_untouched
         report.contains("  CertificatePath in config/network.xml: "),
         "{report}"
     );
-    assert!(report.contains("  _sqlx_migrations (0 rows): "), "{report}");
+    assert!(report.contains("  _sqlx_migrations (1 row): "), "{report}");
     assert!(
         report.ends_with("Backups and scheduled tasks:\n  None.\n"),
         "{report}"
@@ -1161,6 +1176,9 @@ async fn adopted_source(scratch: &Path) -> PathBuf {
         };
         query.execute(db.writer()).await.unwrap();
     }
+    db.record_started(ferrofin_health::build_version())
+        .await
+        .unwrap();
     db.pool().close().await;
     db.writer().close().await;
     source

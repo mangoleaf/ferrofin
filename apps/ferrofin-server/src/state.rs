@@ -3522,6 +3522,14 @@ pub async fn build_app_state(
     if let Some(source) = network_changes {
         background.extend(start_network_change_monitor(source, &changing_network));
     }
+    // Last of `build_app_state`, after every start-time conversion and import
+    // above (keep it last): the export takes this data directory only once a start
+    // of the exporting build has recorded it (gl-1910). A one-shot that failed
+    // has warned and runs again at the next start; recording only a start
+    // where every one succeeded is gl-1952.
+    if let Err(err) = db.record_started(ferrofin_health::build_version()).await {
+        tracing::warn!(%err, "could not record this start; an export will refuse the data directory until a start records it");
+    }
 
     Ok(WiredApp {
         server_id,
@@ -4277,6 +4285,15 @@ mod tests {
         let _router = ferrofin_api::create_router(wired.state.clone());
         // The host starts un-flagged; the composition root flips it after mount.
         wired.app_host.mark_core_startup_complete();
+        // The start recorded its build once the boot repairs ran, which the
+        // export requires of the build exporting the directory (gl-1910).
+        assert_eq!(
+            db.meta_get(ferrofin_db::STARTED_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(ferrofin_health::build_version())
+        );
     }
 
     /// A stop signals the drain and records the restart decision, and leaves

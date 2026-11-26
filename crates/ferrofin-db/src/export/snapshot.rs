@@ -31,7 +31,9 @@ use crate::database::{
 /// Writes a consistent snapshot of the SQLite database at `source` (its real
 /// path, where SQLite keeps its log), including what its write-ahead log or
 /// journal holds, to `dest`, replacing a file already there, with `source`'s
-/// permissions. `source` and its directory are only read.
+/// permissions, once the staged copy passed the checks, among them that
+/// `build`, the exporter's version, started it last. `source` and its
+/// directory are only read.
 ///
 /// # Errors
 /// [`DbError::Export`](crate::DbError::Export) when the database cannot be
@@ -48,6 +50,7 @@ pub(super) async fn snapshot_database(
     source: &Path,
     dest: &Path,
     layout: (&SourceDirs, &Layout),
+    build: &str,
 ) -> Result<(DatabaseEdits, Vec<LibraryContainer>)> {
     let staged = with_suffix(dest, ".export-source");
     let leftovers = staged_files(&staged);
@@ -76,7 +79,7 @@ pub(super) async fn snapshot_database(
     })
     .await;
     let written = match staging {
-        Ok(permissions) => vacuum(&staged, dest, permissions, layout).await,
+        Ok(permissions) => vacuum(&staged, dest, permissions, layout, build).await,
         Err(error) => Err(error),
     };
     // The staged copy goes whether the snapshot was written or not.
@@ -86,12 +89,14 @@ pub(super) async fn snapshot_database(
 
 /// `VACUUM INTO` from the database at `from` to `dest`, with `permissions`,
 /// written under a temporary name and renamed into place once complete, after
-/// the checks and the export's steps ran on `from`.
+/// the checks (`build` the exporter's, [`super::refusal::database`]) and the
+/// export's steps ran on `from`.
 async fn vacuum(
     from: &Path,
     dest: &Path,
     permissions: std::fs::Permissions,
     layout: (&SourceDirs, &Layout),
+    build: &str,
 ) -> Result<(DatabaseEdits, Vec<LibraryContainer>)> {
     init_sqlite();
     let partial = start_snapshot(dest)?;
@@ -110,7 +115,7 @@ async fn vacuum(
             .connect()
             .await
             .map_err(super::refusal::damaged_or)?;
-        let history = super::refusal::database(&mut conn).await?;
+        let history = super::refusal::database(&mut conn, build).await?;
         let edits = super::edit_staged(&mut conn, history.as_ref(), layout).await?;
         let in_libraries = containers::in_libraries(&mut conn, layout.1).await?;
         sqlx::query(sqlx::AssertSqlSafe(vacuum_into(&partial)))

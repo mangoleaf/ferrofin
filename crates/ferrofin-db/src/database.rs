@@ -30,6 +30,21 @@ pub fn schema_head() -> i64 {
         .map_or(0, |migration| migration.version)
 }
 
+/// The `FerrofinMeta` key holding the build (its `git describe`, the
+/// server's version) of the last start that got through its start-time
+/// conversions and imports ([`Database::record_started`]). The export
+/// refuses a database that records another build, so a data directory is
+/// exported only as this version's start left it (gl-1910).
+///
+/// shortcut: a build stamped with no version (no `FERROFIN_GIT_DESCRIBE` and
+/// no `.git`, such as a plain `docker build .`) reports the crate's
+/// placeholder version, and a local build keeps the describe of the commit it
+/// was first built at, so two such builds can record the same and only the
+/// migration head tells them apart; release builds are always stamped. Stamp
+/// every build, or record a hash of the binary, if an unstamped build ever
+/// has to export.
+pub const STARTED_KEY: &str = "started_by";
+
 /// A `BaseItems` row projected down to what the inherited-images walk and
 /// the Episode/Season/Audio parent blocks of the DTO service read off a
 /// parent: its kind, the three ids the walk follows, the album-artist name
@@ -988,6 +1003,18 @@ impl Database {
             out.extend(query.fetch_all(self.pool()).await?);
         }
         Ok(out)
+    }
+
+    /// Records that a start of `build` (the server's version) got through its
+    /// start-time conversions and imports on this database, under
+    /// [`STARTED_KEY`], which the export requires of the build exporting it.
+    /// A one-shot repair that failed there has warned and runs again at the
+    /// next start: the record does not say it succeeded.
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the write fails.
+    pub async fn record_started(&self, build: &str) -> Result<()> {
+        self.meta_set(STARTED_KEY, build).await
     }
 
     /// Reads a `FerrofinMeta` value (Ferrofin's own key/value table), or [`None`]

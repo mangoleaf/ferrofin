@@ -267,15 +267,17 @@ async fn edit_staged(
 /// reached twice; [`DbError::Backup`] or [`DbError::Sqlx`] when the database
 /// snapshot fails; [`DbError::ExportRefused`] when the copy of the database the
 /// snapshot stages fails its checks (a log it cannot fold in whole, a damaged
-/// file, `integrity_check`, `foreign_key_check`, not Ferrofin's, a Jellyfin
-/// history from no release Ferrofin adopts, no proof of the work of a code
-/// migration the history records as applied); and
+/// file, `integrity_check`, `foreign_key_check`, not Ferrofin's, not last
+/// started by `build`, the exporter's own version, at its last migration, a
+/// Jellyfin history from no release Ferrofin adopts, no proof of the work of
+/// a code migration the history records as applied); and
 /// [`DbError::ExportSourceChanged`] when the source changed during the export.
 pub async fn export_data_dir(
     dirs: &SourceDirs,
     layout: &Layout,
     database: &Path,
     out: &Path,
+    build: &str,
 ) -> Result<ExportSummary> {
     let source = &dirs.program_data;
     let (db, from, source_dirs, into) = (
@@ -327,7 +329,7 @@ pub async fn export_data_dir(
     .await?;
     let exported = out.join(EXPORTED_DATABASE);
     let (edits, library_containers) =
-        snapshot::snapshot_database(&resolved, &exported, (dirs, layout)).await?;
+        snapshot::snapshot_database(&resolved, &exported, (dirs, layout), build).await?;
     let mut dirs_copied = copied.dirs;
     // A source with no `data/` (a native one) has none to take the mode from:
     // the snapshot's directory takes the source's own.
