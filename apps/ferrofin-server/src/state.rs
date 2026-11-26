@@ -487,6 +487,10 @@ pub async fn build_app_state(
         paths.root_folder_path(),
         paths.data_path(),
     );
+    // Whether every start-time conversion below succeeded: one that fails
+    // warns, runs again at the next start, and clears this, so the start is
+    // not recorded for the export at the end (gl-1952).
+    let mut converted = true;
     // One-shot, on a database's first boot: Jellyfin's timers and series
     // timers (`data/livetv/*.json`), which nothing else reads. Before the path
     // rebase below, which moves a completed recording's file onto this
@@ -515,10 +519,13 @@ pub async fn build_app_state(
             series_timers,
             "imported jellyfin's live tv timers"
         ),
-        Err(err) => tracing::warn!(
-            %err,
-            "live tv timer import failed; it runs again at the next start"
-        ),
+        Err(err) => {
+            converted = false;
+            tracing::warn!(
+                %err,
+                "live tv timer import failed; it runs again at the next start"
+            );
+        }
     }
     // A database whose program-data directory moved (an adopted Debian
     // `/var/lib/jellyfin`, or a relocated data_dir) keeps its ids but stores
@@ -613,6 +620,7 @@ pub async fn build_app_state(
             );
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "clean-value repair failed; punctuated by-name lookups may miss until the next boot retries it");
         }
     }
@@ -624,6 +632,7 @@ pub async fn build_app_state(
             tracing::info!(repaired, "recomputed sort names from forced sort names");
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "forced sort-name repair failed; items with a sort-title override may sort by the 10.11.8 key until the next boot retries it");
         }
     }
@@ -638,6 +647,7 @@ pub async fn build_app_state(
             tracing::info!(repaired, "romanised the sort names of non-Latin titles");
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "sort-name transliteration repair failed; non-Latin titles may sort as written until the next boot retries it");
         }
     }
@@ -653,6 +663,7 @@ pub async fn build_app_state(
             );
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "box set and playlist repair failed; a renamed playlist may not be found by its new name until the next boot retries it");
         }
     }
@@ -671,6 +682,7 @@ pub async fn build_app_state(
             );
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "container date repair failed; the playlists folder or the collections library stays undated until the next boot retries it");
         }
     }
@@ -692,6 +704,7 @@ pub async fn build_app_state(
             );
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "user view consolidation failed; localized views stay duplicated until the next boot");
         }
     }
@@ -709,6 +722,7 @@ pub async fn build_app_state(
             tracing::info!(collapsed, "unified person identities onto per-name ids");
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "person identity unification failed; person favorites may not round-trip");
         }
     }
@@ -724,6 +738,7 @@ pub async fn build_app_state(
             tracing::info!(repaired, "repaired person metadata paths and sort keys");
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "person metadata repair failed; person sort order and Path may diverge until the next scan");
         }
     }
@@ -1010,7 +1025,7 @@ pub async fn build_app_state(
     .context("failed to re-home local alternate versions")?;
     // Likewise: a season with no folder an older Ferrofin scan keyed by a
     // synthetic path takes the id Jellyfin keys it by.
-    ferrofin_core::adoption_repairs::run_rekey_virtual_seasons(
+    converted &= ferrofin_core::adoption_repairs::run_rekey_virtual_seasons(
         db,
         &id_derivation,
         &virtual_paths,
@@ -1021,7 +1036,7 @@ pub async fn build_app_state(
     .context("failed to re-key seasons with no folder")?;
     // …and a playlist an older Ferrofin created with no folder gets the one
     // Jellyfin's `CreatePlaylist` makes, and the id Jellyfin keys it by.
-    ferrofin_core::adoption_repairs::run_rekey_pathless_playlists(
+    converted &= ferrofin_core::adoption_repairs::run_rekey_pathless_playlists(
         db,
         &id_derivation,
         &format!("{}/playlists", paths.data_path()),
@@ -1035,7 +1050,7 @@ pub async fn build_app_state(
     // version wrote under its own ids move to the ids Jellyfin derives, their
     // art folders with them. Rows the version beside this one in a rolling
     // update writes after this point move on the next boot.
-    ferrofin_core::adoption_repairs::run_rekey_by_name_rows(
+    converted &= ferrofin_core::adoption_repairs::run_rekey_by_name_rows(
         db,
         by_name_identity.as_ref(),
         &virtual_paths,
@@ -1407,7 +1422,7 @@ pub async fn build_app_state(
     // A bare `CollectionFolder` an older build made for the Collections library
     // becomes the real library: before any scan, and before the sweep below
     // reads the libraries' locations.
-    ferrofin_core::adoption_repairs::run_merge_legacy_collections_library(
+    converted &= ferrofin_core::adoption_repairs::run_merge_legacy_collections_library(
         db,
         &virtual_folders_impl,
         &id_derivation,
@@ -1418,7 +1433,7 @@ pub async fn build_app_state(
     // Then a box set an older Ferrofin created with no folder gets the one
     // Jellyfin's `CreateCollectionAsync` makes in that library's folder, and
     // the id Jellyfin keys it by.
-    ferrofin_core::adoption_repairs::run_rekey_pathless_box_sets(
+    converted &= ferrofin_core::adoption_repairs::run_rekey_pathless_box_sets(
         db,
         &id_derivation,
         (&paths.data_path(), &paths.root_folder_path()),
@@ -1443,6 +1458,7 @@ pub async fn build_app_state(
             );
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "parental rating level repair failed; max-rating filters may misjudge until the next scan");
         }
     }
@@ -1461,10 +1477,12 @@ pub async fn build_app_state(
                 tracing::info!(repaired, "recomputed series presentation keys");
             }
             Err(err) => {
+                converted = false;
                 tracing::warn!(%err, "series presentation key repair failed; grouped series may list per library until the next scan");
             }
         },
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "could not list libraries; series presentation key repair skipped until the next boot");
         }
     }
@@ -2454,7 +2472,9 @@ pub async fn build_app_state(
     ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, users_impl.as_ref());
     // One-shot, before the server takes a request: an adopted Jellyfin's
     // LDAP-Auth settings and uid map come across from the plugin's XML, so its
-    // directory users sign in with no admin action (B7).
+    // directory users sign in with no admin action (B7). This and the import
+    // below do not clear `converted`: until one succeeds, the export keeps the
+    // source's own document as it is (`export_cmd::plugins`).
     ferrofin_extensions::ldap_auth::adoption::import_adopted_config(
         &std::path::Path::new(&paths.plugins_path())
             .join("configurations")
@@ -2529,11 +2549,12 @@ pub async fn build_app_state(
     // with no media type, takes what a create or add stores today. It needs
     // the playlist manager's expansion, so it runs here, before the scheduler
     // can start a scan.
-    ferrofin_core::adoption_repairs::run_expand_saved_playlist_containers(db, &playlists).await;
+    converted &=
+        ferrofin_core::adoption_repairs::run_expand_saved_playlist_containers(db, &playlists).await;
     // The playlists folder's playlist.xml files, which no earlier Ferrofin
     // wrote, written from the database before a refresh reads one (gl-341).
     // Boxed: inlined, its future puts startup's over `large_futures`.
-    Box::pin(ferrofin_core::adoption_repairs::run_save_playlist_xml_once(
+    converted &= Box::pin(ferrofin_core::adoption_repairs::run_save_playlist_xml_once(
         db,
         &playlists,
         &container_xml,
@@ -2684,7 +2705,9 @@ pub async fn build_app_state(
     // The rows the repairs deleted while the database opened (orphaned
     // extras, path duplicates) take their metadata folders and extracted
     // data, now that the configured directories and the cleanup are known.
-    ferrofin_core::adoption_repairs::run_cleanup_deleted_item_data(db, &item_data_cleanup).await;
+    converted &=
+        ferrofin_core::adoption_repairs::run_cleanup_deleted_item_data(db, &item_data_cleanup)
+            .await;
     // Jellyfin 12.0's sweeps of a 10.11 database's items whose library or
     // file is gone delete through the library manager, so they run once it
     // removes extracted data too, and before a startup trigger can scan.
@@ -2702,13 +2725,15 @@ pub async fn build_app_state(
     // gl-131 (or by a hand-over that failed) are handed over or deleted, as
     // deleting their owner now does. It deletes through the library manager
     // too; a failure only warns.
-    ferrofin_core::adoption_repairs::run_remove_orphaned_playlists(db, playlists.as_ref()).await;
+    converted &=
+        ferrofin_core::adoption_repairs::run_remove_orphaned_playlists(db, playlists.as_ref())
+            .await;
     // Jellyfin 12.0's `CleanupOrphanedExternalData`, once per database: the
     // extracted data and chapter images left behind for items no longer
     // stored (every earlier Ferrofin left them when a scan removed an item).
     // After the sweeps that delete items, and before a startup trigger can
     // scan; under the configured metadata path.
-    ferrofin_core::adoption_repairs::run_cleanup_orphaned_external_data(
+    converted &= ferrofin_core::adoption_repairs::run_cleanup_orphaned_external_data(
         db,
         &ferrofin_core::adoption_repairs::ExtractedDataRoots {
             data: std::path::PathBuf::from(paths.data_path()),
@@ -2722,11 +2747,12 @@ pub async fn build_app_state(
     // version stored resolved under the data and metadata directories take
     // the `%AppDataPath%`/`%MetadataPath%` form every save writes. Last of the
     // repairs that store a path, and before a scan.
-    ferrofin_core::adoption_repairs::run_reverse_stored_virtual_paths(db, &virtual_paths).await;
+    converted &=
+        ferrofin_core::adoption_repairs::run_reverse_stored_virtual_paths(db, &virtual_paths).await;
     // Once per database (gl-1911): the videos an earlier version probed get the
     // `HasSubtitles` a probe stores in `Data` since gl-1632, from their stored
     // subtitle streams, before a scan.
-    ferrofin_core::adoption_repairs::run_store_has_subtitles(db).await;
+    converted &= ferrofin_core::adoption_repairs::run_store_has_subtitles(db).await;
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
@@ -3284,6 +3310,7 @@ pub async fn build_app_state(
         Ok(0) => {}
         Ok(rows) => tracing::info!(rows, "imported jellyfin's live tv configuration"),
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "live tv configuration import failed; live tv starts unconfigured");
         }
     }
@@ -3524,11 +3551,20 @@ pub async fn build_app_state(
     }
     // Last of `build_app_state`, after every start-time conversion and import
     // above (keep it last): the export takes this data directory only once a start
-    // of the exporting build has recorded it (gl-1910). A one-shot that failed
-    // has warned and runs again at the next start; recording only a start
-    // where every one succeeded is gl-1952.
-    if let Err(err) = db.record_started(ferrofin_health::build_version()).await {
-        tracing::warn!(%err, "could not record this start; an export will refuse the data directory until a start records it");
+    // of the exporting build has recorded it (gl-1910), and only a start where
+    // every one succeeded records it. One where one failed removes the record
+    // an earlier start left, so the export refuses until a start gets through
+    // them all (gl-1952).
+    if converted {
+        if let Err(err) = db.record_started(ferrofin_health::build_version()).await {
+            tracing::warn!(%err, "could not record this start; an export will refuse the data directory until a start records it");
+        }
+    } else if let Err(err) = db.clear_started().await {
+        tracing::warn!(%err, "could not remove the record of an earlier start; an export may take the data directory without the start-time conversion that failed");
+    } else {
+        tracing::warn!(
+            "a start-time conversion failed (warned above); an export will refuse the data directory until a start gets through them all"
+        );
     }
 
     Ok(WiredApp {

@@ -536,11 +536,12 @@ pub(super) async fn database(
 /// `_sqlx_migrations` stops short of or past this build's last migration
 /// ([`crate::schema_head`]), or that does not record a start of `build`, the
 /// exporter's own version ([`crate::STARTED_KEY`]; `has_meta` says whether
-/// `FerrofinMeta` exists). The export takes the database as its last start
-/// left it and runs neither the migrations nor the start-time conversions, so
-/// an upgrade exported before the new version started would carry the older
-/// rows, and a newer version's database could hold rows this build does not
-/// know.
+/// `FerrofinMeta` exists), which only a start whose start-time conversions
+/// all succeeded records (gl-1952). The export takes the database as its last
+/// start left it and runs neither the migrations nor the start-time
+/// conversions, so an upgrade exported before the new version started would
+/// carry the older rows, and a newer version's database could hold rows this
+/// build does not know.
 async fn started(conn: &mut sqlx::SqliteConnection, has_meta: bool, build: &str) -> Result<()> {
     const START_FIRST: &str = "start this release on the data directory once, stop it and export \
                                again (its start runs the migrations and conversions the export \
@@ -576,7 +577,9 @@ async fn started(conn: &mut sqlx::SqliteConnection, has_meta: bool, build: &str)
              ({build}): export it with that build, or {START_FIRST}"
         ))),
         None => Err(refused(format!(
-            "the database records no start of this Ferrofin release ({build}): {START_FIRST}"
+            "the database records no start of this Ferrofin release ({build}) that got \
+             through its start-time conversions (one that fails warns in the server's log): \
+             {START_FIRST}"
         ))),
     }
 }
