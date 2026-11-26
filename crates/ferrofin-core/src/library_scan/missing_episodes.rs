@@ -274,17 +274,15 @@ impl LibraryScanner {
             }
             // One series failing leaves the others to go on, as a failed
             // series refresh does upstream; the next refresh retries it.
-            if let Err(err) = self
-                .refresh_series_missing_episodes(
-                    items.as_ref(),
-                    one,
-                    &settings,
-                    cache,
-                    today,
-                    &mut changes,
-                )
-                .await
-            {
+            let refresh = Box::pin(self.refresh_series_missing_episodes(
+                items.as_ref(),
+                one,
+                &settings,
+                cache,
+                today,
+                &mut changes,
+            ));
+            if let Err(err) = ferrofin_providers::rate_limit::for_item(one.id, refresh).await {
                 tracing::warn!(
                     item_id = %one.id,
                     %err,

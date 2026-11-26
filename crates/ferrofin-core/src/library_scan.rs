@@ -247,6 +247,8 @@ type EarlyEpisodeImages = AbortOnDrop<(Vec<TmdbImage>, u32)>;
 
 /// The walk's next item, as [`ArtworkCache::next_episode`] keeps it.
 struct NextEpisode {
+    /// Its id.
+    id: Uuid,
     /// Its planned row.
     entity: BaseItemEntity,
     /// Which remote images its refresh fetches (never `None`).
@@ -2127,11 +2129,25 @@ pub trait PriorityLane: Send + Sync {
     /// call (a metadata edit over the API writes the row directly). The
     /// walk reads them again before it reaches them, as it does what a lane
     /// refresh touched: upstream's edit changes the cached item the refresh
-    /// merges onto, so its later save keeps the edit. The walk takes them
-    /// between two items only, so an edit that lands after the walk took
-    /// them for an item and before it saved that item is still saved over.
+    /// merges onto, so its later save keeps the edit. An edit that lands
+    /// after the walk read an item's row is caught by
+    /// [`edited_since`](Self::edited_since) instead.
     fn edited(&self) -> Vec<Uuid> {
         Vec::new()
+    }
+    /// How many edits outside the scan were recorded so far: the mark a walk
+    /// takes before it reads a window of stored rows, for
+    /// [`edited_since`](Self::edited_since).
+    fn edit_mark(&self) -> u64 {
+        0
+    }
+    /// Whether `id` was edited outside the scan after `mark` was taken. Takes
+    /// nothing off the lane: the walk asks it of each stored item it is about
+    /// to save, under the item's metadata lock, and leaves an item edited
+    /// since its row was read as the edit wrote it.
+    fn edited_since(&self, id: Uuid, mark: u64) -> bool {
+        let _ = (id, mark);
+        false
     }
 }
 
@@ -2331,6 +2347,10 @@ pub struct ScanRun<'a> {
     pub passes: ScanPasses,
     /// The item refreshes it serves while it runs, if any.
     pub lane: Option<&'a dyn PriorityLane>,
+    /// The lane whose record of edits its saves check
+    /// ([`PriorityLane::edited_since`]): its own, or that of the scan serving
+    /// it, which a served refresh does not serve itself.
+    edits: Option<&'a dyn PriorityLane>,
     /// Where it records the ids it planned, for the scan serving it.
     touched: Option<&'a TouchedIds>,
     /// It validates every library from the root ([`ScanTarget::All`]): a
@@ -2372,6 +2392,7 @@ impl<'a> ScanRun<'a> {
             tracking: None,
             passes: ScanPasses::Library,
             lane: None,
+            edits: None,
             touched: None,
             from_root: false,
             dirs: None,
@@ -2398,6 +2419,7 @@ impl<'a> ScanRun<'a> {
     pub fn with_lane(self, lane: &'a dyn PriorityLane) -> Self {
         Self {
             lane: Some(lane),
+            edits: Some(lane),
             ..self
         }
     }
@@ -2526,6 +2548,8 @@ struct RefreshContext<'a> {
     /// an owned version outside them keeps its stored owner
     /// ([`keep_unplanned_version_owner`]).
     version_groups: &'a VersionGroups,
+    /// The record of edits the walk's saves check ([`ScanRun::edits`]).
+    edits: Option<&'a dyn PriorityLane>,
 }
 
 /// `BeforeSaveInternal`'s `item.HasChanged(info.LastWriteTimeUtc)`: the
@@ -2563,6 +2587,7 @@ impl<'a> RefreshContext<'a> {
             date_added: DateAdded::default(),
             cancel: run.cancel,
             version_groups: &NO_GROUPS,
+            edits: run.edits,
         }
     }
 
@@ -3008,6 +3033,9 @@ struct ItemPass<'a> {
     /// (a first refresh stays first; owner decision D1 — a provider that
     /// fails leaves it unstamped).
     music_pending: bool,
+    /// The edits recorded before its stored row was read
+    /// ([`StoredRows::edit_mark`]).
+    edit_mark: u64,
 }
 
 /// The scan-wide state [`LibraryScanner::scan_item`] reads and updates.
@@ -3039,9 +3067,13 @@ enum ItemSaved {
     Saved,
     /// Nothing about the item changed; nothing was written.
     Unchanged,
-    /// The scan was cancelled while the item waited on its probe or a
-    /// provider, before anything of it was written.
+    /// The scan was cancelled while the item waited on its probe, a provider
+    /// or its metadata lock, before its row was written.
     Cancelled,
+    /// The item was edited outside the scan while it refreshed: its row,
+    /// provider ids, credits, locked fields and stamp were left as the edit
+    /// wrote them, and only the artwork the pass changed on disk recorded.
+    Edited,
 }
 
 /// The refresh facts of a row the walk does not plan: nothing on disk feeds
@@ -4276,6 +4308,10 @@ struct StoredRows {
     /// What previous scans probed for the window's items' image files; moved
     /// into the scan's cache when the walk enters the window.
     images: Vec<StoredImageMetadata>,
+    /// The edits recorded before the window's rows were read
+    /// ([`PriorityLane::edit_mark`]): an item edited after it is left as the
+    /// edit wrote it.
+    edit_mark: u64,
     /// The next window, read early to keep the probe look-ahead fed across
     /// the window boundary. Its rows were read before this window's saves,
     /// which touch other items only: a repeated id is refreshed once, at its
@@ -4711,7 +4747,12 @@ impl LibraryScanner {
         failed
     }
 
-    /// Runs registered metadata savers after the complete item has been persisted.
+    /// Runs registered metadata savers after the complete item has been
+    /// persisted, and holds each stored item's metadata lock
+    /// ([`ProviderManager::lock_item_metadata`]) across the writes an edit
+    /// also makes.
+    ///
+    /// [`ProviderManager::lock_item_metadata`]: ferrofin_traits::providers::ProviderManager::lock_item_metadata
     #[must_use]
     pub fn with_metadata_savers(
         mut self,
@@ -5209,15 +5250,8 @@ impl LibraryScanner {
             }
         }
         if let Some(localization) = &self.localization {
-            let score = entity
-                .custom_rating
-                .as_deref()
-                .filter(|rating| !rating.is_empty())
-                .or(entity.official_rating.as_deref())
-                .and_then(|rating| {
-                    localization
-                        .get_rating_score(rating, entity.preferred_metadata_country_code.as_deref())
-                });
+            let score =
+                crate::localization_manager::parental_rating_score(entity, localization.as_ref());
             entity.inherited_parental_rating_value = score.map(|score| i64::from(score.score));
             entity.inherited_parental_rating_sub_value =
                 score.and_then(|score| score.sub_score.map(i64::from));
@@ -5619,6 +5653,7 @@ impl LibraryScanner {
                 progress: None,
                 tracking: None,
                 lane: None,
+                edits: run.edits,
                 touched: Some(&planned),
                 ..ScanRun::new(&refresh.options, &refresh.ancestors, &refresh.cancel)
                     .with_passes(refresh.passes)
@@ -7331,6 +7366,7 @@ impl LibraryScanner {
                 locked,
                 policy,
                 music_pending,
+                edit_mark: stored_rows.edit_mark,
             };
             let mut state = ItemState {
                 art_cache: &mut art_cache,
@@ -7351,6 +7387,12 @@ impl LibraryScanner {
             let save_attempted = state.save_attempted;
             if undecodable || scanned_item.is_err() {
                 self.keep_stored_series_key(item, &mut series_keys).await;
+            }
+            // What the pass cached about an item it left as an edit wrote it (a
+            // series' key and name, a season's name, its lookups) is the
+            // pass's, not the stored row's: the items after it read it again.
+            if matches!(scanned_item, Ok(ItemSaved::Edited)) {
+                Box::pin(self.reread_touched(&[item.id], &mut art_cache, &mut series_keys)).await;
             }
             let saved = match scanned_item {
                 Ok(saved) => saved,
@@ -7514,7 +7556,7 @@ impl LibraryScanner {
                     });
             }
             match saved {
-                ItemSaved::Unchanged => outcome.unchanged += 1,
+                ItemSaved::Unchanged | ItemSaved::Edited => outcome.unchanged += 1,
                 ItemSaved::Saved if is_new => outcome.created += 1,
                 ItemSaved::Saved => {
                     outcome.updated += 1;
@@ -7527,7 +7569,7 @@ impl LibraryScanner {
                     if is_new && announce {
                         items_added.pop();
                     }
-                    let at = "inside an item, before any write";
+                    let at = "inside an item, before its row was written";
                     self.sync_local_version_groups(&[], &released).await;
                     self.copy_to_owned_videos(&owners, false).await;
                     // A stopped walk writes no file back ([`Self::save_playlist_files`]).
@@ -7554,7 +7596,7 @@ impl LibraryScanner {
             // `Video.cs:549-555`); that copy writes only a part that differs.
             if matches!(saved, ItemSaved::Saved) {
                 owners.note_saved(item, is_new || handed_back || moved_ids.contains(&item.id));
-            } else if matches!(saved, ItemSaved::Unchanged)
+            } else if matches!(saved, ItemSaved::Unchanged | ItemSaved::Edited)
                 && crate::video_versions::additional_part_count(item.entity.data.as_deref()) > 0
             {
                 owners.stacked.push(item.id);
@@ -7569,7 +7611,11 @@ impl LibraryScanner {
                     extra_changed(stored, item, extra_renamed, request.options),
                 );
             }
-            if let Some(owner) = released_by {
+            // An item left as an edit wrote it keeps its stored owner link,
+            // so its owner keeps it too until a later refresh saves it.
+            if let Some(owner) = released_by
+                && !matches!(saved, ItemSaved::Edited)
+            {
                 released.entry(owner).or_default().push(item.id);
             }
             // The independent timer samples these counters once per second.
@@ -8146,7 +8192,8 @@ impl LibraryScanner {
     /// and provider ids all equal what is stored, is not written at all: no
     /// `BaseItems` upsert (so `DateLastSaved` and the DTO `Etag` stay put),
     /// no provider-id, item-value, ancestor, people, stream, chapter,
-    /// attachment or image write.
+    /// attachment or image write. A stored item edited over the API after
+    /// its row was read is not saved either ([`ItemSaved::Edited`]).
     // The per-item pipeline reads best as one straight line; the series-key
     // settle + re-point step (12.0 `UpdateSeriesChildrenInfoAsync`) tipped it
     // over the line count.
@@ -8156,7 +8203,7 @@ impl LibraryScanner {
         pass: ItemPass<'_>,
         state: &mut ItemState<'_, '_>,
     ) -> Result<ItemSaved, ServiceError> {
-        use ferrofin_providers::rate_limit::count_request_failures;
+        use ferrofin_providers::rate_limit::{count_request_failures, for_item};
         let ItemPass {
             index,
             item,
@@ -8167,6 +8214,7 @@ impl LibraryScanner {
             locked,
             policy,
             music_pending,
+            edit_mark,
         } = pass;
         if matches!(stored, Stored::Undecodable) {
             // Only the file facts are written, and only when they moved;
@@ -8511,16 +8559,17 @@ impl LibraryScanner {
             // Boxed: the provider fold below this is the deepest branch of
             // the per-item future.
             let fetched = cancel
-                .unless_cancelled(count_request_failures(Box::pin(
-                    self.fetch_remote_metadata(
+                .unless_cancelled(for_item(
+                    item.id,
+                    count_request_failures(Box::pin(self.fetch_remote_metadata(
                         &mut entity,
                         state.art_cache,
                         policy,
                         prefer,
                         &lookup_ids,
                         &guesses,
-                    ),
-                )))
+                    ))),
+                ))
                 .await;
             let Some((remote, failed)) = fetched else {
                 return Ok(ItemSaved::Cancelled);
@@ -8649,6 +8698,14 @@ impl LibraryScanner {
                 _ => None,
             },
         };
+        // `SaveItemAsync` writes them only for a kind that supports people
+        // (`MetadataService.cs:320`, again in `LibraryManager.UpdatePeopleAsync`):
+        // an `artist.nfo`'s or a `playlist.xml`'s credits are read and dropped,
+        // before they can make a backfill pass save.
+        // TODO(parity, open work item — NOT an accepted divergence; gl-1955):
+        // credits an earlier build stored for such a kind stay as they are
+        // until the owner decides whether a repair removes them.
+        let credits = credits.filter(|_| kind.is_some_and(crate::kinds::supports_people));
         // `BeforeSaveInternal`: a stored file that changed on disk is
         // re-dated under "Use file creation date" (`RefreshContext::redated`).
         let redated = stored_row.and_then(|row| state.refresh.redated(row, item));
@@ -8867,8 +8924,13 @@ impl LibraryScanner {
                 .probe_attachments
                 .insert(item.id, rows.attachments.clone());
         }
-        let ((artwork, cut_short, local_images_changed), failed) = count_request_failures(
-            Box::pin(self.collect_artwork(item.id, art, state.art_cache)),
+        let ((artwork, cut_short, local_images_changed), failed) = for_item(
+            item.id,
+            count_request_failures(Box::pin(self.collect_artwork(
+                item.id,
+                art,
+                state.art_cache,
+            ))),
         )
         .await;
         state.art_cache.probe_attachments.remove(&item.id);
@@ -8989,7 +9051,9 @@ impl LibraryScanner {
         // `BeforeSaveInternal`: a video whose file changed loses what was
         // extracted from the old file before this refresh's trickplay and
         // chapters extract from the new one. Only on a save, which stores the
-        // new `DateModified`, so the same change never prunes twice.
+        // new `DateModified`, so the same change never prunes twice; but for
+        // an item an edit leaves unsaved below ([`ItemSaved::Edited`]), which
+        // the next scan prunes and extracts again.
         //
         // TODO(parity, open work item — NOT an accepted divergence; gl-1697):
         // a row the scan could not read (`Stored::Unread`, and
@@ -9035,6 +9099,50 @@ impl LibraryScanner {
             if !trickplay_ok {
                 return Ok(ItemSaved::Cancelled);
             }
+        }
+        // An edit made over the API after this item's row was read would be
+        // saved over by the writes below; upstream's edit changes the cached
+        // item this refresh merges onto, so its save keeps the edit. The lock
+        // spans the writes an edit also makes (the row, its provider ids,
+        // credits and locked fields): an edit lands before the check and is
+        // kept, or waits and applies to the saved row. (A run with no record
+        // of edits checks nothing, but its writes still never interleave
+        // with an edit's.) An item edited since is left as the edit wrote
+        // it, stamp included, so its metadata refreshes at its next due
+        // refresh; the artwork this pass already changed on disk is
+        // recorded, so its rows never name removed files. A cancel ends a
+        // wait for a held lock the same way.
+        let artwork = artwork.filter(|_| images_changed);
+        let metadata_lock = match (&self.metadata_savers, stored_row) {
+            (Some(providers), Some(_)) => {
+                // The lock first: a cancel gives up only a wait on a held
+                // lock, so a pass it cut short (its artwork pass) still saves
+                // what it has, as `ScanCancel` promises.
+                let mut lock = providers.lock_item_metadata(item.id);
+                tokio::select! {
+                    biased;
+                    lock = &mut lock => Some(lock),
+                    () = cancel.cancelled() => {
+                        // Out of the queue first: the holder's next waiter
+                        // must not be this abandoned wait.
+                        drop(lock);
+                        self.record_artwork(item.id, artwork.as_deref()).await;
+                        return Ok(ItemSaved::Cancelled);
+                    }
+                }
+            }
+            _ => None,
+        };
+        if stored_row.is_some()
+            && state
+                .refresh
+                .edits
+                .is_some_and(|lane| lane.edited_since(item.id, edit_mark))
+        {
+            drop(metadata_lock);
+            self.record_artwork(item.id, artwork.as_deref()).await;
+            tracing::debug!(item_id = %item.id, "item edited during its refresh: left as the edit wrote it");
+            return Ok(ItemSaved::Edited);
         }
         // `DateLastRefreshed` records a refresh that completed with no
         // provider failure (a provider that found nothing still completes);
@@ -9107,9 +9215,11 @@ impl LibraryScanner {
                 .set_ancestors(item.id, &item.ancestors)
                 .await?;
         }
-        if !cast_locked {
-            self.persist_people(item.id, credits).await;
-        }
+        let written_people = if cast_locked {
+            Vec::new()
+        } else {
+            self.persist_people(item.id, credits).await
+        };
         if let Some(fields) = &grown_locks {
             let ids: Vec<i32> = fields
                 .iter()
@@ -9119,6 +9229,10 @@ impl LibraryScanner {
             // union (upstream `LockedFields.Concat(…).Distinct()`).
             self.persistence.add_locked_fields(item.id, &ids).await?;
         }
+        // What an edit writes is written; the credited persons' photos and
+        // biographies are fetched outside the lock.
+        drop(metadata_lock);
+        self.enrich_written_people(written_people).await;
         self.persist_probe_rows(item.id, &rows, subtitle_downloader.map(AsRef::as_ref))
             .await?;
         // Like FFProbeVideoInfo.AddExternalSubtitlesAsync, only a successful
@@ -9185,11 +9299,7 @@ impl LibraryScanner {
             }
             _ => {}
         }
-        if let Some(images) = artwork.filter(|_| images_changed)
-            && let Err(err) = self.persistence.save_item_images(item.id, &images).await
-        {
-            tracing::warn!(%err, item = %item.id, "failed to persist discovered artwork");
-        }
+        self.record_artwork(item.id, artwork.as_deref()).await;
         // A cancel may have cut the chapters, the subtitle downloads or the
         // trickplay short, so it leaves the row unstamped. Otherwise the
         // stamp this refresh earned is written, or the stored one is put
@@ -9251,6 +9361,9 @@ impl LibraryScanner {
         let end = (start + ferrofin_db::BATCH_BIND_CHUNK).min(planned.len());
         window.start = start;
         window.end = end;
+        // Taken before the read: an edit recorded meanwhile marks its item
+        // as edited since, though the read may already hold it.
+        window.edit_mark = refresh.edits.map_or(0, PriorityLane::edit_mark);
         window.rows = None;
         window.links = None;
         window.plans.clear();
@@ -9448,21 +9561,47 @@ impl LibraryScanner {
     /// the stored credits alone, `Some` replaces them (`update_people`
     /// rewrites the item's credit rows), an empty list clearing them — as
     /// `SaveItemAsync` writes `People` only when it is not null
-    /// (`MetadataService.cs:320-324`).
+    /// (`MetadataService.cs:320-324`). Returns the persons it wrote, for
+    /// [`enrich_written_people`](Self::enrich_written_people) once the item's
+    /// metadata lock is released.
     ///
     /// [`pass_credits`]: ferrofin_providers::metadata_merge::pass_credits
-    async fn persist_people(&self, item_id: Uuid, credits: Option<Vec<PeopleEntity>>) {
-        let Some(people) = credits else {
-            return;
+    async fn persist_people(
+        &self,
+        item_id: Uuid,
+        credits: Option<Vec<PeopleEntity>>,
+    ) -> Vec<ferrofin_traits::persistence::WrittenPerson> {
+        let (Some(people), Some(repo)) = (credits, &self.people) else {
+            return Vec::new();
         };
-        let Some(repo) = &self.people else {
-            return;
-        };
-        match repo.update_people(item_id, &people).await {
-            Ok(written) => self.enrich_people(repo.as_ref(), written).await,
-            Err(err) => {
-                tracing::warn!(%err, item = %item_id, "failed to persist cast/crew");
-            }
+        repo.update_people(item_id, &people)
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, %item_id, "failed to persist cast/crew");
+                Vec::new()
+            })
+    }
+
+    /// [`enrich_people`](Self::enrich_people) over the persons
+    /// [`persist_people`](Self::persist_people) wrote: their photos and
+    /// biographies, fetched once the item's own writes are done.
+    async fn enrich_written_people(
+        &self,
+        written: Vec<ferrofin_traits::persistence::WrittenPerson>,
+    ) {
+        if let (Some(repo), false) = (&self.people, written.is_empty()) {
+            self.enrich_people(repo.as_ref(), written).await;
+        }
+    }
+
+    /// Records `images`, the artwork an item's pass found or downloaded, as
+    /// its image rows: nothing when the set did not change. A failure is
+    /// logged, not fatal.
+    async fn record_artwork(&self, item_id: Uuid, images: Option<&[ItemImageInfo]>) {
+        if let Some(images) = images
+            && let Err(err) = self.persistence.save_item_images(item_id, images).await
+        {
+            tracing::warn!(%err, %item_id, "failed to persist discovered artwork");
         }
     }
 
@@ -13027,6 +13166,7 @@ impl LibraryScanner {
         repo: &dyn ferrofin_traits::persistence::PeopleRepository,
         mut written: Vec<ferrofin_traits::persistence::WrittenPerson>,
     ) {
+        use ferrofin_providers::rate_limit::for_item;
         let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
             return;
         };
@@ -13086,7 +13226,7 @@ impl LibraryScanner {
                     "Person",
                     ImageType::Primary,
                 );
-                let mut infos: Vec<_> = download_image(
+                let download = download_image(
                     tmdb,
                     (&dir, &stem),
                     &id,
@@ -13095,10 +13235,10 @@ impl LibraryScanner {
                         url: url.clone(),
                         ..Default::default()
                     },
-                )
-                .await
-                .into_iter()
-                .collect();
+                );
+                // The person's own provider work, though its credit's item's
+                // refresh runs it.
+                let mut infos: Vec<_> = for_item(person.id, download).await.into_iter().collect();
                 if infos.is_empty() {
                     photos_failed().insert(url);
                 }
@@ -13176,9 +13316,11 @@ impl LibraryScanner {
                         &mut locale_cache,
                     )
                     .await;
-                let details = tmdb
-                    .person_details_for_language(tmdb_id, language.as_deref())
-                    .await;
+                let details = for_item(
+                    person.id,
+                    tmdb.person_details_for_language(tmdb_id, language.as_deref()),
+                )
+                .await;
                 // `None` is also TMDB having nothing on the person: asked once.
                 let Some(details) = details else {
                     asked().insert(person.id);
@@ -13367,7 +13509,8 @@ impl LibraryScanner {
                 }
             }
             let (dir, stem) = art_dir_for(&meta_root.resolve(), id, "Studio", ImageType::Thumb);
-            let dest = match studio_thumb(studios, (&dir, &stem), name).await {
+            let thumb = studio_thumb(studios, (&dir, &stem), name);
+            let dest = match ferrofin_providers::rate_limit::for_item(id, thumb).await {
                 StudioThumb::Found(dest) => dest,
                 StudioThumb::Answered => {
                     refreshed.push(id);
@@ -14268,7 +14411,7 @@ impl LibraryScanner {
                     ferrofin_providers::rate_limit::note_request_failure();
                     tracing::warn!(
                         provider = provider.name(),
-                        item = %lookup.item_id,
+                        item_id = %lookup.item_id,
                         %err,
                         "dynamic image provider failed; continuing"
                     );
@@ -14287,7 +14430,7 @@ impl LibraryScanner {
                 let Some(ext) = sniff_image_ext(&bytes) else {
                     tracing::warn!(
                         provider = provider.name(),
-                        item = %entity.id,
+                        item_id = %entity.id,
                         kind = ?kind,
                         "plugin artwork bytes are not a recognized image format; skipping"
                     );
@@ -14299,7 +14442,7 @@ impl LibraryScanner {
                 if let Err(err) =
                     off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
                 {
-                    tracing::warn!(%err, item = %entity.id, "failed to write plugin artwork");
+                    tracing::warn!(%err, item_id = %entity.id, "failed to write plugin artwork");
                     continue;
                 }
                 if let Some(previous) = previous.filter(|path| *path != dest) {
@@ -15114,6 +15257,7 @@ impl LibraryScanner {
         }
         let fetch = stored_rows.plan(index)?.remote_images;
         (fetch != ImageFetch::None).then(|| NextEpisode {
+            id: item.id,
             entity: item.entity.to_entity(),
             fetch,
         })
@@ -15140,6 +15284,7 @@ impl LibraryScanner {
         cache: &mut ArtworkCache,
     ) {
         let Some(NextEpisode {
+            id: next_id,
             entity: next,
             fetch,
         }) = cache.next_episode.take()
@@ -15174,13 +15319,13 @@ impl LibraryScanner {
             return;
         }
         let (series, language) = (key.0, key.3.clone());
+        // The request is the next episode's, as the failures it counts are.
         let task = tokio::spawn(tracing::Instrument::in_current_span(async move {
-            ferrofin_providers::rate_limit::count_request_failures(tmdb.episode_images(
-                series,
-                season,
-                episode,
-                language.as_deref(),
-            ))
+            let request = tmdb.episode_images(series, season, episode, language.as_deref());
+            ferrofin_providers::rate_limit::for_item(
+                next_id,
+                ferrofin_providers::rate_limit::count_request_failures(request),
+            )
             .await
         }));
         cache.episode_images = Some(((series, season, episode, key.3.clone()), AbortOnDrop(task)));
@@ -34197,6 +34342,7 @@ mod tests {
             date_added: super::DateAdded::default(),
             cancel: &super::ScanCancel::new(),
             version_groups: &super::VersionGroups::default(),
+            edits: None,
         };
         let at = |path: &str| super::Planned {
             id: uuid::Uuid::nil(),

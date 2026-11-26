@@ -701,6 +701,13 @@ struct ScanQueue {
     /// The items edited outside the scans (a metadata edit) while one runs,
     /// for it to read again before it reaches them ([`PriorityLane::edited`]).
     edited: Vec<Uuid>,
+    /// How many edits were recorded, ever: the marks
+    /// [`PriorityLane::edited_since`] compares against.
+    edit_count: u64,
+    /// The running scan's edited items, each with the count its last edit
+    /// took, for the walk's check before it saves one
+    /// ([`PriorityLane::edited_since`]).
+    last_edits: HashMap<Uuid, u64>,
     /// The worker's task, for a test to simulate it dying.
     #[cfg(test)]
     worker_task: Option<tokio::task::AbortHandle>,
@@ -861,7 +868,11 @@ impl ScanQueue {
     /// no scan runs: the next one reads every row afresh.
     fn record_edited(&mut self, ids: impl IntoIterator<Item = Uuid>) {
         if self.running.is_some() {
-            self.edited.extend(ids);
+            for id in ids {
+                self.edit_count += 1;
+                self.edited.push(id);
+                self.last_edits.insert(id, self.edit_count);
+            }
         }
     }
 
@@ -869,6 +880,7 @@ impl ScanQueue {
     fn finish_running(&mut self, result: &ScanResult) {
         // The next scan reads every row afresh.
         self.edited.clear();
+        self.last_edits.clear();
         if let Some(done) = self.running.take() {
             for ticket in done.waiters.tickets {
                 self.sinks.remove(&ticket);
@@ -1018,6 +1030,7 @@ impl ScanWorker {
                     // It reads every row afresh, even after a scan that
                     // ended without `finish_running`.
                     queue.edited.clear();
+                    queue.last_edits.clear();
                     Some((pending.request, cancel, waited))
                 } else {
                     // Standing down under the same lock that a new request
@@ -1276,6 +1289,17 @@ impl PriorityLane for QueueLane {
 
     fn edited(&self) -> Vec<Uuid> {
         std::mem::take(&mut lock_queue(&self.queue).edited)
+    }
+
+    fn edit_mark(&self) -> u64 {
+        lock_queue(&self.queue).edit_count
+    }
+
+    fn edited_since(&self, id: Uuid, mark: u64) -> bool {
+        lock_queue(&self.queue)
+            .last_edits
+            .get(&id)
+            .is_some_and(|&edit| edit > mark)
     }
 }
 
@@ -6290,8 +6314,10 @@ mod tests {
     }
 
     /// Each metadata edit made while a scan runs is handed to that scan once,
-    /// for it to read the item again before it saves it; while none runs
-    /// nothing is kept, as the next scan reads every row afresh.
+    /// for it to read the item again before it saves it, and stays known as
+    /// an edit since every earlier mark, for the walk's check before a save;
+    /// while none runs nothing is kept, as the next scan reads every row
+    /// afresh.
     #[tokio::test]
     async fn an_edit_is_handed_to_the_running_scan_once() {
         let db = test_db().await;
@@ -6306,12 +6332,14 @@ mod tests {
             .await
             .expect("idle edit");
         assert!(lane.edited().is_empty(), "no scan runs: nothing kept");
+        assert!(!lane.edited_since(movie, 0), "no scan runs: nothing kept");
 
         lock_queue(&mgr.scan_queue).running = Some(RunningScan {
             waiters: Waiters::default(),
             cancel: ScanCancel::new(),
             validation: true,
         });
+        let before = lane.edit_mark();
         let row = mgr.get_item_by_id(movie).await.expect("read").expect("row");
         mgr.update_items(std::slice::from_ref(&row), None)
             .await
@@ -6326,13 +6354,28 @@ mod tests {
         mgr.update_item_rating(row).await.expect("rating");
         assert_eq!(lane.edited(), [movie; 5]);
         assert!(lane.edited().is_empty(), "handed over once");
+        assert!(
+            lane.edited_since(movie, before),
+            "taking the edits leaves the walk's check its answer"
+        );
+        assert!(
+            !lane.edited_since(Uuid::from_u128(0x92), before),
+            "another item"
+        );
+        let after = lane.edit_mark();
+        assert!(!lane.edited_since(movie, after), "no edit since");
 
         mgr.update_item_locked_fields(movie, &[1])
             .await
             .expect("late edit");
+        assert!(lane.edited_since(movie, after), "edited since");
         lock_queue(&mgr.scan_queue).finish_running(&ScanResult::Completed);
         assert!(
             lane.edited().is_empty(),
+            "the next scan reads every row afresh"
+        );
+        assert!(
+            !lane.edited_since(movie, before),
             "the next scan reads every row afresh"
         );
     }

@@ -266,6 +266,8 @@ def main(argv=None):
                 raise CheckError("fixture needs watched movie or episode history before adoption")
             if not any(row["PlaybackPositionTicks"] > 0 for row in data["items"].values()):
                 raise CheckError("fixture needs movie or episode resume progress before adoption")
+            if not any(row["Played"] and row["LastPlayedDate"] is None for row in data["items"].values()):
+                raise CheckError("fixture needs a played movie or episode without a LastPlayedDate before adoption")
             fd = os.open(args.baseline, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as output:
                 os.fchmod(output.fileno(), 0o600)

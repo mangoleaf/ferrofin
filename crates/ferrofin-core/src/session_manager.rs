@@ -2982,6 +2982,7 @@ impl FerrofinSessionManager {
     }
 
     /// Shared authenticate path (C# `AuthenticateNewSessionInternal`).
+    #[allow(clippy::too_many_lines)] // C#'s AuthenticateNewSessionInternal and GetAuthorizationToken in one
     async fn authenticate_internal(
         &self,
         request: &AuthenticationRequest,
@@ -3063,17 +3064,19 @@ impl FerrofinSessionManager {
                 error!(%err, "error logging out existing session");
             }
         }
+        // C# `new Device(…)`: one instant in all three dates, `IsActive` unset.
+        let now = Utc::now();
         let new_device = DeviceEntity {
             id: 0,
             access_token: Uuid::new_v4().simple().to_string(),
             app_name: app.to_owned(),
             app_version: app_version.to_owned(),
-            date_created: Utc::now(),
-            date_last_activity: Utc::now(),
-            date_modified: Utc::now(),
+            date_created: now,
+            date_last_activity: now,
+            date_modified: now,
             device_id: device_id.to_owned(),
             device_name: device_name.to_owned(),
-            is_active: true,
+            is_active: false,
             user_id: user.id.clone(),
         };
         let created = self.device_manager.create_device(&new_device).await?;

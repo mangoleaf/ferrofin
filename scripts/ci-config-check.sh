@@ -47,6 +47,11 @@ cargo-machete .github/workflows/ci.yml cargo-machete@[0-9.]+
 cargo-machete ci/Dockerfile cargo-machete@[0-9.]+
 cargo-vet .github/workflows/ci.yml cargo-vet@[0-9.]+
 cargo-vet ci/Dockerfile cargo-vet@[0-9.]+
+cargo-about .github/workflows/ci.yml cargo-about@[0-9.]+
+cargo-about .github/workflows/release.yml cargo-about@[0-9.]+
+cargo-about Dockerfile cargo-about@[0-9.]+
+cargo-about ci/Dockerfile cargo-about@[0-9.]+
+cargo-about mise.toml ^"cargo:cargo-about" = \{ version = "[0-9.]+
 cargo-audit .github/workflows/release.yml cargo-audit@[0-9.]+
 cargo-auditable .github/workflows/release.yml cargo-auditable@[0-9.]+
 cargo-auditable Dockerfile cargo-auditable@[0-9.]+

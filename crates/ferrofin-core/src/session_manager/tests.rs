@@ -626,6 +626,48 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
     assert_eq!(resolved.user_id, user_id);
 }
 
+/// The minted `Devices` row is what upstream's `Device` constructor writes:
+/// `IsActive` never set (0), and `DateCreated` copied into `DateModified` and
+/// `DateLastActivity`, so the three hold one instant.
+#[tokio::test]
+async fn a_minted_device_row_is_inactive_with_one_instant_in_its_dates() {
+    use ferrofin_traits::devices::{DeviceManager as _, DeviceQuery};
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "alice").await;
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
+    let request = AuthenticationRequest {
+        user_id: Some(user_id),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device_name: Some("Chrome".to_owned()),
+        remote_endpoint: Some("1.2.3.4".to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    mgr.authenticate_direct(&request).await.unwrap();
+
+    let devices = FerrofinDeviceManager::new(db.clone())
+        .get_devices(&DeviceQuery::default())
+        .await
+        .unwrap();
+    let [device] = devices.items.as_slice() else {
+        panic!("one device row, got {}", devices.items.len());
+    };
+    assert!(!device.is_active, "upstream never sets Device.IsActive");
+    assert_eq!(
+        device.date_modified, device.date_created,
+        "DateModified = DateCreated"
+    );
+    assert_eq!(
+        device.date_last_activity, device.date_created,
+        "DateLastActivity = DateCreated"
+    );
+}
+
 /// Upstream throws one message from `UserManager.AuthenticateUser` (no such
 /// user) and `AuthenticateNewSessionInternal` (wrong password), so a caller
 /// cannot tell them apart. The two are written in different managers here.

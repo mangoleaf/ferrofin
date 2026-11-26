@@ -44,6 +44,10 @@ fn _assert_object_safe_event_manager(_: &dyn EventManager) {}
 /// (`LibraryChanged` is, filtered per user).
 pub const ITEMS_CHANGED: &str = "ItemsChanged";
 
+/// The in-process event a plugin configuration save publishes, with
+/// `{"Id": "<plugin id>"}`; never forwarded to clients.
+pub const PLUGIN_CONFIGURATION_CHANGED: &str = "PluginConfigurationChanged";
+
 /// The future a consumer returns, awaited in registration order by the
 /// event manager's `publish`.
 pub type EventFuture =

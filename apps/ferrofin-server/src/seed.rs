@@ -6,12 +6,12 @@
 //! places: `UserManager.InitializeAsync` creates one administrator on first run,
 //! and the startup wizard's `StartupController.UpdateStartupUser` later renames
 //! that user and sets its password. This module ports `InitializeAsync`: when the
-//! database has no users, create the configured administrator and grant it the
-//! administrator policy. It sets a password only when `admin_password` is
-//! configured (a headless install); otherwise it leaves the admin **passwordless**
-//! — exactly like Jellyfin — so the web setup wizard can set it. A generated
-//! password would trip the wizard's "first user already has a password" guard and
-//! lock setup out.
+//! database has no users, create the configured administrator with the three
+//! permissions upstream's first user gets. It sets a password only when
+//! `admin_password` is configured (a headless install); otherwise it leaves the
+//! admin **passwordless** — exactly like Jellyfin — so the web setup wizard can
+//! set it. A generated password would trip the wizard's "first user already has
+//! a password" guard and lock setup out.
 //!
 //! Seeding is idempotent and a no-op once any user exists, so it is safe to call
 //! unconditionally on every boot: an existing install is never disturbed.
@@ -70,21 +70,22 @@ impl SeedOutcome {
 ///
 /// 1. If any user already exists, return [`SeedOutcome::AlreadyInitialized`]
 ///    without touching the database (idempotent — safe on every boot).
-/// 2. Otherwise create the [`Config::admin_user`] account.
+/// 2. Otherwise create the [`Config::admin_user`] account as `InitializeAsync`
+///    creates its user ([`UserManager::create_first_admin`]): administrator,
+///    content deletion and remote control of other users granted, and no policy
+///    saved after, so its rows hold what a fresh Jellyfin's first user holds.
 /// 3. If [`Config::admin_password`] is configured (non-empty), set it — a headless,
 ///    ready-to-use admin. Otherwise leave the admin **passwordless** (Jellyfin's
 ///    default) so the web setup wizard sets it; `change_password` rejects an empty
 ///    admin password, so the passwordless path simply skips it.
-/// 4. Grant it the administrator `UserPolicy` (`update_policy` does not require a
-///    password, so a passwordless admin is valid until the wizard sets one).
 ///
 /// Returns the [`SeedOutcome`] so the caller can log the result and, for a
 /// passwordless administrator, warn the operator to finish setup.
 ///
 /// # Errors
 ///
-/// Returns an error if querying existing users, creating the user, setting the
-/// password, or applying the administrator policy fails.
+/// Returns an error if querying existing users, creating the user, or setting the
+/// password fails.
 pub async fn seed_default_admin(
     users: &dyn UserManager,
     config: &Config,
@@ -100,7 +101,7 @@ pub async fn seed_default_admin(
 
     let username = config.admin_user.clone();
     let user = users
-        .create_user(&username)
+        .create_first_admin(&username)
         .await
         .with_context(|| format!("failed to create default admin user `{username}`"))?;
     let user_id = Uuid::parse_str(&user.id)
@@ -111,8 +112,7 @@ pub async fn seed_default_admin(
     // wizard can set it via `POST /Startup/User` — the wizard's `UpdateStartupUser`
     // (like Jellyfin) forbids updating a first user that already has a password, so
     // a generated password would lock the wizard out. `change_password` rejects an
-    // empty admin password, so for the passwordless case we simply skip it;
-    // `update_policy` grants admin without touching the password.
+    // empty admin password, so for the passwordless case we simply skip it.
     let configured = config.admin_password.trim();
     let outcome = if configured.is_empty() {
         SeedOutcome::SeededPasswordless {
@@ -127,27 +127,6 @@ pub async fn seed_default_admin(
             username: username.clone(),
         }
     };
-
-    // create_user already set the Jellyfin per-user defaults (auth/password-reset provider
-    // ids, preference access, …); fetch that policy and ELEVATE it to admin rather than
-    // overwriting with UserPolicy::default(), which would blank the provider ids and reset
-    // the per-user flags. Mirrors Jellyfin's admin: content deletion + remote control on,
-    // login lockout disabled (-1).
-    let mut policy = users
-        .get_user_dto(&user, None)
-        .await
-        .context("failed to read the seeded admin's policy")?
-        .policy
-        .unwrap_or_default();
-    policy.is_administrator = true;
-    policy.enable_user_preference_access = true;
-    policy.enable_content_deletion = true;
-    policy.enable_remote_control_of_other_users = true;
-    policy.login_attempts_before_lockout = -1;
-    users
-        .update_policy(user_id, &policy)
-        .await
-        .context("failed to grant the default admin administrator policy")?;
 
     Ok(outcome)
 }
@@ -400,10 +379,56 @@ mod tests {
             .unwrap()
             .expect("seeded admin exists");
         let dto = users.get_user_dto(&user, None).await.unwrap();
-        assert!(dto.policy.is_some_and(|p| p.is_administrator));
+        assert!(dto.policy.is_some_and(|p| p.is_administrator
+            && p.enable_content_deletion
+            && p.enable_remote_control_of_other_users));
         assert!(
             user.password.is_none(),
             "unconfigured seed leaves the admin passwordless for the wizard"
+        );
+
+        // Column for column the Users row a fresh Jellyfin 12.4 gives its first
+        // user (InitializeAsync, read from a stock install): no policy is saved
+        // after the insert, so RowVersion stays 0 and RemoteClientBitrateLimit
+        // NULL, and no Cast receiver id is stored.
+        assert_eq!(
+            user,
+            ferrofin_db::entities::users::UserEntity {
+                id: user.id.clone(),
+                audio_language_preference: None,
+                authentication_provider_id:
+                    "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider".to_owned(),
+                cast_receiver_id: None,
+                display_collections_view: false,
+                display_missing_episodes: false,
+                enable_auto_login: false,
+                enable_local_password: false,
+                enable_next_episode_auto_play: true,
+                enable_user_preference_access: true,
+                hide_played_in_latest: true,
+                internal_id: 1,
+                invalid_login_attempt_count: 0,
+                last_activity_date: None,
+                last_login_date: None,
+                login_attempts_before_lockout: None,
+                max_active_sessions: 0,
+                max_parental_rating_score: None,
+                max_parental_rating_sub_score: None,
+                must_update_password: false,
+                password: None,
+                password_reset_provider_id:
+                    "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider".to_owned(),
+                play_default_audio_track: true,
+                remember_audio_selections: true,
+                remember_subtitle_selections: true,
+                remote_client_bitrate_limit: None,
+                row_version: 0,
+                subtitle_language_preference: None,
+                subtitle_mode: 0,
+                sync_play_access: 0,
+                username: "admin".to_owned(),
+                normalized_username: "ADMIN".to_owned(),
+            }
         );
     }
 

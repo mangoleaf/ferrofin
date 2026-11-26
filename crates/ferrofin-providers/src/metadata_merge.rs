@@ -633,6 +633,50 @@ fn has_album_artist(kind: Option<BaseItemKind>) -> bool {
     )
 }
 
+/// `BaseItem.SupportsPeople` and its overrides: every video, audio and
+/// audiobook, book, series, season, box set and music album. A refresh saves
+/// credits only for these (`SaveItemAsync`, `MetadataService.cs:320`), and
+/// `LibraryManager.GetPeople(BaseItem)` reads none for any other kind. This
+/// crate's copy of `ferrofin_core::kinds::supports_people`, which it cannot
+/// reach.
+pub(crate) fn supports_people(kind: Option<BaseItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            BaseItemKind::Video
+                | BaseItemKind::Movie
+                | BaseItemKind::Episode
+                | BaseItemKind::MusicVideo
+                | BaseItemKind::Trailer
+                | BaseItemKind::Audio
+                | BaseItemKind::AudioBook
+                | BaseItemKind::Book
+                | BaseItemKind::Series
+                | BaseItemKind::Season
+                | BaseItemKind::BoxSet
+                | BaseItemKind::MusicAlbum
+        )
+    )
+}
+
+/// `LibraryManager.GetPeople(BaseItem)`, which the NFO and XML savers write
+/// from: the stored credits of `row`, none for a kind without people
+/// (`LibraryManager.cs:3655-3668`), whatever an earlier build stored for it.
+pub(crate) async fn stored_people(
+    people: &dyn ferrofin_traits::persistence::PeopleRepository,
+    item_id: uuid::Uuid,
+    row: &BaseItemEntity,
+) -> Result<Vec<PeopleEntity>, ferrofin_traits::error::ServiceError> {
+    if !supports_people(BaseItemKind::from_stored_type_name(&row.type_)) {
+        return Ok(Vec::new());
+    }
+    Ok(people
+        .get_people_batch(&[item_id])
+        .await?
+        .remove(&item_id)
+        .unwrap_or_default())
+}
+
 /// `MergeBaseItemData` over the row's columns and its `Data` blob.
 fn merge_base_item(
     source: &BaseItemEntity,

@@ -239,14 +239,6 @@ kind = "value"
 issue = 827
 reason = "The page follows the difference gl-827 tracks."
 
-# The page follows the difference gl-225 tracks.
-[[entry]]
-request = "GetItems.videoTypes.videofile"
-path = "Items[].Id"
-kind = "value"
-issue = 225
-reason = "The page follows the difference gl-225 tracks."
-
 # Paths of by-name items are answered with %MetadataPath% unexpanded.
 [[entry]]
 request = "GetGenre"
@@ -1117,13 +1109,6 @@ issue = 66
 reason = "The Collections library is created as a bare row, with another id."
 
 # ── filed from the first sweep with the edge cases (formerly filed.toml) ──
-[[entry]]
-request = "GetItems.videoTypes.*"
-path = "TotalRecordCount"
-kind = "value"
-issue = 225
-reason = "The videoTypes filter misses v12's version and descendant roll-ups, so the count and the page differ."
-
 [[entry]]
 request = "GetItems.isMissing.true"
 path = "TotalRecordCount"

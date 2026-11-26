@@ -12,7 +12,7 @@
 relative_pct = 15
 absolute = 2
 
-[endpoints]     # endpoint p50, ms
+[endpoints]     # endpoint p50 (the mean for endpoints.py's RANDOM_DRAW), ms
 relative_pct = 15
 absolute = 0.5
 
