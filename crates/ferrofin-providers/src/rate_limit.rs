@@ -598,9 +598,23 @@ impl CountedBody for reqwest::Response {
     }
 }
 
+/// `response`'s whole body under the download limit in force
+/// ([`request_limits`], `image_download_max_mb`), for a body from a host
+/// someone else controls that is read outside this crate: a remote subtitle
+/// (gl-1708). It is the read every provider body goes through, so a read
+/// error also counts into an enclosing [`count_request_failures`] scope.
+///
+/// # Errors
+///
+/// [`BodyError::TooLarge`] once the body, decoded, passes the limit;
+/// [`BodyError::Read`] when it cannot be read.
+pub async fn read_capped(response: reqwest::Response) -> Result<Vec<u8>, BodyError> {
+    response.counted_bytes().await
+}
+
 /// Why a capped body read stopped.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BodyError {
+pub enum BodyError {
     /// The connection failed, or the request's timeout ran out.
     #[error("provider response could not be read: {0}")]
     Read(#[from] reqwest::Error),

@@ -20,6 +20,8 @@
 //!   records as applied;
 //! - `drop_objects`: removing Ferrofin's own tables and indexes from the copy;
 //! - `paths`: the stored paths, rewritten onto the output's layout;
+//! - `earlier_art`: the art earlier builds saved in an item's `{ID}` folder,
+//!   moved into the item's own folder in the output, its rows with it;
 //! - `carried`: what Ferrofin's own tables hold that Jellyfin keeps in files
 //!   (Live TV tuners, guides and timers, LDAP-Auth's uid map), read before
 //!   they are removed;
@@ -50,6 +52,7 @@ pub use classify::{
 pub use containers::{ContainerFile, LibraryContainer};
 pub use counts::FirstStartCounts;
 pub use drop_objects::{DroppedObjects, DroppedTable};
+pub use earlier_art::ArtRelocation;
 pub use history::HistoryRewrite;
 pub use layout::{DOCKER, Layout, LeftOut, SourceDirs};
 pub use paths::PathRewrite;
@@ -61,6 +64,7 @@ mod classify;
 mod containers;
 mod counts;
 mod drop_objects;
+mod earlier_art;
 mod history;
 mod layout;
 mod paths;
@@ -191,6 +195,9 @@ pub struct DatabaseEdits {
     /// The rows Jellyfin's code migrations change on its first start, for the
     /// report of an adopted source (on a native one Jellyfin runs none).
     pub counts: FirstStartCounts,
+    /// The art earlier builds saved in an item's `{ID}` or `{id}` folder,
+    /// moved into the item's own folder in the output, with its rows.
+    pub art: ArtRelocation,
 }
 
 /// The export's changes to its staged copy of the database, in order, on the
@@ -199,10 +206,13 @@ pub struct DatabaseEdits {
 /// INTO` writes the snapshot, so the snapshot holds no free pages from them
 /// and two exports of one source stay equal. Each step is a file of its own; a
 /// step added later goes here, with its field in [`DatabaseEdits`]. The paths
-/// are rewritten onto `layout` from `dirs` and the directories the rows name.
+/// are rewritten onto `layout` from `dirs` and the directories the rows name,
+/// and the art earlier builds saved is moved in `out`, the output the source
+/// is copied into.
 async fn edit_staged(
     conn: &mut SqliteConnection,
     history: Option<&history::SourceHistory>,
+    out: &Path,
     (dirs, layout): (&SourceDirs, &Layout),
 ) -> Result<DatabaseEdits> {
     let mut tx = sqlx::Connection::begin(conn).await?;
@@ -215,6 +225,8 @@ async fn edit_staged(
         paths: paths::rewrite(&mut tx, dirs, layout).await?,
         carried,
         counts: counts::read(&mut tx).await?,
+        // After the paths' rewrite, which spells them on the layout.
+        art: earlier_art::relocate(&mut tx, out, layout).await?,
     };
     tx.commit().await?;
     Ok(edits)
@@ -236,7 +248,8 @@ async fn edit_staged(
 /// source. Left out are the database files: `database`, the file it links to,
 /// the source's own [`EXPORTED_DATABASE`] (a native database's leftover would
 /// otherwise sit under the snapshot), and the `-wal`, `-shm` and `-journal`
-/// files of each. The snapshot holds what they do. Also left out is a
+/// files of each. The snapshot holds what they do. So are the files of
+/// [`SourceDirs::not_needed_files`], in every tree copied. Also left out is a
 /// `migrations.xml` in the configuration directory (the data directory's own,
 /// or the one copied to the layout's), which Jellyfin would read again: from
 /// one listing migrations it writes history rows, or stops its start. So are
@@ -244,12 +257,17 @@ async fn edit_staged(
 /// `data/playlists` and the `collection.xml` of each `[boxset]` folder in its
 /// `data/collections`, which may hold what Jellyfin last wrote rather than
 /// the database's changes since, and which Jellyfin's metadata refresh would
-/// merge back ([`ExportSummary::container_files`]).
+/// merge back ([`ExportSummary::container_files`]). So is each library's
+/// `options.json` in the data directory's `root/default`, Ferrofin's own file:
+/// the export writes the `options.xml` Jellyfin reads beside it, and a later
+/// adoption by Ferrofin would take the stale copy over that.
 /// The snapshot's `__EFMigrationsHistory` is rewritten ([`HistoryRewrite`]),
 /// what Ferrofin's own tables hold that Jellyfin keeps in files is read
 /// ([`CarriedRows`]) before those tables and Ferrofin's indexes are removed
 /// from it ([`DroppedObjects`]), and its stored paths are rewritten onto the
-/// layout ([`PathRewrite`]).
+/// layout ([`PathRewrite`]). The art earlier builds saved in an item's `{ID}`
+/// or `{id}` folder is then moved in the output into the item's own folder,
+/// where Jellyfin keeps it, and its rows follow ([`ArtRelocation`]).
 ///
 /// What is copied is digested while it is copied and again once the database
 /// snapshot is written, and so are the files SQLite keeps beside the
@@ -308,6 +326,7 @@ pub async fn export_data_dir(
         .collect::<Vec<_>>();
     skipped.push(source.join(LEGACY_MIGRATIONS_FILE));
     skipped.push(dirs.config.join(LEGACY_MIGRATIONS_NAME));
+    skipped.extend(dirs.not_needed_files.iter().cloned());
     let (to, files, copied_trees, left_out) = (
         out.to_owned(),
         companions.clone(),
@@ -329,8 +348,18 @@ pub async fn export_data_dir(
     .await?;
     let exported = out.join(EXPORTED_DATABASE);
     let (edits, library_containers) =
-        snapshot::snapshot_database(&resolved, &exported, (dirs, layout), build).await?;
+        snapshot::snapshot_database(&resolved, &exported, out, (dirs, layout), build).await?;
     let mut dirs_copied = copied.dirs;
+    // The folders the art's move made take the mode and time of the folder
+    // the art came from; those it left empty are no longer there to finish.
+    for (made, like) in &edits.art.made {
+        let like = out.join(like);
+        let from = dirs_copied.iter().find(|(to, _)| *to == like);
+        if let Some(from) = from.map(|(_, from)| from.clone()) {
+            dirs_copied.push((out.join(made), from));
+        }
+    }
+    dirs_copied.retain(|(to, _)| !edits.art.removed.iter().any(|dir| *to == out.join(dir)));
     // A source with no `data/` (a native one) has none to take the mode from:
     // the snapshot's directory takes the source's own.
     let data = exported.parent().map(Path::to_owned);

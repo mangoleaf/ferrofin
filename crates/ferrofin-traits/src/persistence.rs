@@ -1313,6 +1313,25 @@ pub trait ItemPersistenceService: Send + Sync {
     async fn set_ancestors(&self, item_id: Uuid, ancestor_ids: &[Uuid])
     -> Result<(), ServiceError>;
 
+    /// Makes each item's `AncestorIds` rows its stored `ParentId` chain up to
+    /// the root: adds the missing rows and removes the rest, skipping a parent
+    /// with no row. The ancestor half of upstream's save
+    /// (`ItemPersistenceService.UpdateOrInsertItems`), which writes
+    /// `GetAncestorIds()`: the parents alone for an item outside every
+    /// library. Only for such items: an item inside a library also descends
+    /// from its `CollectionFolder`, a row this removes; write those with
+    /// [`set_ancestors`](Self::set_ancestors).
+    ///
+    /// The default is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn set_parent_ancestors(&self, item_ids: &[Uuid]) -> Result<(), ServiceError> {
+        let _ = item_ids;
+        Ok(())
+    }
+
     /// Replaces the item's stored image rows (`BaseItemImageInfos`) with
     /// `images` — the write path the library scan uses to persist discovered
     /// artwork (posters/backdrops/…) so the image routes can serve it. Port of
@@ -1665,9 +1684,10 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Takes a deleted version out of its primary's lists — what
     /// `LibraryManager.DeleteItem` does before deleting an alternate version
     /// (`LibraryManager.cs:539-552`): the primary's `LinkedAlternateVersion`
-    /// row for it goes, and so does `version_path` from the primary's `Data`
-    /// `LocalAlternateVersions` (compared ignoring case). The default
-    /// (stub/fake services) writes nothing.
+    /// row for it goes, the primary's other version rows are numbered from 0
+    /// again, as its save writes them, and `version_path` goes from the
+    /// primary's `Data` `LocalAlternateVersions` (compared ignoring case). The
+    /// default (stub/fake services) writes nothing.
     ///
     /// # Errors
     ///

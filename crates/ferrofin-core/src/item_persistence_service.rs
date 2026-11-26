@@ -1768,19 +1768,25 @@ impl FerrofinItemPersistenceService {
     ///
     /// Those rows are the ones with no `DateCreated`. Jellyfin stores NULL
     /// only for `DateTime.MinValue` (`BaseItemMapper.cs:307`), and its create
-    /// paths always date the item (`Folder.AddChild`), so an adopted row is
-    /// selected only if Jellyfin itself left it undated; it then gets what
-    /// Jellyfin's next save of it would store. For each one, in one
-    /// transaction:
+    /// paths always date the item's creation (`Folder.AddChild`), so an
+    /// adopted row is selected only if Jellyfin itself left it undated; it
+    /// then gets what Jellyfin's next save of it would store. For each one,
+    /// in one transaction:
     /// - `CleanName` is re-derived from `Name` (empty for a whitespace-only
     ///   name, as in [`Self::repair_clean_values`]): a playlist renamed by the
     ///   old bare `UPDATE "Name"` still matched its old name, and one the old insert
     ///   wrote after that pass ran had none, so search never found it.
     /// - `SortName` is re-derived from `ForcedSortName`, or else from `Name`,
     ///   the way the C# getter does on every save.
-    /// - `DateCreated`, `DateModified` and `DateLastSaved` are set to now
-    ///   where NULL. The creation time is lost; now is when the row starts
-    ///   being dated.
+    /// - `DateCreated` and `DateLastSaved` are set to now where NULL. The
+    ///   creation time is lost; now is when the row starts being dated.
+    /// - `DateModified` is left as stored (NULL on these rows unless an edit
+    ///   dated it). Every box set and playlist is a folder, and the rekeys
+    ///   later in the same boot (`run_rekey_pathless_playlists`,
+    ///   `run_rekey_pathless_box_sets`) give these path-less rows their
+    ///   directory, which Jellyfin's save restats and finds no
+    ///   `DateModified` on (`MetadataService.cs:244-249`, D2): Jellyfin keeps
+    ///   it NULL, as the create path does (gl-1617).
     ///
     /// Completion is recorded in `FerrofinMeta` under `named_item_rows_v1`.
     /// Returns the number of rows repaired.
@@ -1823,7 +1829,6 @@ impl FerrofinItemPersistenceService {
             let written = sqlx::query(
                 r#"UPDATE "BaseItems" SET "CleanName" = ?2, "SortName" = ?3,
                        "DateCreated" = ?4,
-                       "DateModified" = COALESCE("DateModified", ?4),
                        "DateLastSaved" = COALESCE("DateLastSaved", ?4)
                    WHERE "Id" = ?1 AND "DateCreated" IS NULL"#,
             )
@@ -2865,9 +2870,12 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             for sql in [
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({ids})"#),
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#),
-                // No foreign key reaches these two, so nothing cascades:
-                // upstream deletes them with the rows (`:151`, `:155`), and a
-                // segment provider's scan must not find them published.
+                // No foreign key from these four reaches `BaseItems`, so
+                // nothing cascades: upstream deletes them with the rows
+                // (`:142-143`, `:151`, `:155`), and a segment provider's scan
+                // must not find the segments published.
+                format!(r#"DELETE FROM "CustomItemDisplayPreferences" WHERE "ItemId" IN ({ids})"#),
+                format!(r#"DELETE FROM "ItemDisplayPreferences" WHERE "ItemId" IN ({ids})"#),
                 format!(r#"DELETE FROM "MediaSegments" WHERE "ItemId" IN ({ids})"#),
                 format!(r#"DELETE FROM "TrickplayInfos" WHERE "ItemId" IN ({ids})"#),
             ] {
@@ -3373,43 +3381,51 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), ServiceError> {
+        const READ: &str = r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#;
         let id = guid_to_db(item_id);
+        // Merge into whatever the blob already holds, which replacing it
+        // wholesale would drop; `None` when nothing changes.
+        let fields: Vec<(&str, Option<serde_json::Value>)> = fields
+            .iter()
+            .map(|(key, value)| (key.as_str(), Some(value.clone())))
+            .collect();
+        let merged = |stored: Option<Option<String>>| {
+            stored.and_then(|data| crate::item_data::merge_data_fields(data.as_deref(), &fields))
+        };
         // Read on the pool first: the steady state (already recorded) must not
         // touch the single writer connection.
-        let current: Option<Option<String>> =
-            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
-                .bind(&id)
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db_err)?;
-        let Some(stored) = current else {
-            return Ok(()); // no such row
-        };
-        // Merge into whatever the blob already holds, which replacing it
-        // wholesale would drop.
-        let mut data = stored
-            .as_deref()
-            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-        let Some(obj) = data.as_object_mut() else {
-            return Ok(());
-        };
-        if fields
-            .iter()
-            .all(|(key, value)| obj.get(key) == Some(value))
-        {
-            return Ok(());
-        }
-        for (key, value) in fields {
-            obj.insert(key.clone(), value.clone());
-        }
-        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+        let current: Option<Option<String>> = sqlx::query_scalar(READ)
             .bind(&id)
-            .bind(data.to_string())
-            .execute(self.db.writer())
+            .fetch_optional(self.db.pool())
             .await
             .map_err(db_err)?;
+        if merged(current).is_none() {
+            return Ok(());
+        }
+        // Read again under the write lock, so a save landing between the two
+        // reads is merged into, not overwritten (CONTRIBUTING.md, "Migrations
+        // and one-shot repairs").
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
+        let current: Option<Option<String>> = sqlx::query_scalar(READ)
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        let Some(data) = merged(current) else {
+            return Ok(());
+        };
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(&id)
+            .bind(data)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         note_written(&self.db, std::slice::from_ref(&id), false);
         Ok(())
     }
@@ -3645,6 +3661,24 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         tx.commit().await.map_err(db_err)
     }
 
+    async fn set_parent_ancestors(&self, item_ids: &[Uuid]) -> Result<(), ServiceError> {
+        if item_ids.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = item_ids.iter().map(|id| guid_to_db(*id)).collect();
+        let ids = serde_json::to_string(&ids).map_err(|e| ServiceError::Backend(e.to_string()))?;
+        // One transaction: no reader sees an item between the two halves.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        for sql in [REMOVE_STALE_PARENT_ANCESTORS_SQL, ADD_PARENT_ANCESTORS_SQL] {
+            sqlx::query(sql)
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+        }
+        tx.commit().await.map_err(db_err)
+    }
+
     async fn save_item_images(
         &self,
         item_id: Uuid,
@@ -3735,8 +3769,8 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             }
             let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
             // An empty or non-UTF-8 blurhash reads back as none, and a row with
-            // no stored mtime as the epoch, which no file's matches: both fall
-            // through to a recompute, as C# does for a `default(DateTime)` image.
+            // no stored mtime as `DateTime.MinValue`, which no file's matches: both
+            // fall through to a recompute, as C# does for a `default(DateTime)` image.
             out.extend(rows.into_iter().filter_map(|row| {
                 let item_id = Uuid::parse_str(&row.item_id).ok()?;
                 let image = crate::item_repository::image_info_from_row(row, &self.virtual_paths);
@@ -4256,22 +4290,42 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         version: Uuid,
         version_path: Option<&str>,
     ) -> Result<(), ServiceError> {
-        let primary = guid_to_db(primary);
+        let primary_db = guid_to_db(primary);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"DELETE FROM "LinkedChildren"
                WHERE "ParentId" = ?1 AND "ChildId" = ?2 AND "ChildType" = ?3"#,
         )
-        .bind(&primary)
+        .bind(&primary_db)
         .bind(guid_to_db(version))
         .bind(LINKED_ALTERNATE_VERSION)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        // The primary's save rewrites its version rows from 0
+        // (`ItemPersistenceService.cs:702-724`), here in their stored order,
+        // which the scan keeps local first (gl-1637).
+        let own = links_under(&mut tx, &[primary])
+            .await
+            .map_err(db_err)?
+            .remove(&primary)
+            .unwrap_or_default();
+        let versions = own
+            .iter()
+            .filter(|(_, child_type, _)| is_version_link(*child_type))
+            .map(|&(child, child_type, _)| (child, child_type))
+            .collect();
+        let writes = LocalVersionWrites {
+            rows: renumbered_version_rows(versions, &own),
+            ..LocalVersionWrites::default()
+        };
+        apply_local_version_writes(&mut tx, primary, &writes)
+            .await
+            .map_err(db_err)?;
         if let Some(path) = version_path.filter(|p| !p.is_empty()) {
             let data: Option<Option<String>> =
                 sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
-                    .bind(&primary)
+                    .bind(&primary_db)
                     .fetch_optional(&mut *tx)
                     .await
                     .map_err(db_err)?;
@@ -4284,7 +4338,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
                         .collect();
                     if let Some(text) = with_local_versions(data.as_deref(), &kept) {
                         sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
-                            .bind(&primary)
+                            .bind(&primary_db)
                             .bind(text)
                             .execute(&mut *tx)
                             .await
@@ -5830,7 +5884,7 @@ impl LocalVersionWrites {
 
 /// Every `LinkedChildren` row under each of `parents`, by parent:
 /// `(ChildId, ChildType, SortOrder)` in `SortOrder` order.
-async fn links_under(
+pub(crate) async fn links_under(
     conn: &mut sqlx::SqliteConnection,
     parents: &[Uuid],
 ) -> Result<HashMap<Uuid, Vec<(Uuid, i64, i64)>>, sqlx::Error> {
@@ -7255,6 +7309,43 @@ pub(crate) const PRUNE_ORPHAN_ITEM_VALUES_SQL: &str = r#"DELETE FROM "ItemValues
 /// by `the_closure_credits_read_seeks_each_items_credits`.
 const CLOSURE_CREDITS_SQL: &str = r#"SELECT DISTINCT "PeopleId" FROM "PeopleBaseItemMap"
    WHERE "ItemId" IN (SELECT value FROM json_each(?1))"#;
+
+/// `"chain"("ItemId", "ParentItemId")`: the `ParentId` chain of each item in
+/// the JSON id array `?1`, up to the root. The many-item form of
+/// `library_structure_repository::add_parent_chain_in`'s walk.
+macro_rules! parent_chain {
+    () => {
+        r#"WITH RECURSIVE "chain"("ItemId", "ParentItemId") AS (
+               SELECT "Id", "ParentId" FROM "BaseItems"
+                WHERE "Id" IN (SELECT value FROM json_each(?1)) AND "ParentId" IS NOT NULL
+               UNION
+               SELECT c."ItemId", p."ParentId" FROM "chain" c
+                 JOIN "BaseItems" p ON p."Id" = c."ParentItemId"
+                WHERE p."ParentId" IS NOT NULL)
+           "#
+    };
+}
+
+/// `set_parent_ancestors`' first half: the items' ancestor rows their chain
+/// does not hold (upstream's `RemoveRange(existingAncestorIds)`, `:475`). A
+/// `NOT IN`, not a correlated `NOT EXISTS`, so the chain is walked once rather
+/// than once per row; `EXPLAIN QUERY PLAN` pinned by
+/// `the_parent_ancestor_writes_walk_the_chain_once`.
+const REMOVE_STALE_PARENT_ANCESTORS_SQL: &str = concat!(
+    parent_chain!(),
+    r#"DELETE FROM "AncestorIds"
+        WHERE "ItemId" IN (SELECT value FROM json_each(?1))
+          AND ("ItemId", "ParentItemId") NOT IN (SELECT "ItemId", "ParentItemId" FROM "chain")"#
+);
+
+/// `set_parent_ancestors`' second half: the chain's rows not stored yet, each
+/// parent with no row skipped (upstream's existence filter, `:443-455`).
+const ADD_PARENT_ANCESTORS_SQL: &str = concat!(
+    parent_chain!(),
+    r#"INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId")
+       SELECT "ItemId", "ParentItemId" FROM "chain"
+        WHERE "ParentItemId" IN (SELECT "Id" FROM "BaseItems")"#
+);
 
 /// The ids of the `item_type` rows never refreshed (`DateLastRefreshed`
 /// unset), in id order — `PeopleValidator`'s new person items.
@@ -8862,6 +8953,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owners, vec![guid_to_db(new)]);
+    }
+
+    /// A `Data` merge that waits for the writer merges into the blob as it is
+    /// once it holds the writer: a key a save wrote meanwhile stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_data_merge_behind_a_held_writer_keeps_the_save_before_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A file database: an in-memory one reads through its writer too.
+        let url = format!("sqlite://{}", tmp.path().join("merge.db").display());
+        let db = ferrofin_db::Database::connect(&url).await.expect("connect");
+        db.run_migrations().await.expect("migrations apply");
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Folder).await;
+
+        let mut held = db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold the writer");
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = '{"Before":1}' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(item))
+            .execute(&mut *held)
+            .await
+            .expect("the earlier save");
+        let fields = serde_json::Map::from_iter([("Merged".to_owned(), serde_json::json!(1))]);
+        let merge = tokio::spawn(async move { svc.merge_data_fields(item, &fields).await });
+        // Time for the merge to read the blob and wait for the writer.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        held.commit().await.expect("release the writer");
+        merge.await.expect("joined").expect("merge");
+        let data = stored_text(&db, item, "Data").await.expect("data");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&data).expect("json"),
+            serde_json::json!({ "Before": 1, "Merged": 1 })
+        );
     }
 
     #[tokio::test]
@@ -12023,6 +12150,71 @@ mod tests {
         assert_eq!(read, want);
     }
 
+    /// `set_parent_ancestors` makes an item's ancestors its whole parent chain
+    /// (gl-1638): the missing rows added, a stale one removed, an item with no
+    /// parent left with none, and a parent with no row skipped. An item not
+    /// named keeps its rows, even one its chain does not hold.
+    #[tokio::test]
+    async fn set_parent_ancestors_writes_the_parent_chain() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let [root, folder, item, orphan, stale, dangling] = [(); 6].map(|()| Uuid::new_v4());
+        let row = |id: Uuid, parent: Option<Uuid>| super::BaseItemEntity {
+            id: guid_to_db(id),
+            type_: "MediaBrowser.Controller.Entities.Folder".to_owned(),
+            parent_id: parent.map(guid_to_db),
+            is_folder: true,
+            ..super::BaseItemEntity::default()
+        };
+        for (id, parent) in [
+            (root, None),
+            (stale, None),
+            (folder, Some(root)),
+            (item, Some(folder)),
+            (orphan, None),
+            (dangling, None),
+        ] {
+            svc.save_items(&[row(id, parent)]).await.expect("row");
+        }
+        svc.set_ancestors(item, &[folder, stale])
+            .await
+            .expect("earlier");
+        svc.set_ancestors(orphan, &[stale]).await.expect("earlier");
+        svc.set_ancestors(folder, &[stale]).await.expect("unnamed");
+
+        // A parent row gone with foreign keys off, as an adopted database can
+        // hold: its link would fail the key, so it is skipped.
+        let pragma = |on: &'static str| sqlx::query(on).execute(db.writer());
+        pragma("PRAGMA foreign_keys = OFF").await.expect("fk off");
+        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?1 WHERE "Id" = ?2"#)
+            .bind(guid_to_db(Uuid::new_v4()))
+            .bind(guid_to_db(dangling))
+            .execute(db.writer())
+            .await
+            .expect("dangling parent");
+        pragma("PRAGMA foreign_keys = ON").await.expect("fk on");
+
+        svc.set_parent_ancestors(&[item, orphan, dangling])
+            .await
+            .expect("ancestors");
+        let read = |id: Uuid| {
+            sqlx::query_scalar::<_, String>(
+                r#"SELECT "ParentItemId" FROM "AncestorIds" WHERE "ItemId" = ?1 ORDER BY 1"#,
+            )
+            .bind(guid_to_db(id))
+            .fetch_all(db.pool())
+        };
+        let mut want = vec![guid_to_db(root), guid_to_db(folder)];
+        want.sort();
+        assert_eq!(read(item).await.expect("item"), want);
+        assert_eq!(read(orphan).await.expect("orphan"), Vec::<String>::new());
+        assert_eq!(
+            read(dangling).await.expect("dangling"),
+            Vec::<String>::new()
+        );
+        assert_eq!(read(folder).await.expect("folder"), vec![guid_to_db(stale)]);
+    }
+
     #[tokio::test]
     async fn scan_stored_links_reads_images_ancestors_and_external_streams() {
         let db = test_db().await;
@@ -13359,8 +13551,8 @@ mod tests {
 
     /// The box sets and playlists an older `insert_named_item` wrote (no
     /// `DateCreated`) get the columns a save derives (`CleanName` and
-    /// `SortName` from the current name) and their missing dates; the pass
-    /// runs once.
+    /// `SortName` from the current name) and their missing dates, but no
+    /// `DateModified`, which a folder does not have; the pass runs once.
     #[tokio::test]
     async fn the_named_item_repair_fills_created_box_sets_and_playlists_once() {
         let db = test_db().await;
@@ -13422,7 +13614,9 @@ mod tests {
                     "a stored date is kept"
                 );
             } else {
-                assert_eq!(row.date_modified, Some(created));
+                // A folder's directory has no `DateModified`, so Jellyfin's
+                // save leaves it NULL, as the create path does (gl-1617).
+                assert_eq!(row.date_modified, None);
             }
         }
 
@@ -14907,6 +15101,35 @@ mod tests {
         );
     }
 
+    /// `set_parent_ancestors`' two statements walk the chain once, never once
+    /// per stored row, and seek the items' rows by id.
+    #[tokio::test]
+    async fn the_parent_ancestor_writes_walk_the_chain_once() {
+        let db = test_db().await;
+        for sql in [
+            super::REMOVE_STALE_PARENT_ANCESTORS_SQL,
+            super::ADD_PARENT_ANCESTORS_SQL,
+        ] {
+            let plan = query_plan(&db, sql, 1).await;
+            assert!(
+                !plan.iter().any(|s| s.starts_with("CORRELATED")),
+                "the chain walked once, got: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|s| s.starts_with("SCAN BaseItems") || s.starts_with("SCAN AncestorIds")),
+                "never a scan of the items or the ancestors, got: {plan:?}"
+            );
+        }
+        let plan = query_plan(&db, super::REMOVE_STALE_PARENT_ANCESTORS_SQL, 1).await;
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH AncestorIds") && s.contains("(ItemId=?)")),
+            "the items' ancestor rows sought by ItemId, got: {plan:?}"
+        );
+    }
+
     /// The credits read before a deletion seeks each closure item's credit
     /// rows by `ItemId`, never a scan of every credit in the library.
     #[tokio::test]
@@ -16209,14 +16432,36 @@ mod tests {
     }
 
     /// `delete_items` takes the rows no foreign key reaches with the item —
-    /// its published media segments and trickplay
-    /// (`ItemPersistenceService.cs:151,155`) — and leaves another item's.
+    /// its display preferences, published media segments and trickplay
+    /// (`ItemPersistenceService.cs:142-143,151,155`) — and leaves another
+    /// item's.
     #[tokio::test]
-    async fn delete_items_takes_the_segments_and_trickplay_with_the_item() {
+    async fn delete_items_takes_the_rows_no_foreign_key_reaches_with_the_item() {
         let (gone, kept) = (Uuid::from_u128(0xD401), Uuid::from_u128(0xD402));
+        let user = Uuid::from_u128(0xD4AA);
         let db = test_db().await;
+        crate::test_support::seed_user(&db, user).await;
         for item in [gone, kept] {
             seed_item(&db, item, BaseItemKind::Episode).await;
+            sqlx::query(
+                r#"INSERT INTO "ItemDisplayPreferences" ("Client", "ItemId", "RememberIndexing",
+                   "RememberSorting", "SortBy", "SortOrder", "UserId", "ViewType")
+                   VALUES ('c', ?1, 0, 0, 'SortName', 0, ?2, 0)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .execute(db.writer())
+            .await
+            .expect("display preferences");
+            sqlx::query(
+                r#"INSERT INTO "CustomItemDisplayPreferences" ("Client", "ItemId", "Key",
+                   "UserId", "Value") VALUES ('c', ?1, 'k', ?2, 'v')"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .execute(db.writer())
+            .await
+            .expect("custom display preferences");
             sqlx::query(
                 r#"INSERT INTO "MediaSegments" ("Id", "EndTicks", "ItemId", "SegmentProviderId",
                    "StartTicks", "Type") VALUES (?1, 10, ?2, 'p', 0, 5)"#,
@@ -16238,7 +16483,12 @@ mod tests {
         }
         let svc = FerrofinItemPersistenceService::new(db.clone());
         assert_eq!(svc.delete_items(&[gone]).await.expect("delete"), vec![gone]);
-        for table in ["MediaSegments", "TrickplayInfos"] {
+        for table in [
+            "ItemDisplayPreferences",
+            "CustomItemDisplayPreferences",
+            "MediaSegments",
+            "TrickplayInfos",
+        ] {
             let owners: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 r#"SELECT "ItemId" FROM "{table}""#
             )))

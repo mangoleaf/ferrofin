@@ -2734,7 +2734,9 @@ impl LocalProviderManager {
         item_id: Uuid,
         options: &MetadataRefreshOptions,
     ) -> Result<ItemUpdateType, ServiceError> {
-        use crate::metadata_merge::{MetadataResult, RefreshAnswers, RefreshMerge};
+        use crate::metadata_merge::{
+            MetadataResult, RefreshAnswers, RefreshMerge, supports_people,
+        };
         // Held from the id write and the load below to the last save, so an
         // edit made meanwhile waits and then applies to the saved row. It
         // spans the remote fetches too, so the edit waits for them, minutes at
@@ -3095,8 +3097,12 @@ impl LocalProviderManager {
         // The credits the answers carried, as the scan folds them
         // ([`pass_credits`](crate::metadata_merge::pass_credits)): `None`
         // keeps the stored ones. A locked item and a `Cast` lock keep them
-        // too (`MetadataService.cs:1235`).
-        let credits = if stored.is_locked || locked_fields.contains(&MetadataField::Cast) {
+        // too (`MetadataService.cs:1235`), and a kind without people never
+        // saves any (`SaveItemAsync`, `:320`): a `playlist.xml`'s are dropped.
+        let credits = if stored.is_locked
+            || locked_fields.contains(&MetadataField::Cast)
+            || !supports_people(BaseItemKind::from_stored_type_name(&stored.type_))
+        {
             None
         } else {
             crate::metadata_merge::pass_credits(local_people, &fetched.credits, merge.keep_existing)
@@ -3418,8 +3424,8 @@ impl LocalProviderManager {
     }
 
     /// `LibraryManager.UpdateImagesAsync`, which upstream runs on every save of
-    /// an item (`RunMetadataSavers`), here on `update_to_repository` and a
-    /// refresh's save (not yet the metadata editor's, gl-1922): each local
+    /// an item (`RunMetadataSavers`), here on `update_to_repository` (the
+    /// metadata editor's save among them) and a refresh's save: each local
     /// image whose size or blurhash is missing or whose file changed or is gone
     /// (`ImageNeedsRefresh`), or every one for a save from `ImageUpdate` up (an
     /// image, download or edit save, in upstream's order), is measured and

@@ -2359,6 +2359,14 @@ async fn plan_by_name_moves(
 /// old id stays recoverable: a genre's or studio's is its `ItemValueId`, a
 /// music genre's derives from its name.
 ///
+/// ACCEPTED DIVERGENCE (owner decision 2026-11-24, gl-1928): by-name
+/// `MusicArtist` rows are left out on purpose. A by-name artist row stored
+/// before gl-1624 gave new ones Jellyfin's id keeps the id of its `ItemValues`
+/// row where Jellyfin 12.4 would derive one from the name.
+/// `LibraryManager.CreateItemByName<MusicArtist>` returns an artist with a
+/// matching name before it derives an id, so a database returned to Jellyfin
+/// keeps the row, and a move would break saved artist links.
+///
 /// # Errors
 /// Returns [`ServiceError`] if the planning read fails, or a batch's
 /// transaction cannot be opened or committed: the repair stops there, the

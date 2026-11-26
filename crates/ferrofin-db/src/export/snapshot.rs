@@ -43,12 +43,14 @@ use crate::database::{
 /// taken or published; [`DbError::ExportRefused`](crate::DbError::ExportRefused)
 /// when the staged copy fails its checks. Returns what the export's steps
 /// changed in the copy ([`super::edit_staged`], which rewrites the stored
-/// paths from `layout.0` onto `layout.1`), and the playlists and box sets it
+/// paths from `layout.0` onto `layout.1` and moves art in `out`, the output),
+/// and the playlists and box sets it
 /// stores in media libraries with a metadata file Jellyfin may read
 /// ([`containers::in_libraries`]).
 pub(super) async fn snapshot_database(
     source: &Path,
     dest: &Path,
+    out: &Path,
     layout: (&SourceDirs, &Layout),
     build: &str,
 ) -> Result<(DatabaseEdits, Vec<LibraryContainer>)> {
@@ -79,7 +81,7 @@ pub(super) async fn snapshot_database(
     })
     .await;
     let written = match staging {
-        Ok(permissions) => vacuum(&staged, dest, permissions, layout, build).await,
+        Ok(permissions) => vacuum(&staged, dest, permissions, out, layout, build).await,
         Err(error) => Err(error),
     };
     // The staged copy goes whether the snapshot was written or not.
@@ -95,6 +97,7 @@ async fn vacuum(
     from: &Path,
     dest: &Path,
     permissions: std::fs::Permissions,
+    out: &Path,
     layout: (&SourceDirs, &Layout),
     build: &str,
 ) -> Result<(DatabaseEdits, Vec<LibraryContainer>)> {
@@ -116,7 +119,7 @@ async fn vacuum(
             .await
             .map_err(super::refusal::damaged_or)?;
         let history = super::refusal::database(&mut conn, build).await?;
-        let edits = super::edit_staged(&mut conn, history.as_ref(), layout).await?;
+        let edits = super::edit_staged(&mut conn, history.as_ref(), out, layout).await?;
         let in_libraries = containers::in_libraries(&mut conn, layout.1).await?;
         sqlx::query(sqlx::AssertSqlSafe(vacuum_into(&partial)))
             .execute(&mut conn)
