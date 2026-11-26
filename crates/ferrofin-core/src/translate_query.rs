@@ -1552,15 +1552,21 @@ fn append_resolution_predicate(qb: &mut QueryBuilder<Sqlite>, filter: &InternalI
 
 /// Appends `IncludeItemTypes` / `ExcludeItemTypes` as `Type` in/not-in lists.
 ///
-/// With an `Ids` list in the query the `Type` column is written `+bi."Type"`
-/// so no `Type`-led index can serve it: 12.0 dropped
+/// With an `Ids` list or a person filter in the query the `Type` column is
+/// written `+bi."Type"` so no `Type`-led index can serve it: 12.0 dropped
 /// `IX_BaseItems_Id_Type_IsFolder_IsVirtualItem`, and without it a single
 /// `Type` equality ties with the `Id` primary key in the planner's costing and
 /// wins — a scan of every row of that type (3,001 movies on the bench corpus)
 /// instead of a handful of key lookups. The `Ids` list is always the selective
-/// side, so the pin loses nothing.
+/// side, so the pin loses nothing. A person's credits
+/// ([`append_people_predicates`]) are the same kind of list: unpinned, one
+/// type in one library walks a `Type`-led index for the order it gives for
+/// free (`…_PresentationUniqueKey` for the grouping, `…_SortName` for a
+/// `SortName` page) and tests every row against the list.
 fn append_type_filters(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
-    let column = if filter.item_ids.is_empty() {
+    let credits_listed =
+        non_blank(filter.person.as_ref()).is_some() || !filter.person_ids.is_empty();
+    let column = if filter.item_ids.is_empty() && !credits_listed {
         r#"bi."Type""#
     } else {
         r#"+bi."Type""#
@@ -2727,11 +2733,20 @@ pub(crate) fn push_user_data_exists(
 }
 
 /// Appends the credited-person predicates: `person` (by name) and `person_ids`
-/// (a person's filmography). Each is an `EXISTS` over the `PeopleBaseItemMap`
-/// join, so `/Items?PersonIds=<id>` returns everything that person is credited
-/// on (port of C# `WhereContainsPerson` / the `people` sub-query). A non-empty
-/// `person_types` restricts the matching credit to those types in both arms
+/// (a person's filmography), so `/Items?PersonIds=<id>` returns everything
+/// that person is credited on (port of C# `WhereContainsPerson` / the `people`
+/// sub-query). A non-empty `person_types` restricts the matching credit to
+/// those types in both arms
 /// (`personTypes.Length == 0 || personTypes.Contains(…PersonType)`).
+///
+/// Each arm is a semi-join, as upstream's `Any` is, written uncorrelated:
+/// `bi."Id" IN (<the person's credited items>)`. SQLite builds the list once
+/// from `IX_Peoples_Name` and the map's `PeopleId` index, then seeks the items
+/// by id ([`append_type_filters`] pins `Type` off its indexes for it). As a
+/// correlated `EXISTS` the plan walked every item in scope and probed its
+/// credits row by row; a movie recommendation's "directed by" statement on a
+/// 3,000-movie library, measured alone, took about 9 ms against 0.6 ms
+/// (gl-1945).
 fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     let push_person_types = |qb: &mut QueryBuilder<Sqlite>| {
         if !filter.person_types.is_empty() {
@@ -2741,9 +2756,9 @@ fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItem
     };
     if let Some(name) = non_blank(filter.person.as_ref()) {
         qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm
-                JOIN "Peoples" pp ON pp."Id" = pm."PeopleId"
-                WHERE pm."ItemId" = bi."Id" AND pp."Name" = "#,
+            r#" AND bi."Id" IN (SELECT pm."ItemId" FROM "Peoples" pp
+                JOIN "PeopleBaseItemMap" pm ON pm."PeopleId" = pp."Id"
+                WHERE pp."Name" = "#,
         );
         qb.push_bind(name.to_owned());
         push_person_types(qb);
@@ -2756,13 +2771,16 @@ fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItem
         // *is* a `PeopleId`, e.g. grains that coincide) OR by bridging the
         // requested item id → its `Person` name → the credited `Peoples.Name`.
         // Without the name bridge a person's filmography comes back empty.
+        // `pp."Id"`, the same value as `pm."PeopleId"` through the join, keeps
+        // both disjuncts on `Peoples` (a `MULTI-INDEX OR` over its id and name
+        // indexes); split across the two tables, the `OR` scanned the map.
         let ids = to_guid_strings(&filter.person_ids);
         qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm
-                JOIN "Peoples" pp ON pp."Id" = pm."PeopleId"
-                WHERE pm."ItemId" = bi."Id" AND ("#,
+            r#" AND bi."Id" IN (SELECT pm."ItemId" FROM "Peoples" pp
+                JOIN "PeopleBaseItemMap" pm ON pm."PeopleId" = pp."Id"
+                WHERE ("#,
         );
-        push_in_list(qb, r#"pm."PeopleId""#, &ids);
+        push_in_list(qb, r#"pp."Id""#, &ids);
         qb.push(r#" OR pp."Name" IN (SELECT "Name" FROM "BaseItems" WHERE "#);
         push_in_list(qb, r#""Id""#, &ids);
         qb.push("))");
