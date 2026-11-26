@@ -27,7 +27,8 @@
 //! length / lat-long-alt / ISO.
 //!
 //! C# reads the tags through TagLib#; this port uses `kamadak-exif`, which
-//! reads the same TIFF/EXIF IFDs. Two upstream fields have no EXIF source and
+//! reads the same TIFF/EXIF IFDs, and walks a JPEG's segments as TagLib# does
+//! to decide whether it opens (`jpeg_header`). Two upstream fields have no EXIF source and
 //! are therefore not mapped: `Genres` and `Tags` come from TagLib#'s XMP/IPTC
 //! keyword aggregation, which `kamadak-exif` does not parse.
 
@@ -316,7 +317,7 @@ impl PhotoProvider {
     }
 }
 
-/// The EXIF fields read off one file, plus the image dimensions the tags carry.
+/// The EXIF fields read off one file, plus the image size.
 ///
 /// A flat intermediate so the tag→item mapping (`apply_exif`) stays pure and
 /// unit-testable without a file on disk.
@@ -333,9 +334,11 @@ pub struct ExifTags {
     pub rating: Option<f64>,
     /// `DateTimeOriginal` (falling back to `DateTime`) — C# `ImageTag.DateTime`.
     pub date_taken: Option<DateTime<Utc>>,
-    /// `PixelXDimension` — C# `Properties.PhotoWidth`.
+    /// C# `Properties.PhotoWidth`: a JPEG's frame width, else
+    /// `PixelXDimension` (PNG, TIFF and CR2 sizes: gl-1951).
     pub width: Option<i32>,
-    /// `PixelYDimension` — C# `Properties.PhotoHeight`.
+    /// C# `Properties.PhotoHeight`: a JPEG's frame height, else
+    /// `PixelYDimension`.
     pub height: Option<i32>,
 }
 
@@ -350,9 +353,10 @@ pub struct ExifTags {
 /// TagLib picks its reader by the extension, and that reader throws on a file
 /// that does not start as its format does, a PNG saved as `.jpg` among them
 /// (see `taglib_header`), and on a broken container or EXIF block. Each was
-/// measured against Jellyfin 12.4 (gl-1611). A broken IFD it only marks
-/// corrupt and reads on; kamadak-exif refuses such a file, which is left
-/// alone here (gl-1615). So a container that reads with no EXIF in it yields
+/// measured against Jellyfin 12.4 (gl-1611). A JPEG's container is walked as
+/// TagLib walks it (see `jpeg_tags`). A broken IFD it only marks corrupt and
+/// reads on; kamadak-exif refuses such a file, which is left alone here
+/// (gl-1950). So a container that reads with no EXIF in it yields
 /// DEFAULT tags, the clearing case; a mismatched, broken or unreadable file
 /// yields `None`, the leave-alone case.
 ///
@@ -363,7 +367,8 @@ pub struct ExifTags {
 /// formats to read them.
 fn read_exif(path: &str) -> Option<ExifTags> {
     let file = std::fs::File::open(path).ok()?;
-    // A failed stat skips the IFD walk and leaves the full read to decide. A
+    // A failed stat skips the IFD walk and leaves the full read to decide, and
+    // skips the JPEG walk's end-of-file check, as TagLib does. A
     // file cut short after this stat can still read as it was; its new write
     // time has it read again on the next scan.
     let len = file.metadata().map_or(0, |meta| meta.len());
@@ -374,7 +379,11 @@ fn read_exif(path: &str) -> Option<ExifTags> {
     {
         return None;
     }
-    let mut tags = exif_tags(&mut reader, len)?;
+    let mut tags = if matches!(extension_of(path).as_str(), ".jpg" | ".jpeg") {
+        jpeg_tags(&mut reader, len)?
+    } else {
+        exif_tags(&mut reader, len)?
+    };
     // TagLib#'s combined `ImageTag.Comment` (`CombinedImageTag.cs:621-631`) is
     // never null: it is "" when no tag holds a comment. A WebP or an AVIF,
     // which TagLib cannot open, keeps only a comment its EXIF holds (gl-1614).
@@ -411,6 +420,118 @@ fn taglib_header(path: &str) -> Option<fn(&[u8]) -> bool> {
 /// Whether `head` starts as a TIFF does: a byte order, then the magic 42.
 fn tiff_header(head: &[u8]) -> bool {
     head.starts_with(b"II\x2a\x00") || head.starts_with(b"MM\x00\x2a")
+}
+
+/// [`read_exif`] for a `.jpg` or `.jpeg`, decided as TagLibSharp 2.3.0's
+/// JPEG reader decides (see [`jpeg_header`]). `None` where it throws, and
+/// where it finds no frame size: `PhotoProvider` reads
+/// `Properties.PhotoWidth` before the comment (`PhotoProvider.cs:95`), and
+/// `Properties` is null without one. With no Exif segment before the scan the
+/// tags are the defaults, and kamadak-exif does not read on through the scan
+/// data; with one, kamadak-exif reads that segment, and its errors leave the
+/// photo alone as a broken EXIF block does. They include every TIFF header
+/// whose magic is not 42, which `ReadAPP1Segment` throws on. The size is the
+/// frame's, as TagLib#'s `Properties` are, whatever the EXIF says.
+///
+/// Upstream has already assigned the aperture, shutter speed, camera make and
+/// model when it throws at a missing size; such a file is left alone whole
+/// here (gl-1951).
+fn jpeg_tags<R: Read + Seek>(reader: &mut BufReader<R>, len: u64) -> Option<ExifTags> {
+    let header = jpeg_header(reader, len)?;
+    if header.width == 0 || header.height == 0 {
+        return None;
+    }
+    let mut tags = match header.exif {
+        Some(tiff) => tags_or_unopened(exif::Reader::new().read_raw(tiff))?,
+        None => ExifTags::default(),
+    };
+    tags.width = Some(i32::from(header.width));
+    tags.height = Some(i32::from(header.height));
+    Some(tags)
+}
+
+/// What TagLibSharp 2.3.0's `ReadMetadata` (`Jpeg/File.cs`) takes from a
+/// JPEG's header segments.
+#[derive(Default)]
+struct JpegHeader {
+    /// The last frame header's width (`ReadSOFSegment`), 0 without one.
+    width: u16,
+    /// The last frame header's height, 0 without one.
+    height: u16,
+    /// The TIFF data of the first APP1 segment `ReadAPP1Segment` reads as
+    /// Exif.
+    exif: Option<Vec<u8>>,
+}
+
+/// Walks a JPEG's segments as TagLibSharp 2.3.0's `ValidateHeader` and
+/// `ReadMetadata` do, from SOI to SOS or EOI, seeking past each segment, so the
+/// scan data is never read. `None` where those throw: no SOI, the file ending
+/// in a marker or a size, a marker not starting with `0xFF`
+/// (`ReadSegmentMarker`), and a size under 2 or a segment reaching the end of
+/// the file (`ReadSegmentSize`).
+///
+/// `reader` must be at the start of a file of `len` bytes. A `len` of 0 (a
+/// failed stat) skips the end-of-file check, as TagLib does for a stream
+/// without a length.
+fn jpeg_header<R: Read + Seek>(reader: &mut BufReader<R>, len: u64) -> Option<JpegHeader> {
+    let mut header = JpegHeader::default();
+    let mut soi = [0; 2];
+    reader.read_exact(&mut soi).ok()?;
+    if soi != [0xff, 0xd8] {
+        return None;
+    }
+    let mut at: u64 = 2;
+    loop {
+        let mut marker = [0; 2];
+        reader.read_exact(&mut marker).ok()?;
+        if marker[0] != 0xff {
+            return None;
+        }
+        // EOI or SOS.
+        if matches!(marker[1], 0xd9 | 0xda) {
+            return Some(header);
+        }
+        let mut size = [0; 2];
+        reader.read_exact(&mut size).ok()?;
+        let size = u16::from_be_bytes(size);
+        // The size counts its own two bytes, and a byte must follow the segment.
+        let next = at + 2 + u64::from(size);
+        if size < 2 || (len > 0 && next >= len) {
+            return None;
+        }
+        let data = i64::from(size - 2);
+        let read = match marker[1] {
+            // APP1: only the first with room for an Exif header (14 bytes).
+            0xe1 if header.exif.is_none() && data >= 14 => {
+                let mut segment = vec![0; usize::from(size - 2)];
+                reader.read_exact(&mut segment).ok()?;
+                if segment.starts_with(b"Exif\0\0") {
+                    header.exif = Some(segment.split_off(6));
+                }
+                data
+            }
+            // SOF0-3 and SOF9-11: the precision, height and width, read
+            // whatever the size says, each from the bytes there are
+            // (`ByteVector.ToUShort`).
+            0xc0..=0xc3 | 0xc9..=0xcb => {
+                let mut frame = Vec::with_capacity(5);
+                reader.by_ref().take(5).read_to_end(&mut frame).ok()?;
+                let field = |from: usize| {
+                    frame
+                        .get(from..frame.len().min(from + 2))
+                        .unwrap_or_default()
+                        .iter()
+                        .fold(0, |n, &byte| (n << 8) | u16::from(byte))
+                };
+                header.height = field(1);
+                header.width = field(3);
+                i64::try_from(frame.len()).ok()?
+            }
+            _ => 0,
+        };
+        reader.seek_relative(data - read).ok()?;
+        at = next;
+    }
 }
 
 /// A reader that counts the bytes it returns, so the IFD walk knows what it
@@ -462,7 +583,7 @@ impl<R: Seek> Seek for Metered<R> {
 /// TIFF that walk turns down, goes through kamadak-exif's own reader. `None`
 /// is a file TagLib would refuse (see `tags_or_unopened`).
 fn exif_tags<R: Read + Seek>(reader: &mut BufReader<Metered<R>>, len: u64) -> Option<ExifTags> {
-    // A peek leaves the reader at the start, so a JPEG, PNG or WebP is read
+    // A peek leaves the reader at the start, so a PNG, WebP or AVIF is read
     // exactly as before.
     let is_tiff = reader.fill_buf().is_ok_and(tiff_header);
     let walked = is_tiff
@@ -1416,7 +1537,7 @@ mod tests {
 
     /// A minimal but real JPEG carrying an EXIF APP1 segment built from
     /// `entries` — `(tag, type, count, value-or-offset)` little-endian IFD0
-    /// rows plus the raw bytes any of them point at.
+    /// rows plus the raw bytes any of them point at — and a 1x1 frame header.
     ///
     /// Hand-assembled rather than pulled from a fixture file so the expected
     /// values are visible in the test and no binary lands in the repo.
@@ -1450,7 +1571,8 @@ mod tests {
         jpeg.extend_from_slice(b"\xff\xe1");
         jpeg.extend_from_slice(&u16::try_from(app1.len() + 2).unwrap().to_be_bytes());
         jpeg.extend_from_slice(&app1);
-        jpeg.extend_from_slice(b"\xff\xd9"); // EOI
+        jpeg.extend_from_slice(SOF_1X1);
+        jpeg.extend_from_slice(EOI);
         jpeg
     }
 
@@ -1532,7 +1654,7 @@ mod tests {
         assert_eq!(item.exif, PhotoExif::default());
         // kamadak-exif refuses the file, which leaves the photo alone as a
         // broken EXIF block does. TagLib marks such a loop corrupt and reads
-        // on (gl-1615).
+        // on (gl-1950).
         assert!(!item.exif_was_read);
     }
 
@@ -2132,10 +2254,28 @@ mod tests {
     }
 
     /// A one-pixel JPEG holding `ifd0`'s entries and, when `exif` has any, an
-    /// Exif IFD with them; values over four bytes go out of line. No APP1 when
-    /// both are empty. It has the frame header every image has, which TagLib
-    /// needs for the dimensions upstream reads before the comment.
+    /// Exif IFD with them (see [`exif_segment`]). It has the frame header every
+    /// image has, which TagLib needs for the dimensions upstream reads before
+    /// the comment.
     fn jpeg_with_tags(ifd0: &[(u16, u16, &[u8])], exif: &[(u16, u16, &[u8])]) -> Vec<u8> {
+        [SOI, &exif_segment(ifd0, exif), SOF_1X1, EOI].concat()
+    }
+
+    /// A JPEG's start of image.
+    const SOI: &[u8] = b"\xff\xd8";
+    /// SOF0: 8-bit, 1x1, one component.
+    const SOF_1X1: &[u8] = b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00";
+    /// A JPEG's end of image.
+    const EOI: &[u8] = b"\xff\xd9";
+    /// An Exif segment of 14 data bytes whose TIFF magic is 43, not 42.
+    const BROKEN_EXIF: &[u8] = b"\xff\xe1\x00\x10Exif\0\0II\x2b\x00\x08\x00\x00\x00";
+    /// A start of scan and the first bytes of its entropy-coded data.
+    const SCAN: &[u8] = b"\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x55\xaa\x55\xaa\x55\xaa\x55\xaa";
+
+    /// An APP1 Exif segment holding `ifd0`'s entries and, when `exif` has any,
+    /// an Exif IFD with them; values over four bytes go out of line. Empty when
+    /// both are.
+    fn exif_segment(ifd0: &[(u16, u16, &[u8])], exif: &[(u16, u16, &[u8])]) -> Vec<u8> {
         /// Writes one IFD's entries at `at`, their long values from `data_at`.
         fn ifd(entries: &[(u16, u16, &[u8])], at: u32, out: &mut Vec<u8>, data: &mut Vec<u8>) {
             let count = u32::try_from(entries.len()).unwrap();
@@ -2160,7 +2300,7 @@ mod tests {
             out.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
         }
 
-        let mut jpeg = Vec::from(b"\xff\xd8".as_slice()); // SOI
+        let mut segment = Vec::new();
         if !(ifd0.is_empty() && exif.is_empty()) {
             let mut entries = ifd0.to_vec();
             // IFD0 at 8, then its out-of-line values, then the Exif IFD and its.
@@ -2191,14 +2331,11 @@ mod tests {
             }
             let mut app1 = Vec::from(b"Exif\0\0".as_slice());
             app1.extend_from_slice(&tiff);
-            jpeg.extend_from_slice(b"\xff\xe1");
-            jpeg.extend_from_slice(&u16::try_from(app1.len() + 2).unwrap().to_be_bytes());
-            jpeg.extend_from_slice(&app1);
+            segment.extend_from_slice(b"\xff\xe1");
+            segment.extend_from_slice(&u16::try_from(app1.len() + 2).unwrap().to_be_bytes());
+            segment.extend_from_slice(&app1);
         }
-        // SOF0: 8-bit, 1x1, one component.
-        jpeg.extend_from_slice(b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00");
-        jpeg.extend_from_slice(b"\xff\xd9"); // EOI
-        jpeg
+        segment
     }
 
     /// gl-1611: the comment TagLib#'s `IFDTag.Comment` reads. Each case has the
@@ -2416,6 +2553,9 @@ mod tests {
         Some("stale")
     )]
     #[case::cut_inside_a_segment("photo.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF".to_vec(), Some("stale"))]
+    // gl-1615: TagLib stops at the scan, and needs a frame header.
+    #[case::cut_short_in_its_scan_data("photo.jpg", [SOI, SOF_1X1, SCAN].concat(), Some(""))]
+    #[case::no_frame_header("photo.jpg", [SOI, EOI].concat(), Some("stale"))]
     #[tokio::test]
     async fn the_overview_is_taglibs_comment(
         #[case] name: &str,
@@ -2435,6 +2575,130 @@ mod tests {
         provider.fetch(&mut item).await.expect("fetch");
         assert_eq!(item.exif_was_read, expected != Some("stale"));
         assert_eq!(item.overview.as_deref(), expected);
+    }
+
+    /// An APP1 Exif segment whose Exif IFD holds the ASCII comment `text`.
+    fn comment_segment(text: &str) -> Vec<u8> {
+        exif_segment(
+            &[],
+            &[(
+                0x9286,
+                7,
+                [b"ASCII\0\0\0", text.as_bytes()].concat().as_slice(),
+            )],
+        )
+    }
+
+    /// gl-1615: what TagLibSharp 2.3.0's JPEG reader (`Jpeg/File.cs`,
+    /// `ReadMetadata`) makes of each shape: `None` where it throws or finds no
+    /// frame size, else the comment it reads. Each was read in its source and
+    /// measured on a stock Jellyfin 12.4, whose stored `Overview` is NULL for
+    /// `None` and the comment, or "", otherwise.
+    #[rstest::rstest]
+    // kamadak-exif skips bytes between segments; TagLib wants a marker there.
+    #[case::a_stray_byte_between_segments([SOI, SOF_1X1, b"\0", EOI].concat(), None)]
+    #[case::a_size_under_two([SOI, b"\xff\xfe\x00\x01", SOF_1X1, EOI].concat(), None)]
+    #[case::a_segment_reaching_the_end_of_the_file([SOI, SOF_1X1].concat(), None)]
+    #[case::a_zero_width_frame(
+        [SOI, b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x00\x01\x01\x11\x00", EOI].concat(),
+        None
+    )]
+    #[case::the_last_frame_header_counts(
+        [SOI, SOF_1X1, b"\xff\xc2\x00\x0b\x08\x00\x00\x00\x01\x01\x01\x11\x00", EOI].concat(),
+        None
+    )]
+    // TagLib stops at the scan; kamadak-exif reads on to the end.
+    #[case::an_exif_segment_after_the_scan(
+        [SOI, SOF_1X1, SCAN, comment_segment("hi").as_slice(), EOI].concat(),
+        Some("")
+    )]
+    // An APP1 of under 14 bytes is no Exif to TagLib, which reads the next.
+    #[case::a_short_exif_segment_before_a_full_one(
+        [SOI, b"\xff\xe1\x00\x0eExif\0\0II\x2a\x00\x08\x00", comment_segment("hi").as_slice(), SOF_1X1, EOI].concat(),
+        Some("hi")
+    )]
+    // Jellyfin keeps the aperture, shutter speed, camera make and model it
+    // assigned before the missing size throws (gl-1951).
+    #[case::exif_without_a_frame_header([SOI, comment_segment("hi").as_slice(), EOI].concat(), None)]
+    // TagLib throws on a TIFF magic other than 42; kamadak-exif refuses it too.
+    #[case::a_broken_exif_block([SOI, BROKEN_EXIF, SOF_1X1, EOI].concat(), None)]
+    // TagLib reads the first Exif segment only.
+    #[case::a_second_exif_segment_is_not_read(
+        [SOI, comment_segment("hi").as_slice(), BROKEN_EXIF, SOF_1X1, EOI].concat(),
+        Some("hi")
+    )]
+    #[case::a_big_endian_exif_segment(
+        [SOI, b"\xff\xe1\x00\x16Exif\0\0MM\x00\x2a\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00", SOF_1X1, EOI].concat(),
+        Some("")
+    )]
+    // A frame header of 2 data bytes: TagLib reads its 5 bytes on into the
+    // APP2 segment after it (255 high, 57856 wide), then goes back to it.
+    #[case::a_frame_header_shorter_than_its_fields(
+        [SOI, b"\xff\xc0\x00\x04\x08\x00\xff\xe2\x00\x03\x01", EOI].concat(),
+        Some("")
+    )]
+    fn the_jpeg_walk_is_taglibs(#[case] file: Vec<u8>, #[case] expected: Option<&str>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "photo.jpg", &file);
+        assert_eq!(
+            read_exif(&path).and_then(|tags| tags.comment).as_deref(),
+            expected
+        );
+    }
+
+    #[test]
+    fn the_jpeg_walk_never_reads_the_scan_data() {
+        let scan = vec![0x55; 1 << 20];
+        let file = [
+            SOI,
+            comment_segment("hi").as_slice(),
+            SOF_1X1,
+            SCAN,
+            &scan,
+            EOI,
+        ]
+        .concat();
+        let mut reader = BufReader::new(Metered::new(std::io::Cursor::new(&file)));
+        let tags = jpeg_tags(&mut reader, u64::try_from(file.len()).unwrap());
+        assert_eq!(tags.and_then(|tags| tags.comment).as_deref(), Some("hi"));
+        // One buffer's fill holds the header segments; the megabyte of scan
+        // data after them is never read.
+        let capacity = u64::try_from(reader.capacity()).unwrap();
+        assert!(
+            reader.get_ref().read <= capacity,
+            "read {}",
+            reader.get_ref().read
+        );
+    }
+
+    /// A JPEG's size is its frame header's, as TagLib#'s `Properties` are,
+    /// over whatever the row held: what a stock Jellyfin 12.4 stored for each.
+    #[rstest::rstest]
+    #[case::not_the_exif_size(
+        jpeg_with_tags(
+            &[],
+            &[(0xa002, 4, &4032u32.to_le_bytes()), (0xa003, 4, &3024u32.to_le_bytes())],
+        ),
+        (1, 1)
+    )]
+    #[case::without_exif([SOI, SOF_1X1, EOI].concat(), (1, 1))]
+    #[case::a_frame_header_shorter_than_its_fields(
+        [SOI, b"\xff\xc0\x00\x04\x08\x00\xff\xe2\x00\x03\x01", EOI].concat(),
+        (57856, 255)
+    )]
+    #[tokio::test]
+    async fn a_jpegs_size_is_its_frame_headers(#[case] file: Vec<u8>, #[case] size: (i32, i32)) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "photo.jpg", &file);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 640,
+            height: 480,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert_eq!((item.width, item.height), size);
     }
 
     /// An EXIF block with a camera make and a comment.
