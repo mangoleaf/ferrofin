@@ -16,6 +16,8 @@
 //! - `tree`: the copy of every other file, and the before/after digest;
 //! - `history`: the `__EFMigrationsHistory` the target release must find;
 //! - `classify`: which migrations are schema and which are code migrations;
+//! - `proof`: what proves Ferrofin did the work of a code migration the history
+//!   records as applied;
 //! - `drop_objects`: removing Ferrofin's own tables and indexes from the copy;
 //! - `paths`: the stored paths, rewritten onto the output's layout;
 //! - `carried`: what Ferrofin's own tables hold that Jellyfin keeps in files
@@ -25,6 +27,8 @@
 //!   the copy where they may be stale, and those in media libraries;
 //! - `report`: what the removed tables held and what Jellyfin's first start
 //!   changes, for the operator's loss report;
+//! - `counts`: the rows Jellyfin's code migrations change on its first start,
+//!   for the same report;
 //! - `refusal`: the conditions under which an export must not run.
 //!
 //! The database steps are SQLite-only by design: the export takes a SQLite
@@ -44,20 +48,23 @@ pub use classify::{
     CODE_PRODUCT_VERSION, Disposition, JELLYFIN_MIGRATIONS, SCHEMA_PRODUCT_VERSION,
 };
 pub use containers::{ContainerFile, LibraryContainer};
+pub use counts::FirstStartCounts;
 pub use drop_objects::{DroppedObjects, DroppedTable};
 pub use history::HistoryRewrite;
 pub use layout::{DOCKER, Layout, LeftOut, SourceDirs};
 pub use paths::PathRewrite;
 pub use refusal::Preflight;
-pub use report::{first_start_effects, table_note};
+pub use report::{first_start_effects, recorded_as_applied, table_note};
 
 mod carried;
 mod classify;
 mod containers;
+mod counts;
 mod drop_objects;
 mod history;
 mod layout;
 mod paths;
+mod proof;
 mod refusal;
 mod report;
 mod snapshot;
@@ -181,6 +188,9 @@ pub struct DatabaseEdits {
     /// What Ferrofin's own tables held that Jellyfin keeps in files, read
     /// before they were removed.
     pub carried: CarriedRows,
+    /// The rows Jellyfin's code migrations change on its first start, for the
+    /// report of an adopted source (on a native one Jellyfin runs none).
+    pub counts: FirstStartCounts,
 }
 
 /// The export's changes to its staged copy of the database, in order, on the
@@ -204,6 +214,7 @@ async fn edit_staged(
         dropped: drop_objects::remove(&mut tx).await?,
         paths: paths::rewrite(&mut tx, dirs, layout).await?,
         carried,
+        counts: counts::read(&mut tx).await?,
     };
     tx.commit().await?;
     Ok(edits)
@@ -257,7 +268,8 @@ async fn edit_staged(
 /// snapshot fails; [`DbError::ExportRefused`] when the copy of the database the
 /// snapshot stages fails its checks (a log it cannot fold in whole, a damaged
 /// file, `integrity_check`, `foreign_key_check`, not Ferrofin's, a Jellyfin
-/// history from no release Ferrofin adopts); and
+/// history from no release Ferrofin adopts, no proof of the work of a code
+/// migration the history records as applied); and
 /// [`DbError::ExportSourceChanged`] when the source changed during the export.
 pub async fn export_data_dir(
     dirs: &SourceDirs,

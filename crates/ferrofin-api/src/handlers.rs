@@ -2799,7 +2799,8 @@ macro_rules! item_image_tail {
          2147483647, a hex imageIndex and a malformed percentPlayed; the images match in \
          format and size, and, unresized, in pixels within rounding and the blur's box approximation \
          of Skia's Gaussian (with its Decal edges and premultiplied JPEG), not in bytes \
-         (the image crate, not Skia)"
+         (decoded and resized by libraries other than Skia's; a JPEG is written by \
+         libjpeg-turbo, the codec inside Skia, with SkJpegEncoder's settings)"
     };
 }
 
@@ -3168,10 +3169,16 @@ pub const VERIFIED: &[Verified] = &[
                more; similar_items_repository.rs people_names_of over the first 6 played, \
                GetPeopleNamesByItems in ListOrder per item, distinct, with equal ListOrders \
                on two films in ItemId order, the order SQLite returns for upstream's \
-               statement; each baseline capped to categoryLimit and scored by \
-               similar_category through local_similar, the \
-               MovieSimilarItemsProvider path of the similar-items rows for every baseline, \
-               whatever its kind, with the user and Limit = itemLimit, no remote provider; \
+               statement; each stream's baselines capped to categoryLimit and scored together \
+               by similar_categories, GetSimilarItemsRecommendationsAsync's one \
+               IBatchLocalSimilarItemsProvider and MovieSimilarItemsProvider's \
+               GetBatchSimilarItemsAsync for every baseline, whatever its kind, with the user \
+               and Limit = itemLimit, no remote provider: similar_items_repository.rs \
+               weighted_scores for all of them, each baseline's top itemLimit * 3 by score then \
+               Id, one score_filter_query get_item_list over the union of those windows, and \
+               each category picked from the rows of that union its baseline scored \
+               (scores.ContainsKey), best_scoring_per_key's PrimaryVersionId tie-break and \
+               DistinctBy(PresentationUniqueKey), Take(itemLimit), an empty category skipped; \
                next_person_category, the lazy GetPersonRecommendations: Person = name, \
                Limit = itemLimit + 2 grouped by metadata key, PersonTypes \
                Director for the director stream and none for the \
@@ -3179,15 +3186,10 @@ pub const VERIFIED: &[Verified] = &[
                CategoryId = name.GetMD5(); round_robin_categories: recently played, recently \
                played, liked, liked, directors, actors until categoryLimit or a pass adds \
                nothing, then a stable OrderBy RecommendationType)",
-        date: "2026-11-15",
+        date: "2026-11-24",
         divergences: &[
             SIMILAR_SCORE_WINDOW_DIVERGENCE,
             SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
-            "Each baseline is scored and access-filtered on its own and fills its category \
-         from its own limit * 3 window; upstream's IBatchLocalSimilarItemsProvider scores \
-         every baseline of a stream in one pass, filters the union of their windows once and \
-         fills each category from any candidate in that union its baseline scored, so a \
-         category the filter left short can be longer upstream. Fix path: gl-1357.",
             "An itemLimit above 715827882 overflows upstream's limit * 3 to a negative Take, so \
          every similar-to category is empty; the oversample saturates here. Jellyfin bug not \
          ported.",
@@ -6557,6 +6559,42 @@ pub const VERIFIED: &[Verified] = &[
             "The 400 (an API key with no userId, or a value the query binder cannot convert), \
          403 (another user's id without the administrator role) and 404 (a userId naming no \
          account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Devices",
+        upstream_file: "Jellyfin.Api/Controllers/DevicesController.cs",
+        upstream_method: "GetDevices",
+        ferrofin: "handlers/devices.rs get_devices (RequireAdmin, Policies.RequiresElevation, \
+               which an API key passes as its Administrator role claim does upstream; userId as \
+               Guid? through empty_as_none_uuid: trimmed, an empty value null, a malformed one \
+               400; undeclared parameters ignored) → items.rs effective_user_id \
+               (RequestHelpers.GetUserId: an absent or nil userId is the caller, the nil id for \
+               an API key; another account's id is admitted for the elevated caller) → \
+               ferrofin-core device_manager.rs get_devices_for_user (DeviceManager.\
+               GetDevicesForUser: every Devices row, DateLastActivity descending, then DeviceId \
+               in the current culture as Comparer<string>.Default; a nil or absent id filters \
+               nothing, as !userId.IsNullOrEmpty(); any other id must name an account, else \
+               404 as ResourceNotFoundException, and keeps the devices resolve_access and \
+               access_allows admit, as CanAccessDevice: an empty DeviceId is 400 first, then \
+               EnableAllDevices or IsAdministrator, else EnabledDevices ignoring case or a device \
+               not reporting SupportsPersistentIdentifier) → device_infos_for (ToDeviceInfo: the \
+               DeviceOptions CustomName, a device whose user is gone a 404, raised in device \
+               order with that 400) → to_device_info_dto (ToDeviceInfoDto; AccessToken is never \
+               set) → QueryResult::from_items. Live on a scratch server (gl-1578): an API key \
+               with no or a nil userId lists every device, an unknown userId is 404",
+        date: "2026-11-24",
+        divergences: &[
+            "Capabilities carries what the device last reported (SaveCapabilities); upstream's \
+         ToDeviceInfo never assigns it, so Jellyfin always answers a new ClientCapabilities \
+         (empty lists, SupportsPersistentIdentifier true) beside the reported top-level \
+         IconUrl. Kept: a parity fix does not remove data Ferrofin answers (owner, gl-1662, \
+         2026-11-11).",
+            "The 400 (a malformed userId, an empty device id), 401 (no or bad token), 403 (not \
+         an administrator) and 404 (a userId naming no account, a device whose user is gone) \
+         bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },

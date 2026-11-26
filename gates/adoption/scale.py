@@ -113,12 +113,15 @@ def columns_of(conn, table):
 
 def templates(conn):
     """The media items to repeat: no owner (a 10.11 database writes the all-zero Guid for none, a
-    12.x one NULL), no primary version, not an extra, with a path."""
+    12.x one NULL), no primary version, not an extra, with a path; and no versions merged by hand or
+    additional parts in its data, which every clone would claim as its own."""
     marks = ", ".join("?" * len(TEMPLATE_TYPES))
     cursor = conn.execute(
         f'SELECT * FROM "BaseItems" WHERE "Type" IN ({marks}) AND "Path" IS NOT NULL '
         "AND (\"OwnerId\" IS NULL OR replace(\"OwnerId\", '-', '') = '00000000000000000000000000000000') "
-        'AND "PrimaryVersionId" IS NULL AND ("ExtraType" IS NULL OR "ExtraType" = 0) ORDER BY "Id"', TEMPLATE_TYPES)
+        'AND "PrimaryVersionId" IS NULL AND ("ExtraType" IS NULL OR "ExtraType" = 0) '
+        "AND CASE WHEN json_valid(\"Data\") THEN coalesce(json_array_length(\"Data\", '$.LinkedAlternateVersions'), 0) "
+        "+ coalesce(json_array_length(\"Data\", '$.AdditionalParts'), 0) ELSE 0 END = 0 ORDER BY \"Id\"", TEMPLATE_TYPES)
     names = [column[0] for column in cursor.description]
     return [dict(zip(names, row)) for row in cursor.fetchall()]
 

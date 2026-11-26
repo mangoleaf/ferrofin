@@ -1,13 +1,14 @@
 //! `ImageCrateEncoder` — a real codec [`ImageEncoder`] backed by the `image`
 //! crate (no native Skia).
 //!
-//! Port of `Jellyfin.Drawing.Skia.SkiaEncoder`, re-implemented on the pure-Rust
-//! [`image`] crate. Parity with the C# oracle is **dimensional and
-//! decodable-output**, not byte-exact: the two libraries use different resamplers
-//! and JPEG/PNG/WebP writers, so there is no byte oracle. What is ported exactly
-//! is the *shape* of each operation — which axis wins during resize, the collage
-//! ratio dispatch, the trickplay grid packing, and the "spit out the original
-//! file when options are default" short-circuit.
+//! Port of `Jellyfin.Drawing.Skia.SkiaEncoder`, re-implemented on the [`image`]
+//! crate. Parity with the C# oracle is **dimensional and decodable-output**, not
+//! byte-exact: the decoders, the resampler and the PNG writer differ from Skia's,
+//! so there is no byte oracle, even for JPEG, which libjpeg-turbo writes with
+//! Skia's settings (`encode_jpeg`), and WebP, which libwebp writes. What is
+//! ported exactly is the *shape* of each operation — which axis wins during
+//! resize, the collage ratio dispatch, the trickplay grid packing, and the
+//! "spit out the original file when options are default" short-circuit.
 //!
 //! Port rules applied:
 //! - This encoder advertises the subset of Skia's input formats the `image`
@@ -59,9 +60,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{ImageCollageOptions, ImageProcessingOptions};
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageFormat as CrateFormat, RgbImage, RgbaImage, imageops};
-use jpeg_encoder::{
-    ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor,
-};
+use turbojpeg::Subsamp;
 
 /// Caps how many image encodes run concurrently on the blocking pool.
 ///
@@ -267,7 +266,8 @@ impl ImageCrateEncoder {
 
     /// Encodes `image` as a baseline JPEG at `quality` (0-100)
     /// with **4:2:0 chroma subsampling and optimized Huffman tables**, mirroring
-    /// the C# oracle's `bitmap.Encode(stream, SKEncodedImageFormat.Jpeg, quality)`.
+    /// the C# oracle's `bitmap.Encode(stream, SKEncodedImageFormat.Jpeg, quality)`
+    /// (`SkiaEncoder.EncodeImage` and `CreateTrickplayTile`, v12.4).
     ///
     /// Every JPEG goes through here except a trickplay tile written with
     /// `TrickplayOptions::full_chroma` on, which is 4:4:4
@@ -277,7 +277,7 @@ impl ImageCrateEncoder {
     /// does. `image` 0.25's `JpegEncoder` hardcodes 4:4:4 (every component is
     /// declared `h: 1, v: 1` in `new_with_quality`, at every quality), whereas
     /// Skia's `SkJpegEncoder` defaults to `Downsample::k420` for all three of
-    /// Jellyfin's JPEG writes (`SkiaEncoder.cs` v10.11.8 lines 628, 670 and 778 —
+    /// Jellyfin's JPEG writes (`SkiaEncoder.cs` v12.4 lines 720, 762 and 870 —
     /// resized image, pixmap, and the trickplay tile grid). A tile written with
     /// `full_chroma` on departs from that on purpose:
     /// `TrickplayManager.CreateTiles` derives `TrickplayInfo.Bandwidth` from the
@@ -286,59 +286,43 @@ impl ImageCrateEncoder {
     /// 4:4:4 tile reports a larger scrub-prefetch budget than Jellyfin's, a true
     /// one for the file it describes.
     ///
-    /// `jpeg-encoder` is configured to match Skia on every knob that changes the
-    /// wire format:
+    /// The writer is libjpeg-turbo through TurboJPEG, the codec Skia itself
+    /// links, set the way `SkJpegEncoder` sets it:
     ///
-    /// - **4:2:0 chroma subsampling**, as above. That crate's own default is
-    ///   quality-dependent (4:4:4 at `quality >= 90`), so it is set explicitly
-    ///   rather than inherited.
-    /// - **Optimized Huffman tables** (libjpeg `optimize_coding = TRUE`), which
-    ///   `jpeg-encoder` leaves off. Measured on the wire against Jellyfin
+    /// - **4:2:0 chroma subsampling**, as above (TurboJPEG's own default is
+    ///   4:4:4, so it is always set).
+    /// - **Optimized Huffman tables** (`optimize_coding = TRUE`, which Skia sets
+    ///   and TurboJPEG leaves off). Measured on the wire against Jellyfin
     ///   10.11.8: its tiles carry content-derived tables with 11/93/11/56
     ///   symbols where libjpeg's standard tables have 12/162/12/162. On the flat,
     ///   mostly-DC content a trickplay tile is made of, that difference alone is
-    ///   a factor of two in file size — for the same quantization tables (verified
-    ///   byte-identical between the two servers' tiles) and the same pixels
-    ///   (mean absolute difference 0.005/255).
-    /// - **Baseline, not progressive**, and box-averaged chroma downsampling
-    ///   (libjpeg's `h2v2_downsample`) — both already the crate's defaults.
+    ///   a factor of two in file size. Optimized coding costs a second entropy
+    ///   pass over the image; Skia pays it on every JPEG Jellyfin writes, and it
+    ///   halves what this server stores and serves, so Ferrofin pays it too.
+    /// - Everything else is `jpeg_set_defaults` with `jpeg_set_quality(…,
+    ///   TRUE)`, as in Skia: baseline, the accurate integer DCT, box-averaged
+    ///   chroma downsampling, the components interleaved in one scan, and the
+    ///   JFIF component identifiers 1/2/3.
     ///
-    /// Optimized coding costs a second entropy pass over the image. Skia pays it
-    /// on every JPEG Jellyfin writes, and it halves what this server stores and
-    /// serves, so Ferrofin pays it too. With it, `jpeg-encoder` codes each
-    /// component in a scan of its own (Skia interleaves them in one), a layout
-    /// every decoder must read but the `image` crate's misreads, so this crate
-    /// reads such files back through `jpeg-decoder` ([`crate::split_scans`]).
-    ///
-    /// The output is still not byte-identical to Skia's — no two independent
-    /// JPEG writers are — but the two now agree on subsampling, quantization and
-    /// entropy coding, which is everything a client can observe about the format.
-    ///
-    /// One recorded, decoder-invisible divergence remains: `jpeg-encoder`
-    /// hardcodes the SOF component identifiers to 0/1/2 (`init_components`,
-    /// v0.7.1), where libjpeg — and so Skia — writes the JFIF-conventional
-    /// 1/2/3. JPEG decoders bind components positionally and match the SOS
-    /// selectors against whatever the SOF declared, so no client can observe
-    /// this; the crate exposes no knob for it.
+    /// The bytes still differ from Jellyfin's, because the pixels reaching the
+    /// encoder do (other decoders and another resampler than Skia's).
     fn encode_jpeg(
         image: &DynamicImage,
         output_path: &str,
         quality: i32,
     ) -> Result<Vec<u8>, ServiceError> {
-        Self::encode_jpeg_sampled(image, output_path, quality, SamplingFactor::F_2_2)
+        Self::encode_jpeg_sampled(image, output_path, quality, Subsamp::Sub2x2)
     }
 
-    /// [`Self::encode_jpeg`] at the given chroma `sampling`.
+    /// [`Self::encode_jpeg`] at the given chroma `subsamp`.
     fn encode_jpeg_sampled(
         image: &DynamicImage,
         output_path: &str,
         quality: i32,
-        sampling: SamplingFactor,
+        subsamp: Subsamp,
     ) -> Result<Vec<u8>, ServiceError> {
-        let quality = quality.clamp(0, 100);
-        // Truncation is safe: quality is clamped to 0..=100.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let quality = quality as u8;
+        // libjpeg's `jpeg_set_quality` reads 0 as 1, and TurboJPEG refuses 0.
+        let quality = quality.clamp(1, 100);
         let rgb = match image {
             DynamicImage::ImageRgb8(rgb) => Cow::Borrowed(rgb),
             // Skia's JPEG encoder ignores alpha and writes the premultiplied
@@ -348,25 +332,32 @@ impl ImageCrateEncoder {
             other if other.color().has_alpha() => Cow::Owned(premultiplied_rgb(&other.to_rgba8())),
             other => Cow::Owned(other.to_rgb8()),
         };
-        // JPEG's frame header stores the dimensions in 16 bits, so anything wider
-        // or taller than 65535 cannot be written; Skia fails the same encode.
-        let (Ok(width), Ok(height)) = (u16::try_from(rgb.width()), u16::try_from(rgb.height()))
-        else {
+        // libjpeg refuses a side over JPEG_MAX_DIMENSION (65500, a little under
+        // the frame header's 16 bits), and so does Skia's encode. Refused here as
+        // invalid input: it is decided by the input alone.
+        if rgb.width() > JPEG_MAX_DIMENSION || rgb.height() > JPEG_MAX_DIMENSION {
             return Err(ServiceError::InvalidInput(format!(
-                "cannot write {output_path}: {}x{} exceeds JPEG's 65535x65535 limit",
+                "cannot write {output_path}: {}x{} exceeds JPEG's \
+                 {JPEG_MAX_DIMENSION}x{JPEG_MAX_DIMENSION} limit",
                 rgb.width(),
                 rgb.height()
             )));
+        }
+        let encode = || -> Result<Vec<u8>, turbojpeg::Error> {
+            let mut compressor = turbojpeg::Compressor::new()?;
+            compressor.set_quality(quality)?;
+            compressor.set_subsamp(subsamp)?;
+            compressor.set_optimize(true)?;
+            let format = turbojpeg::PixelFormat::RGB;
+            compressor.compress_to_vec(turbojpeg::Image {
+                pixels: rgb.as_raw().as_slice(),
+                width: rgb.width() as usize,
+                pitch: rgb.width() as usize * format.size(),
+                height: rgb.height() as usize,
+                format,
+            })
         };
-        let mut bytes = Vec::new();
-        let mut encoder = JpegEncoder::new(&mut bytes, quality);
-        encoder.set_sampling_factor(sampling);
-        encoder.set_chroma_subsampling_method(ChromaSubsamplingMethod::Average);
-        encoder.set_optimized_huffman_tables(true);
-        encoder
-            .encode(rgb.as_raw(), width, height, JpegColorType::Rgb)
-            .map_err(|e| DrawingError::jpeg_encode(format!("encode {output_path}"), e))?;
-        Ok(bytes)
+        encode().map_err(|e| DrawingError::jpeg_encode(format!("encode {output_path}"), e).into())
     }
 
     /// Resizes `image` to exactly `size`, the size `SkiaEncoder.ResizeImage`
@@ -650,16 +641,16 @@ impl ImageCrateEncoder {
             }
         }
 
-        let sampling = if full_chroma {
-            SamplingFactor::F_1_1
+        let subsamp = if full_chroma {
+            Subsamp::None
         } else {
-            SamplingFactor::F_2_2
+            Subsamp::Sub2x2
         };
         let bytes = Self::encode_jpeg_sampled(
             &DynamicImage::ImageRgb8(grid),
             &options.output_path,
             quality,
-            sampling,
+            subsamp,
         )?;
         Self::write_encoded(&bytes, &options.output_path)?;
 
@@ -1221,6 +1212,10 @@ const SUPPORTED_INPUT_FORMATS: [&str; 7] = ["jpeg", "jpg", "png", "webp", "gif",
 /// (the bitstream's 14-bit size fields), which the `webp` crate does not
 /// re-export.
 const WEBP_MAX_DIMENSION: u32 = 16_383;
+
+/// The widest or tallest image libjpeg-turbo can write, its `JPEG_MAX_DIMENSION`
+/// (`jmorecfg.h`), which TurboJPEG does not export.
+const JPEG_MAX_DIMENSION: u32 = 65_500;
 
 #[async_trait]
 impl ImageEncoder for ImageCrateEncoder {
@@ -2382,10 +2377,10 @@ mod tests {
         );
     }
 
-    /// gl-1213: a JPEG this encoder wrote (4:2:0, one scan per component)
-    /// keeps its colours when an image request reads it back. A thumbnail at
-    /// half its size decodes it in full; the `image` crate's decoder came back
-    /// green there.
+    /// gl-1213: a JPEG this encoder wrote keeps its colours when an image
+    /// request reads it back. A thumbnail at half its size decodes it in full;
+    /// the `image` crate's decoder came back green there while the encoder
+    /// wrote one scan per component.
     #[tokio::test]
     async fn a_jpeg_this_encoder_wrote_reads_back_with_its_colours() {
         let dir = TempDir::new().expect("tempdir");
@@ -3046,11 +3041,7 @@ mod tests {
     /// JPEG's SOF marker, in declaration order (Y, Cb, Cr).
     ///
     /// `[(2, 2), (1, 1), (1, 1)]` is 4:2:0 — luma sampled twice per chroma
-    /// sample on both axes; `[(1, 1), (1, 1), (1, 1)]` is 4:4:4. The component
-    /// *identifiers* are deliberately not returned: `jpeg-encoder` numbers them
-    /// 0/1/2 where libjpeg (and therefore Skia) uses the JFIF-conventional
-    /// 1/2/3. Decoders bind components positionally, so that difference is
-    /// invisible to every client; the sampling factors are not.
+    /// sample on both axes; `[(1, 1), (1, 1), (1, 1)]` is 4:4:4.
     fn jpeg_sampling_factors(bytes: &[u8]) -> Vec<(u8, u8)> {
         let mut i = 2; // skip SOI
         while i + 4 <= bytes.len() {
@@ -3140,15 +3131,132 @@ mod tests {
         );
     }
 
+    /// The `(component identifiers, scans)` of a JPEG: the identifiers its SOF
+    /// declares, and the component selectors of each SOS, in file order.
+    fn jpeg_components_and_scans(bytes: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let (mut ids, mut scans) = (Vec::new(), Vec::new());
+        let mut i = 2; // skip SOI
+        while i + 4 <= bytes.len() {
+            assert_eq!(bytes[i], 0xFF, "not a JPEG marker at offset {i}");
+            let marker = bytes[i + 1];
+            let length = (usize::from(bytes[i + 2]) << 8) | usize::from(bytes[i + 3]);
+            if (0xC0..=0xC2).contains(&marker) {
+                ids = Vec::from_fn(usize::from(bytes[i + 9]), |k| bytes[i + 10 + 3 * k]);
+            } else if marker == 0xDA {
+                scans.push(Vec::from_fn(usize::from(bytes[i + 4]), |k| {
+                    bytes[i + 5 + 2 * k]
+                }));
+                // The entropy-coded data runs to the next marker that is not a
+                // stuffed 0xFF00 or a restart marker.
+                i += 2 + length;
+                while i + 1 < bytes.len()
+                    && !(bytes[i] == 0xFF
+                        && bytes[i + 1] != 0
+                        && !(0xD0..=0xD7).contains(&bytes[i + 1]))
+                {
+                    i += 1;
+                }
+                continue;
+            } else if marker == 0xD9 {
+                break;
+            }
+            i += 2 + length;
+        }
+        (ids, scans)
+    }
+
+    /// gl-1346: a JPEG is written as Skia's libjpeg-turbo writes it, the three
+    /// components interleaved in one scan under the JFIF identifiers 1/2/3, at
+    /// either chroma. `jpeg-encoder` wrote one scan per component under 0/1/2,
+    /// the layout the `image` crate's decoder misreads (gl-1213).
+    #[rstest]
+    #[case::subsampled(Subsamp::Sub2x2)]
+    #[case::full_chroma(Subsamp::None)]
+    fn a_jpeg_is_one_interleaved_scan_with_jfif_component_ids(#[case] subsamp: Subsamp) {
+        let photo = DynamicImage::ImageRgb8(smooth_photo(64, 48));
+        let bytes =
+            ImageCrateEncoder::encode_jpeg_sampled(&photo, "out.jpg", 90, subsamp).expect("encode");
+        assert_eq!(
+            jpeg_components_and_scans(&bytes),
+            (vec![1, 2, 3], vec![vec![1, 2, 3]])
+        );
+    }
+
+    /// libjpeg refuses a side over its `JPEG_MAX_DIMENSION`, 65500, below the
+    /// frame header's 65535, as Skia's encode does. Past it the image is
+    /// invalid input (the processor serves the original), never a codec error.
+    #[rstest]
+    #[case::too_wide(65_501, 1)]
+    #[case::too_tall(1, 65_501)]
+    fn a_jpeg_past_libjpegs_limit_is_invalid_input(#[case] width: u32, #[case] height: u32) {
+        let image = DynamicImage::ImageRgb8(RgbImage::new(width, height));
+        let error = ImageCrateEncoder::encode_jpeg(&image, "out.jpg", 90).expect_err("refused");
+        assert!(
+            matches!(&error, ServiceError::InvalidInput(m) if m.contains("65500x65500")),
+            "{error:?}"
+        );
+    }
+
+    /// The widest JPEG libjpeg writes is written.
+    #[test]
+    fn a_jpeg_at_libjpegs_limit_is_written() {
+        let image = DynamicImage::ImageRgb8(RgbImage::new(65_500, 1));
+        let bytes = ImageCrateEncoder::encode_jpeg(&image, "out.jpg", 90).expect("encode");
+        let written = image::load_from_memory(&bytes).expect("decodes");
+        assert_eq!((written.width(), written.height()), (65_500, 1));
+    }
+
+    /// A quality outside libjpeg's 1-100 is written at the nearer end, as Skia
+    /// writes it (`jpeg_set_quality` reads anything below 1 as 1), not refused
+    /// as TurboJPEG would.
+    #[rstest]
+    #[case::zero(0, 1)]
+    #[case::negative(-5, 1)]
+    #[case::over(101, 100)]
+    fn a_jpeg_quality_out_of_range_is_clamped(#[case] quality: i32, #[case] written_at: i32) {
+        let photo = DynamicImage::ImageRgb8(smooth_photo(32, 32));
+        let clamped = ImageCrateEncoder::encode_jpeg(&photo, "out.jpg", quality).expect("encode");
+        let expected =
+            ImageCrateEncoder::encode_jpeg(&photo, "out.jpg", written_at).expect("encode");
+        assert_eq!(clamped, expected);
+    }
+
+    /// A failure inside libjpeg-turbo comes back as the backend error naming
+    /// the file, with TurboJPEG's message as its source. An empty image is the
+    /// one input that reaches it (the processor never asks for one).
+    #[test]
+    fn a_turbojpeg_failure_is_a_backend_error_with_its_source() {
+        let empty = DynamicImage::ImageRgb8(RgbImage::new(0, 1));
+        let error = ImageCrateEncoder::encode_jpeg(&empty, "out.jpg", 90).expect_err("refused");
+        let ServiceError::BackendSource(source) = &error else {
+            panic!("{error:?}");
+        };
+        assert!(
+            source.to_string().starts_with("encode out.jpg: "),
+            "{source}"
+        );
+        let drawing = source
+            .downcast_ref::<DrawingError>()
+            .expect("a DrawingError");
+        assert!(
+            matches!(
+                drawing,
+                DrawingError::JpegEncode {
+                    source: turbojpeg::Error::TurboJpegError(_),
+                    ..
+                }
+            ),
+            "{drawing:?}"
+        );
+    }
+
     /// Skia writes every JPEG with `SkJpegEncoder`'s default `Downsample::k420`
     /// — at *every* quality, and on all three of Jellyfin's JPEG writes
-    /// (`SkiaEncoder.cs` v10.11.8 lines 628, 670, 778). Ferrofin departs from it
+    /// (`SkiaEncoder.cs` v12.4 lines 720, 762, 870). Ferrofin departs from it
     /// only for a trickplay tile written with `full_chroma` on
     /// (`a_trickplay_tile_is_written_at_the_chroma_asked_for`); everything else
-    /// is pinned here.
-    ///
-    /// The high-quality case is the one that regresses silently: `jpeg-encoder`'s
-    /// own default sampling factor flips to 4:4:4 at `quality >= 90`.
+    /// is pinned here. TurboJPEG's own default is 4:4:4, so this regresses
+    /// silently if the subsampling is ever left unset.
     #[rstest]
     #[case(80)]
     #[case(90)]
@@ -3382,7 +3490,7 @@ mod tests {
         }
         let canvas = DynamicImage::ImageRgba8(canvas);
         let expected = if full_chroma {
-            ImageCrateEncoder::encode_jpeg_sampled(&canvas, &output, 90, SamplingFactor::F_1_1)
+            ImageCrateEncoder::encode_jpeg_sampled(&canvas, &output, 90, Subsamp::None)
         } else {
             ImageCrateEncoder::encode_jpeg(&canvas, &output, 90)
         }

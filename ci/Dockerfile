@@ -10,6 +10,12 @@ FROM rust:1.100.0-trixie
 # FERROFIN_WASM_GUEST_TESTS=1 end-to-end test — the WIT contract anchor).
 RUN rustup component add rustfmt clippy llvm-tools-preview  && rustup target add wasm32-wasip2
 
+# cmake and nasm build the libjpeg-turbo that turbojpeg-sys vendors (nasm assembles its
+# x86-64 SIMD; require-simd fails the build without it). Same packages as the root Dockerfile.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake nasm \
+ && rm -rf /var/lib/apt/lists/*
+
 # cargo-nextest (test runner) + cargo-llvm-cov (coverage). We deliberately avoid
 # cargo-binstall / GitHub release downloads here: those 503 / rate-limit from CI
 # runners. cargo-nextest ships an official (Cloudflare-backed) tarball at
@@ -28,4 +34,4 @@ RUN cargo install --locked cargo-deny@0.20.2 cargo-machete@0.9.2 cargo-vet@0.10.
 
 # Smoke-check the tools exist at build time (fails the image build if any is missing).
 RUN cargo nextest --version && cargo llvm-cov --version && cargo deny --version && cargo machete --version \
- && cargo vet --version && rustfmt --version && cargo clippy --version
+ && cargo vet --version && rustfmt --version && cargo clippy --version && cmake --version && nasm -v

@@ -60,6 +60,11 @@ pub use automatic::Runtime;
 /// client integrations address the plugin by that id.
 pub const EXTENSION_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
 
+/// The Intro Skipper's settings file in Jellyfin's `plugins/configurations`, named after
+/// its assembly (`BasePlugin<T>.ConfigurationFileName`), which `/Plugins`
+/// reports and adoption imports.
+pub const CONFIGURATION_FILE_NAME: &str = "IntroSkipper.xml";
+
 /// The Intro Skipper extension.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct IntroSkipperExtension;
@@ -89,7 +94,7 @@ impl Extension for IntroSkipperExtension {
             enabled: true,
             has_image: false,
             can_uninstall: false,
-            configuration_file_name: None,
+            configuration_file_name: Some(CONFIGURATION_FILE_NAME.to_owned()),
         }
     }
 

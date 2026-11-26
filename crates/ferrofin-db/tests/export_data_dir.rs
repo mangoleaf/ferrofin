@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 use ferrofin_db::export::{
     CarriedRows, ContainerFile, DOCKER, DatabaseEdits, DroppedObjects, DroppedTable,
-    EXPORTED_DATABASE, HistoryRewrite, IdentityLink, LeftOut, LibraryContainer, MirroredLiveTv,
-    PathRewrite, RecordingRow, SeriesTimerRow, SourceDirs, TimerRow, export_data_dir,
+    EXPORTED_DATABASE, FirstStartCounts, HistoryRewrite, IdentityLink, LeftOut, LibraryContainer,
+    MirroredLiveTv, PathRewrite, RecordingRow, SeriesTimerRow, SourceDirs, TimerRow,
+    export_data_dir,
 };
 use ferrofin_db::{Database, DbError};
 use sqlx::ConnectOptions as _;
@@ -163,12 +164,18 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
     );
     assert_eq!(summary.files, 3);
     assert_eq!(summary.database, out.join(EXPORTED_DATABASE));
-    // A native database has no Jellyfin history to rewrite; Ferrofin's own
+    // A native database has no Jellyfin history: it is given a fresh
+    // install's (tests/export_history.rs checks its ids); Ferrofin's own
     // table goes.
+    assert_eq!(summary.edits.history.recorded.len(), 105);
     assert_eq!(
         summary.edits,
         DatabaseEdits {
-            history: HistoryRewrite::default(),
+            history: HistoryRewrite {
+                generation: None,
+                recorded: summary.edits.history.recorded.clone(),
+                left_to_run: Vec::new(),
+            },
             dropped: DroppedObjects {
                 tables: vec![DroppedTable {
                     name: "_sqlx_migrations".to_owned(),
@@ -182,6 +189,7 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
             },
             // (the moves themselves are checked below)
             carried: CarriedRows::default(),
+            counts: FirstStartCounts::default(),
         }
     );
     assert_eq!(summary.left_out.len(), 0);

@@ -930,7 +930,12 @@ It neither reads nor modifies a personal media server.
 The fixture has eight movie titles (one with two versions, one HDR10, one with two
 audio languages and an attached font, one under a non-ASCII path), one extra, one
 series with two seasons and six episodes, six music tracks across two artists and
-two albums, a book and two photos. One album spans two discs. English subtitle files
+two albums, a book and two photos. One album spans two discs. For the round trip
+(`gates/roundtrip/`, gl-1902) it also has two pairs of movies the builder merges as
+versions through the API, a third copy of the second pair at a smaller size, a movie in
+two parts, a series rated above the child's limit whose season and episodes carry no
+rating of their own, and the adult's playlist of the movie in parts and the movie with
+two versions. English subtitle files
 accompany every movie and episode, every video has chapters, and every movie and
 episode NFO credits two actors. Chapter-image and trickplay extraction run during
 the scan, and the builder runs the keyframe-extraction task, saves display

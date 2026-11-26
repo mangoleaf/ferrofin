@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 sys.path.append(str(Path(__file__).resolve().parent))
 import usage  # noqa: E402
-from fake_server import CHILD, MOVIES, SHARED, SHARED_NAME, Stub, copy, server  # noqa: E402
+from fake_server import ADULT, CHILD, MOVIES, PRIVATE, PRIVATE_NAME, SHARED, SHARED_NAME, Stub, copy, server  # noqa: E402
 
 # The stub numbers what the stage creates from 100: the playlist, the one to delete, the collection, the one to delete.
 PLAYLIST, DOOMED_PLAYLIST, COLLECTION, DOOMED_COLLECTION = (f"{n:032x}" for n in range(100, 104))
@@ -75,10 +75,19 @@ class UsageStage(unittest.TestCase):
                        "image BoxSet Round trip collection Primary", "image Playlist Round trip playlist renamed -",
                        "item Round trip edited movie lock=1 fields=Name,Overview overview=37",
                        f"shares synthetic-adult {SHARED_NAME} = -",
-                       "shares synthetic-adult Round trip playlist renamed = error=403"):
+                       "shares synthetic-adult Round trip playlist renamed = error=403",
+                       f"entries synthetic-adult {PRIVATE_NAME} = -",
+                       "video Rowan Ferry sources=1 parts=0", "video Rowan Ferry Extended sources=1 parts=0",
+                       "video Saffron Gate sources=2 parts=0", "video Saffron Gate Extended sources=1 parts=0",
+                       "rated synthetic-child Season -", "rated synthetic-child Episode -", "videos -"):
             self.assertIn(wanted, lines)
-        # the share was removed as the playlist's owner, through its own web session
+        # the share was removed and the playlist emptied as their owner, through its own web session
         self.assertIn(("DELETE", f"/Playlists/{SHARED}/Users/{CHILD}"), stub.calls)
+        self.assertIn(("DELETE", f"/Playlists/{PRIVATE}/Items"), stub.calls)
+        self.assertEqual(stub.private, [])
+        # both pairs split, and the third copy merged into the second's primary: listed no more
+        self.assertFalse(any(line.startswith("video Saffron Gate Remastered ") for line in lines))
+        self.assertEqual(stub.versions, {f"{0x24:032x}": f"{0x22:032x}"})
         self.assertEqual(stub.shares, [])
         self.assertTrue(any(line.startswith("user roundtrip-passwordless admin=0 disabled=0 hidden=1 folders=1 ")
                             and line.endswith(" sessions=2 audio=deu subs=Always autoplay=0") for line in lines))
@@ -148,7 +157,11 @@ class UsageStage(unittest.TestCase):
                 (f"/Items/{MOVIES[5]}", "edit and lock Movie 6"),
                 (f"/Items/{DOOMED_PLAYLIST}", "delete the playlist Round trip deleted playlist"),
                 (f"/Items/{DOOMED_COLLECTION}", "delete the collection Round trip deleted collection"),
-                (f"DELETE /Playlists/{SHARED}/Users", f"unshare {SHARED_NAME}")):
+                (f"DELETE /Playlists/{SHARED}/Users", f"unshare {SHARED_NAME}"),
+                (f"/Videos/{0x20:032x}/AlternateSources", "split Rowan Ferry"),
+                (f"/Videos/{0x22:032x}/AlternateSources", "split Saffron Gate"),
+                ("/Videos/MergeVersions", "merge Saffron Gate Remastered into Saffron Gate"),
+                (f"DELETE /Playlists/{PRIVATE}/Items", f"empty {PRIVATE_NAME}")):
             with self.subTest(drop=drop):
                 status, err = self.run_stage(Stub(drop=drop))
                 self.assertEqual(status, 1)
@@ -206,11 +219,29 @@ class UsageStage(unittest.TestCase):
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
         api_server = usage.api.Server(f"http://127.0.0.1:{httpd.server_port}", self.data)
-        self.assertEqual(usage.answers.share_lines(api_server, self.data), [f"shares synthetic-adult {SHARED_NAME} = synthetic-child:0"])
+        self.assertEqual(usage.answers.share_lines(api_server, self.data), [
+            f"entries synthetic-adult {SHARED_NAME} = -", f"entries synthetic-adult {PRIVATE_NAME} = Movie 1,Movie 2",
+            f"shares synthetic-adult {SHARED_NAME} = synthetic-child:0", f"shares synthetic-adult {PRIVATE_NAME} = error=403"])
         with closing(sqlite3.connect(self.data / "data" / "jellyfin.db")) as db:
             db.execute("DELETE FROM Devices WHERE AccessToken = 'adulttoken'")
             db.commit()
         self.assertEqual(usage.answers.share_lines(api_server, self.data), ["shares synthetic-adult no session"])
+
+    def test_a_playlist_has_a_user_data_line_for_its_own_data_alone(self):
+        # An empty playlist is played, and upstream then lists another user's private one too: what the played and
+        # resumable filters say of a playlist derives from its items, which have lines of their own.
+        class Playlists(Stub):
+            def filtered(self, name, user):
+                playlist = {"Id": PRIVATE, "Type": "Playlist", "UserData": {"Played": True, "IsFavorite": True}}
+                return [*super().filtered(name, user), *([playlist] if user == ADULT or name == "IsPlayed" else [])]
+
+        httpd = server(Playlists())
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        lines = usage.answers.user_data_lines(usage.api.Server(f"http://127.0.0.1:{httpd.server_port}", self.data))
+        self.assertEqual([line for line in lines if PRIVATE in line],
+                         [f"userdata synthetic-adult {PRIVATE} played=1 fav=1 resume=0"])   # its favourite, its own
 
     def test_a_created_item_without_an_id_is_named(self):
         class NoId(Stub):

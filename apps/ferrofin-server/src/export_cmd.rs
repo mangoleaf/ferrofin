@@ -15,13 +15,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use ferrofin_core::config_export::{self, ConfigExport, LiveTvExport};
 use ferrofin_db::export::{
-    ContainerFile, DOCKER, DatabaseEdits, EXPORTED_DATABASE, ExportSummary, HistoryRewrite,
-    LOSS_REPORT, LeftOut, LibraryContainer, Preflight, SourceDirs,
+    ContainerFile, DOCKER, DatabaseEdits, EXPORTED_DATABASE, ExportSummary, LOSS_REPORT, LeftOut,
+    LibraryContainer, Preflight, SourceDirs,
 };
 
 use crate::config::Config;
 
-mod plugins;
+pub mod plugins;
 
 /// The `export-jellyfin` subcommand's arguments. The source is the data
 /// directory the server would use (`--data-dir`, `FERROFIN_DATA_DIR`,
@@ -325,6 +325,11 @@ fn print_summary(
             history.recorded.len(),
             history.left_to_run.len()
         );
+    } else {
+        println!(
+            "Its Jellyfin migration history (the database was never adopted from Jellyfin): the {} migrations a fresh install of Jellyfin records, so Jellyfin runs none on its first start.",
+            history.recorded.len()
+        );
     }
     if replaced {
         println!(
@@ -534,7 +539,7 @@ fn loss_report(
         report.push_str("  None.\n");
     }
 
-    first_start(&mut report, &edits.history, inputs.database_bytes);
+    first_start(&mut report, edits, inputs.database_bytes);
 
     report.push_str("\nSettings Jellyfin is not given:\n");
     for setting in &configuration.not_exported {
@@ -821,15 +826,23 @@ fn plugin_lines(report: &mut String, plugins: &plugins::PluginsExport) {
 }
 
 /// The loss report's section on what Jellyfin changes on its first start: the
-/// code migrations `history` leaves to run, and the room they take beside a
-/// database of `database_bytes`.
-fn first_start(report: &mut String, history: &HistoryRewrite, database_bytes: u64) {
+/// code migrations the history `edits` wrote leaves to run, each with the rows
+/// it changes where they were counted, the room they take beside a database of
+/// `database_bytes`, and the code migrations it records as applied, with why.
+fn first_start(report: &mut String, edits: &DatabaseEdits, database_bytes: u64) {
     use std::fmt::Write as _;
 
+    let (history, counts) = (&edits.history, &edits.counts);
+    let routine = |report: &mut String, name: &str, text: &str| {
+        let _ = writeln!(report, "  {name}: {text}.");
+        if let Some(here) = counts.note(name) {
+            let _ = writeln!(report, "    Here: {here}.");
+        }
+    };
     report.push_str("\nWhat Jellyfin will change on its first start");
     let Some(generation) = history.generation else {
         report.push_str(
-            ":\n  Not known: the database was never adopted from Jellyfin, so it has no Jellyfin migration history.\n",
+            ":\n  None: the database was never adopted from Jellyfin, so its history is the one a fresh install of Jellyfin records, and Jellyfin runs no migration.\n",
         );
         return;
     };
@@ -837,23 +850,32 @@ fn first_start(report: &mut String, history: &HistoryRewrite, database_bytes: u6
         report,
         ", running the code migrations its history leaves out (the database was adopted as Jellyfin {generation}):"
     );
-    for (routine, effect) in ferrofin_db::export::first_start_effects(&history.left_to_run) {
-        let _ = writeln!(report, "  {routine}: {effect}.");
+    for (name, effect) in ferrofin_db::export::first_start_effects(&history.left_to_run) {
+        routine(report, name, effect);
     }
     if history.left_to_run.is_empty() {
         report.push_str("  None.\n");
-        return;
+    } else {
+        // One copy for the backup, one for the VACUUM that follows the migrations.
+        // Jellyfin copies only for a routine marked `JellyfinMigrationBackup(JellyfinDb
+        // = true)`; every set a supported source leaves holds one
+        // (HarmonizeConflictingUserData among them), so every non-empty one copies.
+        let _ = writeln!(
+            report,
+            "  Before them Jellyfin copies the database ({}) into data/SQLiteBackups, and after them it rebuilds it, so the output's volume needs about {} free besides the export. A start whose migrations fail restores the database from that copy and keeps the copy, one more each time.",
+            mebibytes(database_bytes),
+            mebibytes(database_bytes.saturating_mul(2))
+        );
     }
-    // One copy for the backup, one for the VACUUM that follows the migrations.
-    // Jellyfin copies only for a routine marked `JellyfinMigrationBackup(JellyfinDb
-    // = true)`; every set a supported source leaves holds one
-    // (HarmonizeConflictingUserData among them), so every non-empty one copies.
-    let _ = writeln!(
-        report,
-        "  Before them Jellyfin copies the database ({}) into data/SQLiteBackups, and after them it rebuilds it, so the output's volume needs about {} free besides the export. A start whose migrations fail restores the database from that copy and keeps the copy, one more each time.",
-        mebibytes(database_bytes),
-        mebibytes(database_bytes.saturating_mul(2))
-    );
+    let applied = ferrofin_db::export::recorded_as_applied(&history.recorded);
+    if !applied.is_empty() {
+        report.push_str(
+            "\nWhat Jellyfin does not run, as Ferrofin already did it (its history marks it done):\n",
+        );
+        for (name, why) in applied {
+            routine(report, name, why);
+        }
+    }
 }
 
 /// `n` and the noun for it, `one` or `many`.
@@ -1122,8 +1144,8 @@ async fn write_configuration(export: &ConfigExport, out: &Path) -> anyhow::Resul
 mod tests {
     use ferrofin_core::config_export::{ConfigExport, LiveTvExport, NotExported};
     use ferrofin_db::export::{
-        CarriedRows, ContainerFile, DatabaseEdits, DroppedObjects, DroppedTable, HistoryRewrite,
-        LibraryContainer, MirroredLiveTv,
+        CarriedRows, ContainerFile, DatabaseEdits, DroppedObjects, DroppedTable, FirstStartCounts,
+        HistoryRewrite, LibraryContainer, MirroredLiveTv,
     };
 
     use super::{ReportInputs, amount, loss_report, mebibytes, plugins};
@@ -1167,15 +1189,20 @@ mod tests {
         };
     }
 
-    /// Every kind of line the report has, in its order: the golden file is
-    /// what an operator reads.
-    #[test]
-    fn the_loss_report_reads_as_its_golden_file() {
-        let edits = DatabaseEdits {
+    /// The database edits of [`the_loss_report_reads_as_its_golden_file`]: every kind of
+    /// first-start line among them.
+    fn golden_edits() -> DatabaseEdits {
+        DatabaseEdits {
             history: HistoryRewrite {
                 generation: Some("10.11.8"),
-                recorded: vec!["20260113102337_AddLinkedChildrenTable"],
+                recorded: vec![
+                    "20260113102337_AddLinkedChildrenTable",
+                    "20260113120000_MigrateLinkedChildren",
+                    "20260115120000_FixIncorrectOwnerIdRelationships",
+                    "20260915120000_MigrateRatingLevels",
+                ],
                 left_to_run: vec![
+                    "20260508130000_MergeDuplicatePeople",
                     "20260522092304_UpdateNormalizedUsername",
                     "20260531160000_DisableLegacyAuthorization",
                     "20260912120000_HarmonizeConflictingUserData",
@@ -1201,8 +1228,22 @@ mod tests {
                 },
                 ..CarriedRows::default()
             },
+            counts: FirstStartCounts {
+                shared_paths: 2,
+                persons: 1,
+                credits: 3,
+                play_states: 1,
+                ..FirstStartCounts::default()
+            },
             ..DatabaseEdits::default()
-        };
+        }
+    }
+
+    /// Every kind of line the report has, in its order: the golden file is
+    /// what an operator reads.
+    #[test]
+    fn the_loss_report_reads_as_its_golden_file() {
+        let edits = golden_edits();
         let configuration = ConfigExport {
             files: Vec::new(),
             not_exported: vec![NotExported {
@@ -1271,9 +1312,9 @@ mod tests {
         );
     }
 
-    /// A Ferrofin-native database has no Jellyfin history to tell what
-    /// Jellyfin runs from, and a source without backups or task state leaves
-    /// nothing outside the database.
+    /// A Ferrofin-native database is given a fresh install's history, on
+    /// which Jellyfin runs nothing, and a source without backups or task
+    /// state leaves nothing outside the database.
     #[test]
     fn an_empty_section_says_so() {
         let edits = DatabaseEdits {
@@ -1287,7 +1328,7 @@ mod tests {
         let report = loss_report(&edits, &ConfigExport::default(), &ReportInputs::default());
         assert!(
             report.contains(
-                "What Jellyfin will change on its first start:\n  Not known: the database was never adopted from Jellyfin, so it has no Jellyfin migration history.\n\nSettings Jellyfin is not given:\n  Settings given"
+                "What Jellyfin will change on its first start:\n  None: the database was never adopted from Jellyfin, so its history is the one a fresh install of Jellyfin records, and Jellyfin runs no migration.\n\nSettings Jellyfin is not given:\n  Settings given"
             ),
             "{report}"
         );

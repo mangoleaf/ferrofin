@@ -72,6 +72,11 @@ FROM ${WEB_IMAGE} AS web
 
 # ── server binary ───────────────────────────────────────────────────────
 FROM rust:1.100.0-trixie AS build
+# cmake builds the libjpeg-turbo that turbojpeg-sys vendors, and nasm assembles its
+# x86-64 SIMD (require-simd fails the build without it; arm64 uses Neon intrinsics).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cmake nasm \
+ && rm -rf /var/lib/apt/lists/*
 # cargo-auditable embeds the crate list in the binary (a .dep-v0 section) for `cargo audit bin`
 # and image scanners; release.yml installs the same version. Before COPY, so a rebuild keeps it.
 RUN cargo install --locked cargo-auditable@0.7.7

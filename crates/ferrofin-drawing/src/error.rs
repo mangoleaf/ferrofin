@@ -8,7 +8,7 @@
 //! `ServiceError::Backend(String)`. Converting via [`From`] boxes the typed
 //! error into [`ServiceError::BackendSource`],
 //! so the underlying [`std::io::Error`] / [`image::ImageError`] /
-//! [`jpeg_encoder::EncodingError`] stays reachable
+//! [`turbojpeg::Error`] stays reachable
 //! through [`Error::source`](std::error::Error::source) for logging and tests.
 //!
 //! Pure *semantic* failures (empty path → `400`, missing file → `404`, an
@@ -49,18 +49,18 @@ pub enum DrawingError {
         source: image::ImageError,
     },
 
-    /// The `jpeg-encoder` crate failed to write a JPEG to its output file.
+    /// libjpeg-turbo (the `turbojpeg` crate) failed to write a JPEG.
     ///
-    /// JPEG is written by `jpeg-encoder` rather than by the `image` crate so the
-    /// chroma subsampling can be pinned to 4:2:0 (Skia's default); that encoder
-    /// has its own error type, hence a separate variant.
+    /// JPEG is written by libjpeg-turbo, the codec inside Skia, rather than by
+    /// the `image` crate, whose encoder is fixed at 4:4:4; it has its own error
+    /// type, hence a separate variant.
     #[error("{context}: {source}")]
     JpegEncode {
         /// The operation and path, e.g. `"encode /cache/a.jpg"`.
         context: String,
         /// The underlying codec failure.
         #[source]
-        source: jpeg_encoder::EncodingError,
+        source: turbojpeg::Error,
     },
 
     /// libwebp (the `webp` crate) failed to write a WebP: an empty picture, or
@@ -94,7 +94,7 @@ impl DrawingError {
     }
 
     /// Builds a [`DrawingError::JpegEncode`] tagging `source` with a `context` label.
-    pub fn jpeg_encode(context: impl Into<String>, source: jpeg_encoder::EncodingError) -> Self {
+    pub fn jpeg_encode(context: impl Into<String>, source: turbojpeg::Error) -> Self {
         Self::JpegEncode {
             context: context.into(),
             source,

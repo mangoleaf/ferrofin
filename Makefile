@@ -57,7 +57,8 @@ GATE_SCRIPTS = gates/lib.sh gates/isolation.sh gates/run gates/verify/run.sh gat
 	gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh \
 	gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh gates/bench/testdata/build.sh \
 	gates/roundtrip/lib.sh gates/roundtrip/run.sh gates/roundtrip/routes.sh gates/roundtrip/stage_ferrofin.sh \
-	gates/roundtrip/stage_export.sh gates/roundtrip/stage_jellyfin.sh gates/roundtrip/tests/fake_docker
+	gates/roundtrip/stage_export.sh gates/roundtrip/stage_jellyfin.sh gates/roundtrip/stage_drift.sh \
+	gates/roundtrip/tests/fake_docker
 GATE_TESTS = gates/tests gates/verify/tests gates/adoption/tests gates/parity/tests gates/roundtrip/tests
 
 test-gates-offline:

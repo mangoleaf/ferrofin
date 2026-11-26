@@ -285,6 +285,24 @@ impl FerrofinDeviceManager {
     }
 }
 
+/// Orders devices as C# `GetDevicesForUser` does: most recently active first,
+/// then `ThenBy(d => d.DeviceId)` with `Comparer<string>.Default`, the current
+/// culture's compare (ordinal when no comparer can be built).
+fn sort_by_activity(devices: &mut [DeviceEntity]) {
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    devices.sort_by(|a, b| {
+        b.date_last_activity
+            .cmp(&a.date_last_activity)
+            .then_with(|| {
+                comparer.as_ref().map_or_else(
+                    || a.device_id.cmp(&b.device_id),
+                    |comparer| comparer.compare(&a.device_id, &b.device_id),
+                )
+            })
+    });
+}
+
 /// The user-scoped half of the per-device access check, resolved once per
 /// listing (see [`FerrofinDeviceManager::resolve_access`]).
 enum DeviceAccess {
@@ -400,10 +418,11 @@ impl DeviceManager for FerrofinDeviceManager {
         &self,
         user_id: Option<Uuid>,
     ) -> Result<QueryResult<DeviceInfoDto>, ServiceError> {
-        // All devices, most recently active first (C# ordering).
-        let devices = self.repo.all_by_last_activity().await?;
+        let mut devices = self.repo.all_by_last_activity().await?;
+        sort_by_activity(&mut devices);
 
-        let user = match user_id {
+        // C# `!userId.IsNullOrEmpty()`: the nil id (an API key's caller) filters nothing.
+        let user = match user_id.filter(|id| !id.is_nil()) {
             Some(id) => {
                 let row = sqlx::query_as::<_, UserEntity>(
                     r#"SELECT * FROM "Users" WHERE "Id" = ?1 LIMIT 1"#,
@@ -892,6 +911,35 @@ mod tests {
             ids(&mgr.get_devices_for_user(None).await.expect("list")),
             vec!["dev-a", "dev-b"]
         );
+        // The nil id (an API key's caller) is "no user" too, as C# `IsNullOrEmpty`.
+        assert_eq!(
+            ids(&mgr
+                .get_devices_for_user(Some(Uuid::nil()))
+                .await
+                .expect("list")),
+            vec!["dev-a", "dev-b"]
+        );
+    }
+
+    /// C# `ThenBy(d => d.DeviceId)` compares in the current culture, where
+    /// `Dev-c` sorts after `dev-b`; an ordinal compare puts it first.
+    #[tokio::test]
+    async fn equal_activity_tiebreaks_in_the_current_culture() {
+        let db = test_db().await;
+        let uid = Uuid::from_u128(16);
+        seed_user(&db, uid).await;
+        let mgr = FerrofinDeviceManager::new(db);
+
+        let now = Utc::now();
+        for device_id in ["dev-b", "Dev-c", "dev-a"] {
+            device_at(&mgr, uid, device_id, now).await;
+        }
+
+        let listed = ferrofin_util::current_culture::scope("en-US".to_owned(), async {
+            mgr.get_devices_for_user(None).await.expect("list")
+        })
+        .await;
+        assert_eq!(ids(&listed), vec!["dev-a", "dev-b", "Dev-c"]);
     }
 
     /// The per-device `DeviceOptions` and `Users` reads became one batched read

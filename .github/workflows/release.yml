@@ -331,8 +331,19 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-auditable@0.7.7
+      # turbojpeg-sys builds its vendored libjpeg-turbo with cmake (on the macOS and
+      # Windows images already). Its x86-64 SIMD is assembled with nasm, which
+      # require-simd makes a hard requirement; aarch64 uses Neon intrinsics.
+      - if: contains(matrix.target, 'linux')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          choco install nasm --no-progress -y
+          echo 'C:\Program Files\NASM' >> "$GITHUB_PATH"
       # Linux builds use zig as the C toolchain, linked against GLIBC_FLOOR (the
-      # aarch64 cross-build also needs it for the C in bundled SQLite and aws-lc-sys).
+      # aarch64 cross-build also needs it for the C in bundled SQLite, aws-lc-sys
+      # and libjpeg-turbo).
       - if: contains(matrix.target, 'linux')
         run: |
           # The pair v1.3.2's aarch64 build used; move both together, deliberately.
@@ -443,7 +454,8 @@ jobs:
           set -eu
           name="ferrofin-$GITHUB_REF_NAME-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp LICENSE README.md "dist/$name/"
+          # copyright carries libjpeg-turbo's licence text, which it asks binary distributions to include.
+          cp LICENSE README.md contrib/debian/copyright "dist/$name/"
           case "${{ matrix.target }}" in
             *windows*) cp "target/${{ matrix.target }}/release/ferrofin-server.exe" "dist/$name/"
                        (cd dist && 7z a -bd "$name.zip" "$name" > /dev/null && sha256sum "$name.zip" > "$name.zip.sha256") ;;

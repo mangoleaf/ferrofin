@@ -1,7 +1,8 @@
-//! Adopting a Jellyfin install's settings for the metadata plugins Jellyfin
-//! builds in (TMDb, OMDb, MusicBrainz, `AudioDB`, Studio Images). Each one's
-//! `PluginConfiguration` document comes across once from Jellyfin's
-//! `{program data}/plugins/configurations/<assembly>.xml`
+//! Adopting a Jellyfin install's plugin settings: those of the metadata plugins
+//! Jellyfin builds in (TMDb, OMDb, MusicBrainz, `AudioDB`, Studio Images) and of
+//! the plugins Ferrofin has a compiled-in counterpart of, which the composition
+//! root names. Each one's `PluginConfiguration` document comes across once from
+//! Jellyfin's `{program data}/plugins/configurations/<assembly>.xml`
 //! (`BasePlugin<T>.ConfigurationFilePath`, `BasePluginOfT.cs:125,131`) into the
 //! plugin's `config.json`, so an adopted server keeps the settings its admin
 //! chose instead of coming up at the defaults.
@@ -15,12 +16,12 @@
 //! The import runs per plugin, and only while that plugin has no
 //! `config.json`, so a second boot, or an admin's later edit, is never
 //! overwritten. The file it writes is what marks it done. The previous
-//! version, running beside this one in a rolling update, never reads these
-//! documents and writes a plugin's `config.json` only when an admin saves it,
-//! so it cannot undo the import.
+//! version, running beside this one in a rolling update, writes a plugin's
+//! `config.json` only when an admin saves it, so it cannot undo the import.
 
 use std::path::Path;
 
+use ferrofin_common::config_import::{Node, parse};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::PluginManager;
 use uuid::Uuid;
@@ -93,15 +94,16 @@ async fn import(
     let default: serde_json::Value =
         serde_json::from_slice(&plugins.get_plugin_configuration(id).await?)
             .map_err(|e| ServiceError::backend(format!("default configuration: {e}")))?;
-    // No member is denied: none of the five documents holds a path into
-    // Jellyfin's container, and TMDb's API key is the admin's own, kept in the
-    // same `config.json` the settings page writes.
-    let mut imported = config_import::import_over(&string_lists(&default), &xml, ROOT_ELEMENT, &[])
-        .map_err(|_| {
-            // The parser's message can quote the document's text (an unknown
-            // `&name;` entity), an API key's included, so none of it is logged.
-            ServiceError::backend("not a readable PluginConfiguration document")
-        })?;
+    // The parser's message can quote the document's text (an unknown `&name;`
+    // entity), a key or a password included, so none of it is logged.
+    let unreadable = |_| ServiceError::backend("not a readable PluginConfiguration document");
+    let shape = list_shapes(&default, &parse(&xml).map_err(unreadable)?);
+    // No member is denied: no document holds a path into Jellyfin's container
+    // (Merge Versions' and Intro Skipper's excluded paths are the libraries',
+    // which adoption keeps as they are), and a key or an account is the admin's
+    // own, kept in the same `config.json` the settings page writes.
+    let mut imported =
+        config_import::import_over(&shape, &xml, ROOT_ELEMENT, &[]).map_err(unreadable)?;
     empty_untouched_lists(&default, &mut imported);
     let bytes = serde_json::to_vec(&imported)
         .map_err(|e| ServiceError::backend(format!("serialize: {e}")))?;
@@ -109,23 +111,43 @@ async fn import(
     Ok(true)
 }
 
-/// `default` with one empty-string entry in each empty list. The importer types
-/// a list's entries after the default's, and every list in these documents is
-/// a `string[]` upstream (TMDb's library ids), so an id whose text looks like a
-/// number is still read as a string.
-fn string_lists(default: &serde_json::Value) -> serde_json::Value {
+/// `default` with an entry in each empty list, to type the document's entries
+/// by: the importer types a list's entries after the default's. Every list in
+/// these documents holds text, either a `string[]` (TMDb's library ids, Intro
+/// Skipper's exclusions) or objects whose members are all text (File
+/// Transformation's `PluginDefinedTransformation`, a `Guid` and three strings).
+/// So the entry is an empty string, or an object holding each member the
+/// document's entries have, empty, and an id or a search text that looks like
+/// a number or a bool is still read as text.
+///
+/// shortcut: an entry's members are all read as text; a plugin whose entries
+/// hold a number, a bool or a list needs its entry shape declared.
+fn list_shapes(default: &serde_json::Value, document: &Node) -> serde_json::Value {
     let mut shape = default.clone();
     if let serde_json::Value::Object(members) = &mut shape {
-        for value in members.values_mut() {
-            if value.as_array().is_some_and(Vec::is_empty) {
-                *value = serde_json::json!([""]);
+        for (name, value) in members.iter_mut() {
+            if !value.as_array().is_some_and(Vec::is_empty) {
+                continue;
             }
+            let entry: serde_json::Map<String, serde_json::Value> = document
+                .children
+                .iter()
+                .filter(|list| list.name == *name)
+                .flat_map(|list| &list.children)
+                .flat_map(|entry| &entry.children)
+                .map(|member| (member.name.clone(), serde_json::json!("")))
+                .collect();
+            *value = if entry.is_empty() {
+                serde_json::json!([""])
+            } else {
+                serde_json::json!([entry])
+            };
         }
     }
     shape
 }
 
-/// Puts back empty each list [`string_lists`] gave an entry that the document
+/// Puts back empty each list [`list_shapes`] gave an entry that the document
 /// did not replace.
 fn empty_untouched_lists(default: &serde_json::Value, imported: &mut serde_json::Value) {
     if let (serde_json::Value::Object(defaults), serde_json::Value::Object(members)) =
