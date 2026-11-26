@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferrofin_traits::external_identities::{ExternalIdentity, ExternalIdentityKey};
+use ferrofin_traits::external_identities::{
+    ConditionalLink, ExternalIdentity, ExternalIdentityKey, LinkBy,
+};
 use ferrofin_traits::remote_images::RemoteImageError;
 use serde_json::{Value, json};
 
@@ -181,6 +183,14 @@ impl ExternalIdentityStore for CountingLinks {
         avatar_hash: Option<&str>,
     ) -> Result<ExternalIdentity, ServiceError> {
         self.inner.link(user_id, identity, avatar_hash).await
+    }
+    async fn link_unless_taken(
+        &self,
+        user_id: Uuid,
+        identity: ExternalIdentityKey<'_>,
+        by: LinkBy,
+    ) -> Result<ConditionalLink, ServiceError> {
+        self.inner.link_unless_taken(user_id, identity, by).await
     }
     async fn set_avatar_hash(
         &self,
@@ -479,15 +489,32 @@ fn a_logged_picture_url_keeps_its_scheme_and_host_only() {
 /// userinfo for the picture.
 #[tokio::test]
 async fn a_link_flow_never_asks_userinfo_for_the_picture() {
+    use ferrofin_traits::session::SessionManager as _;
     use ferrofin_traits::sso::SsoManager as _;
     let harness = syncing(Arc::new(FakeImages::default())).await;
     picture_claim(&harness, Value::Null);
     let user = harness.users.create_user("linker").await.expect("created");
+    let user_id = Uuid::parse_str(&user.id).expect("an id");
+    let password = ferrofin_model::secret::Secret::new("linker-password");
+    harness
+        .users
+        .change_password(user_id, password.expose())
+        .await
+        .expect("password set");
+    let session = harness
+        .sessions
+        .authenticate_new_session(&ferrofin_traits::session::AuthenticationRequest {
+            username: Some("linker".to_owned()),
+            password: Some(password.clone()),
+            ..crate::sso::sign_in::tests::device("linker-browser")
+        })
+        .await
+        .expect("signed in");
     let client = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
     let started = Harness::started(
         harness
             .sso
-            .start_oidc_link("fake", Uuid::parse_str(&user.id).expect("an id"), client)
+            .start_oidc_link("fake", user_id, &password, &session.access_token, client)
             .await
             .expect("starts"),
     );

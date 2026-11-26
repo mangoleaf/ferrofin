@@ -393,6 +393,31 @@ fn season_zero_uses_specials_marker() {
     );
 }
 
+/// A negative season number is padded as C#'s `ToString("00")` pads it, sign
+/// in front (`LocalImageProvider.cs:422`), the name the image saver writes.
+#[test]
+fn a_negative_season_finds_its_sign_padded_marker() {
+    let season = ImageItem {
+        kind: ImageItemKind::Season,
+        name: "Season -1".to_owned(),
+        path: None,
+        containing_folder_path: None,
+        file_name_without_extension: None,
+        is_in_mixed_folder: false,
+        index_number: Some(-1),
+        series_folder_path: Some("/media/series".to_owned()),
+        physical_locations: Vec::new(),
+    };
+    let mut fs = FakeDirectoryService::new();
+    fs.file("/media/series", "season-01-poster.png");
+    let images = LocalImageProvider::get_images(&season, &fs);
+    assert!(
+        images
+            .iter()
+            .any(|i| i.file_info.name == "season-01-poster.png")
+    );
+}
+
 /// A season in its own folder, as the scan sees it: its folder is
 /// `/media/series/Season 1`, its series' folder `/media/series`.
 fn folder_season(series_folder: Option<&str>) -> ImageItem {
@@ -897,5 +922,54 @@ fn found_images_become_rows_dated_by_their_files() {
             height: 0,
             blur_hash: None,
         }]
+    );
+}
+
+/// `ImageSaver.GetStandardSavePath`'s names for a save that is not local, by
+/// item kind, short or as stored: the per-type table, then the type's name
+/// lower-cased, and an unnamed type's number (`Enum.ToString`).
+#[rstest::rstest]
+#[case("Movie", ImageType::Primary, "poster")]
+#[case(
+    "MediaBrowser.Controller.Entities.Audio.MusicAlbum",
+    ImageType::Primary,
+    "folder"
+)]
+#[case("PhotoAlbum", ImageType::Primary, "folder")]
+#[case("MusicArtist", ImageType::Primary, "folder")]
+#[case("Series", ImageType::Art, "clearart")]
+#[case("Series", ImageType::BoxRear, "back")]
+#[case("Series", ImageType::Thumb, "landscape")]
+#[case("MusicAlbum", ImageType::Disc, "cdart")]
+#[case("Movie", ImageType::Disc, "disc")]
+#[case("Movie", ImageType::Backdrop, "backdrop")]
+#[case("Movie", ImageType::Banner, "banner")]
+#[case("Movie", ImageType::Logo, "logo")]
+#[case("Movie", ImageType::Box, "box")]
+#[case("Movie", ImageType::Menu, "menu")]
+#[case("Movie", ImageType::Screenshot, "screenshot")]
+#[case("Person", ImageType::Profile, "profile")]
+#[case("Movie", ImageType::Unrecognized(42), "42")]
+fn internal_images_are_named_as_upstream_saves_them(
+    #[case] kind: &str,
+    #[case] image_type: ImageType,
+    #[case] stem: &str,
+) {
+    assert_eq!(internal_image_stem(kind, image_type), stem);
+}
+
+/// An item's own folders: Jellyfin's `{xx}/{idN}` first, then the `{ID}`
+/// and `{id}` folders earlier builds saved art in.
+#[test]
+fn an_items_own_folders_put_jellyfins_layout_first() {
+    let id = uuid::Uuid::parse_str("0c6efd17-cf3f-915e-4920-09bd22e572ed").unwrap();
+    let root = std::path::Path::new("/meta/library");
+    assert_eq!(
+        internal_metadata_dirs(root, id),
+        [
+            root.join("0c/0c6efd17cf3f915e492009bd22e572ed"),
+            root.join("0C6EFD17-CF3F-915E-4920-09BD22E572ED"),
+            root.join("0c6efd17-cf3f-915e-4920-09bd22e572ed"),
+        ]
     );
 }

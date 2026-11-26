@@ -18,9 +18,10 @@ use rstest::rstest;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
 use super::{
-    MetadataResult, RefreshAnswers, RefreshMerge, is_valid_provider_id, language_subtag,
-    matches_preferred_language, merge_data, merge_people, merge_provider_ids, merge_refresh,
-    pass_credits, set_provider_ids, settle_sort_name,
+    MetadataResult, RefreshAnswers, RefreshMerge, audio_sort_name, episode_sort_name,
+    is_valid_provider_id, language_subtag, matches_preferred_language, merge_data, merge_people,
+    merge_provider_ids, merge_refresh, pass_credits, season_sort_name, set_provider_ids,
+    settle_sort_name, stored_people, supports_people,
 };
 
 /// The stored `Type` name for `kind`.
@@ -1925,6 +1926,26 @@ fn refresh_with_providers_foreign_person_provider_id_not_stored(
     assert_eq!(people[0].provider_id, None);
 }
 
+/// A negative number in a season's, an episode's or a track's sort name is
+/// padded as C#'s `"000 - "` and `"0000 - "` formats pad it: its digits to the
+/// width, the sign in front (`Season.cs:157`, `Episode.cs:244-245`,
+/// `Audio.cs:96-97`).
+#[rstest]
+#[case(Some(-1), Some(-2), "-001 - -0002 - Pilot", "-0001 - -0002 - Pilot", "-0002")]
+#[case(Some(1), Some(12), "001 - 0012 - Pilot", "0001 - 0012 - Pilot", "0012")]
+#[case(None, Some(-12345), "-12345 - Pilot", "-12345 - Pilot", "-12345")]
+fn a_negative_number_sorts_as_csharp_formats_it(
+    #[case] parent_index: Option<i64>,
+    #[case] index: Option<i64>,
+    #[case] episode: &str,
+    #[case] track: &str,
+    #[case] season: &str,
+) {
+    assert_eq!(episode_sort_name(parent_index, index, "Pilot"), episode);
+    assert_eq!(audio_sort_name(parent_index, index, "Pilot"), track);
+    assert_eq!(season_sort_name(index, "Pilot"), season);
+}
+
 /// The sort key a refresh settles, by kind: a forced one wins, an episode, a
 /// season and a track sort by number, a person by its name verbatim
 /// (`Person.EnableAlphaNumericSorting => false`), anything else by the
@@ -2066,4 +2087,107 @@ fn members_edited_follows_upstreams_metadata_edit_comparisons(
     let mut after = before.clone();
     change(&mut after);
     assert_eq!(super::members_edited(&before, &after), edited);
+}
+
+/// `SupportsPeople`, as `ferrofin_core::kinds::supports_people` answers it:
+/// true where a class overrides it so, false on `BaseItem` and the playlist,
+/// by-name and person kinds.
+#[rstest]
+#[case(Some(BaseItemKind::Movie), true)]
+#[case(Some(BaseItemKind::Episode), true)]
+#[case(Some(BaseItemKind::MusicVideo), true)]
+#[case(Some(BaseItemKind::Trailer), true)]
+#[case(Some(BaseItemKind::Video), true)]
+#[case(Some(BaseItemKind::Series), true)]
+#[case(Some(BaseItemKind::Season), true)]
+#[case(Some(BaseItemKind::Audio), true)]
+#[case(Some(BaseItemKind::AudioBook), true)]
+#[case(Some(BaseItemKind::Book), true)]
+#[case(Some(BaseItemKind::BoxSet), true)]
+#[case(Some(BaseItemKind::MusicAlbum), true)]
+#[case(Some(BaseItemKind::Playlist), false)]
+#[case(Some(BaseItemKind::Person), false)]
+#[case(Some(BaseItemKind::Genre), false)]
+#[case(Some(BaseItemKind::MusicGenre), false)]
+#[case(Some(BaseItemKind::Studio), false)]
+#[case(Some(BaseItemKind::MusicArtist), false)]
+#[case(Some(BaseItemKind::Year), false)]
+#[case(Some(BaseItemKind::Folder), false)]
+#[case(Some(BaseItemKind::LiveTvProgram), false)]
+#[case(None, false)]
+fn supports_people_follows_the_class_overrides(
+    #[case] kind: Option<BaseItemKind>,
+    #[case] expected: bool,
+) {
+    assert_eq!(supports_people(kind), expected, "{kind:?}");
+}
+
+/// A people store that credits every item with one actor.
+struct OneActorEach;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::persistence::PeopleRepository for OneActorEach {
+    async fn get_people(
+        &self,
+        _filter: &ferrofin_traits::options::InternalPeopleQuery,
+    ) -> Result<
+        ferrofin_model::querying::QueryResult<PeopleEntity>,
+        ferrofin_traits::error::ServiceError,
+    > {
+        Ok(ferrofin_model::querying::QueryResult {
+            items: vec![PeopleEntity {
+                name: "Stored Actor".into(),
+                person_type: Some("Actor".into()),
+                ..PeopleEntity::default()
+            }],
+            ..Default::default()
+        })
+    }
+    async fn update_people(
+        &self,
+        _item_id: uuid::Uuid,
+        _people: &[PeopleEntity],
+    ) -> Result<
+        Vec<ferrofin_traits::persistence::WrittenPerson>,
+        ferrofin_traits::error::ServiceError,
+    > {
+        unimplemented!("read-only fake")
+    }
+    async fn set_person_metadata(
+        &self,
+        _person_id: uuid::Uuid,
+        _metadata: ferrofin_traits::persistence::PersonMetadata,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        unimplemented!("read-only fake")
+    }
+    async fn get_people_names(
+        &self,
+        _filter: &ferrofin_traits::options::InternalPeopleQuery,
+    ) -> Result<Vec<String>, ferrofin_traits::error::ServiceError> {
+        unimplemented!("read-only fake")
+    }
+}
+
+/// The savers write a kind's stored credits as `GetPeople(item)` reads them:
+/// a box set's, never a music artist's or a playlist's, whatever an earlier
+/// build stored for one.
+#[rstest]
+#[case(BaseItemKind::BoxSet, vec!["Stored Actor"])]
+#[case(BaseItemKind::Movie, vec!["Stored Actor"])]
+#[case(BaseItemKind::MusicArtist, vec![])]
+#[case(BaseItemKind::Playlist, vec![])]
+#[tokio::test]
+async fn the_savers_read_no_credits_for_a_kind_without_people(
+    #[case] kind: BaseItemKind,
+    #[case] expected: Vec<&str>,
+) {
+    let row = BaseItemEntity {
+        type_: type_name(kind),
+        ..BaseItemEntity::default()
+    };
+    let people = stored_people(&OneActorEach, uuid::Uuid::from_u128(1), &row)
+        .await
+        .expect("read");
+    let names: Vec<&str> = people.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, expected, "{kind:?}");
 }

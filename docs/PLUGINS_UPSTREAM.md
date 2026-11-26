@@ -74,8 +74,12 @@ compare with.
     published, as automatic rows with an empty hash (upstream's schema upgrade
     does the same): the first pass replaces each with what it detects, or
     deletes it. Hand edits made before `0037`, and the plugin's own records of
-    them on an adopted database, are therefore not kept; nor are the plugin's
-    settings (`IntroSkipper.xml`). `docs/UPGRADING.md` tells operators.
+    them on an adopted database, are therefore not kept. `docs/UPGRADING.md`
+    tells operators. The plugin's settings are imported: on a boot where it has
+    no `config.json` yet, an adopted Jellyfin's
+    `plugins/configurations/IntroSkipper.xml` comes across once
+    (`crates/ferrofin-core/src/plugin_config_adoption.rs`; the owner lifted D3
+    for the settings file on 2026-11-24, gl-1935).
   - **Hashes:** Ferrofin's analysis hashes carry an analyzer-set token
     (`config_hash::ANALYZERS`), bumped when an analyzer lands, so earlier
     results are analysed again with it.
@@ -153,6 +157,10 @@ compare with.
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,
   vendored assets `crates/ferrofin-extensions/assets/filetransformation/`.
+- Adoption (`f4f01c3`): on a boot where the plugin has no `config.json` yet, an adopted
+  Jellyfin's `plugins/configurations/Jellyfin.Plugin.FileTransformation.xml` is imported
+  once (`crates/ferrofin-core/src/plugin_config_adoption.rs`): `DebugLoggingState` and the
+  settings page's `Transformations`, each `PluginDefinedTransformation`'s members as text.
 - Ahead of the pin: the `/web` response for a transformed file (`transform_web_file` in
   `apps/ferrofin-server/src/lib.rs`) follows `Infrastructure/FileTransformationMiddleware.cs`
   @ `0900de8f1`: an `ETag` of the first 8 bytes of SHA-256 over the transformed bytes,
@@ -195,6 +203,10 @@ compare with.
   `POST /Videos/MergeVersions` + `DELETE /Videos/{id}/AlternateSources`) stay
   in `crates/ferrofin-core/src/library_manager.rs` — those are core Jellyfin
   routes, not plugin surface.
+- Adoption (`e6f58d6`): on a boot where the plugin has no `config.json` yet, an adopted
+  Jellyfin's `plugins/configurations/Jellyfin.Plugin.MergeVersions.xml`
+  (`LocationsExcluded`) is imported once
+  (`crates/ferrofin-core/src/plugin_config_adoption.rs`).
 - Ported at 12.0 semantics (`e6f58d6`): provider-first episode merge key
   (Tvdb→Tmdb→Imdb → numbers → title, case-insensitive), transitive
   version-group expansion, existing-primary-preserving primary selection,
@@ -359,8 +371,9 @@ compare with.
   is only read. A missing file is silent; one that cannot be read or parsed, or a write that
   fails, is a warning, and the next boot tries again (`config.json` is written last, so its
   presence means the import finished). `scripts/migrate-jellyfin.sh` copies this file of
-  Jellyfin's `plugins/`, and the `Jellyfin.Plugin.*.xml` settings of the metadata plugins
-  Jellyfin builds in, which adoption imports the same way.
+  Jellyfin's `plugins/`, and the settings of the metadata plugins Jellyfin builds in and of
+  Intro Skipper, Merge Versions, File Transformation and OpenSubtitles, which adoption
+  imports the same way, with no uid map (`crates/ferrofin-core/src/plugin_config_adoption.rs`).
 - Profile images (v24, `d11c86a`): the profile-image block of `Authenticate`,
   `LdapUtils.TryDetermineAttributeFormat`, `ProfileImageUpdater.SetProfileImage` and
   `LdapProfileImageSyncTask`. While `EnableLdapProfileImageSync` is on, `LocateLdapUser` also

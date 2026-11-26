@@ -294,17 +294,41 @@ Wired and working, with a documented limitation or lighter verification:
     ([`INSTALL.md`](INSTALL.md#rar-comics) for bare metal).
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
+- **Photo comment character sets** — **Accepted divergence:** a photo's EXIF comment
+  (its `Overview`) reads as Jellyfin reads it where Jellyfin's text is readable, and as the
+  text where it is not. Jellyfin 12.4 reads a comment under the `ASCII` or the all-zero code
+  as Latin-1, so UTF-8 `café` shows as `cafÃ©`, and one under `UNICODE` as UTF-8, so the
+  UTF-16 that ExifTool and Exiv2 write shows empty or cut to its first letter. Ferrofin reads
+  UTF-8 when the text is valid UTF-8, else Latin-1 as Jellyfin does; under `UNICODE` it reads
+  UTF-8 only when the text also holds no NUL, and UTF-16 in the EXIF block's byte order
+  otherwise, unless a byte-order mark says which. So UTF-8 padded with a NUL under `UNICODE`,
+  which Jellyfin reads, comes out garbled.
+- **Photo EXIF in WebP, AVIF and PNG** — **Accepted divergence:** Ferrofin reads the EXIF a
+  WebP, an AVIF or a PNG's `eXIf` chunk holds (date taken, title, caption, rating, camera,
+  GPS, exposure). Jellyfin 12.4 lists these formats as photos, but its tag library cannot
+  open a WebP or an AVIF, so it keeps none of those fields for them, and never reads a PNG's
+  `eXIf` chunk, so a PNG keeps only what its text chunks or XMP hold.
 - **Playlist files are read, never written** — a library scan makes a playlist of each
   `.m3u`/`.m3u8`/`.pls`/`.wpl`/`.zpl` file in a music or untyped library and of each folder
   named `… [playlist]` or holding a `playlist.xml` (members from the file, or from the
-  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. Of a folder's
-  `playlist.xml` only the members and the media type are read so far — its title, overview,
-  shares and lock are not — and Ferrofin does not write it back after a refresh, as Jellyfin
-  does where it saves XML metadata. Such a playlist belongs to nobody and is open to everyone,
-  so, as on Jellyfin, nobody may edit it and the file is never rewritten. Where Jellyfin 12.2
-  saves XML metadata into the library (a library whose metadata savers are unset), the
-  `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
-  playlist stays empty; Ferrofin always reads the entries and never that sidecar.
+  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. A playlist file belongs to
+  nobody and is open to everyone, so, as on Jellyfin, nobody may edit it and the file is never
+  rewritten. Where Jellyfin 12.2 saves XML metadata into the library (a library whose metadata
+  savers are unset), the `<name>.xml` sidecar it writes beside a playlist file hides the
+  file's entries and the playlist stays empty; Ferrofin always reads the entries and neither
+  reads nor writes that sidecar.
+- **A playlist folder's `playlist.xml`** is read as Jellyfin reads it, when it changes or on a
+  full refresh: its title, overview, lock, locked fields, genres, studios, tags, dates and
+  ratings, its media type, its shares (who may see and edit the playlist) and, for a folder in
+  a media library, its members. Shares merge as Jellyfin merges them: a scan or refresh that
+  replaces takes the file's (an empty `<Shares />` removes every share), "Search for missing
+  metadata" adds the file's to the stored ones. Ferrofin writes the file as Jellyfin writes it,
+  with the owner, the members and the shares, on every change to the playlist and every
+  refresh that saves it: always for a playlist made in Ferrofin (`{data}/playlists`), and for a
+  playlist folder in a media library only when that library opts in, as for a box set below.
+  The first start of a version with this writes the file of every playlist in `{data}/playlists`
+  from the database, so a file Jellyfin wrote before the database was adopted cannot bring back
+  a share, name or lock changed in Ferrofin since.
   A collection made in Ferrofin gets
   Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before 1.4.0 get it, and the
   id it derives, at the first boot of 1.5.2 or later), and its membership lives in the

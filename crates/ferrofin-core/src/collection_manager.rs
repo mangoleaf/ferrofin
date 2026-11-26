@@ -932,18 +932,35 @@ impl CollectionManager for FerrofinCollectionManager {
     ) -> Result<(), ServiceError> {
         self.require_box_set(collection_id).await?;
         self.require_items(item_ids).await?;
-        let current = self
-            .linked_children
-            .get_linked_children_ids(collection_id, None)
-            .await?;
+        // `AddToCollectionAsync` appends the items not yet listed and saves the
+        // whole list, which rewrites the box set's rows from 0 (gl-1637). It
+        // reads before it writes, so it takes the lock first (CONTRIBUTING.md).
+        let parent = guid_to_db(collection_id);
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
+        let mut entries = read_entries(&mut *tx, &parent).await?;
+        let mut listed: std::collections::HashSet<Uuid> = entries
+            .iter()
+            .filter_map(|(child, _)| Uuid::parse_str(child).ok())
+            .collect();
+        let before = entries.len();
         for item_id in item_ids {
-            self.linked_children
-                .upsert_linked_child(collection_id, *item_id, LINKED_CHILD_MANUAL)
-                .await?;
+            if listed.insert(*item_id) {
+                entries.push((guid_to_db(*item_id), LINKED_CHILD_MANUAL.into()));
+            }
         }
+        let added = entries.len() > before;
+        if added {
+            write_entries_in(&mut tx, &parent, &entries).await?;
+        }
+        tx.commit().await.map_err(db_err)?;
         // `AddToCollectionAsync` re-rates, saves and queues its refresh only
         // when an item was new.
-        if item_ids.iter().any(|id| !current.contains(id)) {
+        if added {
             self.update_rating_to_items(collection_id, Rerate::Direct)
                 .await?;
             self.save_membership(collection_id).await?;
@@ -963,17 +980,24 @@ impl CollectionManager for FerrofinCollectionManager {
         item_ids: &[Uuid],
     ) -> Result<(), ServiceError> {
         self.require_box_set(collection_id).await?;
-        for item_id in item_ids {
-            sqlx::query(
-                r#"DELETE FROM "LinkedChildren"
-                   WHERE "ParentId" = ?1 AND "ChildId" = ?2"#,
-            )
-            .bind(guid_to_db(collection_id))
-            .bind(guid_to_db(*item_id))
-            .execute(self.db.writer())
+        // Upstream looks each id up first, and `GetItemById` refuses the empty
+        // one: an `ArgumentException`, a 400 before anything is saved.
+        if item_ids.contains(&Uuid::nil()) {
+            return Err(ServiceError::invalid_input("Guid can't be empty"));
+        }
+        // `collection.LinkedChildren = ….Except(list)` and the save, which
+        // rewrites the box set's rows from 0 whatever it removed (gl-1637).
+        let parent = guid_to_db(collection_id);
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_err)?;
-        }
+        let mut entries = read_entries(&mut *tx, &parent).await?;
+        entries.retain(|(child, _)| !Uuid::parse_str(child).is_ok_and(|c| item_ids.contains(&c)));
+        write_entries_in(&mut tx, &parent, &entries).await?;
+        tx.commit().await.map_err(db_err)?;
         self.update_rating_to_items(collection_id, Rerate::Refresh)
             .await?;
         // `RemoveFromCollectionAsync` saves and queues its refresh whatever it
@@ -1340,10 +1364,20 @@ impl FerrofinPlaylistManager {
     }
 
     /// `UpdatePlaylistInternal` → `UpdateToRepositoryAsync(MetadataEdit)`:
-    /// stamps the playlist's `DateLastSaved` (its Etag moves) and announces
-    /// `ItemUpdated`. The change is committed by now, so a failure is logged,
-    /// not returned.
+    /// runs the metadata savers (`PlaylistXmlSaver` writes the folder's
+    /// `playlist.xml`), stamps the playlist's `DateLastSaved` (its Etag
+    /// moves) and announces `ItemUpdated`. The change is committed by now, so
+    /// a failure is logged, not returned.
     async fn announce_updated(&self, playlist_id: Uuid) {
+        if let Some(providers) = &self.providers {
+            if let Err(err) = providers
+                .update_to_repository(playlist_id, ItemUpdateType::MetadataEdit)
+                .await
+            {
+                tracing::warn!(item_id = %playlist_id, %err, "could not save a playlist change");
+            }
+            return;
+        }
         let Some(persistence) = &self.persistence else {
             return;
         };
@@ -1985,13 +2019,20 @@ impl PlaylistManager for FerrofinPlaylistManager {
         }
         item_data::sync_container_data_in(&mut tx, request.id).await?;
         tx.commit().await.map_err(db_err)?;
+        let refreshes = entries.as_ref().is_some_and(|entries| !entries.is_empty());
+        let rated = if refreshes {
+            self.update_rating_to_items(request.id).await
+        } else {
+            Ok(())
+        };
+        // The save, its savers' file write included, and the queued refresh
+        // run after the edit guard is released, so neither holds it; the
+        // committed change is saved even when the re-rate failed.
+        drop(edit);
         self.announce_updated(request.id).await;
-        if entries.as_ref().is_some_and(|entries| !entries.is_empty()) {
-            self.update_rating_to_items(request.id).await?;
-            // `AddToPlaylistInternal`'s refresh, reached from `UpdatePlaylist`,
-            // queued after the edit guard is released, so the queue call never
-            // runs under it.
-            drop(edit);
+        rated?;
+        if refreshes {
+            // `AddToPlaylistInternal`'s refresh, reached from `UpdatePlaylist`.
             queue_refresh(self.providers.as_deref(), request.id, force_save_refresh()).await?;
         }
         Ok(())
@@ -2214,7 +2255,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // Same ordering the read path uses (`get_linked_children_ids`), so the
         // relocation matches what the client sees.
         let playlist = self.require_playlist_argument(playlist_id).await?;
-        let _edit = self.entry_edits.lock().await;
+        let edit = self.entry_edits.lock().await;
         let pid = guid_to_db(playlist);
         let mut entries = read_entries(self.db.pool(), &pid).await?;
 
@@ -2253,6 +2294,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
         };
         entries.insert(target, entry);
         write_entries(self.db.writer(), &pid, &entries).await?;
+        // The save and its savers' file write run after the edit guard.
+        drop(edit);
         self.announce_updated(playlist).await;
         Ok(())
     }
@@ -2343,11 +2386,12 @@ mod remove_playlists_tests;
 
 mod saved_containers;
 
-/// One playlist entry: `(ChildId, ChildType)` as stored.
+/// One playlist or box-set entry: `(ChildId, ChildType)` as stored.
 type Entry = (String, i64);
 
-/// A playlist's entries in stored order. Entries are positions, not a set:
-/// the same item may appear more than once (12.0's `(ParentId, SortOrder)` key).
+/// A playlist's or box set's entries in stored order. A playlist's entries
+/// are positions, not a set: the same item may appear more than once (12.0's
+/// `(ParentId, SortOrder)` key); a box set lists each item once.
 async fn read_entries<'e>(
     executor: impl sqlx::SqliteExecutor<'e>,
     playlist_id: &str,
@@ -2365,9 +2409,9 @@ async fn read_entries<'e>(
 /// Replaces a playlist's entries wholesale with `entries`, `SortOrder`
 /// dense from 0 in the given order, in one transaction — what 12.0's
 /// `ItemPersistenceService` does on every folder save (delete the parent's
-/// rows, re-insert the array). Shared by remove and move; a create, an add
-/// and an update's replace run [`write_entries_in`] inside their own writer
-/// transaction.
+/// rows, re-insert the array). Shared by a playlist's remove and move; a
+/// playlist's create, add and update's replace, and a box set's add and
+/// remove, run [`write_entries_in`] inside their own writer transaction.
 async fn write_entries(
     pool: &sqlx::SqlitePool,
     playlist_id: &str,
@@ -2379,7 +2423,8 @@ async fn write_entries(
 }
 
 /// [`write_entries`] on a connection the caller holds, normally a writer
-/// transaction that commits more than the entries.
+/// transaction that commits more than the entries. A box set's membership
+/// changes write their rows through it too.
 async fn write_entries_in(
     conn: &mut sqlx::SqliteConnection,
     playlist_id: &str,
@@ -2394,7 +2439,7 @@ async fn write_entries_in(
     // entry is a `[ChildId, ChildType]` pair, and `json_each` yields them in
     // order with the array index as `key`, the dense `SortOrder`.
     let pairs = serde_json::to_string(entries)
-        .map_err(|e| ServiceError::Backend(format!("serialize playlist entries: {e}")))?;
+        .map_err(|e| ServiceError::Backend(format!("serialize linked children: {e}")))?;
     sqlx::query(
         r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
            SELECT ?1, "key", json_extract("value", '$[0]'), json_extract("value", '$[1]')
@@ -3329,6 +3374,77 @@ mod tests {
             .await
             .expect("containing2");
         assert!(containing.is_empty(), "{containing:?}");
+    }
+
+    /// `(ChildId, SortOrder)` of each `LinkedChildren` row under `parent`.
+    async fn sort_orders(db: &ferrofin_db::Database, parent: Uuid) -> Vec<(Uuid, i64)> {
+        let mut conn = db.pool().acquire().await.expect("connection");
+        crate::item_persistence_service::links_under(&mut conn, &[parent])
+            .await
+            .expect("rows")
+            .remove(&parent)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(child, _, sort)| (child, sort))
+            .collect()
+    }
+
+    /// gl-1637: upstream saves a box set after every removal and after an add
+    /// of a new member, and the save rewrites its `LinkedChildren` from 0
+    /// (`ItemPersistenceService.cs:513-537, 623-648`). So a removal leaves no
+    /// gap, and both close one another writer left (a reroute's dropped
+    /// duplicate, `RerouteLinkedChildren`); an add of nothing new saves
+    /// nothing. `GetItemById` refuses the empty id, so a removal naming it
+    /// is a 400 that writes nothing.
+    #[tokio::test]
+    async fn box_set_members_are_numbered_from_zero_after_each_change() {
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let [a, b, c, d] = std::array::from_fn(|_| Uuid::new_v4());
+        for id in [a, b, c, d] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+        }
+        let mgr = collection_manager_over(&db);
+        let created = mgr
+            .create_collection(&CollectionCreationOptions {
+                name: "Set".to_owned(),
+                item_id_list: vec![a, b, c],
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("create");
+        let set = Uuid::parse_str(&created.id).expect("uuid");
+
+        mgr.remove_from_collection(set, &[b]).await.expect("remove");
+        assert_eq!(sort_orders(&db, set).await, vec![(a, 0), (c, 1)]);
+
+        let links = FerrofinLinkedChildrenService::new(db.clone());
+        links.reroute_linked_children(a, c).await.expect("reroute");
+        assert_eq!(sort_orders(&db, set).await, vec![(c, 1)], "the gap");
+        mgr.add_to_collection(set, &[c])
+            .await
+            .expect("add a member");
+        assert_eq!(sort_orders(&db, set).await, vec![(c, 1)], "nothing new");
+        mgr.add_to_collection(set, &[d, c, d]).await.expect("add");
+        assert_eq!(sort_orders(&db, set).await, vec![(c, 0), (d, 1)]);
+
+        // A removal rewrites the rows whatever it removed, refuses the empty
+        // id before writing anything, and can leave the box set empty.
+        links.reroute_linked_children(c, d).await.expect("reroute");
+        assert_eq!(sort_orders(&db, set).await, vec![(d, 1)], "the gap");
+        assert!(matches!(
+            mgr.remove_from_collection(set, &[d, Uuid::nil()]).await,
+            Err(ferrofin_traits::error::ServiceError::InvalidInput(_))
+        ));
+        assert_eq!(sort_orders(&db, set).await, vec![(d, 1)], "refused");
+        mgr.remove_from_collection(set, &[c])
+            .await
+            .expect("remove a non-member");
+        assert_eq!(sort_orders(&db, set).await, vec![(d, 0)]);
+        mgr.remove_from_collection(set, &[d])
+            .await
+            .expect("remove the last");
+        assert_eq!(sort_orders(&db, set).await, Vec::new());
     }
 
     /// Issue #55: a box set or playlist takes the least restrictive rating of
@@ -5547,6 +5663,7 @@ mod tests {
             }]),
             from_file: false,
             replace: true,
+            shares: None,
         }];
         let sync = persistence.sync_scanned_playlists(&scanned);
         let gone = [a];
@@ -6361,6 +6478,79 @@ mod tests {
                 .expect("again")
         );
         assert_eq!(rows(&db, set).await, vec![c, b, a]);
+    }
+
+    /// `UpdatePlaylistInternal` → `UpdateToRepositoryAsync(MetadataEdit)`:
+    /// an update, a share added or removed, a move that moves an entry and a
+    /// hand-over to a share each run the metadata savers once
+    /// (`PlaylistXmlSaver` writes the folder's `playlist.xml`).
+    #[tokio::test]
+    async fn playlist_changes_run_the_metadata_savers() {
+        use ferrofin_model::playlists::PlaylistUserUpdateRequest;
+        let edit = ferrofin_traits::providers::ItemUpdateType::MetadataEdit;
+        let db = test_db().await;
+        let (track_a, track_b) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, track_a, BaseItemKind::Audio).await;
+        seed_item(&db, track_b, BaseItemKind::Audio).await;
+        let (owner, friend) = (Uuid::new_v4(), Uuid::new_v4());
+        crate::test_support::seed_named_user(&db, owner, "owner").await;
+        crate::test_support::seed_named_user(&db, friend, "friend").await;
+        let queued = Arc::new(QueuedRefreshes::default());
+        let (mgr, _root) = playlist_manager(&db).await;
+        let mgr = mgr.with_providers(Arc::clone(&queued) as Arc<_>);
+        let mix = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Mix".to_owned()),
+                item_id_list: vec![track_a, track_b],
+                user_id: owner,
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create");
+        let mix = Uuid::parse_str(&mix.id).expect("uuid");
+        queued.take_saved();
+        mgr.update_playlist(&PlaylistUpdateRequest {
+            id: mix,
+            name: Some("Mix 2".to_owned()),
+            ..PlaylistUpdateRequest::default()
+        })
+        .await
+        .expect("rename");
+        assert_eq!(queued.take_saved(), vec![(mix, edit)]);
+        mgr.add_user_to_shares(&PlaylistUserUpdateRequest {
+            id: mix,
+            user_id: friend,
+            can_edit: Some(true),
+        })
+        .await
+        .expect("share");
+        assert_eq!(queued.take_saved(), vec![(mix, edit)]);
+        mgr.move_item(&mix.to_string(), &track_b.simple().to_string(), 0, owner)
+            .await
+            .expect("move");
+        assert_eq!(queued.take_saved(), vec![(mix, edit)]);
+        mgr.move_item(&mix.to_string(), &track_b.simple().to_string(), 0, owner)
+            .await
+            .expect("no move");
+        assert_eq!(
+            queued.take_saved(),
+            Vec::new(),
+            "a move that moves nothing saves nothing"
+        );
+        mgr.remove_playlists(owner).await.expect("hand over");
+        assert_eq!(
+            queued.take_saved(),
+            vec![(mix, edit)],
+            "handed to the share"
+        );
+        mgr.remove_user_from_shares(
+            mix,
+            friend,
+            &ferrofin_model::entities_media::PlaylistUserPermissions::new(friend, true),
+        )
+        .await
+        .expect("unshare");
+        assert_eq!(queued.take_saved(), vec![(mix, edit)]);
     }
 
     /// `PlaylistManager.AddToPlaylistInternal` (reached from create, update

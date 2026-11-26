@@ -37,6 +37,8 @@ class Routes(unittest.TestCase):
     def test_each_route_returns_to_jellyfin_s_own_first_start_on_its_source(self):
         built = {name: (version, parent) for name, version, parent in VERSIONS}
         for route, fixture, generation, first_start, ran_at, config_at, kind in routes():
+            if kind == "native":
+                continue   # test_the_native_route_has_no_fixture_and_returns_to_a_fresh_install
             with self.subTest(route=route):
                 self.assertEqual(route, fixture.removeprefix("jellyfin-"))
                 source, expected_kind = DERIVED.get(fixture, (fixture, "path"))
@@ -59,9 +61,21 @@ class Routes(unittest.TestCase):
                 else:
                     self.assertEqual(config_at, "-")
 
+    def test_the_native_route_has_no_fixture_and_returns_to_a_fresh_install(self):
+        native = [route for route in routes() if route[-1] == "native"]
+        self.assertEqual(native, [("native", "-", "-", f"jellyfin-{RETURN_RELEASE}-fresh", "/data", "-", "native")])
+        # the fresh install of the release every route returns to: the history its export records
+        self.assertIn((f"jellyfin-{RETURN_RELEASE}-fresh", RETURN_RELEASE, None), VERSIONS)
+
     def test_every_fixture_build_fixtures_sh_builds_is_a_route(self):
-        fixtures = {route[1] for route in routes()}
+        fixtures = {route[1] for route in routes() if route[-1] != "native"}
         self.assertEqual(fixtures, {name for name, _, _ in VERSIONS} | set(DERIVED))
+
+    def test_every_kind_is_one_the_report_records(self):
+        import adoption_report
+        for route in routes():
+            with self.subTest(route=route[0]):
+                self.assertEqual(adoption_report.kind_of(route[-1]), route[-1])
 
     def test_routes_are_named_once(self):
         names = [route[0] for route in routes()]

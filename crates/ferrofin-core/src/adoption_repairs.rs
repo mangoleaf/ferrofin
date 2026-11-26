@@ -114,6 +114,10 @@ pub async fn run_all(db: &Database, paths: &VirtualPathExpander) -> Result<(), S
     if people > 0 {
         tracing::info!(items = people, "merged case-only duplicate people");
     }
+    // Upstream's 20260729, after the duplicate-path fold and the 20260508
+    // merges, on the boot that imported a 10.11 database; before the state's
+    // `save_playlist_xml_once` rewrites a `playlist.xml` from the database.
+    restore_playlist_children_once(db, paths).await?.log();
     // After the merges, which fold rows of one item under several keys (as
     // upstream's 20260508 merges run before its 20260912 harmonize); it logs
     // its own summary, which needs the group count too.
@@ -204,9 +208,11 @@ type ImportRow = (String, String, Option<String>, bool, Option<String>);
 /// 10.11.11). A 12.0 adoption, a Ferrofin-native database and an install
 /// adopted before the record existed have no such record and are skipped.
 /// `paths` expands a container's stored `%AppDataPath%` path, which entries
-/// relative to the container resolve against.
+/// relative to the container resolve against. Its commit also leaves
+/// [`restore_playlist_children_once`] owed, which fills a playlist left with no
+/// rows from its `playlist.xml`.
 ///
-/// Returns the number of rows written.
+/// Returns the number of rows written from `Data`.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -277,6 +283,14 @@ pub async fn import_membership_once(
             written += import_video_alternate_versions(&mut tx, &id, &map, paths).await?;
         }
     }
+    // Upstream's `RestorePlaylistChildrenFromMetadata` runs later in the same
+    // migration pass: [`run_all`] runs it at that point on this boot, keyed by
+    // this marker, which commits with the flag.
+    sqlx::query(r#"INSERT OR REPLACE INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')"#)
+        .bind(RESTORE_PLAYLISTS_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
     sqlx::query(r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#)
         .execute(&mut *tx)
         .await
@@ -286,6 +300,263 @@ pub async fn import_membership_once(
         tracing::warn!(dropped, "dropped unresolvable LinkedChildren entries");
     }
     Ok(written)
+}
+
+/// The `FerrofinMeta` key [`import_membership_once`] sets for
+/// [`restore_playlist_children_once`], which clears it.
+const RESTORE_PLAYLISTS_KEY: &str = "restore_playlist_children_pending_v1";
+
+/// What [`restore_playlist_children_once`] did, for its two log lines.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RestoredPlaylists {
+    /// Playlists given entries, and the entries written.
+    playlists: usize,
+    entries: usize,
+    /// `playlist.xml` paths no item has.
+    unresolved: usize,
+    /// Playlists left as they are with fewer entries than their file lists.
+    short: usize,
+    /// Files that could not be read or do not parse.
+    unreadable: usize,
+}
+
+impl RestoredPlaylists {
+    fn log(&self) {
+        if self.entries > 0 {
+            tracing::info!(
+                entries = self.entries,
+                playlists = self.playlists,
+                "restored the entries of empty playlists from their playlist.xml"
+            );
+        }
+        if self.unresolved + self.short + self.unreadable > 0 {
+            tracing::warn!(
+                unresolved = self.unresolved,
+                short = self.short,
+                unreadable = self.unreadable,
+                "playlist.xml entries not restored: paths no item has, playlists that still hold \
+                 fewer entries than their file lists (check them by hand), files that do not \
+                 read (each one is logged at debug)"
+            );
+        }
+    }
+}
+
+/// `RestorePlaylistChildrenFromMetadata.ReadEntryPaths`: the `<Path>` that
+/// first follows each `<PlaylistItem>` element anywhere in the document,
+/// trimmed, blank ones left out, read as a stream up to the first malformed
+/// spot (a truncated file keeps the entries before it); and whether the whole
+/// document read.
+fn playlist_entry_paths(xml: &str) -> (Vec<String>, bool) {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let (mut paths, mut in_entry, mut open, mut root) = (Vec::new(), false, 0_usize, false);
+    loop {
+        let (element, empty) = match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                open += 1;
+                root = true;
+                (e, false)
+            }
+            Ok(Event::Empty(e)) => {
+                root = true;
+                (e, true)
+            }
+            Ok(Event::End(_)) => {
+                open = open.saturating_sub(1);
+                continue;
+            }
+            // No root, or an element left open: `XmlReader`'s unexpected end
+            // of file.
+            Ok(Event::Eof) => return (paths, root && open == 0),
+            // An entity XML does not define.
+            Ok(Event::GeneralRef(e))
+                if quick_xml::escape::unescape(&format!("&{};", e.as_ref())).is_err() =>
+            {
+                return (paths, false);
+            }
+            // `DtdProcessing.Prohibit`.
+            Ok(Event::DocType(_)) | Err(_) => return (paths, false),
+            Ok(_) => continue,
+        };
+        // `XmlReader` checks an element's attributes as it reads it.
+        if element.attributes().any(|attribute| attribute.is_err()) {
+            return (paths, false);
+        }
+        match element.name().as_ref() {
+            "PlaylistItem" => in_entry = true,
+            "Path" if in_entry => {
+                in_entry = false;
+                // shortcut: the text is read raw, so a CDATA section, a
+                // comment or a child element in `<Path>` is kept as markup
+                // where `XmlReader` would read or refuse it; Jellyfin's
+                // `XmlWriter` writes only escaped text, so upgrade only if a
+                // writer ever does.
+                let value = if empty {
+                    String::new()
+                } else {
+                    // Through its end tag.
+                    open -= 1;
+                    let Ok(raw) = reader.read_text(element.name()) else {
+                        return (paths, false);
+                    };
+                    let Ok(text) = quick_xml::escape::unescape(&raw) else {
+                        return (paths, false);
+                    };
+                    text.into_owned()
+                };
+                if !value.trim().is_empty() {
+                    paths.push(value.trim().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The playlists [`restore_playlist_children_once`] may fill: each one's id,
+/// `playlist.xml` and the paths it lists, read before the write. A file that
+/// does not read, or not whole, counts in `done`.
+async fn listed_playlist_entries(
+    db: &Database,
+    paths: &VirtualPathExpander,
+    done: &mut RestoredPlaylists,
+) -> Result<Vec<(String, PathBuf, Vec<String>)>, ServiceError> {
+    let playlists: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ?1 AND "Path" IS NOT NULL
+           ORDER BY rowid"#,
+    )
+    .bind(stored_type_name(BaseItemKind::Playlist).unwrap_or_default())
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let mut listed = Vec::new();
+    for (id, path) in playlists {
+        let folder = paths.expand(&path);
+        let file = ferrofin_providers::playlist_xml_path(&folder, false);
+        if !Path::new(&folder).is_dir() || !file.is_file() {
+            continue;
+        }
+        let item_id = id.to_ascii_lowercase();
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::debug!(%err, %item_id, path = %file.display(), "could not read playlist.xml");
+                done.unreadable += 1;
+                continue;
+            }
+        };
+        // Upstream keeps the entries read before a malformed spot.
+        let (entries, clean) = playlist_entry_paths(&ferrofin_providers::decode_playlist(&bytes));
+        if !clean {
+            tracing::debug!(%item_id, path = %file.display(), "playlist.xml does not read whole");
+            done.unreadable += 1;
+        }
+        if !entries.is_empty() {
+            listed.push((id, file, entries));
+        }
+    }
+    Ok(listed)
+}
+
+/// 12.0's `RestorePlaylistChildrenFromMetadata`
+/// (`20260729120000_RestorePlaylistChildrenFromMetadata.cs`), once, on the
+/// boot whose [`import_membership_once`] imported a 10.11 database, at
+/// upstream's point in [`run_all`] (after the duplicate-path fold and the
+/// merges, before `save_playlist_xml_once` rewrites a file from the database):
+/// a playlist whose folder holds a `playlist.xml` and which has no
+/// `LinkedChildren` row gets a `Manual` row per `<PlaylistItem><Path>` that is
+/// exactly an item's `Path`, in file order from 0. A playlist that still has
+/// rows is left alone (merging could bring back what a user removed), and so
+/// is a playlist file (`.m3u`), which the scan reads. The files are read
+/// before the write; the rows and the marker's removal commit together.
+///
+/// Upstream's `MigrateLinkedChildren` also removes the 10.11 items whose files
+/// are gone before this runs; here that sweep (`sweep_missing_items`) runs
+/// later in the boot, so an entry naming such an item is restored and then
+/// deleted with it, leaving a gap in `SortOrder` where upstream counts the
+/// entry as unresolved.
+async fn restore_playlist_children_once(
+    db: &Database,
+    paths: &VirtualPathExpander,
+) -> Result<RestoredPlaylists, ServiceError> {
+    let mut done = RestoredPlaylists::default();
+    if db.meta_get(RESTORE_PLAYLISTS_KEY).await?.is_none() {
+        return Ok(done);
+    }
+    let listed = listed_playlist_entries(db, paths, &mut done).await?;
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
+    for (id, file, entries) in listed {
+        // `None`: the other version deleted the playlist since it was read.
+        let children: Option<i64> = sqlx::query_scalar(
+            r#"SELECT (SELECT COUNT(*) FROM "LinkedChildren" WHERE "ParentId" = p."Id")
+               FROM "BaseItems" p WHERE p."Id" = ?1"#,
+        )
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let Some(children) = children else {
+            continue;
+        };
+        if children > 0 {
+            if entries.len() > usize::try_from(children).unwrap_or(usize::MAX) {
+                tracing::debug!(
+                    item_id = %id.to_ascii_lowercase(),
+                    children,
+                    listed = entries.len(),
+                    path = %file.display(),
+                    "a playlist holds fewer entries than its playlist.xml lists; not restored"
+                );
+                done.short += 1;
+            }
+            continue;
+        }
+        let mut order = 0_i64;
+        for entry in &entries {
+            // Upstream's map takes the first row of each `Path`, as stored.
+            let child: Option<String> = sqlx::query_scalar(
+                r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1 ORDER BY rowid LIMIT 1"#,
+            )
+            .bind(entry)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let Some(child) = child else {
+                tracing::debug!(item_id = %id.to_ascii_lowercase(), path = %entry, "no item has this playlist.xml path");
+                done.unresolved += 1;
+                continue;
+            };
+            sqlx::query(
+                r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+                   VALUES (?1, ?2, ?3, ?4)"#,
+            )
+            .bind(&id)
+            .bind(order)
+            .bind(child)
+            .bind(i32::from(ferrofin_db::enums::LinkedChildType::Manual))
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            order += 1;
+        }
+        if order > 0 {
+            tracing::debug!(item_id = %id.to_ascii_lowercase(), entries = order, "restored a playlist's entries");
+            done.playlists += 1;
+            done.entries += usize::try_from(order).unwrap_or_default();
+        }
+    }
+    sqlx::query(r#"DELETE FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+        .bind(RESTORE_PLAYLISTS_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok(done)
 }
 
 /// `MigrateLinkedChildren.ProcessVideoAlternateVersions`: `LocalAlternateVersions`
@@ -441,7 +712,7 @@ pub async fn cleanup_orphaned_extras(db: &Database) -> Result<usize, ServiceErro
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
 pub async fn fix_owner_id_relationships(db: &Database) -> Result<usize, ServiceError> {
-    const KEY: &str = "owner_id_relationships_v12";
+    const KEY: &str = ferrofin_db::repair_markers::OWNER_ID_RELATIONSHIPS;
     if !once(db, KEY).await? {
         return Ok(0);
     }
@@ -1395,7 +1666,7 @@ pub async fn rehome_local_versions(
     path_manager: Option<&dyn PathManager>,
     persistence: &dyn ItemPersistenceService,
 ) -> Result<RehomedVersions, ServiceError> {
-    const KEY: &str = "rehome_local_versions_v12";
+    const KEY: &str = ferrofin_db::repair_markers::REHOME_LOCAL_VERSIONS;
     if !once(db, KEY).await? {
         return Ok(RehomedVersions::default());
     }
@@ -1577,8 +1848,8 @@ fn uuid_of(id: &str) -> Result<Uuid, ServiceError> {
 /// Returns [`ServiceError`] if a query fails; the repair is not marked done
 /// then, and the next boot runs it again.
 pub async fn rederive_adopted_versions(db: &Database) -> Result<u64, ServiceError> {
-    const KEY: &str = "rederive_adopted_versions_v160";
-    const REHOME_KEY: &str = "rehome_local_versions_v12";
+    const KEY: &str = ferrofin_db::repair_markers::REDERIVE_ADOPTED_VERSIONS;
+    const REHOME_KEY: &str = ferrofin_db::repair_markers::REHOME_LOCAL_VERSIONS;
     if once(db, REHOME_KEY).await? || !once(db, KEY).await? || !adopted_from_10_11(db).await? {
         return Ok(0);
     }
@@ -2070,6 +2341,14 @@ async fn plan_by_name_moves(
 /// old id stays recoverable: a genre's or studio's is its `ItemValueId`, a
 /// music genre's derives from its name.
 ///
+/// ACCEPTED DIVERGENCE (owner decision 2026-11-24, gl-1928): by-name
+/// `MusicArtist` rows are left out on purpose. A by-name artist row stored
+/// before gl-1624 gave new ones Jellyfin's id keeps the id of its `ItemValues`
+/// row where Jellyfin 12.4 would derive one from the name.
+/// `LibraryManager.CreateItemByName<MusicArtist>` returns an artist with a
+/// matching name before it derives an id, so a database returned to Jellyfin
+/// keeps the row, and a move would break saved artist links.
+///
 /// # Errors
 /// Returns [`ServiceError`] if the planning read fails. A batch whose
 /// transaction cannot be opened or committed is logged, and the repair stops
@@ -2309,6 +2588,127 @@ pub async fn run_expand_saved_playlist_containers(
             %err,
             "could not expand the container entries of playlists an older Ferrofin saved; \
              the repair runs again on the next boot"
+        ),
+    }
+}
+
+/// What [`save_playlist_xml_once`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedPlaylistXml {
+    /// Files written.
+    pub written: usize,
+    /// Playlists whose file could not be written; the repair runs again on
+    /// the next boot.
+    pub pending: usize,
+    /// The first of those failures, for the one warning.
+    pub first_error: Option<String>,
+}
+
+/// Writes the `playlist.xml` of every playlist in the playlists folder once,
+/// from what the database holds (gl-341). No earlier Ferrofin wrote the file:
+/// a playlist Jellyfin made keeps the file Jellyfin last wrote, whatever was
+/// changed here since, and a refresh now reads that file (a full refresh
+/// merges its shares into the stored ones), so a share removed, or a name or
+/// lock changed, since adoption would come back from it. A playlist the saver
+/// does not write (a server-wide disable list) is left alone. When a file
+/// cannot be written, the repair runs again on the next boot, and then writes
+/// every playlist's file again.
+///
+/// During a rolling update the previous version keeps serving after this
+/// ran: a change it makes to a playlist is not in that playlist's file until
+/// the playlist is next changed here, and until then a full refresh of it can
+/// take a share the previous version removed back from the file.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the playlists cannot be listed or the marker
+/// write fails.
+pub async fn save_playlist_xml_once(
+    db: &Database,
+    playlists: &crate::FerrofinPlaylistManager,
+    saver: &ferrofin_providers::container_xml::ContainerXmlSaver,
+    persistence: &dyn ItemPersistenceService,
+) -> Result<SavedPlaylistXml, ServiceError> {
+    const KEY: &str = "playlist_xml_saved_v1";
+    let mut result = SavedPlaylistXml::default();
+    if !once(db, KEY).await? {
+        return Ok(result);
+    }
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as(r#"SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ?1 ORDER BY rowid"#)
+            .bind(stored_type_name(BaseItemKind::Playlist).unwrap_or_default())
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+    for (id, path) in rows {
+        let (Ok(id), Some(path)) = (Uuid::parse_str(&id), path) else {
+            continue;
+        };
+        if !playlists.in_playlists_folder(&path) {
+            continue;
+        }
+        // `MetadataEdit`, as a playlist manager change saves it; the stamp
+        // after the write keeps the file from reading as changed.
+        let outcome = match saver
+            .save(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
+            .await
+        {
+            Ok(true) => persistence.touch_item_updated(id).await.map(|_| true),
+            other => other,
+        };
+        match outcome {
+            Ok(true) => result.written += 1,
+            Ok(false) => {}
+            // One line per playlist would scale with the library: the count
+            // is the caller's warning.
+            Err(err) => {
+                tracing::debug!(
+                    %err,
+                    item_id = %id,
+                    path = %path,
+                    "could not save a playlist's playlist.xml"
+                );
+                result.pending += 1;
+                result
+                    .first_error
+                    .get_or_insert_with(|| format!("{path}: {err}"));
+            }
+        }
+    }
+    if result.pending == 0 {
+        done(db, KEY).await?;
+    }
+    Ok(result)
+}
+
+/// [`save_playlist_xml_once`] and its log line, for the composition root. A
+/// failure is logged, not returned: the repair is not needed to serve, and it
+/// runs again on the next boot.
+pub async fn run_save_playlist_xml_once(
+    db: &Database,
+    playlists: &crate::FerrofinPlaylistManager,
+    saver: &ferrofin_providers::container_xml::ContainerXmlSaver,
+    persistence: &dyn ItemPersistenceService,
+) {
+    match save_playlist_xml_once(db, playlists, saver, persistence).await {
+        Ok(SavedPlaylistXml {
+            written: 0,
+            pending: 0,
+            ..
+        }) => {}
+        Ok(did) if did.pending > 0 => tracing::warn!(
+            written = did.written,
+            pending = did.pending,
+            first_error = did.first_error.as_deref().unwrap_or_default(),
+            "could not save the playlist.xml of some playlists in the playlists folder \
+             (each one's reason is logged at debug); the repair runs again on the next boot"
+        ),
+        Ok(did) => tracing::info!(
+            written = did.written,
+            "wrote the playlist.xml of the playlists in the playlists folder from the database"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not write the playlists' playlist.xml; the repair runs again on the next boot"
         ),
     }
 }
@@ -2728,7 +3128,7 @@ pub async fn sweep_missing_items(
     internal_metadata: &str,
     user_views: &str,
 ) -> Result<SweptItems, ServiceError> {
-    const KEY: &str = "missing_item_sweeps_v12";
+    const KEY: &str = ferrofin_db::repair_markers::MISSING_ITEM_SWEEPS;
     let Some(adoption) = db.adoption_state().await? else {
         return Ok(SweptItems::default());
     };
@@ -2965,8 +3365,9 @@ const ORPHAN_SWEEP_PROGRESS_STEP: usize = 500;
 /// `{id}` folder — under the metadata root only its `chapters` folder —
 /// whose id no `BaseItems` row has. Nothing else is touched: a folder whose
 /// name is not two characters at the first level, or not an id at the
-/// second, stays, and so do Ferrofin's `{metadata}/library/{GUID}` art
-/// folders and every trickplay folder saved beside the media.
+/// second, stays, and so does the art in an `{id}` folder, as do the
+/// `{metadata}/library/{GUID}` art folders earlier builds wrote and every
+/// trickplay folder saved beside the media.
 ///
 /// Runs once on every database, Ferrofin's own and adopted ones alike:
 /// every Ferrofin before this one left these folders behind when a library
@@ -4963,6 +5364,304 @@ mod tests {
         assert!(found.is_empty(), "{found:?}");
     }
 
+    /// A playlist folder's `playlist.xml` as 10.11 writes it, listing `paths`.
+    fn write_playlist_xml(folder: &Path, paths: &[&str]) {
+        let items = paths
+            .iter()
+            .map(|p| format!("    <PlaylistItem>\n      <Path>{p}</Path>\n    </PlaylistItem>\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        std::fs::create_dir_all(folder).expect("folder");
+        std::fs::write(
+            folder.join("playlist.xml"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n<Item>\n  \
+                 <LocalTitle>Mix</LocalTitle>\n  <PlaylistItems>\n{items}  </PlaylistItems>\n  \
+                 <PlaylistMediaType>Video</PlaylistMediaType>\n</Item>\n"
+            ),
+        )
+        .expect("playlist.xml");
+    }
+
+    /// A 10.11 playlist at `%AppDataPath%/playlists/<name>` whose `Data`
+    /// lists `children` (`None`: no `LinkedChildren` key).
+    async fn seed_10_11_playlist(db: &Database, name: &str, children: Option<&[Uuid]>) -> Uuid {
+        let id = Uuid::new_v4();
+        seed_folder_item(db, id, BaseItemKind::Playlist, name, None).await;
+        set_path(db, id, &format!("%AppDataPath%/playlists/{name}")).await;
+        let entries: Vec<String> = children
+            .unwrap_or_default()
+            .iter()
+            .map(|c| format!(r#"{{"Type":"Manual","ItemId":"{}"}}"#, c.simple()))
+            .collect();
+        let data = match children {
+            Some(_) => format!(r#"{{"LinkedChildren":[{}]}}"#, entries.join(",")),
+            None => "{}".to_owned(),
+        };
+        set_data(db, id, &data).await;
+        id
+    }
+
+    /// gl-1648, 12.0's `RestorePlaylistChildrenFromMetadata`: on the boot that
+    /// imports a 10.11 database's membership, a playlist left with no rows
+    /// (its `Data` empty, unresolvable or keyless) takes a `Manual` row per
+    /// `playlist.xml` path that is exactly an item's, in file order (a repeat
+    /// kept, an unknown path skipped; a malformed file gives the entries
+    /// before its error). A playlist that still has rows, has no file, lists
+    /// nothing or is a playlist file keeps what it has; and it runs once.
+    #[tokio::test]
+    async fn an_empty_10_11_playlist_is_restored_from_its_playlist_xml() {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let root = tempfile::tempdir().expect("program data");
+        let lists = root.path().join("data/playlists");
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                root.path(),
+                "/pd/log",
+                "/pd/c",
+                "/pd/k",
+                "/pd/w",
+            ),
+        ));
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, path) in [(a, "/m/a.mkv"), (b, "/m/b.mkv"), (c, "/m/c.mkv")] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_path(&db, id, path).await;
+        }
+        // Its one `Data` entry names an item that is gone: the import drops it.
+        let emptied = seed_10_11_playlist(&db, "Emptied", Some(&[Uuid::new_v4()])).await;
+        write_playlist_xml(
+            &lists.join("Emptied"),
+            &["/m/a.mkv", "/m/gone.mkv", " /m/b.mkv ", "/m/a.mkv"],
+        );
+        // No `LinkedChildren` key at all: no rows either.
+        let keyless = seed_10_11_playlist(&db, "Keyless", None).await;
+        write_playlist_xml(&lists.join("Keyless"), &["/m/c.mkv"]);
+        // Rows from `Data`: neither restored nor, listing no more, counted.
+        let short = seed_10_11_playlist(&db, "Short", Some(&[c])).await;
+        write_playlist_xml(&lists.join("Short"), &["/m/c.mkv", "/m/a.mkv"]);
+        let even = seed_10_11_playlist(&db, "Even", Some(&[b])).await;
+        write_playlist_xml(&lists.join("Even"), &["/m/c.mkv"]);
+        let no_file = seed_10_11_playlist(&db, "No File", Some(&[])).await;
+        std::fs::create_dir_all(lists.join("No File")).expect("folder");
+        let blank = seed_10_11_playlist(&db, "Blank", Some(&[])).await;
+        write_playlist_xml(&lists.join("Blank"), &["  "]);
+        // Malformed after its first entry: that entry is restored.
+        let broken = seed_10_11_playlist(&db, "Broken", Some(&[])).await;
+        std::fs::create_dir_all(lists.join("Broken")).expect("folder");
+        std::fs::write(
+            lists.join("Broken/playlist.xml"),
+            "<Item><PlaylistItems><PlaylistItem><Path>/m/c.mkv</Path></PlaylistItem>\
+             <PlaylistItem a=></PlaylistItem></PlaylistItems></Item>",
+        )
+        .expect("xml");
+        // A playlist file: the scan's.
+        let m3u = seed_10_11_playlist(&db, "Road.m3u", Some(&[])).await;
+        std::fs::write(lists.join("Road.m3u"), "/m/a.mkv\n").expect("m3u");
+
+        import_membership_once(&db, &paths).await.expect("import");
+        assert_eq!(
+            restore_playlist_children_once(&db, &paths)
+                .await
+                .expect("restore"),
+            RestoredPlaylists {
+                playlists: 3,
+                entries: 5,
+                unresolved: 1,
+                short: 1,
+                unreadable: 1,
+            }
+        );
+
+        let g = guid_to_db;
+        assert_eq!(
+            links(&db)
+                .await
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                (g(emptied), g(a), 0, 0),
+                (g(emptied), g(b), 0, 1),
+                (g(emptied), g(a), 0, 2),
+                (g(keyless), g(c), 0, 0),
+                (g(short), g(c), 0, 0),
+                (g(even), g(b), 0, 0),
+                (g(broken), g(c), 0, 0),
+            ]
+            .into_iter()
+            .collect()
+        );
+        // Once: emptied again, it stays empty.
+        sqlx::query(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" = ?1"#)
+            .bind(g(keyless))
+            .execute(db.writer())
+            .await
+            .expect("emptied");
+        assert_eq!(
+            restore_playlist_children_once(&db, &paths)
+                .await
+                .expect("again"),
+            RestoredPlaylists::default()
+        );
+        for untouched in [no_file, blank, m3u] {
+            assert!(
+                links(&db).await.iter().all(|l| l.0 != g(untouched)),
+                "{untouched}"
+            );
+        }
+    }
+
+    /// `ReadEntryPaths`: the first `<Path>` after each `<PlaylistItem>`,
+    /// wherever it sits, trimmed, blanks left out.
+    #[rstest::rstest]
+    #[case::one_path_per_entry(
+        "<Item><PlaylistItems><PlaylistItem><Path> /a </Path><Path>/b</Path></PlaylistItem>\
+         <PlaylistItem><ItemId>x</ItemId></PlaylistItem></PlaylistItems></Item>",
+        &["/a"],
+        true
+    )]
+    #[case::outside_playlist_items(
+        "<Item><Path>/x</Path><PlaylistItem><Path>/a</Path></PlaylistItem></Item>",
+        &["/a"],
+        true
+    )]
+    #[case::blank_skipped(
+        "<Item><PlaylistItem><Path>  </Path></PlaylistItem><PlaylistItem><Path/></PlaylistItem>\
+         <PlaylistItem><Path>/b</Path></PlaylistItem></Item>",
+        &["/b"],
+        true
+    )]
+    #[case::entities_unescaped(
+        "<Item><PlaylistItem><Path>/m/Tom &amp; Jerry.mkv</Path></PlaylistItem></Item>",
+        &["/m/Tom & Jerry.mkv"],
+        true
+    )]
+    #[case::up_to_a_bad_attribute(
+        "<Item><PlaylistItems><PlaylistItem><Path>/a</Path></PlaylistItem><PlaylistItem x=>\
+         </PlaylistItem></PlaylistItems></Item>",
+        &["/a"],
+        false
+    )]
+    #[case::truncated_in_a_tag(
+        "<Item><PlaylistItems><PlaylistItem><Path>/a</Path></PlaylistItem><PlaylistItem><Pa",
+        &["/a"],
+        false
+    )]
+    #[case::doctype_prohibited(
+        "<!DOCTYPE Item><Item><PlaylistItem><Path>/a</Path></PlaylistItem></Item>",
+        &[],
+        false
+    )]
+    #[case::undefined_entity(
+        "<Item><PlaylistItem><Path>/a</Path></PlaylistItem><Title>&nbsp;</Title>\
+         <PlaylistItem><Path>/b</Path></PlaylistItem></Item>",
+        &["/a"],
+        false
+    )]
+    #[case::no_root("", &[], false)]
+    #[case::truncated_after_a_tag("<Item><PlaylistItem><Path>/a</Path></PlaylistItem>", &["/a"], false)]
+    fn playlist_xml_entries_read_like_upstream(
+        #[case] xml: &str,
+        #[case] expected: &[&str],
+        #[case] clean: bool,
+    ) {
+        assert_eq!(
+            playlist_entry_paths(xml),
+            (expected.iter().map(|p| (*p).to_owned()).collect(), clean)
+        );
+    }
+
+    /// Upstream runs the routine once, in the pass that imports a 10.11
+    /// database. A 12.x adoption ran it in Jellyfin, a database adopted from
+    /// 10.11 by an earlier Ferrofin has been edited here since (its
+    /// `playlist.xml` is the stale one Jellyfin left), and a Ferrofin
+    /// database never had `Data` membership to lose: none is restored.
+    #[rstest::rstest]
+    #[case::not_adopted(None, false)]
+    #[case::adopted_from_12(Some("12.0.0"), false)]
+    #[case::imported_by_an_earlier_boot(Some("10.11.8"), true)]
+    #[tokio::test]
+    async fn no_playlist_is_restored_outside_a_new_10_11_import(
+        #[case] generation: Option<&str>,
+        #[case] imported: bool,
+    ) {
+        let db = test_db().await;
+        if let Some(generation) = generation {
+            db.record_adoption(generation).await.expect("record");
+        }
+        if imported {
+            sqlx::query(r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#)
+                .execute(db.writer())
+                .await
+                .expect("imported");
+        }
+        let root = tempfile::tempdir().expect("program data");
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                root.path(),
+                "/pd/log",
+                "/pd/c",
+                "/pd/k",
+                "/pd/w",
+            ),
+        ));
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        set_path(&db, item, "/m/a.mkv").await;
+        seed_10_11_playlist(&db, "Emptied", Some(&[])).await;
+        write_playlist_xml(&root.path().join("data/playlists/Emptied"), &["/m/a.mkv"]);
+
+        run_all(&db, &paths).await.expect("repairs");
+
+        let found = links(&db).await;
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// Upstream restores after `FixIncorrectOwnerIdRelationships` folds the
+    /// items sharing a path, so an entry whose path two rows held lands on the
+    /// keeper (the newest), not on the first row, which the fold deletes with
+    /// its playlist entries.
+    #[tokio::test]
+    async fn a_restored_entry_lands_on_the_row_the_duplicate_path_fold_keeps() {
+        let db = test_db().await;
+        db.record_adoption("10.11.8").await.expect("record");
+        let root = tempfile::tempdir().expect("program data");
+        let paths = VirtualPathExpander::from_paths(std::sync::Arc::new(
+            crate::FerrofinServerApplicationPaths::new(
+                root.path(),
+                "/pd/log",
+                "/pd/c",
+                "/pd/k",
+                "/pd/w",
+            ),
+        ));
+        let (older, newer) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, created) in [
+            (older, "2025-01-01 00:00:00"),
+            (newer, "2026-01-01 00:00:00"),
+        ] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_path(&db, id, "/m/dup.mkv").await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "DateCreated" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(created)
+                .execute(db.writer())
+                .await
+                .expect("created");
+        }
+        let playlist = seed_10_11_playlist(&db, "Dup", Some(&[])).await;
+        write_playlist_xml(&root.path().join("data/playlists/Dup"), &["/m/dup.mkv"]);
+
+        run_all(&db, &paths).await.expect("repairs");
+
+        assert!(!exists(&db, older).await, "the fold keeps the newest row");
+        assert_eq!(
+            links(&db).await,
+            [(guid_to_db(playlist), guid_to_db(newer), 0, 0)]
+        );
+    }
+
     /// `MigrateLinkedChildren.ResolveChildId`: a cached `ItemId` counts only
     /// while its row exists, then the exact path, a path relative to the
     /// container's expanded folder, and `LibraryItemId`. An entry that
@@ -6624,8 +7323,8 @@ mod tests {
         (cleanup, external)
     }
 
-    /// `id`'s art folder (`{metadata}/library/{GUID}`) under `root`'s test
-    /// directories, written with a file.
+    /// `id`'s own art folder (`{metadata}/library/{xx}/{idN}`) under `root`'s
+    /// test directories, written with a file.
     fn planted_art_folder(root: &Path, id: Uuid) -> PathBuf {
         let art = root.join("program/metadata/library");
         let folder = crate::item_folders::item_art_folders(&art, id)[0].clone();
@@ -8439,7 +9138,7 @@ mod tests {
         std::fs::create_dir_all(orphan_meta.join("chapters")).expect("chapters");
         let live_meta = id_folder(&metadata, &live.simple().to_string());
         std::fs::create_dir_all(live_meta.join("chapters")).expect("chapters");
-        // Ferrofin's own art folder is no `{xx}/{id}` folder.
+        // The `{ID}` art folder earlier builds wrote is no `{xx}/{id}` folder.
         let art = metadata.join(orphan.hyphenated().to_string().to_uppercase());
         std::fs::create_dir_all(&art).expect("art");
 
@@ -8587,8 +9286,8 @@ mod tests {
     }
 }
 
-// Rebases the absolute paths a database stores under a previous program-data
-// directory onto this server's directories (gl-1165).
+// Rebases the paths a database stores under a previous program-data directory
+// onto this server's directories (gl-1165), relative ones included (gl-1668).
 //
 // Jellyfin stores `{program data}/root`, its library folders and every image
 // path absolute: `ReverseVirtualPath` tokenises only `{program data}/data` and
@@ -8608,7 +9307,7 @@ mod tests {
 // written under the new directories, and writes nothing on a server that did
 // not move.
 
-/// The columns that can hold an absolute program-data path.
+/// The columns that can hold a program-data path.
 const PATH_COLUMNS: [(&str, &str); 7] = [
     ("BaseItems", "Path"),
     ("BaseItemImageInfos", "Path"),
@@ -8848,10 +9547,13 @@ async fn rewrite_paths(
 /// root's `ensure()` re-paths it on the first start after a move (since
 /// v1.4.0), and the user root's `ensure()` re-paths that one, so on a database
 /// started since, the libraries are what still name the old directory. Both
-/// run after this pass, which reads them first. Empty when no row names a
-/// directory other than this server's program data, and for a database with
-/// [`IdDerivation::LegacyLowercase`] ids: they embed the absolute path, so
-/// after a move none is the id derived here.
+/// run after this pass, which reads them first. A relative directory counts:
+/// a server started with a relative data directory before every directory was
+/// made absolute (gl-1151) stored its paths relative, and they move like any
+/// others: onto this server's directories, where the file exists. Empty when
+/// no row names a directory other than this server's program data, and for a
+/// database with [`IdDerivation::LegacyLowercase`] ids: they embed the path as
+/// it was stored, so after a move none is the id derived here.
 async fn previous_program_data_dirs(
     db: &Database,
     derivation: &IdDerivation,
@@ -8899,11 +9601,13 @@ async fn previous_program_data_dirs(
             }
             Path::new("root/default").join(name)
         };
+        // A relative directory is one a server started with a relative data
+        // directory stored (gl-1668); an empty one would name every path.
         if let Some(old) = path
             .ends_with(&place)
             .then(|| path.ancestors().nth(place.components().count()))
             .flatten()
-            .filter(|old| old.is_absolute() && *old != program_data)
+            .filter(|old| !old.as_os_str().is_empty() && *old != program_data)
         {
             previous.insert(old.to_string_lossy().into_owned());
         }
@@ -9160,6 +9864,325 @@ pub async fn run_reverse_stored_virtual_paths(db: &Database, paths: &VirtualPath
             "could not store the item and stream paths under the data and metadata \
              directories as %AppDataPath% and %MetadataPath%; the next boot runs it again"
         ),
+    }
+}
+
+// Stores `HasSubtitles` in the `Data` of the videos an earlier Ferrofin probed
+// (gl-1911). Since gl-1632 a probe stores it there, as `FFProbeVideoInfo`
+// does (`video.HasSubtitles = mediaStreams.Any(subtitle)`, the only place
+// Jellyfin keeps it), but a video is probed again only when its file changes,
+// and Jellyfin 12.4 does not re-probe an unchanged file either, so a database
+// returned to Jellyfin read every such video as having none.
+
+/// The `FerrofinMeta` key of [`store_has_subtitles`].
+const HAS_SUBTITLES_STORED: &str = "has_subtitles_stored_v160";
+
+/// Sets `HasSubtitles` in the `Data` of every video row (`Video` and its
+/// subclasses) that has no such key: `true` when the row has a stored
+/// subtitle stream, else `false`, which is what Jellyfin's save writes for a
+/// video it probed with none (`JsonDefaults` skips nulls only). The stream
+/// rows are the ones the probe saved, after the library's embedded-subtitle
+/// filter, and the external subtitle files, so the value is the one the probe
+/// would have stored. A row that holds the key (an adopted Jellyfin row, or
+/// one a probe wrote since gl-1632) is left alone, and so is a `Data` that is
+/// not a JSON object; a row with no (or an empty) `Data` gets one holding just
+/// the key, and a key holding `null` is set, as
+/// `MediaStreamRepository::sync_has_subtitles` treats them.
+///
+/// Ferrofin's DTOs and its `HasSubtitles` filter take subtitle presence from
+/// the stream rows, so nothing Ferrofin serves changes and no snapshot is
+/// taken. Each partition
+/// of `REPAIR_PARTITION` rowids is one `UPDATE`, which takes the write lock
+/// before it reads and re-checks each row, so a row the previous version saves
+/// meanwhile is never overwritten; one it saves without the key after this
+/// ran waits for its next probe. Runs once per database (`FerrofinMeta`); an
+/// interrupted pass runs again from the start on the next boot.
+///
+/// Returns the rows written.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a read or a partition's write fails; the
+/// partitions written before stay, and the next boot runs it again.
+pub async fn store_has_subtitles(db: &Database) -> Result<u64, ServiceError> {
+    store_has_subtitles_in_partitions(db, REPAIR_PARTITION).await
+}
+
+/// One partition of [`store_has_subtitles`]: the video rows with a rowid in
+/// `[?1, ?2]` whose `Data` has no `HasSubtitles` value, `?3` being the
+/// subtitle `StreamType`. `+"Type"` keeps it on a rowid range seek, never a
+/// scan of the `Type` indexes (`EXPLAIN QUERY PLAN` pinned by
+/// `the_partition_update_seeks_the_rowid_range`). The `CASE` reads the key
+/// only from a `Data` that parses as an object: the JSON functions raise on
+/// malformed input, which would fail the statement.
+fn has_subtitles_update_sql() -> String {
+    let videos = crate::extra_owners_repository::VIDEO_TYPES;
+    format!(
+        r#"UPDATE "BaseItems"
+           SET "Data" = json_set(coalesce(nullif("Data", ''), '{{}}'), '$.HasSubtitles',
+                 json(CASE WHEN EXISTS (SELECT 1 FROM "MediaStreamInfos" s
+                                        WHERE s."ItemId" = "BaseItems"."Id"
+                                          AND s."StreamType" = ?3)
+                           THEN 'true' ELSE 'false' END))
+           WHERE rowid BETWEEN ?1 AND ?2 AND +"Type" IN ({videos})
+             AND CASE WHEN json_valid(coalesce(nullif("Data", ''), '{{}}'))
+                 THEN json_type(coalesce(nullif("Data", ''), '{{}}')) = 'object'
+                      AND coalesce(json_type(coalesce(nullif("Data", ''), '{{}}'),
+                                             '$.HasSubtitles'), 'null') = 'null'
+                 ELSE 0 END"#
+    )
+}
+
+/// [`store_has_subtitles`], `partition` rowids per write.
+async fn store_has_subtitles_in_partitions(
+    db: &Database,
+    partition: i64,
+) -> Result<u64, ServiceError> {
+    if !once(db, HAS_SUBTITLES_STORED).await? {
+        return Ok(0);
+    }
+    let (first, last): (Option<i64>, Option<i64>) = sqlx::query_as(
+        r#"SELECT (SELECT min(rowid) FROM "BaseItems"), (SELECT max(rowid) FROM "BaseItems")"#,
+    )
+    .fetch_one(db.pool())
+    .await
+    .map_err(db_err)?;
+    let sql = has_subtitles_update_sql();
+    let mut stored = 0;
+    if let (Some(mut from), Some(last)) = (first, last) {
+        loop {
+            let to = from.saturating_add(partition - 1).min(last);
+            stored += sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .bind(from)
+                .bind(to)
+                .bind(i32::from(
+                    ferrofin_db::enums::MediaStreamTypeEntity::Subtitle,
+                ))
+                .execute(db.writer())
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+            if to >= last {
+                break;
+            }
+            from = to + 1;
+        }
+    }
+    done(db, HAS_SUBTITLES_STORED).await?;
+    Ok(stored)
+}
+
+/// [`store_has_subtitles`] and its log line, for the composition root. A
+/// failure is a warning and never stops the boot: Ferrofin reads subtitle
+/// presence from the stream rows, and the next boot runs it again.
+pub async fn run_store_has_subtitles(db: &Database) {
+    match store_has_subtitles(db).await {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!(
+            rows,
+            "backfilled HasSubtitles on videos an earlier version probed, from their stored \
+             subtitle streams"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not store HasSubtitles on videos an earlier version probed; the next boot \
+             runs it again"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod has_subtitles_tests {
+    use ferrofin_db::enums::MediaStreamTypeEntity;
+    use ferrofin_model::data::BaseItemKind;
+
+    use super::*;
+    use crate::test_support::{seed_item, test_db};
+
+    async fn seed(db: &Database, kind: BaseItemKind, data: Option<&str>) -> Uuid {
+        let id = Uuid::new_v4();
+        seed_item(db, id, kind).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(data)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        id
+    }
+
+    /// A stream row of `stream_type` (`MediaStreamTypeEntity`'s value).
+    async fn seed_stream(db: &Database, item: Uuid, index: i64, stream_type: i32, external: bool) {
+        sqlx::query(
+            r#"INSERT INTO "MediaStreamInfos"
+               ("ItemId", "StreamIndex", "StreamType", "IsDefault", "IsExternal", "IsForced")
+               VALUES (?1, ?2, ?3, 0, ?4, 0)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(index)
+        .bind(stream_type)
+        .bind(external)
+        .execute(db.writer())
+        .await
+        .unwrap();
+    }
+
+    async fn data(db: &Database, id: Uuid) -> Option<String> {
+        sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    const SUBTITLE: i32 = 2;
+    const AUDIO: i32 = 0;
+
+    /// Every video kind without the key (or with it `null`, or with an empty
+    /// `Data`) gets it from its stream rows (an embedded or an external
+    /// subtitle, or none), keeping every other key and value of its `Data`;
+    /// rows that hold the key, other kinds, and a `Data` that is not a JSON
+    /// object are left as they are. Partitions of two rowids cover rows spread
+    /// over several of them.
+    #[tokio::test]
+    async fn videos_without_the_key_get_it_from_their_subtitle_rows() {
+        assert_eq!(i32::from(MediaStreamTypeEntity::Subtitle), SUBTITLE);
+        assert_eq!(i32::from(MediaStreamTypeEntity::Audio), AUDIO);
+        let db = test_db().await;
+        let movie = seed(
+            &db,
+            BaseItemKind::Movie,
+            Some(r#"{"VideoType":"VideoFile","IsHD":true}"#),
+        )
+        .await;
+        seed_stream(&db, movie, 0, AUDIO, false).await;
+        seed_stream(&db, movie, 1, SUBTITLE, false).await;
+        let episode = seed(&db, BaseItemKind::Episode, Some("{}")).await;
+        seed_stream(&db, episode, 3, SUBTITLE, true).await;
+        let video = seed(
+            &db,
+            BaseItemKind::Video,
+            Some(r#"{"VideoType":"VideoFile"}"#),
+        )
+        .await;
+        seed_stream(&db, video, 0, AUDIO, false).await;
+        let music_video = seed(&db, BaseItemKind::MusicVideo, None).await;
+        seed_stream(&db, music_video, 2, SUBTITLE, false).await;
+        let trailer = seed(&db, BaseItemKind::Trailer, None).await;
+        let empty = seed(&db, BaseItemKind::Episode, Some("")).await;
+        seed_stream(&db, empty, 0, SUBTITLE, true).await;
+        let null = seed(&db, BaseItemKind::Movie, Some(r#"{"HasSubtitles":null}"#)).await;
+        // Jellyfin's own value, even where the stream rows say otherwise.
+        let adopted = seed(&db, BaseItemKind::Movie, Some(r#"{"HasSubtitles":false}"#)).await;
+        seed_stream(&db, adopted, 0, SUBTITLE, false).await;
+        let audio = seed(&db, BaseItemKind::Audio, Some("{}")).await;
+        seed_stream(&db, audio, 0, SUBTITLE, false).await;
+        let broken = seed(&db, BaseItemKind::Movie, Some("{not json")).await;
+        let array = seed(&db, BaseItemKind::Movie, Some("[]")).await;
+
+        let stored = store_has_subtitles_in_partitions(&db, 2).await.unwrap();
+
+        assert_eq!(stored, 7);
+        let expected = [
+            (
+                movie,
+                Some(r#"{"VideoType":"VideoFile","IsHD":true,"HasSubtitles":true}"#),
+            ),
+            (episode, Some(r#"{"HasSubtitles":true}"#)),
+            (
+                video,
+                Some(r#"{"VideoType":"VideoFile","HasSubtitles":false}"#),
+            ),
+            (music_video, Some(r#"{"HasSubtitles":true}"#)),
+            (trailer, Some(r#"{"HasSubtitles":false}"#)),
+            (empty, Some(r#"{"HasSubtitles":true}"#)),
+            (null, Some(r#"{"HasSubtitles":false}"#)),
+            (adopted, Some(r#"{"HasSubtitles":false}"#)),
+            (audio, Some("{}")),
+            (broken, Some("{not json")),
+            (array, Some("[]")),
+        ];
+        for (id, want) in expected {
+            assert_eq!(data(&db, id).await.as_deref(), want, "{id}");
+        }
+    }
+
+    /// The repair runs once per database: a video saved without the key
+    /// after it ran waits for its next probe.
+    #[tokio::test]
+    async fn it_runs_once() {
+        let db = test_db().await;
+        let first = seed(&db, BaseItemKind::Movie, Some("{}")).await;
+        assert_eq!(store_has_subtitles(&db).await.unwrap(), 1);
+        assert_eq!(
+            data(&db, first).await.as_deref(),
+            Some(r#"{"HasSubtitles":false}"#)
+        );
+        let later = seed(&db, BaseItemKind::Movie, Some("{}")).await;
+        assert_eq!(store_has_subtitles(&db).await.unwrap(), 0);
+        assert_eq!(data(&db, later).await.as_deref(), Some("{}"));
+    }
+
+    /// A database with no video writes nothing and is marked done.
+    #[tokio::test]
+    async fn a_database_without_videos_writes_nothing_and_is_marked_done() {
+        let db = test_db().await;
+        seed(&db, BaseItemKind::Audio, Some("{}")).await;
+        assert_eq!(store_has_subtitles(&db).await.unwrap(), 0);
+        assert!(!once(&db, HAS_SUBTITLES_STORED).await.unwrap());
+    }
+
+    /// A partition whose write fails stops the pass with the error and
+    /// leaves the repair due, so the next boot runs it again.
+    #[tokio::test]
+    async fn a_failed_write_leaves_the_repair_due() {
+        let db = test_db().await;
+        let movie = seed(&db, BaseItemKind::Movie, Some("{}")).await;
+        sqlx::query(
+            r#"CREATE TRIGGER "refuse" BEFORE UPDATE ON "BaseItems"
+               BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        assert!(store_has_subtitles(&db).await.is_err());
+        assert!(once(&db, HAS_SUBTITLES_STORED).await.unwrap());
+        assert_eq!(data(&db, movie).await.as_deref(), Some("{}"));
+    }
+
+    /// Each partition's `UPDATE` seeks the rowid range, never a `Type` index,
+    /// and probes each row's subtitle rows through the stream table's
+    /// `(ItemId, StreamType)` index.
+    #[tokio::test]
+    async fn the_partition_update_seeks_the_rowid_range() {
+        let db = test_db().await;
+        let explain = format!("EXPLAIN QUERY PLAN {}", has_subtitles_update_sql());
+        let plan: Vec<String> =
+            sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain.as_str()))
+                .bind(1_i64)
+                .bind(2_i64)
+                .bind(SUBTITLE)
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step
+                    == "SEARCH BaseItems USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)"),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().any(|step| step
+                == "SEARCH s USING COVERING INDEX \
+                    FerrofinIX_MediaStreamInfos_ItemId_StreamType (ItemId=? AND StreamType=?)"),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.starts_with("SCAN")),
+            "{plan:?}"
+        );
     }
 }
 
@@ -9569,6 +10592,11 @@ mod program_data_tests {
         /// A child of this one: the deb's old `/var/lib/ferrofin/data` moved to
         /// `/var/lib/ferrofin`.
         Child,
+        /// `--data-dir dB`, stored relative before every directory was made
+        /// absolute (gl-1668).
+        Relative,
+        /// `--data-dir ./data`, the README's quick start, stored the same way.
+        RelativeDot,
     }
 
     /// One row under `old` in each path column besides the item and image
@@ -9646,6 +10674,8 @@ mod program_data_tests {
                 .to_string_lossy()
                 .into_owned(),
             Previous::Child => program_data.join("data").to_string_lossy().into_owned(),
+            Previous::Relative => "dB".to_owned(),
+            Previous::RelativeDot => "./data".to_owned(),
         };
         let mode = derivation(&program_data);
         let root = program_data.join("root");
@@ -9732,6 +10762,8 @@ mod program_data_tests {
     #[case::elsewhere(Previous::Elsewhere)]
     #[case::into_a_subdirectory(Previous::Parent)]
     #[case::out_of_a_subdirectory(Previous::Child)]
+    #[case::relative(Previous::Relative)]
+    #[case::relative_dot(Previous::RelativeDot)]
     #[tokio::test]
     async fn rewrites_each_moved_path_once_where_its_file_is(#[case] previous: Previous) {
         let moved = moved(previous).await;
@@ -9802,6 +10834,7 @@ mod program_data_tests {
         ];
         expected.sort();
         assert_eq!(image_paths(&moved.db).await, expected);
+        assert_eq!(moved.rebase().await, None, "a second start writes nothing");
     }
 
     #[tokio::test]
@@ -9976,6 +11009,39 @@ mod program_data_tests {
 
         assert_eq!(moved.rebase().await, None);
         assert_eq!(item_path(&moved.db, moved.aggregate).await, "/srv/library");
+    }
+
+    /// A data directory of `""` stored `root/default/…`: its previous
+    /// directory is empty, which would put every stored path under it.
+    #[tokio::test]
+    async fn an_empty_previous_directory_is_no_evidence_of_a_move() {
+        let moved = moved(Previous::Elsewhere).await;
+        for (id, path) in [
+            (moved.aggregate, "root"),
+            (moved.user_root, "root/default"),
+            (moved.library, "root/default/Movies"),
+        ] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(path)
+                .execute(moved.db.writer())
+                .await
+                .unwrap();
+        }
+
+        let previous = previous_program_data_dirs(
+            &moved.db,
+            &derivation(&moved.program_data),
+            &dirs(&moved.program_data),
+        )
+        .await
+        .unwrap();
+        assert!(previous.is_empty(), "{previous:?}");
+        assert_eq!(moved.rebase().await, None);
+        assert_eq!(
+            item_path(&moved.db, moved.library).await,
+            "root/default/Movies"
+        );
     }
 
     #[tokio::test]

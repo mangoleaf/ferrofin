@@ -67,6 +67,42 @@ impl ExternalIdentity {
     }
 }
 
+/// Who makes a link with
+/// [`link_unless_taken`](ExternalIdentityStore::link_unless_taken), and so
+/// what it may replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkBy {
+    /// The user, from the session whose access token has this SHA-256 (never
+    /// the token): linked only while one of the user's devices holds that
+    /// token, and never replacing the user's link at the issuer.
+    Session([u8; 32]),
+    /// An administrator: replaces the user's link at the issuer.
+    Administrator,
+}
+
+/// What [`link_unless_taken`](ExternalIdentityStore::link_unless_taken) did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalLink {
+    /// The user had the identity already: nothing changed.
+    Kept(ExternalIdentity),
+    /// The identity is now the user's.
+    Linked {
+        /// The new link.
+        link: ExternalIdentity,
+        /// The user's earlier link at the issuer, which it replaced (an
+        /// administrator's link only).
+        replaced: Option<ExternalIdentity>,
+    },
+    /// Another user has the identity: nothing changed.
+    Taken,
+    /// The user has a link at the issuer, which a session's link never
+    /// replaces: nothing changed.
+    AlreadyLinked,
+    /// None of the user's devices holds the session's token any more: nothing
+    /// changed.
+    SessionEnded,
+}
+
 /// Reads and writes the links between outside identities and users.
 #[async_trait]
 pub trait ExternalIdentityStore: Send + Sync {
@@ -107,6 +143,24 @@ pub trait ExternalIdentityStore: Send + Sync {
         identity: ExternalIdentityKey<'_>,
         avatar_hash: Option<&str>,
     ) -> Result<ExternalIdentity, ServiceError>;
+
+    /// Links `identity` to `user_id` as `by` may, in one transaction that
+    /// takes the database's write lock before it reads, so every condition
+    /// holds at the write whoever else writes, on this server or another: it
+    /// never moves an identity another user has, and for a
+    /// [`LinkBy::Session`] it never replaces the user's link at the issuer and
+    /// links only while the session is one of the user's. Single Sign-On's
+    /// links; [`link`](Self::link) keeps replacing for the providers whose
+    /// rule that is.
+    ///
+    /// # Errors
+    /// [`ServiceError::NotFound`] when no user has `user_id`; nothing changes.
+    async fn link_unless_taken(
+        &self,
+        user_id: Uuid,
+        identity: ExternalIdentityKey<'_>,
+        by: LinkBy,
+    ) -> Result<ConditionalLink, ServiceError>;
 
     /// Sets the avatar hash of `identity`'s link, as the profile-image sync
     /// does (`configUser.ProfileImageHash = …`); an empty hash is stored as

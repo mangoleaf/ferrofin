@@ -6,11 +6,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use ferrofin_db::DbError;
 use ferrofin_db::export::{
-    ContainerFile, DOCKER, DatabaseEdits, DroppedObjects, DroppedTable, EXPORTED_DATABASE,
-    HistoryRewrite, LeftOut, LibraryContainer, PathRewrite, SourceDirs, export_data_dir,
+    ArtRelocation, CarriedRows, ContainerFile, DOCKER, DatabaseEdits, DroppedObjects, DroppedTable,
+    EXPORTED_DATABASE, FirstStartCounts, HistoryRewrite, IdentityLink, LeftOut, LibraryContainer,
+    MirroredLiveTv, PathRewrite, RecordingRow, SeriesTimerRow, SourceDirs, TimerRow,
+    export_data_dir,
 };
+use ferrofin_db::{Database, DbError};
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
@@ -162,12 +164,18 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
     );
     assert_eq!(summary.files, 3);
     assert_eq!(summary.database, out.join(EXPORTED_DATABASE));
-    // A native database has no Jellyfin history to rewrite; Ferrofin's own
+    // A native database has no Jellyfin history: it is given a fresh
+    // install's (tests/export_history.rs checks its ids); Ferrofin's own
     // table goes.
+    assert_eq!(summary.edits.history.recorded.len(), 105);
     assert_eq!(
         summary.edits,
         DatabaseEdits {
-            history: HistoryRewrite::default(),
+            history: HistoryRewrite {
+                generation: None,
+                recorded: summary.edits.history.recorded.clone(),
+                left_to_run: Vec::new(),
+            },
             dropped: DroppedObjects {
                 tables: vec![DroppedTable {
                     name: "_sqlx_migrations".to_owned(),
@@ -175,10 +183,26 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
                 }],
                 indexes: Vec::new(),
             },
-            paths: PathRewrite::default(),
+            paths: PathRewrite {
+                moves: summary.edits.paths.moves.clone(),
+                ..PathRewrite::default()
+            },
+            // (the moves themselves are checked below)
+            carried: CarriedRows::default(),
+            counts: FirstStartCounts::default(),
+            art: ArtRelocation::default(),
         }
     );
     assert_eq!(summary.left_out.len(), 0);
+    // The source's own directory moves to the layout's, for the paths written
+    // into files.
+    assert_eq!(
+        summary
+            .edits
+            .paths
+            .moved(&format!("{}/data/livetv/x.ts", source.display())),
+        Some("/config/data/livetv/x.ts".to_owned())
+    );
     assert_eq!(exported_names(&out).await, ["one", "two", "three"]);
 }
 
@@ -439,7 +463,8 @@ async fn the_database_directory_keeps_its_mode_and_time_after_the_snapshot() {
 /// docker image (gl-1557): its metadata directory becomes the output's
 /// `metadata`, the cache and the data directory's own stale `metadata` are
 /// left out, every stored path under a directory of the source is rewritten
-/// onto `/config`, and every one of those resolves in the output.
+/// onto `/config`, a library's and the root's locations in `Data` included
+/// (gl-1924), and every one of those resolves in the output.
 #[tokio::test]
 async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it() {
     let scratch = tempfile::tempdir().unwrap();
@@ -447,15 +472,17 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
     let image = format!("{}/library/ab/poster.jpg", meta.display());
     let statements = [
         "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
-        r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT)"#.to_owned(),
+        r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT, "Data" TEXT)"#.to_owned(),
         r#"CREATE TABLE "BaseItemImageInfos" ("Path" TEXT NOT NULL)"#.to_owned(),
         r#"CREATE TABLE "ImageInfos" ("Path" TEXT)"#.to_owned(),
         r#"INSERT INTO "BaseItems" VALUES
-           ('MediaBrowser.Controller.Entities.AggregateFolder', '/data/root'),
-           ('MediaBrowser.Controller.Entities.UserRootFolder', '/data/root/default'),
-           ('MediaBrowser.Controller.Entities.CollectionFolder', '/data/root/default/Movies'),
-           ('MediaBrowser.Controller.Entities.Person', '%MetadataPath%/People/A/Actor'),
-           ('MediaBrowser.Controller.Entities.Movies.Movie', '/media/movies/a.mkv')"#
+           ('MediaBrowser.Controller.Entities.AggregateFolder', '/data/root',
+            '{"PhysicalLocationsList":["/data/root","/media/movies"]}'),
+           ('MediaBrowser.Controller.Entities.UserRootFolder', '/data/root/default', NULL),
+           ('MediaBrowser.Controller.Entities.CollectionFolder', '/data/root/default/Movies',
+            '{"PhysicalLocationsList":["/data/root/default/Movies","/media/movies"]}'),
+           ('MediaBrowser.Controller.Entities.Person', '%MetadataPath%/People/A/Actor', NULL),
+           ('MediaBrowser.Controller.Entities.Movies.Movie', '/media/movies/a.mkv', NULL)"#
             .to_owned(),
         format!(r#"INSERT INTO "BaseItemImageInfos" VALUES ('{image}')"#),
         r#"INSERT INTO "ImageInfos" VALUES ('/data/config/users/a/profile.png')"#.to_owned(),
@@ -512,9 +539,14 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
     );
     assert_eq!(summary.edits.paths.stored, ["/data"]);
     assert_eq!(summary.edits.paths.ran_at.as_deref(), Some("/data"));
-    assert_eq!(summary.edits.paths.rows, 5);
+    assert_eq!(summary.edits.paths.rewritten, 7);
     let stored = exported_paths(&out).await;
-    assert!(stored.contains(&"/config/metadata/library/ab/poster.jpg".to_owned()));
+    for path in [
+        "/config/metadata/library/ab/poster.jpg",
+        "/config/root/default/Movies",
+    ] {
+        assert!(stored.contains(&path.to_owned()), "{path}");
+    }
     for path in &stored {
         let source_dirs = [source.as_path(), meta.as_path(), Path::new("/data")];
         assert!(
@@ -535,7 +567,8 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
 }
 
 /// Every path the exported database under `out` stores in `BaseItems`,
-/// `BaseItemImageInfos` and `ImageInfos`.
+/// `BaseItemImageInfos` and `ImageInfos`, and every string value of an
+/// item's `Data`.
 async fn exported_paths(out: &Path) -> Vec<String> {
     let mut conn = SqliteConnectOptions::new()
         .filename(out.join(EXPORTED_DATABASE))
@@ -546,11 +579,260 @@ async fn exported_paths(out: &Path) -> Vec<String> {
     let stored = sqlx::query_scalar(
         r#"SELECT "Path" FROM "BaseItems" WHERE "Path" IS NOT NULL
            UNION ALL SELECT "Path" FROM "BaseItemImageInfos"
-           UNION ALL SELECT "Path" FROM "ImageInfos""#,
+           UNION ALL SELECT "Path" FROM "ImageInfos"
+           UNION ALL SELECT j.value FROM "BaseItems", json_tree("Data") AS j
+                     WHERE "Data" IS NOT NULL AND j.type = 'text'"#,
     )
     .fetch_all(&mut conn)
     .await
     .unwrap();
+    sqlx::Connection::close(conn).await.unwrap();
+    stored
+}
+
+/// The items of [`the_art_earlier_builds_saved_moves_into_jellyfins_layout`]:
+/// a genre, a music album, a movie, one whose name is taken, one whose two
+/// images share a file, and one whose image is in the genre's folder.
+const GENRE: &str = "11111111-2222-4333-8444-555555555555";
+const ALBUM: &str = "AAAAAAAA-0000-4000-8000-000000000001";
+const MOVIE: &str = "BBBBBBBB-0000-4000-8000-000000000002";
+const TAKEN: &str = "CCCCCCCC-0000-4000-8000-000000000003";
+const SHARED: &str = "DDDDDDDD-0000-4000-8000-000000000004";
+const OTHER: &str = "EEEEEEEE-0000-4000-8000-000000000005";
+
+/// `name` in `id`'s own art folder, relative to the library folder:
+/// `{idN[..2]}/{idN}/name`.
+fn own(id: &str, name: &str) -> String {
+    let simple = id.replace('-', "").to_ascii_lowercase();
+    format!("{}/{simple}/{name}", &simple[..2])
+}
+
+/// A source whose database stores `images` (item, type, path relative to its
+/// library folder or absolute) for the items above, each such file under the
+/// library folder holding its path, with `extra` files there besides.
+async fn source_with_images(
+    scratch: &Path,
+    images: &[(&str, i32, String)],
+    extra: &[(String, &str)],
+) -> PathBuf {
+    let library = scratch.join("source/metadata/library");
+    let mut statements = vec![
+        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
+        r#"CREATE TABLE "BaseItems" ("Id" TEXT PRIMARY KEY, "Type" TEXT NOT NULL, "Path" TEXT)"#
+            .to_owned(),
+        r#"CREATE TABLE "BaseItemImageInfos" ("ItemId" TEXT NOT NULL,
+           "ImageType" INTEGER NOT NULL, "Path" TEXT NOT NULL)"#
+            .to_owned(),
+    ];
+    for (id, kind) in [
+        (GENRE, "Genre"),
+        (ALBUM, "Audio.MusicAlbum"),
+        (MOVIE, "Movies.Movie"),
+        (TAKEN, "Movies.Movie"),
+        (SHARED, "Folder"),
+        (OTHER, "Genre"),
+    ] {
+        statements.push(format!(
+            r#"INSERT INTO "BaseItems" VALUES ('{id}', 'MediaBrowser.Controller.Entities.{kind}', NULL)"#
+        ));
+    }
+    let mut files: Vec<(String, &str)> = extra.to_vec();
+    for (id, image_type, path) in images {
+        let stored = if path.starts_with('/') {
+            path.clone()
+        } else {
+            files.push((path.clone(), path));
+            format!("{}/{path}", library.display())
+        };
+        statements.push(format!(
+            r#"INSERT INTO "BaseItemImageInfos" VALUES ('{id}', {image_type}, '{stored}')"#
+        ));
+    }
+    let source = source_with_database(
+        scratch,
+        &statements.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    for (path, bytes) in files {
+        let file = library.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, bytes).unwrap();
+    }
+    source
+}
+
+/// An image row of [`source_with_images`]: item, type, path.
+type ImageRow = (&'static str, i32, String);
+
+/// The image rows and the other files of [`source_with_images`] for the
+/// tests of the art earlier builds saved.
+fn earlier_art() -> ([ImageRow; 12], [(String, &'static str); 2]) {
+    let lower = ALBUM.to_ascii_lowercase();
+    let images = [
+        (GENRE, 0, format!("{GENRE}/primary.png")),
+        (ALBUM, 0, format!("{lower}/primary.JPEG")),
+        (ALBUM, 6, format!("{ALBUM}/disc.png")),
+        (MOVIE, 0, "/media/movies/m/poster.jpg".to_owned()),
+        (MOVIE, 2, format!("{MOVIE}/backdrop.jpg")),
+        (MOVIE, 2, format!("{MOVIE}/backdrop2.jpg")),
+        (MOVIE, 5, format!("{MOVIE}/thumb.jpg")),
+        (TAKEN, 0, format!("{TAKEN}/primary.jpg")),
+        (TAKEN, 0, own(TAKEN, "poster.jpg")),
+        (SHARED, 0, format!("{SHARED}/primary.jpg")),
+        (SHARED, 5, format!("{SHARED}/primary.jpg")),
+        (OTHER, 0, format!("{GENRE}/primary.png")),
+    ];
+    let extra = [
+        (own(MOVIE, "landscape.jpg"), "a file no row names"),
+        (format!("{MOVIE}/stray.jpg"), "no row names it either"),
+    ];
+    (images, extra)
+}
+
+/// The `{xx}` and `{xx}/{idN}` folders made for `id`'s art from `like`,
+/// relative to the output.
+fn made_folders(id: &str, like: &str) -> [(PathBuf, PathBuf); 2] {
+    let lib = |path: &str| PathBuf::from(format!("metadata/library/{path}"));
+    let own = own(id, "");
+    let own = own.trim_end_matches('/');
+    [(lib(&own[..2]), lib(like)), (lib(own), lib(like))]
+}
+
+/// The art earlier builds saved in an item's `{ID}` or `{id}` folder is moved
+/// in the output into the item's own folder under the name Jellyfin's save
+/// gives it, and its rows follow (gl-1916): a file no row names is replaced
+/// there, a file two rows name is copied for the one and moved for the other,
+/// and a folder left empty goes. A name a stored image has keeps the row
+/// where it is, and so do a row in another item's folder, one outside the
+/// library and a file no row names. The source is left byte for byte.
+#[tokio::test]
+async fn the_art_earlier_builds_saved_moves_into_jellyfins_layout() {
+    let scratch = tempfile::tempdir().unwrap();
+    let lower = ALBUM.to_ascii_lowercase();
+    let (images, extra) = earlier_art();
+    let source = source_with_images(scratch.path(), &images, &extra).await;
+    let (out, before) = (scratch.path().join("out"), files(&source));
+
+    let summary = export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        &out,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(files(&source), before, "the source is left as it was");
+    let at = |path: &str| format!("/config/metadata/library/{path}");
+    let lib = |path: &str| PathBuf::from(format!("metadata/library/{path}"));
+    // The rows that move, by their index in `images`, with where to.
+    let moved = [
+        (0, own(GENRE, "poster.png")),
+        (1, own(ALBUM, "folder.jpg")),
+        (2, own(ALBUM, "cdart.png")),
+        (4, own(MOVIE, "backdrop.jpg")),
+        (5, own(MOVIE, "backdrop1.jpg")),
+        (6, own(MOVIE, "landscape.jpg")),
+        (9, own(SHARED, "poster.jpg")),
+        (10, own(SHARED, "landscape.jpg")),
+    ];
+    assert_eq!(
+        summary.edits.art,
+        ArtRelocation {
+            moved: moved
+                .iter()
+                .map(|(row, to)| (at(&images[*row].2), at(to)))
+                .collect(),
+            kept: vec![at(&images[7].2)],
+            made: [
+                made_folders(GENRE, GENRE),
+                made_folders(ALBUM, &lower),
+                made_folders(SHARED, SHARED)
+            ]
+            .concat(),
+            removed: [lower.as_str(), ALBUM, SHARED].map(&lib).into(),
+        }
+    );
+    let copied = files(&out);
+    let file = |path: &str| copied.get(Path::new(&format!("metadata/library/{path}")));
+    for (row, to) in &moved {
+        let from = &images[*row].2;
+        assert_eq!(file(to).map(Vec::as_slice), Some(from.as_bytes()), "{to}");
+        // The genre's file stays for the row of another item that names it.
+        assert_eq!(file(from).is_some(), *row == 0, "{from}");
+    }
+    for left in [&images[7].2, &images[8].2, &extra[1].0] {
+        assert!(file(left).is_some(), "{left}");
+    }
+    for gone in [ALBUM, lower.as_str(), SHARED] {
+        assert!(!out.join("metadata/library").join(gone).exists(), "{gone}");
+    }
+    let expected: Vec<String> = images
+        .iter()
+        .enumerate()
+        .map(
+            |(index, (_, _, path))| match moved.iter().find(|(row, _)| *row == index) {
+                Some((_, to)) => at(to),
+                None if path.starts_with('/') => path.clone(),
+                None => at(path),
+            },
+        )
+        .collect();
+    assert_eq!(exported_image_paths(&out).await, expected);
+}
+
+/// A folder the art's move makes takes the mode of the one the art came from,
+/// as every folder of the copy takes its source's, the one the move then
+/// removes included, and a second export of the source is the same as the
+/// first (gl-1916).
+#[tokio::test]
+async fn the_folders_the_art_moves_into_are_finished_and_two_exports_agree() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (images, extra) = earlier_art();
+    let source = source_with_images(scratch.path(), &images, &extra).await;
+    let lower = ALBUM.to_ascii_lowercase();
+    #[cfg(unix)]
+    for like in [GENRE, lower.as_str()] {
+        use std::os::unix::fs::PermissionsExt as _;
+        let like = source.join("metadata/library").join(like);
+        std::fs::set_permissions(like, std::fs::Permissions::from_mode(0o750)).unwrap();
+    }
+    let (first, second) = (scratch.path().join("first"), scratch.path().join("second"));
+    for out in [&first, &second] {
+        export_data_dir(
+            &SourceDirs::new(&source),
+            &DOCKER,
+            &source.join(EXPORTED_DATABASE),
+            out,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(files(&first), files(&second));
+    #[cfg(unix)]
+    for (made, _) in [made_folders(GENRE, GENRE), made_folders(ALBUM, &lower)].concat() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(first.join(&made))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o750, "{}", made.display());
+    }
+}
+
+/// The image paths the exported database under `out` stores, in row order.
+async fn exported_image_paths(out: &Path) -> Vec<String> {
+    let mut conn = SqliteConnectOptions::new()
+        .filename(out.join(EXPORTED_DATABASE))
+        .read_only(true)
+        .connect()
+        .await
+        .unwrap();
+    let stored = sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItemImageInfos" ORDER BY rowid"#)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
     sqlx::Connection::close(conn).await.unwrap();
     stored
 }
@@ -589,6 +871,51 @@ async fn a_configuration_directory_kept_elsewhere_is_copied_without_its_migratio
         [(PathBuf::from("config"), LeftOut::NotUsed)]
     );
     assert!(etc.join("migrations.xml").exists(), "the source keeps it");
+}
+
+/// The files `not_needed_files` names are left out of every tree copied, the
+/// data directory's and a configuration directory kept elsewhere, and the
+/// source keeps them (gl-1949).
+#[tokio::test]
+async fn files_not_needed_are_left_out_of_every_tree_copied() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source(scratch.path()).await;
+    let etc = scratch.path().join("etc");
+    std::fs::create_dir_all(etc.join("users/named")).unwrap();
+    for file in ["system.json", "system_id", "users/named/network.json"] {
+        std::fs::write(etc.join(file), file).unwrap();
+    }
+    std::fs::write(source.join("task_results.json"), b"{}").unwrap();
+    // Of the same name, elsewhere: copied.
+    std::fs::write(source.join("metadata/system.json"), b"metadata's").unwrap();
+    let dirs = SourceDirs {
+        config: etc.clone(),
+        not_needed_files: vec![
+            etc.join("system.json"),
+            etc.join("users/named/network.json"),
+            etc.join("users/named/encoding.json"),
+            source.join("task_results.json"),
+        ],
+        ..SourceDirs::new(&source)
+    };
+    let (out, before) = (scratch.path().join("out"), files(&etc));
+
+    export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out)
+        .await
+        .unwrap();
+
+    let copied = files(&out);
+    for left_out in [
+        "config/system.json",
+        "config/users/named/network.json",
+        "task_results.json",
+    ] {
+        assert!(!copied.contains_key(Path::new(left_out)), "{left_out}");
+    }
+    assert_eq!(copied[Path::new("config/system_id")], b"system_id");
+    assert_eq!(copied[Path::new("metadata/system.json")], b"metadata's");
+    assert_eq!(files(&etc), before, "the source keeps them");
+    assert!(source.join("task_results.json").exists());
 }
 
 /// A database with `statements` run on it, at `data/jellyfin.db` of a new
@@ -855,5 +1182,156 @@ async fn playlist_and_collection_files_in_the_data_directory_are_left_out() {
     assert!(
         media.join("Heist [boxset]/collection.xml").is_file(),
         "media is never written"
+    );
+}
+
+/// A migrated Ferrofin database holding Live TV (a tuner, a guide, a timer
+/// that recorded, a series timer, a channel and a programme item with a
+/// user's favourite) and an LDAP-Auth link: the export reads what Jellyfin
+/// keeps in files before it drops Ferrofin's tables, keeps the items Jellyfin
+/// reads with the favourite on them (gl-1556), and leaves the source byte for
+/// byte as it was.
+#[tokio::test]
+async fn live_tv_and_identity_rows_are_carried_and_the_items_kept() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = scratch.path().join("source");
+    let database = source.join(EXPORTED_DATABASE);
+    let user = "5386A6F7-707F-47CC-8E9E-6756292CDAFF";
+    live_tv_database(&database, user).await;
+    let before = files(&source);
+    let out = scratch.path().join("out");
+
+    let summary = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        files(&source),
+        before,
+        "the source is left byte for byte as it was"
+    );
+    assert_live_tv_carried(&summary.edits.carried, user);
+    let mut conn = SqliteConnectOptions::new()
+        .filename(out.join(EXPORTED_DATABASE))
+        .read_only(true)
+        .connect()
+        .await
+        .unwrap();
+    let kept: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT b."Type", COALESCE(MAX(u."IsFavorite"), 0) FROM "BaseItems" b
+           LEFT JOIN "UserData" u ON u."ItemId" = b."Id"
+           WHERE b."Type" LIKE 'MediaBrowser.Controller.LiveTv.%' GROUP BY b."Type" ORDER BY 1"#,
+    )
+    .fetch_all(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        kept,
+        [
+            ("MediaBrowser.Controller.LiveTv.LiveTvChannel".to_owned(), 1),
+            ("MediaBrowser.Controller.LiveTv.LiveTvProgram".to_owned(), 0),
+        ],
+        "the channel and the programme are kept, the favourite with them"
+    );
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name GLOB 'Ferrofin*'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// A migrated Ferrofin database at `database` holding Live TV and an LDAP-Auth
+/// link for `user`: [`live_tv_and_identity_rows_are_carried_and_the_items_kept`]'s.
+async fn live_tv_database(database: &Path, user: &str) {
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let db = Database::connect(&format!("sqlite://{}", database.display()))
+        .await
+        .unwrap();
+    let channel = "714EE2D0-C390-F438-28ED-AFC33B39CC9A";
+    for statement in [
+        r#"INSERT INTO "Users" ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess", "HidePlayedInLatest",
+            "InternalId", "InvalidLoginAttemptCount", "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack", "RememberAudioSelections",
+            "RememberSubtitleSelections", "RowVersion", "SubtitleMode", "SyncPlayAccess",
+            "Username", "NormalizedUsername")
+           VALUES (?1, 'auth', 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 'reset', 1, 1, 1, 0, 0, 0,
+                   'ann', 'ANN')"#,
+        r#"INSERT INTO "BaseItems" ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked",
+            "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem", "Name")
+           VALUES (?2, 'MediaBrowser.Controller.LiveTv.LiveTvChannel', 0, 0, 0, 0, 0, 0, 0, 'Test News'),
+                  ('9086A3A8-7441-6453-6DCB-4C74BF66B4C3', 'MediaBrowser.Controller.LiveTv.LiveTvProgram',
+                   0, 0, 0, 0, 0, 1, 0, 'Quiz Night')"#,
+        r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "PlayCount",
+            "PlaybackPositionTicks", "Played") VALUES (?2, ?1, 'key', 1, 0, 0, 0)"#,
+        r#"INSERT INTO "FerrofinLiveTvTunerHosts" ("Id", "Url", "Type", "Data")
+           VALUES ('t', 'http://tuner.lan/a.m3u', 'm3u', '{"Id":"t","Url":"http://tuner.lan/a.m3u"}')"#,
+        r#"INSERT INTO "FerrofinLiveTvListingProviders" ("Id", "Type", "Path", "Data")
+           VALUES ('g', 'xmltv', '/srv/guide.xml', '{"Id":"g","Path":"/srv/guide.xml"}')"#,
+        r#"INSERT INTO "FerrofinLiveTvTimers" ("Id", "ChannelId", "StartDate", "Status", "Data", "IsManual")
+           VALUES ('timer', ?2, '2026-11-22 20:00:00', 'Completed', '{"ExternalId":"x"}', 1)"#,
+        r#"INSERT INTO "FerrofinLiveTvRecordings" ("Id", "ChannelId", "TimerId", "StartDate",
+            "Status", "Path", "EpisodeTitle", "SeasonNumber", "IsKids")
+           VALUES ('rec', ?2, 'timer', '2026-11-22 20:00:00', 'Completed', '/srv/rec.ts', 'Round 1', 1, 1)"#,
+        r#"INSERT INTO "FerrofinLiveTvSeriesTimers" ("Id", "Data", "ExternalId", "SeriesId")
+           VALUES ('series', '{"Name":"Quiz Night"}', 'ext', 'quiz')"#,
+        r#"INSERT INTO "FerrofinExternalIdentities" ("UserId", "ProviderId", "Subject", "AvatarHash",
+            "DateCreated")
+           VALUES (?1, 'Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin', 'ann', 'h1',
+                   '2026-11-21 00:00:00')"#,
+    ] {
+        // Literal test ids only, no binds: a statement takes the ones it names.
+        let statement = statement
+            .replace("?1", &format!("'{user}'"))
+            .replace("?2", &format!("'{channel}'"));
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    db.close().await;
+}
+
+/// Fails unless `carried` is what [`live_tv_database`] stored for `user`.
+fn assert_live_tv_carried(carried: &CarriedRows, user: &str) {
+    assert_eq!(
+        *carried,
+        CarriedRows {
+            tuner_hosts: vec![r#"{"Id":"t","Url":"http://tuner.lan/a.m3u"}"#.to_owned()],
+            listing_providers: vec![r#"{"Id":"g","Path":"/srv/guide.xml"}"#.to_owned()],
+            timers: vec![TimerRow {
+                id: "timer".to_owned(),
+                data: r#"{"ExternalId":"x"}"#.to_owned(),
+                is_manual: true,
+                recording: Some(RecordingRow {
+                    status: "Completed".to_owned(),
+                    path: Some("/srv/rec.ts".to_owned()),
+                    episode_title: Some("Round 1".to_owned()),
+                    season_number: Some(1),
+                    is_kids: true,
+                    ..RecordingRow::default()
+                }),
+            }],
+            series_timers: vec![SeriesTimerRow {
+                data: r#"{"Name":"Quiz Night"}"#.to_owned(),
+                external_id: "ext".to_owned(),
+                series_id: Some("quiz".to_owned()),
+            }],
+            identity_links: vec![IdentityLink {
+                provider_id: "Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin"
+                    .to_owned(),
+                user_id: user.to_owned(),
+                subject: "ann".to_owned(),
+                avatar_hash: Some("h1".to_owned()),
+            }],
+            mirrored: MirroredLiveTv {
+                channels: 1,
+                programs: 1,
+                favorite_channels: 1,
+            },
+        }
     );
 }

@@ -48,6 +48,7 @@ use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::{ItemImageInfo, file_date_modified};
 use ferrofin_traits::persistence::{
     ItemPersistenceService, ItemRepository, ItemTypeLookup, OwnerExtrasRefresh, PlaylistMember,
+    ScannedPlaylist,
 };
 use ferrofin_traits::providers::{
     GeneratedImageProvider, ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions,
@@ -1169,10 +1170,15 @@ pub struct LocalProviderManager {
     /// ([`ProviderManager::lock_item_metadata`]).
     item_metadata_locks: Arc<ferrofin_util::keyed_locks::KeyedLocks>,
     nfo_saver: Option<Arc<crate::nfo_save::NfoSaver>>,
-    /// A box set's `collection.xml` saver (`BoxSetXmlSaver`); with it the
-    /// box set's refresh reads the file too (`BoxSetXmlProvider`).
-    box_set_xml: Option<Arc<crate::box_set_xml::BoxSetXmlSaver>>,
+    /// A box set's `collection.xml` and a playlist folder's `playlist.xml`
+    /// saver (`BoxSetXmlSaver`, `PlaylistXmlSaver`); with it their refresh
+    /// reads the file too (`BoxSetXmlProvider`, `PlaylistXmlProvider`).
+    container_xml: Option<Arc<crate::container_xml::ContainerXmlSaver>>,
     image_saver: Option<Arc<crate::image_save::ImageFileSaver>>,
+    /// Measures a saved image's size and blurhash
+    /// ([`update_images`](Self::update_images)). Absent → saved images keep
+    /// what they were stored with.
+    image_processor: Option<Arc<dyn ferrofin_traits::drawing::ImageProcessor>>,
     external_id_infos: Vec<ExternalIdInfo>,
     /// Runtime-registered named metadata providers (WASM plugins) as
     /// (name, supported kinds), surfaced in library options.
@@ -1357,8 +1363,9 @@ impl std::fmt::Debug for LocalProviderManager {
                 &self.remote_search_providers.len(),
             )
             .field("has_nfo_saver", &self.nfo_saver.is_some())
-            .field("has_box_set_xml", &self.box_set_xml.is_some())
+            .field("has_container_xml", &self.container_xml.is_some())
             .field("has_image_saver", &self.image_saver.is_some())
+            .field("has_image_processor", &self.image_processor.is_some())
             .field("has_image_store", &self.image_store.is_some())
             .field("metadata_dir", &self.metadata_dir)
             .field("has_by_name_rebase", &self.by_name_rebase.is_some())
@@ -1395,6 +1402,17 @@ impl LocalProviderManager {
         self
     }
 
+    /// Attaches the image processor every save measures the item's images
+    /// with ([`update_images`](Self::update_images)).
+    #[must_use]
+    pub fn with_image_processor(
+        mut self,
+        processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor>,
+    ) -> Self {
+        self.image_processor = Some(processor);
+        self
+    }
+
     /// Attaches the registered automatic NFO saver.
     #[must_use]
     pub fn with_nfo_saver(mut self, saver: Arc<crate::nfo_save::NfoSaver>) -> Self {
@@ -1402,11 +1420,15 @@ impl LocalProviderManager {
         self
     }
 
-    /// Attaches the box set `collection.xml` saver, which also makes a box
-    /// set's refresh read the file ([`crate::box_set_xml`]).
+    /// Attaches the `collection.xml` and `playlist.xml` saver, which also
+    /// makes a box set's and a playlist's refresh read the file
+    /// ([`crate::container_xml`]).
     #[must_use]
-    pub fn with_box_set_xml(mut self, saver: Arc<crate::box_set_xml::BoxSetXmlSaver>) -> Self {
-        self.box_set_xml = Some(saver);
+    pub fn with_container_xml(
+        mut self,
+        saver: Arc<crate::container_xml::ContainerXmlSaver>,
+    ) -> Self {
+        self.container_xml = Some(saver);
         self
     }
 
@@ -1442,8 +1464,9 @@ impl LocalProviderManager {
             refresh_queue: Arc::default(),
             item_metadata_locks: Arc::default(),
             nfo_saver: None,
-            box_set_xml: None,
+            container_xml: None,
             image_saver: None,
+            image_processor: None,
             external_id_infos,
             dynamic_fetchers: Vec::new(),
             dynamic_image_providers: Vec::new(),
@@ -2099,22 +2122,24 @@ impl LocalProviderManager {
         Ok(Some(ids))
     }
 
-    /// `RefreshWithProviders`' local metadata provider for a box set,
-    /// `BoxSetXmlProvider`: its `collection.xml` ([`crate::box_set_xml`]),
-    /// read when the plan runs the local readers — never when identifying,
-    /// nor under "Replace all metadata" while a metadata saver is enabled for
-    /// the item (`isSavingMetadata`, `MetadataService.cs:803`). Its provider
-    /// id elements are the box set's external ids
-    /// (`GetExternalIdInfos(item)`).
+    /// `RefreshWithProviders`' local metadata provider for a box set or a
+    /// playlist folder, `BoxSetXmlProvider` or `PlaylistXmlProvider`: its
+    /// `collection.xml` or `playlist.xml` ([`crate::container_xml`]), read
+    /// when the plan runs the local readers — never when identifying, nor
+    /// under "Replace all metadata" while a metadata saver is enabled for the
+    /// item (`isSavingMetadata`, `MetadataService.cs:803`). Its provider id
+    /// elements are the item's external ids (`GetExternalIdInfos(item)`).
     async fn read_local_xml(
         &self,
         stored: &BaseItemEntity,
-        file: Option<&crate::box_set_xml::LocalXmlFile>,
+        file: Option<&crate::container_xml::LocalXmlFile>,
         plan: &ItemRefreshPlan,
         options: &MetadataRefreshOptions,
     ) -> Option<crate::local_xml::LocalContainerXml> {
-        let (saver, file) = (self.box_set_xml.as_ref()?, file?);
-        if !plan.local_metadata || options.search_result.is_some() {
+        let (saver, file) = (self.container_xml.as_ref()?, file?);
+        // A locked item returns before its local providers run
+        // (`MetadataService.cs:785-788`).
+        if !plan.local_metadata || options.search_result.is_some() || stored.is_locked {
             return None;
         }
         if options.replace_all_metadata {
@@ -2127,16 +2152,17 @@ impl LocalProviderManager {
                 Ok(true) => return None,
                 Ok(false) => {}
                 Err(err) => {
-                    tracing::warn!(item_id = %stored.id, %err, "could not tell whether the box set's collection.xml is saved");
+                    tracing::warn!(item_id = %stored.id, %err, "could not tell whether the item's local XML metadata is saved");
                 }
             }
         }
-        let keys: Vec<String> = crate::external_ids::external_id_infos(BaseItemKind::BoxSet)
+        let kind = BaseItemKind::from_stored_type_name(&stored.type_)?;
+        let keys: Vec<String> = crate::external_ids::external_id_infos(kind)
             .into_iter()
             .chain(self.external_id_infos.iter().cloned())
             .filter_map(|info| info.key)
             .collect();
-        crate::box_set_xml::read(&file.path, &keys).await
+        crate::container_xml::read(&file.path, kind, &keys).await
     }
 
     /// `ProviderManager.SaveMetadataAsync` with the NFO saver. A failure is
@@ -2149,15 +2175,55 @@ impl LocalProviderManager {
         }
     }
 
-    /// `ProviderManager.SaveMetadataAsync` with the `collection.xml` saver:
-    /// whether it wrote the file. A failure is logged, never returned: the
+    /// `ProviderManager.SaveMetadataAsync`: the NFO saver, then the
+    /// `collection.xml`/`playlist.xml` saver, over one read of the item's row
+    /// (each saver reads it again under its file's lock before it writes).
+    /// Returns whether the latter wrote its file. Failures are logged, never
+    /// returned: the metadata is already committed.
+    async fn run_savers(&self, item_id: Uuid, update: ItemUpdateType) -> bool {
+        if self.nfo_saver.is_none() && self.container_xml.is_none() {
+            return false;
+        }
+        // A manager built without an item store (no remote images wired):
+        // each saver reads for itself.
+        let Some(items) = &self.items else {
+            self.save_nfo(item_id, update).await;
+            return self.save_container_xml(item_id, update).await;
+        };
+        let row = match items.retrieve_item(item_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(%item_id, %error, "the metadata savers could not read the item");
+                return false;
+            }
+        };
+        if let Some(saver) = &self.nfo_saver
+            && let Err(error) = saver.save_read(item_id, &row, update).await
+        {
+            tracing::warn!(%item_id, %error, "NFO metadata saver failed");
+        }
+        let Some(saver) = &self.container_xml else {
+            return false;
+        };
+        saver
+            .save_read(item_id, &row, update)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%item_id, %error, "local XML metadata saver failed");
+                false
+            })
+    }
+
+    /// `ProviderManager.SaveMetadataAsync` with the `collection.xml` and
+    /// `playlist.xml` saver: whether it wrote the file. A failure is logged, never returned: the
     /// metadata is already committed.
-    async fn save_box_set_xml(&self, item_id: Uuid, update: ItemUpdateType) -> bool {
-        let Some(saver) = &self.box_set_xml else {
+    async fn save_container_xml(&self, item_id: Uuid, update: ItemUpdateType) -> bool {
+        let Some(saver) = &self.container_xml else {
             return false;
         };
         saver.save(item_id, update).await.unwrap_or_else(|error| {
-            tracing::warn!(%item_id, %error, "collection.xml metadata saver failed");
+            tracing::warn!(%item_id, %error, "local XML metadata saver failed");
             false
         })
     }
@@ -2668,7 +2734,9 @@ impl LocalProviderManager {
         item_id: Uuid,
         options: &MetadataRefreshOptions,
     ) -> Result<ItemUpdateType, ServiceError> {
-        use crate::metadata_merge::{MetadataResult, RefreshAnswers, RefreshMerge};
+        use crate::metadata_merge::{
+            MetadataResult, RefreshAnswers, RefreshMerge, supports_people,
+        };
         // Held from the id write and the load below to the last save, so an
         // edit made meanwhile waits and then applies to the saved row. It
         // spans the remote fetches too, so the edit waits for them, minutes at
@@ -2763,10 +2831,11 @@ impl LocalProviderManager {
         // A by-name item off its rebased path is required to refresh
         // (`Genre.RequiresRefresh` and its kin, `MetadataService.cs:99-110`).
         let rebased = self.rebased_by_name_path(&stored);
-        // A box set's local metadata provider, `BoxSetXmlProvider`: its
-        // `collection.xml`, which its change monitor watches.
-        let xml_file = match &self.box_set_xml {
-            Some(_) => crate::box_set_xml::local_file(&stored).await,
+        // A box set's or playlist's local metadata provider,
+        // `BoxSetXmlProvider` or `PlaylistXmlProvider`: its file, which its
+        // change monitor watches.
+        let xml_file = match &self.container_xml {
+            Some(_) => crate::container_xml::local_file(&stored).await,
             None => None,
         };
         let file = FileFacts {
@@ -3008,17 +3077,32 @@ impl LocalProviderManager {
             },
         );
         // The file's links, kept for after the save: they count only for a
-        // box set outside the data directory (`BoxSetMetadataService.MergeData`).
+        // container outside the data directory (`BoxSetMetadataService` and
+        // `PlaylistMetadataService.MergeData`). A playlist's file also
+        // carries its shares and media type, which that merge takes too.
         let mut local = local;
         let local_members = local
             .as_mut()
             .map(|local| std::mem::take(&mut local.children));
+        let local_playlist = local
+            .as_mut()
+            .filter(|_| container == Some(BaseItemKind::Playlist))
+            .map(|local| {
+                (
+                    std::mem::take(&mut local.shares),
+                    crate::local_xml::playlist_media_type(local.playlist_media_type.as_deref()),
+                )
+            });
         let local_people = local.as_mut().and_then(|local| local.item.people.take());
         // The credits the answers carried, as the scan folds them
         // ([`pass_credits`](crate::metadata_merge::pass_credits)): `None`
         // keeps the stored ones. A locked item and a `Cast` lock keep them
-        // too (`MetadataService.cs:1235`).
-        let credits = if stored.is_locked || locked_fields.contains(&MetadataField::Cast) {
+        // too (`MetadataService.cs:1235`), and a kind without people never
+        // saves any (`SaveItemAsync`, `:320`): a `playlist.xml`'s are dropped.
+        let credits = if stored.is_locked
+            || locked_fields.contains(&MetadataField::Cast)
+            || !supports_people(BaseItemKind::from_stored_type_name(&stored.type_))
+        {
             None
         } else {
             crate::metadata_merge::pass_credits(local_people, &fetched.credits, merge.keep_existing)
@@ -3073,6 +3157,19 @@ impl LocalProviderManager {
             _ => current,
         };
         let mut row = merged.item;
+        // `targetItem.PlaylistMediaType = sourceItem.PlaylistMediaType`: the
+        // file's, `Unknown` when it names none, in the column and in `Data`.
+        if let Some((_, media_type)) = &local_playlist {
+            row.media_type = Some((*media_type).to_owned());
+            let mut data = ferrofin_db::item_data::parse_data(row.data.as_deref());
+            data.insert(
+                "PlaylistMediaType".to_owned(),
+                serde_json::Value::String((*media_type).to_owned()),
+            );
+            if let Ok(text) = serde_json::to_string(&data) {
+                row.data = Some(text);
+            }
+        }
         // `BeforeMetadataRefresh` (`MetadataService.cs:162-169`): the moved
         // by-name item takes its rebased path in every mode but `None` (a moved
         // path makes the refresh required), whatever the lock, before the
@@ -3201,28 +3298,52 @@ impl LocalProviderManager {
                     .collect();
                 store.add_locked_fields(item_id, &added).await?;
             }
-            // `BoxSetMetadataService.MergeData`: the file's members join the
-            // links of a box set outside the data directory; in it, the
-            // `LinkedChildren` table is the source of truth (v12.4).
-            if let (Some(members), Some(saver)) = (&local_members, &self.box_set_xml)
-                && row.path.as_deref().is_some_and(|path| {
-                    crate::box_set_xml::takes_members_from_file(
-                        &saver.data_path(),
-                        std::path::Path::new(path),
+            // `BoxSetMetadataService` and `PlaylistMetadataService.MergeData`:
+            // the file's members join the links of a container outside the
+            // data directory; in it, the `LinkedChildren` table is the source
+            // of truth (v12.4).
+            let members = match (&local_members, &self.container_xml) {
+                (Some(members), Some(saver))
+                    if row.path.as_deref().is_some_and(|path| {
+                        crate::container_xml::takes_members_from_file(
+                            &saver.data_path(),
+                            std::path::Path::new(path),
+                        )
+                    }) =>
+                {
+                    Some(
+                        members
+                            .iter()
+                            .map(|child| PlaylistMember {
+                                item_id: child
+                                    .item_id
+                                    .as_deref()
+                                    .and_then(|id| Uuid::parse_str(id).ok()),
+                                path: child.path.clone(),
+                            })
+                            .collect::<Vec<_>>(),
                     )
-                })
-            {
-                let members: Vec<PlaylistMember> = members
-                    .iter()
-                    .map(|child| PlaylistMember {
-                        item_id: child
-                            .item_id
-                            .as_deref()
-                            .and_then(|id| Uuid::parse_str(id).ok()),
-                        path: child.path.clone(),
-                    })
-                    .collect();
-                store.merge_box_set_members(item_id, &members).await?;
+                }
+                _ => None,
+            };
+            match (local_playlist, members) {
+                // A playlist's members and shares, by the merge's
+                // `replaceData` (`shouldReplace`, or a file with `<LockData>`).
+                (Some((shares, _)), members) => {
+                    store
+                        .sync_scanned_playlists(&[ScannedPlaylist {
+                            id: item_id,
+                            members,
+                            from_file: false,
+                            replace: merge.replace,
+                            shares: Some(shares),
+                        }])
+                        .await?;
+                }
+                (None, Some(members)) => {
+                    store.merge_box_set_members(item_id, &members).await?;
+                }
+                (None, None) => {}
             }
             // The refresh of a video copies its title metadata to its parts
             // (`BaseItem.RefreshMetadataForOwnedItem`) and its save gives its
@@ -3297,8 +3418,101 @@ impl LocalProviderManager {
         };
         if decision.save {
             self.save_metadata(item_id, update).await?;
+            self.update_images(item_id, update).await?;
         }
         Ok(update)
+    }
+
+    /// `LibraryManager.UpdateImagesAsync`, which upstream runs on every save of
+    /// an item (`RunMetadataSavers`), here on `update_to_repository` (the
+    /// metadata editor's save among them) and a refresh's save: each local
+    /// image whose size or blurhash is missing or whose file changed or is gone
+    /// (`ImageNeedsRefresh`), or every one for a save from `ImageUpdate` up (an
+    /// image, download or edit save, in upstream's order), is measured and
+    /// dated by its file; a local image whose file is gone is dropped
+    /// (`ValidateImages`), and the rows are saved when anything changed. A
+    /// guide programme's are left alone (`isLiveTvShow`), and a Live TV
+    /// channel's file is read only in the metadata directory, as everywhere
+    /// else. A remote image is not downloaded here: it stays a URL, unmeasured.
+    ///
+    /// The measuring reads files, so the rows are read again before they are
+    /// written, and only the measured and dropped ones still as they were read
+    /// change: an image saved before that second read stays.
+    async fn update_images(
+        &self,
+        item_id: Uuid,
+        update_type: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        use crate::image_metadata::{fill_image_metadata, image_needs_refresh};
+        let (Some(processor), Some(store)) = (&self.image_processor, &self.image_store) else {
+            return Ok(());
+        };
+        let force = matches!(
+            update_type,
+            ItemUpdateType::ImageUpdate
+                | ItemUpdateType::MetadataDownload
+                | ItemUpdateType::MetadataEdit
+        );
+        let Some(images) = self.stored_images(item_id).await else {
+            return Ok(());
+        };
+        let outdated: Vec<ItemImageInfo> = images
+            .into_iter()
+            .filter(|image| image.is_local_file() && (force || image_needs_refresh(image)))
+            .collect();
+        if outdated.is_empty() {
+            return Ok(());
+        }
+        let kind = match &self.items {
+            Some(items) => items
+                .retrieve_item(item_id)
+                .await?
+                .and_then(|row| BaseItemKind::from_stored_type_name(&row.type_)),
+            None => None,
+        };
+        if kind == Some(BaseItemKind::LiveTvProgram) {
+            return Ok(());
+        }
+        // Each row as read, with what it becomes: measured, or none when its
+        // file is gone.
+        let mut changes: Vec<(ItemImageInfo, Option<ItemImageInfo>)> = Vec::new();
+        for original in outdated {
+            let path = original.path.clone();
+            if kind == Some(BaseItemKind::LiveTvChannel) && !self.in_metadata_directory(&path).await
+            {
+                continue;
+            }
+            if !std::path::Path::new(&path).is_file() {
+                tracing::warn!(item_id = %item_id, image_type = ?original.image_type, path = %path, "image not found");
+                changes.push((original, None));
+                continue;
+            }
+            let mut image = original.clone();
+            fill_image_metadata(processor.as_ref(), item_id, &path, &mut image).await;
+            image.date_modified = file_date_modified(std::path::Path::new(&path));
+            changes.push((original, Some(image)));
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+        // A row saved meanwhile, or changed since it was read, is not one
+        // measured here: it stays as it is now.
+        let Some(stored) = self.stored_images(item_id).await else {
+            return Ok(());
+        };
+        let images: Vec<ItemImageInfo> = stored
+            .iter()
+            .filter_map(|row| {
+                changes
+                    .iter()
+                    .find(|(original, _)| original == row)
+                    .map_or_else(|| Some(row.clone()), |(_, new)| new.clone())
+            })
+            .collect();
+        if images != stored {
+            store.save_item_images(item_id, &images).await?;
+        }
+        Ok(())
     }
 
     /// [`remove_images`](crate::local_images::remove_images) over the item's
@@ -3489,6 +3703,7 @@ impl LocalProviderManager {
                 saved |= self
                     .download_candidate_images(
                         item_id,
+                        kind,
                         candidates,
                         preferences,
                         &mut images,
@@ -3536,16 +3751,21 @@ impl LocalProviderManager {
             store.save_item_images(item_id, images).await?;
         }
         published?;
-        if fetch == ImageFetch::All && acquired.contains(&ImageType::Backdrop) {
+        // `ImageSaver.SaveImage` deletes each image a save replaces when the
+        // server keeps it: every type acquired, in any of the item's own
+        // folders (an earlier build's `{ID}` one too).
+        if fetch == ImageFetch::All
+            && let Some(root) = &self.metadata_dir
+        {
+            let folders = crate::local_images::internal_metadata_dirs(&root.resolve(), item_id);
             for old in stored.iter().filter(|image| {
-                image.image_type == ImageType::Backdrop
+                acquired.contains(&image.image_type)
                     && !images.iter().any(|kept| kept.path == image.path)
+                    && folders
+                        .iter()
+                        .any(|folder| std::path::Path::new(&image.path).starts_with(folder))
             }) {
-                if let Some(root) = &self.metadata_dir
-                    && std::path::Path::new(&old.path).starts_with(root.resolve())
-                {
-                    let _ = std::fs::remove_file(&old.path);
-                }
+                let _ = std::fs::remove_file(&old.path);
             }
         }
         Ok(())
@@ -3554,6 +3774,7 @@ impl LocalProviderManager {
     async fn download_candidate_images(
         &self,
         item_id: Uuid,
+        item_kind: &str,
         mut candidates: Vec<RemoteImageInfo>,
         policy: crate::image_policy::ImageAcquisitionPolicy<'_>,
         images: &mut Vec<ItemImageInfo>,
@@ -3606,7 +3827,13 @@ impl LocalProviderManager {
                 continue;
             }
             match self
-                .write_automatic_image(item_id, kind, download.bytes, &download.content_type)
+                .write_automatic_image(
+                    item_id,
+                    item_kind,
+                    kind,
+                    download.bytes,
+                    &download.content_type,
+                )
                 .await
             {
                 Ok(image) => {
@@ -3622,6 +3849,7 @@ impl LocalProviderManager {
     async fn write_automatic_image(
         &self,
         item_id: Uuid,
+        item_kind: &str,
         kind: ImageType,
         bytes: Vec<u8>,
         mime: &str,
@@ -3631,9 +3859,9 @@ impl LocalProviderManager {
                 .metadata_dir
                 .as_ref()
                 .ok_or_else(|| Self::unwired("write_automatic_image"))?;
-            let dir = root.join(ferrofin_db::store::guid_to_db(item_id));
+            let dir = crate::local_images::own_art_dir(&root.resolve(), item_id);
             (0..i32::MAX).find(|index| {
-                let stem = image_file_stem(kind, Some(*index));
+                let stem = backdrop_stem(Some(*index));
                 !["jpg", "jpeg", "png", "webp", "gif"]
                     .iter()
                     .any(|ext| dir.join(format!("{stem}.{ext}")).exists())
@@ -3641,7 +3869,7 @@ impl LocalProviderManager {
         } else {
             None
         };
-        self.write_image_file(item_id, bytes, mime, kind, index)
+        self.write_image_file(item_id, item_kind, bytes, mime, kind, index)
             .await
     }
 
@@ -3679,7 +3907,10 @@ impl LocalProviderManager {
                 continue;
             };
             let mime = mime_types::get_mime_type(&format!("image.{ext}"));
-            match self.write_automatic_image(item_id, kind, bytes, mime).await {
+            match self
+                .write_automatic_image(item_id, &lookup.kind, kind, bytes, mime)
+                .await
+            {
                 Ok(image) => {
                     images.push(image);
                     saved = true;
@@ -3693,6 +3924,7 @@ impl LocalProviderManager {
     async fn write_image_file(
         &self,
         item_id: Uuid,
+        item_kind: &str,
         content: impl Into<Vec<u8>>,
         mime_type: &str,
         image_type: ImageType,
@@ -3704,13 +3936,16 @@ impl LocalProviderManager {
         let ext = mime_types::to_extension(&mime_type.to_ascii_lowercase())
             .unwrap_or(".jpg")
             .trim_start_matches('.');
-        // The scan's art dir for this item (`{meta}/library/{db-format id}`,
-        // same stem naming): writing the upload there makes it the file the
-        // scan re-discovers on every rescan, so an uploaded image replaces the
-        // downloaded artwork durably instead of being wiped by the next scan's
-        // image rewrite.
-        let item_dir = meta_root.join(ferrofin_db::store::guid_to_db(item_id));
-        let stem = image_file_stem(image_type, image_index);
+        // `GetStandardSavePath` in the item's own folder, as the scan names
+        // its art: the scan finds the file there again on every rescan, so an
+        // uploaded image replaces the downloaded artwork durably instead of
+        // being wiped by the next scan's image rewrite.
+        let item_dir = crate::local_images::own_art_dir(&meta_root.resolve(), item_id);
+        let stem = if image_type == ImageType::Backdrop {
+            backdrop_stem(image_index)
+        } else {
+            crate::local_images::internal_image_stem(item_kind, image_type)
+        };
         let dest = item_dir.join(format!("{stem}.{ext}"));
         let content: Vec<u8> = content.into();
         // `atomic_write` fsyncs: keep the disk work off the async workers.
@@ -3744,9 +3979,11 @@ impl LocalProviderManager {
 
     /// `ImageSaver.SaveImage`'s "Delete the current path" for a file kept in the
     /// internal metadata tree. Narrower than upstream's `Contains` test: only a
-    /// file inside this item's own folder, referenced once, and not the shared
-    /// album artwork is removed, so a path an unrelated record points at is
-    /// never deleted. Only a missing file is forgiven; other failures return.
+    /// file inside one of this item's own folders
+    /// ([`internal_metadata_dirs`](crate::local_images::internal_metadata_dirs)),
+    /// referenced once, and not the shared album artwork is removed, so a path
+    /// an unrelated record points at is never deleted. Only a missing file is
+    /// forgiven; other failures return.
     fn remove_replaced_internal_file(
         &self,
         item_id: Uuid,
@@ -3765,8 +4002,9 @@ impl LocalProviderManager {
             return Ok(());
         };
         let old = std::path::Path::new(&previous.path);
+        let folders = crate::local_images::internal_metadata_dirs(&root.resolve(), item_id);
         if ferrofin_util::string_extensions::equals_ordinal_ignore_case(&previous.path, &image.path)
-            || !old.starts_with(root.join(ferrofin_db::store::guid_to_db(item_id)))
+            || !folders.iter().any(|folder| old.starts_with(folder))
             || old
                 .components()
                 .any(|part| part.as_os_str() == SHARED_ALBUM_ARTWORK_DIR)
@@ -3786,13 +4024,11 @@ impl LocalProviderManager {
         let Some(parent) = old.parent().and_then(|parent| parent.canonicalize().ok()) else {
             return Ok(());
         };
-        let Ok(owned_root) = root
-            .join(ferrofin_db::store::guid_to_db(item_id))
-            .canonicalize()
-        else {
-            return Ok(());
-        };
-        if !parent.starts_with(owned_root) {
+        if !folders
+            .iter()
+            .filter_map(|folder| folder.canonicalize().ok())
+            .any(|folder| parent.starts_with(folder))
+        {
             return Ok(());
         }
         match std::fs::remove_file(old) {
@@ -5000,13 +5236,12 @@ fn owns_videos(data: Option<&str>) -> bool {
         })
 }
 
-/// The on-disk filename stem for an uploaded image of `image_type`/`index`,
-/// e.g. `Primary` → `primary`, `Backdrop` index 2 → `backdrop2`.
-fn image_file_stem(image_type: ImageType, index: Option<i32>) -> String {
-    let base = format!("{image_type:?}").to_ascii_lowercase();
+/// The file name, without its extension, of the backdrop saved at file
+/// `index` (`GetBackdropSaveFilename`): `backdrop`, then `backdrop1`, ….
+fn backdrop_stem(index: Option<i32>) -> String {
     match index.filter(|&i| i > 0) {
-        Some(i) => format!("{base}{i}"),
-        None => base,
+        Some(i) => format!("backdrop{i}"),
+        None => "backdrop".to_owned(),
     }
 }
 
@@ -5024,7 +5259,7 @@ fn image_upload_file_index(
     }
     (1..=i32::MAX)
         .find(|index| {
-            let stem = image_file_stem(kind, Some(*index));
+            let stem = backdrop_stem(Some(*index));
             !current.iter().any(|image| {
                 image.image_type == ImageType::Backdrop
                     && std::path::Path::new(&image.path)
@@ -5380,14 +5615,18 @@ impl ProviderManager for LocalProviderManager {
             0
         };
         let write_index = image_upload_file_index(image_type, index, &current)?;
+        // The item names its file (`poster` or `folder`) and the saver reads it.
+        let row = match &self.items {
+            Some(items) => items.retrieve_item(item_id).await?,
+            None => None,
+        };
+        let kind = row.as_ref().map_or("", short_kind);
         let mut image = self
-            .write_image_file(item_id, content, mime_type, image_type, write_index)
+            .write_image_file(item_id, kind, content, mime_type, image_type, write_index)
             .await?;
         let mut cleanup = None;
-        if let (Some(saver), Some(items)) = (&self.image_saver, &self.items)
-            && let Some(row) = items.retrieve_item(item_id).await?
-        {
-            let saved = saver.save(&row, image, index, &current).await?;
+        if let (Some(saver), Some(row)) = (&self.image_saver, &row) {
+            let saved = saver.save(row, image, index, &current).await?;
             image = saved.image;
             cleanup = saved.cleanup;
         }
@@ -5504,16 +5743,15 @@ impl ProviderManager for LocalProviderManager {
     ) -> Result<(), ServiceError> {
         // ProviderManager.SaveMetadataAsync logs saver failures; metadata has
         // already been committed and an unwritable sidecar must not undo it.
-        self.save_nfo(item_id, update_type).await;
         // "Modify again, so saved value is after write time of externally
         // saved metadata" (`LibraryManager.UpdateItemsAsync`): the XML
         // reader's change monitor has no tolerance, so the server's own write
         // must not read as a change.
-        if self.save_box_set_xml(item_id, update_type).await
+        if self.run_savers(item_id, update_type).await
             && let Some(store) = &self.image_store
             && let Err(error) = store.touch_item_updated(item_id).await
         {
-            tracing::warn!(%item_id, %error, "could not stamp the box set's save time after writing its collection.xml");
+            tracing::warn!(%item_id, %error, "could not stamp the item's save time after writing its local XML metadata");
         }
         Ok(())
     }
@@ -5526,10 +5764,10 @@ impl ProviderManager for LocalProviderManager {
         // `LibraryManager.UpdateItemsAsync` runs the savers, then the save
         // re-stamps `DateLastSaved` "after write time of externally saved
         // metadata" and `ItemUpdated` fires, once.
-        self.save_nfo(item_id, update_type).await;
-        self.save_box_set_xml(item_id, update_type).await;
+        self.run_savers(item_id, update_type).await;
         if let Some(store) = &self.image_store {
             store.touch_item_updated(item_id).await?;
+            self.update_images(item_id, update_type).await?;
             // A video's save gives its local versions its images and
             // metadata (`Video.UpdateToRepositoryAsync`, `Video.cs:704-726`).
             store
@@ -8264,7 +8502,7 @@ mod tests {
             &self,
             _item_id: Uuid,
         ) -> Result<Vec<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
-            unimplemented!()
+            Ok(Vec::new())
         }
         async fn swap_item_images(
             &self,
@@ -11319,11 +11557,7 @@ mod tests {
             err.to_string().contains("image_private_http_allow"),
             "{err}"
         );
-        assert!(
-            !dir.path()
-                .join(ferrofin_db::store::guid_to_db(item_id))
-                .exists()
-        );
+        assert!(!crate::local_images::own_art_dir(dir.path(), item_id).exists());
     }
 
     /// The download half of `LibraryManager.ConvertImageToLocal`: each
@@ -11401,7 +11635,7 @@ mod tests {
             Arc::new(RecordingStore::default()),
             dir.path().to_path_buf(),
         );
-        let item_dir = dir.path().join(ferrofin_db::store::guid_to_db(item_id));
+        let item_dir = crate::local_images::own_art_dir(dir.path(), item_id);
 
         // An extensionless URL serving `image/png` lands as a `.png`.
         mgr.save_image_from_url(
@@ -11436,7 +11670,7 @@ mod tests {
             "the C# message names what came back: {err}"
         );
         assert!(
-            !item_dir.join("art.jpg").exists() && !item_dir.join("art.json").exists(),
+            !item_dir.join("clearart.jpg").exists() && !item_dir.join("clearart.json").exists(),
             "a refused download writes no artwork"
         );
     }
@@ -11532,6 +11766,7 @@ mod tests {
         let existing = manager
             .write_image_file(
                 item_id,
+                "Movie",
                 b"earlier",
                 "image/png",
                 ImageType::Backdrop,
@@ -11543,7 +11778,14 @@ mod tests {
             image_upload_file_index(ImageType::Backdrop, 1, std::slice::from_ref(&existing))
                 .unwrap();
         let appended = manager
-            .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, index)
+            .write_image_file(
+                item_id,
+                "Movie",
+                b"later",
+                "image/png",
+                ImageType::Backdrop,
+                index,
+            )
             .await
             .unwrap();
         assert_ne!(appended.path, existing.path);
@@ -11554,11 +11796,572 @@ mod tests {
         let current = [existing.clone(), appended];
         let index = image_upload_file_index(ImageType::Backdrop, 2, &current).unwrap();
         let identical = manager
-            .write_image_file(item_id, b"earlier", "image/png", ImageType::Backdrop, index)
+            .write_image_file(
+                item_id,
+                "Movie",
+                b"earlier",
+                "image/png",
+                ImageType::Backdrop,
+                index,
+            )
             .await
             .unwrap();
         assert!(identical.path.strip_suffix("backdrop3.png").is_some());
         assert_eq!(std::fs::read(existing.path).unwrap(), b"earlier");
+    }
+
+    /// An image processor that measures every file `size` (or fails to,
+    /// `None`) and gives it the blurhash `hash` (or fails to), running
+    /// `during` once, at its first measure.
+    struct MeasuringProcessor {
+        size: Option<(i32, i32)>,
+        hash: Option<&'static str>,
+        during: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl MeasuringProcessor {
+        fn new(size: Option<(i32, i32)>, hash: Option<&'static str>) -> Self {
+            Self {
+                size,
+                hash,
+                during: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ferrofin_traits::drawing::ImageProcessor for MeasuringProcessor {
+        fn supported_input_formats(&self) -> Vec<String> {
+            vec![]
+        }
+        fn supports_image_collage_creation(&self) -> bool {
+            false
+        }
+        fn supported_image_output_formats(&self) -> Vec<ferrofin_model::drawing::ImageFormat> {
+            vec![]
+        }
+        async fn get_image_dimensions(
+            &self,
+            _path: &str,
+        ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+            if let Some(during) = self.during.lock().unwrap().take() {
+                during();
+            }
+            self.size
+                .map(|(width, height)| ferrofin_model::drawing::ImageDimensions { width, height })
+                .ok_or_else(|| ServiceError::backend("undecodable"))
+        }
+        async fn get_item_image_dimensions(
+            &self,
+            _item_id: Uuid,
+            info: &ItemImageInfo,
+        ) -> Result<ferrofin_model::drawing::ImageDimensions, ServiceError> {
+            self.get_image_dimensions(&info.path).await
+        }
+        async fn get_image_blur_hash(&self, _path: &str) -> Result<String, ServiceError> {
+            self.hash
+                .map(str::to_owned)
+                .ok_or_else(|| ServiceError::backend("no hash"))
+        }
+        async fn get_image_blur_hash_sized(
+            &self,
+            path: &str,
+            size: ferrofin_model::drawing::ImageDimensions,
+        ) -> Result<String, ServiceError> {
+            if size.width <= 0 || size.height <= 0 {
+                return Ok(String::new());
+            }
+            self.get_image_blur_hash(path).await
+        }
+        async fn get_image_cache_tag(
+            &self,
+            _item_path: Option<&str>,
+            _image: &ItemImageInfo,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_image_cache_tag_for_path(
+            &self,
+            _base_item_path: &str,
+            _image_date_modified: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+        async fn process_image(
+            &self,
+            _options: &ferrofin_traits::options::ImageProcessingOptions,
+        ) -> Result<ferrofin_traits::drawing::ProcessedImage, ServiceError> {
+            Err(ServiceError::backend("not drawn"))
+        }
+        async fn create_image_collage(
+            &self,
+            _options: &ferrofin_traits::options::ImageCollageOptions,
+            _library_name: Option<&str>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// A manager over `store` whose saves measure images with `processor`.
+    fn measuring(
+        store: &Arc<RecordingStore>,
+        dir: &std::path::Path,
+        size: Option<(i32, i32)>,
+        hash: Option<&'static str>,
+    ) -> LocalProviderManager {
+        LocalProviderManager::default()
+            .with_image_store(Arc::clone(store) as _, dir.to_path_buf())
+            .with_image_processor(Arc::new(MeasuringProcessor::new(size, hash)))
+    }
+
+    /// A stored row for a file written under `dir`, recorded with `size` and
+    /// `hash` and dated by its file.
+    fn stored_image(
+        dir: &std::path::Path,
+        name: &str,
+        image_type: ImageType,
+        (width, height): (i32, i32),
+        hash: Option<&str>,
+    ) -> ItemImageInfo {
+        let path = dir.join(name);
+        std::fs::write(&path, b"art").unwrap();
+        ItemImageInfo {
+            date_modified: ferrofin_traits::options::file_date_modified(&path),
+            path: path.to_string_lossy().into_owned(),
+            image_type,
+            width,
+            height,
+            blur_hash: hash.map(str::to_owned),
+        }
+    }
+
+    /// gl-1054: an upload, like every image save (`UpdateItemAsync` with
+    /// `ImageUpdate`, `RunMetadataSavers` → `UpdateImagesAsync(force)`), stores
+    /// the new image measured, and measures the item's other images again.
+    #[tokio::test]
+    async fn an_image_save_measures_the_items_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let item = Uuid::from_u128(0x1054);
+        let logo = stored_image(dir.path(), "logo.png", ImageType::Logo, (0, 0), None);
+        store.images.lock().unwrap().push((item, logo.clone()));
+        measuring(&store, dir.path(), Some((120, 180)), Some("LKO2"))
+            .save_image(item, b"art", "image/png", ImageType::Primary, None)
+            .await
+            .expect("upload");
+        let saved: Vec<_> = store
+            .images
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, image)| {
+                (
+                    image.image_type,
+                    image.width,
+                    image.height,
+                    image.blur_hash.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                (ImageType::Logo, 120, 180, Some("LKO2".to_owned())),
+                (ImageType::Primary, 120, 180, Some("LKO2".to_owned())),
+            ]
+        );
+    }
+
+    /// A save that is no image or edit save measures only what
+    /// `ImageNeedsRefresh` flags: a missing size or blurhash, or a file whose
+    /// time moved; a local image whose file is gone is dropped
+    /// (`ValidateImages`), and a remote one is left as it is.
+    #[tokio::test]
+    async fn a_plain_save_measures_only_the_images_that_need_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let item = Uuid::from_u128(0x1055);
+        let current = stored_image(
+            dir.path(),
+            "poster.png",
+            ImageType::Primary,
+            (10, 20),
+            Some("OLD"),
+        );
+        let unmeasured = stored_image(dir.path(), "logo.png", ImageType::Logo, (0, 0), None);
+        // Complete, but its file is gone.
+        let gone = stored_image(
+            dir.path(),
+            "landscape.png",
+            ImageType::Thumb,
+            (10, 20),
+            Some("OLD"),
+        );
+        std::fs::remove_file(&gone.path).unwrap();
+        let remote = ItemImageInfo {
+            path: "https://img.example/backdrop.jpg".into(),
+            image_type: ImageType::Backdrop,
+            ..ItemImageInfo::default()
+        };
+        store.images.lock().unwrap().extend(
+            [&current, &unmeasured, &gone, &remote]
+                .into_iter()
+                .map(|image| (item, image.clone())),
+        );
+        measuring(&store, dir.path(), Some((120, 180)), Some("NEW"))
+            .update_to_repository(item, ItemUpdateType::MetadataImport)
+            .await
+            .expect("save");
+        let saved: Vec<_> = store
+            .images
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, image)| (image.image_type, image.width, image.blur_hash.clone()))
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                (ImageType::Primary, 10, Some("OLD".to_owned())),
+                (ImageType::Logo, 120, Some("NEW".to_owned())),
+                (ImageType::Backdrop, 0, None),
+            ]
+        );
+    }
+
+    /// A save from `ImageUpdate` up in upstream's order (`ImageUpdate`,
+    /// `MetadataDownload`, `MetadataEdit`) measures every local image, current
+    /// or not; a lower one measures only what needs it.
+    #[rstest::rstest]
+    #[case(ItemUpdateType::ImageUpdate, 120)]
+    #[case(ItemUpdateType::MetadataDownload, 120)]
+    #[case(ItemUpdateType::MetadataEdit, 120)]
+    #[case(ItemUpdateType::MetadataImport, 10)]
+    #[tokio::test]
+    async fn an_image_download_or_edit_save_measures_every_image(
+        #[case] update: ItemUpdateType,
+        #[case] width: i32,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let item = Uuid::from_u128(0x1057);
+        let current = stored_image(
+            dir.path(),
+            "poster.png",
+            ImageType::Primary,
+            (10, 20),
+            Some("OLD"),
+        );
+        store.images.lock().unwrap().push((item, current));
+        measuring(&store, dir.path(), Some((120, 180)), Some("NEW"))
+            .update_to_repository(item, update)
+            .await
+            .expect("save");
+        assert_eq!(store.images.lock().unwrap()[0].1.width, width);
+    }
+
+    /// A guide programme's images are left alone (`isLiveTvShow`), and a Live
+    /// TV channel's file outside the metadata directory is never read.
+    #[rstest::rstest]
+    #[case(BaseItemKind::LiveTvProgram, "metadata", 0)]
+    #[case(BaseItemKind::LiveTvChannel, "elsewhere", 0)]
+    #[case(BaseItemKind::LiveTvChannel, "metadata", 120)]
+    #[tokio::test]
+    async fn live_tv_images_are_measured_only_where_they_may_be_read(
+        #[case] kind: BaseItemKind,
+        #[case] folder: &str,
+        #[case] width: i32,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let art_root = dir.path().join("metadata").join("library");
+        let files = dir.path().join(folder).join("library");
+        std::fs::create_dir_all(&files).unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let mut row = row("Folder", "Channel 4");
+        row.type_ = kind.stored_type_name().expect("stored type").to_owned();
+        let item = Uuid::parse_str(&row.id).unwrap();
+        let logo = stored_image(&files, "logo.png", ImageType::Primary, (0, 0), None);
+        store.images.lock().unwrap().push((item, logo));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item, row)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, art_root)
+            .with_image_processor(Arc::new(MeasuringProcessor::new(
+                Some((120, 180)),
+                Some("NEW"),
+            )))
+            .update_to_repository(item, ItemUpdateType::ImageUpdate)
+            .await
+            .expect("save");
+        assert_eq!(store.images.lock().unwrap()[0].1.width, width);
+    }
+
+    /// The rows are read again before they are written: an image saved while
+    /// the others are measured stays, and so does a row saved again at the
+    /// same path (a new upload) in the meantime; only the rows still as they
+    /// were read take their measure.
+    #[tokio::test]
+    async fn an_image_saved_while_measuring_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let item = Uuid::from_u128(0x1058);
+        let poster = stored_image(dir.path(), "poster.png", ImageType::Primary, (0, 0), None);
+        let logo = stored_image(dir.path(), "logo.png", ImageType::Logo, (0, 0), None);
+        let thumb = stored_image(
+            dir.path(),
+            "landscape.png",
+            ImageType::Thumb,
+            (7, 7),
+            Some("T"),
+        );
+        let reuploaded = ItemImageInfo {
+            date_modified: logo.date_modified + chrono::TimeDelta::seconds(5),
+            ..logo.clone()
+        };
+        store
+            .images
+            .lock()
+            .unwrap()
+            .extend([(item, poster), (item, logo)]);
+        let processor = MeasuringProcessor::new(Some((120, 180)), Some("NEW"));
+        let meanwhile = Arc::clone(&store);
+        let (added, replaced) = (thumb.clone(), reuploaded.clone());
+        *processor.during.lock().unwrap() = Some(Box::new(move || {
+            let mut images = meanwhile.images.lock().unwrap();
+            images[1].1 = replaced;
+            images.push((item, added));
+        }));
+        LocalProviderManager::default()
+            .with_image_store(Arc::clone(&store) as _, dir.path().to_path_buf())
+            .with_image_processor(Arc::new(processor))
+            .update_to_repository(item, ItemUpdateType::MetadataImport)
+            .await
+            .expect("save");
+        let saved: Vec<_> = store
+            .images
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, image)| image.clone())
+            .collect();
+        assert_eq!(saved.len(), 3, "{saved:?}");
+        assert_eq!(
+            (saved[0].width, saved[0].blur_hash.as_deref()),
+            (120, Some("NEW"))
+        );
+        assert_eq!(
+            saved[1], reuploaded,
+            "the row saved again keeps its new date"
+        );
+        assert_eq!(saved[2], thumb, "the image saved meanwhile stays");
+    }
+
+    /// As upstream, a size that cannot be read is stored 0x0, and a blurhash
+    /// that cannot be computed is empty (as a 0x0 image's is).
+    #[rstest::rstest]
+    #[case::no_size(None, Some("LKO2"), (0, 0))]
+    #[case::no_hash(Some((120, 180)), None, (120, 180))]
+    #[tokio::test]
+    async fn a_failed_measure_stores_upstreams_values(
+        #[case] size: Option<(i32, i32)>,
+        #[case] hash: Option<&'static str>,
+        #[case] stored: (i32, i32),
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RecordingStore::default());
+        let item = Uuid::from_u128(0x1056);
+        let image = stored_image(
+            dir.path(),
+            "poster.png",
+            ImageType::Primary,
+            (10, 20),
+            Some("OLD"),
+        );
+        store.images.lock().unwrap().push((item, image));
+        measuring(&store, dir.path(), size, hash)
+            .update_to_repository(item, ItemUpdateType::ImageUpdate)
+            .await
+            .expect("save");
+        let (_, saved) = store.images.lock().unwrap()[0].clone();
+        assert_eq!((saved.width, saved.height), stored);
+        assert_eq!(saved.blur_hash.as_deref(), Some(""));
+    }
+
+    /// `ImageSaver.GetStandardSavePath` with `saveLocally` false: an upload, a
+    /// chosen image or a refresh download is saved in the item's
+    /// `GetInternalMetadataPath()` (`{root}/{xx}/{idN}`) under upstream's
+    /// name for the item's kind, as Jellyfin 12.4 saves it.
+    #[rstest::rstest]
+    #[case("Movie", ImageType::Primary, None, "poster.png")]
+    #[case("MusicAlbum", ImageType::Primary, None, "folder.png")]
+    #[case("Person", ImageType::Primary, None, "folder.png")]
+    #[case("Movie", ImageType::Thumb, None, "landscape.png")]
+    #[case("Movie", ImageType::Art, None, "clearart.png")]
+    #[case("Movie", ImageType::BoxRear, None, "back.png")]
+    #[case("MusicAlbum", ImageType::Disc, None, "cdart.png")]
+    #[case("Movie", ImageType::Disc, None, "disc.png")]
+    #[case("Movie", ImageType::Logo, None, "logo.png")]
+    #[case("Movie", ImageType::Backdrop, Some(0), "backdrop.png")]
+    #[case("Movie", ImageType::Backdrop, Some(2), "backdrop2.png")]
+    #[tokio::test]
+    async fn an_image_is_saved_where_jellyfin_saves_it(
+        #[case] kind: &str,
+        #[case] image_type: ImageType,
+        #[case] index: Option<i32>,
+        #[case] file: &str,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let item_id = Uuid::parse_str("0c6efd17-cf3f-915e-4920-09bd22e572ed").unwrap();
+        let manager = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            directory.path().to_path_buf(),
+        );
+        let image = manager
+            .write_image_file(item_id, kind, b"art", "image/png", image_type, index)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::path::Path::new(&image.path),
+            directory
+                .path()
+                .join("0c/0c6efd17cf3f915e492009bd22e572ed")
+                .join(file)
+        );
+    }
+
+    /// An upload is named for the item it is saved for, read from its row:
+    /// a music album's Primary is `folder`, a movie's `poster`.
+    #[rstest::rstest]
+    #[case("MusicAlbum", "folder.png")]
+    #[case("Movie", "poster.png")]
+    #[tokio::test]
+    async fn an_upload_is_named_for_the_items_kind(#[case] kind: &str, #[case] file: &str) {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = Arc::new(RecordingStore::default());
+        let item = row(kind, "Item");
+        let id = Uuid::parse_str(&item.id).expect("id");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(id, item)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, dir.path().to_path_buf());
+        mgr.save_image(id, b"art", "image/png", ImageType::Primary, None)
+            .await
+            .expect("save");
+        let saved = store.images.lock().unwrap().last().cloned().expect("row").1;
+        assert_eq!(
+            std::path::Path::new(&saved.path),
+            crate::local_images::own_art_dir(dir.path(), id).join(file)
+        );
+    }
+
+    /// `ImageSaver.SaveImage`'s "Delete the current path": an image an
+    /// earlier build saved in the item's `{ID}` folder is the item's own, so
+    /// its file goes once a new one replaces it.
+    #[tokio::test]
+    async fn replacing_an_image_an_earlier_build_saved_removes_its_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let item_id = Uuid::from_u128(0x9592);
+        let manager = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            directory.path().to_path_buf(),
+        );
+        let earlier = crate::local_images::earlier_art_dir(directory.path(), item_id);
+        std::fs::create_dir_all(&earlier).unwrap();
+        let previous_path = earlier.join("primary.png");
+        std::fs::write(&previous_path, b"earlier").unwrap();
+        let replacement = manager
+            .write_image_file(
+                item_id,
+                "Movie",
+                b"later",
+                "image/png",
+                ImageType::Primary,
+                None,
+            )
+            .await
+            .unwrap();
+        let previous = ItemImageInfo {
+            path: previous_path.to_string_lossy().into_owned(),
+            ..replacement.clone()
+        };
+        manager
+            .remove_replaced_internal_file(
+                item_id,
+                std::slice::from_ref(&previous),
+                0,
+                &replacement,
+            )
+            .unwrap();
+        assert!(!previous_path.exists());
+        assert_eq!(std::fs::read(&replacement.path).unwrap(), b"later");
+    }
+
+    /// A refresh replacing every image deletes the files of the types it
+    /// acquired that the item kept in its own folders, an earlier build's
+    /// `{ID}` folder too, once the new rows are stored; a type it acquired
+    /// nothing of keeps its file.
+    #[tokio::test]
+    async fn a_replacing_refresh_deletes_the_files_it_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let item_id = Uuid::from_u128(0x1575_1054);
+        let store = Arc::new(RecordingStore::default());
+        let manager = LocalProviderManager::default()
+            .with_image_store(Arc::clone(&store) as _, directory.path().to_path_buf());
+        let earlier = crate::local_images::earlier_art_dir(directory.path(), item_id);
+        std::fs::create_dir_all(&earlier).unwrap();
+        let stored_at = |name: &str, image_type| {
+            let path = earlier.join(name);
+            std::fs::write(&path, b"earlier").unwrap();
+            ItemImageInfo {
+                path: path.to_string_lossy().into_owned(),
+                image_type,
+                date_modified: chrono::Utc::now(),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            }
+        };
+        let stored = [
+            stored_at("primary.jpg", ImageType::Primary),
+            stored_at("logo.png", ImageType::Logo),
+        ];
+        let new = manager
+            .write_image_file(
+                item_id,
+                "Movie",
+                b"new",
+                "image/png",
+                ImageType::Primary,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut images = vec![new.clone()];
+        manager
+            .persist_acquired_images(
+                item_id,
+                &row("Movie", "Heat"),
+                &mut images,
+                &stored,
+                super::ImageFetch::All,
+            )
+            .await
+            .unwrap();
+        assert!(std::path::Path::new(&new.path).is_file());
+        assert!(!std::path::Path::new(&stored[0].path).exists(), "replaced");
+        assert!(std::path::Path::new(&stored[1].path).is_file(), "kept");
     }
 
     /// `SetImagePath(…, FileInfo)`: an upload records its file's own
@@ -11574,6 +12377,7 @@ mod tests {
         let image = manager
             .write_image_file(
                 Uuid::from_u128(0x9590),
+                "Movie",
                 b"art",
                 "image/png",
                 ImageType::Primary,
@@ -11608,6 +12412,7 @@ mod tests {
             let blocker = tokio::task::spawn_blocking(move || held.recv());
             let mut write = std::pin::pin!(manager.write_image_file(
                 Uuid::from_u128(0x9591),
+                "Movie",
                 b"art",
                 "image/png",
                 ImageType::Primary,
@@ -11632,7 +12437,14 @@ mod tests {
             directory.path().to_path_buf(),
         );
         let replacement = manager
-            .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(0))
+            .write_image_file(
+                item_id,
+                "Movie",
+                b"later",
+                "image/png",
+                ImageType::Backdrop,
+                Some(0),
+            )
             .await
             .unwrap();
         let previous_path = std::path::Path::new(&replacement.path).with_file_name("BACKDROP.PNG");
@@ -11666,7 +12478,14 @@ mod tests {
             directory.path().to_path_buf(),
         );
         let replacement = manager
-            .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(0))
+            .write_image_file(
+                item_id,
+                "Movie",
+                b"later",
+                "image/png",
+                ImageType::Backdrop,
+                Some(0),
+            )
             .await
             .unwrap();
         let previous_path = std::path::Path::new(&replacement.path).with_file_name("old.jpg");
@@ -11708,6 +12527,7 @@ mod tests {
         let previous = manager
             .write_image_file(
                 item_id,
+                "Movie",
                 b"referenced",
                 "image/png",
                 ImageType::Backdrop,
@@ -11718,6 +12538,7 @@ mod tests {
         let replacement = manager
             .write_image_file(
                 item_id,
+                "Movie",
                 b"replacement",
                 "image/png",
                 ImageType::Backdrop,
@@ -11742,6 +12563,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn image_upload_backdrop_replacement_cleans_only_owned_unshared_files() {
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9021);
@@ -11752,6 +12574,7 @@ mod tests {
         let previous = manager
             .write_image_file(
                 item_id,
+                "Movie",
                 b"earlier",
                 "image/png",
                 ImageType::Backdrop,
@@ -11760,7 +12583,14 @@ mod tests {
             .await
             .unwrap();
         let replacement = manager
-            .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(2))
+            .write_image_file(
+                item_id,
+                "Movie",
+                b"later",
+                "image/png",
+                ImageType::Backdrop,
+                Some(2),
+            )
             .await
             .unwrap();
         manager
@@ -11791,10 +12621,8 @@ mod tests {
         assert!(external_path.is_file());
         #[cfg(unix)]
         {
-            let linked_parent = directory
-                .path()
-                .join(ferrofin_db::store::guid_to_db(item_id))
-                .join("external-link");
+            let linked_parent =
+                crate::local_images::own_art_dir(directory.path(), item_id).join("external-link");
             std::os::unix::fs::symlink(outside.path(), &linked_parent).unwrap();
             let linked = ItemImageInfo {
                 path: linked_parent
@@ -11813,9 +12641,7 @@ mod tests {
                 .unwrap();
             assert!(external_path.is_file());
         }
-        let shared_path = directory
-            .path()
-            .join(ferrofin_db::store::guid_to_db(item_id))
+        let shared_path = crate::local_images::own_art_dir(directory.path(), item_id)
             .join(super::SHARED_ALBUM_ARTWORK_DIR)
             .join("shared.png");
         std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
@@ -13044,6 +13870,73 @@ mod tests {
         assert_eq!(restamped, stamped);
     }
 
+    /// gl-1054: a refresh that saves the item measures its images, as its save
+    /// runs `UpdateImagesAsync`: here "Replace all metadata" with "Replace
+    /// existing images" removes the own Primary, an image update, and the logo
+    /// it keeps is measured.
+    #[tokio::test]
+    async fn a_refresh_save_measures_the_items_images() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let item_id = Uuid::new_v4();
+        let own = crate::local_images::own_art_dir(tmp.path(), item_id);
+        let elsewhere = tmp.path().join("Genre").join("Crime");
+        for dir in [&own, &elsewhere] {
+            std::fs::create_dir_all(dir).expect("dir");
+        }
+        let poster = stored_image(
+            &own,
+            "poster.jpg",
+            ImageType::Primary,
+            (10, 20),
+            Some("OLD"),
+        );
+        let logo = stored_image(&elsewhere, "logo.png", ImageType::Logo, (0, 0), None);
+        let mut stored = row("Genre", "Crime");
+        stored.id = item_id.to_string();
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        store
+            .images
+            .lock()
+            .expect("lock")
+            .extend([(item_id, poster), (item_id, logo.clone())]);
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, tmp.path().to_path_buf())
+            .with_image_processor(Arc::new(MeasuringProcessor::new(
+                Some((120, 180)),
+                Some("NEW"),
+            )));
+        let update = mgr
+            .refresh_single_item(
+                item_id,
+                &Opts {
+                    remove_old_metadata: true,
+                    replace_all_images: true,
+                    ..Opts::default()
+                },
+            )
+            .await
+            .expect("refresh");
+        assert_eq!(update, ItemUpdateType::ImageUpdate);
+        let kept: Vec<_> = store
+            .images
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, image)| (image.path.clone(), image.width, image.blur_hash.clone()))
+            .collect();
+        assert_eq!(kept, [(logo.path, 120, Some("NEW".to_owned()))]);
+    }
+
     /// gl-592: "Replace all metadata" with "Replace existing images" removes
     /// the item's images in its own metadata folders before any provider runs
     /// (`MetadataService.cs:112-118`, `ItemImageProvider.RemoveImages`): the
@@ -13065,7 +13958,7 @@ mod tests {
     ) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let item_id = Uuid::new_v4();
-        let [ours, _, jellyfins] = crate::local_images::internal_metadata_dirs(tmp.path(), item_id);
+        let [jellyfins, ours, _] = crate::local_images::internal_metadata_dirs(tmp.path(), item_id);
         let elsewhere = tmp.path().join("Genre").join("Crime");
         let image = |dir: &std::path::Path, name: &str, image_type| {
             std::fs::create_dir_all(dir).expect("dir");

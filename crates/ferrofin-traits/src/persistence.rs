@@ -1034,11 +1034,13 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
-    /// Writes what a library scan read of the playlists it resolved off disk
-    /// (`PlaylistResolver`): each one's ownership row — owned by nobody,
-    /// open to everyone, as the resolver creates it — when it has none, and
-    /// the members its local reader found, when it ran
-    /// ([`ScannedPlaylist::members`]).
+    /// Writes what a refresh read of playlists' local files: each one's
+    /// ownership row when it has none — owned by nobody and open to
+    /// everyone, as `PlaylistResolver` creates a playlist the library scan
+    /// resolved — and
+    /// the members and shares its local reader found, when it ran
+    /// ([`ScannedPlaylist::members`], [`ScannedPlaylist::shares`]), with the
+    /// `Data` copy of the shares.
     ///
     /// The default is a no-op (for stub/fake services).
     ///
@@ -1051,6 +1053,23 @@ pub trait ItemPersistenceService: Send + Sync {
     ) -> Result<(), ServiceError> {
         let _ = playlists;
         Ok(())
+    }
+
+    /// `playlist`'s owner and shares from its permission rows, the source of
+    /// truth once it has a `FerrofinPlaylists` row; `None` without one, when
+    /// its `Data` is the only record.
+    ///
+    /// The default is `None` (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn playlist_ownership(
+        &self,
+        playlist: Uuid,
+    ) -> Result<Option<PlaylistOwnership>, ServiceError> {
+        let _ = playlist;
+        Ok(None)
     }
 
     /// Joins the members a box set's `collection.xml` names to its links, as
@@ -1293,6 +1312,25 @@ pub trait ItemPersistenceService: Send + Sync {
     /// listing only once its ancestors are registered here.
     async fn set_ancestors(&self, item_id: Uuid, ancestor_ids: &[Uuid])
     -> Result<(), ServiceError>;
+
+    /// Makes each item's `AncestorIds` rows its stored `ParentId` chain up to
+    /// the root: adds the missing rows and removes the rest, skipping a parent
+    /// with no row. The ancestor half of upstream's save
+    /// (`ItemPersistenceService.UpdateOrInsertItems`), which writes
+    /// `GetAncestorIds()`: the parents alone for an item outside every
+    /// library. Only for such items: an item inside a library also descends
+    /// from its `CollectionFolder`, a row this removes; write those with
+    /// [`set_ancestors`](Self::set_ancestors).
+    ///
+    /// The default is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn set_parent_ancestors(&self, item_ids: &[Uuid]) -> Result<(), ServiceError> {
+        let _ = item_ids;
+        Ok(())
+    }
 
     /// Replaces the item's stored image rows (`BaseItemImageInfos`) with
     /// `images` — the write path the library scan uses to persist discovered
@@ -1646,9 +1684,10 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Takes a deleted version out of its primary's lists — what
     /// `LibraryManager.DeleteItem` does before deleting an alternate version
     /// (`LibraryManager.cs:539-552`): the primary's `LinkedAlternateVersion`
-    /// row for it goes, and so does `version_path` from the primary's `Data`
-    /// `LocalAlternateVersions` (compared ignoring case). The default
-    /// (stub/fake services) writes nothing.
+    /// row for it goes, the primary's other version rows are numbered from 0
+    /// again, as its save writes them, and `version_path` goes from the
+    /// primary's `Data` `LocalAlternateVersions` (compared ignoring case). The
+    /// default (stub/fake services) writes nothing.
     ///
     /// # Errors
     ///
@@ -2434,6 +2473,25 @@ pub trait MediaStreamRepository: Send + Sync {
         Ok(map)
     }
 
+    /// Stores in item `item_id`'s `Data` the `HasSubtitles` its stream rows
+    /// hold now: whether one is a subtitle, as `FFProbeVideoInfo.cs:270` sets
+    /// it over the streams the probe saves. Only `Data` keeps it, which a
+    /// returned Jellyfin reads. The rows are read and the flag written in one
+    /// statement, so it agrees with the rows whatever wrote them before. A
+    /// `NULL` or empty `Data` becomes an object holding the flag, and a blob
+    /// without the key gains it. Writes nothing when the flag already agrees,
+    /// when `Data` is not a JSON object, or when there is no such row.
+    ///
+    /// The default (a stub/fake repository) writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn sync_has_subtitles(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let _ = item_id;
+        Ok(())
+    }
+
     /// The subset of `item_ids` with at least one subtitle stream row.
     ///
     /// Backs the DTO builder's per-page `HasSubtitles` (C# stores the flag on
@@ -2670,10 +2728,27 @@ pub struct ScannedPlaylist {
     /// (`PlaylistItemsProvider`), which count only when one of them names a
     /// stored item; a `playlist.xml`'s count whatever they name.
     pub from_file: bool,
-    /// Whether `members` replace the stored ones, or come first with the
-    /// stored ones not among them appended (`PlaylistMetadataService.
+    /// Whether `members` and `shares` replace the stored ones, or come first
+    /// with the stored ones not among them appended (`PlaylistMetadataService.
     /// MergeData` with `replaceData` false).
     pub replace: bool,
+    /// The shares its `playlist.xml` names, in file order — `None` when no
+    /// `playlist.xml` was read, which leaves the stored shares alone. Merged
+    /// as `PlaylistMetadataService.MergeData` merges them: they replace the
+    /// stored ones when `replace` is set or none is stored (an empty list
+    /// removes every share), else they come first and the stored shares of
+    /// the other users follow.
+    pub shares: Option<Vec<ferrofin_model::entities_media::PlaylistUserPermissions>>,
+}
+
+/// A playlist's owner and shares as its permission rows hold them
+/// ([`ItemPersistenceService::playlist_ownership`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaylistOwnership {
+    /// The owner; `None` when the row names none.
+    pub owner: Option<Uuid>,
+    /// Every share row, in share order.
+    pub shares: Vec<ferrofin_model::entities_media::PlaylistUserPermissions>,
 }
 
 /// One entry a playlist's local reader returned — the C# `LinkedChild`: an

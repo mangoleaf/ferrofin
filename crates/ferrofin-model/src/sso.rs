@@ -237,6 +237,18 @@ pub struct OidcExchangeRequest {
     pub code: Secret,
 }
 
+/// What the link page posts to `POST /sso/oidc/{provider}/link`: the
+/// account's current password, which the start checks as a sign-in does
+/// before any flow begins. `Debug` leaves it out.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct OidcLinkStartRequest {
+    /// The account's current password; a missing or empty one starts
+    /// nothing.
+    #[schema(value_type = String)]
+    pub password: Secret,
+}
+
 /// What `POST /sso/oidc/{provider}/link` answers: the identity provider's
 /// sign-in page, for the link page to send the browser to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
@@ -288,6 +300,9 @@ pub struct OidcLinkProvider {
     pub key: String,
     /// The provider's name.
     pub name: String,
+    /// Whether the account has a link at the provider's issuer already: it
+    /// must be removed before another sign-in there can be linked.
+    pub linked: bool,
 }
 
 /// One link, as `GET /sso/admin/links` lists it and `POST /sso/admin/links`
@@ -420,5 +435,17 @@ mod tests {
             serde_json::from_value::<OidcProvider>(written).expect("reads back"),
             provider
         );
+    }
+
+    /// The link start's password binds from the page's body, a missing one
+    /// as empty, and never shows in `Debug`.
+    #[test]
+    fn a_link_start_reads_its_password_and_never_shows_it() {
+        let request: OidcLinkStartRequest =
+            serde_json::from_str(r#"{"Password":"alice-pw-7c1e"}"#).expect("binds");
+        assert_eq!(request.password.expose(), "alice-pw-7c1e");
+        assert!(!format!("{request:?}").contains("alice-pw-7c1e"));
+        let missing: OidcLinkStartRequest = serde_json::from_str("{}").expect("binds");
+        assert_eq!(missing.password.expose(), "");
     }
 }

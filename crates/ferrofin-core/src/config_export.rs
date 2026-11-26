@@ -26,12 +26,18 @@
 //! Each library's options go the same way ([`export_library_options`]): its
 //! `options.json`, read as the server reads it, as the `options.xml` beside it,
 //! with its media paths stored as Jellyfin stores them.
+//!
+//! Live TV ([`export_live_tv`]) and plugin settings ([`export_plugin`]) are
+//! written from what the export carried out of the database and from each
+//! plugin's settings, as Jellyfin keeps them (gl-1556).
 
 mod branding;
 mod encoding;
 mod library;
+mod livetv;
 mod metadata;
 mod network;
+mod plugins;
 mod system;
 mod xbmcmetadata;
 mod xml;
@@ -56,14 +62,38 @@ use crate::configuration_manager::FerrofinServerConfigurationManager as Manager;
 use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
 use crate::virtual_paths::VirtualPathExpander;
 
+pub use livetv::{
+    LiveTvExport, SERIES_TIMERS_FILE as LIVE_TV_SERIES_TIMERS_FILE,
+    TIMERS_FILE as LIVE_TV_TIMERS_FILE, export_live_tv,
+};
+pub use plugins::{PLUGIN_CONFIGURATIONS, PluginDocument, export_plugin};
+
 /// One file of the export, relative to Jellyfin's program data directory
 /// (`config/system.xml`, `data/device.txt`, `root/default/Movies/options.xml`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExportedFile {
     /// Where the file goes, relative to Jellyfin's program data directory.
     pub path: String,
     /// The file's contents.
     pub contents: String,
+    /// Whether it can hold a password or a key: written readable by its
+    /// owner only, unless it replaces a file, whose mode it keeps.
+    pub private: bool,
+}
+
+/// The contents of a private file are left out, so a debug line never
+/// carries a password.
+impl std::fmt::Debug for ExportedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ExportedFile");
+        debug.field("path", &self.path);
+        if self.private {
+            debug.field("contents", &"[private]");
+        } else {
+            debug.field("contents", &self.contents);
+        }
+        debug.field("private", &self.private).finish()
+    }
 }
 
 /// A setting the export leaves to Jellyfin's default, for the loss report.
@@ -160,6 +190,29 @@ pub fn export_configuration(config_dir: &Path) -> Result<ConfigExport, ServiceEr
     )?;
     export.files.push(server_id(config_dir)?);
     Ok(export)
+}
+
+/// The Ferrofin files under the config directory `config_dir` that
+/// [`export_configuration`] and [`export_live_tv`] always write as XML,
+/// whether or not each exists: `system.json` and the named documents. The
+/// export leaves them out of its copy (gl-1949): a later adoption by Ferrofin
+/// reads a document's XML only while its JSON is absent.
+#[must_use]
+pub fn exported_sources(config_dir: &Path) -> Vec<PathBuf> {
+    let named = config_dir.join("users").join(Manager::NAMED_SUBDIR);
+    let mut files = vec![config_dir.join(Manager::CONFIG_FILE_NAME)];
+    files.extend(
+        [
+            Manager::ENCODING_FILE_NAME,
+            Manager::BRANDING_FILE_NAME,
+            Manager::NETWORK_FILE_NAME,
+            Manager::METADATA_FILE_NAME,
+            Manager::XBMC_METADATA_FILE_NAME,
+            Manager::LIVE_TV_FILE_NAME,
+        ]
+        .map(|name| named.join(name)),
+    );
+    files
 }
 
 /// The metadata directory the server of the Ferrofin data directory
@@ -356,6 +409,7 @@ fn export_document<T: Serialize>(
     export.files.push(ExportedFile {
         path: path.to_owned(),
         contents: xml::document(document.root, &fields, document.entries)?,
+        private: false,
     });
     Ok(())
 }
@@ -459,6 +513,7 @@ fn server_id(config_dir: &Path) -> Result<ExportedFile, ServiceError> {
     Ok(ExportedFile {
         path: "data/device.txt".to_owned(),
         contents: id.to_owned(),
+        private: false,
     })
 }
 
@@ -473,6 +528,39 @@ mod tests {
     use crate::config_import::{self, Node};
 
     const SERVER_ID: &str = "3f25fe64f745407b88841fa775eef31b";
+
+    /// The files the export leaves out of its copy are those of exactly the
+    /// documents it writes as XML (gl-1949): a document exported without its
+    /// file listed would be copied beside its XML again.
+    #[test]
+    fn exported_sources_are_the_documents_written_as_xml() {
+        let dir = config_dir(
+            &crate::configuration_manager::default_server_configuration(),
+            &[],
+        );
+        let stem = |path: &Path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
+        };
+        let export = export_configuration(dir.path()).expect("exports");
+        let mut written: Vec<String> = export
+            .files
+            .iter()
+            .map(|file| Path::new(&file.path))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "xml"))
+            .filter_map(stem)
+            .chain(stem(Path::new(livetv::FILE)))
+            .collect();
+        let mut sources: Vec<String> = exported_sources(dir.path())
+            .iter()
+            .filter_map(|path| stem(path))
+            .collect();
+        written.sort();
+        sources.sort();
+        assert_eq!(written, sources);
+        assert!(exported_sources(dir.path()).contains(&dir.path().join("system.json")));
+    }
 
     /// A Ferrofin config directory holding `system.json` and `system_id`,
     /// and the named documents given.
@@ -516,7 +604,7 @@ mod tests {
     }
 
     /// A document's members by name, each as a comparable tree.
-    fn members(xml: &str) -> (String, BTreeMap<String, Node>) {
+    pub(super) fn members(xml: &str) -> (String, BTreeMap<String, Node>) {
         let root = config_import::parse(xml).expect("parses");
         let members = root
             .children

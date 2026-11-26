@@ -7,10 +7,11 @@
         directory Jellyfin expands it to, a media path under the media mount (--media is /media), and no path
         lies under a directory of the source (each --source, and both of each --ran: where the server ran, as
         its rows named it, and the copy that holds it; the first --ran its data directory, a second its
-        configuration directory). With --before, the database the export read (it needs --ran), a path the
-        same column of the source stored without a file where it placed one (a person whose folder Jellyfin
-        never made, a file gone from the media) is not the export's to resolve; an absolute path outside the
-        source's directories and the media always is
+        configuration directory), in a path column or as a string value of an item's Data (a library's
+        PhysicalLocationsList, a video's SubtitleFiles, ...). With --before, the database the export read (it
+        needs --ran), a path the same column of the source stored without a file where it placed one (a person
+        whose folder Jellyfin never made, a file gone from the media) is not the export's to resolve; an
+        absolute path outside the source's directories and the media always is
     checks_paths.py libraries --before FILE --after FILE
         every library folder row of the database Ferrofin stopped with (--before) is in Jellyfin's once its
         scan ran (--after), with the same DateCreated: Jellyfin deletes a library whose stored folder it cannot
@@ -21,6 +22,7 @@ Exit status 0 when it holds; 1 with one line per problem on stdout, the first fe
 
 import argparse
 from contextlib import closing
+import json
 from pathlib import Path
 import re
 import sqlite3
@@ -29,6 +31,9 @@ import sys
 #: The Jellyfin columns that hold a path under its directories (the export's own list).
 PATH_COLUMNS = (("BaseItems", "Path"), ("BaseItemImageInfos", "Path"), ("Chapters", "ImagePath"),
                 ("MediaStreamInfos", "Path"), ("ImageInfos", "Path"))
+#: The Jellyfin JSON columns whose string values can hold such a path (the export's own list): free text is in
+#: columns of its own.
+JSON_PATH_COLUMNS = (("BaseItems", "Data"),)
 #: Where Jellyfin's docker image reads its program data, and the tokens it expands below it.
 CONFIG = "/config"
 TOKENS = {"%AppDataPath%": "data", "%MetadataPath%": "metadata"}
@@ -70,6 +75,21 @@ def place(path, roots, media):
     return OUTSIDE if path.startswith("/") else None
 
 
+def json_strings(document):
+    """Every string value of the JSON `document` in its order (object keys are no values); none when it is not
+    JSON."""
+    def strings(node):
+        if isinstance(node, dict):
+            node = list(node.values())
+        if isinstance(node, list):
+            return [value for child in node for value in strings(child)]
+        return [node] if isinstance(node, str) else []
+    try:
+        return strings(json.loads(document))
+    except ValueError:
+        return []
+
+
 def fileless(before, table, column, media, ran):
     """The paths `table`.`column` of the source's database stored that it placed in its directories (`ran`,
     [(directory, copy)]) or the media and that named no file there. A path it could not place is not one: the
@@ -103,10 +123,13 @@ def stored(db, out, media, sources, before=None, ran=()):
     problems = []
     if has_table(db, "BaseItems") and not rows(db, 'SELECT 1 FROM "BaseItems" WHERE "Path" IS NOT NULL LIMIT 1'):
         problems.append("BaseItems.Path: no stored path to check")
+
+    def is_under(value):
+        return any(value == source or value.startswith(source.rstrip("/") + "/") for source in sources)
+
     for table, column in PATH_COLUMNS:
         values = [value for (value,) in rows(db, f'SELECT "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL')]
-        under = [value for value in values
-                 if any(value == source or value.startswith(source.rstrip("/") + "/") for source in sources)]
+        under = [value for value in values if is_under(value)]
         if under:
             problems.append(f"{table}.{column}: {len(under)} path(s) under the source's directory, first: "
                             + ", ".join(under[:EXAMPLES]))
@@ -121,6 +144,14 @@ def stored(db, out, media, sources, before=None, ran=()):
         if missing:
             problems.append(f"{table}.{column}: {len(missing)} of {len(values)} path(s) not in the export, first: "
                             + ", ".join(missing[:EXAMPLES]))
+    for table, column in JSON_PATH_COLUMNS:
+        if column not in [name for (_, name, *_) in rows(db, f'PRAGMA table_info("{table}")')]:
+            continue
+        under = [value for (document,) in rows(db, f'SELECT "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL')
+                 for value in json_strings(document) if is_under(value)]
+        if under:
+            problems.append(f"{table}.{column}: {len(under)} path(s) under the source's directory, first: "
+                            + ", ".join(under[:EXAMPLES]))
     return problems
 
 

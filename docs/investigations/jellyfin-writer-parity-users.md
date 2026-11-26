@@ -8,7 +8,7 @@ Ledger for phase gl-1559 of the "Backwards migration to Jellyfin" milestone: eve
 - **match:** same value and text form.
 - **fix:** Ferrofin differs. The row names the issue that tracks it, filed by this audit or already open.
 - **recorded:** a divergence an owner decision accepts, or one the code records as a Jellyfin bug not ported; it is cited.
-- **owner?:** a possible accepted divergence the owner has not decided. Each is proposed below (P1 to P6), or waits on its own issue. **owner? (documented)** is a deliberate Ferrofin difference a code comment explains, with no owner decision yet: listed together as P6.
+- **owner?:** a possible accepted divergence the owner has not decided. Each is proposed below (P1 to P6). **owner? (documented)** is a deliberate Ferrofin difference a code comment explains, with no owner decision yet: listed together as P6.
 - **match; edge fix** or **match; recorded edge:** the column matches except in an edge case, which the named issue tracks or the code records as a Jellyfin bug not ported.
 
 ## Method
@@ -98,17 +98,17 @@ Ferrofin: `crates/ferrofin-core/src/user_data_manager.rs` (udm), `user_data_keys
 | Column | Ferrofin writer | Upstream writer | Verdict | Note |
 |---|---|---|---|---|
 | ItemId, UserId | udm:743-744 | UDM:66, 174 | match | user deletion cascades on both |
-| CustomDataKey | `user_data_keys.rs:195-363`; udm:666-668 | UDM:58-75; `BaseItem.cs:1766-1779` and overrides | fix (gl-1610); edge fix (gl-1605) | upstream prepends the item's `ExternalId` for a channel source, which is every item with a `ChannelId`, Live TV programs included (`BaseItem.cs:288-299, 1768-1776`). Ferrofin's note at `crates/ferrofin-core/src/user_data_keys.rs:67-72` takes it for a channel-plugin case only, so a program's user data lacks that key. Edge: a negative index pads with the sign: `{:03}` gives `-01` where C#'s `"000"` gives `-001`, and disc and track `{:04}` likewise |
+| CustomDataKey | `user_data_keys.rs:195-363`; udm:666-668 | UDM:58-75; `BaseItem.cs:1766-1779` and overrides | match; edge fix (gl-1605) | upstream prepends the item's `ExternalId` for a channel source (`BaseItem.cs:1766-1779`), but a Live TV program overrides `SourceType` to `LiveTV` (`MediaBrowser.Controller/LiveTv/LiveTvProgram.cs:34`), so only a channel plugin's items take that key, and Ferrofin has none (re-checked in gl-1610). Edge: a negative index pads with the sign: `{:03}` gives `-01` where C#'s `"000"` gives `-001`, and disc and track `{:04}` likewise |
 | AudioStreamIndex, SubtitleStreamIndex | `crates/ferrofin-traits/src/library.rs:2027-2041` via udm:813-829 | `SessionManager.cs:990, 1016-1055` | match | |
 | IsFavorite, Rating, Likes | udm:1822-1852, 2007-2008 | UDM:130-153; `UserItemData.cs:96-118` | match | Likes derives from Rating (6.5 threshold) on both |
 | PlayCount, PlaybackPositionTicks, Played | udm:1412-1520, 2123-2130 | UDM:455-529; `BaseItem.cs:2252-2302` | match | same thresholds |
-| Played, PlayCount, PlaybackPositionTicks, LastPlayedDate (container unplay) | `user_data_manager.rs:1066-1084` clears the container's own rows | `MarkUnplayed` leaves them | owner? (gl-1064) | awaiting the owner on gl-1064 (`crates/ferrofin-api/src/handlers.rs:1393-1395`) |
+| Played, PlayCount, PlaybackPositionTicks, LastPlayedDate (container unplay) | `user_data_manager.rs:1066-1084` clears the container's own rows | `MarkUnplayed` leaves them | recorded | owner decision 2026-11-20 on gl-1064: kept, to clear the play state versions before 1.4.0 wrote on containers (the `user-data` row of `VERIFIED_SUBSYSTEMS`, `crates/ferrofin-api/src/handlers.rs`) |
 | all (concurrent saves) | each save reads inside the write transaction, so both land | the later save overwrites the earlier one | owner? (documented) | `crates/ferrofin-api/src/handlers.rs:1390-1392` (P6) |
-| LastPlayedDate | udm:1419-1456, 1516-1518, 2126 | `BaseItem.cs:2266, 2301`; `SessionManager.cs:852-855, 982-985` | fix (gl-1565, gl-1604) | datetime form. **Migration `0010_hermit_backfill_last_played.sql:14-16` runs on every adopted database** (not baselined: `crates/ferrofin-db/src/database.rs:1529-1557`). It sets `LastPlayedDate` to the adoption time on every `Played=1` row that has none, rows upstream writes on purpose (`MediaBrowser.Controller/Entities/Video.cs:388`, an NFO `watched` import). That invents play dates |
+| LastPlayedDate | udm:1419-1456, 1516-1518, 2126 | `BaseItem.cs:2266, 2301`; `SessionManager.cs:852-855, 982-985` | fix (gl-1565, gl-1604) | datetime form. **Migration `0010_hermit_backfill_last_played.sql:14-16` runs on every adopted database** (not baselined: `crates/ferrofin-db/src/database.rs:1529-1557`). It sets `LastPlayedDate` to the adoption time on every `Played=1` row that has none, rows upstream writes on purpose (`MediaBrowser.Controller/Entities/Video.cs:388`). That invents play dates |
 | RetentionDate | detach ips:2183; recover `user_data_retention_repository.rs:121`; migration 0042:99-101 | `ItemPersistenceService.cs:61, 129-132`; UDM:69 writes NULL on every save | fix (gl-1565, gl-1605) | datetime form. Ferrofin's update leg keeps an existing value (udm:719-720); upstream clears it. No practical effect: a live row holding one should not exist |
 
 Also:
-- **NFO user-data import is not ported** (gl-1606). `crates/ferrofin-providers/src/xbmc/base_parser.rs:309-316` says "User-data import is out of scope for the local parse; consume". Upstream saves `Played`, `PlayCount` and `LastPlayedDate` from an NFO when its configuration names a user (`MediaBrowser.XbmcMetadata/Parsers/BaseNfoParser.cs:308-370`), so Ferrofin writes no row where upstream does.
+- **NFO user data: match, no import on either side** (gl-1606). Upstream's `watched`, `playcount` and `lastplayed` arms (`MediaBrowser.XbmcMetadata/Parsers/BaseNfoParser.cs:308-370`) save for the configured NFO user only when `!item.Id.IsEmpty()`. `BaseNfoProvider.GetMetadata` parses into a fresh `new T { IndexNumber }`, whose id is always empty, so the save never runs. A stock 12.4 with an NFO user set scanned and refreshed an NFO holding all three and wrote no `UserData` row. Ferrofin reads the three elements and drops them (`crates/ferrofin-providers/src/xbmc/base_parser.rs:309-320`). Only the export half writes them: the NFO saver, for the configured user.
 - **No upstream equivalent:**
   - the user-data retention reattach and recovery semantics (`docs/reviews/user-data-retention.md`; `ips:2237, 2247-2248`): owner? (documented), P6;
   - the scan rekeys and folds (`crates/ferrofin-traits/src/persistence.rs:1563-1566`, owner decisions D4 and D9b): recorded;
@@ -189,14 +189,14 @@ Filed or extended by this audit. None of the issues filed here is in the milesto
 | gl-1603 | A device's new custom name reaches its live sessions (`DeviceOptionsUpdated`) |
 | gl-1604 | Migration `0010` invents play dates on adopted databases |
 | gl-1605 | `UserData` edges: `RetentionDate` cleared on a save, negative-index key padding |
-| gl-1606 | NFO user-data import |
+| gl-1606 | NFO user-data import (re-checked: upstream imports nothing either, so the finding was a stale comment) |
 | gl-1607 | `RowVersion` on `Users`, `Permissions`, `Preferences` |
 | gl-1608 | User rows: `CastReceiverId` at creation and the seeded admin's bitrate limit |
 | gl-1190 (evidence added) | The startup wizard's case fold |
 | gl-1609 | Item deletion removes display preferences |
-| gl-1610 | Live TV programs' `ExternalId` user-data key |
+| gl-1610 | Live TV programs' `ExternalId` user-data key (re-checked: `LiveTvProgram` overrides `SourceType` to `LiveTV`, so upstream adds no such key either; closed as invalid) |
 
-Already open before this audit: gl-410 (skip lengths, owner-decided), gl-429, gl-430 and gl-908 (activity log), and gl-1064 (container unplay, awaiting the owner).
+Already open before this audit: gl-410 (skip lengths, owner-decided), gl-429, gl-430 and gl-908 (activity log), and gl-1064 (container unplay, owner-decided: kept).
 
 **For the owner (proposed accepted divergences):**
 - **P1: the lockout counter.** Upstream counts the locking attempt twice, a Jellyfin bug.

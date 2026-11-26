@@ -26,7 +26,10 @@ change (or bring a deleted item back). Then
      setting of each configuration document answers.py compares changed from its default (SETTINGS);
   7. the second playlist and collection are deleted. The copy's media is read-only, so the items the stage
      deletes are these, whose files live in the data directory;
-  8. every share of the playlist answers.SHARE_OWNER shared in Jellyfin is removed, as its owner.
+  8. every share of the playlist answers.SHARE_OWNER shared in Jellyfin is removed, as its owner;
+  9. both pairs of versions the fixtures merged in Jellyfin are split, and a third copy merged into the second
+     pair's primary: from a 10.11 source that primary's item data still lists the version split off;
+ 10. a playlist of answers.SHARE_OWNER's from the fixtures is emptied, as its owner.
 Then the library is scanned and left to settle again, and the answers (answers.py) are written to FILE: the
 oracle Jellyfin's answers are compared with after the return. Each action must show in them (a write the
 server accepted and lost fails here, not as two equal answers later), and a deleted item must answer 404.
@@ -67,6 +70,10 @@ REMOVED_KIND, EDITED, OVERVIEW = "homevideos", "Round trip edited movie", "Edite
 SETTINGS = (("system", "LibraryMonitorDelay", 75), ("encoding", "H264Crf", 21), ("network", "AutoDiscovery", False),
             ("branding", "LoginDisclaimer", "Round-trip"), ("metadata", "UseFileCreationTimeForDateAdded", False),
             ("xbmcmetadata", "EnableExtraThumbsDuplication", True))
+#: The movies the fixtures merged as versions with "<name> Extended", and the third copy merged into the second pair
+#: once split (gates/adoption/synthetic_media.py MERGED_PAIRS, THIRD_VERSION); and SHARE_OWNER's playlist the stage
+#: empties (gates/adoption/synthetic_fixture.py seed).
+MERGED_PAIRS, THIRD_VERSION, EMPTIED = ("Rowan Ferry", "Saffron Gate"), "Saffron Gate Remastered", "Synthetic private playlist"
 #: Every request the stage made, "<action>  <HTTP status>", in order: FILE.actions.
 RECORD = []
 
@@ -191,6 +198,44 @@ def unshare(server, data_dir):
     raise UsageError(f"unshare a playlist: {answers.SHARE_OWNER} has shared none")
 
 
+def split_versions(server, every):
+    """Splits each pair of versions the fixtures merged, through its primary (the one listed), then merges
+    THIRD_VERSION into the last pair's primary. Returns {movie name: media sources} its answers must show, and the
+    primary that took THIRD_VERSION."""
+    by_name, sources, primary = {m["Name"]: m for m in every}, {}, None
+    for pair in MERGED_PAIRS:
+        listed = [by_name[name] for name in (pair, f"{pair} Extended") if name in by_name]
+        if len(listed) != 1:
+            raise UsageError(f"split {pair}: {len(listed)} of its two versions are listed, wanted the primary alone")
+        primary = listed[0]
+        act(server, f"split {primary['Name']}", "DELETE", f"/Videos/{primary['Id']}/AlternateSources")
+        sources[pair] = sources[f"{pair} Extended"] = 1
+    third = by_name.get(THIRD_VERSION)
+    if third is None:
+        raise UsageError(f"merge {THIRD_VERSION}: it is not listed")
+    act(server, f"merge {THIRD_VERSION} into {primary['Name']}", "POST",
+        "/Videos/MergeVersions" + query(ids=f"{primary['Id']},{third['Id']}"))
+    sources[primary["Name"]] = 2
+    return sources, primary["Name"]
+
+
+def empty(server, data_dir):
+    """Removes every entry of EMPTIED, a playlist of SHARE_OWNER's the fixtures made, as its owner."""
+    owner = answers.smoke_credentials(data_dir, answers.SHARE_OWNER)[3]
+    auth = answers.smoke_auth(data_dir, answers.SHARE_OWNER)
+    found = (act(server, f"list {answers.SHARE_OWNER}'s playlists to empty one", "GET", "/Items" + query(
+        userId=owner, Recursive="true", IncludeItemTypes="Playlist"), auth=auth) or {}).get("Items") or []
+    playlist = next((p for p in found if p.get("Name") == EMPTIED), None)
+    if playlist is None:
+        raise UsageError(f"empty {EMPTIED}: {answers.SHARE_OWNER} has no such playlist")
+    entries = (act(server, f"list {EMPTIED}", "GET", f"/Playlists/{playlist['Id']}/Items" + query(userId=owner),
+                   auth=auth) or {}).get("Items") or []
+    if not entries:
+        raise UsageError(f"empty {EMPTIED}: it has no entry to remove")
+    act(server, f"empty {EMPTIED}", "DELETE", f"/Playlists/{playlist['Id']}/Items" + query(
+        entryIds=",".join(e.get("PlaylistItemId") or "" for e in entries)), auth=auth)
+
+
 def run(base_url, data_dir, oracle_out, timeout):
     server = api.Server(base_url, data_dir)
     name, user = answers.smoke_user(data_dir)
@@ -306,6 +351,9 @@ def run(base_url, data_dir, oracle_out, timeout):
     act(server, f"delete the playlist {DOOMED_PLAYLIST}", "DELETE", f"/Items/{doomed_playlist}")
     act(server, f"delete the collection {DOOMED_COLLECTION}", "DELETE", f"/Items/{doomed_collection}")
     unshared = unshare(server, data_dir)
+    # 9. and 10., what a Jellyfin code migration left to run would undo (gl-1902)
+    sources, merged = split_versions(server, every)
+    empty(server, data_dir)
     refresh(server, timeout, "refresh the library again")
 
     lines = answers.capture(base_url, data_dir)
@@ -359,6 +407,14 @@ def run(base_url, data_dir, oracle_out, timeout):
              gone[doomed_collection] == 404 and not any(line.endswith(f" {DOOMED_COLLECTION}") for line in lines)),
             (f"unshare {unshared}", f"shares {answers.SHARE_OWNER} {unshared} = -",
              f"shares {answers.SHARE_OWNER} {unshared} = -" in lines),
+            *((f"merge {THIRD_VERSION} into {merged}" if name == merged else f"split {name.removesuffix(' Extended')}",
+               f"video {name} sources={count} parts=0", f"video {name} sources={count} parts=0" in lines)
+              # the merge's last: a lost split leaves the merge a third source, but the split names itself first
+              for name, count in sorted(sources.items(), key=lambda source: (source[0] == merged, source[0]))),
+            (f"merge {THIRD_VERSION} into {merged}", f"no video line for {THIRD_VERSION}",
+             not any(line.startswith(f"video {THIRD_VERSION} ") for line in lines)),
+            (f"empty {EMPTIED}", f"entries {answers.SHARE_OWNER} {EMPTIED} = -",
+             f"entries {answers.SHARE_OWNER} {EMPTIED} = -" in lines),
             *((f"create the user {n}", f"login {n} 200 token=yes", f"login {n} 200 token=yes" in lines)
               for n in sorted(answers.GATE_USERS)),
             ("add a library", f"virtualfolder {ADDED_LIBRARY} with EnableRealtimeMonitor=False",

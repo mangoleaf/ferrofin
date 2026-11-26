@@ -165,10 +165,12 @@ the callback Keycloak sends the browser back to to the router. Its eight tests c
    every library, Live TV and its recordings; `oidc-member`'s first session has only that library,
    `oidc-admin`'s every library and both Live TV permissions, `oidc-guest`'s none of them.
 7. **Linking** (`oidc-guest`): a local account signed in with its password links itself at
-   `POST /sso/oidc/keycloak/link`; the identity then signs in to it and so does the password;
+   `POST /sso/oidc/keycloak/link`, giving that password again (its token alone is refused); the
+   identity then signs in to it and so does the password;
    removing the link signs out all three sessions, and the identity is refused again.
-8. **Quick Connect** (`oidc-member`): an app's code entered at `/sso/quickconnect`, signed in at
-   Keycloak and confirmed signs the app in, on its own device only.
+8. **Quick Connect** (`oidc-member`): a sign-in at Keycloak through `/sso/quickconnect`, then the
+   app's code typed on the page after it, signs the app in, on its own device only; a sign-in link
+   carrying the code is refused.
 
 Every test also captures what the process logs meanwhile (at `debug`, the server's crates at
 `trace`, span fields included) and fails if a secret it handled is in it: the client secret (also
@@ -191,7 +193,7 @@ the realm is put back afterwards:
 - **Profile pictures**: step 8 of "Running Ferrofin against it".
 - **jellyfin-web**: steps 5 to 7 of "Running Ferrofin against it" from a browser, the login page's button
   ([`docs/SINGLE_SIGN_ON.md`](../../docs/SINGLE_SIGN_ON.md#what-clients-show)), `/sso/link` and the
-  settings page's **Linked accounts**, and `/sso/quickconnect` with a code an app started.
+  settings page's **Linked accounts**, and `/sso/quickconnect`, typing a code an app started.
 - **Native apps** (not yet run): approve a real app's Quick Connect code through
   `/sso/quickconnect`, look at what each app's login screen shows while a provider is enabled,
   and try the button in the Android app, which wraps jellyfin-web.

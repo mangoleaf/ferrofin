@@ -1,8 +1,9 @@
 //! What the operator is told about the database an export writes (gl-1553):
-//! what each table it removed held ([`table_note`]), and what Jellyfin's code
+//! what each table it removed held ([`table_note`]), what Jellyfin's code
 //! migrations the exported history leaves to run will change on its first
-//! start ([`first_start_effects`]). `ferrofin-server export-jellyfin` writes
-//! them into its loss report.
+//! start ([`first_start_effects`]), and why it records the others as applied
+//! ([`recorded_as_applied`], gl-1902). `ferrofin-server export-jellyfin`
+//! writes them into its loss report.
 
 /// What each Ferrofin table holds and where Jellyfin keeps the same, if
 /// anywhere, by name.
@@ -13,7 +14,7 @@ const TABLE_NOTES: [(&str, &str); 20] = [
     ),
     (
         "FerrofinExternalIdentities",
-        "the links from LDAP-Auth and Single Sign-On identities to users, not exported; Jellyfin's LDAP-Auth plugin keeps its own in its settings. Jellyfin does not know Single Sign-On's provider, so an account Single Sign-On created cannot sign in there until it has the default provider, which saving its profile page in Jellyfin's dashboard gives it; from then on it signs in with an empty password until one is set, so set one right after saving (one set before is ignored)",
+        "the links from LDAP-Auth and Single Sign-On identities to users. LDAP-Auth's are written into its settings for Jellyfin's LDAP-Auth plugin (LdapUsers in plugins/configurations/LDAP-Auth.xml). Jellyfin does not know Single Sign-On's provider, so an account Single Sign-On created cannot sign in there until it has the default provider, which saving its profile page in Jellyfin's dashboard gives it; from then on it signs in with a password an administrator sets after saving (one set before is ignored), and with no other, an empty one included",
     ),
     (
         "FerrofinIntroSkipperDisabledEpisodes",
@@ -29,31 +30,31 @@ const TABLE_NOTES: [(&str, &str); 20] = [
     ),
     (
         "FerrofinLiveTvChannels",
-        "Live TV channels; Jellyfin makes them again from its tuners, once those are added again",
+        "Ferrofin's own copy of the Live TV channels; the channel items Jellyfin reads, which hold the users' favourites, are kept, and Jellyfin's guide refresh rebuilds the rest from the tuners",
     ),
     (
         "FerrofinLiveTvListingProviders",
-        "Live TV guide providers, not exported; Jellyfin keeps them in config/livetv.xml",
+        "Live TV guide providers, written to config/livetv.xml, where Jellyfin keeps them",
     ),
     (
         "FerrofinLiveTvPrograms",
-        "the Live TV guide; Jellyfin downloads it again once its guide providers are added again",
+        "Ferrofin's own copy of the Live TV guide; the programme items Jellyfin reads are kept, and Jellyfin's guide refresh downloads the guide again",
     ),
     (
         "FerrofinLiveTvRecordings",
-        "Ferrofin's records of DVR recordings; the recorded files stay where they were written",
+        "Ferrofin's records of DVR recordings; each completed one's file and programme facts are written into its timer in data/livetv/timers.json, as Jellyfin keeps them, and the recorded files are where they were written",
     ),
     (
         "FerrofinLiveTvSeriesTimers",
-        "series recording rules, not exported; Jellyfin keeps them in data/livetv/seriestimers.json",
+        "series recording rules, written to data/livetv/seriestimers.json, where Jellyfin keeps them",
     ),
     (
         "FerrofinLiveTvTimers",
-        "scheduled recordings, not exported; Jellyfin keeps them in data/livetv/timers.json",
+        "scheduled and completed recordings, written to data/livetv/timers.json, where Jellyfin keeps them",
     ),
     (
         "FerrofinLiveTvTunerHosts",
-        "Live TV tuners, not exported; Jellyfin keeps them in config/livetv.xml",
+        "Live TV tuners, written to config/livetv.xml, where Jellyfin keeps them",
     ),
     (
         "FerrofinMeta",
@@ -103,14 +104,10 @@ pub fn table_note(name: &str) -> &'static str {
 /// changes on Jellyfin's first start, in the order the report prints them:
 /// what an operator would notice first. Read from the routines at `v12.4`
 /// (`Jellyfin.Server/Migrations/Routines/`).
-const FIRST_START: [(&str, &str); 19] = [
+const FIRST_START: [(&str, &str); 16] = [
     (
         "20260531160000_DisableLegacyAuthorization",
         "turns EnableLegacyAuthorization off in system.xml, so clients that sign in the legacy way stop working until it is turned on again",
-    ),
-    (
-        "20260113120000_MigrateLinkedChildren",
-        "reads alternate versions and playlist and collection entries from item data again, and deletes the items of deleted libraries, stray alternate versions, every item whose file is missing from a readable library folder and, when every library folder is readable, every item outside them all: the media must be mounted where Ferrofin saw it",
     ),
     (
         "20260825200000_ConsolidateLocalizedUserViews",
@@ -139,14 +136,6 @@ const FIRST_START: [(&str, &str); 19] = [
     (
         "20260912120000_HarmonizeConflictingUserData",
         "where one item has several play-state rows for a user that disagree, gives them all the most recently played one's values",
-    ),
-    (
-        "20260915120000_MigrateRatingLevels",
-        "scores each item's parental rating from its own rating only: an item without one loses the score it inherited",
-    ),
-    (
-        "20260115120000_FixIncorrectOwnerIdRelationships",
-        "deletes items that share a path with another, clears owner links and sets the primary version of alternate versions again",
     ),
     (
         "20260729120000_RestorePlaylistChildrenFromMetadata",
@@ -182,6 +171,36 @@ const FIRST_START: [(&str, &str); 19] = [
     ),
 ];
 
+/// Why the export records each code migration it records as applied: what
+/// Ferrofin did of its work, and what running it again undoes on a database
+/// Ferrofin maintained, as the round-trip gate showed (`gates/roundtrip/`).
+const RECORDED: [(&str, &str); 3] = [
+    (
+        "20260915120000_MigrateRatingLevels",
+        "Ferrofin ran its own port of it when it adopted the database, and its scans gave each season and episode the rating it inherits from its series since; run again, it would take that rating away, so that lists show them to the accounts it hides them from until Jellyfin's next scan",
+    ),
+    (
+        "20260113120000_MigrateLinkedChildren",
+        "Ferrofin moved the playlist, collection and version links out of the items' data when it adopted the database; run again, it would read them again, merging back the versions split since (and stopping Jellyfin's start when another version took the place of the one split off), and delete the additional parts of every movie in parts",
+    ),
+    (
+        "20260115120000_FixIncorrectOwnerIdRelationships",
+        "Ferrofin repaired the items' owners when it adopted the database; run again, it would take its owner from each additional part of a movie in parts, which would then list as a video of its own until Jellyfin's next scan",
+    ),
+];
+
+/// The routine name of each code migration in `recorded` (the ids an export
+/// added to the history) that is recorded as applied, with why, in the order
+/// the report prints them.
+#[must_use]
+pub fn recorded_as_applied(recorded: &[&'static str]) -> Vec<(&'static str, &'static str)> {
+    RECORDED
+        .iter()
+        .filter(|(id, _)| recorded.contains(id))
+        .map(|&(id, why)| (id.split_once('_').map_or(id, |(_, name)| name), why))
+        .collect()
+}
+
 /// The routine name and effect of each code migration in `left_to_run`, in
 /// the order the report prints them; one this table does not know comes
 /// last, by its name alone.
@@ -203,7 +222,9 @@ pub fn first_start_effects(left_to_run: &[&'static str]) -> Vec<(&'static str, &
 
 #[cfg(test)]
 mod tests {
-    use super::{FIRST_START, TABLE_NOTES, first_start_effects, table_note};
+    use super::{
+        FIRST_START, RECORDED, TABLE_NOTES, first_start_effects, recorded_as_applied, table_note,
+    };
     use crate::Database;
     use crate::database::JELLYFIN_GENERATIONS;
     use crate::export::{Disposition, JELLYFIN_MIGRATIONS};
@@ -264,6 +285,33 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    /// Every code migration recorded as applied says why, and nothing else
+    /// does.
+    #[test]
+    fn every_code_migration_recorded_as_applied_says_why() {
+        for (id, disposition) in JELLYFIN_MIGRATIONS {
+            assert_eq!(
+                RECORDED.iter().any(|(recorded, _)| *recorded == id),
+                disposition == Disposition::CodeRecordedAsApplied,
+                "{id}"
+            );
+        }
+        let ids: Vec<&str> = RECORDED.iter().map(|(id, _)| *id).rev().collect();
+        let names: Vec<&str> = recorded_as_applied(&ids)
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            names,
+            RECORDED.map(|(id, _)| id.split_once('_').unwrap().1),
+            "in the table's order, by routine name"
+        );
+        assert_eq!(
+            recorded_as_applied(&["20260113102337_AddLinkedChildrenTable"]),
+            []
+        );
     }
 
     #[test]

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # The Jellyfin stage of a round-trip route, sourced by run.sh: boot the Jellyfin release under test on what
 # the export wrote, read its log (checks_boot.py), refresh every playlist's metadata in full (api.py
-# refresh-playlists), compare its answers with Ferrofin's oracle, probe the files it serves (probes.py), scan its
-# libraries, compare its answers again, stop it, and check its file and library rows (checks_paths.py); then start
-# it a second time on the same file, which must run no migration, change no row the allowlist does not explain and
-# give the same answers. Its database is copied at the end of each window (allowlist.py WINDOWS: its start, the
-# gate's requests, its scan, the rest until its stop, its second start), and every row a window added, removed or
-# changed must be explained by an allowlist entry (checks_db.py rows); its scan must keep every item and the
-# counts by type (checks_db.py counts). On the scale route, where Ferrofin captured no answers, there is no playlist
-# refresh, answer, probe or scan (stage_ferrofin.sh says why): its starts, logs, windows, stops and file are
-# checked. It uses run.sh's state: route, kind, dst, first_start, the settings, FIXTURES, JELLYFIN_ID, MEDIA, MADE,
-# and why[] through check and mark.
+# refresh-playlists), compare its answers with Ferrofin's oracle, compare its Live TV with Ferrofin's before and
+# after its first guide refresh (livetv.py), probe the files it serves (probes.py), scan its libraries, compare its
+# answers again, stop it, and check its file and library rows (checks_paths.py); then start it a second time on the
+# same file, which must run no migration, change no row the allowlist does not explain and give the same answers.
+# Its database is copied at the end of each window (allowlist.py WINDOWS: its start, the gate's requests, its scan,
+# the rest until its stop, its second start), and every row a window added, removed or changed must be explained by
+# an allowlist entry (checks_db.py rows); its scan must keep every item and the counts by type (checks_db.py
+# counts). On the scale route, where Ferrofin captured no answers, there is no playlist refresh, answer, Live TV
+# check, probe or scan (stage_ferrofin.sh says why): its starts, logs, windows, stops and file are checked. It uses
+# run.sh's state: route, kind, dst, first_start, the settings, FIXTURES, JELLYFIN_ID, MEDIA, MADE, and why[]
+# through check and mark.
 # shellcheck disable=SC2154  # run.sh sets what this reads
 
 # jellyfin_start <stage> <role>: start Jellyfin on the export as the container <role> and wait until it answers and
@@ -20,7 +21,7 @@ jellyfin_start() {
   name=$(rt_name "$RUN_ID" "$route" "$role") cid=$dst/$role.cid url=''
   MADE+=("$cid")
   if port=$(rt_start "$name" "$cid" "$JELLYFIN_ID" -v "$dst/jellyfin:/config" -v "$dst/jellyfin-cache:/cache" \
-      "${MEDIA[@]}" 2>"$dst/$role-start.err"); then
+      -v "$dst/livetv:/livetv:ro" "${MEDIA[@]}" 2>"$dst/$role-start.err"); then
     if rt_wait_up "$name" "$port" "$READY_TIMEOUT" "$RT_JELLYFIN_START_FAILED"; then
       url=http://127.0.0.1:$port
     else
@@ -89,7 +90,7 @@ jellyfin_stage() {
     check reasons python3 "$HERE/checks_boot.py" migrations "$dst/jellyfin-boot.log"
     mark Jellyfin "every migration it began finished"
     # what Jellyfin's own first start on this route's source ran, as build-fixtures.sh logged it, less what the
-    # source's history (as Ferrofin stopped with it) records
+    # source's history (as Ferrofin stopped with it) records and what the export records as applied (classify.rs)
     check reasons python3 "$HERE/checks_boot.py" ran "$dst/jellyfin-boot.log" "$FIXTURES/$first_start.server.log" \
       "$dst/ferrofin/data/jellyfin.db"
     mark Jellyfin "it ran the code migrations it runs on the source, and no schema migration"
@@ -104,6 +105,10 @@ jellyfin_stage() {
       --timeout "$SCAN_TIMEOUT"
     mark Jellyfin "every playlist's full metadata refresh completes"
     answers_equal Jellyfin answers.txt "answers equal Ferrofin's before the stop"
+    # twice the script's own bound, so its own reason comes first
+    check reasons_within $((2 * SCAN_TIMEOUT)) "the Live TV check" python3 "$HERE/livetv.py" check --base-url "$url" \
+      --data-dir "$dst/jellyfin" --ferrofin "$dst/livetv-ferrofin.json" --timeout "$SCAN_TIMEOUT"
+    mark Jellyfin "Live TV: timers, a favourite channel and the guide equal Ferrofin's before and after its first guide refresh"
     check reasons_within "$SCAN_TIMEOUT" "the probes" \
       python3 "$HERE/probes.py" --base-url "$url" --data-dir "$dst/jellyfin" --before "$dst/ferrofin/data/jellyfin.db" \
       --out "$dst/probes.txt"

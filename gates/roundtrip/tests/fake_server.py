@@ -30,10 +30,15 @@ test_usage.py serves a Stub in process. roundtrip.bats's fake docker starts one 
                                                           an export that wrote no configuration document would
 
 The copy holds SHARED, a playlist of synthetic-adult's (answers.SHARE_OWNER) shared with synthetic-child, with a
-playlist.xml listing the share, as the fixtures' Synthetic mixed order is. synthetic-adult also sees the playlists the
+playlist.xml listing the share, as the fixtures' Synthetic mixed order is, and PRIVATE, a playlist of synthetic-adult's
+holding two movies, as the fixtures' Synthetic private playlist is. Besides seven movies it lists the fixtures' merged
+versions (VERSIONS): two pairs, each shown as its primary with two media sources, and a third copy; a merge makes the
+first id given the primary, and synthetic-child is limited by parental rating. synthetic-adult also sees the playlists the
 stage makes, whose shares it is refused (403), as upstream refuses a playlist's shares to anyone but its owner. A full
 refresh of SHARED (POST /Items/SHARED/Refresh?metadataRefreshMode=FullRefresh) moves its DateLastRefreshed in
 CONFIG/data/jellyfin.db a moment later, as Jellyfin's queued refresh does; a refresh of another mode moves nothing.
+Live TV answers as livetv.py asks it: a tuner and a guide, whose guide refresh (the RefreshGuide task) gives two
+channels and their programmes, timers, series timers and favourite channels.
 """
 
 import base64
@@ -59,6 +64,14 @@ ADULT, CHILD = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccccccc
 #: synthetic-adult's playlist, shared with synthetic-child, and its name.
 SHARED, SHARED_NAME = "dddddddddddddddddddddddddddddddd", "Synthetic mixed order"
 MOVIES = [f"{n:032x}" for n in range(1, 8)]   # seven movies; the first one is already played
+#: The fixtures' versions, {id: name}, listed between the sixth movie and the last (as their names sort), and which of
+#: them the fixtures merged into which: {version: primary}.
+VERSIONS = {f"{n:032x}": name for n, name in enumerate(
+    ("Rowan Ferry", "Rowan Ferry Extended", "Saffron Gate", "Saffron Gate Extended", "Saffron Gate Remastered"), 0x20)}
+MERGED = {f"{0x21:032x}": f"{0x20:032x}", f"{0x23:032x}": f"{0x22:032x}"}
+LISTED = [*MOVIES[:6], *VERSIONS, MOVIES[6]]
+#: synthetic-adult's playlist the fixtures filled, and its name.
+PRIVATE, PRIVATE_NAME = "9" * 32, "Synthetic private playlist"
 STATE = "fake-state.json"
 #: How long a "setup" server answers as Jellyfin's setup server does, and then as its starting real server does:
 #: each longer than the harness's poll interval.
@@ -67,11 +80,13 @@ SETUP_SECONDS = 3
 REFRESH_SECONDS = 0.2
 #: What the stub keeps, and saves to CONFIG/fake-state.json.
 FIELDS = ("refreshes", "users", "data", "collections", "accounts", "prefs", "keys", "devices", "libraries", "items",
-          "images", "plays", "shares", "config", "options")
+          "images", "plays", "shares", "config", "options", "livetv", "versions", "private")
 #: Jellyfin's schema, which the copy's database has (gates/roundtrip/lib.sh RT_SCHEMA).
 SCHEMA = Path(__file__).resolve().parents[3] / "crates" / "ferrofin-db" / "tests" / "data" / "jellyfin-12.2-schema.sql"
 #: The export's loss report (lib.sh RT_LOSS_REPORT).
 LOSS_REPORT = "ferrofin-export-report.txt"
+#: The id of the RefreshGuide task.
+GUIDE_TASK = "6c5d7b3a2e1f4a0b9c8d7e6f5a4b3c2d"
 
 
 def fresh():
@@ -79,19 +94,24 @@ def fresh():
         "refreshes": 0,
         "users": {"synthetic-admin": ADMIN, "synthetic-adult": ADULT, "synthetic-child": CHILD},
         "data": {m: {"Played": m == MOVIES[0], "IsFavorite": False, "PlaybackPositionTicks": 0, "PlayCount": 0,
-                     "Likes": None} for m in MOVIES},
+                     "Likes": None} for m in LISTED},
         "collections": [],   # [type, name, id, [[entry id, movie id], ...]]
         "accounts": {},      # user id: {"Policy": {...}, "Configuration": {...}}
         "prefs": {},         # user id: display preferences
         "keys": ["Synthetic adoption"],
         "devices": {},       # device id: custom name
         "libraries": [["Synthetic Movies", "movies", "1" * 32], ["Synthetic Photos", "homevideos", "2" * 32]],
-        "items": {m: {"Name": f"Movie {m[-1]}", "LockData": False, "LockedFields": [], "Overview": "x"} for m in MOVIES},
+        "items": {m: {"Name": VERSIONS.get(m, f"Movie {m[-1]}"), "LockData": False, "LockedFields": [], "Overview": "x"}
+                  for m in LISTED},
         "images": {},        # item id: image types
         "plays": {},         # user id (not ADMIN): movies played to the end
         "shares": [CHILD],   # whom SHARED is shared with
         "config": {},        # document ("system", "encoding", …): the settings posted to it
         "options": {},       # library name: the LibraryOptions it was added with
+        "livetv": {"tuner": False, "guide": False, "refreshes": 0, "channels": [], "programmes": [], "timers": [],
+                   "series": [], "favourites": []},
+        "versions": dict(MERGED),   # version: its primary
+        "private": [["p-0", MOVIES[0]], ["p-1", MOVIES[1]]],   # PRIVATE's entries
     }
 
 
@@ -136,15 +156,66 @@ class Stub:
     def user(self, key):
         account = self.accounts.get(key, {})
         name = next(n for n, k in self.users.items() if k == key)
+        limit = {"MaxParentalRating": 13} if key == CHILD else {}
         return {"Name": name, "Id": key,
-                "Policy": {"IsAdministrator": key == ADMIN, "EnableAllFolders": True, **account.get("Policy", {})},
+                "Policy": {"IsAdministrator": key == ADMIN, "EnableAllFolders": True, **limit, **account.get("Policy", {})},
                 "Configuration": {"SubtitleMode": "Default", **account.get("Configuration", {})}}
 
     def collection(self, key):
+        if key in (PRIVATE, SHARED):   # SHARED's audio entries play no part here
+            return ["Playlist", PRIVATE_NAME, PRIVATE, self.private] if key == PRIVATE else ["Playlist", SHARED_NAME, SHARED, []]
         return next((c for c in self.collections if c[2] == key), None)
+
+    def guide_task(self):
+        return {"Key": "RefreshGuide", "Id": GUIDE_TASK, "State": "Idle",
+                "LastExecutionResult": {"Status": "Completed", "EndTimeUtc": str(self.livetv["refreshes"])}}
+
+    def livetv_get(self, path, query):
+        """The answer to a Live TV read, or None for another path."""
+        tv = self.livetv
+        if path == "/LiveTv/Channels":
+            favourite = query.get("IsFavorite") == ["true"]
+            channels = [c for c in tv["channels"] if not favourite or c["Id"] in tv["favourites"]]
+            return 200, {"Items": channels, "TotalRecordCount": len(channels)}
+        if path == "/LiveTv/Programs":
+            return 200, {"Items": tv["programmes"], "TotalRecordCount": len(tv["programmes"])}
+        if path == "/LiveTv/Timers":
+            return 200, {"Items": tv["timers"], "TotalRecordCount": len(tv["timers"])}
+        if path == "/LiveTv/SeriesTimers":
+            return 200, {"Items": tv["series"], "TotalRecordCount": len(tv["series"])}
+        if path == "/LiveTv/Timers/Defaults":
+            return 200, {"ProgramId": query["programId"][0]}
+        if path == f"/ScheduledTasks/{GUIDE_TASK}":
+            return 200, self.guide_task()
+        return None
+
+    def livetv_post(self, path, body):
+        """The answer to a Live TV write, or None for another path."""
+        tv = self.livetv
+        if path in ("/LiveTv/TunerHosts", "/LiveTv/ListingProviders"):
+            tv["tuner" if path.endswith("TunerHosts") else "guide"] = True
+            return 200, {"Id": path.rsplit("/", 1)[1]}
+        if path == f"/ScheduledTasks/Running/{GUIDE_TASK}":
+            tv["refreshes"] += 1
+            if tv["tuner"]:
+                tv["channels"] = [{"Id": "e" * 32, "Name": "Test News"}, {"Id": "f" * 32, "Name": "Test Films"}]
+            if tv["tuner"] and tv["guide"]:
+                tv["programmes"] = [{"Id": f"{n:032x}"[::-1], "Name": name}
+                                    for n, name in enumerate(["Quiz Night", "The Long Road"], start=1)]
+            return 204, None
+        if path in ("/LiveTv/Timers", "/LiveTv/SeriesTimers"):
+            timers = tv["timers" if path.endswith("/Timers") else "series"]
+            timers.append({"Id": f"timer-{len(tv['timers']) + len(tv['series'])}", "ProgramId": body["ProgramId"]})
+            return 204, None
+        if path.startswith("/UserFavoriteItems/") and any(path.endswith(c["Id"]) for c in tv["channels"]):
+            tv["favourites"].append(path.rsplit("/", 1)[1])
+            return 200, {}
+        return None
 
     def get(self, path, query):
         parts = path.strip("/").split("/")
+        if (live := self.livetv_get(path, query)) is not None:
+            return live
         if path == "/System/Info/Public":
             return 200, {"Version": "12.4.0", "ProductName": self.product}
         if path == "/System/Ping":
@@ -155,7 +226,8 @@ class Stub:
             return 200, self.user(parts[1])
         if path == "/ScheduledTasks":
             return 200, [{"Key": "RefreshLibrary", "State": "Idle",
-                          "LastExecutionResult": {"Status": "Completed", "EndTimeUtc": str(self.refreshes)}}]
+                          "LastExecutionResult": {"Status": "Completed", "EndTimeUtc": str(self.refreshes)}},
+                         self.guide_task()]
         if parts[0] == "Playlists" and len(parts) == 3 and parts[2] == "Users":
             if parts[1] != SHARED:
                 return 403, None
@@ -163,7 +235,8 @@ class Stub:
         if path == "/Items" and query.get("IncludeItemTypes") == ["Playlist"] and query.get("userId") == [ADULT]:
             others = [{"Id": key, "Type": kind, "Name": name} for kind, name, key, _ in self.collections
                       if kind == "Playlist"]
-            return 200, {"Items": [{"Id": SHARED, "Type": "Playlist", "Name": SHARED_NAME}, *others]}
+            return 200, {"Items": [{"Id": SHARED, "Type": "Playlist", "Name": SHARED_NAME},
+                                   {"Id": PRIVATE, "Type": "Playlist", "Name": PRIVATE_NAME}, *others]}
         if path == "/Items" and "ParentId" in query or parts[0] == "Playlists" and len(parts) == 3:
             found = self.collection(query["ParentId"][0] if "ParentId" in query else parts[1])
             if not found:
@@ -171,7 +244,9 @@ class Stub:
             members = [{**self.movie(movie), "PlaylistItemId": entry} for entry, movie in found[3]]
             return 200, {"Items": members, "TotalRecordCount": len(members)}
         if path == "/Items" and query.get("IncludeItemTypes") == ["Movie"]:
-            return 200, {"Items": [self.movie(m) for m in MOVIES]}
+            return 200, {"Items": [self.movie(m) for m in LISTED if m not in self.versions]}
+        if parts[0] == "Videos" and parts[2:] == ["AdditionalParts"]:
+            return 200, {"Items": [], "TotalRecordCount": 0}
         if path == "/Items" and query.get("IncludeItemTypes") == ["Playlist,BoxSet"]:
             return 200, {"Items": [{"Id": key, "Type": kind, "Name": name}
                                    for kind, name, key, _ in sorted(self.collections, key=lambda c: c[1])]}
@@ -179,7 +254,8 @@ class Stub:
             return 200, {"Items": self.filtered(query["Filters"][0], query.get("userId", [""])[0])}
         if parts[0] == "Items" and len(parts) == 2:
             if parts[1] in self.items:
-                return 200, {**self.movie(parts[1]), **self.items[parts[1]]}
+                sources = [parts[1], *(v for v, primary in self.versions.items() if primary == parts[1])]
+                return 200, {**self.movie(parts[1]), **self.items[parts[1]], "MediaSources": [{"Id": s} for s in sources]}
             found = self.collection(parts[1])
             return (200, {"Id": found[2], "Type": found[0], "Name": found[1]}) if found else (404, None)
         if parts[0] == "Items" and len(parts) == 3 and parts[2] == "Images":
@@ -212,6 +288,8 @@ class Stub:
 
     def post(self, path, query, body, auth):
         parts = path.strip("/").split("/")
+        if (live := self.livetv_post(path, body)) is not None:
+            return live
         if parts[0] == "UserPlayedItems":
             self.data[parts[1]]["Played"] = True
         elif parts[0] == "UserFavoriteItems":
@@ -292,6 +370,10 @@ class Stub:
         elif parts[:2] == ["System", "Configuration"]:
             self.config[parts[2] if len(parts) > 2 else "system"] = body
             return 204, None
+        elif path == "/Videos/MergeVersions":
+            primary, *others = query["ids"][0].split(",")
+            self.versions.update({other: primary for other in others})
+            return 204, None
         elif path == "/Users/AuthenticateByName":
             key = self.users.get(body["Username"])
             ok = key and answers.GATE_USERS.get(body["Username"]) == body["Pw"]
@@ -310,6 +392,8 @@ class Stub:
             entries[:] = [e for e in entries if e[1] not in query["ids"][0].split(",")]
         elif path == "/Library/VirtualFolders":
             self.libraries = [lib for lib in self.libraries if lib[0] != query["name"][0]]
+        elif parts[0] == "Videos" and parts[2:] == ["AlternateSources"]:
+            self.versions = {v: primary for v, primary in self.versions.items() if primary != parts[1]}
         elif parts[0] == "Items":
             self.collections = [c for c in self.collections if c[2] != parts[1]]
         return 204, None

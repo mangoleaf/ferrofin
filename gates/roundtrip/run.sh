@@ -18,22 +18,23 @@
 #   Jellyfin   the Jellyfin release UPSTREAM_TAG names (jellyfin/jellyfin:<minor>, or --jellyfin-image)
 #              boots on the export (stage_jellyfin.sh). Checks: ready within ROUNDTRIP_READY_TIMEOUT; every
 #              migration it began finished (a failure names the migration and its SQLite error); it ran the
-#              code migrations its own first start on the route's source ran (routes.sh) and no schema
-#              migration; no ERR or FTL entry outside checks_boot.py's allowlist up to its startup tasks; a
-#              full metadata refresh of every playlist completes (api.py refresh-playlists), then its answers
-#              equal Ferrofin's (adoption_normalise: ids, image sizes and the probes that differ by design
-#              left out), so everything answers.py captures came back: users and their logins, watch state,
-#              devices, API keys, settings, libraries, playlists and collections, a direct play, and more; it
-#              serves every image, chapter and profile image, trickplay tile, external subtitle and attachment
-#              its database lists (probes.py); its library scan completes; it kept every item and the counts
-#              by type (checks_db.py counts), and its answers after the scan equal Ferrofin's too; it stops
-#              cleanly, with no unexpected error in the rest of its log; integrity_check and
-#              foreign_key_check clean; every library folder row Ferrofin stopped with is still there after
-#              that scan, with its DateCreated (checks_paths.py libraries). Then it starts again on the same
-#              file: ready, no migration, no unexpected error, the same answers, a clean stop. Its database is
-#              copied at the end of each window (its start, the gate's requests, its scan, the rest until its
-#              stop, its second start), and every row a window added, removed or changed must be explained by
-#              an entry of allowlist.py (checks_db.py rows, rows-<window>.txt), which run.sh checks first.
+#              code migrations its own first start on the route's source ran (routes.sh), but those the export
+#              records as applied, and no schema migration; no ERR or FTL entry outside checks_boot.py's
+#              allowlist up to its startup tasks; a full metadata refresh of every playlist completes
+#              (api.py refresh-playlists), then its answers equal Ferrofin's (adoption_normalise: ids, image
+#              sizes and the probes that differ by design left out), so everything answers.py captures came
+#              back: users and their logins, watch state, devices, API keys, settings, libraries, playlists
+#              and collections, a direct play, and more; it serves every image, chapter and profile image,
+#              trickplay tile, external subtitle and attachment its database lists (probes.py, which writes
+#              probes.txt); its library scan completes; it kept every item and the counts by type
+#              (checks_db.py counts), and its answers after the scan equal Ferrofin's too; it stops cleanly,
+#              with no unexpected error in the rest of its log; integrity_check and foreign_key_check clean;
+#              every library folder row Ferrofin stopped with is still there after that scan, with its
+#              DateCreated (checks_paths.py libraries). Then it starts again on the same file: ready, no
+#              migration, no unexpected error, the same answers, a clean stop. Its database is copied at the
+#              end of each window (its start, the gate's requests, its scan, the rest until its stop, its
+#              second start), and every row a window added, removed or changed must be explained by an entry
+#              of allowlist.py (checks_db.py rows, rows-<window>.txt), which run.sh checks first.
 # Each route is a record in routes.sh: its fixture, the directories Ferrofin runs in, the media tree it mounts
 # and its kind (a scale route's time and size are recorded on its line, not gated). One PASS/FAIL line per
 # route listed (a missing fixture is a FAIL line too, never a skip), then how many passed; the exit status is
@@ -106,7 +107,7 @@ for spec in "${ROUNDTRIP_ROUTES[@]}"; do   # the fields routes.sh describes
   IFS='|' read -r route _ _ _ ran_at config_at kind <<<"$spec"
   [[ $ran_at == /?* ]] || die "route $route in routes.sh names no absolute data directory for Ferrofin"
   [[ $config_at == - || $config_at == /?* ]] || die "route $route in routes.sh names a configuration directory that is neither - nor absolute"
-  [[ $kind =~ ^(path|messy|scale)$ ]] || die "route $route in routes.sh is of kind '$kind', not path, messy or scale"
+  [[ $kind =~ ^(path|messy|scale|native)$ ]] || die "route $route in routes.sh is of kind '$kind', not path, messy, scale or native"
   [ -z "$ONLY" ] || [[ ",$ONLY," == *",$route,"* ]] && SELECTED+=("$spec")
 done
 (( ${#SELECTED[@]} )) || die "no route to run: routes.sh lists none"
@@ -173,6 +174,8 @@ reasons() { local out; out=$("$@" 2>&1) || printf '%s\n' "${out:-$1 failed}"; }
 . "$HERE/stage_export.sh"     # export_stage
 # shellcheck source=gates/roundtrip/stage_jellyfin.sh
 . "$HERE/stage_jellyfin.sh"   # jellyfin_stage
+# shellcheck source=gates/roundtrip/stage_drift.sh
+. "$HERE/stage_drift.sh"      # drift_stage
 
 
 # timed <stage function>: run it, adding its wall time to took[].
@@ -181,13 +184,13 @@ failed=0 passed=0
 for spec in "${SELECTED[@]}"; do
   IFS='|' read -r route fixture generation first_start ran_at config_at kind <<<"$spec"
   dst=$WORK/$route
-  case $kind in path) media=media;; *) media=media-$kind;; esac
+  case $kind in path|native) media=media;; *) media=media-$kind;; esac
   MEDIA=(-v "$FIXTURES/$media:/media:ro")
   # where Ferrofin runs, for its server and its export: the data directory, and the configuration apart from it
   SERVER_DIRS=(-e FERROFIN_DATA_DIR="$ran_at" -v "$dst/ferrofin:$ran_at")
   [ "$config_at" = - ] || SERVER_DIRS+=(-e FERROFIN_CONFIG_DIR="$config_at" -v "$dst/ferrofin-config:$config_at")
   for needed in "$fixture" "$first_start.server.log" "$media"; do
-    [ ! -e "$FIXTURES/$needed" ] || continue
+    [ "$needed" != - ] && [ ! -e "$FIXTURES/$needed" ] || continue   # "-": the native route's source is built here
     printf '%-5s %-14s %s\n' FAIL "$route" "fixture $needed missing: build the fixtures again into a new directory (gates/adoption/build-fixtures.sh)"
     record_detail row "$WORK" "$route" "$kind" "$generation" FAIL "fixture $needed missing"; failed=1; continue 2
   done
@@ -196,7 +199,9 @@ for spec in "${SELECTED[@]}"; do
   why=(); mark_from=0; took=(); size=''
   if timed ferrofin_stage && timed export_stage; then
     [ "$kind" != scale ] || size=$(du -sh "$dst/jellyfin" 2>/dev/null | cut -f1)   # as written, before Jellyfin's start
-    timed jellyfin_stage
+    [ "$kind" != native ] || drift_stage   # the history as the export wrote it, before Jellyfin opens it
+    # Jellyfin serves on the port the export carried over from Ferrofin's settings
+    RT_HTTP_PORT=$(rt_http_port "$dst/jellyfin/config/network.xml") timed jellyfin_stage
   fi
   verdict=PASS; [ "${#why[@]}" = 0 ] || { verdict=FAIL; failed=1; }
   detail=$(printf '%s; ' "${why[@]}"); detail=${detail%; }

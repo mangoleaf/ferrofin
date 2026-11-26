@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use openidconnect::{Nonce, PkceCodeVerifier};
 use uuid::Uuid;
 
-use super::quick_connect::QuickConnectCode;
+use super::pacing::address_key;
 use super::sign_in::VerifiedIdentity;
 
 /// How long a sign-in may take, from its start to its callback: 10 minutes.
@@ -26,7 +26,8 @@ pub const FLOW_LIFETIME: Duration = Duration::from_mins(10);
 pub const EXCHANGE_CODE_LIFETIME: Duration = Duration::from_secs(60);
 
 /// The pending flows one address may hold; its next start drops its oldest.
-/// Quick Connect's default per-address cap (`DEFAULT_PENDING_PER_IP`).
+/// Quick Connect's default per-address cap (`DEFAULT_PENDING_PER_IP`). An
+/// address is its [`address_key`]: an IPv6 address counts by its /64 (D23).
 /// Candidate setting (D19): a constant until the owner asks for it.
 pub const MAX_PENDING_FLOWS_PER_ADDRESS: usize = 10;
 
@@ -39,13 +40,20 @@ pub const MAX_PENDING_FLOWS: usize = 1000;
 pub enum FlowPurpose {
     /// Signing in to Ferrofin.
     SignIn,
-    /// Linking the identity to this account, the one signed in when the
-    /// flow started ([`links`](super::links)): it opens no session.
-    Link(Uuid),
+    /// Linking the identity to an account ([`links`](super::links)): it
+    /// opens no session.
+    Link {
+        /// The account signed in when the flow started.
+        user_id: Uuid,
+        /// The SHA-256 of the access token of the session that started it,
+        /// never the token: the callback links only while that session is
+        /// still one of the account's.
+        session: [u8; 32],
+    },
     /// Approving a native app's Quick Connect code
     /// ([`quick_connect`](super::quick_connect)): it ends on a confirmation
-    /// page, and opens no browser session.
-    QuickConnect(QuickConnectCode),
+    /// page, where the code is typed (D23), and opens no browser session.
+    QuickConnect,
 }
 
 /// One pending flow: what its callback is checked against.
@@ -90,15 +98,15 @@ pub struct PendingFlows {
 
 impl PendingFlows {
     /// Keeps `flow` under `state`, after dropping every expired flow, then
-    /// its address's oldest until it holds fewer than
-    /// [`MAX_PENDING_FLOWS_PER_ADDRESS`], then the oldest of all until fewer
-    /// than [`MAX_PENDING_FLOWS`] are left, as Quick Connect's `make_room`
-    /// does.
+    /// the oldest of its address's ([`address_key`]) until it holds fewer
+    /// than [`MAX_PENDING_FLOWS_PER_ADDRESS`], then the oldest of all until
+    /// fewer than [`MAX_PENDING_FLOWS`] are left, as Quick Connect's
+    /// `make_room` does.
     pub fn insert(&self, state: String, flow: PendingFlow) {
         let mut flows = self.flows.lock().unwrap_or_else(PoisonError::into_inner);
         flows.retain(|_, pending| !pending.expired());
-        let client = flow.client;
-        make_room(&mut flows, Some(client), MAX_PENDING_FLOWS_PER_ADDRESS);
+        let key = address_key(flow.client);
+        make_room(&mut flows, Some(key), MAX_PENDING_FLOWS_PER_ADDRESS);
         make_room(&mut flows, None, MAX_PENDING_FLOWS);
         flows.insert(state, flow);
     }
@@ -118,7 +126,9 @@ impl PendingFlows {
         self.flows
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|_, flow| flow.purpose != FlowPurpose::Link(user_id));
+            .retain(|_, flow| {
+                !matches!(flow.purpose, FlowPurpose::Link { user_id: of, .. } if of == user_id)
+            });
     }
 
     /// How many flows are pending.
@@ -140,7 +150,7 @@ impl PendingFlows {
 /// A verified sign-in whose completion page holds its exchange code, or
 /// whose Quick Connect confirmation page holds its confirmation: who signs
 /// in, what for, and the browser the code is bound to. `Debug` leaves the
-/// claims and a Quick Connect code out.
+/// claims out.
 #[derive(Debug)]
 pub struct PendingExchange {
     /// The SHA-256 of the flow cookie's value the sign-in was verified with:
@@ -217,13 +227,14 @@ impl ExchangeCodes {
     }
 }
 
-/// Drops the oldest flows of `client` (of every address with `None`) until
-/// fewer than `limit` are left, so the flow about to be added fits.
+/// Drops the oldest flows of the address `key` (of every address with
+/// `None`) until fewer than `limit` are left, so the flow about to be added
+/// fits.
 // shortcut: an O(n) scan per start over at most MAX_PENDING_FLOWS; index by address if the cap grows.
-fn make_room(flows: &mut HashMap<String, PendingFlow>, client: Option<IpAddr>, limit: usize) {
+fn make_room(flows: &mut HashMap<String, PendingFlow>, key: Option<IpAddr>, limit: usize) {
     let mut own: Vec<(Instant, String)> = flows
         .iter()
-        .filter(|(_, flow)| client.is_none_or(|client| flow.client == client))
+        .filter(|(_, flow)| key.is_none_or(|key| address_key(flow.client) == key))
         .map(|(state, flow)| (flow.created, state.clone()))
         .collect();
     if own.len() < limit {

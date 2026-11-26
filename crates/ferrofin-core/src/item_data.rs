@@ -304,6 +304,76 @@ pub fn with_resolved_video_fields(stored: Option<&str>, resolved: Option<&str>) 
     serde_json::to_string(&Value::Object(object)).ok()
 }
 
+/// The `Data` keys the media probe owns: `Container` (`FFProbeVideoInfo.cs:206`,
+/// `AudioFileProber.cs:138`), a video's `DefaultVideoStreamIndex` and
+/// `HasSubtitles` (`FFProbeVideoInfo.cs:268-270`), a track's `LyricFiles`
+/// (`AudioFileProber.cs:584`) and a `.strm` item's `ShortcutPath`
+/// (`ProbeProvider.FetchShortcutInfo`). Upstream's probe is a pre-refresh
+/// provider, run before a refresh's lock check (`MetadataService.cs:780-788`),
+/// and the item is saved whole after it, so a locked item's keys follow its
+/// file too. No user edits any of them. Each holds a scalar or a list: a
+/// locked row's save sets them whole with a merge patch, which would merge an
+/// object instead.
+pub const PROBE_OWNED_KEYS: [&str; 5] = [
+    "Container",
+    "DefaultVideoStreamIndex",
+    "HasSubtitles",
+    "LyricFiles",
+    "ShortcutPath",
+];
+
+/// The one [`PROBE_OWNED_KEYS`] entry a probe removes when it finds none: a
+/// track with no lyric file stores no `LyricFiles`.
+pub const PROBE_CLEARED_KEY: &str = "LyricFiles";
+
+/// `stored` as a locked row's scan save leaves it: the resolver's video
+/// fields ([`with_resolved_video_fields`]), then each of the
+/// [`PROBE_OWNED_KEYS`] `incoming` carries, as it holds it (a JSON `null`
+/// reads as absent and is stored absent). A key `incoming` does not carry is
+/// kept as stored, since a scan that could not read the stored row sends the
+/// planner's blob, which a failed probe leaves without them; except the
+/// [`PROBE_CLEARED_KEY`], whose absence is the probe's answer (a row a scan
+/// read carries its stored list unless the probe cleared it, and one it could
+/// not read loses the list only until the lyric check re-probes it). Every
+/// other key is kept.
+///
+/// `None` when that changes nothing, or either blob is not a JSON object (an
+/// empty or absent `stored` is an empty object). The SQL twin is the
+/// persistence service's `locked_data_sql`, whose changed-or-not answer this
+/// is; its text can differ (it stores no probe key as a JSON `null`).
+#[must_use]
+pub fn with_locked_scan_fields(stored: Option<&str>, incoming: Option<&str>) -> Option<String> {
+    let Value::Object(probed) = serde_json::from_str::<Value>(incoming?).ok()? else {
+        return None;
+    };
+    let resolved = with_resolved_video_fields(stored, incoming);
+    let mut object = match resolved.as_deref().or(stored).filter(|d| !d.is_empty()) {
+        None => Map::new(),
+        Some(text) => match serde_json::from_str::<Value>(text).ok()? {
+            Value::Object(map) => map,
+            _ => return None,
+        },
+    };
+    let mut changed = resolved.is_some();
+    for key in PROBE_OWNED_KEYS {
+        if key != PROBE_CLEARED_KEY && !probed.contains_key(key) {
+            continue;
+        }
+        let value = probed.get(key).filter(|value| !value.is_null());
+        if object.get(key).filter(|value| !value.is_null()) != value {
+            match value {
+                Some(value) => object.insert(key.to_owned(), value.clone()),
+                None => object.remove(key),
+            };
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::to_string(&Value::Object(object)).ok()
+}
+
 /// The `Data` key a series' status lives under — C# `Series.Status`
 /// (`SeriesStatus?`), serialized by name (`"Status":"Ended"`) into the blob
 /// like every other non-column property (`BaseItemMapper.cs:234`).
@@ -928,6 +998,96 @@ pub(crate) async fn add_listed_shares_in(
         .map_err(db_err)?;
     }
     Ok(())
+}
+
+/// A playlist's owner and every share row, in share order, from the
+/// permission tables (what the `Data` copy is synced from); `None` when it
+/// has no `FerrofinPlaylists` row.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub(crate) async fn playlist_ownership(
+    db: &Database,
+    playlist: Uuid,
+) -> Result<Option<ferrofin_traits::persistence::PlaylistOwnership>, ServiceError> {
+    let playlist_db = guid_to_db(playlist);
+    let owner: Option<Option<String>> = sqlx::query_scalar(
+        r#"SELECT "OwnerUserId" FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#,
+    )
+    .bind(&playlist_db)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let shares: Vec<(String, bool)> = sqlx::query_as(
+        r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
+           WHERE "PlaylistId" = ?1 ORDER BY rowid"#,
+    )
+    .bind(&playlist_db)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(Some(ferrofin_traits::persistence::PlaylistOwnership {
+        owner: owner
+            .as_deref()
+            .and_then(|owner| Uuid::parse_str(owner).ok()),
+        shares: shares
+            .into_iter()
+            .filter_map(|(user, can_edit)| {
+                Uuid::parse_str(&user).ok().map(|user| {
+                    ferrofin_model::entities_media::PlaylistUserPermissions::new(user, can_edit)
+                })
+            })
+            .collect(),
+    }))
+}
+
+/// Merges the shares a playlist's `playlist.xml` names into its share rows,
+/// as `PlaylistMetadataService.MergeData` merges `Shares`: `file` replaces the
+/// stored rows when `replace` is set or none is stored — an empty `file`
+/// removes every share — else its entries come first and the stored shares
+/// of the users it does not name follow, each user once (`DistinctBy(s =>
+/// s.UserId)`, the first entry kept). The playlist has its
+/// `FerrofinPlaylists` row by then (the caller writes it), and `Data`
+/// follows the rows. On a connection the caller holds, normally a writer
+/// transaction.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub(crate) async fn merge_playlist_shares_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+    file: &[ferrofin_model::entities_media::PlaylistUserPermissions],
+    replace: bool,
+) -> Result<(), ServiceError> {
+    let playlist_db = guid_to_db(playlist);
+    let stored: Vec<(String, bool)> = sqlx::query_as(
+        r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
+           WHERE "PlaylistId" = ?1 ORDER BY rowid"#,
+    )
+    .bind(&playlist_db)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let mut merged: Vec<(Uuid, bool)> = file.iter().map(|s| (s.user_id, s.can_edit)).collect();
+    if !replace && !stored.is_empty() {
+        merged.extend(
+            stored
+                .iter()
+                .filter_map(|(user, can_edit)| Some((Uuid::parse_str(user).ok()?, *can_edit))),
+        );
+        let mut seen = std::collections::HashSet::new();
+        merged.retain(|(user, _)| seen.insert(*user));
+    }
+    sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
+        .bind(&playlist_db)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    add_listed_shares_in(conn, &playlist_db, &merged).await?;
+    sync_container_data_in(conn, playlist).await
 }
 
 /// Folds a playlist's owner / open-access / shares permission rows into its
@@ -1608,6 +1768,76 @@ mod tests {
         // 12.0 marks Folder.LinkedChildren [JsonIgnore]: membership is table-only.
         assert!(!has_linked_children_key(&map));
         let _ = child;
+    }
+
+    /// `playlist_ownership` reads the permission rows, not a `Data` that lags
+    /// them, and is `None` for a playlist without its row; the share merge
+    /// replaces or unions (file first, each user once), its `Data` copy
+    /// following the rows.
+    #[tokio::test]
+    async fn the_saver_reads_the_rows_and_the_file_merges_into_them() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions as Share;
+        let db = test_db().await;
+        let (playlist, legacy) = (Uuid::new_v4(), Uuid::new_v4());
+        let (owner, a, b, c) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_named_item(&db, playlist, BaseItemKind::Playlist, "Mix").await;
+        seed_named_item(&db, legacy, BaseItemKind::Playlist, "Old").await;
+        assert_eq!(playlist_ownership(&db, legacy).await.expect("read"), None);
+        seed_playlist_owner(&db, playlist, owner).await;
+        let merge = |file: Vec<Share>, replace: bool| {
+            let db = db.clone();
+            async move {
+                let mut tx = db.writer().begin().await.expect("tx");
+                merge_playlist_shares_in(&mut tx, playlist, &file, replace)
+                    .await
+                    .expect("merge");
+                tx.commit().await.expect("commit");
+            }
+        };
+        merge(vec![Share::new(a, true), Share::new(b, false)], false).await;
+        // A `Data` that fell behind the rows is not what the saver writes.
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = '{"Shares":[]}' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(playlist))
+            .execute(db.writer())
+            .await
+            .expect("lag");
+        let read = playlist_ownership(&db, playlist)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(read.owner, Some(owner));
+        assert_eq!(read.shares, [Share::new(a, true), Share::new(b, false)]);
+        merge(vec![Share::new(c, false), Share::new(b, true)], false).await;
+        let read = playlist_ownership(&db, playlist)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            read.shares,
+            [
+                Share::new(c, false),
+                Share::new(b, true),
+                Share::new(a, true)
+            ]
+        );
+        merge(Vec::new(), true).await;
+        let read = playlist_ownership(&db, playlist)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(read.shares, []);
+        let data: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(playlist))
+                .fetch_one(db.pool())
+                .await
+                .expect("data");
+        assert_eq!(parse_data(data.as_deref())["Shares"], serde_json::json!([]));
     }
 
     /// An entry edit's `Data` sync that starts while a share revoke holds the

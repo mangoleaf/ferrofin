@@ -16,6 +16,8 @@ import watch_history as history
 
 MOVIE = "a" * 32
 EPISODE = "b" * 32
+# Played with no LastPlayedDate, as Jellyfin leaves a video's other versions marked played.
+UNDATED = "e" * 32
 USER = "c" * 32
 OTHER_USER = "d" * 32
 
@@ -62,6 +64,9 @@ class WatchHistoryTest(unittest.TestCase):
             db.execute("INSERT INTO UserData SELECT ItemId,UserId,'private-provider-id',"
                        "Played,PlayCount,PlaybackPositionTicks,LastPlayedDate,IsFavorite,"
                        "SubtitleStreamIndex FROM UserData LIMIT 1")
+            db.execute("INSERT INTO BaseItems VALUES (?,?)", (UNDATED, "Movie"))
+            db.execute("INSERT INTO UserData VALUES (?,?,?,1,0,0,NULL,0,NULL)",
+                       (UNDATED, USER, str(history.uuid.UUID(UNDATED))))
         self.expected = history.snapshot(self.db)
 
     def sql(self, statement):
@@ -121,14 +126,15 @@ class WatchHistoryTest(unittest.TestCase):
         api = FakeApi(self.expected)
         api.hide_list = True
         self.assertFalse(history.compare_api(self.expected, api))
-        self.assertEqual(sum(path.startswith("/Users/") for path in api.calls), 4)
+        self.assertEqual(sum(path.startswith("/Users/") for path in api.calls), 5)
 
     def test_date_formats_and_guid_casing_do_not_cause_false_losses(self):
         self.sql("UPDATE UserData SET ItemId=upper(ItemId), UserId=upper(UserId)")
         self.assertFalse(history.compare_db(self.expected, history.snapshot(self.db)))
         api = FakeApi(self.expected)
         for row in api.items.values():
-            row["LastPlayedDate"] = "2026-01-01T12:00:00.0000000Z"
+            if row["LastPlayedDate"]:
+                row["LastPlayedDate"] = "2026-01-01T12:00:00.0000000Z"
         self.assertFalse(history.compare_api(self.expected, api))
 
     def test_baseline_is_private_and_contains_no_provider_keys(self):
@@ -145,6 +151,20 @@ class WatchHistoryTest(unittest.TestCase):
         self.sql("UPDATE UserData SET PlaybackPositionTicks=0")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(history.main(["snapshot", str(self.db), str(self.baseline)]), 1)
+
+    def test_fixture_without_an_undated_played_row_fails(self):
+        self.sql("UPDATE UserData SET LastPlayedDate='2026-01-01 12:00:00'")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(history.main(["snapshot", str(self.db), str(self.baseline)]), 1)
+
+    def test_an_undated_played_row_that_gains_a_date_fails(self):
+        self.assertIsNone(self.expected["items"][USER + ":" + UNDATED]["LastPlayedDate"])
+        self.sql("UPDATE UserData SET LastPlayedDate='2026-11-21 03:30:00' WHERE LastPlayedDate IS NULL")
+        self.assertEqual(history.compare_db(self.expected, history.snapshot(self.db)),
+                         {"database changed watch-history row": 1})
+        api = FakeApi(self.expected)
+        api.items[USER + ":" + UNDATED]["LastPlayedDate"] = "2026-11-21T03:30:00.0000000Z"
+        self.assertEqual(history.compare_api(self.expected, api), {"API changed LastPlayedDate": 1})
 
     def test_check_cli_reports_loss_and_returns_failure(self):
         history.main(["snapshot", str(self.db), str(self.baseline)])
@@ -292,7 +312,7 @@ class AdoptionExpectationTest(unittest.TestCase):
 
     def test_a_null_date_loses_and_a_full_tie_goes_to_the_lower_key(self):
         self.play("dated", "2020-01-01 00:00:00", 1, 0, False)
-        # Unplayed: migration 0010 stamps a date on played rows that have none.
+        # Unplayed: this case is about the date order, not a played row without a date.
         self.play("never", None, 50, 900, False)
         self.play("tie-b", "2022-02-02 00:00:00", 3, 30, False, item=STILL, IsFavorite=1)
         self.play("tie-a", "2022-02-02 00:00:00", 3, 30, False, item=STILL, IsFavorite=0)

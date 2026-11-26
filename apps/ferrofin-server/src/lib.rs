@@ -2390,8 +2390,8 @@ mod tests {
     struct Upper;
     #[async_trait::async_trait]
     impl ferrofin_traits::plugins::FileTransformer for Upper {
-        async fn transform(&self, _path: &str, contents: String) -> String {
-            contents.to_uppercase()
+        async fn transform(&self, _path: &str, contents: &str) -> Option<String> {
+            Some(contents.to_uppercase())
         }
     }
 
@@ -2399,7 +2399,7 @@ mod tests {
     struct Panics;
     #[async_trait::async_trait]
     impl ferrofin_traits::plugins::FileTransformer for Panics {
-        async fn transform(&self, _path: &str, _contents: String) -> String {
+        async fn transform(&self, _path: &str, _contents: &str) -> Option<String> {
             panic!("a faulty transformation")
         }
     }
@@ -2408,8 +2408,8 @@ mod tests {
     struct Identity;
     #[async_trait::async_trait]
     impl ferrofin_traits::plugins::FileTransformer for Identity {
-        async fn transform(&self, _path: &str, contents: String) -> String {
-            contents
+        async fn transform(&self, _path: &str, _contents: &str) -> Option<String> {
+            None
         }
     }
 

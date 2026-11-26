@@ -46,8 +46,8 @@ fn write_profile(path: &std::path::Path, width: u32, height: u32) {
 }
 
 /// A file database with one stored `Person`, a scanner whose metadata
-/// directory holds that person's `primary.jpg` (48×64) where
-/// `download_images` looks (so nothing is downloaded), and the stores.
+/// directory holds that person's `folder.jpg` (48×64) where
+/// `download_image` looks (so nothing is downloaded), and the stores.
 struct Fixture {
     /// Keeps the directory alive.
     _tmp: tempfile::TempDir,
@@ -89,7 +89,7 @@ impl Fixture {
         let meta_root = tmp.path().join("metadata");
         let art_dir = crate::dynamic_images::own_art_dir(&meta_root, person_id);
         std::fs::create_dir_all(&art_dir).expect("art dir");
-        write_profile(&art_dir.join("primary.jpg"), 48, 64);
+        write_profile(&art_dir.join("folder.jpg"), 48, 64);
         let elsewhere = tmp.path().join("People").join("A").join("Ada Lovelace");
         std::fs::create_dir_all(&elsewhere).expect("person folder");
 
@@ -189,7 +189,7 @@ async fn a_person_with_a_primary_takes_no_writer_and_is_left_as_it_is() {
 
     // The file replaced on disk: upstream's scan does not look at a Primary
     // the person has (the person's own refresh does).
-    let profile = f.art_dir.join("primary.jpg");
+    let profile = f.art_dir.join("folder.jpg");
     write_profile(&profile, 32, 40);
     std::fs::File::options()
         .write(true)
@@ -239,7 +239,7 @@ async fn a_primary_stored_elsewhere_and_the_other_images_survive_a_credit() {
         .persistence
         .add_item_image_if_absent(
             f.person_id,
-            &Fixture::row(&f.art_dir, "primary.jpg", ImageType::Primary),
+            &Fixture::row(&f.art_dir, "folder.jpg", ImageType::Primary),
         )
         .await
         .expect("add");
@@ -277,7 +277,7 @@ async fn a_missing_primary_is_added_beside_the_other_images() {
     assert_eq!(
         primary,
         [(
-            f.art_dir.join("primary.jpg").to_string_lossy().into_owned(),
+            f.art_dir.join("folder.jpg").to_string_lossy().into_owned(),
             48,
             64
         )]

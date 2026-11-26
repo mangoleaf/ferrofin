@@ -62,18 +62,26 @@ rt_jellyfin_image() {
 }
 
 # rt_start <name> <cidfile> <image> <docker run arguments…>: start a server container as the calling user,
-# its id in <cidfile> (which must not exist; docker writes it only for a container it created), its 8096
-# published on a loopback port docker picks, its outbound HTTP(S) sent to an unreachable proxy (as the
-# adoption gate does: no provider or plugin repository is reached). Prints that port.
+# its id in <cidfile> (which must not exist; docker writes it only for a container it created), its HTTP port
+# (RT_HTTP_PORT, default 8096) published on a loopback port docker picks, its outbound HTTP(S) sent to an
+# unreachable proxy (as the adoption gate does: no provider or plugin repository is reached). Prints that port.
 rt_start() {
-  local name=$1 cidfile=$2 image=$3 published; shift 3
-  rt_docker run -d --pull never --cidfile "$cidfile" --name "$name" --user "$(id -u):$(id -g)" -p 127.0.0.1::8096 \
+  local name=$1 cidfile=$2 image=$3 published served=${RT_HTTP_PORT:-8096}; shift 3
+  rt_docker run -d --pull never --cidfile "$cidfile" --name "$name" --user "$(id -u):$(id -g)" -p "127.0.0.1::$served" \
     -e HTTP_PROXY=http://127.0.0.1:9 -e HTTPS_PROXY=http://127.0.0.1:9 \
     -e ALL_PROXY=http://127.0.0.1:9 -e NO_PROXY=127.0.0.1,localhost "$@" "$image" >/dev/null || return 1
-  published=$(rt_docker port "$name" 8096/tcp 2>&1)
+  published=$(rt_docker port "$name" "$served/tcp" 2>&1)
   [[ ${published%%$'\n'*} =~ :([0-9]+)$ ]] ||
     { echo "docker published no port for $name (a container that exited at once has none): ${published:-nothing}" >&2; return 1; }
   printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# rt_http_port <network.xml>: the HTTP port a Jellyfin configured by that file serves on: its InternalHttpPort,
+# or 8096 when it names none (no file, or the element missing).
+rt_http_port() {
+  local port
+  port=$(sed -n 's:^ *<InternalHttpPort>\([0-9][0-9]*\)</InternalHttpPort> *$:\1:p' "$1" 2>/dev/null | head -n 1)
+  printf '%s\n' "${port:-8096}"
 }
 
 # rt_run_once <seconds> <name> <cidfile> <image> <docker run arguments…> -- <command arguments…>: run a

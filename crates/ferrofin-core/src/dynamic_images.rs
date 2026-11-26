@@ -143,11 +143,6 @@ pub const GENRE_COLLAGE_SOURCES: i32 = 4;
 /// so four source images fill it; collecting more changes nothing.
 const SQUARE_COLLAGE_TILES: usize = 4;
 
-/// The image file every provider writes (`Path.ChangeExtension(…, ".png")` in
-/// `CreateImage`, stored under the metadata folder as Jellyfin's `SaveImage`
-/// names a Primary: `primary.<ext>`).
-const PRIMARY_STEM: &str = "primary";
-
 /// The image file extensions `SaveImage` may have left behind for an earlier
 /// Primary of the same item; a regeneration replaces all of them.
 const ART_FILE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
@@ -268,7 +263,7 @@ pub struct DynamicImageProviders {
     persistence: Arc<dyn ItemPersistenceService>,
     processor: Arc<dyn ImageProcessor>,
     /// The item-art root (`{metadata}/library`); an item's folder is
-    /// `{root}/{ID}`, the same layout the scanner's downloads and the
+    /// [`own_art_dir`], the same layout the scanner's downloads and the
     /// image-upload endpoint use, so an upload of another type survives and a
     /// rescan re-adopts the generated file.
     metadata_dir: DirectoryPath,
@@ -408,8 +403,9 @@ impl DynamicImageProviders {
     /// every root's plan is taken with `locations_changed` false, where
     /// upstream's `AggregateFolder.RequiresRefresh` also fires when its
     /// physical locations (every library's) differ from the stored list. Fix
-    /// path: record the aggregate's `PhysicalLocationsList` as upstream does
-    /// and pass the comparison for the `AggregateFolder` row.
+    /// path: pass the comparison for the `AggregateFolder` row, against the
+    /// `PhysicalLocationsList` the previous scan stored (gl-1930,
+    /// `LibraryScanner::record_root_locations`, which runs after this pass).
     ///
     /// # Errors
     ///
@@ -637,6 +633,11 @@ impl DynamicImageProviders {
             tracing::warn!(%err, item_id = %item_id, "failed to drop the item's missing images");
         }
         let item_dir = self.item_dir(item_id);
+        // `SaveImage` names the file as `GetStandardSavePath` names a Primary
+        // kept in the item's folder (`Path.ChangeExtension(…, ".png")` in
+        // `CreateImage`): `poster.png`, `folder.<ext>` for an album.
+        let stem =
+            ferrofin_providers::local_images::internal_image_stem(&item.type_, ImageType::Primary);
         if let Some(primary) = images.iter().find(|i| i.image_type == ImageType::Primary)
             && self.primary_is_settled(kind, item_id, primary, force)
         {
@@ -660,16 +661,16 @@ impl DynamicImageProviders {
             DynamicImageKind::PhotoAlbum | DynamicImageKind::MusicAlbum | DynamicImageKind::Folder
         ) {
             // One closure: the stale Primaries go before the copy lands.
-            off_runtime(|| copy_single_image(&item_dir, &sources[0]))?
+            off_runtime(|| copy_single_image(&item_dir, &stem, &sources[0]))?
         } else {
-            let output = item_dir.join(format!("{PRIMARY_STEM}.png"));
+            let output = item_dir.join(format!("{stem}.png"));
             let options = ImageCollageOptions {
                 input_paths: sources,
                 output_path: output.to_string_lossy().into_owned(),
                 width: SQUARE_COLLAGE_SIZE,
                 height: SQUARE_COLLAGE_SIZE,
             };
-            off_runtime(|| remove_other_primaries(&item_dir, &output));
+            off_runtime(|| remove_other_primaries(&item_dir, &stem, &output));
             self.processor
                 .create_image_collage(&options, item.name.as_deref())
                 .await?;
@@ -694,9 +695,15 @@ impl DynamicImageProviders {
             &mut info,
         )
         .await;
+        let replaced = off_runtime(|| {
+            replaced_primary(&self.metadata_dir.resolve(), item_id, &images, &output)
+        });
         images.retain(|i| i.image_type != ImageType::Primary);
         images.insert(0, info);
         self.persistence.save_item_images(item_id, &images).await?;
+        if let Some(file) = replaced {
+            off_runtime(|| remove_replaced_file(item_id, &file));
+        }
         tracing::debug!(item_id = %item.id, kind = ?kind, "dynamic image generated");
         Ok(ItemUpdateType::ImageUpdate)
     }
@@ -779,7 +786,7 @@ impl DynamicImageProviders {
         ))
     }
 
-    /// The item's art folder (`{root}/{ID}`).
+    /// The item's art folder ([`own_art_dir`]).
     fn item_dir(&self, item_id: Uuid) -> PathBuf {
         own_art_dir(&self.metadata_dir.resolve(), item_id)
     }
@@ -1043,53 +1050,7 @@ fn folder_sources_query(folder_id: Uuid) -> InternalItemsQuery {
     }
 }
 
-/// Dimensions + blurhash for a written image file, the way the scanner records
-/// every other image (so the DTO carries `Width`/`Height`/`ImageBlurHashes`):
-/// what `LibraryManager.UpdateImagesAsync` fills for a saved image. `path` is
-/// the file to read: `image.path` itself, or its expansion when the row stores
-/// a virtual path.
-///
-/// Best-effort: an error reading the size leaves the size the caller set,
-/// and an error computing the blurhash leaves no hash. Each failure is logged
-/// with the item, the image type and the path, the events `UpdateImagesAsync`
-/// and its encoder log, at levels set by LOGGING.md rule 1: a missing file, an
-/// error reading the size and a failed blurhash at `warn!` (upstream: Warning,
-/// Error, Error), a file measured 0x0 at `debug!` (upstream: Debug when empty
-/// or unsupported, Warning when undecodable, which this encoder cannot tell
-/// apart).
-pub(crate) async fn fill_image_metadata(
-    processor: &dyn ImageProcessor,
-    item_id: Uuid,
-    path: &str,
-    image: &mut ItemImageInfo,
-) {
-    let image_type = image.image_type;
-    let dims = match processor.get_image_dimensions(path).await {
-        Ok(dims) => dims,
-        Err(ServiceError::NotFound(_)) => {
-            tracing::warn!(item_id = %item_id, ?image_type, path = %path, "image not found");
-            return;
-        }
-        Err(error) => {
-            tracing::warn!(%error, item_id = %item_id, ?image_type, path = %path, "cannot get image dimensions");
-            return;
-        }
-    };
-    if dims.width <= 0 || dims.height <= 0 {
-        // The encoder answers an empty, unsupported or undecodable file 0x0,
-        // and cannot say which: debug, as an SVG logo (no decoder, gl-802) is
-        // one per movie, measured again on every scan.
-        tracing::debug!(item_id = %item_id, ?image_type, path = %path, "unable to determine image dimensions");
-    }
-    image.width = dims.width;
-    image.height = dims.height;
-    match processor.get_image_blur_hash_sized(path, dims).await {
-        Ok(hash) => image.blur_hash = Some(hash),
-        Err(error) => {
-            tracing::warn!(%error, item_id = %item_id, ?image_type, path = %path, "cannot compute blurhash");
-        }
-    }
-}
+pub(crate) use ferrofin_providers::image_metadata::fill_image_metadata;
 
 /// `BaseDynamicImageProvider.HasChangedByDate`: the recorded `DateModified`
 /// differs from the file's current modification time. A file that can no
@@ -1109,7 +1070,7 @@ fn has_changed_by_date(image: &ItemImageInfo) -> bool {
 }
 
 pub(crate) use ferrofin_providers::local_images::{
-    internal_metadata_dirs, legacy_art_dir, own_art_dir,
+    earlier_art_dir, internal_metadata_dirs, legacy_art_dir, own_art_dir,
 };
 
 /// Whether `image` is the item's own (`BaseDynamicImageProvider.FetchAsync` /
@@ -1139,16 +1100,16 @@ pub(crate) fn drop_missing_images(images: &mut Vec<ItemImageInfo>) -> bool {
 pub(crate) use ferrofin_providers::local_images::file_date_modified;
 
 /// `BaseDynamicImageProvider.CreateSingleImage`: copies the source into the
-/// item's folder as `primary.<source extension>`, replacing any earlier Primary.
-fn copy_single_image(item_dir: &Path, source: &str) -> Result<PathBuf, ServiceError> {
+/// item's folder as `<stem>.<source extension>`, replacing any earlier Primary.
+fn copy_single_image(item_dir: &Path, stem: &str, source: &str) -> Result<PathBuf, ServiceError> {
     let source = Path::new(source);
     let ext = source
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
         .ok_or_else(|| ServiceError::invalid_input("single-image source has no extension"))?;
-    let output = item_dir.join(format!("{PRIMARY_STEM}.{ext}"));
-    remove_other_primaries(item_dir, &output);
+    let output = item_dir.join(format!("{stem}.{ext}"));
+    remove_other_primaries(item_dir, stem, &output);
     std::fs::copy(source, &output).map_err(|e| {
         ServiceError::backend(format!(
             "failed to copy {} to {}: {e}",
@@ -1159,18 +1120,63 @@ fn copy_single_image(item_dir: &Path, source: &str) -> Result<PathBuf, ServiceEr
     Ok(output)
 }
 
-/// Removes every `primary.<ext>` in `item_dir` other than `keep`, so a
+/// Removes every `<stem>.<ext>` in `item_dir` other than `keep`, so a
 /// regeneration under a different extension leaves one Primary file behind
 /// (the rescan re-adopts files by stem and would otherwise find two).
-fn remove_other_primaries(item_dir: &Path, keep: &Path) {
+fn remove_other_primaries(item_dir: &Path, stem: &str, keep: &Path) {
     for ext in ART_FILE_EXTENSIONS {
-        let candidate = item_dir.join(format!("{PRIMARY_STEM}.{ext}"));
+        let candidate = item_dir.join(format!("{stem}.{ext}"));
         if candidate != keep
             && candidate.exists()
             && let Err(err) = std::fs::remove_file(&candidate)
         {
             tracing::debug!(%err, path = %candidate.display(), "stale primary not removed");
         }
+    }
+}
+
+/// `ImageSaver.SaveImage`'s "Delete the current path" once `output` is the
+/// item's new Primary: the file of the Primary `images` stored until now, such
+/// as one an earlier build drew in the item's `{ID}` folder. It is named only
+/// when it lies in one of the item's own folders ([`is_own_image`]), with its
+/// links resolved too, is not `output` (ignoring case, as upstream compares
+/// paths), and no other of the item's rows names it. The caller removes it
+/// once the new row is saved ([`remove_replaced_file`]), so no stored row
+/// names a deleted file.
+pub(crate) fn replaced_primary(
+    root: &Path,
+    item_id: Uuid,
+    images: &[ItemImageInfo],
+    output: &Path,
+) -> Option<PathBuf> {
+    use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
+    let previous = images.iter().find(|i| i.image_type == ImageType::Primary)?;
+    if equals_ordinal_ignore_case(&previous.path, &output.to_string_lossy())
+        || !is_own_image(root, item_id, previous)
+        || images
+            .iter()
+            .filter(|i| equals_ordinal_ignore_case(&i.path, &previous.path))
+            .count()
+            > 1
+    {
+        return None;
+    }
+    let file = Path::new(&previous.path);
+    let parent = file.parent()?.canonicalize().ok()?;
+    internal_metadata_dirs(root, item_id)
+        .iter()
+        .filter_map(|dir| dir.canonicalize().ok())
+        .any(|dir| parent.starts_with(dir))
+        .then(|| file.to_owned())
+}
+
+/// Deletes the replaced Primary [`replaced_primary`] named; one already gone
+/// is no failure, and one that cannot go stays, logged.
+pub(crate) fn remove_replaced_file(item_id: Uuid, file: &Path) {
+    if let Err(err) = std::fs::remove_file(file)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(%err, %item_id, path = %file.display(), "replaced primary not removed");
     }
 }
 
@@ -1325,11 +1331,7 @@ mod tests {
         let primary = fx.primary_of(genre_id).await.expect("genre has a Primary");
         assert_eq!(
             Path::new(&primary.path),
-            fx.tmp
-                .path()
-                .join("metadata/library")
-                .join(guid_to_db(genre_id))
-                .join("primary.png")
+            own_art_dir(&fx.tmp.path().join("metadata/library"), genre_id).join("poster.png")
         );
         let decoded = image::open(&primary.path).expect("decodable png");
         assert_eq!((decoded.width(), decoded.height()), (600, 600));
@@ -1340,6 +1342,51 @@ mod tests {
         let rgb = decoded.to_rgb8();
         let tl = rgb.get_pixel(10, 10).0;
         assert!(tl == [200, 20, 20] || tl == [20, 20, 200], "{tl:?}");
+    }
+
+    /// A collage an earlier build drew into the item's `{ID}` folder as
+    /// `primary.png` is the item's own: drawn again, the new one goes to
+    /// Jellyfin's `{xx}/{idN}/poster.png` and the old file goes with its row
+    /// (`ImageSaver.SaveImage`'s "Delete the current path").
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_collage_an_earlier_build_drew_moves_to_jellyfins_folder() {
+        let fx = fixture().await;
+        let media = fx.media_dir();
+        let a = write_png(&media, "a-poster.png", [200, 20, 20]);
+        fx.seed(BaseItemKind::Movie, "Heat", Some("Crime"), Some(&a))
+            .await;
+        fx.providers.refresh_all().await.expect("first pass");
+        let genre = fx.by_name(BaseItemKind::Genre, "Crime").await;
+        let genre_id = Uuid::parse_str(&genre.id).expect("genre id");
+        let root = fx.tmp.path().join("metadata/library");
+        let earlier = earlier_art_dir(&root, genre_id).join("primary.png");
+        std::fs::create_dir_all(earlier.parent().unwrap()).unwrap();
+        std::fs::write(&earlier, b"an earlier collage").unwrap();
+        std::fs::remove_file(own_art_dir(&root, genre_id).join("poster.png")).unwrap();
+        seed_images(
+            &fx.db,
+            genre_id,
+            &[image_info(
+                ImageType::Primary,
+                &earlier.to_string_lossy(),
+                None,
+            )],
+        )
+        .await;
+
+        let update = fx
+            .providers
+            .refresh_item(&genre, true)
+            .await
+            .expect("redraw");
+        assert_eq!(update, ItemUpdateType::ImageUpdate);
+        let primary = fx.primary_of(genre_id).await.expect("primary");
+        assert_eq!(
+            Path::new(&primary.path),
+            own_art_dir(&root, genre_id).join("poster.png")
+        );
+        assert!(Path::new(&primary.path).is_file());
+        assert!(!earlier.exists(), "the replaced collage is removed");
     }
 
     /// A second pass over a current image is a no-op: the recorded
@@ -1478,13 +1525,7 @@ mod tests {
         let genre = fx.by_name(BaseItemKind::Genre, "Crime").await;
         let genre_id = Uuid::parse_str(&genre.id).expect("id");
         assert!(fx.primary_of(genre_id).await.is_none());
-        assert!(
-            !fx.tmp
-                .path()
-                .join("metadata/library")
-                .join(guid_to_db(genre_id))
-                .exists()
-        );
+        assert!(!own_art_dir(&fx.tmp.path().join("metadata/library"), genre_id).exists());
     }
 
     /// `MusicGenreImageProvider` samples the audio kinds: a genre carried only
@@ -1832,7 +1873,7 @@ mod tests {
         fx.providers.refresh_all().await.expect("pass");
 
         let primary = fx.primary_of(user_root).await.expect("root primary");
-        assert!(primary.path.ends_with("primary.png"), "{}", primary.path);
+        assert!(primary.path.ends_with("poster.png"), "{}", primary.path);
         assert_eq!(
             std::fs::read(&primary.path).unwrap(),
             std::fs::read(&tile).unwrap(),
@@ -2098,7 +2139,7 @@ mod tests {
 
         assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 1);
         let primary = fx.primary_of(album).await.expect("album primary");
-        assert!(primary.path.ends_with("primary.jpg"), "{}", primary.path);
+        assert!(primary.path.ends_with("folder.jpg"), "{}", primary.path);
         assert_eq!(
             std::fs::read(&primary.path).unwrap(),
             std::fs::read(&first).unwrap(),
@@ -2288,7 +2329,7 @@ mod tests {
         std::fs::create_dir_all(&art).expect("art dir");
         // Nothing reads it back: the image probe answers 0x0 for a zero-length
         // file (the FIFO) without opening it, which would block forever.
-        let output = art.join("primary.jpg");
+        let output = art.join("folder.jpg");
         let status = std::process::Command::new("mkfifo")
             .arg(&output)
             .status()
@@ -2406,16 +2447,94 @@ mod tests {
         assert!(!is_own_image(root, id, &image("https://e.test/a.jpg")));
     }
 
+    /// Only the item's own earlier Primary is replaced: never the new file
+    /// itself (in any case), a file outside its folders (beside the media, or
+    /// reached through a link out of them), or a file another of its rows
+    /// still names.
+    #[test]
+    fn only_the_items_own_replaced_primary_goes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("library");
+        let id = Uuid::from_u128(0x1575);
+        let row = |path: &Path, image_type| ItemImageInfo {
+            path: path.to_string_lossy().into_owned(),
+            image_type,
+            date_modified: Utc::now(),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        let earlier = earlier_art_dir(&root, id);
+        std::fs::create_dir_all(&earlier).unwrap();
+        let old = earlier.join("primary.png");
+        std::fs::write(&old, b"old").unwrap();
+        let output = own_art_dir(&root, id).join("poster.png");
+        let replaced =
+            |images: &[ItemImageInfo], output: &Path| replaced_primary(&root, id, images, output);
+        assert_eq!(
+            replaced(&[row(&old, ImageType::Primary)], &output),
+            Some(old.clone())
+        );
+        assert_eq!(
+            replaced(&[row(&old, ImageType::Logo)], &output),
+            None,
+            "no Primary"
+        );
+        let upper = PathBuf::from(old.to_string_lossy().replace("primary.png", "PRIMARY.PNG"));
+        assert_eq!(
+            replaced(&[row(&old, ImageType::Primary)], &upper),
+            None,
+            "the new file"
+        );
+        assert_eq!(
+            replaced(
+                &[row(&old, ImageType::Primary), row(&old, ImageType::Thumb)],
+                &output
+            ),
+            None,
+            "another row names it"
+        );
+        let media = tmp.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("poster.jpg"), b"user").unwrap();
+        assert_eq!(
+            replaced(
+                &[row(&media.join("poster.jpg"), ImageType::Primary)],
+                &output
+            ),
+            None,
+            "beside the media"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&media, earlier.join("out")).unwrap();
+            assert_eq!(
+                replaced(
+                    &[row(
+                        &earlier.join("out").join("poster.jpg"),
+                        ImageType::Primary
+                    )],
+                    &output
+                ),
+                None,
+                "through a link out of its folders"
+            );
+        }
+        remove_replaced_file(id, &old);
+        assert!(!old.exists());
+        remove_replaced_file(id, &old);
+    }
+
     #[test]
     fn regeneration_removes_stale_primaries_of_other_extensions() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        std::fs::write(dir.join("primary.jpg"), b"old").unwrap();
+        std::fs::write(dir.join("poster.jpg"), b"old").unwrap();
         std::fs::write(dir.join("backdrop.jpg"), b"keep").unwrap();
-        let keep = dir.join("primary.png");
+        let keep = dir.join("poster.png");
         std::fs::write(&keep, b"new").unwrap();
-        remove_other_primaries(dir, &keep);
-        assert!(!dir.join("primary.jpg").exists());
+        remove_other_primaries(dir, "poster", &keep);
+        assert!(!dir.join("poster.jpg").exists());
         assert!(dir.join("backdrop.jpg").exists());
         assert!(keep.exists());
     }
@@ -2533,7 +2652,8 @@ mod tests {
     /// cannot be decoded as unmeasurable (`debug!`), and a truncated one whose
     /// header still gives its size as having no blurhash (`warn!`), each with
     /// the item, the image type and the path (gl-384,
-    /// `LibraryManager.UpdateImagesAsync`); none gets a hash.
+    /// `LibraryManager.UpdateImagesAsync`); the unreadable ones get an empty
+    /// hash, as upstream stores, and the missing one none.
     #[tokio::test]
     async fn an_unreadable_image_is_logged_with_its_item_type_and_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2582,8 +2702,11 @@ mod tests {
             let mut info = image_info(image_type, path, None);
             fill_image_metadata(&processor, item, path, &mut info).await;
             assert_eq!((info.width, info.height), size, "{path}");
-            assert!(
-                info.blur_hash.as_deref().is_none_or(str::is_empty),
+            // A missing file is left as it is; an unreadable one gets
+            // upstream's empty blurhash.
+            assert_eq!(
+                info.blur_hash.as_deref(),
+                (*path != missing).then_some(""),
                 "{path}"
             );
 

@@ -1,8 +1,16 @@
 //! Playlists the library scan resolves off disk — port of `PlaylistResolver`
 //! (`Emby.Server.Implementations/Library/Resolvers/PlaylistResolver.cs`) and
-//! of the local readers that fill a resolved playlist's members: a playlist
-//! folder's `playlist.xml` (`PlaylistXmlProvider`), a playlist file's own
-//! entries (`PlaylistItemsProvider`).
+//! of the local readers of a resolved playlist: a playlist folder's
+//! `playlist.xml` (`PlaylistXmlProvider`: the item's fields, members, shares
+//! and media type), a playlist file's own entries (`PlaylistItemsProvider`).
+//!
+//! A folder's `playlist.xml` is read with the item's other local readers
+//! ([`read_folder_xml`]), its fields merged as an NFO's are; its members and
+//! shares are merged once the walk has saved every row
+//! ([`LibraryScanner::sync_playlists`]), by `PlaylistMetadataService.
+//! MergeData`'s rule (`ferrofin_providers::container_xml`), and only then is
+//! the file written back, where the library lets its saver write
+//! (`PlaylistXmlSaver`).
 //!
 //! ACCEPTED DIVERGENCE (upstream bug, not ported): where Jellyfin 12.2 saves
 //! a playlist's XML metadata — a library whose metadata savers are unset, as
@@ -50,8 +58,10 @@
 
 use std::path::Path;
 
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::CollectionTypeOptions;
+use ferrofin_model::entities_media::PlaylistUserPermissions;
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::io::{FileSystemEntryInfo, FileSystemEntryType};
 use ferrofin_traits::persistence::{PlaylistMember, ScannedPlaylist};
@@ -59,7 +69,7 @@ use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use unicode_normalization::UnicodeNormalization as _;
 use uuid::Uuid;
 
-use super::{LibraryScanner, PlanCtx, Planned, entry_name, file_stem};
+use super::{LibraryScanner, LocalNfo, PlanCtx, Planned, entry_name, file_stem};
 
 /// `PlaylistResolver`'s directory marker, matched case-insensitively.
 const FOLDER_MARKER: &str = "[playlist]";
@@ -105,6 +115,18 @@ pub(super) fn is_playlist_file(path: &str) -> bool {
     ferrofin_providers::is_playlist_file(path)
 }
 
+/// What a playlist folder's `playlist.xml` gave besides the item's fields,
+/// merged once every row is saved.
+#[derive(Debug, Default)]
+pub(super) struct PlaylistXmlRead {
+    /// `<PlaylistItems>`, in file order.
+    pub(super) members: Vec<PlaylistMember>,
+    /// `<Shares>`, in file order.
+    pub(super) shares: Vec<PlaylistUserPermissions>,
+    /// `<LockData>true`: `isLocalLocked`, under which the merge replaces.
+    pub(super) locked: bool,
+}
+
 /// A playlist the walk saved whose local readers this refresh runs.
 #[derive(Debug)]
 pub(super) struct DuePlaylist {
@@ -112,8 +134,12 @@ pub(super) struct DuePlaylist {
     pub(super) id: Uuid,
     /// Its file or folder.
     pub(super) path: String,
-    /// Whether what the readers return replaces the stored members.
+    /// Whether what the readers return replaces the stored members and
+    /// shares.
     pub(super) replace: bool,
+    /// A folder's `playlist.xml`, when the item's refresh read it; `None`
+    /// for a file, whose entries are read here.
+    pub(super) xml: Option<PlaylistXmlRead>,
 }
 
 /// Whether a refresh with `options` replaces a playlist's members with what
@@ -159,49 +185,53 @@ fn folder_media_type(dir: &str) -> &'static str {
             )
         })
         .and_then(|xml| xml.playlist_media_type);
-    ["Video", "Audio", "Photo", "Book"]
+    ferrofin_providers::playlist_media_type(declared.as_deref())
+}
+
+/// `PlaylistXmlProvider` among the scan's local readers: a playlist folder's
+/// `playlist.xml`, merged into `entity` as `RefreshWithProviders` merges a
+/// local result into `temp` (`MergeData(localItem, temp, [], false, true)`):
+/// its title, when not blank, names the playlist, and its other values fill
+/// what the row lacks. `None` for a playlist file, or a folder whose file is
+/// missing or not well-formed (`HasMetadata` false).
+pub(super) async fn read_folder_xml(entity: &mut BaseItemEntity) -> Option<LocalNfo> {
+    use ferrofin_providers::metadata_merge::{MetadataResult, merge_data};
+    // A folder with no `playlist.xml` has nothing to say (`GetXmlFile`).
+    let file = ferrofin_providers::container_xml::local_file(entity).await?;
+    let keys: Vec<String> = ferrofin_providers::external_id_infos(BaseItemKind::Playlist)
         .into_iter()
-        .find(|known| {
-            declared
-                .as_deref()
-                .is_some_and(|d| d.eq_ignore_ascii_case(known))
-        })
-        .unwrap_or("Unknown")
-}
-
-/// Whether the playlist at `path` is a file (`Playlist.IsPlaylistFile`: an
-/// extension, and no directory).
-fn is_file_playlist(path: &str) -> bool {
-    Path::new(path).extension().is_some() && !Path::new(path).is_dir()
-}
-
-/// What the local reader returns for the playlist at `path`, or `None` when
-/// it has nothing (`HasMetadata` false), which leaves the stored members as
-/// they are.
-fn read_members(path: &str, roots: &[String]) -> Option<Vec<PlaylistMember>> {
-    if !is_file_playlist(path) {
-        // `PlaylistXmlProvider`: a `playlist.xml` that reads is metadata, an
-        // empty item list too. Its media type is the planner's
-        // ([`folder_media_type`]).
-        //
-        // TODO(parity, open work item): the rest of what `PlaylistXmlParser`
-        // reads — `<LocalTitle>`, `<Overview>`, `<Shares>`, `<LockData>` —
-        // is not applied, and `PlaylistXmlSaver` (which writes the folder's
-        // `playlist.xml` back, and the `<name>.xml` sidecar beside a playlist
-        // FILE whose read is the upstream bug this module does not port) has
-        // no port. Port path: carry the parsed fields in `ScannedPlaylist`
-        // and merge them in `sync_scanned_playlists` as `MergeBaseItemData`
-        // does (locked fields kept, a blank title never taken); write the
-        // folder's `playlist.xml` from the playlist manager's updates, never
-        // a sidecar beside a file.
-        let xml = ferrofin_providers::playlist_xml_path(path, false);
-        let parsed = ferrofin_providers::parse_container_xml(
-            &ferrofin_providers::decode_playlist(&std::fs::read(xml).ok()?),
-            BaseItemKind::Playlist,
-            &[],
-        )?;
-        return Some(
-            parsed
+        .filter_map(|info| info.key)
+        .collect();
+    let xml =
+        ferrofin_providers::container_xml::read(&file.path, BaseItemKind::Playlist, &keys).await?;
+    let name = xml
+        .item
+        .item
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let mut target = MetadataResult::of(std::mem::take(entity));
+    merge_data(&xml.item, &mut target, &[], false, true);
+    *entity = target.item;
+    if let Some(name) = name {
+        entity.name = Some(name);
+    }
+    let local = xml.item;
+    Some(LocalNfo {
+        people: local.people.unwrap_or_default(),
+        ids: local
+            .provider_ids
+            .into_iter()
+            .filter(|(_, value)| !value.trim().is_empty())
+            .collect(),
+        found: true,
+        is_locked: local.item.is_locked,
+        locked_fields: local.locked_fields,
+        remote_images: Vec::new(),
+        playlist: Some(PlaylistXmlRead {
+            members: xml
                 .children
                 .into_iter()
                 .map(|child| PlaylistMember {
@@ -212,11 +242,25 @@ fn read_members(path: &str, roots: &[String]) -> Option<Vec<PlaylistMember>> {
                     path: child.path,
                 })
                 .collect(),
-        );
-    }
-    // `PlaylistItemsProvider`: only entries that resolve — none is no
-    // metadata.
-    if !is_playlist_file(path) {
+            shares: xml.shares,
+            locked: local.item.is_locked,
+        }),
+    })
+}
+
+/// Whether the playlist at `path` is a file (`Playlist.IsPlaylistFile`: an
+/// extension, and no directory).
+fn is_file_playlist(path: &str) -> bool {
+    Path::new(path).extension().is_some() && !Path::new(path).is_dir()
+}
+
+/// What `PlaylistItemsProvider` returns for the playlist file at `path`, or
+/// `None` when it has nothing (`HasMetadata` false), which leaves the stored
+/// members as they are. A folder's members are its `playlist.xml`'s
+/// ([`read_folder_xml`]).
+fn read_members(path: &str, roots: &[String]) -> Option<Vec<PlaylistMember>> {
+    // Only entries that resolve — none is no metadata.
+    if !is_file_playlist(path) || !is_playlist_file(path) {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
@@ -358,48 +402,88 @@ impl LibraryScanner {
         true
     }
 
-    /// Runs the local readers of every playlist in `due` and writes what
-    /// they found, with each one's ownership row
+    /// Runs the local readers of every playlist file in `due`, takes what
+    /// each folder's `playlist.xml` gave, and writes the members and shares,
+    /// with each one's ownership row
     /// ([`ItemPersistenceService::sync_scanned_playlists`]). Once the walk
     /// has saved every row, so each entry finds its item. Best-effort, as
     /// the version links are: a failure is logged and the next refresh of
-    /// the playlist retries.
+    /// the playlist retries. Returns whether they were written.
     ///
     /// [`ItemPersistenceService::sync_scanned_playlists`]: ferrofin_traits::persistence::ItemPersistenceService::sync_scanned_playlists
-    pub(super) async fn sync_playlists(&self, due: &[DuePlaylist], folders: &[VirtualFolderInfo]) {
+    pub(super) async fn sync_playlists(
+        &self,
+        due: &[DuePlaylist],
+        folders: &[VirtualFolderInfo],
+    ) -> bool {
         if due.is_empty() {
-            return;
+            return true;
         }
         let roots = member_roots(folders);
-        let reads: Vec<(Uuid, String, bool)> = due
+        // A folder's `playlist.xml` was read with the item; a file's entries
+        // are read here, off the runtime.
+        let mut playlists: Vec<ScannedPlaylist> = due
             .iter()
+            .filter_map(|p| {
+                let xml = p.xml.as_ref()?;
+                Some(ScannedPlaylist {
+                    id: p.id,
+                    members: Some(xml.members.clone()),
+                    from_file: false,
+                    replace: p.replace,
+                    shares: Some(xml.shares.clone()),
+                })
+            })
+            .collect();
+        let files: Vec<(Uuid, String, bool)> = due
+            .iter()
+            .filter(|p| p.xml.is_none())
             .map(|p| (p.id, p.path.clone(), p.replace))
             .collect();
-        let playlists = match tokio::task::spawn_blocking(move || {
-            reads
+        match tokio::task::spawn_blocking(move || {
+            files
                 .into_iter()
                 .map(|(id, path, replace)| ScannedPlaylist {
                     id,
                     members: read_members(&path, &roots),
                     from_file: is_file_playlist(&path),
                     replace,
+                    shares: None,
                 })
                 .collect::<Vec<_>>()
         })
         .await
         {
-            Ok(playlists) => playlists,
+            Ok(read) => playlists.extend(read),
             Err(err) => {
                 tracing::warn!(%err, "could not read the playlists' files; the next refresh retries");
-                return;
+                return false;
             }
-        };
+        }
         if let Err(err) = self.persistence.sync_scanned_playlists(&playlists).await {
             tracing::warn!(
                 %err,
                 playlists = playlists.len(),
-                "could not write the playlists' members; the next refresh retries"
+                "could not write the playlists' members and shares; the next refresh retries"
             );
+            return false;
+        }
+        true
+    }
+
+    /// Writes back the `playlist.xml` of each folder in `due` whose file the
+    /// walk read, once [`Self::sync_playlists`] merged its members and shares:
+    /// that refresh is a `MetadataImport`, which `PlaylistXmlSaver` writes,
+    /// where the library lets it. Only after a walk that saved every row: a
+    /// stopped one has not stored every member yet, and the file would lose
+    /// the rest.
+    pub(super) async fn save_playlist_files(&self, due: &[DuePlaylist]) {
+        for playlist in due.iter().filter(|playlist| playlist.xml.is_some()) {
+            self.save_metadata_sidecars(
+                playlist.id,
+                ferrofin_traits::providers::ItemUpdateType::MetadataImport,
+            )
+            .await;
         }
     }
 }
@@ -528,29 +612,60 @@ mod tests {
         assert_eq!(read_members(&m3u, &roots), None);
     }
 
-    #[test]
-    fn a_playlist_folder_reads_its_playlist_xml() {
+    /// `PlaylistXmlProvider` in the scan: the whole `BaseItemXmlParser` set.
+    /// A title that is not blank names the playlist, other values fill what
+    /// the row lacks, and the members, shares and lock wait for the merge.
+    #[tokio::test]
+    async fn a_playlist_folder_reads_its_playlist_xml() {
         let dir = tempfile::tempdir().expect("tempdir");
         let folder = dir.path().join("Road Trip [playlist]");
         std::fs::create_dir(&folder).expect("mkdir");
         let folder = folder.to_string_lossy().into_owned();
+        let planned = || BaseItemEntity {
+            type_: "MediaBrowser.Controller.Playlists.Playlist".into(),
+            path: Some(folder.clone()),
+            name: Some("Road Trip".into()),
+            ..Default::default()
+        };
         // No `playlist.xml`: nothing to say.
-        assert_eq!(read_members(&folder, &[]), None);
-        let id = Uuid::new_v4();
+        let mut row = planned();
+        assert!(read_folder_xml(&mut row).await.is_none());
+        assert_eq!(row, planned());
+        let (id, user) = (Uuid::new_v4(), Uuid::new_v4());
         std::fs::write(
             format!("{folder}/playlist.xml"),
             format!(
-                "<?xml version=\"1.0\"?><Item><PlaylistItems>\
+                "<?xml version=\"1.0\"?><Item><LocalTitle> Summer Mix </LocalTitle>\
+                 <Overview>Songs for the road</Overview><LockData>true</LockData>\
+                 <LockedFields>Name|Genres</LockedFields><Genres><Genre>Pop</Genre></Genres>\
+                 <PlaylistItems>\
                  <PlaylistItem><Path>/m/a.mp3</Path></PlaylistItem>\
                  <PlaylistItem><ItemId>{}</ItemId></PlaylistItem>\
-                 </PlaylistItems></Item>",
+                 </PlaylistItems><Shares><Share><UserId>{user}</UserId>\
+                 <CanEdit>true</CanEdit></Share></Shares></Item>",
                 id.simple()
             ),
         )
         .expect("write");
+        let mut row = planned();
+        let local = read_folder_xml(&mut row).await.expect("read");
+        assert_eq!(row.name.as_deref(), Some("Summer Mix"));
+        assert_eq!(row.overview.as_deref(), Some("Songs for the road"));
+        assert_eq!(row.genres.as_deref(), Some("Pop"));
+        assert!(row.is_locked && local.found && local.is_locked);
         assert_eq!(
-            read_members(&folder, &[]),
-            Some(vec![
+            local.locked_fields,
+            vec![
+                ferrofin_model::entities::MetadataField::Name,
+                ferrofin_model::entities::MetadataField::Genres
+            ]
+        );
+        let xml = local.playlist.expect("playlist parts");
+        assert!(xml.locked);
+        assert_eq!(xml.shares, vec![PlaylistUserPermissions::new(user, true)]);
+        assert_eq!(
+            xml.members,
+            vec![
                 PlaylistMember {
                     item_id: None,
                     path: Some("/m/a.mp3".to_owned())
@@ -559,7 +674,20 @@ mod tests {
                     item_id: Some(id),
                     path: None
                 },
-            ])
+            ]
         );
+        // A blank title keeps the folder's name; the folder's members are
+        // no file's entries.
+        std::fs::write(
+            format!("{folder}/playlist.xml"),
+            "<Item><LocalTitle>  </LocalTitle></Item>",
+        )
+        .expect("write");
+        let mut row = planned();
+        let local = read_folder_xml(&mut row).await.expect("read");
+        assert_eq!(row.name.as_deref(), Some("Road Trip"));
+        let xml = local.playlist.expect("playlist parts");
+        assert!(xml.members.is_empty() && xml.shares.is_empty() && !xml.locked);
+        assert_eq!(read_members(&folder, &[]), None);
     }
 }

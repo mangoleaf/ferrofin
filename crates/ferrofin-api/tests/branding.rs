@@ -35,7 +35,9 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::session::AuthenticationRequest;
-use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, OidcLinkAt, SsoManager, SsoReply};
+use ferrofin_traits::sso::{
+    OidcCallback, OidcExchangeReply, OidcLinkAt, OidcPacedRoute, SsoManager, SsoReply,
+};
 use ferrofin_traits::system::ServerApplicationPaths;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -699,6 +701,12 @@ impl SsoManager for LoginButtons {
     async fn ensure_enabled(&self) -> Result<(), ServiceError> {
         Err(unused())
     }
+    async fn flow_cookie_name(&self) -> Result<&'static str, ServiceError> {
+        Err(unused())
+    }
+    fn pace_oidc(&self, _route: OidcPacedRoute, _client: std::net::IpAddr) -> Option<SsoReply> {
+        unreachable!("not used by the branding routes")
+    }
     async fn oidc_providers(&self) -> Result<OidcProviderList, ServiceError> {
         Err(unused())
     }
@@ -752,13 +760,14 @@ impl SsoManager for LoginButtons {
         &self,
         _key: &str,
         _client: std::net::IpAddr,
-        _code: &str,
+        _quick_connect: &str,
     ) -> Result<SsoReply, ServiceError> {
         Err(unused())
     }
     async fn confirm_oidc_quick_connect(
         &self,
         _confirmation: Option<Secret>,
+        _code: Option<&str>,
         _flow_cookie: Option<Secret>,
         _client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {
@@ -774,6 +783,8 @@ impl SsoManager for LoginButtons {
         &self,
         _key: &str,
         _user_id: Uuid,
+        _password: &Secret,
+        _session_token: &Secret,
         _client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {
         Err(unused())
@@ -783,6 +794,7 @@ impl SsoManager for LoginButtons {
     }
     async fn add_oidc_link(
         &self,
+        _by: Uuid,
         _user_id: Uuid,
         _key: &str,
         _subject: &str,
@@ -791,6 +803,7 @@ impl SsoManager for LoginButtons {
     }
     async fn remove_oidc_link(
         &self,
+        _by: Uuid,
         _user_id: Uuid,
         _at: OidcLinkAt<'_>,
     ) -> Result<(), ServiceError> {

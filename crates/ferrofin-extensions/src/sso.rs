@@ -40,7 +40,9 @@
 //! - [`login_buttons`]: the "Sign in with" buttons jellyfin-web's login page
 //!   shows under its form;
 //! - [`quick_connect`]: a native app's Quick Connect code approved through a
-//!   sign-in and a confirmation page, under the account rules of a sign-in.
+//!   sign-in and a confirmation page, under the account rules of a sign-in;
+//! - [`pacing`]: the pace of the routes that create a pending flow or take a
+//!   one-time value, per address or IPv6 /64.
 //!
 //! An identity provider is contacted only when an admin saves a provider or a
 //! user signs in with it (B1).
@@ -60,7 +62,9 @@ use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
 use ferrofin_traits::security::{AuthenticationManager, QuickConnect};
 use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
-use ferrofin_traits::sso::{OidcCallback, OidcExchangeReply, OidcLinkAt, SsoManager, SsoReply};
+use ferrofin_traits::sso::{
+    OidcCallback, OidcExchangeReply, OidcLinkAt, OidcPacedRoute, SsoManager, SsoReply,
+};
 use ferrofin_traits::tasks::ScheduledTask;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -77,6 +81,7 @@ pub mod flows;
 pub mod links;
 pub mod login_buttons;
 pub mod oidc_http;
+pub mod pacing;
 pub mod quick_connect;
 pub mod roles;
 pub mod sign_in;
@@ -84,6 +89,7 @@ pub mod sign_in;
 use discovery::MetadataCache;
 use flows::{ExchangeCodes, PendingFlows};
 use oidc_http::OidcHttpClient;
+use pacing::{PaceLimits, Pacing};
 
 /// The Single Sign-On plugin's id in `/Plugins`: Ferrofin's own, generated
 /// once and fixed for good, so its enabled flag, configuration and private
@@ -346,14 +352,15 @@ pub struct SsoService {
     /// Opens a signed-in account's session and mints its token.
     sessions: Arc<dyn SessionManager>,
     /// The dashboard's activity log, for a refused sign-in of a known
-    /// account.
+    /// account, and each link made or removed.
     activity: Arc<dyn ActivityManager>,
     /// Held while an account is created and linked, so two first sign-ins of
-    /// one identity end at one account, while a link is checked and made or
-    /// removed ([`links`]), so a refusal and a link never interleave, and
-    /// while an exchange or a Quick Connect approval checks its link and
-    /// mints its session, so a removal cannot fall between the two.
-    provisioning: tokio::sync::Mutex<()>,
+    /// one identity end at one account, while a link is made, and while a
+    /// removal unlinks and signs the account out ([`links`]), so no link
+    /// falls between the two on this server, and while an exchange or a Quick Connect approval checks its link and
+    /// mints its session, so a removal cannot fall between the two. Shared
+    /// with the task a link change or a removal runs in ([`links`]).
+    provisioning: Arc<tokio::sync::Mutex<()>>,
     /// The server's published URL (`--published-url`,
     /// `FERROFIN_PUBLISHED_URL`), the public URL when the plugin sets none.
     published_url: Option<String>,
@@ -369,10 +376,13 @@ pub struct SsoService {
     /// Each provider's discovery document and key set, for sign-in.
     metadata: MetadataCache,
     /// The sign-ins started and not yet called back.
-    flows: PendingFlows,
+    flows: Arc<PendingFlows>,
     /// The sign-ins called back whose completion page has not yet swapped
     /// its exchange code.
     exchanges: ExchangeCodes,
+    /// The pace of the routes that create a pending flow or take a one-time
+    /// value ([`pacing`]).
+    pacing: Pacing,
     /// Approves a native app's Quick Connect code ([`quick_connect`]), once
     /// [`with_quick_connect`](Self::with_quick_connect) gives it.
     quick_connect: Option<Arc<dyn QuickConnect>>,
@@ -382,8 +392,7 @@ impl SsoService {
     /// A service over the plugin manager (the enabled flag, the configuration
     /// and the private data), the accounts and their identity links, the
     /// sessions a sign-in opens, the activity log, and the server's published
-    /// URL, which the callback URLs fall back to. Never the request's `Host`
-    /// header.
+    /// URL, which the callback URLs fall back to. Never the request's `Host` header.
     #[must_use]
     pub fn new(
         plugins: Arc<dyn PluginManager>,
@@ -399,16 +408,26 @@ impl SsoService {
             identities,
             sessions,
             activity,
-            provisioning: tokio::sync::Mutex::new(()),
+            provisioning: Arc::default(),
             published_url,
             saving: tokio::sync::Mutex::new(()),
             http: OidcHttpClient::new(),
             avatars: None,
             metadata: MetadataCache::default(),
-            flows: PendingFlows::default(),
+            flows: Arc::default(),
             exchanges: ExchangeCodes::default(),
+            pacing: Pacing::new(PaceLimits::DEFAULT),
             quick_connect: None,
         }
+    }
+
+    /// The service paced under `limits` instead of [`PaceLimits::DEFAULT`]:
+    /// for a test that makes more requests from one address than a person
+    /// would. No address is exempt from the pace.
+    #[must_use]
+    pub fn with_pace_limits(mut self, limits: PaceLimits) -> Self {
+        self.pacing = Pacing::new(limits);
+        self
     }
 
     /// The plugin's current configuration.
@@ -508,6 +527,19 @@ impl SsoManager for SsoService {
                 "the Single Sign-On plugin is disabled",
             ))
         }
+    }
+
+    async fn flow_cookie_name(&self) -> Result<&'static str, ServiceError> {
+        self.ensure_enabled().await?;
+        let config = self.config().await?;
+        Ok(sign_in::flow_cookie_name(
+            self.public_url(&config).ok().flatten().as_deref(),
+        ))
+    }
+
+    fn pace_oidc(&self, route: OidcPacedRoute, client: std::net::IpAddr) -> Option<SsoReply> {
+        (!self.pacing.admit(route, client, std::time::Instant::now()))
+            .then(|| pacing::paced_page(route))
     }
 
     async fn oidc_providers(&self) -> Result<OidcProviderList, ServiceError> {
@@ -711,25 +743,26 @@ impl SsoManager for SsoService {
     }
 
     async fn quick_connect_page(&self) -> Result<SsoReply, ServiceError> {
-        self.code_entry_page().await
+        self.sign_in_links_page().await
     }
 
     async fn start_oidc_quick_connect(
         &self,
         key: &str,
         client: std::net::IpAddr,
-        code: &str,
+        quick_connect: &str,
     ) -> Result<SsoReply, ServiceError> {
-        self.start_quick_connect(key, client, code).await
+        self.start_quick_connect(key, client, quick_connect).await
     }
 
     async fn confirm_oidc_quick_connect(
         &self,
         confirmation: Option<Secret>,
+        code: Option<&str>,
         flow_cookie: Option<Secret>,
         client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {
-        self.confirm_quick_connect(confirmation.as_ref(), flow_cookie.as_ref(), client)
+        self.confirm_quick_connect(confirmation.as_ref(), code, flow_cookie.as_ref(), client)
             .await
     }
 
@@ -745,9 +778,11 @@ impl SsoManager for SsoService {
         &self,
         key: &str,
         user_id: Uuid,
+        password: &Secret,
+        session_token: &Secret,
         client: std::net::IpAddr,
     ) -> Result<SsoReply, ServiceError> {
-        self.start_sign_in(key, client, flows::FlowPurpose::Link(user_id))
+        self.start_link(key, user_id, password, session_token, client)
             .await
     }
 
@@ -757,19 +792,21 @@ impl SsoManager for SsoService {
 
     async fn add_oidc_link(
         &self,
+        by: Uuid,
         user_id: Uuid,
         key: &str,
         subject: &str,
     ) -> Result<OidcAdminLink, ServiceError> {
-        self.add_link(user_id, key, subject).await
+        self.add_link(by, user_id, key, subject).await
     }
 
     async fn remove_oidc_link(
         &self,
+        by: Uuid,
         user_id: Uuid,
         at: OidcLinkAt<'_>,
     ) -> Result<(), ServiceError> {
-        self.remove_link(user_id, at).await
+        self.remove_link(by, user_id, at).await
     }
 }
 

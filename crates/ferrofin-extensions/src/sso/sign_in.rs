@@ -20,8 +20,8 @@
 //! 5. the code exchanged with the PKCE verifier and the client secret;
 //! 6. the ID token's signature, with an asymmetric algorithm the provider
 //!    advertises and its keys (fetched again once for an unknown key id);
-//! 7. its issuer, audience (the client id; another beside it only with an
-//!    `azp` naming the client), `azp`, expiry and nonce;
+//! 7. its issuer, audience (the client id, and no other beside it, whatever
+//!    the `azp`), `azp`, expiry and nonce;
 //! 8. when the username claim, or the role claim of a provider that reads
 //!    roles, is not in the ID token, the userinfo answer's `sub`, which must
 //!    be the ID token's. Asked only for the `picture` claim, by a sign-in
@@ -39,7 +39,8 @@
 //! cookie or a claim (B15). A failed check's page says nothing of why; a
 //! refusal about the account says what to ask an administrator.
 //!
-//! One cookie name serves every flow, so a browser holds one sign-in at a
+//! One cookie name serves every flow ([`flow_cookie_name`]: `__Host-`
+//! prefixed on an `https` public URL), so a browser holds one sign-in at a
 //! time: a second start, in another tab or at another provider, replaces the
 //! first's cookie, and the first's callback is then refused.
 
@@ -53,7 +54,9 @@ use ferrofin_common::cryptography::constant_time_eq;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::sso::OidcProvider;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::sso::{OIDC_FLOW_COOKIE, OidcCallback, SsoManager as _, SsoReply};
+use ferrofin_traits::sso::{
+    OIDC_FLOW_COOKIE, OIDC_HOST_FLOW_COOKIE, OidcCallback, SsoManager as _, SsoReply,
+};
 use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreClientAuthMethod, CoreErrorResponseType, CoreIdToken,
     CoreIdTokenVerifier, CoreTokenResponse,
@@ -172,29 +175,42 @@ pub(super) fn sign_in_provider(
         .ok_or_else(|| ServiceError::not_found("no such OIDC provider"))
 }
 
+/// The flow cookie's name on `public_url` (none known reads as `http`):
+/// [`OIDC_HOST_FLOW_COOKIE`] on an `https` one, else [`OIDC_FLOW_COOKIE`].
+pub(super) fn flow_cookie_name(public_url: Option<&str>) -> &'static str {
+    if public_url.is_some_and(|url| url.starts_with("https:")) {
+        OIDC_HOST_FLOW_COOKIE
+    } else {
+        OIDC_FLOW_COOKIE
+    }
+}
+
 /// The flow cookie's `Set-Cookie` value, carrying `value` for `max_age`, or
-/// clearing it with an empty value and no age: scoped to `/sso` below the
-/// public URL's path, `HttpOnly`, `SameSite=Lax` (the callback is a top-level
-/// navigation), and `Secure` on an `https` public URL.
+/// clearing it with an empty value and no age: `HttpOnly` and `SameSite=Lax`
+/// (the callback is a top-level navigation). On an `https` public URL it is
+/// [`OIDC_HOST_FLOW_COOKIE`], `Secure`, for the whole host and with no
+/// `Domain`, as its prefix requires (D23); on an `http` one it is
+/// [`OIDC_FLOW_COOKIE`], scoped to `/sso` below the public URL's path.
 pub(super) fn flow_cookie(public_url: &str, value: &str, max_age: Duration) -> String {
+    let max_age = max_age.as_secs();
+    if flow_cookie_name(Some(public_url)) == OIDC_HOST_FLOW_COOKIE {
+        return format!(
+            "{OIDC_HOST_FLOW_COOKIE}={value}; Path=/; Max-Age={max_age}; HttpOnly; \
+             SameSite=Lax; Secure"
+        );
+    }
     let base_path = url::Url::parse(public_url).map_or_else(
         |_| String::new(),
         |url| url.path().trim_end_matches('/').to_owned(),
     );
-    let max_age = max_age.as_secs();
-    let secure = if public_url.starts_with("https:") {
-        "; Secure"
-    } else {
-        ""
-    };
     format!(
         "{OIDC_FLOW_COOKIE}={value}; Path={base_path}/sso; Max-Age={max_age}; HttpOnly; \
-         SameSite=Lax{secure}"
+         SameSite=Lax"
     )
 }
 
-/// The `Set-Cookie` value that clears the flow cookie, when a public URL
-/// names its path.
+/// The `Set-Cookie` value that clears the flow cookie, when a public URL is
+/// known.
 pub(super) fn cleared_flow_cookie(public_url: Option<&str>) -> Vec<String> {
     public_url
         .map(|url| flow_cookie(url, "", Duration::ZERO))
@@ -285,9 +301,9 @@ fn auth_type(metadata: &ProviderMetadata) -> AuthType {
 /// The verifier of `provider`'s ID tokens under `metadata`: its issuer, its
 /// client id among the audiences, its keys, and the asymmetric algorithms it
 /// advertises only, so neither `none` nor an HMAC keyed with the client
-/// secret passes. Other audiences beside the client id pass here, and
-/// [`SsoService::verify_id_token`] then requires an `azp` naming the client
-/// (OpenID Connect Core 1.0, 3.1.3.7, steps 3 to 5).
+/// secret passes. Other audiences beside the client id pass here, so that
+/// [`SsoService::verify_id_token`] refuses them under a reason of their own
+/// (OpenID Connect Core 1.0, 3.1.3.7, step 3; D23).
 fn id_token_verifier<'a>(
     provider: &OidcProvider,
     metadata: &ProviderMetadata,
@@ -436,18 +452,13 @@ impl SsoService {
                     Err(refusal) => refusal.refused(key),
                 }
             }
-            Ok((FlowPurpose::Link(user_id), identity, _)) => {
-                self.link_verified(&provider, user_id, identity).await?
+            Ok((FlowPurpose::Link { user_id, session }, identity, _)) => {
+                self.link_verified(&provider, user_id, &session, identity)
+                    .await?
             }
-            Ok((FlowPurpose::QuickConnect(code), identity, cookie)) => {
+            Ok((FlowPurpose::QuickConnect, identity, cookie)) => {
                 match self
-                    .quick_connect_verified(
-                        &provider,
-                        identity,
-                        code,
-                        &cookie,
-                        public_url.as_deref(),
-                    )
+                    .quick_connect_verified(&provider, identity, &cookie, public_url.as_deref())
                     .await?
                 {
                     // Keeps the cookie, the confirmation's binding.
@@ -660,13 +671,21 @@ impl SsoService {
             let verifier = id_token_verifier(provider, &metadata)?;
             match id_token.claims(&verifier, nonce) {
                 Ok(claims) => {
-                    // `openidconnect` leaves `azp` unchecked.
-                    let azp = claims.authorized_party().map(|azp| azp.as_str());
-                    if azp.is_some_and(|azp| azp != provider.client_id) {
-                        return Err(Refusal::bad("id_token_azp"));
+                    // No audience the client does not trust, whatever the
+                    // `azp`: this client trusts only itself.
+                    if claims
+                        .audiences()
+                        .iter()
+                        .any(|audience| audience.as_str() != provider.client_id)
+                    {
+                        return Err(Refusal::bad("id_token_extra_audience"));
                     }
-                    if claims.audiences().len() > 1 && azp.is_none() {
-                        return Err(Refusal::bad("id_token_audience"));
+                    // `openidconnect` leaves `azp` unchecked.
+                    if claims
+                        .authorized_party()
+                        .is_some_and(|azp| azp.as_str() != provider.client_id)
+                    {
+                        return Err(Refusal::bad("id_token_azp"));
                     }
                     return Ok((
                         claims.subject().as_str().to_owned(),

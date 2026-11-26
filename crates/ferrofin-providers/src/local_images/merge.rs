@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ferrofin_db::store::guid_to_db;
+pub use ferrofin_db::art::{earlier_art_dir, internal_image_stem, legacy_art_dir, own_art_dir};
 use ferrofin_model::entities::ImageType;
 use ferrofin_traits::options::{ItemImageInfo, file_date_modified};
 use uuid::Uuid;
@@ -127,35 +127,17 @@ fn refresh_found(current: &mut ItemImageInfo, new: &ItemImageInfo) -> bool {
     false
 }
 
-/// An item's own art folders under the metadata `root`: Ferrofin's
-/// `{root}/{ID}` ([`own_art_dir`]), the [`legacy_art_dir`] older scans wrote
-/// some art to, and the `{root}/{xx}/{id:N}` folder Jellyfin's
-/// `BaseItem.GetInternalMetadataPath` uses (`BaseItem.cs:927-937`), which an
-/// adopted database's images keep.
+/// An item's own art folders under the metadata `root`, the one art is saved
+/// in first: [`own_art_dir`], which an adopted database's images keep too,
+/// then the [`earlier_art_dir`] and the [`legacy_art_dir`] earlier builds
+/// saved art in.
 #[must_use]
 pub fn internal_metadata_dirs(root: &Path, item_id: Uuid) -> [PathBuf; 3] {
-    let simple = item_id.simple().to_string();
     [
         own_art_dir(root, item_id),
+        earlier_art_dir(root, item_id),
         legacy_art_dir(root, item_id),
-        root.join(&simple[..2]).join(&simple),
     ]
-}
-
-/// The folder Ferrofin draws an item's art into: `{root}/{ID}`.
-#[must_use]
-pub fn own_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
-    root.join(guid_to_db(item_id))
-}
-
-/// `{root}/{id}`, the item's id lower-cased: where older scans wrote music,
-/// person, studio and embedded-cover art, beside [`own_art_dir`]. Nothing is
-/// written there any more. It is read and cleaned so that art already there
-/// is found, pruned and removed with the item, and its stored paths keep
-/// working.
-#[must_use]
-pub fn legacy_art_dir(root: &Path, item_id: Uuid) -> PathBuf {
-    root.join(item_id.hyphenated().to_string())
 }
 
 /// Port of `ItemImageProvider.RemoveImages` (`ItemImageProvider.cs:74-103`,

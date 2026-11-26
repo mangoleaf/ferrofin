@@ -9,6 +9,7 @@
 //! The commented-out richer per-type schema in the C# `JellyfinDbContext`
 //! (Movie/Episode/Metadata tables) is NOT active upstream and is not ported.
 
+pub mod art;
 pub mod database;
 pub mod entities;
 pub mod enums;
@@ -18,6 +19,7 @@ pub mod item_data;
 pub mod normalized_usernames;
 mod placeholders;
 pub mod presentation_key;
+pub mod repair_markers;
 pub mod row_cache;
 mod sqlite_casing;
 pub mod sqlite_random;

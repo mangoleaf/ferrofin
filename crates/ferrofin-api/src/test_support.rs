@@ -462,6 +462,23 @@ impl AuthService for AuthedAuthService {
     }
 }
 
+/// A fake [`AuthService`] that authenticates as [`authenticated_user_info`]'s
+/// user, with the session's access token, as a browser presents it.
+pub struct SessionAuthService(pub &'static str);
+
+#[async_trait]
+impl AuthService for SessionAuthService {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(AuthorizationInfo {
+            token: Some(ferrofin_model::secret::Secret::new(self.0)),
+            ..authenticated_user_info()
+        })
+    }
+}
+
 /// A valid ordinary test user with a cached policy. Handler-only fakes use this
 /// instead of an authenticated context with neither a user nor an API key.
 #[must_use]
@@ -2972,6 +2989,21 @@ pub fn user_authed_state_with_plugins(
     plugin_state(
         plugins,
         Arc::new(AuthedAuthService),
+        Arc::new(FakeAuthContext),
+    )
+}
+
+/// Like [`user_authed_state_with_plugins`], but the user's session carries
+/// the access token `token` — for routes that tie work to the caller's
+/// session.
+#[must_use]
+pub fn user_session_state_with_plugins(
+    plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
+    token: &'static str,
+) -> AppState {
+    plugin_state(
+        plugins,
+        Arc::new(SessionAuthService(token)),
         Arc::new(FakeAuthContext),
     )
 }

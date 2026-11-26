@@ -19,10 +19,18 @@ use crate::error::ServiceError;
 use crate::session::{AuthenticationRequest, AuthenticationResultData};
 
 /// The cookie that binds a pending OIDC sign-in to the browser that started
-/// it: [`SsoManager::start_oidc_sign_in`] sets it, the callback route reads it
-/// back into [`OidcCallback::flow_cookie`], and the exchange route into
-/// [`SsoManager::exchange_oidc_sign_in`]'s `flow_cookie`.
+/// it, on an `http` public URL: [`SsoManager::start_oidc_sign_in`] sets it,
+/// the callback route reads it back into [`OidcCallback::flow_cookie`], and
+/// the exchange route into [`SsoManager::exchange_oidc_sign_in`]'s
+/// `flow_cookie`. On an `https` public URL the cookie is
+/// [`OIDC_HOST_FLOW_COOKIE`] instead ([`SsoManager::flow_cookie_name`]).
 pub const OIDC_FLOW_COOKIE: &str = "ferrofin_sso_flow";
+
+/// The flow cookie's name on an `https` public URL. Browsers take a
+/// `__Host-` cookie only with `Secure`, `Path=/` and no `Domain`, so no other
+/// host, a sibling subdomain included, can plant one (D23). Only this name is
+/// read there: [`OIDC_FLOW_COOKIE`] is not.
+pub const OIDC_HOST_FLOW_COOKIE: &str = "__Host-ferrofin_sso_flow";
 
 /// What a browser-facing Single Sign-On route answers: a redirect when
 /// [`location`](Self::location) is set, else an HTML page, with the cookies
@@ -81,7 +89,7 @@ pub struct OidcExchangeRefusal {
 
 /// What the identity provider's redirect brought back to
 /// `GET /sso/oidc/{provider}/callback`: its query parameters, and the
-/// browser's [`OIDC_FLOW_COOKIE`]. A callback that repeats any of these
+/// browser's flow cookie. A callback that repeats any of these
 /// parameters is read as having none of them. `Debug` says only which are
 /// present.
 #[derive(Clone, Default)]
@@ -94,7 +102,8 @@ pub struct OidcCallback {
     pub iss: Option<String>,
     /// `error`: the identity provider refused or failed the sign-in.
     pub error: Option<String>,
-    /// The value of the browser's [`OIDC_FLOW_COOKIE`].
+    /// The value of the browser's flow cookie, read under
+    /// [`SsoManager::flow_cookie_name`].
     pub flow_cookie: Option<Secret>,
 }
 
@@ -112,15 +121,37 @@ impl std::fmt::Debug for OidcCallback {
 
 /// The Single Sign-On plugin's operations.
 ///
-/// Every method self-gates on the plugin's enabled flag, reporting
-/// [`ServiceError::NotFound`] while it is disabled, so a disabled plugin's
-/// routes answer as if they did not exist (B1).
+/// Every method but [`pace_oidc`](Self::pace_oidc), which a route calls
+/// once [`ensure_enabled`](Self::ensure_enabled) has passed, self-gates on
+/// the plugin's enabled flag, reporting [`ServiceError::NotFound`] while it
+/// is disabled, so a disabled plugin's routes answer as if they did not
+/// exist (B1).
 #[async_trait]
 pub trait SsoManager: Send + Sync {
     /// Succeeds while the plugin is enabled, and is
     /// [`ServiceError::NotFound`] otherwise, so a route can answer `404`
     /// before it looks at the caller or the request body.
     async fn ensure_enabled(&self) -> Result<(), ServiceError>;
+
+    /// The name of the flow cookie, which the routes read the browser's
+    /// under: [`OIDC_HOST_FLOW_COOKIE`] while the public URL is `https`, else
+    /// [`OIDC_FLOW_COOKIE`]. The plugin sets the cookie under the same name,
+    /// and a cookie under the other name is never read.
+    async fn flow_cookie_name(&self) -> Result<&'static str, ServiceError>;
+
+    /// Counts a request to the paced `route` from `client`, the address the
+    /// server resolved for the caller through its known proxies (D23):
+    /// `None` lets it go on, else the `429` page to answer instead, which
+    /// reflects nothing from the request. An IPv4 address is counted as
+    /// itself, an IPv6 address by its /64, and an IPv4-mapped IPv6 address
+    /// as its IPv4 address. Starts and one-time values are paced apart.
+    ///
+    /// A route calls it once [`ensure_enabled`](Self::ensure_enabled) has
+    /// passed and before it reads the flow cookie, the configuration or
+    /// anything of the request beyond what its extractors took, so a paced
+    /// request costs no configuration read, creates no pending flow, spends
+    /// no one-time value and sends nothing to the identity provider.
+    fn pace_oidc(&self, route: OidcPacedRoute, client: IpAddr) -> Option<SsoReply>;
 
     /// The stored OIDC providers, each with whether a client secret is stored
     /// and its callback URL, and never a secret.
@@ -170,7 +201,7 @@ pub trait SsoManager: Send + Sync {
 
     /// Starts a sign-in at the provider `key` for the browser at `client`:
     /// a redirect to its authorization endpoint (the code flow with PKCE
-    /// `S256`, a `state` and a nonce) that sets the [`OIDC_FLOW_COOKIE`].
+    /// `S256`, a `state` and a nonce) that sets the flow cookie.
     /// When no callback URL can be built, a page naming the public URL
     /// setting; when the provider cannot be reached, the refusal page.
     ///
@@ -184,7 +215,7 @@ pub trait SsoManager: Send + Sync {
     /// to its issuer and subject, else one created and linked when the
     /// provider creates accounts, and the answer is the completion page: it
     /// carries a one-time exchange code for that account, bound to the
-    /// [`OIDC_FLOW_COOKIE`], which it keeps for the exchange, and its script
+    /// flow cookie, which it keeps for the exchange, and its script
     /// swaps the code at [`exchange_oidc_sign_in`](Self::exchange_oidc_sign_in)
     /// and opens jellyfin-web signed in. A sign-in started with
     /// [`start_oidc_quick_connect`](Self::start_oidc_quick_connect) answers
@@ -205,7 +236,7 @@ pub trait SsoManager: Send + Sync {
     ) -> Result<SsoReply, ServiceError>;
 
     /// Swaps the exchange code of a completion page for a session, once:
-    /// `flow_cookie` must be the [`OIDC_FLOW_COOKIE`] the code is bound to,
+    /// `flow_cookie` must be the flow cookie the code is bound to,
     /// and the code at most a minute old. The identity must still be linked
     /// to the account (a link removed since the callback refuses it). The
     /// account must pass the sign-in rules of a password sign-in (disabled,
@@ -239,28 +270,30 @@ pub trait SsoManager: Send + Sync {
     /// disabled plugin; an error only when its configuration cannot be read.
     async fn login_buttons(&self) -> Result<Option<String>, ServiceError>;
 
-    /// The Quick Connect code-entry page (B13): a form for the code a native
-    /// app shows, with a button for each provider that can sign users in,
-    /// each starting
-    /// [`start_oidc_quick_connect`](Self::start_oidc_quick_connect) with the
-    /// code. While Quick Connect is turned off, a `403` page saying so.
+    /// The Quick Connect page (B13): a "Sign in with {name}" link for each
+    /// provider that can sign users in, each starting
+    /// [`start_oidc_quick_connect`](Self::start_oidc_quick_connect). The code
+    /// the app shows is typed after the sign-in, on the confirmation page
+    /// (D23). While Quick Connect is turned off, a `403` page saying so.
     ///
     /// [`ServiceError::NotFound`] while the plugin is disabled, without Quick
     /// Connect approval, and while no provider can sign users in.
     async fn quick_connect_page(&self) -> Result<SsoReply, ServiceError>;
 
     /// Starts a sign-in at the provider `key` whose verified identity approves
-    /// the Quick Connect `code`, as
-    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in) starts one. Its
+    /// a Quick Connect code, as
+    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in) starts one.
+    /// `quick_connect` is the start's `quickConnect` parameter, which holds
+    /// nothing: one that holds anything, a code included, is a `400` page,
+    /// since a link carrying a code can be sent to someone else (D23). Its
     /// callback, at [`finish_oidc_sign_in`](Self::finish_oidc_sign_in), is
     /// checked and finds or creates the account as a sign-in's does, then
     /// answers a confirmation page instead of the completion page: it names
-    /// the code and the account, and holds a one-time confirmation bound to
-    /// the [`OIDC_FLOW_COOKIE`], which it keeps as long, for
+    /// the account, asks for the code the app shows, and holds a one-time
+    /// confirmation bound to the flow cookie, which it keeps as long, for
     /// [`confirm_oidc_quick_connect`](Self::confirm_oidc_quick_connect).
-    /// Nothing is approved before that. A `code` that is not six digits is a
-    /// `400` page, and Quick Connect turned off a `403` one, both before the
-    /// identity provider is contacted.
+    /// Nothing is approved before that. Quick Connect turned off is a `403`
+    /// page. Both refusals come before the identity provider is contacted.
     ///
     /// [`ServiceError::NotFound`] as for `start_oidc_sign_in`, and without
     /// Quick Connect approval.
@@ -268,12 +301,14 @@ pub trait SsoManager: Send + Sync {
         &self,
         key: &str,
         client: IpAddr,
-        code: &str,
+        quick_connect: &str,
     ) -> Result<SsoReply, ServiceError>;
 
-    /// Approves the Quick Connect code of a confirmation page's
-    /// `confirmation`, once: `flow_cookie` must be the [`OIDC_FLOW_COOKIE`] it
-    /// is bound to, and it at most a minute old. The identity must still be
+    /// Approves the Quick Connect `code` typed on a confirmation page, with
+    /// its `confirmation`, once: `flow_cookie` must be the flow cookie the
+    /// confirmation is bound to, and it at most a minute old. The
+    /// confirmation is used up first, so a `code` that is not six digits, or
+    /// that no app is waiting with, spends it. The identity must still be
     /// linked to the account (a link removed since the callback refuses it).
     /// The account must pass the sign-in rules of a password sign-in
     /// (disabled, remote access from the approving browser at `client`,
@@ -282,11 +317,10 @@ pub trait SsoManager: Send + Sync {
     /// browser session is opened. Every answer is a page and clears the
     /// cookie: the app signed in, or why not (`400` for a confirmation or
     /// cookie that does not check out, for an identity no longer linked to
-    /// the account, and for a code that is unknown, expired or approved
-    /// already;
-    /// `403` for Quick Connect turned off, and for an account a sign-in rule
-    /// refuses, which writes an `AuthenticationFailed` activity entry). The
-    /// confirmation is used up by any attempt that reaches it.
+    /// the account, for a `code` that is not one, and for one that is
+    /// unknown, expired or approved already; `403` for Quick Connect turned
+    /// off, and for an account a sign-in rule refuses, which writes an
+    /// `AuthenticationFailed` activity entry).
     ///
     /// [`ServiceError::NotFound`] while the plugin is disabled or without
     /// Quick Connect approval, and an error when the accounts or the sessions
@@ -294,35 +328,59 @@ pub trait SsoManager: Send + Sync {
     async fn confirm_oidc_quick_connect(
         &self,
         confirmation: Option<Secret>,
+        code: Option<&str>,
         flow_cookie: Option<Secret>,
         client: IpAddr,
     ) -> Result<SsoReply, ServiceError>;
 
-    // Linking an account and an identity (B12). Linking never changes the
-    // account's authentication provider or password (D5).
+    // Linking an account and an identity (B12, D22). Linking never changes
+    // the account's authentication provider or password (D5). Each link made
+    // and removed writes a `UserIdentityLinked` or `UserIdentityUnlinked`
+    // activity entry naming the account, the provider and who did it.
 
     /// The link page, `GET /sso/link`: anonymous, its script reads the
     /// session jellyfin-web keeps in the browser and calls the link routes
     /// with it.
     async fn oidc_link_page(&self) -> Result<SsoReply, ServiceError>;
 
-    /// The links of `user_id`, the enabled providers it can link at, and
+    /// The links of `user_id`, the enabled providers it can link at (each
+    /// with whether the account is linked at its issuer already), and
     /// whether the account signs in through Single Sign-On only.
     async fn oidc_links(&self, user_id: Uuid) -> Result<OidcUserLinks, ServiceError>;
 
     /// Starts a link of `user_id` at the provider `key`, for the browser at
-    /// `client`: as [`start_oidc_sign_in`](Self::start_oidc_sign_in) starts a
-    /// sign-in, a redirect that sets the [`OIDC_FLOW_COOKIE`], or a page saying
-    /// why not. Its callback links the verified identity to `user_id`, unless
-    /// another account has it, and ends on a page saying which; it opens no
+    /// `client`, from the session whose access token is `session_token`: as
+    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in) starts a sign-in, a
+    /// redirect that sets the flow cookie, or a page saying why not.
+    ///
+    /// Refused first, with no flow and no cookie:
+    /// [`ServiceError::Forbidden`] for an account whose provider is Single
+    /// Sign-On's (it has no password to confirm with: an administrator adds
+    /// its links), [`ServiceError::Conflict`] for one linked at the
+    /// provider's issuer already (a link is never replaced here: it is
+    /// removed first), [`ServiceError::InvalidInput`] for an empty
+    /// `password`, and [`ServiceError::Forbidden`] for a `password` that does
+    /// not sign the account in. That check goes through the account's own
+    /// authentication provider without opening a session, so a wrong one
+    /// counts as a failed sign-in does and the login backoff paces it.
+    ///
+    /// The flow keeps the session token's hash, never the token. Its callback
+    /// links the verified identity to `user_id` only while that session is
+    /// still one of the account's (a sign-out by any route before the
+    /// callback's write ends the flow),
+    /// unless another account has the identity or the account was linked at
+    /// that issuer since, and ends on a page saying which; it opens no
     /// session.
     ///
     /// [`ServiceError::NotFound`] as for
-    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in).
+    /// [`start_oidc_sign_in`](Self::start_oidc_sign_in), and for an account
+    /// that no longer exists.
     async fn start_oidc_link(
         &self,
         key: &str,
         user_id: Uuid,
+        password: &Secret,
+        session_token: &Secret,
         client: IpAddr,
     ) -> Result<SsoReply, ServiceError>;
 
@@ -331,7 +389,8 @@ pub trait SsoManager: Send + Sync {
     async fn all_oidc_links(&self) -> Result<Vec<OidcAdminLink>, ServiceError>;
 
     /// Links `user_id` to the subject `subject` at the provider `key`'s
-    /// issuer, replacing the account's earlier link at that issuer.
+    /// issuer, replacing the account's earlier link at that issuer, as the
+    /// administrator `by` (nil for an API key).
     ///
     /// [`ServiceError::NotFound`] for an unknown account or provider,
     /// [`ServiceError::InvalidInput`] for an empty subject, one longer than
@@ -340,13 +399,15 @@ pub trait SsoManager: Send + Sync {
     /// identity: nothing is moved.
     async fn add_oidc_link(
         &self,
+        by: Uuid,
         user_id: Uuid,
         key: &str,
         subject: &str,
     ) -> Result<OidcAdminLink, ServiceError>;
 
-    /// Removes the link of `user_id` `at` a provider or an issuer, then signs
-    /// every session of that account out. An exchange code or a Quick
+    /// Removes the link of `user_id` `at` a provider or an issuer, as `by`
+    /// (the account itself, an administrator, or nil for an API key), then
+    /// signs every session of that account out. An exchange code or a Quick
     /// Connect confirmation issued before the removal is refused at
     /// [`exchange_oidc_sign_in`](Self::exchange_oidc_sign_in) or
     /// [`confirm_oidc_quick_connect`](Self::confirm_oidc_quick_connect),
@@ -355,8 +416,27 @@ pub trait SsoManager: Send + Sync {
     /// given another authentication provider.
     ///
     /// [`ServiceError::NotFound`] when there is no such provider or link.
-    async fn remove_oidc_link(&self, user_id: Uuid, at: OidcLinkAt<'_>)
-    -> Result<(), ServiceError>;
+    async fn remove_oidc_link(
+        &self,
+        by: Uuid,
+        user_id: Uuid,
+        at: OidcLinkAt<'_>,
+    ) -> Result<(), ServiceError>;
+}
+
+/// A paced Single Sign-On route ([`SsoManager::pace_oidc`]): one that creates
+/// a pending flow, or one that takes a one-time value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OidcPacedRoute {
+    /// Creates a pending flow: `GET /sso/oidc/{provider}/start`, a sign-in
+    /// or a Quick Connect approval, and `POST /sso/oidc/{provider}/link`.
+    Start,
+    /// Takes the flow's `state`: `GET /sso/oidc/{provider}/callback`.
+    Callback,
+    /// Takes an exchange code: `POST /sso/oidc/exchange`.
+    Exchange,
+    /// Takes a Quick Connect confirmation: `POST /sso/quickconnect`.
+    QuickConnectConfirmation,
 }
 
 /// Which of an account's links: the one at a provider's issuer, named by the

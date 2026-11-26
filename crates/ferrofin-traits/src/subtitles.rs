@@ -200,11 +200,16 @@ pub trait SubtitleManager: Send + Sync {
     /// subtitle delete runs it after the item's refresh: a refresh that probes
     /// the file has already rewritten the rows from the files on disk, as
     /// upstream's does, but one that cannot (no ffprobe, a failed probe)
-    /// leaves them, and the deleted subtitle would stay listed.
+    /// leaves them, and the deleted subtitle would stay listed. When it drops
+    /// one, it stores the item's `HasSubtitles` from the rows left
+    /// ([`MediaStreamRepository::sync_has_subtitles`]).
+    ///
+    /// [`MediaStreamRepository::sync_has_subtitles`]: crate::persistence::MediaStreamRepository::sync_has_subtitles
     ///
     /// # Errors
     ///
-    /// Propagates a storage failure reading or saving the rows.
+    /// Propagates a storage failure reading or saving the rows, or writing
+    /// the flag.
     async fn drop_missing_subtitle_rows(&self, item_id: Uuid) -> Result<(), ServiceError>;
 
     /// Lists the subtitle providers that support the item.

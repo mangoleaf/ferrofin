@@ -246,7 +246,7 @@ async fn a_video_without_artwork_gets_a_grabbed_primary(
     h.scanner.scan_all().await.unwrap();
     assert_eq!(
         images(&h).await,
-        [(0, "primary.jpg".to_owned(), format!("FRAME@{offset}"))]
+        [(0, "poster.jpg".to_owned(), format!("FRAME@{offset}"))]
     );
     assert_eq!(
         h.encoder.grabs.lock().unwrap().clone(),
@@ -378,6 +378,6 @@ async fn replacing_all_images_grabs_again_from_the_stored_streams() {
     );
     assert_eq!(
         images(&h).await,
-        [(0, "primary.jpg".to_owned(), "FRAME@600000000".to_owned())]
+        [(0, "poster.jpg".to_owned(), "FRAME@600000000".to_owned())]
     );
 }

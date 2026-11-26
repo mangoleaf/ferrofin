@@ -728,7 +728,7 @@ pub async fn seed_user(db: &Database, id: Uuid) -> UserEntity {
 /// libraries comes back empty. Tests that browse as a real user want this.
 pub async fn grant_default_permissions(db: &Database, id: Uuid) {
     let mut tx = db.writer().begin().await.expect("begin");
-    crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(id))
+    crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(id), &[])
         .await
         .expect("default permissions");
     tx.commit().await.expect("commit");
@@ -1066,6 +1066,7 @@ pub fn by_name_identity() -> crate::item_type_lookup::ByNameIdentity {
         "/config/metadata/Genre",
         "/config/metadata/MusicGenre",
         "/config/metadata/Studio",
+        "/config/metadata/artists",
     )
     .expect("a Jellyfin-mode identity")
 }

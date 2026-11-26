@@ -433,7 +433,7 @@ fn extension_of(path: &str) -> String {
 /// sees it: a size that rounds an axis to 0, a source the decoder rejects
 /// (corrupt, truncated, a read error mid-decode), one over the
 /// [`ImageLimits`](crate::ImageLimits), a resize past their budget, a JPEG
-/// output past 65535 px, or a WebP output past 16383 px. A failed encode writes no
+/// output past 65500 px, or a WebP output past 16383 px. A failed encode writes no
 /// cache file, so it recurs on every request for that image and its volume
 /// grows with items × requests; LOGGING.md §1 keeps that at `debug`.
 /// Everything else (cache-dir I/O, an unreadable or removed source, codec or

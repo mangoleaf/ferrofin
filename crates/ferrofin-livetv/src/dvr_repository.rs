@@ -424,6 +424,20 @@ pub async fn delete_recording(db: &Database, recording_id: Uuid) -> Result<(), S
     Ok(())
 }
 
+/// Deletes every recording row of the timer `timer_id`.
+///
+/// # Errors
+///
+/// Fails when the write fails.
+pub async fn delete_timer_recordings(db: &Database, timer_id: &str) -> Result<(), ServiceError> {
+    sqlx::query(r#"DELETE FROM "FerrofinLiveTvRecordings" WHERE "TimerId" = ?1"#)
+        .bind(timer_id)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
 /// Deletes the finished recordings whose file is `path` or under it. A capture
 /// in progress keeps its row, and a blank or root `path` names nothing: it
 /// would otherwise match every recording.

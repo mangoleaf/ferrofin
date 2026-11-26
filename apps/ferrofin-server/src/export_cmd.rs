@@ -13,13 +13,15 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use ferrofin_core::config_export::{self, ConfigExport};
+use ferrofin_core::config_export::{self, ConfigExport, LiveTvExport};
 use ferrofin_db::export::{
-    ContainerFile, DOCKER, DatabaseEdits, EXPORTED_DATABASE, ExportSummary, HistoryRewrite,
-    LOSS_REPORT, LeftOut, LibraryContainer, Preflight, SourceDirs,
+    ContainerFile, DOCKER, DatabaseEdits, EXPORTED_DATABASE, ExportSummary, LOSS_REPORT, LeftOut,
+    LibraryContainer, Preflight, SourceDirs,
 };
 
 use crate::config::Config;
+
+pub mod plugins;
 
 /// The `export-jellyfin` subcommand's arguments. The source is the data
 /// directory the server would use (`--data-dir`, `FERROFIN_DATA_DIR`,
@@ -43,6 +45,10 @@ const PROBE_ANSWER_LIMIT: usize = 64 * 1024;
 
 /// Jellyfin's backups directory under the output (`{DataPath}/backups`).
 const JELLYFIN_BACKUPS: &str = "data/backups";
+
+/// Where Ferrofin keeps its scheduled tasks' last results, relative to its
+/// data directory.
+const TASK_RESULTS: &str = "task_results.json";
 
 /// Exports `config`'s data directory into `args.out`, in the layout of
 /// Jellyfin's docker image ([`DOCKER`]), writes the loss report into it
@@ -111,12 +117,10 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
         let libraries = library_options(config, &summary, libraries).await?;
         configuration.files.extend(libraries.files);
         configuration.not_exported.extend(libraries.not_exported);
+        let mut inputs = report_inputs(config, &dirs, &summary, &partial).await?;
+        live_tv_and_plugins(config, &summary, &partial, &mut configuration, &mut inputs).await?;
         write_configuration(&configuration, &partial).await?;
-        let report = loss_report(
-            &summary.edits,
-            &configuration,
-            &report_inputs(config, &dirs, &summary, &partial).await?,
-        );
+        let report = loss_report(&summary.edits, &configuration, &inputs);
         let written = partial.join(LOSS_REPORT);
         tokio::fs::write(&written, &report)
             .await
@@ -206,8 +210,11 @@ async fn library_options(
 
 /// The directories of `config`'s server, as the export reads them: its
 /// metadata directory as its settings name it (the default when they cannot
-/// be read, which the configuration's read then refuses), and its cache, log
-/// and web client directories, which hold nothing Jellyfin reads.
+/// be read, which the configuration's read then refuses), its cache, log
+/// and web client directories, which hold nothing Jellyfin reads, and its own
+/// files Jellyfin does not read: the configuration the export writes as
+/// Jellyfin's XML, which a later adoption by Ferrofin would read over the XML
+/// Jellyfin kept, and the scheduled tasks' last results.
 fn source_dirs(config: &Config) -> SourceDirs {
     SourceDirs {
         program_data: config.data_dir.clone(),
@@ -219,6 +226,11 @@ fn source_dirs(config: &Config) -> SourceDirs {
             config.data_dir.join("log"),
             config.web_dir.clone(),
         ],
+        not_needed_files: config_export::exported_sources(&config.config_dir)
+            .into_iter()
+            .chain(plugins::exported_sources(config))
+            .chain([config.data_dir.join(TASK_RESULTS)])
+            .collect(),
     }
 }
 
@@ -256,7 +268,7 @@ fn print_paths(config: &Config, target: &Path, summary: &ExportSummary) {
     println!(
         "It is in the layout of Jellyfin's docker image, for a volume mounted at {}: {} rewritten onto it{}.",
         DOCKER.program_data,
-        count(paths.rows, "stored path was", "stored paths were"),
+        count(paths.rewritten, "stored path was", "stored paths were"),
         if paths.stored.is_empty() {
             String::new()
         } else {
@@ -266,6 +278,14 @@ fn print_paths(config: &Config, target: &Path, summary: &ExportSummary) {
             )
         }
     );
+    let moved = summary.edits.art.moved.len() as u64;
+    if moved > 0 {
+        println!(
+            "{} that earlier Ferrofin builds saved in an item's {}/library/{{ID}} or {{id}} folder moved into the item's own folder, where Jellyfin keeps its art, each under the name Jellyfin gives it.",
+            count(moved, "image", "images"),
+            DOCKER.metadata()
+        );
+    }
     let elsewhere = ran_elsewhere(config, summary);
     if !elsewhere.is_empty() {
         println!(
@@ -325,6 +345,11 @@ fn print_summary(
             history.recorded.len(),
             history.left_to_run.len()
         );
+    } else {
+        println!(
+            "Its Jellyfin migration history (the database was never adopted from Jellyfin): the {} migrations a fresh install of Jellyfin records, so Jellyfin runs none on its first start.",
+            history.recorded.len()
+        );
     }
     if replaced {
         println!(
@@ -363,6 +388,14 @@ struct ReportInputs {
     /// The playlists and box sets in media libraries with a metadata file
     /// Jellyfin may read, or whose path was not found.
     library_containers: Vec<LibraryContainer>,
+    /// What the Live TV export wrote and left (its files already written).
+    live_tv: LiveTvExport,
+    /// The timers and series timers in the source's own files (Jellyfin's,
+    /// from before adoption) that are not Ferrofin's, which the export
+    /// replaced.
+    adopted_timers: (usize, usize),
+    /// What the plugin export wrote and left (its files already written).
+    plugins: plugins::PluginsExport,
 }
 
 /// Reads what the loss report needs from the files: the size of
@@ -390,7 +423,7 @@ async fn report_inputs(
     let mut task_state = false;
     for file in [
         config.config_dir.join("task_triggers.json"),
-        config.data_dir.join("task_results.json"),
+        config.data_dir.join(TASK_RESULTS),
     ] {
         task_state |= tokio::fs::try_exists(&file)
             .await
@@ -419,7 +452,74 @@ async fn report_inputs(
         metadata_missing: metadata_missing(config, dirs),
         container_files: summary.container_files.clone(),
         library_containers: summary.library_containers.clone(),
+        ..ReportInputs::default()
     })
+}
+
+/// Adds the Live TV files and the plugin settings to `configuration`, from the
+/// rows the export of `summary` carried out of the database and the source's
+/// plugin settings, and what they wrote and left to `inputs`; `partial` is the
+/// output so far, whose copies of the source's files tell what a source kept.
+async fn live_tv_and_plugins(
+    config: &Config,
+    summary: &ExportSummary,
+    partial: &Path,
+    configuration: &mut ConfigExport,
+    inputs: &mut ReportInputs,
+) -> anyhow::Result<()> {
+    let carried = &summary.edits.carried;
+    inputs.live_tv =
+        config_export::export_live_tv(&config.config_dir, carried, &summary.edits.paths)
+            .context("its Live TV settings cannot be written")?;
+    inputs.adopted_timers = adopted_timers(partial, &inputs.live_tv.files).await?;
+    inputs.plugins = plugins::export(
+        config,
+        &carried.identity_links,
+        &summary.edits.paths,
+        partial,
+    )
+    .await?;
+    for written in [&mut inputs.live_tv.files, &mut inputs.plugins.files] {
+        let written = std::mem::take(written);
+        configuration.files.extend(written.files);
+        configuration.not_exported.extend(written.not_exported);
+    }
+    Ok(())
+}
+
+/// How many timers and series timers the output's copies of the source's
+/// `data/livetv/timers.json` and `seriestimers.json` (Jellyfin's, kept since
+/// before adoption) hold that `exported`'s do not: ones Ferrofin did not
+/// import (an adoption by a version before the import) or has removed since,
+/// and the export replaces the files. A file that is not there, or that
+/// Jellyfin could not read either, holds none.
+async fn adopted_timers(out: &Path, exported: &ConfigExport) -> anyhow::Result<(usize, usize)> {
+    let ids = |json: &[u8]| -> Vec<String> {
+        serde_json::from_slice::<Vec<serde_json::Value>>(json)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|timer| Some(timer.get("Id")?.as_str()?.to_owned()))
+            .collect()
+    };
+    let mut counts = [0, 0];
+    for (count, file) in counts.iter_mut().zip([
+        config_export::LIVE_TV_TIMERS_FILE,
+        config_export::LIVE_TV_SERIES_TIMERS_FILE,
+    ]) {
+        let path = out.join(file);
+        let before = match tokio::fs::read(&path).await {
+            Ok(json) => ids(&json),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
+        };
+        let ours = exported
+            .files
+            .iter()
+            .find(|f| f.path == file)
+            .map_or_else(Vec::new, |f| ids(f.contents.as_bytes()));
+        *count = before.iter().filter(|id| !ours.contains(id)).count();
+    }
+    Ok((counts[0], counts[1]))
 }
 
 /// The loss report: what the export removed from the database (`edits`), what
@@ -438,7 +538,7 @@ fn loss_report(
     use std::fmt::Write as _;
 
     let mut report = String::from("What the export to Jellyfin left behind\n");
-    report.push_str("\nFerrofin-only data in the database, removed from the export:\n");
+    report.push_str("\nFerrofin's own tables, removed from the exported database (what each held, and where it went):\n");
     for table in &edits.dropped.tables {
         let _ = writeln!(
             report,
@@ -459,7 +559,7 @@ fn loss_report(
         report.push_str("  None.\n");
     }
 
-    first_start(&mut report, &edits.history, inputs.database_bytes);
+    first_start(&mut report, edits, inputs.database_bytes);
 
     report.push_str("\nSettings Jellyfin is not given:\n");
     for setting in &configuration.not_exported {
@@ -470,8 +570,14 @@ fn loss_report(
         );
     }
     report.push_str(
-        "  Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported.\n",
+        "  Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported, but for the MusicBrainz server and the Studio Images repository, which outrank those plugins' own settings and are written into them.\n",
     );
+    report.push_str(
+        "  Ferrofin's own files for the documents and plugin settings written as XML (system.json, the documents in config/users/named, a written plugin's config.json) are left out of the copy, so the settings listed above from those documents and plugins are not in the output in any form.\n",
+    );
+
+    live_tv(&mut report, edits, inputs);
+    plugin_lines(&mut report, &inputs.plugins);
 
     report.push_str("\nFiles and stored paths:\n");
     for (dir, why) in &inputs.left_out {
@@ -487,10 +593,19 @@ fn loss_report(
             "  The database's root and library rows name another data directory than the one exported: the server ran at another path, or the directory moved since. The stored paths under it were rewritten for Jellyfin too; the export printed both directories.\n",
         );
     }
+    let kept = &edits.art.kept;
+    if let Some(first) = kept.first() {
+        let _ = writeln!(
+            report,
+            "  {} that earlier Ferrofin builds saved in an item's {{ID}} or {{id}} folder stayed there (the first: {first}): the name Jellyfin gives each in the item's own folder is another stored image's. Jellyfin serves each, but does not count it as the item's own art: a collage or a library tile there is never drawn again, and the folder is left behind when the item is deleted.",
+            count(kept.len() as u64, "image", "images")
+        );
+    }
     container_files(&mut report, inputs);
     if inputs.left_out.is_empty()
         && !inputs.metadata_missing
         && !inputs.ran_elsewhere
+        && kept.is_empty()
         && inputs.container_files.is_empty()
         && inputs.library_containers.is_empty()
     {
@@ -600,16 +715,166 @@ fn container_files(report: &mut String, inputs: &ReportInputs) {
     }
 }
 
-/// The loss report's section on what Jellyfin changes on its first start: the
-/// code migrations `history` leaves to run, and the room they take beside a
-/// database of `database_bytes`.
-fn first_start(report: &mut String, history: &HistoryRewrite, database_bytes: u64) {
+/// The loss report's section on Live TV (gl-1556): what was written for
+/// Jellyfin, the channels and programmes kept as items, and what the operator
+/// must do or mount.
+fn live_tv(report: &mut String, edits: &DatabaseEdits, inputs: &ReportInputs) {
     use std::fmt::Write as _;
 
+    let (tv, mirrored) = (&inputs.live_tv, &edits.carried.mirrored);
+    report.push_str("\nLive TV:\n");
+    let _ = writeln!(
+        report,
+        "  Written for Jellyfin: {} and {} in config/livetv.xml, {} ({} among them) in {}, {} in {}.",
+        count(tv.tuners as u64, "tuner", "tuners"),
+        count(tv.guides as u64, "guide provider", "guide providers"),
+        count(tv.timers as u64, "timer", "timers"),
+        count(
+            tv.recordings as u64,
+            "completed recording",
+            "completed recordings"
+        ),
+        config_export::LIVE_TV_TIMERS_FILE,
+        count(tv.series_timers as u64, "series timer", "series timers"),
+        config_export::LIVE_TV_SERIES_TIMERS_FILE,
+    );
+    if mirrored.channels + mirrored.programs > 0 {
+        let _ = writeln!(
+            report,
+            "  Kept in the database: {} and {}, which Jellyfin reads as its own, with the users' data on them ({}). Jellyfin's guide refresh updates them in place where it derives the same ids, which was checked for an M3U tuner with an XMLTV guide; for an HDHomeRun tuner or a Schedules Direct guide it was not, and a channel or programme whose id Jellyfin derives differently is replaced at the refresh, its favourites and the timers on it with it.",
+            count(mirrored.channels, "channel", "channels"),
+            count(mirrored.programs, "guide programme", "guide programmes"),
+            count(
+                mirrored.favorite_channels,
+                "favourite channel",
+                "favourite channels"
+            ),
+        );
+    }
+    if tv.tuners > 0 {
+        report.push_str(
+            "  Before Jellyfin's first guide refresh (its schedule runs one an hour after its start at the earliest; run Refresh Guide in its scheduled tasks to have it at once), make sure every tuner answers from inside Jellyfin's container: a refresh that cannot read a tuner's channels deletes them, with their favourites, their guide and every timer on them, as Jellyfin does on any refresh. A guide it cannot read leaves the channels, the guide and the timers as they are.\n",
+        );
+    }
+    let (timers, series) = inputs.adopted_timers;
+    if timers + series > 0 {
+        let _ = writeln!(
+            report,
+            "  {} and {} that Jellyfin kept before adoption and Ferrofin does not hold are replaced by Ferrofin's.",
+            count(timers as u64, "timer", "timers"),
+            count(series as u64, "series timer", "series timers"),
+        );
+    }
+    for (setting, path) in &tv.outside {
+        let _ = writeln!(
+            report,
+            "  {setting}: {path} is outside the data directory, so it is written as it is: Jellyfin's container must reach it at that path."
+        );
+    }
+    for (tuner, path) in &tv.tuner_files {
+        let _ = writeln!(
+            report,
+            "  Tuner {tuner}: its playlist {path} is a file, written as it is because every channel's id is derived from it: make it readable at that path in Jellyfin's container, or Jellyfin's guide refresh finds no channels and deletes them."
+        );
+    }
+    for (tuner, url) in &tv.tuner_loopback {
+        let _ = writeln!(
+            report,
+            "  Tuner {tuner}: it is at {url}, a loopback address, which inside Jellyfin's container is the container itself: written as it is because every channel's id is derived from it, so give the container that address (host networking), or Jellyfin's guide refresh finds no channels and deletes them."
+        );
+    }
+    if !tv.unreadable.is_empty() {
+        let _ = writeln!(
+            report,
+            "  Not written, as their stored settings could not be read: {}.",
+            tv.unreadable.join(", ")
+        );
+    }
+}
+
+/// The loss report's section on plugin settings (gl-1556, D7).
+fn plugin_lines(report: &mut String, plugins: &plugins::PluginsExport) {
+    use std::fmt::Write as _;
+
+    report.push_str("\nPlugins:\n");
+    if !plugins.written.is_empty() {
+        let _ = writeln!(
+            report,
+            "  Settings written for Jellyfin in {}: {}.",
+            config_export::PLUGIN_CONFIGURATIONS,
+            plugins.written.join(", ")
+        );
+    }
+    let installed: Vec<&str> = plugins
+        .written
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            !ferrofin_providers::builtin_plugins::ALL
+                .iter()
+                .any(|bundled| bundled.name == *name)
+        })
+        .collect();
+    if !installed.is_empty() {
+        let _ = writeln!(
+            report,
+            "  Not part of Jellyfin, so read only once installed from its plugin catalogue: {}.",
+            installed.join(", ")
+        );
+    }
+    if plugins.written.iter().any(|name| name == "LDAP-Auth") {
+        let _ = writeln!(
+            report,
+            "  LDAP-Auth: {} from directory uids to users in its settings; until the plugin is installed, the users who sign in through it cannot sign in.",
+            count(plugins.ldap_users as u64, "link", "links")
+        );
+    }
+    for setting in &plugins.host_paths {
+        let _ = writeln!(
+            report,
+            "  LDAP-Auth's {setting} names a file on Ferrofin's server, written as it is: Jellyfin's container must reach it at that path."
+        );
+    }
+    if !plugins.kept.is_empty() {
+        let _ = writeln!(
+            report,
+            "  Kept as Jellyfin left them before adoption, as Ferrofin never held settings for them: the settings of {}.",
+            plugins.kept.join(", ")
+        );
+    }
+    if !plugins.without_counterpart.is_empty() {
+        let _ = writeln!(
+            report,
+            "  No Jellyfin counterpart, so their settings are not carried: {}.",
+            plugins.without_counterpart.join(", ")
+        );
+    }
+    if plugins.written.is_empty()
+        && plugins.kept.is_empty()
+        && plugins.without_counterpart.is_empty()
+    {
+        report.push_str("  None.\n");
+    }
+}
+
+/// The loss report's section on what Jellyfin changes on its first start: the
+/// code migrations the history `edits` wrote leaves to run, each with the rows
+/// it changes where they were counted, the room they take beside a database of
+/// `database_bytes`, and the code migrations it records as applied, with why.
+fn first_start(report: &mut String, edits: &DatabaseEdits, database_bytes: u64) {
+    use std::fmt::Write as _;
+
+    let (history, counts) = (&edits.history, &edits.counts);
+    let routine = |report: &mut String, name: &str, text: &str| {
+        let _ = writeln!(report, "  {name}: {text}.");
+        if let Some(here) = counts.note(name) {
+            let _ = writeln!(report, "    Here: {here}.");
+        }
+    };
     report.push_str("\nWhat Jellyfin will change on its first start");
     let Some(generation) = history.generation else {
         report.push_str(
-            ":\n  Not known: the database was never adopted from Jellyfin, so it has no Jellyfin migration history.\n",
+            ":\n  None: the database was never adopted from Jellyfin, so its history is the one a fresh install of Jellyfin records, and Jellyfin runs no migration.\n",
         );
         return;
     };
@@ -617,23 +882,32 @@ fn first_start(report: &mut String, history: &HistoryRewrite, database_bytes: u6
         report,
         ", running the code migrations its history leaves out (the database was adopted as Jellyfin {generation}):"
     );
-    for (routine, effect) in ferrofin_db::export::first_start_effects(&history.left_to_run) {
-        let _ = writeln!(report, "  {routine}: {effect}.");
+    for (name, effect) in ferrofin_db::export::first_start_effects(&history.left_to_run) {
+        routine(report, name, effect);
     }
     if history.left_to_run.is_empty() {
         report.push_str("  None.\n");
-        return;
+    } else {
+        // One copy for the backup, one for the VACUUM that follows the migrations.
+        // Jellyfin copies only for a routine marked `JellyfinMigrationBackup(JellyfinDb
+        // = true)`; every set a supported source leaves holds one
+        // (HarmonizeConflictingUserData among them), so every non-empty one copies.
+        let _ = writeln!(
+            report,
+            "  Before them Jellyfin copies the database ({}) into data/SQLiteBackups, and after them it rebuilds it, so the output's volume needs about {} free besides the export. A start whose migrations fail restores the database from that copy and keeps the copy, one more each time.",
+            mebibytes(database_bytes),
+            mebibytes(database_bytes.saturating_mul(2))
+        );
     }
-    // One copy for the backup, one for the VACUUM that follows the migrations.
-    // Jellyfin copies only for a routine marked `JellyfinMigrationBackup(JellyfinDb
-    // = true)`; every set a supported source leaves holds one
-    // (HarmonizeConflictingUserData among them), so every non-empty one copies.
-    let _ = writeln!(
-        report,
-        "  Before them Jellyfin copies the database ({}) into data/SQLiteBackups, and after them it rebuilds it, so the output's volume needs about {} free besides the export. A start whose migrations fail restores the database from that copy and keeps the copy, one more each time.",
-        mebibytes(database_bytes),
-        mebibytes(database_bytes.saturating_mul(2))
-    );
+    let applied = ferrofin_db::export::recorded_as_applied(&history.recorded);
+    if !applied.is_empty() {
+        report.push_str(
+            "\nWhat Jellyfin does not run, as Ferrofin already did it (its history marks it done):\n",
+        );
+        for (name, why) in applied {
+            routine(report, name, why);
+        }
+    }
 }
 
 /// `n` and the noun for it, `one` or `many`.
@@ -838,7 +1112,9 @@ fn refuse_running_server(config: &Config, port: u16, base_url: &str) -> anyhow::
 /// Writes `export`'s files under `out`. Each goes through a `.partial` file and
 /// a rename, which also replaces a copy the source left read-only. A directory
 /// the source left read-only (the copy keeps its mode) cannot take one, and the
-/// export fails, naming it.
+/// export fails, naming it. A private file (one that can hold a password or a
+/// key) is created readable by its owner alone, then given the mode of the copy
+/// it replaces, if any, once written.
 async fn write_configuration(export: &ConfigExport, out: &Path) -> anyhow::Result<()> {
     for file in &export.files {
         let path = out.join(&file.path);
@@ -849,9 +1125,46 @@ async fn write_configuration(export: &ConfigExport, out: &Path) -> anyhow::Resul
         }
         let mut partial = path.clone().into_os_string();
         partial.push(".partial");
-        tokio::fs::write(&partial, &file.contents)
+        let partial = PathBuf::from(partial);
+        // A `.partial` the source happened to hold is not reused: a file is
+        // created here, with the mode below.
+        match tokio::fs::remove_file(&partial).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("could not replace {}", partial.display()));
+            }
+            _ => {}
+        }
+        let mut options = tokio::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // A private file is created with its mode, never readable by others
+        // even for a moment: the output's directories have the source's modes
+        // by now. The replaced copy's mode is set exactly once written, as the
+        // umask may have narrowed it.
+        #[cfg(unix)]
+        let mode = if file.private {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = tokio::fs::metadata(&path)
+                .await
+                .map_or(0o600, |replaced| replaced.permissions().mode() & 0o7777);
+            options.mode(mode & 0o700);
+            Some(mode)
+        } else {
+            None
+        };
+        let written = async {
+            let mut handle = options.open(&partial).await?;
+            tokio::io::AsyncWriteExt::write_all(&mut handle, file.contents.as_bytes()).await?;
+            tokio::io::AsyncWriteExt::flush(&mut handle).await?;
+            #[cfg(unix)]
+            if let Some(mode) = mode {
+                use std::os::unix::fs::PermissionsExt as _;
+                tokio::fs::set_permissions(&partial, std::fs::Permissions::from_mode(mode)).await?;
+            }
+            std::io::Result::Ok(())
+        };
+        written
             .await
-            .with_context(|| format!("could not write {}", Path::new(&partial).display()))?;
+            .with_context(|| format!("could not write {}", partial.display()))?;
         tokio::fs::rename(&partial, &path)
             .await
             .with_context(|| format!("could not replace {}", path.display()))?;
@@ -861,13 +1174,13 @@ async fn write_configuration(export: &ConfigExport, out: &Path) -> anyhow::Resul
 
 #[cfg(test)]
 mod tests {
-    use ferrofin_core::config_export::{ConfigExport, NotExported};
+    use ferrofin_core::config_export::{ConfigExport, LiveTvExport, NotExported};
     use ferrofin_db::export::{
-        ContainerFile, DatabaseEdits, DroppedObjects, DroppedTable, HistoryRewrite,
-        LibraryContainer,
+        ArtRelocation, CarriedRows, ContainerFile, DatabaseEdits, DroppedObjects, DroppedTable,
+        FirstStartCounts, HistoryRewrite, LibraryContainer, MirroredLiveTv,
     };
 
-    use super::{ReportInputs, amount, loss_report, mebibytes};
+    use super::{ReportInputs, amount, loss_report, mebibytes, plugins};
 
     fn table(name: &str, rows: u64) -> DroppedTable {
         DroppedTable {
@@ -876,15 +1189,52 @@ mod tests {
         }
     }
 
-    /// Every kind of line the report has, in its order: the golden file is
-    /// what an operator reads.
-    #[test]
-    fn the_loss_report_reads_as_its_golden_file() {
-        let edits = DatabaseEdits {
+    /// The Live TV and plugin lines of [`the_loss_report_reads_as_its_golden_file`].
+    fn with_live_tv_and_plugins(inputs: &mut ReportInputs) {
+        inputs.live_tv = LiveTvExport {
+            tuners: 2,
+            guides: 1,
+            timers: 3,
+            recordings: 1,
+            series_timers: 1,
+            outside: vec![("MovieRecordingPath".to_owned(), "/mnt/films".to_owned())],
+            tuner_files: vec![("Attic".to_owned(), "/srv/ferrofin/tuner.m3u".to_owned())],
+            tuner_loopback: vec![("Lounge".to_owned(), "http://127.0.0.1:5004".to_owned())],
+            unreadable: vec!["a timer".to_owned()],
+            ..LiveTvExport::default()
+        };
+        inputs.adopted_timers = (2, 1);
+        inputs.plugins = plugins::PluginsExport {
+            written: vec![
+                "TMDb".to_owned(),
+                "LDAP-Auth".to_owned(),
+                "Intro Skipper".to_owned(),
+            ],
+            ldap_users: 2,
+            kept: vec!["Merge Versions".to_owned()],
+            without_counterpart: vec![
+                "Single Sign-On".to_owned(),
+                "a WASM plugin (5f0e8d1c-0000-4000-8000-000000000001)".to_owned(),
+            ],
+            host_paths: vec!["LdapRootCaPath"],
+            ..plugins::PluginsExport::default()
+        };
+    }
+
+    /// The database edits of [`the_loss_report_reads_as_its_golden_file`]: every kind of
+    /// first-start line among them.
+    fn golden_edits() -> DatabaseEdits {
+        DatabaseEdits {
             history: HistoryRewrite {
                 generation: Some("10.11.8"),
-                recorded: vec!["20260113102337_AddLinkedChildrenTable"],
+                recorded: vec![
+                    "20260113102337_AddLinkedChildrenTable",
+                    "20260113120000_MigrateLinkedChildren",
+                    "20260115120000_FixIncorrectOwnerIdRelationships",
+                    "20260915120000_MigrateRatingLevels",
+                ],
                 left_to_run: vec![
+                    "20260508130000_MergeDuplicatePeople",
                     "20260522092304_UpdateNormalizedUsername",
                     "20260531160000_DisableLegacyAuthorization",
                     "20260912120000_HarmonizeConflictingUserData",
@@ -902,8 +1252,39 @@ mod tests {
                     "FerrofinIX_UserData_UserId".to_owned(),
                 ],
             },
+            carried: CarriedRows {
+                mirrored: MirroredLiveTv {
+                    channels: 2,
+                    programs: 8,
+                    favorite_channels: 1,
+                },
+                ..CarriedRows::default()
+            },
+            counts: FirstStartCounts {
+                shared_paths: 2,
+                persons: 1,
+                credits: 3,
+                play_states: 1,
+                ..FirstStartCounts::default()
+            },
+            art: ArtRelocation {
+                kept: vec![
+                    "/config/metadata/library/CCCCCCCC-0000-4000-8000-000000000003/primary.jpg"
+                        .to_owned(),
+                    "/config/metadata/library/DDDDDDDD-0000-4000-8000-000000000004/thumb.jpg"
+                        .to_owned(),
+                ],
+                ..ArtRelocation::default()
+            },
             ..DatabaseEdits::default()
-        };
+        }
+    }
+
+    /// Every kind of line the report has, in its order: the golden file is
+    /// what an operator reads.
+    #[test]
+    fn the_loss_report_reads_as_its_golden_file() {
+        let edits = golden_edits();
         let configuration = ConfigExport {
             files: Vec::new(),
             not_exported: vec![NotExported {
@@ -912,7 +1293,7 @@ mod tests {
                 reason: "a path in Ferrofin's filesystem",
             }],
         };
-        let inputs = ReportInputs {
+        let mut inputs = ReportInputs {
             database_bytes: 43_198_464,
             backups: 2,
             task_state: true,
@@ -963,16 +1344,18 @@ mod tests {
                     found: true,
                 },
             ],
+            ..ReportInputs::default()
         };
+        with_live_tv_and_plugins(&mut inputs);
         assert_eq!(
             loss_report(&edits, &configuration, &inputs),
             include_str!("export_cmd/testdata/loss_report.txt")
         );
     }
 
-    /// A Ferrofin-native database has no Jellyfin history to tell what
-    /// Jellyfin runs from, and a source without backups or task state leaves
-    /// nothing outside the database.
+    /// A Ferrofin-native database is given a fresh install's history, on
+    /// which Jellyfin runs nothing, and a source without backups or task
+    /// state leaves nothing outside the database.
     #[test]
     fn an_empty_section_says_so() {
         let edits = DatabaseEdits {
@@ -986,7 +1369,7 @@ mod tests {
         let report = loss_report(&edits, &ConfigExport::default(), &ReportInputs::default());
         assert!(
             report.contains(
-                "What Jellyfin will change on its first start:\n  Not known: the database was never adopted from Jellyfin, so it has no Jellyfin migration history.\n\nSettings Jellyfin is not given:\n  Settings given"
+                "What Jellyfin will change on its first start:\n  None: the database was never adopted from Jellyfin, so its history is the one a fresh install of Jellyfin records, and Jellyfin runs no migration.\n\nSettings Jellyfin is not given:\n  Settings given"
             ),
             "{report}"
         );
@@ -1011,6 +1394,52 @@ mod tests {
             "{report}"
         );
         assert!(!report.contains("SQLiteBackups"), "{report}");
+    }
+
+    /// A private file replacing a copy keeps the copy's mode; a new one is
+    /// its owner's alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_private_file_keeps_the_replaced_mode_or_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use ferrofin_core::config_export::ExportedFile;
+
+        let out = tempfile::tempdir().expect("tempdir");
+        let replaced = out.path().join("plugins/configurations/LDAP-Auth.xml");
+        std::fs::create_dir_all(replaced.parent().expect("parent")).expect("dir");
+        std::fs::write(&replaced, "old").expect("write");
+        std::fs::set_permissions(&replaced, std::fs::Permissions::from_mode(0o640)).expect("mode");
+        let file = |path: &str, private| ExportedFile {
+            path: path.to_owned(),
+            contents: "new".to_owned(),
+            private,
+        };
+        let export = ConfigExport {
+            files: vec![
+                file("plugins/configurations/LDAP-Auth.xml", true),
+                file("config/livetv.xml", true),
+                file("config/system.xml", false),
+            ],
+            not_exported: Vec::new(),
+        };
+        super::write_configuration(&export, out.path())
+            .await
+            .expect("writes");
+        let mode = |path: &str| {
+            std::fs::metadata(out.path().join(path))
+                .expect("written")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("plugins/configurations/LDAP-Auth.xml"), 0o640);
+        assert_eq!(mode("config/livetv.xml"), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&replaced).expect("read"),
+            "new",
+            "replaced"
+        );
     }
 
     #[test]

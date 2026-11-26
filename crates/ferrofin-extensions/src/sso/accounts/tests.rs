@@ -5,7 +5,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore;
-use ferrofin_traits::external_identities::{ExternalIdentity, ExternalIdentityStore};
+use ferrofin_traits::external_identities::{
+    ConditionalLink, ExternalIdentity, ExternalIdentityStore, LinkBy,
+};
 use ferrofin_traits::library::UserManager;
 use ferrofin_traits::sso::SsoManager as _;
 use serde_json::{Value, json};
@@ -56,7 +58,12 @@ async fn a_first_sign_in_creates_an_account_with_the_password_refusing_provider_
     let created = user(&harness, USERNAME).await.expect("created");
     assert_eq!(created.authentication_provider_id, PROVIDER_ID);
     assert_eq!(created.password_reset_provider_id, PROVIDER_ID);
-    assert_eq!(created.password, None);
+    // D21: a password no one knows, in the default provider's format.
+    let password = created.password.as_deref().expect("a password hash");
+    assert!(
+        password.starts_with("$PBKDF2-SHA512$iterations=210000$"),
+        "{password}"
+    );
     let link = harness
         .identities
         .find(identity(&harness.fake.issuer(), SUBJECT))
@@ -123,7 +130,7 @@ async fn with_create_users_off_an_unlinked_identity_is_refused_and_no_account_is
     assert!(reply.html.contains(r#"<a href="../../../web/">"#));
     assert_eq!(
         reply.set_cookies,
-        ["ferrofin_sso_flow=; Path=/jf/sso; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
+        ["__Host-ferrofin_sso_flow=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"]
     );
     assert_eq!(user_count(&harness).await, 0);
 
@@ -231,7 +238,10 @@ async fn regression_jellyfin_10_11_a_created_account_never_signs_in_with_a_passw
     ] {
         assert!(matches!(set, Err(ServiceError::Forbidden(_))), "{set:?}");
     }
-    assert_eq!(user(&harness, USERNAME).await.expect("kept").password, None);
+    assert_eq!(
+        user(&harness, USERNAME).await.expect("kept").password,
+        created.password
+    );
 
     // With the plugin off, its provider is absent: still refused, still
     // not counted.
@@ -325,6 +335,14 @@ impl ExternalIdentityStore for LateLinks {
             return Err(ServiceError::backend("the store is busy"));
         }
         self.inner.link(user_id, identity, avatar_hash).await
+    }
+    async fn link_unless_taken(
+        &self,
+        user_id: Uuid,
+        identity: ExternalIdentityKey<'_>,
+        by: LinkBy,
+    ) -> Result<ConditionalLink, ServiceError> {
+        self.inner.link_unless_taken(user_id, identity, by).await
     }
     async fn set_avatar_hash(
         &self,

@@ -208,6 +208,11 @@ fn num_cpus_for_analysis() -> usize {
 /// The package name reported in system info (`IStartupOptions.PackageName`).
 const PACKAGE_NAME: &str = "ferrofin-server";
 
+/// The OpenSubtitles plugin's settings before an admin saves them; the export
+/// reads them too.
+pub(crate) const OPENSUBTITLES_DEFAULT_CONFIG: &[u8] =
+    br#"{"ApiKey":"","Username":"","Password":""}"#;
+
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
 /// name refresh, and the lifecycle controller's restart flag).
@@ -482,6 +487,39 @@ pub async fn build_app_state(
         paths.root_folder_path(),
         paths.data_path(),
     );
+    // One-shot, on a database's first boot: Jellyfin's timers and series
+    // timers (`data/livetv/*.json`), which nothing else reads. Before the path
+    // rebase below, which moves a completed recording's file onto this
+    // server's directories as it moves the library's; before the DVR's start
+    // arms the stored timers; and before the Live TV configuration import
+    // further down marks the database as booted.
+    match ferrofin_livetv::import_jellyfin_timers(
+        db,
+        &server_id,
+        std::path::Path::new(&paths.data_path()),
+    )
+    .await
+    {
+        Ok(ferrofin_livetv::ImportedTimers {
+            timers: 0,
+            series_timers: 0,
+            ..
+        }) => {}
+        Ok(ferrofin_livetv::ImportedTimers {
+            timers,
+            recordings,
+            series_timers,
+        }) => tracing::info!(
+            timers,
+            recordings,
+            series_timers,
+            "imported jellyfin's live tv timers"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "live tv timer import failed; it runs again at the next start"
+        ),
+    }
     // A database whose program-data directory moved (an adopted Debian
     // `/var/lib/jellyfin`, or a relocated data_dir) keeps its ids but stores
     // stale absolute paths for the library root and artwork. Before `ensure()`,
@@ -545,13 +583,15 @@ pub async fn build_app_state(
             .with_user_views(Arc::clone(&scope_user_views))
             .with_virtual_paths(virtual_paths.clone()),
     );
-    // Genre, music genre and studio rows take the ids Jellyfin derives from
-    // their metadata paths (gl-1597); a pre-parity database keeps its own.
+    // Genre, music genre, studio and new artist rows take the ids Jellyfin
+    // derives from their metadata paths (gl-1597, gl-1624); a pre-parity
+    // database keeps its own.
     let by_name_identity = ferrofin_core::item_type_lookup::ByNameIdentity::new(
         &id_derivation,
         paths.genre_path(),
         paths.music_genre_path(),
         paths.studio_path(),
+        paths.artists_path(),
     );
     let item_persistence_impl = Arc::new(
         FerrofinItemPersistenceService::new(db.clone())
@@ -1481,8 +1521,8 @@ pub async fn build_app_state(
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
     // A box set's `collection.xml`: written by the metadata save, read by
     // the box set's refresh.
-    let box_set_xml = Arc::new(
-        ferrofin_providers::box_set_xml::BoxSetXmlSaver::new(
+    let container_xml = Arc::new(
+        ferrofin_providers::container_xml::ContainerXmlSaver::new(
             Arc::clone(&item_repository),
             Arc::clone(&item_persistence_service),
             Arc::clone(&people_repository),
@@ -1508,8 +1548,9 @@ pub async fn build_app_state(
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
+            .with_image_processor(Arc::clone(&image_processor))
             .with_nfo_saver(Arc::clone(&nfo_saver))
-            .with_box_set_xml(box_set_xml)
+            .with_container_xml(Arc::clone(&container_xml))
             .with_image_store(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
@@ -2147,11 +2188,13 @@ pub async fn build_app_state(
                 enabled: true,
                 has_image: false,
                 can_uninstall: false,
-                configuration_file_name: None,
+                configuration_file_name: Some(
+                    ferrofin_providers::opensubtitles::CONFIGURATION_FILE_NAME.to_owned(),
+                ),
             },
             None,
         )
-        .with_default_config(br#"{"ApiKey":"","Username":"","Password":""}"#.to_vec()),
+        .with_default_config(OPENSUBTITLES_DEFAULT_CONFIG.to_vec()),
     ];
     // Jellyfin's five IN-TREE provider plugins (TMDb, Studio Images, OMDb,
     // MusicBrainz, AudioDB). They are compiled into `MediaBrowser.Providers`
@@ -2422,18 +2465,16 @@ pub async fn build_app_state(
         extension_cx.external_identities.as_ref(),
     )
     .await;
-    // Likewise the settings of the metadata plugins Jellyfin builds in, from
-    // their `PluginConfiguration` documents, so an adopted server does not come
-    // up with TMDb, OMDb, MusicBrainz, AudioDB and Studio Images at the
-    // defaults (gl-1574).
+    // Likewise the settings of every other plugin with a Jellyfin counterpart,
+    // from their `PluginConfiguration` documents, so an adopted server does not
+    // come up with them at the defaults: the metadata plugins Jellyfin builds
+    // in (gl-1574), Intro Skipper, Merge Versions, File Transformation and
+    // OpenSubtitles (gl-1935), under the file names the export writes.
     ferrofin_core::plugin_config_adoption::import_adopted_plugin_configs(
         &std::path::Path::new(&paths.plugins_path()).join("configurations"),
         &plugin_state_dir,
         plugins.as_ref(),
-        &ferrofin_providers::builtin_plugins::ALL
-            .iter()
-            .map(|p| (p.id, p.configuration_file_name))
-            .collect::<Vec<_>>(),
+        &crate::export_cmd::plugins::adopted_documents(),
     )
     .await;
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
@@ -2489,6 +2530,16 @@ pub async fn build_app_state(
     // the playlist manager's expansion, so it runs here, before the scheduler
     // can start a scan.
     ferrofin_core::adoption_repairs::run_expand_saved_playlist_containers(db, &playlists).await;
+    // The playlists folder's playlist.xml files, which no earlier Ferrofin
+    // wrote, written from the database before a refresh reads one (gl-341).
+    // Boxed: inlined, its future puts startup's over `large_futures`.
+    Box::pin(ferrofin_core::adoption_repairs::run_save_playlist_xml_once(
+        db,
+        &playlists,
+        &container_xml,
+        item_persistence_service.as_ref(),
+    ))
+    .await;
     let playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager> = playlists;
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
@@ -2670,8 +2721,12 @@ pub async fn build_app_state(
     // Once per database (gl-1616): the item and stream paths an earlier
     // version stored resolved under the data and metadata directories take
     // the `%AppDataPath%`/`%MetadataPath%` form every save writes. Last of the
-    // repairs, after every one that stores a path, and before a scan.
+    // repairs that store a path, and before a scan.
     ferrofin_core::adoption_repairs::run_reverse_stored_virtual_paths(db, &virtual_paths).await;
+    // Once per database (gl-1911): the videos an earlier version probed get the
+    // `HasSubtitles` a probe stores in `Data` since gl-1632, from their stored
+    // subtitle streams, before a scan.
+    ferrofin_core::adoption_repairs::run_store_has_subtitles(db).await;
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
@@ -3218,7 +3273,8 @@ pub async fn build_app_state(
     // config file, so nothing else would pick them up — and with no tuner
     // configured Live TV is OFF (`live_tv_enabled_for`), which means adopting a
     // server that had Live TV would silently lose the tuner, the guide and the
-    // view.
+    // view. It stays after the timer import above, which reads its marker as
+    // "a Ferrofin booted this database before".
     match ferrofin_core::live_tv_import::import_live_tv_config(
         db,
         std::path::Path::new(&paths.configuration_directory_path()),
@@ -3389,10 +3445,12 @@ pub async fn build_app_state(
     // the same way. Its callback URLs fall back to the published URL, never
     // to a request's Host header. It finds or creates the account a sign-in
     // ends at through the extensions' user manager and identity links, opens
-    // its session through the session manager, and writes a refused one to
-    // the activity log; a native app's Quick Connect code it approves through
-    // the Quick Connect manager. These exist only long after the extension
-    // context, so they come from the state, not from it.
+    // its session through the session manager, ties a link flow to the
+    // session that started it through the devices holding the tokens, and
+    // writes a refused sign-in and each link change to the activity log; a
+    // native app's Quick Connect code it approves through the Quick Connect
+    // manager. These exist only long after the extension context, so they
+    // come from the state, not from it.
     let sso: Arc<dyn ferrofin_traits::sso::SsoManager> = Arc::new(
         ferrofin_extensions::sso::SsoService::new(
             Arc::clone(&plugins),

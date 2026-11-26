@@ -650,9 +650,10 @@ pub trait LibraryManager: Send + Sync {
     ///   policy;
     /// - any other view reports the kind of the folder it shows, with Folder
     ///   policy unless that folder is a channel or in one. A non-recursive
-    ///   browse, and any browse of a Season, moves `query` onto that folder
-    ///   (`parent_id` and `parent_row`, clearing `user_root_children`); a
-    ///   recursive one stays on the view.
+    ///   browse, any browse of a Season, and any browse of a playlists folder
+    ///   with no user (which lists its own children) moves `query` onto that
+    ///   folder (`parent_id` and `parent_row`, clearing `user_root_children`);
+    ///   any other recursive one stays on the view.
     ///   With no such folder, or one that is gone, the view is left as asked
     ///   and reports itself, with no Folder policy.
     ///
@@ -1662,7 +1663,8 @@ pub enum AdminFlagOutcome {
 /// How [`UserManager::create_external_user`] sets up a user an outside
 /// authentication provider creates at their first sign-in: what upstream's
 /// LDAP plugin writes onto the new `User` before `UpdateUserAsync`
-/// (jellyfin-plugin-ldapauth v24, `LdapAuthenticationProviderPlugin.Authenticate`).
+/// (jellyfin-plugin-ldapauth v24, `LdapAuthenticationProviderPlugin.Authenticate`),
+/// and Ferrofin's own [`unusable_password`](Self::unusable_password).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExternalUserSetup {
     /// Saved as the user's `AuthenticationProviderId`, so their sign-ins go
@@ -1676,6 +1678,12 @@ pub struct ExternalUserSetup {
     /// upstream's `SetPreference` stores them; `None` keeps the new user's
     /// empty one.
     pub enabled_folders: Option<Vec<String>>,
+    /// Store the hash of a random secret no one keeps
+    /// ([`unusable_password`](ferrofin_common::cryptography::unusable_password))
+    /// as the user's password, in the default provider's format, so the user
+    /// never has an empty password, whatever provider they later belong to.
+    /// Single Sign-On sets it; LDAP, as upstream's plugin, does not.
+    pub unusable_password: bool,
 }
 
 /// The state of the server a policy save is checked against: the user's
@@ -1770,20 +1778,52 @@ pub trait UserManager: Send + Sync {
     /// Creates a user with the given name and returns the new row.
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError>;
 
+    /// Creates the first-run administrator `name` and returns the new row, as
+    /// upstream's `InitializeAsync` creates its user (`UserManager.cs:745-772`):
+    /// `IsAdministrator`, `EnableContentDeletion` and
+    /// `EnableRemoteControlOfOtherUsers` are set on the new user before its one
+    /// save, and no policy is saved after it. [`Self::initialize`] creates the
+    /// same user under the host user's name.
+    ///
+    /// The default creates the user and then grants the three with
+    /// [`Self::update_policy`], so impls without a store of their own compile
+    /// unchanged; the concrete manager writes them with the user's other rows.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::InvalidInput`] for a name that is not valid or is
+    /// already taken, or whatever the save surfaces.
+    async fn create_first_admin(&self, name: &str) -> Result<UserEntity, ServiceError> {
+        let user = self.create_user(name).await?;
+        let user_id =
+            Uuid::parse_str(&user.id).map_err(|error| ServiceError::backend(error.to_string()))?;
+        let mut policy = self
+            .get_user_dto(&user, None)
+            .await?
+            .policy
+            .unwrap_or_default();
+        policy.is_administrator = true;
+        policy.enable_content_deletion = true;
+        policy.enable_remote_control_of_other_users = true;
+        self.update_policy(user_id, &policy).await?;
+        Ok(user)
+    }
+
     /// Creates a user `name` whose sign-ins belong to an outside
     /// authentication provider, set up as `setup` says, and returns the new
     /// row. Upstream's LDAP plugin calls `CreateUserAsync`, sets the provider
     /// ids and the folder access on the user, then saves it with
     /// `UpdateUserAsync`.
     ///
-    /// The concrete manager writes the row and `setup` in one transaction.
-    /// Created first and set up after, the account would for a moment be a
-    /// local one without a password, which the built-in provider signs in
-    /// with an empty password; upstream has that window. It also records the
-    /// "User … has been created" activity entry, as `CreateUserAsync` does.
-    /// The default creates the user and then saves `setup` with
-    /// [`Self::update_policy`], so impls without a store of their own compile
-    /// unchanged.
+    /// The concrete manager writes the row and `setup`, the unusable password
+    /// included, in one transaction. Created first and set up after, the
+    /// account would for a moment be a local one without a password, which
+    /// the built-in provider signs in with an empty password; upstream has
+    /// that window. It also records the "User … has been created" activity
+    /// entry, as `CreateUserAsync` does. The default creates the user, sets
+    /// the unusable password with [`Self::change_password`], and then saves
+    /// `setup` with [`Self::update_policy`], so impls without a store of
+    /// their own compile unchanged.
     ///
     /// # Errors
     ///
@@ -1797,6 +1837,11 @@ pub trait UserManager: Send + Sync {
         let user = self.create_user(name).await?;
         let user_id =
             Uuid::parse_str(&user.id).map_err(|error| ServiceError::backend(error.to_string()))?;
+        if setup.unusable_password {
+            // Still the default provider's user, which stores the hash.
+            self.change_password(user_id, &ferrofin_common::cryptography::unusable_password())
+                .await?;
+        }
         let mut policy = self
             .get_user_dto(&user, None)
             .await?
@@ -3302,6 +3347,33 @@ pub trait VirtualFolderManager: Send + Sync {
     /// The default lists the folders afresh.
     async fn library_folders(&self) -> Result<std::sync::Arc<[VirtualFolderInfo]>, ServiceError> {
         Ok(self.get_virtual_folders().await?.into())
+    }
+
+    /// Every location the libraries list, read afresh, for deleting the folder
+    /// of a location no library lists any more (`AggregateFolder.ValidateChildren`);
+    /// `None` while that list cannot be known whole. A location left out of it
+    /// reads as removed and takes every item under it, so `None` covers no
+    /// library configured, a shortcut that did not resolve, and a library
+    /// listing no location without readable options that list none either.
+    /// A library created with no folder adds no location, as upstream's root
+    /// reads it. The same list, after the root's own path, is the root's
+    /// `PhysicalLocationsList`, so it comes in the order upstream's root
+    /// gathers it: each library and each of its shortcuts as its folder lists
+    /// them.
+    ///
+    /// The default lists the folders afresh through
+    /// [`get_virtual_folders`](Self::get_virtual_folders), each library's
+    /// locations sorted as that listing gives them, so not in upstream's
+    /// order, and answers `None` while any library lists no location, since
+    /// it cannot tell those cases apart.
+    async fn locations_for_removal(&self) -> Result<Option<Vec<String>>, ServiceError> {
+        let folders = self.get_virtual_folders().await?;
+        if folders.is_empty() || folders.iter().any(|f| f.locations.is_empty()) {
+            return Ok(None);
+        }
+        Ok(Some(
+            folders.into_iter().flat_map(|f| f.locations).collect(),
+        ))
     }
 
     /// Adds a virtual folder with the given name, optional collection type,

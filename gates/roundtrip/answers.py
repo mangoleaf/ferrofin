@@ -11,9 +11,13 @@ The lines (README.md, "The usage-stage contract"):
     <status>  <metric>  <path>                                    gates/adoption/smoke.sh's probes, as it prints them
     userdata <user> <item> played=<0|1> fav=<0|1> resume=<ticks>  every item the IsPlayed, IsFavorite and
                                                                    IsResumable filters return, for every user, sorted
+                                                                   (a playlist only through IsFavorite:
+                                                                   DERIVED_FILTERS)
     userplays <user> <item> count=<n> likes=<true|false|->        every item the IsPlayed and Likes filters return,
                                                                    for every user, sorted
     user <name> admin=<0|1> disabled=… folders=… sessions=…       every account's policy and settings, by name
+    rated <user> <Season|Episode> <series>/<name>,…               what each account limited by parental rating
+                                                                   lists of them (RATED_KINDS), "-" for none
     badlogin <user> <status>                                      each account in GATE_USERS with a password, logging
                                                                    in with a wrong one (before its right one, so that
                                                                    resets the failed-attempt count)
@@ -42,7 +46,13 @@ The lines (README.md, "The usage-stage contract"):
                                                                    refused), as the owner asks; "shares <owner> no
                                                                    session" when the copy has no web session of the
                                                                    owner's
+    entries <owner> <playlist> = <item names>                     those playlists' items in their order, as the
+                                                                   owner asks, "-" for none
     item <name> lock=<0|1> fields=<locked fields> overview=<n>    the smoke user's movies, by name
+    video <name> sources=<n> parts=<n>                            each of them: its media sources (its versions) and
+                                                                   its additional parts
+    videos <names>                                                the videos the smoke user lists that are no movie
+                                                                   or episode, "-" for none
     config <document> <setting>=<value> …                         server settings a dashboard shows, per document
 The smoke probes run as ADOPTION_USER when it is set (run.sh sets the fixture's oracle user), as smoke.sh
 does. Exit status 0 when the file was written; 1 with one line on stdout when the server could not be
@@ -76,9 +86,16 @@ LOGIN_AUTH = f'MediaBrowser Client="roundtrip", Device="roundtrip", DeviceId="{D
 #: shared with synthetic-child), probed through its own web session in the copy.
 SHARE_OWNER = "synthetic-adult"
 USER_DATA_FILTERS = ("IsPlayed", "IsFavorite", "IsResumable")
+#: What rated_lines lists for an account limited by parental rating: the children of a series that carry no rating
+#: of their own (gates/adoption/synthetic_media.py RATED_SERIES).
+RATED_KINDS = ("Season", "Episode")
 # Not Dislikes: it is "not liked", a mixed listing of nearly everything, where upstream shows other users'
 # private playlists and Ferrofin does not (an accepted divergence).
 USER_PLAYS_FILTERS = ("IsPlayed", "Likes")
+#: The filters whose answer for a playlist derives from its items, which have lines of their own: an empty playlist
+#: is played, and upstream then lists another user's private one too (the accepted divergence above), so a playlist
+#: they return has no line.
+DERIVED_FILTERS = ("IsPlayed", "IsResumable")
 #: Scalar settings a dashboard shows, per configuration document (/System/Configuration/<key>).
 CONFIGURATION = {
     "system": ("UICulture", "PreferredMetadataLanguage", "MetadataCountryCode", "MinResumePct", "MaxResumePct",
@@ -165,7 +182,8 @@ def user_items(server, kind, filters):
             if status != 200:
                 refused.append(f"{kind} {user.get('Name')} {name} {status}")
             for item in found:
-                seen[item.get("Id")] = item.get("UserData") or {}
+                if name not in DERIVED_FILTERS or item.get("Type") != "Playlist":
+                    seen[item.get("Id")] = item.get("UserData") or {}
         out.append((user.get("Name"), sorted(seen.items())))
     return out, refused
 
@@ -280,8 +298,7 @@ def number(value):
 
 
 def image_types(server, item):
-    """The types of one item's images. Not their sizes: an uploaded image is stored 0x0 until gl-1054 is fixed,
-    which Jellyfin measures after the return."""
+    """The types of one item's images. Not their sizes, which Jellyfin measures again on its own saves."""
     status, images = server.send("GET", f"/Items/{item}/Images")
     if status != 200 or not isinstance(images, list):
         return f"error={status}"
@@ -289,6 +306,8 @@ def image_types(server, item):
 
 
 def movie_lines(server, user_id):
+    """The `item` and `video` line of each of the account's movies, then its `videos` line."""
+    by_user = urllib.parse.urlencode({"userId": user_id})
     query = urllib.parse.urlencode({"userId": user_id, "Recursive": "true", "IncludeItemTypes": "Movie",
                                     "SortBy": "SortName", "SortOrder": "Ascending"})
     status, found = items(server, "/Items?" + query)
@@ -296,12 +315,40 @@ def movie_lines(server, user_id):
         return [f"item /Items {status}"]
     out = []
     for movie in sorted(found, key=lambda m: (m.get("Name") or "", m.get("Id") or "")):
-        status, item = server.send("GET", f"/Items/{movie.get('Id')}?" + urllib.parse.urlencode({"userId": user_id}))
+        status, item = server.send("GET", f"/Items/{movie.get('Id')}?{by_user}")
         if status != 200 or not isinstance(item, dict):
             out.append(f"item {movie.get('Name')} error={status}")
             continue
         out.append(f"item {item.get('Name')} lock={flag(item.get('LockData'))} "
                    f"fields={','.join(sorted(item.get('LockedFields') or [])) or '-'} overview={len(item.get('Overview') or '')}")
+        status, parts = server.send("GET", f"/Videos/{movie.get('Id')}/AdditionalParts?{by_user}")
+        parts = parts.get("TotalRecordCount") if status == 200 and isinstance(parts, dict) else f"error={status}"
+        out.append(f"video {item.get('Name')} sources={len(item.get('MediaSources') or [])} parts={parts}")
+    # A version or an additional part lists as a video of its own once it lost its owner or its primary.
+    status, loose = items(server, "/Items?" + urllib.parse.urlencode(
+        {"userId": user_id, "Recursive": "true", "IncludeItemTypes": "Video"}))
+    names = ",".join(sorted(row.get("Name") or "" for row in loose)) or "-" if status == 200 else f"error={status}"
+    out.append(f"videos {names}")
+    return out
+
+
+def rated_lines(server):
+    """What each account limited by parental rating lists of seasons and episodes, by series and name. /Items
+    filters on the scores stored on each row and checks no item against its parents, so a season or an
+    episode that lost the score it inherits from a series rated above the limit shows here."""
+    status, users = accounts(server)
+    if status != 200:
+        return [f"rated /Users {status}"]
+    out = []
+    for user in users:
+        if (user.get("Policy") or {}).get("MaxParentalRating") is None:
+            continue
+        for kind in RATED_KINDS:
+            query = urllib.parse.urlencode({"userId": user.get("Id"), "Recursive": "true", "IncludeItemTypes": kind})
+            status, found = items(server, "/Items?" + query)
+            names = (",".join(sorted(f"{row.get('SeriesName')}/{row.get('Name')}" for row in found)) or "-"
+                     if status == 200 else f"error={status}")
+            out.append(f"rated {user.get('Name')} {kind} {names}")
     return out
 
 
@@ -373,6 +420,10 @@ def share_lines(server, data_dir):
             listed = ",".join(sorted(f"{names.get(uuid_hex(share.get('UserId')), share.get('UserId'))}:"
                                      f"{flag(share.get('CanEdit'))}" for share in shares)) or "-"
         out.append(f"shares {SHARE_OWNER} {playlist.get('Name')} = {listed}")
+        status, body = items(server, f"/Playlists/{playlist.get('Id')}/Items?" + urllib.parse.urlencode(
+            {"userId": owner}), auth)
+        entries = ",".join(row.get("Name") or "" for row in body) or "-" if status == 200 else f"error={status}"
+        out.append(f"entries {SHARE_OWNER} {playlist.get('Name')} = {entries}")
     return sorted(out)
 
 
@@ -389,9 +440,9 @@ def capture(base_url, data_dir):
     server = api.Server(base_url, data_dir)
     _, user_id = smoke_user(data_dir)
     return (smoke_lines(base_url, data_dir) + user_data_lines(server) + user_plays_lines(server)
-            + account_lines(server) + login_lines(server) + preference_lines(server) + server_lines(server)
-            + collection_lines(server, user_id) + share_lines(server, data_dir) + movie_lines(server, user_id)
-            + stream_lines(server, user_id))
+            + account_lines(server) + rated_lines(server) + login_lines(server) + preference_lines(server)
+            + server_lines(server) + collection_lines(server, user_id) + share_lines(server, data_dir)
+            + movie_lines(server, user_id) + stream_lines(server, user_id))
 
 
 def write(path, lines):

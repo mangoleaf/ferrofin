@@ -92,11 +92,11 @@ pub(crate) fn move_item_folders(
 }
 
 /// The folders an item's art and internal metadata live in under the item
-/// art root `art_root` (`{metadata}/library`): Ferrofin's `{art_root}/{GUID}`,
-/// the lower-cased spelling older scans also wrote art to
-/// ([`crate::dynamic_images::legacy_art_dir`]), and Jellyfin's
-/// `{art_root}/{idN[..2]}/{idN}` (`BaseItem.GetInternalMetadataPath`), which an
-/// adopted item carries.
+/// art root `art_root` (`{metadata}/library`): its own
+/// `{art_root}/{idN[..2]}/{idN}` (`BaseItem.GetInternalMetadataPath`), then the
+/// `{art_root}/{GUID}` earlier builds saved art in and the lower-cased spelling
+/// older scans also wrote art to
+/// ([`internal_metadata_dirs`](crate::dynamic_images::internal_metadata_dirs)).
 pub(crate) fn item_art_folders(art_root: &Path, id: Uuid) -> [std::path::PathBuf; 3] {
     crate::dynamic_images::internal_metadata_dirs(art_root, id)
 }
@@ -317,8 +317,8 @@ mod tests {
             ));
             paths.set_internal_metadata_path(Some(format!("{root}/{metadata}").as_str()));
             let art = tmp.path().join(metadata).join("library");
-            let [.., old] = super::item_art_folders(&art, from);
-            let [.., new] = super::item_art_folders(&art, to);
+            let [old, ..] = super::item_art_folders(&art, from);
+            let [new, ..] = super::item_art_folders(&art, to);
             std::fs::create_dir_all(&old).unwrap();
             let (moved, prefixes) = super::move_item_folders(
                 &super::VirtualPathExpander::from_paths(paths),
@@ -352,9 +352,9 @@ mod tests {
         }
     }
 
-    /// A re-key moves the lower-cased art folder older scans wrote, too, to
-    /// the new id's: an item's art folders are its own, that legacy one and
-    /// Jellyfin's `{xx}/{id:N}`.
+    /// A re-key moves the `{ID}` art folder earlier builds wrote and the
+    /// lower-cased one older scans wrote, too, to the new id's: an item's art
+    /// folders are its own `{xx}/{id:N}` and those two.
     #[test]
     fn a_rekey_moves_the_legacy_art_folder() {
         let tmp = tempfile::tempdir().unwrap();
@@ -365,13 +365,16 @@ mod tests {
         );
         let folders = super::item_art_folders(&art, from);
         assert_eq!(
-            folders[1],
+            folders[2],
             crate::dynamic_images::legacy_art_dir(&art, from),
             "{folders:?}"
         );
         let legacy = crate::dynamic_images::legacy_art_dir(&art, from);
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("thumb.jpg"), b"x").unwrap();
+        let earlier = crate::dynamic_images::earlier_art_dir(&art, from);
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::write(earlier.join("primary.png"), b"x").unwrap();
         let (moved, _) = super::move_item_folders(
             &super::VirtualPathExpander::identity(),
             Some(&art),
@@ -387,5 +390,11 @@ mod tests {
                 .is_file()
         );
         assert!(!legacy.exists());
+        assert!(
+            crate::dynamic_images::earlier_art_dir(&art, to)
+                .join("primary.png")
+                .is_file()
+        );
+        assert!(!earlier.exists());
     }
 }

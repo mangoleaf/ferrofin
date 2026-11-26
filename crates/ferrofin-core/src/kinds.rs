@@ -161,7 +161,7 @@ pub fn presentation_unique_key(
     }
     if kind == BaseItemKind::Season {
         return match (series_key.filter(|k| !k.is_empty()), index_number) {
-            (Some(series), Some(index)) => format!("{series}-{index:03}"),
+            (Some(series), Some(index)) => season_presentation_key(series, index),
             _ => own,
         };
     }
@@ -178,6 +178,17 @@ pub fn presentation_unique_key(
             ferrofin_db::presentation_key::by_name_presentation_key(type_name, name)
         })
         .unwrap_or(own)
+}
+
+/// A `Season`'s `PresentationUniqueKey`: its series' key, `-`, and its index
+/// in C#'s `"000"` format (`Season.CreatePresentationUniqueKey`), so `-1` is
+/// `-001`.
+#[must_use]
+pub fn season_presentation_key(series_key: &str, index: i64) -> String {
+    format!(
+        "{series_key}-{}",
+        ferrofin_util::string_extensions::zero_padded(index, 3)
+    )
 }
 
 /// The user-data keys of a `Series` — C# `Series.GetUserDataKeys()` (v12.0
@@ -941,6 +952,14 @@ mod tests {
         SERIES_KEY,
         None,
         "0000000000000000000000000000002a"
+    )]
+    // a negative index pads its digits, sign in front: C#'s `ToString("000")`
+    #[case(
+        BaseItemKind::Season,
+        Some("Season -1"),
+        SERIES_KEY,
+        Some(-1),
+        "595f611d217e8273327033dd5d500d81--001"
     )]
     fn presentation_keys_match_the_ones_jellyfin_stores(
         #[case] kind: BaseItemKind,

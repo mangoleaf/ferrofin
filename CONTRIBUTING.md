@@ -9,7 +9,9 @@ By contributing you agree your work is licensed under the same terms.
 ## Development setup
 
 Rust workspace, edition 2024, toolchain pinned to **1.100.0** (stable — see
-`rust-toolchain.toml`, which rustup honors automatically).
+`rust-toolchain.toml`, which rustup honors automatically). The build also needs a C
+compiler, **cmake**, and on x86-64 **nasm**: `turbojpeg-sys` builds the libjpeg-turbo it
+vendors, and refuses to build it without its SIMD code.
 
 ```bash
 cargo build --workspace
@@ -31,6 +33,7 @@ cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check   # the
 cargo machete apps crates              # declared but unused dependencies
 scripts/check-workspace-deps.py        # every dependency through [workspace.dependencies]
 cargo vet --locked                     # every crate audited or exempted (gates/supply-chain/)
+scripts/third-party-notices.sh         # the license notices every artifact ships (about.toml; needs cargo-about)
 ```
 
 Every `pub` item needs a `///` doc and pedantic clippy must pass (warnings are
@@ -66,6 +69,18 @@ it, or a manifest bump when no compatible release is left. The WASM guest
 finding there with `cargo update --manifest-path examples/wasm-hello/Cargo.toml -p <crate>`
 or a bump in its `Cargo.toml`.
 A new license is a compatibility decision against GPL-3.0-only, not a fix.
+
+**Third-party notices.** Every artifact (the image, the `.deb`, the release archives) ships
+`THIRD-PARTY-NOTICES.txt`, the license texts and copyright notices of the crates and C libraries in
+the binary, which `scripts/third-party-notices.sh` generates from `Cargo.lock` with cargo-about (at
+the version `ci.yml` pins: `cargo install --locked --features cli cargo-about@<version>`). CI's
+`dependencies` job runs it. `about.toml` holds the accepted licenses, `deny.toml`'s allow list in
+the same order (a license added there is added here too), and clarifications: the crates whose
+license file cargo-about cannot read, and the `-sys` crates that compile a vendored C library, so
+that library's own license file is in the notices. When the script fails after a bump, a clarified
+file changed: read the new one, and when its terms are unchanged, update its checksum (`sha256sum`
+of the file). A clarification for a crate that left the graph fails it too: delete it. A new crate
+that compiles C code into the binary needs a clarification adding that library's license file.
 
 **Dependency cooldown.** `.cargo/config.toml` holds Cargo's dependency cooldown:
 `cargo update`, and resolving a newly added dependency, never pick a crate version published

@@ -18,9 +18,10 @@ setup() {
     python3 "$BATS_TEST_DIRNAME/fake_server.py" copy "fixtures/${spec%%:*}"
     echo "${spec#*:}" > "fixtures/${spec%%:*}/fake-generation"
   done
-  # The code migrations the export leaves to run on a 10.11.8 source, and the build logs of Jellyfin's own
-  # first start on each route's source: on 10.11.8 it applied a schema migration too, on 12.3 nothing.
-  printf '%s\n' "${CODE_MIGRATIONS[@]}" > fixtures/jellyfin-10.11.8/fake-left-to-run
+  # The code migrations the export leaves to run on a 10.11.8 source (not the one it records as applied), and the
+  # build logs of Jellyfin's own first start on each route's source: on 10.11.8 it applied a schema migration and
+  # ran both code migrations, on 12.3 nothing.
+  printf '%s\n' "${CODE_MIGRATIONS[@]:1}" > fixtures/jellyfin-10.11.8/fake-left-to-run
   { head -n 1 "$BATS_TEST_DIRNAME/jellyfin-ok.log"
     echo '[07:53:39] [INF] [10] InternalDatabaseMigration: Perform migration 20260113102337_AddLinkedChildrenTable'
     for ran in "${CODE_MIGRATIONS[@]}"; do echo "[07:53:39] [INF] [10] InternalCodeMigration: Perform migration $ran"; done
@@ -30,6 +31,8 @@ setup() {
     FAKE_JELLYFIN FAKE_EXPORT
 }
 
+# The code migrations Jellyfin's own first start runs on a 10.11.8 source: the first one the export records as
+# applied (crates/ferrofin-db/src/export/classify.rs, gl-1902), so it must not run on the export.
 CODE_MIGRATIONS=(20260113120000_MigrateLinkedChildren 20260915104305_FixNullEncoderPreset)
 # The routes a whole run here runs, the two setup fakes fixtures for: test_routes.py checks the others
 # against the fixtures gates/adoption builds.
@@ -41,10 +44,12 @@ fake_fixture() { # fake_fixture <fixture> <generation> [first-start log]: one mo
   [ -z "${3:-}" ] || { mkdir -p "$(dirname "fixtures/$3")"; head -n 1 "$BATS_TEST_DIRNAME/jellyfin-ok.log" > "fixtures/$3.server.log"; }
 }
 
-scratch_repo() { # scratch_repo <gates>: the gates, and Jellyfin's schema the run reads (RT_SCHEMA), in repo/
-  local data=repo/crates/ferrofin-db/tests/data
+scratch_repo() { # scratch_repo <gates>: the gates, and what the run reads from the repository, in repo/:
+  # Jellyfin's schema (RT_SCHEMA) and the export's classification (checks_boot.py)
+  local data=repo/crates/ferrofin-db/tests/data export=repo/crates/ferrofin-db/src/export
   cp -r "$1/lib.sh" "$1/result.py" "$1/adoption" "$1/roundtrip" repo/gates/
-  mkdir -p "$data" && cp "$1/../crates/ferrofin-db/tests/data/jellyfin-12.2-schema.sql" "$data/"
+  mkdir -p "$data" "$export" && cp "$1/../crates/ferrofin-db/tests/data/jellyfin-12.2-schema.sql" "$data/"
+  cp "$1/../crates/ferrofin-db/src/export/classify.rs" "$export/"
 }
 
 teardown() { # no fake server outlives its test
@@ -92,6 +97,18 @@ removed() { [ ! -f "$TMP/state/removed" ] || grep "^${1:-}" "$TMP/state/removed"
 
 @test "jellyfin image: the repository's own pin is readable" {
   [[ "$(rt_jellyfin_image "$ROUNDTRIP/../../crates/ferrofin-api/src/handlers.rs")" =~ ^jellyfin/jellyfin:[0-9]+\.[0-9]+$ ]]
+}
+
+@test "http port: an exported network.xml's InternalHttpPort, else 8096, is the one a start publishes" {
+  printf '<?xml version="1.0"?>\n<NetworkConfiguration>\n  <InternalHttpPort>8097</InternalHttpPort>\n</NetworkConfiguration>\n' > network.xml
+  [ "$(rt_http_port network.xml)" = 8097 ]
+  [ "$(rt_http_port missing.xml)" = 8096 ]
+  echo '<NetworkConfiguration />' > empty.xml
+  [ "$(rt_http_port empty.xml)" = 8096 ]
+  port=$(RT_HTTP_PORT=8097 rt_start rt-x-route-jellyfin "$TMP/x.cid" jellyfin/jellyfin:test)
+  [[ "$port" =~ ^[0-9]+$ ]]
+  grep -q -- '-p 127.0.0.1::8097 ' state/calls
+  rt_remove "$TMP/x.cid"
 }
 
 @test "start: the port is one docker picked, never a fixed one, and the container is the cidfile's" {
@@ -277,6 +294,57 @@ EOS
   [[ "$output" == *"FAIL  12.4-messy     fixture media-messy missing"* ]]
 }
 
+@test "run.sh: the native route starts Ferrofin on an empty directory with no fixture, and records its row as native" {
+  head -n 1 "$BATS_TEST_DIRNAME/jellyfin-ok.log" > fixtures/jellyfin-12.4-fresh.server.log
+  # the fake server plays none of the API the seeding drives, so the route stops at its seeding
+  run run_gate "$TMP/w" --run-id nat --only native
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  native         "*"seed: "* ]]
+  [[ "$output" != *"fixture"*"missing"* ]]
+  grep -qF -- "--name rt-nat-native-ferrofin --user $(id -u):$(id -g) -p 127.0.0.1::8096 " state/calls
+  grep -qF -- "-e FERROFIN_DATA_DIR=/data -v $TMP/w/native/ferrofin:/data " state/calls
+  run ! grep -q -- '--name rt-nat-native-export' state/calls   # nothing to export from a source not built
+  [ "$(jq -r 'select(.event == "row") | "\(.kind) \(.expected) \(.verdict)"' "$TMP/w/results.jsonl")" = "native - FAIL" ]
+  [ "$(jq -r '"\(.verdict) \(.counts.fail) \(.counts.incomplete) \(.detail.rows[0].kind)"' "$TMP/w/result.json")" = \
+    "failed 1 0 native" ]
+}
+
+@test "drift guard: a fresh install's history equal to the export's passes; an id it records that the export lacks fails, named" {
+  # shellcheck source=gates/roundtrip/stage_drift.sh
+  . "$ROUNDTRIP/stage_drift.sh"
+  check() { mapfile -t -O "${#why[@]}" why < <("$@"); }   # run.sh's
+  reasons() { local out; out=$("$@" 2>&1) || printf '%s\n' "${out:-$1 failed}"; }
+  mark() { marked+=("$1: $2: $([ "${#why[@]}" = "$mark_from" ] && echo PASS || echo FAIL)"); mark_from=${#why[@]}; }
+  history() { # history <db> <ids…>: a database holding only a history of those ids
+    local db=$1 id; shift
+    mkdir -p "$(dirname "$db")"
+    sqlite3 "$db" 'CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT PRIMARY KEY, "ProductVersion" TEXT)'
+    for id in "$@"; do sqlite3 "$db" "INSERT INTO \"__EFMigrationsHistory\" VALUES ('$id', '10.0.14')"; done
+  }
+  HERE=$ROUNDTRIP RUN_ID=drift route=native READY_TIMEOUT=10 STOP_TIMEOUT=5 JELLYFIN_ID=jellyfin/jellyfin:test MADE=()
+  for case in same extra; do
+    dst=$TMP/$case why=() mark_from=0 marked=()
+    history "$dst/jellyfin/data/jellyfin.db" 1_A 2_B
+    if [ "$case" = same ]; then history "$dst/fresh/data/jellyfin.db" 1_A 2_B
+    else history "$dst/fresh/data/jellyfin.db" 1_A 2_B 3_New; fi
+    drift_stage
+    [ "${#marked[@]}" = 1 ]
+    if [ "$case" = same ]; then
+      [ "${marked[0]}" = "Export: a fresh Jellyfin records the history the export wrote, no id more or less (the drift guard): PASS" ]
+      [ ! -e "$dst/fresh" ]   # a passed guard keeps only its log
+      [ ! -e "$dst/fresh-cache" ]
+    else
+      [[ "${marked[0]}" == *": FAIL" ]]
+      [[ "${why[*]}" == *"1 id(s) a fresh install records are not in the export's history"*"3_New"* ]]
+      [ -f "$dst/fresh/data/jellyfin.db" ]   # a failed one keeps the fresh install to look into
+    fi
+    [ -f "$dst/fresh.log" ]
+    grep -qF -- "--name rt-drift-native-fresh " state/calls
+    grep -qF -- "-v $dst/fresh:/config -v $dst/fresh-cache:/cache " state/calls
+    [ ! -e "$dst/fresh.cid" ]   # the container is removed
+  done
+}
+
 @test "run.sh: the scale route records on its line the time each stage took and the export's size" {
   fake_fixture jellyfin-10.11.11-scale 10.11.11 oracle/first-start-12.4/jellyfin-10.11.11
   mkdir fixtures/media-scale
@@ -304,9 +372,11 @@ EOS
   for route in 10.11.8 12.4-from-123; do
     checks=$(jq -r --arg r "$route" 'select(.event == "check" and .fixture == $r) | "\(.stage)|\(.check)|\(.verdict)"' \
       "$TMP/w/results.jsonl")
-    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 35 ]
-    [ "$(grep -c . <<<"$checks")" -eq 35 ]
+    [ "$(grep -c '|PASS$' <<<"$checks")" -eq 37 ]
+    [ "$(grep -c . <<<"$checks")" -eq 37 ]
     grep -qx "Export|the export completes|PASS" <<<"$checks"
+    grep -qx "Ferrofin|Live TV: a tuner, a guide, a timer, a series timer and a favourite channel|PASS" <<<"$checks"
+    grep -qx "Jellyfin|Live TV: timers, a favourite channel and the guide equal Ferrofin's before and after its first guide refresh|PASS" <<<"$checks"
     grep -qx "Export|every stored path is in the export, none under the directory Ferrofin ran at|PASS" <<<"$checks"
     grep -qx "Export|its database has Jellyfin's schema, and its loss report every table of Ferrofin's that held rows|PASS" \
       <<<"$checks"
@@ -338,7 +408,7 @@ EOS
   # the export ran from the image under test, as the calling user, on the server's data directory at its path
   grep -E -- "^run --pull never --cidfile $TMP/w/10.11.8/export.cid --name rt-both-10.11.8-export --user $(id -u):$(id -g) --network none -e FERROFIN_DATA_DIR=/data -v $TMP/w/10.11.8/ferrofin:/data -v $TMP/w/10.11.8:/route ferrofin-roundtrip:both export-jellyfin --out /route/jellyfin$" \
     state/calls
-  grep -c 'InternalCodeMigration: Perform migration' "$TMP/w/10.11.8/jellyfin.log" | grep -qx 2
+  grep -c 'InternalCodeMigration: Perform migration' "$TMP/w/10.11.8/jellyfin.log" | grep -qx 1
   # a passing route keeps its logs and answers, not its copies
   [ ! -e "$TMP/w/10.11.8/jellyfin" ]
   [ ! -e "$TMP/w/12.4-from-123/ferrofin" ]
@@ -369,11 +439,18 @@ EOS
 @test "run.sh: an export that records every id fails the 10.11.8 route: the code migrations Jellyfin runs on the source did not run" {
   FAKE_EXPORT=all-recorded run run_gate "$TMP/w" --only 10.11.8
   [ "$status" -eq 1 ]
-  [[ "$output" == *"FAIL  10.11.8        2 code migration(s) it runs on the source did not run: ${CODE_MIGRATIONS[0]}, ${CODE_MIGRATIONS[1]}"* ]]
+  [[ "$output" == *"FAIL  10.11.8        1 code migration(s) it runs on the source did not run: ${CODE_MIGRATIONS[1]}"* ]]
   check="it ran the code migrations it runs on the source, and no schema migration"
   [ "$(jq -r --arg c "$check" 'select(.event == "check" and .check == $c) | .verdict' "$TMP/w/results.jsonl")" = FAIL ]
   # the one check that failed: Jellyfin started and answered as Ferrofin did
   [ "$(jq -r 'select(.event == "check" and .verdict == "FAIL") | .check' "$TMP/w/results.jsonl")" = "$check" ]
+}
+
+@test "run.sh: an export that leaves to run a code migration it should record as applied fails the 10.11.8 route, naming it" {
+  printf '%s\n' "${CODE_MIGRATIONS[@]}" > fixtures/jellyfin-10.11.8/fake-left-to-run   # the history as before gl-1902
+  run run_gate "$TMP/w" --only 10.11.8
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"FAIL  10.11.8        1 code migration(s) ran that it does not run on the source: ${CODE_MIGRATIONS[0]}"* ]]
 }
 
 @test "run.sh: an export that fails fails its route, Jellyfin is never booted, and the export's container is removed" {

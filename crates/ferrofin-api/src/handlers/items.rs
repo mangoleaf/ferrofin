@@ -885,18 +885,26 @@ async fn whitelists_tags(
 /// the plain `parentId=<view>` browse jellyfin-web sends and the
 /// `IncludeItemTypes=Playlist` one), not only the playlists the folder holds.
 /// So the listing is re-rooted at the user root, as the typed browse is
-/// ([`redirect_container_browse`]). With no user (an API key without
-/// `userId`, [`resolve_user_or_api_key`]) upstream lists the folder's own
-/// children only, and so does this.
+/// ([`redirect_container_browse`]).
+///
+/// With no user (an API key without `userId`, [`resolve_user_or_api_key`]),
+/// `PlaylistsFolder.GetItemsInternal` (v12.4 PlaylistsFolder.cs:37-43) turns
+/// the listing into the folder's own children by `ParentId`, whatever their
+/// `AncestorIds` rows, and still only its playlists. A browse typed exactly
+/// `[Playlist]` never reaches the folder: the controller's
+/// `linkedChildAncestorIds` block re-roots it to the user root first (the
+/// folder's collection type is the target's own), so it lists every playlist.
 fn list_playlists_folder_as_playlists(internal: &mut InternalItemsQuery) {
     if matches!(
         internal.parent_type,
         Some(BaseItemKind::PlaylistsFolder | BaseItemKind::ManualPlaylistsFolder)
     ) {
-        internal.recursive = true;
+        let at_user_root =
+            internal.user.is_some() || internal.include_item_types == [BaseItemKind::Playlist];
+        internal.recursive = at_user_root;
         internal.include_item_types = vec![BaseItemKind::Playlist];
         internal.user_root_children = false;
-        if internal.user.is_some() {
+        if at_user_root {
             reroot_to_user_root(internal);
         }
     }
@@ -2321,9 +2329,10 @@ mod tests {
         assert!(!answer(UserPolicy::default(), api_key, other).await);
     }
 
-    /// A browse under either spelling of the playlists folder becomes a
+    /// A user's browse under either spelling of the playlists folder becomes a
     /// recursive `[Playlist]` listing from the user root (so it is
-    /// post-filtered per user); any other parent is left as asked.
+    /// post-filtered per user); one with no user lists the folder's own
+    /// playlists; any other parent is left as asked.
     #[test]
     fn a_playlists_folder_browse_lists_its_playlists_recursively() {
         for (parent, rewritten) in [
@@ -2353,14 +2362,40 @@ mod tests {
                 (rewritten, rewritten, !rewritten, rewritten),
                 "{parent:?}"
             );
-            // With no user the folder keeps its own playlists only.
+            // With no user the folder lists its own children, not recursively:
+            // `PlaylistsFolder.GetItemsInternal`'s no-user arm.
             let mut anonymous = InternalItemsQuery {
                 parent_id,
                 parent_type: parent,
+                include_item_types: vec![BaseItemKind::Audio],
+                user_root_children: true,
                 ..InternalItemsQuery::default()
             };
             list_playlists_folder_as_playlists(&mut anonymous);
-            assert_eq!(anonymous.parent_id, parent_id, "{parent:?}");
+            assert_eq!(
+                (
+                    anonymous.parent_id,
+                    anonymous.recursive,
+                    anonymous.include_item_types == [BaseItemKind::Playlist],
+                    anonymous.user_root_children,
+                ),
+                (parent_id, false, rewritten, !rewritten),
+                "{parent:?}"
+            );
+            // A browse typed exactly `[Playlist]` is the controller's re-root:
+            // every playlist, from the user root, with or without a user.
+            let mut typed = InternalItemsQuery {
+                parent_id,
+                parent_type: parent,
+                include_item_types: vec![BaseItemKind::Playlist],
+                ..InternalItemsQuery::default()
+            };
+            list_playlists_folder_as_playlists(&mut typed);
+            assert_eq!(
+                (typed.recursive, typed.parent_id.is_nil()),
+                (rewritten, rewritten),
+                "{parent:?}"
+            );
         }
     }
 
