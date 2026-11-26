@@ -1000,15 +1000,25 @@ pub async fn build_app_state(
             ferrofin_model::data::BaseItemKind::MusicArtist,
         )),
     ];
-    // An owned video's parental score follows the ratings its owner gives it.
-    item_persistence_impl.set_localization(Arc::clone(&localization));
+    let item_visibility = Arc::new(
+        ferrofin_core::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&item_repository),
+            Arc::clone(&localization),
+            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
+        )
+        .with_virtual_paths(virtual_paths.clone()),
+    );
+    // An owned video's parental score follows the ratings its owner gives it,
+    // by the rule the scan, a refresh and a metadata edit store it by.
+    item_persistence_impl.set_rating_scorer(Arc::clone(&item_visibility) as _);
     let path_manager: Arc<dyn ferrofin_traits::system::PathManager> =
         Arc::new(FerrofinPathManager::new(Arc::clone(&paths)));
     // The one boot repair that re-keys items: a Jellyfin 10.11 local version
     // or stacked part takes the shape 12.x's scanner stores, so the first
     // scan moves nothing; then the local versions 12.x re-creates are handed
     // back to that scan to probe and name afresh. It needs the id
-    // derivation, the folders named after an item and the localization that
+    // derivation, the folders named after an item and the scorer that
     // scores the ratings a primary copies to its versions, so it runs here
     // rather than with the others in `open_database`; nothing has scanned
     // yet.
@@ -1551,15 +1561,6 @@ pub async fn build_app_state(
         .with_self_writes(Arc::clone(&self_writes_guard)),
     );
     user_data_impl.set_save_listener(Arc::downgrade(&nfo_listener))?;
-    let item_visibility = Arc::new(
-        ferrofin_core::item_visibility::ItemVisibility::new(
-            db.clone(),
-            Arc::clone(&item_repository),
-            Arc::clone(&localization),
-            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
-        )
-        .with_virtual_paths(virtual_paths.clone()),
-    );
     // Held weakly by the repository and the count service: the evaluator owns
     // the repository. `set` fails only if already set, which nothing else does.
     let _ = scope_visibility.set(Arc::downgrade(&item_visibility));

@@ -6376,8 +6376,13 @@ mod tests {
         .await;
         seed_provider_id(&db, g.primary, "Tmdb", "990000005").await;
         let store = store(&db);
-        store.set_localization(std::sync::Arc::new(
-            crate::localization_manager::LocalizationManager::new("US"),
+        store.set_rating_scorer(std::sync::Arc::new(
+            crate::item_visibility::ItemVisibility::new(
+                db.clone(),
+                crate::test_support::item_repository_over(db.clone()),
+                std::sync::Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+                "/server/data".to_owned(),
+            ),
         ));
 
         let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store)
