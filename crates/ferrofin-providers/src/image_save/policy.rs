@@ -33,15 +33,8 @@ pub(super) fn eligible(
     filesystem(item) || (short_kind(item) == "Season" && series.is_some_and(filesystem))
 }
 
-fn containing_folder(item: &BaseItemEntity) -> Option<&Path> {
-    let path = Path::new(item.path.as_deref()?);
-    let data: serde_json::Value = item
-        .data
-        .as_deref()
-        .and_then(|data| serde_json::from_str(data).ok())
-        .unwrap_or_default();
-    let disc = matches!(data["VideoType"].as_str(), Some("Dvd" | "BluRay"))
-        && data["IsPlaceHolder"].as_bool() != Some(true);
+fn containing_folder(item: &BaseItemEntity) -> Option<PathBuf> {
+    let path = item.path.as_deref()?;
     // `ContainingFolderPath => Path` (`Genre.cs:26`, `MusicGenre.cs:35`,
     // `Person.cs:27`, `Studio.cs:25`, `Year.cs:31`, `MusicArtist.cs:56`): a
     // by-name item's row is no folder, but its path is its folder.
@@ -49,21 +42,24 @@ fn containing_folder(item: &BaseItemEntity) -> Option<&Path> {
         short_kind(item),
         "Genre" | "MusicGenre" | "Person" | "Studio" | "Year" | "MusicArtist"
     );
-    if item.is_folder || disc || by_name {
-        Some(path)
-    } else {
-        path.parent()
+    if by_name {
+        return Some(PathBuf::from(path));
     }
+    // `Video.ContainingFolderPath`: a stacked rip's is its set's folder.
+    Some(PathBuf::from(
+        ferrofin_db::item_data::containing_folder_path_at(item, path),
+    ))
+    .filter(|folder| !folder.as_os_str().is_empty())
 }
 
 /// The folder every one of [`DestinationPolicy::destinations`] lies in: a
 /// season's series folder (`seasonNN-…`), otherwise the containing folder.
-pub(super) fn art_folder<'a>(
-    item: &'a BaseItemEntity,
-    series: Option<&'a BaseItemEntity>,
-) -> Option<&'a Path> {
+pub(super) fn art_folder(
+    item: &BaseItemEntity,
+    series: Option<&BaseItemEntity>,
+) -> Option<PathBuf> {
     match series.and_then(|series| series.path.as_deref()) {
-        Some(series) if short_kind(item) == "Season" => Some(Path::new(series)),
+        Some(series) if short_kind(item) == "Season" => Some(PathBuf::from(series)),
         _ => containing_folder(item).or_else(|| series.and_then(containing_folder)),
     }
 }
@@ -424,6 +420,37 @@ mod tests {
             destination(&movie, ImageSavingConvention::Legacy, ImageType::Primary),
             vec![PathBuf::from("/media/folder.png")]
         );
+    }
+    /// A stacked rip's art goes in the set's folder, not its first disc's
+    /// (`Video.ContainingFolderPath`: `IsStacked` first).
+    #[test]
+    fn a_stacked_rip_saves_into_its_set_folder() {
+        let mut movie = row("Movie", "/media/Set/Set - Disc 1", false);
+        movie.data =
+            Some(r#"{"VideoType":"BluRay","AdditionalParts":["/media/Set/Set - Disc 2"]}"#.into());
+        assert_eq!(
+            destination(
+                &movie,
+                ImageSavingConvention::Compatible,
+                ImageType::Primary
+            ),
+            vec![PathBuf::from("/media/Set/poster.png")]
+        );
+        let policy = DestinationPolicy {
+            item: &movie,
+            series: None,
+            convention: ImageSavingConvention::Compatible,
+            extra_thumbs: true,
+            images: &[],
+        };
+        assert_eq!(
+            policy.destinations(ImageType::Backdrop, ".png", 1),
+            vec![
+                PathBuf::from("/media/Set/extrafanart/fanart1.png"),
+                PathBuf::from("/media/Set/extrathumbs/thumb1.png"),
+            ]
+        );
+        assert_eq!(art_folder(&movie, None), Some(PathBuf::from("/media/Set")));
     }
     #[test]
     fn physical_and_virtual_seasons_publish_series_art_and_specials() {
