@@ -61,9 +61,10 @@ until you choose the fresh-install or migration procedure in step 4 below.
 
 ### Without the package: the release tarball
 
-The tarball carries the binary and its licence files (`LICENSE`, `copyright`). Do step 1,
-install the two packages by hand (`sudo apt-get install -y jellyfin-ffmpeg8 jellyfin-web`),
-and with a checkout of this repository for the `contrib/` files:
+The tarball carries the binary and its license files (`LICENSE`, `copyright`,
+`THIRD-PARTY-NOTICES.txt`). Do step 1, install the two packages by hand
+(`sudo apt-get install -y jellyfin-ffmpeg8 jellyfin-web`), and with a checkout of this
+repository for the `contrib/` files:
 
 ```sh
 V=v1.0.1; T=x86_64-unknown-linux-gnu             # or aarch64-unknown-linux-gnu
@@ -155,12 +156,13 @@ Install `rsync` and stop both services before copying. Run the checked-in script
 Ferrofin checkout. It uses the Debian package paths by default and assigns the copied files
 to the `ferrofin` user. Ferrofin's `data_dir` has the same layout as Jellyfin's
 `/var/lib/jellyfin`, so each path keeps its relative position; the `data/` inside each
-holds the database, playlists and collections:
+holds the database, playlists, collections and trickplay images:
 
 | Jellyfin | Ferrofin | Contents |
 |---|---|---|
 | `/var/lib/jellyfin/data/jellyfin.db` (and `-wal`/`-shm`) | `{data_dir}/data/` | the database |
 | `/var/lib/jellyfin/data/playlists/`, `collections/` | `{data_dir}/data/` | playlist and collection folders |
+| `/var/lib/jellyfin/data/trickplay/` | `{data_dir}/data/trickplay/` | trickplay images (seek previews) |
 | `/var/lib/jellyfin/root/default/` | `{data_dir}/root/default/` | library definitions |
 | `/var/lib/jellyfin/metadata/` | `{data_dir}/metadata/` | images and downloaded metadata |
 | `/etc/jellyfin/` | `{config_dir}/` | XML configuration |
@@ -171,6 +173,12 @@ holds the database, playlists and collections:
 The script reads `data_dir` and `config_dir` from `/etc/ferrofin/config.toml`. The package
 sets only `data_dir`, so `config_dir` is `{data_dir}/config`; `/etc/ferrofin` keeps just
 `config.toml` and stays read-only to the service.
+
+Trickplay images can be the largest part of Jellyfin's `data/`: check that `data_dir` has
+room for them first (`du -sh /var/lib/jellyfin/data/trickplay`). The script copies them
+last. Only libraries with trickplay image extraction on use them; for a library with it off
+that does not save trickplay beside its media, Ferrofin's trickplay refresh deletes the
+copy, as Jellyfin's does. Trickplay a library saves beside its media stays there.
 
 The rest of Jellyfin's `data/` (subtitle and attachment extraction caches, backups, task
 history) is not copied, nor are `plugins/` and `Subtitle Edit/`, except the plugin

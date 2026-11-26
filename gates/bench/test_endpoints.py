@@ -65,6 +65,12 @@ class CatalogueTests(unittest.TestCase):
         self.assertIn("media", got["GetVideoStream"])
         self.assertEqual(got["op"], "")
 
+    def test_every_random_draw_endpoint_names_a_get_of_the_real_catalogue(self):
+        cat = endpoints.catalogue(endpoints.diff.load_requests(endpoints.default_sets()))
+        ids = {e.request.id for e in cat if not e.skip}
+        self.assertEqual(sorted(set(endpoints.RANDOM_DRAW) - ids), [])
+        self.assertTrue(all(reason for reason in endpoints.RANDOM_DRAW.values()))
+
     def test_every_skip_names_a_get_of_the_real_catalogue(self):
         cat = endpoints.catalogue(endpoints.diff.load_requests(endpoints.default_sets()))
         ids = {e.request.id for e in cat}
@@ -98,6 +104,7 @@ class PercentileTests(unittest.TestCase):
         self.assertEqual((s["n"], s["errors"]), (4, 2))
         self.assertEqual(s["statuses"], {"200": 2, "500": 1, "none": 1})
         self.assertEqual(s["p50"], 2.5)
+        self.assertEqual(s["mean"], 4.0)
 
 
 class FakeClock:
@@ -362,6 +369,55 @@ class VerdictTests(unittest.TestCase):
         rows = gate.endpoint_verdicts([doc_of(2.0)] * 3, [doc_of(3.0)] * 3,
                                       {"endpoints": BAND, "cells": {"endpoints/home": {"relative_pct": 80, "absolute": 5}}})
         self.assertEqual(rows["endpoints/home"]["verdict"], "within noise")
+
+
+def bimodal(fast, n=200, slow_by=0.0):
+    """`n` (status, ms) samples of GET /Movies/Recommendations as gl-1944 measured them: `fast`
+    of them in the 25-35 ms mode, the rest in the 50-65 ms mode (moved by `slow_by` ms)."""
+    return [(200, 25.0 + i % 11) for i in range(fast)] + [(200, 50.0 + i % 16 + slow_by) for i in range(n - fast)]
+
+
+def run_of(eid, samples):
+    """One run's endpoints.json holding `eid` of the real catalogue, measured as `samples`."""
+    e = next(e for e in endpoints.catalogue(endpoints.diff.load_requests(endpoints.default_sets())) if e.request.id == eid)
+    row = {"id": eid, "file": e.request.file, "gates": e.gates, "target": e.request.path, "expect_status": 200}
+    return {"endpoints": [{**row, **endpoints.summarise(samples, 200)}]}
+
+
+class RandomDrawTests(unittest.TestCase):
+    """gl-1944: an endpoint that draws its work at random answers in two modes, and a p50 of 200
+    requests sits on the gap between them, landing in either mode from run to run."""
+    gate_rows = {"endpoints": BAND}
+    key = "endpoints/GetMovieRecommendations"
+
+    def rows(self, a, b):
+        return gate.endpoint_verdicts([run_of("GetMovieRecommendations", s) for s in a],
+                                      [run_of("GetMovieRecommendations", s) for s in b], self.gate_rows)
+
+    def test_one_draw_either_side_of_half_moves_the_p50_from_one_mode_to_the_other(self):
+        self.assertLess(endpoints.summarise(bimodal(101), 200)["p50"], 36)
+        self.assertGreater(endpoints.summarise(bimodal(99), 200)["p50"], 49)
+
+    def test_the_same_mixture_on_both_sides_is_within_noise_on_the_mean(self):
+        # 101 or 99 fast requests of 200 is well inside a fair draw's spread (about ±7).
+        rows = self.rows([bimodal(101), bimodal(101), bimodal(99)], [bimodal(99), bimodal(99), bimodal(101)])
+        row = rows[self.key]
+        self.assertEqual((row["verdict"], row["judged_on"]), ("within noise", "mean"), row)
+        self.assertEqual((row["a_p50"], row["b_p50"]), (35.0, 50.0))  # the p50 alone would have regressed
+        self.assertIn(f"{self.key} (judged on the mean)", [cells[0] for cells in gate.endpoint_rows(rows)])
+
+    def test_a_slower_mode_still_regresses_on_the_mean(self):
+        row = self.rows([bimodal(100)] * 3, [bimodal(100, slow_by=20)] * 3)[self.key]
+        self.assertEqual(row["verdict"], "regressed", row)
+        self.assertAlmostEqual(row["diff"], 10.0)
+
+    def test_a_run_measured_before_the_mean_was_recorded_cannot_be_judged(self):
+        old = run_of("GetMovieRecommendations", bimodal(100))
+        del old["endpoints"][0]["mean"]
+        rows = gate.endpoint_verdicts([old] * 3, [run_of("GetMovieRecommendations", bimodal(100))] * 3, self.gate_rows)
+        self.assertEqual(rows[self.key]["verdict"], "not comparable")
+        self.assertIn("mean", rows[self.key]["reason"])
+        self.assertNotIn(self.key, gate.blocking(rows))
 
 
 class SessionTests(unittest.TestCase):

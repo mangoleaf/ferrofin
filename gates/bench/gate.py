@@ -18,8 +18,9 @@
     gate.py endpoints PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
         the per-endpoint latency pass (`run.sh --only endpoints`, Ferrofin only here) interleaved the
         same way: every GET of the parity catalogue, p50/p95/p99 per run, regressed / within noise /
-        improved per endpoint on the p50 by the `[endpoints]` row; only the `gates/bench/screens.js` shapes
-        and the parity edge-case GETs gate (endpoints.py has the catalogue)
+        improved per endpoint on the p50 (the mean for `endpoints.RANDOM_DRAW`) by the `[endpoints]` row;
+        only the `gates/bench/screens.js` shapes and the parity edge-case GETs gate (endpoints.py has the
+        catalogue)
     gate.py soak PREVIOUS CANDIDATE [--pairs N] [--testdata DIR] [--out DIR] [--dry-run]
         the one-hour memory soak (`run.sh --only soak`, Ferrofin only) back to back, default one
         pair: the anon-memory slope in MiB/h per run, regressed when the candidate's exceeds the
@@ -244,12 +245,13 @@ def verdicts(model_a, model_b, gate):
 
 
 def endpoint_verdicts(docs_a, docs_b, gate):
-    """Per endpoint of either side's `endpoints.json`: the D4 verdict over each run's p50 in
-    schedule order (`docs_a[i]` ran just before `docs_b[i]`), judged by the endpoint's own band
-    (`endpoints/<id>`) or the `[endpoints]` row (D2), with the medians of p50, p95 and p99 per
-    side. Only an endpoint of `endpoints.GATED_FILES` gates, whichever run lacks or skipped it; one
-    whose answers differ between runs cannot be judged (`endpoints.problem`). A session without a
-    single gated endpoint judged nothing, and that blocks as `endpoints/*`."""
+    """Per endpoint of either side's `endpoints.json`: the D4 verdict over each run's p50 (its mean
+    for an endpoint of `endpoints.RANDOM_DRAW`, marked `judged_on`) in schedule order (`docs_a[i]` ran
+    just before `docs_b[i]`), judged by the endpoint's own band (`endpoints/<id>`) or the `[endpoints]`
+    row (D2), with the medians of p50, p95 and p99 per side. Only an endpoint of
+    `endpoints.GATED_FILES` gates, whichever run lacks or skipped it; one whose answers differ between
+    runs cannot be judged (`endpoints.problem`). A session without a single gated endpoint judged
+    nothing, and that blocks as `endpoints/*`."""
     a_runs, b_runs = [endpoints.by_id(d) for d in docs_a], [endpoints.by_id(d) for d in docs_b]
     ids = list(dict.fromkeys(eid for run in a_runs + b_runs for eid in run))
     out = {}
@@ -262,12 +264,15 @@ def endpoint_verdicts(docs_a, docs_b, gate):
         if why:
             row.update(verdict="not comparable", reason=why)
         else:
-            row["a"], row["b"] = [e["p50"] for e in a], [e["p50"] for e in b]
+            stat = "mean" if eid in endpoints.RANDOM_DRAW else "p50"
+            row["a"], row["b"] = [e[stat] for e in a], [e[stat] for e in b]
             v, diff, pct, slower = verdict(row["a"], row["b"], band)
             row.update(verdict=v, diff=diff, pct=pct, slower=slower, a_median=statistics.median(row["a"]),
                        b_median=statistics.median(row["b"]))
+            if stat == "mean":
+                row["judged_on"] = "mean"
             for side, entries in (("a", a), ("b", b)):
-                for q in (95, 99):
+                for q in (50, 95, 99):
                     row[f"{side}_p{q}"] = statistics.median(e[f"p{q}"] for e in entries)
         out[key] = row
     if not any(r["gated"] for r in out.values()):
@@ -566,16 +571,18 @@ NOISE_HEAD = ("cell", "min", "median", "max", "range", "CV", "p95 range", "band"
 VERDICT_HEAD = ("cell", "previous", "candidate", "change", "slower pairs", "band", "gates", "verdict")
 RAMP_HEAD = ("cell", "previous", "candidate", "change", "worse pairs", "band", "gates", "verdict")
 RAMP_RUN_HEAD = ("run", "ceiling", "limit", "stopped at", "why")
-ENDPOINT_HEAD = ("cell", "previous p50 / p95 / p99", "candidate p50 / p95 / p99", "p50 change", "slower pairs", "band",
-                 "gates", "verdict")
+ENDPOINT_HEAD = ("cell", "previous p50 / p95 / p99", "candidate p50 / p95 / p99", "change of the judged value",
+                 "slower pairs", "band", "gates", "verdict")
 
 
 def endpoint_rows(rows):
-    """The endpoint session's rows: the gated endpoints first, then the reported ones."""
+    """The endpoint session's rows: the gated endpoints first, then the reported ones; a cell judged on
+    the mean says so and shows the mean before its percentiles."""
     def pcts(r, side):
         if f"{side}_median" not in r:
             return "—"
-        return " / ".join(fmt(r[k], r["unit"]) for k in (f"{side}_median", f"{side}_p95", f"{side}_p99"))
+        p = " / ".join(fmt(r[k], r["unit"]) for k in (f"{side}_p50", f"{side}_p95", f"{side}_p99"))
+        return f"mean {fmt(r[f'{side}_median'], r['unit'])}; {p}" if r.get("judged_on") else p
     for gated in (True, False):
         for key, r in rows.items():
             if r["gated"] != gated:
@@ -583,7 +590,8 @@ def endpoint_rows(rows):
             b = r["band"]
             band = f"{b['relative_pct']}% / {b['absolute']} {r['unit']}" if b else "—"
             if "diff" in r:
-                yield (key, pcts(r, "a"), pcts(r, "b"),
+                cell = f"{key} (judged on the {r['judged_on']})" if r.get("judged_on") else key
+                yield (cell, pcts(r, "a"), pcts(r, "b"),
                        ("—" if r["pct"] is None else f"{r['pct']:+.0f}%") + f" ({r['diff']:+.2f} {r['unit']})",
                        f"{r['slower']}/{len(r['a'])}", band, "yes" if gated else "reported", r["verdict"])
             else:
@@ -679,7 +687,8 @@ def render_html(plan, result):
         verdict_text = (f"<b>Blocked</b> by {e(', '.join(result['blocking']))}" if result["blocking"]
                         else "<b>Pass</b>: no gated endpoint regressed.")
         parts += [f"<h2>Per-endpoint latency</h2><p class='lede'>{verdict_text} Every GET of the parity catalogue, alone: "
-                  "the median across each side's runs of p50, p95 and p99 (ms). The verdict is on the p50; only the "
+                  "the median across each side's runs of p50, p95 and p99 (ms). The verdict is on the p50, or on the mean for "
+                  "a cell marked <em>judged on the mean</em> (an endpoint whose work is drawn at random); only the "
                   "<code>gates/bench/screens.js</code> shapes and the edge-case GETs gate, and they are listed first.</p>",
                   "<div class='scroll'>" + html_table(ENDPOINT_HEAD, endpoint_rows(result["verdicts"]), verdict_col=7) + "</div>"]
     elif plan["mode"] == "ramp":

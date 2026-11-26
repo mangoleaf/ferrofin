@@ -80,6 +80,12 @@ pub struct SourceDirs {
     /// Its directories that hold nothing Jellyfin reads (its cache, its log,
     /// its web client): left out where they are inside the data directory.
     pub not_needed: Vec<PathBuf>,
+    /// Its files that Jellyfin does not read and the export either writes for
+    /// it in another form (its configuration, written as XML) or has no use
+    /// for (its tasks' last results), each of which may or may not exist:
+    /// digested, never copied, wherever they are. A copy of the configuration
+    /// would outrank that XML at a later adoption by Ferrofin.
+    pub not_needed_files: Vec<PathBuf>,
 }
 
 /// Why a directory inside the data directory was left out of its copy.
@@ -106,6 +112,7 @@ impl SourceDirs {
             config: program_data.join(CONFIG),
             metadata: program_data.join(METADATA),
             not_needed: Vec::new(),
+            not_needed_files: Vec::new(),
         }
     }
 
