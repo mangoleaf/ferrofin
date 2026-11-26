@@ -3927,7 +3927,10 @@ pub const VERIFIED: &[Verified] = &[
                authenticate_internal signed in, as upstream's is GetUserDto of the user it \
                holds; it reads the database where upstream's reads memory, so it is built \
                before the token is minted and a read error fails the sign-in with nothing \
-               minted, as a store error elsewhere in the sign-in fails it upstream",
+               minted, as a store error elsewhere in the sign-in fails it upstream. The \
+               minted Devices row, compared on 2026-11-26 (gl-1600), is the Device \
+               constructor's: one instant in DateCreated, DateModified and \
+               DateLastActivity, and IsActive never set (0)",
         date: "2026-11-05",
         divergences: &[
             "User reads the database (the user's permissions, preferences, access schedules \
@@ -5060,6 +5063,27 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
          error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Auth/Keys",
+        upstream_file: "Jellyfin.Api/Controllers/ApiKeyController.cs",
+        upstream_method: "CreateKey",
+        ferrofin: "handlers/api_key.rs create_key (RequireAdmin, Policies.RequiresElevation; \
+               the query binder's non_nullable and required tables refuse an absent, empty \
+               or blank app, as [FromQuery, Required] string does, and keep any other as \
+               sent) → ferrofin-core api_key_manager.rs create_api_key \
+               (AuthenticationManager.CreateApiKey). Compared: the ApiKey(name) row (Name \
+               as sent, AccessToken Guid.NewGuid().ToString(\"N\"), DateCreated now, \
+               DateLastActivity default(DateTime), stored as 0001-01-01 00:00:00), the 204, \
+               and on a live 12.4 the 400 for an absent, empty or blank app, the first of \
+               repeated app values, and an undeclared parameter ignored",
+        date: "2026-11-26",
+        divergences: &[
+            "The 400 (an absent, empty or blank app), 401 (no or bad token) and 403 (not an \
+         administrator) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
