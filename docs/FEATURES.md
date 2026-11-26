@@ -294,6 +294,15 @@ Wired and working, with a documented limitation or lighter verification:
     ([`INSTALL.md`](INSTALL.md#rar-comics) for bare metal).
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
+- **Photo comment character sets** — **Accepted divergence:** a photo's EXIF comment
+  (its `Overview`) reads as Jellyfin reads it where Jellyfin's text is readable, and as the
+  text where it is not. Jellyfin 12.4 reads a comment under the `ASCII` or the all-zero code
+  as Latin-1, so UTF-8 `café` shows as `cafÃ©`, and one under `UNICODE` as UTF-8, so the
+  UTF-16 that ExifTool and Exiv2 write shows empty or cut to its first letter. Ferrofin reads
+  UTF-8 when the text is valid UTF-8, else Latin-1 as Jellyfin does; under `UNICODE` it reads
+  UTF-8 only when the text also holds no NUL, and UTF-16 in the EXIF block's byte order
+  otherwise, unless a byte-order mark says which. So UTF-8 padded with a NUL under `UNICODE`,
+  which Jellyfin reads, comes out garbled.
 - **Playlist files are read, never written** — a library scan makes a playlist of each
   `.m3u`/`.m3u8`/`.pls`/`.wpl`/`.zpl` file in a music or untyped library and of each folder
   named `… [playlist]` or holding a `playlist.xml` (members from the file, or from the

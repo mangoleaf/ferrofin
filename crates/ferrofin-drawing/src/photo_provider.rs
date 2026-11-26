@@ -842,7 +842,7 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
                 String::from_utf8_lossy(&bytes).into_owned()
             }
             // The Windows XP* tags are BYTE arrays holding UTF-16LE.
-            exif::Value::Byte(bytes) => utf16le(bytes),
+            exif::Value::Byte(bytes) => utf16(bytes, true),
             exif::Value::Undefined(bytes, _) => String::from_utf8_lossy(bytes).into_owned(),
             _ => return None,
         };
@@ -902,7 +902,7 @@ fn ifd_comment(exif: &exif::Exif) -> Option<String> {
         primary(exif, exif::Tag::UserComment).map(|field| &field.value)
         && bytes.len() > 4
     {
-        return Some(user_comment(bytes));
+        return Some(user_comment(bytes, exif.little_endian()));
     }
     // kamadak-exif splits an ASCII value at each NUL.
     match &primary(exif, exif::Tag::ImageDescription)?.value {
@@ -916,20 +916,23 @@ fn ifd_comment(exif: &exif::Exif) -> Option<String> {
 /// An EXIF `UserComment`'s text, decoded as TagLib#'s `UserCommentIFDEntry`
 /// does (`UserCommentIFDEntry.cs:108-168`), branch for branch.
 ///
-/// The character sets are the one difference: TagLib reads `ASCII` text as
-/// Latin-1 and `UNICODE` text as UTF-8, so a non-ASCII comment comes out
-/// garbled (`café` as `cafÃ©`, UTF-16 cut at its first zero byte). This reads
-/// UTF-8 and UTF-16, as the EXIF specification means.
-fn user_comment(bytes: &[u8]) -> String {
-    let up_to_nul = |text: &[u8]| {
-        let text = text.split(|byte| *byte == 0).next().unwrap_or_default();
-        String::from_utf8_lossy(text).into_owned()
-    };
+/// The character sets differ where TagLib garbles the text (owner decision,
+/// gl-1613); where its text is readable this one is the same, but for the
+/// limit [`unicode_comment`] notes. TagLib reads `ASCII` and the all-zero code
+/// as Latin-1, turning UTF-8 `café` into `cafÃ©`: this reads UTF-8 when the
+/// text is valid UTF-8, else Latin-1. TagLib reads `UNICODE` as UTF-8, which
+/// is what its own writer puts there, but ExifTool and Exiv2 write UTF-16 in
+/// the EXIF block's byte order (`little_endian`), which TagLib cuts to one
+/// letter or none: see [`unicode_comment`].
+fn user_comment(bytes: &[u8], little_endian: bool) -> String {
+    fn up_to_nul(text: &[u8]) -> &[u8] {
+        text.split(|byte| *byte == 0).next().unwrap_or_default()
+    }
     if let Some(text) = bytes.strip_prefix(b"ASCII\0\0\0") {
-        return up_to_nul(text);
+        return utf8_or_latin1(up_to_nul(text));
     }
     if let Some(text) = bytes.strip_prefix(b"UNICODE\0") {
-        return utf16_with_bom(text);
+        return unicode_comment(text, little_endian);
     }
     let whole = String::from_utf8_lossy(bytes);
     let trimmed = whole.trim();
@@ -939,22 +942,44 @@ fn user_comment(bytes: &[u8]) -> String {
     // The all-zero "undefined" code, and CanonZoomBrowser's zero byte followed
     // by seven bytes of junk.
     if let [0, _, _, _, _, _, _, _, text @ ..] = bytes {
-        return up_to_nul(text);
+        return utf8_or_latin1(up_to_nul(text));
     }
     // Any other code (JIS among them) is read as text, the code included,
     // except a corrupt `Unicode` one.
-    up_to_nul(bytes.trim_prefix(b"Unicode\0"))
+    String::from_utf8_lossy(up_to_nul(bytes.trim_prefix(b"Unicode\0"))).into_owned()
 }
 
-/// Decodes UTF-16 text, honouring a leading byte-order mark and defaulting to
-/// big-endian as the EXIF spec specifies.
-fn utf16_with_bom(bytes: &[u8]) -> String {
-    let (bytes, little_endian) = match bytes {
-        [0xff, 0xfe, rest @ ..] => (rest, true),
-        // A big-endian BOM and no BOM at all decode the same way: EXIF
-        // specifies big-endian as the default.
-        [0xfe, 0xff, rest @ ..] | rest => (rest, false),
-    };
+/// `bytes` as UTF-8 when they are valid UTF-8, else as Latin-1, the
+/// ISO-8859-1 TagLib reads them as.
+fn utf8_or_latin1(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes).map_or_else(
+        |_| bytes.iter().copied().map(char::from).collect(),
+        str::to_owned,
+    )
+}
+
+/// The text after a `UNICODE` code: UTF-16 after a byte-order mark; without
+/// one, UTF-8 when it is valid UTF-8 and holds no NUL (TagLib#'s writer, read
+/// as TagLib reads it); otherwise UTF-16 in the EXIF block's byte order, as
+/// ExifTool and Exiv2 write it.
+fn unicode_comment(bytes: &[u8], little_endian: bool) -> String {
+    match bytes {
+        [0xff, 0xfe, rest @ ..] => utf16(rest, true),
+        [0xfe, 0xff, rest @ ..] => utf16(rest, false),
+        // shortcut: the owner's rule (gl-1613) misreads UTF-16 whose every byte
+        // is in 0x01-0x7F (Cyrillic or CJK with no ASCII character) as UTF-8,
+        // and UTF-8 padded with a NUL as UTF-16; if such files turn up, weigh
+        // the bytes as ExifTool's `Decompose` (`Charset.pm`) does.
+        _ => match std::str::from_utf8(bytes) {
+            Ok(text) if !text.contains('\0') => text.to_owned(),
+            _ => utf16(bytes, little_endian),
+        },
+    }
+}
+
+/// Decodes UTF-16 text in the byte order `little_endian` picks, up to its
+/// first NUL.
+fn utf16(bytes: &[u8], little_endian: bool) -> String {
     let units: Vec<u16> = bytes
         .as_chunks::<2>()
         .0
@@ -966,18 +991,6 @@ fn utf16_with_bom(bytes: &[u8]) -> String {
                 u16::from_be_bytes([pair[0], pair[1]])
             }
         })
-        .take_while(|unit| *unit != 0)
-        .collect();
-    String::from_utf16_lossy(&units)
-}
-
-/// Decodes a UTF-16LE byte run, as the Windows `XP*` TIFF tags store text.
-fn utf16le(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .take_while(|unit| *unit != 0)
         .collect();
     String::from_utf16_lossy(&units)
@@ -2190,7 +2203,7 @@ mod tests {
     /// gl-1611: the comment TagLib#'s `IFDTag.Comment` reads. Each case has the
     /// tags of a JPEG a stock Jellyfin 12.4 (TagLibSharp 2.3.0) scanned, and
     /// `expected` is the `Overview` it stored, which is this comment, or "" for
-    /// `None`.
+    /// `None`, except the cases marked as the owner's gl-1613 divergence.
     #[rstest::rstest]
     #[case::no_exif(&[], &[], None)]
     #[case::an_empty_comment(&[], &[(0x9286, 7, b"ASCII\0\0\0".as_slice())], Some(""))]
@@ -2237,10 +2250,18 @@ mod tests {
         &[(0x9286, 7, b"UNICODE\0".as_slice())],
         Some("")
     )]
-    // Not upstream's value: TagLib reads UNICODE text as UTF-8 and stores ''
-    // for this one (y10 in gl-1611's measurements). Ferrofin reads UTF-16,
-    // as the EXIF specification means; the choice is the owner's (gl-1613).
+    // TagLib#'s own writer puts UTF-8 under UNICODE, which TagLib reads back.
+    #[case::utf8_unicode_text(&[], &[(0x9286, 7, b"UNICODE\0caf\xc3\xa9 Hi".as_slice())], Some("caf\u{e9} Hi"))]
+    // Not upstream's values, which are '', 'c' and 'cafÃ©': TagLib cuts UTF-16
+    // at its first zero byte and reads ASCII-coded UTF-8 as Latin-1. Ferrofin
+    // reads the text (owner decision, gl-1613).
     #[case::unicode_text_is_utf16(&[], &[(0x9286, 7, b"UNICODE\0\xff\xfeH\0i\0".as_slice())], Some("Hi"))]
+    #[case::exiv2_utf16_in_a_little_endian_block(
+        &[],
+        &[(0x9286, 7, b"UNICODE\0c\0a\0f\0\xe9\0 \0H\0i\0".as_slice())],
+        Some("caf\u{e9} Hi")
+    )]
+    #[case::utf8_ascii_text(&[], &[(0x9286, 7, b"ASCII\0\0\0caf\xc3\xa9".as_slice())], Some("caf\u{e9}"))]
     fn the_comment_is_taglibs(
         #[case] ifd0: &[(u16, u16, &[u8])],
         #[case] exif: &[(u16, u16, &[u8])],
@@ -2248,6 +2269,81 @@ mod tests {
     ) {
         let (read, _) = streamed_tags(&jpeg_with_tags(ifd0, exif));
         assert_eq!(read.and_then(|tags| tags.comment).as_deref(), expected);
+    }
+
+    /// `text` under the `UNICODE` code, as UTF-16 in the byte order
+    /// `little_endian` picks, with no byte-order mark.
+    fn unicode(text: &str, little_endian: bool) -> Vec<u8> {
+        let units = text.encode_utf16();
+        let bytes: Vec<u8> = if little_endian {
+            units.flat_map(u16::to_le_bytes).collect()
+        } else {
+            units.flat_map(u16::to_be_bytes).collect()
+        };
+        [b"UNICODE\0".as_slice(), &bytes].concat()
+    }
+
+    /// gl-1613, the owner's rule: TagLib#'s reading wherever its text is
+    /// readable, else UTF-8 under `ASCII` and the all-zero code, and UTF-16 in
+    /// the EXIF block's byte order under `UNICODE`.
+    #[rstest::rstest]
+    // TagLib's Latin-1, the same as Jellyfin's.
+    #[case::ascii_latin1(b"ASCII\0\0\0caf\xe9\0junk".to_vec(), true, "caf\u{e9}")]
+    #[case::the_undefined_code_latin1(b"\0\0\0\0\0\0\0\0caf\xe9".to_vec(), false, "caf\u{e9}")]
+    // UTF-8, which TagLib turns into 'cafÃ©'.
+    #[case::ascii_utf8(b"ASCII\0\0\0caf\xc3\xa9".to_vec(), false, "caf\u{e9}")]
+    #[case::the_undefined_code_utf8(b"\0junk\0\0\0caf\xc3\xa9\0x".to_vec(), true, "caf\u{e9}")]
+    // TagLib's UTF-8 under UNICODE, in either block.
+    #[case::unicode_utf8_little_endian_block(b"UNICODE\0caf\xc3\xa9".to_vec(), true, "caf\u{e9}")]
+    #[case::unicode_utf8_big_endian_block(b"UNICODE\0caf\xc3\xa9".to_vec(), false, "caf\u{e9}")]
+    #[case::unicode_empty(b"UNICODE\0".to_vec(), true, "")]
+    #[case::unicode_nul_padding(b"UNICODE\0\0\0\0\0".to_vec(), false, "")]
+    // UTF-16 in the block's byte order, as ExifTool and Exiv2 write it.
+    #[case::utf16_little_endian_block(unicode("caf\u{e9} Hi", true), true, "caf\u{e9} Hi")]
+    #[case::utf16_big_endian_block(unicode("caf\u{e9} Hi", false), false, "caf\u{e9} Hi")]
+    #[case::utf16_ascii_little_endian_block(unicode("Hi", true), true, "Hi")]
+    #[case::utf16_ascii_big_endian_block(unicode("Hi", false), false, "Hi")]
+    #[case::utf16_ends_at_a_nul(unicode("Hi\0x", true), true, "Hi")]
+    // A byte-order mark decides over the block's order.
+    #[case::little_endian_bom(b"UNICODE\0\xff\xfeH\0i\0".to_vec(), false, "Hi")]
+    #[case::big_endian_bom(b"UNICODE\0\xfe\xff\0H\0i".to_vec(), true, "Hi")]
+    // Any other code is still read as UTF-8, the code included.
+    #[case::the_jis_code(b"JIS\0\0\0\0\0jis".to_vec(), true, "JIS")]
+    // UTF-16's edges: a pair of surrogates, and an odd last byte, dropped.
+    #[case::utf16_surrogate_pair(unicode("\u{1f600} ok", true), true, "\u{1f600} ok")]
+    #[case::utf16_odd_byte([unicode("Hi", false), vec![0x41]].concat(), false, "Hi")]
+    // The rule's known limit (the `shortcut:` in `unicode_comment`): UTF-8
+    // padded with a NUL is read as UTF-16.
+    #[case::utf8_padded_with_a_nul(b"UNICODE\0Hi\0".to_vec(), true, "\u{6948}")]
+    fn a_user_comment_reads_taglibs_text_else_the_writers(
+        #[case] bytes: Vec<u8>,
+        #[case] little_endian: bool,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(user_comment(&bytes, little_endian), expected);
+    }
+
+    /// gl-1613: the byte order a `UNICODE` comment's UTF-16 is read in is the
+    /// file's, through the IFD walk a TIFF takes.
+    #[rstest::rstest]
+    #[case::little_endian(true)]
+    #[case::big_endian(false)]
+    fn a_tiffs_unicode_comment_is_read_in_its_byte_order(#[case] little_endian: bool) {
+        let comment = unicode("caf\u{e9} Hi", little_endian);
+        let count = u32::try_from(comment.len()).unwrap();
+        let file = tiff_file(
+            little_endian,
+            0,
+            &[],
+            &[(0x9286, 7, count, comment)],
+            &[],
+            &[],
+        );
+        let (read, _) = streamed_tags(&file);
+        assert_eq!(
+            read.and_then(|tags| tags.comment).as_deref(),
+            Some("caf\u{e9} Hi")
+        );
     }
 
     /// A PNG of one pixel with no EXIF: its signature, IHDR and IEND. The CRCs
