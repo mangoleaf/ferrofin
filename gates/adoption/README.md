@@ -972,7 +972,21 @@ Every stage compares against that **source version's Jellyfin responses**:
 initial adoption, restart, a completed scan, and an unchanged second scan. The
 existing database/API metadata, artwork, and watch-history checks also run at
 every stage. Database integrity, expected adoption generation, and repair-free
-restart checks remain in place.
+restart checks remain in place. Three answers differ from the source's post-scan baseline,
+each scoped to the seeded items it concerns:
+
+- A 10.11 source takes the version group's MediaSource ids from the oracle (`FROM_ORACLE`), as
+  every 12.x re-keys a 10.11 alternate version; the real 10.11 to 12.4 upgrade must agree.
+- A 12.0 source takes the two pairs merged as versions from the oracle, in the users' browse
+  lists, the relationships and the subtitles (`MERGED_KEYS`, gl-1954). Jellyfin 12.0's scan did
+  not see a version merged by hand and listed each pair apart; 12.1 on the same database lists one,
+  and `jellyfin-12.1-from-12` must agree with the oracle on those movies.
+- Before the first scan (the adoption and restart stages), a source older than 12.2 shows the
+  child the rated series' unrated season and episodes (`before_first_scan`, gl-1953). Jellyfin
+  12.2's `MigrateRatingLevels`, which Ferrofin's boot runs on such a source, scores each row from
+  its own rating, so they lose the series' score until the scan. That is read from
+  `MigrateRatingLevels.cs` and observed on Ferrofin's adoption; no fixture records Jellyfin's own
+  pre-scan answer. The scan stages hold them hidden again.
 
 The builder refuses to accept an empty scenario: restricted items must actually
 be hidden, the uploaded image must be the chosen image, both users must have
@@ -1038,7 +1052,8 @@ The version/upgrade paths are the ones `run.sh` covers (`VERSIONS` in `synthetic
 fresh installs carry no seeds and are left to `run.sh`.
 Each upgraded Jellyfin completes a scan before supplying its baseline. `--only`
 selects one named fixture; building an upgraded fixture requires its parent to
-have been built. `--port` changes the localhost-only test port (default 18120).
+have been built. Running the matrix on `jellyfin-12.0` (alone or in a full run) also needs
+`jellyfin-12.1-from-12` built, whose baseline guards the merged versions' expectation. `--port` changes the localhost-only test port (default 18120).
 The builder records a recipe hash and refuses to reuse a completed fixture after
 its recipe changes; build into a new directory then. Likewise, a build that fails
 part-way, for example when Jellyfin resets a connection while seeding (seen once under
