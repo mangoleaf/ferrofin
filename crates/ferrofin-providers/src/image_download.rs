@@ -770,7 +770,7 @@ mod destination_tests {
     }
 
     fn guarded(allowed_host: &'static str) -> GuardedHttp {
-        GuardedHttp::new(Arc::new(PrivateBut(allowed_host)), false, &IMAGE_FETCH)
+        GuardedHttp::new(Arc::new(PrivateBut(allowed_host)), None, &IMAGE_FETCH)
     }
 
     fn redirect(location: &str) -> Vec<u8> {
@@ -792,7 +792,7 @@ mod destination_tests {
         let server = MockServer::start_raw(vec![MockServer::raw_ok(PNG_HEADER, PNG)]).await;
         let http = GuardedHttp::new(
             Arc::new(destination::ImageDestinations::default()),
-            false,
+            None,
             &IMAGE_FETCH,
         );
         let err = open_image_capped(&http, &format!("{}/a.png", server.base_url), 1024)
@@ -915,15 +915,21 @@ mod destination_tests {
 
     /// With a proxy configured, which would resolve a name out of the
     /// resolver's sight, a name is checked on the server's own answer before
-    /// anything is sent, then reached at the addresses checked (the hosts the
-    /// proxy settings exclude go there directly; this test sets no proxy, so
-    /// all do). An address literal is checked as it is, and a name the server
-    /// cannot resolve is not sent to the proxy unchecked.
+    /// anything is sent (and again at connect for the hosts the proxy
+    /// settings do not cover, which go there directly; this test sets no
+    /// proxy, so all do). An address literal is checked as it is, and a name
+    /// the server cannot resolve is not sent to the proxy unchecked.
     #[tokio::test]
     async fn through_a_proxy_a_destination_is_checked_before_it_is_sent() {
         let server = MockServer::start_raw(vec![MockServer::raw_ok(PNG_HEADER, PNG)]).await;
         let at = |host: &str| format!("http://{host}:{}/a.png", port(&server));
-        let proxied = |allowed| GuardedHttp::new(Arc::new(PrivateBut(allowed)), true, &IMAGE_FETCH);
+        let proxied = |allowed| {
+            GuardedHttp::new(
+                Arc::new(PrivateBut(allowed)),
+                Some(Vec::new()),
+                &IMAGE_FETCH,
+            )
+        };
 
         let image = open_image_capped(&proxied("localhost"), &at("localhost"), 1024)
             .await
@@ -969,7 +975,8 @@ mod destination_tests {
 
     /// The resolver refuses at connect time too: a name whose answer turns
     /// private after the check before sending (DNS rebinding) never reaches
-    /// that address.
+    /// that address, with a proxy configured or not (a host the proxied
+    /// client reaches directly; this test sets no proxy, so all are).
     #[tokio::test]
     async fn a_name_that_turns_private_after_the_check_is_refused_at_connect() {
         /// Allows the first lookup's addresses, then refuses every private one.
@@ -989,20 +996,25 @@ mod destination_tests {
             .await
             .expect("localhost")
             .len();
-        let http = GuardedHttp::new(
-            Arc::new(Rebinding {
-                allowed,
-                checks: std::sync::atomic::AtomicUsize::new(0),
-            }),
-            false,
-            &IMAGE_FETCH,
-        );
-        let url = format!("http://localhost:{}/a.png", port(&server));
-        let err = open_image_capped(&http, &url, 1024)
-            .await
-            .err()
-            .expect("refused at connect");
-        assert!(matches!(err, ImageFetchError::Unavailable), "{err:?}");
+        for proxy in [None, Some(Vec::new())] {
+            let http = GuardedHttp::new(
+                Arc::new(Rebinding {
+                    allowed,
+                    checks: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                proxy.clone(),
+                &IMAGE_FETCH,
+            );
+            let url = format!("http://localhost:{}/a.png", port(&server));
+            let err = open_image_capped(&http, &url, 1024)
+                .await
+                .err()
+                .expect("refused at connect");
+            assert!(
+                matches!(err, ImageFetchError::Unavailable),
+                "{proxy:?}: {err:?}"
+            );
+        }
         assert_eq!(server.requests(), 0, "nothing reached the address");
     }
 }
