@@ -1909,9 +1909,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Each change reads the row inside its write transaction, so two overlapping saves of \
              one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
              writes every column back, so there the later save undoes the earlier one.",
-            "Marking a container unplayed also clears the play state on the container's own rows, \
-             which earlier Ferrofin builds wrote; upstream's MarkUnplayed leaves them, so a Played \
-             set on a container through the UserData API survives it there. Fix path: gl-1064.",
+            "Marking a series, season, box set, playlist, album or folder unplayed also resets \
+             the play state on the container's own rows, where upstream's MarkUnplayed only walks \
+             the members, so a Played set on a container through the UserData API survives it \
+             there. The clear resets the play state versions before 1.4.0 wrote on containers, which \
+             would otherwise show an album or a library as played for good. Deliberate divergence \
+             (owner decision 2026-11-20, gl-1064).",
             "A container's members are saved a chunk at a time, each chunk in one write \
              transaction, where upstream's Folder.MarkPlayed commits each member's SaveUserData \
              alone and stops at the first that fails: here a member's write that fails also rolls \
