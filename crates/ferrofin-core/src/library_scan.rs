@@ -247,6 +247,8 @@ type EarlyEpisodeImages = AbortOnDrop<(Vec<TmdbImage>, u32)>;
 
 /// The walk's next item, as [`ArtworkCache::next_episode`] keeps it.
 struct NextEpisode {
+    /// Its id.
+    id: Uuid,
     /// Its planned row.
     entity: BaseItemEntity,
     /// Which remote images its refresh fetches (never `None`).
@@ -8109,7 +8111,7 @@ impl LibraryScanner {
         pass: ItemPass<'_>,
         state: &mut ItemState<'_, '_>,
     ) -> Result<ItemSaved, ServiceError> {
-        use ferrofin_providers::rate_limit::count_request_failures;
+        use ferrofin_providers::rate_limit::{count_request_failures, for_item};
         let ItemPass {
             index,
             item,
@@ -8464,16 +8466,17 @@ impl LibraryScanner {
             // Boxed: the provider fold below this is the deepest branch of
             // the per-item future.
             let fetched = cancel
-                .unless_cancelled(count_request_failures(Box::pin(
-                    self.fetch_remote_metadata(
+                .unless_cancelled(for_item(
+                    item.id,
+                    count_request_failures(Box::pin(self.fetch_remote_metadata(
                         &mut entity,
                         state.art_cache,
                         policy,
                         prefer,
                         &lookup_ids,
                         &guesses,
-                    ),
-                )))
+                    ))),
+                ))
                 .await;
             let Some((remote, failed)) = fetched else {
                 return Ok(ItemSaved::Cancelled);
@@ -8820,8 +8823,13 @@ impl LibraryScanner {
                 .probe_attachments
                 .insert(item.id, rows.attachments.clone());
         }
-        let ((artwork, cut_short, local_images_changed), failed) = count_request_failures(
-            Box::pin(self.collect_artwork(item.id, art, state.art_cache)),
+        let ((artwork, cut_short, local_images_changed), failed) = for_item(
+            item.id,
+            count_request_failures(Box::pin(self.collect_artwork(
+                item.id,
+                art,
+                state.art_cache,
+            ))),
         )
         .await;
         state.art_cache.probe_attachments.remove(&item.id);
@@ -12980,6 +12988,7 @@ impl LibraryScanner {
         repo: &dyn ferrofin_traits::persistence::PeopleRepository,
         mut written: Vec<ferrofin_traits::persistence::WrittenPerson>,
     ) {
+        use ferrofin_providers::rate_limit::for_item;
         let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
             return;
         };
@@ -13039,7 +13048,7 @@ impl LibraryScanner {
                     "Person",
                     ImageType::Primary,
                 );
-                let mut infos: Vec<_> = download_image(
+                let download = download_image(
                     tmdb,
                     (&dir, &stem),
                     &id,
@@ -13048,10 +13057,10 @@ impl LibraryScanner {
                         url: url.clone(),
                         ..Default::default()
                     },
-                )
-                .await
-                .into_iter()
-                .collect();
+                );
+                // The person's own provider work, though its credit's item's
+                // refresh runs it.
+                let mut infos: Vec<_> = for_item(person.id, download).await.into_iter().collect();
                 if infos.is_empty() {
                     photos_failed().insert(url);
                 }
@@ -13129,9 +13138,11 @@ impl LibraryScanner {
                         &mut locale_cache,
                     )
                     .await;
-                let details = tmdb
-                    .person_details_for_language(tmdb_id, language.as_deref())
-                    .await;
+                let details = for_item(
+                    person.id,
+                    tmdb.person_details_for_language(tmdb_id, language.as_deref()),
+                )
+                .await;
                 // `None` is also TMDB having nothing on the person: asked once.
                 let Some(details) = details else {
                     asked().insert(person.id);
@@ -13320,7 +13331,8 @@ impl LibraryScanner {
                 }
             }
             let (dir, stem) = art_dir_for(&meta_root.resolve(), id, "Studio", ImageType::Thumb);
-            let dest = match studio_thumb(studios, (&dir, &stem), name).await {
+            let thumb = studio_thumb(studios, (&dir, &stem), name);
+            let dest = match ferrofin_providers::rate_limit::for_item(id, thumb).await {
                 StudioThumb::Found(dest) => dest,
                 StudioThumb::Answered => {
                     refreshed.push(id);
@@ -14221,7 +14233,7 @@ impl LibraryScanner {
                     ferrofin_providers::rate_limit::note_request_failure();
                     tracing::warn!(
                         provider = provider.name(),
-                        item = %lookup.item_id,
+                        item_id = %lookup.item_id,
                         %err,
                         "dynamic image provider failed; continuing"
                     );
@@ -14240,7 +14252,7 @@ impl LibraryScanner {
                 let Some(ext) = sniff_image_ext(&bytes) else {
                     tracing::warn!(
                         provider = provider.name(),
-                        item = %entity.id,
+                        item_id = %entity.id,
                         kind = ?kind,
                         "plugin artwork bytes are not a recognized image format; skipping"
                     );
@@ -14252,7 +14264,7 @@ impl LibraryScanner {
                 if let Err(err) =
                     off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
                 {
-                    tracing::warn!(%err, item = %entity.id, "failed to write plugin artwork");
+                    tracing::warn!(%err, item_id = %entity.id, "failed to write plugin artwork");
                     continue;
                 }
                 if let Some(previous) = previous.filter(|path| *path != dest) {
@@ -15067,6 +15079,7 @@ impl LibraryScanner {
         }
         let fetch = stored_rows.plan(index)?.remote_images;
         (fetch != ImageFetch::None).then(|| NextEpisode {
+            id: item.id,
             entity: item.entity.to_entity(),
             fetch,
         })
@@ -15093,6 +15106,7 @@ impl LibraryScanner {
         cache: &mut ArtworkCache,
     ) {
         let Some(NextEpisode {
+            id: next_id,
             entity: next,
             fetch,
         }) = cache.next_episode.take()
@@ -15127,13 +15141,13 @@ impl LibraryScanner {
             return;
         }
         let (series, language) = (key.0, key.3.clone());
+        // The request is the next episode's, as the failures it counts are.
         let task = tokio::spawn(tracing::Instrument::in_current_span(async move {
-            ferrofin_providers::rate_limit::count_request_failures(tmdb.episode_images(
-                series,
-                season,
-                episode,
-                language.as_deref(),
-            ))
+            let request = tmdb.episode_images(series, season, episode, language.as_deref());
+            ferrofin_providers::rate_limit::for_item(
+                next_id,
+                ferrofin_providers::rate_limit::count_request_failures(request),
+            )
             .await
         }));
         cache.episode_images = Some(((series, season, episode, key.3.clone()), AbortOnDrop(task)));

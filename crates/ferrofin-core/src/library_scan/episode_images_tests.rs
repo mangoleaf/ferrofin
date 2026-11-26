@@ -227,3 +227,78 @@ async fn an_early_answer_goes_only_to_its_own_request(
         "{log:#?}"
     );
 }
+
+/// The early request is the next episode's work, so its failure names that
+/// episode, not the one whose image pass started it (gl-1880): the spawned
+/// task leaves the starting pass's scope behind and takes the next one's.
+#[tokio::test]
+async fn an_early_requests_failure_names_the_next_episode() {
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    // Every request is refused: a failure, warned at the default level.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let _ = stream.read(&mut [0u8; 4096]);
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+        }
+    });
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = Database::connect_in_memory().await.expect("db");
+    db.run_migrations().await.expect("migrations");
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db));
+    let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+        FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+            .with_item_store(persistence.clone()),
+    );
+    let tmdb = ferrofin_providers::TmdbClient::new().with_base_url(&base);
+    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+        .with_metadata(Arc::new(tmdb), tmp.path().join("metadata"));
+    let this = BaseItemEntity {
+        series_id: Some("SERIES".into()),
+        parent_index_number: Some(1),
+        index_number: Some(1),
+        ..BaseItemEntity::default()
+    };
+    let (this_id, next_id) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+    let mut cache = super::ArtworkCache {
+        next_episode: Some(super::NextEpisode {
+            id: next_id,
+            entity: BaseItemEntity {
+                index_number: Some(2),
+                ..this.clone()
+            },
+            fetch: super::ImageFetch::All,
+        }),
+        ..super::ArtworkCache::default()
+    };
+    let logs = crate::test_support::CapturedLogs::default();
+    // A current-thread runtime: the spawned request runs on this thread,
+    // under this subscriber.
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish(),
+    );
+
+    ferrofin_providers::rate_limit::for_item(this_id, async {
+        scanner.prefetch_next_episode_images(&this, &(1399, 1, 1, None), &mut cache);
+    })
+    .await;
+    let (_, mut started) = cache.episode_images.take().expect("started early");
+    let (_, failures) = (&mut started.0).await.expect("the early request");
+
+    assert!(failures > 0);
+    let text = logs.text();
+    assert!(
+        text.lines().any(|line| line.contains("request rejected")
+            && line.contains(&format!("item_id={next_id}"))),
+        "{text}"
+    );
+    assert!(!text.contains(&this_id.to_string()), "{text}");
+}

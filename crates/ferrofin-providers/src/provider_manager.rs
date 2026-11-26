@@ -5483,10 +5483,13 @@ impl ProviderManager for LocalProviderManager {
         options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
         // Boxed: the refresh future holds the whole fetch-merge-save state
-        // (`clippy::large_futures`).
-        Box::pin(self.refresh_item(item_id, options))
-            .await
-            .map(|_| ())
+        // (`clippy::large_futures`). Its provider failures name the item.
+        Box::pin(crate::rate_limit::for_item(
+            item_id,
+            self.refresh_item(item_id, options),
+        ))
+        .await
+        .map(|_| ())
     }
 
     async fn refresh_single_item(
@@ -5497,7 +5500,11 @@ impl ProviderManager for LocalProviderManager {
         // `ProviderManager.RefreshSingleItem`: the item's own metadata service
         // runs and reports what changed. Ferrofin's refresh never recurses
         // into children, so this is the full refresh with its verdict kept.
-        Box::pin(self.refresh_item(item_id, options)).await
+        Box::pin(crate::rate_limit::for_item(
+            item_id,
+            self.refresh_item(item_id, options),
+        ))
+        .await
     }
 
     async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
@@ -9023,6 +9030,41 @@ mod tests {
                 assert!(copied.is_empty(), "{copied:?}");
             }
         }
+    }
+
+    /// A refresh's provider failures name the refreshed item (gl-1880): the
+    /// refresh queue, the people task and a scan's box sets all come here.
+    #[tokio::test]
+    async fn a_refreshs_provider_failure_names_the_item() {
+        use crate::log_capture::{LogBuffer, init_log_capture};
+        use crate::mock_http::MockServer;
+        use tracing::instrument::WithSubscriber as _;
+        init_log_capture();
+        let server = MockServer::start_raw(vec![MockServer::raw_status("401 Unauthorized")]).await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let store = Arc::new(RecordingStore::default());
+        let (item_id, mgr) = box_set_manager(row("Movies.BoxSet", "Matrix"), tmdb, store);
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+
+        let refreshed = mgr
+            .refresh_full_item(item_id, &full_metadata_refresh())
+            .with_subscriber(subscriber)
+            .await;
+
+        assert!(refreshed.is_ok(), "{refreshed:?}");
+        assert!(server.requests() > 0);
+        let logs = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("utf-8");
+        assert!(
+            logs.lines().any(|line| line.contains("request rejected")
+                && line.contains(&format!("item_id={item_id}"))),
+            "{logs}"
+        );
     }
 
     /// Every refresh of an owner reaches its extras (`BaseItem.RefreshExtras`):

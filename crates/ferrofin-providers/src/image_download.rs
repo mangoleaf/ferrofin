@@ -232,6 +232,7 @@ pub(crate) async fn download_image_or_none(url: &str) -> Option<(Vec<u8>, String
         Ok(image) => Some(image),
         Err(error) => {
             tracing::debug!(
+                item_id = crate::rate_limit::request_item(),
                 url = %ferrofin_util::source_url::redact_url(url),
                 ?error,
                 "remote image dropped"
@@ -1234,12 +1235,19 @@ fn artwork_failure(error: ImageFetchError) -> ArtworkDownloadFailure {
     match error {
         ImageFetchError::Missing | ImageFetchError::Refused => ArtworkDownloadFailure::Skip,
         ImageFetchError::TooLarge => {
-            tracing::debug!("artwork is over image_download_max_mb; trying the next candidate");
+            tracing::debug!(
+                item_id = crate::rate_limit::request_item(),
+                "artwork is over image_download_max_mb; trying the next candidate"
+            );
             ArtworkDownloadFailure::Skip
         }
         ImageFetchError::NotAnImage(reason) => {
             crate::rate_limit::note_request_failure();
-            tracing::warn!(%reason, "artwork provider returned a non-image response");
+            tracing::warn!(
+                item_id = crate::rate_limit::request_item(),
+                %reason,
+                "artwork provider returned a non-image response"
+            );
             ArtworkDownloadFailure::Stop
         }
         ImageFetchError::Unavailable | ImageFetchError::Storage(_) => ArtworkDownloadFailure::Stop,

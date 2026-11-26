@@ -774,6 +774,35 @@ async fn a_failed_provider_is_retried_but_one_that_found_nothing_is_not() {
     assert_eq!(fx.stamps(&fx.heat).await, stamped);
 }
 
+/// A provider failure's warning names the item whose refresh it failed, at
+/// the server's default `info` level (gl-1880): the rate limiter's warnings
+/// carry only the provider and, for TMDB, the redacted context `lookup`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_provider_warning_names_the_item() {
+    use tracing::instrument::WithSubscriber as _;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), 0).await;
+    fx.tmdb.answer_heat(Answer::Fail);
+    let log = tmp.path().join("scan.log");
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(Arc::new(std::fs::File::create(&log).expect("log")))
+        .finish();
+    assert_eq!(fx.scan().with_subscriber(subscriber).await.created, 2);
+
+    let logs = std::fs::read_to_string(&log).expect("read log");
+    let heat = derive_item_id(BaseItemKind::Movie, &fx.heat.to_string_lossy()).expect("id");
+    let rejected: Vec<&str> = logs
+        .lines()
+        .filter(|line| line.contains("WARN") && line.contains("request rejected"))
+        .collect();
+    assert!(!rejected.is_empty(), "no rejection warning:\n{logs}");
+    for line in rejected {
+        assert!(line.contains(&format!("item_id={heat}")), "{line}");
+    }
+}
+
 /// A music album with a cover beside its tracks stores its shared,
 /// content-addressed cover — the loop and the post-scan album pass agree on
 /// it, so an unchanged rescan rewrites neither the album's images nor
