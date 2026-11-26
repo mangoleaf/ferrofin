@@ -8649,6 +8649,14 @@ impl LibraryScanner {
                 _ => None,
             },
         };
+        // `SaveItemAsync` writes them only for a kind that supports people
+        // (`MetadataService.cs:320`, again in `LibraryManager.UpdatePeopleAsync`):
+        // an `artist.nfo`'s or a `playlist.xml`'s credits are read and dropped,
+        // before they can make a backfill pass save.
+        // TODO(parity, open work item — NOT an accepted divergence; gl-1955):
+        // credits an earlier build stored for such a kind stay as they are
+        // until the owner decides whether a repair removes them.
+        let credits = credits.filter(|_| kind.is_some_and(crate::kinds::supports_people));
         // `BeforeSaveInternal`: a stored file that changed on disk is
         // re-dated under "Use file creation date" (`RefreshContext::redated`).
         let redated = stored_row.and_then(|row| state.refresh.redated(row, item));
