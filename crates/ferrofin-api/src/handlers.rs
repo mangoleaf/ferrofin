@@ -6433,7 +6433,9 @@ pub const VERIFIED: &[Verified] = &[
                get_playback_media_sources, playback_sources, playback_probe_path: a .strm \
                item, or one whose first non-placeholder source lacks its main stream, is \
                refreshed through item_refresh_remote_probe, EnableRemoteContentProbe and a \
-               FullRefresh, before its sources are read again), FfmpegAttachmentIo open_file, \
+               FullRefresh, before its sources are read again; resolve_symlink_paths, \
+               ResolveSymlinkPaths: a file source's link to an existing file is read from \
+               its final target), FfmpegAttachmentIo open_file, \
                run_ffmpeg → handlers/streaming.rs opened_file_response (FileStreamResult)",
         date: "2026-11-26",
         divergences: &[

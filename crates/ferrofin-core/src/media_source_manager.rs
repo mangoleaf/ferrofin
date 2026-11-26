@@ -276,6 +276,7 @@ impl FerrofinMediaSourceManager {
                 )
                 .await?;
         }
+        resolve_symlink_paths(&mut sources, enable_path_substitution).await;
         // `preferredId`: the first static source's id when it is a `Guid` —
         // the queried version's own file — else the item's id
         // (`MediaSourceManager.cs:232-234`).
@@ -1330,6 +1331,38 @@ fn estimated_video_bitrate(width: i32) -> Option<i32> {
         w if w >= 1200 => Some(8_000_000),
         w if w >= 700 => Some(2_000_000),
         _ => None,
+    }
+}
+
+/// `GetPlaybackMediaSources`' `ResolveSymlinkPaths`: without path substitution, a
+/// file source whose path is a link to an existing file is read from the link's
+/// final target (`FileSystemHelper.ResolveLinkTarget(path, returnFinalTarget: true)`).
+async fn resolve_symlink_paths(sources: &mut [MediaSourceInfo], enable_path_substitution: bool) {
+    if enable_path_substitution {
+        return;
+    }
+    for source in sources {
+        let Some(path) = source.path.as_deref() else {
+            continue;
+        };
+        if source.protocol != MediaProtocol::File
+            || !tokio::fs::symlink_metadata(path)
+                .await
+                .is_ok_and(|meta| meta.is_symlink())
+        {
+            continue;
+        }
+        // shortcut: canonicalize also resolves linked parent directories and `..`,
+        // which upstream's FullName keeps; only an ffmpeg input path differs, so
+        // port the link walk if a caller ever shows the path.
+        if let Ok(target) = tokio::fs::canonicalize(path).await
+            && tokio::fs::metadata(&target)
+                .await
+                .is_ok_and(|meta| meta.is_file())
+            && let Ok(target) = target.into_os_string().into_string()
+        {
+            source.path = Some(target);
+        }
     }
 }
 
@@ -2980,6 +3013,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(probed.lock().unwrap().len(), 3, "its stream is present");
+    }
+
+    /// `ResolveSymlinkPaths`: playback sources read without path substitution
+    /// follow a file link to its final target; with substitution, a link to a
+    /// directory, a dangling link or a loop, the path stays as stored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn playback_without_path_substitution_reads_a_linked_file_from_its_target() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let real = tmp.path().join("real.mkv");
+        std::fs::write(&real, b"x").unwrap();
+        let linked = |name: &str, target: &std::path::Path| {
+            let link = tmp.path().join(name);
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            link.to_str().unwrap().to_owned()
+        };
+        let hop = linked("hop.mkv", &real);
+        let chain = linked("chain.mkv", std::path::Path::new(&hop));
+        let folder = linked("folder.mkv", tmp.path());
+        let dangling = linked("dangling.mkv", &tmp.path().join("gone.mkv"));
+        let looped = linked("loop-a.mkv", &tmp.path().join("loop-b.mkv"));
+        linked("loop-b.mkv", std::path::Path::new(&looped));
+        let target = std::fs::canonicalize(&real).unwrap();
+        let mgr = manager(&db);
+        let user = Uuid::from_u128(0x2FF);
+        for (n, path, resolved) in [
+            (0x221, &chain, target.to_str().unwrap()),
+            (0x222, &folder, folder.as_str()),
+            (0x223, &dangling, dangling.as_str()),
+            (0x224, &looped, looped.as_str()),
+        ] {
+            let id = Uuid::from_u128(n);
+            seed_strm(&db, id, path, "{}").await;
+            let sources = |substitute| mgr.get_playback_media_sources(id, user, false, substitute);
+            assert_eq!(
+                sources(false).await.unwrap()[0].path.as_deref(),
+                Some(resolved)
+            );
+            assert_eq!(
+                sources(true).await.unwrap()[0].path.as_deref(),
+                Some(path.as_str())
+            );
+        }
     }
 
     /// The tuner URL every fake channel plays.
