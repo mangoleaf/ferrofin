@@ -1037,21 +1037,7 @@ impl Database {
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the query fails.
     pub async fn jellyfin_migration_applied(&self, migration_id: &str) -> Result<bool> {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        if exists.is_none() {
-            return Ok(false);
-        }
-        let applied: Option<i64> = sqlx::query_scalar(
-            r#"SELECT 1 FROM "__EFMigrationsHistory" WHERE "MigrationId" = ?1 LIMIT 1"#,
-        )
-        .bind(migration_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(applied.is_some())
+        jellyfin_migration_applied(&mut *self.pool.acquire().await?, migration_id).await
     }
 
     /// Plants an adoption record as the gate would — for tests of the boot
@@ -1765,6 +1751,29 @@ async fn adopt_jellyfin_database(
         "adopted an existing Jellyfin database in place"
     );
     Ok(())
+}
+
+/// [`Database::jellyfin_migration_applied`] on one connection, so a boot
+/// repair can read it inside its own transaction.
+pub(crate) async fn jellyfin_migration_applied(
+    conn: &mut sqlx::SqliteConnection,
+    migration_id: &str,
+) -> Result<bool> {
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if exists.is_none() {
+        return Ok(false);
+    }
+    let applied: Option<i64> = sqlx::query_scalar(
+        r#"SELECT 1 FROM "__EFMigrationsHistory" WHERE "MigrationId" = ?1 LIMIT 1"#,
+    )
+    .bind(migration_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(applied.is_some())
 }
 
 /// The code-created adoption record — like `_sqlx_migrations`, it lives
@@ -4298,6 +4307,101 @@ mod tests {
         Database::connect_sized(&url, Some(2))
             .await
             .expect("re-open after adoption");
+    }
+
+    /// Jellyfin's `UpdateNormalizedUsername` saves every user it changes, and EF
+    /// bumps each one's `RowVersion`. Upgrading 10.11.8 changes every key (from
+    /// `AddNormalizedUsername`'s ''), an all-caps name's included; a 10.11.11
+    /// database already ran it, so adopting one bumps nothing.
+    #[rstest::rstest]
+    #[case::from_10_11_8(false, [4, 1, 8])]
+    #[case::from_10_11_11(true, [3, 0, 7])]
+    #[tokio::test]
+    async fn adoption_bumps_row_versions_as_update_normalized_username_does(
+        #[case] newer: bool,
+        #[case] expected: [i64; 3],
+    ) {
+        use sqlx::ConnectOptions;
+        async fn read(db: &Database) -> Vec<(String, i64)> {
+            sqlx::query_as(
+                r#"SELECT "NormalizedUsername", "RowVersion" FROM "Users" ORDER BY "Id""#,
+            )
+            .fetch_all(db.pool())
+            .await
+            .expect("users")
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut ids = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
+        if newer {
+            ids.extend(JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS);
+        }
+        seed_jellyfin_fixture(&path, &ids).await;
+        let users = [("a", "münchen", 3), ("b", "ı", 0), ("c", "ADMIN", 7)];
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&path)
+            .connect()
+            .await
+            .expect("open fixture db");
+        if newer {
+            sqlx::query(r#"ALTER TABLE "Users" ADD "NormalizedUsername" TEXT NOT NULL DEFAULT ''"#)
+                .execute(&mut conn)
+                .await
+                .expect("add column");
+        }
+        for (internal_id, (id, name, row_version)) in (1_i64..).zip(users) {
+            sqlx::query(
+                r#"INSERT INTO "Users" ("Id","AuthenticationProviderId","DisplayCollectionsView",
+                   "DisplayMissingEpisodes","EnableAutoLogin","EnableLocalPassword",
+                   "EnableNextEpisodeAutoPlay","EnableUserPreferenceAccess","HidePlayedInLatest",
+                   "InternalId","InvalidLoginAttemptCount","MaxActiveSessions","MustUpdatePassword",
+                   "PasswordResetProviderId","PlayDefaultAudioTrack","RememberAudioSelections",
+                   "RememberSubtitleSelections","RowVersion","SubtitleMode","SyncPlayAccess",
+                   "Username")
+                   VALUES (?1,'auth',0,0,0,0,1,1,1,?2,0,0,0,'reset',1,1,1,?3,0,0,?4)"#,
+            )
+            .bind(id)
+            .bind(internal_id)
+            .bind(row_version)
+            .bind(name)
+            .execute(&mut conn)
+            .await
+            .expect("insert user");
+            if newer {
+                sqlx::query(r#"UPDATE "Users" SET "NormalizedUsername" = ?2 WHERE "Id" = ?1"#)
+                    .bind(id)
+                    .bind(ferrofin_util::string_extensions::upper_invariant(name))
+                    .execute(&mut conn)
+                    .await
+                    .expect("Jellyfin's key");
+            }
+        }
+        if newer {
+            sqlx::query(
+                r#"CREATE UNIQUE INDEX "IX_Users_NormalizedUsername" ON "Users" ("NormalizedUsername")"#,
+            )
+            .execute(&mut conn)
+            .await
+            .expect("unique index");
+        }
+        sqlx::Connection::close(conn).await.expect("close");
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(1))
+            .await
+            .expect("adoption succeeds");
+        let want: Vec<(String, i64)> = ["MÜNCHEN", "ı", "ADMIN"]
+            .into_iter()
+            .map(str::to_owned)
+            .zip(expected)
+            .collect();
+        assert_eq!(read(&db).await, want);
+        // Once: the next boot finds the repair done.
+        drop(db);
+        let db = Database::connect_sized(&url, Some(1))
+            .await
+            .expect("re-open");
+        assert_eq!(read(&db).await, want);
     }
 
     #[rstest::rstest]
