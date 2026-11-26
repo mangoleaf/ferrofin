@@ -1665,9 +1665,10 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Takes a deleted version out of its primary's lists — what
     /// `LibraryManager.DeleteItem` does before deleting an alternate version
     /// (`LibraryManager.cs:539-552`): the primary's `LinkedAlternateVersion`
-    /// row for it goes, and so does `version_path` from the primary's `Data`
-    /// `LocalAlternateVersions` (compared ignoring case). The default
-    /// (stub/fake services) writes nothing.
+    /// row for it goes, the primary's other version rows are numbered from 0
+    /// again, as its save writes them, and `version_path` goes from the
+    /// primary's `Data` `LocalAlternateVersions` (compared ignoring case). The
+    /// default (stub/fake services) writes nothing.
     ///
     /// # Errors
     ///

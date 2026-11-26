@@ -5152,23 +5152,72 @@ pub const VERIFIED: &[Verified] = &[
          run once the running one ends; upstream's StartScanInBackground drops it when a \
          scan is running, which misses the new library when that scan listed the libraries \
          before it. Jellyfin bug not ported.",
-            "collection.xml writes <Added> and <PremiereDate> in UTC and reads both <Taglines> \
-         and <TagLines>; upstream writes the dates in the server's local time and reads \
-         them back as UTC, which shifts them on every round trip on a server outside UTC, \
-         and reads only the <TagLines> it never writes. On a UTC server both write the \
-         same dates. Jellyfin bug not ported (owner decision 2026-11-14).",
-            "A box set's refresh takes the <DisplayOrder> its collection.xml carries, and no \
-         refresh resets the display order. Upstream starts the provider result from a new \
-         BoxSet, whose DisplayOrder defaults to PremiereDate, so the file's value never \
-         applies and every refresh a provider answered resets the box set's display order \
-         to PremiereDate. Jellyfin bug not ported (owner decision 2026-11-14).",
-            "The always-true BoxSet.IsSaveLocalMetadataEnabled holds only for a box set whose \
-         folder is in the server's own directories (owner decision 2026-10-17); one in a media \
-         library is written only when that library lists the Emby Xml saver or, with no saver \
-         list, saves into its media folders, and otherwise an edit or member change never \
-         rewrites a collection.xml already there, where upstream, in a library with no saver \
-         list, writes a box set's file whatever SaveLocalMetadata says (owner decision \
-         2026-11-19).",
+            BOX_SET_XML_DATES_DIVERGENCE,
+            BOX_SET_DISPLAY_ORDER_DIVERGENCE,
+            BOX_SET_SAVE_LOCAL_DIVERGENCE,
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Collections/{collectionId}/Items",
+        upstream_file: "Emby.Server.Implementations/Collections/CollectionManager.cs",
+        upstream_method: "AddToCollectionAsync",
+        ferrofin: "handlers/collection.rs add_to_collection (RequireCollectionManagement for the \
+               CollectionManagement policy; parse_csv_uuids for the \
+               CommaDelimitedCollectionModelBinder ids) → ferrofin-core collection_manager.rs \
+               add_to_collection (require_box_set, the `is not BoxSet` ArgumentException; \
+               require_items, GetItemById's ArgumentException for an id naming no item, the \
+               empty one included, before anything is written; the ids the box set does not \
+               list yet appended once each, in order, and its LinkedChildren rewritten from 0 \
+               through write_entries_in, as the save rewrites a folder's rows \
+               (ItemPersistenceService.UpdateOrInsertItems); then, only when an id was new, \
+               update_rating_to_items (UpdateRatingToItems, called directly), save_membership \
+               (UpdateToRepositoryAsync(MetadataEdit): the collection.xml saver and \
+               DateLastSaved) and the ForceSave queue_refresh at High priority)",
+        date: "2026-11-26",
+        divergences: &[
+            "A malformed id in ids is a 400; upstream's CommaDelimitedCollectionModelBinder \
+         drops it. Fix path: gl-884.",
+            "ItemsAddedToCollection is not raised: nothing in the server subscribes to it, only \
+         .NET plugins, which Ferrofin does not load.",
+            "The 400 bodies (a malformed id, an id naming no box set or no item) are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+            BOX_SET_RATING_LOCK_DIVERGENCE,
+            BOX_SET_XML_DATES_DIVERGENCE,
+            BOX_SET_DISPLAY_ORDER_DIVERGENCE,
+            BOX_SET_SAVE_LOCAL_DIVERGENCE,
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/Collections/{collectionId}/Items",
+        upstream_file: "Emby.Server.Implementations/Collections/CollectionManager.cs",
+        upstream_method: "RemoveFromCollectionAsync",
+        ferrofin: "handlers/collection.rs remove_from_collection (RequireCollectionManagement; \
+               parse_csv_uuids) → ferrofin-core collection_manager.rs remove_from_collection \
+               (require_box_set; the empty id refused, GetItemById's ArgumentException, before \
+               anything is written; the rows naming any of ids dropped, an id the box set does \
+               not list skipped, and the rest rewritten from 0 through write_entries_in whatever \
+               was removed, as LinkedChildren.Except and the save do; update_rating_to_items \
+               under the rule of the refresh queued after it (MetadataService.\
+               UpdateOfficialRating: a locked box set keeps its rating, a failure is logged); \
+               save_membership; the ForceSave queue_refresh at High priority, always)",
+        date: "2026-11-26",
+        divergences: &[
+            "A malformed id in ids is a 400; upstream's CommaDelimitedCollectionModelBinder \
+         drops it. Fix path: gl-884.",
+            "The box set takes its members' rating before the answer, under the rule of the \
+         ForceSave refresh queued after it, which re-rates it again; upstream re-rates it only \
+         when that refresh runs, so a read in between sees the old rating there.",
+            "ItemsRemovedFromCollection is not raised: nothing in the server subscribes to it, \
+         only .NET plugins, which Ferrofin does not load.",
+            "The 400 bodies (a malformed id, the empty id, an id naming no box set) are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            BOX_SET_XML_DATES_DIVERGENCE,
+            BOX_SET_DISPLAY_ORDER_DIVERGENCE,
+            BOX_SET_SAVE_LOCAL_DIVERGENCE,
         ],
         refs: &[],
     },
@@ -7281,6 +7330,33 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
 ];
+
+/// How a box set's collection.xml dates differ, for the rows whose save writes it.
+const BOX_SET_XML_DATES_DIVERGENCE: &str = "collection.xml writes <Added> and <PremiereDate> in \
+     UTC and reads both <Taglines> and <TagLines>; upstream writes the dates in the server's \
+     local time and reads them back as UTC, which shifts them on every round trip on a server \
+     outside UTC, and reads only the <TagLines> it never writes. On a UTC server both write the \
+     same dates. Jellyfin bug not ported (owner decision 2026-11-14).";
+
+/// How a box set's refresh treats its display order, for the rows that refresh it.
+const BOX_SET_DISPLAY_ORDER_DIVERGENCE: &str = "A box set's refresh takes the <DisplayOrder> its \
+     collection.xml carries, and no refresh resets the display order. Upstream starts the \
+     provider result from a new BoxSet, whose DisplayOrder defaults to PremiereDate, so the \
+     file's value never applies and every refresh a provider answered resets the box set's \
+     display order to PremiereDate. Jellyfin bug not ported (owner decision 2026-11-14).";
+
+/// Where a box set's collection.xml is written, for the rows whose save writes it.
+const BOX_SET_SAVE_LOCAL_DIVERGENCE: &str = "The always-true BoxSet.IsSaveLocalMetadataEnabled \
+     holds only for a box set whose folder is in the server's own directories (owner decision \
+     2026-10-17); one in a media library is written only when that library lists the Emby Xml \
+     saver or, with no saver list, saves into its media folders, and otherwise an edit or member \
+     change never rewrites a collection.xml already there, where upstream, in a library with no \
+     saver list, writes a box set's file whatever SaveLocalMetadata says (owner decision \
+     2026-11-19).";
+
+/// How an add takes the box set's members' rating.
+const BOX_SET_RATING_LOCK_DIVERGENCE: &str = "A locked OfficialRating field keeps the box set's \
+     rating; upstream's direct UpdateRatingToItems overwrites it. Jellyfin bug not ported.";
 
 /// The two scheduled-task read rows: an adopted trigger file upstream cannot
 /// load.
