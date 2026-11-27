@@ -5416,7 +5416,9 @@ pub const VERIFIED: &[Verified] = &[
                empty one included, before anything is written; the ids the box set does not \
                list yet appended once each, in order, and its LinkedChildren rewritten from 0 \
                through write_entries_in, as the save rewrites a folder's rows \
-               (ItemPersistenceService.UpdateOrInsertItems); then, only when an id was new, \
+               (ItemPersistenceService.UpdateOrInsertItems), an entry whose item row is gone \
+               by then skipped as the save's existingChildIds check skips it; then, only when \
+               an id was new, \
                update_rating_to_items (UpdateRatingToItems, called directly), save_membership \
                (UpdateToRepositoryAsync(MetadataEdit): the collection.xml saver and \
                DateLastSaved) and the ForceSave queue_refresh at High priority)",
@@ -5445,7 +5447,9 @@ pub const VERIFIED: &[Verified] = &[
                (require_box_set; the empty id refused, GetItemById's ArgumentException, before \
                anything is written; the rows naming any of ids dropped, an id the box set does \
                not list skipped, and the rest rewritten from 0 through write_entries_in whatever \
-               was removed, as LinkedChildren.Except and the save do; update_rating_to_items \
+               was removed, as LinkedChildren.Except and the save do (an entry whose item row \
+               is gone skipped, as the save's existingChildIds check skips it); \
+               update_rating_to_items \
                under the rule of the refresh queued after it (MetadataService.\
                UpdateOfficialRating: a locked box set keeps its rating, a failure is logged); \
                save_membership; the ForceSave queue_refresh at High priority, always)",
@@ -5904,12 +5908,15 @@ pub const VERIFIED: &[Verified] = &[
                %AppDataPath%/playlists/<name> (BaseItemMapper.Map → GetPathToSave → \
                ReverseVirtualPath), then report_item_added for AddChild's \
                ItemAdded; playlist_items for AddToPlaylistInternal and \
-               Playlist.GetPlaylistItems; the ForceSave refresh's save through \
+               Playlist.GetPlaylistItems; write_entries_in for the save's LinkedChildren \
+               rows, an entry whose item row is gone by then skipped as the save's \
+               existingChildIds check skips it (ItemPersistenceService); the ForceSave \
+               refresh's save through \
                ferrofin-providers container_xml.rs ContainerXmlSaver, PlaylistXmlSaver: the \
                folder's playlist.xml with BaseXmlSaver's common nodes, OwnerUserId, the \
                PlaylistItems, the Shares and PlaylistMediaType, local_xml.rs \
                save_playlist_xml)",
-        date: "2026-11-20",
+        date: "2026-11-26",
         divergences: &[
             "A request with neither a body nor a name query is a 400; upstream's \
          GetValidFilename(null) throws a NullReferenceException (500). Jellyfin bug not \
@@ -5987,14 +5994,16 @@ pub const VERIFIED: &[Verified] = &[
                entities_media.rs PlaylistUserPermissions \
                (constructor defaults) → ferrofin-core collection_manager.rs \
                FerrofinPlaylistManager::update_playlist (PlaylistManager.UpdatePlaylist: \
-               playlist_items for the Ids' AddToPlaylistInternal, rename_named_item_in, \
+               playlist_items for the Ids' AddToPlaylistInternal, write_entries_in for \
+               the save's LinkedChildren rows (an entry whose item row is gone by then \
+               skipped, as the save's existingChildIds check skips it), rename_named_item_in, \
                OpenAccess, share_playlist_in, sync_container_data_in, queue_refresh; \
                announce_updated for UpdatePlaylistInternal's \
                UpdateToRepositoryAsync(MetadataEdit) through \
                ProviderManager::update_to_repository, whose ferrofin-providers \
                container_xml.rs ContainerXmlSaver rewrites the folder's playlist.xml, \
                PlaylistXmlSaver)",
-        date: "2026-11-20",
+        date: "2026-11-26",
         divergences: &[
             "An empty-GUID id in Ids (`\"Ids\":[null]` or all zeros) is dropped and the other \
          ids replace the entries (204); upstream's UpdatePlaylist clears the entries and \
