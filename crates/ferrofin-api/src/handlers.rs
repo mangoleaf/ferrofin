@@ -1152,14 +1152,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    item and its alternate versions over the query's user's UserData rows, or \
                    every user's when there is no user, for \
                    /Items and the other item queries (ferrofin-core translate_query.rs \
-                   push_order_expression), GET /LiveTv/Channels (ferrofin-livetv manager.rs \
-                   get_channels over guide_repository.rs channel_user_data or \
-                   channel_last_played_by_anyone, then projection.rs sort_channel_rows) and \
-                   the guide (manager.rs push_program_sort_key). A channel and a programme \
+                   push_order_expression), and GET /LiveTv/Channels and the guide \
+                   (ferrofin-livetv manager.rs push_item_sort_key, over the channel's or \
+                   programme's stored item, gl-1681). A channel and a programme \
                    have no alternate versions, so their key is their own rows' alone. \
                    Compared with OrderMapper.MapOrderByField's DatePlayed arm at the pinned \
                    v12.4 tag.",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: &[
             "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
              entries ignored; upstream's GetOrderBy indexes past the sortBy array, which \
@@ -4272,26 +4271,30 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetLiveTvChannels",
         ferrofin: "handlers/live_tv.rs get_channels (items.rs resolve_user_opt, \
                program_dto_options, add_current_program) → ferrofin-livetv manager.rs \
-               get_channels (user_restrictions; guide_repository.rs channel_rows: only the \
-               lineup channels whose item is stored, the user's parental restrictions, and \
-               isMovie/isSeries over the stored channel item's \
-               columns and isKids/isNews/isSports over its Kids/News/Sports tags; \
-               channel_user_data; projection.rs filter_channel_rows, sort_channel_rows, \
+               get_channels (user_restrictions; guide_repository.rs listed_channel_rows: \
+               only the lineup channels whose item is stored, the user's parental \
+               restrictions, isMovie/isSeries over the stored channel item's columns and \
+               isKids/isNews/isSports over its Kids/News/Sports tags, ordered over that \
+               item in SQL: GetInternalChannels' list (the sortBy keys in sortOrder, \
+               IsFavoriteOrLiked descending first for enableFavoriteSorting, SortName \
+               ascending appended whatever was asked) through manager.rs push_apply_order \
+               (ApplyOrder: Default dropped, Name after a leading SortName, \
+               SeriesDatePlayed to SortName) and push_item_sort_key (OrderMapper, StartDate \
+               the item's column), so SortName is the stored one byte-wise and Name is \
+               CleanName (gl-1681); channel_user_data; projection.rs filter_channel_rows, \
                remove_fields; channel_entity → DtoService get_base_item_dtos, which runs \
                AddChannelInfo) (RequestHelpers.GetUserId, LiveTvManager.GetInternalChannels, \
                BaseItemRepository.TranslateQuery, RemoveFields)",
-        date: "2026-11-10",
+        date: "2026-11-26",
         divergences: &[
             "type keeps the channels of that ChannelType, as the parameter documents; \
          upstream's GetInternalChannels never passes LiveTvChannelQuery.ChannelType on and \
          lists every channel. Jellyfin bug not ported.",
-            "Every sortBy key but SortName, Name, IsFavoriteOrLiked and DateCreated compares \
-         equal, so the appended SortName decides; upstream's OrderMapper sorts on them. Fix \
-         path: gl-1354.",
             "isFavorite and isLiked with no user (an API key naming none) match no channel \
-         when true and every channel when false, and enableFavoriteSorting sorts nothing; \
-         upstream's TranslateQuery and OrderMapper dereference the null user \
-         (filter.User!.Id) and fail the request. Jellyfin bug not ported.",
+         when true and every channel when false, enableFavoriteSorting sorts nothing, and a \
+         user-data sortBy key but DatePlayed sorts on SortName, as /Items does; upstream's \
+         TranslateQuery and OrderMapper dereference the null user (filter.User!.Id) and \
+         fail the request. Jellyfin bug not ported.",
             "The 400 (a value the query binder cannot convert) and 403 (another user's id \
          without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
          Fix path: gl-666.",
@@ -4355,8 +4358,8 @@ pub const VERIFIED: &[Verified] = &[
                StartDate default order, the librarySeriesId block) → ferrofin-livetv \
                manager.rs get_programs (stored_series_timer for seriesTimerId, \
                user_restrictions, program_rows_query (the stored programme item joined by \
-               id) over push_program_filters, push_program_order with \
-               push_program_sort_key and push_program_paging, the PROGRAM_COUNT total, \
+               id) over push_program_filters, push_program_order over push_apply_order \
+               and push_item_sort_key, push_program_paging, the PROGRAM_COUNT total, \
                projection.rs remove_fields, program_dtos → program_entity and dto_service.rs \
                get_base_item_dtos, apply_program_info, add_recording_info → \
                scheduled_timers_for over dvr_repository.rs scheduled_timers_for_programs, \
@@ -4406,7 +4409,8 @@ pub const VERIFIED: &[Verified] = &[
                LibrarySeriesId block) → ferrofin-livetv manager.rs get_programs \
                (stored_series_timer for SeriesTimerId, user_restrictions, program_rows_query \
                (the stored programme item joined by id) over push_program_filters, \
-               push_program_order with push_program_sort_key and push_program_paging, the \
+               push_program_order over push_apply_order and push_item_sort_key, \
+               push_program_paging, the \
                PROGRAM_COUNT total, projection.rs remove_fields, program_dtos → \
                program_entity and dto_service.rs get_base_item_dtos, apply_program_info, \
                add_recording_info → scheduled_timers_for over dvr_repository.rs \
