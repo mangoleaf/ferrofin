@@ -34,15 +34,15 @@
 //!   none tracked — installs are synchronous)
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use ferrofin_model::plugins::{PluginInfo, PluginManifest, PluginStatus};
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::plugins::PluginDescriptor;
+use ferrofin_traits::plugins::{PluginDescriptor, PluginImageSource};
 use uuid::Uuid;
 
 use crate::auth::RequireAdmin;
@@ -51,6 +51,7 @@ use crate::extract::{
     DotnetGuid, JsonSeqBody, ProblemDetails, Query, RequiredRouteString, RouteParameter,
     blank_route_values,
 };
+use crate::handlers::streaming::serve_static_file_without_ranges;
 use crate::state::AppState;
 
 /// Ports Jellyfin's `RequiresElevation` policy for the plugin-mutating
@@ -475,6 +476,7 @@ async fn uninstall_plugin_by_version(
 async fn get_plugin_image(
     State(state): State<AppState>,
     Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
+    request: Request,
 ) -> Result<Response, ApiError> {
     // No auth extractor: this is the ONE action upstream marks
     // `[AllowAnonymous]` (v10.11.8 PluginsController.cs:221), against the
@@ -482,19 +484,35 @@ async fn get_plugin_image(
     if let Some(rejection) = version_rejection(&state, plugin_id, &version).await? {
         return Ok(rejection);
     }
-    match state.plugins.plugin_image(plugin_id).await? {
-        Some(image) => Ok((
-            [
-                (header::CONTENT_TYPE, image.content_type),
-                // `Response.Headers.ContentDisposition = "attachment"` before
-                // the `PhysicalFile(...)`, in both trees.
-                (header::CONTENT_DISPOSITION, "attachment".to_owned()),
-            ],
-            image.data,
-        )
-            .into_response()),
-        None => Err(ApiError::NotFound(format!("image for plugin {plugin_id}"))),
-    }
+    let Some(image) = state.plugins.plugin_image(plugin_id).await? else {
+        return Err(ApiError::NotFound(format!("image for plugin {plugin_id}")));
+    };
+    let mut response = match image.source {
+        // `PhysicalFile(imagePath, MimeTypes.GetMimeType(imagePath))`: the
+        // two-argument overload, so a `Range` is ignored, and the file's
+        // `Last-Modified` answers an `If-Modified-Since` with a `304`.
+        PluginImageSource::File(path) => {
+            let mut response =
+                serve_static_file_without_ranges(&path.to_string_lossy(), request).await?;
+            if let (Some(value), Ok(content_type)) = (
+                response.headers_mut().get_mut(header::CONTENT_TYPE),
+                HeaderValue::from_str(&image.content_type),
+            ) {
+                *value = content_type;
+            }
+            response
+        }
+        PluginImageSource::Bytes(data) => {
+            ([(header::CONTENT_TYPE, image.content_type)], data).into_response()
+        }
+    };
+    // `Response.Headers.ContentDisposition = "attachment"` before either
+    // file result, so a `304` carries it too.
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment"),
+    );
+    Ok(response)
 }
 
 /// `POST /Plugins/{pluginId}/Manifest` — read a plugin's manifest.

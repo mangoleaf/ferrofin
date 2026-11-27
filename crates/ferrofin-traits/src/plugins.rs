@@ -77,13 +77,25 @@ pub struct PluginUpdateInfo {
     pub repository_url: Option<String>,
 }
 
-/// A plugin's bundled image, served by `GET /Plugins/{id}/{version}/Image`.
+/// A plugin's image, served by `GET /Plugins/{id}/{version}/Image`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginImage {
     /// The image's MIME type (e.g. `image/png`).
     pub content_type: String,
-    /// The raw image bytes.
-    pub data: Vec<u8>,
+    /// Where the image is, which decides how it is served.
+    pub source: PluginImageSource,
+}
+
+/// Where a [`PluginImage`] is: `GetPluginImage`'s two branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginImageSource {
+    /// Bytes the plugin carries (the `ImageResourceName` branch's
+    /// `File(stream, …)`).
+    Bytes(Vec<u8>),
+    /// The file stored for a repository plugin (the `ImagePath` branch's
+    /// `PhysicalFile`): served with the file's `Last-Modified`, answering a
+    /// conditional request.
+    File(PathBuf),
 }
 
 /// A compiled-in plugin registered with the manager at the composition root.
