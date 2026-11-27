@@ -705,9 +705,15 @@ impl ProviderManager for StubProviders {
     async fn delete_image(
         &self,
         item_id: Uuid,
-        _image_type: ImageType,
+        image_type: ImageType,
         image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
+        // A Logo's file cannot be deleted; an Art's folder is gone.
+        match image_type {
+            ImageType::Logo => return Err(ServiceError::backend("permission denied")),
+            ImageType::Art => return Err(ServiceError::not_found("image folder not found")),
+            _ => {}
+        }
         self.deleted
             .lock()
             .expect("lock")
@@ -1930,6 +1936,60 @@ async fn delete_item_image_binds_only_its_image_index(
     let deleted = s.providers.deleted.lock().expect("lock").clone();
     let expected_deleted: Vec<_> = deleted_index.map(|i| (ITEM_ID, i)).into_iter().collect();
     assert_eq!(deleted, expected_deleted, "{uri}");
+}
+
+/// gl-1663: `DeleteImageAsync` throws for a file it cannot delete (`500`) or
+/// whose folder is gone (`DirectoryNotFoundException`, `404`), and
+/// `ExceptionMiddleware` answers the throw with its status and text/plain
+/// "Error processing request.", on both routes.
+#[rstest::rstest]
+#[case::unwritable("Logo", StatusCode::INTERNAL_SERVER_ERROR)]
+#[case::folder_gone("Art", StatusCode::NOT_FOUND)]
+#[tokio::test]
+async fn a_failed_item_image_delete_is_answered_as_a_throw(
+    #[case] image_type: &str,
+    #[case] expected: StatusCode,
+) {
+    let s = elevated_stubs(String::new(), String::new());
+    for uri in [
+        format!("/Items/{ITEM_ID}/Images/{image_type}"),
+        format!("/Items/{ITEM_ID}/Images/{image_type}/0"),
+    ] {
+        let (status, body) = send(&s, "DELETE", &uri, None).await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (expected, &b"Error processing request."[..]),
+            "{uri}"
+        );
+    }
+}
+
+/// `DeleteItemImageByIndex` binds the route's `imageIndex` as a route int is
+/// bound: trimmed, and in the `0x`, `#` and `&h` hex forms; anything else is the
+/// binder's `400`, before the item is read.
+#[rstest::rstest]
+#[case::hex(ITEM_ID, "0x1", StatusCode::NO_CONTENT, Some(1))]
+#[case::hash(ITEM_ID, "%231", StatusCode::NO_CONTENT, Some(1))]
+#[case::padded(ITEM_ID, "%201", StatusCode::NO_CONTENT, Some(1))]
+#[case::malformed(ITEM_ID, "x", StatusCode::BAD_REQUEST, None)]
+#[case::malformed_missing_item(MISSING_ID, "x", StatusCode::BAD_REQUEST, None)]
+#[tokio::test]
+async fn delete_item_image_by_index_binds_its_route_index(
+    #[case] item: Uuid,
+    #[case] index: &str,
+    #[case] expected: StatusCode,
+    #[case] deleted_index: Option<i32>,
+) {
+    let s = elevated_stubs(String::new(), String::new());
+    let uri = format!("/Items/{item}/Images/Backdrop/{index}");
+    let (status, _) = send(&s, "DELETE", &uri, None).await;
+    assert_eq!(status, expected, "{uri}");
+    let expected_deleted: Vec<_> = deleted_index.map(|i| (ITEM_ID, i)).into_iter().collect();
+    assert_eq!(
+        *s.providers.deleted.lock().expect("lock"),
+        expected_deleted,
+        "{uri}"
+    );
 }
 
 #[tokio::test]

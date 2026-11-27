@@ -29,6 +29,58 @@ pub fn is_shared_album_artwork(path: &str) -> bool {
         .is_some_and(|name| name == SHARED_ALBUM_ARTWORK_DIR)
 }
 
+/// `FileSystem.DeleteFile` of an image's file, which `BaseItem.DeleteImageAsync`
+/// runs before it removes the image ([`settle_image_unlink`]).
+fn delete_image_file(path: &str) -> Result<(), ServiceError> {
+    let file = std::path::Path::new(path);
+    settle_image_unlink(file, std::fs::remove_file(file))
+}
+
+/// The answer `File.Delete` gives on Linux for `unlinked`, the unlink of
+/// `file` (dotnet/runtime `FileSystem.Unix` `DeleteFile`, as the subtitle
+/// delete ports it): a file already gone is nothing to do while its folder
+/// exists; a missing folder, or a folder in the path that is a file, is the
+/// `DirectoryNotFoundException` `ExceptionMiddleware` answers with `404`;
+/// anything else fails the delete.
+fn settle_image_unlink(
+    file: &std::path::Path,
+    unlinked: std::io::Result<()>,
+) -> Result<(), ServiceError> {
+    use std::io::ErrorKind;
+    let folder_missing = |reason: &str| {
+        // The 404 is not logged where it is answered; name the file here.
+        tracing::debug!(path = %file.display(), reason, "image folder not found");
+        ServiceError::not_found("image folder not found")
+    };
+    match unlinked {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            if file.parent().is_some_and(std::path::Path::is_dir) {
+                Ok(())
+            } else {
+                Err(folder_missing("no such folder"))
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotADirectory => {
+            Err(folder_missing("a folder in the path is a file"))
+        }
+        // A read-only mount answers `EROFS` before it looks the file up, so a
+        // file already gone is no error when an `lstat` finds nothing either
+        // (dotnet/runtime issue 22382); anything else at the path still fails.
+        Err(error)
+            if error.kind() == ErrorKind::ReadOnlyFilesystem
+                && std::fs::symlink_metadata(file)
+                    .is_err_and(|stat| stat.kind() == ErrorKind::NotFound) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(ServiceError::backend(format!(
+            "delete image file {}: {error}",
+            file.display()
+        ))),
+    }
+}
+
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -47,8 +99,8 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::{ItemImageInfo, file_date_modified};
 use ferrofin_traits::persistence::{
-    ItemPersistenceService, ItemRepository, ItemTypeLookup, OwnerExtrasRefresh, PlaylistMember,
-    ScannedPlaylist,
+    ChapterRepository, ItemPersistenceService, ItemRepository, ItemTypeLookup, OwnerExtrasRefresh,
+    PlaylistMember, ScannedPlaylist,
 };
 use ferrofin_traits::providers::{
     GeneratedImageProvider, ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions,
@@ -1201,6 +1253,9 @@ pub struct LocalProviderManager {
     /// methods to resolve an item and list/download its TMDB artwork.
     tmdb: Option<Arc<TmdbClient>>,
     items: Option<Arc<dyn ItemRepository>>,
+    /// The chapter rows a Chapter image's delete finds its file in
+    /// (`BaseItem.GetImageInfo`). Absent → that delete reports itself unwired.
+    chapters: Option<Arc<dyn ChapterRepository>>,
     /// The Studio Images client, used to supply a `Studio` item's thumb from the
     /// artwork repository. Absent → studios contribute no remote images.
     studios: Option<Arc<crate::studios::StudiosClient>>,
@@ -1373,6 +1428,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("remote_image_requests", &self.remote_image_requests)
             .field("has_tmdb", &self.tmdb.is_some())
             .field("has_items", &self.items.is_some())
+            .field("has_chapters", &self.chapters.is_some())
             .field("has_studios", &self.studios.is_some())
             .field("has_fanart", &self.fanart.is_some())
             .field("has_audiodb", &self.audiodb.is_some())
@@ -1477,6 +1533,7 @@ impl LocalProviderManager {
             remote_image_requests: Arc::default(),
             tmdb: None,
             items: None,
+            chapters: None,
             studios: None,
             fanart: None,
             audiodb: None,
@@ -1711,6 +1768,14 @@ impl LocalProviderManager {
     ) -> Self {
         self.tmdb = Some(tmdb);
         self.items = Some(items);
+        self
+    }
+
+    /// Attaches the chapter rows, so deleting a Chapter image deletes the
+    /// file its chapter names (`BaseItem.GetImageInfo(ImageType.Chapter, …)`).
+    #[must_use]
+    pub fn with_chapters(mut self, chapters: Arc<dyn ChapterRepository>) -> Self {
+        self.chapters = Some(chapters);
         self
     }
 
@@ -5669,43 +5734,61 @@ impl ProviderManager for LocalProviderManager {
         image_type: ImageType,
         image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
-        let Some(store) = &self.image_store else {
+        let (Some(store), Some(items)) = (&self.image_store, &self.items) else {
             return Err(Self::unwired("delete_image"));
         };
-        // Read before the rows go: `live_tv` comes from the item's image rows.
-        let live_tv = match &self.items {
-            Some(items) => items.get_image_infos_to_serve(item_id).await?.live_tv,
-            None => false,
-        };
-        // Remove the DB rows, then the files they pointed at (best-effort — a
-        // missing file must not fail the delete).
-        let paths = store
-            .delete_item_image(item_id, image_type, image_index)
-            .await?;
-        // `BaseItem.DeleteImageAsync`: a missing slot is "nothing to do" — no
-        // saver, no repository save, no update notification.
-        if paths.is_empty() {
-            return Ok(());
-        }
-        for path in paths {
+        let index = image_index.unwrap_or(0);
+        // `BaseItem.DeleteImageAsync` over `GetImageInfo(type, index)`: a missing
+        // slot is "nothing to do" (no saver, no repository save, no update
+        // notification), and the file goes before the image, so one that
+        // cannot be deleted fails the delete with the image kept.
+        if image_type == ImageType::Chapter {
+            // A chapter's image is the file its chapter names. `RemoveImage`
+            // then matches nothing, so the chapter keeps naming the file until
+            // `RefreshChapterImages` extracts it again or clears it.
+            let Some(chapters) = &self.chapters else {
+                return Err(Self::unwired("delete_image"));
+            };
+            let Some(path) = chapters
+                .get_chapter(item_id, index)
+                .await?
+                .and_then(|chapter| chapter.image_path)
+                .filter(|path| !path.is_empty())
+            else {
+                return Ok(());
+            };
+            if ItemImageInfo::is_local_path(&path) && !path.trim().is_empty() {
+                delete_image_file(&path)?;
+            }
+        } else {
+            let served = items.get_image_infos_to_serve(item_id).await?;
+            let Some(image) = usize::try_from(index).ok().and_then(|slot| {
+                served
+                    .images
+                    .iter()
+                    .filter(|image| image.image_type == image_type)
+                    .nth(slot)
+            }) else {
+                return Ok(());
+            };
+            let path = image.path.as_str();
             // `info.IsLocalFile`: a remote row has no file.
-            if !ItemImageInfo::is_local_path(&path) {
-                continue;
-            }
-            if is_shared_album_artwork(&path) {
-                continue;
-            }
-            if live_tv && !self.in_metadata_directory(&path).await {
+            let has_file = ItemImageInfo::is_local_path(path)
+                && !path.trim().is_empty()
+                && !is_shared_album_artwork(path);
+            if has_file && served.live_tv && !self.in_metadata_directory(path).await {
                 tracing::warn!(
                     item_id = %item_id,
                     // A source's value: a URL other than http keeps only its
                     // scheme and host (LOGGING.md §5).
-                    path = %ferrofin_util::source_url::redact_url(&path),
+                    path = %ferrofin_util::source_url::redact_url(path),
                     "left the file of a Live TV image row outside the metadata directory"
                 );
-                continue;
+            } else if has_file {
+                delete_image_file(path)?;
             }
-            let _ = std::fs::remove_file(&path);
+            // `RemoveImage(info)`: the image read above, wherever it sits now.
+            store.delete_item_image(item_id, image_type, path).await?;
         }
         self.update_to_repository(item_id, ItemUpdateType::ImageUpdate)
             .await
@@ -8421,6 +8504,11 @@ mod tests {
     /// The culture each `retrieve_item` ran under, in call order.
     static SEEN_CULTURES: std::sync::Mutex<Vec<(Uuid, String)>> = std::sync::Mutex::new(Vec::new());
 
+    /// The image rows every [`FakeItems`] answers with, by item: tests use
+    /// fresh item ids, so they share it safely.
+    static FAKE_IMAGES: std::sync::Mutex<Vec<(Uuid, ItemImageInfo)>> =
+        std::sync::Mutex::new(Vec::new());
+
     /// An [`ItemRepository`] over a fixed map, reporting each `retrieve_item`
     /// call on a channel so a test can observe a background refresh running.
     /// Every method the refresh path never touches is `unimplemented!`.
@@ -8513,9 +8601,15 @@ mod tests {
         }
         async fn get_image_infos(
             &self,
-            _item_id: Uuid,
+            item_id: Uuid,
         ) -> Result<Vec<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
-            Ok(Vec::new())
+            Ok(FAKE_IMAGES
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(item, _)| *item == item_id)
+                .map(|(_, image)| image.clone())
+                .collect())
         }
         async fn swap_item_images(
             &self,
@@ -8731,8 +8825,8 @@ mod tests {
         recovered: std::sync::Mutex<Vec<(Uuid, IdPairs)>>,
         /// The `LockedFields` it answers with, per item.
         locked: HashMap<Uuid, Vec<MetadataField>>,
-        /// The file paths its next `delete_item_image` reports as removed.
-        removed_paths: std::sync::Mutex<Vec<String>>,
+        /// Each image `delete_item_image` was asked to remove.
+        deleted_images: std::sync::Mutex<Vec<(Uuid, ImageType, String)>>,
         /// The items whose save time it was asked to stamp.
         touched: std::sync::Mutex<Vec<Uuid>>,
         /// When set, `save_items` parks until the test releases it.
@@ -8797,13 +8891,15 @@ mod tests {
         }
         async fn delete_item_image(
             &self,
-            _item_id: Uuid,
-            _image_type: ImageType,
-            _index: Option<i32>,
-        ) -> Result<Vec<String>, ServiceError> {
-            Ok(std::mem::take(
-                &mut *self.removed_paths.lock().expect("lock"),
-            ))
+            item_id: Uuid,
+            image_type: ImageType,
+            path: &str,
+        ) -> Result<(), ServiceError> {
+            self.deleted_images
+                .lock()
+                .expect("lock")
+                .push((item_id, image_type, path.to_owned()));
+            Ok(())
         }
         async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
             self.touched.lock().expect("lock").push(item_id);
@@ -8992,11 +9088,12 @@ mod tests {
             .await
             .expect("save");
         // A delete that removed a slot (one that found none saves nothing).
-        store
-            .removed_paths
-            .lock()
-            .expect("lock")
-            .push(dir.path().join("gone.jpg").to_string_lossy().into_owned());
+        let mgr = deleting_manager(&store, FakeChapters::default());
+        fake_image(
+            id,
+            ImageType::Backdrop,
+            &dir.path().join("gone.jpg").to_string_lossy(),
+        );
         mgr.delete_image(id, ImageType::Backdrop, None)
             .await
             .expect("delete");
@@ -9222,28 +9319,265 @@ mod tests {
         (item_id, mgr)
     }
 
+    /// Chapter rows over a fixed list, as `ChapterRepository.GetChapter` reads
+    /// them: by `ChapterIndex`.
+    #[derive(Default)]
+    struct FakeChapters(Vec<ferrofin_db::entities::base_items::ChapterEntity>);
+
+    #[async_trait]
+    impl ferrofin_traits::persistence::ChapterRepository for FakeChapters {
+        async fn delete_chapters(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn save_chapters(
+            &self,
+            _item_id: Uuid,
+            _chapters: &[ferrofin_db::entities::base_items::ChapterEntity],
+        ) -> Result<(), ServiceError> {
+            unimplemented!()
+        }
+        async fn get_chapters(
+            &self,
+            _item_id: Uuid,
+        ) -> Result<Vec<ferrofin_db::entities::base_items::ChapterEntity>, ServiceError> {
+            unimplemented!()
+        }
+        async fn get_chapter(
+            &self,
+            item_id: Uuid,
+            index: i32,
+        ) -> Result<Option<ferrofin_db::entities::base_items::ChapterEntity>, ServiceError>
+        {
+            Ok(self
+                .0
+                .iter()
+                .find(|chapter| {
+                    chapter.item_id == item_id.to_string()
+                        && chapter.chapter_index == i64::from(index)
+                })
+                .cloned())
+        }
+    }
+
+    /// A manager deleting images through `store`, [`FakeItems`]' image rows
+    /// ([`fake_image`]) and `chapters`.
+    fn deleting_manager(
+        store: &Arc<RecordingStore>,
+        chapters: FakeChapters,
+    ) -> LocalProviderManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let items = Arc::new(FakeItems {
+            rows: HashMap::new(),
+            seen: tx,
+        });
+        LocalProviderManager::default()
+            .with_remote_images(Arc::new(crate::tmdb::TmdbClient::new()), items)
+            .with_image_store(Arc::clone(store) as Arc<_>, std::env::temp_dir())
+            .with_chapters(Arc::new(chapters))
+    }
+
+    /// Adds an `image_type` row naming `path` to `item`'s images.
+    fn fake_image(item: Uuid, image_type: ImageType, path: &str) {
+        FAKE_IMAGES.lock().unwrap().push((
+            item,
+            ItemImageInfo {
+                path: path.to_owned(),
+                image_type,
+                ..ItemImageInfo::default()
+            },
+        ));
+    }
+
     /// `BaseItem.DeleteImageAsync`: a missing slot is "nothing to do", but a real
-    /// deletion is followed by the `ImageUpdate` repository save.
+    /// deletion is followed by the `ImageUpdate` repository save, and a file
+    /// already gone is no failure (`File.Delete`).
     #[tokio::test]
     async fn delete_image_saves_the_item_only_when_a_slot_was_removed() {
         let store = Arc::new(RecordingStore::default());
-        let mgr =
-            LocalProviderManager::default().with_image_store(store.clone(), std::env::temp_dir());
+        let mgr = deleting_manager(&store, FakeChapters::default());
+        let dir = tempfile::tempdir().expect("tmp");
+        let gone = dir
+            .path()
+            .join("backdrop0.jpg")
+            .to_string_lossy()
+            .into_owned();
         let item = Uuid::new_v4();
+        fake_image(item, ImageType::Backdrop, &gone);
 
-        mgr.delete_image(item, ImageType::Backdrop, Some(7))
-            .await
-            .expect("missing slot");
+        for missing in [Some(7), Some(-1)] {
+            mgr.delete_image(item, ImageType::Backdrop, missing)
+                .await
+                .expect("missing slot");
+        }
         assert!(store.touched.lock().expect("lock").is_empty());
+        assert!(store.deleted_images.lock().expect("lock").is_empty());
 
-        store
-            .removed_paths
-            .lock()
-            .expect("lock")
-            .push("/nonexistent/ferrofin-s40/backdrop0.jpg".to_owned());
         mgr.delete_image(item, ImageType::Backdrop, Some(0))
             .await
             .expect("real delete");
+        assert_eq!(*store.touched.lock().expect("lock"), vec![item]);
+        assert_eq!(
+            *store.deleted_images.lock().expect("lock"),
+            [(item, ImageType::Backdrop, gone)]
+        );
+    }
+
+    /// `DeleteImageAsync` deletes the file before it removes the image, so a
+    /// file that cannot be deleted fails the delete and the item keeps the
+    /// image; one that can is gone before the row goes.
+    #[tokio::test]
+    async fn delete_image_removes_the_image_only_after_its_file() {
+        let store = Arc::new(RecordingStore::default());
+        let mgr = deleting_manager(&store, FakeChapters::default());
+        let dir = tempfile::tempdir().expect("tmp");
+        let item = Uuid::new_v4();
+        // A directory where the file should be: unlink refuses it, as root too.
+        let stuck = dir.path().join("poster.jpg");
+        std::fs::create_dir(&stuck).expect("dir");
+        fake_image(item, ImageType::Primary, &stuck.to_string_lossy());
+
+        mgr.delete_image(item, ImageType::Primary, None)
+            .await
+            .expect_err("the file could not be deleted");
+        assert!(stuck.is_dir());
+        // A folder gone too is `DirectoryNotFoundException`: the image stays.
+        let lost = Uuid::new_v4();
+        fake_image(
+            lost,
+            ImageType::Primary,
+            &dir.path().join("gone/poster.jpg").to_string_lossy(),
+        );
+        let error = mgr
+            .delete_image(lost, ImageType::Primary, None)
+            .await
+            .expect_err("the folder is gone");
+        assert!(matches!(error, ServiceError::NotFound(_)), "{error:?}");
+        assert!(store.deleted_images.lock().expect("lock").is_empty());
+        assert!(store.touched.lock().expect("lock").is_empty());
+
+        let other = Uuid::new_v4();
+        let file = dir.path().join("backdrop.jpg");
+        std::fs::write(&file, b"art").expect("file");
+        fake_image(other, ImageType::Backdrop, &file.to_string_lossy());
+        mgr.delete_image(other, ImageType::Backdrop, Some(0))
+            .await
+            .expect("delete");
+        assert!(!file.exists());
+        assert_eq!(
+            *store.deleted_images.lock().expect("lock"),
+            [(
+                other,
+                ImageType::Backdrop,
+                file.to_string_lossy().into_owned()
+            )]
+        );
+    }
+
+    /// The rows whose file the delete leaves alone still go: a URL has no
+    /// file (`IsLocalFile`), a blank path is skipped (`IsNullOrWhiteSpace`),
+    /// and an earlier build's shared album cover is kept.
+    #[tokio::test]
+    async fn delete_image_removes_a_row_whose_file_it_leaves_alone() {
+        let store = Arc::new(RecordingStore::default());
+        let mgr = deleting_manager(&store, FakeChapters::default());
+        let dir = tempfile::tempdir().expect("tmp");
+        let cover = dir
+            .path()
+            .join(super::SHARED_ALBUM_ARTWORK_DIR)
+            .join("0A1B")
+            .join("cover.jpg");
+        std::fs::create_dir_all(cover.parent().expect("parent")).expect("dir");
+        std::fs::write(&cover, b"cover").expect("cover");
+        for path in [
+            "http://art.invalid/poster.jpg".to_owned(),
+            " ".to_owned(),
+            cover.to_string_lossy().into_owned(),
+        ] {
+            let item = Uuid::new_v4();
+            fake_image(item, ImageType::Primary, &path);
+            mgr.delete_image(item, ImageType::Primary, None)
+                .await
+                .expect(&path);
+            assert!(
+                store.deleted_images.lock().expect("lock").contains(&(
+                    item,
+                    ImageType::Primary,
+                    path.clone()
+                )),
+                "{path}"
+            );
+        }
+        assert!(cover.is_file());
+    }
+
+    /// `File.Delete` on Linux, as `delete_image` settles its unlink: a file
+    /// gone while its folder exists is no error; a missing folder, or a
+    /// folder in the path that is a file, is `DirectoryNotFoundException`'s
+    /// 404; on a read-only mount a file already gone is no error and anything
+    /// at the path fails; any other failure fails.
+    #[rstest::rstest]
+    #[case::file_gone("poster.jpg", std::io::ErrorKind::NotFound, Ok(()))]
+    #[case::folder_gone("gone/poster.jpg", std::io::ErrorKind::NotFound, Err("404"))]
+    #[case::folder_is_a_file("plain/poster.jpg", std::io::ErrorKind::NotADirectory, Err("404"))]
+    #[case::read_only_gone("poster.jpg", std::io::ErrorKind::ReadOnlyFilesystem, Ok(()))]
+    #[case::read_only_present("plain", std::io::ErrorKind::ReadOnlyFilesystem, Err("500"))]
+    #[case::denied("plain", std::io::ErrorKind::PermissionDenied, Err("500"))]
+    fn an_image_unlink_settles_as_file_delete(
+        #[case] name: &str,
+        #[case] kind: std::io::ErrorKind,
+        #[case] expected: Result<(), &str>,
+    ) {
+        let dir = tempfile::tempdir().expect("tmp");
+        std::fs::write(dir.path().join("plain"), b"file").expect("file");
+        let settled = super::settle_image_unlink(&dir.path().join(name), Err(kind.into()));
+        match (settled, expected) {
+            (Ok(()), Ok(()))
+            | (Err(ServiceError::NotFound(_)), Err("404"))
+            | (Err(ServiceError::Backend(_)), Err("500")) => {}
+            (settled, expected) => panic!("{name} {kind:?}: {settled:?}, expected {expected:?}"),
+        }
+    }
+
+    /// `GetImageInfo(ImageType.Chapter, index)` is the chapter's image: its
+    /// delete removes the file the chapter names, removes no image row, and
+    /// saves the item; a chapter without an image is nothing to do.
+    #[tokio::test]
+    async fn delete_image_of_a_chapter_deletes_the_file_its_chapter_names() {
+        let store = Arc::new(RecordingStore::default());
+        let dir = tempfile::tempdir().expect("tmp");
+        let item = Uuid::new_v4();
+        let file = dir.path().join("0.jpg");
+        std::fs::write(&file, b"chapter").expect("file");
+        let chapter = |index: i64, image_path: Option<String>| {
+            ferrofin_db::entities::base_items::ChapterEntity {
+                item_id: item.to_string(),
+                chapter_index: index,
+                image_date_modified: None,
+                image_path,
+                name: None,
+                start_position_ticks: index,
+            }
+        };
+        let mgr = deleting_manager(
+            &store,
+            FakeChapters(vec![
+                chapter(0, Some(file.to_string_lossy().into_owned())),
+                chapter(1, None),
+            ]),
+        );
+
+        for missing in [1, 2] {
+            mgr.delete_image(item, ImageType::Chapter, Some(missing))
+                .await
+                .expect("no chapter image");
+        }
+        assert!(store.touched.lock().expect("lock").is_empty());
+
+        mgr.delete_image(item, ImageType::Chapter, Some(0))
+            .await
+            .expect("chapter delete");
+        assert!(!file.exists());
+        assert!(store.deleted_images.lock().expect("lock").is_empty());
         assert_eq!(*store.touched.lock().expect("lock"), vec![item]);
     }
 

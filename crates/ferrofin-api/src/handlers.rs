@@ -2852,6 +2852,49 @@ macro_rules! scheduled_task_info {
     };
 }
 
+/// The code path the two item image delete rows share after their binding.
+macro_rules! item_image_delete_tail {
+    () => {
+        "require_item, GetItemById(itemId, User.GetUserId()): a missing item, or one a \
+         signed-in user cannot see, is a 404, and an API key's caller is not checked) → \
+         images.rs delete_image_answer (the delete on handlers.rs run_detached's task, as \
+         upstream finishes it for a client that hangs up; a failure is a throw, answered as \
+         ExceptionMiddleware answers it, its status with text/plain \"Error processing \
+         request.\", error.rs into_exception_response) → ferrofin-providers \
+         provider_manager.rs delete_image (BaseItem.DeleteImageAsync over \
+         GetImageInfo(type, index): a Chapter's image is the file its chapter row names, \
+         ChapterRepository.GetChapter by ChapterIndex through ferrofin-core \
+         chapter_repository.rs get_chapter; any other is GetImages(type) \
+         .ElementAtOrDefault(index) over item_repository.rs get_image_infos_to_serve, the \
+         path expanded as ExpandVirtualPath; a missing slot, a chapter without an image or a \
+         negative index is nothing to do, with no save. A local file with a path not blank \
+         (except the file of a Live TV row outside the metadata directory, recorded by the \
+         images row, and an album cover, recorded below) is deleted first, as \
+         FileSystem.DeleteFile on Linux (settle_image_unlink, the \
+         subtitle delete's port: dotnet/runtime FileSystem.Unix DeleteFile and \
+         Interop.GetExceptionForIoErrno, read, not measured): a file already gone is nothing \
+         to do while its folder exists, and on a read-only mount when an lstat finds \
+         nothing at the path; a missing folder, or a folder in the path that is a file, is \
+         DirectoryNotFoundException's 404, and any other failure the 500, each with the \
+         image kept and the item not saved. Then the image goes, RemoveImage(info): \
+         item_persistence_service.rs delete_item_image removes, by its id, the first row of \
+         the type naming the path read, wherever it sits by then; a chapter keeps its \
+         ImagePath, as upstream's RemoveImage matches nothing for it, until \
+         RefreshChapterImages extracts the image again or clears the path. The item is \
+         saved with ItemUpdateType.ImageUpdate)"
+    };
+}
+
+/// The divergences of the two item image delete rows.
+const ITEM_IMAGE_DELETE_DIVERGENCES: &[&str] = &[
+    "A file in the album-covers directory is kept: earlier builds stored there one copy of an \
+     album's cover that the album and every one of its tracks named, and rows a library scan \
+     has not yet replaced may still name it (docs/MUSIC_ARTWORK.md); DeleteImageAsync deletes \
+     any local file. No build writes there any more (gl-692, gl-1633).",
+    "The 400 and 404 bodies of the binder and of a missing item are Ferrofin's error shape, \
+     not upstream's. Fix path: gl-666.",
+];
+
 /// The code path the item image rows share after their handler.
 macro_rules! item_image_tail {
     () => {
@@ -3667,32 +3710,31 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Items/{itemId}/Images/{imageType}",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "DeleteItemImage",
-        ferrofin: "handlers/images.rs delete_item_image (RequireAdmin, as RequiresElevation; \
-               ImageIndexQuery: imageIndex is the action's only query member, so a malformed \
-               one is the binder's 400 before the item is read, a blank one is 0, and no other \
-               query parameter is read, measured on 12.4; require_item, GetItemById(itemId, \
-               User.GetUserId()): a missing item, or one a signed-in user cannot see, is a 404, \
-               and an API key's caller is not checked) → ferrofin-providers \
-               provider_manager.rs delete_image (BaseItem.DeleteImageAsync: a missing slot or a \
-               negative index is nothing to do, with no save; otherwise a local row's file is \
-               deleted and the item saved with ItemUpdateType.ImageUpdate) → ferrofin-core \
-               item_persistence_service.rs delete_item_image (GetImages(type) \
-               .ElementAtOrDefault(index), the row's path expanded as ExpandVirtualPath)",
-        date: "2026-11-11",
-        divergences: &[
-            "A file that cannot be deleted still removes the image: the row goes first and the \
-             file error is dropped, a 204, where DeleteImageAsync deletes the file first and a \
-             failure is a 500 that keeps the image (measured on 12.4). Fix path: gl-1663.",
-            "A Chapter image's file is not deleted: chapter images are not image rows, so the \
-             delete finds nothing and answers 204, where GetImageInfo returns the chapter's \
-             image and DeleteImageAsync deletes its file. Fix path: gl-1663.",
-            "A file in the album-covers directory is kept: earlier builds stored there one \
-             copy of an album's cover that the album and every one of its tracks named, and \
-             rows a library scan has not yet replaced may still name it (docs/MUSIC_ARTWORK.md); \
-             DeleteImageAsync deletes any local file. No build writes there any more (gl-692, \
-             gl-1633).",
-            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
-        ],
+        ferrofin: concat!(
+            "handlers/images.rs delete_item_image (RequireAdmin, as RequiresElevation; \
+             ImageIndexQuery: imageIndex is the action's only query member, so a malformed \
+             one is the binder's 400 before the item is read, a blank one is 0, and no other \
+             query parameter is read, measured on 12.4; ",
+            item_image_delete_tail!()
+        ),
+        date: "2026-11-26",
+        divergences: ITEM_IMAGE_DELETE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "delete",
+        path: "/Items/{itemId}/Images/{imageType}/{imageIndex}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "DeleteItemImageByIndex",
+        ferrofin: concat!(
+            "handlers/images.rs delete_item_image_by_index (RequireAdmin, as \
+             RequiresElevation; the index is the route's, bound by bind_route_number's int \
+             rules (trimmed, the 0x, # and &h hex forms), a malformed one the binder's 400, \
+             and the action declares no query member, so none is read; ",
+            item_image_delete_tail!()
+        ),
+        date: "2026-11-26",
+        divergences: ITEM_IMAGE_DELETE_DIVERGENCES,
         refs: &["images"],
     },
     Verified {
