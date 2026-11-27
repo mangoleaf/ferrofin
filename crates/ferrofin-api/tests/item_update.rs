@@ -386,6 +386,11 @@ impl LibraryManager for OkLibrary {
         _parent_id: Option<Uuid>,
     ) -> Result<(), ServiceError> {
         self.assert_metadata_locked();
+        // `UpdateItem` queues the display-order refresh as its last step.
+        assert!(
+            self.refreshes.lock().unwrap().is_empty(),
+            "the edit wrote a row after queuing its refresh"
+        );
         self.updated.lock().unwrap().extend(items.iter().cloned());
         let mut rows = self.tree.rows.lock().unwrap();
         for item in items {
@@ -613,6 +618,8 @@ impl DtoService for OkDto {
 /// external-id / metadata-editor routes return data).
 struct RecordingProviders {
     queued: Arc<Mutex<Vec<Uuid>>>,
+    /// The library's queued item refreshes: a save after one fails the test.
+    library_refreshes: RecordedRefreshes,
     /// The options each queued refresh ran with.
     options: RecordedOptions,
     /// What `lock_item_metadata` locks, for every item.
@@ -730,6 +737,10 @@ impl ProviderManager for RecordingProviders {
     ) -> Result<(), ServiceError> {
         assert!(!item_id.is_nil());
         assert_eq!(update_type, ItemUpdateType::MetadataEdit);
+        assert!(
+            self.library_refreshes.lock().unwrap().is_empty(),
+            "the edit saved an item after queuing its refresh"
+        );
         Ok(())
     }
     async fn get_all_metadata_plugins(
@@ -880,6 +891,7 @@ fn build_state(
     config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
     metadata_lock: MetadataLock,
 ) -> AppState {
+    let library_refreshes = library.refreshes.clone();
     AppState::new(
         library,
         Arc::new(OkUsers),
@@ -892,6 +904,7 @@ fn build_state(
         config,
         Arc::new(RecordingProviders {
             queued,
+            library_refreshes,
             options,
             metadata_lock,
         }),
@@ -1593,8 +1606,8 @@ async fn season_and_album_rating_changes_reach_only_the_children_following_them(
 /// `IHasDisplayOrder.DisplayOrder = request.DisplayOrder` (`:412-415`): a box
 /// set's and a series' display order is written to the row as sent, a null
 /// clears it, and no other kind keeps one; a series whose order changed
-/// (compared case-insensitively, null as empty) queues a `FullRefresh` that
-/// replaces its metadata (`:83-86,120-132`) — a box set's change does not.
+/// (compared `OrdinalIgnoreCase`, null as empty) queues a `FullRefresh` that
+/// replaces its metadata (`:86-90,122-133`) — a box set's change does not.
 #[tokio::test]
 async fn a_display_order_edit_is_stored_and_a_series_one_refreshes_it() {
     let id = Uuid::from_u128(0xD0);
@@ -1626,6 +1639,14 @@ async fn a_display_order_edit_is_stored_and_a_series_one_refreshes_it() {
             Some(r#"{"DisplayOrder":"DVD"}"#),
             r#","DisplayOrder":"dvd""#,
             Some(r#"{"DisplayOrder":"dvd"}"#),
+            false,
+        ),
+        // OrdinalIgnoreCase folds beyond ASCII.
+        (
+            "TV.Series",
+            Some(r#"{"DisplayOrder":"Ä"}"#),
+            r#","DisplayOrder":"ä""#,
+            Some(r#"{"DisplayOrder":"ä"}"#),
             false,
         ),
         ("TV.Series", None, "", None, false),
@@ -1949,6 +1970,42 @@ async fn a_lock_change_on_a_folder_cascades_to_every_descendant() {
     )
     .await;
     assert_eq!(library.updated.lock().unwrap().len(), 1);
+}
+
+/// The display-order refresh is the edit's last step (v12.4
+/// `ItemUpdateController.cs:105-133`), so the refresh reads what the edit
+/// wrote and runs on locked episodes. The fakes fail any row save
+/// (`update_items`) or `update_to_repository` made after a refresh was
+/// queued, so this pins the episode's lock write, and the series' own saves,
+/// before the refresh.
+#[tokio::test]
+async fn a_series_edit_queues_its_display_order_refresh_last() {
+    let series = Uuid::from_u128(0x90);
+    let tree = Tree {
+        root: Some(BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+            is_folder: true,
+            path: Some("/media/library/Series".to_owned()),
+            data: Some(r#"{"DisplayOrder":"dvd"}"#.to_owned()),
+            ..base_item_entity(series)
+        }),
+        descendants: vec![child(0x91, "TV.Episode", series, None)],
+        ..Tree::default()
+    };
+    let library = post_update(
+        tree_library(series, tree),
+        format!(r#"{{"Id":"{series}","Name":"S","LockData":true,"DisplayOrder":"absolute"}}"#),
+    )
+    .await;
+    let queued = library.refreshes.lock().unwrap().clone();
+    assert_eq!(
+        queued.iter().map(|(item, _)| *item).collect::<Vec<_>>(),
+        vec![series]
+    );
+    assert!(
+        written(&library, 0x91).is_locked,
+        "the episode takes the lock"
+    );
 }
 
 /// A save that changes nothing honors the checkbox: LockData=false stays

@@ -89,13 +89,14 @@ pub(crate) async fn update_item(
     // `var isLockedChanged = item.IsLocked != (request.LockData ?? false)`.
     let lock_changed = item.is_locked != request.lock_data.unwrap_or(false);
     let current_tags = split_list(item.tags.as_deref());
-    // `displayOrderChanged`: only a series, compared case-insensitively with
-    // null as empty (`ItemUpdateController.cs:83-86`).
+    // `displayOrderChanged`: only a series, compared `OrdinalIgnoreCase` with
+    // null as empty (`ItemUpdateController.cs:86-90`).
     let is_series = BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::Series);
     let series_display_order_changed = is_series
-        && !stored_display_order(&item)
-            .unwrap_or_default()
-            .eq_ignore_ascii_case(request.display_order.as_deref().unwrap_or_default());
+        && !equals_ordinal_ignore_case(
+            stored_display_order(&item).as_deref().unwrap_or_default(),
+            request.display_order.as_deref().unwrap_or_default(),
+        );
     // `previousOfficialRating` / `previousCustomRating` (v12.2
     // `ItemUpdateController.cs:295-296`): the cascade moves only the children
     // that followed the item's rating before the edit.
@@ -113,7 +114,7 @@ pub(crate) async fn update_item(
         state.library.update_people(&item, &people).await?;
     }
     // `item.IsLocked = request.LockData ?? false` (`ItemUpdateController.cs:
-    // 418`) — exactly, inside `apply_update`. Editing a field never locks the
+    // 422`) — exactly, inside `apply_update`. Editing a field never locks the
     // row: the scan merges onto the stored row and honours `LockedFields`,
     // so an unlocked edit survives a rescan that runs no provider.
     apply_update(&mut item, &request, &*state.localization);
@@ -149,9 +150,30 @@ pub(crate) async fn update_item(
     // The item's own writes are done; the cascade takes each child's lock.
     drop(metadata);
     cascade_to_children(&state, &item, &previous_ratings, &request, &current_tags).await?;
+    // `item.UpdateToRepositoryAsync(MetadataEdit)` (`ItemUpdateController.cs:
+    // 107-109`): the savers, then `UpdateImagesAsync` measures every image and
+    // drops one whose file is gone, and a video's local versions take the
+    // measured rows.
+    state
+        .providers
+        .update_to_repository(
+            item_id,
+            ferrofin_traits::providers::ItemUpdateType::MetadataEdit,
+        )
+        .await?;
+    // `if (isLockedChanged && item.IsFolder)`: every descendant takes the
+    // new lock (`:111-120`).
+    if lock_changed && item.is_folder {
+        for child in recursive_children(&state, item_id).await? {
+            if let Ok(id) = Uuid::parse_str(&child.id) {
+                rewrite_child(&state, id, |child, _| child.is_locked = item.is_locked).await?;
+            }
+        }
+    }
     // `if (displayOrderChanged) QueueRefresh(series, FullRefresh/FullRefresh,
-    // ReplaceAllMetadata, High)` (`:120-132`): the episodes are renumbered under
-    // the new order.
+    // ReplaceAllMetadata, High)` (`:122-133`): the episodes are renumbered under
+    // the new order. Last, as upstream queues it: the refresh reads the files
+    // the savers wrote and finds the episodes already locked.
     if series_display_order_changed {
         let options = MetadataRefreshOptions {
             metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
@@ -161,25 +183,6 @@ pub(crate) async fn update_item(
         };
         state.library.queue_item_refresh(&item, &options).await?;
     }
-    // `if (isLockedChanged && item.IsFolder)`: every descendant takes the
-    // new lock (`ItemUpdateController.cs:104-113`).
-    if lock_changed && item.is_folder {
-        for child in recursive_children(&state, item_id).await? {
-            if let Ok(id) = Uuid::parse_str(&child.id) {
-                rewrite_child(&state, id, |child, _| child.is_locked = item.is_locked).await?;
-            }
-        }
-    }
-    // `item.UpdateToRepositoryAsync(MetadataEdit)`: the savers, then
-    // `UpdateImagesAsync` measures every image and drops one whose file is
-    // gone, and a video's local versions take the measured rows.
-    state
-        .providers
-        .update_to_repository(
-            item_id,
-            ferrofin_traits::providers::ItemUpdateType::MetadataEdit,
-        )
-        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
