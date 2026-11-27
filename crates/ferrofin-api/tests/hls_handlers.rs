@@ -1776,6 +1776,39 @@ async fn attachment_streams_the_file_with_mime() {
     assert_eq!(body.as_ref(), data.as_slice());
 }
 
+/// `{index}` binds as ASP.NET binds an `int` route value: its hex form is read
+/// (`bind_route_number`'s unit test pins the values), and a word is the
+/// binder's 400 (gl-1664).
+#[tokio::test]
+async fn attachment_binds_its_index_as_the_query_binder() {
+    let rec = Arc::new(Recorded::default());
+    let router = router_with(
+        ok_hls("/nope", rec),
+        Arc::new(FakeAttachments {
+            mime: Some("font/ttf".to_owned()),
+            data: b"FONT".to_vec(),
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    );
+    let resp = router
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/src1/Attachments/0x2"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = router
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/src1/Attachments/two"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
 /// A MIME type no header can carry is sent as a missing one is.
 #[tokio::test]
 async fn attachment_with_an_unusable_mime_is_octet_stream() {

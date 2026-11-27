@@ -9,8 +9,9 @@
 //! [`is_private_address`] names the ranges, a [`DestinationPolicy`] decides
 //! which of them a fetch may still reach, and [`PublicOnlyResolver`] applies
 //! the policy to every name a client resolves. Behind a proxy, which resolves
-//! names itself, a name is vetted before each request and
-//! [`VettedAddresses`] pins it to what was vetted.
+//! names itself, a name is also vetted before each request, and the proxied
+//! client's resolver ([`PublicOnlyResolver::except_proxies`]) exempts only the
+//! proxies' own names.
 //!
 //! Jellyfin has no destination policy (`Jellyfin.Server/Startup.cs` gives its
 //! HTTP clients redirects and no address filter). The guard is an accepted
@@ -22,11 +23,10 @@
 //! `subtitle_private_http_allow` (owner decision 2026-11-03, gl-1160): the
 //! image list does not apply to it.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use async_trait::async_trait;
 use ferrofin_model::net::IpNetwork;
@@ -110,9 +110,8 @@ impl DestinationPolicy for fn(IpAddr) -> bool {
 }
 
 /// Why a destination was refused. Carried through reqwest's error chain by
-/// [`PublicOnlyResolver`], so a caller can tell its user exactly that, and by
-/// [`VettedAddresses`] when a name it was never given (the proxy's own) does
-/// not resolve.
+/// [`PublicOnlyResolver`], so a caller can tell its user exactly that. It
+/// also carries a failed lookup of a proxy's own name.
 #[derive(Debug)]
 pub enum DestinationRefused {
     /// The name resolves to an address the policy denies.
@@ -219,6 +218,34 @@ impl PublicOnlyResolver {
     pub fn new(policy: Arc<dyn DestinationPolicy>) -> Self {
         Self { policy }
     }
+
+    /// A proxied client's resolver: [`Self::new`], except that the proxies'
+    /// own names (`proxies`, from [`environment_proxies`]) resolve as the
+    /// system answers, since a proxy may well be private. A name sent through
+    /// a proxy never reaches it; a host reached directly does (one `NO_PROXY`
+    /// lists, or of a scheme no proxy variable covers), and is vetted at
+    /// connect like any other, so nothing has to be remembered per host
+    /// (gl-1795). A request made directly to a proxy's own name is vetted
+    /// only before it is sent (`resolve_vetted`), not again at connect: that
+    /// name is the operator's, and its connections already took the system's
+    /// answer.
+    #[must_use]
+    pub fn except_proxies(policy: Arc<dyn DestinationPolicy>, proxies: Vec<String>) -> Self {
+        Self::new(Arc::new(ExceptProxies { proxies, policy }))
+    }
+}
+
+/// `policy`, refusing nothing for the names in `proxies` (as hosts compare).
+struct ExceptProxies {
+    proxies: Vec<String>,
+    policy: Arc<dyn DestinationPolicy>,
+}
+
+#[async_trait]
+impl DestinationPolicy for ExceptProxies {
+    async fn refuses(&self, host: &str, address: IpAddr) -> bool {
+        !self.proxies.contains(&normalized_host(host)) && self.policy.refuses(host, address).await
+    }
 }
 
 impl reqwest::dns::Resolve for PublicOnlyResolver {
@@ -234,78 +261,20 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
     }
 }
 
-/// A proxied client's resolver: a name resolves to the addresses last vetted
-/// for it ([`Self::pin`]), which is where a host the proxy settings exclude is
-/// reached. A name never vetted, which is the proxy's own, gets the system's
-/// answer unchecked, since a proxy may well be private. A client per request
-/// with `resolve_to_addrs` did the same, but loaded the root certificates and
-/// connected afresh each time.
-///
-/// An entry is replaced by the next request to its host and never removed:
-/// a connection the pool finishes after its request has ended must still
-/// find it. So the map holds one entry per host fetched through the proxy.
-/// The image downloads, the OpenSubtitles link fetch and the WASM plugin host
-/// each keep one; the WASM host's names are the guest's choice (gl-1795).
-#[derive(Debug, Default)]
-pub struct VettedAddresses(Mutex<HashMap<String, Vec<SocketAddr>>>);
-
-impl VettedAddresses {
-    /// Sends `host` to `addresses`, just vetted for it, from now on. The port
-    /// is dropped: each connection takes its own URL's port. (Hosts compare
-    /// in lower case on both sides, so that a miss never falls through to the
-    /// unchecked lookup.)
-    pub fn pin(&self, host: &str, addresses: &[SocketAddr]) {
-        let addresses = addresses
-            .iter()
-            .map(|address| {
-                // `set_port`, not a new address: an IPv6 zone stays.
-                let mut address = *address;
-                address.set_port(0);
-                address
-            })
-            .collect();
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(host.to_ascii_lowercase(), addresses);
-    }
-
-    /// The addresses `host` is pinned to, if any.
-    #[must_use]
-    pub fn pinned(&self, host: &str) -> Option<Vec<SocketAddr>> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&host.to_ascii_lowercase())
-            .cloned()
-    }
-}
-
-impl reqwest::dns::Resolve for VettedAddresses {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let pinned = self.pinned(name.as_str());
-        let host = name.as_str().to_owned();
-        Box::pin(async move {
-            let addresses = match pinned {
-                Some(addresses) => addresses,
-                None => lookup(&host, 0).await.map_err(|failed| {
-                    Box::new(failed) as Box<dyn std::error::Error + Send + Sync>
-                })?,
-            };
-            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
-
-/// Whether the environment configures an outbound proxy reqwest would use:
-/// a non-empty `ALL_PROXY`, `HTTP_PROXY` or `HTTPS_PROXY`, in either case.
-/// `var` reads the environment (`std::env::var_os`, or a test's map).
+/// The hosts of the outbound proxies the environment configures, as hosts
+/// compare, or `None` when it configures none: a non-empty `ALL_PROXY`,
+/// `HTTP_PROXY` or `HTTPS_PROXY`, in either case, is one (a value without a
+/// scheme is read as `http://`, as reqwest reads it). `var` reads the
+/// environment (`std::env::var_os`, or a test's map).
 ///
 /// A proxy resolves the destination itself, out of a resolver's sight, so a
 /// guarded client that honours it must vet each name before it sends.
-/// Over-reporting only sends fetches down that path, which vets them too.
-pub fn environment_proxy(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
-    [
+/// Over-reporting only sends fetches down that path, which vets them too; a
+/// proxy name missed would be vetted like any other name, refused if private.
+pub fn environment_proxies(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<Vec<String>> {
+    let values: Vec<_> = [
         "ALL_PROXY",
         "all_proxy",
         "HTTP_PROXY",
@@ -314,7 +283,25 @@ pub fn environment_proxy(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bo
         "https_proxy",
     ]
     .iter()
-    .any(|name| var(name).is_some_and(|value| !value.is_empty()))
+    .filter_map(|name| var(name).filter(|value| !value.is_empty()))
+    .collect();
+    if values.is_empty() {
+        return None;
+    }
+    Some(
+        values
+            .iter()
+            .filter_map(|value| {
+                let value = value.to_str()?.trim();
+                let url = if value.contains("://") {
+                    reqwest::Url::parse(value)
+                } else {
+                    reqwest::Url::parse(&format!("http://{value}"))
+                };
+                url.ok()?.host_str().map(normalized_host)
+            })
+            .collect(),
+    )
 }
 
 /// `host` as hosts are compared: lower case, without the brackets of an IPv6
@@ -602,9 +589,9 @@ mod tests {
                     .map(|(_, value)| std::ffi::OsString::from(*value))
             }
         };
-        assert!(!environment_proxy(env(&[])));
-        assert!(!environment_proxy(env(&[("HTTP_PROXY", "")])));
-        assert!(!environment_proxy(env(&[("NO_PROXY", "*")])));
+        assert_eq!(environment_proxies(env(&[])), None);
+        assert_eq!(environment_proxies(env(&[("HTTP_PROXY", "")])), None);
+        assert_eq!(environment_proxies(env(&[("NO_PROXY", "*")])), None);
         for name in [
             "ALL_PROXY",
             "all_proxy",
@@ -615,8 +602,27 @@ mod tests {
         ] {
             let set: &'static [(&'static str, &'static str)] =
                 Box::leak(vec![(name, "http://proxy:3128")].into_boxed_slice());
-            assert!(environment_proxy(env(set)), "{name}");
+            assert_eq!(
+                environment_proxies(env(set)),
+                Some(vec!["proxy".to_owned()]),
+                "{name}"
+            );
         }
+        // Every variable's proxy, as hosts compare; a value reqwest reads as
+        // `http://` without a scheme; one that names no host still counts.
+        assert_eq!(
+            environment_proxies(env(&[
+                ("HTTP_PROXY", "http://user:secret@Proxy.LAN.:3128"),
+                ("https_proxy", "tls-proxy.lan:8443"),
+                ("ALL_PROXY", "socks5h://[fd00::1]:1080"),
+                ("all_proxy", "::"),
+            ])),
+            Some(vec![
+                "fd00::1".to_owned(),
+                "proxy.lan".to_owned(),
+                "tls-proxy.lan".to_owned(),
+            ])
+        );
     }
 
     #[rstest]
@@ -778,28 +784,67 @@ mod tests {
         ));
     }
 
-    /// A proxied client's resolver answers a vetted name with the addresses
-    /// vetted for it, without their port, so that a request to another port
-    /// of the host still takes its own; any other name, the proxy's, with the
-    /// system's answer.
+    /// A proxied client's resolver gives a proxy's own name the system's
+    /// answer, private or not, and vets every other name: what reaches it is
+    /// a host reached directly, not through the proxy (gl-1795).
     #[tokio::test]
-    async fn the_proxied_resolver_answers_a_vetted_name_with_its_vetted_addresses() {
+    async fn the_proxied_resolver_vets_every_name_but_the_proxies() {
         use reqwest::dns::Resolve as _;
-        let pinned = VettedAddresses::default();
-        pinned.pin(
-            "Images.Example",
-            &["203.0.113.7:8080".parse().expect("address")],
-        );
-        let vetted: Vec<std::net::SocketAddr> = pinned
-            .resolve("images.example".parse().expect("name"))
-            .await
-            .expect("pinned")
-            .collect();
-        assert_eq!(vetted, ["203.0.113.7:0".parse().expect("address")]);
-        let mut proxy = pinned
-            .resolve("localhost".parse().expect("name"))
+        let policy: Arc<dyn DestinationPolicy> = Arc::new(is_private_address as fn(IpAddr) -> bool);
+        let proxy =
+            PublicOnlyResolver::except_proxies(Arc::clone(&policy), vec!["localhost".into()]);
+        let mut answer = proxy
+            .resolve("LocalHost".parse().expect("name"))
             .await
             .expect("the system's answer");
-        assert!(proxy.all(|address| address.ip().is_loopback()));
+        assert!(answer.all(|address| address.ip().is_loopback()));
+
+        let other = PublicOnlyResolver::except_proxies(policy, vec!["proxy.lan".into()]);
+        let Err(error) = other.resolve("localhost".parse().expect("name")).await else {
+            panic!("a loopback name that is no proxy's was resolved");
+        };
+        assert!(
+            matches!(
+                error.downcast_ref::<DestinationRefused>(),
+                Some(DestinationRefused::Private { host, .. }) if host == "localhost"
+            ),
+            "{error}"
+        );
+    }
+
+    /// A private proxy is reached by its own name through a proxied client:
+    /// the host [`environment_proxies`] reads from the variable is the name
+    /// reqwest asks the resolver for. The target is the proxy's to resolve
+    /// (this one resolves nowhere).
+    #[tokio::test]
+    async fn a_private_proxy_is_reached_by_the_name_its_variable_gives() {
+        use crate::mock_http::MockServer;
+        let proxy = MockServer::start_raw(vec![MockServer::raw_ok("", b"ok")]).await;
+        let port = proxy.base_url.rsplit(':').next().expect("port");
+        let value = format!("LocalHost:{port}");
+        let hosts = environment_proxies(|name| {
+            (name == "HTTP_PROXY").then(|| std::ffi::OsString::from(&value))
+        })
+        .expect("a proxy");
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{value}")).expect("proxy"))
+            .dns_resolver(Arc::new(PublicOnlyResolver::except_proxies(
+                Arc::new(is_private_address as fn(IpAddr) -> bool),
+                hosts,
+            )))
+            .build()
+            .expect("client");
+        let response = client
+            .get("http://images.invalid/a.png")
+            .send()
+            .await
+            .expect("sent through the proxy");
+        assert_eq!(response.text().await.expect("body"), "ok");
+        assert_eq!(proxy.requests(), 1);
+        assert!(
+            proxy.heads()[0].starts_with("get http://images.invalid/a.png "),
+            "{:?}",
+            proxy.heads()
+        );
     }
 }

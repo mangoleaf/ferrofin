@@ -35,7 +35,7 @@ pub const TEST_FIXTURE_WAT: &str = include_str!("test_fixture.wat");
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use tracing::{error, info, warn};
@@ -1111,6 +1111,20 @@ fn load_one(
     })
 }
 
+/// Epoch-ticker threads whose loop has not ended, that is whose engine may
+/// still be alive.
+static LIVE_EPOCH_TICKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many epoch-ticker threads in this process have not yet found their
+/// engine gone: a test seam for `tests/idle_host.rs`. Counted from before
+/// each thread starts, where sampling `/proc/self/task` can miss one (a
+/// thread that exits mid-listing hides the one after it). Not a public API.
+#[doc(hidden)]
+#[must_use]
+pub fn live_epoch_tickers_for_test() -> usize {
+    LIVE_EPOCH_TICKERS.load(Ordering::Relaxed)
+}
+
 /// Builds the shared wasm runtime pieces: an epoch-ticked engine (weak-held
 /// by its ticker thread) and the world+WASI linker. Shared by
 /// [`WasmPluginHost::load`] and [`WasmArtifactValidator`] so they can never
@@ -1134,8 +1148,9 @@ fn build_runtime_parts(
     // engine and its compiled code forever.
     {
         let engine = engine.weak();
+        // Counted before the thread exists, so no reader can miss it.
+        LIVE_EPOCH_TICKERS.fetch_add(1, Ordering::Relaxed);
         std::thread::Builder::new()
-            // tests/idle_host.rs finds the ticker by this name.
             .name("wasm-epoch-ticker".to_owned())
             .spawn(move || {
                 loop {
@@ -1145,6 +1160,10 @@ fn build_runtime_parts(
                     };
                     engine.increment_epoch();
                 }
+                LIVE_EPOCH_TICKERS.fetch_sub(1, Ordering::Relaxed);
+            })
+            .inspect_err(|_| {
+                LIVE_EPOCH_TICKERS.fetch_sub(1, Ordering::Relaxed);
             })
             .expect("spawning the wasm epoch ticker cannot fail");
     }
@@ -1225,6 +1244,7 @@ fn config_pages_for(
             name: page.name.clone(),
             bytes: page.content.clone(),
             enable_in_main_menu: page.enable_in_main_menu,
+            content_type: None,
         })
         .collect();
     if kept.is_empty() {
@@ -1295,6 +1315,7 @@ fn fallback_config_page(descriptor: &PluginDescriptor) -> PluginConfigPage {
         name: format!("wasm-settings-{id}"),
         bytes: html.into_bytes(),
         enable_in_main_menu: false,
+        content_type: None,
     }
 }
 
@@ -1665,7 +1686,7 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
                 // scan — same rule as every other plugin offer.
                 Err(reason) => warn!(
                     plugin = %self.plugin.descriptor.id,
-                    item = %item.item_id,
+                    item_id = %item.item_id,
                     kind = ?kind,
                     reason,
                     "wasm plugin artwork candidate refused/failed; skipping"
@@ -2166,7 +2187,7 @@ impl WasmMediaAnalysisTask {
                         // library size); one aggregated warn per pass.
                         tracing::debug!(
                             plugin = plugin.descriptor.name,
-                            item = %entity.id,
+                            item_id = %entity.id,
                             error = %e,
                             "scan-media failed for one item (offered once; not retried)"
                         );

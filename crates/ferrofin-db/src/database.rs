@@ -30,6 +30,21 @@ pub fn schema_head() -> i64 {
         .map_or(0, |migration| migration.version)
 }
 
+/// The `FerrofinMeta` key holding the build (its `git describe`, the
+/// server's version) of the last start that got through its start-time
+/// conversions and imports ([`Database::record_started`]). The export
+/// refuses a database that records another build, so a data directory is
+/// exported only as this version's start left it (gl-1910).
+///
+/// shortcut: a build stamped with no version (no `FERROFIN_GIT_DESCRIBE` and
+/// no `.git`, such as a plain `docker build .`) reports the crate's
+/// placeholder version, and a local build keeps the describe of the commit it
+/// was first built at, so two such builds can record the same and only the
+/// migration head tells them apart; release builds are always stamped. Stamp
+/// every build, or record a hash of the binary, if an unstamped build ever
+/// has to export.
+pub const STARTED_KEY: &str = "started_by";
+
 /// A `BaseItems` row projected down to what the inherited-images walk and
 /// the Episode/Season/Audio parent blocks of the DTO service read off a
 /// parent: its kind, the three ids the walk follows, the album-artist name
@@ -109,6 +124,39 @@ pub struct Database {
     /// Lets [`Database::run_migrations`] snapshot the file before a
     /// table-rebuild migration.
     file_path: Option<std::path::PathBuf>,
+}
+
+/// The writer pool's options: one connection, which hands its automatic
+/// checkpoints to `checkpoints`' task, and whose every acquire (of a new
+/// connection or an idle one) and release `holds` records for
+/// [`crate::writer_holds::watch`].
+pub(crate) fn writer_pool_options(
+    checkpoints: &Arc<crate::wal_checkpoints::WalCheckpoints>,
+    holds: &Arc<crate::writer_holds::WriterHolds>,
+) -> SqlitePoolOptions {
+    // The callbacks own `checkpoints` and `holds` for the pool's life, which
+    // is what keeps the WAL hook's context alive under every connection.
+    let take_over = Arc::clone(checkpoints);
+    let (connected, acquired, released) = (Arc::clone(holds), Arc::clone(holds), Arc::clone(holds));
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _| {
+            let checkpoints = Arc::clone(&take_over);
+            let holds = Arc::clone(&connected);
+            Box::pin(async move {
+                checkpoints.take_over(conn).await?;
+                holds.acquired();
+                Ok(())
+            })
+        })
+        .before_acquire(move |_, _| {
+            acquired.acquired();
+            Box::pin(std::future::ready(Ok(true)))
+        })
+        .after_release(move |_, _| {
+            released.released();
+            Box::pin(std::future::ready(Ok(true)))
+        })
 }
 
 impl Database {
@@ -302,21 +350,22 @@ impl Database {
             .max_connections(max_connections)
             .connect_with(read_options)
             .await?;
-        // Every writer connection hands its automatic checkpoints to the task.
-        // The callback owns `checkpoints` for the pool's life, which is what
-        // keeps the hook's context alive under every connection.
-        let take_over = Arc::clone(&checkpoints);
-        let writer = SqlitePoolOptions::new()
-            .max_connections(1)
-            .after_connect(move |conn, _| {
-                let checkpoints = Arc::clone(&take_over);
-                Box::pin(async move { checkpoints.take_over(conn).await })
-            })
+        let writer_holds = Arc::new(crate::writer_holds::WriterHolds::default());
+        let writer = writer_pool_options(&checkpoints, &writer_holds)
             .connect_with(write_options)
             .await?;
         tokio::spawn(tracing::Instrument::instrument(
             crate::wal_checkpoints::run(checkpointer.clone(), Arc::clone(&checkpoints)),
             tracing::info_span!(parent: None, "wal_checkpoints"),
+        ));
+        // Warns once the writer stays out longer than a write waits for it.
+        tokio::spawn(tracing::Instrument::instrument(
+            crate::writer_holds::watch(
+                writer.clone(),
+                Arc::clone(&writer_holds),
+                writer.options().get_acquire_timeout(),
+            ),
+            tracing::info_span!(parent: None, "writer_holds"),
         ));
         // One-time at startup: the reader pool size is the concurrent-read thread
         // count (each sqlx SQLite connection owns a dedicated OS thread), the
@@ -990,6 +1039,33 @@ impl Database {
         Ok(out)
     }
 
+    /// Records that a start of `build` (the server's version) got through its
+    /// start-time conversions and imports on this database, under
+    /// [`STARTED_KEY`], which the export requires of the build exporting it.
+    /// Only for a start where every one succeeded: a start where one failed
+    /// (it warned, and runs again at the next start) calls
+    /// [`Database::clear_started`] instead (gl-1952).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the write fails.
+    pub async fn record_started(&self, build: &str) -> Result<()> {
+        self.meta_set(STARTED_KEY, build).await
+    }
+
+    /// Removes the record [`Database::record_started`] left, for a start
+    /// where a start-time conversion failed, so the export refuses the
+    /// database until a start gets through them all (gl-1952).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the write fails.
+    pub async fn clear_started(&self) -> Result<()> {
+        sqlx::query(r#"DELETE FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+            .bind(STARTED_KEY)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
+    }
+
     /// Reads a `FerrofinMeta` value (Ferrofin's own key/value table), or [`None`]
     /// when the key is unset.
     ///
@@ -1037,21 +1113,7 @@ impl Database {
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the query fails.
     pub async fn jellyfin_migration_applied(&self, migration_id: &str) -> Result<bool> {
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        if exists.is_none() {
-            return Ok(false);
-        }
-        let applied: Option<i64> = sqlx::query_scalar(
-            r#"SELECT 1 FROM "__EFMigrationsHistory" WHERE "MigrationId" = ?1 LIMIT 1"#,
-        )
-        .bind(migration_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(applied.is_some())
+        jellyfin_migration_applied(&mut *self.pool.acquire().await?, migration_id).await
     }
 
     /// Plants an adoption record as the gate would — for tests of the boot
@@ -1083,6 +1145,14 @@ impl Database {
     /// rather than colliding inside SQLite and burning the busy timeout. For
     /// the in-memory test database this is the same pool as
     /// [`Database::pool`].
+    ///
+    /// A write transaction that reads before it writes begins with
+    /// `.begin_with("BEGIN IMMEDIATE")`. Another process (the previous version
+    /// during a rolling update) still writes the same file, and SQLite waits
+    /// out the busy timeout only for a lock taken with no transaction open: a
+    /// deferred transaction that has read fails its first write at once, with
+    /// `SQLITE_BUSY` while the other holds the lock, or `SQLITE_BUSY_SNAPSHOT`
+    /// when it committed after the read.
     #[must_use]
     pub fn writer(&self) -> &SqlitePool {
         &self.writer
@@ -1505,7 +1575,7 @@ const JELLYFIN_12_2_OPTIONAL_MIGRATIONS: [&str; 4] = [
 /// aside — anything newer, older or partial is
 /// refused rather than half-adopted. `baselined_versions` are the Ferrofin
 /// migrations whose *shape* the database already has, or whose data change it
-/// must not get (`0010`), recorded as applied without executing; every other
+/// must not get (`0010`, `0054`), recorded as applied without executing; every other
 /// migration runs.
 #[derive(Debug, Clone, Copy)]
 pub struct JellyfinGeneration {
@@ -1532,7 +1602,10 @@ pub struct JellyfinGeneration {
 /// Ferrofin left undated) is baselined everywhere, because Jellyfin leaves a
 /// played row undated on purpose (`Video.PropagatePlayedState`, a
 /// `Played`-only `POST /UserItems/{id}/UserData`) and the adoption time is no
-/// play date; `0030` (the `NormalizedUsername` column and index)
+/// play date; so is `0054` (which clears the resume positions builds before
+/// v1.4.0 saved for songs and some video extras), because a Jellyfin database
+/// holds one only where a client set it through that endpoint, and Jellyfin
+/// keeps it; `0030` (the `NormalizedUsername` column and index)
 /// is baselined wherever the database already owns it, `0032` (the 12.0
 /// shape) for 12.0, 12.1 and 12.2, and `0040` (12.2's partial `OwnerId`
 /// indexes) for 12.2 only. `0031`, `0033`, `0034`, `0039`, `0041`, `0042` and
@@ -1548,35 +1621,35 @@ pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 5] = [
         migration_ids: &JELLYFIN_10_11_8_MIGRATIONS,
         additional_ids: &[],
         optional_ids: &[],
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 54],
     },
     JellyfinGeneration {
         name: "10.11.11",
         migration_ids: &JELLYFIN_10_11_8_MIGRATIONS,
         additional_ids: &JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS,
         optional_ids: &[],
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 54],
     },
     JellyfinGeneration {
         name: "12.0.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
         additional_ids: &[],
         optional_ids: &JELLYFIN_12_0_OPTIONAL_MIGRATIONS,
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32, 54],
     },
     JellyfinGeneration {
         name: "12.1.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
         additional_ids: &JELLYFIN_12_1_ADDITIVE_MIGRATIONS,
         optional_ids: &JELLYFIN_12_1_OPTIONAL_MIGRATIONS,
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32, 54],
     },
     JellyfinGeneration {
         name: "12.2.0",
         migration_ids: &JELLYFIN_12_0_MIGRATIONS,
         additional_ids: &JELLYFIN_12_2_ADDITIVE_MIGRATIONS,
         optional_ids: &JELLYFIN_12_2_OPTIONAL_MIGRATIONS,
-        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32, 40],
+        baselined_versions: &[1, 2, 3, 4, 5, 6, 7, 10, 30, 32, 40, 54],
     },
 ];
 
@@ -1765,6 +1838,29 @@ async fn adopt_jellyfin_database(
         "adopted an existing Jellyfin database in place"
     );
     Ok(())
+}
+
+/// [`Database::jellyfin_migration_applied`] on one connection, so a boot
+/// repair can read it inside its own transaction.
+pub(crate) async fn jellyfin_migration_applied(
+    conn: &mut sqlx::SqliteConnection,
+    migration_id: &str,
+) -> Result<bool> {
+    let exists: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if exists.is_none() {
+        return Ok(false);
+    }
+    let applied: Option<i64> = sqlx::query_scalar(
+        r#"SELECT 1 FROM "__EFMigrationsHistory" WHERE "MigrationId" = ?1 LIMIT 1"#,
+    )
+    .bind(migration_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(applied.is_some())
 }
 
 /// The code-created adoption record — like `_sqlx_migrations`, it lives
@@ -2446,6 +2542,24 @@ pub fn init_sqlite() -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A start's record is written, replaced by a later build's, and removed
+    /// by a start whose conversions did not all succeed (gl-1952); removing
+    /// it again is a no-op.
+    #[tokio::test]
+    async fn a_start_record_is_written_and_cleared() {
+        let db = Database::connect_in_memory().await.expect("memory");
+        db.run_migrations().await.expect("migrate");
+        db.record_started("v1").await.expect("record");
+        db.record_started("v2").await.expect("record again");
+        assert_eq!(
+            db.meta_get(STARTED_KEY).await.expect("read").as_deref(),
+            Some("v2")
+        );
+        db.clear_started().await.expect("clear");
+        db.clear_started().await.expect("clear again");
+        assert_eq!(db.meta_get(STARTED_KEY).await.expect("read"), None);
+    }
 
     /// The gate on the post-migration `foreign_key_check`.
     ///
@@ -3950,6 +4064,12 @@ mod tests {
                 "{}: 0010 must not run on an adopted database",
                 generation.name
             );
+            // `0054` would clear a position a client set on a song through the API.
+            assert!(
+                generation.baselined_versions.contains(&54),
+                "{}: 0054 must not run on an adopted database",
+                generation.name
+            );
         }
         let by_name = |name: &str| {
             JELLYFIN_GENERATIONS
@@ -4151,6 +4271,68 @@ mod tests {
         assert_eq!(ran_for, 0, "0010 is recorded without running");
     }
 
+    /// A position a client set on a song through `POST /UserItems/{id}/UserData`
+    /// is one Jellyfin keeps, so adoption keeps it: `0054`, which clears the
+    /// positions Ferrofin builds before v1.4.0 saved for songs, is recorded for
+    /// an adopted database without running.
+    #[tokio::test]
+    async fn adoption_keeps_a_songs_position() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture(&path, &JELLYFIN_10_11_8_MIGRATIONS).await;
+        {
+            use sqlx::ConnectOptions;
+            let mut conn = SqliteConnectOptions::new()
+                .filename(&path)
+                .connect()
+                .await
+                .expect("open fixture db");
+            sqlx::raw_sql(
+                r#"INSERT INTO "Users"
+                    ("Id","AuthenticationProviderId","DisplayCollectionsView","DisplayMissingEpisodes",
+                     "EnableAutoLogin","EnableLocalPassword","EnableNextEpisodeAutoPlay",
+                     "EnableUserPreferenceAccess","HidePlayedInLatest","InternalId",
+                     "InvalidLoginAttemptCount","MaxActiveSessions","MustUpdatePassword",
+                     "PasswordResetProviderId","PlayDefaultAudioTrack","RememberAudioSelections",
+                     "RememberSubtitleSelections","RowVersion","SubtitleMode","SyncPlayAccess","Username")
+                   VALUES ('EEF5FFE4-B970-4ED2-8CE8-F1881E032051','auth',0,0,0,0,1,1,1,1,0,0,0,
+                           'reset',1,1,1,0,0,0,'listener');
+                   INSERT INTO "BaseItems" ("Id","IsFolder","IsInMixedFolder","IsLocked","IsMovie",
+                     "IsRepeat","IsSeries","IsVirtualItem","Type")
+                   VALUES ('00000000-0000-0000-0000-0000000000AA',0,0,0,0,0,0,0,
+                           'MediaBrowser.Controller.Entities.Audio.Audio');
+                   INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite",
+                     "PlayCount","PlaybackPositionTicks","Played")
+                   VALUES ('00000000-0000-0000-0000-0000000000AA',
+                           'EEF5FFE4-B970-4ED2-8CE8-F1881E032051','aa',0,1,2000000000,0);"#,
+            )
+            .execute(&mut conn)
+            .await
+            .expect("seed a song with a position");
+            sqlx::Connection::close(conn).await.expect("close");
+        }
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(2))
+            .await
+            .expect("adoption succeeds");
+        let position: i64 = sqlx::query_scalar(r#"SELECT "PlaybackPositionTicks" FROM "UserData""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("user data");
+        assert_eq!(
+            position, 2_000_000_000,
+            "adoption keeps the song's position"
+        );
+        let ran_for: i64 = sqlx::query_scalar(
+            r#"SELECT execution_time FROM "_sqlx_migrations" WHERE version = 54"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("0054 is recorded");
+        assert_eq!(ran_for, 0, "0054 is recorded without running");
+    }
+
     /// A Ferrofin-native database keeps `0010`'s backfill: there a played row
     /// without a date is history an early build failed to date at playback
     /// start.
@@ -4298,6 +4480,101 @@ mod tests {
         Database::connect_sized(&url, Some(2))
             .await
             .expect("re-open after adoption");
+    }
+
+    /// Jellyfin's `UpdateNormalizedUsername` saves every user it changes, and EF
+    /// bumps each one's `RowVersion`. Upgrading 10.11.8 changes every key (from
+    /// `AddNormalizedUsername`'s ''), an all-caps name's included; a 10.11.11
+    /// database already ran it, so adopting one bumps nothing.
+    #[rstest::rstest]
+    #[case::from_10_11_8(false, [4, 1, 8])]
+    #[case::from_10_11_11(true, [3, 0, 7])]
+    #[tokio::test]
+    async fn adoption_bumps_row_versions_as_update_normalized_username_does(
+        #[case] newer: bool,
+        #[case] expected: [i64; 3],
+    ) {
+        use sqlx::ConnectOptions;
+        async fn read(db: &Database) -> Vec<(String, i64)> {
+            sqlx::query_as(
+                r#"SELECT "NormalizedUsername", "RowVersion" FROM "Users" ORDER BY "Id""#,
+            )
+            .fetch_all(db.pool())
+            .await
+            .expect("users")
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut ids = JELLYFIN_10_11_8_MIGRATIONS.to_vec();
+        if newer {
+            ids.extend(JELLYFIN_10_11_X_ADDITIVE_MIGRATIONS);
+        }
+        seed_jellyfin_fixture(&path, &ids).await;
+        let users = [("a", "münchen", 3), ("b", "ı", 0), ("c", "ADMIN", 7)];
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&path)
+            .connect()
+            .await
+            .expect("open fixture db");
+        if newer {
+            sqlx::query(r#"ALTER TABLE "Users" ADD "NormalizedUsername" TEXT NOT NULL DEFAULT ''"#)
+                .execute(&mut conn)
+                .await
+                .expect("add column");
+        }
+        for (internal_id, (id, name, row_version)) in (1_i64..).zip(users) {
+            sqlx::query(
+                r#"INSERT INTO "Users" ("Id","AuthenticationProviderId","DisplayCollectionsView",
+                   "DisplayMissingEpisodes","EnableAutoLogin","EnableLocalPassword",
+                   "EnableNextEpisodeAutoPlay","EnableUserPreferenceAccess","HidePlayedInLatest",
+                   "InternalId","InvalidLoginAttemptCount","MaxActiveSessions","MustUpdatePassword",
+                   "PasswordResetProviderId","PlayDefaultAudioTrack","RememberAudioSelections",
+                   "RememberSubtitleSelections","RowVersion","SubtitleMode","SyncPlayAccess",
+                   "Username")
+                   VALUES (?1,'auth',0,0,0,0,1,1,1,?2,0,0,0,'reset',1,1,1,?3,0,0,?4)"#,
+            )
+            .bind(id)
+            .bind(internal_id)
+            .bind(row_version)
+            .bind(name)
+            .execute(&mut conn)
+            .await
+            .expect("insert user");
+            if newer {
+                sqlx::query(r#"UPDATE "Users" SET "NormalizedUsername" = ?2 WHERE "Id" = ?1"#)
+                    .bind(id)
+                    .bind(ferrofin_util::string_extensions::upper_invariant(name))
+                    .execute(&mut conn)
+                    .await
+                    .expect("Jellyfin's key");
+            }
+        }
+        if newer {
+            sqlx::query(
+                r#"CREATE UNIQUE INDEX "IX_Users_NormalizedUsername" ON "Users" ("NormalizedUsername")"#,
+            )
+            .execute(&mut conn)
+            .await
+            .expect("unique index");
+        }
+        sqlx::Connection::close(conn).await.expect("close");
+
+        let url = format!("sqlite://{}", path.display());
+        let db = Database::connect_sized(&url, Some(1))
+            .await
+            .expect("adoption succeeds");
+        let want: Vec<(String, i64)> = ["MÜNCHEN", "ı", "ADMIN"]
+            .into_iter()
+            .map(str::to_owned)
+            .zip(expected)
+            .collect();
+        assert_eq!(read(&db).await, want);
+        // Once: the next boot finds the repair done.
+        drop(db);
+        let db = Database::connect_sized(&url, Some(1))
+            .await
+            .expect("re-open");
+        assert_eq!(read(&db).await, want);
     }
 
     #[rstest::rstest]

@@ -196,6 +196,12 @@ async fn done(db: &Database, key: &str) -> Result<(), ServiceError> {
     Ok(db.meta_set(key, "1").await?)
 }
 
+/// Whether the one-shot repair under `key` is marked done. Once it has run,
+/// one that stopped short (it warned, and the next boot runs it again) is not.
+async fn finished(db: &Database, key: &str) -> Result<bool, ServiceError> {
+    Ok(!once(db, key).await?)
+}
+
 /// A row [`import_membership_once`] reads: `Id`, `Type`, `Path`, `IsFolder`, `Data`.
 type ImportRow = (String, String, Option<String>, bool, Option<String>);
 
@@ -248,7 +254,12 @@ pub async fn import_membership_once(
     .await
     .map_err(db_err)?;
 
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut written = 0usize;
     let mut dropped = 0usize;
     for (id, type_, path, is_folder, data) in rows {
@@ -712,14 +723,19 @@ pub async fn cleanup_orphaned_extras(db: &Database) -> Result<usize, ServiceErro
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
 pub async fn fix_owner_id_relationships(db: &Database) -> Result<usize, ServiceError> {
-    const KEY: &str = "owner_id_relationships_v12";
+    const KEY: &str = ferrofin_db::repair_markers::OWNER_ID_RELATIONSHIPS;
     if !once(db, KEY).await? {
         return Ok(0);
     }
     let video = stored_type_name(BaseItemKind::Video).unwrap_or_default();
     let movie = stored_type_name(BaseItemKind::Movie).unwrap_or_default();
     let folder = stored_type_name(BaseItemKind::Folder).unwrap_or_default();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let deleted = dedupe_paths(&mut tx, folder).await?;
     // Step 2: videos/movies (not extras) owned by a video/movie or by nothing
     // — except the owner's own local versions and stacked parts (its
@@ -1125,9 +1141,10 @@ pub async fn cleanup_deleted_item_data(
 
 /// [`cleanup_deleted_item_data`] and its log line, for the composition root.
 /// A failure is a warning and never stops the boot: the folders stay, and
-/// the next boot tries again.
-pub async fn run_cleanup_deleted_item_data(db: &Database, cleanup: &ItemDataCleanup) {
-    match cleanup_deleted_item_data(db, cleanup).await {
+/// the next boot tries again. Returns whether it succeeded.
+pub async fn run_cleanup_deleted_item_data(db: &Database, cleanup: &ItemDataCleanup) -> bool {
+    let result = cleanup_deleted_item_data(db, cleanup).await;
+    match &result {
         Ok(0) => {}
         Ok(items) => tracing::info!(
             items,
@@ -1139,6 +1156,7 @@ pub async fn run_cleanup_deleted_item_data(db: &Database, cleanup: &ItemDataClea
              the next boot tries again"
         ),
     }
+    result.is_ok()
 }
 
 /// Reunites the local alternate versions a Ferrofin v1.0.0 scan split off
@@ -1164,7 +1182,12 @@ pub async fn reunite_split_versions(db: &Database) -> Result<usize, ServiceError
         return Ok(0);
     }
     let video = stored_type_name(BaseItemKind::Video).unwrap_or_default();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     // (stale video, standalone row, primary, path, primary's path, primary's Data)
     let splits: Vec<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
         r#"SELECT v."Id", m."Id", p."Id", v."Path", p."Path", p."Data"
@@ -1262,7 +1285,12 @@ pub async fn backfill_alternate_version_links(db: &Database) -> Result<usize, Se
     .fetch_all(db.pool())
     .await
     .map_err(db_err)?;
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut written = 0usize;
     for (child, primary) in &pairs {
         let (Ok(child_id), Ok(primary_id)) = (Uuid::parse_str(child), Uuid::parse_str(primary))
@@ -1334,7 +1362,12 @@ pub async fn repair_alternate_version_links(db: &Database) -> Result<(usize, usi
         .collect();
     item_ids.sort_unstable();
     item_ids.dedup();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let (mut repaired, mut promoted) = (0usize, 0usize);
     for id in item_ids {
         let Some((primary_version_id, key, owner_id)) =
@@ -1666,7 +1699,7 @@ pub async fn rehome_local_versions(
     path_manager: Option<&dyn PathManager>,
     persistence: &dyn ItemPersistenceService,
 ) -> Result<RehomedVersions, ServiceError> {
-    const KEY: &str = "rehome_local_versions_v12";
+    const KEY: &str = ferrofin_db::repair_markers::REHOME_LOCAL_VERSIONS;
     if !once(db, KEY).await? {
         return Ok(RehomedVersions::default());
     }
@@ -1848,8 +1881,8 @@ fn uuid_of(id: &str) -> Result<Uuid, ServiceError> {
 /// Returns [`ServiceError`] if a query fails; the repair is not marked done
 /// then, and the next boot runs it again.
 pub async fn rederive_adopted_versions(db: &Database) -> Result<u64, ServiceError> {
-    const KEY: &str = "rederive_adopted_versions_v160";
-    const REHOME_KEY: &str = "rehome_local_versions_v12";
+    const KEY: &str = ferrofin_db::repair_markers::REDERIVE_ADOPTED_VERSIONS;
+    const REHOME_KEY: &str = ferrofin_db::repair_markers::REHOME_LOCAL_VERSIONS;
     if once(db, REHOME_KEY).await? || !once(db, KEY).await? || !adopted_from_10_11(db).await? {
         return Ok(0);
     }
@@ -1963,7 +1996,7 @@ pub async fn rekey_virtual_seasons(
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
-    const KEY: &str = "virtual_season_ids_v12";
+    const KEY: &str = VIRTUAL_SEASON_IDS_KEY;
     if !once(db, KEY).await? {
         return Ok(0);
     }
@@ -2051,7 +2084,12 @@ pub async fn rekey_virtual_seasons(
     Ok(made.len())
 }
 
+/// The `FerrofinMeta` key of [`rekey_virtual_seasons`].
+const VIRTUAL_SEASON_IDS_KEY: &str = "virtual_season_ids_v12";
+
 /// [`rekey_virtual_seasons`] and its log line, for the composition root.
+/// Returns whether it finished: `false` when it stopped short (it warned),
+/// and the next boot runs it again.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the repair's queries fail.
@@ -2061,7 +2099,7 @@ pub async fn run_rekey_virtual_seasons(
     virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
-) -> Result<(), ServiceError> {
+) -> Result<bool, ServiceError> {
     let moved =
         rekey_virtual_seasons(db, derivation, virtual_paths, art_root, path_manager).await?;
     if moved > 0 {
@@ -2070,7 +2108,7 @@ pub async fn run_rekey_virtual_seasons(
             "re-keyed seasons with no folder to their series, number and name"
         );
     }
-    Ok(())
+    finished(db, VIRTUAL_SEASON_IDS_KEY).await
 }
 
 /// The extension of the database snapshot [`rekey_pathless_playlists`]
@@ -2106,7 +2144,7 @@ pub async fn rekey_pathless_playlists(
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
-    const KEY: &str = "playlist_folders_v1";
+    const KEY: &str = PLAYLIST_FOLDERS_KEY;
     if !once(db, KEY).await? {
         return Ok(0);
     }
@@ -2200,7 +2238,12 @@ pub async fn rekey_pathless_playlists(
     Ok(made.len())
 }
 
+/// The `FerrofinMeta` key of [`rekey_pathless_playlists`].
+const PLAYLIST_FOLDERS_KEY: &str = "playlist_folders_v1";
+
 /// [`rekey_pathless_playlists`] and its log line, for the composition root.
+/// Returns whether it finished: `false` when it stopped short (it warned),
+/// and the next boot runs it again.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the repair's queries fail.
@@ -2211,7 +2254,7 @@ pub async fn run_rekey_pathless_playlists(
     virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
-) -> Result<(), ServiceError> {
+) -> Result<bool, ServiceError> {
     let moved = rekey_pathless_playlists(
         db,
         derivation,
@@ -2227,7 +2270,7 @@ pub async fn run_rekey_pathless_playlists(
             "gave playlists with no folder their folders and the ids Jellyfin keys them by"
         );
     }
-    Ok(())
+    finished(db, PLAYLIST_FOLDERS_KEY).await
 }
 
 /// Moves per transaction in [`rekey_by_name_rows`], keeping each write short.
@@ -2341,10 +2384,18 @@ async fn plan_by_name_moves(
 /// old id stays recoverable: a genre's or studio's is its `ItemValueId`, a
 /// music genre's derives from its name.
 ///
+/// ACCEPTED DIVERGENCE (owner decision 2026-11-24, gl-1928): by-name
+/// `MusicArtist` rows are left out on purpose. A by-name artist row stored
+/// before gl-1624 gave new ones Jellyfin's id keeps the id of its `ItemValues`
+/// row where Jellyfin 12.4 would derive one from the name.
+/// `LibraryManager.CreateItemByName<MusicArtist>` returns an artist with a
+/// matching name before it derives an id, so a database returned to Jellyfin
+/// keeps the row, and a move would break saved artist links.
+///
 /// # Errors
-/// Returns [`ServiceError`] if the planning read fails. A batch whose
-/// transaction cannot be opened or committed is logged, and the repair stops
-/// there for the next boot.
+/// Returns [`ServiceError`] if the planning read fails, or a batch's
+/// transaction cannot be opened or committed: the repair stops there, the
+/// batches made before stay, and the next boot does the rest.
 pub async fn rekey_by_name_rows(
     db: &Database,
     identity: &ByNameIdentity,
@@ -2379,15 +2430,10 @@ pub async fn rekey_by_name_rows(
             // the problem, and the next batch would wait as long again. Stop
             // here; the batches already made stay, the next boot does the rest.
             Err(err) => {
-                tracing::warn!(
-                    %err,
-                    "could not move genre, music genre and studio rows to their ids; \
-                     the next boot does the rest"
-                );
                 for (_, folders) in renamed {
                     folders.undo();
                 }
-                break;
+                return Err(err);
             }
         };
         for (to, folders) in renamed {
@@ -2404,17 +2450,19 @@ pub async fn rekey_by_name_rows(
 
 /// [`rekey_by_name_rows`] and its log line, for the composition root: a
 /// failure is logged and the next boot retries, never stopping this one.
+/// Returns whether it succeeded (or had nothing to do).
 pub async fn run_rekey_by_name_rows(
     db: &Database,
     identity: Option<&ByNameIdentity>,
     virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
-) {
+) -> bool {
     let Some(identity) = identity else {
-        return;
+        return true;
     };
-    match rekey_by_name_rows(db, identity, virtual_paths, art_root, path_manager).await {
+    let result = rekey_by_name_rows(db, identity, virtual_paths, art_root, path_manager).await;
+    match &result {
         Ok(0) => {}
         Ok(moved) => tracing::info!(
             moved,
@@ -2425,6 +2473,7 @@ pub async fn run_rekey_by_name_rows(
             "could not move genre, music genre and studio rows to their ids; the next boot retries"
         ),
     }
+    result.is_ok()
 }
 
 /// The extension of the database snapshot [`expand_saved_playlist_containers`]
@@ -2558,12 +2607,14 @@ pub async fn expand_saved_playlist_containers(
 
 /// [`expand_saved_playlist_containers`] and its log line, for the
 /// composition root. A failure is logged, not returned: the repair is not
-/// needed to serve, and it runs again on the next boot.
+/// needed to serve, and it runs again on the next boot. Returns whether it
+/// succeeded with no playlist left for the next boot.
 pub async fn run_expand_saved_playlist_containers(
     db: &Database,
     playlists: &crate::FerrofinPlaylistManager,
-) {
-    match expand_saved_playlist_containers(db, playlists).await {
+) -> bool {
+    let result = expand_saved_playlist_containers(db, playlists).await;
+    match &result {
         Ok(ExpandedPlaylists {
             expanded: 0,
             stamped: 0,
@@ -2582,6 +2633,7 @@ pub async fn run_expand_saved_playlist_containers(
              the repair runs again on the next boot"
         ),
     }
+    result.is_ok_and(|did| did.pending == 0)
 }
 
 /// What [`save_playlist_xml_once`] did.
@@ -2674,14 +2726,16 @@ pub async fn save_playlist_xml_once(
 
 /// [`save_playlist_xml_once`] and its log line, for the composition root. A
 /// failure is logged, not returned: the repair is not needed to serve, and it
-/// runs again on the next boot.
+/// runs again on the next boot. Returns whether it succeeded with no
+/// playlist left for the next boot.
 pub async fn run_save_playlist_xml_once(
     db: &Database,
     playlists: &crate::FerrofinPlaylistManager,
     saver: &ferrofin_providers::container_xml::ContainerXmlSaver,
     persistence: &dyn ItemPersistenceService,
-) {
-    match save_playlist_xml_once(db, playlists, saver, persistence).await {
+) -> bool {
+    let result = save_playlist_xml_once(db, playlists, saver, persistence).await;
+    match &result {
         Ok(SavedPlaylistXml {
             written: 0,
             pending: 0,
@@ -2703,6 +2757,7 @@ pub async fn run_save_playlist_xml_once(
             "could not write the playlists' playlist.xml; the repair runs again on the next boot"
         ),
     }
+    result.is_ok_and(|did| did.pending == 0)
 }
 
 /// The extension of the database snapshot
@@ -2811,16 +2866,17 @@ pub async fn merge_legacy_collections_library(
 /// [`merge_legacy_collections_library`] and its log line, for the composition
 /// root. A failure is a warning and never stops the boot: the old row keeps
 /// working, as it did before this version, and the next boot tries again.
+/// Returns whether it succeeded.
 pub async fn run_merge_legacy_collections_library(
     db: &Database,
     virtual_folders: &crate::FerrofinVirtualFolderManager,
     derivation: &IdDerivation,
     directories: (&str, &str),
     paths: &VirtualPathExpander,
-) {
-    match merge_legacy_collections_library(db, virtual_folders, derivation, directories, paths)
-        .await
-    {
+) -> bool {
+    let result =
+        merge_legacy_collections_library(db, virtual_folders, derivation, directories, paths).await;
+    match &result {
         Ok(None) => {}
         Ok(Some(merged)) => tracing::info!(
             count = merged.moved,
@@ -2835,7 +2891,11 @@ pub async fn run_merge_legacy_collections_library(
              and the next boot tries again"
         ),
     }
+    result.is_ok()
 }
+
+/// The `FerrofinMeta` key of [`rekey_pathless_box_sets`].
+const BOX_SET_FOLDERS_KEY: &str = "box_set_folders_v1";
 
 /// The extension of the database snapshot [`rekey_pathless_box_sets`]
 /// takes (`jellyfin.db.pre-box-set-folders`).
@@ -2874,7 +2934,7 @@ pub async fn rekey_pathless_box_sets(
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
-    const KEY: &str = "box_set_folders_v1";
+    const KEY: &str = BOX_SET_FOLDERS_KEY;
     if !once(db, KEY).await? {
         return Ok(0);
     }
@@ -3014,7 +3074,9 @@ async fn give_box_set_its_folder(
 
 /// [`rekey_pathless_box_sets`] and its log line, for the composition root. A
 /// failure is a warning and never stops the boot: the box sets keep their ids
-/// and work as before, and the next boot tries again.
+/// and work as before, and the next boot tries again. Returns whether it
+/// finished: `false` after a failure it warned about, here or for some box
+/// sets.
 pub async fn run_rekey_pathless_box_sets(
     db: &Database,
     derivation: &IdDerivation,
@@ -3022,8 +3084,8 @@ pub async fn run_rekey_pathless_box_sets(
     virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
-) {
-    match rekey_pathless_box_sets(
+) -> bool {
+    let result = rekey_pathless_box_sets(
         db,
         derivation,
         directories,
@@ -3031,8 +3093,8 @@ pub async fn run_rekey_pathless_box_sets(
         art_root,
         path_manager,
     )
-    .await
-    {
+    .await;
+    match &result {
         Ok(0) => {}
         Ok(moved) => tracing::info!(
             items = moved,
@@ -3044,6 +3106,7 @@ pub async fn run_rekey_pathless_box_sets(
              and the next boot tries again"
         ),
     }
+    result.is_ok() && matches!(finished(db, BOX_SET_FOLDERS_KEY).await, Ok(true))
 }
 
 /// The extension of the database snapshot [`sweep_missing_items`] takes
@@ -3120,7 +3183,7 @@ pub async fn sweep_missing_items(
     internal_metadata: &str,
     user_views: &str,
 ) -> Result<SweptItems, ServiceError> {
-    const KEY: &str = "missing_item_sweeps_v12";
+    const KEY: &str = ferrofin_db::repair_markers::MISSING_ITEM_SWEEPS;
     let Some(adoption) = db.adoption_state().await? else {
         return Ok(SweptItems::default());
     };
@@ -3176,6 +3239,9 @@ pub async fn run_sweep_missing_items(
     Ok(())
 }
 
+/// The `FerrofinMeta` key of [`remove_orphaned_playlists`].
+const ORPHANED_PLAYLIST_OWNERS_KEY: &str = "orphaned_playlist_owners_v1";
+
 /// The extension of the database snapshot [`remove_orphaned_playlists`]
 /// takes (`jellyfin.db.pre-orphaned-playlists`).
 const ORPHANED_PLAYLISTS_SNAPSHOT_EXTENSION: &str = "db.pre-orphaned-playlists";
@@ -3210,7 +3276,7 @@ pub async fn remove_orphaned_playlists(
     db: &Database,
     playlists: &dyn PlaylistManager,
 ) -> Result<usize, ServiceError> {
-    const KEY: &str = "orphaned_playlist_owners_v1";
+    const KEY: &str = ORPHANED_PLAYLIST_OWNERS_KEY;
     if !once(db, KEY).await? {
         return Ok(0);
     }
@@ -3290,9 +3356,12 @@ pub async fn remove_orphaned_playlists(
 
 /// [`remove_orphaned_playlists`] and its log line, for the composition root.
 /// A failure is a warning and never stops the boot: the playlists stay as
-/// they were, and the next boot tries again.
-pub async fn run_remove_orphaned_playlists(db: &Database, playlists: &dyn PlaylistManager) {
-    match remove_orphaned_playlists(db, playlists).await {
+/// they were, and the next boot tries again. Returns whether it finished:
+/// `false` after a failure it warned about, here or when no user could be
+/// read.
+pub async fn run_remove_orphaned_playlists(db: &Database, playlists: &dyn PlaylistManager) -> bool {
+    let result = remove_orphaned_playlists(db, playlists).await;
+    match &result {
         Ok(0) => {}
         Ok(users) => tracing::info!(
             users,
@@ -3304,6 +3373,7 @@ pub async fn run_remove_orphaned_playlists(db: &Database, playlists: &dyn Playli
              the next boot tries again"
         ),
     }
+    result.is_ok() && matches!(finished(db, ORPHANED_PLAYLIST_OWNERS_KEY).await, Ok(true))
 }
 
 #[cfg(test)]
@@ -3408,14 +3478,15 @@ pub async fn cleanup_orphaned_external_data(
 }
 
 /// [`cleanup_orphaned_external_data`] and its summary line, for the
-/// composition root.
+/// composition root. Returns whether it finished: `false` when a folder could
+/// not be read (it warned), and the next start sweeps again.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the sweep fails.
 pub async fn run_cleanup_orphaned_external_data(
     db: &Database,
     roots: &ExtractedDataRoots,
-) -> Result<(), ServiceError> {
+) -> Result<bool, ServiceError> {
     let removed = cleanup_orphaned_external_data(db, roots).await?;
     if removed > 0 {
         tracing::info!(
@@ -3423,7 +3494,7 @@ pub async fn run_cleanup_orphaned_external_data(
             "removed extracted data of items that no longer exist"
         );
     }
-    Ok(())
+    finished(db, ORPHANED_EXTERNAL_DATA_KEY).await
 }
 
 /// Every stored item's id (`context.BaseItems.Select(b => b.Id)`).
@@ -4416,7 +4487,12 @@ async fn place_owned(
     mut copies: Option<&mut BTreeSet<Uuid>>,
 ) -> Result<usize, ServiceError> {
     let versions = copies.is_some();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut changed = 0usize;
     let mut owed = false;
     for pair in pairs {
@@ -4644,7 +4720,12 @@ async fn merge_case_duplicates(
             .or_default()
             .push((id, created));
     }
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut deleted = 0usize;
     for members in groups.into_values().filter(|g| g.len() > 1) {
         let mut candidates = Vec::with_capacity(members.len());
@@ -4957,7 +5038,12 @@ async fn harmonize_groups(
     db: &Database,
     groups: &[(String, String)],
 ) -> Result<usize, ServiceError> {
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut updated = 0u64;
     for (item, user) in groups {
         let rows: Vec<UserDataEntity> =
@@ -6330,8 +6416,13 @@ mod tests {
         .await;
         seed_provider_id(&db, g.primary, "Tmdb", "990000005").await;
         let store = store(&db);
-        store.set_localization(std::sync::Arc::new(
-            crate::localization_manager::LocalizationManager::new("US"),
+        store.set_rating_scorer(std::sync::Arc::new(
+            crate::item_visibility::ItemVisibility::new(
+                db.clone(),
+                crate::test_support::item_repository_over(db.clone()),
+                std::sync::Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+                "/server/data".to_owned(),
+            ),
         ));
 
         let rehomed = rehome_local_versions(&db, &DERIVATION, &NO_PATHS, None, None, &store)
@@ -9842,9 +9933,11 @@ async fn reverse_virtual_paths_in_partitions(
 
 /// [`reverse_stored_virtual_paths`] and its log line, for the composition
 /// root. A failure is a warning and never stops the boot: every reader
-/// expands both forms, and the next boot runs it again.
-pub async fn run_reverse_stored_virtual_paths(db: &Database, paths: &VirtualPathExpander) {
-    match reverse_stored_virtual_paths(db, paths).await {
+/// expands both forms, and the next boot runs it again. Returns whether it
+/// succeeded.
+pub async fn run_reverse_stored_virtual_paths(db: &Database, paths: &VirtualPathExpander) -> bool {
+    let result = reverse_stored_virtual_paths(db, paths).await;
+    match &result {
         Ok(0) => {}
         Ok(rows) => tracing::info!(
             rows,
@@ -9856,6 +9949,329 @@ pub async fn run_reverse_stored_virtual_paths(db: &Database, paths: &VirtualPath
             "could not store the item and stream paths under the data and metadata \
              directories as %AppDataPath% and %MetadataPath%; the next boot runs it again"
         ),
+    }
+    result.is_ok()
+}
+
+// Stores `HasSubtitles` in the `Data` of the videos an earlier Ferrofin probed
+// (gl-1911). Since gl-1632 a probe stores it there, as `FFProbeVideoInfo`
+// does (`video.HasSubtitles = mediaStreams.Any(subtitle)`, the only place
+// Jellyfin keeps it), but a video is probed again only when its file changes,
+// and Jellyfin 12.4 does not re-probe an unchanged file either, so a database
+// returned to Jellyfin read every such video as having none.
+
+/// The `FerrofinMeta` key of [`store_has_subtitles`].
+const HAS_SUBTITLES_STORED: &str = "has_subtitles_stored_v160";
+
+/// Sets `HasSubtitles` in the `Data` of every video row (`Video` and its
+/// subclasses) that has no such key: `true` when the row has a stored
+/// subtitle stream, else `false`, which is what Jellyfin's save writes for a
+/// video it probed with none (`JsonDefaults` skips nulls only). The stream
+/// rows are the ones the probe saved, after the library's embedded-subtitle
+/// filter, and the external subtitle files, so the value is the one the probe
+/// would have stored. A row that holds the key (an adopted Jellyfin row, or
+/// one a probe wrote since gl-1632) is left alone, and so is a `Data` that is
+/// not a JSON object; a row with no (or an empty) `Data` gets one holding just
+/// the key, and a key holding `null` is set, as
+/// `MediaStreamRepository::sync_has_subtitles` treats them.
+///
+/// Ferrofin's DTOs and its `HasSubtitles` filter take subtitle presence from
+/// the stream rows, so nothing Ferrofin serves changes and no snapshot is
+/// taken. Each partition
+/// of `REPAIR_PARTITION` rowids is one `UPDATE`, which takes the write lock
+/// before it reads and re-checks each row, so a row the previous version saves
+/// meanwhile is never overwritten; one it saves without the key after this
+/// ran waits for its next probe. Runs once per database (`FerrofinMeta`); an
+/// interrupted pass runs again from the start on the next boot.
+///
+/// Returns the rows written.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a read or a partition's write fails; the
+/// partitions written before stay, and the next boot runs it again.
+pub async fn store_has_subtitles(db: &Database) -> Result<u64, ServiceError> {
+    store_has_subtitles_in_partitions(db, REPAIR_PARTITION).await
+}
+
+/// One partition of [`store_has_subtitles`]: the video rows with a rowid in
+/// `[?1, ?2]` whose `Data` has no `HasSubtitles` value, `?3` being the
+/// subtitle `StreamType`. `+"Type"` keeps it on a rowid range seek, never a
+/// scan of the `Type` indexes (`EXPLAIN QUERY PLAN` pinned by
+/// `the_partition_update_seeks_the_rowid_range`). The `CASE` reads the key
+/// only from a `Data` that parses as an object: the JSON functions raise on
+/// malformed input, which would fail the statement.
+fn has_subtitles_update_sql() -> String {
+    let videos = crate::extra_owners_repository::VIDEO_TYPES;
+    format!(
+        r#"UPDATE "BaseItems"
+           SET "Data" = json_set(coalesce(nullif("Data", ''), '{{}}'), '$.HasSubtitles',
+                 json(CASE WHEN EXISTS (SELECT 1 FROM "MediaStreamInfos" s
+                                        WHERE s."ItemId" = "BaseItems"."Id"
+                                          AND s."StreamType" = ?3)
+                           THEN 'true' ELSE 'false' END))
+           WHERE rowid BETWEEN ?1 AND ?2 AND +"Type" IN ({videos})
+             AND CASE WHEN json_valid(coalesce(nullif("Data", ''), '{{}}'))
+                 THEN json_type(coalesce(nullif("Data", ''), '{{}}')) = 'object'
+                      AND coalesce(json_type(coalesce(nullif("Data", ''), '{{}}'),
+                                             '$.HasSubtitles'), 'null') = 'null'
+                 ELSE 0 END"#
+    )
+}
+
+/// [`store_has_subtitles`], `partition` rowids per write.
+async fn store_has_subtitles_in_partitions(
+    db: &Database,
+    partition: i64,
+) -> Result<u64, ServiceError> {
+    if !once(db, HAS_SUBTITLES_STORED).await? {
+        return Ok(0);
+    }
+    let (first, last): (Option<i64>, Option<i64>) = sqlx::query_as(
+        r#"SELECT (SELECT min(rowid) FROM "BaseItems"), (SELECT max(rowid) FROM "BaseItems")"#,
+    )
+    .fetch_one(db.pool())
+    .await
+    .map_err(db_err)?;
+    let sql = has_subtitles_update_sql();
+    let mut stored = 0;
+    if let (Some(mut from), Some(last)) = (first, last) {
+        loop {
+            let to = from.saturating_add(partition - 1).min(last);
+            stored += sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+                .bind(from)
+                .bind(to)
+                .bind(i32::from(
+                    ferrofin_db::enums::MediaStreamTypeEntity::Subtitle,
+                ))
+                .execute(db.writer())
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+            if to >= last {
+                break;
+            }
+            from = to + 1;
+        }
+    }
+    done(db, HAS_SUBTITLES_STORED).await?;
+    Ok(stored)
+}
+
+/// [`store_has_subtitles`] and its log line, for the composition root. A
+/// failure is a warning and never stops the boot: Ferrofin reads subtitle
+/// presence from the stream rows, and the next boot runs it again. Returns
+/// whether it succeeded.
+pub async fn run_store_has_subtitles(db: &Database) -> bool {
+    let result = store_has_subtitles(db).await;
+    match &result {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!(
+            rows,
+            "backfilled HasSubtitles on videos an earlier version probed, from their stored \
+             subtitle streams"
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not store HasSubtitles on videos an earlier version probed; the next boot \
+             runs it again"
+        ),
+    }
+    result.is_ok()
+}
+
+#[cfg(test)]
+mod has_subtitles_tests {
+    use ferrofin_db::enums::MediaStreamTypeEntity;
+    use ferrofin_model::data::BaseItemKind;
+
+    use super::*;
+    use crate::test_support::{seed_item, test_db};
+
+    async fn seed(db: &Database, kind: BaseItemKind, data: Option<&str>) -> Uuid {
+        let id = Uuid::new_v4();
+        seed_item(db, id, kind).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(data)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        id
+    }
+
+    /// A stream row of `stream_type` (`MediaStreamTypeEntity`'s value).
+    async fn seed_stream(db: &Database, item: Uuid, index: i64, stream_type: i32, external: bool) {
+        sqlx::query(
+            r#"INSERT INTO "MediaStreamInfos"
+               ("ItemId", "StreamIndex", "StreamType", "IsDefault", "IsExternal", "IsForced")
+               VALUES (?1, ?2, ?3, 0, ?4, 0)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(index)
+        .bind(stream_type)
+        .bind(external)
+        .execute(db.writer())
+        .await
+        .unwrap();
+    }
+
+    async fn data(db: &Database, id: Uuid) -> Option<String> {
+        sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    const SUBTITLE: i32 = 2;
+    const AUDIO: i32 = 0;
+
+    /// Every video kind without the key (or with it `null`, or with an empty
+    /// `Data`) gets it from its stream rows (an embedded or an external
+    /// subtitle, or none), keeping every other key and value of its `Data`;
+    /// rows that hold the key, other kinds, and a `Data` that is not a JSON
+    /// object are left as they are. Partitions of two rowids cover rows spread
+    /// over several of them.
+    #[tokio::test]
+    async fn videos_without_the_key_get_it_from_their_subtitle_rows() {
+        assert_eq!(i32::from(MediaStreamTypeEntity::Subtitle), SUBTITLE);
+        assert_eq!(i32::from(MediaStreamTypeEntity::Audio), AUDIO);
+        let db = test_db().await;
+        let movie = seed(
+            &db,
+            BaseItemKind::Movie,
+            Some(r#"{"VideoType":"VideoFile","IsHD":true}"#),
+        )
+        .await;
+        seed_stream(&db, movie, 0, AUDIO, false).await;
+        seed_stream(&db, movie, 1, SUBTITLE, false).await;
+        let episode = seed(&db, BaseItemKind::Episode, Some("{}")).await;
+        seed_stream(&db, episode, 3, SUBTITLE, true).await;
+        let video = seed(
+            &db,
+            BaseItemKind::Video,
+            Some(r#"{"VideoType":"VideoFile"}"#),
+        )
+        .await;
+        seed_stream(&db, video, 0, AUDIO, false).await;
+        let music_video = seed(&db, BaseItemKind::MusicVideo, None).await;
+        seed_stream(&db, music_video, 2, SUBTITLE, false).await;
+        let trailer = seed(&db, BaseItemKind::Trailer, None).await;
+        let empty = seed(&db, BaseItemKind::Episode, Some("")).await;
+        seed_stream(&db, empty, 0, SUBTITLE, true).await;
+        let null = seed(&db, BaseItemKind::Movie, Some(r#"{"HasSubtitles":null}"#)).await;
+        // Jellyfin's own value, even where the stream rows say otherwise.
+        let adopted = seed(&db, BaseItemKind::Movie, Some(r#"{"HasSubtitles":false}"#)).await;
+        seed_stream(&db, adopted, 0, SUBTITLE, false).await;
+        let audio = seed(&db, BaseItemKind::Audio, Some("{}")).await;
+        seed_stream(&db, audio, 0, SUBTITLE, false).await;
+        let broken = seed(&db, BaseItemKind::Movie, Some("{not json")).await;
+        let array = seed(&db, BaseItemKind::Movie, Some("[]")).await;
+
+        let stored = store_has_subtitles_in_partitions(&db, 2).await.unwrap();
+
+        assert_eq!(stored, 7);
+        let expected = [
+            (
+                movie,
+                Some(r#"{"VideoType":"VideoFile","IsHD":true,"HasSubtitles":true}"#),
+            ),
+            (episode, Some(r#"{"HasSubtitles":true}"#)),
+            (
+                video,
+                Some(r#"{"VideoType":"VideoFile","HasSubtitles":false}"#),
+            ),
+            (music_video, Some(r#"{"HasSubtitles":true}"#)),
+            (trailer, Some(r#"{"HasSubtitles":false}"#)),
+            (empty, Some(r#"{"HasSubtitles":true}"#)),
+            (null, Some(r#"{"HasSubtitles":false}"#)),
+            (adopted, Some(r#"{"HasSubtitles":false}"#)),
+            (audio, Some("{}")),
+            (broken, Some("{not json")),
+            (array, Some("[]")),
+        ];
+        for (id, want) in expected {
+            assert_eq!(data(&db, id).await.as_deref(), want, "{id}");
+        }
+    }
+
+    /// The repair runs once per database: a video saved without the key
+    /// after it ran waits for its next probe.
+    #[tokio::test]
+    async fn it_runs_once() {
+        let db = test_db().await;
+        let first = seed(&db, BaseItemKind::Movie, Some("{}")).await;
+        assert_eq!(store_has_subtitles(&db).await.unwrap(), 1);
+        assert_eq!(
+            data(&db, first).await.as_deref(),
+            Some(r#"{"HasSubtitles":false}"#)
+        );
+        let later = seed(&db, BaseItemKind::Movie, Some("{}")).await;
+        assert_eq!(store_has_subtitles(&db).await.unwrap(), 0);
+        assert_eq!(data(&db, later).await.as_deref(), Some("{}"));
+    }
+
+    /// A database with no video writes nothing and is marked done.
+    #[tokio::test]
+    async fn a_database_without_videos_writes_nothing_and_is_marked_done() {
+        let db = test_db().await;
+        seed(&db, BaseItemKind::Audio, Some("{}")).await;
+        assert_eq!(store_has_subtitles(&db).await.unwrap(), 0);
+        assert!(!once(&db, HAS_SUBTITLES_STORED).await.unwrap());
+    }
+
+    /// A partition whose write fails stops the pass with the error and
+    /// leaves the repair due, so the next boot runs it again.
+    #[tokio::test]
+    async fn a_failed_write_leaves_the_repair_due() {
+        let db = test_db().await;
+        let movie = seed(&db, BaseItemKind::Movie, Some("{}")).await;
+        sqlx::query(
+            r#"CREATE TRIGGER "refuse" BEFORE UPDATE ON "BaseItems"
+               BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+        )
+        .execute(db.writer())
+        .await
+        .unwrap();
+        assert!(store_has_subtitles(&db).await.is_err());
+        assert!(once(&db, HAS_SUBTITLES_STORED).await.unwrap());
+        assert_eq!(data(&db, movie).await.as_deref(), Some("{}"));
+    }
+
+    /// Each partition's `UPDATE` seeks the rowid range, never a `Type` index,
+    /// and probes each row's subtitle rows through the stream table's
+    /// `(ItemId, StreamType)` index.
+    #[tokio::test]
+    async fn the_partition_update_seeks_the_rowid_range() {
+        let db = test_db().await;
+        let explain = format!("EXPLAIN QUERY PLAN {}", has_subtitles_update_sql());
+        let plan: Vec<String> =
+            sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain.as_str()))
+                .bind(1_i64)
+                .bind(2_i64)
+                .bind(SUBTITLE)
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step
+                    == "SEARCH BaseItems USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)"),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().any(|step| step
+                == "SEARCH s USING COVERING INDEX \
+                    FerrofinIX_MediaStreamInfos_ItemId_StreamType (ItemId=? AND StreamType=?)"),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.starts_with("SCAN")),
+            "{plan:?}"
+        );
     }
 }
 

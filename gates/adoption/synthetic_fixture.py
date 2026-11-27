@@ -18,6 +18,7 @@ import uuid
 from PIL import Image
 
 from metadata import Api as MetadataApi, CheckError
+from synthetic_media import MERGED_PAIRS, RATED_SERIES, STACKED
 
 
 EPISODE_TYPE = "MediaBrowser.Controller.Entities.TV.Episode"
@@ -34,6 +35,8 @@ CONFLICT = (("Tmdb", "2023-08-14 00:00:00", 9, 0, 1), ("Imdb", "2021-12-31 00:00
 # The play state on the second item of the dangling parent chain.
 ORPHAN_PLAY = {"LastPlayedDate": "2025-05-05 00:00:00", "PlayCount": 3, "PlaybackPositionTicks": 0, "Played": 1}
 PASSWORD = "Synthetic-adoption-only-123!"
+#: synthetic-adult's playlist of the stacked movie and the movie with local versions.
+VERSIONS_PLAYLIST = "Synthetic versions playlist"
 USERS = ("synthetic-admin", "synthetic-adult", "synthetic-child")
 LIBRARIES = (("Synthetic Movies", "movies", "movies"),
              ("Synthetic Private", "movies", "private"),
@@ -203,10 +206,11 @@ def seed(base):
     rows = api.get("/Items", userId=api.user, recursive="true", limit=1000,
                    fields="Path,ProviderIds,MediaSources,Genres,Studios,Tags")["Items"]
     movies = {r["Name"]: r for r in rows if r["Type"] == "Movie"}
-    episodes = sorted((r for r in rows if r["Type"] == "Episode"),
+    episodes = sorted((r for r in rows if r["Type"] == "Episode" and r.get("SeriesName") == "Clockwork Garden"),
                       key=lambda r: (r["ParentIndexNumber"], r["IndexNumber"]))
+    rated = [r for r in rows if r["Type"] == "Episode" and r.get("SeriesName") == RATED_SERIES]
     tracks = sorted((r for r in rows if r["Type"] == "Audio"), key=lambda r: r["Path"])
-    if len(episodes) != 6 or len(tracks) != 6 or len(movies) < 8:
+    if len(episodes) != 6 or len(rated) != 2 or len(tracks) != 6 or len(movies) < 14:
         raise CheckError("synthetic media was not fully scanned")
 
     adult = users[USERS[1]]["Id"]
@@ -232,6 +236,10 @@ def seed(base):
                                (child["Id"], movies["Amber Harbor"]["Id"], 1_000_000_000)]:
         api.post(f"/UserItems/{item}/UserData", {"Played": False, "PlaybackPositionTicks": ticks,
                  "LastPlayedDate": "2026-01-06T12:00:00Z"}, userId=user)
+    # Played with no LastPlayedDate: the row shape Jellyfin leaves on a video's other versions (12.0+
+    # Video.PropagatePlayedState), a Played-only update and an NFO watched import. 10.11.8 has no
+    # propagation, so this Played-only update writes it on every lineage (UserDataManager.SaveUserData).
+    api.post(f"/UserItems/{movies['Twin Horizon']['Id']}/UserData", {"Played": True}, userId=adult)
     api.post(f"/UserFavoriteItems/{tracks[0]['Id']}", userId=adult)
 
     # One save writes DisplayPreferences, ItemDisplayPreferences and, for the keys it does not
@@ -266,6 +274,12 @@ def seed(base):
     linked_collection = api.post("/Collections", name="Synthetic linked collection",
                                  ids=movies["Crimson Signal"]["Id"], isLocked="true")["Id"]
     api.post(f"/Collections/{linked_collection}/Items", ids=movies["Crimson Signal"]["Id"])
+    # Versions merged by hand (10.11 keeps them in the primary's LinkedAlternateVersions), which the round
+    # trip splits; and the stacked movie and the movie with local versions in one playlist.
+    for pair in MERGED_PAIRS:
+        api.post("/Videos/MergeVersions", ids=f"{movies[pair]['Id']},{movies[pair + ' Extended']['Id']}")
+    api.post("/Playlists", {"Name": VERSIONS_PLAYLIST, "MediaType": "Video", "UserId": adult, "IsPublic": False,
+                            "Ids": [movies[STACKED]["Id"], movies["Twin Horizon"]["Id"]]})
     api.idle()
     manifest = {"version": 1, "users": {name: users[name]["Id"] for name in USERS},
             "libraries": {name: row["ItemId"] for name, row in libraries.items()},
@@ -275,7 +289,12 @@ def seed(base):
             "versions_movie": movies["Twin Horizon"]["Id"],
             "playlist": playlist, "private_playlist": private_playlist, "collection": collection,
             "linked_playlist": linked_playlist, "linked_collection": linked_collection,
-            "linked_pathless": linked_pathless}
+            "linked_pathless": linked_pathless,
+            # The rated series' unrated season and episodes, which a pre-12.2 source serves to the
+            # child until the first scan (preservation.before_first_scan, gl-1953), and the movies
+            # merged as versions, which 12.0 alone lists apart (preservation.MERGED_KEYS, gl-1954).
+            "rated_series": {"season": rated[0]["SeasonId"], "episodes": sorted(r["Id"] for r in rated)},
+            "merged_pairs": sorted(movies[name]["Id"] for pair in MERGED_PAIRS for name in (pair, pair + " Extended"))}
 
     from user_accounts import seed as seed_accounts
     seed_accounts(api, manifest)

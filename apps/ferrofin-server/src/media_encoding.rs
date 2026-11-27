@@ -14,6 +14,7 @@
 //! ffmpeg/filesystem [`AttachmentIo`]).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
@@ -44,6 +45,7 @@ use ferrofin_traits::media_encoding::{
 };
 use ferrofin_traits::persistence::KeyframeRepository;
 use ferrofin_traits::system::PathManager;
+use ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT;
 use ferrofin_util::source_url::{is_remote_url, redact_url, redact_urls_in};
 use uuid::Uuid;
 
@@ -420,18 +422,40 @@ pub fn build_media_encoding(
 }
 
 /// `GET url`, its body or what went wrong, which names only the URL's host.
-async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+///
+/// The body is read under `image_download_max_mb`, as a provider's is: the
+/// host is someone else's, and a compressed body is decoded, so a few KB
+/// could otherwise expand without bound (gl-1708). Upstream reads it whole.
+/// The response headers must come within `headers_timeout`, as
+/// `HttpClient.Timeout` bounds upstream's `GetStreamAsync`; the body has no
+/// time limit there either.
+async fn http_get_bytes(url: &str, headers_timeout: Duration) -> Result<Vec<u8>, String> {
+    use ferrofin_providers::rate_limit::{BodyError, read_capped, request_limits};
+    // One client, so the reads share a connection pool; `reqwest::get` builds one per call.
+    // `NamedClient.Default`'s defaults, as upstream reads through it.
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let source = ferrofin_util::source_url::redact_url(url);
-    let resp = reqwest::get(url)
+    let client = CLIENT.get_or_init(|| {
+        ferrofin_util::http_client::builder(ferrofin_health::USER_AGENT)
+            .build()
+            .unwrap_or_default()
+    });
+    let request = client.get(url).send();
+    let resp = tokio::time::timeout(headers_timeout, request)
         .await
+        .map_err(|_| format!("GET {source}: no response headers within {headers_timeout:?}"))?
         .map_err(|e| format!("GET {source}: {}", e.without_url()))?;
     if !resp.status().is_success() {
         return Err(format!("GET {source}: HTTP {}", resp.status()));
     }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("GET {source} body: {}", e.without_url()))
+    read_capped(resp).await.map_err(|error| match error {
+        BodyError::TooLarge => format!(
+            "GET {source}: the subtitle is over image_download_max_mb ({} MiB); not read",
+            request_limits().download_max_bytes / (1024 * 1024)
+        ),
+        BodyError::Read(e) => format!("GET {source} body: {e}"),
+        BodyError::Decode(e) => format!("GET {source} body: {e}"),
+    })
 }
 
 /// The real ffmpeg + filesystem [`SubtitleIo`] for the subtitle encoder.
@@ -456,7 +480,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
     }
 
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
-        http_get_bytes(url).await
+        http_get_bytes(url, HTTP_CLIENT_DEFAULT_TIMEOUT).await
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
@@ -731,13 +755,17 @@ impl MediaEncoder for DynMediaEncoder {
     }
 }
 
-/// Adapts the [`MediaSourceManager`] to the attachment extractor's
-/// [`MediaSourceResolver`] seam.
+/// Adapts the [`MediaSourceManager`] to the [`MediaSourceResolver`] seam of the
+/// subtitle encoder and the attachment extractor.
 ///
-/// Port of the `IMediaSourceManager.GetPlaybackMediaSources` call inside
-/// `GetAttachment`: resolves `(item_id, media_source_id)` to a
-/// [`MediaSourceInfo`]; each static source already carries its own attachment
-/// rows (so a merged alternate version resolves to ITS attachments).
+/// Port of the `GetPlaybackMediaSources(item, null, true, false)` call inside
+/// `SubtitleEncoder.GetSubtitles` and `AttachmentExtractor.GetAttachment`, so
+/// the subtitle and attachment routes only: a `.strm` item, or one whose first
+/// source lacks its main stream, is refreshed with the remote probe before its
+/// sources are read. The transcode planner never comes here: it hands the
+/// encoder and the extractor the source it holds, as `EncodingHelper` and
+/// `TranscodeManager` do. Each source carries its own attachment rows, so a
+/// merged alternate version resolves to ITS attachments.
 struct MediaSourceManagerResolver {
     media_sources: Arc<dyn MediaSourceManager>,
 }
@@ -749,9 +777,10 @@ impl MediaSourceResolver for MediaSourceManagerResolver {
         item_id: Uuid,
         media_source_id: &str,
     ) -> Result<Option<MediaSourceInfo>, ServiceError> {
+        // The nil id is upstream's `null` user.
         let sources = self
             .media_sources
-            .get_static_media_sources(item_id, false, None)
+            .get_playback_media_sources(item_id, Uuid::nil(), true, false)
             .await?;
         Ok(sources.into_iter().find(|s| s.id_matches(media_source_id)))
     }
@@ -869,6 +898,7 @@ mod tests {
     async fn a_failed_remote_subtitle_names_only_the_host() {
         let error = http_get_bytes(
             "http://acct-user:info-secret@127.0.0.1:0/path-secret/en.srt?token=query-secret",
+            HTTP_CLIENT_DEFAULT_TIMEOUT,
         )
         .await
         .expect_err("nothing listens there");
@@ -880,9 +910,12 @@ mod tests {
     /// it, and fails there without naming its account or path either.
     #[tokio::test]
     async fn a_subtitle_url_on_another_scheme_names_only_the_host() {
-        let error = http_get_bytes("smb://acct-user:info-secret@nas/path-secret/en.srt")
-            .await
-            .expect_err("no smb client");
+        let error = http_get_bytes(
+            "smb://acct-user:info-secret@nas/path-secret/en.srt",
+            HTTP_CLIENT_DEFAULT_TIMEOUT,
+        )
+        .await
+        .expect_err("no smb client");
 
         assert!(error.starts_with("GET smb://nas"), "{error}");
         assert!(
@@ -891,10 +924,187 @@ mod tests {
         );
     }
 
-    /// A fake [`MediaSourceManager`] returning fixed sources + attachments.
+    /// A loopback server answering every request with `decoded`, gzipped and
+    /// sent as `Content-Encoding: gzip`; its `/path-secret/en.srt` URL.
+    async fn gzip_subtitle_url(decoded: &[u8]) -> String {
+        use std::io::Write as _;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(decoded).unwrap();
+        let body = gzip.finish().unwrap();
+        let app = axum::Router::new().fallback(move || {
+            let body = body.clone();
+            async move { ([(axum::http::header::CONTENT_ENCODING, "gzip")], body) }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{addr}/path-secret/en.srt")
+    }
+
+    /// A remote subtitle is decoded and read whole.
+    #[tokio::test]
+    async fn a_remote_subtitle_is_decoded_and_read_whole() {
+        let srt = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n";
+
+        let body = http_get_bytes(&gzip_subtitle_url(srt).await, HTTP_CLIENT_DEFAULT_TIMEOUT).await;
+
+        assert_eq!(body.as_deref(), Ok(&srt[..]));
+    }
+
+    /// `SubtitleEncoder.GetSubtitleStream` reads through `NamedClient.Default`:
+    /// the server's `User-Agent` and the `Accept` list. The origin echoes them.
+    #[tokio::test]
+    async fn a_remote_subtitle_is_asked_for_with_the_default_client_headers() {
+        let app = axum::Router::new().fallback(|headers: axum::http::HeaderMap| async move {
+            let header = |name| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            format!("{:?}|{:?}", header("user-agent"), header("accept"))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let body = http_get_bytes(
+            &format!("http://{addr}/en.srt"),
+            HTTP_CLIENT_DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        let expected = format!(
+            "{:?}|{:?}",
+            Some(ferrofin_health::USER_AGENT),
+            Some("application/json; q=1.0, application/xml; q=0.9, */*; q=0.8")
+        );
+        assert_eq!(String::from_utf8(body).unwrap(), expected);
+    }
+
+    /// A redirect the client does not follow (https to http, or past the
+    /// limit) fails the read, as `GetStreamAsync`'s
+    /// `EnsureSuccessStatusCode` does.
+    #[tokio::test]
+    async fn a_redirect_the_client_does_not_follow_fails_the_subtitle_read() {
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, "/en.srt")],
+            )
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let error = http_get_bytes(
+            &format!("http://{addr}/en.srt"),
+            HTTP_CLIENT_DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("HTTP 302"), "{error}");
+    }
+
+    /// A small compressed body that decodes past the download limit is
+    /// refused at the limit, not held whole (gl-1708).
+    #[tokio::test]
+    async fn a_remote_subtitle_that_decodes_past_the_limit_is_refused() {
+        let limit = ferrofin_providers::rate_limit::request_limits().download_max_bytes;
+        let url = gzip_subtitle_url(&vec![0; usize::try_from(limit).unwrap() + 1]).await;
+
+        // The length only: a failure must not print the body.
+        let error = http_get_bytes(&url, HTTP_CLIENT_DEFAULT_TIMEOUT)
+            .await
+            .map(|body| body.len())
+            .expect_err("over the limit");
+
+        let host = url.trim_end_matches("/path-secret/en.srt");
+        let mib = limit / (1024 * 1024);
+        assert_eq!(
+            error,
+            format!("GET {host}: the subtitle is over image_download_max_mb ({mib} MiB); not read")
+        );
+    }
+
+    /// How long the tests below give the response headers.
+    const SHORT_TIMEOUT: Duration = Duration::from_millis(200);
+    /// How long a test waits before it calls a hang a failure.
+    const GUARD: Duration = Duration::from_secs(5);
+
+    /// A subtitle host that accepts one connection, reads the request, then
+    /// sends `head` (nothing when it is empty) and each of `chunks`
+    /// [`SHORT_TIMEOUT`] apart, holding the connection open afterwards.
+    async fn slow_subtitle_host(
+        head: &'static str,
+        chunks: &'static [&'static str],
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = stream.read(&mut [0; 4096]).await;
+            let _ = stream.write_all(head.as_bytes()).await;
+            for chunk in chunks {
+                tokio::time::sleep(SHORT_TIMEOUT).await;
+                let _ = stream.write_all(chunk.as_bytes()).await;
+            }
+            std::future::pending::<()>().await;
+        });
+        addr
+    }
+
+    /// A host that never answers is given up on once the response headers are
+    /// late, as `HttpClient.Timeout` gives up on `GetStreamAsync`, and the
+    /// error names only the host.
+    #[tokio::test]
+    async fn a_remote_subtitle_host_that_never_answers_is_given_up_on() {
+        let addr = slow_subtitle_host("", &[]).await;
+        let url =
+            format!("http://acct-user:info-secret@{addr}/path-secret/en.srt?token=query-secret");
+
+        let outcome = tokio::time::timeout(GUARD, http_get_bytes(&url, SHORT_TIMEOUT))
+            .await
+            .expect("gave up");
+
+        assert_eq!(
+            outcome,
+            Err(format!(
+                "GET http://{addr}: no response headers within {SHORT_TIMEOUT:?}"
+            ))
+        );
+    }
+
+    /// Only the headers are timed: `GetStreamAsync` returns at the headers, so
+    /// a body slower than the timeout is still read whole.
+    #[tokio::test]
+    async fn a_remote_subtitle_body_slower_than_the_timeout_is_read_whole() {
+        let addr = slow_subtitle_host(
+            "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n",
+            &["abc", "def", "ghi", "jkl"],
+        )
+        .await;
+
+        let body = tokio::time::timeout(
+            GUARD,
+            http_get_bytes(&format!("http://{addr}/en.srt"), SHORT_TIMEOUT),
+        )
+        .await
+        .expect("read");
+
+        assert_eq!(body.as_deref(), Ok(&b"abcdefghijkl"[..]));
+    }
+
+    /// A fake [`MediaSourceManager`] returning fixed sources + attachments,
+    /// recording each playback lookup's `(user, allow probe, path substitution)`.
+    #[derive(Default)]
     struct FakeSources {
         sources: Vec<MediaSourceInfo>,
         attachments: Vec<MediaAttachment>,
+        playback_calls: std::sync::Mutex<Vec<(Uuid, bool, bool)>>,
     }
 
     #[async_trait]
@@ -914,10 +1124,15 @@ mod tests {
         async fn get_playback_media_sources(
             &self,
             _item_id: Uuid,
-            _user_id: Uuid,
-            _allow_media_probe: bool,
-            _enable_path_substitution: bool,
+            user_id: Uuid,
+            allow_media_probe: bool,
+            enable_path_substitution: bool,
         ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+            self.playback_calls.lock().unwrap().push((
+                user_id,
+                allow_media_probe,
+                enable_path_substitution,
+            ));
             Ok(self.sources.clone())
         }
         async fn get_static_media_sources(
@@ -1141,7 +1356,7 @@ mod tests {
     fn build_media_encoding_produces_real_pair() {
         let media_sources: Arc<dyn MediaSourceManager> = Arc::new(FakeSources {
             sources: vec![source("abc")],
-            attachments: Vec::new(),
+            ..FakeSources::default()
         });
         let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
         let tmp = tempfile::tempdir().unwrap();
@@ -1202,7 +1417,7 @@ mod tests {
         let _ = build_media_encoding(
             Arc::new(FakeSources {
                 sources: Vec::new(),
-                attachments: Vec::new(),
+                ..FakeSources::default()
             }),
             Arc::new(RecordingEncoder),
             config,
@@ -1504,7 +1719,7 @@ mod tests {
         vod.run_time_ticks = Some(90 * 60 * 10_000_000);
         let media_sources: Arc<dyn MediaSourceManager> = Arc::new(FakeSources {
             sources: vec![vod],
-            attachments: Vec::new(),
+            ..FakeSources::default()
         });
         let encoder: Arc<dyn MediaEncoder> = Arc::new(RecordingEncoder);
         let directory = tempfile::tempdir().expect("owned composition paths");
@@ -1734,7 +1949,7 @@ mod tests {
         let resolver = MediaSourceManagerResolver {
             media_sources: Arc::new(FakeSources {
                 sources: vec![primary, alternate],
-                attachments: Vec::new(),
+                ..FakeSources::default()
             }),
         };
         let outcome = resolver
@@ -1763,11 +1978,30 @@ mod tests {
         let resolver = MediaSourceManagerResolver {
             media_sources: Arc::new(FakeSources {
                 sources: vec![source("abc")],
-                attachments: Vec::new(),
+                ..FakeSources::default()
             }),
         };
         let outcome = resolver.resolve(Uuid::from_u128(1), "nope").await.unwrap();
         assert!(outcome.is_none());
+    }
+
+    /// `GetSubtitles` and `GetAttachment` read `GetPlaybackMediaSources(item,
+    /// null, true, false)`: no user, the probe a `.strm` (or an item with no
+    /// main stream) gets first, no path substitution.
+    #[tokio::test]
+    async fn resolver_reads_playback_sources_with_the_probe_allowed() {
+        let sources = Arc::new(FakeSources {
+            sources: vec![source("abc")],
+            ..FakeSources::default()
+        });
+        let resolver = MediaSourceManagerResolver {
+            media_sources: Arc::clone(&sources) as Arc<dyn MediaSourceManager>,
+        };
+        resolver.resolve(Uuid::from_u128(1), "abc").await.unwrap();
+        assert_eq!(
+            *sources.playback_calls.lock().unwrap(),
+            [(Uuid::nil(), true, false)]
+        );
     }
 
     #[tokio::test]
@@ -1975,7 +2209,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let file = tmp.path().join("config/users/named/encoding.json");
+        let file = tmp.path().join("config/encoding.json");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"{ \"SubtitleExtractionTimeoutMinutes\": 1, }").unwrap();
 

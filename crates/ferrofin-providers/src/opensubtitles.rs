@@ -53,6 +53,11 @@ use uuid::Uuid;
 /// The stable id of the compiled-in OpenSubtitles plugin (dashboard config key).
 pub const PLUGIN_ID: Uuid = Uuid::from_u128(0x4a3f_8e21_6c94_4d17_a2b8_0f5e_9c3d_7a10);
 
+/// The OpenSubtitles plugin's settings file in Jellyfin's `plugins/configurations`, named after
+/// its assembly (`BasePlugin<T>.ConfigurationFileName`), which `/Plugins`
+/// reports and adoption imports.
+pub const CONFIGURATION_FILE_NAME: &str = "Jellyfin.Plugin.OpenSubtitles.xml";
+
 /// The provider's name, the plugin's `OpenSubtitleDownloader.Name`: the
 /// fetcher name a library's `DisabledSubtitleFetchers` and
 /// `SubtitleFetcherOrder` hold, each candidate's `ProviderName`, and (as its

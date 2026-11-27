@@ -188,6 +188,8 @@ jobs:
           # libx264), never Debian's — owner rule.
           docker exec smoke ffmpeg -version | head -1 | tee ffmpeg.txt
           grep -qi jellyfin ffmpeg.txt || { echo "ffmpeg in the image is not jellyfin-ffmpeg"; exit 1; }
+          docker exec smoke test -s /usr/share/doc/ferrofin/THIRD-PARTY-NOTICES.txt \
+            || { echo "the image ships no third-party notices"; exit 1; }
           docker rm -f smoke
       # Upgrade check: a populated install of the PREVIOUS release and of v1.0.0, the oldest,
       # must keep its user data under this one. v1.0.0 shipped with a modified released
@@ -331,8 +333,22 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-auditable@0.7.7
+      # cargo-about writes the third-party notices every archive and the .deb ship; the version ci.yml
+      # and the Dockerfile install, built from crates.io as ci.yml does (see the note there).
+      - run: cargo install --locked --features cli cargo-about@0.9.3 # the binary needs `cli`
+      # turbojpeg-sys builds its vendored libjpeg-turbo with cmake (on the macOS and
+      # Windows images already). Its x86-64 SIMD is assembled with nasm, which
+      # require-simd makes a hard requirement; aarch64 uses Neon intrinsics.
+      - if: contains(matrix.target, 'linux')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          choco install nasm --no-progress -y
+          echo 'C:\Program Files\NASM' >> "$GITHUB_PATH"
       # Linux builds use zig as the C toolchain, linked against GLIBC_FLOOR (the
-      # aarch64 cross-build also needs it for the C in bundled SQLite and aws-lc-sys).
+      # aarch64 cross-build also needs it for the C in bundled SQLite, aws-lc-sys
+      # and libjpeg-turbo).
       - if: contains(matrix.target, 'linux')
         run: |
           # The pair v1.3.2's aarch64 build used; move both together, deliberately.
@@ -340,6 +356,10 @@ jobs:
           cargo auditable zigbuild --locked --release -p ferrofin-server --target "${{ matrix.target }}.$GLIBC_FLOOR"
       - if: ${{ !contains(matrix.target, 'linux') }}
         run: cargo auditable build --locked --release -p ferrofin-server --target ${{ matrix.target }}
+      # target/THIRD-PARTY-NOTICES.txt, for the .deb and the archive (the image writes its own).
+      - name: third-party notices
+        shell: bash
+        run: scripts/third-party-notices.sh
       # The .deb depends on jellyfin-ffmpeg8 + jellyfin-web (the same runtime the
       # image bundles); package metadata and contents live in the server manifest.
       - name: build the Debian package
@@ -368,6 +388,8 @@ jobs:
             || { echo "expected version $version, got $deb ($(dpkg-deb -f "$deb" Version))"; exit 1; }
           dpkg-deb -c "$deb" | grep -q ' \./usr/share/doc/ferrofin/copyright$' \
             || { echo "$deb ships no copyright file"; exit 1; }
+          dpkg-deb -c "$deb" | grep -q ' \./usr/share/doc/ferrofin/THIRD-PARTY-NOTICES\.txt$' \
+            || { echo "$deb ships no third-party notices"; exit 1; }
       # Install it the way a user will: Jellyfin's apt repository first, then
       # the package, which must pull jellyfin-ffmpeg8 + jellyfin-web, create the
       # service user, and boot against jellyfin-ffmpeg (libfdk_aac present).
@@ -396,6 +418,7 @@ jobs:
             su -s /bin/sh ferrofin -c "test -r /etc/ferrofin/config.toml && test ! -w /etc/ferrofin/config.toml"
             su -s /bin/sh nobody -c "test ! -r /etc/ferrofin/config.toml"
             test -f /lib/systemd/system/ferrofin.service
+            test -s /usr/share/doc/ferrofin/THIRD-PARTY-NOTICES.txt
             su -s /bin/sh ferrofin -c "FERROFIN_FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg \
               FERROFIN_WEB_DIR=/usr/share/jellyfin/web \
               /usr/bin/ferrofin-server --config /etc/ferrofin/config.toml --bind 127.0.0.1 --port 8096" \
@@ -443,7 +466,8 @@ jobs:
           set -eu
           name="ferrofin-$GITHUB_REF_NAME-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp LICENSE README.md "dist/$name/"
+          # The licenses of the binary: Ferrofin's own, and the third-party code it is built from.
+          cp LICENSE README.md contrib/debian/copyright target/THIRD-PARTY-NOTICES.txt "dist/$name/"
           case "${{ matrix.target }}" in
             *windows*) cp "target/${{ matrix.target }}/release/ferrofin-server.exe" "dist/$name/"
                        (cd dist && 7z a -bd "$name.zip" "$name" > /dev/null && sha256sum "$name.zip" > "$name.zip.sha256") ;;

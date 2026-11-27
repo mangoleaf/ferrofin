@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 /// `Jellyfin.Plugin.Tmdb.xml` exactly as a stock Jellyfin 12.4 writes it at its
 /// first start, then edited the way its settings page would: missing episodes
-/// on for two libraries, a cast cap of 20, an API key of the admin's own.
-/// `SimilarItemsCacheDays` is upstream's and has no Ferrofin setting.
+/// on for two libraries, a cast cap of 20, an API key of the admin's own, and
+/// similar items cached for 30 days.
 const TMDB_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <PluginConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <TmdbApiKey>admins-own-key</TmdbApiKey>
@@ -34,7 +34,7 @@ const TMDB_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   <MaxCrewMembers>15</MaxCrewMembers>
   <HideMissingCastMembers>false</HideMissingCastMembers>
   <HideMissingCrewMembers>false</HideMissingCrewMembers>
-  <SimilarItemsCacheDays>90</SimilarItemsCacheDays>
+  <SimilarItemsCacheDays>30</SimilarItemsCacheDays>
 </PluginConfiguration>"#;
 
 /// `Jellyfin.Plugin.MusicBrainz.xml` as Jellyfin 12.4 writes it, pointed at a
@@ -129,7 +129,7 @@ async fn a_stock_12_4_document_edited_by_its_admin_comes_across() {
     );
     // Upstream leaves a null image size out; it keeps Ferrofin's default.
     assert_eq!(tmdb.get("PosterSize"), Some(&Value::Null));
-    assert!(tmdb.get("SimilarItemsCacheDays").is_none(), "{tmdb}");
+    assert_eq!(tmdb["SimilarItemsCacheDays"], 30);
     let musicbrainz = configuration(&plugins, &MUSICBRAINZ).await;
     assert_eq!(
         musicbrainz,
@@ -178,6 +178,14 @@ fn edited_documents() -> Vec<(BuiltinPlugin, String, Value)> {
                 "Studio Images" => (
                     "  <RepositoryUrl>https://art.example/studios</RepositoryUrl>",
                     json!({"RepositoryUrl": "https://art.example/studios"}),
+                ),
+                // As a stock 12.4 writes it after a save on its settings page.
+                "ListenBrainz Similarity Provider" => (
+                    "  <LabsServer>https://labs.example.org</LabsServer>\n  \
+                     <Algorithm>SessionBased75Days</Algorithm>\n  <RateLimit>0.25</RateLimit>\n  \
+                     <SimilarItemsCacheDays>30</SimilarItemsCacheDays>",
+                    json!({"LabsServer": "https://labs.example.org", "Algorithm": "SessionBased75Days",
+                           "RateLimit": 0.25, "SimilarItemsCacheDays": 30}),
                 ),
                 other => panic!("a bundled plugin with no test document: {other}"),
             };
@@ -306,5 +314,158 @@ async fn no_document_an_unreadable_one_or_no_such_plugin_imports_nothing() {
     assert_eq!(
         configuration(&plugins, &MUSICBRAINZ).await,
         serde_json::from_str::<Value>(MUSICBRAINZ.default_config).unwrap()
+    );
+}
+
+/// A plugin registered with `default_config`, under `id`.
+fn manager_of(state_dir: &Path, id: uuid::Uuid, default_config: &str) -> FerrofinPluginManager {
+    let registered = RegisteredPlugin::new(
+        PluginDescriptor {
+            id,
+            name: "Example".to_owned(),
+            version: "1.0.0".to_owned(),
+            description: String::new(),
+            enabled: true,
+            has_image: false,
+            can_uninstall: false,
+            configuration_file_name: None,
+        },
+        None,
+    )
+    .with_default_config(default_config.as_bytes().to_vec());
+    FerrofinPluginManager::new(vec![registered], state_dir.to_owned())
+}
+
+/// File Transformation's `PluginConfiguration` (`f4f01c3`) as `XmlSerializer`
+/// writes it with two transformations from its settings page: a
+/// `PluginDefinedTransformation[]` whose default is empty, each entry a `Guid`
+/// and three strings, two of them text that reads like a number and a bool.
+const FILE_TRANSFORMATION_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<PluginConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <DebugLoggingState>Enabled</DebugLoggingState>
+  <Transformations>
+    <PluginDefinedTransformation>
+      <Id>0f8fad5b-d9cb-469f-a165-70867728950e</Id>
+      <FilenamePattern>index.html</FilenamePattern>
+      <SearchText>1</SearchText>
+      <ReplaceText>true</ReplaceText>
+    </PluginDefinedTransformation>
+    <PluginDefinedTransformation>
+      <Id>7c9e6679-7425-40de-944b-e07fc1f90ae7</Id>
+      <FilenamePattern>main\.jellyfin\.bundle\.js</FilenamePattern>
+      <SearchText>007</SearchText>
+      <ReplaceText />
+    </PluginDefinedTransformation>
+  </Transformations>
+</PluginConfiguration>"#;
+
+#[tokio::test]
+async fn a_list_of_objects_with_an_empty_default_comes_across_as_text() {
+    let id = uuid::Uuid::from_u128(0x5e87_cc92_571a_4d8d_8d98_d2d4_147f_9f90);
+    let file = "Jellyfin.Plugin.FileTransformation.xml";
+    let adopted = Adopted::new(&[(file, FILE_TRANSFORMATION_XML)]);
+    let plugins = manager_of(
+        &adopted.state(),
+        id,
+        r#"{"DebugLoggingState":"Disabled","Transformations":[]}"#,
+    );
+
+    import_adopted_plugin_configs(
+        &adopted.configurations(),
+        &adopted.state(),
+        &plugins,
+        &[(id, file)],
+    )
+    .await;
+
+    let stored: Value =
+        serde_json::from_slice(&plugins.get_plugin_configuration(id).await.unwrap()).unwrap();
+    assert_eq!(
+        stored,
+        json!({
+            "DebugLoggingState": "Enabled",
+            "Transformations": [
+                {
+                    "Id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+                    "FilenamePattern": "index.html",
+                    "SearchText": "1",
+                    "ReplaceText": "true"
+                },
+                {
+                    "Id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+                    "FilenamePattern": "main\\.jellyfin\\.bundle\\.js",
+                    "SearchText": "007",
+                    "ReplaceText": ""
+                }
+            ]
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_single_object_entry_is_still_a_list() {
+    let id = uuid::Uuid::from_u128(2);
+    let xml = "<PluginConfiguration><Transformations><PluginDefinedTransformation>\
+               <Id>0f8fad5b-d9cb-469f-a165-70867728950e</Id><FilenamePattern>a</FilenamePattern>\
+               <SearchText>b</SearchText><ReplaceText>c</ReplaceText>\
+               </PluginDefinedTransformation></Transformations></PluginConfiguration>";
+    let adopted = Adopted::new(&[("Example.xml", xml)]);
+    let plugins = manager_of(&adopted.state(), id, r#"{"Transformations":[]}"#);
+
+    import_adopted_plugin_configs(
+        &adopted.configurations(),
+        &adopted.state(),
+        &plugins,
+        &[(id, "Example.xml")],
+    )
+    .await;
+
+    let stored: Value =
+        serde_json::from_slice(&plugins.get_plugin_configuration(id).await.unwrap()).unwrap();
+    assert_eq!(
+        stored["Transformations"],
+        json!([{"Id": "0f8fad5b-d9cb-469f-a165-70867728950e", "FilenamePattern": "a", "SearchText": "b", "ReplaceText": "c"}])
+    );
+}
+
+#[tokio::test]
+async fn an_empty_object_list_stays_empty_and_an_omitted_member_is_empty_text() {
+    let id = uuid::Uuid::from_u128(3);
+    let empty = Adopted::new(&[(
+        "Example.xml",
+        "<PluginConfiguration><Transformations /></PluginConfiguration>",
+    )]);
+    let plugins = manager_of(&empty.state(), id, r#"{"Transformations":[]}"#);
+    import_adopted_plugin_configs(
+        &empty.configurations(),
+        &empty.state(),
+        &plugins,
+        &[(id, "Example.xml")],
+    )
+    .await;
+    let stored: Value =
+        serde_json::from_slice(&plugins.get_plugin_configuration(id).await.unwrap()).unwrap();
+    assert_eq!(stored["Transformations"], json!([]));
+
+    // `XmlSerializer` leaves out a null string, so an entry can lack a member
+    // another entry has.
+    let xml = "<PluginConfiguration><Transformations>\
+               <PluginDefinedTransformation><Id>a</Id><SearchText>b</SearchText></PluginDefinedTransformation>\
+               <PluginDefinedTransformation><Id>c</Id></PluginDefinedTransformation>\
+               </Transformations></PluginConfiguration>";
+    let partial = Adopted::new(&[("Example.xml", xml)]);
+    let plugins = manager_of(&partial.state(), id, r#"{"Transformations":[]}"#);
+    import_adopted_plugin_configs(
+        &partial.configurations(),
+        &partial.state(),
+        &plugins,
+        &[(id, "Example.xml")],
+    )
+    .await;
+    let stored: Value =
+        serde_json::from_slice(&plugins.get_plugin_configuration(id).await.unwrap()).unwrap();
+    assert_eq!(
+        stored["Transformations"],
+        json!([{"Id": "a", "SearchText": "b"}, {"Id": "c", "SearchText": ""}])
     );
 }

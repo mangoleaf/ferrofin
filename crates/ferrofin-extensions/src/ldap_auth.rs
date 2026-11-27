@@ -1206,6 +1206,7 @@ impl Extension for LdapAuthExtension {
             name: "LDAP-Auth".to_owned(),
             bytes: include_bytes!(concat!(env!("OUT_DIR"), "/ldapauth/configPage.html")).to_vec(),
             enable_in_main_menu: false,
+            content_type: None,
         }]
     }
 

@@ -4,7 +4,8 @@
 //! src/Jellyfin.LiveTv/Guide/GuideManager.cs:232-339) reads a channel's
 //! existing programmes (`ChannelIds = [currentChannel.Id]`), merges and stores
 //! them, then moves on, so a large guide is never in memory whole. These tests
-//! watch the item repository the mirror reads through.
+//! watch the item repository the mirror, and the guide reads over it, read
+//! through.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -17,16 +18,17 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::entities::{ImageType, MediaStreamType};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
+use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemRepository, ItemWithCounts, PlaylistItemsWithAccess};
 use ferrofin_traits::stubs::{LiveTvChannelQuery, LiveTvManager as _};
+use ferrofin_traits::tasks::TaskProgress;
 use uuid::Uuid;
 
 use super::{ArtServices, M3U, guide_day, item_lab_reading_through};
 use crate::projection::PROGRAM_TYPE_NAME;
 
 /// One airing: `(guide channel, start hour, end hour, title, icon URL)`.
-type Airing = (
+pub(super) type Airing = (
     &'static str,
     &'static str,
     &'static str,
@@ -35,7 +37,7 @@ type Airing = (
 );
 
 /// Two airings on each of the fixture lineup's two channels, tomorrow.
-const AIRINGS: [Airing; 4] = [
+pub(super) const AIRINGS: [Airing; 4] = [
     (
         "one.tv",
         "06",
@@ -56,7 +58,7 @@ const AIRINGS: [Airing; 4] = [
 
 /// A guide listing both of the fixture lineup's channels, carrying `airings`
 /// on `day` (a [`guide_day`]), each with a genre and an icon.
-fn guide(day: &str, airings: &[Airing]) -> String {
+pub(super) fn guide(day: &str, airings: &[Airing]) -> String {
     let mut xml = String::from(
         "<tv>\
          <channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
@@ -81,9 +83,12 @@ fn guide(day: &str, airings: &[Airing]) -> String {
 /// (`build_access_filter`, the folder-children trio, the version batches,
 /// `get_item_id_clean_names`, …) keep the trait's default, which the guide
 /// refresh never reaches; forward one here if that changes.
-struct ChannelReads {
-    inner: Arc<dyn ItemRepository>,
-    reads: Mutex<Vec<BTreeSet<String>>>,
+pub(super) struct ChannelReads {
+    pub(super) inner: Arc<dyn ItemRepository>,
+    pub(super) reads: Mutex<Vec<BTreeSet<String>>>,
+    /// Run at each read recorded, so while one channel's airings are being
+    /// mirrored: a stop that arrives then, or a look at the run's progress.
+    pub(super) at_read: Box<dyn Fn() + Send + Sync>,
 }
 
 impl ChannelReads {
@@ -94,6 +99,7 @@ impl ChannelReads {
             .map(|row| row.channel_id.clone().unwrap_or_default())
             .collect();
         if !channels.is_empty() {
+            (self.at_read)();
             self.reads.lock().expect("reads").push(channels);
         }
     }
@@ -273,6 +279,51 @@ impl ItemRepository for ChannelReads {
     }
 }
 
+/// A stop that arrives while one channel's airings are mirrored ends the
+/// refresh before the next channel's are read, as upstream throws at the top
+/// of its per-channel loop (`cancellationToken.ThrowIfCancellationRequested()`,
+/// GuideManager.cs:234). The channel in progress is written whole, and no
+/// airing's item is removed: the clean-up needs every channel's.
+#[tokio::test]
+async fn a_stop_ends_the_mirror_before_the_next_channel() {
+    let run = TaskProgress::default();
+    let mut recorder = None;
+    let lab = item_lab_reading_through(M3U, Some(guide(&guide_day(0), &AIRINGS)), |inner| {
+        let reads = Arc::new(ChannelReads {
+            inner,
+            reads: Mutex::new(Vec::new()),
+            at_read: Box::new({
+                let stop = run.cancel_token().clone();
+                move || stop.cancel()
+            }),
+        });
+        recorder = Some(Arc::clone(&reads));
+        reads
+    })
+    .await;
+    let reads = recorder.expect("the lab wraps its item reads");
+    // The first import reads no stored airing, so nothing stops it.
+    lab.mgr.refresh_guide().await.expect("first refresh");
+    assert!(reads.reads().is_empty() && !run.cancel_token().is_cancelled());
+
+    let finished = lab
+        .mgr
+        .refresh_guide_until(&run)
+        .await
+        .expect("stopped refresh");
+    assert!(!finished, "a stopped refresh says so");
+    assert_eq!(
+        reads.reads().len(),
+        1,
+        "only the channel in progress was read back: {:?}",
+        reads.reads()
+    );
+    let stored = crate::guide_repository::test_support::stored_program_items(&lab.mgr.db)
+        .await
+        .expect("programme items");
+    assert_eq!(stored.len(), 4, "no airing's item was removed: {stored:?}");
+}
+
 /// A refresh that finds the guide already stored reads it back one channel at
 /// a time, as upstream loads `existingPrograms` per channel, and still mirrors
 /// every airing under its own channel.
@@ -287,6 +338,7 @@ async fn a_guide_refresh_reads_the_stored_airings_one_channel_at_a_time() {
         let reads = Arc::new(ChannelReads {
             inner,
             reads: Mutex::new(Vec::new()),
+            at_read: Box::new(|| ()),
         });
         recorder = Some(Arc::clone(&reads));
         reads
@@ -328,6 +380,36 @@ async fn a_guide_refresh_reads_the_stored_airings_one_channel_at_a_time() {
         .await
         .expect("genre links");
     assert_eq!(links.len(), 4, "every airing keeps its genre: {links:?}");
+}
+
+/// gl-1690: a guide read projects its page's stored programme items, which it
+/// reads in one batched read for the whole page, not one per airing or per
+/// channel: the guide page is a hot path.
+#[tokio::test]
+async fn a_guide_page_reads_its_programme_items_once() {
+    let mut recorder = None;
+    let lab = item_lab_reading_through(M3U, Some(guide(&guide_day(0), &AIRINGS)), |inner| {
+        let reads = Arc::new(ChannelReads {
+            inner,
+            reads: Mutex::new(Vec::new()),
+        });
+        recorder = Some(Arc::clone(&reads));
+        reads
+    })
+    .await;
+    let reads = recorder.expect("the lab wraps its item reads");
+    lab.mgr.refresh_guide().await.expect("refresh");
+    reads.reads.lock().expect("reads").clear();
+
+    let page = lab
+        .mgr
+        .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+        .await
+        .expect("programs");
+    assert_eq!(page.items.len(), AIRINGS.len());
+    let seen = reads.reads();
+    assert_eq!(seen.len(), 1, "one read for the page: {seen:?}");
+    assert_eq!(seen[0].len(), 2, "both channels' airings in it: {seen:?}");
 }
 
 /// One channel's airings are read through the `("ChannelId", "StartDate")`
@@ -422,6 +504,58 @@ async fn a_logo_that_is_no_url_leaves_no_row_and_takes_the_stored_one(
             .is_empty(),
         "the refresh removed the row"
     );
+}
+
+/// gl-1639: artwork that stays at its URL is upstream's `new ItemImageInfo {
+/// Path = url, Type = type }` (`GuideManager.UpdateImage`, `SetImagePath`),
+/// whose `DateModified` is `default(DateTime)`: .NET's `MinValue`, stored as
+/// `0001-01-01 00:00:00`, not chrono's Unix epoch. Both rows read back as that
+/// date.
+#[tokio::test]
+async fn remote_artwork_rows_are_dated_dotnet_min_value() {
+    let lab = item_lab_reading_through(
+        "#EXTM3U\n#EXTINF:-1 tvg-id=\"one.tv\" tvg-chno=\"1\" \
+         tvg-logo=\"http://img/logo.png\",One\nhttp://tuner/one\n",
+        Some(guide(&guide_day(0), &AIRINGS[..1])),
+        |inner| inner,
+    )
+    .await;
+    lab.mgr.refresh_guide().await.expect("refresh");
+
+    let min = || Some("0001-01-01 00:00:00".to_owned());
+    assert_eq!(
+        crate::guide_repository::test_support::image_rows(&lab.mgr.db)
+            .await
+            .expect("image rows"),
+        [
+            ("http://img/logo.png".to_owned(), min()),
+            ("http://img/one-early.png".to_owned(), min())
+        ]
+    );
+    let channels = crate::guide_repository::channel_rows(
+        &lab.mgr.db,
+        &LiveTvChannelQuery::default(),
+        None,
+        false,
+    )
+    .await
+    .expect("channels");
+    let programmes = crate::guide_repository::test_support::stored_program_items(&lab.mgr.db)
+        .await
+        .expect("programme items");
+    for id in [&channels[0].id, &programmes[0].0] {
+        let images = lab
+            .items
+            .get_image_infos(Uuid::parse_str(id).expect("guid"))
+            .await
+            .expect("images");
+        let dates: Vec<_> = images.iter().map(|image| image.date_modified).collect();
+        assert_eq!(
+            dates,
+            [ferrofin_model::json::datetime::dotnet_min()],
+            "{id}"
+        );
+    }
 }
 
 /// A channel whose airings all left the guide has nothing to mirror, so its

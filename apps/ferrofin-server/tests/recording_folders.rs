@@ -175,9 +175,9 @@ fn media_locations(wired: &WiredApp) -> Value {
         .state
         .config
         .application_paths()
-        .user_configuration_directory_path();
+        .configuration_directory_path();
     let saved: Value = serde_json::from_slice(
-        &std::fs::read(Path::new(&directory).join("named/livetv.json")).expect("livetv.json"),
+        &std::fs::read(Path::new(&directory).join("livetv.json")).expect("livetv.json"),
     )
     .expect("json");
     saved["MediaLocationsCreated"].clone()

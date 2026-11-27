@@ -1,7 +1,7 @@
-//! Late-bound access to the dashboard configuration of Jellyfin's five in-tree
+//! Late-bound access to the dashboard configuration of Jellyfin's six in-tree
 //! provider plugins.
 //!
-//! `MediaBrowser.Providers/Plugins/{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages}`
+//! `MediaBrowser.Providers/Plugins/{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages,ListenBrainz}`
 //! each read their settings through the static `Plugin.Instance.Configuration`
 //! at call time, so an admin's save on the plugin's settings page takes effect
 //! on the next lookup. Ferrofin's equivalent is
@@ -166,6 +166,9 @@ pub struct TmdbConfig {
     pub profile_size: Option<String>,
     /// The image CDN size segment for episode stills.
     pub still_size: Option<String>,
+    /// How many days similar movies and series are cached; `0` (or less)
+    /// disables caching (`SimilarItemsCacheDays`, C# default 90).
+    pub similar_items_cache_days: i32,
     /// Replaces `TMDB_IMAGE_ROOT`, TMDb's image CDN — not a plugin setting
     /// (never read from the settings page's JSON): the client's test seam
     /// (`TmdbClient::with_image_root`), so a mock server can serve the
@@ -199,6 +202,8 @@ impl Default for TmdbConfig {
             logo_size: None,
             profile_size: None,
             still_size: None,
+            // `PluginConfiguration.cs:131`.
+            similar_items_cache_days: 90,
             image_root: None,
         }
     }
@@ -254,6 +259,28 @@ impl TmdbConfig {
             TmdbImageKind::Still => &self.still_size,
         };
         raw.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    /// `TmdbClientManager.ValidatePreferences`: a configured image size that
+    /// TMDb's client configuration does not list for its kind falls back to the
+    /// last size listed (TMDb lists them smallest first, `original` last). A
+    /// kind TMDb lists nothing for keeps its size, and so does an unset one.
+    pub fn keep_listed_sizes(&mut self, images: &ferrofin_model::dto::ConfigImageTypes) {
+        for (size, listed) in [
+            (&mut self.poster_size, &images.poster_sizes),
+            (&mut self.backdrop_size, &images.backdrop_sizes),
+            (&mut self.logo_size, &images.logo_sizes),
+            (&mut self.profile_size, &images.profile_sizes),
+            (&mut self.still_size, &images.still_sizes),
+        ] {
+            let configured = size.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            if let (Some(configured), Some(listed)) = (configured, listed)
+                && !listed.iter().any(|listed| listed == configured)
+                && let Some(last) = listed.last()
+            {
+                *size = Some(last.clone());
+            }
+        }
     }
 
     /// Whether `kind`'s images are fetched at their original size: unset, or
@@ -478,6 +505,48 @@ mod tests {
     use super::{
         AudioDbConfig, ConfigSource, MusicBrainzConfig, OmdbConfig, StudioImagesConfig, TmdbConfig,
     };
+
+    /// `ValidatePreferences`: only a configured size TMDb does not list for its
+    /// kind moves, to the last one listed; a blank size (unset), a kind TMDb
+    /// lists no sizes for and a kind it sends no list for keep theirs.
+    #[test]
+    fn keep_listed_sizes_moves_only_a_configured_size_tmdb_does_not_list() {
+        let mut cfg = TmdbConfig {
+            poster_size: Some("w9999".to_owned()),
+            backdrop_size: Some("   ".to_owned()),
+            logo_size: Some("w45".to_owned()),
+            profile_size: Some("w45".to_owned()),
+            still_size: Some(" w92 ".to_owned()),
+            ..TmdbConfig::default()
+        };
+        cfg.keep_listed_sizes(&ferrofin_model::dto::ConfigImageTypes {
+            poster_sizes: Some(vec!["w92".to_owned(), "original".to_owned()]),
+            backdrop_sizes: Some(vec!["w300".to_owned()]),
+            logo_sizes: Some(Vec::new()),
+            profile_sizes: None,
+            still_sizes: Some(vec!["w92".to_owned(), "original".to_owned()]),
+            ..ferrofin_model::dto::ConfigImageTypes::default()
+        });
+        assert_eq!(cfg.poster_size.as_deref(), Some("original"));
+        assert_eq!(cfg.backdrop_size.as_deref(), Some("   "));
+        assert_eq!(cfg.logo_size.as_deref(), Some("w45"));
+        assert_eq!(cfg.profile_size.as_deref(), Some("w45"));
+        assert_eq!(
+            cfg.still_size.as_deref(),
+            Some(" w92 "),
+            "read trimmed: listed"
+        );
+        // `List.Contains` is ordinal: another casing is not listed.
+        let mut cased = TmdbConfig {
+            poster_size: Some("Original".to_owned()),
+            ..TmdbConfig::default()
+        };
+        cased.keep_listed_sizes(&ferrofin_model::dto::ConfigImageTypes {
+            poster_sizes: Some(vec!["w92".to_owned(), "original".to_owned()]),
+            ..ferrofin_model::dto::ConfigImageTypes::default()
+        });
+        assert_eq!(cased.poster_size.as_deref(), Some("original"));
+    }
 
     #[test]
     fn defaults_are_the_csharp_plugin_configuration_defaults() {

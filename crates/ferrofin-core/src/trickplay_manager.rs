@@ -564,7 +564,7 @@ impl FerrofinTrickplayManager {
         // Source checks these only inside per-width work: they do not bypass
         // discovery or the outer disabled/replace cleanup.
         if !off_runtime(|| Path::new(ctx.media_path).is_file()) {
-            tracing::warn!(item = %ctx.item_id, path = ctx.media_path, "trickplay media file not found");
+            tracing::warn!(item_id = %ctx.item_id, path = ctx.media_path, "trickplay media file not found");
             return Ok(None);
         }
         if Path::new(ctx.media_path)
@@ -572,7 +572,7 @@ impl FerrofinTrickplayManager {
             .and_then(Path::file_name)
             .is_some_and(|name| name.eq_ignore_ascii_case("backdrops"))
         {
-            tracing::debug!(item = %ctx.item_id, path = ctx.media_path, "ignoring backdrop media");
+            tracing::debug!(item_id = %ctx.item_id, path = ctx.media_path, "ignoring backdrop media");
             return Ok(None);
         }
         // CanGenerateTrickplay counts all streams, but the pinned per-width
@@ -600,7 +600,7 @@ impl FerrofinTrickplayManager {
             match rows.entry(actual_width) {
                 Entry::Occupied(_) => {
                     if off_runtime(|| has_tiles(&output_dir)) {
-                        tracing::debug!(item = %ctx.item_id, "found existing trickplay files");
+                        tracing::debug!(item_id = %ctx.item_id, "found existing trickplay files");
                         return Ok(None);
                     }
                 }
@@ -922,7 +922,7 @@ impl FerrofinTrickplayManager {
         }
 
         self.save_trickplay_info(&info).await?;
-        tracing::debug!(item = %item_id, "imported existing trickplay files");
+        tracing::debug!(%item_id, "imported existing trickplay files");
         Ok(info)
     }
 
@@ -2133,8 +2133,8 @@ fn generated_width(width: i32, video_stream: &MediaStream) -> (i32, Option<i64>)
 /// Whether a JPEG samples chroma as often as luma (4:4:4), from the sampling
 /// factors in its frame header, read without decoding the image. Components
 /// are compared with each other: ffmpeg writes 4:4:4 as `(1, 2)` on every
-/// component and `jpeg-encoder` as `(1, 1)`. `None` when the file is not a
-/// readable JPEG or is grayscale.
+/// component and libjpeg-turbo (this server's tiles) as `(1, 1)`. `None` when
+/// the file is not a readable JPEG or is grayscale.
 fn jpeg_full_chroma(path: &Path) -> Option<bool> {
     use std::io::{BufReader, Read as _};
     let mut file = BufReader::new(std::fs::File::open(path).ok()?);
@@ -3492,7 +3492,7 @@ mod tests {
 
     /// The chroma is read from the frame header, comparing components with
     /// each other: ffmpeg's mjpeg declares 4:4:4 as `(1, 2)` on every
-    /// component, `jpeg-encoder` as `(1, 1)`.
+    /// component, libjpeg-turbo as `(1, 1)`.
     #[rstest::rstest]
     #[case::ffmpeg_full(&[0x12, 0x12, 0x12], Some(true))]
     #[case::encoder_full(&[0x11, 0x11, 0x11], Some(true))]

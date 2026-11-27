@@ -33,8 +33,9 @@ RESULTS = "results.jsonl"
 REPORT = "report.html"
 RESULT = "result.json"
 VERDICTS = ("PASS", "FAIL", "SKIP")
-#: What a fixture row is: an upgrade path, a messy copy, the scale copy, or a preservation-matrix path.
-KINDS = ("path", "messy", "scale", "matrix")
+#: What a fixture row is: an upgrade path, a messy copy, the scale copy, a preservation-matrix path, or the round
+#: trip's native route (a database Ferrofin created itself, gates/roundtrip/routes.sh).
+KINDS = ("path", "messy", "scale", "matrix", "native")
 #: The table-digest differences of a stage embedded in the page: the first this many, then a count of
 #: the rest, so a fixture that loses everything does not make a page of tens of megabytes. run.sh keeps
 #: the full list in the `<fixture>.tables-*.log` beside the report; `synthetic.py run` prints it in the

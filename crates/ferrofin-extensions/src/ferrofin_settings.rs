@@ -71,6 +71,7 @@ impl Extension for FerrofinSettingsExtension {
             ))
             .to_vec(),
             enable_in_main_menu: true,
+            content_type: None,
         }]
     }
 

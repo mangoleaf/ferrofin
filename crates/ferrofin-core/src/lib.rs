@@ -107,9 +107,8 @@
 //!   in-memory `SessionInfo` table (the C# `_activeConnections`), reports
 //!   playback through the injected [`UserDataManager`](ferrofin_traits::library::UserDataManager),
 //!   and broadcasts server → client messages as pre-serialized JSON to each
-//!   session's sink on the `SessionMessageBus` (which `ferrofin-api`'s
-//!   `/socket` handler registers), or to a directly attached connection, which
-//!   only tests attach (gl-248). Sibling managers (user/device/
+//!   session's sink on the `SessionMessageBus`, which `ferrofin-api`'s
+//!   `/socket` handler registers. Sibling managers (user/device/
 //!   user-data/library/DTO) plus the [`EventManager`](ferrofin_traits::events::EventManager)
 //!   are injected. It also runs the idle-playback and inactive-session checks
 //!   (`StartCheckTimers`) and counts live-stream consumers per session.
@@ -122,13 +121,6 @@
 //!   ([`ferrofin_traits::events::ClientEventLogger`]), persisting client-uploaded
 //!   diagnostic documents under the injected paths' log directory with a
 //!   traversal-safe file name.
-//! - [`session_websocket_listener`] — [`FerrofinSessionWebSocketListener`]
-//!   ([`ferrofin_traits::net::WebSocketListener`]) resolving a connection's
-//!   session on connect, and [`FerrofinWebSocketManager`]
-//!   ([`ferrofin_traits::net::WebSocketManager`]) validating the upgrade request.
-//!   The actual HTTP → WS upgrade and per-connection receive loop belong to the
-//!   HTTP layer, and `ferrofin-api`'s `/socket` handler does that work without
-//!   calling either (TODO(gl-248): open work item: one path, not two).
 //!
 //! The session-id derivation reuses [`ferrofin_common::extensions::get_md5`] (the
 //! C# `key.GetMD5().ToString("N")`), not a re-implemented hash.
@@ -236,6 +228,7 @@ pub mod media_stream_repository;
 mod media_stream_selector;
 pub mod mount_table;
 pub mod music_manager;
+pub mod named_configuration_files;
 pub mod next_up_service;
 pub mod notify_watcher;
 pub mod password_reset;
@@ -259,7 +252,6 @@ pub mod search_manager;
 pub mod server_discovery;
 pub mod session_bus;
 pub mod session_manager;
-pub mod session_websocket_listener;
 mod shortcut;
 pub mod similar_items_manager;
 mod similar_items_repository;
@@ -349,7 +341,6 @@ pub use search_manager::FerrofinSearchManager;
 pub use server_discovery::{ServerDiscovery, ServerDiscoveryError};
 pub use session_bus::FerrofinSessionMessageBus;
 pub use session_manager::FerrofinSessionManager;
-pub use session_websocket_listener::{FerrofinSessionWebSocketListener, FerrofinWebSocketManager};
 pub use similar_items_manager::FerrofinSimilarItemsManager;
 pub use subtitle_manager::FerrofinSubtitleManager;
 pub use sync_play_manager::FerrofinSyncPlayManager;

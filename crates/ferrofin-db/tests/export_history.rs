@@ -1,8 +1,11 @@
-//! The `__EFMigrationsHistory` an export records (gl-1549, gl-1551): every id
-//! of the target Jellyfin release classified once, as that release records it,
-//! and the history written through `ferrofin_db::export::export_data_dir` for a
-//! source of every generation Ferrofin adopts, with each combination of the
-//! ids it may or may not carry.
+//! The `__EFMigrationsHistory` an export records (gl-1549, gl-1551, gl-1552,
+//! gl-1902): every id of the target Jellyfin release classified once, as that
+//! release records it, and the history written through
+//! `ferrofin_db::export::export_data_dir` for a source of every generation
+//! Ferrofin adopts, with each combination of the ids it may or may not carry,
+//! and for a database Ferrofin created itself, which gets a fresh install's;
+//! and the refusal of a source without the proof of the work of a code
+//! migration it records as applied.
 
 use std::path::{Path, PathBuf};
 
@@ -10,7 +13,7 @@ use ferrofin_db::export::{
     CODE_PRODUCT_VERSION, DOCKER, Disposition, EXPORTED_DATABASE, JELLYFIN_MIGRATIONS,
     SCHEMA_PRODUCT_VERSION, SourceDirs, export_data_dir,
 };
-use ferrofin_db::{JELLYFIN_GENERATIONS, JellyfinGeneration};
+use ferrofin_db::{DbError, JELLYFIN_GENERATIONS, JellyfinGeneration, repair_markers};
 use sqlx::ConnectOptions as _;
 use sqlx::sqlite::SqliteConnectOptions;
 
@@ -173,7 +176,7 @@ const RUN_ON_10_11_11: [&str; 18] = [
 /// 10.11.8's ids, 10.11.10 records 10.11.11's, and 12.3 and 12.4 record
 /// 12.2's): how many schema migrations it applied, which the export records,
 /// and the code migrations it ran, which the export leaves out of the history
-/// for it to run.
+/// for it to run but those it records as applied (gl-1902).
 const LEFT_TO_RUN: [(&str, usize, &[&str]); 5] = [
     ("10.11.8", 20, &RUN_ON_10_11_8),
     ("10.11.11", 18, &RUN_ON_10_11_11),
@@ -211,9 +214,29 @@ fn schema_ids_in(history: &[(String, String)]) -> usize {
 /// The version an adopted source's rows carry, which the export must keep.
 const SOURCE_VERSION: &str = "9.0.11";
 
+/// The `FerrofinMeta` keys of the boot repairs that do the work of the code
+/// migrations the export records as applied, on every database each applies
+/// to (`ferrofin-core`'s `adoption_repairs` and `item_persistence_service`;
+/// `rederive_adopted_versions` only on one adopted from 10.11, as these are).
+const PROOFS: [&str; 4] = [
+    repair_markers::REHOME_LOCAL_VERSIONS,
+    repair_markers::REDERIVE_ADOPTED_VERSIONS,
+    repair_markers::OWNER_ID_RELATIONSHIPS,
+    repair_markers::RATING_LEVELS,
+];
+
+/// The code migrations the export records as applied, in id order.
+fn recorded_as_applied() -> Vec<&'static str> {
+    JELLYFIN_MIGRATIONS
+        .iter()
+        .filter(|(_, d)| *d == Disposition::CodeRecordedAsApplied)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
 /// A data directory whose database Ferrofin adopted from a Jellyfin that
 /// recorded `ids`, with a lock a crashed Jellyfin left behind, or with no lock
-/// table at all.
+/// table at all, and every repair's marker in [`PROOFS`].
 async fn source_with(scratch: &Path, ids: &[&str], lock_table: bool) -> PathBuf {
     let source = scratch.join("source");
     let database = source.join(EXPORTED_DATABASE);
@@ -231,6 +254,7 @@ async fn source_with(scratch: &Path, ids: &[&str], lock_table: bool) -> PathBuf 
     for statement in [
         "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)",
         r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT NOT NULL CONSTRAINT "PK___EFMigrationsHistory" PRIMARY KEY, "ProductVersion" TEXT NOT NULL)"#,
+        r#"CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL)"#,
     ]
     .into_iter()
     .chain(lock.into_iter().filter(|_| lock_table))
@@ -245,8 +269,46 @@ async fn source_with(scratch: &Path, ids: &[&str], lock_table: bool) -> PathBuf 
             .await
             .unwrap();
     }
+    for key in PROOFS {
+        sqlx::query(r#"INSERT INTO "FerrofinMeta" VALUES (?1, '1')"#)
+            .bind(key)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    started(&mut conn).await;
     sqlx::Connection::close(conn).await.unwrap();
     source
+}
+
+/// A statement deleting every `FerrofinMeta` row but `keep`'s and the
+/// record of the start, which the export checks before any proof (gl-1910).
+fn delete_markers_but(keep: &str) -> String {
+    format!(
+        r#"DELETE FROM "FerrofinMeta" WHERE "Key" NOT IN ('{keep}', '{}')"#,
+        ferrofin_db::STARTED_KEY
+    )
+}
+
+/// The build these tests export as, whose start each source records.
+const BUILD: &str = "v0.0.0-test";
+
+/// Makes the database on `conn`, which has Ferrofin's migration table and
+/// `FerrofinMeta`, one this build's start left, which the export requires
+/// (gl-1910): at this build's last migration, with a start of [`BUILD`]
+/// recorded.
+async fn started(conn: &mut sqlx::SqliteConnection) {
+    sqlx::query("INSERT INTO _sqlx_migrations VALUES (?1)")
+        .bind(ferrofin_db::schema_head())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(r#"INSERT INTO "FerrofinMeta" VALUES (?1, ?2)"#)
+        .bind(ferrofin_db::STARTED_KEY)
+        .bind(BUILD)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 }
 
 /// [`source_with`] a lock table.
@@ -328,15 +390,21 @@ async fn every_generation_records_the_target_schema_and_leaves_the_code_migratio
                 &DOCKER,
                 &source.join(EXPORTED_DATABASE),
                 &out,
+                BUILD,
             )
             .await
             .unwrap();
 
             // The source's rows as they were, and every schema id of the
-            // target it lacks, exactly as the target spells it.
+            // target it lacks and every code id recorded as applied it lacks,
+            // exactly as the target spells each.
             let added: Vec<&str> = schema
                 .iter()
                 .copied()
+                .filter(|id| !ids.contains(id))
+                .collect();
+            let applied_code: Vec<&str> = recorded_as_applied()
+                .into_iter()
                 .filter(|id| !ids.contains(id))
                 .collect();
             let mut expected: Vec<(String, String)> = ids
@@ -347,8 +415,21 @@ async fn every_generation_records_the_target_schema_and_leaves_the_code_migratio
                         .iter()
                         .map(|id| ((*id).to_owned(), SCHEMA_PRODUCT_VERSION.to_owned())),
                 )
+                .chain(
+                    applied_code
+                        .iter()
+                        .map(|id| ((*id).to_owned(), CODE_PRODUCT_VERSION.to_owned())),
+                )
                 .collect();
             expected.sort();
+            let mut recorded: Vec<&str> = added.iter().chain(&applied_code).copied().collect();
+            recorded.sort_unstable();
+            // Every code migration its first start runs, but those recorded.
+            let left_to_run: Vec<&str> = left_to_run
+                .iter()
+                .copied()
+                .filter(|id| !applied_code.contains(id))
+                .collect();
             let history = exported_history(&out).await;
             assert_eq!(history, expected, "{case}");
             assert_eq!(schema_ids_in(&history), 56, "{case}");
@@ -360,9 +441,9 @@ async fn every_generation_records_the_target_schema_and_leaves_the_code_migratio
             );
             let rewrite = &summary.edits.history;
             assert_eq!(rewrite.generation, Some(generation.name), "{case}");
-            assert_eq!(rewrite.recorded, added, "{case}");
+            assert_eq!(rewrite.recorded, recorded, "{case}");
             assert_eq!(added.len(), applied, "{case}");
-            assert_eq!(rewrite.left_to_run, *left_to_run, "{case}");
+            assert_eq!(rewrite.left_to_run, left_to_run, "{case}");
             // Once Jellyfin has run them, its history is the one its own
             // first start on the source leaves: the source's ids and every id
             // a fresh install records.
@@ -391,6 +472,7 @@ async fn a_database_without_a_lock_table_is_rewritten_without_one() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -404,6 +486,88 @@ async fn a_database_without_a_lock_table_is_rewritten_without_one() {
     assert_eq!(lock, []);
 }
 
+/// The text of `statement` without its whitespace, its `IF NOT EXISTS` and
+/// its closing `;`, to compare a `CREATE TABLE` as SQLite stores it with one
+/// as the `.schema` of a real database prints it.
+fn squashed(statement: &str) -> String {
+    statement
+        .replace("IF NOT EXISTS", "")
+        .split_whitespace()
+        .collect::<String>()
+        .trim_end_matches(';')
+        .to_owned()
+}
+
+/// gl-1552: a database Ferrofin created itself has no Jellyfin history. The
+/// export gives it Jellyfin's two bookkeeping tables, as a real Jellyfin
+/// database has them, holding exactly the history a fresh Jellyfin 12.4
+/// install records, each id with its `ProductVersion`, and no lock: Jellyfin's
+/// first start on it runs no migration.
+#[tokio::test]
+async fn a_native_database_gets_exactly_a_fresh_install_s_history() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = scratch.path().join("source");
+    let database = source.join(EXPORTED_DATABASE);
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let mut conn = SqliteConnectOptions::new()
+        .filename(&database)
+        .create_if_missing(true)
+        .connect()
+        .await
+        .unwrap();
+    for statement in [
+        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)",
+        r#"CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL)"#,
+    ] {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+    started(&mut conn).await;
+    sqlx::Connection::close(conn).await.unwrap();
+    let out = scratch.path().join("out");
+
+    let summary = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out, BUILD)
+        .await
+        .unwrap();
+
+    let fresh: Vec<(String, String)> = FRESH_12_4_HISTORY
+        .lines()
+        .map(|line| {
+            let (id, version) = line.split_once('\t').expect("id and version");
+            (id.to_owned(), version.to_owned())
+        })
+        .collect();
+    assert_eq!(exported_history(&out).await, fresh);
+    assert_eq!(exported_locks(&out).await, 0);
+    let rewrite = &summary.edits.history;
+    assert_eq!(rewrite.generation, None);
+    assert_eq!(
+        rewrite.recorded,
+        fresh.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(rewrite.left_to_run, Vec::<&str>::new());
+    // The tables as Jellyfin's own schema has them.
+    let pinned = include_str!("data/jellyfin-12.2-schema.sql");
+    let created: Vec<(String,)> = exported(
+        &out,
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name LIKE '\\_\\_EFMigrations%' ESCAPE '\\'",
+    )
+    .await;
+    assert_eq!(created.len(), 2);
+    for table in ["__EFMigrationsHistory", "__EFMigrationsLock"] {
+        let ours = created
+            .iter()
+            .map(|(sql,)| squashed(sql))
+            .find(|sql| sql.starts_with(&format!("CREATETABLE\"{table}\"")))
+            .unwrap_or_else(|| panic!("no {table} in the export"));
+        let theirs = pinned
+            .split_inclusive(";\n")
+            .map(squashed)
+            .find(|sql| sql.starts_with(&format!("CREATETABLE\"{table}\"")))
+            .unwrap();
+        assert_eq!(ours, theirs, "{table}");
+    }
+}
+
 #[test]
 fn a_schema_id_left_out_below_a_recorded_one_is_a_gap() {
     let history = [
@@ -413,4 +577,147 @@ fn a_schema_id_left_out_below_a_recorded_one_is_a_gap() {
     .map(|id| (id.to_owned(), SCHEMA_PRODUCT_VERSION.to_owned()));
     assert_eq!(schema_gap(&history), Some("20200613202153_AddUsers"));
     assert_eq!(schema_gap(&history[..1]), None);
+}
+
+/// Runs `statements` on the source's database.
+async fn alter(source: &Path, statements: &[&str]) {
+    let mut conn = SqliteConnectOptions::new()
+        .filename(source.join(EXPORTED_DATABASE))
+        .connect()
+        .await
+        .unwrap();
+    for statement in statements {
+        sqlx::query(sqlx::AssertSqlSafe(*statement))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
+    sqlx::Connection::close(conn).await.unwrap();
+}
+
+/// The export of `source` into `out` as [`BUILD`], which must succeed.
+async fn export(source: &Path, out: &Path) -> ferrofin_db::export::ExportSummary {
+    export_data_dir(
+        &SourceDirs::new(source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        out,
+        BUILD,
+    )
+    .await
+    .unwrap()
+}
+
+/// Why exporting `source` was refused.
+async fn refusal(source: &Path, out: &Path) -> String {
+    let error = export_data_dir(
+        &SourceDirs::new(source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        out,
+        BUILD,
+    )
+    .await
+    .unwrap_err();
+    let DbError::ExportRefused { reason } = error else {
+        panic!("not a refusal: {error}");
+    };
+    reason
+}
+
+/// gl-1902: recording a code migration as applied claims its work was done,
+/// and the marker of the boot repair that does it is the proof. A source
+/// without one is refused, naming each routine and marker; a source whose
+/// history already records every routine needs none.
+#[tokio::test]
+async fn a_source_without_the_proof_of_a_recorded_routine_s_work_is_refused() {
+    let adoption = [
+        r#"CREATE TABLE "FerrofinAdoption" ("Generation" TEXT NOT NULL, "AdoptedAt" TEXT NOT NULL, "MembershipImportDone" INTEGER NOT NULL DEFAULT 0)"#,
+        r#"INSERT INTO "FerrofinAdoption" VALUES ('10.11.8', '2026-11-01 00:00:00', 0)"#,
+    ];
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = source(scratch.path(), &every_id_of("10.11.8")).await;
+    alter(
+        &dir,
+        &[r#"DELETE FROM "FerrofinMeta" WHERE "Key" IN ('rating_levels_v122', 'rederive_adopted_versions_v160')"#],
+    )
+    .await;
+    assert_eq!(
+        refusal(&dir, &scratch.path().join("out")).await,
+        "the export marks as done the Jellyfin code migrations whose work Ferrofin already did, but this \
+         database lacks the proof of that work for: MigrateLinkedChildren (rederive_adopted_versions_v160), \
+         MigrateRatingLevels (rating_levels_v122). A Ferrofin \
+         release older than the repair doing it last started on it: start this release on the data directory \
+         once, stop it and export again"
+    );
+
+    // Adopted from 10.11 with the adoption's record: its membership import and
+    // its sweeps are owed too, until done.
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = source(scratch.path(), &every_id_of("10.11.8")).await;
+    alter(&dir, &adoption).await;
+    let reason = refusal(&dir, &scratch.path().join("out")).await;
+    assert!(
+        reason.contains(
+            "for: MigrateLinkedChildren (the adoption's membership import), MigrateLinkedChildren \
+             (missing_item_sweeps_v12). "
+        ),
+        "{reason}"
+    );
+    alter(
+        &dir,
+        &[
+            r#"UPDATE "FerrofinAdoption" SET "MembershipImportDone" = 1"#,
+            r#"INSERT INTO "FerrofinMeta" VALUES ('missing_item_sweeps_v12', '1')"#,
+        ],
+    )
+    .await;
+    let out = scratch.path().join("out-done");
+    export(&dir, &out).await;
+    let history = exported_history(&out).await;
+    for id in recorded_as_applied() {
+        assert!(
+            history.contains(&(id.to_owned(), CODE_PRODUCT_VERSION.to_owned())),
+            "{id}: {history:?}"
+        );
+    }
+
+    // A 12.0 source lacks only MigrateRatingLevels, whose proof it has: the
+    // membership import and the sweeps a record names only for 10.11 are not
+    // asked of its record, done or not.
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = source(scratch.path(), &every_id_of("12.0.0")).await;
+    alter(
+        &dir,
+        &[
+            &delete_markers_but("rating_levels_v122"),
+            adoption[0],
+            r#"INSERT INTO "FerrofinAdoption" VALUES ('12.0.0', '2026-11-01 00:00:00', 0)"#,
+        ],
+    )
+    .await;
+    let out = scratch.path().join("out");
+    let summary = export(&dir, &out).await;
+    assert!(
+        summary
+            .edits
+            .history
+            .recorded
+            .contains(&"20260915120000_MigrateRatingLevels")
+    );
+
+    // A 12.2 source records them all: nothing is recorded for it, so no proof
+    // is asked for, not even of a record naming another release.
+    let scratch = tempfile::tempdir().unwrap();
+    let dir = source(scratch.path(), &every_id_of("12.2.0")).await;
+    alter(
+        &dir,
+        &[
+            &delete_markers_but(""),
+            adoption[0],
+            r#"INSERT INTO "FerrofinAdoption" VALUES ('12.2.0', '2026-11-01 00:00:00', 0)"#,
+        ],
+    )
+    .await;
+    export(&dir, &scratch.path().join("out")).await;
 }

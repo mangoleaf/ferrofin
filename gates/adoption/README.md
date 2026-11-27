@@ -390,7 +390,9 @@ for every user: watched flags, play counts, resume positions, last-played dates,
 favorites must match the original fixture. Hidden alternate versions are checked
 through their detail endpoints. These checks do not sample watch history.
 Fixtures must include both watched videos and videos with resume progress, so an
-empty history cannot make the gate pass.
+empty history cannot make the gate pass, and a played video with no last-played date
+(the row Jellyfin leaves on a video's other versions, a `Played`-only update and an NFO
+`watched` import), so a change that dates, drops or rewrites one fails.
 
 The private watch-history baseline stores hashes of database rows and provider
 keys, plus user/item UUIDs and the playback fields needed for API checks. It has
@@ -607,9 +609,10 @@ Where Ferrofin is written to differ (`DIVERGENCES`, each with its reason): every
 is deleted on both lineages (migration 0044); on 12.x it removes a dangling-owner extra as on 10.11,
 collapses a duplicate path with the ported routine, merges case-only duplicates (the routines Jellyfin
 ran when it upgraded that database), re-spells an owner id in another case and nulls a 32-character
-one (0045), and recomputes every user's normalised name; and on both lineages it deletes the
-`AncestorIds` rows that name a missing item (0044: what the key's cascade would have removed).
-`PrimaryVersionId` is left as written on 12.x, as Jellyfin leaves it; whether Ferrofin should re-spell it (its own lookups of it are byte-exact) is gl-752.
+one (0045), converts a primary-version id as on the 10.11 lineage (0053: Ferrofin's lookups of it are
+byte-exact, and Jellyfin writes it upper-case dashed on its next save of the item), and recomputes
+every user's normalised name; and on both lineages it deletes the `AncestorIds` rows that name a
+missing item (0044: what the key's cascade would have removed).
 
 ### The stale-file sweep
 
@@ -786,10 +789,11 @@ sampling, corrupt image responses and description/rating loss. Bats invokes thes
 Python tests, so CI runs them too. `tests/test_watch_history.py` checks unchanged
 history, changes to each playback field, deleted provider-keyed rows, progress for
 another user, unwatched-to-watched changes, missing API history, hidden versions,
-date/GUID normalization, private baselines, fixtures missing watched/resume data, and
-failure reporting, and that its model of migration 0050's date rewrite matches the
-migration's own statement and leaves Jellyfin's form alone. Its fixtures contain only
-invented IDs and playback data.
+date/GUID normalization, private baselines, fixtures missing watched, resume or
+undated played data, an undated played row given a date, and failure reporting, and
+that its model of migration 0050's date rewrite matches the migration's own statement
+and leaves Jellyfin's form alone. Its fixtures contain only invented IDs and playback
+data.
 `tests/test_table_digests.py` checks a lost row in each listed table, a changed column, a
 lost and an added column, and a case per normaliser rule (each with the unrewritten change
 next to it that must still fail). `tests/test_messy.py` checks each shape's seeder and end-state
@@ -930,7 +934,12 @@ It neither reads nor modifies a personal media server.
 The fixture has eight movie titles (one with two versions, one HDR10, one with two
 audio languages and an attached font, one under a non-ASCII path), one extra, one
 series with two seasons and six episodes, six music tracks across two artists and
-two albums, a book and two photos. One album spans two discs. English subtitle files
+two albums, a book and two photos. One album spans two discs. For the round trip
+(`gates/roundtrip/`, gl-1902) it also has two pairs of movies the builder merges as
+versions through the API, a third copy of the second pair at a smaller size, a movie in
+two parts, a series rated above the child's limit whose season and episodes carry no
+rating of their own, and the adult's playlist of the movie in parts and the movie with
+two versions. English subtitle files
 accompany every movie and episode, every video has chapters, and every movie and
 episode NFO credits two actors. Chapter-image and trickplay extraction run during
 the scan, and the builder runs the keyframe-extraction task, saves display
@@ -964,7 +973,21 @@ Every stage compares against that **source version's Jellyfin responses**:
 initial adoption, restart, a completed scan, and an unchanged second scan. The
 existing database/API metadata, artwork, and watch-history checks also run at
 every stage. Database integrity, expected adoption generation, and repair-free
-restart checks remain in place.
+restart checks remain in place. Three answers differ from the source's post-scan baseline,
+each scoped to the seeded items it concerns:
+
+- A 10.11 source takes the version group's MediaSource ids from the oracle (`FROM_ORACLE`), as
+  every 12.x re-keys a 10.11 alternate version; the real 10.11 to 12.4 upgrade must agree.
+- A 12.0 source takes the two pairs merged as versions from the oracle, in the users' browse
+  lists, the relationships and the subtitles (`MERGED_KEYS`, gl-1954). Jellyfin 12.0's scan did
+  not see a version merged by hand and listed each pair apart; 12.1 on the same database lists one,
+  and `jellyfin-12.1-from-12` must agree with the oracle on those movies.
+- Before the first scan (the adoption and restart stages), a source older than 12.2 shows the
+  child the rated series' unrated season and episodes (`before_first_scan`, gl-1953). Jellyfin
+  12.2's `MigrateRatingLevels`, which Ferrofin's boot runs on such a source, scores each row from
+  its own rating, so they lose the series' score until the scan. That is read from
+  `MigrateRatingLevels.cs` and observed on Ferrofin's adoption; no fixture records Jellyfin's own
+  pre-scan answer. The scan stages hold them hidden again.
 
 The builder refuses to accept an empty scenario: restricted items must actually
 be hidden, the uploaded image must be the chosen image, both users must have
@@ -1030,7 +1053,8 @@ The version/upgrade paths are the ones `run.sh` covers (`VERSIONS` in `synthetic
 fresh installs carry no seeds and are left to `run.sh`.
 Each upgraded Jellyfin completes a scan before supplying its baseline. `--only`
 selects one named fixture; building an upgraded fixture requires its parent to
-have been built. `--port` changes the localhost-only test port (default 18120).
+have been built. Running the matrix on `jellyfin-12.0` (alone or in a full run) also needs
+`jellyfin-12.1-from-12` built, whose baseline guards the merged versions' expectation. `--port` changes the localhost-only test port (default 18120).
 The builder records a recipe hash and refuses to reuse a completed fixture after
 its recipe changes; build into a new directory then. Likewise, a build that fails
 part-way, for example when Jellyfin resets a connection while seeding (seen once under

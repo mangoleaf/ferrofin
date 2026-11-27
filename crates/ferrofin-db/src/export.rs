@@ -16,8 +16,14 @@
 //! - `tree`: the copy of every other file, and the before/after digest;
 //! - `history`: the `__EFMigrationsHistory` the target release must find;
 //! - `classify`: which migrations are schema and which are code migrations;
+//! - `proof`: what proves Ferrofin did the work of a code migration the history
+//!   records as applied;
 //! - `drop_objects`: removing Ferrofin's own tables and indexes from the copy;
+//! - `shapes`: a native database's Jellyfin tables, rebuilt in the shape of
+//!   Jellyfin's (column order, `AUTOINCREMENT`);
 //! - `paths`: the stored paths, rewritten onto the output's layout;
+//! - `earlier_art`: the art earlier builds saved in an item's `{ID}` folder,
+//!   moved into the item's own folder in the output, its rows with it;
 //! - `carried`: what Ferrofin's own tables hold that Jellyfin keeps in files
 //!   (Live TV tuners, guides and timers, LDAP-Auth's uid map), read before
 //!   they are removed;
@@ -25,6 +31,8 @@
 //!   the copy where they may be stale, and those in media libraries;
 //! - `report`: what the removed tables held and what Jellyfin's first start
 //!   changes, for the operator's loss report;
+//! - `counts`: the rows Jellyfin's code migrations change on its first start,
+//!   for the same report;
 //! - `refusal`: the conditions under which an export must not run.
 //!
 //! The database steps are SQLite-only by design: the export takes a SQLite
@@ -44,22 +52,28 @@ pub use classify::{
     CODE_PRODUCT_VERSION, Disposition, JELLYFIN_MIGRATIONS, SCHEMA_PRODUCT_VERSION,
 };
 pub use containers::{ContainerFile, LibraryContainer};
+pub use counts::FirstStartCounts;
 pub use drop_objects::{DroppedObjects, DroppedTable};
+pub use earlier_art::ArtRelocation;
 pub use history::HistoryRewrite;
 pub use layout::{DOCKER, Layout, LeftOut, SourceDirs};
 pub use paths::PathRewrite;
 pub use refusal::Preflight;
-pub use report::{first_start_effects, table_note};
+pub use report::{first_start_effects, recorded_as_applied, table_note};
 
 mod carried;
 mod classify;
 mod containers;
+mod counts;
 mod drop_objects;
+mod earlier_art;
 mod history;
 mod layout;
 mod paths;
+mod proof;
 mod refusal;
 mod report;
+mod shapes;
 mod snapshot;
 mod tree;
 
@@ -176,11 +190,21 @@ pub struct DatabaseEdits {
     pub history: HistoryRewrite,
     /// Ferrofin's own tables and indexes, removed.
     pub dropped: DroppedObjects,
+    /// The Jellyfin tables of a Ferrofin-native database rebuilt in the shape
+    /// of Jellyfin's (its columns in Jellyfin's order, its `AUTOINCREMENT`
+    /// key), rows and all, in name order; none for an adopted database.
+    pub rebuilt: Vec<String>,
     /// The stored paths, rewritten onto the output's layout.
     pub paths: PathRewrite,
     /// What Ferrofin's own tables held that Jellyfin keeps in files, read
     /// before they were removed.
     pub carried: CarriedRows,
+    /// The rows Jellyfin's code migrations change on its first start, for the
+    /// report of an adopted source (on a native one Jellyfin runs none).
+    pub counts: FirstStartCounts,
+    /// The art earlier builds saved in an item's `{ID}` or `{id}` folder,
+    /// moved into the item's own folder in the output, with its rows.
+    pub art: ArtRelocation,
 }
 
 /// The export's changes to its staged copy of the database, in order, on the
@@ -189,12 +213,24 @@ pub struct DatabaseEdits {
 /// INTO` writes the snapshot, so the snapshot holds no free pages from them
 /// and two exports of one source stay equal. Each step is a file of its own; a
 /// step added later goes here, with its field in [`DatabaseEdits`]. The paths
-/// are rewritten onto `layout` from `dirs` and the directories the rows name.
+/// are rewritten onto `layout` from `dirs` and the directories the rows name,
+/// and the art earlier builds saved is moved in `out`, the output the source
+/// is copied into.
 async fn edit_staged(
     conn: &mut SqliteConnection,
     history: Option<&history::SourceHistory>,
+    out: &Path,
     (dirs, layout): (&SourceDirs, &Layout),
 ) -> Result<DatabaseEdits> {
+    let native = history.is_none();
+    if native {
+        // Outside the transaction, where SQLite ignores it: the shapes'
+        // rebuild drops tables that others reference, which would delete
+        // their rows.
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await?;
+    }
     let mut tx = sqlx::Connection::begin(conn).await?;
     let history = history::rewrite(&mut tx, history).await?;
     // Before the drop, which removes the tables it reads.
@@ -202,8 +238,17 @@ async fn edit_staged(
     let edits = DatabaseEdits {
         history,
         dropped: drop_objects::remove(&mut tx).await?,
+        // After the drop, which counts the indexes of Ferrofin's on them.
+        rebuilt: if native {
+            shapes::rebuild(&mut tx).await?
+        } else {
+            Vec::new()
+        },
         paths: paths::rewrite(&mut tx, dirs, layout).await?,
         carried,
+        counts: counts::read(&mut tx).await?,
+        // After the paths' rewrite, which spells them on the layout.
+        art: earlier_art::relocate(&mut tx, out, layout).await?,
     };
     tx.commit().await?;
     Ok(edits)
@@ -225,7 +270,8 @@ async fn edit_staged(
 /// source. Left out are the database files: `database`, the file it links to,
 /// the source's own [`EXPORTED_DATABASE`] (a native database's leftover would
 /// otherwise sit under the snapshot), and the `-wal`, `-shm` and `-journal`
-/// files of each. The snapshot holds what they do. Also left out is a
+/// files of each. The snapshot holds what they do. So are the files of
+/// [`SourceDirs::not_needed_files`], in every tree copied. Also left out is a
 /// `migrations.xml` in the configuration directory (the data directory's own,
 /// or the one copied to the layout's), which Jellyfin would read again: from
 /// one listing migrations it writes history rows, or stops its start. So are
@@ -233,12 +279,20 @@ async fn edit_staged(
 /// `data/playlists` and the `collection.xml` of each `[boxset]` folder in its
 /// `data/collections`, which may hold what Jellyfin last wrote rather than
 /// the database's changes since, and which Jellyfin's metadata refresh would
-/// merge back ([`ExportSummary::container_files`]).
+/// merge back ([`ExportSummary::container_files`]). So is each library's
+/// `options.json` in the data directory's `root/default`, Ferrofin's own file:
+/// the export writes the `options.xml` Jellyfin reads beside it, and a later
+/// adoption by Ferrofin would take the stale copy over that.
 /// The snapshot's `__EFMigrationsHistory` is rewritten ([`HistoryRewrite`]),
 /// what Ferrofin's own tables hold that Jellyfin keeps in files is read
 /// ([`CarriedRows`]) before those tables and Ferrofin's indexes are removed
-/// from it ([`DroppedObjects`]), and its stored paths are rewritten onto the
-/// layout ([`PathRewrite`]).
+/// from it ([`DroppedObjects`]). In a database Ferrofin created itself, the
+/// Jellyfin tables `0001` made in another shape are then rebuilt in
+/// Jellyfin's ([`DatabaseEdits::rebuilt`]), and its stored paths are
+/// rewritten onto the layout ([`PathRewrite`]). The art earlier builds saved
+/// in an item's `{ID}` or `{id}` folder is then moved in the output into the
+/// item's own folder, where Jellyfin keeps it, and its rows follow
+/// ([`ArtRelocation`]).
 ///
 /// What is copied is digested while it is copied and again once the database
 /// snapshot is written, and so are the files SQLite keeps beside the
@@ -256,14 +310,17 @@ async fn edit_staged(
 /// reached twice; [`DbError::Backup`] or [`DbError::Sqlx`] when the database
 /// snapshot fails; [`DbError::ExportRefused`] when the copy of the database the
 /// snapshot stages fails its checks (a log it cannot fold in whole, a damaged
-/// file, `integrity_check`, `foreign_key_check`, not Ferrofin's, a Jellyfin
-/// history from no release Ferrofin adopts); and
+/// file, `integrity_check`, `foreign_key_check`, not Ferrofin's, not last
+/// started by `build`, the exporter's own version, at its last migration, a
+/// Jellyfin history from no release Ferrofin adopts, no proof of the work of
+/// a code migration the history records as applied); and
 /// [`DbError::ExportSourceChanged`] when the source changed during the export.
 pub async fn export_data_dir(
     dirs: &SourceDirs,
     layout: &Layout,
     database: &Path,
     out: &Path,
+    build: &str,
 ) -> Result<ExportSummary> {
     let source = &dirs.program_data;
     let (db, from, source_dirs, into) = (
@@ -294,6 +351,7 @@ pub async fn export_data_dir(
         .collect::<Vec<_>>();
     skipped.push(source.join(LEGACY_MIGRATIONS_FILE));
     skipped.push(dirs.config.join(LEGACY_MIGRATIONS_NAME));
+    skipped.extend(dirs.not_needed_files.iter().cloned());
     let (to, files, copied_trees, left_out) = (
         out.to_owned(),
         companions.clone(),
@@ -315,8 +373,18 @@ pub async fn export_data_dir(
     .await?;
     let exported = out.join(EXPORTED_DATABASE);
     let (edits, library_containers) =
-        snapshot::snapshot_database(&resolved, &exported, (dirs, layout)).await?;
+        snapshot::snapshot_database(&resolved, &exported, out, (dirs, layout), build).await?;
     let mut dirs_copied = copied.dirs;
+    // The folders the art's move made take the mode and time of the folder
+    // the art came from; those it left empty are no longer there to finish.
+    for (made, like) in &edits.art.made {
+        let like = out.join(like);
+        let from = dirs_copied.iter().find(|(to, _)| *to == like);
+        if let Some(from) = from.map(|(_, from)| from.clone()) {
+            dirs_copied.push((out.join(made), from));
+        }
+    }
+    dirs_copied.retain(|(to, _)| !edits.art.removed.iter().any(|dir| *to == out.join(dir)));
     // A source with no `data/` (a native one) has none to take the mode from:
     // the snapshot's directory takes the source's own.
     let data = exported.parent().map(Path::to_owned);

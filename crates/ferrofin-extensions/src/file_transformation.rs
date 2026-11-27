@@ -29,13 +29,12 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferrofin_core::event_manager::FerrofinEventManager;
-use ferrofin_core::plugin_manager::PLUGIN_CONFIGURATION_CHANGED;
-use ferrofin_core::{PluginConfigPage, ScheduledTask};
+use ferrofin_traits::events::{EventSubscriber, PLUGIN_CONFIGURATION_CHANGED};
 use ferrofin_traits::plugins::{
-    FileTransformationService, FileTransformer, PluginDescriptor, PluginManager,
+    FileTransformationService, FileTransformer, PluginConfigPage, PluginDescriptor, PluginManager,
 };
 use ferrofin_traits::system::LocalApiAccess;
+use ferrofin_traits::tasks::ScheduledTask;
 use ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -45,6 +44,11 @@ use crate::{Extension, ExtensionContext};
 /// The File Transformation plugin's stable id — the **upstream plugin's GUID**
 /// (Intro Skipper detects the plugin's presence by this exact id).
 pub const EXTENSION_ID: Uuid = Uuid::from_u128(0x5e87_cc92_571a_4d8d_8d98_d2d4_147f_9f90);
+
+/// The File Transformation plugin's settings file in Jellyfin's `plugins/configurations`, named after
+/// its assembly (`BasePlugin<T>.ConfigurationFileName`), which `/Plugins`
+/// reports and adoption imports.
+pub const CONFIGURATION_FILE_NAME: &str = "Jellyfin.Plugin.FileTransformation.xml";
 
 /// The Intro Skipper's id, under which its skip-button transformer registers.
 const INTRO_SKIPPER_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
@@ -70,7 +74,7 @@ impl Extension for FileTransformationExtension {
             enabled: true,
             has_image: false,
             can_uninstall: false,
-            configuration_file_name: None,
+            configuration_file_name: Some(CONFIGURATION_FILE_NAME.to_owned()),
         }
     }
 
@@ -89,6 +93,7 @@ impl Extension for FileTransformationExtension {
             bytes: include_bytes!(concat!(env!("OUT_DIR"), "/filetransformation/config.html"))
                 .to_vec(),
             enable_in_main_menu: true,
+            content_type: None,
         }]
     }
 
@@ -847,7 +852,7 @@ pub async fn register_skip_button_transformer(
 /// what it saved applies from the next `/web` request. Any plugin's save
 /// does: saves are rare, and the next request reads the file once. Called
 /// once by the composition root.
-pub fn subscribe(events: &FerrofinEventManager, service: &Arc<WebFileTransformationService>) {
+pub fn subscribe(events: &dyn EventSubscriber, service: &Arc<WebFileTransformationService>) {
     let service = Arc::clone(service);
     events.subscribe(
         PLUGIN_CONFIGURATION_CHANGED,

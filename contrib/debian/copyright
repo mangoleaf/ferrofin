@@ -11,10 +11,12 @@ Comment: Ferrofin is derived from the Jellyfin media server
  reference. It is an independent project, not affiliated with, endorsed by
  or supported by the Jellyfin project.
  .
- /usr/bin/ferrofin-server statically links third-party Rust crates and C
- libraries, which keep their own permissive licenses (among them MIT,
- Apache-2.0, BSD and ISC); SQLite is public domain and jemalloc is
- BSD-2-Clause.
+ ferrofin-server statically links third-party Rust crates and C libraries
+ (AWS-LC, jemalloc, libjpeg-turbo, libwebp and SQLite), which keep their own
+ licenses. Their copyright notices and license texts are in
+ THIRD-PARTY-NOTICES.txt beside this file, generated from Cargo.lock with
+ cargo-about (about.toml in the source). This software is based in part on
+ the work of the Independent JPEG Group.
 
 Files: crates/ferrofin-extensions/assets/introskipper/*
 Copyright: Intro Skipper contributors

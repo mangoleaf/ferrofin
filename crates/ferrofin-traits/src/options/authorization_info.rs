@@ -55,7 +55,7 @@ pub struct AuthorizationInfo {
     /// every request. Ferrofin's handlers receive the resolved
     /// [`AuthorizationInfo`] instead of the request, so the address rides along
     /// here. Without it `SessionInfo.RemoteEndPoint` is blank and every
-    /// activity-log `ShortOverview` ("IP address: …") built from it is null.
+    /// activity-log `ShortOverview` built from it reads a bare "IP address: ".
     pub remote_endpoint: Option<String>,
 }
 

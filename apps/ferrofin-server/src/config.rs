@@ -531,8 +531,8 @@ pub struct Config {
     /// original file.
     pub image_resize_budget_mb: u32,
 
-    /// The largest remote image downloaded, and the largest metadata provider
-    /// response, in MiB. Resolved
+    /// The largest remote image downloaded, the largest metadata provider
+    /// response, and the largest subtitle read from a URL, in MiB. Resolved
     /// `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` env > `image_download_max_mb` in
     /// `config.toml` > 64, clamped to [`RequestLimits::DOWNLOAD_MAX_MB`] with a
     /// warning. A larger one is refused, and the read stops at the limit.
@@ -798,8 +798,9 @@ pub struct Config {
     /// `config.toml` > default; must be within [`CACHE_TTL_RANGE_SECS`].
     pub row_cache_ttl_secs: Option<u32>,
 
-    /// How many items generate trickplay at once (each one's widths in turn,
-    /// an ffmpeg frame extraction plus tile packing per width). A library scan
+    /// How many items generate trickplay at once (each one's widths' frames
+    /// from one ffmpeg run, or one per width when trickplay uses a VAAPI or QSV
+    /// GPU, then each width's tiles packed). A library scan
     /// runs several; the scheduled task runs one but shares the cap. `None` =
     /// `auto`: as many as the shared image-encoding pool allows
     /// (`ParallelImageEncodingLimit`, else the usable cores).

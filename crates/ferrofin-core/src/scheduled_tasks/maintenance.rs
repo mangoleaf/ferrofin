@@ -15,7 +15,9 @@
 //! [`TaskProgress`]: the file sweeps check
 //! [`TaskProgress::stop_requested`] before each file, as upstream's
 //! `ThrowIfCancellationRequested` does, since a sweep on the blocking pool
-//! outlives a dropped body.
+//! outlives a dropped body. Optimize database and Clean up user data check it
+//! before their first statement, and Migrate Trickplay Image Location before
+//! each item, where upstream's token is first observed (gl-2004).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -500,6 +502,12 @@ impl ScheduledTask for DeleteTranscodeFileTask {
 /// did: the dashboard's "(Failed)" and Alerts entry are an administrator's
 /// only sign that the database is not being compacted (a full disk, the
 /// write lock held past the busy timeout). No client acts on the status.
+///
+/// Jellyfin bug not ported: the same `catch` records a run stopped before its
+/// optimisation `Completed`; Ferrofin records it `Cancelled` (the
+/// `DELETE /ScheduledTasks/Running/{taskId}` parity row). The run checks its
+/// stop at its first statement only; upstream's token also reaches each later
+/// statement (gl-2006).
 pub struct OptimizeDatabaseTask {
     db: Database,
     sessions: Arc<dyn SessionManager>,
@@ -583,6 +591,13 @@ impl ScheduledTask for OptimizeDatabaseTask {
             tracing::info!("skipping database optimization: a database snapshot is running");
             return Ok(());
         };
+        // `RunScheduledOptimisation(cancellationToken)` throws for a run already
+        // stopped. Upstream's `catch (Exception)` then logs it as an error and
+        // records the run Completed; here it is Cancelled (gl-2004). The
+        // statements below take no token (gl-2006).
+        if progress.stop_requested() {
+            return Ok(());
+        }
         // Playback-decision rows hold per-user, per-device history: they expire
         // with the activity log (unset keeps both), before the vacuum reclaims
         // their pages. Clean Activity Log has no default trigger; this task does.
@@ -671,6 +686,12 @@ impl ScheduledTask for CleanupUserDataTask {
         true
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // Upstream's first call that observes the token is
+        // `ExecuteDeleteAsync(cancellationToken)`, after two counts it only
+        // logs: a run already stopped deletes nothing (gl-2004).
+        if progress.stop_requested() {
+            return Ok(());
+        }
         let detached: i64 =
             sqlx::query_scalar(r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1"#)
                 .bind(PLACEHOLDER_ID)
@@ -747,12 +768,16 @@ impl ScheduledTask for MoveTrickplayImagesTask {
                 .collect();
             seen.dedup();
             for item_id in seen {
+                // `ThrowIfCancellationRequested()` before each item (gl-2004).
+                if progress.stop_requested() {
+                    return Ok(());
+                }
                 if let Err(e) = self
                     .trickplay
                     .move_generated_library_trickplay_data(item_id)
                     .await
                 {
-                    tracing::warn!(item = %item_id, error = %e, "error moving trickplay files");
+                    tracing::warn!(%item_id, error = %e, "error moving trickplay files");
                 } else {
                     moved += 1;
                 }
@@ -1335,6 +1360,27 @@ mod tests {
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
     }
 
+    /// gl-2004: a run stopped before the optimisation runs none of it, not
+    /// even the prune, and is recorded Cancelled, where upstream's `catch`
+    /// records it Completed.
+    #[tokio::test]
+    async fn a_stopped_optimisation_runs_nothing() {
+        let db = test_db().await;
+        seed_old_session(&db).await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+            retention_days(Some(30)),
+        );
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+        assert!(progress.reported().is_none(), "nothing reported");
+        assert!(progress.was_stopped(), "recorded Cancelled");
+        assert_eq!(test_rows::remaining(&db).await, ["old"], "nor the prune");
+    }
+
     /// Ferrofin's plan pins assume the planner has no statistics, so the
     /// run takes none, over populated, indexed tables (Jellyfin 12.x runs a
     /// full `ANALYZE` here).
@@ -1612,12 +1658,12 @@ mod tests {
                 db.clone(),
                 Arc::new(crate::ItemTypeLookup::new()),
             )),
-            Arc::new(crate::FerrofinMediaStreamRepository::new(db)),
+            Arc::new(crate::FerrofinMediaStreamRepository::new(db.clone())),
             Arc::new(NoExtract),
             Arc::new(ferrofin_drawing::ImageCrateEncoder::new()),
         ));
 
-        let task = MoveTrickplayImagesTask::new(trickplay);
+        let task = MoveTrickplayImagesTask::new(trickplay.clone());
         assert_eq!(task.key(), "MoveTrickplayImages");
         assert_eq!(task.name(), "TaskMoveTrickplayImages");
         let default_triggers = task.default_triggers();
@@ -1627,9 +1673,46 @@ mod tests {
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("run");
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+
+        // gl-2004: with a stored row, a stopped run moves nothing: it stops
+        // before the item, and reports no page.
+        let item = uuid::Uuid::from_u128(0x7A);
+        crate::test_support::seed_item(&db, item, ferrofin_model::data::BaseItemKind::Movie).await;
+        ferrofin_traits::trickplay::TrickplayManager::save_trickplay_info(
+            trickplay.as_ref(),
+            &ferrofin_db::entities::playback::TrickplayInfoEntity {
+                item_id: ferrofin_db::store::guid_to_db(item),
+                width: 320,
+                bandwidth: 0,
+                height: 180,
+                interval: 10_000,
+                thumbnail_count: 1,
+                tile_height: 10,
+                tile_width: 10,
+            },
+        )
+        .await
+        .expect("trickplay row");
+        let stopped = TaskProgress::default();
+        stopped.cancel_token().cancel();
+        task.execute(&stopped).await.expect("stopped run");
+        assert!(stopped.reported().is_none(), "no page reported");
+        assert!(stopped.was_stopped(), "recorded Cancelled");
     }
 
     // -- User data cleanup -------------------------------------------------
+
+    /// gl-2004: a run stopped before it starts purges nothing and is
+    /// recorded Cancelled.
+    #[tokio::test]
+    async fn a_stopped_user_data_cleanup_does_nothing() {
+        let task = CleanupUserDataTask::new(test_db().await);
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+        assert!(progress.reported().is_none(), "nothing reported");
+        assert!(progress.was_stopped(), "recorded Cancelled");
+    }
 
     #[tokio::test]
     async fn user_data_cleanup_removes_expired_detached_rows() {

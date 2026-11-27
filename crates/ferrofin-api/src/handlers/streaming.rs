@@ -344,9 +344,9 @@ async fn serve_remote_static(
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     // `NamedClient.Default` always names the server; a source's required agent
     // replaces it per request (reqwest fills only headers a request leaves unset).
+    // A redirect it does not follow (https to http) is relayed as its 3xx.
     let client = CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent(ferrofin_health::USER_AGENT)
+        ferrofin_util::http_client::builder(ferrofin_health::USER_AGENT)
             .build()
             .unwrap_or_default()
     });
@@ -940,6 +940,65 @@ mod remote_static_tests {
         for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
             assert!(!text.contains(secret), "{text}");
         }
+    }
+
+    /// `NamedClient.Default`'s headers go to the origin: the server's
+    /// `User-Agent` and the `Accept` list.
+    #[tokio::test]
+    async fn the_origin_is_asked_with_the_default_client_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/media.mkv", listener.local_addr().expect("addr"));
+        let head = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).await.expect("read");
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase()
+        });
+        serve_remote_static(&url, None, Request::new(Body::empty()), GUARD)
+            .await
+            .expect("relayed");
+
+        let head = head.await.expect("head");
+        let agent = format!(
+            "\r\nuser-agent: {}\r\n",
+            ferrofin_health::USER_AGENT.to_ascii_lowercase()
+        );
+        assert!(head.contains(&agent), "{head}");
+        assert!(
+            head.contains(
+                "\r\naccept: application/json; q=1.0, application/xml; q=0.9, */*; q=0.8\r\n"
+            ),
+            "{head}"
+        );
+    }
+
+    /// A redirect the client does not follow (https to http, or past the
+    /// limit) is relayed with its status, as `GetStaticRemoteStreamResult`
+    /// copies `response.StatusCode`, not answered as a failure.
+    #[tokio::test]
+    async fn a_redirect_the_client_does_not_follow_is_relayed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/media.mkv", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 302 Found\r\nLocation: /media.mkv\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let response = serve_remote_static(&url, None, Request::new(Body::empty()), GUARD)
+            .await
+            .expect("relayed");
+        assert_eq!(response.status(), axum::http::StatusCode::FOUND);
     }
 
     /// The timeout stops at the headers (`ResponseHeadersRead`): a body that

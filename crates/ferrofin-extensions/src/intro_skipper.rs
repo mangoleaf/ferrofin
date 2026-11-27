@@ -60,6 +60,11 @@ pub use automatic::Runtime;
 /// client integrations address the plugin by that id.
 pub const EXTENSION_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
 
+/// The Intro Skipper's settings file in Jellyfin's `plugins/configurations`, named after
+/// its assembly (`BasePlugin<T>.ConfigurationFileName`), which `/Plugins`
+/// reports and adoption imports.
+pub const CONFIGURATION_FILE_NAME: &str = "IntroSkipper.xml";
+
 /// The Intro Skipper extension.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct IntroSkipperExtension;
@@ -89,7 +94,7 @@ impl Extension for IntroSkipperExtension {
             enabled: true,
             has_image: false,
             can_uninstall: false,
-            configuration_file_name: None,
+            configuration_file_name: Some(CONFIGURATION_FILE_NAME.to_owned()),
         }
     }
 
@@ -109,18 +114,21 @@ impl Extension for IntroSkipperExtension {
                 bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/configPage.html"))
                     .to_vec(),
                 enable_in_main_menu: true,
+                content_type: None,
             },
             PluginConfigPage {
                 name: "introskipper.js".to_owned(),
                 bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/introskipper.js"))
                     .to_vec(),
                 enable_in_main_menu: false,
+                content_type: None,
             },
             PluginConfigPage {
                 name: "introskipper.css".to_owned(),
                 bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/introskipper.css"))
                     .to_vec(),
                 enable_in_main_menu: false,
+                content_type: None,
             },
         ]
     }
@@ -241,11 +249,19 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
         };
         // Background, not bound to the request, as upstream's `Task.Run`.
         let task = self.clone();
-        tokio::spawn(async move {
-            let _release = lease;
-            tracing::info!(%season_id, "intro skipper: rescanning a season");
-            task.rescan_season(season_id).await;
-        });
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                let _release = lease;
+                tracing::info!("intro skipper: rescanning a season");
+                task.rescan_season(season_id).await;
+            },
+            tracing::info_span!(
+                parent: None,
+                "intro_skipper_rescan",
+                item_id = %season_id,
+                trigger = "api"
+            ),
+        ));
         Ok(true)
     }
 
@@ -2306,6 +2322,38 @@ mod tests {
             "{modes:?}"
         );
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+    }
+
+    /// The rescan logs in an `intro_skipper_rescan` root span naming the
+    /// season, not in the request's (LOGGING.md, rule 4).
+    #[tokio::test]
+    async fn a_rescan_logs_in_a_root_span_naming_the_season() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let logs = crate::tests::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let started =
+            tracing::Instrument::instrument(h.task.rescan(SEASON), tracing::info_span!("request"))
+                .await;
+        assert!(started.expect("started"));
+        for _ in 0..200 {
+            if !h.task.is_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|line| line.contains("rescanning a season"))
+            .unwrap_or_else(|| panic!("no rescan line:\n{text}"));
+        let span = format!(" intro_skipper_rescan{{item_id={SEASON} trigger=\"api\"}}: ");
+        assert!(line.contains(&span), "{line}");
+        assert!(!line.contains("request"), "not the request's child: {line}");
     }
 
     /// `QueueManager.GetMediaItems`: a disabled library is skipped, an

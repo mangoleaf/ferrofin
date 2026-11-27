@@ -440,6 +440,188 @@ async fn a_failed_tmdb_find_is_asked_again_by_the_next_scan_not_searched_by_name
     assert!(refreshed(&db, &path).await);
 }
 
+/// The series metadata options with TMDb's image provider off: it asks
+/// `/find` too, and its failure would keep the refresh unstamped on its own.
+fn series_without_tmdb_images() -> Vec<ferrofin_model::configuration::MetadataOptions> {
+    vec![ferrofin_model::configuration::MetadataOptions {
+        item_type: Some("Series".to_owned()),
+        disabled_image_fetchers: vec!["TheMovieDb".to_owned()],
+        ..Default::default()
+    }]
+}
+
+/// `/find` answers with no title, by either id; anything else as
+/// [`tmdb_series`].
+fn tmdb_series_find_empty(line: &str) -> (&'static str, String) {
+    if line.contains("/find/") {
+        (
+            "200 OK",
+            r#"{"movie_results": [], "tv_results": []}"#.to_owned(),
+        )
+    } else {
+        tmdb_series(line)
+    }
+}
+
+/// A series whose IMDb id TMDb's `/find` answers with no title goes on to the
+/// TVDB `/find`, then to the name search, and the refresh is stamped: an
+/// empty answer is not a failure (`TmdbSeriesProvider.cs:178-213`).
+#[tokio::test]
+async fn a_series_find_answered_empty_goes_on_to_the_tvdb_find_and_the_search() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("tv");
+    let folder = "Show 2026 [imdbid-tt0000404] [tvdbid-77]";
+    touch(&media, &format!("{folder}/Season 1/Show 2026 S01E01.mkv"));
+    let (db, scanner) = library(tmp.path(), &media, CollectionTypeOptions::tvshows).await;
+    let (base, requests) = spawn(tmdb_series_find_empty);
+
+    scanner
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("metadata"),
+        )
+        .with_metadata_options(series_without_tmdb_images)
+        .scan_all()
+        .await
+        .expect("scan");
+
+    let asked = requests.lock().expect("log").clone();
+    for path in ["/find/tt0000404", "/find/77", "/search/tv"] {
+        assert!(asked.iter().any(|l| l.contains(path)), "{path}: {asked:?}");
+    }
+    let path = media.join(folder);
+    assert_eq!(
+        ids_of(&db, &path).await,
+        ["Imdb=tt0000404", "Tmdb=30", "Tvdb=77"]
+    );
+    assert!(refreshed(&db, &path).await, "no provider failed");
+}
+
+/// Whether [`tmdb_series_find_recovers`]' `/find` answers yet.
+static SERIES_FIND_ANSWERS: AtomicBool = AtomicBool::new(false);
+
+/// `/find` fails (500) until [`SERIES_FIND_ANSWERS`] is set, then resolves
+/// the IMDb id to `/tv/31`, a show the name search (`/tv/30`) would not pick.
+fn tmdb_series_find_recovers(line: &str) -> (&'static str, String) {
+    if line.contains("/tv/31?") {
+        (
+            "200 OK",
+            r#"{"id": 31, "name": "Show", "overview": "From /find."}"#.to_owned(),
+        )
+    } else if !line.contains("/find/") {
+        tmdb_series(line)
+    } else if SERIES_FIND_ANSWERS.load(Ordering::SeqCst) {
+        (
+            "200 OK",
+            r#"{"movie_results": [], "tv_results": [{"id": 31}]}"#.to_owned(),
+        )
+    } else {
+        ("500 Internal Server Error", "{}".to_owned())
+    }
+}
+
+/// A series whose IMDb `/find` request fails (a 500 through every retry)
+/// asks neither the TVDB `/find` nor the name search, so it keeps no guessed
+/// `Tmdb` id; the refresh is not stamped, and the next scan asks `/find`
+/// again and stores the id it resolves. Upstream's `FindByExternalIdAsync`
+/// throws out of `TmdbSeriesProvider.GetMetadata` before the TVDB `/find` and
+/// `SearchSeriesAsync` (`TmdbSeriesProvider.cs:178-213`);
+/// `ExecuteRemoteProviders` counts it (`MetadataService.cs:1017-1021`).
+#[tokio::test]
+async fn a_failed_tmdb_find_leaves_a_series_unmatched_until_the_next_scan() {
+    // Every retry of the 500 is still sent; the limiter's own suite tests
+    // the backoff between them.
+    ferrofin_providers::rate_limit::test_support::skip_backoff();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("tv");
+    let folder = "Show 2026 [imdbid-tt0000500] [tvdbid-77]";
+    touch(&media, &format!("{folder}/Season 1/Show 2026 S01E01.mkv"));
+    let (db, scanner) = library(tmp.path(), &media, CollectionTypeOptions::tvshows).await;
+    let (base, requests) = spawn(tmdb_series_find_recovers);
+    let scanner = scanner
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("metadata"),
+        )
+        .with_metadata_options(series_without_tmdb_images);
+    let path = media.join(folder);
+
+    scanner.scan_all().await.expect("scan");
+    let asked = std::mem::take(&mut *requests.lock().expect("log"));
+    assert!(
+        asked.iter().any(|l| l.contains("/find/tt0000500")),
+        "{asked:?}"
+    );
+    assert!(
+        asked
+            .iter()
+            .all(|l| !l.contains("/find/77") && !l.contains("/search/")),
+        "{asked:?}"
+    );
+    assert_eq!(ids_of(&db, &path).await, ["Imdb=tt0000500", "Tvdb=77"]);
+    assert!(
+        !refreshed(&db, &path).await,
+        "the failure leaves it unstamped"
+    );
+
+    SERIES_FIND_ANSWERS.store(true, Ordering::SeqCst);
+    scanner.scan_all().await.expect("second scan");
+    let asked = requests.lock().expect("log").clone();
+    assert!(
+        asked.iter().any(|l| l.contains("/find/tt0000500")),
+        "{asked:?}"
+    );
+    assert!(asked.iter().all(|l| !l.contains("/search/")), "{asked:?}");
+    assert_eq!(
+        ids_of(&db, &path).await,
+        ["Imdb=tt0000500", "Tmdb=31", "Tvdb=77"]
+    );
+    assert!(refreshed(&db, &path).await);
+}
+
+/// `/find` fails (500); anything else as [`tmdb_series`].
+fn tmdb_series_find_fails(line: &str) -> (&'static str, String) {
+    if line.contains("/find/") {
+        ("500 Internal Server Error", "{}".to_owned())
+    } else {
+        tmdb_series(line)
+    }
+}
+
+/// A series with only a TVDB id whose `/find` request fails is not searched
+/// by name either, and is left unstamped (`FindByExternalIdAsync` throws out
+/// of `TmdbSeriesProvider.GetMetadata` there too).
+#[tokio::test]
+async fn a_failed_tvdb_find_leaves_a_series_unsearched() {
+    ferrofin_providers::rate_limit::test_support::skip_backoff();
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("tv");
+    let folder = "Show 2026 [tvdbid-77]";
+    touch(&media, &format!("{folder}/Season 1/Show 2026 S01E01.mkv"));
+    let (db, scanner) = library(tmp.path(), &media, CollectionTypeOptions::tvshows).await;
+    let (base, requests) = spawn(tmdb_series_find_fails);
+
+    scanner
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("metadata"),
+        )
+        .with_metadata_options(series_without_tmdb_images)
+        .scan_all()
+        .await
+        .expect("scan");
+
+    let asked = requests.lock().expect("log").clone();
+    assert!(asked.iter().any(|l| l.contains("/find/77")), "{asked:?}");
+    assert!(asked.iter().all(|l| !l.contains("/search/")), "{asked:?}");
+    let path = media.join(folder);
+    assert_eq!(ids_of(&db, &path).await, ["Tvdb=77"]);
+    assert!(
+        !refreshed(&db, &path).await,
+        "the failure leaves it unstamped"
+    );
+}
+
 /// OMDb's exact-title lookup answers only `t=Ocean's Eleven&y=2001`.
 fn omdb(line: &str) -> (&'static str, String) {
     let Some(target) = line.split(' ').nth(1) else {

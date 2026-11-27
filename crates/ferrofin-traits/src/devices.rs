@@ -81,7 +81,7 @@ pub trait DeviceManager: Send + Sync {
         query: &DeviceQuery,
     ) -> Result<QueryResult<DeviceEntity>, ServiceError>;
 
-    /// Gets the device info DTOs visible to a user (or all when `None`).
+    /// Gets the device info DTOs visible to a user (all when `None` or the nil id).
     async fn get_devices_for_user(
         &self,
         user_id: Option<Uuid>,

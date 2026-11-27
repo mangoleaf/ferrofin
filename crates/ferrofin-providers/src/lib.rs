@@ -49,6 +49,7 @@ pub mod rate_limit;
 pub mod refresh_plan;
 pub mod remote_images;
 pub mod season;
+pub mod season_episodes;
 pub mod similarity;
 pub mod studios;
 #[cfg(test)]
@@ -75,7 +76,7 @@ pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
 pub use image_download::{
     ArtworkDownload, ArtworkDownloadFailure, DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
-    IMAGE_NEGATIVE_CACHE_TTL_SECS, sniff_image_ext,
+    IMAGE_NEGATIVE_CACHE_TTL_SECS, download_artwork, sniff_image_ext,
 };
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{
@@ -83,9 +84,7 @@ pub use musicbrainz::{
     ReleaseArtistCredit, ReleaseHit,
 };
 pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit, OmdbSearchKey};
-pub use similarity::{
-    ListenBrainzSimilarArtistProvider, TMDB_SIMILAR_CACHE_DAYS, TmdbSimilarProvider,
-};
+pub use similarity::{ListenBrainzSimilarArtistProvider, TmdbSimilarProvider};
 pub use studios::StudiosClient;
 pub use tmdb::{
     EpisodeDetails, RemoteImage, SeasonDetails, TmdbClient, TmdbCollection, TmdbCollectionHit,
