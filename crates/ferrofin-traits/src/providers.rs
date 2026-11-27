@@ -286,6 +286,11 @@ pub trait ProviderManager: Send + Sync {
     /// refresh's save carries an edit made while it ran. Ferrofin loads a row
     /// per caller instead. A manager that runs no refresh has nothing to
     /// exclude, so the default holds a lock no one else shares.
+    ///
+    /// A delete (`LibraryManager::delete_item`) holds it too, from before it
+    /// reads the row until the delete is done: a refresh's save inserts a row
+    /// that is gone, so one that loaded the row first would bring the
+    /// deleted item back. Upstream has that window; Ferrofin closes it.
     async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         let _ = item_id;
         std::sync::Arc::new(tokio::sync::Mutex::new(()))

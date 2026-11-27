@@ -5357,12 +5357,18 @@ impl Drop for WorkerGuard {
 impl LocalProviderManager {
     /// `StartProcessingRefreshQueue`: refreshes one item at a time, highest
     /// priority first, until the queue is empty. A failed refresh is logged and
-    /// the queue keeps draining.
+    /// the queue keeps draining; an item deleted since it was queued is passed
+    /// over, as upstream's `if (item is null) continue;`.
     async fn drain_refresh_queue(&self) {
         let mut worker = WorkerGuard(Some(Arc::clone(&self.refresh_queue)));
         while let Some((item_id, options)) = worker.next_refresh() {
-            if let Err(err) = self.refresh_full_item(item_id, &options).await {
-                tracing::warn!(%item_id, %err, "queued metadata refresh failed");
+            match self.refresh_full_item(item_id, &options).await {
+                Ok(()) => {}
+                // `refresh_item`'s only `NotFound` is the item's own row.
+                Err(ServiceError::NotFound(_)) => {
+                    tracing::debug!(%item_id, "queued metadata refresh skipped: the item is gone");
+                }
+                Err(err) => tracing::warn!(%item_id, %err, "queued metadata refresh failed"),
             }
         }
     }
@@ -10519,7 +10525,7 @@ mod tests {
     #[tokio::test]
     async fn queue_refresh_swallows_refresh_errors() {
         // The item is missing → the spawned refresh errors NotFound; the enqueue
-        // still reports Ok and the error is only logged.
+        // still reports Ok and the refresh is passed over.
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let items = Arc::new(FakeItems {
             rows: HashMap::new(),
@@ -10537,6 +10543,67 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("background refresh attempted the lookup");
+    }
+
+    /// `StartProcessingRefreshQueue` passes over an item deleted since it was
+    /// queued (`if (item is null) continue;`) without a warning, as deleting a
+    /// collection right after creating it does to its queued refresh. A
+    /// refresh that fails for another reason still warns.
+    #[tokio::test]
+    async fn the_queue_passes_over_an_item_deleted_since_it_was_queued() {
+        use crate::log_capture::{LogBuffer, init_log_capture};
+        use tracing::instrument::WithSubscriber as _;
+        init_log_capture();
+        let gone = Uuid::from_u128(0x1577);
+        let failing = Uuid::from_u128(0x1578);
+        let mut stored = row("TV.Season", "Pathless");
+        stored.id = failing.to_string();
+        // Refreshed already, so its Default refresh fetches nothing remote.
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(failing, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::new(RecordingStore::default()), std::env::temp_dir())
+            .with_rating_scorer(Arc::new(FailingScores));
+        for id in [gone, failing] {
+            mgr.refresh_queue.lock().unwrap().push(
+                id,
+                MetadataRefreshOptions::default(),
+                RefreshPriority::High,
+            );
+        }
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(logs.clone())
+            .finish();
+        mgr.drain_refresh_queue().with_subscriber(subscriber).await;
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let lines_for = |id: Uuid| {
+            logs.lines()
+                .filter(|line| {
+                    line.contains("queued metadata refresh") && line.contains(&id.to_string())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            matches!(&lines_for(gone)[..], [only] if only.contains("DEBUG")
+                && only.contains("skipped: the item is gone")),
+            "{logs}"
+        );
+        assert!(
+            matches!(&lines_for(failing)[..], [only] if only.contains("WARN")
+                && only.contains("queued metadata refresh failed")),
+            "{logs}"
+        );
     }
 
     #[tokio::test]
