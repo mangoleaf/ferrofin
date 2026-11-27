@@ -954,6 +954,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// shared by direct play, the download and file routes, the HLS segments and
 /// a graphical subtitle's file, most of whose operations have no row of their
 /// own yet.
+/// `escape-charsets` is which 7-bit escape encodings a text subtitle sidecar
+/// or a playlist file is read in, which the subtitle stream operations and the
+/// playlist scan share.
 /// `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
@@ -1004,6 +1007,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "access-filtering",
     "images",
     "static-file-ranges",
+    "escape-charsets",
     "paging-sort",
     "websocket-streams",
     "scan-failure-isolation",
@@ -2794,6 +2798,45 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              a full metadata refresh keeps a downloaded Primary where upstream keeps the \
              copy, and Replace all images keeps the copy where upstream keeps the \
              download. Fix path: gl-1909.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "escape-charsets",
+        upstream_file: "MediaBrowser.MediaEncoding/Subtitles/SubtitleEncoder.cs",
+        upstream_method: "GetSubtitleStream",
+        ferrofin: "Which 7-bit escape encodings a text subtitle sidecar and a playlist file \
+                   are read in, and how (gl-1657). ferrofin-util escape_charset.rs detect \
+                   ports UTF.Unknown 2.7.0, the version Jellyfin 12.4 pins: \
+                   CharsetDetector.Feed and FindInputState (1024-byte chunks, a high byte but \
+                   0xA0 dropping the escape prober, an ESC or a { after a ~ starting it) and \
+                   EscCharsetProber over the HZ_GB_2312_SMModel, Iso_2022_JP_SMModel and \
+                   Iso_2022_KR_SMModel tables, copied verbatim, the first machine to reach \
+                   ITSME naming the charset. EscapeCharset::decode reads HZ-GB-2312 as GB 2312 \
+                   (GBK) and ISO-2022-KR as EUC-KR with the high bit restored, as .NET's code \
+                   pages 52936 and 50225 do for Jellyfin: ports of .NET 10's \
+                   ISO2022Encoding.GetCharsCP52936 and GetCharsCP50225KR, their replacement ? \
+                   and their quirks included. mediaencoding encoder.rs \
+                   detect_charset serves the decoded text from get_subtitle_stream \
+                   (GetSubtitleStream) and the names hz-gb-2312 and iso-2022-kr from \
+                   get_subtitle_file_character_set (GetSubtitleFileCharacterSet, ffmpeg's \
+                   -sub_charenc); providers playlist_file.rs decode_playlist decodes a \
+                   playlist the same way (PlaylistItemsProvider.DetectEncoding). ISO-2022-JP \
+                   only decides which designation comes first and stays chardetng's to decode \
+                   (gl-1422). Iso_2022_CN_SMModel is left out: its 2.7.0 table gives $ class \
+                   0, which the state after ESC errors on, so it never names ISO-2022-CN, and \
+                   Jellyfin 12.4 serves such a file as it is, as Ferrofin does. Measured on \
+                   Jellyfin 12.4: ISO-2022-KR, HZ (with ~~), ISO-2022-JP and ISO-2022-CN \
+                   sidecars serve the same text as Ferrofin's. 8-bit input and the \
+                   multi-byte and single-byte probers are not part of this row.",
+        date: "2026-11-26",
+        divergences: &[
+            "Two 7-bit ISO-2022-JP variants chardetng rejects, an ISO-2022-JP-2 JIS X 0212 \
+             designation and a run left open across a newline, are served as they are, where \
+             Jellyfin's escape prober detects ISO-2022-JP and .NET decodes the JIS X 0208 \
+             runs (with the 0212 character wrong). Fix path: gl-1998.",
+            "A pair is looked up in encoding_rs's GBK and EUC-KR tables (WHATWG), which may \
+             differ from .NET's code pages 936 and 949 for a few code points (Private Use \
+             Area and GB18030 mappings). Fix path: gl-2000.",
         ],
     },
 ];

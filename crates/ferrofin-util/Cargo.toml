@@ -15,6 +15,8 @@ workspace = true
 tokio = { workspace = true, optional = true }
 uuid.workspace = true
 thiserror.workspace = true
+# `escape_charset`: decoding ISO-2022-KR and HZ-GB-2312 through EUC-KR and GBK.
+encoding_rs.workspace = true
 rand.workspace = true
 unicode-normalization.workspace = true
 regex.workspace = true
