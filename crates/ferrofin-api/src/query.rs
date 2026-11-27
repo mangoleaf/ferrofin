@@ -393,9 +393,53 @@ fn decoded_key(key: &str) -> Cow<'_, str> {
         .map_or(Cow::Borrowed(""), |(key, _)| key)
 }
 
+/// Binds one required numeric route segment as ASP.NET binds a route value,
+/// with the rules the query binder ports (an integer trimmed, also in the `0x`,
+/// `#` and `&h` hex forms; a double through `DoubleModelBinder`, with group
+/// separators and no `inf`; measured on 12.4), a failure being the `400` its
+/// model binder produces for `[FromRoute, Required] int`/`double`. A NUL,
+/// which the query binder takes after a number, is a `400` here: Kestrel
+/// refuses a path holding one before any route runs (measured on 12.4).
+pub(crate) fn bind_route_number<T: serde::de::DeserializeOwned>(
+    raw: &str,
+    name: &str,
+) -> Result<T, crate::error::ApiError> {
+    let invalid = || {
+        crate::error::ApiError::BadRequest(format!("The value '{raw}' is not valid for {name}."))
+    };
+    if raw.contains('\0') {
+        return Err(invalid());
+    }
+    T::deserialize(crate::query::value::Value::nullable(raw)).map_err(|_| invalid())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{Query, QueryParameters};
+    use super::{Query, QueryParameters, bind_route_number};
+
+    #[test]
+    fn route_numbers_reject_garbage() {
+        assert_eq!(bind_route_number::<i32>("400", "maxWidth").ok(), Some(400));
+        assert_eq!(
+            bind_route_number::<f64>("50", "percentPlayed").ok(),
+            Some(50.0)
+        );
+        assert!(bind_route_number::<i32>("abc", "unplayedCount").is_err());
+        assert!(bind_route_number::<f64>("xyz", "percentPlayed").is_err());
+        // The binder's forms, measured on 12.4.
+        assert_eq!(bind_route_number::<i32>("0x10", "maxWidth").ok(), Some(16));
+        assert_eq!(bind_route_number::<i32>(" #10 ", "maxWidth").ok(), Some(16));
+        assert_eq!(bind_route_number::<i32>("&h10", "maxWidth").ok(), Some(16));
+        assert!(bind_route_number::<i32>("2147483648", "maxWidth").is_err());
+        assert!(bind_route_number::<f64>("inf", "percentPlayed").is_err());
+        // Kestrel refuses a NUL in the path; the query binder takes one.
+        assert!(bind_route_number::<i32>("1\0", "maxWidth").is_err());
+        assert!(bind_route_number::<f64>("1\0", "percentPlayed").is_err());
+        assert_eq!(
+            bind_route_number::<f64>("1,000", "percentPlayed").ok(),
+            Some(1000.0)
+        );
+    }
 
     /// Audit every implemented query field against the newest vendored operation
     /// that declares it. The older contract still covers removed/legacy routes;

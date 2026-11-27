@@ -15,11 +15,15 @@ workspace = true
 tokio = { workspace = true, optional = true }
 uuid.workspace = true
 thiserror.workspace = true
+# `escape_charset`: decoding ISO-2022-KR and HZ-GB-2312 through EUC-KR and GBK.
+encoding_rs.workspace = true
 rand.workspace = true
 unicode-normalization.workspace = true
 regex.workspace = true
 # `source_url`: splitting a URL the way `reqwest` does.
 url.workspace = true
+# `http_client::builder`: a client with `NamedClient.Default`'s defaults.
+reqwest = { workspace = true, optional = true }
 icu_casemap.workspace = true
 icu_collator.workspace = true
 icu_locale_core.workspace = true
@@ -35,6 +39,8 @@ zerovec.workspace = true
 # `process_priority::ChildProcess` for `tokio::process::Child`, `keyed_locks`,
 # `change_watch`, and `file_helper::read_head`.
 tokio = ["dep:tokio"]
+# `http_client::builder`.
+reqwest = ["dep:reqwest"]
 
 # `process_priority`: the OS priority of background ffmpeg/ffprobe processes.
 [target.'cfg(unix)'.dependencies]
@@ -46,3 +52,5 @@ windows-sys.workspace = true
 [dev-dependencies]
 rstest.workspace = true
 tempfile.workspace = true
+# `http_client`'s client tests: a loopback server.
+tokio.workspace = true

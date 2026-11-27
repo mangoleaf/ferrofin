@@ -29,7 +29,7 @@ mod tests {
             root.join("cache"),
             root.join("web"),
         ));
-        let file = root.join("config/users/named/encoding.json");
+        let file = root.join("config/encoding.json");
         let manager = FerrofinServerConfigurationManager::load(paths)
             .await
             .expect("configuration");

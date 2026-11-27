@@ -145,7 +145,7 @@ pub async fn auth_context_layer(
     // `httpContext.GetNormalizedRemoteIP().ToString()` on every request, so a
     // session's `RemoteEndPoint` tracks a roaming client. Without it every
     // session reports an empty address and every activity-log `ShortOverview`
-    // built from it is null.
+    // built from it reads a bare "IP address: ".
     let remote = state.client_address(&parts).to_string();
     let ctx = auth_request_context(&parts.headers, parts.uri.query(), Some(remote));
     let info = state

@@ -10,9 +10,11 @@ use ferrofin_model::entities::VideoType;
 
 use crate::container_types::MetadataResult;
 
-use super::base_parser::{BaseNfoParser, NfoParser};
+use super::base_parser::{BaseNfoParser, FetchResult, NfoParser, catch_xml_exception};
 use super::item::{NfoBaseItem, NfoItemKind};
-use super::xml_ext::{get_air_days, read_normalized_string, try_parse_series_status, try_read_int};
+use super::xml_ext::{
+    ReadError, get_air_days, read_normalized_string, try_parse_series_status, try_read_int,
+};
 use super::xml_reader::XmlCursor;
 
 /// NFO parser for movies (and music videos) — port of `MovieNfoParser`.
@@ -42,7 +44,7 @@ impl NfoParser for MovieNfoParser {
         base: &BaseNfoParser<'_>,
         reader: &mut XmlCursor,
         result: &mut MetadataResult<NfoBaseItem>,
-    ) {
+    ) -> Result<(), ReadError> {
         match reader.name() {
             "id" => parse_id_node(reader, result),
             "set" => {
@@ -73,8 +75,9 @@ impl NfoParser for MovieNfoParser {
                     result.item.album = Some(album);
                 }
             }
-            _ => base.fetch_data_from_xml_node_base(reader, result),
+            _ => return base.fetch_data_from_xml_node_base(reader, result),
         }
+        Ok(())
     }
 }
 
@@ -157,12 +160,16 @@ impl EpisodeNfoParser {
     /// writes the higher episode first. The lowest block populates the item,
     /// and the others append their name, overview and original title with
     /// `" / "` and extend `IndexNumberEnd`, in ascending order.
+    ///
+    /// # Errors
+    /// [`super::base_parser::FetchError::InvalidValue`] for a
+    /// [`ReadError::Uncaught`], which its `catch (XmlException)` lets through.
     pub fn fetch(
         &self,
         base: &BaseNfoParser<'_>,
         result: &mut MetadataResult<NfoBaseItem>,
         xml: &str,
-    ) {
+    ) -> FetchResult {
         result.reset_people();
 
         let needle = "</episodedetails>";
@@ -177,26 +184,27 @@ impl EpisodeNfoParser {
             blocks.push(remaining);
         }
         // C# reads inside `catch (XmlException)`: one block keeps what it read
-        // before a malformed spot, and with several a malformed block ends the
-        // read before anything is merged into the item.
+        // before a malformed spot or a value that does not convert, and with
+        // several a bad block ends the read before anything is merged into the
+        // item.
         if let [only] = blocks.as_slice() {
-            self.read_details(base, result, only);
-            return;
+            return catch_xml_exception(self.read_details(base, result, only));
         }
 
         let mut episodes: Vec<(&str, MetadataResult<NfoBaseItem>)> = Vec::new();
         for block in blocks {
             let mut episode = MetadataResult::new(NfoBaseItem::new(NfoItemKind::Episode));
-            if !self.read_details(base, &mut episode, block) {
-                return;
+            if let Err(error) = self.read_details(base, &mut episode, block) {
+                return catch_xml_exception(Err(error));
             }
             episodes.push((block, episode));
         }
         // Stable, as LINQ's `OrderBy` is.
         episodes.sort_by_key(|(_, episode)| episode.item.index_number.unwrap_or(i32::MAX));
 
-        // The lowest-numbered episode populates the item itself.
-        self.read_details(base, result, episodes[0].0);
+        // The lowest-numbered episode populates the item itself; it read
+        // cleanly above.
+        self.read_details(base, result, episodes[0].0)?;
 
         let mut name = result.item.name.clone().unwrap_or_default();
         let mut original_title = result.item.original_title.clone().unwrap_or_default();
@@ -233,27 +241,29 @@ impl EpisodeNfoParser {
         result.item.name = Some(name);
         result.item.original_title = Some(original_title);
         result.item.overview = Some(overview);
+        Ok(())
     }
 
     /// Streams one `<episodedetails>` block through the element switch, up to
-    /// its first malformed spot. Returns whether the block was well-formed.
+    /// its first malformed spot or typed-read error; a malformed spot is a
+    /// [`ReadError::Xml`] too.
     fn read_details(
         self,
         base: &BaseNfoParser<'_>,
         result: &mut MetadataResult<NfoBaseItem>,
         xml: &str,
-    ) -> bool {
+    ) -> Result<(), ReadError> {
         let (mut reader, clean) = XmlCursor::up_to_error(xml);
         reader.move_to_content();
         reader.read();
         while !reader.eof() {
             if reader.is_element() {
-                self.fetch_data_from_xml_node(base, &mut reader, result);
+                self.fetch_data_from_xml_node(base, &mut reader, result)?;
             } else {
                 reader.read();
             }
         }
-        clean
+        if clean { Ok(()) } else { Err(ReadError::Xml) }
     }
 }
 
@@ -263,7 +273,7 @@ impl NfoParser for EpisodeNfoParser {
         base: &BaseNfoParser<'_>,
         reader: &mut XmlCursor,
         result: &mut MetadataResult<NfoBaseItem>,
-    ) {
+    ) -> Result<(), ReadError> {
         match reader.name() {
             "season" => {
                 if let Some(v) = try_read_int(reader) {
@@ -296,8 +306,9 @@ impl NfoParser for EpisodeNfoParser {
                 }
             }
             "showtitle" => result.item.series_name = Some(read_normalized_string(reader)),
-            _ => base.fetch_data_from_xml_node_base(reader, result),
+            _ => return base.fetch_data_from_xml_node_base(reader, result),
         }
+        Ok(())
     }
 }
 
@@ -318,7 +329,7 @@ impl NfoParser for SeriesNfoParser {
         base: &BaseNfoParser<'_>,
         reader: &mut XmlCursor,
         result: &mut MetadataResult<NfoBaseItem>,
-    ) {
+    ) -> Result<(), ReadError> {
         match reader.name() {
             "id" => parse_id_node(reader, result),
             "airs_dayofweek" => {
@@ -337,8 +348,9 @@ impl NfoParser for SeriesNfoParser {
                 }
             }
             "namedseason" => reader.skip(),
-            _ => base.fetch_data_from_xml_node_base(reader, result),
+            _ => return base.fetch_data_from_xml_node_base(reader, result),
         }
+        Ok(())
     }
 }
 
@@ -354,7 +366,7 @@ impl NfoParser for SeasonNfoParser {
         base: &BaseNfoParser<'_>,
         reader: &mut XmlCursor,
         result: &mut MetadataResult<NfoBaseItem>,
-    ) {
+    ) -> Result<(), ReadError> {
         match reader.name() {
             "seasonnumber" => {
                 if let Some(v) = try_read_int(reader) {
@@ -362,8 +374,9 @@ impl NfoParser for SeasonNfoParser {
                 }
             }
             "seasonname" => result.item.name = Some(read_normalized_string(reader)),
-            _ => base.fetch_data_from_xml_node_base(reader, result),
+            _ => return base.fetch_data_from_xml_node_base(reader, result),
         }
+        Ok(())
     }
 }
 
@@ -385,7 +398,7 @@ impl NfoParser for SeriesNfoSeasonParser {
         _base: &BaseNfoParser<'_>,
         reader: &mut XmlCursor,
         result: &mut MetadataResult<NfoBaseItem>,
-    ) {
+    ) -> Result<(), ReadError> {
         if reader.name() == "namedseason" {
             let number = reader
                 .get_attribute("number")
@@ -401,6 +414,7 @@ impl NfoParser for SeriesNfoSeasonParser {
         } else {
             reader.skip();
         }
+        Ok(())
     }
 }
 

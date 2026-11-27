@@ -1404,13 +1404,14 @@ fn urlencoding_all(value: &str) -> String {
 }
 
 /// `GET /Plugins` is `_pluginManager.Plugins.OrderBy(p => p.Name)`
-/// (v10.11.8 `PluginsController.cs:55-57`) — the wire order is alphabetical, not
-/// registration order.
+/// (v12.4 `PluginsController.cs:56-58`) — the wire order is alphabetical, not
+/// registration order, and alphabetical in the request's culture:
+/// `OrderBy` compares with `Comparer<string>.Default`, `string.CompareTo`.
 ///
-/// Measured on the lane-3 lab pair before the fix: Jellyfin returned AudioDB,
-/// MusicBrainz, OMDb, Studio Images, TMDb for its five in-tree provider plugins
-/// while Ferrofin returned them TMDb-first, in the order the composition root
-/// registers them.
+/// Measured on the lane-3 lab pair before `GetPlugins` sorted at all: Jellyfin
+/// returned AudioDB, MusicBrainz, OMDb, Studio Images, TMDb for its five in-tree
+/// provider plugins while Ferrofin returned them TMDb-first, in the order the
+/// composition root registers them.
 #[tokio::test]
 async fn plugins_are_listed_by_name() {
     let fake = Arc::new(RecordingPlugins::default());
@@ -1440,11 +1441,10 @@ async fn plugins_are_listed_by_name() {
         .iter()
         .map(|p| p["Name"].as_str().expect("name"))
         .collect();
-    // `Ord` on `String` is bytewise, which puts every capitalised name before a
-    // lowercase one — the same order .NET's default string comparer produces
-    // for this set, and the same order the live Jellyfin returned.
+    // The culture's collation puts `alpha` first; a bytewise `Ord` would put
+    // every capitalised name before it.
     assert_eq!(
         names,
-        vec!["AudioDB", "Demo", "Studio Images", "Zulu", "alpha"]
+        vec!["alpha", "AudioDB", "Demo", "Studio Images", "Zulu"]
     );
 }

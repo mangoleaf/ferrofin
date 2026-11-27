@@ -284,7 +284,14 @@ impl DetectSegmentsTask {
             return;
         }
         let task = self.clone();
-        auto.run = Some(tokio::spawn(async move { task.run_automatic().await }));
+        auto.run = Some(tokio::spawn(tracing::Instrument::instrument(
+            async move { task.run_automatic().await },
+            tracing::info_span!(
+                parent: None,
+                "intro_skipper_automatic",
+                trigger = "library_change"
+            ),
+        )));
     }
 
     /// `PerformAnalysisAsync`: analyse the queued seasons under the latch,
@@ -590,6 +597,32 @@ mod tests {
             }
         }
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+    }
+
+    /// The run logs in an `intro_skipper_automatic` root span tagged with its
+    /// trigger, whatever span started it (LOGGING.md, rule 4).
+    #[tokio::test]
+    async fn the_automatic_run_logs_in_a_root_span_of_its_own() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let logs = crate::tests::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        tracing::info_span!("request").in_scope(|| h.task.start_run());
+        let run = h.task.runtime.automatic.lock().expect("lock").run.take();
+        run.expect("a run").await.expect("the run");
+        let text = logs.text();
+        let started = text
+            .lines()
+            .find(|line| line.contains("automatic analysis started"))
+            .unwrap_or_else(|| panic!("no start line:\n{text}"));
+        assert!(
+            started.contains(r#" intro_skipper_automatic{trigger="library_change"}: "#),
+            "{started}"
+        );
     }
 
     /// A run after the plugin was turned off does nothing.
