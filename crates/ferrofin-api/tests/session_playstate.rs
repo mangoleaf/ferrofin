@@ -1019,6 +1019,8 @@ fn recording() -> (Arc<RecordingSessions>, Arc<RecordingUserData>) {
 /// A canned [`SyncPlayManager`]: group ops return a fixed group, playback
 /// requests succeed. Enough to drive the `/SyncPlay/*` handler wiring.
 const GROUP_ID: Uuid = Uuid::from_u128(0xABCD);
+/// A group [`FakeSyncPlay`] does not have, or the caller may not see.
+const MISSING_GROUP_ID: Uuid = Uuid::from_u128(0xDEAD);
 
 #[derive(Default)]
 struct FakeSyncPlay {
@@ -1063,6 +1065,9 @@ impl SyncPlayManager for FakeSyncPlay {
         _s: &SyncPlaySession,
         group_id: Uuid,
     ) -> Result<GroupInfoDto, ServiceError> {
+        if group_id == MISSING_GROUP_ID {
+            return Err(ServiceError::not_found("sync-play group"));
+        }
         Ok(GroupInfoDto {
             group_id,
             ..Default::default()
@@ -1164,6 +1169,28 @@ async fn sync_play_list_get_and_playback_ops() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+/// `SyncPlayGetGroup` answers a group that does not exist, or one the caller
+/// may not see, with a parameterless `NotFound()`: ASP.NET's `ProblemDetails`.
+#[tokio::test]
+async fn sync_play_get_group_answers_a_missing_group_with_problem_details() {
+    let (status, body) = send(
+        sync_state(),
+        "GET",
+        &format!("/SyncPlay/{MISSING_GROUP_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({
+            "type": "https://tools.ietf.org/html/rfc9110#section-15.5.5",
+            "title": "Not Found",
+            "status": 404
+        })
+    );
+}
+
 #[tokio::test]
 async fn sync_play_returns_501_when_manager_unwired() {
     // The route is registered, but with no SyncPlay manager composed in the
@@ -1182,7 +1209,8 @@ async fn sync_play_returns_501_when_manager_unwired() {
 // ── SyncPlay access policy (C# `SyncPlayAccessHandler`) ────────────────────
 
 /// Authenticates as [`USER_ID`] with a chosen stored `SyncPlayAccess` value, so
-/// the policy table can be driven from a test.
+/// the policy table can be driven from a test, or, for [`ANONYMOUS`],
+/// authenticates no one.
 struct PolicyAuth {
     access: i32,
     admin: bool,
@@ -1191,6 +1219,9 @@ struct PolicyAuth {
 
 impl PolicyAuth {
     fn info(&self) -> AuthorizationInfo {
+        if self.access == ANONYMOUS {
+            return AuthorizationInfo::default();
+        }
         let mut user = user_entity(USER_ID, "alice");
         user.sync_play_access = self.access;
         AuthorizationInfo {
@@ -1344,6 +1375,8 @@ fn policy_state_as(
 const CREATE_AND_JOIN: i32 = 0;
 const JOIN_ONLY: i32 = 1;
 const NO_SYNC_PLAY: i32 = 2;
+/// Not a stored value: [`PolicyAuth`] then authenticates no one.
+const ANONYMOUS: i32 = -1;
 
 #[tokio::test]
 async fn sync_play_new_requires_create_access() {
@@ -1447,6 +1480,45 @@ async fn sync_play_join_and_list_require_join_access() {
             );
         }
     }
+}
+
+/// `[HttpGet("{id:guid}")]` is a route constraint: an id that is not a GUID
+/// matches no route, so it is a 404 with no body before authentication or any
+/// policy runs, for a caller the SyncPlay policy refuses and for no caller at
+/// all. Every `Guid.TryParse` spelling matches (`parse_dotnet_guid`'s tests);
+/// the B format, percent-encoded, stands for them here.
+#[tokio::test]
+async fn sync_play_get_group_with_an_id_that_is_not_a_guid_matches_no_route() {
+    for access in [NO_SYNC_PLAY, ANONYMOUS] {
+        let (state, _) = policy_state(access, false);
+        let (status, body) = send(state, "GET", "/SyncPlay/not-a-guid", Body::empty()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "access {access}");
+        assert!(body.is_empty(), "{}", String::from_utf8_lossy(&body));
+    }
+
+    let (state, _) = policy_state(ANONYMOUS, false);
+    let (status, _) = send(
+        state,
+        "GET",
+        &format!("/SyncPlay/{GROUP_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a GUID matches, then authenticates"
+    );
+
+    let (state, _) = policy_state(NO_SYNC_PLAY, false);
+    let (status, _) = send(
+        state,
+        "GET",
+        "/SyncPlay/%7B00000000-0000-0000-0000-000000000001%7D",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a B-format GUID matches");
 }
 
 #[tokio::test]

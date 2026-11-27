@@ -37,6 +37,7 @@ use ferrofin_model::sync_play::{
     SetRepeatModeRequestDto, SetShuffleModeRequestDto,
 };
 use ferrofin_model::users::SyncPlayUserAccessType;
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::stubs::{
     PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying, SyncPlaySession,
@@ -44,7 +45,7 @@ use ferrofin_traits::stubs::{
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
-use crate::error::ApiError;
+use crate::error::{ApiError, ProblemStatus};
 use crate::extract::{DotnetGuid, JsonBody, ProblemDetails};
 use crate::handlers::items::{resolve_user_opt, user_uuid};
 use crate::handlers::session_ctx::current_session;
@@ -211,7 +212,7 @@ trait Requirement {
 struct HasAccess;
 /// [`SyncPlayAccess::CreateGroup`]: `POST /SyncPlay/New`.
 struct CreateGroup;
-/// [`SyncPlayAccess::JoinGroup`]: `Join` and `List`.
+/// [`SyncPlayAccess::JoinGroup`]: `Join`, `List` and `{id}`.
 struct JoinGroup;
 /// [`SyncPlayAccess::IsInGroup`]: `Leave` and the playback verbs but `Ping`.
 struct IsInGroup;
@@ -325,20 +326,46 @@ async fn list_groups(
     Ok(Json(mgr.list_groups(&session).await?))
 }
 
+/// The `{id:guid}` route constraint of `GET /SyncPlay/{id}`: an id that
+/// `Guid.TryParse` refuses matches no route, so routing answers it with a
+/// bodiless `404` before authentication runs. An extractor, so it can run
+/// first.
+struct GuidRoute(Uuid);
+
+impl FromRequestParts<AppState> for GuidRoute {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let Path(id) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        DotnetGuid::parse(&id)
+            .map(Self)
+            .map_err(|_| StatusCode::NOT_FOUND)
+    }
+}
+
 /// `GET /SyncPlay/{id}` — info for a single group.
 ///
-/// The one route whose policy runs after its parameter binds: upstream's
+/// The one route whose parameter is checked before its policy: upstream's
 /// `{id:guid}` is a route constraint, checked by routing before
 /// `UseAuthorization`.
 async fn get_group(
-    RequireAuth(auth): RequireAuth,
+    GuidRoute(group_id): GuidRoute,
+    SyncPlayAuth(auth, _): SyncPlayAuth<JoinGroup>,
     State(state): State<AppState>,
-    Path(DotnetGuid(group_id)): Path<DotnetGuid>,
 ) -> Result<Json<GroupInfoDto>, ApiError> {
-    require_access(&state, &auth, SyncPlayAccess::JoinGroup).await?;
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
-    Ok(Json(mgr.get_group(&session, group_id).await?))
+    match mgr.get_group(&session, group_id).await {
+        Ok(group) => Ok(Json(group)),
+        // `group is null ? NotFound() : Ok(group)`: the parameterless result.
+        Err(ServiceError::NotFound(_)) => Err(ApiError::Problem(ProblemStatus::NotFound)),
+        Err(err) => Err(err.into()),
+    }
 }
 
 // ── playback requests ──────────────────────────────────────────────────────
