@@ -48,7 +48,7 @@ use ferrofin_traits::stubs::{
     LiveStreamFile, LiveTvChannelQuery, LiveTvManager, RecordingVisibility,
 };
 use ferrofin_traits::system::LocalApiAccess;
-use ferrofin_traits::tasks::ScanCancel;
+use ferrofin_traits::tasks::{ScanCancel, TaskProgress};
 use serde::de::DeserializeOwned;
 
 use crate::dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
@@ -1864,15 +1864,16 @@ impl FerrofinLiveTvManager {
     /// out of the map. Returned are the programmes created or updated, with
     /// their end, one group per channel, for `PreCacheImages`.
     ///
-    /// `None` when `stop` ended it before a channel
+    /// `None` when `run`'s token ended it before a channel
     /// (`cancellationToken.ThrowIfCancellationRequested()` at the top of
     /// upstream's per-channel loop, :234): the channels before it are
     /// mirrored whole, and nothing is cleaned, which needs every channel's
-    /// airings.
+    /// airings. Each channel done moves `run` on by its share of the 85
+    /// points after 15, as that loop's `progress.Report` does (:337).
     async fn sync_program_items(
         &self,
         mut listings: HashMap<Uuid, ProgramImages>,
-        stop: &ScanCancel,
+        run: &TaskProgress,
     ) -> Result<Option<Vec<RefreshedAirings>>, ServiceError> {
         let Some(store) = self.item_store.get() else {
             return Ok(Some(Vec::new()));
@@ -1888,24 +1889,35 @@ impl FerrofinLiveTvManager {
         // What each channel's airings add up to (`RefreshChannelsInternal`),
         // a channel with none included; stored once every channel is done.
         let mut aggregates: Vec<(Uuid, ChannelAggregate)> = Vec::new();
-        for channel_id in crate::guide_repository::all_channel_ids(&self.db).await? {
-            if stop.is_cancelled() {
+        let channel_ids = crate::guide_repository::all_channel_ids(&self.db).await?;
+        let channels = channel_ids.len();
+        for (done, channel_id) in channel_ids.into_iter().enumerate() {
+            if run.cancel_token().is_cancelled() {
                 return Ok(None);
             }
             let rows = crate::guide_repository::channel_program_rows(&self.db, &channel_id).await?;
             if let Ok(id) = Uuid::parse_str(&channel_id) {
                 aggregates.push((id, ChannelAggregate::of(&rows)));
             }
-            if rows.is_empty() {
-                continue;
+            if !rows.is_empty() {
+                kept.extend(rows.iter().filter_map(|row| Uuid::parse_str(&row.id).ok()));
+                let written = Self::sync_channel_program_items(
+                    &self.db,
+                    store,
+                    &rows,
+                    view_id,
+                    &mut listings,
+                )
+                .await?;
+                if !written.is_empty() {
+                    refreshed.push(written);
+                }
             }
-            kept.extend(rows.iter().filter_map(|row| Uuid::parse_str(&row.id).ok()));
-            let written =
-                Self::sync_channel_program_items(&self.db, store, &rows, view_id, &mut listings)
-                    .await?;
-            if !written.is_empty() {
-                refreshed.push(written);
-            }
+            // `progress.Report((85 * percent) + 15)` after each channel, one
+            // with no airing included (:334-337).
+            #[allow(clippy::cast_precision_loss)] // a progress ratio
+            let percent = (done + 1) as f64 / channels as f64;
+            run.report((85.0 * percent) + 15.0);
         }
         Self::save_channel_aggregates(&self.db, store, &aggregates).await?;
         // What is left was written this pass and replaced since (a later
@@ -4014,14 +4026,16 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
-        // Nobody stops this one (a configuration write's queued refresh).
-        self.refresh_guide_until(&ScanCancel::new())
+        // Nobody watches or stops this one (a configuration write's queued
+        // refresh).
+        self.refresh_guide_until(&TaskProgress::default())
             .await
             .map(|_| ())
     }
 
     #[allow(clippy::too_many_lines)] // one pass: the fetches, then the writes under the guide lock
-    async fn refresh_guide_until(&self, stop: &ScanCancel) -> Result<bool, ServiceError> {
+    async fn refresh_guide_until(&self, run: &TaskProgress) -> Result<bool, ServiceError> {
+        let stop = run.cancel_token();
         // `GuideManager.RefreshGuide` starts here.
         self.create_recording_folders().await;
         // `cancellationToken.ThrowIfCancellationRequested()` before each
@@ -4030,6 +4044,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
         if stop.is_cancelled() {
             return Ok(false);
         }
+        // `RefreshChannelsInternal` opens with `progress.Report(10)` (:181),
+        // before it reads the service's channels. With one service,
+        // `RefreshGuide` passes its reports on unscaled (:109-126).
+        run.report(10.0);
         let generation = self.refresh_generation.fetch_add(1, Ordering::SeqCst) + 1;
         // FETCH FIRST, OUTSIDE THE LOCK. `guide_lock` exists to keep two passes
         // from interleaving their WRITES (see the field doc); holding it across
@@ -4181,7 +4199,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 kept_programs.extend(written);
             }
         }
-        // `CleanDatabase` checks before each stored item (:356).
+        // `CleanDatabase` checks before each stored item (:356). It also
+        // reports after each one (:384), on the task's own progress; the
+        // clean-ups here and in the two item mirrors below delete as sets and
+        // report nothing (gl-2027).
         if stop.is_cancelled() {
             return Ok(false);
         }
@@ -4193,12 +4214,20 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // item (and cleans the departed ones) before it fetches programmes —
         // a programme item is parented to its channel's item.
         self.sync_channel_items().await?;
+        // `progress.Report(15)` (:221): every channel item is stored. They
+        // are one write here, so none of upstream's values between 10 and 15,
+        // one after each channel item (:218), is reported (gl-2027).
+        run.report(15.0);
         // Every provider has spoken, so the programme table now holds exactly
         // upstream's `newProgramIdList` across all services — the set its
         // `CleanDatabase(newProgramIdList, [LiveTvProgram])` is taken over.
-        let Some(refreshed) = self.sync_program_items(kept_programs, stop).await? else {
+        let Some(refreshed) = self.sync_program_items(kept_programs, run).await? else {
             return Ok(false);
         };
+        // `RefreshChannelsInternal` ends on `progress.Report(100)` (:340) and
+        // `RefreshGuide` reports its one service done (:151), a lineup with no
+        // channel included.
+        run.report(100.0);
         // `RefreshGuide`'s tail: `RefreshSeriesTimers` then `RefreshTimers`
         // (v12.2 src/Jellyfin.LiveTv/Guide/GuideManager.cs:163-164).
         self.refresh_series_timers().await?;
@@ -9029,6 +9058,7 @@ mod tests {
     mod programme_listing;
     mod recording_folders;
     mod recording_images;
+    mod refresh_progress;
     mod refresh_stop;
     mod schedules_direct;
 

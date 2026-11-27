@@ -25,7 +25,7 @@ const LIVE_TV: &str = "Live TV";
 /// (XMLTV) and rewrites the channel/guide cache. Port of
 /// `RefreshGuideScheduledTask`, whose `ExecuteAsync` is
 /// `GuideManager.RefreshGuide`; Ferrofin's equivalent is
-/// [`LiveTvManager::refresh_guide_until`], handed the run's token.
+/// [`LiveTvManager::refresh_guide_until`], handed the run's progress and token.
 pub struct RefreshGuideTask {
     live_tv: Arc<dyn LiveTvManager>,
 }
@@ -82,23 +82,15 @@ impl ScheduledTask for RefreshGuideTask {
         if progress.stop_requested() {
             return Ok(());
         }
-        // Divergence: upstream's `GuideManager.RefreshGuide(progress, ct)`
-        // reports across its tuner and listing passes, so the dashboard shows a
-        // moving bar; Ferrofin's `refresh_guide` takes no progress handle, so
-        // the run reads 0% until it finishes. Closing it means widening the
-        // manager seam, not faking intermediate percentages here (fix path:
-        // gl-2021).
-        //
-        // The refresh checks the run's token where upstream's does, and says
-        // when a stop ended it: recorded Cancelled, with no closing 100 %.
-        if !self
-            .live_tv
-            .refresh_guide_until(progress.cancel_token())
-            .await?
-        {
+        // `GuideManager.RefreshGuide(progress, cancellationToken)`: the
+        // refresh reports through the run's handle and checks its token where
+        // upstream's does, and says when a stop ended it: recorded Cancelled,
+        // with no closing 100 %.
+        if !self.live_tv.refresh_guide_until(progress).await? {
             progress.stopped();
             return Ok(());
         }
+        // `RefreshGuide`'s closing `progress.Report(100)` (:167).
         progress.report(100.0);
         Ok(())
     }
@@ -119,6 +111,9 @@ mod tests {
         /// A Stop arrives while the refresh runs.
         stopped_inside: AtomicBool,
     }
+
+    /// What [`FakeLiveTv`]'s refresh reports through the run it is handed.
+    const REFRESH_REPORT: f64 = 57.5;
 
     #[async_trait]
     impl LiveTvManager for FakeLiveTv {
@@ -142,15 +137,13 @@ mod tests {
             self.refreshes.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
-        async fn refresh_guide_until(
-            &self,
-            stop: &ferrofin_traits::tasks::ScanCancel,
-        ) -> Result<bool, ServiceError> {
+        async fn refresh_guide_until(&self, run: &TaskProgress) -> Result<bool, ServiceError> {
             self.refresh_guide().await?;
+            run.report(REFRESH_REPORT);
             if self.stopped_inside.load(Ordering::Relaxed) {
-                stop.cancel();
+                run.cancel_token().cancel();
             }
-            Ok(!stop.is_cancelled())
+            Ok(!run.cancel_token().is_cancelled())
         }
         async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
             unreachable!("the guide-refresh task never asks for listings countries")
@@ -349,9 +342,10 @@ mod tests {
         assert!(progress.was_stopped(), "recorded Cancelled");
     }
 
-    /// A stop inside the refresh reaches it through the run's own token
-    /// (`RefreshGuide(progress, cancellationToken)`): the refresh ends early
-    /// and the run is recorded Cancelled, with no closing 100 %.
+    /// The refresh is handed the run itself
+    /// (`RefreshGuide(progress, cancellationToken)`): what it reports shows on
+    /// the run, and a stop inside it reaches it through the run's own token.
+    /// It ends early and the run is recorded Cancelled, with no closing 100 %.
     #[tokio::test]
     async fn a_stop_inside_the_refresh_cancels_the_run() {
         let fake = Arc::new(FakeLiveTv::default());
@@ -365,7 +359,11 @@ mod tests {
             "the refresh was handed the run's token"
         );
         assert!(progress.was_stopped(), "recorded Cancelled");
-        assert_eq!(progress.reported(), None, "no 100 % for a stopped refresh");
+        assert_eq!(
+            progress.reported(),
+            Some(REFRESH_REPORT),
+            "the refresh's own report, and no 100 % for a stopped refresh"
+        );
     }
 
     #[tokio::test]

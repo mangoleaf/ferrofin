@@ -20,14 +20,14 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemRepository, ItemWithCounts, PlaylistItemsWithAccess};
 use ferrofin_traits::stubs::{LiveTvChannelQuery, LiveTvManager as _};
-use ferrofin_traits::tasks::ScanCancel;
+use ferrofin_traits::tasks::TaskProgress;
 use uuid::Uuid;
 
 use super::{ArtServices, M3U, guide_day, item_lab_reading_through};
 use crate::projection::PROGRAM_TYPE_NAME;
 
 /// One airing: `(guide channel, start hour, end hour, title, icon URL)`.
-type Airing = (
+pub(super) type Airing = (
     &'static str,
     &'static str,
     &'static str,
@@ -36,7 +36,7 @@ type Airing = (
 );
 
 /// Two airings on each of the fixture lineup's two channels, tomorrow.
-const AIRINGS: [Airing; 4] = [
+pub(super) const AIRINGS: [Airing; 4] = [
     (
         "one.tv",
         "06",
@@ -57,7 +57,7 @@ const AIRINGS: [Airing; 4] = [
 
 /// A guide listing both of the fixture lineup's channels, carrying `airings`
 /// on `day` (a [`guide_day`]), each with a genre and an icon.
-fn guide(day: &str, airings: &[Airing]) -> String {
+pub(super) fn guide(day: &str, airings: &[Airing]) -> String {
     let mut xml = String::from(
         "<tv>\
          <channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
@@ -82,12 +82,12 @@ fn guide(day: &str, airings: &[Airing]) -> String {
 /// (`build_access_filter`, the folder-children trio, the version batches,
 /// `get_item_id_clean_names`, …) keep the trait's default, which the guide
 /// refresh never reaches; forward one here if that changes.
-struct ChannelReads {
-    inner: Arc<dyn ItemRepository>,
-    reads: Mutex<Vec<BTreeSet<String>>>,
-    /// Cancelled at the first read recorded: a stop that arrives while one
-    /// channel's airings are being mirrored.
-    stop: Option<ScanCancel>,
+pub(super) struct ChannelReads {
+    pub(super) inner: Arc<dyn ItemRepository>,
+    pub(super) reads: Mutex<Vec<BTreeSet<String>>>,
+    /// Run at each read recorded, so while one channel's airings are being
+    /// mirrored: a stop that arrives then, or a look at the run's progress.
+    pub(super) at_read: Box<dyn Fn() + Send + Sync>,
 }
 
 impl ChannelReads {
@@ -98,9 +98,7 @@ impl ChannelReads {
             .map(|row| row.channel_id.clone().unwrap_or_default())
             .collect();
         if !channels.is_empty() {
-            if let Some(stop) = &self.stop {
-                stop.cancel();
-            }
+            (self.at_read)();
             self.reads.lock().expect("reads").push(channels);
         }
     }
@@ -287,13 +285,16 @@ impl ItemRepository for ChannelReads {
 /// airing's item is removed: the clean-up needs every channel's.
 #[tokio::test]
 async fn a_stop_ends_the_mirror_before_the_next_channel() {
-    let stop = ScanCancel::new();
+    let run = TaskProgress::default();
     let mut recorder = None;
     let lab = item_lab_reading_through(M3U, Some(guide(&guide_day(0), &AIRINGS)), |inner| {
         let reads = Arc::new(ChannelReads {
             inner,
             reads: Mutex::new(Vec::new()),
-            stop: Some(stop.clone()),
+            at_read: Box::new({
+                let stop = run.cancel_token().clone();
+                move || stop.cancel()
+            }),
         });
         recorder = Some(Arc::clone(&reads));
         reads
@@ -302,11 +303,11 @@ async fn a_stop_ends_the_mirror_before_the_next_channel() {
     let reads = recorder.expect("the lab wraps its item reads");
     // The first import reads no stored airing, so nothing stops it.
     lab.mgr.refresh_guide().await.expect("first refresh");
-    assert!(reads.reads().is_empty() && !stop.is_cancelled());
+    assert!(reads.reads().is_empty() && !run.cancel_token().is_cancelled());
 
     let finished = lab
         .mgr
-        .refresh_guide_until(&stop)
+        .refresh_guide_until(&run)
         .await
         .expect("stopped refresh");
     assert!(!finished, "a stopped refresh says so");
@@ -336,7 +337,7 @@ async fn a_guide_refresh_reads_the_stored_airings_one_channel_at_a_time() {
         let reads = Arc::new(ChannelReads {
             inner,
             reads: Mutex::new(Vec::new()),
-            stop: None,
+            at_read: Box::new(|| ()),
         });
         recorder = Some(Arc::clone(&reads));
         reads

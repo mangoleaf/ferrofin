@@ -990,7 +990,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// and with what lookup, the Identify case first, shared by Identify → Apply,
 /// the item refresh and the library scan, and `metadata-providers` what
 /// TheMovieDb's movie, series, season and episode providers write onto an item
-/// from TMDb's answer. `guide-programme-items` is what the guide refresh
+/// from TMDb's answer. `guide-refresh-progress` is the progress a running
+/// Refresh Guide reports, which the two scheduled-task reads and the socket's
+/// task frames show. `guide-programme-items` is what the guide refresh
 /// stores on each programme item and its external ids, which every programme
 /// operation reads. `guide-channel-items` is where the guide refresh puts each
 /// channel item in the item tree (its parent, top parent and ancestors), which
@@ -1020,6 +1022,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "direct-recording",
     "metadata-refresh",
     "metadata-providers",
+    "guide-refresh-progress",
     "guide-programme-items",
     "guide-channel-items",
     "music-artwork",
@@ -1096,6 +1099,57 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              counts as updated. No known client reads either, and keeping the save to a \
              changed programme avoids one full-row write per airing per refresh (owner \
              decision 2026-11-20, gl-1628).",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "guide-refresh-progress",
+        upstream_file: "src/Jellyfin.LiveTv/Guide/GuideManager.cs",
+        upstream_method: "RefreshGuide",
+        ferrofin: "What a running Refresh Guide reports as its progress. ferrofin-core \
+                   scheduled_tasks/live_tv.rs RefreshGuideTask::execute hands its run, the \
+                   progress handle with the token, to ferrofin-livetv manager.rs \
+                   refresh_guide_until (RefreshGuideScheduledTask.ExecuteAsync, \
+                   RefreshGuide(progress, cancellationToken)), which reports 10 after its \
+                   first stop check and before it reads a tuner (RefreshChannelsInternal's \
+                   Report(10) ahead of GetChannelsAsync), 15 once sync_channel_items has \
+                   stored the channel items (Report(15)), and 100 after sync_program_items \
+                   (RefreshChannelsInternal's closing Report(100), then RefreshGuide's 100 * \
+                   services done / services); sync_program_items reports (85 * channels done \
+                   / channels) + 15 after each channel's programme items, a channel with no \
+                   airing included (Report((85 * percent) + 15)). A stock server has one \
+                   service, so RefreshGuide's innerProgress passes each report on times 1; a \
+                   second ILiveTvService is a plugin's. The task then reports RefreshGuide's \
+                   closing 100, and adds none for a refresh its stop ended (one stopped in \
+                   the image pre-cache already reads 100). A refresh a newer one superseded \
+                   while it fetched writes nothing, and goes from 10 to that 100. \
+                   Compared with RefreshGuide, RefreshChannelsInternal and CleanDatabase at \
+                   the pinned v12.4 tag. Live on a scratch server (gl-2021), GET \
+                   /ScheduledTasks/{taskId} polled through a run over 300 channels and a \
+                   tuner answering in 4 s: 10 from the first poll, then 15, each of the 300 \
+                   per-channel values in order up to 100, and no value once Idle",
+        date: "2026-11-27",
+        divergences: &[
+            "The clean-ups report nothing, so the value never starts again: upstream runs \
+             CleanDatabase over the stored channel items and then the stored programme \
+             items on the task's own progress, after its 100, and reports 100 * items \
+             looked at / items after each. Ferrofin deletes the stale rows as sets, in \
+             clean_guide and sync_channel_items before the 15 and at the end of \
+             sync_program_items. Open: owner decision pending, tracked in gl-2027.",
+            "None of the values between 10 and 15 is reported: upstream reports (5 * \
+             percent) + 10 after each channel item, and Ferrofin stores the channel items \
+             as one batch. Open: owner decision pending, tracked in gl-2027.",
+            "The run reads 10 while the listings are fetched and written to the guide's \
+             own tables, as it does for the tuners, and 100 while programme images are \
+             pre-cached: upstream reads a channel's listings (GetProgramsAsync) and \
+             pre-caches its images (PreCacheImages) inside that channel's turn of the span \
+             from 15 to 100, which here covers only the mirror into items. Ferrofin fetches \
+             every listings provider and writes its airings (insert_programs) before the \
+             15, and pre-caches after the 100; the fetches and the pre-cache run outside \
+             the guide's write lock. Open: owner decision pending, tracked in gl-2027.",
+            "A guide refresh a Live TV configuration write queues is not a run of the task \
+             (handlers/live_tv.rs queue_guide_refresh spawns refresh_guide), so the task \
+             shows no state, progress or result for it; upstream queues the task itself \
+             (CancelIfRunningAndQueue<RefreshGuideScheduledTask>). Fix path: gl-54.",
         ],
     },
     VerifiedSubsystem {
@@ -6884,12 +6938,11 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             ADOPTED_TRIGGER_FILE_DIVERGENCE,
             ADOPTED_FILE_LENIENCY_DIVERGENCE,
-            GUIDE_PROGRESS_DIVERGENCE,
             "The 400 (an isHidden or isEnabled value the query binder cannot convert), 401 (no \
          or bad token) and 403 (not an administrator) bodies are Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["guide-refresh-progress"],
     },
     Verified {
         method: "get",
@@ -6907,11 +6960,10 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             ADOPTED_TRIGGER_FILE_DIVERGENCE,
             ADOPTED_FILE_LENIENCY_DIVERGENCE,
-            GUIDE_PROGRESS_DIVERGENCE,
             "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
          id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["guide-refresh-progress"],
     },
     Verified {
         method: "delete",
@@ -7592,13 +7644,6 @@ const ADOPTED_FILE_LENIENCY_DIVERGENCE: &str = "An adopted task file that leans 
      System.Text.Json's leniency (a trigger without Type, a numeric Status, a number written \
      as a string) is skipped as unreadable, where upstream reads it; Jellyfin never writes \
      one. Fix path: gl-1845.";
-
-/// The two scheduled-task read rows: the progress a running Refresh Guide
-/// does not report.
-const GUIDE_PROGRESS_DIVERGENCE: &str = "A running Refresh Guide shows no \
-     CurrentProgressPercentage until it ends: its refresh reports none, where upstream's \
-     GuideManager.RefreshGuide reports through its channel and programme passes. Fix path: \
-     gl-2021.";
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
 /// `ArtistsController` + `BaseItemRepository.GetItemValues`.

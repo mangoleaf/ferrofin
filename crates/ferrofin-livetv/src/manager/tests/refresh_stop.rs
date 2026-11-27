@@ -14,7 +14,7 @@ use std::time::Duration;
 use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::stubs::LiveTvManager as _;
-use ferrofin_traits::tasks::ScanCancel;
+use ferrofin_traits::tasks::{ScanCancel, TaskProgress};
 
 use super::{M3U, XMLTV, as_xmltv, dated, manager_with_fetcher};
 use crate::fetch::SourceFetcher;
@@ -135,15 +135,15 @@ async fn a_stop_ends_the_fetch_in_flight_and_the_refresh(
     #[case] asked: &[&str],
 ) {
     let (mgr, fetcher) = lab(slow, At::Hang).await;
-    let stop = ScanCancel::new();
+    let run = TaskProgress::default();
     let stopper = async {
         while !fetcher.asked().iter().any(|url| url == slow) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        stop.cancel();
+        run.cancel_token().cancel();
     };
     let (finished, ()) = tokio::time::timeout(WAIT, async {
-        tokio::join!(mgr.refresh_guide_until(&stop), stopper)
+        tokio::join!(mgr.refresh_guide_until(&run), stopper)
     })
     .await
     .expect("the stop ended the refresh");
@@ -163,9 +163,9 @@ async fn a_stop_ends_the_refresh_at_its_next_check(
     #[case] stopped_at: &'static str,
     #[case] asked: &[&str],
 ) {
-    let stop = ScanCancel::new();
-    let (mgr, fetcher) = lab(stopped_at, At::Stop(stop.clone())).await;
-    let finished = tokio::time::timeout(WAIT, mgr.refresh_guide_until(&stop))
+    let run = TaskProgress::default();
+    let (mgr, fetcher) = lab(stopped_at, At::Stop(run.cancel_token().clone())).await;
+    let finished = tokio::time::timeout(WAIT, mgr.refresh_guide_until(&run))
         .await
         .expect("the refresh returned")
         .expect("refresh");
@@ -174,7 +174,7 @@ async fn a_stop_ends_the_refresh_at_its_next_check(
     assert_eq!(stored_channels(&mgr).await, 0, "nothing was written");
 
     let finished = mgr
-        .refresh_guide_until(&ScanCancel::new())
+        .refresh_guide_until(&TaskProgress::default())
         .await
         .expect("next refresh");
     assert!(finished, "a refresh nobody stopped runs to its end");

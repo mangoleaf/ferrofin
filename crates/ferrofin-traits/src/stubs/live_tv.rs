@@ -29,7 +29,7 @@ use ferrofin_model::querying::QueryResult;
 
 use crate::error::ServiceError;
 use crate::options::{DtoOptions, InternalItemsQuery};
-use crate::tasks::ScanCancel;
+use crate::tasks::TaskProgress;
 
 /// The channel-list query `GET /LiveTv/Channels` binds.
 ///
@@ -470,20 +470,24 @@ pub trait LiveTvManager: Send + Sync {
     /// admin request must not hang on them.
     async fn refresh_guide(&self) -> Result<(), ServiceError>;
 
-    /// [`refresh_guide`](Self::refresh_guide) for a caller that can stop it,
-    /// the "Refresh Guide" task: `GuideManager.RefreshGuide(progress,
-    /// cancellationToken)`. `stop` is checked where upstream checks its token
-    /// (before each service, each channel item and each channel's programmes),
-    /// and it ends the tuner and listings fetches upstream hands its token to.
+    /// [`refresh_guide`](Self::refresh_guide) for the "Refresh Guide" task,
+    /// which shows its progress and can be stopped:
+    /// `GuideManager.RefreshGuide(progress, cancellationToken)`. `run` carries
+    /// both. The refresh reports through it where upstream's
+    /// `RefreshChannelsInternal` does (10, 15 once the channel items are
+    /// stored, a share of the remaining 85 after each channel's programmes,
+    /// then 100). Its token is checked where upstream checks its own (before
+    /// each service, each channel item and each channel's programmes), and
+    /// ends the tuner and listings fetches upstream hands its token to.
     ///
-    /// Returns whether the refresh ran to its end: `false` when `stop` ended
-    /// it, upstream's `OperationCanceledException`. What it wrote before the
-    /// stop stays, and the next refresh writes the rest.
+    /// Returns whether the refresh ran to its end: `false` when the token
+    /// ended it, upstream's `OperationCanceledException`. What it wrote before
+    /// the stop stays, and the next refresh writes the rest.
     ///
     /// The default runs the whole refresh, for an implementation with nothing
-    /// to stop inside; the real manager overrides it.
-    async fn refresh_guide_until(&self, stop: &ScanCancel) -> Result<bool, ServiceError> {
-        let _ = stop;
+    /// to report or stop inside; the real manager overrides it.
+    async fn refresh_guide_until(&self, run: &TaskProgress) -> Result<bool, ServiceError> {
+        let _ = run;
         self.refresh_guide().await.map(|()| true)
     }
 
