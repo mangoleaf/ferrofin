@@ -3709,47 +3709,40 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // Port of `LiveTvManager.GetInternalChannels` + the controller's
         // projection. The generic item repository upstream runs this over SQL.
         // Here the read lists only the channels whose item is stored, as
-        // upstream lists the items, and applies the user's parental
-        // restrictions (as `new InternalItemsQuery(user)` does) and the kind
-        // filters over them; the type, favourite and like filters and the
-        // sort run over the loaded lineup, all before the page is cut.
+        // upstream lists the items, applies the user's parental restrictions
+        // (as `new InternalItemsQuery(user)` does) and the kind filters over
+        // them, and orders them over those items as `ApplyOrder` does; the
+        // type, favourite and like filters run over the loaded lineup, which
+        // keeps that order, all before the page is cut.
         let restrictions = self
             .user_restrictions(&InternalItemsQuery {
                 user: query.user.clone(),
                 ..InternalItemsQuery::default()
             })
             .await?;
-        let mut rows: Vec<ChannelRow> = crate::guide_repository::channel_rows(
-            &self.db,
-            query,
-            restrictions.as_ref(),
-            self.item_store.get().is_some(),
-        )
-        .await?;
-
-        // Favourite/like filters, favourite-first sorting and the user-data
-        // sort keys read the user's channel user-data (C# pushes the same
-        // predicates and `OrderMapper` keys into SQL).
         let user_id = query
             .user
             .as_ref()
             .and_then(|u| Uuid::parse_str(&u.id).ok());
-        let needs_user_data = query.enable_favorite_sorting
-            || query.is_favorite.is_some()
-            || query.is_liked.is_some()
-            || crate::projection::sort_reads_user_data(&query.sort_by);
+        let stored_user = user_id.map(guid_to_db);
+        let mut rows: Vec<ChannelRow> = crate::guide_repository::listed_channel_rows(
+            &self.db,
+            query,
+            restrictions.as_ref(),
+            self.item_store.get().is_some(),
+            stored_user.as_deref(),
+        )
+        .await?;
+
+        // The favourite and like filters read the user's channel user data
+        // (C# pushes the same predicates into SQL).
         let user_data = match user_id {
-            Some(uid) if needs_user_data => {
+            Some(uid) if query.is_favorite.is_some() || query.is_liked.is_some() => {
                 crate::guide_repository::channel_user_data(&self.db, uid).await?
-            }
-            // Without a user, `DatePlayed` is every user's newest play.
-            None if query.sort_by.contains(&ItemSortBy::DatePlayed) => {
-                crate::guide_repository::channel_last_played_by_anyone(&self.db).await?
             }
             _ => HashMap::new(),
         };
         crate::projection::filter_channel_rows(&mut rows, query, &user_data);
-        crate::projection::sort_channel_rows(&mut rows, query, &user_data);
 
         let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
         let start_index = query.start_index.unwrap_or(0);
@@ -8263,16 +8256,10 @@ fn push_program_genres(
 /// Pushes the `ORDER BY` clause. With no key sent, C#
 /// `LiveTvManager.GetPrograms` orders by start date "to take advantage of a
 /// specialized index"; then `BaseItemRepository.ApplyOrder` (v12.4
-/// QueryBuilding.cs:306-384) orders the stored programme items:
-/// - `Default` is dropped, and no key left sorts by `SortName` alone;
-/// - a leading `SortName` is followed by `Name` in its direction;
-/// - `SortName` ascending breaks the last ties unless `SortName` or `Name` was
-///   asked for;
-/// - a `SeriesDatePlayed` key hands the order to `ApplySeriesDatePlayedOrder`:
-///   the played date of the series the row is, which no programme is, then
-///   `SortName` ascending.
+/// QueryBuilding.cs:306-384) orders the stored programme items, with
+/// `StartDate` read from the guide row.
 ///
-/// Each key is [`push_program_sort_key`]. No id key follows, as none does
+/// [`push_apply_order`] applies them. No id key follows, as none does
 /// upstream: a third key after `StartDate, SortName` tips SQLite's sort-cost
 /// estimate, and the default order then scans and sorts the whole guide
 /// instead of walking its start-date index and sorting each start's ties.
@@ -8283,6 +8270,26 @@ fn push_program_order(qb: &mut QueryBuilder<Sqlite>, query: &InternalItemsQuery)
     } else {
         &query.order_by[..]
     };
+    let user = query.user_id().map(guid_to_db);
+    push_apply_order(qb, requested, user.as_deref(), r#"p."StartDate""#);
+}
+
+/// Pushes `BaseItemRepository.ApplyOrder`'s `ORDER BY` (v12.4
+/// QueryBuilding.cs:306-384) for `requested` over the stored item `item`, each
+/// key [`push_item_sort_key`] with `start_date` for `StartDate`:
+/// - `Default` is dropped, and no key left sorts by `SortName` alone;
+/// - a leading `SortName` is followed by `Name` in its direction;
+/// - `SortName` ascending breaks the last ties unless `SortName` or `Name` was
+///   asked for;
+/// - a `SeriesDatePlayed` key hands the order to `ApplySeriesDatePlayedOrder`:
+///   the played date of the series the row is, which no programme or channel
+///   is, then `SortName` ascending.
+pub(crate) fn push_apply_order(
+    qb: &mut QueryBuilder<Sqlite>,
+    requested: &[(ItemSortBy, SortOrder)],
+    user: Option<&str>,
+    start_date: &'static str,
+) {
     let keys: Vec<&(ItemSortBy, SortOrder)> = requested
         .iter()
         .filter(|(by, _)| *by != ItemSortBy::Default)
@@ -8295,7 +8302,6 @@ fn push_program_order(qb: &mut QueryBuilder<Sqlite>, query: &InternalItemsQuery)
     {
         qb.push(r#"item."SortName""#);
     } else {
-        let user = query.user_id().map(guid_to_db);
         for (index, (by, order)) in keys.iter().enumerate() {
             if index > 0 {
                 qb.push(", ");
@@ -8306,7 +8312,7 @@ fn push_program_order(qb: &mut QueryBuilder<Sqlite>, query: &InternalItemsQuery)
             } else {
                 " DESC"
             };
-            push_program_sort_key(qb, *by, user.as_deref());
+            push_item_sort_key(qb, *by, user, start_date);
             qb.push(direction);
             if index == 0 && *by == ItemSortBy::SortName {
                 qb.push(r#", item."Name""#).push(direction);
@@ -8322,17 +8328,23 @@ fn push_program_order(qb: &mut QueryBuilder<Sqlite>, query: &InternalItemsQuery)
 }
 
 /// Pushes what C# `OrderMapper.MapOrderByField` (v12.4 OrderMapper.cs:30-90)
-/// sorts `by` on, over the stored programme item `item`, as the item
-/// repository's `translate_query` maps it for `/Items`.
+/// sorts `by` on, over the stored programme or channel item `item`, as the
+/// item repository's `translate_query` maps it for `/Items`.
 ///
-/// `StartDate` reads the guide row, which holds the same instant and carries
-/// the index the default order walks. The user-data keys read `user`'s rows;
-/// without a user, `DatePlayed` reads every user's, as upstream's does, and
-/// the others fall back to `SortName` as `/Items` does (upstream reads the
-/// missing user's id and fails). A programme is never a folder and has no
-/// alternate versions, so its played date is its own rows' and it is played
-/// when its own row says so.
-fn push_program_sort_key(qb: &mut QueryBuilder<Sqlite>, by: ItemSortBy, user: Option<&str>) {
+/// `StartDate` reads `start_date`: a programme's guide row, which holds the
+/// same instant and carries the index the default order walks, or a channel
+/// item's own column. The user-data keys read `user`'s rows; without a user,
+/// `DatePlayed` reads every user's, as upstream's does, and the others fall
+/// back to `SortName` as `/Items` does (upstream reads the missing user's id
+/// and fails). A programme or channel is never a folder and has no alternate
+/// versions, so its played date is its own rows' and it is played when its
+/// own row says so.
+fn push_item_sort_key(
+    qb: &mut QueryBuilder<Sqlite>,
+    by: ItemSortBy,
+    user: Option<&str>,
+    start_date: &'static str,
+) {
     use ferrofin_db::enums::ItemValueType;
 
     if by == ItemSortBy::DatePlayed {
@@ -8387,7 +8399,7 @@ fn push_program_sort_key(qb: &mut QueryBuilder<Sqlite>, by: ItemSortBy, user: Op
         return;
     }
     qb.push(match by {
-        ItemSortBy::StartDate => r#"p."StartDate""#,
+        ItemSortBy::StartDate => start_date,
         ItemSortBy::Random => ferrofin_db::sqlite_random::RANDOM_SQL_EXPR,
         ItemSortBy::Runtime => r#"item."RunTimeTicks""#,
         ItemSortBy::DateCreated => r#"item."DateCreated""#,
@@ -15711,19 +15723,12 @@ mod tests {
             #EXTINF:-1 tvg-id=\"c\" tvg-chno=\"10001\",Ten One\nhttp://tuner/c\n\
             #EXTINF:-1 tvg-id=\"d\" tvg-chno=\"4.12\",Alpha\nhttp://tuner/d\n\
             #EXTINF:-1 tvg-id=\"e\" tvg-chno=\"4.11\",Zulu\nhttp://tuner/e\n";
-        let mut sources = HashMap::new();
-        sources.insert("http://tuner/playlist.m3u".to_owned(), m3u.to_owned());
-        let mgr = manager_with(FakeFetcher(sources)).await;
-        mgr.save_tuner_host(TunerHostInfo {
-            type_: Some("m3u".to_owned()),
-            url: Some("http://tuner/playlist.m3u".to_owned()),
-            ..TunerHostInfo::default()
-        })
-        .await
-        .expect("tuner");
-        mgr.refresh_guide().await.expect("refresh");
+        // The order is the stored channel items' `SortName` (gl-1681).
+        let lab = item_lab(m3u, None).await;
+        lab.mgr.refresh_guide().await.expect("refresh");
 
-        let names: Vec<String> = mgr
+        let names: Vec<String> = lab
+            .mgr
             .get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
             .await
             .expect("channels")
