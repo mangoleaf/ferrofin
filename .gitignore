@@ -1,4 +1,6 @@
 /target
+# the libjpeg-turbo scripts/libjpeg-turbo.sh builds for this checkout
+/scripts/libjpeg-turbo.sh.out/
 **/*.rs.bk
 *.pdb
 # local media/data used for manual First-Light testing

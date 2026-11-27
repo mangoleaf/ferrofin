@@ -86,8 +86,8 @@ RUN cargo install --locked cargo-auditable@0.7.7
 RUN cargo install --locked --features cli cargo-about@0.9.3
 WORKDIR /src
 # The libjpeg-turbo the binary links statically: the official release the script pins, checks and
-# builds into /src/target, which the build context never carries (.dockerignore). Before
-# `COPY . .`, so a source change does not build it again.
+# builds beside itself, in scripts/libjpeg-turbo.sh.out, which the build context never carries
+# (.dockerignore). Before `COPY . .`, so a source change does not build it again.
 COPY scripts/libjpeg-turbo.sh scripts/libjpeg-turbo.sh
 RUN scripts/libjpeg-turbo.sh
 COPY . .

@@ -3,11 +3,18 @@
 # below by version and SHA-256, downloaded, checked and compiled with cmake (and nasm on x86-64,
 # whose SIMD code REQUIRE_SIMD makes mandatory). turbojpeg-sys carries an older libjpeg-turbo and
 # is built without it (Cargo.toml): it links the library in TURBOJPEG_LIB_DIR, which
-# .cargo/config.toml points at target/libjpeg-turbo-<version>/lib, where this script installs.
-# The directory is named after the version, so a checkout never links another pin's library.
+# .cargo/config.toml points at scripts/libjpeg-turbo.sh.out/<version>/lib, where this script
+# installs. The directory is named after the version, so a checkout never links another pin's
+# library, and after this script: a build without the library stops in turbojpeg-sys's build
+# script with "Cannot canonicalize TURBOJPEG_LIB_DIR", whose output shows the path, and the path
+# says what makes it. (Cargo runs nothing of ours before that build script, so no message of ours
+# can.) The directory is there only with a whole library in it: it is built aside and renamed into
+# place. It is outside target/ on purpose: CI's cache action (rust-cache) deletes every loose file
+# under target/ when it restores another commit's cache, which left the directory without its
+# library and the build failing in rustc with "could not find native static library".
 #
-# Run it once per checkout before the first cargo build, and again when the pin moves or target/
-# is deleted; it does nothing while the directory holds this build.
+# Run it once per checkout before the first cargo build, and again when the pin moves; it does
+# nothing while the directory holds this build.
 #
 #   scripts/libjpeg-turbo.sh [--zig-target <zig target>]
 #   scripts/libjpeg-turbo.sh --check <binary>
@@ -55,7 +62,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-prefix="$(cd "$(dirname "$0")/.." && pwd)/target/libjpeg-turbo-$VERSION"
+out="$(cd "$(dirname "$0")" && pwd)/libjpeg-turbo.sh.out"
+prefix=$out/$VERSION
+work=$prefix.partial
 stamp="$VERSION $SHA256 ${zig_target:-native}"
 if [ "$(cat "$prefix/stamp" 2>/dev/null)" = "$stamp" ]; then
   exit 0
@@ -68,9 +77,9 @@ sha256() {
 # Nothing of an earlier build stays, so a build that fails here leaves no library to link.
 # Everything below runs inside the work directory and names paths relative to it, so cmake gets
 # no absolute path for Git Bash on Windows to rewrite.
-rm -rf -- "${prefix:?}"
-mkdir -p "$prefix/work"
-cd "$prefix/work"
+rm -rf -- "${prefix:?}" "${work:?}"
+mkdir -p "$work"
+cd "$work"
 
 tarball=libjpeg-turbo-$VERSION.tar.gz
 curl -fsSL --retry 5 --retry-all-errors -o "$tarball" \
@@ -113,12 +122,14 @@ esac
 
 cmake -S "$source" -B build "${args[@]}"
 cmake --build build --config Release --parallel 4
-cmake --install build --config Release --prefix ..
-cd ..
+cmake --install build --config Release --prefix install
 # Visual C++ builds name the static library turbojpeg-static.lib; turbojpeg-sys links "turbojpeg".
-if [ -f lib/turbojpeg-static.lib ]; then
-  cp lib/turbojpeg-static.lib lib/turbojpeg.lib
+if [ -f install/lib/turbojpeg-static.lib ]; then
+  cp install/lib/turbojpeg-static.lib install/lib/turbojpeg.lib
 fi
-rm -rf -- "${prefix:?}/work"
-echo "$stamp" >stamp
+echo "$stamp" >install/stamp
+# The one step that makes the library visible to a build.
+mv install "../$VERSION"
+cd ..
+rm -rf -- "${work:?}"
 echo "libjpeg-turbo $VERSION installed in $prefix"

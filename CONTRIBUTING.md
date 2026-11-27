@@ -12,10 +12,11 @@ Rust workspace, edition 2024, toolchain pinned to **1.100.0** (stable — see
 `rust-toolchain.toml`, which rustup honors automatically). The build also needs a C
 compiler, **cmake**, **curl**, and on x86-64 **nasm**, for libjpeg-turbo:
 `scripts/libjpeg-turbo.sh` downloads the official release it pins, checks its SHA-256 and builds
-it into `target/`, with its SIMD code or not at all, and `.cargo/config.toml` points
-`turbojpeg-sys` at the result. Run it once per checkout, and again when its pinned version moves
-or `target/` is deleted; until then a build stops at `turbojpeg-sys` with "Cannot canonicalize
-TURBOJPEG_LIB_DIR".
+it into `scripts/libjpeg-turbo.sh.out/`, with its SIMD code or not at all, and
+`.cargo/config.toml` points `turbojpeg-sys` at the result. Run it once per checkout, and again
+when its pinned version moves (`cargo clean` leaves it alone); until then a build stops at
+`turbojpeg-sys` with "Cannot canonicalize TURBOJPEG_LIB_DIR", under a line showing that
+directory's path.
 
 ```bash
 scripts/libjpeg-turbo.sh

@@ -75,8 +75,10 @@ jobs:
         run: df -h /
       # The libjpeg-turbo the workspace links: scripts/libjpeg-turbo.sh downloads the official
       # release it pins, checks it and builds it with cmake; nasm assembles the x86-64 SIMD,
-      # which the script makes a hard requirement. lint-tests and coverage-shard reuse this
-      # step (*build-libjpeg-turbo).
+      # which the script makes a hard requirement. It installs beside the script, not under
+      # target/: rust-cache deletes every loose file under target/ when it restores another
+      # commit's cache, a PR's among them. lint-tests and coverage-shard reuse this step
+      # (*build-libjpeg-turbo).
       - &build-libjpeg-turbo
         name: build libjpeg-turbo (cmake, nasm)
         run: |

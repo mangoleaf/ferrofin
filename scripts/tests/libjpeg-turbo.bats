@@ -9,7 +9,7 @@ setup() {
   cp "$BATS_TEST_DIRNAME/../libjpeg-turbo.sh" "$TREE/scripts/"
   VERSION=$(sed -n 's/^VERSION=//p' "$TREE/scripts/libjpeg-turbo.sh")
   SHA256=$(sed -n 's/^SHA256=//p' "$TREE/scripts/libjpeg-turbo.sh")
-  PREFIX="$TREE/target/libjpeg-turbo-$VERSION"
+  PREFIX="$TREE/scripts/libjpeg-turbo.sh.out/$VERSION"
   export CALLS="$BATS_TEST_TMPDIR/calls"
   # Writes something that is not the release to the -o file, as a tampered mirror would.
   cat >"$BATS_TEST_TMPDIR/bin/curl" <<'FAKE'
@@ -30,8 +30,8 @@ FAKE
   [ "$status" -eq 1 ]
   [[ "$output" == *"does not have the pinned SHA-256"* ]]
   [[ "$(cat "$CALLS")" == *"/releases/download/$VERSION/libjpeg-turbo-$VERSION.tar.gz" ]]
-  [ ! -e "$PREFIX/lib" ]
-  [ ! -e "$PREFIX/stamp" ]
+  # Not even the directory cargo is pointed at: a build then stops with its path.
+  [ ! -e "$PREFIX" ]
 }
 
 @test "a build already there is left alone" {
@@ -48,7 +48,7 @@ FAKE
   run "$TREE/scripts/libjpeg-turbo.sh"
   [ "$status" -eq 1 ]
   [ -e "$CALLS" ]
-  [ ! -e "$PREFIX/stamp" ]
+  [ ! -e "$PREFIX" ]
 }
 
 @test "--check tells a binary linking the pinned version from any other" {
@@ -64,7 +64,7 @@ FAKE
 
 @test "cargo looks for the library where the pinned version is installed" {
   # .cargo/config.toml names the directory itself: it has to move with the script's VERSION.
-  grep -qF "\"target/libjpeg-turbo-$VERSION/lib\"" "$BATS_TEST_DIRNAME/../../.cargo/config.toml"
+  grep -qF "\"scripts/libjpeg-turbo.sh.out/$VERSION/lib\"" "$BATS_TEST_DIRNAME/../../.cargo/config.toml"
 }
 
 @test "an unknown argument is refused" {
