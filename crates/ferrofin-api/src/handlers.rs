@@ -2579,7 +2579,25 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    cleared (ApplySearchResult runs whenever the item has a provider: an \
                    episode always, its forced ProbeProvider and TrickplayProvider, a \
                    path-less season only when a remote one runs), refresh_ordered_images \
-                   with the chosen provider first). A box set's or playlist folder's \
+                   with the chosen provider first; a season's SaveIsVirtualItem past \
+                   isFullRefresh or an image RemoveImages removed or ValidateImages \
+                   registered, whatever the lock: season.rs save_is_virtual_item over its \
+                   season_episodes.rs season_episode_rows, GetEpisodes with \
+                   DisplaySpecialsWithinSeasons). A series' children \
+                   (Series.RefreshAllMetadataInternal, which library validation and the \
+                   series' own refresh run for every series they reach): the walk \
+                   refreshes those it plans; library_scan/series_children.rs \
+                   refresh_pathless_series_children refreshes the rest after the TMDb \
+                   missing-episode provider and RemoveObsoleteEpisodes (a library's \
+                   post_scan_passes, a series' own touched_passes), as the series' own \
+                   refresh runs them first upstream: every path-less season the walk did \
+                   not plan, then every missing episode but one aired over 30 days ago \
+                   outside a FullRefresh or ReplaceAllMetadata (skipItem), each by \
+                   refresh_single_item with the refresh's options, an Identify's result \
+                   included. refresh_item takes that result as the item's own ids only \
+                   from refresh_full_item (the controller's SetProviderIds is the \
+                   identified item's); a child's lookup gets it as its series' ids \
+                   (ApplySearchResult). A box set's or playlist folder's \
                    local XML file: ferrofin-providers container_xml.rs (BoxSetXmlProvider and \
                    PlaylistXmlProvider, HasChanged as LocalMetadataFormat::Xml; the saver gate \
                    IsSaverEnabledForItem) read in provider_manager.rs refresh_item and, for a \
@@ -2598,6 +2616,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and the NFO and XML savers write the credits LibraryManager.GetPeople(item) \
                    reads, none for such a kind (metadata_merge.rs stored_people from nfo_save.rs \
                    and container_xml.rs). Compared with RefreshMetadata, \
+                   EnableUpdateMetadataFromChildren, \
+                   SeasonMetadataService.UpdateMetadataFromChildren and SaveIsVirtualItem, \
+                   Series.RefreshAllMetadataInternal and Folder.RefreshAllMetadataForContainer, \
                    SaveItemAsync, LibraryManager.UpdatePeopleAsync, LibraryManager.GetPeople, \
                    BaseNfoSaver.AddCommonNodes, BaseXmlSaver.AddCommonNodesAsync, \
                    ApplySearchResult, \
@@ -2610,11 +2631,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    the answers merge field by field (gl-1813) are not part of this row.",
         date: "2026-11-26",
         divergences: &[
-            "An album below an identified artist is looked up by its own ids, name and year; \
-             upstream's ApplySearchResult gives every child but a season or an episode the \
-             artist's result, its ids replacing the album's and its name and year the \
-             album's, so the album is searched under the artist's name. Jellyfin bug not \
-             ported.",
+            "A child of an identified item but a season or an episode (an album below an \
+             identified artist, a box set the scan refreshes through the provider \
+             manager) is looked up by its own ids, name and year; upstream's \
+             ApplySearchResult gives it the identified item's result, its ids replacing \
+             the child's and its name and year the child's, so an album is searched under \
+             the artist's name. Jellyfin bug not ported.",
             "A Default scan also runs the remote providers of an item the backfill \
              heuristics pick, merging their answers fill-only; upstream runs no remote \
              provider on an unchanged Default refresh. Kept by owner decision 2026-09-24 \
@@ -2622,7 +2644,19 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "An item the provider manager refreshes (a box set, person, genre, studio, or \
              virtual season or episode) asks no plugin metadata source. Fix path: gl-1773.",
             "An item the provider manager refreshes runs no local image provider \
-             (ValidateImages), except for a virtual season. Fix path: gl-1053.",
+             (ValidateImages), except for a virtual season, whose refresh registers new \
+             files but does not count a stored image whose file is gone (the save drops \
+             it later) toward SaveIsVirtualItem's gate. Fix path: gl-1053.",
+            "A virtual season's refresh takes no premiere date or year from its episodes; \
+             upstream's SeasonMetadataService.UpdateMetadataFromChildren does \
+             (EnableUpdatingPremiereDateFromChildren) past the gate SaveIsVirtualItem \
+             runs behind. Fix path: gl-1838.",
+            "A series' refresh runs the series' own refresh once, before its path-less \
+             children; upstream's RefreshAllMetadataInternal ends with \
+             RefreshSingleItem of the series after them, rerunning its custom providers \
+             (TmdbMissingEpisodeProvider's UpdateVirtualEpisode) and AfterMetadataRefresh \
+             (RemoveObsoleteEpisodes and the season passes) over what the children's \
+             refresh changed, which here waits for the next refresh. Fix path: gl-1964.",
             "Replacing all images under RemoveOldMetadata, for an item whose art is saved \
              beside it, deletes a file outside its metadata folders only where \
              ImageFileSaver writes that item's art (the folder of its destinations, a \

@@ -1321,6 +1321,10 @@ pub struct LocalProviderManager {
     /// `POST /System/Configuration` applies without a restart. Absent → an
     /// empty global array, i.e. no server-wide ranking.
     metadata_options: Option<Arc<dyn Fn() -> Vec<MetadataOptions> + Send + Sync>>,
+    /// `ServerConfiguration.DisplaySpecialsWithinSeasons`, which decides the
+    /// episodes a season's refresh reads (`Season.GetEpisodes`). Read live,
+    /// as the scan reads it. `None` → the C# default, on.
+    display_specials_within_seasons: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// `GetRebasedPath` of a by-name Genre, MusicGenre, Person, Studio or
     /// Year at a path (`None` for any other kind). Absent → no by-name item
     /// is ever rebased by a refresh.
@@ -1446,6 +1450,10 @@ impl std::fmt::Debug for LocalProviderManager {
             )
             .field("kind_by_type_name", &self.kind_by_type_name.len())
             .field("has_metadata_options", &self.metadata_options.is_some())
+            .field(
+                "has_display_specials_within_seasons",
+                &self.display_specials_within_seasons.is_some(),
+            )
             .finish()
     }
 }
@@ -1549,6 +1557,7 @@ impl LocalProviderManager {
             server_metadata_language: None,
             server_metadata_country: None,
             metadata_options: None,
+            display_specials_within_seasons: None,
             by_name_rebase: None,
         }
     }
@@ -1640,6 +1649,18 @@ impl LocalProviderManager {
         options: impl Fn() -> Vec<MetadataOptions> + Send + Sync + 'static,
     ) -> Self {
         self.metadata_options = Some(Arc::new(options));
+        self
+    }
+
+    /// Attaches a reader for the server configuration's
+    /// `DisplaySpecialsWithinSeasons`: with it on, a season's episodes
+    /// (`Season.GetEpisodes`) include the specials that air within it.
+    #[must_use]
+    pub fn with_display_specials_within_seasons(
+        mut self,
+        read: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.display_specials_within_seasons = Some(Arc::new(read));
         self
     }
 
@@ -2789,7 +2810,16 @@ impl LocalProviderManager {
     /// settles it, and the row saved under `SaveInternal`'s rule with
     /// `DateLastRefreshed` stamped only when no provider failed. The credits
     /// the providers answered with are saved with the row (`pass_credits`'
-    /// rule; a `Cast` lock keeps the stored ones).
+    /// rule; a `Cast` lock keeps the stored ones). Before the merge, a box
+    /// set or playlist takes its members' values and a season its virtual
+    /// flag from its episodes (`UpdateMetadataFromChildren`).
+    ///
+    /// `identified` says the item is the one an Identify's result in
+    /// `options` was chosen for, which takes the result's ids as its own (the
+    /// controller's `SetProviderIds`). A child of it, a series' season or
+    /// episode its `RefreshAllMetadata` refreshes with the same options, takes
+    /// the result only as `ApplySearchResult` hands it on: a season's or an
+    /// episode's series ids, its own left as stored.
     ///
     /// [`fetch_season_providers`]: Self::fetch_season_providers
     // One gate-fetch-merge-save sequence, read top to bottom.
@@ -2798,6 +2828,7 @@ impl LocalProviderManager {
         &self,
         item_id: Uuid,
         options: &MetadataRefreshOptions,
+        identified: bool,
     ) -> Result<ItemUpdateType, ServiceError> {
         use crate::metadata_merge::{
             MetadataResult, RefreshAnswers, RefreshMerge, supports_people,
@@ -2826,9 +2857,8 @@ impl LocalProviderManager {
                 .flatten()
                 .map(|(k, v)| (k.as_str(), v.as_str())),
         );
-        if options.search_result.is_some()
-            && let Some(store) = &self.image_store
-        {
+        let identified = identified && options.search_result.is_some();
+        if identified && let Some(store) = &self.image_store {
             store.replace_provider_ids(item_id, &chosen_ids).await?;
         }
         // The item store comes with the TMDB client (`with_remote_images`):
@@ -2850,8 +2880,8 @@ impl LocalProviderManager {
             && self.remove_own_images(item_id, &stored).await?;
         // The item's `LockedFields`: the merge leaves them as stored.
         let locked_fields = self.stored_locked_fields(item_id).await;
-        let stored_ids = if options.search_result.is_some() {
-            chosen_ids
+        let stored_ids = if identified {
+            chosen_ids.clone()
         } else {
             self.stored_provider_ids(item_id).await
         };
@@ -2946,9 +2976,12 @@ impl LocalProviderManager {
                 && plan.remote_images != ImageFetch::None
                 && wants_fetch(gated.image_refresh_mode),
         };
+        // A child is looked up by its own name and year, never the chosen
+        // result's (the first divergence of the `metadata-refresh` row).
         let chosen_name = options
             .search_result
             .as_ref()
+            .filter(|_| identified)
             .and_then(|r| r.name.as_deref())
             .map(str::trim)
             .filter(|n| !n.is_empty());
@@ -2984,7 +3017,7 @@ impl LocalProviderManager {
                 // identified season looks up by the chosen result's ids as
                 // its SERIES' ids.
                 let series_ids = match (&options.search_result, series_id) {
-                    (Some(_), _) => stored_ids.clone(),
+                    (Some(_), _) => chosen_ids.clone(),
                     (None, Some(series)) => self.stored_provider_ids(series).await,
                     (None, None) => Vec::new(),
                 };
@@ -3015,7 +3048,7 @@ impl LocalProviderManager {
                 // `ApplySearchResult`: an identified episode looks up by the
                 // chosen result's ids as its SERIES' ids and has none of its own.
                 let (series_ids, own_ids) = match (&options.search_result, series_id) {
-                    (Some(_), _) => (stored_ids.clone(), Vec::new()),
+                    (Some(_), _) => (chosen_ids.clone(), Vec::new()),
                     (None, Some(series)) => {
                         (self.stored_provider_ids(series).await, stored_ids.clone())
                     }
@@ -3076,9 +3109,10 @@ impl LocalProviderManager {
             _ => None,
         };
         let mut base = stored.clone();
-        // Whether the members changed a value `UpdateMetadataFromChildren`
-        // reports as `MetadataEdit` (the date, year, genres, studios, rating).
-        let mut members_edited = false;
+        // Whether the children changed a value `UpdateMetadataFromChildren`
+        // reports as `MetadataEdit`: a box set's or playlist's date, year,
+        // genres, studios or rating, a season's virtual flag.
+        let mut children_edited = false;
         // `BeforeSave` → `UpdateMetadataFromChildren` (`MetadataService.cs:
         // 404-483`): past the `isFullRefresh` gate a box set or playlist takes
         // its runtime, genres, studios, date and rating from its members
@@ -3102,7 +3136,29 @@ impl LocalProviderManager {
                 )
                 .map(str::to_owned);
             }
-            members_edited = crate::metadata_merge::members_edited(&stored, &base);
+            children_edited = crate::metadata_merge::members_edited(&stored, &base);
+        }
+        // `SeasonMetadataService.UpdateMetadataFromChildren` (`SeasonMetadataService.cs:
+        // 94-103`): past `isFullRefresh || updateType > None` (the images this
+        // refresh removed or validated before `BeforeSave`), whatever the lock,
+        // a season is virtual only while it and all its episodes are path-less
+        // (`SaveIsVirtualItem`).
+        if BaseItemKind::from_stored_type_name(&stored.type_) == Some(BaseItemKind::Season)
+            && (crate::refresh_plan::full_refresh(&plan, &request)
+                || removed_images
+                || local_images)
+        {
+            let episodes = crate::season_episodes::season_episode_rows(
+                items.as_ref(),
+                item_id,
+                stored.clone(),
+                &ferrofin_traits::options::InternalItemsQuery::default(),
+                self.display_specials_within_seasons
+                    .as_ref()
+                    .is_none_or(|read| read()),
+            )
+            .await?;
+            children_edited |= crate::season::save_is_virtual_item(&mut base, &episodes);
         }
         // `BoxSetMetadataService.BeforeSaveInternal`: on every refresh, past
         // any gate or lock, a box set's `LibraryFolderIds` — the libraries
@@ -3460,7 +3516,8 @@ impl LocalProviderManager {
         // What changed, as the closest single value to the C#
         // `ItemUpdateType` flags the savers are gated on: `MetadataEdit` when
         // the members changed the date, genres, studios or rating
-        // (`UpdatePremiereDate` and its siblings, `MetadataService.cs:543-635`),
+        // (`UpdatePremiereDate` and its siblings, `MetadataService.cs:543-635`)
+        // or the episodes a season's virtual flag (`SaveIsVirtualItem`),
         // `MetadataDownload` when a remote provider answered, changed or not
         // (`ExecuteRemoteProviders`), or the options force it (`ForceSave`,
         // `ReplaceAllMetadata`, `:258-262`), else an image save, else
@@ -3470,7 +3527,7 @@ impl LocalProviderManager {
         // import, so a file the user edited stays as they wrote it.
         let forced = request.force_save || request.options.replace_all_metadata;
         let metadata = metadata_changed || ids_changed || locks_changed;
-        let update = if members_edited {
+        let update = if children_edited {
             ItemUpdateType::MetadataEdit
         } else if forced || downloaded {
             ItemUpdateType::MetadataDownload
@@ -5560,10 +5617,12 @@ impl ProviderManager for LocalProviderManager {
         options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
         // Boxed: the refresh future holds the whole fetch-merge-save state
-        // (`clippy::large_futures`). Its provider failures name the item.
+        // (`clippy::large_futures`). Its provider failures name the item. The
+        // Identify's and the queue's entry: the item is the one an Identify's
+        // result was chosen for.
         Box::pin(crate::rate_limit::for_item(
             item_id,
-            self.refresh_item(item_id, options),
+            self.refresh_item(item_id, options, true),
         ))
         .await
         .map(|_| ())
@@ -5576,10 +5635,12 @@ impl ProviderManager for LocalProviderManager {
     ) -> Result<ItemUpdateType, ServiceError> {
         // `ProviderManager.RefreshSingleItem`: the item's own metadata service
         // runs and reports what changed. Ferrofin's refresh never recurses
-        // into children, so this is the full refresh with its verdict kept.
+        // into children, so this is the full refresh with its verdict kept,
+        // as a child's (`RefreshAllMetadata`'s `item.RefreshMetadata`): an
+        // Identify's result in `options` is its series'.
         Box::pin(crate::rate_limit::for_item(
             item_id,
-            self.refresh_item(item_id, options),
+            self.refresh_item(item_id, options, false),
         ))
         .await
     }
@@ -8587,6 +8648,22 @@ mod tests {
             _filter: &ferrofin_traits::options::InternalItemsQuery,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             unimplemented!()
+        }
+        async fn get_episode_order_rows(
+            &self,
+            filter: &ferrofin_traits::options::InternalItemsQuery,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            // A season's `GetEpisodes` reads its series' rows by key.
+            Ok(self
+                .rows
+                .values()
+                .filter(|row| {
+                    row.series_presentation_unique_key.is_some()
+                        && row.series_presentation_unique_key
+                            == filter.series_presentation_unique_key
+                })
+                .cloned()
+                .collect())
         }
         async fn get_latest_item_list(
             &self,
@@ -14417,6 +14494,167 @@ mod tests {
         assert_eq!(kept, [(logo.path, 120, Some("NEW".to_owned()))]);
     }
 
+    /// `SaveIsVirtualItem` over the season's episodes (`GetEpisodes`,
+    /// gl-1621), on a refresh that forces a save (`isFullRefresh`): a
+    /// path-less season stored virtual is real while one episode has a file,
+    /// and a real special that airs within it counts only with "Display
+    /// specials within seasons" on (`FilterEpisodesBySeason`).
+    #[rstest::rstest]
+    #[case::a_real_episode(true, false, true, false)]
+    #[case::only_missing_episodes(false, false, true, true)]
+    #[case::a_special_within_it(false, true, true, false)]
+    #[case::a_special_with_the_setting_off(false, true, false, true)]
+    #[tokio::test]
+    async fn a_seasons_episodes_decide_its_virtual_flag(
+        #[case] real_episode: bool,
+        #[case] real_special: bool,
+        #[case] specials_within_seasons: bool,
+        #[case] expected: bool,
+    ) {
+        let mut series = row("TV.Series", "Show");
+        let series_key = series.id.clone();
+        series.path = Some("/tv/Show".to_owned());
+        let mut season = row("TV.Season", "Season 1");
+        let season_id = Uuid::parse_str(&season.id).expect("id");
+        season.series_id = Some(series.id.clone());
+        season.parent_id = Some(series.id.clone());
+        season.series_presentation_unique_key = Some(series_key.clone());
+        season.index_number = Some(1);
+        season.is_virtual_item = true;
+        season.date_last_refreshed = Some(chrono::Utc::now());
+        crate::metadata_merge::settle_sort_name(&mut season);
+        let mut specials = row("TV.Season", "Specials");
+        specials.series_id = Some(series.id.clone());
+        specials.parent_id = Some(series.id.clone());
+        specials.series_presentation_unique_key = Some(series_key.clone());
+        specials.index_number = Some(0);
+        let episode = |name: &str, season_number: i64, path: Option<&str>| {
+            let mut episode = row("TV.Episode", name);
+            episode.series_id = Some(series.id.clone());
+            episode.series_presentation_unique_key = Some(series_key.clone());
+            episode.parent_index_number = Some(season_number);
+            episode.index_number = Some(1);
+            episode.path = path.map(str::to_owned);
+            let parent = if season_number == 1 {
+                &season
+            } else {
+                episode.data = Some(r#"{"AirsBeforeSeasonNumber":1}"#.to_owned());
+                &specials
+            };
+            episode.season_id = Some(parent.id.clone());
+            episode.parent_id = Some(parent.id.clone());
+            episode
+        };
+        let mut rows = vec![
+            series.clone(),
+            season.clone(),
+            specials.clone(),
+            episode("Missing", 1, None),
+        ];
+        if real_episode {
+            rows.push(episode("Real", 1, Some("/tv/Show/Show S01E01.mkv")));
+        }
+        if real_special {
+            rows.push(episode("Special", 0, Some("/tv/Show/Show S00E01.mkv")));
+        }
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: rows
+                        .into_iter()
+                        .map(|row| (Uuid::parse_str(&row.id).expect("id"), row))
+                        .collect(),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_display_specials_within_seasons(move || specials_within_seasons);
+        let update = mgr
+            .refresh_single_item(
+                season_id,
+                &Opts {
+                    force_save: true,
+                    ..Opts::default()
+                },
+            )
+            .await
+            .expect("refresh");
+        let saved = store.saved.lock().expect("lock");
+        let flag = saved.last().map(|row| row.is_virtual_item);
+        assert_eq!(flag, Some(expected), "{saved:?}");
+        let changed = !expected;
+        assert_eq!(update == ItemUpdateType::MetadataEdit, changed);
+    }
+
+    /// `SaveIsVirtualItem`'s gate past a plain refresh (gl-1621): the images
+    /// `RemoveImages` took out before `BeforeSave` make `updateType > None`
+    /// (`MetadataService.cs:112-118,150`), so a path-less season with no
+    /// episode becomes virtual (a `MetadataEdit`); without them a refreshed
+    /// season's plain refresh leaves its flag.
+    #[rstest::rstest]
+    #[case::images_removed(true, ItemUpdateType::MetadataEdit)]
+    #[case::plain(false, ItemUpdateType::None)]
+    #[tokio::test]
+    async fn removed_images_open_a_seasons_virtual_flag(
+        #[case] replace: bool,
+        #[case] expected_update: ItemUpdateType,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let item_id = Uuid::new_v4();
+        let ours = crate::local_images::own_art_dir(tmp.path(), item_id);
+        std::fs::create_dir_all(&ours).expect("dir");
+        let poster = ours.join("poster.jpg");
+        std::fs::write(&poster, b"x").expect("write");
+        let mut stored = row("TV.Season", "Season 1");
+        stored.id = item_id.to_string();
+        stored.index_number = Some(1);
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        crate::metadata_merge::settle_sort_name(&mut stored);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        store.images.lock().expect("lock").push((
+            item_id,
+            ItemImageInfo {
+                path: poster.to_string_lossy().into_owned(),
+                image_type: ImageType::Primary,
+                date_modified: chrono::Utc::now(),
+                width: 0,
+                height: 0,
+                blur_hash: None,
+            },
+        ));
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, tmp.path().to_path_buf());
+        let options = Opts {
+            remove_old_metadata: replace,
+            replace_all_images: replace,
+            ..Opts::default()
+        };
+        let update = mgr
+            .refresh_single_item(item_id, &options)
+            .await
+            .expect("refresh");
+        assert_eq!(update, expected_update);
+        // Saved virtual, or (the flag unchanged and nothing else to write)
+        // not saved at all.
+        let saved = store.saved.lock().expect("lock");
+        assert_eq!(
+            saved.last().map(|row| row.is_virtual_item),
+            replace.then_some(true),
+            "{saved:?}"
+        );
+    }
+
     /// gl-592: "Replace all metadata" with "Replace existing images" removes
     /// the item's images in its own metadata folders before any provider runs
     /// (`MetadataService.cs:112-118`, `ItemImageProvider.RemoveImages`): the
@@ -14929,6 +15167,9 @@ mod tests {
             season.series_id = Some(series_id.to_string());
             season.top_parent_id = Some(library_id.to_string());
             season.index_number = Some(1);
+            // No episode: the images' `updateType` opens `SaveIsVirtualItem`,
+            // which keeps it virtual.
+            season.is_virtual_item = true;
             let refreshed = chrono::Utc::now() - chrono::Duration::days(1);
             season.date_last_refreshed = Some(refreshed);
             crate::metadata_merge::settle_sort_name(&mut season);
