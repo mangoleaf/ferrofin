@@ -98,8 +98,10 @@
 //!   stamp the rest of the refresh left it, unless it failed, and re-saves a
 //!   row whose image it drew, as upstream's one `RefreshMetadata` does.
 //! - A library's or the root's refresh validates whole libraries the same
-//!   way, and also redraws the library tiles; the root's reaches the user
-//!   root's image too ([`DynamicImageProviders::refresh_roots_between`]).
+//!   way, and also redraws the library tiles; the user root's reaches its
+//!   own image too, and the `AggregateFolder`'s its own and the user root's
+//!   ([`DynamicImageProviders::refresh_roots_between`]), then refreshes the
+//!   playlists of its `PlaylistsFolder` through the provider manager.
 //!   The walk plans neither, so each is forced as its own refresh plan says
 //!   (`unwalked_refresh_plan`):
 //!   by the refresh's options, or by its own first or overdue refresh.
@@ -405,20 +407,15 @@ impl DynamicImageProviders {
     /// else gated, and its `DateLastRefreshed` stamped as the save rule says.
     /// Awaits `between` before each row.
     ///
-    /// A refresh of the root reaches the user root's image (`UserRootFolder`
-    /// is the root clients refresh, and its children are the libraries). Library
+    /// A refresh of the user root reaches its image (`UserRootFolder` is the
+    /// root clients refresh, and its children are the libraries); a refresh
+    /// of the `AggregateFolder` reaches the aggregate's and then the user
+    /// root's (the scanner's `touched_passes`, which also refreshes the
+    /// playlists in the aggregate's virtual `PlaylistsFolder`). Library
     /// validation opens with both, the `AggregateFolder` and then the user
     /// root, with default options whatever the scan's
     /// (`ValidateTopLibraryFolders`: `RootFolder.RefreshMetadata`, then
     /// `GetUserRootFolder().RefreshMetadata()`).
-    ///
-    /// TODO(parity, open work item — NOT an accepted divergence; gl-595): an
-    /// `AggregateFolder` refresh reaches its own image and every playlist's
-    /// too (its virtual `PlaylistsFolder` child, `LibraryManager.cs:
-    /// 1120-1146`), but both roots refresh as the same `ScanTarget::All`, so
-    /// the scan cannot tell them apart. Un-defer path: carry the refreshed
-    /// root in the scan request and draw the `AggregateFolder`, the user root
-    /// and the playlists for the aggregate's refresh.
     ///
     /// TODO(parity, open work item — NOT an accepted divergence; gl-1847):
     /// every root's plan is taken with `locations_changed` false, where

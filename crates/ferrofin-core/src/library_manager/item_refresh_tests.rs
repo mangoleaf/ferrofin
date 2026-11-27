@@ -490,6 +490,37 @@ async fn a_refresh_runs_through_the_scan_or_the_provider_manager() {
     assert!(runner.take().is_empty(), "no scan covers a box set");
 }
 
+/// gl-595: both roots refresh every library (`ScanTarget::All`), and the
+/// `AggregateFolder`'s refresh says so to the scan, which also draws its own
+/// image and refreshes its `PlaylistsFolder`'s playlists; the user root's
+/// does not.
+#[tokio::test]
+async fn the_aggregate_folders_refresh_is_told_apart_from_the_user_roots() {
+    let db = test_db().await;
+    let runner = Arc::new(RecordingRunner::default());
+    let mgr = manager(&db).with_scan_runner(runner.clone());
+    for kind in [BaseItemKind::AggregateFolder, BaseItemKind::UserRootFolder] {
+        mgr.queue_item_refresh(
+            &row(2, kind, true, None, None),
+            &MetadataRefreshOptions::default(),
+        )
+        .await
+        .expect("queued");
+        for _ in 0..500 {
+            if !runner.scopes.lock().expect("scopes").is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            runner.take(),
+            [(ScanTarget::All, MetadataRefreshOptions::default())],
+            "{kind:?}"
+        );
+    }
+    assert_eq!(*runner.aggregate.lock().expect("runs"), [true, false]);
+}
+
 /// Without a provider manager, an item no scan covers is refused rather
 /// than silently left unrefreshed; without the library locations, so is an
 /// Identify that has to check them.
@@ -515,6 +546,8 @@ async fn a_provider_refresh_without_a_provider_manager_is_refused() {
 #[derive(Default)]
 struct RecordingRunner {
     scopes: Mutex<Vec<(ScanTarget, MetadataRefreshOptions)>>,
+    /// Whether each run was the `AggregateFolder`'s refresh, in run order.
+    aggregate: Mutex<Vec<bool>>,
 }
 
 impl RecordingRunner {
@@ -526,6 +559,7 @@ impl RecordingRunner {
 #[async_trait]
 impl ScanRunner for RecordingRunner {
     async fn run(&self, scope: &ScanTarget, run: ScanRun<'_>) -> Result<ScanOutcome, ServiceError> {
+        self.aggregate.lock().expect("runs").push(run.aggregate);
         self.scopes
             .lock()
             .expect("scopes")

@@ -2,6 +2,8 @@
 //! upstream's `Folder.ValidateChildrenInternal2` → `RefreshMetadataRecursive`
 //! does for every library: each box set in the library's locations goes
 //! through the single-item refresh with the scan's refresh options (gl-324).
+//! The `AggregateFolder`'s refresh refreshes the playlists of its virtual
+//! child, the `PlaylistsFolder`, the same way (gl-595).
 
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +11,7 @@ use async_trait::async_trait;
 use ferrofin_core::item_type_lookup::ItemTypeLookup;
 use ferrofin_core::{
     FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
-    LibraryScanner, ScanCancel, ScanRun,
+    LibraryScanner, ScanCancel, ScanPasses, ScanRun,
 };
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -139,6 +141,7 @@ struct Lab {
     collections: std::path::PathBuf,
     inside: Uuid,
     adopted: Uuid,
+    persistence: Arc<FerrofinItemPersistenceService>,
 }
 
 #[allow(clippy::too_many_lines)] // one fixture: two libraries and four box sets
@@ -242,7 +245,7 @@ async fn lab() -> Lab {
     let scanner = LibraryScanner::new(
         Arc::clone(&vf),
         Arc::new(ferrofin_core::file_system::FerrofinFileSystem::new()),
-        persistence,
+        persistence.clone(),
     )
     .with_items(items)
     .with_metadata_savers(refreshes.clone())
@@ -265,6 +268,7 @@ async fn lab() -> Lab {
         collections,
         inside,
         adopted,
+        persistence,
     }
 }
 
@@ -319,6 +323,87 @@ async fn a_scan_refreshes_the_collections_librarys_box_sets(
                 == (options.metadata_refresh_mode, options.image_refresh_mode)),
         "each box set refreshes with the scan's options"
     );
+}
+
+/// gl-595: the `AggregateFolder`'s refresh validates its virtual child, the
+/// `PlaylistsFolder` (`LibraryManager.CreateRootFolder`), so the folder and
+/// then every playlist in it refresh with the refresh's options
+/// (`RefreshChildMetadata`), which draws each playlist's collage; a playlist
+/// elsewhere is not one of them, and the user root's refresh, the same
+/// `ScanTarget::All`, reaches none. A playlists folder whose directory is
+/// empty is skipped with its playlists (`IsLibraryFolderAccessible`).
+#[rstest::rstest]
+#[case::aggregate(true, true)]
+#[case::user_root(false, true)]
+#[case::aggregate_over_an_empty_folder(true, false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_aggregate_folders_refresh_refreshes_its_playlists(
+    #[case] aggregate: bool,
+    #[case] holds_an_entry: bool,
+) {
+    const PLAYLISTS_FOLDER: &str = "Emby.Server.Implementations.Playlists.PlaylistsFolder";
+    const PLAYLIST: &str = "MediaBrowser.Controller.Playlists.Playlist";
+    let lab = lab().await;
+    let (folder, playlist, elsewhere) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let row = |id: Uuid, type_: &str, parent: Option<Uuid>, path: &str| BaseItemEntity {
+        id: guid_to_db(id),
+        type_: type_.to_owned(),
+        name: Some(path.to_owned()),
+        path: Some(lab.tmp.path().join(path).to_string_lossy().into_owned()),
+        parent_id: parent.map(guid_to_db),
+        is_folder: true,
+        ..BaseItemEntity::default()
+    };
+    // `IsLibraryFolderAccessible`: the folder's directory holds the playlist's.
+    std::fs::create_dir_all(lab.tmp.path().join("data/playlists")).expect("playlists dir");
+    if holds_an_entry {
+        std::fs::create_dir_all(lab.tmp.path().join("data/playlists/Mix")).expect("playlist dir");
+    }
+    lab.persistence
+        .save_items(&[
+            row(folder, PLAYLISTS_FOLDER, None, "data/playlists"),
+            row(playlist, PLAYLIST, Some(folder), "data/playlists/Mix"),
+            row(elsewhere, PLAYLIST, None, "movies/Road Trip [playlist]"),
+        ])
+        .await
+        .expect("playlists");
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    let cancel = ScanCancel::new();
+    lab.scanner
+        .scan_target(
+            &ScanTarget::All,
+            ScanRun::new(&full, &full, &cancel)
+                .with_passes(ScanPasses::Touched)
+                .with_aggregate(aggregate),
+        )
+        .await
+        .expect("refresh");
+    let playlists: Vec<_> = lab
+        .refreshes
+        .refreshed
+        .lock()
+        .expect("log")
+        .iter()
+        .filter(|(id, ..)| [folder, playlist, elsewhere].contains(id))
+        .copied()
+        .collect();
+    let full_refresh = |id| {
+        (
+            id,
+            MetadataRefreshMode::FullRefresh,
+            MetadataRefreshMode::FullRefresh,
+        )
+    };
+    let want = if aggregate && holds_an_entry {
+        vec![full_refresh(folder), full_refresh(playlist)]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(playlists, want);
 }
 
 /// One box set whose refresh fails does not stop the others'.

@@ -1380,7 +1380,9 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// - a library (`CollectionFolder`) scans that library
     ///   (`RefreshCollectionFolderChildren`), the root or the aggregate
-    ///   folder every library;
+    ///   folder every library; the aggregate folder's also draws its own
+    ///   image and the root's, and refreshes its `PlaylistsFolder` child and
+    ///   every playlist in it;
     /// - any other folder with a path validates its own subtree, the folder
     ///   included (`ValidateChildren`), and a file item refreshes itself
     ///   (`RefreshSingleItem`) through the scan of its own path — both

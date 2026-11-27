@@ -478,6 +478,10 @@ struct ScanRequest {
     /// It waits in the priority lane: an item refresh a caller is waiting
     /// for, which runs ahead of every queued scan and inside a running one.
     priority: bool,
+    /// It is the `AggregateFolder`'s refresh, which reaches the root's own
+    /// image and its `PlaylistsFolder`'s playlists too; the user root's, the
+    /// same [`ScanTarget::All`], does not ([`ScanRun::aggregate`]).
+    aggregate: bool,
 }
 
 impl ScanRequest {
@@ -491,6 +495,7 @@ impl ScanRequest {
             trigger,
             passes: ScanPasses::Library,
             priority: false,
+            aggregate: false,
         }
     }
 
@@ -509,6 +514,7 @@ impl ScanRequest {
             // `RefreshItem` runs no post-scan task.
             passes: ScanPasses::Touched,
             priority: false,
+            aggregate: false,
         }
     }
 
@@ -541,6 +547,7 @@ impl ScanRequest {
             trigger,
             passes: ScanPasses::Touched,
             priority: false,
+            aggregate: false,
         }
     }
 
@@ -552,7 +559,9 @@ impl ScanRequest {
     /// library's include the touched items'). A scan narrower than a
     /// library must also treat the folders it carries for context alike; a
     /// library's validation refreshes every item with its options, so a
-    /// full scan covers a path-scoped request's context folders too.
+    /// full scan covers a path-scoped request's context folders too. Only
+    /// the `AggregateFolder`'s refresh covers another of its own, which does
+    /// more than the user root's (`aggregate`).
     fn covers(&self, other: &Self) -> bool {
         let scope = match (&self.scope, &other.scope) {
             (ScanTarget::All, _) => true,
@@ -566,6 +575,7 @@ impl ScanRequest {
             && self.priority == other.priority
             && (self.passes == other.passes || self.passes == ScanPasses::Library)
             && (whole_libraries || self.ancestors == other.ancestors)
+            && (self.aggregate || !other.aggregate)
     }
 
     /// Whether this is a full library validation — upstream's
@@ -583,6 +593,7 @@ impl ScanRequest {
             && self.ancestors == other.ancestors
             && self.passes == other.passes
             && self.priority == other.priority
+            && self.aggregate == other.aggregate
     }
 }
 
@@ -1134,6 +1145,7 @@ impl ScanWorker {
                         ScanRun::new(&request.options, &request.ancestors, &cancel)
                             .with_progress(&report)
                             .with_passes(request.passes)
+                            .with_aggregate(request.aggregate)
                             .with_lane(&lane),
                     )
                     .await
@@ -3811,6 +3823,18 @@ impl LibraryManager for FerrofinLibraryManager {
         options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
         match self.refresh_target(item).await? {
+            // The aggregate root's refresh reaches more than the user root's.
+            Some(ScanTarget::All)
+                if self.scanner.is_some()
+                    && BaseItemKind::from_stored_type_name(&item.type_)
+                        == Some(BaseItemKind::AggregateFolder) =>
+            {
+                self.spawn_scan(ScanRequest {
+                    aggregate: true,
+                    ..ScanRequest::folder_refresh(ScanTarget::All, options.clone())
+                });
+                Ok(())
+            }
             Some(target) => self.queue_refresh_scan(target, options).await,
             None => self.queue_provider_refresh(item, options).await,
         }
@@ -5504,6 +5528,7 @@ mod tests {
             trigger: ScanTrigger::Api,
             passes: ScanPasses::Library,
             priority: false,
+            aggregate: false,
         }
     }
 
@@ -5609,6 +5634,42 @@ mod tests {
             false,
         );
         assert_eq!(queue.pending.len(), 2);
+    }
+
+    /// gl-595: the `AggregateFolder`'s refresh does more than the user
+    /// root's (its own image, its `PlaylistsFolder`'s playlists), so it takes
+    /// a queued user-root refresh's place, or takes a later one in, while a
+    /// queued user-root refresh or library validation never takes it in.
+    #[test]
+    fn only_an_aggregate_refresh_covers_an_aggregate_refresh() {
+        let aggregate = || ScanRequest {
+            aggregate: true,
+            ..ScanRequest::folder_refresh(ScanTarget::All, MetadataRefreshOptions::default())
+        };
+        let user_root =
+            || ScanRequest::folder_refresh(ScanTarget::All, MetadataRefreshOptions::default());
+        for (first, second) in [(user_root(), aggregate()), (aggregate(), user_root())] {
+            let mut queue = ScanQueue::default();
+            queue.enqueue(first, true);
+            queue.enqueue(second, true);
+            assert_eq!(queue.pending.len(), 1);
+            assert!(
+                queue.pending[0].request.aggregate,
+                "the aggregate refresh runs"
+            );
+            assert_eq!(queue.pending[0].waiters.tickets.len(), 2);
+        }
+        let mut queue = ScanQueue::default();
+        queue.enqueue(
+            request(ScanTarget::All, MetadataRefreshOptions::default()),
+            false,
+        );
+        queue.enqueue(aggregate(), false);
+        assert_eq!(
+            queue.pending.len(),
+            2,
+            "library validation covers no aggregate refresh"
+        );
     }
 
     #[test]

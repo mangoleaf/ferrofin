@@ -7072,7 +7072,15 @@ pub const VERIFIED: &[Verified] = &[
                library_manager/item_refresh.rs refresh_target (QueueRefresh at High \
                priority, then the queue's RefreshItem or RefreshArtist): a \
                CollectionFolder's physical folders \
-               (RefreshCollectionFolderChildren), every library for the root, another \
+               (RefreshCollectionFolderChildren), every library for either root (the \
+               user root's refresh draws its image after the library tiles; the \
+               AggregateFolder's, a request of its own (ScanRequest::aggregate), draws its \
+               own image and the user root's and then refreshes its virtual \
+               PlaylistsFolder child and every playlist in it with the same options \
+               through ProviderManager::refresh_single_item, unless the folder's \
+               directory is empty or gone, library_scan.rs refresh_folder_playlists: \
+               LibraryManager.CreateRootFolder, AggregateFolder.GetNonCachedChildren, \
+               Folder.RefreshChildMetadata and IsLibraryFolderAccessible), another \
                folder's subtree (the folder, then ValidateChildren with the same options) \
                and a file's own path (RefreshSingleItem's metadata service), each as a scan \
                through queue_refresh_scan; a music artist by artist_target \
@@ -7082,7 +7090,7 @@ pub const VERIFIED: &[Verified] = &[
                playlist, view, virtual season, person, genre, studio or channel through \
                ProviderManager::queue_refresh at High priority → 204 without waiting for \
                the refresh.",
-        date: "2026-11-14",
+        date: "2026-11-26",
         divergences: &[
             "An item whose path no library location covers is answered 204 and not \
          refreshed; upstream refreshes it. Fix path: gl-1770.",

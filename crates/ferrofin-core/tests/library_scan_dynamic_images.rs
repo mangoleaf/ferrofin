@@ -1232,6 +1232,60 @@ async fn user_root_of(lib: &PhotoLibrary) -> BaseItemEntity {
         .expect("the root the library hangs under")
 }
 
+/// gl-595: the `AggregateFolder`'s refresh (`ScanTarget::All` with the
+/// folder-refresh closing passes, told apart from the user root's) runs its
+/// own `FolderImageProvider`, forced by a full refresh and stamped; the user
+/// root's refresh of every library leaves the aggregate alone.
+#[rstest::rstest]
+#[case::aggregate(true)]
+#[case::user_root(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_aggregate_folders_refresh_draws_its_own_image(#[case] aggregate: bool) {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let root = uuid::Uuid::new_v4();
+    lib.persistence
+        .save_items(&[BaseItemEntity {
+            id: guid_to_db(root),
+            type_: "MediaBrowser.Controller.Entities.AggregateFolder".to_owned(),
+            name: Some("root".to_owned()),
+            path: Some(lib.tmp.path().join("root").to_string_lossy().into_owned()),
+            is_folder: true,
+            ..BaseItemEntity::default()
+        }])
+        .await
+        .expect("aggregate");
+    let library = lib.row(BaseItemKind::CollectionFolder, "Photos").await;
+    let library_id = uuid::Uuid::parse_str(&library.id).expect("id");
+    lib.persistence
+        .set_ancestors(library_id, &[root])
+        .await
+        .expect("ancestors");
+
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    let cancel = ScanCancel::new();
+    lib.scanner
+        .scan_target(
+            &ScanTarget::All,
+            ScanRun::new(&full, &full, &cancel)
+                .with_passes(ScanPasses::Touched)
+                .with_aggregate(aggregate),
+        )
+        .await
+        .expect("refresh");
+    let row = lib.row(BaseItemKind::AggregateFolder, "root").await;
+    let images = lib.items.get_image_infos(root).await.expect("images");
+    assert_eq!(
+        images.iter().any(|i| i.image_type == ImageType::Primary),
+        aggregate,
+        "{images:?}"
+    );
+    assert_eq!(row.date_last_refreshed.is_some(), aggregate);
+}
+
 /// gl-950: library validation refreshes the user root at its opening, as
 /// upstream's `ValidateTopLibraryFolders` does, before any library is walked:
 /// a fresh library's first validation finds no tile to copy and records the

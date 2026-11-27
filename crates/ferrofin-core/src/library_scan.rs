@@ -2099,7 +2099,8 @@ pub enum ScanPasses {
     /// Primaries of the music and photo albums, folders and playlists among
     /// them — plus
     /// the library tiles for a library's or the root's refresh, and the user
-    /// root's image for the root's.
+    /// root's image for the root's (for the `AggregateFolder`'s, its own image
+    /// and the playlists of its `PlaylistsFolder` too).
     /// An item or folder refresh over the API, and the library monitor's
     /// refresh of what a changed path belongs to (the watcher, the
     /// webhooks): upstream's `ProviderManager.RefreshItem` runs no post-scan
@@ -2356,6 +2357,11 @@ pub struct ScanRun<'a> {
     /// It validates every library from the root ([`ScanTarget::All`]): a
     /// refresh of the root reaches the user root's image too.
     from_root: bool,
+    /// It is the `AggregateFolder`'s refresh, which reaches the aggregate's
+    /// own image and every playlist in its virtual child, the
+    /// `PlaylistsFolder` (`LibraryManager.CreateRootFolder`,
+    /// `AggregateFolder.GetNonCachedChildren`), as well as the user root's.
+    pub aggregate: bool,
     /// The directory listings the run shares between its items (one per
     /// run, as upstream's validation has one `DirectoryService`); set by
     /// [`LibraryScanner::scan_target`].
@@ -2395,6 +2401,7 @@ impl<'a> ScanRun<'a> {
             edits: None,
             touched: None,
             from_root: false,
+            aggregate: false,
             dirs: None,
         }
     }
@@ -2412,6 +2419,13 @@ impl<'a> ScanRun<'a> {
     #[must_use]
     pub fn with_passes(self, passes: ScanPasses) -> Self {
         Self { passes, ..self }
+    }
+
+    /// This run as the `AggregateFolder`'s refresh, when `aggregate`
+    /// ([`aggregate`](Self::aggregate)).
+    #[must_use]
+    pub fn with_aggregate(self, aggregate: bool) -> Self {
+        Self { aggregate, ..self }
     }
 
     /// This run serving `lane` while it runs.
@@ -3162,6 +3176,19 @@ const UNWALKED_FACTS: FileFacts = FileFacts {
     path_rebased: false,
     locations_changed: false,
 };
+
+/// Whether the directory at `path` holds an entry: upstream's
+/// `DirectoryService.IsAccessible`, by which a validation skips a top parent
+/// whose directory is empty or gone (`Folder.cs:400-412`).
+async fn holds_an_entry(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    match tokio::fs::read_dir(path).await {
+        Ok(mut entries) => entries.next_entry().await.is_ok_and(|e| e.is_some()),
+        Err(_) => false,
+    }
+}
 
 /// The refresh plan of `row`, a row a library or root refresh reaches
 /// without the walk planning it: a library tile (`library` is its options)
@@ -8345,7 +8372,10 @@ impl LibraryScanner {
     /// Primaries of the music and photo albums, folders and playlists it
     /// refreshed, and
     /// the tiles of the `libraries` a library's or the root's refresh
-    /// validated whole — never a pass over the whole database. (The folders
+    /// validated whole, the root images, and for the `AggregateFolder`'s
+    /// refresh the playlists of its `PlaylistsFolder`
+    /// ([`refresh_folder_playlists`](Self::refresh_folder_playlists)) — never
+    /// a pass over the whole database. (The folders
     /// planned for context included: see the owner-approved divergence at
     /// [`update_folder_aggregates`](Self::update_folder_aggregates).)
     async fn touched_passes(
@@ -8401,22 +8431,87 @@ impl LibraryScanner {
             {
                 tracing::warn!(%err, "failed to record the library tiles' refresh");
             }
-            // The user root's image a root's refresh reaches, after the tiles
-            // it copies.
+            // The root images a root's refresh reaches, after the tiles they
+            // copy: the user root's, and for the aggregate's refresh its own
+            // first, as library validation orders them.
             if run.cancel.is_cancelled() {
                 return false;
             }
+            let roots: &[BaseItemKind] = if run.aggregate {
+                &[BaseItemKind::AggregateFolder, BaseItemKind::UserRootFolder]
+            } else {
+                &[BaseItemKind::UserRootFolder]
+            };
             if runs
                 && run.from_root
                 && let Err(err) = providers
-                    .refresh_roots_between(&[BaseItemKind::UserRootFolder], run.options, &between)
+                    .refresh_roots_between(roots, run.options, &between)
                     .await
             {
                 tracing::warn!(%err, "root image pass failed");
             }
         }
+        if run.aggregate {
+            self.refresh_folder_playlists(run).await;
+        }
         run.report(100.0);
         !run.cancel.is_cancelled()
+    }
+
+    /// The `AggregateFolder` refresh's last child: its virtual child, the
+    /// `PlaylistsFolder` (`LibraryManager.CreateRootFolder`,
+    /// `AggregateFolder.GetNonCachedChildren`), which refreshes with the
+    /// refresh's options and then every playlist in it
+    /// (`Folder.RefreshChildMetadata`), unless its directory is empty or gone
+    /// (`IsLibraryFolderAccessible`, a top parent). They refresh through the
+    /// provider manager, as an item with no file of its own does, which draws
+    /// each playlist's collage (`PlaylistImageProvider`); the lane is served
+    /// between two. A failure is logged.
+    async fn refresh_folder_playlists(&self, run: ScanRun<'_>) {
+        let (Some(items), Some(providers)) = (&self.item_repository, &self.metadata_savers) else {
+            return;
+        };
+        let of_kind = |kind| InternalItemsQuery {
+            include_item_types: vec![kind],
+            ..InternalItemsQuery::default()
+        };
+        let (folders, playlists) = match (
+            items
+                .get_item_list(&of_kind(BaseItemKind::PlaylistsFolder))
+                .await,
+            items.get_item_list(&of_kind(BaseItemKind::Playlist)).await,
+        ) {
+            (Ok(folders), Ok(playlists)) => (folders, playlists),
+            (Err(err), _) | (_, Err(err)) => {
+                tracing::warn!(%err, "could not list the playlists folder's playlists");
+                return;
+            }
+        };
+        for folder in folders {
+            if !holds_an_entry(folder.path.as_deref()).await {
+                continue;
+            }
+            let Ok(folder_id) = Uuid::parse_str(&folder.id) else {
+                continue;
+            };
+            let children = playlists.iter().filter_map(|row| {
+                (row.parent_id
+                    .as_deref()
+                    .and_then(|p| Uuid::parse_str(p).ok())
+                    == Some(folder_id))
+                .then(|| Uuid::parse_str(&row.id).ok())
+                .flatten()
+            });
+            for id in std::iter::once(folder_id).chain(children) {
+                if run.cancel.is_cancelled() {
+                    return;
+                }
+                Box::pin(self.serve_lane(run)).await;
+                if let Err(err) = providers.refresh_single_item(id, run.options).await {
+                    tracing::warn!(%err, item_id = %id, "could not refresh an item of the playlists folder");
+                }
+            }
+        }
     }
 
     /// Keeps the stored-row window (see `StoredRows`) over item `scanned`,
@@ -13735,14 +13830,7 @@ impl LibraryScanner {
             .await?;
         if let (Some(repo), false) = (&self.item_repository, folders.is_empty()) {
             for mut row in repo.retrieve_items(&folders).await? {
-                let accessible = match row.path.as_deref() {
-                    Some(path) => match tokio::fs::read_dir(path).await {
-                        Ok(mut entries) => entries.next_entry().await.is_ok_and(|e| e.is_some()),
-                        Err(_) => false,
-                    },
-                    None => false,
-                };
-                if !accessible {
+                if !holds_an_entry(row.path.as_deref()).await {
                     continue;
                 }
                 ferrofin_providers::provider_manager::restat_directory(&mut row).await;
