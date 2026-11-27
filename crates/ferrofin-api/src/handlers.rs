@@ -6950,6 +6950,75 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "post",
+        path: "/ScheduledTasks/Running/{taskId}",
+        upstream_file: "Jellyfin.Api/Controllers/ScheduledTasksController.cs",
+        upstream_method: "StartTask",
+        ferrofin: "handlers/scheduled_tasks.rs start_task (RequireAdmin, \
+               Policies.RequiresElevation; RequiredRouteString taskId: ConvertEmptyStringToNull, \
+               then [Required]; the task looked up first, none is the 404) → ferrofin-core \
+               scheduled_tasks.rs start_task (the Id matched ignoring case, as \
+               OrdinalIgnoreCase) → queue (TaskManager.Execute → ScheduledTaskWorker.Execute \
+               with new TaskOptions(): no max runtime, the run started on its own task and not \
+               awaited, so the request answers 204 at once; a task already running or stopping \
+               keeps its one run and the request still answers 204, as ExecuteInternal's \
+               InvalidOperationException goes unobserved) → execute_contained and finish \
+               (ExecuteInternal: the run's result recorded, then ExecuteQueuedTasks)",
+        date: "2026-11-27",
+        divergences: &[
+            "While the server shuts down, a start of an idle task answers 503 and starts \
+         nothing: the task registry refuses new runs once its shutdown begins, a state \
+         upstream's TaskManager.Execute has no check for. A task still running or stopping \
+         answers 204 then, as at any other time.",
+            "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
+         id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/ScheduledTasks/{taskId}/Triggers",
+        upstream_file: "Jellyfin.Api/Controllers/ScheduledTasksController.cs",
+        upstream_method: "UpdateTask",
+        ferrofin: "handlers/scheduled_tasks.rs update_task_triggers (RequireAdmin, \
+               Policies.RequiresElevation; RequiredRouteString taskId: ConvertEmptyStringToNull, \
+               then [Required]; JsonSeqBody for [FromBody, Required] TaskTriggerInfo[], its null \
+               entries dropped as the Triggers setter's Where(i => i is not null)) → \
+               ferrofin-core scheduled_tasks.rs update_triggers (the Id matched ignoring case; \
+               none is the 404) → set_triggers (GetTrigger's ArgumentException for an unnamed \
+               trigger type, a daily or weekly trigger with no TimeOfDayTicks, a weekly one \
+               with no DayOfWeek and an interval one with no IntervalTicks, and the \
+               ArgumentOutOfRangeException WeeklyTrigger.Start throws for a weekday no member \
+               names: each the 400 ExceptionMiddleware answers, text/plain, \"Error processing \
+               request.\", as a failed SaveTriggers is its 500; then SaveTriggers, a failed \
+               write keeping the old triggers, and the new list in place of the old, daily and \
+               weekly ones re-armed for their next occurrence as ReloadTriggerEvents(false) \
+               re-arms them)",
+        date: "2026-11-27",
+        divergences: &[
+            "A list holding a trigger upstream cannot build is refused before anything is \
+         saved. Upstream's setter runs SaveTriggers first and throws after (for a weekday no \
+         member names, after the new list is also in place), so the file it refused is the \
+         one it loads at its next start, and Jellyfin does not start. Jellyfin bug not \
+         ported.",
+            "The triggers are saved to Ferrofin's trigger store, not to an adopted Jellyfin's \
+         {ConfigurationDirectoryPath}/ScheduledTasks/{id}.js, which is only read.",
+            "A saved interval trigger is anchored on the task's last completion, not re-armed at \
+         now + 1 minute + interval: an interval that has already passed since the last run \
+         starts the task at the next scheduler sweep, and on a task that has never \
+         completed, a save once the first-run delay since startup has passed does too, where \
+         upstream arms now + 1 hour on every save (the accepted divergence recorded at \
+         trigger_due in ferrofin-core scheduled_tasks.rs).",
+            "An IntervalTicks of zero or less is saved and never fires. Upstream checks only \
+         that it is set: a zero interval re-arms a minute after each run, and a negative one \
+         of more than a minute throws from the timer once the task has a result, a 400 after the \
+         list is saved. jellyfin-web offers neither. Jellyfin bug not ported.",
+            "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
+         id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
         path: "/Library/Refresh",
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "RefreshLibrary",

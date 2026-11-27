@@ -163,6 +163,12 @@ impl TaskManager for StubTasks {
         triggers: &[ferrofin_model::tasks::TaskTriggerInfo],
     ) -> Result<(), ServiceError> {
         if self.tasks.iter().any(|t| t.id.as_deref() == Some(task_id)) {
+            if triggers.iter().any(|t| {
+                t.type_ == ferrofin_model::tasks::TaskTriggerInfoType::DailyTrigger
+                    && t.time_of_day_ticks.is_none()
+            }) {
+                return Err(ServiceError::invalid_input("no time of day"));
+            }
             self.triggered
                 .lock()
                 .expect("lock")
@@ -507,17 +513,103 @@ async fn update_triggers_persists_and_returns_204() {
     assert_eq!(recorded.as_slice(), [("scan".to_owned(), 1)]);
 }
 
+/// gl-2018: the `Triggers` setter drops `null` entries ("bad user input")
+/// instead of refusing the body.
 #[tokio::test]
-async fn update_triggers_unknown_id_is_404() {
+async fn update_triggers_drops_null_entries() {
     let tasks = Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]));
     let status = send_json(
         Arc::clone(&tasks),
         true,
         "POST",
-        "/ScheduledTasks/nope/Triggers",
-        "[]",
+        "/ScheduledTasks/scan/Triggers",
+        r#"[null, {"Type":"StartupTrigger"}, null]"#,
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        tasks.triggered.lock().expect("lock").as_slice(),
+        [("scan".to_owned(), 1)]
+    );
+}
+
+/// A body of nothing but `null` is an empty list, saved like any other.
+#[tokio::test]
+async fn update_triggers_of_only_nulls_saves_an_empty_list() {
+    let tasks = Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]));
+    let status = send_json(
+        Arc::clone(&tasks),
+        true,
+        "POST",
+        "/ScheduledTasks/scan/Triggers",
+        "[null]",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        tasks.triggered.lock().expect("lock").as_slice(),
+        [("scan".to_owned(), 0)]
+    );
+}
+
+/// gl-2018: a trigger `GetTrigger` cannot build is its `ArgumentException`,
+/// which upstream's `ExceptionMiddleware` answers 400, `text/plain`,
+/// "Error processing request.".
+#[tokio::test]
+async fn an_unbuildable_trigger_is_answered_as_upstreams_exception() {
+    use tower::ServiceExt;
+    let tasks = Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]));
+    let response = create_router(state(Arc::clone(&tasks), true))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ScheduledTasks/scan/Triggers")
+                .header("Authorization", "Token abc")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"[{"Type":"DailyTrigger"}]"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .map(axum::http::HeaderValue::as_bytes),
+        Some(&b"text/plain"[..])
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"Error processing request.");
+    assert!(tasks.triggered.lock().expect("lock").is_empty());
+}
+
+#[tokio::test]
+async fn update_triggers_unknown_id_is_404() {
+    use tower::ServiceExt;
+    let tasks = Arc::new(StubTasks::new(vec![task_info("scan", "Scan", false)]));
+    let response = create_router(state(Arc::clone(&tasks), true))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ScheduledTasks/nope/Triggers")
+                .header("Authorization", "Token abc")
+                .header("Content-Type", "application/json")
+                .body(Body::from("[]"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // `NotFound()` is an action result, not `ExceptionMiddleware`'s answer.
+    assert_ne!(
+        response
+            .headers()
+            .get("content-type")
+            .map(axum::http::HeaderValue::as_bytes),
+        Some(&b"text/plain"[..])
+    );
     assert!(tasks.triggered.lock().expect("lock").is_empty());
 }
