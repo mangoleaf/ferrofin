@@ -25,10 +25,11 @@ mod sqlite_casing;
 pub mod sqlite_random;
 pub mod store;
 mod wal_checkpoints;
+mod writer_holds;
 
 pub use database::{
     AdoptionState, DEFAULT_STATEMENT_CACHE_CAPACITY, Database, ImageParentRow,
-    JELLYFIN_GENERATIONS, JellyfinGeneration, MigrationHistory, init_sqlite,
+    JELLYFIN_GENERATIONS, JellyfinGeneration, MigrationHistory, STARTED_KEY, init_sqlite,
     inspect_migration_history, schema_head,
 };
 

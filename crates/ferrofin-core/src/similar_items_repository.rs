@@ -15,6 +15,7 @@ use uuid::Uuid;
 use ferrofin_traits::error::ServiceError;
 
 use crate::db_error::db_err;
+use crate::translate_query::ALTERNATE_VERSION_HIDDEN;
 use crate::user_entity_ext::{cached_guid_preference, cached_permission};
 
 /// A score-pass row: the candidate and its weighted-overlap score.
@@ -53,7 +54,9 @@ impl SimilarItemsRepository {
     /// one map row per credited role, so the seed's side is its distinct
     /// people (upstream's `HashSet` of `PeopleId` per item): an actor in two
     /// parts on the seed counts once. The candidate side keeps every row, as
-    /// upstream's candidate list does.
+    /// upstream's candidate list does. A version whose primary is in its own
+    /// library is never a candidate (upstream's `hiddenVersionIds`), so it
+    /// takes no place in the window.
     ///
     /// An empty `candidate_types` matches nothing (C# has no provider for the
     /// kind, so nothing is scored).
@@ -86,7 +89,7 @@ impl SimilarItemsRepository {
     /// every seed's weighted-overlap score of every candidate of the stored
     /// `candidate_types` other than the seed itself, as
     /// `(seed, candidate, score)`, in one statement for all `seed_ids`. The
-    /// weights and the seed-side person de-dup are
+    /// weights, the seed-side person de-dup and the hidden versions are
     /// [`Self::weighted_similar_items`]'s.
     ///
     /// Unranked and uncut: the manager takes each seed's top `limit * 3` and
@@ -390,6 +393,9 @@ fn weighted_similar_sql(type_count: usize, exclude_count: usize) -> String {
         sql.push_str(&(next + i).to_string());
     }
     sql.push(')');
+    // `hiddenVersionIds`: a version behind a primary in its own library
+    // scores nothing (`ComputeBatchScoresAsync`).
+    sql.push_str(ALTERNATE_VERSION_HIDDEN);
     next += type_count;
     if exclude_count > 0 {
         sql.push_str(r#" AND bi."Id" NOT IN ("#);
@@ -421,7 +427,12 @@ fn weighted_scores_sql(seed_count: usize, type_count: usize) -> String {
     // and studio row and probes the map for each seed. The type set filters
     // the grouped pairs, outside `s`: written into the arms' `WHERE`, it
     // became an `ItemId` seek per movie for every shared value, about 5x
-    // slower on 3,000 movies. The plan test catches both shapes.
+    // slower on 3,000 movies. The plan test catches both shapes. The hidden
+    // versions (`hiddenVersionIds`, a version behind a primary in its own
+    // library) are one set built off the partial `PrimaryVersionId` index,
+    // the versions alone; it must stay the rule `ALTERNATE_VERSION_HIDDEN`
+    // states, which `a_version_hidden_behind_its_primary_is_never_scored`
+    // checks on both passes.
     format!(
         r#"SELECT s."seed", s."cand", s."score" FROM (
                SELECT scored."seed", scored."cand", SUM(scored."w") AS "score" FROM (
@@ -442,7 +453,12 @@ fn weighted_scores_sql(seed_count: usize, type_count: usize) -> String {
                WHERE scored."cand" <> scored."seed"
                GROUP BY scored."seed", scored."cand"
            ) s
-           WHERE s."cand" IN (SELECT "Id" FROM "BaseItems" WHERE "Type" IN ({types}))"#
+           WHERE s."cand" IN (SELECT "Id" FROM "BaseItems" WHERE "Type" IN ({types}))
+             AND s."cand" NOT IN (SELECT v."Id" FROM "BaseItems" v
+                                  WHERE v."PrimaryVersionId" IS NOT NULL
+                                    AND EXISTS (SELECT 1 FROM "BaseItems" p
+                                                WHERE p."Id" = v."PrimaryVersionId"
+                                                  AND p."TopParentId" IS v."TopParentId"))"#
     )
 }
 
@@ -481,7 +497,8 @@ mod tests {
     /// `PeopleBaseItemMap` primary key (`ItemId`, `PeopleId`, `Role`), whose
     /// order already makes them distinct, so the `DISTINCT` adds no temp
     /// B-tree; the candidate side still seeks by `PeopleId`. The genre arm and
-    /// the `Id`-driven `BaseItems` join are unchanged.
+    /// the `Id`-driven `BaseItems` join are unchanged, and a version's primary
+    /// is one primary-key probe.
     #[tokio::test]
     async fn the_seed_people_are_read_distinct_off_the_map_key() {
         let db = Database::connect_in_memory().await.expect("db");
@@ -503,6 +520,8 @@ mod tests {
             "SEARCH pm2 USING COVERING INDEX IX_PeopleBaseItemMap_PeopleId_ItemId (PeopleId=?)",
             "SEARCH ivm0 USING INDEX IX_ItemValuesMap_ItemId (ItemId=?)",
             "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)",
+            // A version's primary, for the hidden-version rule.
+            "SEARCH p USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)",
         ] {
             assert!(plan.iter().any(|d| d == step), "{step} not in {plan:#?}");
         }
@@ -515,7 +534,8 @@ mod tests {
     /// The batched score pass seeks each seed's values and people by
     /// `ItemId`, fans out by value and person id alone, and reads the type
     /// set off the covering `Type` index once: no `BaseItems` row per pair and
-    /// no `ItemId` seek per candidate.
+    /// no `ItemId` seek per candidate. The hidden versions come off the
+    /// partial `PrimaryVersionId` index, never a scan of `BaseItems`.
     #[tokio::test]
     async fn the_batched_scores_start_from_each_seed_and_read_the_types_once() {
         let db = Database::connect_in_memory().await.expect("db");
@@ -543,13 +563,19 @@ mod tests {
             "SEARCH PeopleBaseItemMap USING COVERING INDEX sqlite_autoindex_PeopleBaseItemMap_1 (ItemId=?)",
             "SEARCH pm2 USING COVERING INDEX IX_PeopleBaseItemMap_PeopleId_ItemId (PeopleId=?)",
             "SEARCH BaseItems USING COVERING INDEX IX_BaseItems_Type_TopParentId_Id (Type=?)",
+            // The hidden versions: the versions alone, each primary by id.
+            "SEARCH v USING INDEX IX_BaseItems_PrimaryVersionId (PrimaryVersionId>?)",
+            "SEARCH p EXISTS USING COVERING INDEX IX_BaseItems_TopParentId_Id (TopParentId=? AND Id=?)",
         ] {
             assert!(plan.iter().any(|d| d == step), "{step} not in {plan:#?}");
         }
         assert!(
-            !plan
-                .iter()
-                .any(|d| d.contains("FOR DISTINCT") || d.contains("SCAN BaseItems")),
+            !plan.iter().any(|d| d.contains("FOR DISTINCT")
+                || d.contains("SCAN BaseItems")
+                // Not `SCAN pm0`, the seed's people off the map key.
+                || ["SCAN v", "SCAN p"]
+                    .iter()
+                    .any(|scan| d == scan || d.starts_with(&format!("{scan} ")))),
             "{plan:#?}"
         );
     }

@@ -11,8 +11,6 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::PermissionKind;
 use ferrofin_model::session::ClientCapabilities;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::net::WebSocketConnection;
-use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::session::SessionManager;
 use ferrofin_traits::session_bus::SessionMessageBus;
 use uuid::Uuid;
@@ -20,8 +18,8 @@ use uuid::Uuid;
 use crate::event_manager::EventFuture;
 
 use super::{
-    FakeConnection, FerrofinSessionManager, active_at, manager_with_events, playing_session,
-    record_event, seed_named_user, set_permission, sign_in, test_db,
+    FerrofinSessionManager, active_at, manager_with_events, playing_session, record_event,
+    seed_named_user, set_permission, sign_in, test_db,
 };
 
 const WINDOW: TimeDelta = TimeDelta::hours(24);
@@ -52,14 +50,6 @@ async fn remote_session(
     id
 }
 
-/// Attaches an open WebSocket to the session directly.
-async fn connect(mgr: &FerrofinSessionManager, session_id: &str) {
-    let socket = FakeConnection::new(AuthorizationInfo::default());
-    mgr.add_web_socket(session_id, socket as Arc<dyn WebSocketConnection>)
-        .await
-        .expect("socket");
-}
-
 #[tokio::test]
 async fn an_idle_socketless_session_ends_and_its_devices_capabilities_stay() {
     let db = test_db().await;
@@ -80,10 +70,10 @@ async fn an_idle_socketless_session_ends_and_its_devices_capabilities_stay() {
     // Connected over a WebSocket, as the `/socket` handler connects it.
     let socket = remote_session(&mgr, &user, "Web", "dev-socket").await;
     bus.register(socket.clone(), Box::new(|_| {}));
-    // HTTP only, on a device id a directly connected session also uses.
+    // HTTP only, on a device id a connected session also uses.
     let shared = remote_session(&mgr, &user, "Kodi", "dev-shared").await;
     let shared_socket = remote_session(&mgr, &user, "Web", "dev-shared").await;
-    connect(&mgr, &shared_socket).await;
+    bus.register(shared_socket.clone(), Box::new(|_| {}));
     // HTTP only, on a device id a sign-in registered (its own session, from
     // the sign-in, is HTTP only too).
     sign_in(&mgr, user_id, "dev-registered").await;

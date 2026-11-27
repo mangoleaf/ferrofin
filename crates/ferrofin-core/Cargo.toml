@@ -10,11 +10,13 @@ description = "Core manager implementations for Ferrofin (port of Emby/Jellyfin.
 workspace = true
 
 [dependencies]
-ferrofin-util = { workspace = true, features = ["tokio"] }
+ferrofin-util = { workspace = true, features = ["tokio", "reqwest"] }
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
 ferrofin-common.workspace = true
+# `USER_AGENT`, the product header of the plugin repository requests.
+ferrofin-health.workspace = true
 ferrofin-naming.workspace = true
 ferrofin-providers.workspace = true
 ferrofin-keyframes.workspace = true
