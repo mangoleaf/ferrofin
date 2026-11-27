@@ -281,20 +281,22 @@ pub fn series_presentation_unique_key(
     key
 }
 
-/// Whether this kind is an "item by name" — a genre, studio, year, person, or
-/// artist that groups other items rather than being real media
-/// (C# `IItemByName`).
+/// The "item by name" kinds — a genre, studio, year, person, or artist that
+/// groups other items rather than being real media (the C# classes that
+/// implement `IItemByName`).
+pub const ITEM_BY_NAME_KINDS: [BaseItemKind; 6] = [
+    BaseItemKind::Genre,
+    BaseItemKind::MusicGenre,
+    BaseItemKind::Studio,
+    BaseItemKind::Year,
+    BaseItemKind::Person,
+    BaseItemKind::MusicArtist,
+];
+
+/// Whether this kind is one of [`ITEM_BY_NAME_KINDS`] (C# `IItemByName`).
 #[must_use]
 pub fn is_item_by_name(kind: BaseItemKind) -> bool {
-    matches!(
-        kind,
-        BaseItemKind::Genre
-            | BaseItemKind::MusicGenre
-            | BaseItemKind::Studio
-            | BaseItemKind::Year
-            | BaseItemKind::Person
-            | BaseItemKind::MusicArtist
-    )
+    ITEM_BY_NAME_KINDS.contains(&kind)
 }
 
 /// Whether `CreateSortName` builds the alphanumeric sort key for this kind
