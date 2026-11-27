@@ -75,7 +75,7 @@ pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
 pub use image_download::{
     ArtworkDownload, ArtworkDownloadFailure, DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
-    IMAGE_NEGATIVE_CACHE_TTL_SECS, sniff_image_ext,
+    IMAGE_NEGATIVE_CACHE_TTL_SECS, download_artwork, sniff_image_ext,
 };
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{
