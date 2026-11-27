@@ -202,7 +202,8 @@ class Stub:
         if path == f"/ScheduledTasks/Running/{GUIDE_TASK}":
             tv["refreshes"] += 1
             if tv["tuner"]:
-                tv["channels"] = [{"Id": "e" * 32, "Name": "Test News"}, {"Id": "f" * 32, "Name": "Test Films"}]
+                tv["channels"] = [{"Id": "e" * 32, "Name": "Test News", "Number": "101", "ChannelType": "TV"},
+                                  {"Id": "f" * 32, "Name": "Test Films", "Number": "102", "ChannelType": "TV"}]
             if tv["tuner"] and tv["guide"]:
                 tv["programmes"] = [{"Id": f"{n:032x}"[::-1], "Name": name}
                                     for n, name in enumerate(["Quiz Night", "The Long Road"], start=1)]

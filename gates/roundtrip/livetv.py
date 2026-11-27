@@ -12,9 +12,9 @@ in Jellyfin, before and after Jellyfin's first guide refresh.
 Both servers read the fixture at /livetv (run.sh mounts it there), so the tuner's path, which every channel's and
 programme's id is derived from, is the same on both. The guide starts the next day at 18:00 UTC, so no airing ends
 during a run; one of its programmes is in +01:00, whose id embeds the offset. The answers compared are each
-timer's and series timer's ids, name and times, the channels' ids, the favourite channels' names, and the
-programmes' ids. Credentials come from the copy (api.py), and the favourite is the account smoke.sh probes as
-(answers.smoke_user). Exit status 0; 1 with one line per difference on stdout.
+timer's and series timer's ids, name and times, the channels' ids, numbers and types, the favourite channels' names,
+and the programmes' ids. Credentials come from the copy (api.py), and the favourite is the account smoke.sh probes
+as (answers.smoke_user). Exit status 0; 1 with one line per difference on stdout.
 """
 
 import argparse
@@ -39,6 +39,9 @@ POLL_SECONDS = api.POLL_SECONDS
 TIMER_KEYS = ("Id", "ExternalId", "ChannelId", "ExternalChannelId", "ProgramId", "ExternalProgramId",
               "SeriesTimerId", "ExternalSeriesTimerId", "Name", "StartDate", "EndDate", "Status")
 SERIES_KEYS = ("Id", "ExternalId", "Name", "ChannelId", "ProgramId", "ExternalProgramId")
+#: The answers compared per channel. Its number and type live only in its item's Data
+#: (MediaBrowser.Controller/LiveTv/LiveTvChannel.cs), so a channel exported without one lists no number.
+CHANNEL_KEYS = ("Id", "Number", "ChannelType")
 
 
 def fixture(directory, now=None):
@@ -122,7 +125,7 @@ def capture(server, user):
     return {
         "timers": sorted(({k: t.get(k) for k in TIMER_KEYS} for t in timers), key=json.dumps),
         "series_timers": sorted(({k: t.get(k) for k in SERIES_KEYS} for t in series), key=json.dumps),
-        "channels": sorted(c.get("Id") for c in channels),
+        "channels": sorted(({k: c.get(k) for k in CHANNEL_KEYS} for c in channels), key=json.dumps),
         "favourite_channels": sorted(c.get("Name") for c in favourites),
         "programmes": sorted(p.get("Id") for p in programmes),
     }
