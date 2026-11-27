@@ -213,6 +213,8 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
                 ],
                 indexes: Vec::new(),
             },
+            // It holds none of Jellyfin's tables.
+            rebuilt: Vec::new(),
             paths: PathRewrite {
                 moves: summary.edits.paths.moves.clone(),
                 ..PathRewrite::default()
