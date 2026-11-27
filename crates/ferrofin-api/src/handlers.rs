@@ -3022,6 +3022,117 @@ pub struct Verified {
     pub refs: &'static [&'static str],
 }
 
+/// The gate every elevated `PluginsController` row starts with.
+macro_rules! plugins_elevation {
+    () => {
+        "RequireAdmin, and require_admin again in the handler (the class's \
+         [Authorize(Policy = RequiresElevation)]: an administrator or an API key, with no \
+         remote-access or access-schedule check)"
+    };
+}
+
+/// The version gate the versioned `PluginsController` rows share: the
+/// `[FromRoute, Required] Version version` binding and `GetPlugin(pluginId, version)`.
+macro_rules! plugins_version_gate {
+    () => {
+        "version_rejection ([Required]'s 400 for a blank version and VersionConverter's 400 \
+         for one that is no Version: parse_dotnet_version, two to four Int32 components, an \
+         absent one -1; GetPlugin(pluginId, version)'s 404 unless all four equal the plugin's \
+         own, so 12.4 does not address 12.4.0.0; a WASM plugin's version that is no Version, \
+         a semantic version with a prerelease or build suffix, addresses only the plugin whose \
+         version is that exact string, which no Jellyfin plugin reaches, as an upstream \
+         manifest's version always parses)"
+    };
+}
+
+/// How the elevated `PluginsController` rows' error bodies differ.
+const PLUGINS_ERROR_BODIES: &str = "The 401 (no or bad token), 403 (not an administrator) \
+     and 404 bodies and the 400 for a pluginId that is no Guid are Ferrofin's error shape, \
+     where upstream sends an empty 401 and 403, NotFound()'s ProblemDetails and the binder's \
+     ValidationProblemDetails. Fix path: gl-666.";
+
+/// The three `[HttpGet]` `PluginsController` rows on a `HEAD`.
+const PLUGINS_HEAD: &str = "HEAD is answered as GET is, where the [HttpGet]-only action \
+     answers 405. Fix path: gl-1840.";
+
+/// The plugins a `PluginsController` row cannot address that upstream lists.
+const PLUGINS_UNLISTED_ENTRIES: &str = "A plugin installed or updated since the boot, or one \
+     that failed to load, is a 404, where upstream addresses its own Restart, Malfunctioned or \
+     NotSupported entry. Fix path: gl-729.";
+
+/// What the two configuration rows answer for a plugin disabled before the boot.
+const PLUGINS_CONFIGURATION_DISABLED_AT_BOOT: &str = "A plugin disabled before the boot \
+     answers here. Upstream's LoadAssemblies never loads a plugin that is not \
+     IsEnabledAndSupported, so it has no Instance and the action answers 404 until a restart \
+     after enabling it; Ferrofin loads every plugin, and a WASM plugin or an extension stops \
+     its own work at run time when disabled, so a toggle needs no restart. Fix path: gl-729.";
+
+/// The one Ferrofin plugin with nothing to configure, on the configuration rows.
+const PLUGINS_CONFIGURATION_FERROFIN_SETTINGS: &str = "Ferrofin Settings, Ferrofin's own \
+     plugin with nothing to configure, answers {} and takes a save, where upstream answers 404 \
+     for a plugin that is not IHasPluginConfiguration. Every Jellyfin plugin Ferrofin has is \
+     configurable, and every WASM plugin has a configuration through the WIT's default-config \
+     as a BasePlugin<T> has, so none is answered differently.";
+
+/// Where the configuration rows keep a plugin's configuration.
+const PLUGINS_CONFIGURATION_STORAGE: &str = "The configuration is stored as JSON in \
+     {config}/plugins/{id}/config.json, where BasePlugin<T> keeps it as XML in \
+     plugins/configurations/<ConfigurationFileName> and a first read with no file saves the \
+     defaults there. Response-invisible: adoption reads that XML (gl-1149, gl-1574, gl-1935) \
+     and export-jellyfin writes it (gl-1556).";
+
+/// What the two toggle rows answer that upstream reports as Restart.
+const PLUGINS_TOGGLE_AT_ONCE: &str = "A toggle is reported at once, GET /Plugins answering \
+     Active or Disabled, and a WASM plugin's or compiled-in extension's tasks, events, lookups \
+     and pages follow it at once. Upstream's ProcessAlternative sets RestartRequired, so the \
+     plugin keeps running as it was until the restart and GET /Plugins reports Restart, and \
+     enabling one installed version supersedes another. Fix path: gl-729.";
+
+/// The toggle rows on OpenSubtitles.
+const PLUGINS_TOGGLE_OPENSUBTITLES: &str = "Disabling OpenSubtitles changes only what GET \
+     /Plugins and the manifest report: its subtitle provider never reads the flag and keeps \
+     searching and downloading. On Jellyfin a disabled OpenSubtitles runs \
+     until the restart and is not loaded after it. Fix path: gl-2025.";
+
+/// The toggle rows on an in-tree provider.
+const PLUGINS_TOGGLE_IN_TREE: &str = "A toggle that changes an in-tree provider's status \
+     (TMDb, OMDb, MusicBrainz, AudioDB, Studio Images) answers 204 and keeps the state across \
+     restarts. Upstream sets the status in memory, then SaveManifest writes meta.json under \
+     the provider's DLL path, whose DirectoryNotFoundException ExceptionMiddleware answers 404, \
+     and a restart reverts it (gl-840); one that leaves the status as it is answers 204 there \
+     and reports Restart, as the toggle divergence above says. Jellyfin bug not ported.";
+
+/// The two uninstall rows on a compiled-in plugin.
+const PLUGINS_UNINSTALL_COMPILED_IN: &str = "A compiled-in plugin other than the in-tree \
+     providers (OpenSubtitles and the extensions, Ferrofin Settings and Single Sign-On among \
+     them) answers 400: its code is part of the binary, so there is nothing to delete, and \
+     disabling an extension stops it instead (the plugin tiers, docs/EXTENSIONS.md; a \
+     disabled OpenSubtitles keeps working, gl-2025). On Jellyfin, where those with a Jellyfin \
+     counterpart are repository plugins, the request deletes them.";
+
+/// What the two uninstall rows delete that upstream keeps.
+const PLUGINS_UNINSTALL_CONFIGURATION: &str = "The uninstall deletes the plugin's \
+     configuration with it; upstream's DeletePlugin removes only the plugin's folder, so its \
+     XML under plugins/configurations survives and an install again reads it. Fix path: \
+     gl-2022.";
+
+/// What the two uninstall rows never announce.
+const PLUGINS_UNINSTALL_EVENT: &str = "No PluginUninstalled event is published, so no \
+     PluginUninstalledWithName activity entry is written and no PackageUninstalled message \
+     reaches the administrators' sessions. Fix path: gl-430.";
+
+/// The plugin code upstream runs at an uninstall.
+const PLUGINS_UNINSTALL_NO_HOOK: &str = "No plugin code runs at the uninstall: the WIT has no \
+     OnUninstalling export, and a sandboxed WASM guest has no files of its own to clean up, \
+     as the host holds everything it stored and removes it (the WASM tier, \
+     docs/EXTENSIONS.md). Response-invisible.";
+
+/// What the two uninstall rows answer when the file cannot be deleted.
+const PLUGINS_UNINSTALL_DELETE_FAILURE: &str = "A plugin file that cannot be deleted answers \
+     500 and leaves the plugin installed; upstream's RemovePlugin, when it can still save the \
+     plugin's manifest, marks it Deleted, answers 204 and deletes it at the next boot \
+     (LoadAssemblies). Fix path: gl-2024.";
+
 /// The code path the two scheduled-task read rows share after their handler:
 /// `ScheduledTaskHelpers.GetTaskInfo` over the task's worker.
 macro_rules! scheduled_task_info {
@@ -7963,6 +8074,336 @@ pub const VERIFIED: &[Verified] = &[
         ),
         date: "2026-11-15",
         divergences: &[LEGACY_HLS_BODIES, LEGACY_HLS_AUDIO_KEEP_ALIVE],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Plugins",
+        upstream_file: "Jellyfin.Api/Controllers/PluginsController.cs",
+        upstream_method: "GetPlugins",
+        ferrofin: concat!(
+            "handlers/plugins.rs get_plugins (",
+            plugins_elevation!(),
+            ") → ferrofin-core plugin_manager.rs list_plugins (the registry the composition \
+             root builds: the five in-tree providers, OpenSubtitles, the compiled-in extensions \
+             (only Ferrofin Settings with FERROFIN_DISABLE_EXTENSIONS, the benchmark's switch) \
+             and the WASM plugins loaded at the boot, less those uninstalled since, as \
+             DeletePlugin's _plugins.Remove; enabled is the persisted override, else the \
+             descriptor's) → \
+             sorted by Name with current_culture's comparer (OrderBy(p => p.Name), \
+             string.CompareTo in the request's culture) → to_plugin_info \
+             (LocalPlugin.GetPluginInfo over the instance's GetPluginInfo: Name, Version, \
+             Description, Id, CanUninstall, false for an in-tree provider and true for the \
+             rest as for a plugin outside the server's directory, ConfigurationFileName, \
+             BasePlugin<T>'s and the in-tree providers' overrides such as \
+             Jellyfin.Plugin.Tmdb.xml, HasImage, a WASM plugin's stored repository image, and \
+             Status)"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            "Status is only Active or Disabled, and only the plugins loaded at the boot are \
+             listed. Upstream also lists a plugin installed or updated since the boot as an \
+             entry of its own reported Restart (RestartRequired), a plugin that failed to load \
+             as Malfunctioned or NotSupported and a replaced version as Superseded, and \
+             reports Restart after a toggle (ProcessAlternative). It also persists \
+             Malfunctioned and NotSupported, so a plugin that failed once stays unloaded until \
+             it is enabled again, where Ferrofin tries the file at every boot and lists it \
+             Active once it loads. Fix path: gl-729.",
+            "The in-tree providers report HasImage false, where the ImageResourceName of their \
+             IHasEmbeddedImage makes it true upstream. Fix path: gl-487.",
+            "The compiled-in plugins that are repository plugins on Jellyfin (Intro Skipper, \
+             LDAP-Auth, File Transformation, Merge Versions, OpenSubtitles) report HasImage \
+             false, where the ImagePath PopulateManifest stores from the catalog's imageUrl \
+             makes it true there. Fix path: gl-2023.",
+            "Stock 12.4 also lists its in-tree ListenBrainz plugin. Ferrofin runs its \
+             similar-artist provider with the default settings but does not register it as a \
+             plugin yet, so it has no entry, configuration or page. Fix path: gl-220.",
+            "The compiled-in plugins (Intro Skipper, LDAP-Auth, File Transformation, Merge \
+             Versions, OpenSubtitles) are listed beside the in-tree providers, as on a Jellyfin \
+             with those plugins installed, and so are Ferrofin's own Ferrofin Settings and \
+             Single Sign-On and the WASM plugins (the plugin tiers, docs/EXTENSIONS.md). Those \
+             two and every WASM plugin report no ConfigurationFileName, where an upstream \
+             BasePlugin<T> always names its XML file, and a WASM plugin reports its semantic \
+             version as it is, which a .NET Version cannot print when it has a prerelease or \
+             build suffix: none of them is a Jellyfin plugin with a file name or a Version to \
+             report.",
+            PLUGINS_HEAD,
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+             error shape, where upstream sends both empty. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Plugins/{pluginId}/Configuration",
+        upstream_file: "Jellyfin.Api/Controllers/PluginsController.cs",
+        upstream_method: "GetPluginConfiguration",
+        ferrofin: concat!(
+            "handlers/plugins.rs get_plugin_configuration (",
+            plugins_elevation!(),
+            "; pluginId through DotnetGuid, Guid.Parse's spellings) → ferrofin-core \
+             plugin_manager.rs get_plugin_configuration (GetPlugin(pluginId) and its \
+             IHasPluginConfiguration test: the registered plugin, a 404 when there is none or \
+             it was uninstalled since the boot; the stored {config}/plugins/{id}/config.json \
+             overlaid on the plugin's default document by merge_config at every depth outside \
+             a list, a nested default of {} taken as stored, as LoadConfiguration's typed read \
+             keeps a member the file lacks at its default, else the default document) → \
+             without_nulls (JsonDefaults' WhenWritingNull leaves out a null \
+             property at every depth and keeps array elements) as application/json"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            PLUGINS_CONFIGURATION_DISABLED_AT_BOOT,
+            PLUGINS_CONFIGURATION_FERROFIN_SETTINGS,
+            PLUGINS_CONFIGURATION_STORAGE,
+            PLUGINS_HEAD,
+            PLUGINS_ERROR_BODIES,
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Plugins/{pluginId}/Configuration",
+        upstream_file: "Jellyfin.Api/Controllers/PluginsController.cs",
+        upstream_method: "UpdatePluginConfiguration",
+        ferrofin: concat!(
+            "handlers/plugins.rs update_plugin_configuration (",
+            plugins_elevation!(),
+            "; DotnetGuid; the body as it arrives, whatever its Content-Type, as Request.Body) \
+             → ferrofin-core plugin_manager.rs set_plugin_configuration (GetPlugin(pluginId), a \
+             404 when there is none or it was uninstalled since the boot; a JSON null is the \
+             action's null-configuration no-op, still a 204; an object goes to project_config, \
+             which binds it onto the plugin's default document as \
+             JsonSerializer.DeserializeAsync(Request.Body, ConfigurationType, \
+             JsonDefaults.Options) binds it into the configuration type: members matched by \
+             their exact name, an undeclared top-level member dropped and an omitted one at its \
+             default, a number or a bool read into a string field as its text \
+             (JsonStringConverter), a string holding a number into a number field \
+             (AllowReadingFromString), and a nested object's members and a list's elements \
+             bound against the default's) → \
+             config.json written whole (UpdateConfiguration's SaveConfiguration) → \
+             PLUGIN_CONFIGURATION_CHANGED announced (ConfigurationChanged) → 204"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            "A body that does not bind (not JSON, empty, an array or a scalar, or a member of \
+             the wrong kind) is a 400. Upstream's JsonException reaches ExceptionMiddleware, \
+             which maps no JsonException, so it answers 500 \"Error processing request.\". \
+             Jellyfin bug not ported.",
+            PLUGINS_CONFIGURATION_DISABLED_AT_BOOT,
+            "A field whose default is null takes any JSON kind, where its C# property's type \
+             refuses the wrong one. Fix path: gl-1735.",
+            "A built-in plugin's C# property setters are not run on the save, an enum member \
+             takes any string and an int field a number it cannot hold, which upstream's typed \
+             deserialize settles or refuses. Fix path: gl-1978.",
+            "A null is stored for any field, then left out of every later GET, a restart's \
+             included; upstream refuses it for a non-nullable value type (an int, a bool, an \
+             enum) with its JsonException's 500, and the default document cannot tell those \
+             apart. Upstream also reads a null it stored in a string back from the XML at the \
+             property's default after a restart. Fix path: gl-1735.",
+            "The default document is the only schema, and it cannot tell a map from a class. \
+             So a nested object refills the members a save omits from its default and keeps \
+             those its default lacks, where upstream refills and drops them for a nested class \
+             and replaces a Dictionary whole, keeping its keys (gl-1872); and a default of {} \
+             has no schema, so what is posted there is stored as it arrives: the rule \
+             docs/EXTENSIONS.md gives plugin authors. Accepted by the owner, the default \
+             document staying the only schema (gl-1878).",
+            "A list's elements are bound against its default's first element but their \
+             omitted members are not filled, on a save or a read, and a list whose default is \
+             empty keeps its elements as posted, unbound; upstream builds each element of the \
+             element type, its omitted members at their defaults. Fix path: gl-1735.",
+            PLUGINS_CONFIGURATION_FERROFIN_SETTINGS,
+            PLUGINS_CONFIGURATION_STORAGE,
+            PLUGINS_ERROR_BODIES,
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Plugins/{pluginId}/{version}/Enable",
+        upstream_file: "Jellyfin.Api/Controllers/PluginsController.cs",
+        upstream_method: "EnablePlugin",
+        ferrofin: concat!(
+            "handlers/plugins.rs enable_plugin (",
+            plugins_elevation!(),
+            "; DotnetGuid; ",
+            plugins_version_gate!(),
+            ") → ferrofin-core plugin_manager.rs enable_plugin → set_enabled (the enabled \
+             override persisted to state.json, ChangePluginState(plugin, Active)'s manifest \
+             save; a 404 for a plugin uninstalled since the boot) → 204"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            PLUGINS_TOGGLE_AT_ONCE,
+            PLUGINS_TOGGLE_IN_TREE,
+            PLUGINS_TOGGLE_OPENSUBTITLES,
+            PLUGINS_UNLISTED_ENTRIES,
+            PLUGINS_ERROR_BODIES,
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Plugins/{pluginId}/{version}/Disable",
+        upstream_file: "Jellyfin.Api/Controllers/PluginsController.cs",
+        upstream_method: "DisablePlugin",
+        ferrofin: concat!(
+            "handlers/plugins.rs disable_plugin (",
+            plugins_elevation!(),
+            "; DotnetGuid; ",
+            plugins_version_gate!(),
+            ") → ferrofin-core plugin_manager.rs disable_plugin → set_enabled (the enabled \
+             override persisted to state.json, ChangePluginState(plugin, Disabled)'s manifest \
+             save; a 404 for a plugin uninstalled since the boot) → 204"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            PLUGINS_TOGGLE_AT_ONCE,
+            PLUGINS_TOGGLE_IN_TREE,
+            PLUGINS_TOGGLE_OPENSUBTITLES,
+            PLUGINS_UNLISTED_ENTRIES,
+            PLUGINS_ERROR_BODIES,
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/Plugins/{pluginId}",
+        upstream_file: "Jellyfin.Api/Controllers/PluginsController.cs",
+        upstream_method: "UninstallPlugin",
+        ferrofin: concat!(
+            "handlers/plugins.rs uninstall_plugin (",
+            plugins_elevation!(),
+            "; DotnetGuid) → ferrofin-core plugin_manager.rs remove_plugin \
+             (InstallationManager.UninstallPlugin: a WASM plugin's file, whatever its name, and \
+             an install's staged {id}.wasm are deleted with its {config}/plugins/{id} \
+             directory, KV state, segment cache, offered-items record and enabled override, it \
+             leaves every lookup until the restart, DeletePlugin's _plugins.Remove, and the \
+             restart is flagged, NotifyPendingRestart → 204; a plugin reporting CanUninstall \
+             false, an in-tree provider, is logged at warn and answered 204, the \"Attempt to \
+             delete non removable plugin\" return; no plugin is a 404)"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            PLUGINS_UNINSTALL_COMPILED_IN,
+            "With an update staged since the boot, the running version and the staged one are \
+             removed together; upstream removes the entry with no Instance, the staged one, \
+             first and keeps the running version. A plugin whose file failed to load is removed \
+             when that file is the {id}.wasm an install staged and is a 404 under any other \
+             name, where upstream removes its Malfunctioned or NotSupported entry. Fix path: \
+             gl-729.",
+            PLUGINS_UNINSTALL_CONFIGURATION,
+            PLUGINS_UNINSTALL_DELETE_FAILURE,
+            PLUGINS_UNINSTALL_EVENT,
+            PLUGINS_UNINSTALL_NO_HOOK,
+            PLUGINS_ERROR_BODIES,
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/Plugins/{pluginId}/{version}",
+        upstream_file: "Jellyfin.Api/Controllers/PluginsController.cs",
+        upstream_method: "UninstallPluginByVersion",
+        ferrofin: concat!(
+            "handlers/plugins.rs uninstall_plugin_by_version (",
+            plugins_elevation!(),
+            "; DotnetGuid; blank_route_values, [Required]'s 400 for a blank version; for a \
+             registered plugin, ",
+            plugins_version_gate!(),
+            "; an id the registry does not know goes on to a staged {id}.wasm, and when there \
+             is none, VersionConverter's 400 for a version that is no Version, else the 404) \
+             → remove_plugin, as on DELETE /Plugins/{pluginId} \
+             (InstallationManager.UninstallPlugin)"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            PLUGINS_UNINSTALL_COMPILED_IN,
+            "A WASM plugin installed since the boot is removed whatever version is sent, one \
+             that is no Version included, where upstream matches its staged entry's own \
+             version. With an update staged since the boot, the running version's number \
+             removes the staged one too, where upstream removes only the running entry, and the \
+             staged update's own number is a 404, where upstream removes that entry. A plugin \
+             whose file failed to load is removed by any version when that file is the \
+             {id}.wasm an install staged and is a 404 under any other name, where upstream \
+             removes its Malfunctioned or NotSupported entry. Fix path: gl-729.",
+            PLUGINS_UNINSTALL_CONFIGURATION,
+            PLUGINS_UNINSTALL_DELETE_FAILURE,
+            PLUGINS_UNINSTALL_EVENT,
+            PLUGINS_UNINSTALL_NO_HOOK,
+            PLUGINS_ERROR_BODIES,
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Plugins/{pluginId}/{version}/Image",
+        upstream_file: "Jellyfin.Api/Controllers/PluginsController.cs",
+        upstream_method: "GetPluginImage",
+        ferrofin: concat!(
+            "handlers/plugins.rs get_plugin_image (anonymous, the action's [AllowAnonymous] \
+             over the class's RequiresElevation; DotnetGuid; ",
+            plugins_version_gate!(),
+            ") → ferrofin-core plugin_manager.rs plugin_image (the image the boot found: a \
+             repository plugin's, stored in {config}/plugins/{id}/ by the install or a catalog \
+             fetch, PopulateManifest's ImagePath, served by serve_static_file_without_ranges \
+             and typed by mime_types, PhysicalFile(imagePath, MimeTypes.GetMimeType(imagePath)): \
+             a Range ignored, no Accept-Ranges, the file's Last-Modified and a 304 for an \
+             If-Modified-Since at it; or bytes registered with the plugin, which no plugin is \
+             today, as File(stream, MimeTypes.GetMimeType(resourceName))), a 404 when there is \
+             none → \
+             Content-Disposition: attachment on either answer, the 304's included"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            "The in-tree providers have no image here and answer 404, where upstream serves \
+             the embedded resource their ImageResourceName names. Fix path: gl-487.",
+            "The compiled-in plugins that are repository plugins on Jellyfin (Intro Skipper, \
+             LDAP-Auth, File Transformation, Merge Versions, OpenSubtitles) have no image here \
+             and answer 404, where upstream serves the one PopulateManifest stored from the \
+             catalog's imageUrl. Fix path: gl-2023.",
+            PLUGINS_UNLISTED_ENTRIES,
+            "A stored image answers conditional requests as tower-http's ServeFile does: an \
+             ETag on the answer, If-Match and If-None-Match honoured, and an If-Modified-Since \
+             or If-Unmodified-Since after now counted; upstream's PhysicalFile sends no ETag and \
+             evaluates neither tag header nor a future date. Fix path: gl-1823.",
+            PLUGINS_HEAD,
+            "The 404 bodies and the 400 for a pluginId that is no Guid are Ferrofin's error \
+             shape, where upstream sends NotFound()'s ProblemDetails and the binder's \
+             ValidationProblemDetails. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Plugins/{pluginId}/Manifest",
+        upstream_file: "Jellyfin.Api/Controllers/PluginsController.cs",
+        upstream_method: "GetPluginManifest",
+        ferrofin: concat!(
+            "handlers/plugins.rs get_plugin_manifest (",
+            plugins_elevation!(),
+            "; DotnetGuid) → ferrofin-core plugin_manager.rs get_plugin (GetPlugin(pluginId): \
+             the registered plugin, a 404 when there is none or it was uninstalled since the \
+             boot) → ferrofin-model plugins.rs PluginManifest::manifestless, the camelCase \
+             PluginManifest (guid for Id) of the record CreatePluginInstance makes for an \
+             in-tree provider: guid, name, version and status (Manifest.Status, Active or \
+             Disabled, never Restart), the strings empty, timestamp DateTime.MinValue, \
+             autoUpdate true, no imagePath and an empty assemblies list"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            "A WASM plugin and a compiled-in extension answer that record too. Upstream answers \
+             a repository plugin's meta.json as PopulateManifest writes it, the package's \
+             category, description, overview and owner, the version's changelog, targetAbi and \
+             timestamp, and its imagePath, and a plugin dropped in without one the record \
+             LoadManifest makes (autoUpdate false, targetAbi the server's version) with the \
+             instance's description. Fix path: gl-2023.",
+            "A plugin installed since the boot, or one that failed to load, is a 404, where \
+             upstream answers the manifest of its staged, Malfunctioned or NotSupported entry \
+             (a plugin with an update staged answers the running version's here, as upstream \
+             prefers the entry with an Instance). Fix path: gl-729.",
+            PLUGINS_ERROR_BODIES,
+        ],
         refs: &[],
     },
 ];

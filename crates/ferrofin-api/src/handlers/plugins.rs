@@ -218,11 +218,18 @@ async fn get_plugins(
     require_admin(&state, &auth).await?;
     let mut plugins = state.plugins.list_plugins().await?;
     // `PluginsController.GetPlugins` is `_pluginManager.Plugins.OrderBy(p => p.Name)`
-    // (v10.11.8 PluginsController.cs:55-57). Registration order is not the wire
+    // (v12.4 PluginsController.cs:56-58). Registration order is not the wire
     // order: a stock Jellyfin answers AudioDB, MusicBrainz, OMDb, Studio Images,
     // TMDb for the same five plugins Ferrofin registers TMDb-first, and the
-    // dashboard renders the list in the order it arrives.
-    plugins.sort_by(|a, b| a.name.cmp(&b.name));
+    // dashboard renders the list in the order it arrives. `OrderBy` compares
+    // with `string.CompareTo`, in the request's culture, not bytewise.
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    plugins.sort_by(|a, b| {
+        comparer
+            .as_ref()
+            .map_or_else(|| a.name.cmp(&b.name), |c| c.compare(&a.name, &b.name))
+    });
     Ok(Json(plugins.into_iter().map(to_plugin_info).collect()))
 }
 

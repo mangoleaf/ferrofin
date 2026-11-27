@@ -1825,6 +1825,9 @@ fn with_view(
 /// config saved by an older plugin version still returns every field (missing
 /// keys keep their default).
 ///
+/// Nested objects are overlaid the same way, at every depth outside a list, as
+/// [`overlay`] says.
+///
 /// A stored document that is not an object falls back to the DEFAULTS rather
 /// than to the raw bytes: this endpoint's contract is a
 /// `BasePluginConfiguration` object, and answering with whatever a corrupted
@@ -1846,7 +1849,7 @@ fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
         parsed_stored,
     ) {
         (Ok(serde_json::Value::Object(mut base)), Ok(serde_json::Value::Object(over))) => {
-            base.extend(over);
+            overlay(&mut base, over);
             serde_json::to_vec(&serde_json::Value::Object(base)).unwrap_or_else(|_| stored.to_vec())
         }
         // The stored document IS a usable object; there is simply nothing to
@@ -1854,6 +1857,28 @@ fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
         (_, Ok(serde_json::Value::Object(_))) => stored.to_vec(),
         // The stored document is missing, unparseable or not an object.
         _ => defaults.to_vec(),
+    }
+}
+
+/// Puts each of `over`'s members into `base`, the way `LoadConfiguration`'s
+/// typed read fills the configuration class: a nested object `over` holds is
+/// overlaid onto `base`'s in turn, so a member it lacks keeps its default.
+/// A nested default of `{}` (a map, `docs/EXTENSIONS.md`) has nothing to fill
+/// from, so it ends up as stored, and a list is never filled, as a save binds
+/// them ([`bind_json`]).
+fn overlay(
+    base: &mut serde_json::Map<String, serde_json::Value>,
+    over: serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in over {
+        match (base.get_mut(&key), value) {
+            (Some(serde_json::Value::Object(slot)), serde_json::Value::Object(nested)) => {
+                overlay(slot, nested);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
     }
 }
 
@@ -2042,8 +2067,9 @@ fn integral(number: serde_json::Number) -> serde_json::Number {
 /// One `Number` class, as .NET has: a `double RateLimit` accepts the integer
 /// `1` and an `int MaxCastMembers` accepts `15`, so the JSON distinction between
 /// integer and float is not one the C# deserializer draws. A `null` is accepted
-/// for any field — a nullable C# property takes it, and a non-nullable one falls
-/// back to its default rather than throwing.
+/// for any field, as a C# reference-type or nullable property takes it; the
+/// deserializer refuses it for a non-nullable value type (an `int`, a `bool`, an
+/// enum), which the default document cannot tell apart (gl-1735).
 fn same_json_kind(slot: &serde_json::Value, value: &serde_json::Value) -> bool {
     use serde_json::Value::{Array, Bool, Null, Number, Object, String as Str};
     matches!(
@@ -2098,6 +2124,32 @@ mod tests {
         // values.)
         assert_eq!(merge_config(b"[]", stored), stored);
         assert_eq!(merge_config(b"not json either", stored), stored);
+    }
+
+    /// `GetPluginConfiguration` answers the configuration `LoadConfiguration`
+    /// read into the plugin's type, so a nested member a file saved by an older
+    /// plugin version lacks has its default, as the top-level ones do, at every
+    /// depth. A nested default of `{}` is a map (`docs/EXTENSIONS.md`) and is
+    /// answered as stored, a stored `null` stays `null`, and a list is never
+    /// filled, as a save binds them.
+    #[test]
+    fn a_stored_nested_object_is_filled_from_its_default() {
+        let defaults = br#"{"Inner":{"A":1,"B":2},"Outer":{"Inner":{"A":1,"B":2}},"Map":{},
+            "Null":{"A":1},"List":[{"A":1,"B":2}]}"#;
+        let stored = br#"{"Inner":{"A":9},"Outer":{"Inner":{"A":9}},"Map":{"k":1},
+            "Null":null,"List":[{"A":5}]}"#;
+        let merged: serde_json::Value =
+            serde_json::from_slice(&merge_config(defaults, stored)).unwrap();
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "Inner": {"A": 9, "B": 2},
+                "Outer": {"Inner": {"A": 9, "B": 2}},
+                "Map": {"k": 1},
+                "Null": null,
+                "List": [{"A": 5}],
+            })
+        );
     }
 
     /// `POST /Plugins/{id}/Configuration` deserializes into the plugin's own
