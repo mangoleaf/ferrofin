@@ -967,22 +967,24 @@ impl RemoteSearchProvider for MusicBrainzArtistSearchProvider {
 }
 
 /// The TheAudioDb face of the "Identify" flow for a `MusicAlbum` /
-/// `MusicArtist`. Port of `AudioDbAlbumProvider.GetSearchResults`, which
-/// returns an empty set: TheAudioDb contributes to an album only during the
-/// metadata fetch. Registered so the provider is selectable by name exactly
-/// as it is in Jellyfin. TODO(gl-497): v12.4's
-/// `AudioDbArtistProvider.GetSearchResults` searches, by the artist's
-/// `AudioDbArtist` id, else its MusicBrainz id, else its name; the artist
-/// half still returns nothing.
+/// `MusicArtist`. For an album, a port of `AudioDbAlbumProvider.
+/// GetSearchResults`, which returns an empty set: TheAudioDb contributes to an
+/// album only during the metadata fetch. For an artist, a port of v12.4's
+/// `AudioDbArtistProvider.GetSearchResults`: by the artist's `AudioDbArtist`
+/// id, else its MusicBrainz id, else its name.
 pub struct AudioDbSearchProvider {
     supported: BaseItemKind,
+    audiodb: Arc<crate::audiodb::AudioDbClient>,
 }
 
 impl AudioDbSearchProvider {
     /// A TheAudioDb search provider for `kind` (`MusicAlbum` or `MusicArtist`).
     #[must_use]
-    pub fn new(kind: BaseItemKind) -> Self {
-        Self { supported: kind }
+    pub fn new(kind: BaseItemKind, audiodb: Arc<crate::audiodb::AudioDbClient>) -> Self {
+        Self {
+            supported: kind,
+            audiodb,
+        }
     }
 }
 
@@ -1008,10 +1010,53 @@ impl RemoteSearchProvider for AudioDbSearchProvider {
 
     async fn get_search_results(
         &self,
-        _request: &RemoteSearchRequest,
+        request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        // `Task.FromResult(Enumerable.Empty<RemoteSearchResult>())`.
-        Ok(Vec::new())
+        if self.supported != BaseItemKind::MusicArtist {
+            // `AudioDbAlbumProvider`:
+            // `Task.FromResult(Enumerable.Empty<RemoteSearchResult>())`.
+            return Ok(Vec::new());
+        }
+        let musicbrainz_id = artist_mbid(request);
+        let search = self.audiodb.search_artists(
+            provider_id_of(request.search_info.provider_ids.as_ref(), "AudioDbArtist"),
+            musicbrainz_id.as_deref(),
+            request.search_info.name.as_deref(),
+        );
+        // `FetchArtists`' `EnsureSuccessStatusCode`: a failed request fails
+        // the provider.
+        match crate::rate_limit::count_request_failures(search).await {
+            (artists, 0) => Ok(artists.into_iter().map(audiodb_artist_result).collect()),
+            _ => Err(ServiceError::backend("TheAudioDB artist search failed")),
+        }
+    }
+}
+
+/// Maps one TheAudioDB artist into the "Identify" result shape — port of
+/// `AudioDbArtistProvider.ToRemoteSearchResult`.
+fn audiodb_artist_result(artist: crate::audiodb::AudioDbArtist) -> RemoteSearchResult {
+    let provider_ids = [
+        ("AudioDbArtist", artist.audiodb_id),
+        ("MusicBrainzArtist", artist.musicbrainz_id),
+    ]
+    .into_iter()
+    .filter_map(|(key, id)| Some((key.to_owned(), id?)))
+    .collect();
+    RemoteSearchResult {
+        // `(strBiographyEN ?? string.Empty).StripHtml()`: the `…EN` text only,
+        // not the unsuffixed one the metadata fetch falls back to.
+        overview: Some(
+            artist
+                .biographies
+                .get("EN")
+                .map_or_default(|text| ferrofin_common::extensions::strip_html(text)),
+        ),
+        name: artist.name,
+        image_url: artist.thumb,
+        production_year: artist.formed_year,
+        search_provider_name: Some(AUDIODB_PROVIDER_NAME.to_owned()),
+        provider_ids: Some(provider_ids),
+        ..RemoteSearchResult::default()
     }
 }
 
@@ -4932,8 +4977,9 @@ impl LocalProviderManager {
         }
     }
 
-    /// The single-key image providers: TheAudioDb (artist/album by MusicBrainz
-    /// id), OMDb's poster (by IMDb id), the studio artwork repository (by name).
+    /// The single-key image providers: TheAudioDb (an artist by MusicBrainz
+    /// id, else by its own id; an album by MusicBrainz id), OMDb's poster (by
+    /// IMDb id), the studio artwork repository (by name).
     async fn keyed_images(
         &self,
         source: RemoteImageSource,
@@ -4942,11 +4988,14 @@ impl LocalProviderManager {
     ) -> Vec<TmdbImage> {
         let id = |key: &str| provider_id_of_pairs(ids, key);
         match source {
-            RemoteImageSource::AudioDbArtist => match (&self.audiodb, id("MusicBrainzArtist")) {
-                (Some(audiodb), Some(artist)) => {
-                    audiodb.artist(artist).await.map_or_default(|a| a.images)
-                }
-                _ => Vec::new(),
+            // `AudioDbArtistImageProvider.GetImages`: `GetArtist(musicBrainzId,
+            // audioDbId)`.
+            RemoteImageSource::AudioDbArtist => match &self.audiodb {
+                Some(audiodb) => audiodb
+                    .artist(id("MusicBrainzArtist"), id("AudioDbArtist"))
+                    .await
+                    .map_or_default(|a| a.images),
+                None => Vec::new(),
             },
             RemoteImageSource::AudioDbAlbum => {
                 match (&self.audiodb, id("MusicBrainzReleaseGroup")) {
@@ -6818,11 +6867,27 @@ mod tests {
         assert_eq!(results[0].production_year, Some(1926));
     }
 
+    /// `AudioDbAlbumProvider.GetSearchResults` finds nothing;
+    /// `AudioDbArtistProvider.GetSearchResults` (v12.4) asks by the artist's
+    /// TheAudioDB id, else its MusicBrainz id, else its name, maps each
+    /// artist by `ToRemoteSearchResult`, and fails on a failed request.
     #[tokio::test]
-    async fn audiodb_identify_is_empty_for_both_music_kinds() {
+    async fn audiodb_identify_finds_artists_and_no_albums() {
         use super::AudioDbSearchProvider;
-        let album = AudioDbSearchProvider::new(BaseItemKind::MusicAlbum);
-        let artist = AudioDbSearchProvider::new(BaseItemKind::MusicArtist);
+        let server = crate::mock_http::MockServer::start(vec![(
+            "/search.php",
+            r#"{"artists":[{"idArtist":"113159","strArtist":"Miles Davis","intFormedYear":" 1944",
+                "strBiographyEN":"<p>A trumpeter.</p>","strArtistThumb":"https://a/thumb.jpg",
+                "strMusicBrainzID":"561d854a-6a28-4aa7-8c99-323e6ce46c2a"},
+                {"strArtist":"Miles Davis Quintet","strBiography":"A group."}]}"#
+                .to_owned(),
+        )])
+        .await;
+        let client = Arc::new(crate::audiodb::AudioDbClient::with_base_url(
+            &server.base_url,
+        ));
+        let album = AudioDbSearchProvider::new(BaseItemKind::MusicAlbum, Arc::clone(&client));
+        let artist = AudioDbSearchProvider::new(BaseItemKind::MusicArtist, client);
         assert_eq!(album.name(), "TheAudioDB");
         assert!(album.supports(BaseItemKind::MusicAlbum));
         assert!(!album.supports(BaseItemKind::MusicArtist));
@@ -6832,11 +6897,85 @@ mod tests {
             .await
             .expect("ok");
         assert!(search_results.is_empty(), "{search_results:?}");
-        let search_results = artist
+
+        let found = artist
             .get_search_results(&named_request(BaseItemKind::MusicArtist, "Miles Davis"))
             .await
             .expect("ok");
-        assert!(search_results.is_empty(), "{search_results:?}");
+        assert_eq!(
+            found,
+            [
+                RemoteSearchResult {
+                    name: Some("Miles Davis".to_owned()),
+                    provider_ids: Some(HashMap::from([
+                        ("AudioDbArtist".to_owned(), "113159".to_owned()),
+                        (
+                            "MusicBrainzArtist".to_owned(),
+                            "561d854a-6a28-4aa7-8c99-323e6ce46c2a".to_owned()
+                        ),
+                    ])),
+                    production_year: Some(1944),
+                    image_url: Some("https://a/thumb.jpg".to_owned()),
+                    search_provider_name: Some("TheAudioDB".to_owned()),
+                    overview: Some("A trumpeter.".to_owned()),
+                    ..RemoteSearchResult::default()
+                },
+                RemoteSearchResult {
+                    name: Some("Miles Davis Quintet".to_owned()),
+                    provider_ids: Some(HashMap::new()),
+                    search_provider_name: Some("TheAudioDB".to_owned()),
+                    overview: Some(String::new()),
+                    ..RemoteSearchResult::default()
+                },
+            ]
+        );
+        // The artist's own id first, then its MusicBrainz id (the song's
+        // album artist when it has none), neither falling through to the name.
+        let mut by_id = id_request(
+            BaseItemKind::MusicArtist,
+            &[
+                ("AudioDbArtist", "113159"),
+                ("MusicBrainzArtist", "561d854a-6a28-4aa7-8c99-323e6ce46c2a"),
+            ],
+        );
+        by_id.search_info.name = Some("ignored".to_owned());
+        artist.get_search_results(&by_id).await.expect("ok");
+        let mut by_song = named_request(BaseItemKind::MusicArtist, "ignored");
+        by_song.song_infos = vec![ferrofin_model::providers::SongInfo {
+            base: ItemLookupInfo {
+                provider_ids: Some(HashMap::from([(
+                    "MusicBrainzAlbumArtist".to_owned(),
+                    "c0000000-0000-4000-8000-00000000000c".to_owned(),
+                )])),
+                ..ItemLookupInfo::default()
+            },
+            ..ferrofin_model::providers::SongInfo::default()
+        }];
+        artist.get_search_results(&by_song).await.expect("ok");
+        assert_eq!(server.query_values("/artist.php", "i"), ["113159"]);
+        assert_eq!(
+            server.query_values("/artist-mb.php", "i"),
+            ["c0000000-0000-4000-8000-00000000000c"]
+        );
+        assert_eq!(server.query_values("/search.php", "s"), ["Miles Davis"]);
+
+        // `EnsureSuccessStatusCode`: a refused request fails the provider.
+        let refusing = crate::mock_http::MockServer::start_raw(vec![
+            crate::mock_http::MockServer::raw_status("400 Bad Request"),
+        ])
+        .await;
+        let refused = AudioDbSearchProvider::new(
+            BaseItemKind::MusicArtist,
+            Arc::new(crate::audiodb::AudioDbClient::with_base_url(
+                &refusing.base_url,
+            )),
+        );
+        assert!(
+            refused
+                .get_search_results(&named_request(BaseItemKind::MusicArtist, "Miles Davis"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -9818,6 +9957,38 @@ mod tests {
     const AUDIODB_ARTIST: &str = r#"{"artists":[{"strArtistThumb":"https://a/thumb.jpg","strArtistLogo":"https://a/logo.png","strArtistFanart":"https://a/fan.jpg"}]}"#;
     const AUDIODB_ALBUM: &str =
         r#"{"album":[{"strAlbumThumb":"https://a/cover.jpg","strAlbumCDart":"https://a/cd.png"}]}"#;
+
+    /// `AudioDbArtistImageProvider.GetImages` (v12.4) asks `GetArtist`, which
+    /// looks an artist with no MusicBrainz id up by its `AudioDbArtist` id.
+    #[tokio::test]
+    async fn an_artist_without_a_musicbrainz_id_gets_theaudiodb_images_by_its_own_id() {
+        let audiodb = crate::mock_http::MockServer::always(AUDIODB_ARTIST).await;
+        let (item_id, mgr) = image_manager(
+            "Audio.MusicArtist",
+            "Miles Davis",
+            &[("AudioDbArtist", "113159")],
+            Arc::new(crate::tmdb::TmdbClient::new()),
+            |mgr| {
+                mgr.with_audiodb(Arc::new(crate::audiodb::AudioDbClient::with_base_url(
+                    &audiodb.base_url,
+                )))
+            },
+        );
+        let all = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::default())
+            .await
+            .unwrap();
+        let types: Vec<ImageType> = all.iter().map(|i| i.type_).collect();
+        assert_eq!(
+            types,
+            [ImageType::Primary, ImageType::Logo, ImageType::Backdrop]
+        );
+        assert_eq!(audiodb.query_values("/artist.php", "i"), ["113159"]);
+        assert_eq!(
+            audiodb.query_values("/artist-mb.php", "i"),
+            Vec::<String>::new()
+        );
+    }
 
     #[tokio::test]
     async fn music_artist_remote_images_come_from_audiodb_and_fanart() {
