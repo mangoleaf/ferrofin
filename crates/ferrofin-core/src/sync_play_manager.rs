@@ -699,10 +699,10 @@ impl Group {
     /// and resumes once everyone is ready unless the creator was paused.
     ///
     /// The playlist is the reported queue. When the queue lacks the playing
-    /// item it is that item alone, as the open upstream fix
-    /// jellyfin/jellyfin#18198 does: v12.2 stores `NowPlayingQueue` only when
+    /// item it is that item alone: upstream stores `NowPlayingQueue` only when
     /// playback stops, so its queue is stale or empty and a missing item
-    /// leaves the group with nothing playing.
+    /// leaves the group with nothing playing (the open jellyfin/jellyfin#18198
+    /// stores the reported queue during playback instead).
     fn seed_from_now_playing(&mut self, now_playing: &SyncPlayNowPlaying) {
         let item = now_playing.item_id;
         let (ids, at) = match now_playing.queue.iter().position(|id| *id == item) {
@@ -2914,7 +2914,7 @@ mod tests {
     }
 
     /// A reported queue that lacks the playing item is replaced by the item
-    /// alone, as jellyfin/jellyfin#18198 does, so the group still plays it.
+    /// alone, so the group still plays it.
     #[tokio::test]
     async fn a_queue_without_the_playing_item_falls_back_to_the_item() {
         let (m, bus) = mgr();
