@@ -76,6 +76,28 @@ class Export(Databases):
         self.assertEqual(checks_db.export(exported, source, report, SCHEMA),
                          ["the database the export read holds no table of Ferrofin's: nothing to find in the loss report"])
 
+    def test_a_table_rebuilt_without_autoincrement_or_in_another_column_order_is_named(self):
+        def rebuilt(columns, key):   # in a fresh tmp each time
+            shutil.rmtree(self.tmp)
+            self.tmp.mkdir()
+            exported, source, report = self.run_export("  FerrofinMeta (2 rows): settings.\n")
+            self.edit(exported, "DROP TABLE AccessSchedules",
+                      f'CREATE TABLE "AccessSchedules" ({columns}, CONSTRAINT "PK_AccessSchedules" PRIMARY KEY ("Id"{key}))',
+                      'CREATE INDEX "IX_AccessSchedules_UserId" ON "AccessSchedules" ("UserId")')
+            return checks_db.export(exported, source, report, SCHEMA)
+
+        jellyfin_order = ('"Id" INTEGER NOT NULL, "UserId" TEXT NOT NULL, "DayOfWeek" INTEGER NOT NULL, '
+                          '"StartHour" REAL NOT NULL, "EndHour" REAL NOT NULL')
+        another_order = ('"Id" INTEGER NOT NULL, "DayOfWeek" INTEGER NOT NULL, "EndHour" REAL NOT NULL, '
+                         '"StartHour" REAL NOT NULL, "UserId" TEXT NOT NULL')
+        self.assertEqual(rebuilt(jellyfin_order, " AUTOINCREMENT"), [])   # Jellyfin's table again: nothing to name
+        for columns, key in ((jellyfin_order, ""), (another_order, " AUTOINCREMENT")):   # one difference each
+            problems = rebuilt(columns, key)
+            self.assertEqual(len(problems), 2, problems)
+            self.assertIn("table AccessSchedules", problems[0])
+            self.assertIn("table AccessSchedules", problems[1])
+            self.assertEqual(("'AUTOINCREMENT'" in problems[0], "'AUTOINCREMENT'" in problems[1]), (bool(key), True))
+
     def test_an_object_left_behind_or_missing_is_named(self):
         exported, source, report = self.run_export("  FerrofinMeta (2 rows): settings.\n")
         self.edit(exported, "CREATE TABLE FerrofinMeta (Key TEXT)", "DROP INDEX IX_BaseItems_Type_TopParentId_Id")

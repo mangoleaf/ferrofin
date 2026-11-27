@@ -70,15 +70,18 @@ def shown(items):
 # --- export -------------------------------------------------------------------------------------------------
 
 def schema(db):
-    """Every table (its columns), index (its columns, an expression as <expr>, and whether it is unique), view and
-    trigger (by name), one line each, SQLite's own objects and the partial indexes' WHERE aside: what the export's own
-    test compares (apps/ferrofin-server/tests/export_jellyfin.rs, schema)."""
+    """Every table (its columns, in order, and whether its key is AUTOINCREMENT), index (its columns, an expression as
+    <expr>, and whether it is unique), view and trigger (by name), one line each, SQLite's own objects and the partial
+    indexes' WHERE aside: what the export's own test compares (apps/ferrofin-server/tests/export_jellyfin.rs, schema),
+    and AUTOINCREMENT, which decides whether SQLite may hand a deleted last row's id out again."""
     lines = set()
-    for kind, name, table in db.execute(
-            "SELECT type, name, tbl_name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"):
+    for kind, name, table, sql in db.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"):
         if kind == "table":
             detail = [repr(row) for row in db.execute(
                 'SELECT name, upper(type), "notnull", dflt_value, pk FROM pragma_table_info(?)', (name,))]
+            if "AUTOINCREMENT" in (sql or "").upper():
+                detail.append("AUTOINCREMENT")
         elif kind == "index":
             detail = [row[0] for row in db.execute(
                 "SELECT coalesce(name, '<expr>') FROM pragma_index_info(?1) "
