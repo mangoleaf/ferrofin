@@ -1356,8 +1356,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    episodes, and UpdatePremiereDate, which changes nothing without them); \
                    apply_parental_rating_score and \
                    inherit_stored_rating; keep_stored_series_key; series_display_order \
-                   (an unread series skips its children's TheTVDB lookups, counting no \
-                   failure). Compared with \
+                   (an unread series skips the TheTVDB lookups of its children with no \
+                   TheTVDB id of their own, counting no failure). Compared with \
                    MediaBrowser.Controller/Entities/TV/Episode.cs (GetLookupInfo), \
                    MediaBrowser.Controller/LibraryTaskScheduler/\
                    LimitedConcurrencyLibraryScheduler.cs (ProcessItem), \
@@ -1388,11 +1388,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              child is fetched, and stamped, in that locale, where upstream's read of such a \
              row would throw into the per-child catch and the item would not refresh.",
             "An episode, or a season whose refresh reaches its TheTVDB lookups, whose series \
-             row cannot be read is refreshed and stamped without TheTVDB's answer, as \
-             upstream treats a child with no series (GetLookupInfo sets no \
-             SeriesProviderIds, and jellyfin-plugin-tvdb 5c4592f returns an empty result), \
-             where upstream's read of such a row would throw into the per-child catch and \
-             the item would not refresh.",
+             row cannot be read is refreshed and stamped as upstream treats a child with no \
+             series: GetLookupInfo sets no SeriesProviderIds, so jellyfin-plugin-tvdb v24 \
+             answers only by the child's own Tvdb id (an episode as in aired order) and \
+             returns an empty result without one; upstream's read of such a row would \
+             instead throw into the per-child catch and the item would not refresh.",
             "A season whose series row cannot be read keeps its premiere date and year where \
              its refresh would take them from its episodes, and is stamped, as upstream treats \
              a season with no series (GetEpisodes lists none, and UpdatePremiereDate changes \
@@ -2536,8 +2536,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    RefreshContext::identified, and its providers resolve the series by the \
                    chosen ids alone, ResolverGuesses::identified_series_ids: TheMovieDb's \
                    season and episode, TheTVDB's season and episode and OMDb's episode \
-                   lookups, as SeriesProviderIds; its image providers read the series \
-                   itself), remote_sources and provider_order \
+                   lookups, as SeriesProviderIds; its image providers read the ids the \
+                   pass leaves it, TheTVDB's own Tvdb id first, else the series itself), \
+                   remote_sources and provider_order \
                    (GetMetadataProvidersInternal: MetadataFetcherOrder, then IHasOrder, then \
                    registration, the plugins' sources among them; the chosen result's provider \
                    first, a stable OrderBy) and the artwork chain by FetcherPolicy::image_order \

@@ -421,9 +421,10 @@ fn dashboard(choice: &str) -> MetadataRefreshOptions {
 /// season provider runs first and TheTVDB's fills only what it left: TMDB's
 /// overview, air date and cast stand, and the season's Tvdb id is the one
 /// TMDB's answer carried (the first answer wins a key). The season's TMDB
-/// request is the one its episode shares, and its TVDB id comes from the
-/// series record the series provider read: a first scan asks TheMovieDb for
-/// the season once and TheTVDB for the season's record once. An unchanged
+/// request is the one its episode shares, and TheTVDB looks the season up by
+/// that Tvdb id, its own in the lookup (`MergeNewData`; plugin `v24`), with
+/// no series record read for it: a first scan asks TheMovieDb for the season
+/// once and TheTVDB for that season's record once. An unchanged
 /// rescan asks nothing — a changed season folder neither (D2); a season to
 /// refresh again asks both season providers again, and nothing else.
 #[tokio::test(flavor = "multi_thread")]
@@ -464,11 +465,11 @@ async fn a_tmdb_first_season_folds_tvdb_after_it_and_shares_its_season_request()
         "{:?}",
         drain(&log)
     );
-    assert_eq!(asked(&log, "/tvdb/seasons/77/extended"), 1);
+    assert_eq!(asked(&log, "/tvdb/seasons/364731/extended"), 1);
     assert_eq!(
         asked(&log, "short=true"),
         0,
-        "the season's id came from the series record: {:?}",
+        "the season's id came from TheMovieDb's answer: {:?}",
         drain(&log)
     );
     drain(&log);
@@ -502,7 +503,7 @@ async fn a_tmdb_first_season_folds_tvdb_after_it_and_shares_its_season_request()
     asked_now.sort();
     assert_eq!(
         asked_now,
-        ["/tmdb/tv/1399/season/1", "/tvdb/seasons/77/extended"],
+        ["/tmdb/tv/1399/season/1", "/tvdb/seasons/364731/extended"],
         "the season's two providers, once each"
     );
 }

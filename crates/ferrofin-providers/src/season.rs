@@ -2,7 +2,8 @@
 //! (`MediaBrowser.Providers/Plugins/Tmdb/TV/TmdbSeasonProvider.cs`, master
 //! `96bca6f0bd`) and the TVDB plugin's `TvdbSeasonProvider`
 //! (jellyfin-plugin-tvdb `5c4592f`,
-//! `Jellyfin.Plugin.Tvdb/Providers/TvdbSeasonProvider.cs`).
+//! `Jellyfin.Plugin.Tvdb/Providers/TvdbSeasonProvider.cs`; how a season is
+//! looked up, by its own id first, is `v24`'s `228f7b3`).
 //!
 //! Each turns its client's answer for one season into the provider's
 //! `MetadataResult<Season>`: a fresh item carrying only what the provider
@@ -118,7 +119,8 @@ pub fn tmdb_answer(
 }
 
 /// `TvdbSeasonProvider.MapSeasonToResult`'s answer (`:99-123`) for season
-/// `season_number`, from the season's record: the number, the overview in
+/// `season_number` (none for a season with no number, looked up by its own
+/// id), from the season's record: the number, the overview in
 /// the item's metadata `language` ([`TvdbSeasonDetails::translated_overview`],
 /// matched through `three_letter_names`, the culture's ISO 639-2 codes) and
 /// the season's own `Tvdb` id. The plugin never touches `People` here (a
@@ -128,12 +130,12 @@ pub fn tmdb_answer(
 #[must_use]
 pub fn tvdb_answer(
     record: &TvdbSeasonDetails,
-    season_number: i32,
+    season_number: Option<i32>,
     language: &str,
     three_letter_names: &[String],
 ) -> MetadataResult {
     let item = BaseItemEntity {
-        index_number: Some(i64::from(season_number)),
+        index_number: season_number.map(i64::from),
         overview: record.translated_overview(language, three_letter_names),
         ..BaseItemEntity::default()
     };
@@ -147,42 +149,42 @@ pub fn tvdb_answer(
     }
 }
 
-/// `TvdbSeasonProvider.GetMetadata` (`:53-97`) for season `season_number`
-/// of the series TheTVDB knows as `series_tvdb_id`, in the `season_type`
-/// ordering: the season's id from the series' record
-/// ([`TvdbClient::season_id`]), then the season's record, mapped by
-/// [`tvdb_answer`]. `None` is no answer — TheTVDB lists no such season, or
-/// a request failed (the failure is counted by the request).
+/// `TvdbSeasonProvider.GetMetadata` (plugin `v24`, `:53-97`): the season's
+/// record by its own `Tvdb` id (`own_id`, [`crate::tvdb::own_tvdb_id`])
+/// when it is not 0, with no series or number needed (`228f7b3`); else
+/// season `season_number` of the series TheTVDB knows by `series`' id, in
+/// its `season_type` ordering, by the series' record
+/// ([`TvdbClient::season_id`]). Mapped by [`tvdb_answer`]. `None` is no
+/// answer — no own id and no series or number, TheTVDB lists no such
+/// season, or a request failed (the failure is counted by the request).
 ///
-/// At `5c4592f` the plugin re-reads the season's id from the series
-/// whenever the refresh is automated ("the order has changed and we need to
-/// find the new season id", `:67-91`), and a scan always is, so this never
-/// resolves by an id already on the season. TODO(parity, open work item
-/// gl-791 — NOT an accepted divergence): the plugin's latest release, `v24`,
-/// dropped that `IsAutomated` branch here and in `TvdbEpisodeProvider`
-/// (`228f7b3`): it takes the season's own `Tvdb` id whenever there is one
-/// and reads the series only when there is none. Porting that, with the
-/// rest of `5c4592f..v24`, is gl-791. (`MetadataRefreshOptions` carries
-/// `is_automated`, but the plugin no longer reads it.)
+/// The plugin no longer re-reads a season's id from the series under an
+/// automated refresh (`5c4592f`'s `|| info.IsAutomated`): a stored id is
+/// kept when the series' display order changes, the trade-off `228f7b3`
+/// names, until the id is cleared from the season.
 ///
-/// The caller supplies `series_tvdb_id` only when the series has a `Tvdb`
-/// id. ACCEPTED DIVERGENCE (owner, 2026-10-04; don't-port-bugs): upstream
-/// also proceeds for a series that has only an IMDb or Zap2It id
-/// (`IsSupported`, `:55`) and then asks for series `0`
-/// (`Convert.ToInt32(null)`, `:76-80`), which TheTVDB rejects — a failed
+/// The caller supplies `series` only when the series has a `Tvdb` id.
+/// ACCEPTED DIVERGENCE (owner, 2026-10-04; don't-port-bugs): with no own
+/// id, upstream also proceeds for a series that has only an IMDb or Zap2It
+/// id (`IsSupported`, `:58`) and then asks for series `0`
+/// (`Convert.ToInt32(null)`, `:77-80`), which TheTVDB rejects — a failed
 /// request, and so an unstamped refresh, on every refresh of every such
 /// season. Ferrofin makes no request there.
 pub async fn tvdb_season(
     tvdb: &TvdbClient,
-    series_tvdb_id: i64,
-    season_type: &str,
-    season_number: i32,
+    own_id: i64,
+    series: Option<(i64, &str)>,
+    season_number: Option<i32>,
     language: &str,
     three_letter_names: &[String],
 ) -> Option<MetadataResult> {
-    let season_id = tvdb
-        .season_id(series_tvdb_id, season_type, season_number)
-        .await?;
+    let season_id = if own_id == 0 {
+        let (series_tvdb_id, season_type) = series?;
+        tvdb.season_id(series_tvdb_id, season_type, season_number?)
+            .await?
+    } else {
+        own_id
+    };
     let record = tvdb.season_details(season_id).await?;
     Some(tvdb_answer(
         &record,
@@ -337,7 +339,7 @@ mod tests {
             ..TvdbSeasonDetails::default()
         };
         let english = ["eng".to_owned()];
-        let answer = tvdb_answer(&record, 1, "en", &english);
+        let answer = tvdb_answer(&record, Some(1), "en", &english);
         assert_eq!(answer.item.index_number, Some(1));
         assert_eq!(answer.item.overview.as_deref(), Some("Winter is coming."));
         assert_eq!(answer.item.name, None);
@@ -348,7 +350,7 @@ mod tests {
         );
         let french = ["fre".to_owned(), "fra".to_owned()];
         assert_eq!(
-            tvdb_answer(&record, 1, "fr", &french)
+            tvdb_answer(&record, Some(1), "fr", &french)
                 .item
                 .overview
                 .as_deref(),
@@ -372,7 +374,7 @@ mod tests {
         };
         assert_eq!(record.translated_overview("es", &["spa".to_owned()]), None);
         assert_eq!(record.translated_overview("en", &["eng".to_owned()]), None);
-        let provider_ids = tvdb_answer(&record, 2, "en", &[]).provider_ids;
+        let provider_ids = tvdb_answer(&record, Some(2), "en", &[]).provider_ids;
         assert!(provider_ids.is_empty(), "{provider_ids:?}");
     }
 
@@ -408,7 +410,8 @@ mod tests {
     /// The whole provider over HTTP: the season's id from the series' short
     /// record (by number and ordering), then the season's record; a second
     /// season of the same series reuses the series' record; a season the
-    /// series does not list asks for nothing more.
+    /// series does not list asks for nothing more; a season with its own id
+    /// is asked for by it alone.
     #[tokio::test]
     async fn tvdb_season_resolves_by_the_series_record_once() {
         use std::io::{Read as _, Write as _};
@@ -450,20 +453,47 @@ mod tests {
         });
         let tvdb = TvdbClient::new().with_base_url(&format!("http://{addr}"));
         let english = ["eng".to_owned()];
-        let first = tvdb_season(&tvdb, 121_361, "official", 1, "en", &english)
-            .await
-            .expect("season 1");
+        let first = tvdb_season(
+            &tvdb,
+            0,
+            Some((121_361, "official")),
+            Some(1),
+            "en",
+            &english,
+        )
+        .await
+        .expect("season 1");
         assert_eq!(first.item.overview.as_deref(), Some("The first season."));
         assert_eq!(first.provider_ids, [("Tvdb".to_owned(), "12".to_owned())]);
-        let second = tvdb_season(&tvdb, 121_361, "OFFICIAL", 2, "en", &english)
-            .await
-            .expect("season 2");
+        let second = tvdb_season(
+            &tvdb,
+            0,
+            Some((121_361, "OFFICIAL")),
+            Some(2),
+            "en",
+            &english,
+        )
+        .await
+        .expect("season 2");
         assert_eq!(second.item.overview, None);
         assert!(
-            tvdb_season(&tvdb, 121_361, "official", 9, "en", &english)
-                .await
-                .is_none()
+            tvdb_season(
+                &tvdb,
+                0,
+                Some((121_361, "official")),
+                Some(9),
+                "en",
+                &english
+            )
+            .await
+            .is_none()
         );
+        // Its own id needs no series and no number (plugin `v24`).
+        let own = tvdb_season(&tvdb, 13, None, None, "en", &english)
+            .await
+            .expect("by its own id");
+        assert_eq!(own.item.index_number, None);
+        assert_eq!(own.provider_ids, [("Tvdb".to_owned(), "13".to_owned())]);
         let asked = requests.lock().expect("log").clone();
         let series: Vec<&String> = asked
             .iter()

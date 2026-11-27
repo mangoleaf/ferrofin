@@ -261,6 +261,13 @@ impl MockServer {
         self.heads.lock().expect("lock").clone()
     }
 
+    /// The target (path and query) of each request a [`start`](Self::start)
+    /// or [`with_headers`](Self::with_headers) server has had, in order of
+    /// arrival.
+    pub fn targets(&self) -> Vec<String> {
+        self.targets.lock().expect("lock").clone()
+    }
+
     /// The decoded `key` query parameter of each request to `path`, in order of
     /// arrival. Only [`start`](Self::start) and
     /// [`with_headers`](Self::with_headers) servers record their requests.

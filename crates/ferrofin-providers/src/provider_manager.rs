@@ -2400,9 +2400,10 @@ impl LocalProviderManager {
     /// identifying runs the chosen result's provider first (`:876-882`).
     /// Neither names a `ResultLanguage` here, so the fold's language
     /// fallback (`:977-999`) never applies to a season: its request carries
-    /// the resolved metadata language. The ids an answer brings
-    /// are not looked up by: TheTVDB reads the season's id from its series,
-    /// as the plugin at `5c4592f` does under an automated refresh (see
+    /// the resolved metadata language. The lookup's own ids are the
+    /// season's, with the ids each answer gathers added (`MergeNewData`,
+    /// `:1004`), and TheTVDB looks the season up by its `Tvdb` id among them
+    /// first, through its series only without one (plugin `v24`, see
     /// [`crate::season::tvdb_season`]).
     ///
     /// [`BUILT_IN_METADATA_FETCHERS`]: crate::library_options::BUILT_IN_METADATA_FETCHERS
@@ -2412,6 +2413,7 @@ impl LocalProviderManager {
         let SeasonRefresh {
             row,
             series_ids,
+            own_ids,
             season_number,
             library,
             prefer,
@@ -2447,6 +2449,7 @@ impl LocalProviderManager {
             }
             _ => None,
         };
+        let mut lookup: Vec<(String, String)> = own_ids.to_vec();
         let mut fetched = Fetched::default();
         let mut temp = MetadataResult::of(BaseItemEntity::default());
         let mut answered = false;
@@ -2461,23 +2464,8 @@ impl LocalProviderManager {
                     _ => None,
                 }
             } else {
-                match (self.tvdb.as_ref(), id_of("Tvdb")) {
-                    (Some(client), Some(series)) => {
-                        let language = self.preferred_metadata_language(row).await;
-                        let three_letter = self.three_letter_language_names(&language);
-                        let display_order = self.series_display_order_of(row).await;
-                        crate::season::tvdb_season(
-                            client,
-                            series,
-                            crate::tvdb::season_lookup_order(&display_order),
-                            season_number,
-                            &language,
-                            &three_letter,
-                        )
-                        .await
-                    }
-                    _ => None,
-                }
+                self.tvdb_season(row, (&lookup, id_of("Tvdb")), season_number)
+                    .await
             };
             let Some(answer) = answer else { continue };
             merge_data(
@@ -2488,6 +2476,7 @@ impl LocalProviderManager {
                 false,
             );
             temp.provider_ids = merge_provider_ids(&answer.provider_ids, &temp.provider_ids, false);
+            lookup = merge_provider_ids(&temp.provider_ids, &lookup, false);
             fetched.credits.push(answer.people);
             answered = true;
         }
@@ -2496,6 +2485,40 @@ impl LocalProviderManager {
             fetched.provider_ids = temp.provider_ids;
         }
         fetched
+    }
+
+    /// `TvdbSeasonProvider`'s answer for a path-less season (plugin `v24`):
+    /// by its own `Tvdb` id among the lookup's `ids` when it is not 0
+    /// (`228f7b3`), else season `season_number` of the series known as
+    /// `series_tvdb_id`, in the series' display order.
+    async fn tvdb_season(
+        &self,
+        row: &BaseItemEntity,
+        (ids, series_tvdb_id): (&[(String, String)], Option<i64>),
+        season_number: i32,
+    ) -> Option<crate::metadata_merge::MetadataResult> {
+        let client = self.tvdb.as_ref()?;
+        let own_id = crate::tvdb::own_tvdb_id(ids)?;
+        if own_id == 0 && series_tvdb_id.is_none() {
+            return None;
+        }
+        let language = self.preferred_metadata_language(row).await;
+        let three_letter = self.three_letter_language_names(&language);
+        // The order only picks the season the series lists.
+        let display_order = if own_id == 0 {
+            self.series_display_order_of(row).await
+        } else {
+            String::new()
+        };
+        crate::season::tvdb_season(
+            client,
+            own_id,
+            series_tvdb_id.map(|series| (series, crate::tvdb::season_lookup_order(&display_order))),
+            Some(season_number),
+            &language,
+            &three_letter,
+        )
+        .await
     }
 
     /// The ISO 639-2 codes the culture table lists for `language`, which a
@@ -2516,17 +2539,18 @@ impl LocalProviderManager {
     /// only TheTVDB is asked ([`answers_for_episode`]); one with a remote path,
     /// or a path outside every library, is asked of all three.
     ///
-    /// Each provider resolves by the parent series' ids alone, never by its
-    /// name: TheMovieDb by the series' `Tmdb` id (`TmdbEpisodeProvider.cs:
-    /// 92-97`, no search), OMDb by its `Imdb` id and the episode's own, TheTVDB
-    /// by its `Tvdb` id in the series' display order. An answer folds into
-    /// `temp` as the scan folds it: an answer in the preferred language with an
-    /// overview drops one an earlier answer in another language supplied (and
-    /// one in another language marks the overview it is first to supply as a
-    /// fallback), the fields fill only where `temp` is empty, and the ids it
-    /// gathered join the lookup the providers after it resolve by (OMDb finds
-    /// the episode's own `Imdb` id there). Each answer's credits are kept to be
-    /// folded as the scan folds them.
+    /// Each provider resolves by ids, never by its name: TheMovieDb by the
+    /// series' `Tmdb` id (`TmdbEpisodeProvider.cs:92-97`, no search), OMDb by
+    /// its `Imdb` id and the episode's own, TheTVDB by the episode's own `Tvdb`
+    /// id when the lookup has one (plugin `v24`), else by the series' `Tvdb` id
+    /// in the series' display order. An answer folds into `temp` as the scan
+    /// folds it: an answer in the preferred language with an overview drops
+    /// one an earlier answer in another language supplied (and one in another
+    /// language marks the overview it is first to supply as a fallback), the
+    /// fields fill only where `temp` is empty, and the ids it gathered join the
+    /// lookup the providers after it resolve by (OMDb finds the episode's own
+    /// `Imdb` id there, TheTVDB its `Tvdb` id). Each answer's credits are kept
+    /// to be folded as the scan folds them.
     async fn fetch_episode_providers(&self, episode: EpisodeRefresh<'_>) -> Fetched {
         use crate::library_options::metadata_fetcher_rank;
         use crate::metadata_merge::{MetadataResult, merge_data, merge_provider_ids};
@@ -2584,13 +2608,13 @@ impl LocalProviderManager {
                 )
                 .await
             } else {
-                match series_id_of("Tvdb") {
-                    Some(series) => {
-                        self.tvdb_episode(row, series, (season_number, episode_number), &language)
-                            .await
-                    }
-                    None => None,
-                }
+                self.tvdb_episode(
+                    row,
+                    (&lookup, series_id_of("Tvdb")),
+                    (season_number, episode_number),
+                    &language,
+                )
+                .await
             };
             let Some(answer) = answer else { continue };
             let has_overview = answer
@@ -2669,24 +2693,34 @@ impl LocalProviderManager {
         }
     }
 
-    /// `TvdbEpisodeProvider`'s answer: TheTVDB's record for the episode of the
-    /// series known as `series_tvdb_id`, numbered in the series' display order
-    /// and localized into `language`.
+    /// `TvdbEpisodeProvider`'s answer (plugin `v24`): TheTVDB's record for the
+    /// episode by its own `Tvdb` id among the lookup's `ids` when it is not 0
+    /// (`228f7b3`), else for the episode of the series known as
+    /// `series_tvdb_id`, numbered in the series' display order; localized
+    /// into `language`.
     async fn tvdb_episode(
         &self,
         row: &BaseItemEntity,
-        series_tvdb_id: i64,
+        (ids, series_tvdb_id): (&[(String, String)], Option<i64>),
         (season_number, episode_number): (i32, i32),
         language: &str,
     ) -> Option<crate::episode::EpisodeAnswer> {
         let client = self.tvdb.as_ref()?;
+        let own_id = crate::tvdb::own_tvdb_id(ids)?;
+        if own_id == 0 && series_tvdb_id.is_none() {
+            return None;
+        }
         let three_letter = self.three_letter_language_names(language);
         let display_order = self.series_display_order_of(row).await;
-        let (season_type, season, number) =
-            crate::tvdb::episode_lookup(&display_order, Some(season_number), episode_number);
-        let mut record = client
-            .episode_by_number(series_tvdb_id, season_type, season, number)
-            .await?;
+        let mut record = if own_id == 0 {
+            let (season_type, season, number) =
+                crate::tvdb::episode_lookup(&display_order, Some(season_number), episode_number);
+            client
+                .episode_by_number(series_tvdb_id?, season_type, season, number)
+                .await?
+        } else {
+            client.episode_details(own_id).await?
+        };
         record.localize(language, &three_letter);
         Some(crate::episode::tvdb_answer(
             &record,
@@ -2982,15 +3016,18 @@ impl LocalProviderManager {
             }) => {
                 // `ApplySearchResult` (`MetadataService.cs:272-293`): an
                 // identified season looks up by the chosen result's ids as
-                // its SERIES' ids.
-                let series_ids = match (&options.search_result, series_id) {
-                    (Some(_), _) => stored_ids.clone(),
-                    (None, Some(series)) => self.stored_provider_ids(series).await,
-                    (None, None) => Vec::new(),
+                // its SERIES' ids and has none of its own.
+                let (series_ids, own_ids) = match (&options.search_result, series_id) {
+                    (Some(_), _) => (stored_ids.clone(), Vec::new()),
+                    (None, Some(series)) => {
+                        (self.stored_provider_ids(series).await, stored_ids.clone())
+                    }
+                    (None, None) => (Vec::new(), stored_ids.clone()),
                 };
                 let season = SeasonRefresh {
                     row: &stored,
                     series_ids: &series_ids,
+                    own_ids: &own_ids,
                     season_number,
                     library: library.as_ref(),
                     prefer: options
@@ -4216,6 +4253,8 @@ struct SeasonRefresh<'a> {
     row: &'a BaseItemEntity,
     /// The series' ids the providers resolve by (`SeriesProviderIds`).
     series_ids: &'a [(String, String)],
+    /// The season's own ids (the lookup info's `ProviderIds`).
+    own_ids: &'a [(String, String)],
     /// The season's number.
     season_number: i32,
     /// The owning library's options (its fetcher checkboxes and order).
@@ -4723,32 +4762,36 @@ impl LocalProviderManager {
                 None => Vec::new(),
             }
         } else {
-            let Some(series) = self.parent_series_of(entity).await else {
+            // `TvdbSeasonImageProvider` and `TvdbEpisodeImageProvider` (plugin
+            // `v24`, `228f7b3`): the item's own `Tvdb` id first, the series'
+            // id and the item's numbers only without one.
+            let Some(own_id) = crate::tvdb::own_tvdb_id(ids) else {
                 return Vec::new();
             };
-            let Ok(id) = Uuid::parse_str(&series.id) else {
-                return Vec::new();
+            let series = self.parent_series_of(entity).await;
+            let series_id = match series.as_ref().map(|series| Uuid::parse_str(&series.id)) {
+                Some(Ok(id)) => id_of(&self.stored_provider_ids(id).await),
+                _ => None,
             };
-            let Some(series_id) = id_of(&self.stored_provider_ids(id).await) else {
+            let number = entity.index_number.and_then(|n| i32::try_from(n).ok());
+            if own_id == 0 && (series_id.is_none() || number.is_none()) {
                 return Vec::new();
-            };
-            let order = crate::tvdb::display_order_of(series.data.as_deref());
+            }
+            let order =
+                crate::tvdb::display_order_of(series.as_ref().and_then(|s| s.data.as_deref()));
             let order = if order.is_empty() {
                 crate::tvdb::DEFAULT_SEASON_TYPE
             } else {
                 order.as_str()
             };
             if source == RemoteImageSource::TvdbSeason {
-                match entity
-                    .index_number
-                    .and_then(|number| i32::try_from(number).ok())
-                {
-                    Some(number) => client.season_images(series_id, order, number).await,
-                    None => Vec::new(),
-                }
+                // `IndexNumber ?? 0` for a season looked up by its own id.
+                client
+                    .season_images(own_id, series_id, order, number.unwrap_or(0))
+                    .await
             } else {
-                let details =
-                    if let Some(number) = entity.index_number.and_then(|n| i32::try_from(n).ok()) {
+                let details = match (own_id, series_id, number) {
+                    (0, Some(series_id), Some(number)) => {
                         let season = entity
                             .parent_index_number
                             .and_then(|n| i32::try_from(n).ok())
@@ -4757,9 +4800,10 @@ impl LocalProviderManager {
                         client
                             .episode_by_number(series_id, order, season, number)
                             .await
-                    } else {
-                        None
-                    };
+                    }
+                    (0, ..) => None,
+                    (own, ..) => client.episode_details(own).await,
+                };
                 details
                     .and_then(|details| details.image_url)
                     .filter(|url| !url.is_empty())
@@ -14788,20 +14832,23 @@ mod tests {
     /// field (here the overview and the season's Tvdb id), a later one fills
     /// what is still empty (TMDB's air date and cast after TVDB's), and the
     /// credits TheMovieDb answers with are saved (`SaveItemAsync` →
-    /// `UpdatePeopleAsync`). Both providers resolve by the series' ids. With
+    /// `UpdatePeopleAsync`). Both providers resolve by the series' ids, but
+    /// TheTVDB by the season's own `Tvdb` id first, which TheMovieDb's answer
+    /// carries when it ran first (`MergeNewData`; plugin `v24`). With
     /// no saved order (an empty `order` here: no `TypeOptions` at all),
     /// registration breaks the tie of two providers that declare no
     /// `IHasOrder`: TheTVDB first, as the TVDB plugin registers before the
     /// server's providers in Jellyfin.
     #[rstest::rstest]
-    #[case::tmdb_first(&[crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::TVDB], "TMDB season.", "364731")]
-    #[case::tvdb_first(&[crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::TMDB], "TVDB season.", "77")]
-    #[case::no_saved_order(&[], "TVDB season.", "77")]
+    #[case::tmdb_first(&[crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::TVDB], "TMDB season.", "364731", "/tvdb/seasons/364731/extended")]
+    #[case::tvdb_first(&[crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::TMDB], "TVDB season.", "77", "/tvdb/seasons/77/extended")]
+    #[case::no_saved_order(&[], "TVDB season.", "77", "/tvdb/seasons/77/extended")]
     #[tokio::test]
     async fn a_virtual_season_runs_every_season_provider_in_the_librarys_order(
         #[case] order: &[&str],
         #[case] overview: &str,
         #[case] tvdb_id: &str,
+        #[case] tvdb_record: &str,
     ) {
         let (base, log) = spawn_season_providers(false);
         let options = if order.is_empty() {
@@ -14848,12 +14895,7 @@ mod tests {
             1,
             "{asked:?}"
         );
-        assert!(
-            asked
-                .iter()
-                .any(|l| l.contains("/tvdb/seasons/77/extended")),
-            "{asked:?}"
-        );
+        assert!(asked.iter().any(|l| l.contains(tvdb_record)), "{asked:?}");
         assert!(
             !asked.iter().any(|l| l.contains("/search")),
             "the series' ids, never a search: {asked:?}"
@@ -15205,6 +15247,94 @@ mod tests {
         assert!(season.people.written.lock().expect("lock").is_empty());
     }
 
+    /// A path-less season with a TheTVDB id of its own is fetched by it, its
+    /// series not asked (plugin `v24`, `228f7b3`); one whose id
+    /// `Convert.ToInt32` cannot read asks TheTVDB nothing and is a failure,
+    /// so its refresh is not stamped.
+    #[rstest::rstest]
+    #[case::own_id("77", true)]
+    #[case::unreadable_id("x77", false)]
+    #[tokio::test]
+    async fn a_virtual_season_with_its_own_tvdb_id_is_fetched_by_it(
+        #[case] own_id: &str,
+        #[case] answers: bool,
+    ) {
+        let (base, log) = spawn_season_providers(false);
+        let season = VirtualSeason::new(
+            &base,
+            &[("Tvdb", "121361")],
+            season_fetchers(&[crate::library_options::fetcher_names::TVDB]),
+            |_| {},
+        );
+        season.store.stored_ids.lock().expect("lock").insert(
+            season.season_id,
+            vec![("Tvdb".to_owned(), own_id.to_owned())],
+        );
+        season
+            .mgr
+            .refresh_full_item(season.season_id, &search_missing())
+            .await
+            .expect("refresh");
+        let asked = log.lock().expect("log").clone();
+        assert!(!asked.iter().any(|l| l.contains("/series/")), "{asked:?}");
+        let row = season.saved();
+        if answers {
+            let row = row.expect("a full refresh saves");
+            assert_eq!(row.overview.as_deref(), Some("TVDB season."));
+            assert!(row.date_last_refreshed.is_some());
+        } else {
+            assert!(!asked.iter().any(|l| l.contains("/seasons/")), "{asked:?}");
+            assert_eq!(row.as_ref().and_then(|r| r.overview.as_deref()), None);
+            assert_eq!(
+                row.and_then(|r| r.date_last_refreshed),
+                None,
+                "a failure is not stamped"
+            );
+        }
+    }
+
+    /// Identify clears a path-less season's own ids (`ApplySearchResult`,
+    /// `MetadataService.cs:282-283`): TheTVDB looks it up through the chosen
+    /// series, never by a stored id or the chosen series' id as its own.
+    #[tokio::test]
+    async fn an_identified_virtual_season_reaches_tvdb_through_the_chosen_series() {
+        let (base, log) = spawn_season_providers(false);
+        let season = VirtualSeason::new(
+            &base,
+            &[],
+            season_fetchers(&[crate::library_options::fetcher_names::TVDB]),
+            |_| {},
+        );
+        season
+            .store
+            .stored_ids
+            .lock()
+            .expect("lock")
+            .insert(season.season_id, vec![("Tvdb".to_owned(), "99".to_owned())]);
+        season
+            .mgr
+            .refresh_full_item(season.season_id, &identify_series(&[("Tvdb", "121361")]))
+            .await
+            .expect("refresh");
+        let asked = log.lock().expect("log").clone();
+        assert!(
+            asked
+                .iter()
+                .any(|l| l.contains("/tvdb/series/121361/extended")),
+            "{asked:?}"
+        );
+        assert!(
+            !asked
+                .iter()
+                .any(|l| l.contains("/tvdb/seasons/99/") || l.contains("/tvdb/seasons/121361/")),
+            "{asked:?}"
+        );
+        assert_eq!(
+            season.saved().and_then(|row| row.overview).as_deref(),
+            Some("TVDB season.")
+        );
+    }
+
     // ── an episode with no file of its own: its episode providers ──────────
 
     /// TheMovieDb's season listing with episode 2, and the episode's own
@@ -15432,16 +15562,69 @@ mod tests {
         assert!(row.date_last_refreshed.is_some());
     }
 
+    /// A missing episode with a TheTVDB id of its own is fetched by it, its
+    /// series' episode listing not asked (plugin `v24`, `228f7b3`); one whose
+    /// id `Convert.ToInt32` cannot read asks TheTVDB nothing and is a
+    /// failure, so its refresh is not stamped.
+    #[rstest::rstest]
+    #[case::own_id("5002", true)]
+    #[case::unreadable_id("x5002", false)]
+    #[tokio::test]
+    async fn a_missing_episode_with_its_own_tvdb_id_is_fetched_by_it(
+        #[case] own_id: &str,
+        #[case] answers: bool,
+    ) {
+        let (base, log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tvdb", "121361")],
+            ferrofin_model::configuration::LibraryOptions::default(),
+            |_| {},
+        );
+        episode.store.stored_ids.lock().expect("lock").insert(
+            episode.episode_id,
+            vec![("Tvdb".to_owned(), own_id.to_owned())],
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let asked = log.lock().expect("log").clone();
+        assert!(!asked.iter().any(|l| l.contains("/series/")), "{asked:?}");
+        let row = episode.saved();
+        if answers {
+            assert!(
+                asked
+                    .iter()
+                    .any(|l| l.contains("/tvdb/episodes/5002/extended")),
+                "{asked:?}"
+            );
+            let row = row.expect("a full refresh saves");
+            assert_eq!(row.name.as_deref(), Some("TVDB Episode"));
+            assert!(row.date_last_refreshed.is_some());
+        } else {
+            assert!(!asked.iter().any(|l| l.contains("/tvdb/")), "{asked:?}");
+            assert_eq!(
+                row.and_then(|r| r.date_last_refreshed),
+                None,
+                "a failure is not stamped"
+            );
+        }
+    }
+
     /// An episode with no file of its own that is no missing episode (a
     /// remote path) refreshes through every episode provider the library
     /// ticks, in its fetcher order, as the scan's episode does: the first
     /// answer wins a field (title, synopsis, air date), a later one fills what
     /// is still empty (OMDb's rating), the ids all gather on the row, and each
     /// credited provider's credits are folded. Every provider resolves by the
-    /// series' ids — never a search.
+    /// series' ids — never a search — but TheTVDB by the episode's own `Tvdb`
+    /// id first, which TheMovieDb's answer carries when it ran first
+    /// (`MergeNewData`; plugin `v24`).
     #[rstest::rstest]
-    #[case::tmdb_first(&[crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::OMDB], "TMDB Episode", "TMDB synopsis.", "2011-04-24", "tt0002002")]
-    #[case::tvdb_first(&[crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::OMDB], "TVDB Episode", "TVDB synopsis.", "2011-04-23", "tt0005002")]
+    #[case::tmdb_first(&[crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::OMDB], "TMDB Episode", "TMDB synopsis.", "2011-04-24", "tt0002002", "/tvdb/episodes/5002/extended")]
+    #[case::tvdb_first(&[crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::OMDB], "TVDB Episode", "TVDB synopsis.", "2011-04-23", "tt0005002", "/tvdb/series/121361/episodes/official")]
     #[tokio::test]
     async fn a_remote_episode_runs_every_episode_provider_in_the_librarys_order(
         #[case] order: &[&str],
@@ -15449,6 +15632,7 @@ mod tests {
         #[case] overview: &str,
         #[case] premiere: &str,
         #[case] imdb: &str,
+        #[case] tvdb_request: &str,
     ) {
         let (base, log) = spawn_episode_providers(false);
         let episode = VirtualEpisode::new(
@@ -15492,11 +15676,7 @@ mod tests {
             );
         }
         let asked = log.lock().expect("log").clone();
-        for expected in [
-            "/tmdb/tv/1399/season/1/episode/2",
-            "/tvdb/series/121361/episodes/official",
-            "/omdb/",
-        ] {
+        for expected in ["/tmdb/tv/1399/season/1/episode/2", tvdb_request, "/omdb/"] {
             assert!(
                 asked.iter().any(|l| l.contains(expected)),
                 "{expected}: {asked:?}"
@@ -16288,15 +16468,35 @@ mod tests {
         assert_eq!(kept.original_language.as_deref(), value);
     }
 
+    /// TheTVDB's artwork without metadata refresh: a series by its id, a
+    /// season and an episode through the series and their numbers, and (plugin
+    /// `v24`, `228f7b3`) a season or an episode with a TheTVDB id of its own
+    /// by that id — the episode's still without the series' listing, the
+    /// season's own art, the official season's when it has none — and none
+    /// for an own id `Convert.ToInt32` cannot read.
+    #[rstest::rstest]
+    #[case::through_the_series(None, None, "season.jpg", Some("episode.jpg"))]
+    #[case::by_their_own_ids(Some("61"), Some("999"), "own-season.jpg", Some("own-episode.jpg"))]
+    #[case::own_season_without_art(Some("62"), None, "official.jpg", Some("episode.jpg"))]
+    #[case::unreadable_episode_id(None, Some("x999"), "season.jpg", None)]
     #[tokio::test]
-    async fn tvdb_images_resolve_series_season_and_episode_with_disabled_metadata() {
+    async fn tvdb_images_resolve_series_season_and_episode_with_disabled_metadata(
+        #[case] season_own: Option<&str>,
+        #[case] episode_own: Option<&str>,
+        #[case] season_url: &str,
+        #[case] episode_url: Option<&str>,
+    ) {
         let server = crate::mock_http::MockServer::start(vec![
             ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
             ("/artwork/types", r#"{"data":[{"id":7,"name":"Poster","recordType":"season"}]}"#.to_owned()),
-            ("/series/5/extended", r#"{"data":{"id":5,"seasons":[{"id":51,"number":1,"type":{"type":"dvd"}}],"artworks":[{"type":2,"image":"series.jpg","language":"eng"}]}}"#.to_owned()),
+            ("/series/5/extended", r#"{"data":{"id":5,"seasons":[{"id":51,"number":1,"type":{"type":"dvd"}},{"id":52,"number":1,"type":{"type":"official"}}],"artworks":[{"type":2,"image":"series.jpg","language":"eng"}]}}"#.to_owned()),
             ("/seasons/51/extended", r#"{"data":{"artwork":[{"type":7,"image":"season.jpg","language":"fre"}]}}"#.to_owned()),
+            ("/seasons/52/extended", r#"{"data":{"artwork":[{"type":7,"image":"official.jpg","language":"fre"}]}}"#.to_owned()),
+            ("/seasons/61/extended", r#"{"data":{"artwork":[{"type":7,"image":"own-season.jpg","language":"fre"}]}}"#.to_owned()),
+            ("/seasons/62/extended", r#"{"data":{"artwork":[]}}"#.to_owned()),
             ("/series/5/episodes/dvd", r#"{"data":{"episodes":[{"id":9,"seasonNumber":1,"number":2}]}}"#.to_owned()),
             ("/episodes/9/extended", r#"{"data":{"id":9,"image":"episode.jpg"}}"#.to_owned()),
+            ("/episodes/999/extended", r#"{"data":{"id":999,"image":"own-episode.jpg"}}"#.to_owned()),
         ]).await;
         let series_id = Uuid::new_v4();
         let season_id = Uuid::new_v4();
@@ -16319,10 +16519,20 @@ mod tests {
         }
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let store = Arc::new(RecordingStore::default());
-        store.stored_ids.lock().unwrap().extend([
-            (series_id, vec![("Tvdb".to_owned(), "5".to_owned())]),
-            (episode_id, vec![("Tvdb".to_owned(), "999".to_owned())]),
-        ]);
+        store
+            .stored_ids
+            .lock()
+            .unwrap()
+            .insert(series_id, vec![("Tvdb".to_owned(), "5".to_owned())]);
+        for (id, own) in [(season_id, season_own), (episode_id, episode_own)] {
+            if let Some(own) = own {
+                store
+                    .stored_ids
+                    .lock()
+                    .unwrap()
+                    .insert(id, vec![("Tvdb".to_owned(), own.to_owned())]);
+            }
+        }
         let mut mgr = LocalProviderManager::default()
             .with_tvdb(Arc::new(
                 crate::tvdb::TvdbClient::new().with_base_url(&server.base_url),
@@ -16352,9 +16562,9 @@ mod tests {
             seen: tx,
         }));
         for (id, url, language) in [
-            (series_id, "series.jpg", Some("en")),
-            (season_id, "season.jpg", Some("fr")),
-            (episode_id, "episode.jpg", None),
+            (series_id, Some("series.jpg"), Some("en")),
+            (season_id, Some(season_url), Some("fr")),
+            (episode_id, episode_url, None),
         ] {
             let providers = mgr.get_remote_image_provider_info(id).await.unwrap();
             assert_eq!(providers.len(), 1);
@@ -16369,6 +16579,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let Some(url) = url else {
+                assert!(images.is_empty(), "{id}: {images:?}");
+                continue;
+            };
             assert_eq!(images.len(), 1, "{id}: {images:?}");
             assert_eq!(images[0].url.as_deref(), Some(url));
             assert_eq!(images[0].language.as_deref(), language);

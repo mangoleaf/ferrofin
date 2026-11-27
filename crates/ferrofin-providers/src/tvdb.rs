@@ -88,6 +88,34 @@ pub fn season_lookup_order(display_order: &str) -> &str {
     }
 }
 
+/// `ProviderIdsExtensions.GetTvdbId` over a season's or an episode's ids
+/// (`Convert.ToInt32(item.GetProviderId("Tvdb"))`): its own `Tvdb` id, 0
+/// when it has none. Since plugin `v24` (`228f7b3`) its season and episode
+/// providers, metadata and images, look the item up by this id when it is
+/// not 0, and through its series only when it is 0. A blank value, which
+/// Jellyfin never stores (`SetProviderId` removes it), reads as none.
+///
+/// `None` when the id is one `Convert.ToInt32` cannot read (not a 32-bit
+/// integer): each of those providers reads it before anything else and
+/// throws, which upstream counts as the provider's failure, so this counts
+/// one ([`note_request_failure`](crate::rate_limit::note_request_failure)).
+#[must_use]
+pub fn own_tvdb_id(ids: &[(String, String)]) -> Option<i64> {
+    let Some(value) = ids
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("Tvdb"))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Some(0);
+    };
+    let id = value.parse::<i32>().ok().map(i64::from);
+    if id.is_none() {
+        crate::rate_limit::note_request_failure();
+    }
+    id
+}
+
 /// `TvdbClientManager.GetEpisodeTvdbId`'s season-number lookup for one
 /// episode: the TVDB ordering to ask, the season and the episode number. A
 /// season-less episode is in season 1; absolute order is always season 1
@@ -1205,41 +1233,61 @@ impl TvdbClient {
         seasons
     }
 
-    /// `TvdbSeasonImageProvider`: the selected ordering's artwork, falling
-    /// back to the official season only when the selected season has no art.
+    /// `TvdbSeasonImageProvider.GetSeasonArtworks` (plugin `v24`,
+    /// `228f7b3`): the artwork of the season's own `Tvdb` id (`own_id`, 0 for
+    /// none), else of season `number` of series `series_id` in the selected
+    /// ordering; when that season has no art, the official season's, whose
+    /// id is read from the series only then, and not asked twice.
     pub async fn season_images(
         &self,
-        series_id: i64,
+        own_id: i64,
+        series_id: Option<i64>,
         season_type: &str,
         number: i32,
     ) -> Vec<TmdbImage> {
+        let Some(types) = self.image_types().await else {
+            return Vec::new();
+        };
+        let first = match (own_id, series_id) {
+            (0, Some(series)) => self.season_id(series, season_type, number).await,
+            (0, None) => None,
+            (own, _) => Some(own),
+        };
+        if let Some(images) = match first {
+            Some(id) => self.season_artwork(id, &types).await,
+            None => None,
+        } {
+            return images;
+        }
+        let official = match series_id {
+            Some(series)
+                if own_id != 0 || !season_type.eq_ignore_ascii_case(DEFAULT_SEASON_TYPE) =>
+            {
+                self.season_id(series, DEFAULT_SEASON_TYPE, number).await
+            }
+            _ => None,
+        };
+        match official.filter(|id| Some(*id) != first) {
+            Some(id) => self.season_artwork(id, &types).await.unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Season `id`'s artwork of the season types TheTVDB's `/artwork/types`
+    /// lists; `None` when the request failed or the season has no artwork,
+    /// which [`season_images`](Self::season_images) falls back from.
+    async fn season_artwork(&self, id: i64, types: &[ArtworkTypeWire]) -> Option<Vec<TmdbImage>> {
         #[derive(Deserialize)]
         struct SeasonArtwork {
             artwork: Option<Vec<ArtworkWire>>,
         }
-        let Some(types) = self.image_types().await else {
-            return Vec::new();
-        };
-        let orders = if season_type.eq_ignore_ascii_case(DEFAULT_SEASON_TYPE) {
-            vec![DEFAULT_SEASON_TYPE]
-        } else {
-            vec![season_type, DEFAULT_SEASON_TYPE]
-        };
-        for order in orders {
-            let Some(id) = self.season_id(series_id, order, number).await else {
-                continue;
-            };
-            let Some(wire) = self
-                .get::<SeasonArtwork>(&format!("/seasons/{id}/extended"), &[])
-                .await
-            else {
-                continue;
-            };
-            let artwork = wire.artwork.unwrap_or_default();
-            if artwork.is_empty() {
-                continue;
-            }
-            return artwork
+        let artwork = self
+            .get::<SeasonArtwork>(&format!("/seasons/{id}/extended"), &[])
+            .await?
+            .artwork
+            .filter(|artwork| !artwork.is_empty())?;
+        Some(
+            artwork
                 .into_iter()
                 .filter_map(|art| {
                     let kind = types.iter().find(|kind| {
@@ -1260,9 +1308,8 @@ impl TvdbClient {
                     };
                     art.into_image(image_type)
                 })
-                .collect();
-        }
-        Vec::new()
+                .collect(),
+        )
     }
 
     async fn image_types(&self) -> Option<Vec<ArtworkTypeWire>> {
@@ -2226,6 +2273,36 @@ mod tests {
         );
     }
 
+    /// A season's own id that is also the official season's: when it has no
+    /// art, the official fallback is the same season and is not asked again.
+    #[tokio::test]
+    async fn an_own_season_without_art_is_not_asked_again_as_the_official_one() {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            (
+                "/artwork/types",
+                r#"{"data":[{"id":71,"name":"Poster","recordType":"season"}]}"#.to_owned(),
+            ),
+            (
+                "/series/5/extended",
+                r#"{"data":{"seasons":[{"id":52,"number":1,"type":{"type":"official"}}]}}"#
+                    .to_owned(),
+            ),
+            (
+                "/seasons/52/extended",
+                r#"{"data":{"artwork":[]}}"#.to_owned(),
+            ),
+        ])
+        .await;
+        let client = TvdbClient::new().with_base_url(&server.base_url);
+        let images = client.season_images(52, Some(5), "official", 1).await;
+        assert!(images.is_empty(), "{images:?}");
+        let targets = server.targets();
+        let asked = |path: &str| targets.iter().filter(|t| t.starts_with(path)).count();
+        assert_eq!(asked("/seasons/52/extended"), 1, "{targets:?}");
+        assert_eq!(asked("/series/5/extended"), 1, "{targets:?}");
+    }
+
     #[rstest::rstest]
     #[case::missing_order("missing", "[]", 1)]
     #[case::empty_order("dvd", "[]", 1)]
@@ -2244,7 +2321,7 @@ mod tests {
             ("/seasons/52/extended", r#"{"data":{"artwork":[{"type":71,"image":"poster.jpg","thumbnail":"poster_t.jpg","language":"fre","width":800,"score":7},{"type":72,"image":"wrong.jpg"}]}}"#.to_owned()),
         ]).await;
         let client = TvdbClient::new().with_base_url(&server.base_url);
-        let images = client.season_images(5, order, 1).await;
+        let images = client.season_images(0, Some(5), order, 1).await;
         assert_eq!(images.len(), count);
         if count > 0 {
             assert_eq!(images[0].image_type, ImageType::Primary);
@@ -2256,7 +2333,7 @@ mod tests {
             assert_eq!(images[0].thumbnail_url.as_deref(), Some("poster_t.jpg"));
         }
         assert!(client.artwork_types.lock().unwrap().is_some());
-        let season_images = client.season_images(5, "official", 99).await;
+        let season_images = client.season_images(0, Some(5), "official", 99).await;
         assert!(season_images.is_empty(), "{season_images:?}");
     }
 }

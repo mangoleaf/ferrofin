@@ -12000,7 +12000,7 @@ impl LibraryScanner {
                     self.fetch_tmdb_season(&row, cache, lookup).await
                 }
                 RemoteSource::Tvdb if short == "Season" => {
-                    self.fetch_tvdb_season(&row, cache, lookup, &preferred_language)
+                    self.fetch_tvdb_season(&row, cache, lookup, &fold.lookup, &preferred_language)
                         .await
                 }
                 RemoteSource::Tmdb => {
@@ -12770,16 +12770,19 @@ impl LibraryScanner {
     }
 
     /// The TheTVDB **season** provider — port of the TVDB plugin's
-    /// `TvdbSeasonProvider` (jellyfin-plugin-tvdb `5c4592f`, `:53-123`),
-    /// through [`ferrofin_providers::season::tvdb_season`]: the season's id
-    /// from its series' record by number and ordering, then the season's
-    /// record, whose overview is the translation into `language` (the item's
-    /// preferred metadata language, matched through the culture table's
-    /// ISO 639-2 codes, `IsMatch`).
+    /// `TvdbSeasonProvider` (jellyfin-plugin-tvdb `v24`, `:53-123`),
+    /// through [`ferrofin_providers::season::tvdb_season`]: the season's
+    /// record by its own `Tvdb` id among the lookup's `known_ids` (stored, an
+    /// NFO's, a folder name's, or an earlier provider's this pass) when there
+    /// is one (`228f7b3`), else the season's id from its series' record by
+    /// number and ordering, then its record; its overview is the translation
+    /// into `language` (the item's preferred metadata language, matched
+    /// through the culture table's ISO 639-2 codes, `IsMatch`).
     ///
-    /// It resolves under the series' `Tvdb` id — this scan's TVDB match, else
-    /// the recorded one (TMDB's answer for the series hands its TVDB id on
-    /// to the record), and under an Identify the chosen result's alone
+    /// Without its own id it resolves under the series' `Tvdb` id — this
+    /// scan's TVDB match, else the recorded one (TMDB's answer for the series
+    /// hands its TVDB id on to the record), and under an Identify the chosen
+    /// result's alone, the season keeping no ids of its own
     /// ([`lookup_series_tvdb_id`]) — and without one there is no answer and
     /// no request;
     /// neither is there when the series row cannot be read
@@ -12793,26 +12796,39 @@ impl LibraryScanner {
     /// their defaults; their separate plugin configuration page is an open
     /// settings work item, as recorded in `ferrofin_providers::tvdb`.
     ///
-    /// The season is looked up in the series' own ordering
-    /// (`info.SeriesDisplayOrder`, `official` when blank, `:65-74`), with no
+    /// Without its own id the season is looked up in the series' own ordering
+    /// (`info.SeriesDisplayOrder`, `official` when blank, `:67-75`), with no
     /// fallback to another ordering when the series lists no such season.
     async fn fetch_tvdb_season(
         &self,
         row: &BaseItemEntity,
         cache: &ArtworkCache,
         lookup: &ResolverGuesses,
+        known_ids: &[(String, String)],
         language: &str,
     ) -> Option<RemoteAnswer> {
         let tvdb = self.tvdb.as_ref()?;
-        let (Some(series_id), Some(number)) = (row.series_id.as_deref(), lookup.index(row)) else {
-            return None;
+        let own_id = ferrofin_providers::tvdb::own_tvdb_id(known_ids)?;
+        let number = lookup.index(row);
+        let display_order;
+        let series = if own_id == 0 {
+            let (Some(series_id), Some(_)) = (row.series_id.as_deref(), number) else {
+                return None;
+            };
+            let series_tvdb =
+                lookup_series_tvdb_id(cache, lookup, series_id).filter(|id| *id > 0)?;
+            display_order = self.series_display_order(cache, series_id).await?;
+            Some((
+                series_tvdb,
+                ferrofin_providers::tvdb::season_lookup_order(&display_order),
+            ))
+        } else {
+            None
         };
-        let series_tvdb = lookup_series_tvdb_id(cache, lookup, series_id).filter(|id| *id > 0)?;
-        let display_order = self.series_display_order(cache, series_id).await?;
         let result = ferrofin_providers::season::tvdb_season(
             tvdb,
-            series_tvdb,
-            ferrofin_providers::tvdb::season_lookup_order(&display_order),
+            own_id,
+            series,
             number,
             language,
             &self.three_letter_language_names(language),
@@ -12860,7 +12876,8 @@ impl LibraryScanner {
     }
 
     /// The TheTVDB provider — port of the TVDB plugin's `TvdbSeriesProvider`
-    /// and `TvdbEpisodeProvider` (jellyfin-plugin-tvdb `5c4592f`).
+    /// and `TvdbEpisodeProvider` (jellyfin-plugin-tvdb `5c4592f`; how an
+    /// episode is looked up is `v24`'s `228f7b3`).
     ///
     /// For a **series** it fetches the series the `Tvdb` id in the lookup
     /// pins — an NFO's, a previous match's, the chosen Identify result's, or
@@ -12871,8 +12888,9 @@ impl LibraryScanner {
     /// by name/year (`Identify`) — a lone Tmdb id included. It caches the
     /// details (its `tvdb_id` lets episodes resolve, its artwork feeds the
     /// image pass). For an
-    /// **episode** it resolves the episode by (season, number) against the
-    /// series' TVDB id. The plugin `ResetPeople`s on every answer
+    /// **episode** it fetches the episode by its own `Tvdb` id among
+    /// `known_ids` when it has one, else resolves it by (season, number)
+    /// against the series' TVDB id. The plugin `ResetPeople`s on every answer
     /// (`TvdbSeriesProvider.cs:228`, `TvdbEpisodeProvider.cs:225`), so its
     /// `People` is a list, empty when TVDB credits nobody.
     ///
@@ -12986,27 +13004,47 @@ impl LibraryScanner {
                 Some(answer)
             }
             "Episode" => {
-                let (Some(series_id), Some(number)) = (row.series_id.clone(), lookup.index(row))
-                else {
-                    return None;
+                // `TvdbEpisodeProvider.GetEpisode` (plugin `v24`, `228f7b3`):
+                // the episode's own `Tvdb` id among the lookup's when it has
+                // one, the series and its numbers only without.
+                let own_id = ferrofin_providers::tvdb::own_tvdb_id(known_ids)?;
+                let (mut ep, display_order) = if own_id == 0 {
+                    let (Some(series_id), Some(number)) =
+                        (row.series_id.as_deref(), lookup.index(row))
+                    else {
+                        return None;
+                    };
+                    // The parent series matched TVDB earlier this scan, or a
+                    // previous scan recorded its Tvdb id (an unchanged series
+                    // runs no provider, so only the record has it); under an
+                    // Identify, the chosen result's.
+                    let tvdb_id = lookup_series_tvdb_id(cache, lookup, series_id)?;
+                    // `GetEpisodeTvdbId`: the series' ordering decides the
+                    // season type and numbers asked for; a season-less episode
+                    // is in season 1.
+                    let display_order = self.series_display_order(cache, series_id).await?;
+                    let (season_type, season, number) = ferrofin_providers::tvdb::episode_lookup(
+                        &display_order,
+                        lookup.parent_index(row),
+                        number,
+                    );
+                    let ep = tvdb
+                        .episode_by_number(tvdb_id, season_type, season, number)
+                        .await?;
+                    (ep, display_order)
+                } else {
+                    // Here the order only places specials (`Airs*`): a series
+                    // that cannot be read is no series to the plugin, so its
+                    // episode is in aired order.
+                    let display_order = match row.series_id.as_deref() {
+                        Some(series_id) => self
+                            .series_display_order(cache, series_id)
+                            .await
+                            .unwrap_or_default(),
+                        None => String::new(),
+                    };
+                    (tvdb.episode_details(own_id).await?, display_order)
                 };
-                // The parent series matched TVDB earlier this scan, or a
-                // previous scan recorded its Tvdb id (an unchanged series runs
-                // no provider, so only the record has it); under an Identify,
-                // the chosen result's.
-                let tvdb_id = lookup_series_tvdb_id(cache, lookup, &series_id)?;
-                // `GetEpisodeTvdbId`: the series' ordering decides the season
-                // type and numbers asked for; a season-less episode is in
-                // season 1.
-                let display_order = self.series_display_order(cache, &series_id).await?;
-                let (season_type, season, number) = ferrofin_providers::tvdb::episode_lookup(
-                    &display_order,
-                    lookup.parent_index(row),
-                    number,
-                );
-                let mut ep = tvdb
-                    .episode_by_number(tvdb_id, season_type, season, number)
-                    .await?;
                 let language = lookup.metadata_language(FetcherPolicy::default());
                 ep.localize(&language, &self.three_letter_language_names(&language));
                 if let Some(url) = &ep.image_url {
@@ -15620,36 +15658,20 @@ impl LibraryScanner {
         absolute
     }
 
-    /// TVDB artwork resolves through the series and its display order, even
-    /// when metadata refresh was disabled. Episode-local ids do not select art.
+    /// TheTVDB's season and episode artwork (`TvdbSeasonImageProvider`,
+    /// `TvdbEpisodeImageProvider`, plugin `v24`), even when metadata refresh
+    /// was disabled: by the item's own `Tvdb` id when it has one (`228f7b3`;
+    /// its ids as this pass settled them), else through the series' id and
+    /// display order and the item's numbers.
     async fn tvdb_child_images(
         &self,
         entity: &BaseItemEntity,
         cache: &ArtworkCache,
     ) -> Vec<RemoteImage> {
-        let Some(series_id) = entity.series_id.as_deref() else {
-            return Vec::new();
-        };
-        let Some(tvdb_id) = cache
-            .series_tvdb
-            .get(series_id)
-            .map(|d| d.tvdb_id)
-            .or_else(|| recorded_provider_id(cache, series_id, "Tvdb"))
-            .filter(|id| *id > 0)
-        else {
-            return Vec::new();
-        };
-        let Some(order) = self.series_display_order(cache, series_id).await else {
-            return Vec::new();
-        };
-        let order = if order.is_empty() {
-            ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE
-        } else {
-            order.as_str()
-        };
-        // The metadata episode provider looked the episode up in the same
-        // series order ([`ferrofin_providers::tvdb::episode_lookup`]), so the
-        // still it found is the one this provider would resolve.
+        // The metadata episode provider looked the episode up by the same
+        // id, or in the same series order
+        // ([`ferrofin_providers::tvdb::episode_lookup`]), so the still it
+        // found is the one this provider would resolve.
         if entity.type_.ends_with("Episode")
             && let Some(url) = cache.episode_tvdb_still.get(&entity.id)
         {
@@ -15662,25 +15684,65 @@ impl LibraryScanner {
         let Some(client) = &self.tvdb else {
             return Vec::new();
         };
-        let Some(number) = entity.index_number.and_then(|n| i32::try_from(n).ok()) else {
+        let own_ids = cache
+            .item_provider_ids
+            .get(&entity.id)
+            .map_or(&[][..], Vec::as_slice);
+        let Some(own_id) = ferrofin_providers::tvdb::own_tvdb_id(own_ids) else {
             return Vec::new();
         };
+        let series_tvdb = entity
+            .series_id
+            .as_deref()
+            .and_then(|series_id| {
+                cache
+                    .series_tvdb
+                    .get(series_id)
+                    .map(|d| d.tvdb_id)
+                    .or_else(|| recorded_provider_id(cache, series_id, "Tvdb"))
+            })
+            .filter(|id| *id > 0);
+        let number = entity.index_number.and_then(|n| i32::try_from(n).ok());
+        let order = match (own_id, entity.series_id.as_deref(), series_tvdb, number) {
+            (0, Some(series_id), Some(_), Some(_)) => {
+                let Some(order) = self.series_display_order(cache, series_id).await else {
+                    return Vec::new();
+                };
+                order
+            }
+            (0, ..) => return Vec::new(),
+            // By its own id only the official season is asked by number.
+            _ => String::new(),
+        };
+        let order = if order.is_empty() {
+            ferrofin_providers::tvdb::DEFAULT_SEASON_TYPE
+        } else {
+            order.as_str()
+        };
         if entity.type_.ends_with("Season") {
+            // `IndexNumber ?? 0` for a season looked up by its own id.
             return client
-                .season_images(tvdb_id, order, number)
+                .season_images(own_id, series_tvdb, order, number.unwrap_or(0))
                 .await
                 .into_iter()
                 .map(RemoteImage::from)
                 .collect();
         }
-        let season = entity
-            .parent_index_number
-            .and_then(|n| i32::try_from(n).ok())
-            .unwrap_or(1);
-        let (order, season) = ferrofin_providers::tvdb::episode_image_order(order, season);
-        client
-            .episode_by_number(tvdb_id, order, season, number)
-            .await
+        let details = match (own_id, series_tvdb, number) {
+            (0, Some(tvdb_id), Some(number)) => {
+                let season = entity
+                    .parent_index_number
+                    .and_then(|n| i32::try_from(n).ok())
+                    .unwrap_or(1);
+                let (order, season) = ferrofin_providers::tvdb::episode_image_order(order, season);
+                client
+                    .episode_by_number(tvdb_id, order, season, number)
+                    .await
+            }
+            (0, ..) => None,
+            (own, ..) => client.episode_details(own).await,
+        };
+        details
             .and_then(|details| details.image_url)
             .filter(|url| !url.is_empty())
             .map_or_default(|url| {
@@ -25246,6 +25308,8 @@ mod person_biography_tests;
 mod person_image_tests;
 #[cfg(test)]
 mod plan_paths_tests;
+#[cfg(test)]
+mod tvdb_own_id_tests;
 #[cfg(test)]
 mod unread_series_tests;
 
@@ -39255,7 +39319,7 @@ mod tests {
         let asked = || std::mem::take(&mut *requests.lock().unwrap());
 
         let _ = scanner
-            .fetch_tvdb_season(&season, &cache, &lookup, "en")
+            .fetch_tvdb_season(&season, &cache, &lookup, &[], "en")
             .await;
         assert_eq!(!asked().is_empty(), asks, "TheTVDB's season");
         let _ = scanner
