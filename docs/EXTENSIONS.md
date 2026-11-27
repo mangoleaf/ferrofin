@@ -325,7 +325,9 @@ that a nested object's default ships comes back after a save that removed it. Gi
 whose entries a user may remove (per-library settings keyed by id, say) an empty default,
 `{}`: an empty object has nothing to fill from and is stored exactly as posted. Jellyfin
 replaces a settable `Dictionary` property outright, but a JSON default cannot tell a map
-from a class, and upstream's nested settings are classes in practice.
+from a class, and upstream's nested settings are classes in practice. A read fills the
+same way, so a configuration saved by an older version of the plugin is read back with the
+keys a newer `default-config` added, nested ones included.
 
 **The sandbox is the point.** A WASM plugin gets *no filesystem, no direct network, no
 environment, no stdio* — its only capabilities are the functions the WIT `host` interface
