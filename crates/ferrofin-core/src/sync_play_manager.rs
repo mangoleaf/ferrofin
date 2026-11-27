@@ -938,14 +938,15 @@ impl Group {
     /// `Group.RunTimeTicks` — the run time of the CURRENT playing item.
     ///
     /// Upstream re-reads it from `_libraryManager.GetItemById(...)` at every
-    /// point the playing item changes (Group.cs:506-507/520-526/550-558/613-614/
-    /// 628-629). Ferrofin resolves the run times ONCE, as the items enter the
+    /// point the playing item changes (Group.cs:305, 561, 576-580, 608-612, 668,
+    /// 683). Ferrofin resolves the run times ONCE, as the items enter the
     /// queue — the manager is already reading those rows for the access check —
     /// and looks the current one up here: a run time is a property of the item,
     /// so the two are equivalent and this one costs no query per transition.
     ///
-    /// `None` means "not known here": the library seam is unwired (unit tests),
-    /// which is the only way an item that passed the access check can be absent.
+    /// `None` when nothing is playing, or when the run time is not known here:
+    /// the library seam is unwired (unit tests), which is the only way an item
+    /// that passed the access check can be absent.
     fn run_time_ticks(&self) -> Option<i64> {
         self.queue
             .current()
@@ -953,10 +954,13 @@ impl Group {
     }
 
     /// Port of `Group.SanitizePositionTicks` — `Math.Clamp(ticks, 0, RunTimeTicks)`
-    /// (Group.cs:429-432). With no library seam wired only the floor applies.
+    /// (Group.cs:476-480). With nothing playing the position is 0, as upstream's
+    /// `RunTimeTicks` is then (except after a ClearPlaylist, which leaves it at
+    /// the cleared item's); with no library seam wired only the floor applies.
     fn sanitize_position_ticks(&self, ticks: i64) -> i64 {
         match self.run_time_ticks() {
             Some(run_time) => ticks.clamp(0, run_time.max(0)),
+            None if !self.queue.is_item_playing() => 0,
             None => ticks.max(0),
         }
     }
@@ -3534,7 +3538,7 @@ mod tests {
     }
 
     /// `Group.SanitizePositionTicks` — `Math.Clamp(ticks, 0, RunTimeTicks)`
-    /// (Group.cs:429-432). Ferrofin had the floor and no ceiling, so a client
+    /// (Group.cs:476-480). Ferrofin had the floor and no ceiling, so a client
     /// could seek the whole group past the end of the file.
     #[test]
     fn seek_clamps_to_the_playing_item_run_time() {
@@ -3562,6 +3566,38 @@ mod tests {
             now,
         );
         assert_eq!(g.position_ticks, 0, "and floored at zero");
+    }
+
+    /// With nothing playing `Group.RunTimeTicks` is 0: `SetPlayingItem`
+    /// zeroes it for an id not in the queue (Group.cs:569-584), as
+    /// `RemoveFromPlayQueue` does for an emptied queue, and a new group starts
+    /// at 0. So `SanitizePositionTicks` lands a Seek on 0.
+    #[test]
+    fn a_seek_with_nothing_playing_lands_on_zero() {
+        let now = Utc::now();
+        let mut g = Group::new(Uuid::new_v4(), "g".into(), now);
+        let item = Uuid::new_v4();
+        g.item_runtimes.insert(item, 10_230_000);
+        g.queue.set(&[item], 0);
+        g.state = GroupStateType::Paused;
+        g.handle(
+            "s1",
+            &PlaybackRequest::SetPlaylistItem {
+                playlist_item_id: Uuid::new_v4(),
+            },
+            now,
+        );
+        assert!(!g.queue.is_item_playing());
+        assert_eq!(g.state, GroupStateType::Paused);
+
+        g.handle(
+            "s1",
+            &PlaybackRequest::Seek {
+                position_ticks: 5_000_000,
+            },
+            now,
+        );
+        assert_eq!(g.position_ticks, 0);
     }
 
     /// Ticks in `n` minutes.
