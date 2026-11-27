@@ -5,7 +5,7 @@ use ferrofin_traits::error::ServiceError;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-const VIDEO_TYPES: &str = "'MediaBrowser.Controller.Entities.Video','MediaBrowser.Controller.Entities.Movies.Movie','MediaBrowser.Controller.Entities.TV.Episode','MediaBrowser.Controller.Entities.MusicVideo','MediaBrowser.Controller.Entities.Trailer'";
+pub(crate) const VIDEO_TYPES: &str = "'MediaBrowser.Controller.Entities.Video','MediaBrowser.Controller.Entities.Movies.Movie','MediaBrowser.Controller.Entities.TV.Episode','MediaBrowser.Controller.Entities.MusicVideo','MediaBrowser.Controller.Entities.Trailer'";
 
 pub(crate) async fn get_extra_owner_ids_batch(
     db: &Database,

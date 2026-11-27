@@ -8,6 +8,12 @@
 //! separate queries; they must share the order (type, then `rowid`), or rows
 //! whose ids do not sort in insertion order (adopted Jellyfin rows, uploads)
 //! put one file's tag on another file's index.
+//!
+//! And what the metadata editor's save records of those images: it measures
+//! each one and drops a row whose file is gone, as upstream's `UpdateItem`
+//! does through `UpdateToRepositoryAsync(MetadataEdit)` (v12.4
+//! `LibraryManager.RunMetadataSavers` → `UpdateImagesAsync`, forced from
+//! `ImageUpdate` up).
 
 use std::path::PathBuf;
 
@@ -25,8 +31,18 @@ use uuid::Uuid;
 const ADMIN_USER: &str = "admin";
 const ADMIN_PASSWORD: &str = "image-order-admin-pw";
 const MOVIE: &str = "movies/Crimson Square (1963)/Crimson Square (1963).mkv";
+/// `BaseItemImageInfos.ImageType` of a primary image.
+const PRIMARY: i32 = 0;
 /// `BaseItemImageInfos.ImageType` of a backdrop.
 const BACKDROP: i32 = 2;
+/// A decodable 4×2 PNG.
+const WIDE_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xf0, 0xca, 0xea,
+    0x34, 0x00, 0x00, 0x00, 0x10, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+    0x47, 0x0c, 0xc8, 0x1c, 0x00, 0x6f, 0xaa, 0x07, 0xf9, 0x80, 0xdc, 0x00, 0x28, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
 
 /// A booted server that scanned one movie, its database, and a session.
 struct Fixture {
@@ -227,6 +243,84 @@ async fn backdrop_tags_name_the_files_served_by_index() {
         page["Items"][0]["BackdropImageTags"],
         json!(tags),
         "item page"
+    );
+}
+
+#[tokio::test]
+async fn a_metadata_edit_measures_the_images_and_drops_a_missing_one() {
+    let Fixture {
+        _wired,
+        temp,
+        db,
+        router,
+        token,
+        movie,
+        ..
+    } = fixture().await;
+    // Stored unmeasured, as an adopted or hand-added row may be.
+    let poster = temp.path().join("poster.png");
+    std::fs::write(&poster, WIDE_PNG).expect("poster");
+    let gone = temp.path().join("gone.jpg");
+    for (row_id, image_type, file) in [(1_u128, PRIMARY, &poster), (2, BACKDROP, &gone)] {
+        sqlx::query(
+            r#"INSERT INTO "BaseItemImageInfos" ("Id","ItemId","ImageType","Path","Width","Height")
+               VALUES (?1,?2,?3,?4,0,0)"#,
+        )
+        .bind(guid_to_db(Uuid::from_u128(row_id)))
+        .bind(guid_to_db(Uuid::parse_str(&movie).expect("id")))
+        .bind(image_type)
+        .bind(file.to_string_lossy().as_ref())
+        .execute(db.pool())
+        .await
+        .expect("insert image");
+    }
+
+    let (status, body) = call(
+        &router,
+        "POST",
+        &format!("/Items/{movie}"),
+        Some(&token),
+        Some(json!({ "Name": "Crimson Square", "Overview": "Edited." })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let infos = json_of(
+        call(
+            &router,
+            "GET",
+            &format!("/Items/{movie}/Images"),
+            Some(&token),
+            None,
+        )
+        .await,
+    );
+    let infos = infos.as_array().expect("image infos");
+    let of = |file: &std::path::Path| {
+        infos
+            .iter()
+            .find(|info| info["Path"].as_str() == Some(file.to_string_lossy().as_ref()))
+    };
+    let primary = of(&poster).expect("the poster's row stays");
+    assert_eq!(
+        (&primary["Width"], &primary["Height"]),
+        (&json!(4), &json!(2)),
+        "measured: {primary}"
+    );
+    assert!(
+        primary["BlurHash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty()),
+        "blurhash computed: {primary}"
+    );
+    assert!(
+        of(&gone).is_none(),
+        "the missing file's row is dropped: {infos:?}"
     );
 }
 

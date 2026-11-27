@@ -69,11 +69,16 @@ const JELLYFIN_OPTIONS_FILE: &str = "options.xml";
 /// every dashboard load names a damaged file once. A file that loads again is
 /// forgotten, so a later failure is logged anew, and so is an XML that is gone
 /// or that an [`OPTIONS_FILE`] beside it, usable or not, has taken over from.
+/// Also the library folders whose adopted XML could not be saved as an
+/// [`OPTIONS_FILE`] (logged at warn), keyed by the folder so a torn
+/// [`OPTIONS_FILE`] is still reported apart, and forgotten once a save
+/// succeeds or an [`OPTIONS_FILE`] appears.
 static UNUSABLE_OPTIONS: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// Records that `path` failed to load: `true` the first time since it last
-/// loaded, when the failure is logged at error rather than debug.
+/// Records that `path` failed to load (a library folder: that its adopted
+/// options failed to save): `true` the first time since it last loaded or
+/// saved, when the failure is logged at error (warn) rather than debug.
 fn first_options_failure(path: &Path) -> bool {
     UNUSABLE_OPTIONS
         .lock()
@@ -81,12 +86,61 @@ fn first_options_failure(path: &Path) -> bool {
         .insert(path.to_path_buf())
 }
 
-/// Forgets a file that loaded, so its next failure is logged at error again.
+/// Forgets a file that loaded (a library folder: whose adopted options saved
+/// or gained an options.json), so its next failure is logged anew.
 fn forget_options_failure(path: &Path) {
     UNUSABLE_OPTIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(path);
+}
+
+/// The adopted [`JELLYFIN_OPTIONS_FILE`]s that converted with fields left at
+/// their defaults, and those fields. Every read converts the XML again while no
+/// [`OPTIONS_FILE`] is saved beside it, so each file's loss is logged at warn
+/// once and at debug after; a file is forgotten once it converts whole, fails
+/// to convert, is gone, or an [`OPTIONS_FILE`] takes over.
+static UNIMPORTED_OPTIONS: std::sync::Mutex<
+    std::collections::BTreeMap<PathBuf, crate::config_import::Unimported>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Logs the fields the adopted XML at `xml_path` converted without: at warn
+/// the first time for that file and those fields, at debug while it converts
+/// the same way. An empty `unimported` forgets the file.
+fn report_unimported_options(xml_path: &Path, unimported: &crate::config_import::Unimported) {
+    let mut reported = UNIMPORTED_OPTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if unimported.is_empty() {
+        reported.remove(xml_path);
+        return;
+    }
+    let first = reported.get(xml_path) != Some(unimported);
+    if first {
+        reported.insert(xml_path.to_path_buf(), unimported.clone());
+    }
+    drop(reported);
+    unimported.log("LibraryOptions", Some(xml_path), first);
+}
+
+/// Converts the adopted XML read from `xml_path`, reporting the fields it
+/// converts without through [`report_unimported_options`].
+fn import_jellyfin_options(xml_path: &Path, xml: &str) -> Result<LibraryOptions, String> {
+    match crate::config_import::import_reporting(
+        &LibraryOptions::default(),
+        xml,
+        "LibraryOptions",
+        &[],
+    ) {
+        Ok((options, unimported)) => {
+            report_unimported_options(xml_path, &unimported);
+            Ok(options)
+        }
+        Err(error) => {
+            report_unimported_options(xml_path, &crate::config_import::Unimported::default());
+            Err(error.to_string())
+        }
+    }
 }
 
 /// Whether `path` is a shortcut: its .NET extension (`Path.GetExtension`,
@@ -790,10 +844,13 @@ impl FerrofinVirtualFolderManager {
 
     /// Records the library's locations on its `CollectionFolder` row as
     /// Jellyfin keeps them (`CollectionFolder.PhysicalLocationsList` and
-    /// `PhysicalFolderIds`): the folder's own path then each location, and
-    /// the id of the `Folder` row the scan keeps for each location (owner
-    /// decision D1) — what every library read resolves a library's items
-    /// through.
+    /// `PhysicalFolderIds`): the folder's own path then each location, in the
+    /// order the folder lists their shortcuts, unsorted, as
+    /// `CollectionFolder.CreateResolveArgs` gathers them
+    /// ([`Self::read_locations`]), and the id of the `Folder` row the scan
+    /// keeps for each location (owner decision D1), in the same order
+    /// (`GetPhysicalFolders`) — what every library read resolves a library's
+    /// items through.
     ///
     /// With `track`, a row whose recorded locations or folder ids differ from
     /// these (compared in order, as `SequenceEqual`, the stored ones expanded)
@@ -808,7 +865,7 @@ impl FerrofinVirtualFolderManager {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
-        let locations = self.resolve_locations(folder_path).await?;
+        let locations = self.read_locations(folder_path).await?.0;
         let trimmed = |location: &str| match location.trim_end_matches('/') {
             "" => "/".to_owned(),
             rest => rest.to_owned(),
@@ -1207,8 +1264,11 @@ impl FerrofinVirtualFolderManager {
             return None;
         }
         // An options.json, usable or not, wins over the XML, so a damage the
-        // XML had is moot.
-        forget_options_failure(&folder_path.join(JELLYFIN_OPTIONS_FILE));
+        // XML had, a failure to save it as JSON, or fields it lost, are moot.
+        let xml_path = folder_path.join(JELLYFIN_OPTIONS_FILE);
+        forget_options_failure(&xml_path);
+        forget_options_failure(folder_path);
+        report_unimported_options(&xml_path, &crate::config_import::Unimported::default());
         let error = match read {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(options) => {
@@ -1262,7 +1322,9 @@ impl FerrofinVirtualFolderManager {
     /// converted, so one damaged file never blocks listing the library. That
     /// failure is logged as `LoadLibraryOptions` logs "Error loading library
     /// options": at error the first time, at debug while it stays so, since the
-    /// dashboard's listing reads it on every load.
+    /// dashboard's listing reads it on every load. A save that fails (a
+    /// read-only folder) is logged the same way, at warn, and so are the fields
+    /// the XML converts without ([`report_unimported_options`]).
     async fn adopt_jellyfin_options(
         folder_path: &Path,
         paths: &crate::virtual_paths::VirtualPathExpander,
@@ -1270,18 +1332,16 @@ impl FerrofinVirtualFolderManager {
     ) -> Option<LibraryOptions> {
         let xml_path = folder_path.join(JELLYFIN_OPTIONS_FILE);
         let converted = match tokio::fs::read_to_string(&xml_path).await {
-            Ok(xml) => crate::config_import::import_over(
-                &LibraryOptions::default(),
-                &xml,
-                "LibraryOptions",
-                &[],
-            )
-            .map_err(|error| error.to_string()),
+            Ok(xml) => import_jellyfin_options(&xml_path, &xml),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 forget_options_failure(&xml_path);
+                report_unimported_options(&xml_path, &crate::config_import::Unimported::default());
                 return None;
             }
-            Err(error) => Err(error.to_string()),
+            Err(error) => {
+                report_unimported_options(&xml_path, &crate::config_import::Unimported::default());
+                Err(error.to_string())
+            }
         };
         let imported = match converted {
             Ok(mut options) => {
@@ -1311,12 +1371,23 @@ impl FerrofinVirtualFolderManager {
             return Some(imported);
         }
         if let Err(err) = Self::save_options(folder_path, &imported).await {
-            tracing::warn!(
-                path = %folder_path.join(OPTIONS_FILE).display(),
-                error = %err,
-                "adopted jellyfin library options but could not persist them; they will be re-imported on the next read"
-            );
+            // Nothing is persisted, so every listing converts and fails to
+            // save again: warn once per folder, then debug.
+            if first_options_failure(folder_path) {
+                tracing::warn!(
+                    path = %folder_path.join(OPTIONS_FILE).display(),
+                    error = %err,
+                    "adopted jellyfin library options but could not persist them; they will be re-imported on the next read"
+                );
+            } else {
+                tracing::debug!(
+                    path = %folder_path.join(OPTIONS_FILE).display(),
+                    error = %err,
+                    "adopted jellyfin library options still cannot be persisted; re-imported them"
+                );
+            }
         } else {
+            forget_options_failure(folder_path);
             tracing::info!(
                 path = %xml_path.display(),
                 "adopted jellyfin library options"
@@ -1364,15 +1435,20 @@ impl FerrofinVirtualFolderManager {
     /// Lists the resolved `.mblink` shortcut targets in a folder, expanded,
     /// as `GetVirtualFolderInfo` builds `VirtualFolderInfo.Locations`: a
     /// shortcut that cannot be read is logged and left out. They are sorted
-    /// ordinally here, because this list is also persisted and read by
-    /// background work; [`get_virtual_folders`](VirtualFolderManager::get_virtual_folders)
+    /// ordinally here, because the libraries' snapshot built from this list is
+    /// also read by background work; [`get_virtual_folders`](VirtualFolderManager::get_virtual_folders)
     /// re-sorts its response in the request's culture, as upstream's `.Order()` does.
+    /// The library's row records them unsorted ([`Self::sync_physical_folders`]).
     async fn resolve_locations(&self, folder_path: &Path) -> Result<Vec<String>, ServiceError> {
-        Ok(self.read_locations(folder_path).await?.0)
+        let mut locations = self.read_locations(folder_path).await?.0;
+        locations.sort();
+        Ok(locations)
     }
 
-    /// [`Self::resolve_locations`], with the first shortcut that resolved to
-    /// no location: one that could not be read, or an empty one.
+    /// [`Self::resolve_locations`] in the order the folder lists its
+    /// shortcuts, as `FileData.GetFilteredFileSystemEntries` adds them to the
+    /// root's and a library's locations, with the first shortcut that resolved to no
+    /// location: one that could not be read, or an empty one.
     async fn read_locations(
         &self,
         folder_path: &Path,
@@ -1408,7 +1484,6 @@ impl FerrofinVirtualFolderManager {
                 }
             }
         }
-        locations.sort();
         Ok((locations, unresolved))
     }
 
@@ -1422,14 +1497,9 @@ impl FerrofinVirtualFolderManager {
         let options = match tokio::fs::read(folder_path.join(OPTIONS_FILE)).await {
             Ok(bytes) => serde_json::from_slice::<LibraryOptions>(&bytes).ok(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                match tokio::fs::read_to_string(folder_path.join(JELLYFIN_OPTIONS_FILE)).await {
-                    Ok(xml) => crate::config_import::import_over(
-                        &LibraryOptions::default(),
-                        &xml,
-                        "LibraryOptions",
-                        &[],
-                    )
-                    .ok(),
+                let xml_path = folder_path.join(JELLYFIN_OPTIONS_FILE);
+                match tokio::fs::read_to_string(&xml_path).await {
+                    Ok(xml) => import_jellyfin_options(&xml_path, &xml).ok(),
                     Err(_) => None,
                 }
             }
@@ -1821,7 +1891,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     /// pass, so a shortcut that fails between two reads cannot drop out of the
     /// list unnoticed, and outside a structure change, whose half-done folder
     /// (a rename's) could. What stops the removal is logged here, naming the
-    /// library.
+    /// library. The libraries and each one's shortcuts come in the order their
+    /// folders list them, unsorted, as `AggregateFolder.CreateResolveArgs`
+    /// gathers the root's locations.
     async fn locations_for_removal(&self) -> Result<Option<Vec<String>>, ServiceError> {
         let _no_change = self.structure_change.read().await;
         let mut dir = match tokio::fs::read_dir(&self.root).await {
@@ -3551,6 +3623,270 @@ mod tests {
         assert!(json_path.exists(), "the next listing persists it");
     }
 
+    /// gl-1807: an adopted `options.xml` whose converted `options.json` cannot
+    /// be saved (here a read-only library folder) is served converted on every
+    /// listing, the failed save logged at warn the first time and at debug while
+    /// it keeps failing. An `options.json` that appears or a save that succeeds
+    /// forgets it, so a later failure is logged at warn again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adoption_that_cannot_be_saved_is_logged_once_until_it_is_saved() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("ReadOnly");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(
+            folder.join(super::JELLYFIN_OPTIONS_FILE),
+            JELLYFIN_OPTIONS_XML,
+        )
+        .expect("xml");
+        let json_path = folder.join(super::OPTIONS_FILE);
+        let set_mode = |mode| {
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        };
+        set_mode(0o555);
+        // Running as root ignores the mode bits: only assert when the folder
+        // really cannot be written by this uid.
+        if std::fs::File::create(folder.join("probe")).is_ok() {
+            set_mode(0o755);
+            eprintln!("skipped: the read-only folder is still writable (running as root?)");
+            return;
+        }
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let count = |level: &str| {
+            logs.text()
+                .lines()
+                .filter(|line| line.contains(level) && line.contains("ReadOnly/options.json"))
+                .count()
+        };
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            );
+            for _ in 0..3 {
+                let folders = mgr.get_virtual_folders().await.expect("list");
+                let options = folders[0].library_options.as_ref().expect("options");
+                assert_eq!(
+                    options.preferred_metadata_language.as_deref(),
+                    Some("en"),
+                    "the XML served"
+                );
+            }
+            assert!(!json_path.exists(), "nothing persisted");
+            assert_eq!(count(" WARN "), 1, "{}", logs.text());
+            assert_eq!(count(" DEBUG "), 2, "{}", logs.text());
+
+            // An options.json that appears takes over and forgets it. Its own
+            // failure is keyed apart, so a torn one is still logged at error.
+            set_mode(0o755);
+            std::fs::write(&json_path, br#"{"EnableRealtimeMonitor":tr"#).expect("torn json");
+            mgr.get_virtual_folders().await.expect("list");
+            assert_eq!(count(" ERROR "), 1, "{}", logs.text());
+            std::fs::remove_file(&json_path).expect("remove json");
+            set_mode(0o555);
+            mgr.get_virtual_folders().await.expect("list");
+
+            // A save that succeeds forgets it too.
+            set_mode(0o755);
+            mgr.get_virtual_folders().await.expect("list");
+            assert!(json_path.exists(), "persisted once writable");
+            std::fs::remove_file(&json_path).expect("remove json");
+            set_mode(0o555);
+            mgr.get_virtual_folders().await.expect("list");
+        }
+        set_mode(0o755);
+        assert_eq!(count(" WARN "), 3, "{}", logs.text());
+        assert_eq!(count(" DEBUG "), 2, "{}", logs.text());
+    }
+
+    /// gl-1960: an adopted `options.xml` that converts with fields left at
+    /// their defaults (Jellyfin 10.10's `MediaSegmentProvideOrder`, which
+    /// Ferrofin has no field for, and an `AllowEmbeddedSubtitles` value no
+    /// reading converts) names them and the file at warn the first time, and at
+    /// debug while every read converts it again because its `options.json`
+    /// cannot be saved. Another library with the same leftovers is reported
+    /// apart, and an `options.json` that takes over forgets the file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_xml_s_unimported_fields_are_reported_once_per_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        const IGNORED: &str = "have no ferrofin counterpart";
+        const REJECTED: &str = "keeping ferrofin's default";
+        let (tmp, mgr) = manager();
+        let xml = JELLYFIN_OPTIONS_XML.replace(
+            "<AllowEmbeddedSubtitles>AllowAll<",
+            "<AllowEmbeddedSubtitles>Sometimes<",
+        );
+        let folder = tmp.path().join("default").join("ReadOnly");
+        let writable = tmp.path().join("default").join("Writable");
+        for dir in [&folder, &writable] {
+            std::fs::create_dir_all(dir).expect("folder");
+            std::fs::write(dir.join(super::JELLYFIN_OPTIONS_FILE), &xml).expect("xml");
+        }
+        let json_path = folder.join(super::OPTIONS_FILE);
+        let set_mode = |mode| {
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        };
+        set_mode(0o555);
+        // Running as root ignores the mode bits: only assert when the folder
+        // really cannot be written by this uid.
+        if std::fs::File::create(folder.join("probe")).is_ok() {
+            set_mode(0o755);
+            eprintln!("skipped: the read-only folder is still writable (running as root?)");
+            return;
+        }
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let count = |level: &str, message: &str, file: &str| {
+            logs.text()
+                .lines()
+                .filter(|line| {
+                    line.contains(level) && line.contains(message) && line.contains(file)
+                })
+                .count()
+        };
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            );
+            for _ in 0..3 {
+                mgr.get_virtual_folders().await.expect("list");
+            }
+            // An access check's read shares the listing's report.
+            FerrofinVirtualFolderManager::read_options(&folder, &mgr.virtual_paths).await;
+            assert!(!json_path.exists(), "nothing persisted");
+            for message in [IGNORED, REJECTED] {
+                assert_eq!(count(" WARN ", message, ""), 2, "{}", logs.text());
+                assert_eq!(
+                    count(" WARN ", message, "ReadOnly/options.xml"),
+                    1,
+                    "{}",
+                    logs.text()
+                );
+                assert_eq!(
+                    count(" DEBUG ", message, "ReadOnly/options.xml"),
+                    3,
+                    "{}",
+                    logs.text()
+                );
+                assert_eq!(
+                    count(" WARN ", message, "Writable/options.xml"),
+                    1,
+                    "{}",
+                    logs.text()
+                );
+            }
+
+            // An options.json that takes over forgets the file, so a later
+            // adoption of it is reported anew.
+            set_mode(0o755);
+            std::fs::write(&json_path, b"{}").expect("json");
+            mgr.get_virtual_folders().await.expect("list");
+            std::fs::remove_file(&json_path).expect("remove json");
+            set_mode(0o555);
+            mgr.get_virtual_folders().await.expect("list");
+        }
+        set_mode(0o755);
+        for message in [IGNORED, REJECTED] {
+            assert_eq!(
+                count(" WARN ", message, "ReadOnly/options.xml"),
+                2,
+                "{}",
+                logs.text()
+            );
+        }
+    }
+
+    /// gl-1960: the once-per-file report of an adopted `options.xml`'s
+    /// leftovers, through reads that never persist (an access check's, the
+    /// prune path's): warned again when what the file loses changes, and after
+    /// the file converts whole or is gone, so a later loss is a new finding.
+    #[tokio::test]
+    async fn an_adopted_xml_s_unimported_fields_are_reported_anew_when_they_change() {
+        const IGNORED: &str = "have no ferrofin counterpart";
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("Adopted");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let xml_path = folder.join(super::JELLYFIN_OPTIONS_FILE);
+        let whole = JELLYFIN_OPTIONS_XML.replace("<MediaSegmentProvideOrder />", "");
+        let other = JELLYFIN_OPTIONS_XML.replace(
+            "<MediaSegmentProvideOrder />",
+            "<MediaSegmentProvideOrder /><LegacyField>1</LegacyField>",
+        );
+        let logs = crate::test_support::CapturedLogs::default();
+        let count = |level: &str| {
+            logs.text()
+                .lines()
+                .filter(|line| {
+                    line.contains(level)
+                        && line.contains(IGNORED)
+                        && line.contains("Adopted/options.xml")
+                })
+                .count()
+        };
+        let read = || FerrofinVirtualFolderManager::read_options(&folder, &mgr.virtual_paths);
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            );
+            std::fs::write(&xml_path, JELLYFIN_OPTIONS_XML).expect("xml");
+            read().await;
+            read().await;
+            FerrofinVirtualFolderManager::configured_without_location(&folder).await;
+            assert_eq!(
+                (count(" WARN "), count(" DEBUG ")),
+                (1, 2),
+                "{}",
+                logs.text()
+            );
+
+            // What it loses changes: a new finding.
+            std::fs::write(&xml_path, &other).expect("xml");
+            read().await;
+            assert_eq!(count(" WARN "), 2, "{}", logs.text());
+
+            // It converts whole, then loses a field again.
+            std::fs::write(&xml_path, &whole).expect("xml");
+            read().await;
+            std::fs::write(&xml_path, &other).expect("xml");
+            read().await;
+            assert_eq!(count(" WARN "), 3, "{}", logs.text());
+
+            // It is gone, then comes back.
+            std::fs::remove_file(&xml_path).expect("remove xml");
+            read().await;
+            std::fs::write(&xml_path, &other).expect("xml");
+            read().await;
+        }
+        assert_eq!(
+            (count(" WARN "), count(" DEBUG ")),
+            (4, 2),
+            "{}",
+            logs.text()
+        );
+        assert!(
+            logs.text()
+                .contains("fields=MediaSegmentProvideOrder, LegacyField"),
+            "{}",
+            logs.text()
+        );
+    }
+
     #[tokio::test]
     async fn get_virtual_folders_reheals_a_missing_collection_folder_row() {
         let (tmp, db, mgr) = manager_with_store().await;
@@ -3618,6 +3954,56 @@ mod tests {
         let _other_listing = mgr.structure_change.read().await;
         mgr.get_virtual_folders().await.expect("list");
         assert!(row().await, "the next listing heals the row");
+    }
+
+    /// gl-1933: a library's row records its locations in the order its folder
+    /// lists their shortcuts, as `CollectionFolder.CreateResolveArgs` gathers
+    /// them (`FileData.GetFilteredFileSystemEntries`, unsorted), and its folder
+    /// ids in that order (`GetPhysicalFolders`), so a Jellyfin reading the
+    /// folder computes the same lists and does not save the row again.
+    #[tokio::test]
+    async fn a_librarys_row_records_its_locations_in_listing_order() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let (tmp, db, mgr) = manager_with_store().await;
+        let items = crate::item_repository::FerrofinItemRepository::new(
+            db,
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        // Added out of path order, as in Jellyfin 12.4's run (gl-1933): where
+        // the folder lists by creation order, its shortcuts list unsorted.
+        let paths = [media_dir(&tmp, "shows"), media_dir(&tmp, "extra")];
+        mgr.add_virtual_folder("Mixed", None, &opts_with_paths(&paths))
+            .await
+            .expect("add");
+        let folder = tmp.path().join("default").join("Mixed");
+        let id = mgr.collection_folder_id(&folder).expect("id");
+        let listed: Vec<String> = std::fs::read_dir(&folder)
+            .expect("folder")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "mblink"))
+            .map(|path| std::fs::read_to_string(path).expect("shortcut"))
+            .collect();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+
+        let row = items.retrieve_item(id).await.expect("read").expect("row");
+        let data = crate::item_data::parse_data(row.data.as_deref());
+        let locations: Vec<String> = std::iter::once(folder.to_string_lossy().into_owned())
+            .chain(listed.iter().cloned())
+            .collect();
+        assert_eq!(data["PhysicalLocationsList"], serde_json::json!(locations));
+        let ids: Vec<String> = listed
+            .iter()
+            .map(|location| {
+                crate::item_type_lookup::derive_item_id(
+                    ferrofin_model::data::BaseItemKind::Folder,
+                    location,
+                )
+                .expect("id")
+                .simple()
+                .to_string()
+            })
+            .collect();
+        assert_eq!(data["PhysicalFolderIds"], serde_json::json!(ids));
     }
 
     /// A media-path change records the library's locations on its row before

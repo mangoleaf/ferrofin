@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ferrofin_db::export::{
-    CarriedRows, ContainerFile, DOCKER, DatabaseEdits, DroppedObjects, DroppedTable,
+    ArtRelocation, CarriedRows, ContainerFile, DOCKER, DatabaseEdits, DroppedObjects, DroppedTable,
     EXPORTED_DATABASE, FirstStartCounts, HistoryRewrite, IdentityLink, LeftOut, LibraryContainer,
     MirroredLiveTv, PathRewrite, RecordingRow, SeriesTimerRow, SourceDirs, TimerRow,
     export_data_dir,
@@ -21,6 +21,27 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
+}
+
+/// The build these tests export as, whose start each source records.
+const BUILD: &str = "v0.0.0-test";
+
+/// What makes a test database one this build's start left, which the export
+/// requires (gl-1910): Ferrofin's migration table at this build's last
+/// migration, and the record of a start of [`BUILD`].
+fn started() -> [String; 4] {
+    [
+        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
+        format!(
+            "INSERT INTO _sqlx_migrations VALUES ({})",
+            ferrofin_db::schema_head()
+        ),
+        r#"CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL)"#.to_owned(),
+        format!(
+            r#"INSERT INTO "FerrofinMeta" VALUES ('{}', '{BUILD}')"#,
+            ferrofin_db::STARTED_KEY
+        ),
+    ]
 }
 
 /// Every file under `root`, relative to it, with its bytes.
@@ -53,11 +74,13 @@ async fn database_with_unfolded_log(scratch: &Path, database: &Path) {
         .connect()
         .await
         .unwrap();
-    // Ferrofin's own bookkeeping table: what makes it a Ferrofin database.
-    sqlx::query("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)")
-        .execute(&mut conn)
-        .await
-        .unwrap();
+    // Ferrofin's own bookkeeping: a Ferrofin database this build started.
+    for statement in started() {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
     sqlx::query("CREATE TABLE Items (Name TEXT NOT NULL)")
         .execute(&mut conn)
         .await
@@ -137,6 +160,7 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -177,12 +201,20 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
                 left_to_run: Vec::new(),
             },
             dropped: DroppedObjects {
-                tables: vec![DroppedTable {
-                    name: "_sqlx_migrations".to_owned(),
-                    rows: 0
-                }],
+                tables: vec![
+                    DroppedTable {
+                        name: "FerrofinMeta".to_owned(),
+                        rows: 1
+                    },
+                    DroppedTable {
+                        name: "_sqlx_migrations".to_owned(),
+                        rows: 1
+                    },
+                ],
                 indexes: Vec::new(),
             },
+            // It holds none of Jellyfin's tables.
+            rebuilt: Vec::new(),
             paths: PathRewrite {
                 moves: summary.edits.paths.moves.clone(),
                 ..PathRewrite::default()
@@ -190,6 +222,7 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
             // (the moves themselves are checked below)
             carried: CarriedRows::default(),
             counts: FirstStartCounts::default(),
+            art: ArtRelocation::default(),
         }
     );
     assert_eq!(summary.left_out.len(), 0);
@@ -212,12 +245,18 @@ async fn two_exports_of_one_source_hold_the_same_database() {
     let database = source.join(EXPORTED_DATABASE);
     let (first, second) = (scratch.path().join("first"), scratch.path().join("second"));
 
-    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &first)
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &first, BUILD)
         .await
         .unwrap();
-    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &second)
-        .await
-        .unwrap();
+    export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &database,
+        &second,
+        BUILD,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(files(&first), files(&second));
 }
@@ -242,6 +281,7 @@ async fn a_native_database_is_exported_in_place_of_a_leftover_jellyfin_one() {
         &DOCKER,
         &source.join("ferrofin.db"),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -265,6 +305,7 @@ async fn a_source_that_changes_during_the_export_fails_it() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap_err();
@@ -298,6 +339,7 @@ async fn a_linked_data_directory_is_copied_and_its_target_left_alone() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -330,6 +372,7 @@ async fn a_linked_database_is_read_where_sqlite_keeps_its_log() {
         &DOCKER,
         &source.join("ferrofin.db"),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -349,7 +392,7 @@ async fn a_missing_or_foreign_database_is_refused_before_anything_is_written() {
     let out = scratch.path().join("out");
 
     for database in [source.join("missing.db"), source.join("ferrofin.db")] {
-        let error = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+        let error = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out, BUILD)
             .await
             .unwrap_err();
         assert!(matches!(error, DbError::Export { .. }), "{error}");
@@ -367,7 +410,7 @@ async fn the_snapshot_keeps_the_database_files_permissions() {
     std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
     let out = scratch.path().join("out");
 
-    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out, BUILD)
         .await
         .unwrap();
 
@@ -387,7 +430,7 @@ async fn a_read_only_database_is_exported_with_its_mode() {
     }
     let out = scratch.path().join("out");
 
-    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out, BUILD)
         .await
         .unwrap();
 
@@ -410,6 +453,7 @@ async fn a_database_linked_to_a_file_inside_the_source_is_not_copied_raw() {
         &DOCKER,
         &source.join("ferrofin.db"),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -443,6 +487,7 @@ async fn the_database_directory_keeps_its_mode_and_time_after_the_snapshot() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await;
 
@@ -470,7 +515,6 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
     let meta = scratch.path().join("meta");
     let image = format!("{}/library/ab/poster.jpg", meta.display());
     let statements = [
-        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
         r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT, "Data" TEXT)"#.to_owned(),
         r#"CREATE TABLE "BaseItemImageInfos" ("Path" TEXT NOT NULL)"#.to_owned(),
         r#"CREATE TABLE "ImageInfos" ("Path" TEXT)"#.to_owned(),
@@ -485,7 +529,10 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
             .to_owned(),
         format!(r#"INSERT INTO "BaseItemImageInfos" VALUES ('{image}')"#),
         r#"INSERT INTO "ImageInfos" VALUES ('/data/config/users/a/profile.png')"#.to_owned(),
-    ];
+    ]
+    .into_iter()
+    .chain(started())
+    .collect::<Vec<_>>();
     let source = source_with_database(
         scratch.path(),
         &statements.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -510,7 +557,7 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
     };
     let (out, before) = (scratch.path().join("out"), files(&source));
 
-    let summary = export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out)
+    let summary = export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out, BUILD)
         .await
         .unwrap();
 
@@ -589,6 +636,255 @@ async fn exported_paths(out: &Path) -> Vec<String> {
     stored
 }
 
+/// The items of [`the_art_earlier_builds_saved_moves_into_jellyfins_layout`]:
+/// a genre, a music album, a movie, one whose name is taken, one whose two
+/// images share a file, and one whose image is in the genre's folder.
+const GENRE: &str = "11111111-2222-4333-8444-555555555555";
+const ALBUM: &str = "AAAAAAAA-0000-4000-8000-000000000001";
+const MOVIE: &str = "BBBBBBBB-0000-4000-8000-000000000002";
+const TAKEN: &str = "CCCCCCCC-0000-4000-8000-000000000003";
+const SHARED: &str = "DDDDDDDD-0000-4000-8000-000000000004";
+const OTHER: &str = "EEEEEEEE-0000-4000-8000-000000000005";
+
+/// `name` in `id`'s own art folder, relative to the library folder:
+/// `{idN[..2]}/{idN}/name`.
+fn own(id: &str, name: &str) -> String {
+    let simple = id.replace('-', "").to_ascii_lowercase();
+    format!("{}/{simple}/{name}", &simple[..2])
+}
+
+/// A source whose database stores `images` (item, type, path relative to its
+/// library folder or absolute) for the items above, each such file under the
+/// library folder holding its path, with `extra` files there besides.
+async fn source_with_images(
+    scratch: &Path,
+    images: &[(&str, i32, String)],
+    extra: &[(String, &str)],
+) -> PathBuf {
+    let library = scratch.join("source/metadata/library");
+    let mut statements = started().to_vec();
+    statements.extend([
+        r#"CREATE TABLE "BaseItems" ("Id" TEXT PRIMARY KEY, "Type" TEXT NOT NULL, "Path" TEXT)"#
+            .to_owned(),
+        r#"CREATE TABLE "BaseItemImageInfos" ("ItemId" TEXT NOT NULL,
+           "ImageType" INTEGER NOT NULL, "Path" TEXT NOT NULL)"#
+            .to_owned(),
+    ]);
+    for (id, kind) in [
+        (GENRE, "Genre"),
+        (ALBUM, "Audio.MusicAlbum"),
+        (MOVIE, "Movies.Movie"),
+        (TAKEN, "Movies.Movie"),
+        (SHARED, "Folder"),
+        (OTHER, "Genre"),
+    ] {
+        statements.push(format!(
+            r#"INSERT INTO "BaseItems" VALUES ('{id}', 'MediaBrowser.Controller.Entities.{kind}', NULL)"#
+        ));
+    }
+    let mut files: Vec<(String, &str)> = extra.to_vec();
+    for (id, image_type, path) in images {
+        let stored = if path.starts_with('/') {
+            path.clone()
+        } else {
+            files.push((path.clone(), path));
+            format!("{}/{path}", library.display())
+        };
+        statements.push(format!(
+            r#"INSERT INTO "BaseItemImageInfos" VALUES ('{id}', {image_type}, '{stored}')"#
+        ));
+    }
+    let source = source_with_database(
+        scratch,
+        &statements.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    for (path, bytes) in files {
+        let file = library.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, bytes).unwrap();
+    }
+    source
+}
+
+/// An image row of [`source_with_images`]: item, type, path.
+type ImageRow = (&'static str, i32, String);
+
+/// The image rows and the other files of [`source_with_images`] for the
+/// tests of the art earlier builds saved.
+fn earlier_art() -> ([ImageRow; 12], [(String, &'static str); 2]) {
+    let lower = ALBUM.to_ascii_lowercase();
+    let images = [
+        (GENRE, 0, format!("{GENRE}/primary.png")),
+        (ALBUM, 0, format!("{lower}/primary.JPEG")),
+        (ALBUM, 6, format!("{ALBUM}/disc.png")),
+        (MOVIE, 0, "/media/movies/m/poster.jpg".to_owned()),
+        (MOVIE, 2, format!("{MOVIE}/backdrop.jpg")),
+        (MOVIE, 2, format!("{MOVIE}/backdrop2.jpg")),
+        (MOVIE, 5, format!("{MOVIE}/thumb.jpg")),
+        (TAKEN, 0, format!("{TAKEN}/primary.jpg")),
+        (TAKEN, 0, own(TAKEN, "poster.jpg")),
+        (SHARED, 0, format!("{SHARED}/primary.jpg")),
+        (SHARED, 5, format!("{SHARED}/primary.jpg")),
+        (OTHER, 0, format!("{GENRE}/primary.png")),
+    ];
+    let extra = [
+        (own(MOVIE, "landscape.jpg"), "a file no row names"),
+        (format!("{MOVIE}/stray.jpg"), "no row names it either"),
+    ];
+    (images, extra)
+}
+
+/// The `{xx}` and `{xx}/{idN}` folders made for `id`'s art from `like`,
+/// relative to the output.
+fn made_folders(id: &str, like: &str) -> [(PathBuf, PathBuf); 2] {
+    let lib = |path: &str| PathBuf::from(format!("metadata/library/{path}"));
+    let own = own(id, "");
+    let own = own.trim_end_matches('/');
+    [(lib(&own[..2]), lib(like)), (lib(own), lib(like))]
+}
+
+/// The art earlier builds saved in an item's `{ID}` or `{id}` folder is moved
+/// in the output into the item's own folder under the name Jellyfin's save
+/// gives it, and its rows follow (gl-1916): a file no row names is replaced
+/// there, a file two rows name is copied for the one and moved for the other,
+/// and a folder left empty goes. A name a stored image has keeps the row
+/// where it is, and so do a row in another item's folder, one outside the
+/// library and a file no row names. The source is left byte for byte.
+#[tokio::test]
+async fn the_art_earlier_builds_saved_moves_into_jellyfins_layout() {
+    let scratch = tempfile::tempdir().unwrap();
+    let lower = ALBUM.to_ascii_lowercase();
+    let (images, extra) = earlier_art();
+    let source = source_with_images(scratch.path(), &images, &extra).await;
+    let (out, before) = (scratch.path().join("out"), files(&source));
+
+    let summary = export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        &out,
+        BUILD,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(files(&source), before, "the source is left as it was");
+    let at = |path: &str| format!("/config/metadata/library/{path}");
+    let lib = |path: &str| PathBuf::from(format!("metadata/library/{path}"));
+    // The rows that move, by their index in `images`, with where to.
+    let moved = [
+        (0, own(GENRE, "poster.png")),
+        (1, own(ALBUM, "folder.jpg")),
+        (2, own(ALBUM, "cdart.png")),
+        (4, own(MOVIE, "backdrop.jpg")),
+        (5, own(MOVIE, "backdrop1.jpg")),
+        (6, own(MOVIE, "landscape.jpg")),
+        (9, own(SHARED, "poster.jpg")),
+        (10, own(SHARED, "landscape.jpg")),
+    ];
+    assert_eq!(
+        summary.edits.art,
+        ArtRelocation {
+            moved: moved
+                .iter()
+                .map(|(row, to)| (at(&images[*row].2), at(to)))
+                .collect(),
+            kept: vec![at(&images[7].2)],
+            made: [
+                made_folders(GENRE, GENRE),
+                made_folders(ALBUM, &lower),
+                made_folders(SHARED, SHARED)
+            ]
+            .concat(),
+            removed: [lower.as_str(), ALBUM, SHARED].map(&lib).into(),
+        }
+    );
+    let copied = files(&out);
+    let file = |path: &str| copied.get(Path::new(&format!("metadata/library/{path}")));
+    for (row, to) in &moved {
+        let from = &images[*row].2;
+        assert_eq!(file(to).map(Vec::as_slice), Some(from.as_bytes()), "{to}");
+        // The genre's file stays for the row of another item that names it.
+        assert_eq!(file(from).is_some(), *row == 0, "{from}");
+    }
+    for left in [&images[7].2, &images[8].2, &extra[1].0] {
+        assert!(file(left).is_some(), "{left}");
+    }
+    for gone in [ALBUM, lower.as_str(), SHARED] {
+        assert!(!out.join("metadata/library").join(gone).exists(), "{gone}");
+    }
+    let expected: Vec<String> = images
+        .iter()
+        .enumerate()
+        .map(
+            |(index, (_, _, path))| match moved.iter().find(|(row, _)| *row == index) {
+                Some((_, to)) => at(to),
+                None if path.starts_with('/') => path.clone(),
+                None => at(path),
+            },
+        )
+        .collect();
+    assert_eq!(exported_image_paths(&out).await, expected);
+}
+
+/// A folder the art's move makes takes the mode of the one the art came from,
+/// as every folder of the copy takes its source's, the one the move then
+/// removes included, and a second export of the source is the same as the
+/// first (gl-1916).
+#[tokio::test]
+async fn the_folders_the_art_moves_into_are_finished_and_two_exports_agree() {
+    let scratch = tempfile::tempdir().unwrap();
+    let (images, extra) = earlier_art();
+    let source = source_with_images(scratch.path(), &images, &extra).await;
+    let lower = ALBUM.to_ascii_lowercase();
+    #[cfg(unix)]
+    for like in [GENRE, lower.as_str()] {
+        use std::os::unix::fs::PermissionsExt as _;
+        let like = source.join("metadata/library").join(like);
+        std::fs::set_permissions(like, std::fs::Permissions::from_mode(0o750)).unwrap();
+    }
+    let (first, second) = (scratch.path().join("first"), scratch.path().join("second"));
+    for out in [&first, &second] {
+        export_data_dir(
+            &SourceDirs::new(&source),
+            &DOCKER,
+            &source.join(EXPORTED_DATABASE),
+            out,
+            BUILD,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(files(&first), files(&second));
+    #[cfg(unix)]
+    for (made, _) in [made_folders(GENRE, GENRE), made_folders(ALBUM, &lower)].concat() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(first.join(&made))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o750, "{}", made.display());
+    }
+}
+
+/// The image paths the exported database under `out` stores, in row order.
+async fn exported_image_paths(out: &Path) -> Vec<String> {
+    let mut conn = SqliteConnectOptions::new()
+        .filename(out.join(EXPORTED_DATABASE))
+        .read_only(true)
+        .connect()
+        .await
+        .unwrap();
+    let stored = sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItemImageInfos" ORDER BY rowid"#)
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+    sqlx::Connection::close(conn).await.unwrap();
+    stored
+}
+
 /// A configuration directory kept outside the data directory is copied to
 /// the output's `config`, without a `migrations.xml` Jellyfin would read again,
 /// and the data directory's own `config` is left out (gl-1557).
@@ -607,7 +903,7 @@ async fn a_configuration_directory_kept_elsewhere_is_copied_without_its_migratio
     };
     let out = scratch.path().join("out");
 
-    let summary = export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out)
+    let summary = export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out, BUILD)
         .await
         .unwrap();
 
@@ -623,6 +919,51 @@ async fn a_configuration_directory_kept_elsewhere_is_copied_without_its_migratio
         [(PathBuf::from("config"), LeftOut::NotUsed)]
     );
     assert!(etc.join("migrations.xml").exists(), "the source keeps it");
+}
+
+/// The files `not_needed_files` names are left out of every tree copied, the
+/// data directory's and a configuration directory kept elsewhere, and the
+/// source keeps them (gl-1949).
+#[tokio::test]
+async fn files_not_needed_are_left_out_of_every_tree_copied() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = source(scratch.path()).await;
+    let etc = scratch.path().join("etc");
+    std::fs::create_dir_all(etc.join("users/named")).unwrap();
+    for file in ["system.json", "system_id", "users/named/network.json"] {
+        std::fs::write(etc.join(file), file).unwrap();
+    }
+    std::fs::write(source.join("task_results.json"), b"{}").unwrap();
+    // Of the same name, elsewhere: copied.
+    std::fs::write(source.join("metadata/system.json"), b"metadata's").unwrap();
+    let dirs = SourceDirs {
+        config: etc.clone(),
+        not_needed_files: vec![
+            etc.join("system.json"),
+            etc.join("users/named/network.json"),
+            etc.join("users/named/encoding.json"),
+            source.join("task_results.json"),
+        ],
+        ..SourceDirs::new(&source)
+    };
+    let (out, before) = (scratch.path().join("out"), files(&etc));
+
+    export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out, BUILD)
+        .await
+        .unwrap();
+
+    let copied = files(&out);
+    for left_out in [
+        "config/system.json",
+        "config/users/named/network.json",
+        "task_results.json",
+    ] {
+        assert!(!copied.contains_key(Path::new(left_out)), "{left_out}");
+    }
+    assert_eq!(copied[Path::new("config/system_id")], b"system_id");
+    assert_eq!(copied[Path::new("metadata/system.json")], b"metadata's");
+    assert_eq!(files(&etc), before, "the source keeps them");
+    assert!(source.join("task_results.json").exists());
 }
 
 /// A database with `statements` run on it, at `data/jellyfin.db` of a new
@@ -656,6 +997,7 @@ async fn refusal(source: &Path, out: &Path) -> String {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         out,
+        BUILD,
     )
     .await;
     assert_eq!(files(source), before, "the source is left as it was");
@@ -694,15 +1036,81 @@ async fn a_database_the_export_cannot_vouch_for_is_refused() {
     let scratch = tempfile::tempdir().unwrap();
     let source = source_with_database(
         scratch.path(),
-        &[
-            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)",
-            r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT PRIMARY KEY, "ProductVersion" TEXT)"#,
-            r#"INSERT INTO "__EFMigrationsHistory" VALUES ('20991231000000_FromTheFuture', '99.0')"#,
-        ],
+        &started()
+            .iter()
+            .map(String::as_str)
+            .chain([
+                r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT PRIMARY KEY, "ProductVersion" TEXT)"#,
+                r#"INSERT INTO "__EFMigrationsHistory" VALUES ('20991231000000_FromTheFuture', '99.0')"#,
+            ])
+            .collect::<Vec<_>>(),
     )
     .await;
     let reason = refusal(&source, &scratch.path().join("out")).await;
     assert!(reason.contains("matches no Jellyfin release"), "{reason}");
+}
+
+/// A database this version's start has not left is refused, with the step to
+/// take, and the source left as it was (gl-1910): one an earlier release last
+/// started, one a newer release migrated, and one at this build's last
+/// migration that records no start, or the start of another build.
+#[tokio::test]
+async fn a_database_this_version_has_not_started_is_refused() {
+    let head = ferrofin_db::schema_head();
+    let meta = r#"CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL)"#;
+    let mark = |value: &str| {
+        format!(
+            r#"INSERT INTO "FerrofinMeta" VALUES ('{}', '{value}')"#,
+            ferrofin_db::STARTED_KEY
+        )
+    };
+    // The migration head, then the record: `None` no `FerrofinMeta`, `""` the
+    // table without the key, anything else the build it names.
+    let cases = [
+        (head - 1, None, "an earlier Ferrofin release last started"),
+        (head + 1, None, "migrated by a newer Ferrofin release"),
+        (
+            head,
+            None,
+            "records no start of this Ferrofin release (v0.0.0-test)",
+        ),
+        (
+            head,
+            Some(""),
+            "records no start of this Ferrofin release (v0.0.0-test)",
+        ),
+        (
+            head,
+            Some("v0.0.0-other"),
+            "another Ferrofin build (v0.0.0-other) last started on the database, not this one (v0.0.0-test)",
+        ),
+    ];
+    for (version, recorded, expected) in cases {
+        let mut statements = vec![
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
+            format!("INSERT INTO _sqlx_migrations VALUES ({version})"),
+        ];
+        if let Some(recorded) = recorded {
+            statements.push(meta.to_owned());
+            if !recorded.is_empty() {
+                statements.push(mark(recorded));
+            }
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let source = source_with_database(
+            scratch.path(),
+            &statements.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .await;
+        let reason = refusal(&source, &scratch.path().join("out")).await;
+        assert!(reason.contains(expected), "{expected}: {reason}");
+        let newer = expected.contains("newer");
+        assert_eq!(
+            reason.contains("start this release on the data directory once"),
+            !newer,
+            "{reason}"
+        );
+    }
 }
 
 /// A database damaged anywhere (its header, a middle page, a truncated end)
@@ -777,8 +1185,7 @@ async fn database_with_containers(database: &Path, source: &Path, media: &Path) 
         .connect()
         .await
         .unwrap();
-    for statement in [
-        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
+    for statement in started().into_iter().chain([
         r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT)"#.to_owned(),
         format!(
             r#"INSERT INTO "BaseItems" VALUES
@@ -791,7 +1198,7 @@ async fn database_with_containers(database: &Path, source: &Path, media: &Path) 
             media = media.display(),
             source = source.display()
         ),
-    ] {
+    ]) {
         sqlx::query(sqlx::AssertSqlSafe(statement))
             .execute(&mut conn)
             .await
@@ -838,6 +1245,7 @@ async fn playlist_and_collection_files_in_the_data_directory_are_left_out() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -908,7 +1316,7 @@ async fn live_tv_and_identity_rows_are_carried_and_the_items_kept() {
     let before = files(&source);
     let out = scratch.path().join("out");
 
-    let summary = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+    let summary = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out, BUILD)
         .await
         .unwrap();
 
@@ -999,6 +1407,7 @@ async fn live_tv_database(database: &Path, user: &str) {
             .await
             .unwrap();
     }
+    db.record_started(BUILD).await.unwrap();
     db.close().await;
 }
 

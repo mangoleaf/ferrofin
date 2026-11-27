@@ -25,26 +25,98 @@ pub fn read_normalized_string(reader: &mut XmlCursor) -> String {
 
 /// Reads an `i32` from the current node (`XmlReaderExtensions.TryReadInt`).
 ///
-/// Uses invariant-culture integer parsing on the trimmed content.
+/// `int.TryParse(s, InvariantCulture)`: the grammar of [`parse_int`], with no
+/// value instead of an exception.
 pub fn try_read_int(reader: &mut XmlCursor) -> Option<i32> {
-    reader.read_element_content_as_string().trim().parse().ok()
+    parse_int(&reader.read_element_content_as_string()).ok()
+}
+
+/// The exception a typed read (`ReadElementContentAsBoolean`,
+/// `ReadElementContentAsInt`) throws, which ends the parse where it happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadError {
+    /// An `XmlException`: a value that does not convert, or a child element in
+    /// the element. The parsers that catch `XmlException` keep what they read
+    /// before it, as they do for a syntax error.
+    Xml,
+    /// An exception no parser catches: the `FormatException` of an empty
+    /// element, whose `XmlConvert.ToXxx(string.Empty)` runs outside the
+    /// `XmlException` wrapping, or the `OverflowException` of an integer out of
+    /// range. It fails the local provider.
+    Uncaught,
+}
+
+/// .NET's `int.Parse` with `NumberStyles.Integer` and the invariant culture,
+/// which both `XmlConvert.ToInt32` and `int.TryParse(s, InvariantCulture)` run:
+/// an optional `+`/`-` and ASCII digits, white space (tab to CR, and space)
+/// around them, then any NULs. A bad format is [`ReadError::Xml`] (the
+/// `FormatException` `ReadContentAsInt` wraps) and wins over an overflow, which
+/// is [`ReadError::Uncaught`].
+fn parse_int(text: &str) -> Result<i32, ReadError> {
+    let white = |c: char| c == ' ' || ('\t'..='\r').contains(&c);
+    let number = text
+        .trim_start_matches(white)
+        .trim_end_matches('\0')
+        .trim_end_matches(white);
+    let digits = number.strip_prefix(['+', '-']).unwrap_or(number);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ReadError::Xml);
+    }
+    number.parse().map_err(|_| ReadError::Uncaught)
+}
+
+/// Reads the current element's text and converts it, as
+/// `ReadElementContentAsXxx` does: a child element before or after the text is
+/// an `XmlException`, and an empty element is [`ReadError::Uncaught`]
+/// (`XmlConvert` refuses `""` for both types read this way).
+fn read_element_content_as<T>(
+    reader: &mut XmlCursor,
+    convert: impl FnOnce(&str) -> Result<T, ReadError>,
+) -> Result<T, ReadError> {
+    if reader.is_empty_element() {
+        return Err(ReadError::Uncaught);
+    }
+    reader.read();
+    if reader.is_element() {
+        return Err(ReadError::Xml);
+    }
+    let Some(text) = reader.text_value() else {
+        return Err(ReadError::Uncaught);
+    };
+    let value = convert(text)?;
+    reader.read();
+    if reader.is_element() {
+        return Err(ReadError::Xml);
+    }
+    reader.read();
+    Ok(value)
 }
 
 /// Reads a boolean from the current node
 /// (`XmlReader.ReadElementContentAsBoolean`).
 ///
-/// .NET's `XmlConvert.ToBoolean` accepts only `true`/`false`/`1`/`0` (trimmed,
-/// case-sensitive); on anything else the read throws an `XmlException`, which
-/// ends the NFO read. This matches the words case-insensitively and returns
-/// `None` for anything else.
-/// TODO(parity, open work item — gl-1943): port the case-sensitive match and the
-/// read error.
-pub fn read_element_content_as_bool(reader: &mut XmlCursor) -> Option<bool> {
-    match reader.read_element_content_as_string().trim() {
-        s if s.eq_ignore_ascii_case("true") || s == "1" => Some(true),
-        s if s.eq_ignore_ascii_case("false") || s == "0" => Some(false),
-        _ => None,
-    }
+/// `XmlConvert.ToBoolean` takes exactly `true`, `false`, `1` or `0` after
+/// trimming XML white space (space, tab, CR, LF).
+///
+/// # Errors
+/// [`ReadError`] where .NET throws.
+pub fn read_element_content_as_bool(reader: &mut XmlCursor) -> Result<bool, ReadError> {
+    read_element_content_as(reader, |text| {
+        match text.trim_matches([' ', '\t', '\n', '\r']) {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(ReadError::Xml),
+        }
+    })
+}
+
+/// Reads an `i32` from the current node (`XmlReader.ReadElementContentAsInt`,
+/// whose `XmlConvert.ToInt32` is `int.Parse`).
+///
+/// # Errors
+/// [`ReadError`] where .NET throws.
+pub fn read_element_content_as_int(reader: &mut XmlCursor) -> Result<i32, ReadError> {
+    read_element_content_as(reader, parse_int)
 }
 
 /// Parses a `DateTime` from the current node (`XmlReaderExtensions.TryReadDateTime`).
@@ -282,4 +354,27 @@ pub fn try_parse_series_status(status: &str) -> Option<SeriesStatus> {
         return Some(SeriesStatus::Ended);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadError, parse_int};
+
+    /// `int.Parse(s, NumberStyles.Integer, InvariantInfo)`: NULs may only end
+    /// the text, after any trailing white space; the full `i32` range parses.
+    #[rstest::rstest]
+    #[case::trailing_nuls("5\0\0", Ok(5))]
+    #[case::white_space_then_nul(" 5 \0", Ok(5))]
+    #[case::nul_then_white_space("5\0 ", Err(ReadError::Xml))]
+    #[case::nul_first("\0 5", Err(ReadError::Xml))]
+    #[case::vertical_tab_and_form_feed("\u{b}5\u{c}", Ok(5))]
+    #[case::sign_alone("-", Err(ReadError::Xml))]
+    #[case::two_signs("+-5", Err(ReadError::Xml))]
+    #[case::min("-2147483648", Ok(i32::MIN))]
+    #[case::below_min("-2147483649", Err(ReadError::Uncaught))]
+    #[case::above_max("2147483648", Err(ReadError::Uncaught))]
+    #[case::leading_zeros("-0000000000002147483648", Ok(i32::MIN))]
+    fn parse_int_follows_dotnet(#[case] text: &str, #[case] expected: Result<i32, ReadError>) {
+        assert_eq!(parse_int(text), expected, "{text:?}");
+    }
 }

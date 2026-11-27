@@ -29,7 +29,7 @@ ferrofin-networking.workspace = true
 ferrofin-common.workspace = true
 # `guid_extensions::parse_dotnet_guid` — the .NET `Guid.TryParse` format set
 # ASP.NET binds a `Guid?` query parameter with, which is not `Uuid::parse_str`'s.
-ferrofin-util.workspace = true
+ferrofin-util = { workspace = true, features = ["reqwest"] }
 # The manager traits return `ferrofin-db` entity types (`UserEntity`,
 # `BaseItemEntity`, …); the real handlers name them when projecting to DTOs, so
 # this is a plain (non-optional) dependency.

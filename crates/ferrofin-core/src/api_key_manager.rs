@@ -9,8 +9,8 @@
 //! - `CreateApiKey` builds a C# `ApiKey(name)`, whose constructor sets
 //!   `AccessToken = Guid.NewGuid().ToString("N")` (32 lowercase hex digits, no
 //!   hyphens) and `DateCreated = DateTime.UtcNow`. This port mirrors that exactly
-//!   (`Uuid::new_v4().simple()`), and also seeds `DateLastActivity` (a
-//!   `NOT NULL` column the EF default leaves at `now`).
+//!   (`Uuid::new_v4().simple()`). `DateLastActivity` is never assigned, so EF
+//!   stores `default(DateTime)` in that `NOT NULL` column: `0001-01-01 00:00:00`.
 //! - `GetApiKeys` projects each row into an [`AuthenticationInfo`] with
 //!   `AppName`/`AccessToken`/`DateCreated` from the key and empty device fields,
 //!   matching the C# `Select`.
@@ -96,16 +96,16 @@ impl ApiKeyManager for FerrofinApiKeyManager {
     }
 
     async fn create_api_key(&self, name: &str) -> Result<(), ServiceError> {
-        // C# `ApiKey(name)`: token is a hyphen-free lowercase-hex GUID; created +
-        // last-activity both stamped now.
+        // C# `ApiKey(name)`: token is a hyphen-free lowercase-hex GUID, created
+        // now, never used (`DateLastActivity` left at `default(DateTime)`).
         let access_token = Uuid::new_v4().simple().to_string();
-        let now = Utc::now();
         sqlx::query(
             r#"INSERT INTO "ApiKeys" ("AccessToken", "DateCreated", "DateLastActivity", "Name")
-                VALUES (?1, ?2, ?2, ?3)"#,
+                VALUES (?1, ?2, ?3, ?4)"#,
         )
         .bind(&access_token)
-        .bind(datetime_to_db(now))
+        .bind(datetime_to_db(Utc::now()))
+        .bind(datetime_to_db(ferrofin_model::json::datetime::dotnet_min()))
         .bind(name)
         .execute(self.db.writer())
         .await

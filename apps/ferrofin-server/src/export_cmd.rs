@@ -46,6 +46,10 @@ const PROBE_ANSWER_LIMIT: usize = 64 * 1024;
 /// Jellyfin's backups directory under the output (`{DataPath}/backups`).
 const JELLYFIN_BACKUPS: &str = "data/backups";
 
+/// Where Ferrofin keeps its scheduled tasks' last results, relative to its
+/// data directory.
+const TASK_RESULTS: &str = "task_results.json";
+
 /// Exports `config`'s data directory into `args.out`, in the layout of
 /// Jellyfin's docker image ([`DOCKER`]), writes the loss report into it
 /// ([`LOSS_REPORT`]) and prints what it wrote and the report.
@@ -107,9 +111,14 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
         .await
         .with_context(nothing_written)?;
     let written = async {
-        let summary =
-            ferrofin_db::export::export_data_dir(&dirs, &DOCKER, &config.database_path(), &partial)
-                .await?;
+        let summary = ferrofin_db::export::export_data_dir(
+            &dirs,
+            &DOCKER,
+            &config.database_path(),
+            &partial,
+            ferrofin_health::build_version(),
+        )
+        .await?;
         let libraries = library_options(config, &summary, libraries).await?;
         configuration.files.extend(libraries.files);
         configuration.not_exported.extend(libraries.not_exported);
@@ -206,8 +215,11 @@ async fn library_options(
 
 /// The directories of `config`'s server, as the export reads them: its
 /// metadata directory as its settings name it (the default when they cannot
-/// be read, which the configuration's read then refuses), and its cache, log
-/// and web client directories, which hold nothing Jellyfin reads.
+/// be read, which the configuration's read then refuses), its cache, log
+/// and web client directories, which hold nothing Jellyfin reads, and its own
+/// files Jellyfin does not read: the configuration the export writes as
+/// Jellyfin's XML, which a later adoption by Ferrofin would read over the XML
+/// Jellyfin kept, and the scheduled tasks' last results.
 fn source_dirs(config: &Config) -> SourceDirs {
     SourceDirs {
         program_data: config.data_dir.clone(),
@@ -219,6 +231,11 @@ fn source_dirs(config: &Config) -> SourceDirs {
             config.data_dir.join("log"),
             config.web_dir.clone(),
         ],
+        not_needed_files: config_export::exported_sources(&config.config_dir)
+            .into_iter()
+            .chain(plugins::exported_sources(config))
+            .chain([config.data_dir.join(TASK_RESULTS)])
+            .collect(),
     }
 }
 
@@ -266,6 +283,14 @@ fn print_paths(config: &Config, target: &Path, summary: &ExportSummary) {
             )
         }
     );
+    let moved = summary.edits.art.moved.len() as u64;
+    if moved > 0 {
+        println!(
+            "{} that earlier Ferrofin builds saved in an item's {}/library/{{ID}} or {{id}} folder moved into the item's own folder, where Jellyfin keeps its art, each under the name Jellyfin gives it.",
+            count(moved, "image", "images"),
+            DOCKER.metadata()
+        );
+    }
     let elsewhere = ran_elsewhere(config, summary);
     if !elsewhere.is_empty() {
         println!(
@@ -403,7 +428,7 @@ async fn report_inputs(
     let mut task_state = false;
     for file in [
         config.config_dir.join("task_triggers.json"),
-        config.data_dir.join("task_results.json"),
+        config.data_dir.join(TASK_RESULTS),
     ] {
         task_state |= tokio::fs::try_exists(&file)
             .await
@@ -552,6 +577,9 @@ fn loss_report(
     report.push_str(
         "  Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported, but for the MusicBrainz server and the Studio Images repository, which outrank those plugins' own settings and are written into them.\n",
     );
+    report.push_str(
+        "  Ferrofin's own files for the documents and plugin settings written as XML (system.json, the named documents beside it, a written plugin's config.json) are left out of the copy, so the settings listed above from those documents and plugins are not in the output in any form.\n",
+    );
 
     live_tv(&mut report, edits, inputs);
     plugin_lines(&mut report, &inputs.plugins);
@@ -570,10 +598,19 @@ fn loss_report(
             "  The database's root and library rows name another data directory than the one exported: the server ran at another path, or the directory moved since. The stored paths under it were rewritten for Jellyfin too; the export printed both directories.\n",
         );
     }
+    let kept = &edits.art.kept;
+    if let Some(first) = kept.first() {
+        let _ = writeln!(
+            report,
+            "  {} that earlier Ferrofin builds saved in an item's {{ID}} or {{id}} folder stayed there (the first: {first}): the name Jellyfin gives each in the item's own folder is another stored image's. Jellyfin serves each, but does not count it as the item's own art: a collage or a library tile there is never drawn again, and the folder is left behind when the item is deleted.",
+            count(kept.len() as u64, "image", "images")
+        );
+    }
     container_files(&mut report, inputs);
     if inputs.left_out.is_empty()
         && !inputs.metadata_missing
         && !inputs.ran_elsewhere
+        && kept.is_empty()
         && inputs.container_files.is_empty()
         && inputs.library_containers.is_empty()
     {
@@ -1144,8 +1181,8 @@ async fn write_configuration(export: &ConfigExport, out: &Path) -> anyhow::Resul
 mod tests {
     use ferrofin_core::config_export::{ConfigExport, LiveTvExport, NotExported};
     use ferrofin_db::export::{
-        CarriedRows, ContainerFile, DatabaseEdits, DroppedObjects, DroppedTable, FirstStartCounts,
-        HistoryRewrite, LibraryContainer, MirroredLiveTv,
+        ArtRelocation, CarriedRows, ContainerFile, DatabaseEdits, DroppedObjects, DroppedTable,
+        FirstStartCounts, HistoryRewrite, LibraryContainer, MirroredLiveTv,
     };
 
     use super::{ReportInputs, amount, loss_report, mebibytes, plugins};
@@ -1234,6 +1271,15 @@ mod tests {
                 credits: 3,
                 play_states: 1,
                 ..FirstStartCounts::default()
+            },
+            art: ArtRelocation {
+                kept: vec![
+                    "/config/metadata/library/CCCCCCCC-0000-4000-8000-000000000003/primary.jpg"
+                        .to_owned(),
+                    "/config/metadata/library/DDDDDDDD-0000-4000-8000-000000000004/thumb.jpg"
+                        .to_owned(),
+                ],
+                ..ArtRelocation::default()
             },
             ..DatabaseEdits::default()
         }

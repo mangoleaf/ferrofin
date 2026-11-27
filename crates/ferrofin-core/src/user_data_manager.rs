@@ -1056,14 +1056,15 @@ impl FerrofinUserDataManager {
     /// Resets the play state a container's own rows carry, under every key,
     /// when the container is marked unplayed.
     ///
-    /// Upstream's container mark never writes those rows, but earlier
-    /// Ferrofin builds marked the container itself. Where a kind's played
-    /// state IS its own row (a music album, a library) that stale state would
-    /// otherwise show for good. Divergence: upstream's `MarkUnplayed` leaves
-    /// the row alone, so a `Played` set on a container through the UserData
-    /// API survives it there; here the user's unmark clears it. A played mark
-    /// clears nothing: the row then agrees with it. Favourite and rating are
-    /// kept, and a row with no play state is not written.
+    /// Upstream's container mark never writes those rows, but versions before
+    /// 1.4.0 marked the container itself. Where a kind's played state IS its
+    /// own row (a music album, a library) that stale state would otherwise
+    /// show for good. Deliberate divergence (owner decision 2026-11-20,
+    /// gl-1064): upstream's `MarkUnplayed` leaves the row alone, so a `Played`
+    /// set on a container through the UserData API survives it there; here
+    /// the user's unmark clears it. A played mark clears nothing: the row
+    /// then agrees with it. Favourite and rating are kept, and a row with no
+    /// play state is not written.
     async fn clear_own_play_state(&self, user_id: Uuid, item_id: Uuid) -> Result<(), ServiceError> {
         sqlx::query(
             r#"UPDATE "UserData"

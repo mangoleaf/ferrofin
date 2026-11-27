@@ -144,7 +144,7 @@ pub struct PluginManifest {
 /// Port of `MediaBrowser.Model.Plugins.ConfigurationPageInfo`. In Jellyfin this
 /// is projected from a plugin's `PluginPageInfo` plus the owning plugin id;
 /// Ferrofin projects it from the compiled-in registry the same way — Jellyfin's
-/// five in-tree provider plugins, the curated extensions, and any loaded WASM
+/// six in-tree provider plugins, the curated extensions, and any loaded WASM
 /// plugin each contribute their pages.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
@@ -185,7 +185,7 @@ impl PluginManifest {
     /// constructor defaults (empty), `Assemblies` is empty, `Timestamp` is
     /// `DateTime.MinValue` — which `JsonDateTimeConverter` writes as
     /// `0001-01-01T00:00:00.0000000Z` — and `AutoUpdate` keeps its `true`
-    /// property initializer. That is what a stock Jellyfin returns for its five
+    /// property initializer. That is what a stock Jellyfin returns for its six
     /// in-tree provider plugins, and every Ferrofin plugin (compiled-in or
     /// staged WASM) has that same manifest-less shape.
     ///

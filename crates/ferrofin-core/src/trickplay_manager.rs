@@ -564,7 +564,7 @@ impl FerrofinTrickplayManager {
         // Source checks these only inside per-width work: they do not bypass
         // discovery or the outer disabled/replace cleanup.
         if !off_runtime(|| Path::new(ctx.media_path).is_file()) {
-            tracing::warn!(item = %ctx.item_id, path = ctx.media_path, "trickplay media file not found");
+            tracing::warn!(item_id = %ctx.item_id, path = ctx.media_path, "trickplay media file not found");
             return Ok(None);
         }
         if Path::new(ctx.media_path)
@@ -572,7 +572,7 @@ impl FerrofinTrickplayManager {
             .and_then(Path::file_name)
             .is_some_and(|name| name.eq_ignore_ascii_case("backdrops"))
         {
-            tracing::debug!(item = %ctx.item_id, path = ctx.media_path, "ignoring backdrop media");
+            tracing::debug!(item_id = %ctx.item_id, path = ctx.media_path, "ignoring backdrop media");
             return Ok(None);
         }
         // CanGenerateTrickplay counts all streams, but the pinned per-width
@@ -600,7 +600,7 @@ impl FerrofinTrickplayManager {
             match rows.entry(actual_width) {
                 Entry::Occupied(_) => {
                     if off_runtime(|| has_tiles(&output_dir)) {
-                        tracing::debug!(item = %ctx.item_id, "found existing trickplay files");
+                        tracing::debug!(item_id = %ctx.item_id, "found existing trickplay files");
                         return Ok(None);
                     }
                 }
@@ -922,7 +922,7 @@ impl FerrofinTrickplayManager {
         }
 
         self.save_trickplay_info(&info).await?;
-        tracing::debug!(item = %item_id, "imported existing trickplay files");
+        tracing::debug!(%item_id, "imported existing trickplay files");
         Ok(info)
     }
 

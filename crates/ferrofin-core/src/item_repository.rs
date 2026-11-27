@@ -103,6 +103,41 @@ impl From<EpisodeOrderRow> for BaseItemEntity {
     }
 }
 
+/// Whether `row`'s stored `Type` names an item kind. A read skips a row that
+/// does not (a removed plugin's item, an old server's, a corrupt row), as
+/// `DeserializeBaseItem` returns null for it (jellyfin/jellyfin#15956), and
+/// this logs it. Upstream warns on every read; a removed plugin leaves all its
+/// items behind, so here only the first row of each type per process is a
+/// warning and the rest are debug (LOGGING.md §1).
+pub(crate) fn has_known_type(row: &BaseItemEntity) -> bool {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    if crate::item_type_lookup::kind_from_type_name(&row.type_).is_some() {
+        return true;
+    }
+    let first = {
+        let mut warned = WARNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !warned.contains(&row.type_) && warned.insert(row.type_.clone())
+    };
+    if first {
+        tracing::warn!(
+            item_id = %row.id,
+            item_type = ?row.type_,
+            "skipping item with unknown type; this may indicate a removed plugin or database \
+             corruption (later items of this type are logged at debug)"
+        );
+    } else {
+        tracing::debug!(
+            item_id = %row.id,
+            item_type = ?row.type_,
+            "skipping item with unknown type"
+        );
+    }
+    false
+}
+
 /// The concrete item repository.
 ///
 /// Holds a cheaply-cloneable [`Database`] handle plus the shared
@@ -534,17 +569,23 @@ impl FerrofinItemRepository {
     /// [`ItemRepository`] read returns goes through here; the save stores the
     /// token form again (`FerrofinItemPersistenceService::upsert_item`,
     /// `GetPathToSave`).
-    fn mapped(&self, mut row: BaseItemEntity) -> BaseItemEntity {
+    ///
+    /// `None` for a row whose stored `Type` names no kind ([`has_known_type`]):
+    /// every caller drops it, as upstream's callers drop `DeserializeBaseItem`'s
+    /// null. The row itself is left as it is.
+    fn mapped(&self, mut row: BaseItemEntity) -> Option<BaseItemEntity> {
+        if !has_known_type(&row) {
+            return None;
+        }
         self.virtual_paths.expand_in_place(&mut row.path);
-        row
+        Some(row)
     }
 
-    /// [`Self::mapped`] over every row.
-    fn mapped_rows(&self, mut rows: Vec<BaseItemEntity>) -> Vec<BaseItemEntity> {
-        for row in &mut rows {
-            self.virtual_paths.expand_in_place(&mut row.path);
-        }
-        rows
+    /// [`Self::mapped`] over every row, dropping the unknown ones.
+    fn mapped_rows(&self, rows: Vec<BaseItemEntity>) -> Vec<BaseItemEntity> {
+        rows.into_iter()
+            .filter_map(|row| self.mapped(row))
+            .collect()
     }
 
     /// Installs the slot the composition root later fills with Live TV's
@@ -1786,10 +1827,12 @@ impl FerrofinItemRepository {
         let filter = resolved.as_ref().unwrap_or(filter);
         // The window is whole rows whatever the shape: a `FullRows` caller
         // needs them, and an `EpisodeOrder` caller reads a subset of them.
-        if let Some(window) = window {
-            return Ok(sql_page(self.rows_in_order(&window).await?, filter));
-        }
-        self.fetch_rows_resolved(filter, shape).await
+        let rows = if let Some(window) = window {
+            sql_page(self.rows_in_order(&window).await?, filter)
+        } else {
+            self.fetch_rows_resolved(filter, shape).await?
+        };
+        Ok(self.mapped_rows(rows))
     }
 
     /// The SQL path's `AdjacentTo` (v12.2 `ApplyAdjacencyFilter`, which
@@ -1824,9 +1867,11 @@ impl FerrofinItemRepository {
     /// The rows of an adjacency window, in the window's order. Upstream
     /// re-reads the window by id alone and orders it again; keeping the first
     /// pass's order is the same for every deterministic sort, and keeps a
-    /// `Random` or linked-order window as the pass that chose it.
+    /// `Random` or linked-order window as the pass that chose it. The rows are
+    /// as stored: the caller pages them, then maps them ([`Self::mapped`]), as
+    /// upstream pages before it deserializes.
     async fn rows_in_order(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let mut rows = self.retrieve_items(ids).await?;
+        let mut rows = self.stored_rows(ids).await?;
         rows.sort_by_key(|row| {
             Uuid::parse_str(&row.id)
                 .ok()
@@ -1835,10 +1880,30 @@ impl FerrofinItemRepository {
         Ok(rows)
     }
 
+    /// The stored rows of `ids`, in no particular order and not yet mapped
+    /// ([`Self::mapped`]): [`ItemRepository::retrieve_items`] and the
+    /// adjacency window ([`Self::rows_in_order`]) read them.
+    async fn stored_rows(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut rows = Vec::new();
+        for chunk in ferrofin_db::padded_in_chunks(ids) {
+            let sql = format!(
+                r#"SELECT * FROM "BaseItems" WHERE "Id" IN ({})"#,
+                placeholders(chunk.len())
+            );
+            let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql.as_str()));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            rows.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
+        }
+        Ok(rows)
+    }
+
     /// [`Self::fetch_rows`] for a filter whose views are already resolved.
     ///
     /// Resolving twice is harmless — it is idempotent — but it is a wasted
     /// round trip, and `get_items` runs both this and the count off one scope.
+    /// The rows are as SQL produced them, not yet mapped ([`Self::mapped`]).
     async fn fetch_rows_resolved(
         &self,
         filter: &InternalItemsQuery,
@@ -1859,15 +1924,16 @@ impl FerrofinItemRepository {
                 .await
                 .map_err(db_err)?
         };
-        Ok(self.mapped_rows(rows))
+        Ok(rows)
     }
 
     /// Runs a translated query returning only the id and clean-name columns.
     ///
     /// Same statement as [`Self::fetch_rows`] but for the projection, so the
     /// rows — and their order — are identical to what `get_item_list` would
-    /// have returned. An `AdjacentTo` window (a few rows) is read as whole
-    /// rows, as `fetch_rows` reads it.
+    /// have returned, except that a row of an unknown stored `Type` is kept, as
+    /// the ids-only reads keep it. An `AdjacentTo` window (a few rows) is read
+    /// as whole rows, as `fetch_rows` reads it.
     async fn fetch_id_clean_names(
         &self,
         filter: &InternalItemsQuery,
@@ -1935,46 +2001,20 @@ impl FerrofinItemRepository {
         Ok(i32::try_from(count).unwrap_or(i32::MAX))
     }
 
-    /// Distinct `ItemValues.Value`s of the given types, optionally scoped to items
-    /// of certain stored `Type`s (C# `GetItemValueNames`).
+    /// One name per `CleanValue` of the given types, optionally scoped to items
+    /// of certain stored `Type`s (C# `GetItemValueNames`); see
+    /// [`item_value_names_statement`].
     async fn item_value_names(
         &self,
         types: &[ItemValueType],
         with_item_types: &[&str],
         exclude_item_types: &[&str],
     ) -> Result<Vec<String>, ServiceError> {
-        let type_ints: Vec<i64> = types.iter().map(|t| i64::from(i32::from(*t))).collect();
-        let mut sql = String::from(
-            r#"SELECT DISTINCT iv."Value" FROM "ItemValuesMap" ivm
-               JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
-               JOIN "BaseItems" bi ON bi."Id" = ivm."ItemId"
-               WHERE iv."Type" IN ("#,
-        );
-        sql.push_str(&placeholders(type_ints.len()));
-        sql.push(')');
-        if !with_item_types.is_empty() {
-            sql.push_str(r#" AND bi."Type" IN ("#);
-            sql.push_str(&placeholders(with_item_types.len()));
-            sql.push(')');
-        }
-        if !exclude_item_types.is_empty() {
-            sql.push_str(r#" AND bi."Type" NOT IN ("#);
-            sql.push_str(&placeholders(exclude_item_types.len()));
-            sql.push(')');
-        }
-        sql.push_str(r#" ORDER BY iv."Value""#);
-
-        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
-        for t in &type_ints {
-            query = query.bind(*t);
-        }
-        for t in with_item_types {
-            query = query.bind((*t).to_owned());
-        }
-        for t in exclude_item_types {
-            query = query.bind((*t).to_owned());
-        }
-        query.fetch_all(self.db.pool()).await.map_err(db_err)
+        item_value_names_statement(types, with_item_types, exclude_item_types)
+            .build_query_scalar::<String>()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)
     }
 
     /// Total for a by-name page that came back empty — `limit=0`, or an offset
@@ -2395,15 +2435,17 @@ impl FerrofinItemRepository {
         let counts_by_clean_name = self.page_counts(&scope, value_types, filter, &rows).await?;
         let items: Vec<ItemWithCounts> = rows
             .into_iter()
-            .map(|r| ItemWithCounts {
-                counts: r
-                    .item
-                    .clean_name
-                    .as_deref()
-                    .and_then(|name| counts_by_clean_name.get(name))
-                    .copied()
-                    .unwrap_or_default(),
-                item: self.mapped(r.item),
+            .filter_map(|r| {
+                Some(ItemWithCounts {
+                    counts: r
+                        .item
+                        .clean_name
+                        .as_deref()
+                        .and_then(|name| counts_by_clean_name.get(name))
+                        .copied()
+                        .unwrap_or_default(),
+                    item: self.mapped(r.item)?,
+                })
             })
             .collect();
         Ok(QueryResult::new(Some(start_index), Some(total), items))
@@ -3215,7 +3257,9 @@ pub(crate) fn images_of_items_sql(placeholders: &str) -> String {
 ///
 /// The stored `Blurhash` is a UTF-8 byte blob; an empty blob (or one that is not
 /// valid UTF-8) becomes [`None`]. A zero/negative width or height (the "unknown"
-/// sentinel) is preserved as-is; the API layer nulls those out per Jellyfin.
+/// sentinel) is preserved as-is; the API layer nulls those out per Jellyfin. A
+/// row with no `DateModified` reads as `DateTime.MinValue`, as upstream's
+/// `e.DateModified ?? DateTime.MinValue` does.
 pub(crate) fn image_info_from_row(
     row: BaseItemImageInfoEntity,
     virtual_paths: &VirtualPathExpander,
@@ -3227,17 +3271,13 @@ pub(crate) fn image_info_from_row(
     ItemImageInfo {
         path: virtual_paths.expand(&row.path),
         image_type: image_type_from_disc(row.image_type),
-        date_modified: row.date_modified.unwrap_or_else(default_epoch),
+        date_modified: row
+            .date_modified
+            .unwrap_or_else(ferrofin_model::json::datetime::dotnet_min),
         width: i32::try_from(row.width).unwrap_or(0),
         height: i32::try_from(row.height).unwrap_or(0),
         blur_hash,
     }
-}
-
-/// The Unix epoch as a UTC timestamp — the placeholder for a row with no stored
-/// `DateModified` (C# leaves the `default(DateTime)`).
-fn default_epoch() -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(Utc::now)
 }
 
 /// Loads the user snapshot needed by repository count queries.
@@ -4036,23 +4076,11 @@ impl ItemRepository for FerrofinItemRepository {
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(row.map(|row| self.mapped(row)))
+        Ok(row.and_then(|row| self.mapped(row)))
     }
 
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let mut rows = Vec::new();
-        for chunk in ferrofin_db::padded_in_chunks(ids) {
-            let sql = format!(
-                r#"SELECT * FROM "BaseItems" WHERE "Id" IN ({})"#,
-                placeholders(chunk.len())
-            );
-            let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql.as_str()));
-            for id in chunk {
-                query = query.bind(guid_to_db(*id));
-            }
-            rows.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
-        }
-        Ok(self.mapped_rows(rows))
+        Ok(self.mapped_rows(self.stored_rows(ids).await?))
     }
 
     async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
@@ -4102,12 +4130,13 @@ impl ItemRepository for FerrofinItemRepository {
                 Ok(None)
             };
         }
-        // Deduplicate by id (nearest-first) in case the tree has a cycle.
+        // Deduplicate by id (nearest-first) in case the tree has a cycle. An
+        // unknown ancestor ends the chain, as `GetParent()` is null there.
         let mut seen = std::collections::HashSet::new();
         let deduped = rows
             .into_iter()
             .filter(|r| seen.insert(r.id.clone()))
-            .map(|r| self.mapped(r))
+            .map_while(|r| self.mapped(r))
             .collect();
         Ok(Some(deduped))
     }
@@ -4144,7 +4173,7 @@ impl ItemRepository for FerrofinItemRepository {
         if let Some(window) = window {
             // `GetItems` counts the trimmed set, then pages it.
             let window_len = window.len();
-            let items = sql_page(self.rows_in_order(&window).await?, filter);
+            let items = self.mapped_rows(sql_page(self.rows_in_order(&window).await?, filter));
             let total = if filter.enable_total_record_count
                 && (filter.limit.is_some() || start_index > 0)
             {
@@ -4155,15 +4184,19 @@ impl ItemRepository for FerrofinItemRepository {
             };
             return Ok(QueryResult::new(Some(start_index), Some(total), items));
         }
-        let items = self
+        let rows = self
             .fetch_rows_resolved(filter, QueryShape::FullRows)
             .await?;
+        // What SQL produced, before `mapped_rows` drops a row of an unknown
+        // type: that is what tells a short page, as upstream counts in SQL.
+        let sql_len = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+        let items = self.mapped_rows(rows);
         let page_len = i32::try_from(items.len()).unwrap_or(i32::MAX);
         // A page that came back SHORT of its own `LIMIT` has nothing after it,
-        // so the total is already in hand: `start_index + page_len`, exactly what
-        // the `COUNT(*)` would return. `fetch_rows` hands back precisely what SQL
-        // produced — no Rust-side dedup or filtering — so a short page can only
-        // mean the result set is exhausted.
+        // so the total is already in hand: `start_index + sql_len`, exactly what
+        // the `COUNT(*)` would return. `sql_len` is precisely what SQL produced
+        // — no Rust-side dedup or filtering — so a short page can only mean the
+        // result set is exhausted.
         //
         // The count is otherwise a second full pass over the page query's
         // predicate, and unlike the page it cannot stop at `LIMIT` rows: 2.367 ms
@@ -4178,20 +4211,20 @@ impl ItemRepository for FerrofinItemRepository {
         // number above the real total, not the total. That case still counts.
         // (`by_name_total_survives_offset_past_end` records the same trap on the
         // by-name path.)
-        let count_is_known = filter.limit.is_some_and(|limit| page_len < limit)
-            && (page_len > 0 || start_index == 0);
-        let total = if filter.enable_total_record_count
-            && (filter.limit.is_some() || start_index > 0)
-            && !count_is_known
-        {
-            self.fetch_count_resolved(filter).await?
-        } else if filter.enable_total_record_count {
-            page_len + start_index
-        } else {
-            // Uncounted: `GetItems` answers `GetItemList`'s page and its length
-            // (v12.4 `BaseItemRepository.Querying.cs:34-40`), whatever the offset.
-            page_len
-        };
+        let count_is_known =
+            filter.limit.is_some_and(|limit| sql_len < limit) && (sql_len > 0 || start_index == 0);
+        let total =
+            if filter.enable_total_record_count && (filter.limit.is_some() || start_index > 0) {
+                if count_is_known {
+                    sql_len + start_index
+                } else {
+                    self.fetch_count_resolved(filter).await?
+                }
+            } else {
+                // Uncounted or unpaged: `GetItems` answers `GetItemList`'s page and
+                // its length (v12.4 `BaseItemRepository.Querying.cs:34-40`).
+                page_len
+            };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
 
@@ -4248,9 +4281,11 @@ impl ItemRepository for FerrofinItemRepository {
             .map_err(db_err)
             .map(|rows| {
                 rows.into_iter()
-                    .map(|row| FolderChild {
-                        item: self.mapped(row.item),
-                        linked: row.linked,
+                    .filter_map(|row| {
+                        Some(FolderChild {
+                            item: self.mapped(row.item)?,
+                            linked: row.linked,
+                        })
                     })
                     .collect()
             })
@@ -4425,8 +4460,9 @@ impl ItemRepository for FerrofinItemRepository {
                     .primary_version_id
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok())
+                    && let Some(row) = self.mapped(row)
                 {
-                    map.entry(primary).or_default().push(self.mapped(row));
+                    map.entry(primary).or_default().push(row);
                 }
             }
         }
@@ -4438,8 +4474,11 @@ impl ItemRepository for FerrofinItemRepository {
         primary_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
         let mut map = rows_by_primary_flagged(&self.db, primary_ids).await?;
-        for (row, _) in map.values_mut().flatten() {
-            self.virtual_paths.expand_in_place(&mut row.path);
+        for rows in map.values_mut() {
+            rows.retain(|(row, _)| has_known_type(row));
+            for (row, _) in rows {
+                self.virtual_paths.expand_in_place(&mut row.path);
+            }
         }
         Ok(map)
     }
@@ -4926,9 +4965,14 @@ impl ItemRepository for FerrofinItemRepository {
             let index = if let Some(&seen) = index_of.get(id) {
                 seen
             } else {
+                // An unknown member has no entry, as `ResolveLinkedChildren`
+                // drops an item `GetItemById` cannot read.
+                let Some(item) = self.mapped(BaseItemEntity::from_row(&row).map_err(db_err)?)
+                else {
+                    continue;
+                };
                 index_of.insert(id.to_owned(), members.items.len());
-                let item = BaseItemEntity::from_row(&row).map_err(db_err)?;
-                members.items.push(self.mapped(item));
+                members.items.push(item);
                 members.items.len() - 1
             };
             members.entries.push(index);
@@ -5148,6 +5192,46 @@ fn item_values_statement(
     qb
 }
 
+/// The statement [`FerrofinItemRepository::item_value_names`] runs, v12.4
+/// `GetItemValueNames` (`BaseItemRepository.ByName.cs:149-172`): the values of
+/// `types` some item maps (an item of a stored `Type` in `with`, and in none of
+/// `exclude`, when given), one `MIN("Value")` per `CleanValue`. SQLite's `MIN`
+/// on TEXT is the binary order, .NET's ordinal `Min`. Upstream has no
+/// `ORDER BY`, so its order is whatever its grouping yields; the `ORDER BY`
+/// here matches the `GROUP BY`, so SQLite adds no second sort.
+/// `item_value_names_statement_reads_values_by_type_and_probes_the_map` pins
+/// the plan.
+fn item_value_names_statement(
+    types: &[ItemValueType],
+    with: &[&str],
+    exclude: &[&str],
+) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> =
+        QueryBuilder::new(r#"SELECT MIN(iv."Value") FROM "ItemValues" AS iv WHERE iv."Type" IN ("#);
+    let mut sep = qb.separated(", ");
+    for t in types {
+        sep.push_bind(i64::from(i32::from(*t)));
+    }
+    qb.push(r#") AND EXISTS (SELECT 1 FROM "ItemValuesMap" AS ivm"#);
+    if !with.is_empty() || !exclude.is_empty() {
+        qb.push(r#" JOIN "BaseItems" AS bi ON bi."Id" = ivm."ItemId""#);
+    }
+    qb.push(r#" WHERE ivm."ItemValueId" = iv."ItemValueId""#);
+    for (names, op) in [(with, " IN ("), (exclude, " NOT IN (")] {
+        if names.is_empty() {
+            continue;
+        }
+        qb.push(r#" AND bi."Type""#).push(op);
+        let mut sep = qb.separated(", ");
+        for name in names {
+            sep.push_bind((*name).to_owned());
+        }
+        qb.push(")");
+    }
+    qb.push(r#") GROUP BY iv."CleanValue" ORDER BY iv."CleanValue""#);
+    qb
+}
+
 /// Builds a `?, ?, …` placeholder list of length `n` (at least one).
 fn placeholders(n: usize) -> String {
     if n == 0 {
@@ -5268,8 +5352,8 @@ mod tests {
     use ferrofin_util::string_extensions::lower_invariant;
 
     /// `MapImageFromEntity`: the type is cast as stored, an unknown one kept;
-    /// an empty or non-UTF-8 blurhash reads as none; no stored date is the
-    /// epoch.
+    /// an empty or non-UTF-8 blurhash reads as none; no stored date is
+    /// `DateTime.MinValue` (`e.DateModified ?? MinValue`), not the epoch.
     #[rstest::rstest]
     #[case::known_type(1, Some(b"LKO2".to_vec()), ImageType::Art, Some("LKO2"))]
     #[case::unknown_type_kept(99, None, ImageType::Unrecognized(99), None)]
@@ -5294,7 +5378,10 @@ mod tests {
         let image = image_info_from_row(row, &VirtualPathExpander::identity());
         assert_eq!(image.image_type, image_type);
         assert_eq!(image.blur_hash.as_deref(), blur_hash);
-        assert_eq!(image.date_modified, default_epoch());
+        assert_eq!(
+            image.date_modified,
+            ferrofin_model::json::datetime::dotnet_min()
+        );
         assert_eq!(
             (image.path.as_str(), image.width, image.height),
             ("/m/poster.jpg", 3, 2)
@@ -9920,6 +10007,69 @@ mod tests {
         assert!(music_genre_names.is_empty(), "{music_genre_names:?}");
     }
 
+    /// v12.4 `BaseItemRepositoryItemValueTests.GetGenreNames_GroupsAndFiltersMappedItemValues`:
+    /// two spellings of one `CleanValue` are one name, the ordinal-least; a
+    /// value no item maps is none; a music item's genres are the music genres.
+    #[tokio::test]
+    async fn genre_names_group_and_filter_mapped_item_values() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0x9011);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        seed_item_genre(&db, movie, "Movie Genre").await;
+        seed_item_genre(&db, movie, "movie genre").await;
+        let audio = Uuid::from_u128(0x9012);
+        seed_named_item(&db, audio, BaseItemKind::Audio, "Audio").await;
+        seed_item_genre(&db, audio, "Music Genre").await;
+        sqlx::query(
+            r#"INSERT INTO "ItemValues" ("ItemValueId", "CleanValue", "Type", "Value")
+               VALUES (?1, 'orphaned genre', ?2, 'Orphaned Genre')"#,
+        )
+        .bind(guid_to_db(Uuid::from_u128(0x9013)))
+        .bind(i32::from(ItemValueType::Genre))
+        .execute(db.writer())
+        .await
+        .expect("orphaned genre");
+
+        let genres = repository.get_genre_names().await.expect("genres");
+        assert_eq!(genres, ["Movie Genre"]);
+        let music = repository.get_music_genre_names().await.expect("music");
+        assert_eq!(music, ["Music Genre"]);
+    }
+
+    /// Every name list groups as `GetItemValueNames` does: one name per
+    /// `CleanValue` across all the list's types (an artist and an album
+    /// artist of one clean name are one), the ordinal-least spelling, in
+    /// `CleanValue` order.
+    #[tokio::test]
+    async fn value_name_lists_take_the_ordinal_least_spelling_per_clean_value() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0x9021);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let other = Uuid::from_u128(0x9022);
+        seed_named_item(&db, other, BaseItemKind::Movie, "Other").await;
+        for (id, value_type, value) in [
+            (movie, ItemValueType::Genre, "sci-fi"),
+            (other, ItemValueType::Genre, "Sci-Fi"),
+            (movie, ItemValueType::Genre, "Zeta"),
+            (other, ItemValueType::Genre, "alpha"),
+            (movie, ItemValueType::Studios, "warner bros."),
+            (other, ItemValueType::Studios, "Warner Bros"),
+            (movie, ItemValueType::Artist, "abba"),
+            (other, ItemValueType::AlbumArtist, "ABBA"),
+        ] {
+            seed_item_value(&db, id, value_type, value).await;
+        }
+
+        let genres = repository.get_genre_names().await.expect("genres");
+        assert_eq!(genres, ["alpha", "Sci-Fi", "Zeta"]);
+        let studios = repository.get_studio_names().await.expect("studios");
+        assert_eq!(studios, ["Warner Bros"]);
+        let artists = repository.get_all_artist_names().await.expect("artists");
+        assert_eq!(artists, ["ABBA"]);
+    }
+
     #[tokio::test]
     async fn query_filters_legacy_collects_years_ratings_genres_tags() {
         let db = test_db().await;
@@ -10687,6 +10837,54 @@ mod tests {
                 "{plan:#?}"
             );
             assert!(!plan.iter().any(|d| d.starts_with("SCAN ")), "{plan:#?}");
+        }
+    }
+
+    /// Plan pin for the name lists' statement: the values of the list's types
+    /// by a `Type` index, each probed in the map by its own key and, under an
+    /// item-type filter, its items by theirs. No scan, and the `ORDER BY` adds
+    /// no sort of its own.
+    #[tokio::test]
+    async fn item_value_names_statement_reads_values_by_type_and_probes_the_map() {
+        use crate::item_type_lookup::MUSIC_GENRE_TYPES;
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        for (types, with, exclude) in [
+            (GENRE_TYPES, MUSIC_GENRE_TYPES, &[][..]),
+            (GENRE_TYPES, &[][..], MUSIC_GENRE_TYPES),
+            (STUDIO_TYPES, &[][..], &[][..]),
+            (ALL_ARTIST_TYPES, &[][..], &[][..]),
+        ] {
+            let mut qb = item_value_names_statement(types, with, exclude);
+            let mut query = qb.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>();
+            let at = |prefix: &str| {
+                plan.iter()
+                    .position(|d| d.starts_with(prefix))
+                    .unwrap_or_else(|| panic!("no {prefix}: {plan:#?}"))
+            };
+            let (iv, ivm) = (
+                at("SEARCH iv USING INDEX IX_ItemValues_Type_"),
+                at("SEARCH ivm "),
+            );
+            assert!(
+                iv < ivm && plan[ivm].contains("(ItemValueId=?)"),
+                "{plan:#?}"
+            );
+            if !with.is_empty() || !exclude.is_empty() {
+                let bi = at("SEARCH bi ");
+                assert!(ivm < bi && plan[bi].ends_with("(Id=?)"), "{plan:#?}");
+            }
+            assert!(!plan.iter().any(|d| d.starts_with("SCAN ")), "{plan:#?}");
+            assert!(!plan.iter().any(|d| d.contains("ORDER BY")), "{plan:#?}");
         }
     }
 
@@ -17473,3 +17671,7 @@ mod folder_sort_key_tests;
 #[cfg(test)]
 #[path = "item_repository/folder_sql_order_tests.rs"]
 mod folder_sql_order_tests;
+
+#[cfg(test)]
+#[path = "item_repository/unknown_type_tests.rs"]
+mod unknown_type_tests;

@@ -182,8 +182,8 @@ fn item_name(name: Option<&str>, series_name: Option<&str>, artists: &[String]) 
     if let Some(series) = series_name.filter(|s| !s.is_empty()) {
         out = format!("{series} - {out}");
     }
-    // C# `item.Artists[0]`.
-    if let Some(first) = artists.iter().find(|a| !a.is_empty()) {
+    // C# `item.Artists[0]`, empty or not.
+    if let Some(first) = artists.first() {
         out = format!("{first} - {out}");
     }
     out
@@ -339,8 +339,11 @@ mod tests {
             item_name(Some("Ep"), Some("Show"), &artists(&["A"])),
             "A - Show - Ep"
         );
-        // Empty strings must not produce a bare separator.
-        assert_eq!(item_name(Some("X"), Some(""), &artists(&[""])), "X");
+        // An empty series is skipped (`IsNullOrEmpty`); the first artist is
+        // taken as it is, empty or not. Only a reported `Item` can carry one:
+        // a library item's are split with the empty segments dropped.
+        assert_eq!(item_name(Some("X"), Some(""), &artists(&[""])), " - X");
+        assert_eq!(item_name(Some("X"), None, &artists(&["", "B"])), " - X");
         assert_eq!(item_name(None, None, &[]), "");
     }
 

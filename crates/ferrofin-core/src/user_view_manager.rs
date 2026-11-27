@@ -66,13 +66,14 @@ use ferrofin_util::sort_name::create_sort_name;
 /// token, hence the suffix match.
 pub(crate) const LIVE_TV_VIEW_PATH_SUFFIX: &str = "/views/livetv";
 
-/// Whether `GetNamedView` queues the refresh of a user's view it found
-/// (`LibraryManager.cs:3095-3115`): it was never refreshed, its last refresh
-/// is `_viewRefreshInterval` (24 hours, `:101`) old or older, or its display
-/// parent was saved since.
+/// Whether `GetNamedView` or `GetShadowView` queues the forced refresh of a
+/// user's view or a shadow view it found (`LibraryManager.cs:3095-3115`,
+/// `:3168-3187`): it was never refreshed, its last refresh is
+/// `_viewRefreshInterval` (24 hours, `:101`) old or older, or its display
+/// parent, when it has one, was saved since.
 fn view_refresh_due(
     view: &BaseItemEntity,
-    display_parent: &BaseItemEntity,
+    display_parent: Option<&BaseItemEntity>,
     now: chrono::DateTime<Utc>,
 ) -> bool {
     let Some(refreshed) = view.date_last_refreshed else {
@@ -80,8 +81,50 @@ fn view_refresh_due(
     };
     now - refreshed >= chrono::TimeDelta::hours(24)
         || display_parent
-            .date_last_saved
+            .and_then(|parent| parent.date_last_saved)
             .is_some_and(|saved| saved > refreshed)
+}
+
+/// What the refresh `GetNamedView` and `GetShadowView` queue for a view
+/// leaves on its row, made at once as the view's save
+/// (`MetadataService.RefreshMetadata`, `MetadataService.cs:223,242-256`): the
+/// restat of its directory leaves no `DateModified` (D2), and the refresh
+/// is stamped. The save stamps `DateLastSaved`: an update with its own time,
+/// and an insert as the row carries it, so a new view's caller sets it too.
+async fn stamp_view_refresh(row: &mut BaseItemEntity, now: chrono::DateTime<Utc>) {
+    ferrofin_providers::provider_manager::restat_directory(row).await;
+    row.date_last_refreshed = Some(now);
+}
+
+/// When `dir`, the directory `GetNamedView` just created for a view, was
+/// created (`DirectoryInfo.CreationTimeUtc`), or `fallback` when it cannot
+/// be read.
+async fn view_directory_created(
+    dir: &std::path::Path,
+    fallback: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    tokio::fs::metadata(dir)
+        .await
+        .ok()
+        .map_or(fallback, |meta| {
+            crate::library_scan::created_and_modified(&meta).0
+        })
+}
+
+/// Saves a stored view refreshed ([`stamp_view_refresh`]); `view` names its
+/// kind in the log. Upstream queues this refresh, so it never fails the
+/// listing: a failure is logged, the row stays due, and the next listing
+/// retries it.
+async fn save_view_refresh(
+    persistence: &dyn ItemPersistenceService,
+    row: &mut BaseItemEntity,
+    now: chrono::DateTime<Utc>,
+    view: &str,
+) {
+    stamp_view_refresh(row, now).await;
+    if let Err(err) = persistence.save_items(std::slice::from_ref(row)).await {
+        tracing::warn!(%err, item_id = %row.id, view, "view refresh failed");
+    }
 }
 
 /// Whether `path` is the Live TV view's, in either separator — C# builds it
@@ -300,7 +343,10 @@ impl FerrofinUserViewManager {
 
     /// `GetNamedView(name, folders, "")`: localization changes the display name
     /// while the type/path-derived id stays stable. Disabled views remain stored
-    /// so the user's hidden-view preferences survive a later re-enable.
+    /// so the user's hidden-view preferences survive a later re-enable. A new
+    /// view is dated from its directory and saved as the refresh queued for it
+    /// leaves it ([`stamp_view_refresh`]); that refresh is never repeated for
+    /// the view's age (`LibraryManager.cs:3002-3052`).
     async fn folders_view(&self) -> Result<Option<BaseItemEntity>, ServiceError> {
         let (Some(configuration), Some(persistence), Some(metadata_path)) =
             (&self.configuration, &self.persistence, &self.metadata_path)
@@ -361,9 +407,9 @@ impl FerrofinUserViewManager {
                 })
         });
         if same_path
-            && previous
-                .as_ref()
-                .is_some_and(|row| row.name.as_deref() == Some(name.as_str()))
+            && previous.as_ref().is_some_and(|row| {
+                row.name.as_deref() == Some(name.as_str()) && row.date_last_refreshed.is_some()
+            })
         {
             return Ok(previous);
         }
@@ -381,12 +427,9 @@ impl FerrofinUserViewManager {
             let metadata = tokio::fs::metadata(&view_path).await.map_err(|error| {
                 ServiceError::backend(format!("read folders view directory dates: {error}"))
             })?;
-            row.date_created = metadata
-                .created()
-                .or_else(|_| metadata.modified())
-                .ok()
-                .map(chrono::DateTime::<Utc>::from);
-            row.date_modified = metadata.modified().ok().map(chrono::DateTime::<Utc>::from);
+            let (created, modified) = crate::library_scan::created_and_modified(&metadata);
+            row.date_created = Some(created);
+            row.date_modified = Some(modified);
         }
         row.id = ferrofin_db::store::guid_to_db(id);
         item_type_lookup::stored_type_name(BaseItemKind::UserView)
@@ -398,8 +441,15 @@ impl FerrofinUserViewManager {
         row.path = Some(view_path.to_string_lossy().into_owned());
         row.parent_id = None;
         row.is_folder = true;
-        // TODO(gl-1655): GetNamedView's first refresh leaves this view no DateModified and stamps DateLastRefreshed.
         row.date_created = row.date_created.or_else(|| Some(Utc::now()));
+        // The refresh queued for a new or renamed view saves only as a first
+        // refresh (`MetadataService.cs:95,242`); a view an earlier build stored
+        // without one gets it here too.
+        if row.date_last_refreshed.is_none() {
+            let now = Utc::now();
+            stamp_view_refresh(&mut row, now).await;
+            row.date_last_saved = Some(now);
+        }
         let mut data = crate::item_data::parse_data(row.data.as_deref());
         data.insert("ViewType".to_owned(), serde_json::json!("folders"));
         row.data = Some(serde_json::Value::Object(data).to_string());
@@ -728,6 +778,10 @@ impl FerrofinUserViewManager {
     /// [`grouped_view_id`], created on first read under
     /// `{InternalMetadataPath}/views/{id N}` with its `ViewType` and `UserId`,
     /// and renamed when the server-localized `name_key` reads differently.
+    /// It is dated from its directory and refreshed when new and then whenever
+    /// [`view_refresh_due`] says, with no display parent (`:3095-3115`); the
+    /// refresh is its save ([`save_view_refresh`]). TODO(gl-1656): upstream's
+    /// refresh also draws the view's collage (`DynamicImageProvider`).
     /// `None` without an item store and a metadata path.
     async fn grouped_view(
         &self,
@@ -752,31 +806,44 @@ impl FerrofinUserViewManager {
                 row.name = Some(name);
                 persistence.save_items(std::slice::from_ref(&row)).await?;
             }
+            let now = Utc::now();
+            if view_refresh_due(&row, None, now) {
+                // A view an earlier build wrote has no `ForcedSortName`.
+                row.forced_sort_name.get_or_insert_default();
+                save_view_refresh(persistence.as_ref(), &mut row, now, "grouped").await;
+            }
             return Ok(Some(row));
         }
         let view_path = metadata_path.join("views").join(id.simple().to_string());
         tokio::fs::create_dir_all(&view_path)
             .await
             .map_err(|e| ServiceError::backend(format!("create grouped view directory: {e}")))?;
+        // The refresh follows the creation, as upstream's queued one does.
+        let refreshed = Utc::now();
+        let created = view_directory_created(&view_path, refreshed).await;
         let data = serde_json::json!({
             "ViewType": view_type,
             "UserId": user_id.simple().to_string(),
         });
-        let entity = BaseItemEntity {
+        let mut entity = BaseItemEntity {
             id: ferrofin_db::store::guid_to_db(id),
             type_: item_type_lookup::stored_type_name(BaseItemKind::UserView)
                 .unwrap_or_default()
                 .to_owned(),
+            // `GetUserView(parents, …)` passes `string.Empty` as the
+            // `ForcedSortName`: the sort name comes from the name.
             sort_name: Some(create_sort_name(&name)),
+            forced_sort_name: Some(String::new()),
             name: Some(name),
             path: Some(view_path.to_string_lossy().into_owned()),
             parent_id: None,
             is_folder: true,
-            // TODO(gl-1655): dated from its directory and refreshed, as GetNamedView does.
-            date_created: Some(Utc::now()),
+            date_created: Some(created),
+            date_last_saved: Some(refreshed),
             data: Some(data.to_string()),
             ..BaseItemEntity::default()
         };
+        stamp_view_refresh(&mut entity, refreshed).await;
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;
@@ -827,10 +894,13 @@ impl FerrofinUserViewManager {
     /// times date it), `ViewType` and `DisplayParentId`, and no parent.
     /// `None` without an item store, or for a library with no id or path.
     ///
-    /// TODO(parity, open work item gl-1655): `GetShadowView` also queues the
-    /// view's metadata refresh (new, stale, or older than its library's
-    /// `DateLastSaved`); TODO(parity, open work item gl-1656): the refresh
-    /// draws its collage.
+    /// The view is refreshed when new and then whenever [`view_refresh_due`]
+    /// says, the library being its display parent (`:3168-3187`); the refresh
+    /// is its save ([`save_view_refresh`]). Upstream's refresh draws no
+    /// collage on it: `DynamicImageProvider` takes only movies, TV shows and
+    /// playlists views, and its query for a movies or TV shows shadow view,
+    /// which has no user, throws in `SetUser`, so upstream never stamps the
+    /// refresh of those two (the `access-filtering` parity row's divergence).
     async fn shadow_view(
         &self,
         library: &BaseItemEntity,
@@ -847,43 +917,49 @@ impl FerrofinUserViewManager {
         let Some(id) = shadow_view_id(&self.id_derivation, &name, parent_id, view_type) else {
             return Ok(None);
         };
-        if let Some(row) = self.items.retrieve_item(id).await? {
+        if let Some(mut row) = self.items.retrieve_item(id).await? {
+            let now = Utc::now();
+            if view_refresh_due(&row, Some(library), now) {
+                // A view an earlier build wrote has no `ForcedSortName`.
+                row.forced_sort_name.get_or_insert_default();
+                save_view_refresh(persistence.as_ref(), &mut row, now, "shadow").await;
+            }
             return Ok(Some(row));
         }
         // `Directory.CreateDirectory(path)`, whose `CreationTimeUtc` and
-        // `LastWriteTimeUtc` become the view's dates.
+        // `LastWriteTimeUtc` become the view's dates, until its refresh.
         tokio::fs::create_dir_all(path)
             .await
             .map_err(|e| ServiceError::backend(format!("create shadow view directory: {e}")))?;
         let metadata = tokio::fs::metadata(path)
             .await
             .map_err(|e| ServiceError::backend(format!("read shadow view directory: {e}")))?;
+        let (created, modified) = crate::library_scan::created_and_modified(&metadata);
+        // The refresh follows the creation, as upstream's queued one does.
+        let refreshed = Utc::now();
         let data = serde_json::json!({
             "ViewType": view_type,
             "DisplayParentId": parent_id.simple().to_string(),
         });
-        let entity = BaseItemEntity {
+        let mut entity = BaseItemEntity {
             id: ferrofin_db::store::guid_to_db(id),
             type_: item_type_lookup::stored_type_name(BaseItemKind::UserView)
                 .unwrap_or_default()
                 .to_owned(),
             // `ForcedSortName = string.Empty`: the sort name comes from the name.
             sort_name: Some(create_sort_name(&name)),
+            forced_sort_name: Some(String::new()),
             name: Some(name),
             path: Some(path.to_owned()),
             parent_id: None,
             is_folder: true,
-            // `CreationTimeUtc` falls back to the write time without a birth
-            // time, as `folders_view` reads it.
-            date_created: metadata
-                .created()
-                .or_else(|_| metadata.modified())
-                .ok()
-                .map(chrono::DateTime::<Utc>::from),
-            date_modified: metadata.modified().ok().map(chrono::DateTime::<Utc>::from),
+            date_created: Some(created),
+            date_modified: Some(modified),
+            date_last_saved: Some(refreshed),
             data: Some(data.to_string()),
             ..BaseItemEntity::default()
         };
+        stamp_view_refresh(&mut entity, refreshed).await;
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;
@@ -953,7 +1029,7 @@ impl FerrofinUserViewManager {
                 .unwrap_or_else(|| PLAYLISTS_FOLDER_NAME.to_owned());
             let stored = listed.iter().find(|row| row.id == stored_id);
             let renamed = stored.is_some_and(|row| row.name.as_deref() != Some(name.as_str()));
-            if stored.is_some_and(|row| !renamed && !view_refresh_due(row, &folder, now)) {
+            if stored.is_some_and(|row| !renamed && !view_refresh_due(row, Some(&folder), now)) {
                 continue;
             }
             // 12.2: the folder is skipped before `GetNamedView`, so a user
@@ -976,14 +1052,8 @@ impl FerrofinUserViewManager {
                     persistence.save_items(std::slice::from_ref(&row)).await?;
                     written = true;
                 }
-                if view_refresh_due(&row, &folder, now) {
-                    ferrofin_providers::provider_manager::restat_directory(&mut row).await;
-                    row.date_last_refreshed = Some(now);
-                    // Upstream queues this refresh, so it never fails the
-                    // listing; the row stays due and the next listing retries it.
-                    if let Err(err) = persistence.save_items(std::slice::from_ref(&row)).await {
-                        tracing::warn!(%err, item_id = %id, "playlists view refresh failed");
-                    }
+                if view_refresh_due(&row, Some(&folder), now) {
+                    save_view_refresh(persistence.as_ref(), &mut row, now, "playlists").await;
                 }
                 continue;
             }
@@ -993,12 +1063,7 @@ impl FerrofinUserViewManager {
             })?;
             // The refresh follows the creation, as upstream's queued one does.
             let refreshed = Utc::now();
-            let created = tokio::fs::metadata(&view_path)
-                .await
-                .ok()
-                .map_or(refreshed, |dir| {
-                    crate::library_scan::created_and_modified(&dir).0
-                });
+            let created = view_directory_created(&view_path, refreshed).await;
             let data = serde_json::json!({
                 "ViewType": "playlists",
                 "DisplayParentId": parent.simple().to_string(),
@@ -1082,6 +1147,11 @@ impl FerrofinUserViewManager {
     /// `None` means the manager has no item store or metadata path wired;
     /// otherwise the id and whether a row was written. With `listed`, the view
     /// rows the caller has read, the row is looked for there instead of by id.
+    ///
+    /// `GetNamedView(name, livetv, name)` (`LibraryManager.cs:3002-3052`): a
+    /// new view is dated from its directory and saved as the refresh queued
+    /// for it leaves it ([`stamp_view_refresh`]), and that refresh is never
+    /// repeated for the view's age.
     async fn provision_live_tv_view(
         &self,
         listed: Option<&[BaseItemEntity]>,
@@ -1111,19 +1181,31 @@ impl FerrofinUserViewManager {
         };
         if let Some(mut row) = stored {
             let renamed = row.name.as_deref() != Some(name.as_str());
+            // The refresh queued for a renamed view saves only as a first
+            // refresh (`MetadataService.cs:95,242`); a view an earlier build
+            // stored without one gets it here too.
+            let refresh = row.date_last_refreshed.is_none();
             if renamed {
                 row.sort_name = Some(ferrofin_util::sort_name::forced_sort_key(&name));
                 row.forced_sort_name = Some(name.clone());
                 row.name = Some(name);
+                if refresh {
+                    stamp_view_refresh(&mut row, Utc::now()).await;
+                }
                 persistence.save_items(std::slice::from_ref(&row)).await?;
+            } else if refresh {
+                save_view_refresh(persistence.as_ref(), &mut row, Utc::now(), "live tv").await;
             }
-            return Ok(Some((id, renamed)));
+            return Ok(Some((id, renamed || refresh)));
         }
         // C# `Directory.CreateDirectory(path)` inside `GetNamedView`.
         tokio::fs::create_dir_all(&view_path)
             .await
             .map_err(|e| ServiceError::backend(format!("create live tv view directory: {e}")))?;
-        let entity = BaseItemEntity {
+        // The refresh follows the creation, as upstream's queued one does.
+        let refreshed = Utc::now();
+        let created = view_directory_created(&view_path, refreshed).await;
+        let mut entity = BaseItemEntity {
             // `guid_to_db`, not `to_string()`: `BaseItems."Id"` is plain TEXT
             // with no COLLATE NOCASE, so a lowercase id is a different row.
             id: ferrofin_db::store::guid_to_db(id),
@@ -1142,13 +1224,14 @@ impl FerrofinUserViewManager {
             // provision it.
             parent_id: None,
             is_folder: true,
-            // TODO(gl-1655): dated from its directory and refreshed, as GetNamedView does.
-            date_created: Some(Utc::now()),
+            date_created: Some(created),
+            date_last_saved: Some(refreshed),
             // `UserView.ViewType` backs `IHasCollectionType.CollectionType`
             // (UserView.cs:58) and is what the DTO projection reads.
             data: Some(r#"{"ViewType":"livetv"}"#.to_owned()),
             ..BaseItemEntity::default()
         };
+        stamp_view_refresh(&mut entity, refreshed).await;
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;
@@ -2931,7 +3014,7 @@ mod tests {
         seed_user(&db, user_id).await;
         let user = guid_to_db(user_id);
         let mut tx = db.writer().begin().await.expect("begin");
-        crate::user_entity_ext::seed_defaults(&mut tx, &user)
+        crate::user_entity_ext::seed_defaults(&mut tx, &user, &[])
             .await
             .expect("permissions");
         tx.commit().await.expect("commit");
@@ -5523,7 +5606,7 @@ mod tests {
         let user_id = Uuid::from_u128(0x5111);
         seed_user(&db, user_id).await;
         let mut tx = db.writer().begin().await.expect("begin");
-        crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(user_id))
+        crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(user_id), &[])
             .await
             .expect("permissions");
         tx.commit().await.expect("commit");
@@ -6014,7 +6097,8 @@ mod tests {
             crate::test_support::fetch_item(&db, films).await.path
         );
         assert_eq!(made.parent_id, None);
-        assert!(made.date_created.is_some() && made.date_modified.is_some());
+        assert!(made.date_created.is_some());
+        assert_eq!(made.date_modified, None, "its refresh's restat");
 
         // The plain listing keeps the libraries (and hides Films by its id).
         assert_eq!(
@@ -6037,7 +6121,7 @@ mod tests {
         let user = Uuid::from_u128(0x7821);
         seed_user(&db, user).await;
         let mut tx = db.writer().begin().await.expect("begin");
-        crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(user))
+        crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(user), &[])
             .await
             .expect("permissions");
         tx.commit().await.expect("commit");
@@ -6284,5 +6368,403 @@ mod tests {
         .await
         .expect("hide");
         assert_eq!(view_names(&mgr, user).await, ["Series"]);
+    }
+
+    type ViewDates = (
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+    );
+
+    /// A stored view's `DateCreated`, `DateModified`, `DateLastRefreshed` and
+    /// `DateLastSaved`.
+    async fn view_dates(db: &Database, id: Uuid) -> ViewDates {
+        let row = crate::test_support::fetch_item(db, id).await;
+        (
+            row.date_created,
+            row.date_modified,
+            row.date_last_refreshed,
+            row.date_last_saved,
+        )
+    }
+
+    /// Asserts what a view's first refresh leaves (`MetadataService.cs:95,
+    /// 223,242-256`): created when `dir` was, no `DateModified` (the restat of
+    /// a directory), the refresh and the save stamped. Returns the refresh.
+    async fn assert_first_refresh(
+        db: &Database,
+        id: Uuid,
+        dir: &std::path::Path,
+    ) -> chrono::DateTime<Utc> {
+        let dir_created =
+            crate::library_scan::created_and_modified(&std::fs::metadata(dir).expect("dir")).0;
+        let (created, modified, refreshed, saved) = view_dates(db, id).await;
+        assert_eq!(
+            created.map(ferrofin_db::store::datetime_to_db),
+            Some(ferrofin_db::store::datetime_to_db(dir_created)),
+            "dated from its directory"
+        );
+        assert_eq!(modified, None, "the refresh's restat of a directory");
+        let refreshed = refreshed.expect("refreshed when new");
+        assert!(saved.expect("saved") >= refreshed);
+        refreshed
+    }
+
+    /// A stored view's `ForcedSortName`.
+    async fn forced_sort_name(db: &Database, id: Uuid) -> Option<String> {
+        crate::test_support::fetch_item(db, id)
+            .await
+            .forced_sort_name
+    }
+
+    /// Clears a stored view's `ForcedSortName`, as an earlier build left the
+    /// grouped and shadow views.
+    async fn without_forced_sort_name(db: &Database, id: Uuid) {
+        let mut row = crate::test_support::fetch_item(db, id).await;
+        row.forced_sort_name = None;
+        crate::test_support::save_item(db, &row).await;
+        assert_eq!(forced_sort_name(db, id).await, None);
+    }
+
+    /// Clears a stored view's `DateLastRefreshed`, as an earlier build left
+    /// every view but the Playlists one, and gives it a `DateModified`.
+    async fn never_refreshed(db: &Database, id: Uuid) {
+        let mut row = crate::test_support::fetch_item(db, id).await;
+        row.date_last_refreshed = None;
+        row.date_modified = Some(Utc::now());
+        crate::test_support::save_item(db, &row).await;
+    }
+
+    /// gl-1655: `GetNamedView(user, …)` (`LibraryManager.cs:3054-3117`)
+    /// dates a new grouped view from its directory and gives it the forced
+    /// refresh, then again when it never was or 24 hours after its last
+    /// refresh. A grouped view has no display parent (`Guid.Empty`).
+    #[tokio::test]
+    async fn a_grouped_view_is_dated_from_its_directory_and_refreshed_when_new_and_daily() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = Uuid::from_u128(0x7771);
+        seed_user(&db, user).await;
+        let (action, comedy) = (Uuid::from_u128(0x7772), Uuid::from_u128(0x7773));
+        seed_library(&db, action, "Action", Some("movies")).await;
+        seed_library(&db, comedy, "Comedy", Some("movies")).await;
+        group(&db, user, &[action, comedy]).await;
+        let mgr = grouping_manager(&db, tmp.path());
+        let id = grouped_view_id(&mgr.id_derivation, user, "movies").expect("id");
+        let seed = crate::item_persistence_service::seed_refresh_dates;
+
+        assert_eq!(view_names(&mgr, user).await, ["Movies"]);
+        let dir = tmp.path().join("views").join(id.simple().to_string());
+        let refreshed = assert_first_refresh(&db, id, &dir).await;
+        // `GetUserView(parents, …)`'s `string.Empty`.
+        assert_eq!(forced_sort_name(&db, id).await.as_deref(), Some(""));
+        assert_eq!(view_names(&mgr, user).await, ["Movies"]);
+        assert_eq!(
+            view_dates(&db, id).await.2,
+            Some(refreshed),
+            "fresh: no refresh"
+        );
+
+        let now = Utc::now();
+        seed(
+            &db,
+            id,
+            Some(now),
+            Some(now - chrono::TimeDelta::hours(23)),
+            None,
+        )
+        .await;
+        let before = view_dates(&db, id).await;
+        assert_eq!(view_names(&mgr, user).await, ["Movies"]);
+        assert_eq!(view_dates(&db, id).await, before, "23 hours: no refresh");
+
+        seed(
+            &db,
+            id,
+            None,
+            Some(now - chrono::TimeDelta::hours(25)),
+            None,
+        )
+        .await;
+        assert_eq!(view_names(&mgr, user).await, ["Movies"]);
+        let (_, modified, refreshed, saved) = view_dates(&db, id).await;
+        assert_eq!(modified, None, "the refresh's restat");
+        assert!(refreshed.expect("refreshed") >= now, "25 hours");
+        assert!(saved >= refreshed);
+
+        never_refreshed(&db, id).await;
+        without_forced_sort_name(&db, id).await;
+        let sort_name = crate::test_support::fetch_item(&db, id).await.sort_name;
+        assert_eq!(view_names(&mgr, user).await, ["Movies"]);
+        let (_, modified, again, _) = view_dates(&db, id).await;
+        assert_eq!(modified, None);
+        assert!(again > refreshed, "never refreshed: due");
+        let row = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(
+            row.forced_sort_name.as_deref(),
+            Some(""),
+            "an earlier build's view takes it at its refresh"
+        );
+        assert_eq!(
+            row.sort_name, sort_name,
+            "the sort name still comes from the name"
+        );
+
+        // A value already set stays.
+        let mut row = row;
+        row.forced_sort_name = Some("Zed".to_owned());
+        crate::test_support::save_item(&db, &row).await;
+        never_refreshed(&db, id).await;
+        assert_eq!(view_names(&mgr, user).await, ["Movies"]);
+        assert_eq!(view_dates(&db, id).await.1, None, "refreshed");
+        assert_eq!(forced_sort_name(&db, id).await.as_deref(), Some("Zed"));
+    }
+
+    /// gl-1655: `GetShadowView` (`LibraryManager.cs:3131-3190`) gives a new
+    /// shadow view the forced refresh, then again 24 hours after its last
+    /// refresh or once its library (the display parent) was saved since.
+    #[tokio::test]
+    async fn a_shadow_view_is_refreshed_when_new_daily_and_after_its_library_is_saved() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = Uuid::from_u128(0x7781);
+        seed_user(&db, user).await;
+        let shows = Uuid::from_u128(0x7782);
+        seed_library(&db, shows, "Shows", Some("tvshows")).await;
+        let library_dir = tmp.path().join("root").join("Shows");
+        set_item_path(&db, shows, library_dir.to_str().expect("utf-8")).await;
+        let mgr = grouping_manager(&db, &tmp.path().join("metadata"));
+        let id = shadow_view_id(&mgr.id_derivation, "Shows", shows, "tvshows").expect("id");
+        let preset = UserViewQuery {
+            preset_views: vec![CollectionType::tvshows],
+            ..UserViewQuery::default()
+        };
+        let list = || async {
+            let views = mgr
+                .get_user_views_with_query(user, &preset)
+                .await
+                .expect("views");
+            assert_eq!(views.iter().map(uuid).collect::<Vec<_>>(), [id]);
+        };
+        let seed = crate::item_persistence_service::seed_refresh_dates;
+        let library_saved_at = |at| seed(&db, shows, None, None, Some(at));
+
+        list().await;
+        let refreshed = assert_first_refresh(&db, id, &library_dir).await;
+        // `GetUserView(folder, …, string.Empty)`.
+        assert_eq!(forced_sort_name(&db, id).await.as_deref(), Some(""));
+        list().await;
+        assert_eq!(
+            view_dates(&db, id).await.2,
+            Some(refreshed),
+            "fresh: no refresh"
+        );
+
+        let now = Utc::now();
+        seed(
+            &db,
+            id,
+            Some(now),
+            Some(now - chrono::TimeDelta::hours(23)),
+            None,
+        )
+        .await;
+        library_saved_at(now - chrono::TimeDelta::hours(24)).await;
+        let before = view_dates(&db, id).await;
+        list().await;
+        assert_eq!(
+            view_dates(&db, id).await,
+            before,
+            "23 hours, library saved before"
+        );
+
+        // The library saved before the last refresh: only the age is due.
+        library_saved_at(now - chrono::TimeDelta::hours(48)).await;
+        seed(
+            &db,
+            id,
+            None,
+            Some(now - chrono::TimeDelta::hours(25)),
+            None,
+        )
+        .await;
+        list().await;
+        let (_, modified, refreshed, _) = view_dates(&db, id).await;
+        assert_eq!(modified, None, "the refresh's restat");
+        assert!(refreshed.expect("refreshed") >= now, "25 hours");
+
+        seed(&db, id, None, Some(now - chrono::TimeDelta::hours(1)), None).await;
+        library_saved_at(now - chrono::TimeDelta::minutes(30)).await;
+        list().await;
+        assert!(
+            view_dates(&db, id).await.2.expect("refreshed") >= now,
+            "the library was saved since"
+        );
+
+        never_refreshed(&db, id).await;
+        without_forced_sort_name(&db, id).await;
+        let sort_name = crate::test_support::fetch_item(&db, id).await.sort_name;
+        list().await;
+        let row = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(
+            row.forced_sort_name.as_deref(),
+            Some(""),
+            "an earlier build's view takes it at its refresh"
+        );
+        assert_eq!(
+            row.sort_name, sort_name,
+            "the sort name still comes from the name"
+        );
+
+        // A value already set stays.
+        let mut row = row;
+        row.forced_sort_name = Some("Zed".to_owned());
+        crate::test_support::save_item(&db, &row).await;
+        never_refreshed(&db, id).await;
+        list().await;
+        assert_eq!(view_dates(&db, id).await.1, None, "refreshed");
+        assert_eq!(forced_sort_name(&db, id).await.as_deref(), Some("Zed"));
+    }
+
+    /// gl-1655: `GetNamedView(name, viewType, sortName)`
+    /// (`LibraryManager.cs:3002-3052`) gives the Folders view its refresh
+    /// when it is new or renamed, never for its age; renaming one already
+    /// refreshed saves the name and leaves its refresh, as upstream's
+    /// refresh saves nothing that did not change. A view stored without a
+    /// refresh, as an earlier build left it, gets its first refresh.
+    #[tokio::test]
+    async fn the_folders_view_is_refreshed_when_new_never_for_its_age() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(0x7791);
+        seed_user(&db, user).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let metadata = tmp.path().join("metadata");
+        let config = Arc::new(DashboardConfiguration::default());
+        config.0.lock().expect("config").enable_folder_view = true;
+        let localization = Arc::new(
+            crate::LocalizationManager::new("US").with_ui_culture_source({
+                let config = Arc::clone(&config);
+                move || config.0.lock().expect("config").ui_culture.clone()
+            }),
+        );
+        let mgr = manager(&db)
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
+            .with_metadata_path(metadata.clone())
+            .with_database(db.clone())
+            .with_dashboard_configuration(config.clone(), localization);
+        let id =
+            crate::user_view_repository::named_view_id(&mgr.id_derivation, &metadata, "folders")
+                .expect("id");
+        let read = || async {
+            assert!(
+                mgr.get_user_views(user)
+                    .await
+                    .expect("views")
+                    .iter()
+                    .any(|view| uuid(view) == id)
+            );
+        };
+
+        read().await;
+        assert_first_refresh(&db, id, &metadata.join("views").join("folders")).await;
+
+        let now = Utc::now();
+        let old = now - chrono::TimeDelta::hours(25);
+        crate::item_persistence_service::seed_refresh_dates(&db, id, Some(now), Some(old), None)
+            .await;
+        let before = view_dates(&db, id).await;
+        read().await;
+        assert_eq!(view_dates(&db, id).await, before, "25 hours: no refresh");
+
+        config.0.lock().expect("config").ui_culture = "fr".to_owned();
+        read().await;
+        let (_, modified, refreshed, saved) = view_dates(&db, id).await;
+        assert_eq!(
+            (modified, refreshed),
+            (before.1, before.2),
+            "renamed: saved, not refreshed again"
+        );
+        assert!(saved > before.3);
+
+        never_refreshed(&db, id).await;
+        read().await;
+        let (_, modified, refreshed, _) = view_dates(&db, id).await;
+        assert_eq!(modified, None, "the first refresh's restat");
+        assert!(
+            refreshed.expect("refreshed") >= now,
+            "never refreshed: its first refresh"
+        );
+    }
+
+    /// gl-1655: the Live TV view is `GetNamedView(name, livetv, name)`, the
+    /// same overload as the Folders view: dated from its directory and
+    /// refreshed when new, renamed without another refresh, never refreshed
+    /// for its age, and given its first refresh when stored without one.
+    #[tokio::test]
+    async fn the_live_tv_view_is_refreshed_when_new_never_for_its_age() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let metadata = tmp.path().join("metadata");
+        let config = Arc::new(DashboardConfiguration::default());
+        let localization = Arc::new(
+            crate::LocalizationManager::new("US").with_ui_culture_source({
+                let config = Arc::clone(&config);
+                move || config.0.lock().expect("config").ui_culture.clone()
+            }),
+        );
+        let mgr = manager(&db)
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
+            .with_metadata_path(metadata.clone())
+            .with_database(db.clone())
+            .with_dashboard_configuration(config.clone(), localization);
+        let provision = || async {
+            mgr.get_internal_live_tv_folder_id()
+                .await
+                .expect("provision")
+                .expect("an id")
+        };
+
+        let id = provision().await;
+        assert_first_refresh(&db, id, &metadata.join("views").join("livetv")).await;
+
+        let now = Utc::now();
+        let old = now - chrono::TimeDelta::hours(25);
+        crate::item_persistence_service::seed_refresh_dates(&db, id, Some(now), Some(old), None)
+            .await;
+        let before = view_dates(&db, id).await;
+        assert_eq!(provision().await, id);
+        assert_eq!(view_dates(&db, id).await, before, "25 hours: no refresh");
+
+        config.0.lock().expect("config").ui_culture = "fr".to_owned();
+        assert_eq!(provision().await, id);
+        let (_, modified, refreshed, saved) = view_dates(&db, id).await;
+        assert_eq!(
+            (modified, refreshed),
+            (before.1, before.2),
+            "renamed: saved, not refreshed again"
+        );
+        assert!(saved > before.3);
+
+        never_refreshed(&db, id).await;
+        assert_eq!(provision().await, id);
+        let (_, modified, refreshed, _) = view_dates(&db, id).await;
+        assert_eq!(modified, None, "the first refresh's restat");
+        assert!(
+            refreshed.expect("refreshed") >= now,
+            "never refreshed: its first refresh"
+        );
+
+        // Renamed and never refreshed: one save carries both.
+        never_refreshed(&db, id).await;
+        config.0.lock().expect("config").ui_culture = "en-US".to_owned();
+        assert_eq!(provision().await, id);
+        let row = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(row.name.as_deref(), Some("Live TV"), "renamed");
+        assert_eq!(row.date_modified, None, "the first refresh's restat");
+        assert!(
+            row.date_last_refreshed.expect("refreshed") >= now,
+            "never refreshed: its first refresh"
+        );
     }
 }

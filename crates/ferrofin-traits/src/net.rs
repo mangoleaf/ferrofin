@@ -1,9 +1,10 @@
-//! Networking-layer traits — request authorization and WebSocket plumbing.
+//! Networking-layer traits — request authorization.
 //!
-//! Port of the `MediaBrowser.Controller.Net` interfaces:
-//! `IAuthorizationContext`, `IAuthService`, `IWebSocketConnection`,
-//! `IWebSocketListener`, `IWebSocketManager`. `WebSocketListenerState`'s timing
-//! lives with the push loops, in `ferrofin-api`'s WebSocket handler.
+//! Port of the `MediaBrowser.Controller.Net` interfaces `IAuthorizationContext`
+//! and `IAuthService`. The WebSocket ones (`IWebSocketConnection`,
+//! `IWebSocketListener`, `IWebSocketManager`) have no trait here:
+//! `ferrofin-api`'s `/socket` handler is their port, and it delivers server
+//! pushes through [`crate::session_bus::SessionMessageBus`].
 //!
 //! Port rules applied throughout:
 //! - The C# methods take `HttpContext`/`HttpRequest` (ASP.NET Core). To keep this
@@ -13,9 +14,6 @@
 //!   reads). The `ferrofin-core`/HTTP layer builds one from its real request type.
 //! - `AuthorizationInfo` is the ported [`crate::options::AuthorizationInfo`]
 //!   (a server-side context value, never serialized).
-//! - `IAsyncDisposable`/`IDisposable`, .NET events, and the concrete
-//!   `System.Net.WebSockets` state enum are dropped; the connection's liveness is
-//!   exposed as a plain [`bool`].
 //! - `Task<T>` → `async fn -> Result<T, ServiceError>`; `CancellationToken` is
 //!   dropped for v1.
 //!
@@ -110,75 +108,6 @@ pub trait AuthService: Send + Sync {
 }
 
 fn _assert_object_safe_auth_service(_: &dyn AuthService) {}
-
-/// A single live client WebSocket connection.
-///
-/// Port of `IWebSocketConnection` (the object-safe subset). The C#
-/// `IAsyncDisposable`/`IDisposable` bases, the `OnReceive` callback property,
-/// the `Closed` event, and the raw `WebSocketState` are dropped; liveness is a
-/// plain [`Self::is_open`] check. Outbound messages are the serialized envelope
-/// carried as bytes so the trait stays non-generic and object-safe (the typed
-/// `SendAsync<T>` overload collapses into this one).
-#[async_trait]
-pub trait WebSocketConnection: Send + Sync {
-    /// The client's remote endpoint (IP, possibly with port), if known.
-    fn remote_endpoint(&self) -> Option<&str>;
-
-    /// The [`AuthorizationInfo`] captured when the connection was established.
-    fn authorization_info(&self) -> &AuthorizationInfo;
-
-    /// Whether the connection is still open and usable for sending.
-    fn is_open(&self) -> bool;
-
-    /// Sends an already-serialized outbound message envelope to the client.
-    async fn send(&self, message: &[u8]) -> Result<(), ServiceError>;
-
-    /// Applies the culture captured from the connection's upgrade request to
-    /// the current task, so server-initiated payloads localise for the client.
-    async fn apply_request_culture(&self) -> Result<(), ServiceError>;
-}
-
-fn _assert_object_safe_web_socket_connection(_: &dyn WebSocketConnection) {}
-
-/// Handles messages and lifecycle events for WebSocket connections.
-///
-/// Port of `IWebSocketListener`. The `HttpContext` argument of
-/// `ProcessWebSocketConnectedAsync` becomes a [`RequestContext`]; the connection
-/// is passed as `&dyn` [`WebSocketConnection`] to preserve object safety. The
-/// incoming message is the raw serialized frame (the typed
-/// `WebSocketMessageInfo` is decoded by the implementation).
-#[async_trait]
-pub trait WebSocketListener: Send + Sync {
-    /// Processes a single inbound message from a connection.
-    async fn process_message(
-        &self,
-        connection: &dyn WebSocketConnection,
-        message: &[u8],
-    ) -> Result<(), ServiceError>;
-
-    /// Reacts to a newly established WebSocket connection.
-    async fn process_web_socket_connected(
-        &self,
-        connection: &dyn WebSocketConnection,
-        request: &RequestContext,
-    ) -> Result<(), ServiceError>;
-}
-
-fn _assert_object_safe_web_socket_listener(_: &dyn WebSocketListener) {}
-
-/// Upgrades incoming HTTP requests to WebSocket connections.
-///
-/// Port of `IWebSocketManager`. The C# `WebSocketRequestHandler(HttpContext)` —
-/// which performs the protocol upgrade in place on ASP.NET's context — becomes a
-/// request-handling entry point taking a [`RequestContext`]; the actual socket
-/// upgrade is performed by the HTTP layer that satisfies this trait.
-#[async_trait]
-pub trait WebSocketManager: Send + Sync {
-    /// Handles a WebSocket upgrade request.
-    async fn handle_request(&self, request: &RequestContext) -> Result<(), ServiceError>;
-}
-
-fn _assert_object_safe_web_socket_manager(_: &dyn WebSocketManager) {}
 
 #[cfg(test)]
 mod tests {

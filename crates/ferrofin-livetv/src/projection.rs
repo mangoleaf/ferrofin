@@ -1,11 +1,14 @@
-//! Guide rows → synthetic [`BaseItemEntity`] rows for the DTO service.
+//! Guide rows → [`BaseItemEntity`] rows for the DTO service.
 //!
 //! Jellyfin stores channels and programmes as `BaseItems` and projects them
 //! through `DtoService`; Ferrofin keeps its guide cache in its own tables and
-//! instead builds the equivalent entity row in memory here — the projection
-//! then runs through the very same `DtoService::get_base_item_dtos` path every
-//! other item takes, which is what makes the channel/programme DTOs carry
-//! `UserData`, the image maps, `SortName`, `CanDelete` and the rest for free.
+//! builds the equivalent entity row here. The guide refresh stores a
+//! programme's row as its item, which the programme reads project; the channel
+//! reads, and a programme read of an airing with no stored item, project the
+//! row built in memory. Either way the projection runs through the very same
+//! `DtoService::get_base_item_dtos` path every other item takes, which is what
+//! makes the channel/programme DTOs carry `UserData`, the image maps,
+//! `SortName`, `CanDelete` and the rest for free.
 //!
 //! The field values are ports of `Jellyfin.LiveTv.Guide.GuideManager.GetChannel`
 //! / `GetProgram` (what the C# scan writes onto the items) and
@@ -137,34 +140,24 @@ pub struct ProgramRow {
 }
 
 /// One channel's user data for the requesting user: its row under the
-/// channel's own id key. `UserDataManager.SaveUserData` writes the same values
-/// under every key of the item, so this row answers what upstream reads from
-/// the first row by key (`IsFavorite`, `PlayCount`), from any row (`Played`)
-/// and from the newest (`LastPlayedDate`).
+/// channel's own id key, which the favourite and like filters read.
+/// `UserDataManager.SaveUserData` writes the same values under every key of the
+/// item, so this row answers what upstream reads from the first row by key.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChannelUserDataRow {
     /// `UserData.IsFavorite`.
     pub is_favorite: bool,
     /// `UserData.Rating`, on the 0–10 scale.
     pub rating: Option<f64>,
-    /// `UserData.PlayCount`.
-    pub play_count: i32,
-    /// `UserData.Played`.
-    pub played: bool,
-    /// `UserData.LastPlayedDate` as stored. Every writer stores one text
-    /// format, so it orders as SQLite orders the column upstream.
-    pub last_played_date: Option<String>,
 }
 
-/// The requesting user's channel user data, keyed by the stored channel id; with
-/// no user, every user's newest play on each channel and nothing else
-/// ([`crate::guide_repository::channel_last_played_by_anyone`]).
+/// The requesting user's channel user data, keyed by the stored channel id.
 pub type ChannelUserData = std::collections::HashMap<String, ChannelUserDataRow>;
 
 /// Applies `GetInternalChannels`' filters to the loaded lineup.
 ///
 /// The type filter matches the stored `ChannelType`. The kind flags are
-/// applied by the read itself ([`crate::guide_repository`]'s `channel_rows`,
+/// applied by the read itself ([`crate::guide_repository`]'s `listed_channel_rows`,
 /// from the stored channel items). `IsDisliked` is accepted and
 /// dropped, as upstream's `GetInternalChannels` drops it. The favourite/like
 /// filters read `user_data` (`UserItemData.MinLikeValue` upstream is 6.5 on
@@ -196,166 +189,6 @@ pub fn filter_channel_rows(
                 .is_some_and(|x| x >= 6.5)
                 == want
         });
-    }
-}
-
-/// Sorts the lineup the way `GetInternalChannels` builds its order-by list and
-/// `BaseItemRepository.ApplyOrder` applies it: each requested key but
-/// `Default` (which `ApplyOrder` drops) takes the single requested order,
-/// favourite sorting prepends `(IsFavoriteOrLiked, Desc)`, and
-/// `(SortName, Asc)` is appended unless already requested. A
-/// `SeriesDatePlayed` key hands the whole order to
-/// `ApplySeriesDatePlayedOrder`: the series' played date, which no channel
-/// has, then `SortName` ascending.
-///
-/// Each key compares as `OrderMapper.MapOrderByField` maps it for a channel
-/// item. The user-data keys read `user_data`, where a channel without a row
-/// is `NULL` for `DatePlayed` and `PlayCount` (first ascending, last
-/// descending), unplayed for `IsPlayed`/`IsUnplayed` (through
-/// `BuildIsPlayedFilter`) and no favourite. With no user, `user_data` holds
-/// every user's newest play on each channel for `DatePlayed`
-/// ([`crate::guide_repository::channel_last_played_by_anyone`]) and the other
-/// user-data keys tie. `Random` draws a fresh order on
-/// every call. `AirTime` and the keys `OrderMapper` has no arm for fall back
-/// to `SortName`. The keys over columns a channel item never fills
-/// (`RunTimeTicks`, `PremiereDate`, the ratings, the studios, …) or fills
-/// alike (`IsFolder`) tie. `IsFavoriteOrLiked` sorts on the `IsFavorite`
-/// bit, exactly like the item repository's `translate_query`.
-pub fn sort_channel_rows(
-    rows: &mut Vec<ChannelRow>,
-    query: &ferrofin_traits::stubs::LiveTvChannelQuery,
-    user_data: &ChannelUserData,
-) {
-    use ferrofin_model::dto::SortOrder;
-    use ferrofin_model::live_tv::ItemSortBy;
-    use std::cmp::Ordering;
-
-    let requested_order = query.sort_order.unwrap_or(SortOrder::Ascending);
-    let mut order: Vec<(ItemSortBy, SortOrder)> = query
-        .sort_by
-        .iter()
-        .filter(|s| **s != ItemSortBy::Default)
-        .map(|s| (*s, requested_order))
-        .collect();
-    if query.enable_favorite_sorting {
-        order.insert(0, (ItemSortBy::IsFavoriteOrLiked, SortOrder::Descending));
-    }
-    if !order.iter().any(|(s, _)| *s == ItemSortBy::SortName) {
-        order.push((ItemSortBy::SortName, SortOrder::Ascending));
-    }
-    if order
-        .iter()
-        .any(|(s, _)| *s == ItemSortBy::SeriesDatePlayed)
-    {
-        order = vec![(ItemSortBy::SortName, SortOrder::Ascending)];
-    }
-    // A shuffled rank per row is `ORDER BY RANDOM()`'s per-row draw.
-    let mut random: Vec<usize> = Vec::new();
-    if order.iter().any(|(s, _)| *s == ItemSortBy::Random) {
-        random = (0..rows.len()).collect();
-        ferrofin_util::shuffle_extensions::shuffle(&mut random);
-    }
-    // Each row's keys are built once: rebuilding the padded sort name on both
-    // sides of every comparison dominated the sort of a large lineup.
-    let mut keyed: Vec<KeyedChannel<'_>> = rows
-        .drain(..)
-        .enumerate()
-        .map(|(index, row)| KeyedChannel {
-            sort_name: channel_sort_name(row.number.as_deref(), &row.name).to_lowercase(),
-            name: row.name.to_lowercase(),
-            user_data: user_data.get(&row.id),
-            random: random.get(index).copied().unwrap_or_default(),
-            row,
-        })
-        .collect();
-    keyed.sort_by(|a, b| {
-        for (sort, direction) in &order {
-            let ordering = match sort {
-                // Upstream maps `ItemSortBy.Name` to `CleanName` — the plain
-                // display name, not the number-padded channel sort key.
-                ItemSortBy::Name => a.name.cmp(&b.name),
-                ItemSortBy::IsFavoriteOrLiked => a.is_favorite().cmp(&b.is_favorite()),
-                ItemSortBy::DateCreated => a.row.date_created.cmp(&b.row.date_created),
-                ItemSortBy::DatePlayed => a.last_played().cmp(&b.last_played()),
-                ItemSortBy::PlayCount => a.play_count().cmp(&b.play_count()),
-                ItemSortBy::IsPlayed => a.played().cmp(&b.played()),
-                ItemSortBy::IsUnplayed => b.played().cmp(&a.played()),
-                ItemSortBy::Random => a.random.cmp(&b.random),
-                ItemSortBy::Album
-                | ItemSortBy::AlbumArtist
-                | ItemSortBy::Artist
-                | ItemSortBy::OfficialRating
-                | ItemSortBy::PremiereDate
-                | ItemSortBy::StartDate
-                | ItemSortBy::Runtime
-                | ItemSortBy::CommunityRating
-                | ItemSortBy::ProductionYear
-                | ItemSortBy::CriticRating
-                | ItemSortBy::IsFolder
-                | ItemSortBy::SeriesSortName
-                | ItemSortBy::VideoBitRate
-                | ItemSortBy::Studio
-                | ItemSortBy::DateLastContentAdded
-                | ItemSortBy::ParentIndexNumber
-                | ItemSortBy::IndexNumber => Ordering::Equal,
-                // `SortName`, `AirTime`'s arm and `OrderMapper`'s
-                // `_ => e.SortName` (`AiredEpisodeOrder`, an unknown value).
-                _ => a.sort_name.cmp(&b.sort_name),
-            };
-            let ordering = match direction {
-                SortOrder::Ascending => ordering,
-                SortOrder::Descending | SortOrder::Unrecognized(_) => ordering.reverse(),
-            };
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
-        }
-        Ordering::Equal
-    });
-    rows.extend(keyed.into_iter().map(|keyed| keyed.row));
-}
-
-/// Whether [`sort_channel_rows`] reads `user_data` for one of `sort_by`'s
-/// keys, so the caller must load it.
-#[must_use]
-pub fn sort_reads_user_data(sort_by: &[ferrofin_model::live_tv::ItemSortBy]) -> bool {
-    use ferrofin_model::live_tv::ItemSortBy;
-    sort_by.iter().any(|by| {
-        matches!(
-            by,
-            ItemSortBy::IsFavoriteOrLiked
-                | ItemSortBy::DatePlayed
-                | ItemSortBy::PlayCount
-                | ItemSortBy::IsPlayed
-                | ItemSortBy::IsUnplayed
-        )
-    })
-}
-
-/// A lineup row with the keys [`sort_channel_rows`] sorts it on.
-struct KeyedChannel<'a> {
-    sort_name: String,
-    name: String,
-    user_data: Option<&'a ChannelUserDataRow>,
-    random: usize,
-    row: ChannelRow,
-}
-
-impl KeyedChannel<'_> {
-    fn is_favorite(&self) -> bool {
-        self.user_data.is_some_and(|d| d.is_favorite)
-    }
-
-    fn played(&self) -> bool {
-        self.user_data.is_some_and(|d| d.played)
-    }
-
-    fn play_count(&self) -> Option<i32> {
-        self.user_data.map(|d| d.play_count)
-    }
-
-    fn last_played(&self) -> Option<&str> {
-        self.user_data.and_then(|d| d.last_played_date.as_deref())
     }
 }
 
@@ -393,11 +226,62 @@ pub fn channel_sort_name(number: Option<&str>, name: &str) -> String {
     }
 }
 
+/// A channel item's `Data`: the `LiveTvChannel` Jellyfin serialises into that
+/// column (`BaseItemMapper.cs:266-268`, `JsonDefaults.Options`), in its key
+/// order. `Number` and `ChannelType` have no column, so a Jellyfin reading the
+/// row takes them from here only; a null `Number` is left out
+/// (`WhenWritingNull`) and the type is the enum's name. The other keys are
+/// `BaseItem`'s defaults on a channel. `DateLastSaved` is left out: Jellyfin
+/// reads it from its column (`BaseItemMapper.cs:120`), which the save stamps.
+fn channel_data(number: Option<&str>, channel_type: &str) -> String {
+    let number = number.map_or_else(String::new, |number| {
+        format!(r#""Number":{},"#, serde_json::Value::from(number))
+    });
+    let channel_type = if channel_type == "Radio" {
+        "Radio"
+    } else {
+        "TV"
+    };
+    format!(
+        r#"{{{number}"ChannelType":"{channel_type}","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}}"#
+    )
+}
+
+/// `fresh`'s channel `Data` ([`channel_data`]) applied to the `stored` one.
+/// `GetChannel` assigns `Number` and `ChannelType`, so those two follow the
+/// lineup; every other key is the item's own and keeps its stored value, a
+/// missing one taking the default. A row stored with no `Data` (by an earlier
+/// Ferrofin) takes `fresh`'s whole, and one already holding these values keeps
+/// its bytes.
+fn merged_channel_data(stored: Option<&str>, fresh: Option<&str>) -> Option<String> {
+    let mut data = ferrofin_db::item_data::parse_data(stored);
+    if data.is_empty() {
+        return fresh.map(str::to_owned);
+    }
+    let before = data.clone();
+    let fresh = ferrofin_db::item_data::parse_data(fresh);
+    for key in ["Number", "ChannelType"] {
+        match fresh.get(key) {
+            Some(value) => data.insert(key.to_owned(), value.clone()),
+            None => data.remove(key),
+        };
+    }
+    for (key, value) in fresh {
+        data.entry(key).or_insert(value);
+    }
+    if data == before {
+        stored.map(str::to_owned)
+    } else {
+        Some(serde_json::Value::Object(data).to_string())
+    }
+}
+
 /// Builds the synthetic `BaseItems` row a channel projects from.
 ///
 /// Port of `GuideManager.GetChannel`'s item shape: `LiveTvChannel` type, no
 /// path (the tuner URL is resolved at stream time, not stored on the item),
-/// the `CreateSortName` sort key, and the first-seen `DateCreated`.
+/// the `CreateSortName` sort key, the first-seen `DateCreated`, and the
+/// serialised channel in `Data` ([`channel_data`]).
 ///
 /// `CleanName` and `PresentationUniqueKey` are deliberately left unset: the
 /// item store derives both at write time (C# `SaveItem` likewise stamps
@@ -438,6 +322,7 @@ pub fn channel_entity(
         external_service_id: Some("Emby".to_owned()),
         // `LiveTvChannel.GetBlockUnratedType() => UnratedItem.LiveTvChannel`.
         unrated_type: Some("LiveTvChannel".to_owned()),
+        data: Some(channel_data(row.number.as_deref(), &row.channel_type)),
         date_created: row.date_created.as_deref().and_then(parse_dt),
         parent_id: parent.clone(),
         top_parent_id: parent,
@@ -465,10 +350,12 @@ pub fn channel_entity(
 /// and `Data` onto it, and the next `RefreshGuide` would put every one of them
 /// back to `NULL`.
 ///
-/// `Number`/`ChannelType` are not `BaseItems` columns here — they reach the
-/// wire through `LiveTvManager::add_channel_info` from
-/// `FerrofinLiveTvChannels`, which the same refresh rewrites. The primary
-/// image is an image row, written by [`channel_images_update`]'s caller.
+/// `Number`/`ChannelType` are no `BaseItems` columns: Jellyfin keeps them only
+/// in the serialised item, so the refresh merges them into the stored `Data`
+/// ([`merged_channel_data`]). Ferrofin's own answers take them from
+/// `FerrofinLiveTvChannels` (`LiveTvManager::add_channel_info`), which the same
+/// refresh rewrites. The primary image is an image row, written by
+/// [`channel_images_update`]'s caller.
 #[must_use]
 pub fn channel_item_update(
     stored: &BaseItemEntity,
@@ -485,6 +372,7 @@ pub fn channel_item_update(
     item.parent_id.clone_from(&fresh.parent_id);
     item.top_parent_id.clone_from(&fresh.top_parent_id);
     item.is_folder = fresh.is_folder;
+    item.data = merged_channel_data(stored.data.as_deref(), fresh.data.as_deref());
     // `SortName` is a lazy property upstream, not a stored assignment:
     // `ForcedSortName` when the metadata editor set one, else
     // `CreateSortName()` off Number/Name. Re-deriving it unconditionally would
@@ -602,11 +490,13 @@ pub(crate) fn is_artwork_url(value: &str) -> bool {
 }
 
 /// A remote image row for `url`: upstream's `new ItemImageInfo { Path = url,
-/// Type = type }`. The image routes serve it through the remote-image cache.
+/// Type = type }`, its `DateModified` left at `default(DateTime)`, .NET's
+/// `MinValue`. The image routes serve it through the remote-image cache.
 fn remote_image(image_type: ImageType, url: &str) -> ItemImageInfo {
     ItemImageInfo {
         path: url.to_owned(),
         image_type,
+        date_modified: ferrofin_model::json::datetime::dotnet_min(),
         ..ItemImageInfo::default()
     }
 }
@@ -861,7 +751,8 @@ pub fn recording_entity(
     }
 }
 
-/// Builds the synthetic `BaseItems` row a programme projects from.
+/// Builds the `BaseItems` row the guide refresh stores for a new airing, which
+/// a guide read also projects for an airing with no stored item.
 ///
 /// Port of `GuideManager.GetProgram`'s item shape: the flag-derived `Tags`
 /// list (in upstream's exact order), pipe-joined `Genres`,
@@ -1205,8 +1096,6 @@ pub fn item_sort_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrofin_model::dto::SortOrder;
-    use ferrofin_model::live_tv::ItemSortBy;
 
     fn parse(s: &str) -> Option<DateTime<Utc>> {
         s.parse().ok()
@@ -1729,6 +1618,56 @@ mod tests {
         );
     }
 
+    /// What Jellyfin 12.4 wrote into a channel's `Data` at its guide refresh
+    /// (the round-trip gate's capture), for channel number 1.
+    const JELLYFIN_CHANNEL_DATA: &str = r#"{"Number":"1","ChannelType":"TV","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"DateLastSaved":"2026-11-27T00:09:50.4414863Z","RemoteTrailers":[]}"#;
+
+    /// A channel item's `Data` is the `LiveTvChannel` Jellyfin serialises
+    /// (`BaseItemMapper.cs:266-268`, `JsonDefaults.Options`) but its
+    /// `DateLastSaved`, in its key order: a null `Number` is not written and
+    /// the type is the enum's name. A refresh moves those two keys in a stored
+    /// `Data` and keeps the rest.
+    #[test]
+    fn channel_data_is_the_serialised_live_tv_channel() {
+        let row = ChannelRow {
+            id: "CCCCCCCC-0000-0000-0000-000000000003".to_owned(),
+            tvg_id: String::new(),
+            external_id: "m3u_1".to_owned(),
+            name: "Parity One".to_owned(),
+            number: Some("1".to_owned()),
+            channel_type: "Tv".to_owned(),
+            date_created: None,
+            image_url: None,
+        };
+        let fresh = channel_entity(&row, parse, None);
+        assert_eq!(
+            fresh.data.as_deref(),
+            Some(
+                r#"{"Number":"1","ChannelType":"TV","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}"#
+            )
+        );
+        let radio = ChannelRow {
+            number: None,
+            channel_type: "Radio".to_owned(),
+            ..row
+        };
+        let radio = channel_entity(&radio, parse, None);
+        assert_eq!(
+            radio.data.as_deref(),
+            Some(
+                r#"{"ChannelType":"Radio","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}"#
+            )
+        );
+
+        let mut stored = fresh;
+        stored.data = Some(JELLYFIN_CHANNEL_DATA.to_owned());
+        let updated = channel_item_update(&stored, &radio).expect("the type moved");
+        let data = ferrofin_db::item_data::parse_data(updated.data.as_deref());
+        assert_eq!(data.get("Number"), None, "a number gone from the lineup");
+        assert_eq!(data["ChannelType"], "Radio");
+        assert_eq!(data["DateLastSaved"], "2026-11-27T00:09:50.4414863Z");
+    }
+
     /// A refresh assigns only the properties `GuideManager.GetChannel` assigns,
     /// and writes at all only when one of them changed.
     #[test]
@@ -1758,7 +1697,7 @@ mod tests {
         stored.custom_rating = Some("PG".to_owned());
         stored.official_rating = Some("TV-14".to_owned());
         stored.is_locked = true;
-        stored.data = Some("{}".to_owned());
+        stored.data = Some(JELLYFIN_CHANNEL_DATA.to_owned());
         stored.date_created = Some(
             DateTime::parse_from_rfc3339("2019-01-02T03:04:05Z")
                 .expect("date")
@@ -1782,7 +1721,7 @@ mod tests {
         assert_eq!(updated.custom_rating.as_deref(), Some("PG"));
         assert_eq!(updated.official_rating.as_deref(), Some("TV-14"));
         assert!(updated.is_locked);
-        assert_eq!(updated.data.as_deref(), Some("{}"));
+        assert_eq!(updated.data.as_deref(), Some(JELLYFIN_CHANNEL_DATA));
         // `DateCreated` is stamped on a NEW item only.
         assert_eq!(updated.date_created, stored.date_created);
 
@@ -1810,139 +1749,6 @@ mod tests {
         // title sorts as ASCII and interleaves with the rest of the library
         // instead of landing after it under SQLite's BINARY collation.
         assert_eq!(item_sort_name("Café Größe"), "cafe grosse");
-    }
-
-    const ASC: Option<SortOrder> = Some(SortOrder::Ascending);
-    const DESC: Option<SortOrder> = Some(SortOrder::Descending);
-
-    /// The ids of the lineup below, sorted. `e` and `c` share the sort key
-    /// "0000000002.00000-alpha". `c` is a favourite, marked played, and
-    /// watched three times; `a` was watched last but never marked played (as
-    /// playback leaves a channel); `b` has a row with no play; `d` and `e`
-    /// have no row.
-    fn sorted_lineup(
-        sort_by: &[ItemSortBy],
-        sort_order: Option<SortOrder>,
-        enable_favorite_sorting: bool,
-    ) -> Vec<String> {
-        let row = |id: &str, number: Option<&str>, name: &str, created: &str| ChannelRow {
-            id: id.to_owned(),
-            tvg_id: String::new(),
-            external_id: String::new(),
-            name: name.to_owned(),
-            number: number.map(str::to_owned),
-            channel_type: "Tv".to_owned(),
-            date_created: Some(created.to_owned()),
-            image_url: None,
-        };
-        let mut rows = vec![
-            row("e", Some("2.0"), "ALPHA", "2026-01-02"),
-            row("a", Some("10"), "bravo", "2026-01-03"),
-            row("b", Some("2"), "Charlie", "2026-01-01"),
-            row("c", Some("2"), "alpha", "2026-01-02"),
-            row("d", None, "Delta", "2026-01-01"),
-        ];
-        let played = |play_count: i32, last: Option<&str>| ChannelUserDataRow {
-            play_count,
-            played: last.is_some(),
-            last_played_date: last.map(str::to_owned),
-            ..ChannelUserDataRow::default()
-        };
-        let user_data: ChannelUserData = [
-            (
-                "c".to_owned(),
-                ChannelUserDataRow {
-                    is_favorite: true,
-                    ..played(3, Some("2026-11-01 08:00:00.0000000"))
-                },
-            ),
-            (
-                "a".to_owned(),
-                ChannelUserDataRow {
-                    played: false,
-                    ..played(1, Some("2026-11-03 08:00:00.0000000"))
-                },
-            ),
-            ("b".to_owned(), played(0, None)),
-        ]
-        .into();
-        let query = ferrofin_traits::stubs::LiveTvChannelQuery {
-            sort_by: sort_by.to_vec(),
-            sort_order,
-            enable_favorite_sorting,
-            ..ferrofin_traits::stubs::LiveTvChannelQuery::default()
-        };
-        sort_channel_rows(&mut rows, &query, &user_data);
-        rows.into_iter().map(|r| r.id).collect()
-    }
-
-    /// Every key the lineup sorts on, in both directions, with favourite-first
-    /// and the appended `SortName`; ties keep the stored order. A channel
-    /// without a row, or without a play, is `NULL` for `DatePlayed` and
-    /// `PlayCount` (last descending, first ascending) and unplayed.
-    #[rstest::rstest]
-    #[case::sort_name(&[], None, false, ["d", "e", "c", "b", "a"])]
-    // `ApplyOrder` drops `Default`: the appended ascending `SortName` is left.
-    #[case::default_dropped(&[ItemSortBy::Default], DESC, false, ["d", "e", "c", "b", "a"])]
-    #[case::sort_name_desc(&[ItemSortBy::SortName], DESC, false, ["a", "b", "e", "c", "d"])]
-    #[case::name(&[ItemSortBy::Name], None, false, ["e", "c", "a", "b", "d"])]
-    #[case::name_desc(&[ItemSortBy::Name], DESC, false, ["d", "b", "a", "e", "c"])]
-    #[case::date_created(&[ItemSortBy::DateCreated], None, false, ["d", "b", "e", "c", "a"])]
-    #[case::date_created_desc(&[ItemSortBy::DateCreated], DESC, false, ["a", "e", "c", "d", "b"])]
-    #[case::favourites_first(&[], None, true, ["c", "d", "e", "b", "a"])]
-    #[case::favourites_then_name(&[ItemSortBy::Name], DESC, true, ["c", "d", "b", "a", "e"])]
-    #[case::favourite_key(&[ItemSortBy::IsFavoriteOrLiked], DESC, false, ["c", "d", "e", "b", "a"])]
-    #[case::date_played_desc(&[ItemSortBy::DatePlayed], DESC, false, ["a", "c", "d", "e", "b"])]
-    #[case::date_played(&[ItemSortBy::DatePlayed], ASC, false, ["d", "e", "b", "c", "a"])]
-    // The guide's "Recently watched" order.
-    #[case::recently_watched(&[ItemSortBy::DatePlayed], DESC, true, ["c", "a", "d", "e", "b"])]
-    #[case::play_count_desc(&[ItemSortBy::PlayCount], DESC, false, ["c", "a", "b", "d", "e"])]
-    #[case::play_count(&[ItemSortBy::PlayCount], ASC, false, ["d", "e", "b", "a", "c"])]
-    // Only the played flag counts: `a`'s plays leave it unplayed.
-    #[case::played_desc(&[ItemSortBy::IsPlayed], DESC, false, ["c", "d", "e", "b", "a"])]
-    #[case::played(&[ItemSortBy::IsPlayed], ASC, false, ["d", "e", "b", "a", "c"])]
-    #[case::unplayed_desc(&[ItemSortBy::IsUnplayed], DESC, false, ["d", "e", "b", "a", "c"])]
-    #[case::unplayed(&[ItemSortBy::IsUnplayed], ASC, false, ["c", "d", "e", "b", "a"])]
-    // `AirTime` and the keys `OrderMapper` has no arm for are `SortName`.
-    #[case::air_time(&[ItemSortBy::AirTime], DESC, false, ["a", "b", "e", "c", "d"])]
-    #[case::unknown_key(&[ItemSortBy::Unrecognized(99)], DESC, false, ["a", "b", "e", "c", "d"])]
-    #[case::aired_episode_order(&[ItemSortBy::AiredEpisodeOrder], None, false, ["d", "e", "c", "b", "a"])]
-    // A key over a column no channel item fills ties.
-    #[case::runtime(&[ItemSortBy::Runtime], DESC, false, ["d", "e", "c", "b", "a"])]
-    // `SeriesDatePlayed` leaves `SortName` ascending alone: favourites and
-    // the other keys are dropped.
-    #[case::series_date_played(
-        &[ItemSortBy::PlayCount, ItemSortBy::SeriesDatePlayed],
-        DESC,
-        true,
-        ["d", "e", "c", "b", "a"]
-    )]
-    fn the_lineup_sorts_on_each_requested_key(
-        #[case] sort_by: &[ItemSortBy],
-        #[case] sort_order: Option<SortOrder>,
-        #[case] enable_favorite_sorting: bool,
-        #[case] expected: [&str; 5],
-    ) {
-        assert_eq!(
-            sorted_lineup(sort_by, sort_order, enable_favorite_sorting),
-            expected
-        );
-    }
-
-    /// `Random` below the favourites: `c` leads, and the rest is a fresh
-    /// order on each call.
-    #[test]
-    fn a_random_lineup_is_a_fresh_order_each_time() {
-        let draws: std::collections::HashSet<Vec<String>> = (0..64)
-            .map(|_| sorted_lineup(&[ItemSortBy::Random], None, true))
-            .collect();
-        assert!(draws.len() > 1, "{draws:?}");
-        for draw in &draws {
-            assert_eq!(draw[0], "c", "{draw:?}");
-            let mut ids = draw.clone();
-            ids.sort();
-            assert_eq!(ids, ["a", "b", "c", "d", "e"]);
-        }
     }
 
     #[test]

@@ -550,6 +550,71 @@ async fn a_networking_page_port_applies_on_the_restart() {
         .expect("run exits cleanly");
 }
 
+/// gl-319: the named configurations a release before 1.6.0 kept in
+/// `config/users/named/` are moved to `config/` before the configuration
+/// manager reads (or seeds from Jellyfin's XML) anything, a link is left for
+/// that release while it still serves, and the next lifetime removes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn named_configurations_an_earlier_release_left_are_moved_at_boot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_dir = tmp.path().join("config");
+    let legacy = config_dir.join("users").join("named");
+    std::fs::create_dir_all(&legacy).expect("legacy directory");
+    std::fs::write(legacy.join("encoding.json"), r#"{"EncoderPreset":"slow"}"#).expect("encoding");
+    std::fs::write(legacy.join("network.json"), r#"{"AutoDiscovery":false}"#).expect("network");
+    // Seeded only while `network.json` is missing: a move after the seeding
+    // would replace the saved document with this one.
+    std::fs::write(
+        config_dir.join("network.xml"),
+        "<NetworkConfiguration><AutoDiscovery>true</AutoDiscovery></NetworkConfiguration>",
+    )
+    .expect("network.xml");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let (server, base, config) = spawn_server(&client, |port| Config {
+        server_name: "ferrofin-named-move".to_owned(),
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        port,
+        ..Config::test_stub(tmp.path())
+    })
+    .await;
+    let tok = token(&client, &base).await;
+    let saved = async |tok: &str| {
+        let network = get_json(&client, &base, "/System/Configuration/network", tok).await;
+        let encoding = get_json(&client, &base, "/System/Configuration/encoding", tok).await;
+        (
+            network["AutoDiscovery"].clone(),
+            encoding["EncoderPreset"].clone(),
+        )
+    };
+    assert_eq!(saved(&tok).await, (false.into(), "slow".into()));
+    for file in ["encoding.json", "network.json"] {
+        assert!(config_dir.join(file).is_file(), "{file} moved");
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(legacy.join(file))
+                .expect("link")
+                .is_symlink(),
+            "{file} linked back"
+        );
+    }
+
+    assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
+    wait_for_new_lifetime(&client, &base, &config.server_name, &tok).await;
+    assert!(!legacy.exists(), "the next lifetime removes the links");
+    assert_eq!(saved(&tok).await, (false.into(), "slow".into()));
+
+    assert_eq!(post(&client, &base, "/System/Shutdown", &tok).await, 204);
+    tokio::task::spawn_blocking(move || server.join())
+        .await
+        .expect("join task")
+        .expect("server thread did not panic")
+        .expect("run exits cleanly");
+}
+
 /// Saved dashboard settings survive a new lifetime, while the restart flag
 /// clears. The old session token must still authorize these checks.
 async fn prepare_dashboard_restart(

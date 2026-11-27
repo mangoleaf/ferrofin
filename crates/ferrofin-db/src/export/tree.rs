@@ -8,7 +8,8 @@
 //! a link loop or by two links to one directory, is refused. A directory the
 //! export leaves out ([`Skip::leaving_out`]) is neither read nor digested; a
 //! file it leaves out (the database's, and with [`Skip::with_containers`] a
-//! playlist's or box set's metadata file, `super::containers`) is digested.
+//! playlist's or box set's metadata file (`super::containers`) or a library's
+//! `options.json`) is digested.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -84,7 +85,8 @@ pub(super) struct Skip {
     /// Directories left out, relative to the root.
     dirs: HashSet<PathBuf>,
     /// Whether the root is the data directory, whose playlists' and box sets'
-    /// metadata files are classified and the stale ones left out.
+    /// metadata files are classified and the stale ones left out, and whose
+    /// libraries' `options.json` are left out ([`library_options_json`]).
     containers: bool,
 }
 
@@ -114,7 +116,8 @@ impl Skip {
 
     /// Also leaves out the playlists' and box sets' metadata files the data
     /// directory holds in Jellyfin's own folders ([`containers::classify`]),
-    /// digested all the same, and records each such file found.
+    /// and its libraries' `options.json` ([`library_options_json`]), digested
+    /// all the same, and records each container file found.
     pub(super) fn with_containers(mut self) -> Self {
         self.containers = true;
         self
@@ -136,6 +139,25 @@ impl Skip {
             .contains(&std::fs::canonicalize(path).map_err(failed(path))?))
     }
 }
+
+/// Whether `relative`, a path relative to the data directory, is a library
+/// folder's `options.json` (`root/default/<library>/options.json`): Ferrofin's
+/// own file, which Jellyfin never reads. The export writes the `options.xml`
+/// Jellyfin reads in its place, and a later adoption by Ferrofin would take a
+/// copied `options.json` over the `options.xml` Jellyfin kept current (gl-1931).
+fn library_options_json(relative: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = relative.iter().collect();
+    matches!(parts.as_slice(), [root, default, _, file]
+        if [*root, *default] == LIBRARIES && *file == LIBRARY_OPTIONS)
+}
+
+/// The libraries' folder under program data (`root/default`, Jellyfin's
+/// `DefaultUserViewsPath`).
+const LIBRARIES: [&str; 2] = ["root", "default"];
+
+/// A library folder's own options file (`OPTIONS_FILE` in ferrofin-core's
+/// `virtual_folder_manager`).
+const LIBRARY_OPTIONS: &str = "options.json";
 
 /// A path's kind, links followed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,7 +299,8 @@ fn walk(root: &Path, out: Option<&Path>, skip: &Skip) -> Result<Copied> {
                 if let Some(container) = container {
                     copied.containers.push((path.clone(), container));
                 }
-                let left_out = container == Some(ContainerFile::LeftOut);
+                let left_out = container == Some(ContainerFile::LeftOut)
+                    || (skip.containers && library_options_json(&path));
                 let to = if to.is_some() && (left_out || skip.holds(&from)?) {
                     None
                 } else {
@@ -293,12 +316,24 @@ fn walk(root: &Path, out: Option<&Path>, skip: &Skip) -> Result<Copied> {
         };
         copied.digest.0.insert(path, entry);
     }
+    // The report lists them by path; the walk met them in listing order.
+    copied.containers.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(copied)
 }
 
-/// Every path under `root`, relative to it, with its kind, links followed, in
-/// path order (a directory before what it holds), but the directories
-/// `left_out` names and what they hold.
+/// Every path under `root`, relative to it, with its kind, links followed, but
+/// the directories `left_out` names and what they hold: each directory's
+/// entries in the order it lists them, a directory before what it holds. A
+/// copy creates them in that order, so an output that lists by creation order
+/// (btrfs) lists each directory as the source does, and a returned
+/// Jellyfin finds the libraries and their shortcuts in the order of the
+/// `PhysicalLocationsList`s the database stores (gl-1933).
+///
+/// shortcut: only an output that lists by creation order is given the source's
+/// order. ext4 lists by its names' hashes, seeded per filesystem (the source's
+/// own ext4 gives the source's order, another one its own), and tmpfs lists
+/// newest first; reorder the stored lists onto the output's listing for those
+/// (gl-1983).
 fn list(root: &Path, left_out: &HashSet<PathBuf>) -> Result<Vec<(PathBuf, Kind)>> {
     let mut found = Vec::new();
     // Each directory listed, by where it really is, with the path it was reached by.
@@ -353,7 +388,6 @@ fn list(root: &Path, left_out: &HashSet<PathBuf>) -> Result<Vec<(PathBuf, Kind)>
             found.push((path, kind));
         }
     }
-    found.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(found)
 }
 
@@ -427,9 +461,10 @@ fn refused(path: &Path, why: &str) -> DbError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
-    use super::{ContainerFile, Skip, copy, digest, digest_files, finish, walk_all};
+    use super::{ContainerFile, Skip, copy, digest, digest_files, finish, list, walk_all};
 
     fn write(root: &Path, path: &str, bytes: &[u8]) {
         let path = root.join(path);
@@ -545,6 +580,82 @@ mod tests {
         let copied = copy(&source, &plain, &Skip::default()).unwrap();
         assert!(plain.join("data/playlists/Mix/playlist.xml").is_file());
         assert_eq!(copied.containers, []);
+    }
+
+    /// With the containers on (the data directory's walk), a library folder's
+    /// `options.json` is left out and digested all the same; an
+    /// `options.json` anywhere else is copied (gl-1931).
+    #[test]
+    fn library_options_json_is_left_out_but_digested() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, out) = (dir.path().join("source"), dir.path().join("out"));
+        write(&source, "root/default/Movies/options.json", b"{}");
+        write(
+            &source,
+            "root/default/Movies/movies.mblink",
+            b"/media/movies",
+        );
+        write(&source, "metadata/options.json", b"{}");
+        write(&source, "root/default/options.json", b"{}");
+        write(&source, "root/default/Movies/sub/options.json", b"{}");
+        let skip = Skip::default().with_containers();
+
+        let copied = copy(&source, &out, &skip).unwrap();
+
+        assert!(!out.join("root/default/Movies/options.json").exists());
+        assert!(out.join("root/default/Movies/movies.mblink").is_file());
+        assert!(out.join("metadata/options.json").is_file());
+        assert!(out.join("root/default/options.json").is_file());
+        assert!(out.join("root/default/Movies/sub/options.json").is_file());
+        // Another tree's walk (a configuration or metadata directory) copies it.
+        let plain = dir.path().join("plain");
+        copy(&source, &plain, &Skip::default()).unwrap();
+        assert!(plain.join("root/default/Movies/options.json").is_file());
+        write(
+            &source,
+            "root/default/Movies/options.json",
+            b"{\"changed\":1}",
+        );
+        assert_eq!(
+            copied.digest.changes(&digest(&source, &skip).unwrap()),
+            ["root/default/Movies/options.json"]
+        );
+    }
+
+    /// gl-1933: the walk, and so the copy, takes each directory's entries in
+    /// the order the source lists them, so where the output lists by creation
+    /// order (btrfs) a returned Jellyfin finds the libraries and their
+    /// shortcuts in the source's order, the order of the lists the database
+    /// stores (`PhysicalLocationsList`), and does not save them again. Each
+    /// directory still comes before what it holds.
+    #[test]
+    fn walks_each_directory_in_the_sources_listing_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        // Out of path order, as Jellyfin creates a library added after
+        // another and a location added after the first.
+        write(&source, "root/default/Zed/shows.mblink", b"/media/shows");
+        write(&source, "root/default/Zed/extra.mblink", b"/media/extra");
+        write(&source, "root/default/Alpha/films.mblink", b"/media/films");
+
+        let listed = list(&source, &HashSet::new()).unwrap();
+
+        for folder in ["", "root", "root/default", "root/default/Zed"] {
+            let folder = Path::new(folder);
+            let walked: Vec<&Path> = listed
+                .iter()
+                .map(|(path, _)| path.as_path())
+                .filter(|path| path.parent() == Some(folder))
+                .collect();
+            let source_lists: Vec<PathBuf> = std::fs::read_dir(source.join(folder))
+                .unwrap()
+                .map(|entry| folder.join(entry.unwrap().file_name()))
+                .collect();
+            assert_eq!(walked, source_lists, "{}", folder.display());
+        }
+        let at = |path: &str| listed.iter().position(|(p, _)| p == Path::new(path));
+        assert!(at("root/default/Zed") < at("root/default/Zed/shows.mblink"));
+        assert!(at("root/default/Zed") < at("root/default/Zed/extra.mblink"));
     }
 
     #[test]

@@ -66,7 +66,8 @@ Spans for I/O boundaries and units of work (request, DB transaction, ffmpeg
 spawn, provider fetch) — not for pure functions or one-line delegations. sqlx
 query logs already land as events inside the request span; don't wrap every query
 in a hand-made span. Add spans opportunistically when debugging — no bulk
-`#[instrument]` sweeps.
+`#[instrument]` sweeps. The item a scan's provider fetch is for is a log field,
+not a span per item ([LOGGING.md](LOGGING.md), rule 3).
 
 ## 6. Flush on shutdown
 

@@ -134,7 +134,12 @@ async fn read_reference_cache(
 /// `SaveSimilarItemsCacheAsync` moves its temporary file over it, so a request
 /// reading the entry meanwhile never sees a partial one.
 async fn write_reference_cache(path: &Path, references: &[SimilarItemReference], ttl: Duration) {
-    let Ok(ttl) = chrono::Duration::from_std(ttl) else {
+    // A plugin's cache days are an admin's setting, so a span past the
+    // calendar's end is possible: no entry then, rather than a panic.
+    let Some(expires_at) = chrono::Duration::from_std(ttl)
+        .ok()
+        .and_then(|ttl| chrono::Utc::now().checked_add_signed(ttl))
+    else {
         return;
     };
     let cache = SimilarItemsCache {
@@ -148,7 +153,7 @@ async fn write_reference_cache(path: &Path, references: &[SimilarItemReference],
                 })
                 .collect(),
         ),
-        expires_at: chrono::Utc::now() + ttl,
+        expires_at,
     };
     let Ok(json) = serde_json::to_vec(&cache) else {
         return;
@@ -1067,11 +1072,11 @@ impl FerrofinSimilarItemsManager {
                 .await,
             );
         }
-        if let (Some(path), Some(ttl), false) = (
-            cache_path.as_deref(),
-            provider.cache_duration(),
-            collected.is_empty(),
-        ) {
+        // C# `collectedReferences.Count > 0 && provider.CacheDuration is not null`.
+        if let Some(path) = cache_path.as_deref()
+            && !collected.is_empty()
+            && let Some(ttl) = provider.cache_duration().await
+        {
             write_reference_cache(path, &collected, ttl).await;
         }
         results
@@ -2015,7 +2020,7 @@ mod tests {
         fn supports(&self, item_kind: BaseItemKind) -> bool {
             item_kind == self.kind
         }
-        fn cache_duration(&self) -> Option<Duration> {
+        async fn cache_duration(&self) -> Option<Duration> {
             self.cache
         }
         async fn similar_items_page(
@@ -3110,6 +3115,87 @@ mod tests {
         assert_eq!(names(&rows), ["Primary Cut"]);
     }
 
+    #[tokio::test]
+    async fn a_version_hidden_behind_its_primary_is_never_scored() {
+        // C# `ComputeBatchScoresAsync` leaves `hiddenVersionIds` (a version
+        // whose primary is in the same library) out of every candidate row,
+        // so they take no place in the `limit * 3` window. Here three such
+        // versions tie with their primary and sort first by id: scored, they
+        // filled a one-item request's window of three and the access filter
+        // then dropped all of them.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0xE3F)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let seed = Uuid::from_u128(0xE30);
+        let versions = [0xE31, 0xE32, 0xE33].map(Uuid::from_u128);
+        let primary = Uuid::from_u128(0xE34);
+        seed_movie(&db, seed, "Seed", "SciFi").await;
+        for id in versions {
+            seed_movie(&db, id, "Version", "SciFi").await;
+        }
+        seed_movie(&db, primary, "Primary", "SciFi").await;
+        crate::test_support::seed_library_over(
+            &db,
+            &[seed, primary, versions[0], versions[1], versions[2]],
+        )
+        .await;
+        for id in versions {
+            crate::test_support::link_alternate_version(&db, id, primary).await;
+        }
+
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(1))
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(names(&rows), ["Primary"]);
+
+        // The batched score pass behind the recommendations scores the same way.
+        seed_user_data(&db, user_id, seed, true, None).await;
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 6, 1, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        let played = recs
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::SimilarToRecentlyPlayed)
+            .map(|r| names(&r.items));
+        assert_eq!(played, Some(vec!["Primary".to_owned()]));
+
+        // Through the people too, and only behind a primary in the same
+        // library: a version in another library is an item of its own there,
+        // so it is scored, and here it outscores the primary.
+        let (elsewhere, other_library) = (Uuid::from_u128(0xE35), Uuid::from_u128(0xE3A));
+        crate::test_support::seed_named_item(
+            &db,
+            other_library,
+            BaseItemKind::CollectionFolder,
+            "Other",
+        )
+        .await;
+        seed_movie_in(&db, elsewhere, "Elsewhere", "SciFi", Some(other_library)).await;
+        crate::test_support::link_alternate_version(&db, elsewhere, primary).await;
+        for id in [seed, versions[0], versions[1], versions[2], elsewhere] {
+            credit_person(&db, id, "Dee Director", "Director").await;
+        }
+        let rows = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(1))
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(names(&rows), ["Elsewhere"]);
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 6, 1, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        let played = recs
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::SimilarToRecentlyPlayed)
+            .map(|r| names(&r.items));
+        assert_eq!(played, Some(vec!["Elsewhere".to_owned()]));
+    }
+
     #[test]
     fn an_unlisted_provider_sorts_last_not_first() {
         // C# `GetConfiguredSimilarProviderOrder` returns int.MaxValue for a
@@ -3312,6 +3398,16 @@ mod tests {
             super::read_reference_cache(&path, "TheMovieDb", Uuid::nil()).await,
             None
         );
+        // A span past the calendar's end (the largest `SimilarItemsCacheDays`
+        // a client can save) writes nothing, rather than panicking.
+        let far = dir.path().join("themoviedb-similar-movie").join("far.json");
+        super::write_reference_cache(
+            &far,
+            &references,
+            Duration::from_secs(u64::from(i32::MAX.unsigned_abs()) * 24 * 60 * 60),
+        )
+        .await;
+        assert!(!far.exists());
         // A missing file is simply a miss.
         assert_eq!(
             super::read_reference_cache(

@@ -316,9 +316,9 @@ impl NfoSaver {
         let path = PathBuf::from(
             self.configuration
                 .application_paths()
-                .user_configuration_directory_path(),
+                .configuration_directory_path(),
         )
-        .join("named/xbmcmetadata.json");
+        .join("xbmcmetadata.json");
         match tokio::fs::read(&path).await {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|error| ServiceError::backend(format!("read NFO options: {error}"))),
@@ -352,12 +352,7 @@ impl NfoSaver {
             .await?
             .remove(&id)
             .unwrap_or_default();
-        let credits = self
-            .people
-            .get_people_batch(&[id])
-            .await?
-            .remove(&id)
-            .unwrap_or_default();
+        let credits = crate::metadata_merge::stored_people(self.people.as_ref(), id, row).await?;
         let actor_images = if save_images {
             self.actor_primary_images(&credits).await?
         } else {

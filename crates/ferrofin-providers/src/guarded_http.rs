@@ -15,20 +15,12 @@
 //! a fetch never follows a redirect from https to http, and its clients have
 //! the provider defaults ([`crate::http_client`]).
 
-use crate::destination::{
-    self, DestinationPolicy, DestinationRefused, PublicOnlyResolver, VettedAddresses,
-};
+use crate::destination::{self, DestinationPolicy, DestinationRefused, PublicOnlyResolver};
 use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError, request_limits};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-
-/// Most redirects one fetch follows: reqwest's default policy
-/// (`redirect::Policy::default()`), which downloads went by until they followed
-/// redirects themselves, to vet each hop, and which the provider client
-/// ([`crate::http_client`]) keeps.
-pub(crate) const MAX_REDIRECTS: usize = 10;
 
 /// Why a URL, or a redirect, whose scheme is not http or https is not sent.
 const OTHER_SCHEME: &str = "a URL with a scheme other than http or https";
@@ -134,7 +126,12 @@ impl FetchKind {
     /// logged at `debug`, since a library can hold any number.
     fn unsent(&self, reason: &'static str) -> SendError {
         crate::rate_limit::note_request_failure();
-        tracing::debug!(reason, "{} not downloaded", self.noun);
+        tracing::debug!(
+            item_id = crate::rate_limit::request_item(),
+            reason,
+            "{} not downloaded",
+            self.noun
+        );
         SendError::Failed(reason)
     }
 }
@@ -150,8 +147,10 @@ pub(crate) enum SendError {
     Request(RequestError),
     /// No request could be made: a URL that does not parse or whose scheme
     /// is not http or https, a redirect to another scheme, from https to
-    /// http or past [`MAX_REDIRECTS`], a name a proxy would resolve that the
-    /// server cannot, or a client that could not be built.
+    /// http or past
+    /// [`MAX_REDIRECTS`](ferrofin_util::http_client::MAX_REDIRECTS), a name
+    /// a proxy would resolve that the server cannot, or a client that could
+    /// not be built.
     Failed(&'static str),
 }
 
@@ -173,25 +172,24 @@ pub(crate) struct GuardedHttp {
     /// fails, rather than going out unguarded.
     vetted: Option<reqwest::Client>,
     /// Set when the environment configures a proxy
-    /// ([`destination::environment_proxy`]): the client that goes through it.
-    /// The proxy resolves names itself, out of the resolver's sight, so a name
-    /// is checked on the server's own answer before each request and pinned
-    /// to it ([`VettedAddresses`]) for the hosts the proxy settings exclude.
-    /// One client serves every request, so its connections are reused
-    /// (gl-1270).
+    /// ([`destination::environment_proxies`]): the client that goes through
+    /// it. The proxy resolves names itself, out of the resolver's sight, so a
+    /// name is checked on the server's own answer before each request; a host
+    /// it reaches directly (one `NO_PROXY` lists, or of a scheme no proxy
+    /// variable covers) is vetted again when its resolver
+    /// ([`PublicOnlyResolver::except_proxies`]) connects to it. One client
+    /// serves every request, so its connections are reused (gl-1270).
     proxied: Option<reqwest::Client>,
-    /// The proxied client's resolver.
-    pinned: Arc<VettedAddresses>,
     policy: Arc<dyn DestinationPolicy>,
     kind: &'static FetchKind,
 }
 
 impl GuardedHttp {
     /// Clients refusing what `policy` refuses, through the environment's
-    /// proxy when `proxy`.
+    /// proxy when `proxy_hosts` is set: the proxies' hosts.
     pub(crate) fn new(
         policy: Arc<dyn DestinationPolicy>,
-        proxy: bool,
+        proxy_hosts: Option<Vec<String>>,
         kind: &'static FetchKind,
     ) -> Self {
         let vetted = crate::http_client::builder()
@@ -200,18 +198,19 @@ impl GuardedHttp {
             .dns_resolver(Arc::new(PublicOnlyResolver::new(Arc::clone(&policy))))
             .build()
             .ok();
-        let pinned = Arc::new(VettedAddresses::default());
-        let proxied = proxy.then(|| {
+        let proxied = proxy_hosts.and_then(|proxy_hosts| {
             crate::http_client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .dns_resolver(Arc::clone(&pinned))
+                .dns_resolver(Arc::new(PublicOnlyResolver::except_proxies(
+                    Arc::clone(&policy),
+                    proxy_hosts,
+                )))
                 .build()
                 .ok()
         });
         Self {
             vetted,
-            proxied: proxied.flatten(),
-            pinned,
+            proxied,
             policy,
             kind,
         }
@@ -225,13 +224,14 @@ impl GuardedHttp {
     ) -> Self {
         Self::new(
             policy,
-            destination::environment_proxy(|name| std::env::var_os(name)),
+            destination::environment_proxies(|name| std::env::var_os(name)),
             kind,
         )
     }
 
     /// GETs `url` through its origin's limiter, following redirects up to
-    /// [`MAX_REDIRECTS`] and vetting the destination of each.
+    /// [`MAX_REDIRECTS`](ferrofin_util::http_client::MAX_REDIRECTS) and
+    /// vetting the destination of each.
     pub(crate) async fn send(&self, url: &str) -> Result<Fetched, SendError> {
         let mut current =
             reqwest::Url::parse(url).map_err(|_| SendError::Failed("a URL that does not parse"))?;
@@ -265,7 +265,7 @@ impl GuardedHttp {
                 });
             };
             // The provider client's rule: past MAX_REDIRECTS, or https to http.
-            if let Some(reason) = crate::http_client::redirect_refusal(&previous, &next) {
+            if let Some(reason) = ferrofin_util::http_client::redirect_refusal(&previous, &next) {
                 return Err(self.kind.unsent(reason));
             }
             previous.push(next.clone());
@@ -303,13 +303,13 @@ impl GuardedHttp {
         // failure, unless a proxy would resolve it.
         let port = url.port_or_known_default().unwrap_or_default();
         let lookup = destination::resolve_vetted(self.policy.as_ref(), host, port);
-        let vetted = match tokio::time::timeout(request_limits().timeout, lookup).await {
-            Ok(Ok(addresses)) => Some(addresses),
+        let resolved = match tokio::time::timeout(request_limits().timeout, lookup).await {
+            Ok(Ok(_)) => true,
             Ok(Err(DestinationRefused::Private { host, address })) => {
                 kind.refused(&host, address);
                 return Err(SendError::Refused);
             }
-            Ok(Err(_)) | Err(_) => None,
+            Ok(Err(_)) | Err(_) => false,
         };
         let Some(proxied) = &self.proxied else {
             return self
@@ -317,13 +317,12 @@ impl GuardedHttp {
                 .clone()
                 .ok_or_else(|| kind.unsent("the HTTP client could not be built"));
         };
-        // Through the proxy, or straight to the vetted addresses for a host
-        // the proxy settings exclude.
-        let Some(addresses) = vetted else {
+        // Through the proxy, or straight to the host if the proxy settings
+        // do not cover it, where the proxied client's resolver vets it again.
+        if !resolved {
             kind.unresolvable_behind_a_proxy(host);
             return Err(kind.unsent("a host the server cannot resolve, behind a proxy"));
-        };
-        self.pinned.pin(host, &addresses);
+        }
         Ok(proxied.clone())
     }
 }
@@ -333,7 +332,7 @@ impl GuardedHttp {
     /// Clients that refuse nothing, for a test serving on loopback.
     pub(crate) fn open(kind: &'static FetchKind) -> Self {
         let nothing: fn(IpAddr) -> bool = |_| false;
-        Self::new(Arc::new(nothing), false, kind)
+        Self::new(Arc::new(nothing), None, kind)
     }
 }
 
@@ -401,8 +400,8 @@ mod tests {
     /// gl-1270: with a proxy configured, the requests to a named host go
     /// through one client, so the second reuses the first's connection
     /// instead of building a client and connecting again. (No proxy is set
-    /// in the test's environment, so the client reaches the host directly, at
-    /// the addresses vetted for it.)
+    /// in the test's environment, so the client reaches the host directly,
+    /// as one the proxy settings do not cover, and its resolver vets it.)
     #[tokio::test]
     async fn behind_a_proxy_requests_to_a_named_host_share_a_connection() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -436,7 +435,7 @@ mod tests {
             }
         });
         let nothing: fn(std::net::IpAddr) -> bool = |_| false;
-        let http = super::GuardedHttp::new(std::sync::Arc::new(nothing), true, &KIND);
+        let http = super::GuardedHttp::new(std::sync::Arc::new(nothing), Some(Vec::new()), &KIND);
         for _ in 0..2 {
             let fetched = http
                 .send(&format!("http://localhost:{port}/a.png"))
@@ -446,37 +445,40 @@ mod tests {
         }
         server.abort();
         assert_eq!(connections.load(Ordering::SeqCst), 1);
-        // It went to the addresses vetted for the name, pinned without a port.
-        let vetted = http.pinned.pinned("localhost").expect("a pin for the name");
-        assert!(
-            vetted
-                .iter()
-                .all(|address| address.ip().is_loopback() && address.port() == 0),
-            "{vetted:?}"
-        );
     }
 
-    /// The proxied client reaches a named host at the addresses last pinned
-    /// for it, whatever the system would answer (this name it cannot), and on
-    /// the URL's port, not the pin's.
+    /// gl-1795: the proxied client vets every name it resolves itself (a
+    /// host it reaches directly), so no per-host pin has to outlive the
+    /// request: a name the policy refuses is refused at connect, and nothing
+    /// reaches the server behind it. (No proxy is set in the test's
+    /// environment, so the client reaches `localhost` directly.)
     #[tokio::test]
-    async fn the_proxied_client_connects_to_the_addresses_last_pinned_for_a_name() {
+    async fn the_proxied_client_vets_a_name_it_connects_to() {
         use crate::mock_http::MockServer;
         let server = MockServer::start_raw(vec![MockServer::raw_ok("", b"ok")]).await;
         let port = server.base_url.rsplit(':').next().expect("port");
-        let url = format!("http://pinned.invalid:{port}/a.png");
-        let nothing: fn(std::net::IpAddr) -> bool = |_| false;
-        let http = super::GuardedHttp::new(std::sync::Arc::new(nothing), true, &KIND);
+        let loopback: fn(std::net::IpAddr) -> bool = |address| address.is_loopback();
+        let http = super::GuardedHttp::new(std::sync::Arc::new(loopback), Some(Vec::new()), &KIND);
         let proxied = http.proxied.clone().expect("a proxied client");
 
-        // The server listens on 127.0.0.1 only.
-        http.pinned
-            .pin("pinned.invalid", &["127.0.0.2:9".parse().expect("address")]);
-        assert!(proxied.get(&url).send().await.is_err(), "nothing there");
-        http.pinned
-            .pin("pinned.invalid", &["127.0.0.1:9".parse().expect("address")]);
-        let response = proxied.get(&url).send().await.expect("the new pin");
-        assert_eq!(response.text().await.expect("body"), "ok");
-        assert_eq!(server.requests(), 1);
+        let error = proxied
+            .get(format!("http://localhost:{port}/a.png"))
+            .send()
+            .await
+            .expect_err("a loopback name is refused");
+        let refused = std::iter::successors(
+            Some(&error as &(dyn std::error::Error + 'static)),
+            |cause| cause.source(),
+        )
+        .find_map(|cause| cause.downcast_ref::<crate::destination::DestinationRefused>());
+        assert!(
+            matches!(
+                refused,
+                Some(crate::destination::DestinationRefused::Private { host, .. })
+                    if host == "localhost"
+            ),
+            "{error:?}"
+        );
+        assert_eq!(server.requests(), 0);
     }
 }
