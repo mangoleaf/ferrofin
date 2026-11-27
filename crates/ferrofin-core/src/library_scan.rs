@@ -12303,6 +12303,7 @@ impl LibraryScanner {
             tracing::warn!(%err, item = %entity.id, "photo embedded-information pass failed");
             return Vec::new();
         }
+        let exif_fields = photo_exif_written(&photo);
         if photo.width > 0 {
             entity.width = Some(i64::from(photo.width));
         }
@@ -12334,12 +12335,11 @@ impl LibraryScanner {
         // Same rule as the overview/rating above: these keys are written from
         // the tags, so a `None` CLEARS the stored value — but only when the
         // file was actually read. A photo whose EXIF failed to open says
-        // nothing about its camera or GPS and must keep what it had.
-        if photo.exif_was_read
-            && let Some(data) = crate::item_data::merge_data_fields(
-                entity.data.as_deref(),
-                &photo_exif_fields(&photo.exif),
-            )
+        // nothing about its camera or GPS and must keep what it had, and one
+        // read only up to its missing size writes its camera fields alone
+        // (`photo_exif_written`).
+        if let Some(data) =
+            crate::item_data::merge_data_fields(entity.data.as_deref(), &exif_fields)
         {
             entity.data = Some(data);
         }
@@ -19859,6 +19859,28 @@ fn photo_exif_fields(
             exif.iso_speed_rating.map(serde_json::Value::from),
         ),
     ]
+}
+
+/// The [`photo_exif_fields`] a photo's embedded-information pass writes: all
+/// of them for a file read whole; for one read only up to its missing size
+/// ([`PhotoItem::exif_partly_read`](ferrofin_drawing::photo_provider::PhotoItem::exif_partly_read)),
+/// the camera make and model, and the aperture and shutter speed it holds;
+/// none for a file not read.
+fn photo_exif_written(
+    photo: &ferrofin_drawing::photo_provider::PhotoItem,
+) -> Vec<(&'static str, Option<serde_json::Value>)> {
+    let mut fields = photo_exif_fields(&photo.exif);
+    if !photo.exif_was_read {
+        fields.retain(|(key, value)| {
+            photo.exif_partly_read
+                && match *key {
+                    "CameraMake" | "CameraModel" => true,
+                    "Aperture" | "ShutterSpeed" => value.is_some(),
+                    _ => false,
+                }
+        });
+    }
+    fields
 }
 
 /// Whether [`LibraryScanner::enrich_people`] fetches `person`'s biography: it
@@ -28100,6 +28122,52 @@ mod tests {
         )
         .expect("data changed");
         assert!(!crate::item_data::parse_data(Some(&cleared)).contains_key("CameraMake"));
+    }
+
+    // gl-1951: a photo read only up to its missing size writes its camera make
+    // and model, and the aperture and shutter speed it holds, as Jellyfin 12.4
+    // stored them, and keeps every other key; a photo not read writes none.
+    #[test]
+    fn a_photo_read_partly_writes_only_its_camera_keys() {
+        use crate::item_data::{merge_data_fields, parse_data, read_data_f64, read_data_string};
+        use ferrofin_drawing::photo_provider::{PhotoExif, PhotoItem};
+        let stored = merge_data_fields(
+            None,
+            &super::photo_exif_fields(&PhotoExif {
+                camera_make: Some("OLD".into()),
+                camera_model: Some("OldModel".into()),
+                software: Some("OldSoft".into()),
+                aperture: Some(1.4),
+                ..Default::default()
+            }),
+        )
+        .expect("data");
+        let mut photo = PhotoItem {
+            exif_partly_read: true,
+            exif: PhotoExif {
+                camera_make: Some("ACME".into()),
+                shutter_speed: Some(8.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = merge_data_fields(Some(&stored), &super::photo_exif_written(&photo))
+            .expect("data changed");
+        let parsed = parse_data(Some(&merged));
+        assert_eq!(
+            read_data_string(&parsed, "CameraMake").as_deref(),
+            Some("ACME")
+        );
+        assert!(!parsed.contains_key("CameraModel"));
+        assert_eq!(
+            read_data_string(&parsed, "Software").as_deref(),
+            Some("OldSoft")
+        );
+        assert_eq!(read_data_f64(&parsed, "Aperture"), Some(1.4));
+        assert_eq!(read_data_f64(&parsed, "ShutterSpeed"), Some(8.0));
+
+        photo.exif_partly_read = false;
+        assert_eq!(super::photo_exif_written(&photo), Vec::new());
     }
 
     // Unrelated Data keys (playlist membership, VideoType, …) survive the merge.

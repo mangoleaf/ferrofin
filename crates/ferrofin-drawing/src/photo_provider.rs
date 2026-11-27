@@ -101,15 +101,24 @@ pub struct PhotoItem {
     pub path: String,
 
     /// Set by [`PhotoProvider::fetch`] when the file was read as TagLib would
-    /// open it, with or without EXIF, and for a WebP or an AVIF Ferrofin reads
-    /// where TagLib cannot (an accepted divergence, gl-1614).
+    /// open it, with or without EXIF, and with a size, and for a WebP or an
+    /// AVIF Ferrofin reads where TagLib cannot (an accepted divergence,
+    /// gl-1614).
     ///
-    /// Not a Jellyfin field: C# expresses the same thing by only entering the
-    /// assignment block inside its `try`. A caller must not write the
-    /// unconditionally-assigned fields (`overview`, `community_rating`) back
-    /// onto a row when this is `false`, or a file TagLib would refuse would
-    /// clear values it never spoke about.
+    /// Not a Jellyfin field: C# expresses the same thing by only reaching the
+    /// end of the assignment block inside its `try`. A caller must not write
+    /// the unconditionally-assigned fields (`overview`, `community_rating`)
+    /// back onto a row when this is `false`, or a file TagLib would refuse
+    /// would clear values it never spoke about.
     pub exif_was_read: bool,
+
+    /// Set instead of [`exif_was_read`](Self::exif_was_read) when the file
+    /// opened as TagLib would open it but holds no size. C# `FetchAsync` has
+    /// assigned the aperture and shutter speed the EXIF holds and the camera
+    /// make and model when it throws at `Properties.PhotoWidth`
+    /// (`PhotoProvider.cs:77-95`), so a caller writes back those four fields
+    /// alone, the aperture and shutter speed only where they are `Some`.
+    pub exif_partly_read: bool,
 
     /// The image width in pixels (`<= 0` when unknown → backfilled). Port of
     /// `Photo.Width`.
@@ -339,16 +348,22 @@ pub struct ExifTags {
     pub rating: Option<f64>,
     /// `DateTimeOriginal` (falling back to `DateTime`) — C# `ImageTag.DateTime`.
     pub date_taken: Option<DateTime<Utc>>,
-    /// C# `Properties.PhotoWidth`: a JPEG's frame width, else
-    /// `PixelXDimension` (PNG, TIFF and CR2 sizes: gl-1951).
+    /// C# `Properties.PhotoWidth`, each reader's `ExtractProperties`: a
+    /// JPEG's frame width, a PNG's IHDR width, a TIFF's IFD0 `ImageWidth`,
+    /// else `PixelXDimension` (a CR2's, and a WebP's or an AVIF's, which
+    /// TagLib cannot open).
     pub width: Option<i32>,
-    /// C# `Properties.PhotoHeight`: a JPEG's frame height, else
-    /// `PixelYDimension`.
+    /// C# `Properties.PhotoHeight`, from where the width comes from.
     pub height: Option<i32>,
     /// IFD0's `XMLPacket` when it is `BYTE`-typed: the XMP packet TagLib#'s
     /// TIFF reader takes (`Tiff/File.cs`, `Read`), which `read_exif` reads for
     /// a `.tiff` only.
     xmp: Option<Vec<u8>>,
+    /// IFD0's `ImageWidth` and `ImageLength`, a `.tiff`'s size.
+    ifd0_size: (Option<i32>, Option<i32>),
+    /// Set for a file TagLib opens without a positive size, of which only the
+    /// aperture, shutter speed, camera make and model are read (`read_exif`).
+    partial: bool,
 }
 
 /// Reads `path`'s EXIF tags, or `None` when TagLib would fail to open it.
@@ -367,7 +382,11 @@ pub struct ExifTags {
 /// reads on; kamadak-exif refuses such a file, which is left alone here
 /// (gl-1950). So a container that reads with no EXIF in it yields
 /// DEFAULT tags, the clearing case; a mismatched, broken or unreadable file
-/// yields `None`, the leave-alone case.
+/// yields `None`, the leave-alone case. One it opens without a positive size
+/// yields the aperture, shutter speed, camera make and model alone, marked
+/// `partial`: `PhotoProvider` reads `Properties.PhotoWidth` after those
+/// (`PhotoProvider.cs:68-95`), and `Properties` is null without a size, so it
+/// throws there and leaves the rest.
 ///
 /// Ferrofin reads EXIF from containers TagLib reads none from: WebP and AVIF,
 /// which it cannot open, and a PNG's `eXIf` chunk, which its PNG reader skips.
@@ -401,6 +420,36 @@ fn read_exif(path: &str) -> Option<ExifTags> {
     if header.is_none() {
         tags.comment = tags.comment.filter(|comment| !comment.is_empty());
         return Some(tags);
+    }
+    match extension.as_str() {
+        ".png" => {
+            reader.rewind().ok()?;
+            (tags.width, tags.height) = png_size(&mut reader);
+        }
+        ".tiff" => (tags.width, tags.height) = tags.ifd0_size,
+        _ => {}
+    }
+    // A CR2 without an Exif IFD is size-less too: TagLib#'s `IFDTag.ExifIFD`
+    // makes an empty one for its `ExtractProperties`.
+    if tags.width.is_none_or(|w| w <= 0) || tags.height.is_none_or(|h| h <= 0) {
+        let PhotoExif {
+            aperture,
+            shutter_speed,
+            camera_make,
+            camera_model,
+            ..
+        } = tags.exif;
+        return Some(ExifTags {
+            exif: PhotoExif {
+                aperture,
+                shutter_speed,
+                camera_make,
+                camera_model,
+                ..PhotoExif::default()
+            },
+            partial: true,
+            ..ExifTags::default()
+        });
     }
     let ifd = tags.comment.take();
     tags.comment = Some(match extension.as_str() {
@@ -448,28 +497,19 @@ fn tiff_header(head: &[u8]) -> bool {
 }
 
 /// [`read_exif`] for a `.jpg` or `.jpeg`, decided as TagLibSharp 2.3.0's
-/// JPEG reader decides (see [`jpeg_header`]). `None` where it throws, and
-/// where it finds no frame size: `PhotoProvider` reads
-/// `Properties.PhotoWidth` before the comment (`PhotoProvider.cs:95`), and
-/// `Properties` is null without one. With no Exif segment before the scan the
-/// tags are the defaults, and kamadak-exif does not read on through the scan
-/// data; with one, kamadak-exif reads that segment, and its errors leave the
-/// photo alone as a broken EXIF block does. They include every TIFF header
-/// whose magic is not 42, which `ReadAPP1Segment` throws on. The size is the
-/// frame's, as TagLib#'s `Properties` are, whatever the EXIF says.
-///
-/// Upstream has already assigned the aperture, shutter speed, camera make and
-/// model when it throws at a missing size; such a file is left alone whole
-/// here (gl-1951).
+/// JPEG reader decides (see [`jpeg_header`]). `None` where it throws. With no
+/// Exif segment before the scan the tags are the defaults, and kamadak-exif
+/// does not read on through the scan data; with one, kamadak-exif reads that
+/// segment, and its errors leave the photo alone as a broken EXIF block does.
+/// They include every TIFF header whose magic is not 42, which
+/// `ReadAPP1Segment` throws on. The size is the frame's, as TagLib#'s
+/// `Properties` are, whatever the EXIF says, and 0 without a frame header.
 ///
 /// The comment is the combined one: the XMP tag's, an IPTC-IIM caption
 /// filling in for it (`CombinedImageTag.AddTag`), the IFD tag's, then the COM
 /// segment's.
 fn jpeg_tags<R: Read + Seek>(reader: &mut BufReader<R>, len: u64) -> Option<ExifTags> {
     let header = jpeg_header(reader, len)?;
-    if header.width == 0 || header.height == 0 {
-        return None;
-    }
     let mut tags = match header.exif {
         Some(tiff) => tags_or_unopened(exif::Reader::new().read_raw(tiff))?,
         None => ExifTags::default(),
@@ -601,6 +641,26 @@ fn jpeg_header<R: Read + Seek>(reader: &mut BufReader<R>, len: u64) -> Option<Jp
         reader.seek_relative(data - read).ok()?;
         at = next;
     }
+}
+
+/// A PNG's size as TagLibSharp 2.3.0's `ReadIHDRChunk` (`Png/File.cs`) reads
+/// it: the width and height of the IHDR chunk, which must come first.
+/// `reader` must be at the start of the file.
+///
+/// Each is `None` where TagLib# throws instead, which leaves the photo alone
+/// there and reads it partly here (gl-1973): a first chunk that is not a
+/// 13-byte IHDR, or a size over 2^31 - 1. TagLib# also checks the chunk's
+/// CRC, which this does not.
+fn png_size(reader: &mut impl Read) -> (Option<i32>, Option<i32>) {
+    let mut head = [0; 24];
+    if reader.read_exact(&mut head).is_err() || head[8..16] != *b"\0\0\0\x0dIHDR" {
+        return (None, None);
+    }
+    let field = |at: usize| {
+        let bytes = [head[at], head[at + 1], head[at + 2], head[at + 3]];
+        i32::try_from(u32::from_be_bytes(bytes)).ok()
+    };
+    (field(16), field(20))
 }
 
 /// A reader that counts the bytes it returns, so the IFD walk knows what it
@@ -981,7 +1041,9 @@ fn field_unit_len(kind: u16) -> u64 {
 
 /// Every primary-image tag [`tags_from`] reads. [`primary_tiff`] keeps only
 /// these, so a TIFF-based file's other values are never loaded.
-const PRIMARY_TAGS: [exif::Tag; 24] = [
+const PRIMARY_TAGS: [exif::Tag; 26] = [
+    exif::Tag::ImageWidth,
+    exif::Tag::ImageLength,
     exif::Tag::Make,
     exif::Tag::Model,
     exif::Tag::Software,
@@ -1055,6 +1117,20 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
             .get_uint(0)
             .and_then(|v| i32::try_from(v).ok())
     };
+    // `IFDStructure.GetLongValue`, which the sizes are read with: one SHORT
+    // or one LONG.
+    let long = |tag: Tag| -> Option<i32> {
+        let value = &primary(exif, tag)?.value;
+        let count = match value {
+            exif::Value::Short(values) => values.len(),
+            exif::Value::Long(values) => values.len(),
+            _ => 0,
+        };
+        if count != 1 {
+            return None;
+        }
+        i32::try_from(value.get_uint(0)?).ok()
+    };
 
     ExifTags {
         exif: PhotoExif {
@@ -1081,14 +1157,16 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
         title: text(XP_TITLE),
         rating: integer(RATING).map(f64::from),
         date_taken: exif_datetime(exif),
-        width: integer(Tag::PixelXDimension),
-        height: integer(Tag::PixelYDimension),
+        width: long(Tag::PixelXDimension),
+        height: long(Tag::PixelYDimension),
         xmp: match primary(exif, XMP_PACKET).map(|field| &field.value) {
             Some(exif::Value::Byte(packet)) if packet.len() <= comment::TEXT_LIMIT => {
                 Some(packet.clone())
             }
             _ => None,
         },
+        ifd0_size: (long(Tag::ImageWidth), long(Tag::ImageLength)),
+        partial: false,
     }
 }
 
@@ -1281,15 +1359,30 @@ fn exif_datetime(exif: &exif::Exif) -> Option<DateTime<Utc>> {
 
 /// Writes the read tags onto the item, in the order C# `FetchAsync` does.
 ///
-/// Every assignment is unconditional (as upstream's is) except the title, which
-/// C# skips for a locked `Name`, and the dimensions, which are only taken when
-/// the tags carry positive ones. Unconditional means a photo whose rating or
-/// comment tag was REMOVED has the field cleared on the next refresh — the file
-/// is the only source of truth for a photo, and upstream assigns both straight
-/// from the tag. It runs for every file TagLib would open, one with no EXIF
-/// included; a file it would fail to open never reaches here and keeps
-/// whatever it had.
+/// Every assignment is unconditional except the title, which C# skips for a
+/// locked `Name`, and the dimensions, which are only taken when the tags carry
+/// positive ones. C# assigns the aperture and shutter speed only from a
+/// one-value RATIONAL entry and keeps them otherwise; here they come from any
+/// rational and are cleared without one (an owner decision, gl-1984).
+/// Unconditional means a photo whose rating or comment tag was REMOVED has the
+/// field cleared on the next refresh — the file is the only source of truth
+/// for a photo, and upstream assigns both straight from the tag. It runs for
+/// every file TagLib would open, one with no EXIF included; a file it would
+/// fail to open never reaches here and keeps whatever it had.
+///
+/// A file read partly (see `read_exif`) gets what C# had assigned when it
+/// threw at the size: the camera make and model, and the aperture and shutter
+/// speed only where the file holds them (`PhotoProvider.cs:77-85` assigns
+/// those inside an `is RationalIFDEntry` check).
 fn apply_exif(item: &mut PhotoItem, tags: &ExifTags) {
+    if tags.partial {
+        item.exif_partly_read = true;
+        item.exif.aperture = tags.exif.aperture.or(item.exif.aperture);
+        item.exif.shutter_speed = tags.exif.shutter_speed.or(item.exif.shutter_speed);
+        item.exif.camera_make.clone_from(&tags.exif.camera_make);
+        item.exif.camera_model.clone_from(&tags.exif.camera_model);
+        return;
+    }
     item.exif_was_read = true;
     item.exif = tags.exif.clone();
     if let Some(width) = tags.width.filter(|w| *w > 0) {
@@ -2001,6 +2094,8 @@ mod tests {
             .flat_map(u16::to_le_bytes)
             .collect();
         let ifd0: Vec<Row> = vec![
+            (0x0100, 3, 1, short(6000)),         // ImageWidth, a SHORT
+            (0x0101, 4, 1, long(4000)),          // ImageLength, a LONG
             (0x010f, 2, 6, b"Wrong\0".to_vec()), // a duplicate: the last Make wins
             (0x010f, 2, 6, b"Canon\0".to_vec()),
             (0x0110, 2, 13, b"Canon EOS R5\0".to_vec()),
@@ -2081,6 +2176,7 @@ mod tests {
         assert_eq!(tags.comment.as_deref(), Some("Hello"));
         assert_eq!(tags.rating, Some(4.0));
         assert_eq!((tags.width, tags.height), (Some(8192), Some(5464)));
+        assert_eq!(tags.ifd0_size, (Some(6000), Some(4000)));
         // The IFDs and the values read (in 8 KiB buffer fills, about 64 KiB),
         // not the pixel data, the 2 MiB of layers, the ICC profile or the
         // maker note.
@@ -2268,7 +2364,8 @@ mod tests {
         assert!(item.exif_was_read);
         assert_eq!(item.exif.camera_make.as_deref(), Some("Canon"));
         assert_eq!(item.exif.orientation, Some(ImageOrientation::RightTop));
-        assert_eq!((item.width, item.height), (8192, 5464));
+        // IFD0's size, not the Exif IFD's (gl-1951).
+        assert_eq!((item.width, item.height), (6000, 4000));
         assert_eq!(item.name.as_deref(), Some("Harbour"));
         assert_eq!(item.production_year, Some(2023));
     }
@@ -2697,7 +2794,8 @@ mod tests {
 
     /// gl-1615: what TagLibSharp 2.3.0's JPEG reader (`Jpeg/File.cs`,
     /// `ReadMetadata`) makes of each shape: `None` where it throws or finds no
-    /// frame size, else the comment it reads. Each was read in its source and
+    /// frame size (which `PhotoProvider` throws at, after the camera fields:
+    /// gl-1951), else the comment it reads. Each was read in its source and
     /// measured on a stock Jellyfin 12.4, whose stored `Overview` is NULL for
     /// `None` and the comment, or "", otherwise.
     #[rstest::rstest]
@@ -2723,8 +2821,6 @@ mod tests {
         [SOI, b"\xff\xe1\x00\x0eExif\0\0II\x2a\x00\x08\x00", comment_segment("hi").as_slice(), SOF_1X1, EOI].concat(),
         Some("hi")
     )]
-    // Jellyfin keeps the aperture, shutter speed, camera make and model it
-    // assigned before the missing size throws (gl-1951).
     #[case::exif_without_a_frame_header([SOI, comment_segment("hi").as_slice(), EOI].concat(), None)]
     // TagLib throws on a TIFF magic other than 42; kamadak-exif refuses it too.
     #[case::a_broken_exif_block([SOI, BROKEN_EXIF, SOF_1X1, EOI].concat(), None)]
@@ -3162,5 +3258,257 @@ mod tests {
         assert!(item.exif_was_read);
         assert_eq!(item.overview.as_deref(), Some(overview));
         assert_eq!(item.exif.camera_make.as_deref(), camera_make);
+    }
+
+    /// A little-endian SHORT row of `value`.
+    fn short_row(tag: u16, value: u16) -> Row {
+        (tag, 3, 1, value.to_le_bytes().to_vec())
+    }
+
+    /// A little-endian LONG row of `value`.
+    fn long_row(tag: u16, value: u32) -> Row {
+        (tag, 4, 1, value.to_le_bytes().to_vec())
+    }
+
+    /// A PNG whose IHDR says `width` by `height`, holding `chunks` (type,
+    /// data) before its IEND, every CRC right.
+    fn png_sized(width: u32, height: u32, chunks: &[(&[u8], Vec<u8>)]) -> Vec<u8> {
+        let ihdr = [
+            &width.to_be_bytes()[..],
+            &height.to_be_bytes(),
+            &[8, 2, 0, 0, 0],
+        ]
+        .concat();
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(chunk(b"IHDR", &ihdr));
+        for (kind, data) in chunks {
+            png.extend(chunk(kind, data));
+        }
+        png.extend(chunk(b"IEND", b""));
+        png
+    }
+
+    /// A little-endian CR2 of `ifd0` and an Exif IFD of `exif` (see
+    /// [`cr2_without_a_comment`]).
+    fn cr2(ifd0: &[Row], exif: &[Row]) -> Vec<u8> {
+        let mut cr2 = tiff_file(true, 8, ifd0, exif, &[], &[]);
+        cr2[8..16].copy_from_slice(b"CR\x02\x00\0\0\0\0");
+        cr2
+    }
+
+    /// An EXIF block whose `PixelXDimension` and `PixelYDimension` say
+    /// `width` by `height`.
+    fn exif_sized(width: u32, height: u32) -> Vec<u8> {
+        let size = [long_row(0xa002, width), long_row(0xa003, height)];
+        tiff_file(true, 0, &[], &size, &[], &[])
+    }
+
+    /// gl-1951: a photo's size is its container's, as TagLib#'s `Properties`
+    /// are (each reader's `ExtractProperties`), whatever its EXIF and its row
+    /// say: a PNG's IHDR, a TIFF's IFD0 `ImageWidth` and `ImageLength`, a
+    /// CR2's Exif IFD `PixelXDimension` and `PixelYDimension`.
+    #[rstest::rstest]
+    #[case::a_png_not_its_exif_size("photo.png", png_sized(3, 2, &[(b"eXIf", exif_sized(4032, 3024))]))]
+    #[case::a_png_without_exif("photo.png", png_sized(3, 2, &[]))]
+    #[case::a_tiff_not_its_exif_size(
+        "photo.tiff",
+        tiff_file(
+            true,
+            0,
+            &[short_row(0x0100, 3), long_row(0x0101, 2)],
+            &[long_row(0xa002, 4032), long_row(0xa003, 3024)],
+            &[],
+            &[],
+        )
+    )]
+    #[case::a_tiff_without_an_exif_size(
+        "photo.tiff",
+        tiff_file(true, 0, &[long_row(0x0100, 3), short_row(0x0101, 2)], &[], &[], &[])
+    )]
+    #[case::a_cr2_not_its_preview_size(
+        "photo.cr2",
+        cr2(
+            &[long_row(0x0100, 160), long_row(0x0101, 120)],
+            &[long_row(0xa002, 3), long_row(0xa003, 2)],
+        )
+    )]
+    #[tokio::test]
+    async fn a_photos_size_is_its_containers(#[case] name: &str, #[case] bytes: Vec<u8>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, name, &bytes);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 640,
+            height: 480,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert!(item.exif_was_read);
+        assert_eq!((item.width, item.height), (3, 2));
+    }
+
+    /// The EXIF of a photo without a size: IFD0's Make "ACME", Software and
+    /// Rating, and the Exif IFD's RATIONAL shutter speed of 8 and comment; no
+    /// aperture, no model.
+    fn camera_rows() -> (Vec<Row>, Vec<Row>) {
+        let ifd0 = vec![
+            (0x010f, 2, 5, b"ACME\0".to_vec()),
+            (0x0131, 2, 10, b"Darktable\0".to_vec()),
+            short_row(0x4746, 5),
+        ];
+        let exif = vec![
+            (0x9201, 5, 1, rationals(true, &[(8, 1)])),
+            (0x9286, 7, 10, b"ASCII\0\0\0hi".to_vec()),
+        ];
+        (ifd0, exif)
+    }
+
+    /// [`camera_rows`] as an EXIF block (or a TIFF) with `ifd0_extra` in IFD0.
+    fn camera_without_a_size(ifd0_extra: &[Row]) -> Vec<u8> {
+        let (ifd0, exif) = camera_rows();
+        tiff_file(true, 0, &[ifd0_extra, &ifd0].concat(), &exif, &[], &[])
+    }
+
+    /// gl-1951: TagLib# opens a photo without a positive size, but its
+    /// `Properties` are null, so `PhotoProvider` throws at
+    /// `Properties.PhotoWidth` (`PhotoProvider.cs:95`) after assigning the
+    /// aperture and shutter speed the EXIF holds (`:77-85`) and the camera
+    /// make and model (`:92-93`), and leaves everything else. A stock Jellyfin
+    /// 12.4 rescanned a JPEG, a TIFF and a CR2 that way. The size is
+    /// then the image processor's (`:152-166`).
+    #[rstest::rstest]
+    #[case::a_jpeg_without_a_frame_header(
+        "photo.jpg",
+        [SOI, &segment(0xe1, &[b"Exif\0\0".as_slice(), &camera_without_a_size(&[])].concat()), EOI].concat()
+    )]
+    #[case::a_jpeg_with_a_zero_width_frame(
+        "photo.jpg",
+        [
+            SOI,
+            &segment(0xe1, &[b"Exif\0\0".as_slice(), &camera_without_a_size(&[])].concat()),
+            b"\xff\xc0\x00\x0b\x08\x00\x01\x00\x00\x01\x01\x11\x00",
+            EOI,
+        ]
+        .concat()
+    )]
+    // Its camera tags are its eXIf chunk's, an accepted divergence (gl-1614).
+    #[case::a_png_of_no_size("photo.png", png_sized(0, 0, &[(b"eXIf", camera_without_a_size(&[]))]))]
+    // Not upstream's: TagLib# throws at a first chunk that is not IHDR, which
+    // leaves the photo alone whole; Ferrofin reads it as size-less (gl-1973).
+    #[case::a_png_without_an_ihdr_first(
+        "photo.png",
+        [
+            b"\x89PNG\r\n\x1a\n".as_slice(),
+            &chunk(b"eXIf", &camera_without_a_size(&[])),
+            &chunk(b"IEND", b""),
+        ]
+        .concat()
+    )]
+    #[case::a_png_of_no_height("photo.png", png_sized(3, 0, &[(b"eXIf", camera_without_a_size(&[]))]))]
+    #[case::a_tiff_without_a_size("photo.tiff", camera_without_a_size(&[]))]
+    #[case::a_tiff_of_no_width(
+        "photo.tiff",
+        camera_without_a_size(&[long_row(0x0100, 0), long_row(0x0101, 2)])
+    )]
+    #[case::a_tiff_without_a_height("photo.tiff", camera_without_a_size(&[long_row(0x0100, 3)]))]
+    // `GetLongValue` reads one SHORT or one LONG, never an array.
+    #[case::a_tiff_whose_width_is_two_values(
+        "photo.tiff",
+        camera_without_a_size(&[(0x0100, 4, 2, [3u32.to_le_bytes(), 3u32.to_le_bytes()].concat()), long_row(0x0101, 2)])
+    )]
+    #[case::a_tiff_whose_width_is_a_byte(
+        "photo.tiff",
+        camera_without_a_size(&[(0x0100, 1, 1, vec![3]), long_row(0x0101, 2)])
+    )]
+    // Its IFD0 size is its preview's.
+    #[case::a_cr2_without_a_size("photo.cr2", {
+        let (ifd0, exif) = camera_rows();
+        cr2(&[&[long_row(0x0100, 160), long_row(0x0101, 120)], ifd0.as_slice()].concat(), &exif)
+    })]
+    #[tokio::test]
+    async fn a_photo_without_a_size_is_read_up_to_its_camera(
+        #[case] name: &str,
+        #[case] bytes: Vec<u8>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, name, &bytes);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(4, 3)));
+        let mut item = PhotoItem {
+            path,
+            name: Some("kept".into()),
+            overview: Some("stale".into()),
+            community_rating: Some(3.0),
+            exif: PhotoExif {
+                aperture: Some(1.4),
+                camera_model: Some("stale".into()),
+                software: Some("stale".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert!(!item.exif_was_read);
+        assert!(item.exif_partly_read);
+        let exif = PhotoExif {
+            aperture: Some(1.4),
+            shutter_speed: Some(8.0),
+            camera_make: Some("ACME".into()),
+            camera_model: None,
+            software: Some("stale".into()),
+            ..Default::default()
+        };
+        assert_eq!(item.exif, exif);
+        assert_eq!(item.name.as_deref(), Some("kept"));
+        assert_eq!(item.overview.as_deref(), Some("stale"));
+        assert_eq!(item.community_rating, Some(3.0));
+        assert_eq!((item.width, item.height), (4, 3));
+    }
+
+    /// A partly read photo takes the aperture its EXIF holds over the item's.
+    #[tokio::test]
+    async fn a_photo_without_a_size_takes_the_aperture_it_holds() {
+        let (ifd0, mut exif) = camera_rows();
+        exif.push((0x9202, 5, 1, rationals(true, &[(28, 10)])));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(
+            &dir,
+            "photo.tiff",
+            &tiff_file(true, 0, &ifd0, &exif, &[], &[]),
+        );
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            exif: PhotoExif {
+                aperture: Some(1.4),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert!(item.exif_partly_read);
+        assert_eq!(item.exif.aperture, Some(2.8));
+    }
+
+    /// gl-1951: TagLibSharp 2.3.0's `ReadIHDRChunk` size, `None` for each
+    /// field where TagLib# throws instead (gl-1973).
+    #[rstest::rstest]
+    #[case::the_ihdr_size(png_sized(3, 2, &[]), (Some(3), Some(2)))]
+    #[case::a_zero_size(png_sized(0, 0, &[]), (Some(0), Some(0)))]
+    #[case::a_width_over_2_31(png_sized(1 << 31, 2, &[]), (None, Some(2)))]
+    #[case::cut_inside_the_ihdr(png_sized(3, 2, &[])[..20].to_vec(), (None, None))]
+    #[case::an_ihdr_of_another_length(
+        [b"\x89PNG\r\n\x1a\n".as_slice(), &chunk(b"IHDR", &[0, 0, 0, 3, 0, 0, 0, 2, 8, 2, 0, 0])].concat(),
+        (None, None)
+    )]
+    #[case::another_chunk_first(
+        [b"\x89PNG\r\n\x1a\n".as_slice(), &chunk(b"tEXt", b"Comment\0a comment"), &png_sized(3, 2, &[])[8..]].concat(),
+        (None, None)
+    )]
+    fn a_pngs_size_is_its_first_chunks_ihdr(
+        #[case] file: Vec<u8>,
+        #[case] size: (Option<i32>, Option<i32>),
+    ) {
+        assert_eq!(png_size(&mut file.as_slice()), size);
     }
 }
