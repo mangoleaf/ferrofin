@@ -3116,6 +3116,83 @@ const LEGACY_HLS_AUDIO_KEEP_ALIVE: &str = "The job whose playlist's file stem pr
      deliberate, response-invisible superset: it only stops the idle reaper from killing a \
      transcode a client is reading.";
 
+/// The divergences of the two `RemoteImageController` read rows: which remote
+/// image providers are offered, unlike upstream, then the row's own `$own`.
+macro_rules! remote_image_provider_divergences {
+    ($($own:expr),* $(,)?) => {
+        &[
+            "TheTVDB (series, seasons and episodes) and fanart.tv (movies, trailers, series, \
+             seasons, artists and albums) are listed and asked too: Ferrofin compiles its remote \
+             providers in (CLAUDE.md, Current scope), where stock v12.4 lists them only with \
+             jellyfin-plugin-tvdb and jellyfin-plugin-fanart installed.",
+            "TheTVDB's movie and person image providers (TvdbMovieImageProvider, \
+             TvdbPersonImageProvider) are not ported, so a movie or a person lists no TheTVDB \
+             where the plugin offers its artwork. Fix paths: gl-1405 (movies), gl-1124 \
+             (people).",
+            "fanart.tv's provider is named FanArt (in the provider list and each candidate's \
+             ProviderName), where every provider of the Fanart plugin is named Fanart. Fix path: \
+             gl-1990.",
+            "fanart.tv's movie artwork is offered for movies and trailers, where the plugin's \
+             MovieProvider supports movies, box sets and music videos. Fix path: gl-1991.",
+            "A season's fanart.tv and TheMovieDb providers, which tie on IHasOrder (1), are \
+             listed and asked TheMovieDb first when no image order is saved; Jellyfin registers \
+             plugin assemblies first, so with the Fanart plugin it lists Fanart first (seen on \
+             12.4 with Fanart 15). Fix path: gl-2001.",
+            "A WASM plugin's remote-images candidates are neither listed nor asked (they serve \
+             the refresh's automatic pick only), where upstream lists and asks every installed \
+             plugin's IRemoteImageProvider. Fix path: gl-1992.",
+            "A nil itemId is a 404; upstream's GetItemById(Guid.Empty) throws, a 400. Fix path: \
+             gl-1695.",
+            "The 401 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+             gl-666.",
+            $($own),*
+        ]
+    };
+}
+
+/// The divergences of `GET /Items/{itemId}/RemoteImages/Providers`.
+const REMOTE_IMAGE_PROVIDERS_DIVERGENCES: &[&str] = remote_image_provider_divergences!();
+
+/// What `GET /Items/{itemId}/RemoteImages` does unlike upstream: which
+/// providers are offered, then the providers' candidates.
+const REMOTE_IMAGES_DIVERGENCES: &[&str] = remote_image_provider_divergences!(
+    "TheMovieDb's image providers look an item with no id up by its name (and a series by an \
+     IMDb or TVDB id through /find), and a season's or an episode's need the series' name, \
+     where upstream's ask only by the Tmdb id (a movie also by its IMDb id through /find) and \
+     return nothing without it. Fix path: gl-1045.",
+    "TheMovieDb's candidates still pass through 10.11's AdjustImageLanguage after \
+     GetImageLanguage, so under a preferred language that is neither two letters nor two \
+     parts (fil, zh-Hans-CN, set through the API) an image whose code is the tag's first two \
+     letters is labelled with the tag and ranked first; v12.4 has no such step. Fix path: \
+     gl-1716.",
+    "An episode's TheMovieDb stills are those of its aired-order numbers, where \
+     TmdbEpisodeImageProvider passes the series' DisplayOrder, mapped through TMDb's episode \
+     group. Fix path: gl-1784.",
+    "TheAudioDB's artist artwork needs the artist's MusicBrainz id, where \
+     AudioDbArtistImageProvider falls back to its TheAudioDB id (artist.php). Fix path: \
+     gl-497.",
+    "TheTVDB's series artwork maps artwork types 22 and 23 through a fixed table (22 a logo, \
+     23 clear art, which TheTVDB's own Kodi scraper numbers the other way round; not yet \
+     confirmed against /artwork/types), where the plugin maps each by its name through \
+     /artwork/types. Fix path: gl-1856.",
+    "TheTVDB's lookups differ from plugin 5c4592f only where a request fails or TheTVDB's \
+     data is unusual: a series' artwork comes from /series/{id}/extended rather than \
+     /series/{id}/artworks, a failed display-order season falls back to the aired one where \
+     the plugin answers none, a season's type is matched ignoring case, an episode row must \
+     match its numbers, an artwork language TheTVDB's /languages does not list is kept, and \
+     artwork with no URL is dropped. Fix path: gl-791.",
+    "TheTVDB's series artwork carries its score as CommunityRating and keeps a missing width \
+     or height unknown, so it is ordered by score within each language, where the plugin \
+     sets no rating and 0 (owner decision 2026-11-19, gl-1873).",
+    "fanart.tv's season artwork is read from the series' fanart.tv document by the series' \
+     TVDb id; the plugin's SeasonProvider looks the season's own Tmdb or Tvdb id up, which \
+     names no fanart.tv show, so it offers nothing (seen on 12.4 with Fanart 15). Jellyfin \
+     bug not ported.",
+    "fanart.tv's documents and TheAudioDB's answers are fetched on every request, where the \
+     Fanart plugin and TheAudioDB's image providers keep each on disk for 2 days, so new \
+     artwork there is offered sooner. Fix path: gl-1987.",
+);
+
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
 /// ([`UPSTREAM_TAG`], or the earlier tag [`VERIFIED_AGAINST_EARLIER_PIN`]
@@ -7293,6 +7370,87 @@ pub const VERIFIED: &[Verified] = &[
             "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
          path: gl-666.",
         ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/RemoteImages",
+        upstream_file: "Jellyfin.Api/Controllers/RemoteImageController.cs",
+        upstream_method: "GetRemoteImages",
+        ferrofin: "handlers/remote_images.rs get_remote_images (RequireAuth, the controller's \
+               [Authorize]; type, startIndex, limit, providerName and includeAllLanguages, \
+               false by default; require_item, GetItemById(itemId, User.GetUserId()): a \
+               missing item, or one a signed-in user cannot see, is a 404, and an API key's \
+               caller is not checked; RemoteImageQuery with IncludeDisabledProviders; the \
+               provider list GetRemoteImageProviderInfo filtered to those whose \
+               SupportedImages hold type, its names Distinct(OrdinalIgnoreCase); \
+               TotalRecordCount before paging, then Skip(startIndex) and Take(limit), a \
+               negative skip skipping none and a negative take taking none) → \
+               ferrofin-providers provider_manager.rs get_available_remote_images → \
+               available_images_for (ProviderManager.GetAvailableRemoteImages: \
+               ordered_image_sources, GetRemoteImageProviders through \
+               GetImageProvidersInternal: image_sources_for's Supports per kind in \
+               registration order (a season's fanart.tv and TheMovieDb tie excepted, see the \
+               divergences), then the library's TypeOptions ImageFetcherOrder, else the \
+               server's, matched exactly, \
+               then library_options.rs default_image_order's IHasOrder, a stable sort; \
+               providerName matched OrdinalIgnoreCase; type matched against \
+               GetSupportedImages; IncludeDisabledProviders, so CanRefreshImages' lock, extra \
+               and enabled-fetcher checks do not apply; GetPreferredMetadataLanguage through \
+               preferred_metadata_language; every provider asked together, Task.WhenAll, and \
+               their blocks joined in provider order; per provider GetImages' type filter, \
+               its language filter unless includeAllLanguages (no language, the preferred \
+               one, or en, when the preferred language is not blank) and ferrofin-model \
+               extensions.rs order_by_language_descending, OrderByLanguageDescending) → \
+               images_from, each provider's GetImages: tmdb_images through tmdb.rs \
+               all_images, season_images, episode_images, collection_images and \
+               person_images (TmdbMovieImageProvider, Order 0, a Tmdb id else an Imdb id \
+               through /find; TmdbSeriesImageProvider, 2; TmdbSeasonImageProvider and \
+               TmdbEpisodeImageProvider, 1, by the series' Tmdb id and the season and \
+               episode numbers, an episode with no season number in season 1; \
+               TmdbBoxSetImageProvider and TmdbPersonImageProvider, 0; \
+               ConvertToRemoteImageInfo: the size setting per family, the ThumbnailSizes \
+               preview, the dimensions only at the original size, vote average and count, \
+               GetImageLanguage with the region added only when it contradicts the request \
+               and \"\" for an untagged image, a languaged backdrop as a Thumb, RatingType \
+               Score), tvdb_images and tvdb.rs (jellyfin-plugin-tvdb 5c4592f \
+               TvdbSeriesImageProvider, TvdbSeasonImageProvider in the series' display order \
+               else the aired one, TvdbEpisodeImageProvider, no IHasOrder so 50; \
+               tvdb_image_language, NormalizeToJellyfin's culture match and its zhtw, pt and \
+               por overrides), fanart_images and fanart_season_images through fanart.rs \
+               (jellyfin-plugin-fanart 15, the release Jellyfin 12.4's plugin catalogue \
+               installs: MovieProvider, SeriesProvider, SeasonProvider, ArtistProvider and \
+               AlbumProvider, their Order 1, 1, 1, 0 and 1; each array's fixed width and \
+               height, a series or season thumb added before 2016-01-08 at 500x281, the \
+               series leg's season filter, the URL as given and its /bigpreview/ twin as \
+               the thumbnail, likes read as int.TryParse reads them, 00 as no language, \
+               the album matched by its release or release-group id, the plugin's \
+               width-first sort; RatingType Likes), keyed_images (AudioDbArtistImageProvider, \
+               Order 1, and AudioDbAlbumImageProvider, 2, through audiodb.rs: the artist's \
+               thumb, logo, banner and three fanart, the album's thumb and CD art; \
+               OmdbImageProvider, 90, the Imdb id's Poster, N/A as none; \
+               StudiosImageProvider through studios.rs, GetComparableName against the \
+               repository's thumbs.txt, kept a day). Compared at the pinned v12.4 tag, and \
+               live on 12.4 with Fanart 15.0.0.0 installed",
+        date: "2026-11-26",
+        divergences: REMOTE_IMAGES_DIVERGENCES,
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/RemoteImages/Providers",
+        upstream_file: "Jellyfin.Api/Controllers/RemoteImageController.cs",
+        upstream_method: "GetRemoteImageProviders",
+        ferrofin: "handlers/remote_images.rs get_remote_image_providers (RequireAuth; \
+               require_item's 404, as for GET /Items/{itemId}/RemoteImages) → \
+               ferrofin-providers provider_manager.rs get_remote_image_provider_info \
+               (ProviderManager.GetRemoteImageProviderInfo: GetRemoteImageProviders(item, \
+               true) in ordered_image_sources' order, each provider's Name and \
+               GetSupportedImages, RemoteImageSource::supported_images, each list verbatim \
+               from the C# provider). Compared at the pinned v12.4 tag, and live on 12.4 \
+               with Fanart 15.0.0.0 installed",
+        date: "2026-11-26",
+        divergences: REMOTE_IMAGE_PROVIDERS_DIVERGENCES,
         refs: &[],
     },
     Verified {

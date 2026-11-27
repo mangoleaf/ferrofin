@@ -721,35 +721,35 @@ reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented sco
 request = "GetRemoteImageProviders"
 path = "$"
 kind = "length"
-issue = 862
+verified = "GET /Items/{itemId}/RemoteImages/Providers"
 reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks."
 
 [[entry]]
 request = "GetRemoteImageProviders"
 path = "[].Name"
 kind = "value"
-issue = 862
+verified = "GET /Items/{itemId}/RemoteImages/Providers"
 reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks."
 
 [[entry]]
 request = "GetRemoteImageProviders"
 path = "[].SupportedImages"
 kind = "length"
-issue = 862
+verified = "GET /Items/{itemId}/RemoteImages/Providers"
 reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks."
 
 [[entry]]
 request = "GetRemoteImages"
 path = "Providers"
 kind = "length"
-issue = 862
+verified = "GET /Items/{itemId}/RemoteImages"
 reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks."
 
 [[entry]]
 request = "GetRemoteImages"
 path = "Providers[]"
 kind = "value"
-issue = 862
+verified = "GET /Items/{itemId}/RemoteImages"
 reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks."
 
 [[entry]]
