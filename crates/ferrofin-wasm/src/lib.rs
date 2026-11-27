@@ -136,6 +136,10 @@ pub struct WasmSettings {
     /// run every surface it declares, gated on and fed the compiled-in
     /// plugin's flag and configuration, while invisible on `/Plugins`.
     pub reserved_ids: Vec<Uuid>,
+    /// Files an uninstall marked for deletion that the start could not
+    /// delete (not a knob: the composition root fills it). None is loaded,
+    /// as upstream skips a plugin whose status is `Deleted`.
+    pub skipped_files: Vec<std::path::PathBuf>,
 }
 
 impl Default for WasmSettings {
@@ -152,6 +156,7 @@ impl Default for WasmSettings {
             subtitle_extract_mb: 10,
             private_http_allow: Vec::new(),
             reserved_ids: Vec::new(),
+            skipped_files: Vec::new(),
         }
     }
 }
@@ -162,6 +167,13 @@ impl WasmSettings {
     #[must_use]
     pub fn with_reserved_ids(mut self, ids: impl IntoIterator<Item = Uuid>) -> Self {
         self.reserved_ids = ids.into_iter().collect();
+        self
+    }
+
+    /// Never loads `files` (see [`skipped_files`](Self::skipped_files)).
+    #[must_use]
+    pub fn with_skipped_files(mut self, files: Vec<std::path::PathBuf>) -> Self {
+        self.skipped_files = files;
         self
     }
 
@@ -394,7 +406,8 @@ impl WasmPluginHost {
     /// world version, reports an invalid descriptor, or duplicates an id is
     /// **skipped with an `error!`** — one bad file never blocks the server
     /// or the other plugins. With no `*.wasm` file it builds nothing: no
-    /// engine, no epoch-ticker thread, no guest HTTP clients.
+    /// engine, no epoch-ticker thread, no guest HTTP clients. A file in
+    /// [`WasmSettings::skipped_files`] is not loaded at all.
     ///
     /// It also removes the segment cache (`{id}.segments/`) of every plugin
     /// not installed, unless the directory could not be listed or a file
@@ -422,6 +435,7 @@ impl WasmPluginHost {
                 })
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|ext| ext == "wasm"))
+                .filter(|p| !settings.skipped_files.contains(p))
                 .collect(),
             // A missing directory is the normal no-plugins state; anything
             // else (permissions, I/O) must not masquerade as it.

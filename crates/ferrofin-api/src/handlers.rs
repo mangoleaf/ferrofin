@@ -2932,11 +2932,13 @@ const PLUGINS_UNINSTALL_NO_HOOK: &str = "No plugin code runs at the uninstall: t
      as the host holds everything it stored and removes it (the WASM tier, \
      docs/EXTENSIONS.md). Response-invisible.";
 
-/// What the two uninstall rows answer when the file cannot be deleted.
-const PLUGINS_UNINSTALL_DELETE_FAILURE: &str = "A plugin file that cannot be deleted answers \
-     500 and leaves the plugin installed; upstream's RemovePlugin, when it can still save the \
-     plugin's manifest, marks it Deleted, answers 204 and deletes it at the next boot \
-     (LoadAssemblies). Fix path: gl-2024.";
+/// What the two uninstall rows list for a plugin whose file could not be deleted.
+const PLUGINS_UNINSTALL_MARKED_DELETED: &str = "A plugin whose file could not be deleted \
+     leaves GET /Plugins and every lookup at once, as one whose file was deleted does, and \
+     uninstalling it again is a 404 unless that file is the {id}.wasm an install staged. \
+     Upstream keeps its Deleted entry: GET /Plugins reports it as Restart until the restart \
+     and, after a start that still cannot delete the file, as Deleted, and uninstalling it \
+     again answers 204. Fix path: gl-729.";
 
 /// The code path the two scheduled-task read rows share after their handler:
 /// `ScheduledTaskHelpers.GetTaskInfo` over the task's worker.
@@ -7842,9 +7844,17 @@ pub const VERIFIED: &[Verified] = &[
              an install's staged {id}.wasm are deleted with its {config}/plugins/{id} \
              directory, KV state, segment cache, offered-items record and enabled override, it \
              leaves every lookup until the restart, DeletePlugin's _plugins.Remove, and the \
-             restart is flagged, NotifyPendingRestart → 204; a plugin reporting CanUninstall \
-             false, an in-tree provider, is logged at warn and answered 204, the \"Attempt to \
-             delete non removable plugin\" return; no plugin is a 404)"
+             restart is flagged, NotifyPendingRestart → 204; a file that cannot be deleted is \
+             logged at warn and marked in {config}/plugins/state.json, RemovePlugin's \
+             ChangePluginState(plugin, PluginStatus.Deleted), and the uninstall goes on as \
+             above, a mark that cannot be saved answering 500 as SaveManifest's failed write \
+             does; each start then runs delete_plugins_marked_deleted before the WASM host \
+             loads the directory, LoadAssemblies' Deleted loop: a marked file is deleted and \
+             forgotten, one it still cannot delete stays marked and is not loaded, and an \
+             install writing the file again forgets its mark, as PopulateManifest writes the \
+             new status over Deleted; a plugin reporting CanUninstall false, an in-tree \
+             provider, is logged at warn and answered 204, the \"Attempt to delete non \
+             removable plugin\" return; no plugin is a 404)"
         ),
         date: "2026-11-27",
         divergences: &[
@@ -7856,7 +7866,7 @@ pub const VERIFIED: &[Verified] = &[
              name, where upstream removes its Malfunctioned or NotSupported entry. Fix path: \
              gl-729.",
             PLUGINS_UNINSTALL_CONFIGURATION,
-            PLUGINS_UNINSTALL_DELETE_FAILURE,
+            PLUGINS_UNINSTALL_MARKED_DELETED,
             PLUGINS_UNINSTALL_EVENT,
             PLUGINS_UNINSTALL_NO_HOOK,
             PLUGINS_ERROR_BODIES,
@@ -7891,7 +7901,7 @@ pub const VERIFIED: &[Verified] = &[
              {id}.wasm an install staged and is a 404 under any other name, where upstream \
              removes its Malfunctioned or NotSupported entry. Fix path: gl-729.",
             PLUGINS_UNINSTALL_CONFIGURATION,
-            PLUGINS_UNINSTALL_DELETE_FAILURE,
+            PLUGINS_UNINSTALL_MARKED_DELETED,
             PLUGINS_UNINSTALL_EVENT,
             PLUGINS_UNINSTALL_NO_HOOK,
             PLUGINS_ERROR_BODIES,
