@@ -27,9 +27,9 @@ use crate::local_images::DirectoryService;
 use super::config::NfoConfiguration;
 use super::item::{NfoBaseItem, NfoItemKind};
 use super::xml_ext::{
-    get_image_type, get_person_array, get_person_from_xml_node, left_part,
-    read_element_content_as_bool, read_normalized_string, try_read_date_time,
-    try_read_date_time_exact, try_read_int,
+    ReadError, get_image_type, get_person_array, get_person_from_xml_node, left_part,
+    read_element_content_as_bool, read_element_content_as_int, read_normalized_string,
+    try_read_date_time, try_read_date_time_exact, try_read_int,
 };
 use super::xml_reader::XmlCursor;
 
@@ -90,6 +90,29 @@ pub enum FetchError {
     /// `Fetch` lets the `XmlException` reach the provider, whose result is
     /// then not used.
     MalformedXml,
+    /// A typed read threw what no parser catches ([`ReadError::Uncaught`]: an
+    /// empty `<watched/>` or `<width/>`, an integer out of range). It reaches
+    /// the provider on every path, and the provider's result is not used.
+    InvalidValue,
+}
+
+impl From<ReadError> for FetchError {
+    /// The plain `Fetch`, which catches nothing.
+    fn from(error: ReadError) -> Self {
+        match error {
+            ReadError::Xml => Self::MalformedXml,
+            ReadError::Uncaught => Self::InvalidValue,
+        }
+    }
+}
+
+/// A read inside `catch (XmlException) { }`: an `XmlException` ends it with what
+/// was read so far, and an uncaught error still fails the fetch.
+pub(crate) fn catch_xml_exception(read: Result<(), ReadError>) -> FetchResult {
+    match read {
+        Err(ReadError::Uncaught) => Err(FetchError::InvalidValue),
+        Ok(()) | Err(ReadError::Xml) => Ok(()),
+    }
 }
 
 /// The extension point the per-kind subclasses implement.
@@ -106,13 +129,16 @@ pub trait NfoParser {
     }
 
     /// Handles one element, dispatching to the base switch by default.
+    ///
+    /// # Errors
+    /// The [`ReadError`] of a typed read, which ends the parse there.
     fn fetch_data_from_xml_node(
         &self,
         base: &BaseNfoParser<'_>,
         reader: &mut XmlCursor,
         result: &mut MetadataResult<NfoBaseItem>,
-    ) {
-        base.fetch_data_from_xml_node_base(reader, result);
+    ) -> Result<(), ReadError> {
+        base.fetch_data_from_xml_node_base(reader, result)
     }
 }
 
@@ -181,8 +207,10 @@ impl<'a> BaseNfoParser<'a> {
     ///
     /// # Errors
     /// [`FetchError::MalformedXml`] when the plain path meets a malformed
-    /// document. The URL path keeps the elements read before the error, as
-    /// its C# `catch (XmlException)` does.
+    /// document or a value a typed read throws an `XmlException` on. The URL
+    /// path keeps the elements read before either, as its C#
+    /// `catch (XmlException)` does. [`FetchError::InvalidValue`] on both paths
+    /// for a [`ReadError::Uncaught`].
     pub fn fetch<P: NfoParser>(
         &self,
         parser: &P,
@@ -193,8 +221,7 @@ impl<'a> BaseNfoParser<'a> {
 
         if !parser.supports_url_after_closing_xml_tag() {
             let reader = XmlCursor::new(xml).map_err(|_| FetchError::MalformedXml)?;
-            self.fetch_document(parser, result, reader);
-            return Ok(());
+            return Ok(self.fetch_document(parser, result, reader)?);
         }
 
         // Handle a url after the xml data (http://kodi.wiki/view/NFO_files/movies).
@@ -214,7 +241,7 @@ impl<'a> BaseNfoParser<'a> {
                 }
 
                 let (reader, _) = XmlCursor::up_to_error(&xml[..=idx]);
-                self.fetch_document(parser, result, reader);
+                return catch_xml_exception(self.fetch_document(parser, result, reader));
             }
             None => {
                 // The file is just provider urls.
@@ -230,17 +257,18 @@ impl<'a> BaseNfoParser<'a> {
         parser: &P,
         result: &mut MetadataResult<NfoBaseItem>,
         mut reader: XmlCursor,
-    ) {
+    ) -> Result<(), ReadError> {
         reader.move_to_content();
         reader.read();
 
         while !reader.eof() {
             if reader.is_element() {
-                parser.fetch_data_from_xml_node(self, &mut reader, result);
+                parser.fetch_data_from_xml_node(self, &mut reader, result)?;
             } else {
                 reader.read();
             }
         }
+        Ok(())
     }
 
     /// Scans a trailing/leading raw URL for IMDb/TMDb/TVDb ids
@@ -273,12 +301,15 @@ impl<'a> BaseNfoParser<'a> {
     /// Handles every tag common to all item kinds; unrecognized tags that match
     /// a `_validProviderIds` entry set a provider id, otherwise the element is
     /// skipped.
+    ///
+    /// # Errors
+    /// The [`ReadError`] of a typed read (`<watched>`, fileinfo integers).
     #[allow(clippy::too_many_lines)]
     pub fn fetch_data_from_xml_node_base(
         &self,
         reader: &mut XmlCursor,
         result: &mut MetadataResult<NfoBaseItem>,
-    ) {
+    ) -> Result<(), ReadError> {
         let name = reader.name().to_owned();
         match name.as_str() {
             "dateadded" => {
@@ -312,8 +343,9 @@ impl<'a> BaseNfoParser<'a> {
             // into a fresh `new T { IndexNumber }` whose id is always empty, so
             // the save never runs. A stock 12.4 with an NFO user set scanned and
             // refreshed an NFO carrying all three and wrote no `UserData` row.
+            // The `<watched>` read still throws on a value it cannot convert.
             "watched" => {
-                let _ = read_element_content_as_bool(reader);
+                read_element_content_as_bool(reader)?;
             }
             "playcount" | "lastplayed" => {
                 let _ = reader.read_element_content_as_string();
@@ -467,11 +499,11 @@ impl<'a> BaseNfoParser<'a> {
                     result.item.add_tag(tag);
                 }
             }
-            "fileinfo" => Self::fetch_from_file_info_node(reader, &mut result.item),
+            "fileinfo" => Self::fetch_from_file_info_node(reader, &mut result.item)?,
             "uniqueid" => {
                 if reader.is_empty_element() {
                     reader.read();
-                    return;
+                    return Ok(());
                 }
                 let provider = reader.get_attribute("type").map(ToOwned::to_owned);
                 let provider_id = reader.read_element_content_as_string();
@@ -486,7 +518,7 @@ impl<'a> BaseNfoParser<'a> {
             "fanart" => {
                 if reader.is_empty_element() {
                     reader.read();
-                    return;
+                    return Ok(());
                 }
                 let mut subtree = reader.read_subtree();
                 if read_to_descendant(&mut subtree, "thumb") {
@@ -502,6 +534,7 @@ impl<'a> BaseNfoParser<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     /// Reads a `<thumb>`/`<fanart><thumb>` node into the images/remote-images
@@ -558,10 +591,13 @@ impl<'a> BaseNfoParser<'a> {
     }
 
     /// Reads `<fileinfo>` → `<streamdetails>` (`FetchFromFileInfoNode`).
-    fn fetch_from_file_info_node(reader: &mut XmlCursor, item: &mut NfoBaseItem) {
+    fn fetch_from_file_info_node(
+        reader: &mut XmlCursor,
+        item: &mut NfoBaseItem,
+    ) -> Result<(), ReadError> {
         if reader.is_empty_element() {
             reader.read();
-            return;
+            return Ok(());
         }
         let mut sub = reader.read_subtree();
         sub.move_to_content();
@@ -572,17 +608,21 @@ impl<'a> BaseNfoParser<'a> {
                 continue;
             }
             match sub.name() {
-                "streamdetails" => Self::fetch_from_stream_details_node(&mut sub, item),
+                "streamdetails" => Self::fetch_from_stream_details_node(&mut sub, item)?,
                 _ => sub.skip(),
             }
         }
+        Ok(())
     }
 
     /// Reads `<streamdetails>` → `<video>`/`<subtitle>` (`FetchFromStreamDetailsNode`).
-    fn fetch_from_stream_details_node(reader: &mut XmlCursor, item: &mut NfoBaseItem) {
+    fn fetch_from_stream_details_node(
+        reader: &mut XmlCursor,
+        item: &mut NfoBaseItem,
+    ) -> Result<(), ReadError> {
         if reader.is_empty_element() {
             reader.read();
-            return;
+            return Ok(());
         }
         let mut sub = reader.read_subtree();
         sub.move_to_content();
@@ -593,18 +633,22 @@ impl<'a> BaseNfoParser<'a> {
                 continue;
             }
             match sub.name() {
-                "video" => Self::fetch_from_video_node(&mut sub, item),
+                "video" => Self::fetch_from_video_node(&mut sub, item)?,
                 "subtitle" => Self::fetch_from_subtitle_node(&mut sub, item),
                 _ => sub.skip(),
             }
         }
+        Ok(())
     }
 
     /// Reads a `<video>` stream node (`FetchFromVideoNode`).
-    fn fetch_from_video_node(reader: &mut XmlCursor, item: &mut NfoBaseItem) {
+    fn fetch_from_video_node(
+        reader: &mut XmlCursor,
+        item: &mut NfoBaseItem,
+    ) -> Result<(), ReadError> {
         if reader.is_empty_element() {
             reader.read();
-            return;
+            return Ok(());
         }
         let mut sub = reader.read_subtree();
         sub.move_to_content();
@@ -619,16 +663,16 @@ impl<'a> BaseNfoParser<'a> {
                     item.video_3d_format = parse_3d_format(&sub.read_element_content_as_string());
                 }
                 "aspect" => item.aspect_ratio = Some(read_normalized_string(&mut sub)),
-                "width" => item.width = try_read_int(&mut sub),
-                "height" => item.height = try_read_int(&mut sub),
+                "width" => item.width = Some(read_element_content_as_int(&mut sub)?),
+                "height" => item.height = Some(read_element_content_as_int(&mut sub)?),
                 "durationinseconds" => {
-                    if let Some(seconds) = try_read_int(&mut sub) {
-                        item.run_time_ticks = Some(i64::from(seconds) * TICKS_PER_SECOND);
-                    }
+                    let seconds = read_element_content_as_int(&mut sub)?;
+                    item.run_time_ticks = Some(i64::from(seconds) * TICKS_PER_SECOND);
                 }
                 _ => sub.skip(),
             }
         }
+        Ok(())
     }
 
     /// Reads a `<subtitle>` stream node (`FetchFromSubtitleNode`).

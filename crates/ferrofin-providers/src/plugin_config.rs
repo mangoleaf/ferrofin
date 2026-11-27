@@ -1,7 +1,7 @@
-//! Late-bound access to the dashboard configuration of Jellyfin's five in-tree
+//! Late-bound access to the dashboard configuration of Jellyfin's six in-tree
 //! provider plugins.
 //!
-//! `MediaBrowser.Providers/Plugins/{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages}`
+//! `MediaBrowser.Providers/Plugins/{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages,ListenBrainz}`
 //! each read their settings through the static `Plugin.Instance.Configuration`
 //! at call time, so an admin's save on the plugin's settings page takes effect
 //! on the next lookup. Ferrofin's equivalent is
@@ -166,6 +166,9 @@ pub struct TmdbConfig {
     pub profile_size: Option<String>,
     /// The image CDN size segment for episode stills.
     pub still_size: Option<String>,
+    /// How many days similar movies and series are cached; `0` (or less)
+    /// disables caching (`SimilarItemsCacheDays`, C# default 90).
+    pub similar_items_cache_days: i32,
     /// Replaces `TMDB_IMAGE_ROOT`, TMDb's image CDN — not a plugin setting
     /// (never read from the settings page's JSON): the client's test seam
     /// (`TmdbClient::with_image_root`), so a mock server can serve the
@@ -199,6 +202,8 @@ impl Default for TmdbConfig {
             logo_size: None,
             profile_size: None,
             still_size: None,
+            // `PluginConfiguration.cs:131`.
+            similar_items_cache_days: 90,
             image_root: None,
         }
     }

@@ -682,7 +682,8 @@ impl SelfWriteGuard for FerrofinLibraryMonitor {
         };
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(settle);
+                // In the writer's span: the release ends its write.
+                runtime.spawn(tracing::Instrument::in_current_span(settle));
             }
             Err(_) => {
                 self.suppressed
@@ -845,7 +846,16 @@ impl FerrofinLibraryMonitor {
             (spawn, !spawn && pending.next_deadline() < previous)
         };
         if spawn_worker {
-            tokio::spawn(self.clone().debounce_worker());
+            // A root of its own: it outlives the report that started it and
+            // queues the scans of every report until it drains.
+            tokio::spawn(tracing::Instrument::instrument(
+                self.clone().debounce_worker(),
+                tracing::info_span!(
+                    parent: None,
+                    "library_monitor_debounce",
+                    task = "library_monitor"
+                ),
+            ));
         } else if wake_worker {
             self.flush.notify_one();
         }
