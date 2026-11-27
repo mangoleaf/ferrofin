@@ -276,8 +276,39 @@ async fn source_with(scratch: &Path, ids: &[&str], lock_table: bool) -> PathBuf 
             .await
             .unwrap();
     }
+    started(&mut conn).await;
     sqlx::Connection::close(conn).await.unwrap();
     source
+}
+
+/// A statement deleting every `FerrofinMeta` row but `keep`'s and the
+/// record of the start, which the export checks before any proof (gl-1910).
+fn delete_markers_but(keep: &str) -> String {
+    format!(
+        r#"DELETE FROM "FerrofinMeta" WHERE "Key" NOT IN ('{keep}', '{}')"#,
+        ferrofin_db::STARTED_KEY
+    )
+}
+
+/// The build these tests export as, whose start each source records.
+const BUILD: &str = "v0.0.0-test";
+
+/// Makes the database on `conn`, which has Ferrofin's migration table and
+/// `FerrofinMeta`, one this build's start left, which the export requires
+/// (gl-1910): at this build's last migration, with a start of [`BUILD`]
+/// recorded.
+async fn started(conn: &mut sqlx::SqliteConnection) {
+    sqlx::query("INSERT INTO _sqlx_migrations VALUES (?1)")
+        .bind(ferrofin_db::schema_head())
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query(r#"INSERT INTO "FerrofinMeta" VALUES (?1, ?2)"#)
+        .bind(ferrofin_db::STARTED_KEY)
+        .bind(BUILD)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 }
 
 /// [`source_with`] a lock table.
@@ -359,6 +390,7 @@ async fn every_generation_records_the_target_schema_and_leaves_the_code_migratio
                 &DOCKER,
                 &source.join(EXPORTED_DATABASE),
                 &out,
+                BUILD,
             )
             .await
             .unwrap();
@@ -440,6 +472,7 @@ async fn a_database_without_a_lock_table_is_rewritten_without_one() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -482,14 +515,17 @@ async fn a_native_database_gets_exactly_a_fresh_install_s_history() {
         .connect()
         .await
         .unwrap();
-    sqlx::query("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)")
-        .execute(&mut conn)
-        .await
-        .unwrap();
+    for statement in [
+        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)",
+        r#"CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL)"#,
+    ] {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+    started(&mut conn).await;
     sqlx::Connection::close(conn).await.unwrap();
     let out = scratch.path().join("out");
 
-    let summary = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+    let summary = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out, BUILD)
         .await
         .unwrap();
 
@@ -559,6 +595,19 @@ async fn alter(source: &Path, statements: &[&str]) {
     sqlx::Connection::close(conn).await.unwrap();
 }
 
+/// The export of `source` into `out` as [`BUILD`], which must succeed.
+async fn export(source: &Path, out: &Path) -> ferrofin_db::export::ExportSummary {
+    export_data_dir(
+        &SourceDirs::new(source),
+        &DOCKER,
+        &source.join(EXPORTED_DATABASE),
+        out,
+        BUILD,
+    )
+    .await
+    .unwrap()
+}
+
 /// Why exporting `source` was refused.
 async fn refusal(source: &Path, out: &Path) -> String {
     let error = export_data_dir(
@@ -566,6 +615,7 @@ async fn refusal(source: &Path, out: &Path) -> String {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         out,
+        BUILD,
     )
     .await
     .unwrap_err();
@@ -623,14 +673,7 @@ async fn a_source_without_the_proof_of_a_recorded_routine_s_work_is_refused() {
     )
     .await;
     let out = scratch.path().join("out-done");
-    export_data_dir(
-        &SourceDirs::new(&dir),
-        &DOCKER,
-        &dir.join(EXPORTED_DATABASE),
-        &out,
-    )
-    .await
-    .unwrap();
+    export(&dir, &out).await;
     let history = exported_history(&out).await;
     for id in recorded_as_applied() {
         assert!(
@@ -647,21 +690,14 @@ async fn a_source_without_the_proof_of_a_recorded_routine_s_work_is_refused() {
     alter(
         &dir,
         &[
-            r#"DELETE FROM "FerrofinMeta" WHERE "Key" <> 'rating_levels_v122'"#,
+            &delete_markers_but("rating_levels_v122"),
             adoption[0],
             r#"INSERT INTO "FerrofinAdoption" VALUES ('12.0.0', '2026-11-01 00:00:00', 0)"#,
         ],
     )
     .await;
     let out = scratch.path().join("out");
-    let summary = export_data_dir(
-        &SourceDirs::new(&dir),
-        &DOCKER,
-        &dir.join(EXPORTED_DATABASE),
-        &out,
-    )
-    .await
-    .unwrap();
+    let summary = export(&dir, &out).await;
     assert!(
         summary
             .edits
@@ -677,18 +713,11 @@ async fn a_source_without_the_proof_of_a_recorded_routine_s_work_is_refused() {
     alter(
         &dir,
         &[
-            r#"DELETE FROM "FerrofinMeta""#,
+            &delete_markers_but(""),
             adoption[0],
             r#"INSERT INTO "FerrofinAdoption" VALUES ('12.2.0', '2026-11-01 00:00:00', 0)"#,
         ],
     )
     .await;
-    export_data_dir(
-        &SourceDirs::new(&dir),
-        &DOCKER,
-        &dir.join(EXPORTED_DATABASE),
-        &scratch.path().join("out"),
-    )
-    .await
-    .unwrap();
+    export(&dir, &scratch.path().join("out")).await;
 }

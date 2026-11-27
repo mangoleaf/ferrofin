@@ -188,11 +188,7 @@ async fn read_capped(
         )));
     }
     let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| download_error(url, &e))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|e| download_error(url, e))? {
         if (bytes.len() + chunk.len()) as u64 > cap_bytes {
             return Err(ServiceError::invalid_input(format!(
                 "download from {url} exceeds the {cap_bytes}-byte limit"
@@ -205,12 +201,13 @@ async fn read_capped(
 
 /// The error for a failed download from `url`. A timeout says so, as
 /// upstream's `TimeoutException` does, rather than reqwest's generic "error
-/// decoding response body".
-fn download_error(url: &str, e: &reqwest::Error) -> ServiceError {
+/// decoding response body". Only `url` names the source: reqwest's own copy
+/// of it is dropped, so a caller passing a redacted one logs no more.
+fn download_error(url: &str, e: reqwest::Error) -> ServiceError {
     if e.is_timeout() {
         ServiceError::backend(format!("downloading {url} timed out"))
     } else {
-        ServiceError::backend(format!("downloading {url}: {e}"))
+        ServiceError::backend(format!("downloading {url}: {}", e.without_url()))
     }
 }
 
@@ -242,10 +239,9 @@ async fn download_and_verify(
     require_https(source_url, loopback_ok)?;
     // GitHub release assets 302 to a CDN, so redirects must be followed —
     // but the default policy would happily follow https → http → an internal
-    // host. Re-run the transport check on every hop instead. (10 = reqwest's
-    // own default hop limit.)
+    // host. Re-run the transport check on every hop instead.
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() > 10 {
+        if attempt.previous().len() > ferrofin_util::http_client::MAX_REDIRECTS {
             attempt.error("too many redirects")
         } else if require_https(attempt.url().as_str(), loopback_ok).is_ok() {
             attempt.follow()
@@ -254,8 +250,9 @@ async fn download_and_verify(
         }
     });
     // Idle timeouts, so the artifact never sits silent, and the total
-    // `budget` a legitimate artifact on a slow link fits in.
-    let client = reqwest::Client::builder()
+    // `budget` a legitimate artifact on a slow link fits in. Otherwise
+    // `NamedClient.Default`'s defaults, as `PerformPackageInstallation` has.
+    let client = ferrofin_util::http_client::builder(ferrofin_health::USER_AGENT)
         .redirect(policy)
         .connect_timeout(REPO_FETCH_TIMEOUT)
         .read_timeout(REPO_FETCH_TIMEOUT)
@@ -266,7 +263,7 @@ async fn download_and_verify(
         .get(source_url)
         .send()
         .await
-        .map_err(|e| download_error(source_url, &e))?;
+        .map_err(|e| download_error(source_url, e))?;
     if !response.status().is_success() {
         return Err(ServiceError::backend(format!(
             "downloading {source_url}: HTTP {}",
@@ -1347,7 +1344,7 @@ impl PluginManager for FerrofinPluginManager {
         // request" and returns, while `PluginsController.UninstallPlugin` goes
         // on to answer `204` (v10.11.8 InstallationManager.cs +
         // PluginsController.cs:136-152). That is not a Jellyfin bug to skip:
-        // every plugin compiled into Jellyfin's own server tree — the five
+        // every plugin compiled into Jellyfin's own server tree — the six
         // in-tree metadata providers Ferrofin now registers — takes this exact
         // path, so `DELETE /Plugins/{shared id}` is a `204` no-op on a stock
         // server and used to be a `400` here.
@@ -1615,15 +1612,19 @@ impl PluginManager for FerrofinPluginManager {
         let Some(plugin) = self.find(id) else {
             return Err(ServiceError::not_found(format!("plugin {id}")));
         };
-        match tokio::fs::read(self.config_path(id)).await {
+        let config = match tokio::fs::read(self.config_path(id)).await {
             // Overlay the stored values onto the current defaults, so a config
             // saved by an older plugin version (missing newly-added keys) still
             // returns every field at its default — matching how C# deserializes a
             // partial `PluginConfiguration`.
-            Ok(bytes) => Ok(merge_config(&plugin.default_config, &bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(plugin.default_config.clone()),
-            Err(e) => Err(ServiceError::backend(format!("read plugin config: {e}"))),
-        }
+            Ok(bytes) => merge_config(&plugin.default_config, &bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => plugin.default_config.clone(),
+            Err(e) => return Err(ServiceError::backend(format!("read plugin config: {e}"))),
+        };
+        Ok(match plugin.config_view {
+            Some(view) => with_view(config, view),
+            None => config,
+        })
     }
 
     async fn set_plugin_configuration(
@@ -1732,9 +1733,10 @@ impl PluginManager for FerrofinPluginManager {
     async fn list_packages(&self) -> Result<Vec<PackageInfo>, ServiceError> {
         // Fetch and aggregate the enabled repositories' plugin manifests (each a
         // JSON `PackageInfo[]`), mirroring `InstallationManager.GetAvailablePackages`.
-        // A repository that is unreachable or serves malformed JSON is skipped with
-        // a warning rather than failing the whole catalog. What this lists is
-        // installable via `install_package` when the installer is armed.
+        // A repository that is unreachable, answers a non-2xx status or serves
+        // malformed JSON is skipped with a warning rather than failing the whole
+        // catalog. What this lists is installable via `install_package` when the
+        // installer is armed.
         let repos: Vec<RepositoryInfo> = self
             .configured_repositories()
             .await?
@@ -1751,8 +1753,9 @@ impl PluginManager for FerrofinPluginManager {
         // Manifests are small JSON documents: a total deadline plus a
         // streamed size cap, so a hostile/hung repository can neither OOM
         // the server nor pin the task (GET /Packages is admin-only, but the
-        // repository is remote and untrusted).
-        let client = reqwest::Client::builder()
+        // repository is remote and untrusted). Otherwise `NamedClient.Default`'s
+        // defaults, as `InstallationManager.GetPackages` has.
+        let client = ferrofin_util::http_client::builder(ferrofin_health::USER_AGENT)
             .timeout(REPO_FETCH_TIMEOUT)
             .build()
             .map_err(|e| ServiceError::backend(format!("building repository client: {e}")))?;
@@ -1766,23 +1769,36 @@ impl PluginManager for FerrofinPluginManager {
                 .clone()
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| "Unnamed Repo".to_owned());
+            // An operator's URL can carry a token: its scheme and host only.
+            let source = ferrofin_util::source_url::redact_url(url);
             let body = match client.get(url).send().await {
-                Ok(resp) => match read_capped(resp, MAX_MANIFEST_BYTES, url).await {
+                // `GetFromJsonAsync` throws on a non-2xx status, a redirect the
+                // client did not follow included, and `GetPackages` lists nothing.
+                Ok(resp) if !resp.status().is_success() => {
+                    tracing::warn!(
+                        repository = %repo_name,
+                        url = %source,
+                        status = resp.status().as_u16(),
+                        "plugin repository manifest request failed"
+                    );
+                    continue;
+                }
+                Ok(resp) => match read_capped(resp, MAX_MANIFEST_BYTES, &source).await {
                     Ok(body) => body,
                     Err(e) => {
-                        tracing::warn!(url, error = %e, "failed to read plugin repository manifest");
+                        tracing::warn!(repository = %repo_name, url = %source, error = %e, "failed to read plugin repository manifest");
                         continue;
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(url, error = %e, "failed to fetch plugin repository manifest");
+                    tracing::warn!(repository = %repo_name, url = %source, error = %e.without_url(), "failed to fetch plugin repository manifest");
                     continue;
                 }
             };
             let list = match serde_json::from_slice::<Vec<PackageInfo>>(&body) {
                 Ok(list) => list,
                 Err(e) => {
-                    tracing::warn!(url, error = %e, "plugin repository manifest was not valid JSON");
+                    tracing::warn!(repository = %repo_name, url = %source, error = %e, "plugin repository manifest was not valid JSON");
                     continue;
                 }
             };
@@ -1933,7 +1949,10 @@ impl PluginManager for FerrofinPluginManager {
         Ok(pages)
     }
 
-    async fn get_configuration_page(&self, name: &str) -> Result<Option<Vec<u8>>, ServiceError> {
+    async fn get_configuration_page(
+        &self,
+        name: &str,
+    ) -> Result<Option<PluginConfigPage>, ServiceError> {
         // Same disabled-plugin gate as `get_configuration_pages`: this
         // endpoint is unauthenticated (matching Jellyfin), so a disabled
         // plugin's page must not remain fetchable by name.
@@ -1946,8 +1965,22 @@ impl PluginManager for FerrofinPluginManager {
                     .config_pages
                     .iter()
                     .find(|page| page.name.eq_ignore_ascii_case(name))
-                    .map(|page| page.bytes.clone())
+                    .cloned()
             }))
+    }
+}
+
+/// `config` with the members `view` computes added, when it is an object.
+fn with_view(
+    config: Vec<u8>,
+    view: fn(&mut serde_json::Map<String, serde_json::Value>),
+) -> Vec<u8> {
+    match serde_json::from_slice::<serde_json::Value>(&config) {
+        Ok(serde_json::Value::Object(mut members)) => {
+            view(&mut members);
+            serde_json::to_vec(&members).unwrap_or(config)
+        }
+        _ => config,
     }
 }
 
@@ -2599,7 +2632,7 @@ mod tests {
     /// A plugin reporting `CanUninstall: false` is ignored, not refused —
     /// upstream's `InstallationManager.UninstallPlugin` logs
     /// "Attempt to delete non removable plugin … ignoring request" and returns,
-    /// while `PluginsController` still answers `204`. That is the path all five
+    /// while `PluginsController` still answers `204`. That is the path all six
     /// of Jellyfin's in-tree provider plugins take, so `DELETE /Plugins/{id}`
     /// on a shared id must be `204` here too (it was `400`).
     #[tokio::test]
@@ -4276,6 +4309,55 @@ mod tests {
         assert!(err.to_string().contains("redirect"), "{err}");
     }
 
+    /// A get-only C# property is in every read of the configuration, computed
+    /// from what is stored, and a save ignores it, as `System.Text.Json` does
+    /// (ListenBrainz's `AlgorithmString`, measured on a stock 12.4: a posted
+    /// `"zzz"` reads back as the chosen algorithm's string).
+    #[tokio::test]
+    async fn a_config_view_computes_members_a_save_ignores() {
+        fn view(config: &mut serde_json::Map<String, serde_json::Value>) {
+            let doubled = config["Size"].as_i64().unwrap_or(0) * 2;
+            config.insert("Doubled".to_owned(), doubled.into());
+        }
+        let plugin = RegisteredPlugin::new(descriptor(PKG_ID, "Viewed", true), None)
+            .with_default_config(br#"{"Size":1}"#.to_vec())
+            .with_config_view(view);
+        let (mgr, _dir) = manager(vec![plugin]);
+        let read = |bytes: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        assert_eq!(
+            read(mgr.get_plugin_configuration(PKG_ID).await.unwrap()),
+            serde_json::json!({"Size": 1, "Doubled": 2})
+        );
+        mgr.set_plugin_configuration(PKG_ID, br#"{"Size":5,"Doubled":99}"#.to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            read(mgr.get_plugin_configuration(PKG_ID).await.unwrap()),
+            serde_json::json!({"Size": 5, "Doubled": 10})
+        );
+    }
+
+    /// A page served with the type its resource has, not its name's
+    /// (ListenBrainz's notice: `NOTICE.md`, named `…Notice`).
+    #[tokio::test]
+    async fn a_configuration_page_keeps_its_declared_type() {
+        let plugin = RegisteredPlugin::new(descriptor(PKG_ID, "Paged", true), None)
+            .with_config_page(super::PluginConfigPage {
+                name: "PagedNotice".to_owned(),
+                bytes: b"# Notice".to_vec(),
+                enable_in_main_menu: false,
+                content_type: Some("text/markdown"),
+            });
+        let (mgr, _dir) = manager(vec![plugin]);
+        let page = mgr
+            .get_configuration_page("pagednotice")
+            .await
+            .unwrap()
+            .expect("page");
+        assert_eq!(page.content_type, Some("text/markdown"));
+        assert_eq!(page.bytes, b"# Notice");
+    }
+
     #[tokio::test]
     async fn disabled_plugins_hide_their_configuration_pages() {
         let plugin = RegisteredPlugin::new(descriptor(PKG_ID, "Paged", true), None)
@@ -4283,6 +4365,7 @@ mod tests {
                 name: "paged-settings".to_owned(),
                 bytes: b"<div data-role=\"page\">x</div>".to_vec(),
                 enable_in_main_menu: false,
+                content_type: None,
             });
         let (mgr, _dir) = manager(vec![plugin]);
         // Enabled: listed and fetchable.
@@ -4316,6 +4399,7 @@ mod tests {
             name: name.to_owned(),
             bytes: b"x".to_vec(),
             enable_in_main_menu: false,
+            content_type: None,
         };
         let base_id = Uuid::from_u128(1);
         let mut registered = vec![
@@ -4534,6 +4618,144 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    /// `InstallationManager` asks for a manifest and a package through
+    /// `NamedClient.Default`: the server's `User-Agent` and the `Accept` list.
+    #[tokio::test]
+    async fn repository_requests_have_the_default_client_headers() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&seen);
+        let (base, _stop) = raw_server(move |_| {
+            Box::new(move |request| {
+                log.lock().unwrap().push(request.to_ascii_lowercase());
+                http_ok("application/json", b"[]")
+            })
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf());
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("headers".to_owned()),
+            url: Some(format!("{base}/manifest.json")),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        mgr.list_packages().await.unwrap();
+        let version = ferrofin_model::updates::VersionInfo {
+            version: "1.0.0".to_owned(),
+            checksum: Some("0".repeat(32)),
+            ..Default::default()
+        };
+        // The body is no package: only the request matters here.
+        let budget = std::time::Duration::from_secs(5);
+        let _ = super::download_and_verify(
+            &format!("{base}/plugin.wasm"),
+            "Headers",
+            &version,
+            true,
+            1 << 20,
+            budget,
+        )
+        .await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let agent = format!(
+            "\r\nuser-agent: {}\r\n",
+            ferrofin_health::USER_AGENT.to_ascii_lowercase()
+        );
+        for request in seen.iter() {
+            assert!(request.contains(&agent), "{request}");
+            assert!(
+                request.contains(
+                    "\r\naccept: application/json; q=1.0, application/xml; q=0.9, */*; q=0.8\r\n"
+                ),
+                "{request}"
+            );
+        }
+    }
+
+    /// A repository answering anything but a success, a redirect the client
+    /// did not follow included, lists nothing whatever its body holds:
+    /// `GetFromJsonAsync` throws the `HttpRequestException` that
+    /// `GetPackages` answers with no packages. The warning names the
+    /// repository and only the scheme and host of its URL.
+    #[tokio::test]
+    async fn a_manifest_with_a_failure_status_lists_nothing() {
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        for status in ["500 Internal Server Error", "404 Not Found", "302 Found"] {
+            let (base, _stop) = raw_server(move |base| {
+                let manifest = manifest_json(base, &"0".repeat(32), None, TEST_ABI);
+                Box::new(move |_| {
+                    let mut out = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        manifest.len()
+                    )
+                    .into_bytes();
+                    out.extend_from_slice(manifest.as_bytes());
+                    out
+                })
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf());
+            mgr.set_repositories(vec![RepositoryInfo {
+                name: Some("failing".to_owned()),
+                url: Some(format!(
+                    "{base}/path-secret/manifest.json?token=query-secret"
+                )),
+                enabled: true,
+            }])
+            .await
+            .unwrap();
+            let packages = mgr
+                .list_packages()
+                .await
+                .expect("the catalog still answers");
+            assert!(packages.is_empty(), "{status}: {packages:?}");
+        }
+        // A transport failure: nothing listens there any more.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf());
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("unreachable".to_owned()),
+            url: Some(format!(
+                "http://{addr}/path-secret/manifest.json?token=query-secret"
+            )),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        let packages = mgr.list_packages().await.unwrap();
+        assert!(packages.is_empty(), "{packages:?}");
+
+        let text = logs.text();
+        let count = |message| text.matches(message).count();
+        assert_eq!(
+            count("plugin repository manifest request failed"),
+            3,
+            "{text}"
+        );
+        assert_eq!(
+            count("failed to fetch plugin repository manifest"),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("repository=failing"), "{text}");
+        assert!(text.contains("repository=unreachable"), "{text}");
+        assert!(text.contains("url=http://127.0.0.1:"), "{text}");
+        for secret in ["path-secret", "query-secret"] {
+            assert!(!text.contains(secret), "{secret} logged: {text}");
+        }
     }
 
     #[tokio::test]

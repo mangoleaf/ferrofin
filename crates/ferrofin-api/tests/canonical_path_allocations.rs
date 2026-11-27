@@ -91,6 +91,10 @@ fn a_path_needing_no_rewrite_allocates_nothing() {
         "/health",
         "/definitely/not/a/route",
         "/",
+        // An empty segment fits no route (gl-1675).
+        "/System//Info/Public",
+        "//Items",
+        "/Items//",
     ] {
         assert_eq!(canonicalize_counting(path), (None, 0), "{path}");
     }

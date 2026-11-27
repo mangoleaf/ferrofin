@@ -1258,6 +1258,7 @@ fn config_pages_for(
             name: page.name.clone(),
             bytes: page.content.clone(),
             enable_in_main_menu: page.enable_in_main_menu,
+            content_type: None,
         })
         .collect();
     if kept.is_empty() {
@@ -1328,6 +1329,7 @@ fn fallback_config_page(descriptor: &PluginDescriptor) -> PluginConfigPage {
         name: format!("wasm-settings-{id}"),
         bytes: html.into_bytes(),
         enable_in_main_menu: false,
+        content_type: None,
     }
 }
 
@@ -1698,7 +1700,7 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
                 // scan — same rule as every other plugin offer.
                 Err(reason) => warn!(
                     plugin = %self.plugin.descriptor.id,
-                    item = %item.item_id,
+                    item_id = %item.item_id,
                     kind = ?kind,
                     reason,
                     "wasm plugin artwork candidate refused/failed; skipping"
@@ -2199,7 +2201,7 @@ impl WasmMediaAnalysisTask {
                         // library size); one aggregated warn per pass.
                         tracing::debug!(
                             plugin = plugin.descriptor.name,
-                            item = %entity.id,
+                            item_id = %entity.id,
                             error = %e,
                             "scan-media failed for one item (offered once; not retried)"
                         );

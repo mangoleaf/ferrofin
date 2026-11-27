@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 # `M3uParser.KeyValueRegex`, ported verbatim.
 regex.workspace = true
-ferrofin-util.workspace = true
+ferrofin-util = { workspace = true, features = ["reqwest"] }
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-common.workspace = true
