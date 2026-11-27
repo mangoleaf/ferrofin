@@ -25,6 +25,7 @@ What Jellyfin does not run, as Ferrofin already did it (its history marks it don
 Settings Jellyfin is not given:
   CertificatePath in config/network.xml: a path in Ferrofin's filesystem.
   Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported, but for the MusicBrainz server and the Studio Images repository, which outrank those plugins' own settings and are written into them.
+  Ferrofin's own files for the documents and plugin settings written as XML (system.json, the documents in config/users/named, a written plugin's config.json) are left out of the copy, so the settings listed above from those documents and plugins are not in the output in any form.
 
 Live TV:
   Written for Jellyfin: 2 tuners and 1 guide provider in config/livetv.xml, 3 timers (1 completed recording among them) in data/livetv/timers.json, 1 series timer in data/livetv/seriestimers.json.
@@ -49,6 +50,7 @@ Files and stored paths:
   metadata: left out of the copy; not the directory the server's settings name for it.
   The metadata directory the server's settings name was not found where the export ran, so the output's metadata holds none of it: every image and folder Jellyfin looks for there through %MetadataPath% is missing. Export again where that directory is reachable at the path the settings give.
   The database's root and library rows name another data directory than the one exported: the server ran at another path, or the directory moved since. The stored paths under it were rewritten for Jellyfin too; the export printed both directories.
+  2 images that earlier Ferrofin builds saved in an item's {ID} or {id} folder stayed there (the first: /config/metadata/library/CCCCCCCC-0000-4000-8000-000000000003/primary.jpg): the name Jellyfin gives each in the item's own folder is another stored image's. Jellyfin serves each, but does not count it as the item's own art: a collage or a library tile there is never drawn again, and the folder is left behind when the item is deleted.
   playlist.xml of 2 playlists in data/playlists, collection.xml of 1 collection in data/collections: left out of the copy. Each may hold what Jellyfin last wrote rather than the changes made in Ferrofin since (a share or a member removed, a rename), which Jellyfin's metadata refresh would merge back; Jellyfin finds the playlists and collections without them, and writes each file again from the database when it next saves the playlist or collection.
   data/collections/Odd/collection.xml: kept, though it may hold what Jellyfin last wrote rather than the changes made in Ferrofin since: its folder's name lacks [boxset], so the file is what makes the folder a collection for Jellyfin.
   /media/movies/Heist [boxset]/collection.xml: the collection it belongs to is in a media library, which the export never writes, so the file stays; Jellyfin's metadata refresh may merge the members it lists back into the collection.

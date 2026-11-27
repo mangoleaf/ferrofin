@@ -15,11 +15,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
 use ferrofin_chromaprint::{AnalysisMode as PrintMode, CompareConfig, TimeRange, compare_episodes};
-use ferrofin_core::TaskProgress;
 use ferrofin_model::entities_media::ChapterInfo;
 use ferrofin_model::intro_skipper::{AnalysisMode as Mode, AnalyzerAction};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{self as intro_store, SeasonState, StoredSegment};
+use ferrofin_traits::tasks::TaskProgress;
 use ferrofin_util::change_watch::Watch;
 use futures_util::StreamExt as _;
 use uuid::Uuid;

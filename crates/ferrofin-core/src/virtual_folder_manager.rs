@@ -69,11 +69,16 @@ const JELLYFIN_OPTIONS_FILE: &str = "options.xml";
 /// every dashboard load names a damaged file once. A file that loads again is
 /// forgotten, so a later failure is logged anew, and so is an XML that is gone
 /// or that an [`OPTIONS_FILE`] beside it, usable or not, has taken over from.
+/// Also the library folders whose adopted XML could not be saved as an
+/// [`OPTIONS_FILE`] (logged at warn), keyed by the folder so a torn
+/// [`OPTIONS_FILE`] is still reported apart, and forgotten once a save
+/// succeeds or an [`OPTIONS_FILE`] appears.
 static UNUSABLE_OPTIONS: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// Records that `path` failed to load: `true` the first time since it last
-/// loaded, when the failure is logged at error rather than debug.
+/// Records that `path` failed to load (a library folder: that its adopted
+/// options failed to save): `true` the first time since it last loaded or
+/// saved, when the failure is logged at error (warn) rather than debug.
 fn first_options_failure(path: &Path) -> bool {
     UNUSABLE_OPTIONS
         .lock()
@@ -81,7 +86,8 @@ fn first_options_failure(path: &Path) -> bool {
         .insert(path.to_path_buf())
 }
 
-/// Forgets a file that loaded, so its next failure is logged at error again.
+/// Forgets a file that loaded (a library folder: whose adopted options saved
+/// or gained an options.json), so its next failure is logged anew.
 fn forget_options_failure(path: &Path) {
     UNUSABLE_OPTIONS
         .lock()
@@ -1207,8 +1213,9 @@ impl FerrofinVirtualFolderManager {
             return None;
         }
         // An options.json, usable or not, wins over the XML, so a damage the
-        // XML had is moot.
+        // XML had, or a failure to save it as JSON, is moot.
         forget_options_failure(&folder_path.join(JELLYFIN_OPTIONS_FILE));
+        forget_options_failure(folder_path);
         let error = match read {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(options) => {
@@ -1262,7 +1269,8 @@ impl FerrofinVirtualFolderManager {
     /// converted, so one damaged file never blocks listing the library. That
     /// failure is logged as `LoadLibraryOptions` logs "Error loading library
     /// options": at error the first time, at debug while it stays so, since the
-    /// dashboard's listing reads it on every load.
+    /// dashboard's listing reads it on every load. A save that fails (a
+    /// read-only folder) is logged the same way, at warn.
     async fn adopt_jellyfin_options(
         folder_path: &Path,
         paths: &crate::virtual_paths::VirtualPathExpander,
@@ -1311,12 +1319,23 @@ impl FerrofinVirtualFolderManager {
             return Some(imported);
         }
         if let Err(err) = Self::save_options(folder_path, &imported).await {
-            tracing::warn!(
-                path = %folder_path.join(OPTIONS_FILE).display(),
-                error = %err,
-                "adopted jellyfin library options but could not persist them; they will be re-imported on the next read"
-            );
+            // Nothing is persisted, so every listing converts and fails to
+            // save again: warn once per folder, then debug.
+            if first_options_failure(folder_path) {
+                tracing::warn!(
+                    path = %folder_path.join(OPTIONS_FILE).display(),
+                    error = %err,
+                    "adopted jellyfin library options but could not persist them; they will be re-imported on the next read"
+                );
+            } else {
+                tracing::debug!(
+                    path = %folder_path.join(OPTIONS_FILE).display(),
+                    error = %err,
+                    "adopted jellyfin library options still cannot be persisted; re-imported them"
+                );
+            }
         } else {
+            forget_options_failure(folder_path);
             tracing::info!(
                 path = %xml_path.display(),
                 "adopted jellyfin library options"
@@ -1368,11 +1387,15 @@ impl FerrofinVirtualFolderManager {
     /// background work; [`get_virtual_folders`](VirtualFolderManager::get_virtual_folders)
     /// re-sorts its response in the request's culture, as upstream's `.Order()` does.
     async fn resolve_locations(&self, folder_path: &Path) -> Result<Vec<String>, ServiceError> {
-        Ok(self.read_locations(folder_path).await?.0)
+        let mut locations = self.read_locations(folder_path).await?.0;
+        locations.sort();
+        Ok(locations)
     }
 
-    /// [`Self::resolve_locations`], with the first shortcut that resolved to
-    /// no location: one that could not be read, or an empty one.
+    /// [`Self::resolve_locations`] in the order the folder lists its
+    /// shortcuts, as `FileData.GetFilteredFileSystemEntries` adds them to the
+    /// root's locations, with the first shortcut that resolved to no
+    /// location: one that could not be read, or an empty one.
     async fn read_locations(
         &self,
         folder_path: &Path,
@@ -1408,7 +1431,6 @@ impl FerrofinVirtualFolderManager {
                 }
             }
         }
-        locations.sort();
         Ok((locations, unresolved))
     }
 
@@ -1821,7 +1843,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     /// pass, so a shortcut that fails between two reads cannot drop out of the
     /// list unnoticed, and outside a structure change, whose half-done folder
     /// (a rename's) could. What stops the removal is logged here, naming the
-    /// library.
+    /// library. The libraries and each one's shortcuts come in the order their
+    /// folders list them, unsorted, as `AggregateFolder.CreateResolveArgs`
+    /// gathers the root's locations.
     async fn locations_for_removal(&self) -> Result<Option<Vec<String>>, ServiceError> {
         let _no_change = self.structure_change.read().await;
         let mut dir = match tokio::fs::read_dir(&self.root).await {
@@ -3549,6 +3573,88 @@ mod tests {
         drop(change);
         mgr.get_virtual_folders().await.expect("list");
         assert!(json_path.exists(), "the next listing persists it");
+    }
+
+    /// gl-1807: an adopted `options.xml` whose converted `options.json` cannot
+    /// be saved (here a read-only library folder) is served converted on every
+    /// listing, the failed save logged at warn the first time and at debug while
+    /// it keeps failing. An `options.json` that appears or a save that succeeds
+    /// forgets it, so a later failure is logged at warn again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adoption_that_cannot_be_saved_is_logged_once_until_it_is_saved() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("ReadOnly");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(
+            folder.join(super::JELLYFIN_OPTIONS_FILE),
+            JELLYFIN_OPTIONS_XML,
+        )
+        .expect("xml");
+        let json_path = folder.join(super::OPTIONS_FILE);
+        let set_mode = |mode| {
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+        };
+        set_mode(0o555);
+        // Running as root ignores the mode bits: only assert when the folder
+        // really cannot be written by this uid.
+        if std::fs::File::create(folder.join("probe")).is_ok() {
+            set_mode(0o755);
+            eprintln!("skipped: the read-only folder is still writable (running as root?)");
+            return;
+        }
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let count = |level: &str| {
+            logs.text()
+                .lines()
+                .filter(|line| line.contains(level) && line.contains("ReadOnly/options.json"))
+                .count()
+        };
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            );
+            for _ in 0..3 {
+                let folders = mgr.get_virtual_folders().await.expect("list");
+                let options = folders[0].library_options.as_ref().expect("options");
+                assert_eq!(
+                    options.preferred_metadata_language.as_deref(),
+                    Some("en"),
+                    "the XML served"
+                );
+            }
+            assert!(!json_path.exists(), "nothing persisted");
+            assert_eq!(count(" WARN "), 1, "{}", logs.text());
+            assert_eq!(count(" DEBUG "), 2, "{}", logs.text());
+
+            // An options.json that appears takes over and forgets it. Its own
+            // failure is keyed apart, so a torn one is still logged at error.
+            set_mode(0o755);
+            std::fs::write(&json_path, br#"{"EnableRealtimeMonitor":tr"#).expect("torn json");
+            mgr.get_virtual_folders().await.expect("list");
+            assert_eq!(count(" ERROR "), 1, "{}", logs.text());
+            std::fs::remove_file(&json_path).expect("remove json");
+            set_mode(0o555);
+            mgr.get_virtual_folders().await.expect("list");
+
+            // A save that succeeds forgets it too.
+            set_mode(0o755);
+            mgr.get_virtual_folders().await.expect("list");
+            assert!(json_path.exists(), "persisted once writable");
+            std::fs::remove_file(&json_path).expect("remove json");
+            set_mode(0o555);
+            mgr.get_virtual_folders().await.expect("list");
+        }
+        set_mode(0o755);
+        assert_eq!(count(" WARN "), 3, "{}", logs.text());
+        assert_eq!(count(" DEBUG "), 2, "{}", logs.text());
     }
 
     #[tokio::test]

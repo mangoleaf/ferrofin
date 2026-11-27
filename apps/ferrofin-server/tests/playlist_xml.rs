@@ -11,7 +11,10 @@
 //!   back only once its library saves into its media folders (the owner rule
 //!   on media-library writes).
 //! - the first boot of this version writes the file of every playlist in the
-//!   playlists folder from the database, once.
+//!   playlists folder from the database, once;
+//! - the people a file lists are never stored, nor stored ones written: a
+//!   playlist supports none (`BaseItem.SupportsPeople`, checked by
+//!   `SaveItemAsync` and `GetPeople`).
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -22,6 +25,7 @@ use axum::{
 use ferrofin_db::Database;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_server::{config::Config, state::build_app_state};
+use ferrofin_traits::persistence::PeopleRepository as _;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
@@ -127,6 +131,15 @@ fn edit(path: &Path, text: &str) {
         .unwrap();
 }
 
+/// How many credit rows (`PeopleBaseItemMap`) `item` has.
+async fn credit_rows(db: &Database, item: Uuid) -> i64 {
+    sqlx::query_scalar(r#"SELECT count(*) FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1"#)
+        .bind(guid_to_db(item))
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
 /// A playlist's share rows, in share order.
 async fn shares(db: &Database, playlist: Uuid) -> Vec<(Uuid, bool)> {
     let rows: Vec<(String, bool)> = sqlx::query_as(
@@ -222,6 +235,8 @@ async fn a_playlists_xml_follows_its_changes_and_is_read_back() {
         "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>\n<Item>\n  \
          <Added>11/20/2026 10:00:00</Added>\n  <LockData>false</LockData>\n  \
          <Overview>Movie night</Overview>\n  <LocalTitle>The Mix</LocalTitle>\n  \
+         <Persons>\n    <Person>\n      <Name>Mix Narrator</Name>\n      \
+         <Type>Actor</Type>\n    </Person>\n  </Persons>\n  \
          <OwnerUserId>{}</OwnerUserId>\n  <PlaylistItems>\n    <PlaylistItem>\n      \
          <Path>{beta_path}</Path>\n    </PlaylistItem>\n  </PlaylistItems>\n  <Shares>\n    \
          <Share>\n      <UserId>{friend}</UserId>\n      <CanEdit>true</CanEdit>\n    </Share>\n  \
@@ -280,6 +295,11 @@ async fn a_playlists_xml_follows_its_changes_and_is_read_back() {
     assert_eq!(item["Name"], "The Mix");
     assert_eq!(item["Overview"], "Movie night");
     assert_eq!(shares(&db, scanned).await, [(friend, true)]);
+    assert_eq!(
+        credit_rows(&db, scanned).await,
+        0,
+        "a playlist credits nobody"
+    );
     let (_, entries) = call(
         &router,
         token,
@@ -402,7 +422,9 @@ async fn a_playlists_xml_follows_its_changes_and_is_read_back() {
         .unwrap()
         .replace(
             "<LocalTitle>Road Trip 2</LocalTitle>",
-            "<LocalTitle>Edited Trip</LocalTitle>\n  <Overview>By hand</Overview>",
+            "<LocalTitle>Edited Trip</LocalTitle>\n  <Overview>By hand</Overview>\n  \
+             <Persons>\n    <Person>\n      <Name>Trip Narrator</Name>\n      \
+             <Type>Actor</Type>\n    </Person>\n  </Persons>",
         )
         .replace(
             "<Shares />",
@@ -430,6 +452,11 @@ async fn a_playlists_xml_follows_its_changes_and_is_read_back() {
     .await;
     assert_eq!(item["Name"], "Edited Trip");
     assert_eq!(item["Overview"], "By hand");
+    assert_eq!(
+        credit_rows(&db, playlist).await,
+        0,
+        "a playlist credits nobody"
+    );
     let (_, users) = call(
         &router,
         token,
@@ -548,6 +575,19 @@ async fn a_playlists_xml_follows_its_changes_and_is_read_back() {
     );
 
     // A locked playlist reads nothing (`RefreshWithProviders` returns first).
+    // And a credit an earlier build stored for it is not written back: the
+    // saver writes what `GetPeople(item)` reads, none for a playlist.
+    ferrofin_core::FerrofinPeopleRepository::new(db.clone())
+        .update_people(
+            playlist,
+            &[ferrofin_db::entities::base_items::PeopleEntity {
+                name: "Stored Narrator".to_owned(),
+                person_type: Some("Actor".to_owned()),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
     let (status, body) = call(
         &router,
         token,
@@ -558,6 +598,7 @@ async fn a_playlists_xml_follows_its_changes_and_is_read_back() {
     .await;
     assert!(status.is_success(), "{status} {body}");
     let locked = wait_for_file(&xml, |text| text.contains("<LockData>true</LockData>")).await;
+    assert!(!locked.contains("<Persons>"), "{locked}");
     edit(
         &xml,
         &locked.replace(

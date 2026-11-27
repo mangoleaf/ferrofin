@@ -142,6 +142,12 @@ pub struct NextUpEpisodeUserData {
     /// (C# `GetMostRecentlyPlayedVersion`), `None` when no version carries a
     /// date.
     pub last_played_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// The version that date is on, when it is an alternate version (it has a
+    /// `PrimaryVersionId`): `GetMostRecentlyPlayedVersion`'s played version,
+    /// the episode itself winning a tie. `None` when no version carries a
+    /// date or the one played last is the primary, the cases in which
+    /// `GetPreferredVersion` keeps the pick.
+    pub played_version: Option<Uuid>,
 }
 
 /// An episode a next-up batch names: what `DetermineNextEpisode` reads of it,
@@ -1313,6 +1319,25 @@ pub trait ItemPersistenceService: Send + Sync {
     async fn set_ancestors(&self, item_id: Uuid, ancestor_ids: &[Uuid])
     -> Result<(), ServiceError>;
 
+    /// Makes each item's `AncestorIds` rows its stored `ParentId` chain up to
+    /// the root: adds the missing rows and removes the rest, skipping a parent
+    /// with no row. The ancestor half of upstream's save
+    /// (`ItemPersistenceService.UpdateOrInsertItems`), which writes
+    /// `GetAncestorIds()`: the parents alone for an item outside every
+    /// library. Only for such items: an item inside a library also descends
+    /// from its `CollectionFolder`, a row this removes; write those with
+    /// [`set_ancestors`](Self::set_ancestors).
+    ///
+    /// The default is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn set_parent_ancestors(&self, item_ids: &[Uuid]) -> Result<(), ServiceError> {
+        let _ = item_ids;
+        Ok(())
+    }
+
     /// Replaces the item's stored image rows (`BaseItemImageInfos`) with
     /// `images` — the write path the library scan uses to persist discovered
     /// artwork (posters/backdrops/…) so the image routes can serve it. Port of
@@ -1665,9 +1690,10 @@ pub trait ItemPersistenceService: Send + Sync {
     /// Takes a deleted version out of its primary's lists — what
     /// `LibraryManager.DeleteItem` does before deleting an alternate version
     /// (`LibraryManager.cs:539-552`): the primary's `LinkedAlternateVersion`
-    /// row for it goes, and so does `version_path` from the primary's `Data`
-    /// `LocalAlternateVersions` (compared ignoring case). The default
-    /// (stub/fake services) writes nothing.
+    /// row for it goes, the primary's other version rows are numbered from 0
+    /// again, as its save writes them, and `version_path` goes from the
+    /// primary's `Data` `LocalAlternateVersions` (compared ignoring case). The
+    /// default (stub/fake services) writes nothing.
     ///
     /// # Errors
     ///
@@ -3121,11 +3147,22 @@ pub trait NextUpService: Send + Sync {
 
     /// Reads the full rows of the given episodes, keyed by id: the picks of
     /// the requested page, specials included, once the batch has decided and
-    /// ordered them. An id with no row has no entry.
+    /// ordered them (a pick [`Self::get_preferred_versions`] swapped, as that
+    /// version). An id with no row has no entry.
     async fn get_next_up_episode_rows(
         &self,
         ids: &[Uuid],
     ) -> Result<HashMap<Uuid, BaseItemEntity>, ServiceError>;
+
+    /// Port of `TVSeriesManager.GetPreferredVersion`, for the picks of the
+    /// requested page whose last watched episode was played as an alternate
+    /// version: each `(pick, last watched episode, its played version)` is
+    /// answered, in order, with the version of the pick whose media source
+    /// has that version's source name, or `None` to keep the pick.
+    async fn get_preferred_versions(
+        &self,
+        picks: &[(Uuid, Uuid, Uuid)],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError>;
 }
 
 fn _assert_object_safe_next_up_service(_: &dyn NextUpService) {}
@@ -3211,5 +3248,6 @@ mod tests {
         assert!(!ud.played);
         assert_eq!(ud.playback_position_ticks, 0);
         assert!(ud.last_played_date.is_none());
+        assert!(ud.played_version.is_none());
     }
 }

@@ -655,14 +655,16 @@ DIVERGENCES = {
     # when that database was upgraded; Ferrofin runs its ports once, whatever the source.
     # 0032 (a 10.11 source) upper-cases an OwnerId and nulls one that is not 36 characters, as
     # Jellyfin's ChangeOwnerIdToGuid does; 0045 does both for every other source (an owner that
-    # exists in another case takes the id's spelling, a 32-character one becomes NULL). PrimaryVersionId
-    # is left as written, as 12.4 leaves it, though Ferrofin's own lookups of it are byte-exact: whether
-    # it should be re-spelled too is gl-752, and this expectation changes with that decision.
+    # exists in another case takes the id's spelling, a 32-character one becomes NULL). 0053 runs
+    # 0032's copy of ChangePrimaryVersionIdToGuid on every source, so a PrimaryVersionId ends upper-case
+    # dashed as on the 10.11 lineage (Ferrofin's lookups of it are byte-exact, and 12.4 writes it that way
+    # on its next save of the item, which Ferrofin's scan never does).
     ("guid_casing", "12.x"): ({"owner_lower36": {"owner": "upper36->item", "primary": "null"},
                               "owner_n32": {"owner": "null", "primary": "null"},
-                              "primary_lower36": {"owner": "null", "primary": "lower36->item"},
-                              "primary_n32": {"owner": "null", "primary": "n32lower->item"}},
-                             "0045 re-spells an owner in another case and nulls a 32-character one; 12.4 keeps them as written"),
+                              "primary_lower36": {"owner": "null", "primary": "upper36->item"},
+                              "primary_n32": {"owner": "null", "primary": "upper36->item"}},
+                             "0045 re-spells an owner in another case and nulls a 32-character one, 0053 converts a primary "
+                             "version as on 10.11; 12.4 keeps them as written"),
     # MergeDuplicatePeople and MergeDuplicateMusicArtists (12.0) run once per adoption in Ferrofin, so a
     # case-only pair on a 12.x database is merged (people grouped by lower-cased name and type).
     ("case_duplicates", "12.x"): ({"person_item_ascii": 1, "people_ascii": {"rows": 1, "links": 1},

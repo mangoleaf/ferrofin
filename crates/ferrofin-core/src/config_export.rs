@@ -192,6 +192,29 @@ pub fn export_configuration(config_dir: &Path) -> Result<ConfigExport, ServiceEr
     Ok(export)
 }
 
+/// The Ferrofin files under the config directory `config_dir` that
+/// [`export_configuration`] and [`export_live_tv`] always write as XML,
+/// whether or not each exists: `system.json` and the named documents. The
+/// export leaves them out of its copy (gl-1949): a later adoption by Ferrofin
+/// reads a document's XML only while its JSON is absent.
+#[must_use]
+pub fn exported_sources(config_dir: &Path) -> Vec<PathBuf> {
+    let named = config_dir.join("users").join(Manager::NAMED_SUBDIR);
+    let mut files = vec![config_dir.join(Manager::CONFIG_FILE_NAME)];
+    files.extend(
+        [
+            Manager::ENCODING_FILE_NAME,
+            Manager::BRANDING_FILE_NAME,
+            Manager::NETWORK_FILE_NAME,
+            Manager::METADATA_FILE_NAME,
+            Manager::XBMC_METADATA_FILE_NAME,
+            Manager::LIVE_TV_FILE_NAME,
+        ]
+        .map(|name| named.join(name)),
+    );
+    files
+}
+
 /// The metadata directory the server of the Ferrofin data directory
 /// `program_data_dir` (with its config directory `config_dir`) uses, as it
 /// names it: its settings' `MetadataPath`, else `{program data}/metadata`.
@@ -505,6 +528,39 @@ mod tests {
     use crate::config_import::{self, Node};
 
     const SERVER_ID: &str = "3f25fe64f745407b88841fa775eef31b";
+
+    /// The files the export leaves out of its copy are those of exactly the
+    /// documents it writes as XML (gl-1949): a document exported without its
+    /// file listed would be copied beside its XML again.
+    #[test]
+    fn exported_sources_are_the_documents_written_as_xml() {
+        let dir = config_dir(
+            &crate::configuration_manager::default_server_configuration(),
+            &[],
+        );
+        let stem = |path: &Path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
+        };
+        let export = export_configuration(dir.path()).expect("exports");
+        let mut written: Vec<String> = export
+            .files
+            .iter()
+            .map(|file| Path::new(&file.path))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "xml"))
+            .filter_map(stem)
+            .chain(stem(Path::new(livetv::FILE)))
+            .collect();
+        let mut sources: Vec<String> = exported_sources(dir.path())
+            .iter()
+            .filter_map(|path| stem(path))
+            .collect();
+        written.sort();
+        sources.sort();
+        assert_eq!(written, sources);
+        assert!(exported_sources(dir.path()).contains(&dir.path().join("system.json")));
+    }
 
     /// A Ferrofin config directory holding `system.json` and `system_id`,
     /// and the named documents given.
