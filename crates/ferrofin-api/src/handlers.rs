@@ -4244,7 +4244,7 @@ pub const VERIFIED: &[Verified] = &[
                store_listing_provider) → schedules_direct.rs SchedulesDirect::validate \
                (ListingsManager.SaveListingProvider, XmlTvListingsProvider.Validate, \
                SchedulesDirect.Validate)",
-        date: "2026-11-11",
+        date: "2026-11-26",
         divergences: &[
             "An XMLTV provider with no Path, or a null one, is a 400; upstream's Validate \
          dereferences the null path and answers a NullReferenceException 500 (an empty or \
@@ -4263,8 +4263,12 @@ pub const VERIFIED: &[Verified] = &[
          EnableAllTuners off the tuner check calls Contains on a null EnabledTuners (an \
          ArgumentNullException). Jellyfin bug not ported.",
             "A null element in a list (\"EnabledTuners\":[null], \"ChannelMappings\":[null] or \
-         a category list) is a 400; upstream binds and stores it (200, measured on Jellyfin \
-         12.4 for the first two). Fix path: gl-1677.",
+         a category list) is saved, answered and kept through livetv.xml as upstream keeps \
+         it, but read as enabling no tuner, matching no category and mapping no channel; \
+         upstream's guide mapping and channel-mapping options dereference a null \
+         ChannelMappings element once a listed tuner channel's lookup reaches it, and its \
+         channel-mapping save always does (a NullReferenceException). Jellyfin bug not \
+         ported.",
             "The 400 (an XMLTV provider with no Path, a Schedules Direct save missing its \
          Username, Password or ListingsId, or a query value the binder cannot convert), 401 \
          (Schedules Direct refuses the login) and 404 (an unknown or missing Type, or an \
@@ -4559,7 +4563,7 @@ pub const VERIFIED: &[Verified] = &[
                directory that is not there is a 404 (fetch.rs missing_file_is_not_found, \
                FileNotFoundException and DirectoryNotFoundException), an empty Path a 400 \
                (ArgumentException)",
-        date: "2026-11-17",
+        date: "2026-11-26",
         divergences: &[
             "An absent providerId, or one that names no listings provider, is a 404; \
          upstream's .First(...) throws InvalidOperationException, a 500. Jellyfin bug not \
@@ -4580,7 +4584,10 @@ pub const VERIFIED: &[Verified] = &[
          matched by local name. Fix path: gl-942.",
             "A ChannelMappings saved as null reads as the empty list; upstream keeps the null \
          until a restart and, once a tuner channel is listed, dereferences it (a \
-         NullReferenceException 500). Jellyfin bug not ported.",
+         NullReferenceException 500). A null element in it maps no channel and is always \
+         left out of Mappings; upstream answers it in Mappings ([null]) when no listed tuner \
+         channel's lookup reaches it, and otherwise GetMappedChannel dereferences it (the \
+         same 500). Jellyfin bug not ported.",
             "An XMLTV provider with no Path (only an adopted livetv.xml stores one) is read \
          from a stale cached copy; upstream's GetXml dereferences the null Path before it \
          falls back to one (a NullReferenceException 500). With no copy cached both answer \
@@ -4616,7 +4623,7 @@ pub const VERIFIED: &[Verified] = &[
                XMLTV file or directory that is not there, with no copy cached, is a 404 after \
                the pair is stored and before the refresh is queued, as upstream's \
                FileNotFoundException is",
-        date: "2026-11-17",
+        date: "2026-11-26",
         divergences: &[
             "A ProviderId that names no listings provider is a 404 before anything is stored, \
          and a TunerChannelId no tuner channel has is a 404 after the pair is stored; \
@@ -4640,7 +4647,9 @@ pub const VERIFIED: &[Verified] = &[
          not ported). Fix path: gl-939, gl-942.",
             "A ChannelMappings saved as null reads as the empty list; upstream keeps the null \
          until a restart, and its .Any(...) throws ArgumentNullException before anything is \
-         stored (a 400). Jellyfin bug not ported.",
+         stored (a 400). A null element in it is kept and matches nothing, where upstream's \
+         .Any(...), or its .Where(...) when .Any stops at an earlier match, dereferences it \
+         (a NullReferenceException) before anything is stored. Jellyfin bug not ported.",
             "An XMLTV guide at a .gz or .gzip URL that its server sends with \
          Content-Encoding: gzip, which the HTTP client decodes as upstream's \
          AutomaticDecompression does, is read, as is any such URL whose body does not start \

@@ -128,10 +128,13 @@ const COLLECTION_ITEM_NAMES: &[&str] = &[
     // `XmlSerializer` names a class-typed list entry after its class, so a
     // one-entry `<PathInfos><MediaPathInfo>…` (a library with a single path —
     // the common case) is indistinguishable from a nested object without
-    // these. They are the entry classes of a per-library `options.xml`.
+    // these. They are the entry classes of a per-library `options.xml`, and of
+    // a guide provider's `ChannelMappings` in `livetv.xml`, whose entry type
+    // the empty default provider list cannot supply.
     "MediaPathInfo",
     "TypeOptions",
     "ImageOption",
+    "NameValuePair",
 ];
 
 /// How an element with no Ferrofin default to take its shape from is read.
