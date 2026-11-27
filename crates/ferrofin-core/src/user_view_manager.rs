@@ -808,6 +808,8 @@ impl FerrofinUserViewManager {
             }
             let now = Utc::now();
             if view_refresh_due(&row, None, now) {
+                // A view an earlier build wrote has no `ForcedSortName`.
+                row.forced_sort_name.get_or_insert_default();
                 save_view_refresh(persistence.as_ref(), &mut row, now, "grouped").await;
             }
             return Ok(Some(row));
@@ -828,7 +830,10 @@ impl FerrofinUserViewManager {
             type_: item_type_lookup::stored_type_name(BaseItemKind::UserView)
                 .unwrap_or_default()
                 .to_owned(),
+            // `GetUserView(parents, …)` passes `string.Empty` as the
+            // `ForcedSortName`: the sort name comes from the name.
             sort_name: Some(create_sort_name(&name)),
+            forced_sort_name: Some(String::new()),
             name: Some(name),
             path: Some(view_path.to_string_lossy().into_owned()),
             parent_id: None,
@@ -915,6 +920,8 @@ impl FerrofinUserViewManager {
         if let Some(mut row) = self.items.retrieve_item(id).await? {
             let now = Utc::now();
             if view_refresh_due(&row, Some(library), now) {
+                // A view an earlier build wrote has no `ForcedSortName`.
+                row.forced_sort_name.get_or_insert_default();
                 save_view_refresh(persistence.as_ref(), &mut row, now, "shadow").await;
             }
             return Ok(Some(row));
@@ -941,6 +948,7 @@ impl FerrofinUserViewManager {
                 .to_owned(),
             // `ForcedSortName = string.Empty`: the sort name comes from the name.
             sort_name: Some(create_sort_name(&name)),
+            forced_sort_name: Some(String::new()),
             name: Some(name),
             path: Some(path.to_owned()),
             parent_id: None,
@@ -6403,6 +6411,22 @@ mod tests {
         refreshed
     }
 
+    /// A stored view's `ForcedSortName`.
+    async fn forced_sort_name(db: &Database, id: Uuid) -> Option<String> {
+        crate::test_support::fetch_item(db, id)
+            .await
+            .forced_sort_name
+    }
+
+    /// Clears a stored view's `ForcedSortName`, as an earlier build left the
+    /// grouped and shadow views.
+    async fn without_forced_sort_name(db: &Database, id: Uuid) {
+        let mut row = crate::test_support::fetch_item(db, id).await;
+        row.forced_sort_name = None;
+        crate::test_support::save_item(db, &row).await;
+        assert_eq!(forced_sort_name(db, id).await, None);
+    }
+
     /// Clears a stored view's `DateLastRefreshed`, as an earlier build left
     /// every view but the Playlists one, and gives it a `DateModified`.
     async fn never_refreshed(db: &Database, id: Uuid) {
@@ -6433,6 +6457,8 @@ mod tests {
         assert_eq!(view_names(&mgr, user).await, ["Movies"]);
         let dir = tmp.path().join("views").join(id.simple().to_string());
         let refreshed = assert_first_refresh(&db, id, &dir).await;
+        // `GetUserView(parents, …)`'s `string.Empty`.
+        assert_eq!(forced_sort_name(&db, id).await.as_deref(), Some(""));
         assert_eq!(view_names(&mgr, user).await, ["Movies"]);
         assert_eq!(
             view_dates(&db, id).await.2,
@@ -6468,10 +6494,31 @@ mod tests {
         assert!(saved >= refreshed);
 
         never_refreshed(&db, id).await;
+        without_forced_sort_name(&db, id).await;
+        let sort_name = crate::test_support::fetch_item(&db, id).await.sort_name;
         assert_eq!(view_names(&mgr, user).await, ["Movies"]);
         let (_, modified, again, _) = view_dates(&db, id).await;
         assert_eq!(modified, None);
         assert!(again > refreshed, "never refreshed: due");
+        let row = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(
+            row.forced_sort_name.as_deref(),
+            Some(""),
+            "an earlier build's view takes it at its refresh"
+        );
+        assert_eq!(
+            row.sort_name, sort_name,
+            "the sort name still comes from the name"
+        );
+
+        // A value already set stays.
+        let mut row = row;
+        row.forced_sort_name = Some("Zed".to_owned());
+        crate::test_support::save_item(&db, &row).await;
+        never_refreshed(&db, id).await;
+        assert_eq!(view_names(&mgr, user).await, ["Movies"]);
+        assert_eq!(view_dates(&db, id).await.1, None, "refreshed");
+        assert_eq!(forced_sort_name(&db, id).await.as_deref(), Some("Zed"));
     }
 
     /// gl-1655: `GetShadowView` (`LibraryManager.cs:3131-3190`) gives a new
@@ -6505,6 +6552,8 @@ mod tests {
 
         list().await;
         let refreshed = assert_first_refresh(&db, id, &library_dir).await;
+        // `GetUserView(folder, …, string.Empty)`.
+        assert_eq!(forced_sort_name(&db, id).await.as_deref(), Some(""));
         list().await;
         assert_eq!(
             view_dates(&db, id).await.2,
@@ -6552,6 +6601,30 @@ mod tests {
             view_dates(&db, id).await.2.expect("refreshed") >= now,
             "the library was saved since"
         );
+
+        never_refreshed(&db, id).await;
+        without_forced_sort_name(&db, id).await;
+        let sort_name = crate::test_support::fetch_item(&db, id).await.sort_name;
+        list().await;
+        let row = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(
+            row.forced_sort_name.as_deref(),
+            Some(""),
+            "an earlier build's view takes it at its refresh"
+        );
+        assert_eq!(
+            row.sort_name, sort_name,
+            "the sort name still comes from the name"
+        );
+
+        // A value already set stays.
+        let mut row = row;
+        row.forced_sort_name = Some("Zed".to_owned());
+        crate::test_support::save_item(&db, &row).await;
+        never_refreshed(&db, id).await;
+        list().await;
+        assert_eq!(view_dates(&db, id).await.1, None, "refreshed");
+        assert_eq!(forced_sort_name(&db, id).await.as_deref(), Some("Zed"));
     }
 
     /// gl-1655: `GetNamedView(name, viewType, sortName)`
