@@ -18,10 +18,12 @@
 //! (`AudioLanguages` / `SubtitleLanguages`), `HasSubtitles`, the four
 //! `HasNo*TrackWithLanguage` filters and `HasChapterImages` with v12's
 //! alternate-version and folder roll-up
-//! (`push_item_version_or_folder_matching`), `HasOfficialRating` and
-//! `IsPlaceHolder` with v12's item-or-descendant roll-up
-//! (`push_item_or_descendant_matching`), the provider-id maps
-//! (`WhereProviderMatch`), `TrailerTypes`, `HasDeadParentId`,
+//! (`push_item_version_or_folder_matching`), `OfficialRatings`,
+//! `HasOfficialRating`, `VideoTypes`, `Is3D`, `IsPlaceHolder` and the four
+//! extras filters (`HasTrailer`, `HasThemeSong`, `HasThemeVideo`,
+//! `HasSpecialFeature`, with `WithPrimaryVersions`) with v12's
+//! item-or-descendant roll-up (`push_item_or_descendant_matching`), the
+//! provider-id maps (`WhereProviderMatch`), `TrailerTypes`, `HasDeadParentId`,
 //! `SeriesStatuses`, the parental-rating chain, and the resolution filters
 //! (`IsHD` / `Is4K`, `Min`/`Max` `Width`/`Height`) with v12's
 //! `VersionsMatchingDimension` and, for `IsHD` / `Is4K`, the folder
@@ -1136,9 +1138,16 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
             ));
         });
     }
+    // `OfficialRatings` takes the same roll-up (`TranslateQuery.cs:684-688`).
     if !filter.official_ratings.is_empty() {
         qb.push(" AND ");
-        push_in_list(qb, r#"bi."OfficialRating""#, &filter.official_ratings);
+        push_item_or_descendant_matching(qb, &|qb, alias| {
+            push_in_list(
+                qb,
+                &format!(r#"{alias}."OfficialRating""#),
+                &filter.official_ratings,
+            );
+        });
     }
 
     // `e.TrailerTypes!.Any(w => trailerTypes.Contains(w.Id))`
@@ -1864,7 +1873,7 @@ fn build_box_set_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryB
 /// feature), then the `Data`-blob matches ([`append_data_blob_predicates`]).
 ///
 /// Ports of C# `TranslateQuery`'s `HasSubtitles`, `HasChapterImages`,
-/// `ImageTypes` and the `ExtraIds`-backed extra filters; the anti-join
+/// `ImageTypes` and the owned-extra filters; the anti-join
 /// (`not_offered_to_plugin`) is Ferrofin's own.
 fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     // Subtitle presence (v12 `TranslateQuery.cs:897-918`, criteria
@@ -1922,66 +1931,59 @@ fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
         qb.push(")");
     }
 
-    // Owned extras: `ExtraType` discriminants match `extra_type_from_disc`
-    // (2 = Trailer, 8 = ThemeSong, 9 = ThemeVideo).
-    let mut extra_exists = |want: bool, cond: &str| {
-        qb.push(if want {
-            " AND EXISTS "
-        } else {
-            " AND NOT EXISTS "
-        })
-        .push(format!(
-            r#"(SELECT 1 FROM "BaseItems" x
-                WHERE x."OwnerId" = bi."Id" AND {cond})"#
-        ));
-    };
-    if let Some(want) = filter.has_trailer {
-        extra_exists(want, r#"x."ExtraType" = 2"#);
-    }
-    if let Some(want) = filter.has_theme_song {
-        extra_exists(want, r#"x."ExtraType" = 8"#);
-    }
-    if let Some(want) = filter.has_theme_video {
-        extra_exists(want, r#"x."ExtraType" = 9"#);
-    }
-    // A "special feature" is any owned extra that is not unknown/trailer/theme
-    // (C# `BaseItem.DisplayExtraTypes` complement used by `HasSpecialFeature`).
-    if let Some(want) = filter.has_special_feature {
-        extra_exists(
-            want,
-            r#"x."ExtraType" IS NOT NULL AND x."ExtraType" NOT IN (0, 2, 8, 9)"#,
-        );
+    // Owned extras (`TranslateQuery.cs:1210-1274`): `ExtraType` discriminants
+    // match `extra_type_from_disc` (2 = Trailer, 8 = ThemeSong, 9 = ThemeVideo);
+    // a special feature is any other extra but `Unknown` (0).
+    for (want, extra_type) in [
+        (
+            filter.has_special_feature,
+            r#"x."ExtraType" NOT IN (0, 2, 8, 9)"#,
+        ),
+        (filter.has_trailer, r#"x."ExtraType" = 2"#),
+        (filter.has_theme_song, r#"x."ExtraType" = 8"#),
+        (filter.has_theme_video, r#"x."ExtraType" = 9"#),
+    ] {
+        if let Some(want) = want {
+            qb.push(if want { " AND " } else { " AND NOT " });
+            push_item_or_descendant_matching(qb, &|qb, alias| {
+                push_extra_owner(qb, alias, extra_type);
+            });
+        }
     }
 
     append_data_blob_predicates(qb, filter);
 }
 
-/// The filters matched inside the serialized `Data` blob, by substring as C#
-/// does: video types and 3D, placeholders (rolled up), series statuses and
-/// box-set library folders.
+/// The filters matched inside the serialized `Data` blob, by ordinal
+/// substring as C# does: video types, 3D and placeholders (rolled up), series
+/// statuses and box-set library folders.
 fn append_data_blob_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
-    // Video types / 3D live inside the serialized `Data` blob, matched by
-    // substring exactly as C# does (`"VideoType":"BluRay"` / `Video3DFormat`).
+    // `"VideoType":"<t>"` or `"IsoType":"<t>"` in `Data` (a disc is a folder
+    // rip or an image), and `Video3DFormat`, rolled up like `HasOfficialRating`
+    // (`TranslateQuery.cs:1181-1199`).
     if !filter.video_types.is_empty() {
-        qb.push(" AND (");
-        for (i, vt) in filter.video_types.iter().enumerate() {
-            if i > 0 {
-                qb.push(" OR ");
+        qb.push(" AND ");
+        push_item_or_descendant_matching(qb, &|qb, alias| {
+            qb.push("(");
+            for (i, vt) in filter.video_types.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" OR ");
+                }
+                let name = vt.json_name();
+                qb.push(format!(r#"instr({alias}."Data", "#))
+                    .push_bind(format!("\"VideoType\":\"{name}\""))
+                    .push(format!(r#") > 0 OR instr({alias}."Data", "#))
+                    .push_bind(format!("\"IsoType\":\"{name}\""))
+                    .push(") > 0");
             }
-            let name = vt.json_name();
-            qb.push(r#"bi."Data" LIKE "#)
-                .push_bind(format!("%\"VideoType\":\"{name}\"%"))
-                .push(r#" OR bi."Data" LIKE "#)
-                .push_bind(format!("%\"IsoType\":\"{name}\"%"));
-        }
-        qb.push(")");
+            qb.push(")");
+        });
     }
     if let Some(want) = filter.is_3d {
-        if want {
-            qb.push(r#" AND bi."Data" LIKE '%Video3DFormat%'"#);
-        } else {
-            qb.push(r#" AND (bi."Data" IS NULL OR bi."Data" NOT LIKE '%Video3DFormat%')"#);
-        }
+        qb.push(if want { " AND " } else { " AND NOT " });
+        push_item_or_descendant_matching(qb, &|qb, alias| {
+            qb.push(format!(r#"instr({alias}."Data", 'Video3DFormat') > 0"#));
+        });
     }
     // `e.Data!.Contains("IsPlaceHolder\":true")`, rolled up like
     // `HasOfficialRating` (`TranslateQuery.cs:1201-1208`).
@@ -2024,7 +2026,7 @@ fn append_data_blob_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalI
     }
 }
 
-/// v12.2 `FolderAwareFilterExtensions.WhereItemOrDescendantMatches`: the row
+/// v12.4 `FolderAwareFilterExtensions.WhereItemOrDescendantMatches`: the row
 /// matches when it satisfies `condition`, or an item below it (`AncestorIds`)
 /// or linked to it (`LinkedChildren`, any link type) does. `condition` pushes
 /// the predicate over a `BaseItems` alias.
@@ -2047,6 +2049,20 @@ fn push_item_or_descendant_matching(
         UNION SELECT a."ParentItemId" FROM "AncestorIds" a WHERE a."ItemId" IN (SELECT "Id" FROM direct)
         UNION SELECT lc."ParentId" FROM "LinkedChildren" lc WHERE lc."ChildId" IN (SELECT "Id" FROM direct)))"#,
     );
+}
+
+/// The `condition` v12.4 hands the item-or-descendant roll-up for an extras
+/// filter (`TranslateQuery.cs:1210-1274`): `{alias}` owns an extra matching
+/// `extra_type` (over alias `x`), or is the primary of a version that does
+/// (`WithPrimaryVersions`: an extra named after a version belongs to that
+/// version). The owners are read once into `o`, and each owner's row is
+/// sought by id for its `PrimaryVersionId`.
+fn push_extra_owner(qb: &mut QueryBuilder<Sqlite>, alias: &str, extra_type: &str) {
+    qb.push(format!(
+        r#"{alias}."Id" IN (WITH o("Id") AS MATERIALIZED (SELECT x."OwnerId" FROM "BaseItems" x WHERE x."OwnerId" IS NOT NULL AND {extra_type})
+        SELECT "Id" FROM o
+        UNION ALL SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND v."Id" IN (SELECT "Id" FROM o))"#
+    ));
 }
 
 /// The language code standing for "undetermined": a list carrying it also

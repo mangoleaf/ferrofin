@@ -7,6 +7,7 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
 use ferrofin_model::configuration::LibraryOptions;
 use ferrofin_model::entities::{MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
+use ferrofin_providers::rate_limit::for_item;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::stubs::LiveTvManager;
@@ -222,9 +223,8 @@ impl SubtitleDownloader {
                 ..SubtitleSearchRequest::default()
             };
             // Only reads and network requests can be dropped on cancellation.
-            let found = cancel
-                .unless_cancelled(self.find_missing(manager.as_ref(), &request, options, probed))
-                .await;
+            let find = self.find_missing(manager.as_ref(), &request, options, probed);
+            let found = cancel.unless_cancelled(for_item(item_id, find)).await;
             let id = match found {
                 None => break,
                 Some(Ok(None)) => continue,
@@ -237,7 +237,7 @@ impl SubtitleDownloader {
             // Upstream's cancelled fetch throws into `catch (Exception)` and so
             // records a failure; a cancelled scan or task records none here.
             let Some(fetched) = cancel
-                .unless_cancelled(manager.get_remote_subtitles(&id))
+                .unless_cancelled(for_item(item_id, manager.get_remote_subtitles(&id)))
                 .await
             else {
                 break;

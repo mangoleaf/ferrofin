@@ -168,7 +168,7 @@ Ferrofin: `crates/ferrofin-core/src/display_preferences_manager.rs` (DPM), `crat
 On these tables, beyond what the rows above cover:
 - **Fresh databases only**, not run on adoption (`crates/ferrofin-db/src/database.rs:1529-1557` baselines it): migration `0007` uppercases GUIDs and rewrites `T`-form dates to three fractional digits (`crates/ferrofin-db/migrations/0007_jellyfin_10118_parity.sql:321-333, 410-419`).
 - **An owner decision**, the adoption-realism milestone: `0044` deletes the rows of users that no longer exist (`0044_dangling_user_and_ancestor_cleanup.sql:14-19`).
-- **Upgraded databases:** `0030_normalized_usernames.sql:13` and the `NormalizedUsername` repair (`crates/ferrofin-db/src/normalized_usernames.rs:91-102`), which match upstream's routine except for its `RowVersion` bump (gl-1607).
+- **Upgraded databases:** `0030_normalized_usernames.sql:13` and the `NormalizedUsername` repair (`crates/ferrofin-db/src/normalized_usernames.rs:107-125`), which match upstream's routine, its `RowVersion` bump included (gl-1958).
 - **The same end state as upstream:**
   - explicit child deletes before a user's row (`crates/ferrofin-core/src/user_manager.rs:1424-1442`);
   - upserts where upstream reads then writes (`crates/ferrofin-core/src/device_manager.rs:546-549`, DPM:100-107);
