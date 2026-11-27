@@ -101,6 +101,9 @@ class UsageStage(unittest.TestCase):
                                   ("metadata", "UseFileCreationTimeForDateAdded=False"),
                                   ("xbmcmetadata", "EnableExtraThumbsDuplication=True")):
             self.assertIn(setting, next(line for line in lines if line.startswith(f"config {document} ")).split())
+        # the cast receivers in their order, the fixtures' own kept through the change of the system settings
+        self.assertIn("castreceivers F007D354=Stable,6F511C87=Unstable,synthetic-cast-receiver=Synthetic cast receiver",
+                      lines)
         unset = " ".join(f"{option}=None" for option in usage.answers.LIBRARY_OPTIONS[1:])
         self.assertEqual([line for line in lines if line.startswith("virtualfolder ")],
                          [f"virtualfolder Round trip library type=movies locations=- EnableRealtimeMonitor=False {unset}",

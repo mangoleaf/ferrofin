@@ -254,6 +254,9 @@ the checks above change:
 - **A missing configuration document:** in a scratch copy of `gates/`, have `export_stage` delete
   `$dst/jellyfin/config/encoding.xml`. Jellyfin falls back to its defaults, and every answers comparison fails on
   the `config encoding` line (`H264Crf=21` against 23).
+- **A lost cast receiver:** in a scratch copy of `gates/`, have `export_stage` remove the fixtures'
+  `synthetic-cast-receiver` entry from `$dst/jellyfin/config/system.xml` after the export. The answers comparison
+  fails on the `castreceivers` line (Jellyfin lists only `F007D354=Stable,6F511C87=Unstable`).
 - **A table of Ferrofin's left in the export, or one the loss report misses:** in a scratch copy of `gates/`, have
   `export_stage` create a `FerrofinLeft` table in the exported database, or delete a table's line from
   `ferrofin-export-report.txt`, before the export's checks. Its database check fails naming the table.
@@ -350,8 +353,12 @@ virtualfolder <name> type=<type> locations=<paths> <option>=…  each library as
                                                                 names)
 config <document> <setting>=<value> …                          settings a dashboard shows, per document: system,
                                                                 encoding, network, branding, metadata, xbmcmetadata
-                                                                (answers.CONFIGURATION; livetv is not compared until
-                                                                the export writes livetv.xml, gl-1556)
+                                                                (answers.CONFIGURATION; Live TV's tuners and guides
+                                                                are judged by livetv.py)
+castreceivers <id>=<name>,…                                    the system settings' cast receivers in their order
+                                                                (the first is an account's until it picks one), "-"
+                                                                for none (no route answers that: every fixture adds
+                                                                a receiver of its own)
 collection <Playlist|BoxSet> <item count> <name>               the probed account's playlists and collections
 members <Playlist|BoxSet> <name> = <item names>                their items: a playlist's in order, a collection's
                                                                 by name

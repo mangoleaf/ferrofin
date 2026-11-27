@@ -106,7 +106,11 @@ def fresh():
         "images": {},        # item id: image types
         "plays": {},         # user id (not ADMIN): movies played to the end
         "shares": [CHILD],   # whom SHARED is shared with
-        "config": {},        # document ("system", "encoding", …): the settings posted to it
+        # document ("system", "encoding", …): the settings posted to it; Jellyfin's two default cast receivers in its
+        # order (not sorted by id), then the fixtures'
+        "config": {"system": {"CastReceiverApplications": [{"Id": "F007D354", "Name": "Stable"},
+                                                           {"Id": "6F511C87", "Name": "Unstable"},
+                                                           {"Id": "synthetic-cast-receiver", "Name": "Synthetic cast receiver"}]}},
         "options": {},       # library name: the LibraryOptions it was added with
         "livetv": {"tuner": False, "guide": False, "refreshes": 0, "channels": [], "programmes": [], "timers": [],
                    "series": [], "favourites": []},

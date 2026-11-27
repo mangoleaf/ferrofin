@@ -54,6 +54,8 @@ The lines (README.md, "The usage-stage contract"):
     videos <names>                                                the videos the smoke user lists that are no movie
                                                                    or episode, "-" for none
     config <document> <setting>=<value> …                         server settings a dashboard shows, per document
+    castreceivers <id>=<name>,…                                   the system settings' cast receivers (Playback's
+                                                                   Chromecast list), in their order, "-" for none
 The smoke probes run as ADOPTION_USER when it is set (run.sh sets the fixture's oracle user), as smoke.sh
 does. Exit status 0 when the file was written; 1 with one line on stdout when the server could not be
 asked (an answer the server refused is a line, never a failure: the comparison judges it).
@@ -282,6 +284,11 @@ def server_lines(server):
             out.append(f"config {key} error={status}")
             continue
         out.append(f"config {key} " + " ".join(f"{field}={number(document.get(field))}" for field in fields))
+        if key == "system":
+            # in order: the first is the receiver of every account that picked none
+            # (Jellyfin.Server.Implementations/Users/UserManager.cs:481-484)
+            receivers = document.get("CastReceiverApplications") or []
+            out.append("castreceivers " + (",".join(f"{r.get('Id')}={r.get('Name')}" for r in receivers) or "-"))
     return out
 
 
