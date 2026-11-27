@@ -3252,7 +3252,8 @@ mod tests {
         assert!(!m.is_user_active(b.user_id).await.unwrap());
         // The last member ending drops the group.
         m.session_ended(&a);
-        assert!(m.list_groups(&b).await.unwrap().is_empty());
+        let groups = m.list_groups(&b).await.unwrap();
+        assert!(groups.is_empty(), "{groups:?}");
     }
 
     /// `WaitingGroupState.HandleRequest(PlayGroupRequest)`
