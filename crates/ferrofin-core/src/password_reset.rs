@@ -217,10 +217,8 @@ impl PasswordResetManager for DefaultPasswordResetProvider<'_> {
                 .ok_or_else(|| ServiceError::not_found("user for recovery record"))?;
             let user_id = Uuid::parse_str(&user.id)
                 .map_err(|error| ServiceError::backend(error.to_string()))?;
+            // Writes the "Password has been changed" entry, as C#'s does.
             self.users.change_password(user_id, pin).await?;
-            self.users
-                .log_password_changed(user_id, &user.username)
-                .await;
             users_reset.push(user.username);
             std::fs::remove_file(path)
                 .map_err(|e| ServiceError::backend(format!("remove consumed reset: {e}")))?;

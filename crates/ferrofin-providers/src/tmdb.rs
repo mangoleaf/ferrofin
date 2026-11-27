@@ -269,7 +269,8 @@ pub struct TmdbImage {
     pub community_rating: Option<f64>,
     /// The vote count backing the rating.
     pub vote_count: Option<i32>,
-    /// The ISO-639-1 language of the image, if tagged.
+    /// The ISO-639-1 language of the image, if tagged. TheMovieDb's own
+    /// candidates always carry one, `""` when untagged (`GetImageLanguage`).
     pub language: Option<String>,
 }
 
@@ -1302,28 +1303,32 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// Port of `TmdbUtils.GetImageLanguage`: the region (`iso_3166_1`) is appended
 /// only when it contradicts the requested region, so a `pt-PT` image for a
 /// `pt-BR` request returns `"pt-PT"` while an `en-US` image for an `en-US`
-/// request returns the plain request code.
+/// request returns the plain request code. An untagged image (TMDb's `xx`)
+/// is `""`, `string.Empty`, which the API answers as `"Language": ""`.
 fn get_image_language(
     image_language: Option<&str>,
     image_region: Option<&str>,
     request_language: Option<&str>,
-) -> Option<String> {
-    let lang = image_language.filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("xx"))?;
+) -> String {
+    let Some(lang) = image_language.filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("xx"))
+    else {
+        return String::new();
+    };
 
     let Some(request) = request_language.filter(|r| !r.is_empty()) else {
-        return Some(lang.to_owned());
+        return lang.to_owned();
     };
 
     let parts: Vec<&str> = request.split('-').collect();
     if parts.len() != 2 || !parts[0].eq_ignore_ascii_case(lang) {
-        return Some(lang.to_owned());
+        return lang.to_owned();
     }
 
     match image_region.filter(|r| !r.is_empty()) {
         Some(region) if !region.eq_ignore_ascii_case(parts[1]) => {
-            Some(format!("{}-{}", lang, region.to_uppercase()))
+            format!("{}-{}", lang, region.to_uppercase())
         }
-        _ => Some(request.to_owned()),
+        _ => request.to_owned(),
     }
 }
 
@@ -1952,11 +1957,11 @@ impl TmdbClient {
                     height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
-                    language: get_image_language(
+                    language: Some(get_image_language(
                         image.iso_639_1.as_deref(),
                         image.iso_3166_1.as_deref(),
                         request_language,
-                    ),
+                    )),
                 })
             })
         };
@@ -2143,7 +2148,7 @@ impl TmdbClient {
                 );
                 // A backdrop with a language carries text — C#
                 // `ConvertToRemoteImageInfo` returns those as `Thumb`.
-                let image_type = if image_type == ImageType::Backdrop && language.is_some() {
+                let image_type = if image_type == ImageType::Backdrop && !language.is_empty() {
                     ImageType::Thumb
                 } else {
                     image_type
@@ -2156,7 +2161,7 @@ impl TmdbClient {
                     height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
-                    language,
+                    language: Some(language),
                 })
             })
         };
@@ -2270,11 +2275,11 @@ impl TmdbClient {
                     height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
-                    language: get_image_language(
+                    language: Some(get_image_language(
                         e.iso_639_1.as_deref(),
                         e.iso_3166_1.as_deref(),
                         request_language,
-                    ),
+                    )),
                 })
             })
             .collect()
@@ -2709,11 +2714,11 @@ impl TmdbClient {
                     height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
-                    language: get_image_language(
+                    language: Some(get_image_language(
                         image.iso_639_1.as_deref(),
                         image.iso_3166_1.as_deref(),
                         request_language,
-                    ),
+                    )),
                 })
             })
             .collect()
@@ -3056,28 +3061,28 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case(Some("pt"), Some("BR"), Some("pt-BR"), Some("pt-BR"))]
-    #[case(Some("pt"), Some("PT"), Some("pt-BR"), Some("pt-PT"))]
-    #[case(Some("en"), Some("GB"), Some("en-US"), Some("en-GB"))]
-    #[case(Some("en"), Some("US"), Some("en-US"), Some("en-US"))]
-    #[case(Some("en"), None, Some("en-US"), Some("en-US"))]
-    #[case(Some("en"), Some("US"), Some("en"), Some("en"))]
-    #[case(Some("pt"), Some("PT"), Some("pt"), Some("pt"))]
-    #[case(Some("en"), Some("US"), Some("pt-BR"), Some("en"))]
-    #[case(Some("de"), Some("DE"), Some("en-US"), Some("de"))]
-    #[case(Some("xx"), Some("US"), Some("en-US"), None)]
-    #[case(Some(""), Some("US"), Some("en-US"), None)]
-    #[case(None, None, Some("en-US"), None)]
-    #[case(Some("en"), None, None, Some("en"))]
+    #[case(Some("pt"), Some("BR"), Some("pt-BR"), "pt-BR")]
+    #[case(Some("pt"), Some("PT"), Some("pt-BR"), "pt-PT")]
+    #[case(Some("en"), Some("GB"), Some("en-US"), "en-GB")]
+    #[case(Some("en"), Some("US"), Some("en-US"), "en-US")]
+    #[case(Some("en"), None, Some("en-US"), "en-US")]
+    #[case(Some("en"), Some("US"), Some("en"), "en")]
+    #[case(Some("pt"), Some("PT"), Some("pt"), "pt")]
+    #[case(Some("en"), Some("US"), Some("pt-BR"), "en")]
+    #[case(Some("de"), Some("DE"), Some("en-US"), "de")]
+    #[case(Some("xx"), Some("US"), Some("en-US"), "")]
+    #[case(Some(""), Some("US"), Some("en-US"), "")]
+    #[case(None, None, Some("en-US"), "")]
+    #[case(Some("en"), None, None, "en")]
     fn image_language_region(
         #[case] image_language: Option<&str>,
         #[case] image_region: Option<&str>,
         #[case] request_language: Option<&str>,
-        #[case] expected: Option<&str>,
+        #[case] expected: &str,
     ) {
         assert_eq!(
             get_image_language(image_language, image_region, request_language),
-            expected.map(str::to_owned),
+            expected,
         );
     }
 

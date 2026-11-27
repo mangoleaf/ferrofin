@@ -6,7 +6,7 @@
 
 pub use ferrofin_common::config_import::{
     BRANDING_XML_DENY, ENCODING_XML_DENY, LIVETV_OPTIONS_XML_DENY, LIVETV_XML_DENY,
-    NETWORK_XML_DENY, SYSTEM_XML_DENY, import_over,
+    NETWORK_XML_DENY, SYSTEM_XML_DENY, Unimported, import_over, import_reporting,
 };
 // The export's tests compare documents as parsed trees.
 #[cfg(test)]

@@ -525,9 +525,7 @@ async fn move_item(
     {
         return Ok(rejection);
     }
-    let new_index: i32 = new_index
-        .parse()
-        .map_err(|_| ApiError::BadRequest(format!("invalid index {new_index:?}")))?;
+    let new_index: i32 = crate::query::bind_route_number(new_index, "newIndex")?;
     let calling_user_id = auth.user_id();
     // `Guid.Parse(playlistId)` here, and `new Guid(playlistId)` in `MoveItemAsync`.
     let playlist_uuid = DotnetGuid::parse(playlist_id)
