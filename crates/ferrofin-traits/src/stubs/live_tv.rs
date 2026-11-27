@@ -29,6 +29,7 @@ use ferrofin_model::querying::QueryResult;
 
 use crate::error::ServiceError;
 use crate::options::{DtoOptions, InternalItemsQuery};
+use crate::tasks::TaskProgress;
 
 /// The channel-list query `GET /LiveTv/Channels` binds.
 ///
@@ -468,6 +469,27 @@ pub trait LiveTvManager: Send + Sync {
     /// than awaiting it, because the fetches are third-party network I/O and an
     /// admin request must not hang on them.
     async fn refresh_guide(&self) -> Result<(), ServiceError>;
+
+    /// [`refresh_guide`](Self::refresh_guide) for the "Refresh Guide" task,
+    /// which shows its progress and can be stopped:
+    /// `GuideManager.RefreshGuide(progress, cancellationToken)`. `run` carries
+    /// both. The refresh reports through it where upstream's
+    /// `RefreshChannelsInternal` does (10, 15 once the channel items are
+    /// stored, a share of the remaining 85 after each channel's programmes,
+    /// then 100). Its token is checked where upstream checks its own (before
+    /// each service, each channel item and each channel's programmes), and
+    /// ends the tuner and listings fetches upstream hands its token to.
+    ///
+    /// Returns whether the refresh ran to its end: `false` when the token
+    /// ended it, upstream's `OperationCanceledException`. What it wrote before
+    /// the stop stays, and the next refresh writes the rest.
+    ///
+    /// The default runs the whole refresh, for an implementation with nothing
+    /// to report or stop inside; the real manager overrides it.
+    async fn refresh_guide_until(&self, run: &TaskProgress) -> Result<bool, ServiceError> {
+        let _ = run;
+        self.refresh_guide().await.map(|()| true)
+    }
 
     /// The guide's advertised date range.
     ///

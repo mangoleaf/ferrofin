@@ -47,7 +47,8 @@ use crate::item_type_lookup::stored_type_name;
 
 // The readers live in `ferrofin-db`, so the crates beside core share them.
 pub use ferrofin_db::item_data::{
-    VideoFormat, parse_data, read_data_f64, read_data_i32, read_data_string, video_format,
+    VideoFormat, is_disc_folder, parse_data, read_data_f64, read_data_i32, read_data_string,
+    video_format,
 };
 
 /// One entry of the `LinkedChildren` array (C# `LinkedChild`).
@@ -558,26 +559,6 @@ pub fn video_display(data: Option<&str>) -> VideoDisplay {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     }
-}
-
-/// Whether a video's `Data` makes its path a disc rip's folder: a DVD or
-/// Blu-ray `VideoType` on a video that is no placeholder (`.disc` stub) —
-/// the case `Video.ContainingFolderPath` (`Video.cs:201-219`) and
-/// `MovieNfoSaver.GetMovieSavePaths` treat the path itself as the folder.
-/// The text is read first, so a blob naming neither type is not parsed.
-#[must_use]
-pub fn is_disc_folder(data: Option<&str>) -> bool {
-    let Some(text) = data.filter(|t| t.contains("\"Dvd\"") || t.contains("\"BluRay\"")) else {
-        return false;
-    };
-    let data = parse_data(Some(text));
-    matches!(
-        read_data_string(&data, "VideoType").as_deref(),
-        Some("Dvd" | "BluRay")
-    ) && !data
-        .get("IsPlaceHolder")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 /// Whether `item`'s path names a directory: a folder's, or a disc rip's
