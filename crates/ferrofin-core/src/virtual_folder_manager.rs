@@ -796,10 +796,13 @@ impl FerrofinVirtualFolderManager {
 
     /// Records the library's locations on its `CollectionFolder` row as
     /// Jellyfin keeps them (`CollectionFolder.PhysicalLocationsList` and
-    /// `PhysicalFolderIds`): the folder's own path then each location, and
-    /// the id of the `Folder` row the scan keeps for each location (owner
-    /// decision D1) — what every library read resolves a library's items
-    /// through.
+    /// `PhysicalFolderIds`): the folder's own path then each location, in the
+    /// order the folder lists their shortcuts, unsorted, as
+    /// `CollectionFolder.CreateResolveArgs` gathers them
+    /// ([`Self::read_locations`]), and the id of the `Folder` row the scan
+    /// keeps for each location (owner decision D1), in the same order
+    /// (`GetPhysicalFolders`) — what every library read resolves a library's
+    /// items through.
     ///
     /// With `track`, a row whose recorded locations or folder ids differ from
     /// these (compared in order, as `SequenceEqual`, the stored ones expanded)
@@ -814,7 +817,7 @@ impl FerrofinVirtualFolderManager {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
-        let locations = self.resolve_locations(folder_path).await?;
+        let locations = self.read_locations(folder_path).await?.0;
         let trimmed = |location: &str| match location.trim_end_matches('/') {
             "" => "/".to_owned(),
             rest => rest.to_owned(),
@@ -1383,9 +1386,10 @@ impl FerrofinVirtualFolderManager {
     /// Lists the resolved `.mblink` shortcut targets in a folder, expanded,
     /// as `GetVirtualFolderInfo` builds `VirtualFolderInfo.Locations`: a
     /// shortcut that cannot be read is logged and left out. They are sorted
-    /// ordinally here, because this list is also persisted and read by
-    /// background work; [`get_virtual_folders`](VirtualFolderManager::get_virtual_folders)
+    /// ordinally here, because the libraries' snapshot built from this list is
+    /// also read by background work; [`get_virtual_folders`](VirtualFolderManager::get_virtual_folders)
     /// re-sorts its response in the request's culture, as upstream's `.Order()` does.
+    /// The library's row records them unsorted ([`Self::sync_physical_folders`]).
     async fn resolve_locations(&self, folder_path: &Path) -> Result<Vec<String>, ServiceError> {
         let mut locations = self.read_locations(folder_path).await?.0;
         locations.sort();
@@ -1394,7 +1398,7 @@ impl FerrofinVirtualFolderManager {
 
     /// [`Self::resolve_locations`] in the order the folder lists its
     /// shortcuts, as `FileData.GetFilteredFileSystemEntries` adds them to the
-    /// root's locations, with the first shortcut that resolved to no
+    /// root's and a library's locations, with the first shortcut that resolved to no
     /// location: one that could not be read, or an empty one.
     async fn read_locations(
         &self,
@@ -3724,6 +3728,56 @@ mod tests {
         let _other_listing = mgr.structure_change.read().await;
         mgr.get_virtual_folders().await.expect("list");
         assert!(row().await, "the next listing heals the row");
+    }
+
+    /// gl-1933: a library's row records its locations in the order its folder
+    /// lists their shortcuts, as `CollectionFolder.CreateResolveArgs` gathers
+    /// them (`FileData.GetFilteredFileSystemEntries`, unsorted), and its folder
+    /// ids in that order (`GetPhysicalFolders`), so a Jellyfin reading the
+    /// folder computes the same lists and does not save the row again.
+    #[tokio::test]
+    async fn a_librarys_row_records_its_locations_in_listing_order() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let (tmp, db, mgr) = manager_with_store().await;
+        let items = crate::item_repository::FerrofinItemRepository::new(
+            db,
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        // Added out of path order, as in Jellyfin 12.4's run (gl-1933): where
+        // the folder lists by creation order, its shortcuts list unsorted.
+        let paths = [media_dir(&tmp, "shows"), media_dir(&tmp, "extra")];
+        mgr.add_virtual_folder("Mixed", None, &opts_with_paths(&paths))
+            .await
+            .expect("add");
+        let folder = tmp.path().join("default").join("Mixed");
+        let id = mgr.collection_folder_id(&folder).expect("id");
+        let listed: Vec<String> = std::fs::read_dir(&folder)
+            .expect("folder")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "mblink"))
+            .map(|path| std::fs::read_to_string(path).expect("shortcut"))
+            .collect();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+
+        let row = items.retrieve_item(id).await.expect("read").expect("row");
+        let data = crate::item_data::parse_data(row.data.as_deref());
+        let locations: Vec<String> = std::iter::once(folder.to_string_lossy().into_owned())
+            .chain(listed.iter().cloned())
+            .collect();
+        assert_eq!(data["PhysicalLocationsList"], serde_json::json!(locations));
+        let ids: Vec<String> = listed
+            .iter()
+            .map(|location| {
+                crate::item_type_lookup::derive_item_id(
+                    ferrofin_model::data::BaseItemKind::Folder,
+                    location,
+                )
+                .expect("id")
+                .simple()
+                .to_string()
+            })
+            .collect();
+        assert_eq!(data["PhysicalFolderIds"], serde_json::json!(ids));
     }
 
     /// A media-path change records the library's locations on its row before

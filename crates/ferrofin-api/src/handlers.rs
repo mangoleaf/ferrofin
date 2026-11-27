@@ -5417,7 +5417,13 @@ pub const VERIFIED: &[Verified] = &[
                read_collection_type, load_options, stored_options and \
                adopt_jellyfin_options for CollectionFolder.GetLibraryOptions and \
                LoadLibraryOptions (its defaults, its error log, its ExpandVirtualPath), \
-               scan_progress for RefreshProgress and RefreshStatus) → ferrofin-model \
+               scan_progress for RefreshProgress and RefreshStatus; the CollectionFolder \
+               row it writes through ensure_collection_folder and sync_physical_folders, \
+               whose PhysicalLocationsList is the folder's path then read_locations' \
+               shortcut targets in the order the folder lists them, unsorted \
+               (CollectionFolder.CreateResolveArgs, FileData.GetFilteredFileSystemEntries), \
+               with PhysicalFolderIds in that order (GetPhysicalFolders) and both compared \
+               in order for RequiresRefresh's SequenceEqual) → ferrofin-model \
                entities_media.rs VirtualFolderInfo, configuration.rs LibraryOptions, \
                TypeOptions, ImageOption, MediaPathInfo",
         date: "2026-11-26",
