@@ -308,6 +308,25 @@ fn add_provider_metadata(
     }
 }
 
+/// `BaseTunerHost.GetChannels`' `newChannels`: the channels of `lineup` whose
+/// id no earlier tuner of the same type listed, with `listed` holding the ids
+/// those tuners listed and taking these. So a channel two tuners list is the
+/// first tuner's, and one playlist's own repeats stay.
+fn new_channels(
+    listed: &mut HashSet<String>,
+    lineup: Vec<crate::tuner_host::TunerChannel>,
+) -> Vec<crate::tuner_host::TunerChannel> {
+    let new: Vec<_> = lineup
+        .into_iter()
+        .filter(|ch| !listed.contains(&ordinal_ignore_case_key(&ch.external_id)))
+        .collect();
+    listed.extend(
+        new.iter()
+            .map(|ch| ordinal_ignore_case_key(&ch.external_id)),
+    );
+    new
+}
+
 /// Says once per guide refresh how many of a playlist's or guide's artwork
 /// values were left out for not being URLs, so a source whose logos stop
 /// showing leaves a trace. The count, not the values: it stays one line
@@ -2637,16 +2656,7 @@ impl FerrofinLiveTvManager {
                         continue;
                     }
                 };
-                // `newChannels` is checked against the earlier tuners only, so
-                // one playlist's own repeats stay.
-                let new: Vec<_> = lineup
-                    .into_iter()
-                    .filter(|ch| !listed.contains(&ordinal_ignore_case_key(&ch.external_id)))
-                    .collect();
-                listed.extend(
-                    new.iter()
-                        .map(|ch| ordinal_ignore_case_key(&ch.external_id)),
-                );
+                let new = new_channels(&mut listed, lineup);
                 if !is_listing_provider_enabled_for_tuner(info, host_id) {
                     continue;
                 }
@@ -2746,16 +2756,24 @@ impl FerrofinLiveTvManager {
     /// from the CHANNEL's external id (`ListingsManager.GetProgramsAsync`,
     /// v10.11.8 ListingsManager.cs:151-155), not from its item GUID, and one
     /// guide channel can legitimately feed more than one tuner channel.
+    ///
+    /// A channel in `filled` is left out: an earlier provider of this refresh
+    /// wrote airings on it, and `GetProgramsAsync` returns the first
+    /// provider's.
     async fn bind_guide_channels(
         &self,
         epg_channels: &[EpgChannel],
         provider: &ListingsProviderInfo,
+        filled: &HashSet<String>,
     ) -> Result<HashMap<String, Vec<(String, String)>>, ServiceError> {
         let epg = EpgChannelData::new(epg_channels);
         let mut by_epg_channel: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for (stored_id, tuner_channel) in
             self.stored_channels_for_listings_provider(provider).await?
         {
+            if filled.contains(&stored_id) {
+                continue;
+            }
             if let Some(matched) =
                 epg_channel_for_tuner_channel(&provider.channel_mappings, &tuner_channel, &epg)
             {
@@ -2794,21 +2812,27 @@ impl FerrofinLiveTvManager {
     /// the item mirror need. XMLTV does not group a channel's airings
     /// together, so they are not written a channel at a time as upstream
     /// writes them; the write is one transaction either way.
+    ///
+    /// A channel in `filled` is not touched, and a channel this write puts an
+    /// airing on joins it ([`Self::bind_guide_channels`]).
     async fn insert_programs(
         &self,
         document: XmlTvDocument,
         channels: &[XmltvChannel],
         provider: &ListingsProviderInfo,
         window: (DateTime<Utc>, DateTime<Utc>),
+        filled: &mut HashSet<String>,
     ) -> Result<HashMap<Uuid, ProgramImages>, ServiceError> {
         let classes = CategoryClasses::from_provider(provider);
         let (window_start, window_end) = window;
 
         let epg_channels: Vec<EpgChannel> = channels.iter().map(epg_channel).collect();
-        let by_epg_channel = self.bind_guide_channels(&epg_channels, provider).await?;
+        let by_epg_channel = self
+            .bind_guide_channels(&epg_channels, provider, filled)
+            .await?;
         // The channels this document is authoritative for — the ones the ladder
-        // actually bound, so the write replaces only those and a second
-        // listings provider's airings survive this pass.
+        // bound and no earlier provider filled, so the write replaces only those
+        // and another listings provider's airings survive this pass.
         let touched: Vec<String> = by_epg_channel
             .values()
             .flatten()
@@ -2863,7 +2887,7 @@ impl FerrofinLiveTvManager {
                 break;
             }
         }
-        write.finish(&touched).await
+        write.finish(&touched, filled).await
     }
 
     /// Inserts the Schedules Direct airings fetched for one provider, binding
@@ -2873,13 +2897,15 @@ impl FerrofinLiveTvManager {
     ///
     /// Only the channels bound to a station whose airings were fetched are
     /// replaced: a station the refresh could not read keeps its stored guide.
+    /// `filled` as for [`Self::insert_programs`].
     async fn insert_schedules_direct_programs(
         &self,
         channels: &[EpgChannel],
         programs: &HashMap<String, Vec<SdProgram>>,
         provider: &ListingsProviderInfo,
+        filled: &mut HashSet<String>,
     ) -> Result<HashMap<Uuid, ProgramImages>, ServiceError> {
-        let by_station = self.bind_guide_channels(channels, provider).await?;
+        let by_station = self.bind_guide_channels(channels, provider, filled).await?;
         let touched: Vec<String> = by_station
             .iter()
             .filter(|(station, _)| programs.contains_key(*station))
@@ -2931,7 +2957,7 @@ impl FerrofinLiveTvManager {
             })
         }));
 
-        self.write_program_rows(rows, &touched).await
+        self.write_program_rows(rows, &touched, filled).await
     }
 
     /// Whether a refresh newer than `generation` has started.
@@ -3119,7 +3145,8 @@ impl FerrofinLiveTvManager {
     }
 
     /// Replaces the airings on `touched` with `rows`, in one [`GuideWrite`],
-    /// and returns each written airing's id with its listing's artwork.
+    /// adds the channels it wrote an airing on to `filled`, and returns each
+    /// written airing's id with its listing's artwork.
     ///
     /// `rows` is drawn one statement's worth at a time, so the whole guide's
     /// rows never exist at once; only the id and artwork of each are kept, for
@@ -3128,6 +3155,7 @@ impl FerrofinLiveTvManager {
         &self,
         mut rows: ProgramRows<'_>,
         touched: &[String],
+        filled: &mut HashSet<String>,
     ) -> Result<HashMap<Uuid, ProgramImages>, ServiceError> {
         let mut write = GuideWrite::begin(&self.db).await?;
         let mut chunk: Vec<ProgramRow<'_>> = Vec::with_capacity(PROGRAM_ROWS_PER_STATEMENT);
@@ -3144,7 +3172,7 @@ impl FerrofinLiveTvManager {
                 break;
             }
         }
-        write.finish(touched).await
+        write.finish(touched, filled).await
     }
 }
 
@@ -3256,20 +3284,24 @@ impl GuideWrite {
     }
 
     /// Removes the airings stored on `touched` that this write did not emit,
-    /// one channel's at a time, commits, and returns what it wrote.
+    /// one channel's at a time, adds each channel it emitted an airing on to
+    /// `filled`, commits, and returns what it wrote.
     async fn finish(
         mut self,
         touched: &[String],
+        filled: &mut HashSet<String>,
     ) -> Result<HashMap<Uuid, ProgramImages>, ServiceError> {
         for channel_id in touched {
-            let left: Vec<String> =
+            let (kept, left): (Vec<String>, Vec<String>) =
                 crate::guide_repository::channel_program_ids(&mut self.tx, channel_id)
                     .await?
                     .into_iter()
-                    .filter(|id| {
-                        !Uuid::parse_str(id).is_ok_and(|id| self.written.contains_key(&id))
-                    })
-                    .collect();
+                    .partition(|id| {
+                        Uuid::parse_str(id).is_ok_and(|id| self.written.contains_key(&id))
+                    });
+            if !kept.is_empty() {
+                filled.insert(channel_id.clone());
+            }
             crate::guide_repository::delete_programs_in(&mut self.tx, &left).await?;
         }
         self.tx.commit().await.map_err(db_err)?;
@@ -3315,8 +3347,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn get_tuner_hosts(&self) -> Result<Vec<TunerHostInfo>, ServiceError> {
+        // In the order the tuners were added, as upstream's `TunerHosts` array
+        // keeps them (`SaveTunerHost` appends or replaces in place): a row's
+        // rowid survives the save's upsert and an id rename.
         let rows =
-            sqlx::query(r#"SELECT "Id", "Data" FROM "FerrofinLiveTvTunerHosts" ORDER BY "Id""#)
+            sqlx::query(r#"SELECT "Id", "Data" FROM "FerrofinLiveTvTunerHosts" ORDER BY rowid"#)
                 .fetch_all(self.db.pool())
                 .await
                 .map_err(db_err)?;
@@ -3508,8 +3543,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn get_listing_providers(&self) -> Result<Vec<ListingsProviderInfo>, ServiceError> {
+        // In the order they were added, as `get_tuner_hosts`: the order the
+        // guide refresh asks them in.
         let rows = sqlx::query(
-            r#"SELECT "Id", "Data" FROM "FerrofinLiveTvListingProviders" ORDER BY "Id""#,
+            r#"SELECT "Id", "Data" FROM "FerrofinLiveTvListingProviders" ORDER BY rowid"#,
         )
         .fetch_all(self.db.pool())
         .await
@@ -4021,6 +4058,8 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // tuner or guide that could not be read never empties the cache.
         let mut clean_database = true;
         let mut tuner_lineups: Vec<(String, Vec<crate::tuner_host::TunerChannel>)> = Vec::new();
+        // The channel ids the tuners read so far listed, per host type.
+        let mut listed: HashMap<&str, HashSet<String>> = HashMap::new();
         for tuner in self.get_tuner_hosts().await? {
             let Some(id) = tuner.id.clone() else {
                 clean_database = false;
@@ -4049,7 +4088,8 @@ impl LiveTvManager for FerrofinLiveTvManager {
             );
             match lineup.await {
                 Ok(channels) => {
-                    tuner_lineups.push((id, channels));
+                    let listed = listed.entry(host.type_id()).or_default();
+                    tuner_lineups.push((id, new_channels(listed, channels)));
                 }
                 Err(e) => {
                     // `BaseTunerHost.GetChannels` logs and falls back to its
@@ -4115,17 +4155,27 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // A provider that could not be read writes none, so its cached
         // airings keep the images they have.
         let mut kept_programs: HashMap<Uuid, ProgramImages> = HashMap::new();
+        // `ListingsManager.GetProgramsAsync` takes a channel's airings from the
+        // first provider, in the order they were added, with any for it: a
+        // channel an earlier provider filled is neither written nor cleaned by
+        // a later one.
+        let mut filled: HashSet<String> = HashSet::new();
         // By value: each document goes as soon as its airings are written,
         // rather than living through the item mirror below.
         for (provider, source) in guides {
             let written = match source {
                 GuideSource::XmlTv { document, channels } => {
-                    self.insert_programs(document, &channels, &provider, window)
+                    self.insert_programs(document, &channels, &provider, window, &mut filled)
                         .await?
                 }
                 GuideSource::SchedulesDirect { channels, programs } => {
-                    self.insert_schedules_direct_programs(&channels, &programs, &provider)
-                        .await?
+                    self.insert_schedules_direct_programs(
+                        &channels,
+                        &programs,
+                        &provider,
+                        &mut filled,
+                    )
+                    .await?
                 }
             };
             // Extending an empty map reserves a second table the size of
@@ -9990,6 +10040,259 @@ mod tests {
         assert_ne!(added.id.as_deref(), Some(padded.as_str()));
         assert_ne!(added.id.as_deref(), Some(upper.as_str()));
         assert_eq!(mgr.get_tuner_hosts().await.expect("list").len(), 2);
+    }
+
+    /// A fresh configuration-row id whose first hex digit is `lead`, so a test
+    /// chooses how ids sort. Fresh, because the test managers share one XMLTV
+    /// cache directory, whose files are named by the provider's id.
+    fn id_led_by(lead: char) -> String {
+        format!("{lead}{}", &Uuid::new_v4().simple().to_string()[1..])
+    }
+
+    /// Two fresh ids for the rows added first and second: the first sorts
+    /// before the second when `first_sorts_first`, after it otherwise.
+    fn first_and_second(first_sorts_first: bool) -> (String, String) {
+        let (low, high) = (id_led_by('0'), id_led_by('f'));
+        if first_sorts_first {
+            (low, high)
+        } else {
+            (high, low)
+        }
+    }
+
+    /// Stores an M3U tuner on `url` under `id`, unvalidated, so a test chooses
+    /// how its id sorts against the order the tuners are added.
+    async fn store_tuner_as(mgr: &FerrofinLiveTvManager, id: &str, url: &str) {
+        let info = TunerHostInfo {
+            id: Some(id.to_owned()),
+            type_: Some("m3u".to_owned()),
+            url: Some(url.to_owned()),
+            ..TunerHostInfo::default()
+        };
+        let data = serde_json::to_string(&info).expect("json");
+        crate::guide_repository::store_tuner_host(&mgr.db, None, id, url, "m3u", &data)
+            .await
+            .expect("tuner");
+    }
+
+    /// Stores `info` as an XMLTV provider under `id`, unvalidated, as
+    /// [`store_tuner_as`] stores a tuner.
+    async fn store_provider_as(mgr: &FerrofinLiveTvManager, id: &str, info: ListingsProviderInfo) {
+        let info = as_xmltv(ListingsProviderInfo {
+            id: Some(id.to_owned()),
+            ..info
+        });
+        let path = info.path.clone().unwrap_or_default();
+        let data = serde_json::to_string(&info).expect("json");
+        crate::guide_repository::store_listing_provider(&mgr.db, None, id, "xmltv", &path, &data)
+            .await
+            .expect("provider");
+    }
+
+    /// Each stored channel's name, with its logo and its airings' titles.
+    async fn guide_by_channel(
+        mgr: &FerrofinLiveTvManager,
+    ) -> std::collections::BTreeMap<String, (Option<String>, Vec<String>)> {
+        let mut out: std::collections::BTreeMap<_, _> =
+            crate::guide_repository::test_support::channel_logos(&mgr.db)
+                .await
+                .expect("channels")
+                .into_iter()
+                .map(|(name, logo)| (name, (logo, Vec::new())))
+                .collect();
+        for programme in crate::guide_repository::test_support::program_rows(&mgr.db)
+            .await
+            .expect("programmes")
+        {
+            let id = Uuid::parse_str(&programme.channel_id).expect("guid");
+            let row = crate::guide_repository::channel_row(&mgr.db, id)
+                .await
+                .expect("read")
+                .expect("channel");
+            if let Some((_, titles)) = out.get_mut(&row.name) {
+                titles.push(programme.title);
+                titles.sort();
+            }
+        }
+        out
+    }
+
+    /// `ListingsManager.SaveListingProvider` and `TunerHostManager.SaveTunerHost`
+    /// append a new row (`[.. list, info]`) and replace a matched one in place
+    /// (`list[index] = info`), so both lists read back in the order the rows
+    /// were added whatever their ids, and a row saved again under another
+    /// spelling of its id keeps its place.
+    #[tokio::test]
+    async fn tuners_and_listing_providers_read_back_in_the_order_they_were_added() {
+        let ids = [id_led_by('f'), id_led_by('0'), id_led_by('8')];
+        let mut sources = HashMap::new();
+        for id in &ids {
+            sources.insert(format!("http://tuner/{id}.m3u"), M3U.to_owned());
+        }
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        for id in &ids {
+            store_tuner_as(&mgr, id, &format!("http://tuner/{id}.m3u")).await;
+            store_provider_as(
+                &mgr,
+                id,
+                ListingsProviderInfo {
+                    path: Some(format!("http://guide/{id}.xml")),
+                    ..ListingsProviderInfo::default()
+                },
+            )
+            .await;
+        }
+
+        let first = ids[0].to_uppercase();
+        mgr.save_tuner_host(TunerHostInfo {
+            id: Some(first.clone()),
+            type_: Some("m3u".to_owned()),
+            url: Some(format!("http://tuner/{}.m3u", ids[0])),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner saved again");
+        mgr.save_listing_provider(
+            as_xmltv(ListingsProviderInfo {
+                id: Some(first.clone()),
+                path: Some("http://guide/again.xml".to_owned()),
+                ..ListingsProviderInfo::default()
+            }),
+            false,
+            false,
+        )
+        .await
+        .expect("provider saved again");
+
+        let expected = [first.as_str(), ids[1].as_str(), ids[2].as_str()];
+        let tuners: Vec<_> = mgr
+            .get_tuner_hosts()
+            .await
+            .expect("tuners")
+            .into_iter()
+            .map(|t| t.id.unwrap_or_default())
+            .collect();
+        assert_eq!(tuners, expected);
+        let providers = mgr.get_listing_providers().await.expect("providers");
+        let provider_ids: Vec<_> = providers
+            .iter()
+            .map(|p| p.id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(provider_ids, expected);
+        assert_eq!(providers[0].path.as_deref(), Some("http://guide/again.xml"));
+    }
+
+    /// `ListingsManager.GetProgramsAsync` takes a channel's airings from the
+    /// first provider, in the order they were added, with any for it in the
+    /// guide window; one that binds the channel with none falls through to the
+    /// next. `AddProviderMetadata` lets each later provider's logo replace an
+    /// earlier one's. Run with the ids both ways round, so no order of ids
+    /// passes by chance.
+    #[rstest::rstest]
+    #[case::first_added_sorts_first(true)]
+    #[case::first_added_sorts_last(false)]
+    #[tokio::test]
+    async fn a_channel_two_providers_bind_shows_the_first_one_with_airings(
+        #[case] first_sorts_first: bool,
+    ) {
+        let (first, second) = first_and_second(first_sorts_first);
+        let with_logo = |guide: String, url: &str| {
+            guide.replacen(
+                "<display-name>Channel One</display-name>",
+                &format!("<display-name>Channel One</display-name><icon src=\"{url}\"/>"),
+                1,
+            )
+        };
+        // The first binds both channels but has an airing on Channel One only.
+        let first_guide = with_logo(
+            guide_of(&[("one.tv", 60, 120, "First One", "News")]),
+            "http://img/first.png",
+        );
+        let second_guide = with_logo(
+            guide_of(&[
+                ("one.tv", 60, 120, "Second One", "News"),
+                ("two.tv", 60, 120, "Second Two", "News"),
+            ]),
+            "http://img/second.png",
+        );
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/first.xml".to_owned(), first_guide);
+        sources.insert("http://guide/second.xml".to_owned(), second_guide);
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        store_tuner_as(&mgr, &id_led_by('1'), "http://tuner/playlist.m3u").await;
+        for (id, path) in [
+            (&first, "http://guide/first.xml"),
+            (&second, "http://guide/second.xml"),
+        ] {
+            let info = ListingsProviderInfo {
+                path: Some(path.to_owned()),
+                ..ListingsProviderInfo::default()
+            };
+            store_provider_as(&mgr, id, info).await;
+        }
+
+        mgr.refresh_guide().await.expect("refresh");
+
+        let logo = Some("http://img/second.png".to_owned());
+        assert_eq!(
+            guide_by_channel(&mgr).await,
+            std::collections::BTreeMap::from([
+                (
+                    "Channel One".to_owned(),
+                    (logo, vec!["First One".to_owned()])
+                ),
+                (
+                    "Channel Two".to_owned(),
+                    (None, vec!["Second Two".to_owned()])
+                ),
+            ])
+        );
+    }
+
+    /// `BaseTunerHost.GetChannels`: a channel two tuners of one type list (the
+    /// same playlist twice) is the tuner added first's, so a provider enabled
+    /// for only the other one binds none of them. Ids both ways round, as
+    /// above.
+    #[rstest::rstest]
+    #[case::first_added_sorts_first(true)]
+    #[case::first_added_sorts_last(false)]
+    #[tokio::test]
+    async fn a_channel_two_tuners_list_is_the_first_tuners(#[case] first_sorts_first: bool) {
+        let (first, second) = first_and_second(first_sorts_first);
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        sources.insert("http://guide/xmltv.xml".to_owned(), relative_guide());
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        for id in [&first, &second] {
+            store_tuner_as(&mgr, id, "http://tuner/playlist.m3u").await;
+        }
+        let only_second = ListingsProviderInfo {
+            path: Some("http://guide/xmltv.xml".to_owned()),
+            enable_all_tuners: false,
+            enabled_tuners: vec![second.clone()],
+            ..ListingsProviderInfo::default()
+        };
+        store_provider_as(&mgr, &id_led_by('2'), only_second).await;
+
+        mgr.refresh_guide().await.expect("refresh");
+
+        let channels = crate::guide_repository::all_channel_ids(&mgr.db)
+            .await
+            .expect("channels");
+        assert_eq!(channels.len(), 2);
+        for id in channels {
+            let id = Uuid::parse_str(&id).expect("guid");
+            let (_, host) = crate::guide_repository::channel_stream_source(&mgr.db, id)
+                .await
+                .expect("read")
+                .expect("channel");
+            assert_eq!(host, first, "the channel is the first tuner's");
+        }
+        let programmes = crate::guide_repository::test_support::program_rows(&mgr.db)
+            .await
+            .expect("programmes");
+        assert!(programmes.is_empty(), "{programmes:?}");
     }
 
     /// A guide with a news airing, a movie, and a series episode (xmltv_ns
@@ -15916,7 +16219,10 @@ mod tests {
             let mut rows: Vec<_> = xmltv_program_rows(airing, by_epg_channel, &classes).collect();
             write.upsert(&mut rows).await.expect("upsert");
             let changed = total_changes(&mut write.tx).await.expect("changes") - before;
-            write.finish(&[]).await.expect("finish");
+            write
+                .finish(&[], &mut std::collections::HashSet::new())
+                .await
+                .expect("finish");
             changed
         }
 
@@ -17346,13 +17652,13 @@ mod tests {
             .get_channel_mapping_options(&provider_id)
             .await
             .expect("options");
-        // Sorted: the tuners come back in id order (gl-762), not as added.
-        let mut names: Vec<_> = opts
+        // In the order the tuners were added: the first playlist, then the
+        // other one; the second tuner on the first playlist adds nothing.
+        let names: Vec<_> = opts
             .tuner_channels
             .iter()
             .map(|c| c.name.as_deref().unwrap_or_default())
             .collect();
-        names.sort_unstable();
         assert_eq!(
             names,
             [

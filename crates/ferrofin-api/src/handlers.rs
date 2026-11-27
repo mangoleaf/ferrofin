@@ -938,8 +938,6 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     // gl-884: a malformed genreIds/studioIds token is a 400, not dropped.
     ("get", "/Artists", "v12.2"),
     ("get", "/Artists/AlbumArtists", "v12.2"),
-    // gl-762: livetv lists tuners and listing providers by id, not as added.
-    ("get", "/System/Configuration/{key}", "v12.2"),
 ];
 
 /// [`VERIFIED_SUBSYSTEMS`] rows last compared against an earlier pin, as
@@ -994,7 +992,10 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// stores on each programme item and its external ids, which every programme
 /// operation reads. `guide-channel-items` is where the guide refresh puts each
 /// channel item in the item tree (its parent, top parent and ancestors), which
-/// the recursive queries and folder filters read. `music-artwork` is what a
+/// the recursive queries and folder filters read. `guide-listings` is which
+/// tuner a channel two tuners list belongs to, and which listings provider a
+/// channel's airings and logo come from, which the channel and programme
+/// operations read. `music-artwork` is what a
 /// library scan stores as a music album's and a track's Primary, which the
 /// item and image operations serve. `route-matching` is which request paths
 /// find a route when one holds an empty segment, which every operation shares.
@@ -1023,6 +1024,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "metadata-providers",
     "guide-programme-items",
     "guide-channel-items",
+    "guide-listings",
     "music-artwork",
     "route-matching",
 ];
@@ -1169,6 +1171,40 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              Ferrofin stamps that column in the save's SQL. A Data merged into stored keys \
              is written in serde_json's key order, not the serialiser's. The rest of the \
              serialised item's shape is gl-1630's.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "guide-listings",
+        upstream_file: "src/Jellyfin.LiveTv/Listings/ListingsManager.cs",
+        upstream_method: "GetProgramsAsync",
+        ferrofin: "Which tuner a channel belongs to and which listings provider fills it, in \
+                   the guide refresh. ferrofin-livetv manager.rs get_tuner_hosts and \
+                   get_listing_providers read the rows in the order they were added (rowid, \
+                   which the save's upsert and the id rename keep); refresh_guide fetches the \
+                   tuners in that order and keeps a channel an earlier tuner of its type \
+                   listed for that tuner (new_channels, which channels_for_listings_provider \
+                   shares), and writes the providers in that order: bind_guide_channels leaves \
+                   out a channel an earlier provider filled, so insert_programs and \
+                   insert_schedules_direct_programs neither write nor clean it, and \
+                   GuideWrite::finish records the channels each provider wrote an airing on; \
+                   add_provider_metadata lets each later provider's logo replace an earlier \
+                   one's. Compared with ListingsManager.GetProgramsAsync, AddProviderMetadata, \
+                   GetListingProviders and SaveListingProvider, TunerHostManager.SaveTunerHost, \
+                   BaseTunerHost.GetChannels and DefaultLiveTvService.GetChannelsAsync at the \
+                   pinned v12.4 tag, and live against a Jellyfin 12.4 server holding three \
+                   tuners and three XMLTV guides (gl-762).",
+        date: "2026-11-26",
+        divergences: &[
+            "A listings provider that cannot be read (no copy of its guide cached), or a \
+             Schedules Direct station it cannot read, writes nothing, and the next provider \
+             fills the channels it would have come first for. Upstream's GetProgramsAsync \
+             throws for each such channel before it asks a later provider, and the channel \
+             keeps the airings it had until the provider can be read again (a first provider \
+             enabled for every tuner that cannot be read stops the whole guide updating). \
+             Jellyfin quirk not ported.",
+            "Schedules Direct is asked for every station a tuner channel binds, a channel an \
+             earlier provider fills included; upstream asks it only for a channel no earlier \
+             provider filled. The guide shows the same airings. Fix path: gl-1999.",
         ],
     },
     VerifiedSubsystem {
@@ -4679,9 +4715,6 @@ pub const VERIFIED: &[Verified] = &[
             "An absent providerId, or one that names no listings provider, is a 404; \
          upstream's .First(...) throws InvalidOperationException, a 500. Jellyfin bug not \
          ported.",
-            "The tuners of each type are read in id order, not configuration order, so their \
-         channels are listed in that order, and a channel two tuners of one type both list is \
-         kept for the one read first. Fix path: gl-762.",
             "An M3U entry with neither tvg-id nor channel-id is matched to the guide by its \
          display name (or a CUID attribute) as its TunerChannelId; upstream's is null, so its \
          match goes on to the number. Fix path: gl-751.",
@@ -4741,9 +4774,6 @@ pub const VERIFIED: &[Verified] = &[
          upstream's .First(...) throws InvalidOperationException (a 500) at the same two \
          points, and both queue the guide refresh before the second. Jellyfin bug not \
          ported.",
-            "The tuners of each type are read in id order, not configuration order, which \
-         decides the tuner a channel two tuners of one type share is kept for, and so whether \
-         a provider enabled for only one of them lists it. Fix path: gl-762.",
             "An M3U entry with neither tvg-id nor channel-id is matched to the guide by its \
          display name (or a CUID attribute) as its TunerChannelId; upstream's is null, so its \
          match goes on to the number. Fix path: gl-751.",
@@ -4800,9 +4830,11 @@ pub const VERIFIED: &[Verified] = &[
                (read_named, through read_named_kept for branding and encoding; \
                BaseConfigurationManager.GetConfiguration and LoadConfiguration, the seven \
                ConfigurationStore registrations) → encoding_response for encoding, the Live \
-               TV manager's tuner and provider rows for livetv, blank_for_non_administrator \
-               for livetv and network",
-        date: "2026-10-23",
+               TV manager's tuner and provider rows for livetv (ferrofin-livetv manager.rs \
+               get_tuner_hosts and get_listing_providers, in the order they were added, as \
+               TunerHostManager.SaveTunerHost and ListingsManager.SaveListingProvider keep \
+               the arrays; gl-762), blank_for_non_administrator for livetv and network",
+        date: "2026-11-26",
         divergences: &[
             "The stored document is not cached from the first load until a save: branding and \
          encoding are kept until their file's stamp changes, and the other stored documents \
@@ -4829,6 +4861,9 @@ pub const VERIFIED: &[Verified] = &[
          CertificatePath and CertificatePassword. Upstream's plain [Authorize] serves them to \
          every signed-in user (owner decision 2026-10-23, widened by gl-1093). encoding stays \
          whole: the player reads it.",
+            "The 404 body for a key no store has is Ferrofin's error shape, not upstream's \
+         text/plain \"Error processing request.\" (a blank key's 400 ValidationProblemDetails \
+         is upstream's, checked live). Fix path: gl-666.",
         ],
         refs: &[],
     },
