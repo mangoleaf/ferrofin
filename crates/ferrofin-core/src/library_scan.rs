@@ -8251,6 +8251,9 @@ impl LibraryScanner {
                 .path
                 .as_deref()
                 .and_then(|path| library_holding(path, library_locations(folders))),
+            // The planned row's: a stored one keeps the series a content-type
+            // override has since made a folder of shows.
+            in_folder: item.entity.series_id.is_none(),
         };
         // The options this item refreshes with (the scan's, or the defaults
         // for an ancestor a path-scoped scan carries along).
@@ -17658,7 +17661,8 @@ impl LibraryScanner {
     /// TV library: each top-level folder is a `Series`; its `Season NN` subfolders
     /// are `Season`s and the videos beneath them `Episode`s. A folder whose own
     /// content-type override is `tvshows` is a folder of shows instead
-    /// ([`Self::plan_tv_folder`]).
+    /// ([`Self::plan_tv_folder`]). A video directly in the location is an
+    /// `Episode` with no series ([`Self::plan_shows_in`]).
     ///
     /// The series keys read `ctx.key_folders`, every configured library, not
     /// just the one being planned: a series' presentation key names EVERY
@@ -17703,12 +17707,12 @@ impl LibraryScanner {
         ctx.tv_library.set(tv_library);
     }
 
-    /// What a folder holds where its children resolve as in a tvshows library:
-    /// each subfolder a series or a folder of shows ([`Self::plan_tv_folder`]),
-    /// hanging off `parent`, resolved independently, up to the library fanout
-    /// limit at once, its rows taken back in listing order.
-    ///
-    /// Loose files are skipped, as directly under a tvshows root.
+    /// What a folder holds where its children resolve as in a tvshows library,
+    /// all hanging off `parent`: each subfolder a series or a folder of shows
+    /// ([`Self::plan_tv_folder`]), resolved independently, up to the library
+    /// fanout limit at once, its rows taken back in listing order; then its
+    /// videos, which `ResolveVideos<Episode>` makes episodes with no series
+    /// (`MovieResolver.cs:232-235`), and the extras a lone one owns.
     fn plan_shows_in(
         &self,
         dir: &str,
@@ -17718,6 +17722,19 @@ impl LibraryScanner {
         out: &mut Vec<Planned>,
     ) {
         let entries = self.list(dir, ctx);
+        // A location, whose rows hang off the library until
+        // `place_under_location` moves them, is a top parent (`IsTopParent`).
+        let top_parent = parent.0 == cf;
+        // Extra files are no items.
+        let set_aside = set_aside_extras(
+            &entries
+                .iter()
+                .filter(|entry| entry.type_ != FileSystemEntryType::Directory)
+                .cloned()
+                .collect::<Vec<_>>(),
+            dir,
+            ctx,
+        );
         let dirs: Vec<_> = entries
             .iter()
             .filter(|entry| {
@@ -17731,6 +17748,25 @@ impl LibraryScanner {
         }) {
             out.extend(rows);
         }
+        note_episode_folder(dir, &entries, top_parent, ctx);
+        let home = EpisodeHome {
+            cf,
+            owner: EpisodeOwner::Folder(parent.0, &parent.1),
+            season: None,
+            season_name: None,
+            virtual_season: false,
+        };
+        for entry in &entries {
+            if entry.type_ != FileSystemEntryType::Directory
+                && !set_aside.contains(&entry.path)
+                && video_resolver::is_video_file(&entry.path, ctx.naming)
+                && episode_file_kept(&entry.path, ctx)
+            {
+                self.plan_episode_file(&entry.path, home, ctx, out);
+            }
+        }
+        // After the episodes: an extra's owner saves first.
+        self.plan_episode_folder_extras(&entries, dir, cf, ctx, out);
     }
 
     /// A folder resolved as in a tvshows library, hanging off `parent`
@@ -17918,7 +17954,7 @@ impl LibraryScanner {
             .borrow_mut()
             .insert(series_id, series_dir.to_owned());
         let entries = self.list(series_dir, ctx);
-        note_episode_folder(series_dir, &entries, ctx);
+        note_episode_folder(series_dir, &entries, false, ctx);
         let extras = self.plan_folder_extras(&entries, series_dir, series_id, cf, ctx, out);
         let names = self.season_names(ctx, cf, series_dir);
         // The subfolders (seasons, or folders of loose episodes) resolve
@@ -18107,7 +18143,7 @@ impl LibraryScanner {
         out_paths: &mut Vec<String>,
     ) {
         let entries = self.list(dir, ctx);
-        note_episode_folder(dir, &entries, ctx);
+        note_episode_folder(dir, &entries, false, ctx);
         let extras = set_aside_extras(&entries, dir, ctx);
         self.plan_episode_folder_extras(&entries, dir, cf, ctx, owned_extras);
         for entry in entries {
@@ -18230,10 +18266,8 @@ impl LibraryScanner {
             let season_name = names.virtual_season(num);
             let home = EpisodeHome {
                 cf,
-                series_id,
+                owner: EpisodeOwner::Series(series_id, series_name, series_key),
                 season,
-                series_name,
-                series_key,
                 season_name: Some(&season_name),
                 virtual_season: true,
             };
@@ -18260,7 +18294,7 @@ impl LibraryScanner {
         let owner = season.map_or(series_id, |(id, _)| id);
         let owner_dir = ctx.owner_paths.borrow().get(&owner).cloned();
         let entries = self.list(dir, ctx);
-        note_episode_folder(dir, &entries, ctx);
+        note_episode_folder(dir, &entries, false, ctx);
         let extras = if owner_dir.as_deref() == Some(dir) {
             self.plan_folder_extras(&entries, dir, owner, cf, ctx, out)
         } else {
@@ -18301,10 +18335,8 @@ impl LibraryScanner {
             {
                 let home = EpisodeHome {
                     cf,
-                    series_id,
+                    owner: EpisodeOwner::Series(series_id, series_name, series_key),
                     season,
-                    series_name,
-                    series_key,
                     season_name,
                     virtual_season: false,
                 };
@@ -18458,10 +18490,16 @@ impl LibraryScanner {
         home: EpisodeHome<'_>,
         ctx: &PlanCtx<'_>,
     ) -> Option<Planned<BaseItemEntity>> {
-        let info = EpisodeResolver::new(ctx.naming).resolve_simple(
-            below_library(path, library_locations(ctx.key_folders)),
-            false,
-        );
+        let below = |path| below_library(path, library_locations(ctx.key_folders));
+        let resolver = EpisodeResolver::new(ctx.naming);
+        let info = resolver.resolve_simple(below(path), false).or_else(|| {
+            // A file that reads as no episode takes the numbers of the plain
+            // folder it hangs off ([`resolve_episode_path`]).
+            let EpisodeOwner::Folder(..) = home.owner else {
+                return None;
+            };
+            resolver.resolve_simple(below(Path::new(path).parent()?.to_str()?), true)
+        });
         let (parent, ancestors) = home.parent();
         let (id, mut entity) = self.base_item(
             ctx,
@@ -18494,12 +18532,14 @@ impl LibraryScanner {
         // series.Name`). A filename-derived series name is release-group noise
         // ("Show.2009", "Show - 4x09 - Title") and fragments the parent line on
         // every episode card.
-        entity.series_name = Some(home.series_name.to_owned());
-        entity.season_name = home.season_name.map(str::to_owned);
         // Link the episode to its series/season so the `/Shows/{id}/Episodes`
         // query (which filters on `SeriesPresentationUniqueKey`) returns it.
-        entity.series_id = Some(guid_to_db(home.series_id));
-        entity.series_presentation_unique_key = Some(home.series_key.to_owned());
+        if let EpisodeOwner::Series(series_id, series_name, series_key) = home.owner {
+            entity.series_name = Some(series_name.to_owned());
+            entity.series_id = Some(guid_to_db(series_id));
+            entity.series_presentation_unique_key = Some(series_key.to_owned());
+        }
+        entity.season_name = home.season_name.map(str::to_owned);
         entity.season_id = home.season.map(|(sid, _)| guid_to_db(sid));
         // Episodes sort by position, not title (`Episode.CreateSortName`) — the
         // numbers are only known here, after the resolver ran.
@@ -20965,19 +21005,26 @@ struct EpisodeFolder {
 struct EpisodeHome<'a> {
     /// The library's collection folder.
     cf: Uuid,
-    /// The series.
-    series_id: Uuid,
+    /// The series, or the folder of an episode with none.
+    owner: EpisodeOwner<'a>,
     /// The season's id and number, when the episode has one.
     season: Option<(Uuid, Option<i32>)>,
-    /// The series' name.
-    series_name: &'a str,
-    /// The series' presentation key.
-    series_key: &'a str,
     /// The season's name.
     season_name: Option<&'a str>,
     /// Whether the season is virtual: grouped from files in the series folder
     /// (`SeriesMetadataService.CreateSeasonsAsync`), not the folder they are in.
     virtual_season: bool,
+}
+
+/// What an episode belongs to besides its season.
+#[derive(Clone, Copy)]
+enum EpisodeOwner<'a> {
+    /// Its series: the id, name and presentation key.
+    Series(Uuid, &'a str, &'a str),
+    /// No series: a video in a folder whose children resolve as in a tvshows
+    /// library (`ResolveVideos<Episode>`, `MovieResolver.cs:232-235`), which
+    /// hangs off that folder. Its id and ancestors.
+    Folder(Uuid, &'a [Uuid]),
 }
 
 impl EpisodeHome<'_> {
@@ -20987,12 +21034,16 @@ impl EpisodeHome<'_> {
     /// links by `SeasonId`. Either way the season is an ancestor
     /// (`Episode.GetAncestorIds()` adds `SeasonId`).
     fn parent(self) -> (Uuid, Vec<Uuid>) {
+        let series_id = match self.owner {
+            EpisodeOwner::Series(series_id, ..) => series_id,
+            EpisodeOwner::Folder(folder, ancestors) => return (folder, ancestors.to_vec()),
+        };
         match self.season {
             Some((season_id, _)) if self.virtual_season => {
-                (self.series_id, vec![self.cf, self.series_id, season_id])
+                (series_id, vec![self.cf, series_id, season_id])
             }
-            Some((season_id, _)) => (season_id, vec![self.cf, self.series_id, season_id]),
-            None => (self.series_id, vec![self.cf, self.series_id]),
+            Some((season_id, _)) => (season_id, vec![self.cf, series_id, season_id]),
+            None => (series_id, vec![self.cf, series_id]),
         }
     }
 }
@@ -21033,12 +21084,18 @@ fn set_aside_extras(
 /// tvshows library resolves a folder's files through `ResolveVideos<Episode>`
 /// (`MovieResolver.cs:231-234`), which groups stacks and episode versions
 /// (`VideoListResolver.GetEpisodesGroupedByVersion`) and sets
-/// `IsInMixedFolder = Count > 1` — a series or season folder is never a top
-/// parent — and whether it resolved an item: if not, `ResolvePaths` resolves
-/// each file on its own (`LibraryManager.cs:1064`), never in a mixed folder.
-/// A folder of an untyped library's series is not recorded: its files
+/// `IsInMixedFolder = Count > 1 || parent.IsTopParent` (`MovieResolver.cs:
+/// 287`) — `top_parent` for a library location; a series or season folder is
+/// never one — and whether it resolved an item: if not, `ResolvePaths`
+/// resolves each file on its own (`LibraryManager.cs:1064`), never in a mixed
+/// folder. A folder of an untyped library's series is not recorded: its files
 /// resolve one by one (`MovieResolver.cs:219-222`).
-fn note_episode_folder(dir: &str, entries: &[FileSystemEntryInfo], ctx: &PlanCtx<'_>) {
+fn note_episode_folder(
+    dir: &str,
+    entries: &[FileSystemEntryInfo],
+    top_parent: bool,
+    ctx: &PlanCtx<'_>,
+) {
     if !ctx.tv_library.get() {
         return;
     }
@@ -21051,7 +21108,7 @@ fn note_episode_folder(dir: &str, entries: &[FileSystemEntryInfo], ctx: &PlanCtx
         Some(ferrofin_model::data::CollectionType::tvshows),
     );
     let has_items = videos.iter().any(|video| video.extra_type.is_none());
-    let mixed = has_items && videos.len() > 1;
+    let mixed = has_items && (videos.len() > 1 || top_parent);
     let groups = VideoGroups::of(videos, ctx.naming);
     let grouped = groups
         .videos
@@ -21703,6 +21760,10 @@ struct EpisodeNaming<'a> {
     /// The library location holding the episode: only the path below it is
     /// read ([`below_library`]).
     library: Option<&'a str>,
+    /// The episode hangs off a plain `Folder`, which the planner makes its
+    /// parent only when it has no series ([`EpisodeOwner::Folder`]): a path
+    /// that reads as no episode reads that folder ([`resolve_episode_path`]).
+    in_folder: bool,
 }
 
 /// MovieResolver.FindMovie accepts one resolved movie (including versions)
@@ -22787,8 +22848,8 @@ fn names_its_own_folder(row: &BaseItemEntity) -> bool {
 /// (`season_index`).
 ///
 /// Resolved as the planner resolves episodes: the path below its library
-/// ([`below_library`]), and no plain-folder parent (the planner creates
-/// none).
+/// ([`below_library`]), or the plain folder an episode with no series hangs
+/// off ([`resolve_episode_path`]).
 ///
 /// A series whose `DisplayOrder` is `absolute` resolves with
 /// `isAbsoluteNaming` (`LibraryManager.cs:3292-3298`): only the expressions
@@ -22835,19 +22896,27 @@ fn fill_episode_numbers_from_path(
 
 /// `FillMissingEpisodeNumbersFromPath`'s resolve: the path below its library
 /// ([`below_library`]), with `isAbsoluteNaming` `null` (no filter) unless
-/// the series is absolute.
+/// the series is absolute. A path that reads as no episode, of an episode
+/// whose parent is a plain `Folder` ([`EpisodeNaming::in_folder`]), reads
+/// that folder instead, as a directory (`LibraryManager.cs:3324-3333`).
 fn resolve_episode_path(
     path: &str,
     naming: EpisodeNaming<'_>,
 ) -> Option<ferrofin_naming::tv::EpisodeInfo> {
-    EpisodeResolver::new(NamingOptions::shared()).resolve(
-        below_library(path, naming.library),
-        false,
-        None,
-        None,
-        naming.absolute.then_some(true),
-        true,
-    )
+    let resolve = |path, is_directory| {
+        EpisodeResolver::new(NamingOptions::shared()).resolve(
+            below_library(path, naming.library),
+            is_directory,
+            None,
+            None,
+            naming.absolute.then_some(true),
+            true,
+        )
+    };
+    resolve(path, false).or_else(|| {
+        let folder = Path::new(path).parent()?.to_str()?;
+        naming.in_folder.then(|| resolve(folder, true)).flatten()
+    })
 }
 
 /// A NEW episode's range end from its path, where its providers (an NFO)
@@ -34747,7 +34816,7 @@ mod tests {
             None,
             super::EpisodeNaming {
                 absolute: true,
-                library: None,
+                ..super::EpisodeNaming::default()
             },
         );
         assert_eq!(
@@ -34762,7 +34831,7 @@ mod tests {
             None,
             super::EpisodeNaming {
                 absolute: true,
-                library: None,
+                ..super::EpisodeNaming::default()
             },
         );
         assert_eq!(bare.index_number, Some(101));
@@ -34781,14 +34850,37 @@ mod tests {
                 false,
                 None,
                 super::EpisodeNaming {
-                    absolute: false,
                     library,
+                    ..super::EpisodeNaming::default()
                 },
             );
             (row.parent_index_number, row.index_number)
         };
         assert_eq!(refill(Some("/srv/media-v12-2/tv")), (None, None));
         assert_eq!(refill(None), (Some(12), Some(2)));
+    }
+
+    /// A file that reads as no episode takes the numbers of the plain folder
+    /// it hangs off, read as a directory (`LibraryManager.cs:3324-3333`); an
+    /// episode whose parent is a season or the series takes none.
+    #[test]
+    fn the_refill_reads_a_plain_parent_folder() {
+        let refill = |in_folder| {
+            let mut row = stored_row("TV.Episode", "/tv/Odd S02E05/Bonus.mkv", None, None);
+            super::before_metadata_refresh(
+                &mut row,
+                false,
+                None,
+                super::EpisodeNaming {
+                    library: Some("/tv"),
+                    in_folder,
+                    ..super::EpisodeNaming::default()
+                },
+            );
+            (row.parent_index_number, row.index_number)
+        };
+        assert_eq!(refill(true), (Some(2), Some(5)));
+        assert_eq!(refill(false), (None, None));
     }
 
     #[test]
