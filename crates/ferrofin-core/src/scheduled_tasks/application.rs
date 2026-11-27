@@ -9,7 +9,7 @@
 //!
 //! The C# `IProgress<double>` maps to [`TaskProgress`]; the body does not check
 //! the run's token yet, so a stop drops it when it does not stop in time
-//! (gl-1709).
+//! (gl-2004).
 
 use std::sync::Arc;
 

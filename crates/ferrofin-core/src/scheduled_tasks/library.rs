@@ -20,10 +20,12 @@
 //! and guest analysis retain their own producer passes and persistent output.
 //!
 //! The C# `IProgress<double>` and `CancellationToken` both map to
-//! [`TaskProgress`]. The keyframe, chapter-image, subtitle and
-//! audio-normalization tasks check [`TaskProgress::stop_requested`] where
-//! upstream checks its token; the others are dropped when they do not stop
-//! in time (gl-1709).
+//! [`TaskProgress`]. Every task here checks [`TaskProgress::stop_requested`]
+//! where upstream checks its token, between its items (gl-1709). The chapter
+//! extractor, the subtitle downloader and audio normalization's ffmpeg run
+//! also take the token itself; the keyframe extractor and the five tasks
+//! gl-2006 lists do not yet, so an item still running when the stop wait ends
+//! is dropped mid-item there.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -961,7 +963,7 @@ impl PeopleValidationTask {
     }
 
     /// Phase 1: merge duplicate people and drop orphans.
-    async fn dedupe_and_orphans(&self) -> Result<(), ServiceError> {
+    async fn dedupe_and_orphans(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         let dup_groups: Vec<String> = sqlx::query_scalar(
             r#"SELECT GROUP_CONCAT("Id")
                FROM "Peoples"
@@ -972,6 +974,11 @@ impl PeopleValidationTask {
         .await
         .map_err(db_err)?;
         for group in dup_groups {
+            // Each of upstream's merge writes takes the run's token, so a stop
+            // ends the run at the next group's (gl-1709).
+            if progress.stop_requested() {
+                return Ok(());
+            }
             let ids: Vec<&str> = group.split(',').collect();
             let Some((keep, dups)) = ids.split_first() else {
                 continue;
@@ -999,6 +1006,10 @@ impl PeopleValidationTask {
                     .await
                     .map_err(db_err)?;
             }
+        }
+        // The orphan delete takes the token upstream too.
+        if progress.stop_requested() {
+            return Ok(());
         }
         let orphans = sqlx::query(
             r#"DELETE FROM "Peoples"
@@ -1082,6 +1093,11 @@ impl PeopleValidationTask {
         let mut refreshed = 0usize;
         let mut failed = false;
         for (index, id) in ids.iter().enumerate() {
+            // `ThrowIfCancellationRequested()` before each person, in
+            // `PeopleValidator.Run` and `RefreshPeopleImagesAsync` (gl-1709).
+            if progress.stop_requested() {
+                break;
+            }
             if let Ok(item_id) = Uuid::parse_str(id) {
                 match self
                     .providers
@@ -1185,12 +1201,23 @@ impl ScheduledTask for PeopleValidationTask {
             tracing::info!("skipping people validation: a library scan is running");
             return Ok(());
         }
-        self.dedupe_and_orphans().await?;
+        // A stop ends the run between the phases too: each one upstream
+        // takes the run's token (gl-1709).
+        self.dedupe_and_orphans(progress).await?;
+        if progress.stop_requested() {
+            return Ok(());
+        }
         progress.report(33.0);
         self.validate_person_items().await?;
         self.refresh_new_person_items(progress, 50.0, 16.0).await?;
+        if progress.stop_requested() {
+            return Ok(());
+        }
         progress.report(66.0);
         self.refresh_person_items(progress, 66.0, 34.0).await?;
+        if progress.stop_requested() {
+            return Ok(());
+        }
         progress.report(100.0);
         Ok(())
     }
@@ -1374,6 +1401,11 @@ impl ScheduledTask for LyricDownloadTask {
                 .into_iter()
                 .collect();
             for item in &items {
+                // `cancellationToken.ThrowIfCancellationRequested()` before each
+                // item: a stop ends the run here, as stopped (gl-1709).
+                if progress.stop_requested() {
+                    return Ok(());
+                }
                 progress.report(100.0 * pages.complete_one());
                 let Ok(item_id) = Uuid::parse_str(&item.id) else {
                     continue;
@@ -1474,7 +1506,14 @@ impl TmdbUpcomingEpisodesTask {
             .get_item_ids(&virtual_of(BaseItemKind::Episode))
             .await?;
         let mut removed = 0;
+        // `ThrowIfCancellationRequested()` before each virtual episode and
+        // each virtual season (gl-1709); the count is logged all the same.
+        let mut stopped = false;
         for (i, id) in episodes.iter().enumerate() {
+            if progress.stop_requested() {
+                stopped = true;
+                break;
+            }
             // Information upstream; debug here, one per episode: the count
             // below is the info line (LOGGING.md rule 1), as the scan's own
             // removals are.
@@ -1491,11 +1530,18 @@ impl TmdbUpcomingEpisodesTask {
             #[allow(clippy::cast_precision_loss)] // a progress ratio
             progress.report(95.0 * (i + 1) as f64 / episodes.len() as f64);
         }
-        for season in self
-            .library
-            .get_item_ids(&virtual_of(BaseItemKind::Season))
-            .await?
-        {
+        let seasons = if stopped {
+            Vec::new()
+        } else {
+            self.library
+                .get_item_ids(&virtual_of(BaseItemKind::Season))
+                .await?
+        };
+        for season in seasons {
+            if progress.stop_requested() {
+                stopped = true;
+                break;
+            }
             let episodes = self
                 .library
                 .get_item_ids(&InternalItemsQuery {
@@ -1518,7 +1564,9 @@ impl TmdbUpcomingEpisodesTask {
                 "removed the virtual episodes: the TMDb missing episode provider is disabled"
             );
         }
-        progress.report(100.0);
+        if !stopped {
+            progress.report(100.0);
+        }
         Ok(())
     }
 
@@ -1602,6 +1650,10 @@ impl ScheduledTask for TmdbUpcomingEpisodesTask {
             ..MetadataRefreshOptions::default()
         };
         for (i, (id, path)) in series.iter().enumerate() {
+            // `ThrowIfCancellationRequested()` before each series (gl-1709).
+            if progress.stop_requested() {
+                return Ok(());
+            }
             if let Some(path) = path.clone().filter(|p| !p.is_empty()) {
                 match self
                     .library
@@ -1729,6 +1781,11 @@ impl ScheduledTask for TrickplayImagesTask {
                 .collect();
             let page_streams = self.streams.get_media_streams_batch(&ids).await?;
             for item in &items {
+                // `cancellationToken.ThrowIfCancellationRequested()` before each
+                // item: a stop ends the run here, as stopped (gl-1709).
+                if progress.stop_requested() {
+                    return Ok(());
+                }
                 let fraction = pages.complete_one();
                 // The pin declares SourceTypes but never consumes it in query
                 // translation. Retain physical Video kinds, including channel
@@ -1844,6 +1901,10 @@ impl ScheduledTask for MediaSegmentExtractionTask {
         vec![interval_hours(12)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `ExecuteAsync` opens with `ThrowIfCancellationRequested()`.
+        if progress.stop_requested() {
+            return Ok(());
+        }
         progress.report(0.0);
         let query = InternalItemsQuery {
             media_types: vec![MediaType::Video, MediaType::Audio],
@@ -1864,6 +1925,11 @@ impl ScheduledTask for MediaSegmentExtractionTask {
         let mut providers_run = 0usize;
         while let Some(items) = pages.next().await? {
             for item in &items {
+                // `cancellationToken.ThrowIfCancellationRequested()` before each
+                // item: a stop ends the run here, as stopped (gl-1709).
+                if progress.stop_requested() {
+                    return Ok(());
+                }
                 let fraction = pages.complete_one();
                 // Only local files are supported (upstream's `IsFileProtocol
                 // && File.Exists`); a missing file — or a directory, a disc
@@ -3768,7 +3834,74 @@ mod tests {
         );
     }
 
+    /// gl-1709: `ThrowIfCancellationRequested()` before each audio item, so a
+    /// stop requested before the run searches nothing and is stopped.
+    #[tokio::test]
+    async fn lyric_download_stops_before_its_first_item_once_asked() {
+        let db = test_db().await;
+        let missing = Uuid::from_u128(0x63);
+        seed_item(&db, missing, BaseItemKind::Audio).await;
+        let lyrics = Arc::new(FakeLyrics {
+            existing: Vec::new(),
+            downloads: Mutex::new(Vec::new()),
+            automated_searches: Mutex::new(Vec::new()),
+        });
+        let streams =
+            crate::media_stream_repository::FerrofinMediaStreamRepository::new(db.clone());
+        let task = LyricDownloadTask::new(
+            library_manager_over(db.clone()),
+            lyrics.clone(),
+            Arc::new(streams),
+        );
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+        assert!(lyrics.automated_searches.lock().expect("lock").is_empty());
+        assert!(progress.was_stopped(), "recorded Cancelled");
+    }
+
     // -- Generate Trickplay Images -------------------------------------------
+
+    /// gl-1709: `ThrowIfCancellationRequested()` before each video, so a stop
+    /// requested before the run refreshes none, and the pass is not finished.
+    #[tokio::test]
+    async fn trickplay_task_stops_before_its_first_video_once_asked() {
+        let db = test_db().await;
+        let video = Uuid::from_u128(0x73);
+        seed_item(&db, video, BaseItemKind::Movie).await;
+        set_media_type(&db, video, "Video").await;
+        set_path(&db, video, "/media/movies/c.mkv").await;
+        let trickplay = Arc::new(FakeTrickplay {
+            check: Some(ferrofin_traits::trickplay::TrickplayCheck {
+                previous_widths: vec![320],
+                settings: "new".to_owned(),
+            }),
+            ..FakeTrickplay::default()
+        });
+        let task = TrickplayImagesTask::new(
+            library_manager_over(db.clone()),
+            Arc::new(folder_with(
+                LibraryOptions {
+                    enable_trickplay_image_extraction: true,
+                    ..LibraryOptions::default()
+                },
+                None,
+                "/media/movies",
+            )),
+            trickplay.clone(),
+            Arc::new(FakeStreams::new(Vec::new())),
+        );
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+        assert!(trickplay.refreshed.lock().expect("lock").is_empty());
+        assert!(trickplay.checked.lock().expect("lock").is_empty());
+        assert!(
+            trickplay.finished.lock().expect("lock").is_empty(),
+            "the checking pass is not finished"
+        );
+        assert!(progress.was_stopped(), "recorded Cancelled");
+    }
 
     #[rstest::rstest]
     #[tokio::test]
@@ -4302,6 +4435,116 @@ mod tests {
         );
     }
 
+    /// gl-1709: `ExecuteAsync` opens with `ThrowIfCancellationRequested()`, so
+    /// a stop requested before the run hands no item over and is stopped.
+    #[tokio::test]
+    async fn media_segment_extraction_stops_before_it_starts_once_asked() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let item = Uuid::from_u128(0xA7);
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        set_media_type(&db, item, "Video").await;
+        let path = dir.path().join("a.mkv");
+        std::fs::write(&path, b"x").expect("write");
+        set_path(&db, item, &path.to_string_lossy()).await;
+        let segments = Arc::new(FakeSegments::default());
+        let task =
+            MediaSegmentExtractionTask::new(library_manager_over(db.clone()), segments.clone());
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+        assert!(segments.ran.lock().expect("lock").is_empty());
+        assert!(
+            progress.reported().is_none(),
+            "stopped before its 0 % report"
+        );
+        assert!(progress.was_stopped(), "recorded Cancelled");
+    }
+
+    /// gl-1709: each of upstream's merge writes takes the run's token, and
+    /// each person's refresh is preceded by `ThrowIfCancellationRequested()`,
+    /// so a stop requested before the run merges no duplicate, refreshes no
+    /// person, and is stopped.
+    #[tokio::test]
+    async fn people_validation_stops_before_its_first_duplicate_once_asked() {
+        let db = test_db().await;
+        let person = Uuid::from_u128(0xC4);
+        seed_named_item(&db, person, BaseItemKind::Person, "John Roe").await;
+        crate::people_repository::seed_people_row(&db, Uuid::from_u128(0xC5), "John Roe", "Actor")
+            .await;
+        crate::people_repository::seed_people_row(&db, Uuid::from_u128(0xC6), "John Roe", "Actor")
+            .await;
+        let providers = Arc::new(RecordingProviders::default());
+        let task = PeopleValidationTask::new(
+            db.clone(),
+            providers.clone(),
+            library_manager_over(db.clone()),
+            crate::people_repository::FerrofinPeopleRepository::new(db.clone()),
+        );
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+        assert_eq!(
+            crate::people_repository::people_row_count(&db).await,
+            2,
+            "no duplicate is merged"
+        );
+        assert!(providers.refreshed.lock().expect("lock").is_empty());
+        assert!(progress.reported().is_none(), "no phase after it reports");
+        assert!(progress.was_stopped(), "recorded Cancelled");
+    }
+
+    /// gl-1709: the orphan sweep's delete takes the token upstream, so a run
+    /// stopped with no duplicate to merge leaves an orphaned `Peoples` row.
+    #[tokio::test]
+    async fn people_validation_stops_before_its_orphan_sweep_once_asked() {
+        let db = test_db().await;
+        crate::people_repository::seed_people_row(&db, Uuid::from_u128(0xCA), "Orphan", "Actor")
+            .await;
+        let providers = Arc::new(RecordingProviders::default());
+        let task = unwired_people_task(&db, providers);
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+        assert_eq!(
+            crate::people_repository::people_row_count(&db).await,
+            1,
+            "the orphan is not swept"
+        );
+        assert!(progress.was_stopped(), "recorded Cancelled");
+    }
+
+    /// gl-1709: a stop arriving during the run ends it before the next
+    /// person, and the phases after it do not run: the new people are
+    /// refreshed one at a time, the image pass never starts, and the run is
+    /// stopped short of 66 %.
+    #[tokio::test]
+    async fn people_validation_stops_between_people_and_skips_the_later_phases() {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0xC9);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        for (id, name) in [(0xC7, "Ann Lee"), (0xC8, "Bob Ray")] {
+            seed_named_item(&db, Uuid::from_u128(id), BaseItemKind::Person, name).await;
+            // A credit on an item keeps the person through validation.
+            crate::people_repository::seed_credit(&db, movie, Uuid::from_u128(id + 0x10), name)
+                .await;
+        }
+        let progress = TaskProgress::default();
+        let providers = Arc::new(RecordingProviders {
+            stop: Some(progress.cancel_token().clone()),
+            ..RecordingProviders::default()
+        });
+        let task = unwired_people_task(&db, providers.clone());
+        task.execute(&progress).await.expect("run");
+        assert_eq!(
+            providers.refreshed.lock().expect("lock").len(),
+            1,
+            "the second person is never reached"
+        );
+        assert!(progress.was_stopped(), "recorded Cancelled");
+        assert!(progress.current() < 66.0, "{}", progress.current());
+    }
+
     /// `PeopleValidationTask.ExecuteAsync` returns at once while a library
     /// scan runs (`IsScanRunning`): its de-duplication and person refreshes
     /// are heavy writes that would contend with the scan's. The skipped run
@@ -4673,6 +4916,9 @@ mod tests {
     struct RecordingProviders {
         refreshed: Mutex<Vec<(Uuid, MetadataRefreshOptions)>>,
         failing: Vec<Uuid>,
+        /// A run token this fake cancels after its first refresh, as a stop
+        /// arriving during the run.
+        stop: Option<crate::ScanCancel>,
     }
 
     #[async_trait]
@@ -4701,6 +4947,9 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push((item_id, options.clone()));
+            if let Some(stop) = &self.stop {
+                stop.cancel();
+            }
             if self.failing.contains(&item_id) {
                 return Err(ServiceError::backend("disk I/O error"));
             }
@@ -5609,6 +5858,16 @@ mod tests {
             Arc::clone(&library),
         );
         assert_eq!(task.key(), "TmdbRefreshUpcomingEpisodes");
+        // gl-1709: a stop requested before the run removes nothing, and the
+        // run is stopped.
+        let stopped = TaskProgress::default();
+        stopped.cancel_token().cancel();
+        task.execute(&stopped).await.expect("stopped run");
+        assert!(stopped.was_stopped(), "recorded Cancelled");
+        assert!(
+            library.get_item_by_id(ours).await.expect("read").is_some(),
+            "a stopped run removes no virtual episode"
+        );
         // gl-275: one info line for the run, each episode's at debug.
         let logs = crate::test_support::CapturedLogs::default();
         {
@@ -5646,6 +5905,60 @@ mod tests {
             "another provider's virtual episode stays"
         );
         assert!(alive(file).await, "a file's episode stays");
+    }
+
+    /// gl-1709: with no virtual episode left, a stop is seen before the first
+    /// virtual season, which stays.
+    #[tokio::test]
+    async fn tmdb_upcoming_episodes_stops_before_its_first_virtual_season() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+        let db = test_db().await;
+        let library = library_manager_over(db.clone());
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        let season = Uuid::from_u128(0x75);
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(season),
+                type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Season)
+                    .expect("type")
+                    .to_owned(),
+                name: Some("Season 1".to_owned()),
+                is_virtual_item: true,
+                is_folder: true,
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("save");
+        persistence
+            .save_provider_id(season, "Tmdb", "63057")
+            .await
+            .expect("tmdb id");
+        let task = TmdbUpcomingEpisodesTask::new(
+            Arc::new(ferrofin_providers::TmdbClient::new()),
+            Arc::clone(&library),
+        );
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+        assert!(progress.was_stopped(), "recorded Cancelled");
+        assert!(
+            library
+                .get_item_by_id(season)
+                .await
+                .expect("read")
+                .is_some(),
+            "the empty virtual season stays"
+        );
+        // Without the stop it goes: the check, not the query, kept it.
+        task.execute(&TaskProgress::default()).await.expect("run");
+        assert!(
+            library
+                .get_item_by_id(season)
+                .await
+                .expect("read")
+                .is_none()
+        );
     }
 
     /// `GetDefaultTriggers`: every `MissingEpisodeRefreshIntervalDays` days,

@@ -6855,9 +6855,13 @@ pub const VERIFIED: &[Verified] = &[
          upstream's Cancel throws InvalidOperationException there, a 500. Jellyfin bug not \
          ported.",
             "A body still running STOP_WAIT (2 s) after the stop is dropped and recorded \
-         Cancelled; upstream waits for ExecuteAsync however long it takes. Fix path: every \
-         task body checks its token as upstream's do (gl-1709); the value is a candidate \
-         setting (gl-1710).",
+         Cancelled; upstream waits for ExecuteAsync however long it takes. The Keyframe \
+         Extractor (gl-129) and the five library bodies gl-1709 made check between items \
+         hand their per-item work no token, so an item running when the wait ends is cut \
+         off mid-item (gl-2006); the bodies that check no token are cut off wherever they \
+         are. Fix path: gl-2004 (the other \
+         ferrofin-core bodies), gl-2005 (the extensions' and WASM bodies) and gl-2006; the \
+         value is a candidate setting (gl-1710).",
             "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
          id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -6881,7 +6885,7 @@ pub const VERIFIED: &[Verified] = &[
             "A Scan Media Library run the refresh cancels ends when its scan wait is \
          withdrawn, before the scan's item in progress does; upstream's run stays Cancelling \
          until ValidateMediaLibraryInternal returns. The scan queue still starts the new \
-         scan after the stopping one. Fix path: gl-1709.",
+         scan after the stopping one. Fix path: gl-2004.",
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
          error shape, not upstream's. Fix path: gl-666.",
         ],
