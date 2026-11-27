@@ -9,7 +9,9 @@ use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 use icu_properties::CodePointMapData;
 use icu_properties::props::GeneralCategory;
 
-use crate::string_extensions::{lower_invariant, remove_diacritics, transliterated};
+use crate::string_extensions::{
+    lower_invariant, remove_diacritics, remove_diacritics_nfd, transliterated,
+};
 
 /// `ServerConfiguration.SortRemoveWords` defaults — leading/interior/trailing
 /// articles.
@@ -131,6 +133,22 @@ pub fn untransliterated_sort_name(name: &str) -> String {
     )
 }
 
+/// [`get_sort_name`] as builds between the transliteration step and gl-1908
+/// derived it (diacritics folded by [`remove_diacritics_nfd`]), over the
+/// installed rules, kept only so the one-shot repair that ports the
+/// `Diacritics` package's table can recognise the keys they stored. Never use
+/// it for a new write or a query parameter.
+#[must_use]
+pub fn nfd_folded_sort_name(name: &str) -> String {
+    get_sort_name_with(
+        name,
+        true,
+        lower_invariant,
+        &installed_rules(),
+        modify_sort_chunks_nfd,
+    )
+}
+
 /// The derivation before invariant casing (full Unicode `to_lowercase`), kept
 /// only so migration `0031` can recognise keys Ferrofin wrote with it, always
 /// over Jellyfin's default rules (Ferrofin wrote those keys before it read the
@@ -246,8 +264,13 @@ pub fn forced_sort_key(forced: &str) -> String {
 /// character in the Basic Multilingual Plane (`٣`, `２`), never one outside it,
 /// which C# sees as two surrogates.
 fn modify_sort_chunks(name: &str) -> String {
+    modify_sort_chunks_with(name, remove_diacritics)
+}
+
+/// [`modify_sort_chunks`] over `fold`.
+fn modify_sort_chunks_with(name: &str, fold: fn(&str) -> String) -> String {
     let categories = CodePointMapData::<GeneralCategory>::new();
-    let folded = remove_diacritics(&pad_digit_runs(name, |c| {
+    let folded = fold(&pad_digit_runs(name, |c| {
         c.is_ascii_digit()
             || (!c.is_ascii()
                 && u32::from(c) <= 0xFFFF
@@ -260,12 +283,19 @@ fn modify_sort_chunks(name: &str) -> String {
     }
 }
 
+/// [`modify_sort_chunks`] as builds before gl-1908 had it: the diacritic fold
+/// was [`remove_diacritics_nfd`]. Kept for the repair that recognises the keys
+/// it gave.
+fn modify_sort_chunks_nfd(name: &str) -> String {
+    modify_sort_chunks_with(name, remove_diacritics_nfd)
+}
+
 /// [`modify_sort_chunks`] as builds before the transliteration step had it:
-/// ASCII digit runs padded and diacritics stripped, nothing romanised. Frozen
-/// for the functions released migrations call and the repair that recognises
-/// the keys it gave.
+/// ASCII digit runs padded and diacritics stripped with the fold of the time
+/// ([`remove_diacritics_nfd`]), nothing romanised. Frozen for the functions
+/// released migrations call and the repairs that recognise the keys it gave.
 fn modify_sort_chunks_untransliterated(name: &str) -> String {
-    remove_diacritics(&pad_digit_runs(name, |c| c.is_ascii_digit()))
+    remove_diacritics_nfd(&pad_digit_runs(name, |c| c.is_ascii_digit()))
 }
 
 /// Left-pads each maximal run of `is_digit` characters in `name` to 10
@@ -663,27 +693,59 @@ mod tests {
     /// Where the same oracle differs, with Jellyfin 12.4's key in the comment.
     /// ICU4X has no Thai-Latin (gl-1907). Its CLDR is newer than ICU 60's
     /// for Bopomofo (no tone number), `Latin-ASCII` (it folds `ꜱ`) and
-    /// Hebrew-Latin (it drops the vowel points). The vowel points of Hebrew
-    /// and Arabic are also removed by the diacritic fold before
-    /// transliteration, where `Diacritics.Extensions` keeps them (gl-1908);
-    /// for Arabic the transliteration itself agrees
-    /// ([`a_pointed_name_transliterates_as_on_jellyfin`]).
+    /// Hebrew-Latin (it drops the vowel points the diacritic fold now keeps):
+    /// gl-2038.
     #[rstest]
     #[case("สวัสดี", "สวสด")] // swasdi
     #[case("ภาพยนตร์", "ภาพยนตร")] // phaphyntr
     #[case("ㄅㄆㄇ", "bpm")] // bpm1
     #[case("ꜱᴍᴀʟʟ ᴄᴀᴘꜱ", "small caps")] // ꜱmall capꜱ
     #[case("שָׁלוֹם", "slwm")] // salwom
-    #[case("مُحَمَّد", "mhmd")] // muhamad
     fn sort_names_that_differ_from_jellyfin_12_4(#[case] name: &str, #[case] ours: &str) {
         assert_eq!(create_sort_name(name), ours, "{name}");
     }
 
-    /// The pointed Arabic name above, transliterated without the diacritic
-    /// fold, gives Jellyfin's key.
-    #[test]
-    fn a_pointed_name_transliterates_as_on_jellyfin() {
-        assert_eq!(crate::string_extensions::transliterated("مُحَمَّد"), "muhamad");
+    /// Names with combining marks and letters the `Diacritics` table maps or
+    /// leaves (gl-1908), against `BaseItem.GetSortName(name, true, new
+    /// ServerConfiguration())` run from the assemblies the Jellyfin 12.4 image
+    /// ships.
+    #[rstest]
+    #[case("Zoë Saldaña", "zoe saldana")]
+    #[case("Zoe\u{308} Saldan\u{303}a", "zoe saldana")]
+    #[case("مُحَمَّد", "muhamad")]
+    #[case("Straße", "strasse")]
+    #[case("STRA\u{1E9E}E", "strasse")]
+    #[case("¡Three Amigos!", "three amigos!")]
+    #[case("¿Quién?", "quien?")]
+    #[case("Esperanto Ĉeĥo", "esperanto ceho")]
+    #[case("Wǒ Ài Nǐ", "wo ai ni")]
+    #[case("Țară", "tara")]
+    #[case("Ţară", "tara")]
+    #[case("Muškatų", "muskatu")]
+    #[case("Fran\u{63}\u{327}ois", "francois")]
+    #[case("Αθήνα", "athena")]
+    #[case("Ἀθῆναι", "athenai")]
+    #[case("Андрей", "andrei")]
+    #[case("Ёлка", "elka")]
+    #[case("ѓуб", "gub")]
+    #[case("Mañana ª º", "manana a o")]
+    #[case("İstanbul ı", "Istanbul i")]
+    #[case("Əli ə", "ali a")]
+    #[case("Đorđe", "dorde")]
+    #[case("Æon Fløde Œuvre Łódź", "aeon flode oeuvre lodz")]
+    #[case("Ðð Þþ", "dd thth")]
+    #[case("الموسيقى", "almwsyqy")]
+    #[case("ٱلله", "allh")]
+    #[case("ஔவை", "ovai")]
+    #[case("\u{212B}\u{2126}\u{212A}", "aok")]
+    #[case("\u{F900}", "qi")]
+    #[case("Tiếng Việt", "tieng viet")]
+    #[case("\u{FB2A}לום", "slwm")]
+    #[case("किताब", "kitaba")]
+    #[case("é\u{301}", "e")]
+    #[case("a\u{FFFD}b", "ab")]
+    fn sort_names_with_diacritics_match_jellyfin_12_4(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(create_sort_name(name), expected, "{name}");
     }
 
     #[test]

@@ -293,7 +293,9 @@ mod tests {
     #[case("ς", "σ", true)]
     #[case("é", "E", true)]
     #[case("𐐨", "𐐀", true)]
-    #[case("ı", "I", false)]
+    // The `Diacritics` table maps the dotless `ı` to `i` before the compare
+    // (gl-1908), so upstream's `DistinctNames` merges it with `I`.
+    #[case("ı", "I", true)]
     #[case("ſ", "s", false)]
     fn unicode_distinct_names(#[case] first: &str, #[case] second: &str, #[case] equal: bool) {
         let expected = if equal {

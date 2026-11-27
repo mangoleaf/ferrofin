@@ -42,6 +42,31 @@ REMOVE_DIACRITICS = [
     ("Béla Tarr", "Bela Tarr"),
 ]
 
+# From `diacritics_match_jellyfin_12_4`: (input, RemoveDiacritics, GetCleanValue) as Jellyfin 12.4's
+# own assemblies give them. Combining marks are kept (only the combining cedilla goes) and cleaned to
+# spaces; letters outside the Diacritics package's table are kept.
+JELLYFIN_12_4 = [
+    ("Zo\u00eb Salda\u00f1a", "Zoe Saldana", "zoe saldana"),
+    ("Zoe\u0308 Saldan\u0303a", "Zoe\u0308 Saldan\u0303a", "zoe saldan a"),
+    ("\u05e9\u05b8\u05c1\u05dc\u05d5\u05b9\u05dd", "\u05e9\u05b8\u05c1\u05dc\u05d5\u05b9\u05dd", "\u05e9 \u05dc\u05d5 \u05dd"),
+    ("\u0645\u064f\u062d\u064e\u0645\u0651\u064e\u062f", "\u0645\u064f\u062d\u064e\u0645\u0651\u064e\u062f", "\u0645 \u062d \u0645 \u062f"),
+    ("Stra\u00dfe", "Stra\u00dfe", "stra\u00dfe"),
+    ("STRA\u1e9eE", "STRA\u00dfE", "stra\u00dfe"),
+    ("\u00a1Three Amigos!", "Three Amigos!", "three amigos"),
+    ("Esperanto \u0108e\u0125o", "Esperanto \u0108e\u0125o", "esperanto \u0109e\u0125o"),
+    ("Fran\u0063\u0327ois", "Francois", "francois"),
+    ("\u0410\u043d\u0434\u0440\u0435\u0439", "\u0410\u043d\u0434\u0440\u0435\u0438", "\u0430\u043d\u0434\u0440\u0435\u0438"),
+    ("Ma\u00f1ana \u00aa \u00ba", "Manana a o", "manana a o"),
+    ("\u0130stanbul \u0131", "Istanbul i", "istanbul i"),
+    ("\u0110or\u0111e", "Dorde", "dorde"),
+    ("\u00c6on Fl\u00f8de \u0152uvre \u0141\u00f3d\u017a", "\u00c6on Flode \u0152uvre Lodz", "\u00e6on flode \u0153uvre lodz"),
+    ("\u00d0\u00f0 \u00de\u00fe", "\u00d0\u00f0 \u00de\u00fe", "\u00f0\u00f0 \u00fe\u00fe"),
+    ("\u212b\u2126\u212a", "\u212b\u2126\u212a", "\u00e5\u03c9k"),
+    ("\uf900", "\uf900", "\uf900"),
+    ("\u0915\u093f\u0924\u093e\u092c", "\u0915\u093f\u0924\u093e\u092c", "\u0915 \u0924 \u092c"),
+    ("\u00e9\u0301", "e\u0301", "e"),
+]
+
 # The lower half of `invariant_casing` (input -> lower), the cases that exercise simple casing.
 LOWER_INVARIANT = [
     ("alice", "alice"),
@@ -65,6 +90,12 @@ class CleanValuePort(unittest.TestCase):
         for value, expected in REMOVE_DIACRITICS:
             with self.subTest(value=value):
                 self.assertEqual(remove_diacritics(value), expected)
+
+    def test_the_fold_matches_jellyfin_12_4(self):
+        for value, removed, clean in JELLYFIN_12_4:
+            with self.subTest(value=value):
+                self.assertEqual(remove_diacritics(value), removed)
+                self.assertEqual(get_clean_value(value), clean)
 
     def test_lower_invariant_matches_rust_oracle(self):
         for value, expected in LOWER_INVARIANT:
