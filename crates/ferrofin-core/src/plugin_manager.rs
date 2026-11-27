@@ -241,10 +241,9 @@ async fn download_and_verify(
     require_https(source_url, loopback_ok)?;
     // GitHub release assets 302 to a CDN, so redirects must be followed —
     // but the default policy would happily follow https → http → an internal
-    // host. Re-run the transport check on every hop instead. (10 = reqwest's
-    // own default hop limit.)
+    // host. Re-run the transport check on every hop instead.
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() > 10 {
+        if attempt.previous().len() > ferrofin_util::http_client::MAX_REDIRECTS {
             attempt.error("too many redirects")
         } else if require_https(attempt.url().as_str(), loopback_ok).is_ok() {
             attempt.follow()
@@ -253,8 +252,9 @@ async fn download_and_verify(
         }
     });
     // Idle timeouts, so the artifact never sits silent, and the total
-    // `budget` a legitimate artifact on a slow link fits in.
-    let client = reqwest::Client::builder()
+    // `budget` a legitimate artifact on a slow link fits in. Otherwise
+    // `NamedClient.Default`'s defaults, as `PerformPackageInstallation` has.
+    let client = ferrofin_util::http_client::builder(ferrofin_health::USER_AGENT)
         .redirect(policy)
         .connect_timeout(REPO_FETCH_TIMEOUT)
         .read_timeout(REPO_FETCH_TIMEOUT)
@@ -1600,8 +1600,9 @@ impl PluginManager for FerrofinPluginManager {
         // Manifests are small JSON documents: a total deadline plus a
         // streamed size cap, so a hostile/hung repository can neither OOM
         // the server nor pin the task (GET /Packages is admin-only, but the
-        // repository is remote and untrusted).
-        let client = reqwest::Client::builder()
+        // repository is remote and untrusted). Otherwise `NamedClient.Default`'s
+        // defaults, as `InstallationManager.GetPackages` has.
+        let client = ferrofin_util::http_client::builder(ferrofin_health::USER_AGENT)
             .timeout(REPO_FETCH_TIMEOUT)
             .build()
             .map_err(|e| ServiceError::backend(format!("building repository client: {e}")))?;
@@ -4330,6 +4331,62 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    /// `InstallationManager` asks for a manifest and a package through
+    /// `NamedClient.Default`: the server's `User-Agent` and the `Accept` list.
+    #[tokio::test]
+    async fn repository_requests_have_the_default_client_headers() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&seen);
+        let (base, _stop) = raw_server(move |_| {
+            Box::new(move |request| {
+                log.lock().unwrap().push(request.to_ascii_lowercase());
+                http_ok("application/json", b"[]")
+            })
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf());
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("headers".to_owned()),
+            url: Some(format!("{base}/manifest.json")),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        mgr.list_packages().await.unwrap();
+        let version = ferrofin_model::updates::VersionInfo {
+            version: "1.0.0".to_owned(),
+            checksum: Some("0".repeat(32)),
+            ..Default::default()
+        };
+        // The body is no package: only the request matters here.
+        let budget = std::time::Duration::from_secs(5);
+        let _ = super::download_and_verify(
+            &format!("{base}/plugin.wasm"),
+            "Headers",
+            &version,
+            true,
+            1 << 20,
+            budget,
+        )
+        .await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let agent = format!(
+            "\r\nuser-agent: {}\r\n",
+            ferrofin_health::USER_AGENT.to_ascii_lowercase()
+        );
+        for request in seen.iter() {
+            assert!(request.contains(&agent), "{request}");
+            assert!(
+                request.contains(
+                    "\r\naccept: application/json; q=1.0, application/xml; q=0.9, */*; q=0.8\r\n"
+                ),
+                "{request}"
+            );
+        }
     }
 
     #[tokio::test]
