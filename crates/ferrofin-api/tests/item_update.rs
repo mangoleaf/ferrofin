@@ -2084,11 +2084,48 @@ async fn update_item_replaces_the_external_ids() {
     );
 }
 
-/// A body with no `ProviderIds` key leaves the stored ids alone rather than
-/// clearing them: the vendored contract types the field `nullable: true`, so an
-/// absent key is a legal request that says nothing about the ids.
+/// `ProviderIds` binds as C#'s `Dictionary<string, string>`: a null value is
+/// taken (and dropped, as `TrySetProviderId` skips it), and the pairs reach
+/// the manager in document order, which decides which of two spellings of one
+/// name `SetProviderIds` keeps the value of (the later).
 #[tokio::test]
-async fn update_item_without_provider_ids_leaves_them_alone() {
+async fn update_item_takes_provider_ids_in_document_order_and_null_values() {
+    let item_id = Uuid::from_u128(0x59);
+    let recorded: RecordedProviderIds = Arc::default();
+    let library = Arc::new(OkLibrary {
+        item_id,
+        is_folder: false,
+        top_parent_id: None,
+        refreshes: Arc::default(),
+        provider_ids: recorded.clone(),
+        updated: Arc::default(),
+        tree: Arc::default(),
+        lock_probe: None,
+    });
+    post_update(
+        library,
+        format!(
+            r#"{{"Id":"{item_id}","Name":"X","ProviderIds":{{"tmdb":"11","Imdb":null,"Tmdb":"12"}}}}"#
+        ),
+    )
+    .await;
+    let written = recorded.lock().unwrap();
+    assert_eq!(
+        written.first().map(|(_, ids)| ids.clone()),
+        Some(vec![
+            ("tmdb".to_owned(), "11".to_owned()),
+            ("Tmdb".to_owned(), "12".to_owned()),
+        ])
+    );
+}
+
+/// A body with no `ProviderIds` key, or a null one, leaves the stored ids
+/// alone rather than clearing them (`if (request.ProviderIds is not null)`).
+#[rstest::rstest]
+#[case::absent("")]
+#[case::null(r#","ProviderIds":null"#)]
+#[tokio::test]
+async fn update_item_without_provider_ids_leaves_them_alone(#[case] provider_ids: &str) {
     let item_id = Uuid::from_u128(0x59);
     let recorded: RecordedProviderIds = Arc::default();
     let router = create_router(state_with_library(
@@ -2112,7 +2149,7 @@ async fn update_item_without_provider_ids_leaves_them_alone() {
                 .header("X-Emby-Token", "valid")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"Renamed"}}"#
+                    r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"Renamed"{provider_ids}}}"#
                 )))
                 .unwrap(),
         )
@@ -2121,7 +2158,7 @@ async fn update_item_without_provider_ids_leaves_them_alone() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(
         recorded.lock().unwrap().is_empty(),
-        "an absent ProviderIds key must not write (and so must not clear) the id set"
+        "an absent or null ProviderIds key must not write (and so must not clear) the id set"
     );
 }
 

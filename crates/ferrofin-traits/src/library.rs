@@ -719,7 +719,10 @@ pub trait LibraryManager: Send + Sync {
     /// **assignment**, so a key the request omits is removed, not merged. Each
     /// pair goes through `TrySetProviderId`: trimmed, dropped when blank, when
     /// its name holds `=` or when the id cannot belong to its provider, and a
-    /// known provider's name stored in its canonical spelling.
+    /// known provider's name stored in its canonical spelling. The pairs are
+    /// taken in order, and of two spellings of one name (`OrdinalIgnoreCase`)
+    /// the later one's value is kept, so a caller passes them in the request's
+    /// document order.
     ///
     /// External ids live in their own table, not on [`BaseItemEntity`], so they
     /// cannot ride along with [`update_items`](Self::update_items) — hence a

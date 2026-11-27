@@ -126,16 +126,10 @@ pub(crate) async fn update_item(
     // second write rather than a column on the row. C# `SetProviderIds` ASSIGNS
     // the dictionary, which is why this replaces the set instead of merging into
     // it; the manager drops, trims and renames the pairs as `TrySetProviderId` does.
-    if let Some(ids) = &request.provider_ids {
-        let mut pairs: Vec<(String, String)> =
-            ids.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        // A HashMap has no order; sort so the write (and its test) is deterministic.
-        // Of two keys differing only in case, the later in this byte order wins,
-        // where C# keeps the later in the JSON.
-        pairs.sort();
+    if let Some(ProviderIdPairs(pairs)) = &request.provider_ids {
         state
             .library
-            .update_item_provider_ids(item_id, &pairs)
+            .update_item_provider_ids(item_id, pairs)
             .await?;
     }
     // `if (request.LockedFields is not null) item.LockedFields =
@@ -262,13 +256,10 @@ pub(crate) struct UpdateItemRequest {
     /// when blank or invalid for its provider (`ItemUpdateController.UpdateItem`,
     /// v12.4 lines 435-438).
     ///
-    /// An ABSENT key leaves the stored ids alone. The vendored contract types
-    /// `BaseItemDto.ProviderIds` as `nullable: true`, so a body without it is a
-    /// legal request; upstream's own model binder happens to reject one with a
-    /// 400 because its C# dictionary is non-nullable, and copying that quirk
-    /// would reject bodies Ferrofin's contract accepts.
+    /// An ABSENT or null key leaves the stored ids alone
+    /// (`if (request.ProviderIds is not null)`).
     #[serde(default)]
-    provider_ids: Option<std::collections::HashMap<String, String>>,
+    provider_ids: Option<ProviderIdPairs>,
     /// `IHasDisplayOrder.DisplayOrder` — a series' episode ordering, a box
     /// set's member ordering — assigned as sent, a null clearing it.
     #[serde(default)]
@@ -308,6 +299,36 @@ pub(crate) struct UpdateItemRequest {
     /// A series' `RunTimeTicks` (a file's comes from its probe).
     #[serde(default, deserialize_with = "ferrofin_model::json::value::nullable")]
     run_time_ticks: Option<i64>,
+}
+
+/// `BaseItemDto.ProviderIds` as C# binds its `Dictionary<string, string>`:
+/// the pairs in document order, which decides the value `SetProviderIds`
+/// keeps of two spellings of one name (the later), and a null value left out,
+/// as `TrySetProviderId` skips it.
+#[derive(Debug)]
+pub(crate) struct ProviderIdPairs(Vec<(String, String)>);
+
+impl<'de> Deserialize<'de> for ProviderIdPairs {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Pairs;
+        impl<'de> serde::de::Visitor<'de> for Pairs {
+            type Value = ProviderIdPairs;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an object of provider ids")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<ProviderIdPairs, A::Error> {
+                let mut pairs = Vec::new();
+                while let Some((name, value)) = map.next_entry::<String, Option<String>>()? {
+                    pairs.extend(value.map(|value| (name, value)));
+                }
+                Ok(ProviderIdPairs(pairs))
+            }
+        }
+        deserializer.deserialize_map(Pairs)
+    }
 }
 
 /// One `BaseItemPerson` of the request: what `UpdateItem` keeps of it
