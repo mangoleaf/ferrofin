@@ -3577,8 +3577,9 @@ pub trait RemoteSimilarItemsProvider: Send + Sync {
     fn supports(&self, item_kind: BaseItemKind) -> bool;
 
     /// How long the manager may reuse this provider's results from disk.
-    /// `None` disables caching for it.
-    fn cache_duration(&self) -> Option<std::time::Duration> {
+    /// `None` disables caching for it. Async because upstream's
+    /// `CacheDuration` reads the plugin's settings each time it is asked.
+    async fn cache_duration(&self) -> Option<std::time::Duration> {
         None
     }
 

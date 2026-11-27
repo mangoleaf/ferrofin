@@ -1688,19 +1688,18 @@ pub async fn build_app_state(
     // Similar items: the local weighted-overlap scorer always runs; the remote
     // providers below run only for a library that ticked them in its
     // "Similarity providers" list, in the admin's configured order.
+    let listenbrainz_client = Arc::new(ferrofin_providers::ListenBrainzClient::new());
     let similar_providers: Vec<Arc<dyn ferrofin_traits::library::RemoteSimilarItemsProvider>> = vec![
         Arc::new(ferrofin_providers::TmdbSimilarProvider::new(
             Arc::clone(&tmdb_client),
             ferrofin_providers::TmdbKind::Movie,
-            ferrofin_providers::TMDB_SIMILAR_CACHE_DAYS,
         )),
         Arc::new(ferrofin_providers::TmdbSimilarProvider::new(
             Arc::clone(&tmdb_client),
             ferrofin_providers::TmdbKind::Series,
-            ferrofin_providers::TMDB_SIMILAR_CACHE_DAYS,
         )),
         Arc::new(ferrofin_providers::ListenBrainzSimilarArtistProvider::new(
-            Arc::new(ferrofin_providers::ListenBrainzClient::default()),
+            Arc::clone(&listenbrainz_client),
         )),
     ];
     let similar_items: Arc<dyn ferrofin_traits::library::SimilarItemsManager> = Arc::new(
@@ -2197,20 +2196,20 @@ pub async fn build_app_state(
         )
         .with_default_config(OPENSUBTITLES_DEFAULT_CONFIG.to_vec()),
     ];
-    // Jellyfin's five IN-TREE provider plugins (TMDb, Studio Images, OMDb,
-    // MusicBrainz, AudioDB). They are compiled into `MediaBrowser.Providers`
-    // upstream, so every stock server has them and every dashboard shows their
-    // settings pages; Ferrofin ports all five as native providers but had never
-    // given them a plugin identity, which is why `/web/ConfigurationPages`,
-    // `/Plugins` and `/Plugins/{id}/Configuration` came back empty against
-    // Jellyfin's five entries.
+    // Jellyfin's six IN-TREE provider plugins (TMDb, Studio Images, OMDb,
+    // MusicBrainz, ListenBrainz, AudioDB). They are compiled into
+    // `MediaBrowser.Providers` upstream, so every stock server has them and
+    // every dashboard shows their settings pages; Ferrofin ports all six as
+    // native providers but had never given them a plugin identity, which is why
+    // `/web/ConfigurationPages`, `/Plugins` and `/Plugins/{id}/Configuration`
+    // came back empty against Jellyfin's entries.
     //
     // Registered UNCONDITIONALLY — outside the `disable_extensions` branch
     // above. That flag exists so a benchmark leg compares against a
-    // plugin-free Jellyfin; these five are never absent from Jellyfin, so
+    // plugin-free Jellyfin; these six are never absent from Jellyfin, so
     // suppressing them would recreate the exact divergence being closed.
     registered_plugins.extend(ferrofin_providers::builtin_plugins::ALL.iter().map(|p| {
-        ferrofin_core::RegisteredPlugin::new(
+        let plugin = ferrofin_core::RegisteredPlugin::new(
             ferrofin_traits::plugins::PluginDescriptor {
                 id: p.id,
                 name: p.name.to_owned(),
@@ -2229,13 +2228,29 @@ pub async fn build_app_state(
         .non_removable()
         .with_default_config(p.default_config.as_bytes().to_vec())
         .with_config_page(ferrofin_core::PluginConfigPage {
-            // C# `GetPages()` yields exactly one page, named `Name`, with no
-            // main-menu flag — `GET /web/ConfigurationPage?name=TMDb` matches
-            // it case-insensitively.
+            // C# `GetPages()` yields a page named `Name`, with no main-menu
+            // flag — `GET /web/ConfigurationPage?name=TMDb` matches it
+            // case-insensitively.
             name: p.name.to_owned(),
             bytes: p.config_page.to_vec(),
             enable_in_main_menu: false,
-        })
+            content_type: None,
+        });
+        // ListenBrainz's second page, `Name + "Notice"`, served with the type
+        // its resource's name gives (`MimeTypes.GetMimeType`).
+        let plugin = match p.notice {
+            Some(notice) => plugin.with_config_page(ferrofin_core::PluginConfigPage {
+                name: format!("{}Notice", p.name),
+                bytes: notice.to_vec(),
+                enable_in_main_menu: false,
+                content_type: Some(ferrofin_model::net::mime_types::get_mime_type("NOTICE.md")),
+            }),
+            None => plugin,
+        };
+        match p.config_view {
+            Some(view) => plugin.with_config_view(view),
+            None => plugin,
+        }
     }));
     // Every curated extension surfaces as a plugin here.
     registered_plugins.extend(ferrofin_extensions::registered_plugins(&extensions));
@@ -2326,7 +2341,7 @@ pub async fn build_app_state(
             // A saved configuration is announced in-process (`ConfigurationChanged`).
             .with_events(Arc::clone(&event_manager)),
     );
-    // Jellyfin's five in-tree provider plugins read their settings through
+    // Jellyfin's six in-tree provider plugins read their settings through
     // `Plugin.Instance.Configuration` at call time, so an admin's save on a
     // settings page takes effect on the next lookup with no restart. The
     // metadata clients are built far above this line (they are leaves with no
@@ -2338,6 +2353,7 @@ pub async fn build_app_state(
     musicbrainz_client.attach_plugin_manager(Arc::clone(&plugins));
     audiodb_client.attach_plugin_manager(Arc::clone(&plugins));
     studios_client.attach_plugin_manager(Arc::clone(&plugins));
+    listenbrainz_client.attach_plugin_manager(Arc::clone(&plugins));
 
     // The download link OpenSubtitles answers with refuses private addresses
     // but those its own allow-list names (gl-1160); the image list does not

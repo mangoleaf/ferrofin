@@ -134,7 +134,12 @@ async fn read_reference_cache(
 /// `SaveSimilarItemsCacheAsync` moves its temporary file over it, so a request
 /// reading the entry meanwhile never sees a partial one.
 async fn write_reference_cache(path: &Path, references: &[SimilarItemReference], ttl: Duration) {
-    let Ok(ttl) = chrono::Duration::from_std(ttl) else {
+    // A plugin's cache days are an admin's setting, so a span past the
+    // calendar's end is possible: no entry then, rather than a panic.
+    let Some(expires_at) = chrono::Duration::from_std(ttl)
+        .ok()
+        .and_then(|ttl| chrono::Utc::now().checked_add_signed(ttl))
+    else {
         return;
     };
     let cache = SimilarItemsCache {
@@ -148,7 +153,7 @@ async fn write_reference_cache(path: &Path, references: &[SimilarItemReference],
                 })
                 .collect(),
         ),
-        expires_at: chrono::Utc::now() + ttl,
+        expires_at,
     };
     let Ok(json) = serde_json::to_vec(&cache) else {
         return;
@@ -1067,11 +1072,11 @@ impl FerrofinSimilarItemsManager {
                 .await,
             );
         }
-        if let (Some(path), Some(ttl), false) = (
-            cache_path.as_deref(),
-            provider.cache_duration(),
-            collected.is_empty(),
-        ) {
+        // C# `collectedReferences.Count > 0 && provider.CacheDuration is not null`.
+        if let Some(path) = cache_path.as_deref()
+            && !collected.is_empty()
+            && let Some(ttl) = provider.cache_duration().await
+        {
             write_reference_cache(path, &collected, ttl).await;
         }
         results
@@ -2015,7 +2020,7 @@ mod tests {
         fn supports(&self, item_kind: BaseItemKind) -> bool {
             item_kind == self.kind
         }
-        fn cache_duration(&self) -> Option<Duration> {
+        async fn cache_duration(&self) -> Option<Duration> {
             self.cache
         }
         async fn similar_items_page(
@@ -3312,6 +3317,16 @@ mod tests {
             super::read_reference_cache(&path, "TheMovieDb", Uuid::nil()).await,
             None
         );
+        // A span past the calendar's end (the largest `SimilarItemsCacheDays`
+        // a client can save) writes nothing, rather than panicking.
+        let far = dir.path().join("themoviedb-similar-movie").join("far.json");
+        super::write_reference_cache(
+            &far,
+            &references,
+            Duration::from_secs(u64::from(i32::MAX.unsigned_abs()) * 24 * 60 * 60),
+        )
+        .await;
+        assert!(!far.exists());
         // A missing file is simply a miss.
         assert_eq!(
             super::read_reference_cache(

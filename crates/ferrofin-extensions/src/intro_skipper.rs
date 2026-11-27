@@ -114,18 +114,21 @@ impl Extension for IntroSkipperExtension {
                 bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/configPage.html"))
                     .to_vec(),
                 enable_in_main_menu: true,
+                content_type: None,
             },
             PluginConfigPage {
                 name: "introskipper.js".to_owned(),
                 bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/introskipper.js"))
                     .to_vec(),
                 enable_in_main_menu: false,
+                content_type: None,
             },
             PluginConfigPage {
                 name: "introskipper.css".to_owned(),
                 bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/introskipper.css"))
                     .to_vec(),
                 enable_in_main_menu: false,
+                content_type: None,
             },
         ]
     }

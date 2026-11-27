@@ -384,7 +384,7 @@ async fn disable_plugin(
 /// `DELETE /Plugins/{pluginId}` — uninstall a plugin.
 ///
 /// A staged WASM plugin is really removed. A plugin that reports
-/// `CanUninstall: false` — Jellyfin's five in-tree metadata providers — is
+/// `CanUninstall: false` — Jellyfin's six in-tree metadata providers — is
 /// ignored with a warning and answered `204`, which is what upstream's
 /// `InstallationManager.UninstallPlugin` + `PluginsController` do. A
 /// compiled-in extension (which reports `CanUninstall: true` only to surface

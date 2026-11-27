@@ -110,6 +110,10 @@ pub struct RegisteredPlugin {
     /// The file a runtime-loaded (WASM) plugin was loaded from, whatever its
     /// name; uninstalling the plugin deletes it. `None` for a compiled-in one.
     pub artifact: Option<PathBuf>,
+    /// Adds the members the plugin's configuration type computes from its
+    /// others (C# get-only properties, which `GET /Plugins/{id}/Configuration`
+    /// serializes and a save ignores) to every read of its configuration.
+    pub config_view: Option<fn(&mut serde_json::Map<String, serde_json::Value>)>,
 }
 
 /// One dashboard page (or page resource) a plugin ships. Mirrors the C#
@@ -125,6 +129,9 @@ pub struct PluginConfigPage {
     /// Whether the dashboard drawer shows a direct link to this page
     /// (`EnableInMainMenu`).
     pub enable_in_main_menu: bool,
+    /// The MIME type the page is served with, where its name's extension does
+    /// not give it (upstream takes it from the embedded resource's file name).
+    pub content_type: Option<&'static str>,
 }
 
 impl RegisteredPlugin {
@@ -149,6 +156,7 @@ impl RegisteredPlugin {
             default_config: b"{}".to_vec(),
             config_pages: Vec::new(),
             artifact: None,
+            config_view: None,
         }
     }
 
@@ -176,6 +184,16 @@ impl RegisteredPlugin {
     #[must_use]
     pub fn with_default_config(mut self, config: Vec<u8>) -> Self {
         self.default_config = config;
+        self
+    }
+
+    /// Sets [`Self::config_view`].
+    #[must_use]
+    pub fn with_config_view(
+        mut self,
+        view: fn(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> Self {
+        self.config_view = Some(view);
         self
     }
 
@@ -378,9 +396,12 @@ pub trait PluginManager: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// A configuration page's HTML by its page `name`, for
+    /// A configuration page by its page `name`, for
     /// `GET /web/ConfigurationPage`. Defaults to `None` (no such page).
-    async fn get_configuration_page(&self, _name: &str) -> Result<Option<Vec<u8>>, ServiceError> {
+    async fn get_configuration_page(
+        &self,
+        _name: &str,
+    ) -> Result<Option<PluginConfigPage>, ServiceError> {
         Ok(None)
     }
 }
