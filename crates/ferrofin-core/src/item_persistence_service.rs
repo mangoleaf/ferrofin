@@ -4673,6 +4673,39 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(written.rows_affected() > 0)
     }
 
+    async fn record_pending_child_metadata(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        sqlx::query(
+            r#"INSERT OR IGNORE INTO "FerrofinPendingChildMetadata" ("ItemId")
+               SELECT ?1 WHERE EXISTS (SELECT 1 FROM "BaseItems" WHERE "Id" = ?1)"#,
+        )
+        .bind(guid_to_db(item_id))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn pending_child_metadata_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+        let ids: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "ItemId" FROM "FerrofinPendingChildMetadata""#)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(ids
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
+    async fn clear_pending_child_metadata(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        sqlx::query(r#"DELETE FROM "FerrofinPendingChildMetadata" WHERE "ItemId" = ?1"#)
+            .bind(guid_to_db(item_id))
+            .execute(self.db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn presentation_unique_key(&self, item_id: Uuid) -> Result<Option<String>, ServiceError> {
         let key: Option<Option<String>> = sqlx::query_scalar(
             r#"SELECT "PresentationUniqueKey" FROM "BaseItems" WHERE "Id" = ?1"#,
@@ -8264,6 +8297,29 @@ mod tests {
     use ferrofin_db::store::guid_to_db;
 
     use super::FerrofinItemPersistenceService;
+
+    /// gl-608: an album's owed children-derived tags are recorded once and
+    /// listed until cleared; an id with no row is quietly not recorded, since
+    /// the walk also records an album whose row it could not read.
+    #[tokio::test]
+    async fn pending_child_metadata_records_lists_and_clears() {
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let album = Uuid::new_v4();
+        seed_item(&db, album, BaseItemKind::MusicAlbum).await;
+        store.record_pending_child_metadata(album).await.unwrap();
+        store.record_pending_child_metadata(album).await.unwrap();
+        store
+            .record_pending_child_metadata(Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(store.pending_child_metadata_ids().await.unwrap(), [album]);
+        store.clear_pending_child_metadata(album).await.unwrap();
+        assert_eq!(
+            store.pending_child_metadata_ids().await.unwrap(),
+            Vec::<Uuid>::new()
+        );
+    }
 
     /// One stored column of row `id`, as text.
     async fn stored_text(db: &ferrofin_db::Database, id: Uuid, column: &str) -> Option<String> {

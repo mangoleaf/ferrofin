@@ -1232,6 +1232,80 @@ async fn an_album_refresh_survives_a_scan_cancelled_before_its_music_pass() {
     assert!(fx.music.take().is_empty(), "then quiet");
 }
 
+/// gl-608: an album the walk saved for a reason of its own (here a new
+/// `folder.jpg`, upstream's `ImageUpdate`) owes its children-derived tags
+/// (`isFullRefresh || updateType > None`, `MetadataService.cs:404-483`,
+/// `AlbumMetadataService.cs:72-104`), which upstream derives in that same
+/// `RefreshMetadata`. A scan stopped between the walk and the music pass
+/// leaves the debt recorded, so the next scan derives them, though it sees
+/// the album unchanged; and the scan after it derives nothing again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_album_saved_by_a_cancelled_walk_still_takes_its_tracks_tags() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::build(tmp.path(), LibraryOptions::default(), Vec::new(), false).await;
+    fx.scan().await;
+    assert_eq!(fx.row(fx.album_id()).await.genres, None, "untagged tracks");
+    for track in ["01 - So What.mp3", "02 - Blue in Green.mp3"] {
+        let path = fx.album_dir.join(track);
+        let id = derive_item_id(BaseItemKind::Audio, &path.to_string_lossy()).expect("id");
+        let row = fx.row(id).await;
+        fx.persistence
+            .save_items(&[BaseItemEntity {
+                genres: Some("Jazz".to_owned()),
+                ..row
+            }])
+            .await
+            .expect("retag");
+    }
+    image::RgbImage::from_pixel(8, 8, image::Rgb([200, 0, 0]))
+        .save(fx.album_dir.join("folder.jpg"))
+        .expect("folder.jpg");
+
+    let stopped = scan_cancelled_after_the_walk(&fx.scanner).await;
+    assert!(stopped.stopped, "{stopped:?}");
+    let images = fx
+        .items
+        .get_image_infos(fx.album_id())
+        .await
+        .expect("images");
+    assert!(
+        images.iter().any(|i| i.path.ends_with("folder.jpg")),
+        "the walk saved the album's new image: {images:?}"
+    );
+    assert_eq!(
+        fx.row(fx.album_id()).await.genres,
+        None,
+        "no music pass ran"
+    );
+    let pending = || async {
+        fx.persistence
+            .pending_child_metadata_ids()
+            .await
+            .expect("pending")
+    };
+    assert_eq!(pending().await, [fx.album_id()], "the debt is recorded");
+
+    fx.scan().await;
+    let album = fx.row(fx.album_id()).await;
+    assert_eq!(
+        album.genres.as_deref(),
+        Some("Jazz"),
+        "the next scan derives what the walk's save owed"
+    );
+    assert_eq!(pending().await, Vec::<Uuid>::new(), "and clears the record");
+    fx.scan().await;
+    assert_eq!(
+        fx.row(fx.album_id()).await.date_last_saved,
+        album.date_last_saved,
+        "then the album is left alone"
+    );
+    assert_eq!(
+        pending().await,
+        Vec::<Uuid>::new(),
+        "an unchanged scan records nothing"
+    );
+}
+
 /// A retagged track changes nothing the album's providers own: with no
 /// refresh of the album itself (upstream's `isFullRefresh || updateType >
 /// None`, `AlbumMetadataService.cs:77-95`), the album keeps the

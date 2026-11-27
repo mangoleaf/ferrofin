@@ -130,6 +130,10 @@ struct ArtworkCache {
     resolved_locales: HashMap<String, (String, String)>,
     /// Track → actual album identity, including multi-disc descendants.
     track_albums: HashMap<Uuid, Uuid>,
+    /// The albums an earlier scan's walk saved and that still owe their
+    /// children-derived tags ([`records_child_metadata`]), read once per scan
+    /// that plans an album.
+    pending_child_metadata: std::collections::HashSet<Uuid>,
     /// Album → the first `REPLAYGAIN_ALBUM_GAIN` its unlocked tracks' probes
     /// read this scan, for the music pass to store on an album that has none.
     album_gains: HashMap<Uuid, f64>,
@@ -3755,6 +3759,20 @@ fn album_cover_key(album: Uuid, track: &BaseItemEntity) -> Option<AlbumCoverKey>
             .find(|a| !a.is_empty()),
     )?;
     Some((album, tag.to_owned(), artist.to_owned()))
+}
+
+/// Whether the walk records an item's children-derived metadata as owed
+/// before it saves the item
+/// ([`record_pending_child_metadata`](ItemPersistenceService::record_pending_child_metadata)):
+/// an album's, which the music pass derives after the walk (upstream derives
+/// it in the same `RefreshMetadata` as the save, `isFullRefresh ||
+/// updateType > None`, `AlbumMetadataService.cs:72-104`), so a scan stopped in between
+/// leaves the next scan to derive it. Not a new album: it has no row to
+/// record yet, and its unset stamp, which the walk leaves to the music pass
+/// ([`ItemPass::music_pending`]), keeps it due. (A row the walk could not read
+/// is recorded if it exists.)
+fn records_child_metadata(music: Option<MusicKind>, stored: Stored<'_>) -> bool {
+    music == Some(MusicKind::Album) && !matches!(stored, Stored::New)
 }
 
 /// Each planned track's album, by id from the plan, never by album title
@@ -7646,6 +7664,10 @@ impl LibraryScanner {
             if let (Some(kind), false) =
                 (music, undecodable || matches!(saved, ItemSaved::Cancelled))
             {
+                // What an earlier scan's walk saved and its music pass never
+                // derived, and what this walk's save recorded.
+                let pending_row = art_cache.pending_child_metadata.contains(&item.id)
+                    || (matches!(saved, ItemSaved::Saved) && records_child_metadata(music, stored));
                 work.music.push(MusicRefresh {
                     id: item.id,
                     kind,
@@ -7653,25 +7675,12 @@ impl LibraryScanner {
                     request,
                     identified: refresh.identified(item),
                     policy,
-                    // `isFullRefresh || updateType > None`: the walk saved it.
-                    //
-                    // TODO(parity, open work item — NOT an accepted
-                    // divergence): the `updateType > None` half lives only
-                    // in this scan's memory. The full-refresh half survives
-                    // a cancel between the walk and the music pass (the
-                    // walk leaves the stamp for the music pass,
-                    // `music_pending`), but an album the walk
-                    // saved for another reason (a new local image, a moved
-                    // parent) loses its children-derived tags if the scan
-                    // stops before the music pass; upstream derives them in
-                    // the same `RefreshMetadata` as that save. Un-defer path:
-                    // persist the owed derivation with the walk's save (a
-                    // Ferrofin-namespaced pending-refresh row keyed by the
-                    // item, cleared by the music pass's save and selected by
-                    // the next validation's music pass), and test it with a
-                    // scan cancelled after the walk.
+                    // `isFullRefresh || updateType > None`: the walk saved it,
+                    // or an earlier walk did and its scan stopped first.
                     aggregate: crate::refresh_plan::full_refresh(&plan, &request)
-                        || matches!(saved, ItemSaved::Saved),
+                        || matches!(saved, ItemSaved::Saved)
+                        || pending_row,
+                    pending_row,
                     owns_stamp: music_pending,
                     owns_save: false,
                     draw: draw_pending,
@@ -9354,6 +9363,14 @@ impl LibraryScanner {
         if !decision.save {
             return Ok(ItemSaved::Unchanged);
         }
+        // Before anything of the save is written (an edit or a cancel below
+        // still records the artwork): a scan stopped anywhere after it leaves
+        // the album's tags to the next scan's music pass (gl-608).
+        if records_child_metadata(MusicKind::of_planned(&entity), stored) {
+            self.persistence
+                .record_pending_child_metadata(item.id)
+                .await?;
+        }
         // `BeforeSaveInternal`: a video whose file changed loses what was
         // extracted from the old file before this refresh's trickplay and
         // chapters extract from the new one. Only on a save, which stores the
@@ -10051,8 +10068,9 @@ impl LibraryScanner {
     }
 
     /// The batches the walk reads across items, gathered once up front: the
-    /// series' recorded provider ids and the locked-item set, with each
-    /// track's album from the plan. What only an item's own visit reads, its recorded provider ids and
+    /// series' recorded provider ids, the locked-item set and the albums that
+    /// still owe their children-derived tags, with each track's album from the
+    /// plan. What only an item's own visit reads, its recorded provider ids and
     /// stored image probes, is read with its stored-row window instead
     /// ([`read_window_prereads`](Self::read_window_prereads)).
     ///
@@ -10090,6 +10108,19 @@ impl LibraryScanner {
         self.preload_kept_provider_ids(planned, &mut art_cache)
             .await;
         art_cache.track_albums = track_albums(planned);
+        if planned.iter().any(|item| {
+            item_type_lookup::kind_from_type_name(&item.entity.type_)
+                == Some(BaseItemKind::MusicAlbum)
+        }) {
+            match self.persistence.pending_child_metadata_ids().await {
+                Ok(ids) => art_cache.pending_child_metadata = ids.into_iter().collect(),
+                Err(err) => tracing::warn!(
+                    %err,
+                    "failed to read the albums owing their tracks' tags; \
+                     the next scan derives them"
+                ),
+            }
+        }
         // One read of the locked-item set for the whole scan, for the items
         // whose stored row the walk has none of (see `locked_items`).
         let locked_items = self.locked_items(planned).await;

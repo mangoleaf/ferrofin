@@ -10,7 +10,9 @@
 //! the album's stored row as it stood before the scan
 //! (`MetadataService.RefreshMetadata`'s `isFirstRefresh`/`requiresRefresh`
 //! and `GetProviders`, `MetadataService.cs:89-270,647-715`). So an unchanged
-//! album or artist runs nothing here and makes no request; a new,
+//! album or artist runs nothing here and makes no request (an album an
+//! earlier scan's walk saved and left owing its tags, when that scan stopped
+//! before this pass, derives them here, which asks no provider); a new,
 //! interval-expired, "Search for missing metadata" or "Replace all
 //! metadata" one runs its providers once (a folder has no `DateModified`
 //! to drift, so a changed directory is no trigger), merged by
@@ -119,14 +121,27 @@ pub(super) struct MusicRefresh<'r> {
     /// Its children-derived metadata is recomputed: upstream's
     /// `UpdateMetadataFromChildren` past its `isFullRefresh || updateType >
     /// None` gate (`MetadataService.cs:404-483`, `AlbumMetadataService.cs:
-    /// 77-95`) — a first, required, full or replacing refresh, or one whose
-    /// walk saved the item. A child that changed does not make it due. The
+    /// 72-104`) — a first, required, full or replacing refresh, or one whose
+    /// walk saved the item (this scan's, or an earlier scan's that stopped
+    /// before this pass: [`pending_row`](Self::pending_row)). A child that
+    /// changed does not make it due. The
     /// cumulative runtime is the folder aggregate pass's, over every folder
     /// the scan planned: upstream derives it only past this gate too
     /// (`MetadataService.cs:451-454`), and deriving it on every validation
     /// is a deliberate, harmless divergence
     /// ([`update_folder_aggregates`](LibraryScanner::update_folder_aggregates)).
+    //
+    // TODO(parity, open work item — NOT an accepted divergence; gl-2002):
+    // upstream refreshes the album with `FullRefresh` when any track's
+    // refresh returned `updateType > None` (`MusicAlbum.cs:200-207`), so a
+    // retagged or added track re-derives its album. Fix path: make the album
+    // of every track the walk saved due here with those options, recorded as
+    // `pending_row` before the track's save.
     pub(super) aggregate: bool,
+    /// A `FerrofinPendingChildMetadata` row records that `aggregate` is owed
+    /// (a walk saved the album, perhaps in an earlier scan that stopped before
+    /// this pass): the pass deletes it once the album's refresh is done.
+    pub(super) pending_row: bool,
     /// This pass stamps the item's `DateLastRefreshed`: the walk left it to
     /// it (a refresh that fails or never runs leaves the item due).
     pub(super) owns_stamp: bool,
@@ -609,7 +624,7 @@ impl LibraryScanner {
                 // One item that cannot be read or written is skipped: the
                 // items after it still refresh, and it keeps what made it
                 // due for the next scan.
-                if let Err(err) = Box::pin(self.refresh_music_item(
+                match Box::pin(self.refresh_music_item(
                     item,
                     album_gain,
                     run.cancel,
@@ -619,7 +634,17 @@ impl LibraryScanner {
                 ))
                 .await
                 {
-                    skipped.note(item.id, &err);
+                    // Its tags are derived (and saved where they moved). A
+                    // failed delete only derives them once more next scan.
+                    Ok(Some(_)) if item.pending_row => {
+                        if let Err(err) =
+                            self.persistence.clear_pending_child_metadata(item.id).await
+                        {
+                            skipped.note(item.id, &err);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => skipped.note(item.id, &err),
                 }
             }
             if kind == MusicKind::Album {
@@ -889,6 +914,7 @@ impl LibraryScanner {
                 identified: None,
                 policy: outside,
                 aggregate: full_refresh(&plan, &request),
+                pending_row: false,
                 owns_stamp: true,
                 owns_save: true,
                 draw: false,
@@ -967,6 +993,7 @@ impl LibraryScanner {
                 ..Default::default()
             },
             aggregate: full_refresh(&plan, &request),
+            pending_row: false,
             owns_stamp: true,
             owns_save: true,
             draw: false,
@@ -2106,6 +2133,7 @@ impl LibraryScanner {
                 identified: None,
                 policy,
                 aggregate: true,
+                pending_row: false,
                 owns_stamp: remote,
                 owns_save: kind == MusicKind::ByNameArtist,
                 draw: false,

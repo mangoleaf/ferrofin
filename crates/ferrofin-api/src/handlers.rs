@@ -1347,7 +1347,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    DateLastRefreshed, a new item with no row takes its descendants along, a \
                    refresh of an item or folder ends with that item's own failure) and \
                    scan_item (the row is saved unstamped, and its stamp written after what \
-                   hangs off it, unless a cancel cut that short) \
+                   hangs off it, unless a cancel cut that short; a stored album records the \
+                   children-derived tags its save owes, FerrofinPendingChildMetadata, before \
+                   the first write, and the music pass, refresh_music, clears the record once \
+                   it has derived them, so a scan stopped between the two leaves the next scan \
+                   to derive them) \
                    ← parent_row (a failed read counts as \
                    no row, once per pass) ← sync_series_name (FindSeriesName), \
                    sync_season_name, remember_series_folder, locale_parent (GetParents, \
@@ -1367,14 +1371,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    GetPreferredMetadataLanguage, GetPreferredMetadataCountryCode, GetParents), \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (RefreshItem), \
                    MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata, \
-                   UpdatePremiereDate), \
+                   BeforeSave, UpdateMetadataFromChildren, UpdatePremiereDate), \
+                   MediaBrowser.Controller/Entities/Audio/MusicAlbum.cs \
+                   (RefreshAllMetadataInternal), \
+                   MediaBrowser.Providers/Music/AlbumMetadataService.cs \
+                   (UpdateMetadataFromChildren), \
                    MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName, GetLookupInfo, \
                    Series, GetEpisodes), \
                    MediaBrowser.Providers/TV/SeasonMetadataService.cs \
                    (EnableUpdatingPremiereDateFromChildren, GetChildrenForMetadataUpdates), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
                    MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
-        date: "2026-11-15",
+        date: "2026-11-27",
         divergences: &[
             "An item whose parent chain cannot be read is scored from its own rating and \
              country, an ancestor's custom rating not counting, else takes the score stored on \
@@ -1408,6 +1416,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A new item that fails before its first save has no row until the next scan, \
              where upstream's CreateItems and first-refresh save keep one, so a new folder \
              that fails takes its descendants with it for this scan.",
+            "A stored album the walk saved for a change of its own (a new local image) shows \
+             that change with its old children-derived tags until its music pass derives \
+             them, and until the next scan's music pass when the scan stops first, where \
+             upstream validates the image and derives the tags in one RefreshMetadata: its \
+             stopped scan has saved neither, and its next scan saves both. Fix path: refresh \
+             an album after its tracks in the walk, as MusicAlbum.RefreshAllMetadata does, so \
+             its save and its derivation are one write (the walk plans an album before its \
+             tracks, which is why the music pass derives it today).",
+            "A track whose refresh changed something does not make its album's refresh a full \
+             one, as MusicAlbum.RefreshAllMetadataInternal does (childUpdateType > None), so \
+             a retagged or added track leaves its album's children-derived tags as they were \
+             until the album's own save or full refresh. Fix path: gl-2002.",
             "A stored folder that fails leaves its children to refresh, where \
              RefreshChildMetadata does not recurse into a folder that threw, because the \
              flat walk has already planned them and a persistent failure on a season must \

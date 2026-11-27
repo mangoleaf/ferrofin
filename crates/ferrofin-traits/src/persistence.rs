@@ -2000,6 +2000,47 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(false)
     }
 
+    /// Records that `item_id`'s children-derived metadata is owed: a scan's
+    /// walk is about to save the album for a change of its own, and the
+    /// music pass after it derives the album's tags from its tracks. A scan
+    /// stopped before that pass leaves the record, so the next one derives
+    /// them. Recording an item twice keeps one record, and an item with no
+    /// row is not recorded.
+    ///
+    /// The default records nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn record_pending_child_metadata(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let _ = item_id;
+        Ok(())
+    }
+
+    /// The items [`record_pending_child_metadata`](Self::record_pending_child_metadata)
+    /// recorded and no music pass has cleared since.
+    ///
+    /// The default knows of none (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn pending_child_metadata_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(Vec::new())
+    }
+
+    /// Clears `item_id`'s record: its children-derived metadata is derived.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn clear_pending_child_metadata(&self, item_id: Uuid) -> Result<(), ServiceError> {
+        let _ = item_id;
+        Ok(())
+    }
+
     /// `item_id`'s stored `PresentationUniqueKey`, read as that one column so
     /// a row the decoder rejects still answers. `None` for no row or no key.
     ///
