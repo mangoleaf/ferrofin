@@ -1566,21 +1566,65 @@ impl FerrofinSessionManager {
             ..InternalItemsQuery::default()
         };
         if by_name {
-            // `IItemByName.GetTaggedItems` — the filter field differs per kind.
+            // `IItemByName.GetTaggedItems` — the filter field differs per kind,
+            // and a genre keeps to its side of the video/music split.
             match kind {
-                Some(BaseItemKind::Genre | BaseItemKind::MusicGenre) => query.genre_ids = vec![id],
+                Some(BaseItemKind::Genre) => {
+                    query.genre_ids = vec![id];
+                    query.exclude_item_types = vec![
+                        BaseItemKind::MusicVideo,
+                        BaseItemKind::Audio,
+                        BaseItemKind::MusicAlbum,
+                        BaseItemKind::MusicArtist,
+                    ];
+                }
+                Some(BaseItemKind::MusicGenre) => {
+                    query.genre_ids = vec![id];
+                    query.include_item_types = vec![
+                        BaseItemKind::MusicVideo,
+                        BaseItemKind::Audio,
+                        BaseItemKind::MusicAlbum,
+                        BaseItemKind::MusicArtist,
+                    ];
+                }
                 Some(BaseItemKind::Studio) => query.studio_ids = vec![id],
                 Some(BaseItemKind::Person) => query.person_ids = vec![id],
-                Some(BaseItemKind::MusicArtist) => query.artist_ids = vec![id],
+                Some(BaseItemKind::MusicArtist) => {
+                    query.include_item_types = vec![
+                        BaseItemKind::Audio,
+                        BaseItemKind::MusicVideo,
+                        BaseItemKind::MusicAlbum,
+                    ];
+                    query.artist_ids = vec![id];
+                }
                 Some(BaseItemKind::Year) => {
-                    let Some(year) = item.production_year.and_then(|y| i32::try_from(y).ok())
-                    else {
+                    // `int.TryParse(Name, NumberStyles.Integer, …)`: a year row
+                    // stores its year as its name, not as a `ProductionYear`.
+                    let Some(year) = item.name.as_deref().and_then(|name| {
+                        name.trim_matches(|c| matches!(c, '\t'..='\r' | ' '))
+                            .parse()
+                            .ok()
+                    }) else {
                         return Ok(Vec::new());
                     };
                     query.years = vec![year];
                 }
                 // Not a by-name kind after all — fall back to the folder path.
                 _ => query.ancestor_ids = vec![id],
+            }
+            // `.Where(i => i is not IItemByName)`: a music genre also tags its
+            // by-name artists, rows that are not folders and have no sources.
+            // Applied to the query's type lists instead (an include list
+            // overrides an exclude list; each one above keeps a playable
+            // kind); the query has no paging, so the same rows remain.
+            if query.include_item_types.is_empty() {
+                query
+                    .exclude_item_types
+                    .extend(crate::kinds::ITEM_BY_NAME_KINDS);
+            } else {
+                query
+                    .include_item_types
+                    .retain(|kind| !crate::kinds::is_item_by_name(*kind));
             }
         } else {
             query.ancestor_ids = vec![id];

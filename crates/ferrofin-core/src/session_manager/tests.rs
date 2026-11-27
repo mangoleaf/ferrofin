@@ -3270,7 +3270,7 @@ async fn casting_a_plain_item_passes_through_unexpanded() {
 }
 
 #[tokio::test]
-async fn casting_a_genre_expands_to_the_items_tagged_with_it() {
+async fn casting_a_music_genre_expands_to_the_tracks_tagged_with_it() {
     let db = test_db().await;
     let (mgr, bus) = cast_manager(&db);
     let user_uuid = Uuid::new_v4();
@@ -3279,12 +3279,12 @@ async fn casting_a_genre_expands_to_the_items_tagged_with_it() {
     crate::test_support::grant_default_permissions(&db, user_uuid).await;
     allow_playback(&db, &user).await;
 
-    // A genre is stored as a by-name folder row; tagged items reference it.
+    // A music genre is stored as a by-name folder row; tagged items reference it.
     let genre = Uuid::new_v4();
     crate::test_support::seed_folder_item(
         &db,
         genre,
-        ferrofin_model::data::BaseItemKind::Genre,
+        ferrofin_model::data::BaseItemKind::MusicGenre,
         "Jazz",
         None,
     )
@@ -3315,6 +3315,120 @@ async fn casting_a_genre_expands_to_the_items_tagged_with_it() {
         vec![track],
         "the genre expands to the tagged track, not to itself"
     );
+}
+
+/// Sets an item's `ProductionYear` through the production repository save.
+async fn set_production_year(db: &Database, id: Uuid, year: i32) {
+    let mut row = library_manager(db)
+        .get_item_by_id(id)
+        .await
+        .expect("load item")
+        .expect("item present");
+    row.production_year = Some(year.into());
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(std::slice::from_ref(&row))
+        .await
+        .expect("set production year");
+}
+
+/// Each by-name kind's `GetTaggedItems` type filter, then
+/// `TranslateItemForPlayback`'s `.Where(i => i is not IItemByName)`
+/// (v12.4 `SessionManager.cs:1466-1485`; `Genre.cs`, `MusicGenre.cs`,
+/// `MusicArtist.cs` and `Year.cs` `GetTaggedItems`), for a target session with
+/// a user and one without. Upstream's `PlayCommandQueueTests` case is the music genre's:
+/// it tags a by-name artist (not a folder) beside the song. A stock Jellyfin
+/// 12.4 queued the same for a scanned movie and song sharing a genre name.
+#[tokio::test]
+async fn casting_a_by_name_item_queues_only_the_playable_items_of_its_kind() {
+    use ferrofin_db::enums::ItemValueType;
+    use std::collections::BTreeSet;
+    let db = test_db().await;
+    let (mgr, bus) = cast_manager(&db);
+    let user_uuid = Uuid::new_v4();
+    let user = seed_named_user(&db, user_uuid, "alice").await;
+    crate::test_support::grant_default_permissions(&db, user_uuid).await;
+    allow_playback(&db, &user).await;
+
+    let by_name = |kind, name: &'static str| {
+        let db = db.clone();
+        async move {
+            let id = Uuid::new_v4();
+            crate::test_support::seed_named_item(&db, id, kind, name).await;
+            crate::test_support::set_clean_name(&db, id, name).await;
+            id
+        }
+    };
+    let genre = by_name(BaseItemKind::Genre, "Comedy").await;
+    let music_genre = by_name(BaseItemKind::MusicGenre, "Comedy").await;
+    let year = by_name(BaseItemKind::Year, "2001").await;
+    // `int.TryParse` fails, and `Year.GetTaggedItems` answers nothing.
+    let not_a_year = by_name(BaseItemKind::Year, "MMI").await;
+    let studio = by_name(BaseItemKind::Studio, "Studio").await;
+    let person = by_name(BaseItemKind::Person, "Actor").await;
+    let artist = Uuid::new_v4();
+    crate::test_support::seed_music_artist_item(&db, artist, "Band").await;
+
+    let movie = Uuid::new_v4();
+    let track = Uuid::new_v4();
+    let audiobook = Uuid::new_v4();
+    crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+    crate::test_support::seed_named_item(&db, track, BaseItemKind::Audio, "Track").await;
+    crate::test_support::seed_named_item(&db, audiobook, BaseItemKind::AudioBook, "Book").await;
+    for id in [movie, track, artist] {
+        crate::test_support::seed_item_genre(&db, id, "Comedy").await;
+    }
+    for id in [track, audiobook] {
+        crate::test_support::seed_item_value(&db, id, ItemValueType::Artist, "Band").await;
+    }
+    for id in [movie, artist] {
+        crate::test_support::seed_item_value(&db, id, ItemValueType::Studios, "Studio").await;
+    }
+    // The year row itself has only its name, as `/Years/{year}` stores it.
+    for id in [movie, track, person, artist] {
+        set_production_year(&db, id, 2001).await;
+    }
+    crate::test_support::seed_library_over(&db, &[movie, track, audiobook]).await;
+
+    let (with_user, with_user_pushes) = cast_target(&mgr, bus.as_ref(), &user, "dev-user").await;
+    let without_user = mgr
+        .log_session_activity("Web", "1.0", "dev-none", "TV", "e", None)
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let without_user_pushes = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&without_user_pushes);
+    bus.register(
+        without_user.clone(),
+        Box::new(move |msg| sink.lock().unwrap().push(msg)),
+    );
+
+    for (cast, expected) in [
+        (genre, vec![movie]),
+        (music_genre, vec![track]),
+        (artist, vec![track]),
+        (studio, vec![movie]),
+        (year, vec![movie, track]),
+        (not_a_year, vec![]),
+    ] {
+        for (session_id, received) in [
+            (&with_user, &with_user_pushes),
+            (&without_user, &without_user_pushes),
+        ] {
+            mgr.send_play_command("", session_id, &play_now(vec![cast]))
+                .await
+                .unwrap();
+            let queued: BTreeSet<Uuid> = pushed_item_ids(&only_pushed_data(received))
+                .into_iter()
+                .collect();
+            received.lock().unwrap().clear();
+            assert_eq!(
+                queued,
+                expected.iter().copied().collect(),
+                "cast of {cast} to {session_id}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
