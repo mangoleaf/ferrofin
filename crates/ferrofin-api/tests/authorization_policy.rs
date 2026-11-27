@@ -613,7 +613,7 @@ async fn every_contract_operation_answers_each_caller_as_its_policy_does() {
         }
     }));
     // Handlers past the gate may write under the fake paths, which are
-    // relative (`POST /Startup/RemoteAccess` saves `named/network.json`): keep
+    // relative (`POST /Startup/RemoteAccess` saves `network.json`): keep
     // that out of the source tree. This binary holds this one test only, so
     // changing the process's directory touches no other test.
     let scratch = tempfile::tempdir().expect("scratch directory");

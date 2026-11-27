@@ -70,6 +70,12 @@ pub fn create_router(state: AppState) -> Router {
     }
     // Mount the real handlers in the slots the loop skipped.
     api = handlers::register(api);
+    // ASP.NET's router matches no endpoint to an empty segment; axum binds one
+    // as an empty route value when a `/` follows it (gl-1675). `Router::route_layer`
+    // wraps each route's method fallback too, so its 405 becomes this 404.
+    api = api.route_layer(middleware::from_fn(
+        crate::routes::refuse_empty_route_values,
+    ));
 
     // `/health` is behind the IP filter, as `MapHealthChecks` is upstream. The
     // probes are Ferrofin's own and are not: an orchestrator's address need not

@@ -54,20 +54,24 @@ pub fn read_playlist_file(path: &str, contents: &str) -> Vec<PathBuf> {
 /// DetectEncoding`, which reads the file in the encoding `UtfUnknown`
 /// detects and in UTF-8 when it detects none.
 ///
-/// A BOM decides first; then bytes that are valid UTF-8 with no ESC byte are
-/// UTF-8, and anything else is decoded in the encoding [`chardetng`] guesses:
-/// ISO-2022-JP first, otherwise UTF-8 or a legacy encoding (an old Winamp
-/// `.m3u` is usually Windows-1252).
+/// A BOM decides first, then 7-bit ISO-2022-KR or HZ-GB-2312
+/// ([`ferrofin_util::escape_charset::detect`]). Bytes that are valid UTF-8 with
+/// no ESC byte are UTF-8, and anything else is decoded in the encoding
+/// [`chardetng`] guesses: ISO-2022-JP first, otherwise UTF-8 or a legacy
+/// encoding (an old Winamp `.m3u` is usually Windows-1252).
 #[must_use]
 pub fn decode_playlist(bytes: &[u8]) -> String {
     if let Some((encoding, _)) = encoding_rs::Encoding::for_bom(bytes) {
         return encoding.decode_with_bom_removal(bytes).0.into_owned();
     }
-    // 7-bit ISO-2022-JP is valid UTF-8 too, and `UtfUnknown`'s escape prober
-    // finds it first: an ESC, which starts its designations, leaves the choice
-    // to chardetng. It answers ISO-2022-JP only for ASCII that decodes as it,
-    // and UTF-8 for any other valid UTF-8. TODO(gl-1657): the prober's other
-    // 7-bit encodings, ISO-2022-KR and HZ-GB-2312, are not detected yet.
+    // 7-bit ISO-2022-KR and HZ-GB-2312 are valid UTF-8 too, and `UtfUnknown`'s
+    // escape prober finds them first (gl-1657).
+    if let Some(charset) = ferrofin_util::escape_charset::detect(bytes) {
+        return charset.decode(bytes);
+    }
+    // So it does 7-bit ISO-2022-JP: an ESC, which starts its designations,
+    // leaves the choice to chardetng. It answers ISO-2022-JP only for ASCII
+    // that decodes as it, and UTF-8 for any other valid UTF-8.
     if !bytes.contains(&0x1B)
         && let Ok(text) = std::str::from_utf8(bytes)
     {
@@ -483,6 +487,21 @@ mod tests {
         assert_eq!(
             decode_playlist("\u{1B}[1m曲.mp3\n".as_bytes()),
             "\u{1B}[1m曲.mp3\n"
+        );
+    }
+
+    /// 7-bit ISO-2022-KR and HZ-GB-2312 are valid UTF-8 too; `UtfUnknown`'s
+    /// escape prober detects them, and Jellyfin decodes them (gl-1657). The
+    /// bytes are what Python's `iso2022_kr` and `hz` codecs write.
+    #[test]
+    fn a_seven_bit_korean_or_chinese_playlist_is_decoded() {
+        assert_eq!(
+            decode_playlist(b"\x1b$)C\x0eGQ19>n\x0f/\x0e@Z87\x0f.mp3\n"),
+            "한국어/자막.mp3\n"
+        );
+        assert_eq!(
+            decode_playlist(b"~{VPND~}/~{WVD;~}.mp3\n~~1.mp3\n"),
+            "中文/字幕.mp3\n~1.mp3\n"
         );
     }
 

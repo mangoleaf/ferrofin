@@ -798,7 +798,13 @@ pub trait LibraryManager: Send + Sync {
         Ok(())
     }
 
-    /// Deletes an item, honoring the given [`DeleteOptions`].
+    /// Deletes an item, honoring the given [`DeleteOptions`]. The core
+    /// implementation holds the item's metadata
+    /// ([`ProviderManager::lock_item_metadata`]) from before it reads the row
+    /// until the delete is done, so a refresh that loaded the row first
+    /// cannot save the deleted item back.
+    ///
+    /// [`ProviderManager::lock_item_metadata`]: crate::providers::ProviderManager::lock_item_metadata
     async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError>;
 
     /// Merges several videos into one version group.
@@ -1522,6 +1528,19 @@ pub trait LibraryManager: Send + Sync {
         self.run_library_scan(ScanTrigger::Api, progress).await
     }
 
+    /// Resolves once no scan that was told to stop is still running: at once
+    /// unless the running scan was cancelled, otherwise when it has ended.
+    ///
+    /// For the "Scan Media Library" run. Its stop withdraws its wait
+    /// ([`run_library_scan`](Self::run_library_scan)), and the scan it leaves
+    /// ends at its next item: the run waits here for that, so it stays
+    /// `Cancelling` until its scan has ended, as upstream's does until
+    /// `ValidateMediaLibraryInternal` returns.
+    ///
+    /// A manager with no scanner runs no scan, so the default resolves at
+    /// once.
+    async fn stopped_scan_ended(&self) {}
+
     /// Whether a full library validation is running: upstream's
     /// `ILibraryManager.IsScanRunning`, which `ValidateMediaLibraryInternal`
     /// holds for the whole of a full scan (the "Scan Media Library" task,
@@ -1869,10 +1888,15 @@ pub trait UserManager: Send + Sync {
     /// Deletes a user by id.
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError>;
 
-    /// Resets a user's password to empty.
+    /// Resets a user's password to empty: [`Self::change_password`] with an
+    /// empty password.
     async fn reset_password(&self, user_id: Uuid) -> Result<(), ServiceError>;
 
     /// Changes a user's password.
+    ///
+    /// Once the password is saved the implementation writes the
+    /// "Password has been changed" activity entry, as C# `ChangePassword`
+    /// publishes `UserPasswordChangedEventArgs`, so callers write none.
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError>;
 
     /// Authenticates a user by name/password, returning the row on success.
@@ -2912,6 +2936,11 @@ pub trait MediaSourceManager: Send + Sync {
     }
 
     /// Gets the static (non-probed) media sources for an item.
+    ///
+    /// An item that cannot have any (one that is not a video, an audio item
+    /// or a Live TV channel: a folder, a by-name item, a photo, a book) is
+    /// [`ServiceError::InvalidInput`], as upstream's `GetStaticMediaSources`
+    /// throws `ArgumentException` for an item that is not `IHasMediaSources`.
     async fn get_static_media_sources(
         &self,
         item_id: Uuid,
@@ -3577,8 +3606,9 @@ pub trait RemoteSimilarItemsProvider: Send + Sync {
     fn supports(&self, item_kind: BaseItemKind) -> bool;
 
     /// How long the manager may reuse this provider's results from disk.
-    /// `None` disables caching for it.
-    fn cache_duration(&self) -> Option<std::time::Duration> {
+    /// `None` disables caching for it. Async because upstream's
+    /// `CacheDuration` reads the plugin's settings each time it is asked.
+    async fn cache_duration(&self) -> Option<std::time::Duration> {
         None
     }
 

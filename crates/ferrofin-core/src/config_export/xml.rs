@@ -122,22 +122,26 @@ fn entry_name<'a>(
     item: &Value,
     entries: &[(&str, &'a str)],
 ) -> Result<&'a str, ServiceError> {
-    match item {
-        // A null entry only occurs in a string collection here; it is written
-        // `<string xsi:nil="true" />`, as `XmlSerializer` writes one.
-        Value::String(_) | Value::Null => Ok("string"),
-        Value::Bool(_) => Ok("boolean"),
-        Value::Number(n) if n.is_f64() => Ok("double"),
-        Value::Number(_) => Ok("int"),
-        Value::Object(_) | Value::Array(_) => entries
+    let declared = || {
+        entries
             .iter()
             .find(|(member, _)| *member == field)
             .map(|(_, entry)| *entry)
-            .ok_or_else(|| {
-                ServiceError::Backend(format!(
-                    "no XML entry name is known for the entries of {field}"
-                ))
-            }),
+    };
+    match item {
+        // A null entry is written `xsi:nil="true"` under its entry's name, as
+        // `XmlSerializer` writes one: its declared class in a collection of
+        // objects (`<NameValuePair xsi:nil="true" />`), `string` otherwise.
+        Value::Null => Ok(declared().unwrap_or("string")),
+        Value::String(_) => Ok("string"),
+        Value::Bool(_) => Ok("boolean"),
+        Value::Number(n) if n.is_f64() => Ok("double"),
+        Value::Number(_) => Ok("int"),
+        Value::Object(_) | Value::Array(_) => declared().ok_or_else(|| {
+            ServiceError::Backend(format!(
+                "no XML entry name is known for the entries of {field}"
+            ))
+        }),
     }
 }
 
@@ -259,6 +263,19 @@ mod tests {
         assert!(xml.contains("<boolean>true</boolean>"), "{xml}");
         assert!(xml.contains("<double>0.5</double>"), "{xml}");
         assert!(xml.contains("<string xsi:nil=\"true\" />"), "{xml}");
+    }
+
+    /// A null entry of a collection of objects is nil under its entry class,
+    /// as `XmlSerializer` writes a null `NameValuePair` (gl-1677).
+    #[test]
+    fn a_null_entry_of_objects_takes_its_entry_class() {
+        let xml = write(
+            &json!({"ChannelMappings": [null, {"Name": "1", "Value": "one"}]}),
+            &[("ChannelMappings", "NameValuePair")],
+        )
+        .expect("writes");
+        assert!(xml.contains("<NameValuePair xsi:nil=\"true\" />"), "{xml}");
+        assert!(xml.contains("<NameValuePair>"), "{xml}");
     }
 
     /// An empty object is written as an empty element.
