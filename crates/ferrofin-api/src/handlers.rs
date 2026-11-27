@@ -1982,7 +1982,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    grouped view and shadow_view a shadow view (GetNamedView's user overload, \
                    GetShadowView), folders_view and provision_live_tv_view the Folders and \
                    Live TV views (GetNamedView(name, viewType, sortName), \
-                   MetadataService.RefreshMetadata; compared 2026-11-26), reading a library's \
+                   MetadataService.RefreshMetadata; compared 2026-11-26), and queue_view_image \
+                   drawing a grouped or Playlists view's collage in the background through \
+                   dynamic_images.rs DynamicImageKind::UserView, user_view_sources and \
+                   strip_collage_path (DynamicImageProvider: Supports, GetItemsWithImages, \
+                   CreateImage; BaseDynamicImageProvider: FetchAsync, HasChanged, \
+                   GetStripCollageImagePaths, CreateThumbCollage; MetadataService.GetProviders' \
+                   runAllProviders; StripCollageBuilder.BuildThumbCollageBitmap; compared \
+                   2026-11-27, and live against Jellyfin 12.4), reading a library's \
                    options at its \
                    Path expanded as BaseItemMapper.Map expands it \
                    (CollectionFolder.GetLibraryOptions, compared 2026-11-05); handlers/items.rs \
@@ -2062,8 +2069,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              when one is stored without a refresh, as an earlier Ferrofin left them, which \
              upstream leaves alone (it refreshes those two only when new or renamed, and \
              renaming one already refreshed saves only its name here, as upstream's refresh \
-             then has nothing to save). The collage that refresh draws upstream on the \
-             Playlists views and the movies and TV shows grouped views is TODO(gl-1656). It \
+             then has nothing to save). That refresh's collage on a Playlists or grouped \
+             view (DynamicImageProvider) is drawn in the background after the save, with \
+             every provider on the view's first refresh and otherwise behind HasChanged; \
+             its paths are the first window of 500 random items with a local image, where \
+             upstream reads on past a window whose every file fails to decode. A season or \
+             episode the user sees under a series they may not see does not draw that \
+             series, which upstream does (a Jellyfin bug not ported). A TV shows view's \
+             collage is drawn from its series alone, so a season or episode with no series, \
+             which upstream can draw itself, never is. Fix path: gl-2007, a repository \
+             filter for the view's seasons and episodes that have no series. The refresh \
              falls due only where the views are read: on every GET /UserViews (a shadow \
              view only on one naming presetViews), and on the query path when that writes \
              them, so a refresh due while the set stays the same waits for the next GET \

@@ -640,14 +640,15 @@ pub trait DynamicMetadataProvider: Send + Sync {
 fn _assert_object_safe_dynamic_metadata_provider(_: &dyn DynamicMetadataProvider) {}
 
 /// The providers that draw an item's Primary from other items' artwork: a
-/// genre's, music genre's or playlist's collage, a photo album's or folder's
-/// copied image.
+/// genre's, music genre's, playlist's or user view's collage, a photo album's
+/// or folder's copied image.
 ///
 /// Port of upstream's `BaseDynamicImageProvider<T>` family as an item refresh
 /// runs it: an `ICustomMetadataProvider` that is also an `IForcedProvider` and
 /// an `IHasItemChangeMonitor` (`MetadataService.GetProviders`). The library
 /// scan calls the implementation directly; this is the seam the provider
-/// manager, below it in the crate graph, reaches it through.
+/// manager, below it in the crate graph, and the user-view manager's view
+/// refresh reach it through.
 #[async_trait]
 pub trait GeneratedImageProvider: Send + Sync {
     /// `FetchAsync` for one item: draws its Primary and reports

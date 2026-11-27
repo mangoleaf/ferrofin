@@ -48,6 +48,7 @@ use ferrofin_traits::options::{
     DtoOptions, InternalItemsQuery, LATEST_ITEMS_FALLBACK_LIMIT, LatestItemsQuery, UserViewQuery,
 };
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+use ferrofin_traits::providers::GeneratedImageProvider;
 
 use crate::item_type_lookup;
 use crate::kinds;
@@ -236,6 +237,9 @@ pub struct FerrofinUserViewManager {
     /// The batched `IsVisible` evaluator. Without it (unit tests) an item the
     /// user-scoped query returns counts as visible.
     visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
+    /// The view refresh's image provider (`DynamicImageProvider`), set by the
+    /// composition root. `None` in unit tests: a view then gets no collage.
+    generated_images: Option<Arc<dyn GeneratedImageProvider>>,
 }
 
 impl std::fmt::Debug for FerrofinUserViewManager {
@@ -245,6 +249,7 @@ impl std::fmt::Debug for FerrofinUserViewManager {
             .field("has_user_root", &self.user_root.is_some())
             .field("has_virtual_folders", &self.virtual_folders.is_some())
             .field("metadata_path", &self.metadata_path)
+            .field("has_generated_images", &self.generated_images.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -326,6 +331,7 @@ impl FerrofinUserViewManager {
             users: None,
             visibility: None,
             metadata_path: None,
+            generated_images: None,
         }
     }
 
@@ -471,6 +477,14 @@ impl FerrofinUserViewManager {
     #[must_use]
     pub fn with_users(mut self, users: Arc<dyn UserManager>) -> Self {
         self.users = Some(users);
+        self
+    }
+
+    /// Wires the image provider a view's refresh runs (see the
+    /// `generated_images` field). Called once by the composition root.
+    #[must_use]
+    pub fn with_generated_images(mut self, provider: Arc<dyn GeneratedImageProvider>) -> Self {
+        self.generated_images = Some(provider);
         self
     }
 
@@ -780,9 +794,9 @@ impl FerrofinUserViewManager {
     /// and renamed when the server-localized `name_key` reads differently.
     /// It is dated from its directory and refreshed when new and then whenever
     /// [`view_refresh_due`] says, with no display parent (`:3095-3115`); the
-    /// refresh is its save ([`save_view_refresh`]). TODO(gl-1656): upstream's
-    /// refresh also draws the view's collage (`DynamicImageProvider`).
-    /// `None` without an item store and a metadata path.
+    /// refresh is its save ([`save_view_refresh`]) and its collage
+    /// ([`Self::queue_view_image`]). `None` without an item store and a
+    /// metadata path.
     async fn grouped_view(
         &self,
         user_id: Uuid,
@@ -808,9 +822,11 @@ impl FerrofinUserViewManager {
             }
             let now = Utc::now();
             if view_refresh_due(&row, None, now) {
+                let first = row.date_last_refreshed.is_none();
                 // A view an earlier build wrote has no `ForcedSortName`.
                 row.forced_sort_name.get_or_insert_default();
                 save_view_refresh(persistence.as_ref(), &mut row, now, "grouped").await;
+                self.queue_view_image(&row, user_id, first);
             }
             return Ok(Some(row));
         }
@@ -847,7 +863,43 @@ impl FerrofinUserViewManager {
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;
+        self.queue_view_image(&entity, user_id, true);
         Ok(Some(entity))
+    }
+
+    /// The image part of the refresh `GetNamedView` queues for a user's
+    /// `view`: its `DynamicImageProvider`, which draws a movies, TV shows or
+    /// playlists view's collage (`MetadataService.RefreshWithProviders`' custom
+    /// providers). It runs every provider on the view's `first` refresh
+    /// (`isFirstRefresh`) and is otherwise gated by the provider's own
+    /// `HasChanged`; a locked view runs none. Upstream queues the refresh, so
+    /// this runs in the background, in a root span of its own (LOGGING.md,
+    /// rule 4), and never holds up or fails the listing; a failure is logged.
+    /// A no-op without an image provider wired.
+    fn queue_view_image(&self, view: &BaseItemEntity, user_id: Uuid, first: bool) {
+        use tracing::Instrument as _;
+        let Some(provider) = self.generated_images.clone() else {
+            return;
+        };
+        if view.is_locked {
+            return;
+        }
+        let span = tracing::info_span!(
+            parent: None,
+            "view_image",
+            item_id = %view.id,
+            user_id = %user_id,
+            trigger = "api"
+        );
+        let view = view.clone();
+        drop(tokio::spawn(
+            async move {
+                if let Err(err) = provider.refresh_generated_image(&view, first).await {
+                    tracing::warn!(%err, "view image failed");
+                }
+            }
+            .instrument(span),
+        ));
     }
 
     /// `GetUserViews`' preset arm (`UserViewManager.cs:87-94`, v12.4), and
@@ -987,8 +1039,8 @@ impl FerrofinUserViewManager {
     /// refresh is its save here: the directory's restat leaves no
     /// `DateModified` (D2), and `DateLastRefreshed` and `DateLastSaved` are
     /// stamped. A new row is saved as that refresh leaves it, created when its
-    /// directory was (gl-1625). TODO(gl-1656): upstream's refresh also draws
-    /// the view's collage (`DynamicImageProvider`), not ported yet.
+    /// directory was (gl-1625), and the refresh draws the view's collage
+    /// ([`Self::queue_view_image`]).
     ///
     /// Returns whether a row was created or renamed. Idempotent; a no-op
     /// without an item store and a metadata path.
@@ -1053,7 +1105,9 @@ impl FerrofinUserViewManager {
                     written = true;
                 }
                 if view_refresh_due(&row, Some(&folder), now) {
+                    let first = row.date_last_refreshed.is_none();
                     save_view_refresh(persistence.as_ref(), &mut row, now, "playlists").await;
+                    self.queue_view_image(&row, user_id, first);
                 }
                 continue;
             }
@@ -1088,6 +1142,7 @@ impl FerrofinUserViewManager {
             persistence
                 .save_items(std::slice::from_ref(&entity))
                 .await?;
+            self.queue_view_image(&entity, user_id, true);
             written = true;
         }
         Ok(written)
@@ -6766,5 +6821,422 @@ mod tests {
             row.date_last_refreshed.expect("refreshed") >= now,
             "never refreshed: its first refresh"
         );
+    }
+
+    /// Writes a solid-colour 16:9 PNG at `dir/name`, returning its path.
+    fn solid_png(dir: &std::path::Path, name: &str, rgb: [u8; 3]) -> String {
+        let img = image::RgbImage::from_pixel(32, 18, image::Rgb(rgb));
+        let path = dir.join(name);
+        img.save(&path).expect("write png");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The view's stored Primary, once the refresh's background draw saved it.
+    async fn drawn_primary(db: &Database, view: Uuid) -> ferrofin_traits::options::ItemImageInfo {
+        let items = crate::test_support::item_repository_over(db.clone());
+        for _ in 0..200 {
+            if let Some(primary) = items
+                .get_image_infos(view)
+                .await
+                .expect("images")
+                .into_iter()
+                .find(|i| i.image_type == ferrofin_model::entities::ImageType::Primary)
+            {
+                return primary;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("no Primary was drawn for {view}");
+    }
+
+    /// Adds a solid-colour image of `kind` to each item, written under `dir`.
+    async fn add_images(
+        db: &Database,
+        dir: &std::path::Path,
+        images: &[(Uuid, ferrofin_model::entities::ImageType, [u8; 3])],
+    ) {
+        std::fs::create_dir_all(dir).expect("art dir");
+        let items = crate::test_support::item_repository_over(db.clone());
+        for (n, (item, kind, rgb)) in images.iter().enumerate() {
+            let path = solid_png(dir, &format!("{n}.png"), *rgb);
+            let mut stored = items.get_image_infos(*item).await.expect("images");
+            stored.push(crate::test_support::image_info(*kind, &path, None));
+            crate::test_support::seed_images(db, *item, &stored).await;
+        }
+    }
+
+    /// The dynamic image providers the composition root wires into the
+    /// manager, over `items` and drawing into `art_root` with the real encoder.
+    fn view_image_providers(
+        db: &Database,
+        items: Arc<dyn ItemRepository>,
+        art_root: &std::path::Path,
+        cache: &std::path::Path,
+    ) -> crate::dynamic_images::DynamicImageProviders {
+        let processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> =
+            Arc::new(ferrofin_drawing::processor::ImageProcessor::new(
+                Arc::new(ferrofin_drawing::image_encoder::ImageCrateEncoder::new()),
+                cache.to_path_buf(),
+            ));
+        crate::dynamic_images::DynamicImageProviders::new(
+            items,
+            Arc::new(FerrofinItemPersistenceService::new(db.clone())),
+            processor,
+            art_root.to_path_buf(),
+        )
+        .with_users(Arc::new(crate::user_manager::FerrofinUserManager::new(
+            db.clone(),
+        )))
+    }
+
+    /// Waits for `view`'s drawn Primary and checks it is a 960×540 thumb
+    /// collage in the view's own folder whose centre is `expected`.
+    async fn assert_collage(
+        db: &Database,
+        art_root: &std::path::Path,
+        view: Uuid,
+        expected: [u8; 3],
+    ) {
+        let primary = drawn_primary(db, view).await;
+        assert_eq!(
+            std::path::PathBuf::from(&primary.path),
+            crate::dynamic_images::own_art_dir(art_root, view).join("poster.png"),
+            "the view's own folder"
+        );
+        assert_eq!((primary.width, primary.height), (960, 540));
+        let drawn = image::open(&primary.path).expect("decode").to_rgb8();
+        assert_eq!(drawn.dimensions(), (960, 540));
+        let pixel = drawn.get_pixel(480, 270).0;
+        assert!(
+            pixel
+                .iter()
+                .zip(expected)
+                .all(|(got, want)| got.abs_diff(want) <= 3),
+            "{view}: {pixel:?}, expected {expected:?}"
+        );
+    }
+
+    /// gl-1656: the refresh `GetNamedView` queues runs `DynamicImageProvider`,
+    /// so a user's grouped Movies and TV Shows views and their Playlists view
+    /// get a 960×540 thumb collage (`CreateThumbCollage`) in the background,
+    /// saved as the view's own `poster.png`. It is drawn from a movie, series
+    /// or playlist the user sees in the view that has a Primary or a Thumb,
+    /// from its Backdrop before its Primary (`GetStripCollageImagePaths`),
+    /// darkened by the strip's shadow; a movie of a library outside the view,
+    /// and a series with only a Backdrop, are never drawn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_users_grouped_and_playlists_views_get_a_thumb_collage() {
+        use ferrofin_model::entities::ImageType;
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let id = |n: u128| Uuid::from_u128(0xC0_1A6E_0000 + n);
+        let user = id(1);
+        crate::test_support::seed_user_with_defaults(&db, user).await;
+        let (action, comedy, anime, drama, elsewhere) = (id(2), id(3), id(4), id(5), id(6));
+        seed_library(&db, action, "Action", Some("movies")).await;
+        seed_library(&db, comedy, "Comedy", Some("movies")).await;
+        seed_library(&db, anime, "Anime", Some("tvshows")).await;
+        seed_library(&db, drama, "Drama", Some("tvshows")).await;
+        seed_library(&db, elsewhere, "Elsewhere", Some("movies")).await;
+        group(&db, user, &[action, comedy, anime, drama]).await;
+        let (heat, outside, show, backdrop_only) = (id(11), id(12), id(13), id(14));
+        seed(
+            &db,
+            &[
+                Row::new(heat, BaseItemKind::Movie, "Heat", day(1), action),
+                Row::new(outside, BaseItemKind::Movie, "Outside", day(1), elsewhere),
+                Row::new(show, BaseItemKind::Series, "Show", day(1), anime),
+                Row::new(backdrop_only, BaseItemKind::Series, "Bare", day(1), drama),
+            ],
+        )
+        .await;
+        let folder = id(20);
+        put(
+            &db,
+            folder,
+            (BaseItemKind::PlaylistsFolder, "Playlists"),
+            (None, folder),
+            &format!("{DATA}/playlists"),
+            &serde_json::json!({}),
+        )
+        .await;
+        let mine = id(21);
+        put(
+            &db,
+            mine,
+            (BaseItemKind::Playlist, "Mine"),
+            (Some(folder), folder),
+            &format!("{DATA}/playlists/Mine"),
+            &serde_json::json!({"OwnerUserId": user, "OpenAccess": true}),
+        )
+        .await;
+        add_images(
+            &db,
+            &tmp.path().join("art"),
+            &[
+                (heat, ImageType::Backdrop, [200, 0, 0]),
+                (heat, ImageType::Primary, [0, 200, 0]),
+                (outside, ImageType::Backdrop, [0, 0, 200]),
+                (outside, ImageType::Primary, [0, 0, 200]),
+                (show, ImageType::Backdrop, [200, 0, 200]),
+                (show, ImageType::Thumb, [0, 200, 200]),
+                (backdrop_only, ImageType::Backdrop, [0, 200, 0]),
+                (mine, ImageType::Primary, [200, 200, 0]),
+            ],
+        )
+        .await;
+        let metadata = tmp.path().join("metadata");
+        let art_root = metadata.join("library");
+        let providers = view_image_providers(
+            &db,
+            crate::test_support::item_repository_over(db.clone()),
+            &art_root,
+            &tmp.path().join("cache"),
+        );
+        let mgr =
+            manager_with_visibility(&db, &metadata).with_generated_images(Arc::new(providers));
+
+        assert_eq!(
+            view_names(&mgr, user).await,
+            ["Elsewhere", "Movies", "Playlists", "TvShows"]
+        );
+        let views = [
+            (
+                grouped_view_id(&mgr.id_derivation, user, "movies").expect("id"),
+                [106, 0, 0],
+            ),
+            (
+                grouped_view_id(&mgr.id_derivation, user, "tvshows").expect("id"),
+                [106, 0, 106],
+            ),
+            (
+                mgr.user_named_view_id(user, folder, "playlists")
+                    .expect("id"),
+                [106, 106, 0],
+            ),
+        ];
+        for (view, expected) in views {
+            assert_collage(&db, &art_root, view, expected).await;
+        }
+    }
+
+    /// A repository whose query scope hides the playlists a user may not see
+    /// (`Playlist.IsVisibleStandalone`), bound as the composition root binds
+    /// it; the evaluator is returned to keep it alive.
+    fn scoped_repository(
+        db: &Database,
+    ) -> (
+        Arc<dyn ItemRepository>,
+        Arc<crate::item_visibility::ItemVisibility>,
+    ) {
+        let slot = crate::item_repository::VisibilitySlot::default();
+        let repository: Arc<dyn ItemRepository> = Arc::new(
+            FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
+                .with_visibility(Arc::clone(&slot)),
+        );
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&repository),
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            DATA.to_owned(),
+        ));
+        assert!(slot.set(Arc::downgrade(&visibility)).is_ok());
+        (repository, visibility)
+    }
+
+    /// gl-1656: the Playlists view's collage comes only from a playlist its
+    /// user may see (`PlaylistsFolder.GetItemsInternal` keeps
+    /// `IsVisibleStandalone`), so another user's private playlist never draws
+    /// it, and draws it once its owner opens it to everyone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_users_private_playlist_never_draws_the_playlists_view() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (user, other) = (
+            Uuid::from_u128(0xC0_1A70_0001),
+            Uuid::from_u128(0xC0_1A70_0002),
+        );
+        crate::test_support::seed_user_with_defaults(&db, user).await;
+        seed_named_user(&db, other, "other").await;
+        crate::test_support::grant_default_permissions(&db, other).await;
+        let folder = Uuid::from_u128(0xC0_1A70_0003);
+        put(
+            &db,
+            folder,
+            (BaseItemKind::PlaylistsFolder, "Playlists"),
+            (None, folder),
+            &format!("{DATA}/playlists"),
+            &serde_json::json!({}),
+        )
+        .await;
+        let playlist = |id: u128, name: &'static str, owner: Uuid, open: bool| {
+            let db = db.clone();
+            async move {
+                put(
+                    &db,
+                    Uuid::from_u128(id),
+                    (BaseItemKind::Playlist, name),
+                    (Some(folder), folder),
+                    &format!("{DATA}/playlists/{name}"),
+                    &serde_json::json!({"OwnerUserId": owner, "OpenAccess": open}),
+                )
+                .await;
+            }
+        };
+        playlist(0xC0_1A70_0004, "Mine", user, false).await;
+        playlist(0xC0_1A70_0005, "Theirs", other, false).await;
+        add_images(
+            &db,
+            &tmp.path().join("art"),
+            &[(
+                Uuid::from_u128(0xC0_1A70_0005),
+                ferrofin_model::entities::ImageType::Primary,
+                [0, 0, 200],
+            )],
+        )
+        .await;
+        let metadata = tmp.path().join("metadata");
+        let (repository, _visibility) = scoped_repository(&db);
+        let providers = view_image_providers(
+            &db,
+            repository,
+            &metadata.join("library"),
+            &tmp.path().join("cache"),
+        );
+        let mgr = manager_with_visibility(&db, &metadata);
+        assert!(lists(&mgr, user, "Playlists").await);
+        let view = crate::test_support::fetch_item(
+            &db,
+            mgr.user_named_view_id(user, folder, "playlists")
+                .expect("id"),
+        )
+        .await;
+        let refresh = || providers.refresh_item(&view, true);
+
+        assert_eq!(
+            refresh().await.expect("refresh"),
+            ferrofin_traits::providers::ItemUpdateType::None,
+            "their private playlist"
+        );
+        playlist(0xC0_1A70_0005, "Theirs", other, true).await;
+        assert_eq!(
+            refresh().await.expect("refresh"),
+            ferrofin_traits::providers::ItemUpdateType::ImageUpdate,
+            "their playlist, open to everyone"
+        );
+    }
+
+    /// The image part of a view's refresh, as a fake provider sees it.
+    struct RecordedDraws(tokio::sync::mpsc::UnboundedSender<(Uuid, bool)>);
+
+    #[async_trait]
+    impl GeneratedImageProvider for RecordedDraws {
+        async fn refresh_generated_image(
+            &self,
+            item: &BaseItemEntity,
+            force: bool,
+        ) -> Result<ferrofin_traits::providers::ItemUpdateType, ServiceError> {
+            let _ = self.0.send((uuid(item), force));
+            Ok(ferrofin_traits::providers::ItemUpdateType::None)
+        }
+    }
+
+    /// Lets the spawned draws run, then takes what they recorded.
+    async fn recorded(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(Uuid, bool)>,
+    ) -> Vec<(Uuid, bool)> {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let mut draws = Vec::new();
+        while let Ok(draw) = rx.try_recv() {
+            draws.push(draw);
+        }
+        draws
+    }
+
+    /// gl-1656: a view's refresh runs its image provider with every provider
+    /// on its first refresh (`isFirstRefresh`: a new view, or one an earlier
+    /// build never refreshed) and behind the provider's own gate on a later
+    /// one; a view not due runs nothing, and a locked view runs no provider
+    /// (`RefreshWithProviders`).
+    #[tokio::test]
+    async fn a_view_refresh_draws_its_image_forced_only_the_first_time() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let user = Uuid::from_u128(0xC0_1A6F_0001);
+        crate::test_support::seed_user_with_defaults(&db, user).await;
+        let (action, comedy) = (
+            Uuid::from_u128(0xC0_1A6F_0002),
+            Uuid::from_u128(0xC0_1A6F_0003),
+        );
+        seed_library(&db, action, "Action", Some("movies")).await;
+        seed_library(&db, comedy, "Comedy", Some("movies")).await;
+        group(&db, user, &[action, comedy]).await;
+        let folder = Uuid::from_u128(0xC0_1A6F_0004);
+        put(
+            &db,
+            folder,
+            (BaseItemKind::PlaylistsFolder, "Playlists"),
+            (None, folder),
+            &format!("{DATA}/playlists"),
+            &serde_json::json!({}),
+        )
+        .await;
+        put(
+            &db,
+            Uuid::from_u128(0xC0_1A6F_0005),
+            (BaseItemKind::Playlist, "Mine"),
+            (Some(folder), folder),
+            &format!("{DATA}/playlists/Mine"),
+            &serde_json::json!({"OwnerUserId": user, "OpenAccess": true}),
+        )
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mgr = manager_with_visibility(&db, tmp.path())
+            .with_generated_images(Arc::new(RecordedDraws(tx)));
+        let movies = grouped_view_id(&mgr.id_derivation, user, "movies").expect("id");
+        let playlists = mgr
+            .user_named_view_id(user, folder, "playlists")
+            .expect("id");
+        let sorted = |mut draws: Vec<(Uuid, bool)>| {
+            draws.sort();
+            draws
+        };
+
+        assert_eq!(view_names(&mgr, user).await, ["Movies", "Playlists"]);
+        assert_eq!(
+            sorted(recorded(&mut rx).await),
+            sorted(vec![(movies, true), (playlists, true)]),
+            "new views: their first refresh"
+        );
+        assert_eq!(view_names(&mgr, user).await, ["Movies", "Playlists"]);
+        assert_eq!(recorded(&mut rx).await, [], "fresh: no refresh");
+
+        let seed = crate::item_persistence_service::seed_refresh_dates;
+        let day_old = Utc::now() - chrono::TimeDelta::hours(25);
+        seed(&db, movies, None, Some(day_old), None).await;
+        seed(&db, playlists, None, Some(day_old), None).await;
+        assert_eq!(view_names(&mgr, user).await, ["Movies", "Playlists"]);
+        assert_eq!(
+            sorted(recorded(&mut rx).await),
+            sorted(vec![(movies, false), (playlists, false)]),
+            "a day old: behind the provider's gate"
+        );
+
+        never_refreshed(&db, movies).await;
+        assert_eq!(view_names(&mgr, user).await, ["Movies", "Playlists"]);
+        assert_eq!(
+            recorded(&mut rx).await,
+            [(movies, true)],
+            "never refreshed: its first refresh"
+        );
+
+        let mut locked = crate::test_support::fetch_item(&db, movies).await;
+        locked.is_locked = true;
+        locked.date_last_refreshed = None;
+        crate::test_support::save_item(&db, &locked).await;
+        assert_eq!(view_names(&mgr, user).await, ["Movies", "Playlists"]);
+        assert_eq!(recorded(&mut rx).await, [], "locked: no provider");
     }
 }

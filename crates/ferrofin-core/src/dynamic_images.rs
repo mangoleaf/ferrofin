@@ -13,12 +13,13 @@
 //! | `MusicAlbumImageProvider`   | `MusicAlbum` | the album's first child that is no folder, with a Primary (`BaseFolderImageProvider`) |
 //! | `FolderImageProvider`       | any `Folder` | the folder's first descendant with a Primary (`BaseFolderImageProvider`) |
 //! | `ArtistImageProvider`       | `MusicArtist`| none — upstream returns `Array.Empty` (see [`ArtistSources`])       |
+//! | `DynamicImageProvider`      | `UserView`   | a movies, TV shows or playlists view's movies, series or playlists, for its user |
 //!
 //! `CollectionFolderImageProvider` (the library tiles) is ported separately by
-//! the scanner's `refresh_library_images`, and `DynamicImageProvider`
-//! (`UserView`) has nothing to act on here: Ferrofin never persists `UserView`
-//! rows — a user's views *are* the `CollectionFolder` rows, whose tile that
-//! same pass already draws.
+//! the scanner's `refresh_library_images`. `DynamicImageProvider` draws the
+//! views the user-view manager stores for a user (a grouped Movies or TV Shows
+//! view, the Playlists view) when the view's refresh runs it, in the
+//! background as upstream queues that refresh; no library pass draws a view.
 //!
 //! `FolderImageProvider` is the generic-folder arm: it `Supports` every
 //! `Folder` that is not a `PhotoAlbum`/`MusicAlbum` and not
@@ -31,17 +32,19 @@
 //! which is where its 960×540 (`PrimaryImageAspectRatio` 1.7778) comes from.
 //!
 //! Every provider here supports only `ImageType.Primary`, and the base class
-//! routes all five kinds to `CreateSquareCollage` — a
-//! [`SQUARE_COLLAGE_SIZE`]-pixel square 2×2 tile — except the music and photo
-//! albums, whose `BaseFolderImageProvider` copies the single source image
-//! verbatim (`CreateSingleImage`). A music album with no image of its own (no
-//! `folder.jpg` beside it, no upload) takes a copy of its first track's
-//! cover, in its own art folder whatever "Save artwork into media folders"
-//! says (`FetchToFileInternal` saves with `saveLocallyWithMedia: false`).
+//! routes every kind to `CreateSquareCollage` — a [`SQUARE_COLLAGE_SIZE`]-pixel
+//! square 2×2 tile — except the music and photo albums, whose
+//! `BaseFolderImageProvider` copies the single source image verbatim
+//! (`CreateSingleImage`), and a view, which `DynamicImageProvider` draws as a
+//! 960×540 thumb collage (`CreateThumbCollage`) of one source. A music album
+//! with no image of its own (no `folder.jpg` beside it, no upload) takes a
+//! copy of its first track's cover, in its own art folder whatever "Save
+//! artwork into media folders" says (`FetchToFileInternal` saves with
+//! `saveLocallyWithMedia: false`).
 //!
 //! The source image preference is upstream's `GetStripCollageImagePaths`:
-//! Primary, then Thumb (the Backdrop-first rule is reserved for
-//! `CollectionFolder`/`UserView`).
+//! Primary, then Thumb, with a Backdrop before both for a `UserView` (and for
+//! the library tiles' `CollectionFolder`).
 //!
 //! # When an image is (re)generated
 //!
@@ -120,6 +123,7 @@ use ferrofin_model::entities::ImageType;
 use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::UserManager;
 use ferrofin_traits::options::{
     ImageCollageOptions, InternalItemsQuery, ItemImageInfo, live_tv_image_is_internal,
 };
@@ -143,6 +147,10 @@ pub const GENRE_COLLAGE_SOURCES: i32 = 4;
 /// so four source images fill it; collecting more changes nothing.
 const SQUARE_COLLAGE_TILES: usize = 4;
 
+/// The size of the thumb collage `DynamicImageProvider.CreateImage` draws for
+/// a view: `CreateThumbCollage(item, itemsWithImages, outputPath, 960, 540)`.
+const THUMB_COLLAGE_SIZE: (i32, i32) = (960, 540);
+
 /// The image file extensions `SaveImage` may have left behind for an earlier
 /// Primary of the same item; a regeneration replaces all of them.
 const ART_FILE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif"];
@@ -164,6 +172,8 @@ pub enum DynamicImageKind {
     MusicArtist,
     /// `FolderImageProvider` — a generic folder that is not a top parent.
     Folder,
+    /// `DynamicImageProvider` — a movies, TV shows or playlists view.
+    UserView,
 }
 
 impl DynamicImageKind {
@@ -206,6 +216,12 @@ impl DynamicImageKind {
             BaseItemKind::Folder | BaseItemKind::UserRootFolder | BaseItemKind::AggregateFolder => {
                 Some(Self::Folder)
             }
+            // `DynamicImageProvider.Supports`: `IsUsingCollectionStrip`.
+            BaseItemKind::UserView => matches!(
+                crate::user_view_repository::view_type_of(entity.data.as_deref()).as_deref(),
+                Some("movies" | "tvshows" | "playlists")
+            )
+            .then_some(Self::UserView),
             _ => None,
         }
     }
@@ -267,6 +283,10 @@ pub struct DynamicImageProviders {
     /// image-upload endpoint use, so an upload of another type survives and a
     /// rescan re-adopts the generated file.
     metadata_dir: DirectoryPath,
+    /// The users a view's collage is drawn for (`DynamicImageProvider` queries
+    /// the view as its `UserId`). `None` in the library scan's passes, which
+    /// draw no view.
+    users: Option<Arc<dyn UserManager>>,
 }
 
 #[async_trait::async_trait]
@@ -308,7 +328,16 @@ impl DynamicImageProviders {
             persistence,
             processor,
             metadata_dir: metadata_dir.into(),
+            users: None,
         }
+    }
+
+    /// Wires the user manager a view's collage is queried through (see the
+    /// `users` field). Called by the composition root.
+    #[must_use]
+    pub fn with_users(mut self, users: Arc<dyn UserManager>) -> Self {
+        self.users = Some(users);
+        self
     }
 
     /// A library validation's two dynamic image passes with nothing left out
@@ -664,11 +693,16 @@ impl DynamicImageProviders {
             off_runtime(|| copy_single_image(&item_dir, &stem, &sources[0]))?
         } else {
             let output = item_dir.join(format!("{stem}.png"));
+            let (width, height) = if kind == DynamicImageKind::UserView {
+                THUMB_COLLAGE_SIZE
+            } else {
+                (SQUARE_COLLAGE_SIZE, SQUARE_COLLAGE_SIZE)
+            };
             let options = ImageCollageOptions {
                 input_paths: sources,
                 output_path: output.to_string_lossy().into_owned(),
-                width: SQUARE_COLLAGE_SIZE,
-                height: SQUARE_COLLAGE_SIZE,
+                width,
+                height,
             };
             off_runtime(|| remove_other_primaries(&item_dir, &stem, &output));
             self.processor
@@ -821,7 +855,88 @@ impl DynamicImageProviders {
             }
             DynamicImageKind::MusicAlbum => self.folder_sources(item_id, true).await,
             DynamicImageKind::MusicArtist => Ok(ArtistSources::image_paths()),
+            DynamicImageKind::UserView => self.user_view_sources(item, item_id).await,
         }
+    }
+
+    /// `DynamicImageProvider.GetItemsWithImages` + `GetStripCollageImagePaths`
+    /// for a movies, TV shows or playlists view: the view's items for its
+    /// `UserId` with a Primary or a Thumb, shuffled, each drawn from its local
+    /// Backdrop, else Primary, else Thumb. The items are a movies view's movies
+    /// (`UserViewBuilder.GetMovieFolders`) and a TV shows view's series
+    /// (`GetTvView` lists series, seasons and episodes, and each season and
+    /// episode stands for its series), recursive with `CollapseBoxSetItems =
+    /// false`, and every playlist the user sees for the Playlists view
+    /// (`PlaylistsFolder.GetItemsInternal`, scoped by `AddUserToQuery`).
+    ///
+    /// The thumb collage draws one image, the first path `GetNextValidImage`
+    /// decodes, so not every item's images are read: the ids come in random
+    /// order, a window of them ([`ferrofin_db::BATCH_BIND_CHUNK`]) has its
+    /// images read in one statement, and the window's paths go to the collage,
+    /// which skips a file that is missing or does not decode. A later window
+    /// is read only when one holds no local image; upstream would also reach
+    /// it when every file of a window fails to decode.
+    ///
+    /// A view with no user (a shadow view) gets none, as upstream's query
+    /// throws in `SetUser` for it. A season or episode the user sees under a
+    /// series they cannot is never drawn, where upstream draws that hidden
+    /// series: a Jellyfin bug not ported.
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-2007): a TV
+    /// shows view samples its series alone, so a season or episode with no
+    /// series, which upstream draws itself, is never drawn. Un-defer path: a
+    /// repository filter for a view's seasons and episodes that have no series,
+    /// sampled with the series as one shuffled set.
+    async fn user_view_sources(
+        &self,
+        view: &BaseItemEntity,
+        view_id: Uuid,
+    ) -> Result<Vec<String>, ServiceError> {
+        let data = crate::item_data::parse_data(view.data.as_deref());
+        let user_id = crate::item_data::read_data_string(&data, "UserId")
+            .and_then(|id| Uuid::parse_str(&id).ok())
+            .filter(|id| !id.is_nil());
+        let (Some(users), Some(user_id)) = (&self.users, user_id) else {
+            return Ok(Vec::new());
+        };
+        let Some(user) = users.get_user_by_id(user_id).await? else {
+            return Ok(Vec::new());
+        };
+        let mut query = InternalItemsQuery {
+            user: Some(Arc::new(user)),
+            recursive: true,
+            collapse_box_set_items: Some(false),
+            image_types: vec![ImageType::Primary, ImageType::Thumb],
+            order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
+            ..InternalItemsQuery::default()
+        };
+        match crate::user_view_repository::view_type_of(view.data.as_deref()).as_deref() {
+            // Unscoped: `AddUserToQuery` spans the user's views.
+            Some("playlists") => query.include_item_types = vec![BaseItemKind::Playlist],
+            Some("movies") => {
+                query.parent_id = view_id;
+                query.include_item_types = vec![BaseItemKind::Movie];
+            }
+            Some("tvshows") => {
+                query.parent_id = view_id;
+                query.include_item_types = vec![BaseItemKind::Series];
+            }
+            _ => return Ok(Vec::new()),
+        }
+        let ids = self.items.get_item_ids(&query).await?;
+        for window in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            // No Live TV channel or programme is a movie, series or playlist,
+            // so the stored rows need no `local_images` rule.
+            let mut stored = self.items.get_image_infos_batch(window).await?;
+            let paths: Vec<String> = window
+                .iter()
+                .filter_map(|id| strip_collage_path(&stored.remove(id)?, true))
+                .collect();
+            if !paths.is_empty() {
+                return Ok(paths);
+            }
+        }
+        Ok(Vec::new())
     }
 
     /// `GenreImageProvider` / `MusicGenreImageProvider.GetItemsWithImages`:
@@ -975,14 +1090,7 @@ impl DynamicImageProviders {
 
     /// The item's local Primary path, else its local Thumb path.
     async fn primary_or_thumb_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
-        let infos = self.local_images(id).await?;
-        let pick = |kind: ImageType| {
-            infos
-                .iter()
-                .find(|i| i.image_type == kind)
-                .map(|i| i.path.clone())
-        };
-        Ok(pick(ImageType::Primary).or_else(|| pick(ImageType::Thumb)))
+        Ok(strip_collage_path(&self.local_images(id).await?, false))
     }
 
     /// The item's images a collage may draw: `IsLocalFile`, and for a Live TV
@@ -1020,6 +1128,24 @@ impl DynamicImageProviders {
             .iter()
             .any(|i| i.image_type == ImageType::Primary))
     }
+}
+
+/// `GetStripCollageImagePaths` for one item's `images`: its first Backdrop
+/// when `backdrop_first` (a `UserView`'s collage), else its first Primary,
+/// else its first Thumb, each only while it is a local file.
+fn strip_collage_path(images: &[ItemImageInfo], backdrop_first: bool) -> Option<String> {
+    let pick = |kind: ImageType| {
+        images
+            .iter()
+            .find(|i| i.image_type == kind)
+            .filter(|i| i.is_local_file())
+            .map(|i| i.path.clone())
+    };
+    backdrop_first
+        .then(|| pick(ImageType::Backdrop))
+        .flatten()
+        .or_else(|| pick(ImageType::Primary))
+        .or_else(|| pick(ImageType::Thumb))
 }
 
 /// Every row of `kind`, for a dynamic image pass.
@@ -1307,6 +1433,216 @@ mod tests {
                 .into_iter()
                 .find(|i| i.image_type == ImageType::Primary)
         }
+    }
+
+    /// `DynamicImageProvider.Supports` (`IsUsingCollectionStrip`): a movies, TV
+    /// shows or playlists view, its `ViewType` bound by name or by number; no
+    /// other view.
+    #[test]
+    fn only_a_movies_tv_or_playlists_view_has_the_view_provider() {
+        let view = |data: &str| BaseItemEntity {
+            type_: stored_type_name(BaseItemKind::UserView)
+                .expect("type name")
+                .to_owned(),
+            data: Some(data.to_owned()),
+            ..Default::default()
+        };
+        for (data, supported) in [
+            (r#"{"ViewType":"movies"}"#, true),
+            (r#"{"ViewType":"tvshows"}"#, true),
+            (r#"{"ViewType":"playlists"}"#, true),
+            (r#"{"ViewType":11}"#, true),
+            (r#"{"ViewType":"folders"}"#, false),
+            (r#"{"ViewType":"livetv"}"#, false),
+            (r#"{"ViewType":"music"}"#, false),
+            (r#"{"ViewType":"boxsets"}"#, false),
+            ("{}", false),
+        ] {
+            assert_eq!(
+                DynamicImageKind::for_entity(&view(data)),
+                supported.then_some(DynamicImageKind::UserView),
+                "{data}"
+            );
+        }
+    }
+
+    /// A view is drawn as its `UserId` sees it, so a shadow view, which has
+    /// none, gets no image (upstream's query throws in `SetUser`), where the
+    /// same view of the same library for a user gets a 960×540 thumb collage.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_view_without_a_user_gets_no_collage() {
+        let mut fx = fixture().await;
+        fx.providers.users = Some(Arc::new(crate::user_manager::FerrofinUserManager::new(
+            fx.db.clone(),
+        )));
+        let user = Uuid::new_v4();
+        crate::test_support::seed_user_with_defaults(&fx.db, user).await;
+        let (library, movie) = (Uuid::new_v4(), Uuid::new_v4());
+        crate::test_support::seed_named_item(
+            &fx.db,
+            library,
+            BaseItemKind::CollectionFolder,
+            "Films",
+        )
+        .await;
+        crate::test_support::seed_top_parented_item(
+            &fx.db,
+            movie,
+            BaseItemKind::Movie,
+            "Heat",
+            library,
+        )
+        .await;
+        let poster = write_png(&fx.media_dir(), "heat.png", [9, 9, 9]);
+        seed_images(
+            &fx.db,
+            movie,
+            &[image_info(ImageType::Primary, &poster, None)],
+        )
+        .await;
+        let view = |data: serde_json::Value| BaseItemEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            type_: stored_type_name(BaseItemKind::UserView)
+                .expect("type name")
+                .to_owned(),
+            name: Some("Films".to_owned()),
+            data: Some(data.to_string()),
+            ..Default::default()
+        };
+        let shadow = view(serde_json::json!({"ViewType": "movies", "DisplayParentId": library}));
+        let users = view(serde_json::json!({
+            "ViewType": "movies",
+            "DisplayParentId": library,
+            "UserId": user,
+        }));
+        fx.persistence
+            .save_items(&[shadow.clone(), users.clone()])
+            .await
+            .expect("views");
+
+        assert_eq!(
+            fx.providers
+                .refresh_item(&shadow, true)
+                .await
+                .expect("shadow"),
+            ItemUpdateType::None
+        );
+        assert_eq!(
+            fx.providers
+                .refresh_item(&users, true)
+                .await
+                .expect("user's"),
+            ItemUpdateType::ImageUpdate
+        );
+        let id = |row: &BaseItemEntity| Uuid::parse_str(&row.id).expect("id");
+        assert!(fx.primary_of(id(&shadow)).await.is_none());
+        let primary = fx.primary_of(id(&users)).await.expect("drawn");
+        assert_eq!((primary.width, primary.height), (960, 540));
+    }
+
+    /// `DynamicImageProvider.GetItemsWithImages` for a user's movies view: only
+    /// a movie the view lists that has a Primary or a Thumb is a source, so a
+    /// view whose movies have only a Backdrop, or whose only poster is in
+    /// another library, gets nothing. Among the sources, a file that is gone or
+    /// does not decode is passed over (`GetNextValidImage`), and the collage is
+    /// the next one's Backdrop, darkened by the strip's shadow.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_view_draws_the_next_decodable_image_of_a_movie_it_lists() {
+        let mut fx = fixture().await;
+        fx.providers.users = Some(Arc::new(crate::user_manager::FerrofinUserManager::new(
+            fx.db.clone(),
+        )));
+        let user = Uuid::new_v4();
+        crate::test_support::seed_user_with_defaults(&fx.db, user).await;
+        let (films, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let media = fx.media_dir();
+        let movie = |library: Uuid, images: Vec<ItemImageInfo>| {
+            let db = fx.db.clone();
+            async move {
+                let id = Uuid::new_v4();
+                crate::test_support::seed_top_parented_item(
+                    &db,
+                    id,
+                    BaseItemKind::Movie,
+                    "Movie",
+                    library,
+                )
+                .await;
+                seed_images(&db, id, &images).await;
+            }
+        };
+        for library in [films, other] {
+            crate::test_support::seed_named_item(
+                &fx.db,
+                library,
+                BaseItemKind::CollectionFolder,
+                "Library",
+            )
+            .await;
+        }
+        let red = write_png(&media, "red.png", [200, 0, 0]);
+        let green = write_png(&media, "green.png", [0, 200, 0]);
+        movie(films, vec![image_info(ImageType::Backdrop, &green, None)]).await;
+        movie(other, vec![image_info(ImageType::Primary, &green, None)]).await;
+        let view = BaseItemEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            type_: stored_type_name(BaseItemKind::UserView)
+                .expect("type name")
+                .to_owned(),
+            data: Some(
+                serde_json::json!({"ViewType": "movies", "DisplayParentId": films, "UserId": user})
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        fx.persistence
+            .save_items(std::slice::from_ref(&view))
+            .await
+            .expect("view");
+        let refresh = || fx.providers.refresh_item(&view, true);
+
+        assert_eq!(refresh().await.expect("refresh"), ItemUpdateType::None);
+
+        let garbage = media.join("garbage.png");
+        std::fs::write(&garbage, b"not an image").expect("garbage");
+        let gone = media.join("gone.png");
+        movie(
+            films,
+            vec![image_info(
+                ImageType::Primary,
+                &gone.to_string_lossy(),
+                None,
+            )],
+        )
+        .await;
+        movie(
+            films,
+            vec![image_info(
+                ImageType::Thumb,
+                &garbage.to_string_lossy(),
+                None,
+            )],
+        )
+        .await;
+        movie(
+            films,
+            vec![
+                image_info(ImageType::Primary, &green, None),
+                image_info(ImageType::Backdrop, &red, None),
+            ],
+        )
+        .await;
+        assert_eq!(
+            refresh().await.expect("refresh"),
+            ItemUpdateType::ImageUpdate
+        );
+        let primary = fx
+            .primary_of(Uuid::parse_str(&view.id).expect("id"))
+            .await
+            .expect("drawn");
+        let drawn = image::open(&primary.path).expect("decode").to_rgb8();
+        assert_eq!(drawn.dimensions(), (960, 540));
+        assert_eq!(drawn.get_pixel(480, 270).0, [106, 0, 0], "the red backdrop");
     }
 
     /// A genre with two movie posters gets a 600×600 Primary written into its
@@ -1809,8 +2145,8 @@ mod tests {
     /// `IsTopParent`'s `livetv` test reads `IHasCollectionType.CollectionType`,
     /// never a stray `CollectionType` member on a plain folder, which is no
     /// `IHasCollectionType`. [`DynamicImageKind::for_entity`] routes only the
-    /// plain folder kinds here; the user-view case pins the kind-aware read
-    /// (its bound `ViewType`, a number included) for a kind it may add.
+    /// plain folder kinds here, a view to its own provider; the user-view case
+    /// pins the kind-aware read (its bound `ViewType`, a number included).
     #[tokio::test]
     async fn the_live_tv_top_parent_test_reads_the_collection_type_of_the_kind() {
         let fx = fixture().await;

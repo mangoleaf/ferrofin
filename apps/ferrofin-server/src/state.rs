@@ -1546,6 +1546,17 @@ pub async fn build_app_state(
     // Held weakly by the repository and the count service: the evaluator owns
     // the repository. `set` fails only if already set, which nothing else does.
     let _ = scope_visibility.set(Arc::downgrade(&item_visibility));
+    // The dynamic image providers an item refresh runs: a genre's, playlist's
+    // or folder's generated Primary, and a user's view's collage.
+    let generated_images: Arc<dyn ferrofin_traits::providers::GeneratedImageProvider> = Arc::new(
+        ferrofin_core::dynamic_images::DynamicImageProviders::new(
+            Arc::clone(&item_repository),
+            Arc::clone(&item_persistence_service),
+            Arc::clone(&image_processor),
+            metadata_library.clone(),
+        )
+        .with_users(Arc::clone(&users)),
+    );
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
@@ -1587,14 +1598,7 @@ pub async fn build_app_state(
             .with_rating_scorer(Arc::clone(&item_visibility) as _)
             // A genre's, music genre's or playlist's refresh redraws its
             // generated Primary, as the scan's closing pass draws it.
-            .with_generated_images(Arc::new(
-                ferrofin_core::dynamic_images::DynamicImageProviders::new(
-                    Arc::clone(&item_repository),
-                    Arc::clone(&item_persistence_service),
-                    Arc::clone(&image_processor),
-                    metadata_library.clone(),
-                ),
-            ))
+            .with_generated_images(Arc::clone(&generated_images))
             // The SERVER-WIDE per-item-type MetadataOptions. Identify's
             // provider ordering falls back to this array's
             // `MetadataFetcherOrder` for a kind whose library saved no
@@ -1663,6 +1667,8 @@ pub async fn build_app_state(
             // folders, memoized by the store.
             .with_user_root(user_root_store.clone())
             .with_metadata_path(metadata_root.clone())
+            // A view's refresh draws its collage (`DynamicImageProvider`).
+            .with_generated_images(Arc::clone(&generated_images))
             .with_id_derivation(id_derivation.clone())
             .with_virtual_folders(Arc::clone(&virtual_folders))
             // 12.2 lists a playlists/boxsets view only when the user can see
