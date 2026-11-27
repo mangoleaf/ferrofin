@@ -555,6 +555,17 @@ fn set_provider_ids_keeps_only_the_valid_pairs_given() {
     assert!(found.is_empty(), "{found:?}");
 }
 
+/// `instance.ProviderIds` is a `StringComparer.OrdinalIgnoreCase`
+/// dictionary, which folds case beyond ASCII: two spellings of one name
+/// are one id, the first spelling kept and the later value taken.
+#[test]
+fn set_provider_ids_folds_names_ordinal_ignore_case() {
+    assert_eq!(
+        set_provider_ids([("Ärzte", "1"), ("äRZTE", "2")]),
+        ids(&[("Ärzte", "2")])
+    );
+}
+
 /// `ProviderIdsExtensionsTests.IsValidProviderId_ChecksKnownFormats`
 /// (`null` is the empty string here).
 #[rstest]

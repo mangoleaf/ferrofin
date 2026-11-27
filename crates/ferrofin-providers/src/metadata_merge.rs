@@ -38,7 +38,7 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::MetadataField;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
-use ferrofin_util::string_extensions::zero_padded;
+use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, zero_padded};
 use serde_json::{Map, Value};
 
 /// A `Data` column value's JSON object; `NULL`, empty and malformed payloads
@@ -1200,8 +1200,8 @@ pub fn merge_provider_ids(
 /// be read back from the database), is dropped; name and value are trimmed;
 /// an id that cannot belong to its provider ([`is_valid_provider_id`]) is
 /// dropped; a known provider's name takes its canonical spelling
-/// (`MetadataProvider`); a later pair for the same name (ignoring case)
-/// replaces an earlier one.
+/// (`MetadataProvider`); a later pair for the same name replaces an earlier
+/// one's value. Names compare as the `OrdinalIgnoreCase` dictionaries do.
 #[must_use]
 pub fn set_provider_ids<'a>(
     ids: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -1218,9 +1218,12 @@ pub fn set_provider_ids<'a>(
         let name = ferrofin_model::entities_media::MetadataProvider::all()
             .iter()
             .map(|p| p.as_name())
-            .find(|known| known.eq_ignore_ascii_case(name))
+            .find(|known| equals_ordinal_ignore_case(known, name))
             .unwrap_or(name);
-        match out.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+        match out
+            .iter_mut()
+            .find(|(k, _)| equals_ordinal_ignore_case(k, name))
+        {
             Some(existing) => value.clone_into(&mut existing.1),
             None => out.push((name.to_owned(), value.to_owned())),
         }
