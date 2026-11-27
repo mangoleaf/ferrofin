@@ -995,7 +995,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// channel item in the item tree (its parent, top parent and ancestors), which
 /// the recursive queries and folder filters read. `music-artwork` is what a
 /// library scan stores as a music album's and a track's Primary, which the
-/// item and image operations serve.
+/// item and image operations serve. `route-matching` is which request paths
+/// find a route when one holds an empty segment, which every operation shares.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -1022,6 +1023,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "guide-programme-items",
     "guide-channel-items",
     "music-artwork",
+    "route-matching",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1049,6 +1051,34 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "route-matching",
+        upstream_file: "Jellyfin.Server/Startup.cs",
+        upstream_method: "Configure",
+        ferrofin: "Which request paths find a route, for a path with an empty segment \
+                   (gl-1675). routes.rs segments reads a path as ASP.NET Core 10's \
+                   FastPathTokenizer, which Configure's UseRouting reaches through the \
+                   DfaMatcher: each / after the leading one starts a segment, an empty one \
+                   included, and a single trailing / adds none. fits matches no literal and \
+                   no parameter to an empty segment, as the DFA's jump tables send one to \
+                   the exit state, so canonicalize_path passes such a path on as sent and \
+                   axum finds no route; refuse_empty_route_values, a route layer on the API \
+                   router, answers 404 where axum bound a parameter followed by / to an \
+                   empty value. Either 404 has an empty body and passes through the API \
+                   router's layers, as an unmatched path's does. Measured on Jellyfin 12.4: a leading //, one inside \
+                   the path, at a literal or a parameter, and a doubled trailing / are 404 \
+                   on every routed path, a single trailing / matches, and the static web \
+                   files (UseStaticFiles, before UseRouting) are not routed.",
+        date: "2026-11-26",
+        divergences: &[
+            "The tail of Ferrofin's own catch-all, /Plugins/{pluginId}/web/{*path}, is the \
+             WASM plugin's to read, empty segments included; Jellyfin has no such route.",
+            "A 404 refuse_empty_route_values answers is counted on /metrics and traced under \
+             the route axum matched, where Jellyfin's request matched no endpoint and has an \
+             empty controller, action and endpoint; refusing it before the match would take \
+             a second walk of the route table on every request.",
+        ],
+    },
     VerifiedSubsystem {
         key: "guide-programme-items",
         upstream_file: "src/Jellyfin.LiveTv/Guide/GuideManager.cs",
