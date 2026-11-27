@@ -982,11 +982,14 @@ async fn reset_tuner(
 /// fetch before it notices.
 fn queue_guide_refresh(manager: &std::sync::Arc<dyn ferrofin_traits::stubs::LiveTvManager>) {
     let manager = std::sync::Arc::clone(manager);
-    tokio::spawn(async move {
-        if let Err(error) = manager.refresh_guide().await {
-            tracing::warn!(%error, "live tv: queued guide refresh failed");
-        }
-    });
+    tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            if let Err(error) = manager.refresh_guide().await {
+                tracing::warn!(%error, "live tv: queued guide refresh failed");
+            }
+        },
+        tracing::info_span!(parent: None, "guide_refresh", trigger = "api"),
+    ));
 }
 
 /// Returns the wired Live TV manager, or `501` when Live TV is not configured in
@@ -3012,6 +3015,8 @@ mod tests {
         /// M3U/XMLTV source. A handler that awaited the refresh instead of
         /// queuing it could not answer at all.
         hang_refresh: bool,
+        /// The span each refresh ran in, by name.
+        refresh_spans: std::sync::Mutex<Vec<Option<&'static str>>>,
         /// The tuner-host types the manager reports, so a test can prove the
         /// handler *projects the manager's list* rather than a literal.
         tuner_host_types: Vec<NameIdPair>,
@@ -3218,6 +3223,11 @@ mod tests {
         async fn refresh_guide(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
             self.refreshes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.refresh_spans.lock().unwrap().push(
+                tracing::Span::current()
+                    .metadata()
+                    .map(tracing::Metadata::name),
+            );
             self.refresh_started.notify_one();
             if self.hang_refresh {
                 std::future::pending::<()>().await;
@@ -3398,6 +3408,23 @@ mod tests {
             1,
             "exactly one refresh per configuration write"
         );
+    }
+
+    /// A queued refresh runs in a `guide_refresh` span of its own, not in the
+    /// request's (LOGGING.md, rule 4).
+    #[tokio::test]
+    async fn a_queued_guide_refresh_runs_in_a_span_of_its_own() {
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let fake = std::sync::Arc::new(FakeLiveTv::default());
+        let manager: std::sync::Arc<dyn ferrofin_traits::stubs::LiveTvManager> = fake.clone();
+        tracing::info_span!("request").in_scope(|| queue_guide_refresh(&manager));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fake.refresh_started.notified(),
+        )
+        .await
+        .expect("the refresh started");
+        assert_eq!(*fake.refresh_spans.lock().unwrap(), [Some("guide_refresh")]);
     }
 
     /// `TunerHostManager.DeleteTunerHost` queues the guide refresh whose

@@ -2088,13 +2088,21 @@ pub async fn build_app_state(
     let changing_network = Arc::clone(&network);
     if let Some(mut rx) = fs_events {
         let monitor = Arc::clone(&library_monitor);
-        background.push(tokio::spawn(async move {
-            while let Some(path) = rx.recv().await {
-                if let Err(err) = monitor.report_file_system_changed(&path).await {
-                    tracing::warn!(%err, path, "failed to report filesystem change");
+        background.push(tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                while let Some(path) = rx.recv().await {
+                    if let Err(err) = monitor.report_file_system_changed(&path).await {
+                        tracing::warn!(%err, path, "failed to report filesystem change");
+                    }
                 }
-            }
-        }));
+            },
+            tracing::info_span!(
+                parent: None,
+                "file_system_events",
+                task = "library_monitor",
+                trigger = "watcher"
+            ),
+        )));
     }
     // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
     // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
@@ -2659,9 +2667,10 @@ pub async fn build_app_state(
         // (no channel-plugin mechanism, see `docs/EXTENSIONS.md`), so the task
         // reports itself hidden just like a Jellyfin with no channel plugin.
         task_manager.register(Arc::new(
-            ferrofin_core::scheduled_tasks::channels::RefreshChannelsTask::new(Arc::new(
-                ferrofin_core::FerrofinChannelManager::new(),
-            ))
+            ferrofin_core::scheduled_tasks::channels::RefreshChannelsTask::new(
+                Arc::new(ferrofin_core::FerrofinChannelManager::new()),
+                Arc::clone(&library),
+            )
             .await,
         ));
     }
@@ -2875,7 +2884,10 @@ pub async fn build_app_state(
                 Arc::new(move |payload: &str| {
                     let sessions = Arc::clone(&sessions);
                     let payload = payload.to_owned();
-                    tokio::spawn(async move {
+                    // In the publisher's span (a scan, a task run, a request):
+                    // the push is the tail of its work, and a root per event
+                    // would be a trace per progress report.
+                    tokio::spawn(tracing::Instrument::in_current_span(async move {
                         let result = if admin_only {
                             sessions
                                 .send_message_to_admin_sessions(message_type, &payload)
@@ -2888,7 +2900,7 @@ pub async fn build_app_state(
                         if let Err(err) = result {
                             tracing::debug!(%err, ?message_type, "failed to push event to sessions");
                         }
-                    });
+                    }));
                     // A client push is best-effort and must never hold up the
                     // publisher (a scan publishes RefreshProgress repeatedly),
                     // so this one stays spawned.
@@ -3389,6 +3401,7 @@ pub async fn build_app_state(
                     user_id: session.user_id,
                     user_name: session.user_name,
                 };
+                // Inline, so it runs in the publisher's span.
                 sync_play.session_ended(&member);
                 ferrofin_core::event_manager::consumer_done()
             }),
@@ -3694,9 +3707,9 @@ fn subscribe_intro_skipper(
                     ids(&info.items_updated),
                     ids(&info.items_removed),
                 );
-                tokio::spawn(async move {
+                tokio::spawn(tracing::Instrument::in_current_span(async move {
                     analysis.items_changed(&added, &updated, &removed).await;
-                });
+                }));
             }
             ferrofin_core::event_manager::consumer_done()
         }),
@@ -3714,9 +3727,9 @@ fn subscribe_intro_skipper(
                 let completed =
                     result.status == ferrofin_model::tasks::TaskCompletionStatus::Completed;
                 let key = result.key.unwrap_or_default();
-                tokio::spawn(async move {
+                tokio::spawn(tracing::Instrument::in_current_span(async move {
                     analysis.task_completed(&key, completed).await;
-                });
+                }));
             }
             ferrofin_core::event_manager::consumer_done()
         }),
@@ -3740,9 +3753,9 @@ fn subscribe_intro_skipper(
             }
             if let Some(id) = id {
                 let analysis = Arc::clone(&settings);
-                tokio::spawn(async move {
+                tokio::spawn(tracing::Instrument::in_current_span(async move {
                     analysis.plugin_configuration_changed(id).await;
-                });
+                }));
             }
             ferrofin_core::event_manager::consumer_done()
         }),

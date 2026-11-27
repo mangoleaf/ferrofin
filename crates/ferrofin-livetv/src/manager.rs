@@ -1560,7 +1560,7 @@ impl FerrofinLiveTvManager {
                     failed += 1;
                 }
                 let providers = Arc::clone(&images.providers);
-                downloads.spawn(async move {
+                downloads.spawn(tracing::Instrument::in_current_span(async move {
                     providers
                         .cached_remote_image(&path)
                         .await
@@ -1568,7 +1568,7 @@ impl FerrofinLiveTvManager {
                             tracing::debug!(%error, "live tv: could not pre-cache a programme image");
                         })
                         .is_ok()
-                });
+                }));
             }
         }
         while let Some(done) = downloads.join_next().await {
@@ -5106,8 +5106,8 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // that hangs up must not stop a pass between adding a library and
         // saving that it did, which would leave the library unrecorded.
         let manager = self.clone();
-        // The caller's own span, or a root of its own for the two that have
-        // none: a save's worker and a queued guide refresh.
+        // The caller's own span, or a root of its own for a caller that has
+        // none, such as a save's worker.
         let span = match tracing::Span::current() {
             current if current.is_none() => {
                 tracing::info_span!(parent: None, "recording_folders", trigger = "api")
@@ -6615,7 +6615,15 @@ impl FerrofinLiveTvManager {
         // `cancel_recording`'s job (C# `RecordingsManager.CancelRecording`);
         // this only stops one that has not started.
         let manager = self.clone();
-        tokio::spawn(async move {
+        // A root of its own, whoever armed it: the capture it runs logs under
+        // the timer's id.
+        let span = tracing::info_span!(
+            parent: None,
+            "dvr_recording",
+            timer_id = %id,
+            trigger = "schedule"
+        );
+        let fire = async move {
             if !delay.is_zero() {
                 // A shutdown wakes the wait, so a timer due in days does not
                 // keep this lifetime's manager alive until then (gl-141).
@@ -6642,7 +6650,8 @@ impl FerrofinLiveTvManager {
                 armed.remove(&id);
             }
             manager.on_timer_fired(id).await;
-        });
+        };
+        tokio::spawn(tracing::Instrument::instrument(fire, span));
     }
 
     /// Cancels the pending fire of one timer (C# `TimerManager.StopTimer`).
@@ -18567,6 +18576,41 @@ mod tests {
         .await
         .expect("test timed out");
         drop(guard);
+    }
+
+    /// A fire, and the capture it runs, log in a `dvr_recording` root span
+    /// naming the timer and the trigger, even when the timer was armed inside
+    /// a request (LOGGING.md, rules 3 and 4).
+    #[tokio::test]
+    async fn a_fire_logs_in_a_root_span_naming_its_timer() {
+        use std::time::Duration;
+        let mgr = tokio::time::timeout(Duration::from_secs(60), manager_with_closed_pool())
+            .await
+            .expect("setup timed out");
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        tracing::info_span!("request")
+            .in_scope(|| mgr.schedule_fire("spanned".to_owned(), Duration::ZERO));
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while fires_of(&logs, "spanned") == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the timer never fired");
+        drop(guard);
+        let lines = logs.lines_at("DEBUG", "fired after its server stopped");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(r#" dvr_recording{timer_id=spanned trigger="schedule"}: "#),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains("request"),
+            "not the request's child: {}",
+            lines[0]
+        );
     }
 
     /// A scheduled read retry really fires through its task, once,

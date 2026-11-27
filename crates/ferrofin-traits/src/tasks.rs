@@ -113,9 +113,10 @@ pub trait TaskManager: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`ServiceError::NotFound`] when no task has that id;
-    /// [`ServiceError::InvalidInput`] when it is already running; or whatever
-    /// error the task body itself returns.
+    /// [`ServiceError::NotFound`] when no task has that id, or
+    /// [`ServiceError::Unavailable`] when the server is shutting down. A task
+    /// already running or stopping keeps its run and the call succeeds, as
+    /// upstream's `Execute` starts a run that throws out of sight.
     async fn start_task(&self, task_id: &str) -> Result<(), ServiceError>;
 
     /// Cancels a running task.
@@ -155,7 +156,11 @@ pub trait TaskManager: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`ServiceError::NotFound`] when no task has that id.
+    /// [`ServiceError::NotFound`] when no task has that id;
+    /// [`ServiceError::InvalidInput`] when a trigger is one upstream's
+    /// `GetTrigger` cannot build (an unnamed type or weekday, or a type
+    /// without the time, weekday or interval it needs), and nothing is saved;
+    /// or the error of a failed save.
     async fn update_triggers(
         &self,
         task_id: &str,

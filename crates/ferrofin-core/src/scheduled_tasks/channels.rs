@@ -11,9 +11,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::tasks::TaskTriggerInfo;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::LibraryManager;
+use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery};
 use ferrofin_traits::stubs::ChannelManager;
+use uuid::Uuid;
 
 use super::{ScheduledTask, TaskProgress, interval_hours};
 
@@ -33,15 +37,23 @@ const CHANNELS: &str = "TasksChannelsCategory";
 /// empty — note the `/Channels` HTTP surface does not go through that stub at
 /// all, it returns empty results directly, so "no channels exist" is true on
 /// both paths for the same reason. The run records the set's size for the
-/// hidden rule and — with nothing in it — finishes. There is no per-channel
-/// refresh entry point to call and this task does not pretend otherwise; what
-/// is missing is the channel backend itself, not a call site.
+/// hidden rule. There is no per-channel refresh entry point to call and this
+/// task does not pretend otherwise; what is missing is the channel backend
+/// itself, not a call site.
+///
+/// The run then cleans the database as upstream's `ChannelPostScanTask` does:
+/// every stored `Channel` item that is not one of the set, with every item of
+/// it, is deleted with its metadata folders, its media files left alone. With
+/// the set empty that is every stored channel, such as those an adopted
+/// Jellyfin database kept from a channel plugin.
 ///
 /// Like upstream (`IsHidden => Channels.Length == 0`) the task hides itself
 /// while that set is empty, which is what the Jellyfin oracle reports too, so
 /// the dashboard matches.
 pub struct RefreshChannelsTask {
     channels: Arc<dyn ChannelManager>,
+    /// Lists and deletes the stored channels no channel backend has.
+    library: Arc<dyn LibraryManager>,
     /// The channel count seen by the last run, backing the sync
     /// [`is_hidden`](ScheduledTask::is_hidden) rule (upstream reads
     /// `ChannelManager.Channels.Length`, a plain field; the seam here is
@@ -57,7 +69,7 @@ impl RefreshChannelsTask {
     ///
     /// A failed read leaves the count at zero — the task hides rather than
     /// advertising channels it could not confirm.
-    pub async fn new(channels: Arc<dyn ChannelManager>) -> Self {
+    pub async fn new(channels: Arc<dyn ChannelManager>, library: Arc<dyn LibraryManager>) -> Self {
         let count = match channels.get_channel_features(None).await {
             Ok(features) => features.len(),
             Err(e) => {
@@ -67,8 +79,39 @@ impl RefreshChannelsTask {
         };
         Self {
             channels,
+            library,
             channel_count: AtomicUsize::new(count),
         }
+    }
+
+    /// `ChannelPostScanTask.CleanChannel`: deletes every item of `channel`,
+    /// then the channel, leaving their files. `false` when the run was stopped
+    /// before it finished.
+    async fn clean_channel(
+        &self,
+        channel: Uuid,
+        progress: &TaskProgress,
+    ) -> Result<bool, ServiceError> {
+        tracing::info!(item_id = %channel, "cleaning channel from database");
+        let items = self
+            .library
+            .get_item_ids(&InternalItemsQuery {
+                channel_ids: vec![channel],
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let keep_files = DeleteOptions {
+            delete_file_location: false,
+            ..DeleteOptions::default()
+        };
+        for item in items {
+            if progress.stop_requested() {
+                return Ok(false);
+            }
+            self.library.delete_item(item, &keep_files).await?;
+        }
+        self.library.delete_item(channel, &keep_files).await?;
+        Ok(true)
     }
 }
 
@@ -112,11 +155,30 @@ impl ScheduledTask for RefreshChannelsTask {
             // Unreachable while Ferrofin registers no channel backends. If one
             // ever appears, this is where the refresh has to be implemented —
             // saying so is more use than a loop that walks the set and calls
-            // nothing.
+            // nothing. That refresh checks the stop token before each channel,
+            // as upstream's `RefreshChannels` does; with none registered today
+            // there is nothing to stop.
             tracing::warn!(
                 channels = channels.len(),
                 "channels are registered but Ferrofin has no channel refresh backend"
             );
+        }
+        // `ChannelPostScanTask.CleanDatabase` (gl-2017): the stored channels
+        // no installed channel is, each checked for a stop first.
+        let uninstalled = self
+            .library
+            .get_item_ids(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Channel],
+                exclude_item_ids: channels.iter().map(|channel| channel.id).collect(),
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        // A nil id would list every item of no channel (the nil `ChannelId`
+        // ordinary rows store): a corrupt row upstream's MD5 ids never make.
+        for channel in uninstalled.into_iter().filter(|id| !id.is_nil()) {
+            if progress.stop_requested() || !self.clean_channel(channel, progress).await? {
+                return Ok(());
+            }
         }
         progress.report(100.0);
         Ok(())
@@ -188,7 +250,9 @@ mod tests {
     }
 
     async fn task(channels: Vec<ChannelFeatures>) -> RefreshChannelsTask {
-        RefreshChannelsTask::new(Arc::new(FakeChannels(channels))).await
+        let library =
+            crate::test_support::library_manager_over(crate::test_support::test_db().await);
+        RefreshChannelsTask::new(Arc::new(FakeChannels(channels)), library).await
     }
 
     #[tokio::test]
@@ -268,11 +332,133 @@ mod tests {
         assert!((progress.current() - 100.0).abs() < f64::EPSILON);
     }
 
+    /// `ChannelPostScanTask.CleanDatabase` (gl-2017): a stored channel no
+    /// backend has is deleted with its items, files left alone; a channel the
+    /// set has, and an item of no channel, stay.
+    #[tokio::test]
+    async fn a_run_deletes_the_stored_channels_no_backend_has() {
+        use crate::test_support::{seed_channel, seed_channel_item, seed_item, test_db};
+        use ferrofin_model::data::BaseItemKind;
+
+        let db = test_db().await;
+        let (gone, kept) = (Uuid::from_u128(0xC1), Uuid::from_u128(0xC2));
+        let (gone_item, gone_second, kept_item, movie) = (
+            Uuid::from_u128(0xC11),
+            Uuid::from_u128(0xC12),
+            Uuid::from_u128(0xC21),
+            Uuid::from_u128(0xF1),
+        );
+        let (tuner_channel, programme) = (Uuid::from_u128(0x71), Uuid::from_u128(0x711));
+        // A corrupt channel row with the nil id is never cleaned: it would
+        // list every item of no channel.
+        seed_item(&db, Uuid::nil(), BaseItemKind::Channel).await;
+        // As upstream stores a channel: its own id as its `ChannelId`, so it
+        // is among its own items, and deleting it first is harmless.
+        seed_channel(&db, gone).await;
+        seed_channel(&db, kept).await;
+        seed_channel_item(&db, gone_item, BaseItemKind::Folder, gone).await;
+        seed_channel_item(&db, gone_second, BaseItemKind::Video, gone).await;
+        seed_channel_item(&db, kept_item, BaseItemKind::Video, kept).await;
+        // Stored as an ordinary row is: a nil `ChannelId`, not NULL.
+        seed_channel_item(&db, movie, BaseItemKind::Movie, Uuid::nil()).await;
+        // Live TV rows carry their tuner channel's id in `ChannelId` too.
+        seed_item(&db, tuner_channel, BaseItemKind::LiveTvChannel).await;
+        seed_channel_item(&db, programme, BaseItemKind::LiveTvProgram, tuner_channel).await;
+
+        let library = crate::test_support::library_manager_over(db.clone());
+        let task = RefreshChannelsTask::new(
+            Arc::new(FakeChannels(vec![ChannelFeatures {
+                id: kept,
+                ..ChannelFeatures::default()
+            }])),
+            library.clone(),
+        )
+        .await;
+
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("run");
+
+        for (id, stays) in [
+            (gone, false),
+            (gone_item, false),
+            (gone_second, false),
+            (kept, true),
+            (kept_item, true),
+            (movie, true),
+            (tuner_channel, true),
+            (programme, true),
+        ] {
+            assert_eq!(
+                library.get_item_by_id(id).await.expect("read").is_some(),
+                stays,
+                "{id}"
+            );
+        }
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
+    }
+
+    /// A stop before a channel is cleaned leaves it, and the run is Cancelled
+    /// (`ThrowIfCancellationRequested` before each channel). The channel has
+    /// no items, so only the check before each channel can keep it.
+    #[tokio::test]
+    async fn a_stopped_run_deletes_no_channel() {
+        use crate::test_support::{seed_channel, test_db};
+
+        let db = test_db().await;
+        let channel = Uuid::from_u128(0xC1);
+        seed_channel(&db, channel).await;
+        let library = crate::test_support::library_manager_over(db.clone());
+        let task =
+            RefreshChannelsTask::new(Arc::new(FakeChannels(Vec::new())), library.clone()).await;
+
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+
+        let kept = library.get_item_by_id(channel).await.expect("read");
+        assert!(kept.is_some(), "the channel stays");
+        assert!(progress.was_stopped(), "recorded Cancelled");
+    }
+
+    /// The check before each item (`ThrowIfCancellationRequested` in
+    /// `CleanChannel`): a stopped run deletes none of a channel's items, nor
+    /// the channel.
+    #[tokio::test]
+    async fn a_stop_inside_a_channel_deletes_none_of_its_items() {
+        use crate::test_support::{seed_channel, seed_channel_item, test_db};
+        use ferrofin_model::data::BaseItemKind;
+
+        let db = test_db().await;
+        let (channel, first, second) = (
+            Uuid::from_u128(0xC1),
+            Uuid::from_u128(0xC11),
+            Uuid::from_u128(0xC12),
+        );
+        seed_channel(&db, channel).await;
+        seed_channel_item(&db, first, BaseItemKind::Video, channel).await;
+        seed_channel_item(&db, second, BaseItemKind::Video, channel).await;
+        let library = crate::test_support::library_manager_over(db.clone());
+        let task =
+            RefreshChannelsTask::new(Arc::new(FakeChannels(Vec::new())), library.clone()).await;
+
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        let finished = task.clean_channel(channel, &progress).await.expect("clean");
+
+        assert!(!finished, "stopped");
+        for id in [channel, first, second] {
+            let kept = library.get_item_by_id(id).await.expect("read");
+            assert!(kept.is_some(), "{id}");
+        }
+    }
+
     #[tokio::test]
     async fn a_failed_read_hides_the_task_and_fails_the_run() {
         // Constructing over a broken seam must not advertise channels it could
         // not confirm…
-        let task = RefreshChannelsTask::new(Arc::new(BrokenChannels)).await;
+        let library =
+            crate::test_support::library_manager_over(crate::test_support::test_db().await);
+        let task = RefreshChannelsTask::new(Arc::new(BrokenChannels), library).await;
         assert!(task.is_hidden());
         // …and the run itself surfaces the error rather than reporting success.
         let progress = TaskProgress::default();

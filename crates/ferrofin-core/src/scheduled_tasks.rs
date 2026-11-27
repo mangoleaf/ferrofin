@@ -76,7 +76,9 @@ const SHUTDOWN_RUN_WAIT: Duration = Duration::from_secs(2);
 /// upstream's shutdown wait ([`SHUTDOWN_RUN_WAIT`]); whether it becomes a
 /// setting is the owner's call (gl-1710). Fix path for the limit itself:
 /// every body checks [`TaskProgress::stop_requested`] between its items
-/// (gl-1709).
+/// (gl-2005, gl-2013) and hands its token to each item's work (gl-2006: the
+/// Keyframe Extractor, the five library bodies, Update Plugins and Migrate
+/// Trickplay Image Location).
 pub(crate) const STOP_WAIT: Duration = Duration::from_secs(2);
 
 /// How long after startup an interval task that has **never completed** first
@@ -528,6 +530,22 @@ fn unusable_trigger(trigger: &TaskTriggerInfo) -> bool {
     matches!(trigger.type_, TaskTriggerInfoType::Unrecognized(_))
         || (trigger.type_ == TaskTriggerInfoType::WeeklyTrigger
             && matches!(trigger.day_of_week, Some(DayOfWeek::Unrecognized(_))))
+}
+
+/// A trigger without the field its type needs, for which `GetTrigger` also
+/// throws an `ArgumentException`: a daily or weekly trigger with no
+/// `TimeOfDayTicks`, a weekly one with no `DayOfWeek`, an interval one with no
+/// `IntervalTicks`. Refused when saved; an adopted file's is kept and never
+/// fires (`ADOPTED_TRIGGER_FILE_DIVERGENCE` in the API's parity record).
+fn incomplete_trigger(trigger: &TaskTriggerInfo) -> bool {
+    match trigger.type_ {
+        TaskTriggerInfoType::DailyTrigger => trigger.time_of_day_ticks.is_none(),
+        TaskTriggerInfoType::WeeklyTrigger => {
+            trigger.time_of_day_ticks.is_none() || trigger.day_of_week.is_none()
+        }
+        TaskTriggerInfoType::IntervalTrigger => trigger.interval_ticks.is_none(),
+        TaskTriggerInfoType::StartupTrigger | TaskTriggerInfoType::Unrecognized(_) => false,
+    }
 }
 
 impl FerrofinTaskManager {
@@ -1039,9 +1057,10 @@ impl FerrofinTaskManager {
     /// Starts the named task in the background, returning as soon as it is
     /// [`Running`](TaskState::Running).
     ///
-    /// Port of `TaskManager.QueueScheduledTask` (the `StartTask` HTTP path and
-    /// the scheduler's trigger path): the caller gets an immediate answer while
-    /// the task runs to completion on a spawned tokio task — so the dashboard
+    /// Port of `TaskManager.Execute`, the `StartTask` HTTP path's: it starts an
+    /// idle task and refuses a running one (the scheduler's trigger path
+    /// queues behind a running task instead). The caller gets an immediate
+    /// answer while the task runs to completion on a spawned tokio task — so the dashboard
     /// sees the `Running` state (and live progress) for the task's real
     /// duration. Failures are recorded on the task's last result (they have no
     /// caller to propagate to).
@@ -1147,7 +1166,8 @@ impl FerrofinTaskManager {
             .get_mut(key)
             .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
         // A run that is stopping still holds the task (upstream's
-        // `CurrentCancellationTokenSource` is set until it returns).
+        // `CurrentCancellationTokenSource` is set until it returns). This is
+        // `claim`'s only `InvalidInput`: `start_task` answers it as success.
         if reg.state != TaskState::Idle {
             return Err(ServiceError::invalid_input(format!(
                 "scheduled task {key} is already running"
@@ -1345,15 +1365,25 @@ impl FerrofinTaskManager {
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceError::NotFound`] if no task has that key.
+    /// Returns [`ServiceError::NotFound`] if no task has that key,
+    /// [`ServiceError::InvalidInput`] if a trigger is one upstream's
+    /// `GetTrigger` cannot build (nothing is saved), or
+    /// [`ServiceError::Backend`] if the save fails.
     pub fn set_triggers(
         &self,
         key: &str,
         triggers: &[TaskTriggerInfo],
     ) -> Result<(), ServiceError> {
-        if triggers.iter().any(unusable_trigger) {
-            return Err(ServiceError::backend(
-                "unrecognized task trigger type or weekday",
+        // `GetTrigger`'s `ArgumentException`, a 400 through upstream's
+        // `ExceptionMiddleware`. Upstream saves the list first, so the file
+        // it rejects is what it loads next; nothing is saved here.
+        if triggers
+            .iter()
+            .any(|trigger| unusable_trigger(trigger) || incomplete_trigger(trigger))
+        {
+            return Err(ServiceError::invalid_input(
+                "a trigger has no type a task trigger can be built from, or lacks the time, \
+                 weekday or interval its type needs",
             ));
         }
         if !lock(&self.tasks).contains_key(key) {
@@ -1841,7 +1871,7 @@ impl ScheduledTask for RefreshLibraryTask {
         };
         // A stop withdraws the run's wait, and a scan nobody else waits for
         // stops at its next item. The run ends before that item does, which
-        // upstream's waits for (fix path: gl-1709); the scan queue starts the
+        // upstream's waits for (fix path: gl-2013); the scan queue starts the
         // next scan after it.
         let finished = progress
             .cancel_token()
@@ -1915,9 +1945,16 @@ impl ferrofin_traits::tasks::TaskManager for FerrofinTaskManager {
     }
 
     async fn start_task(&self, task_id: &str) -> Result<(), ServiceError> {
-        // The HTTP path queues (C# QueueScheduledTask): the request returns as
-        // soon as the task is Running; the dashboard tracks state from there.
-        self.queue(&self.resolve_id(task_id)?)
+        // `TaskManager.Execute`, not `QueueScheduledTask`: the run starts now
+        // and the request returns as soon as the task is Running; the
+        // dashboard tracks state from there. Nothing waits behind a running
+        // task. A task already running or stopping keeps its run: upstream's
+        // `Execute` starts one whose `ExecuteInternal` throws
+        // `InvalidOperationException` unobserved, and `StartTask` answers 204.
+        match self.queue(&self.resolve_id(task_id)?) {
+            Err(ServiceError::InvalidInput(_)) => Ok(()),
+            other => other,
+        }
     }
 
     async fn cancel_task(&self, task_id: &str) -> Result<(), ServiceError> {
@@ -2776,6 +2813,25 @@ mod tests {
         (mgr, runs, gate)
     }
 
+    /// gl-2018: `StartTask` on a running task answers 204 and starts nothing,
+    /// as upstream's `Execute` starts a run that throws out of sight.
+    #[tokio::test]
+    async fn starting_a_running_task_succeeds_and_keeps_its_one_run() {
+        use ferrofin_traits::tasks::TaskManager as _;
+
+        let (mgr, runs, gate) = counted_gated();
+        let id = mgr.get("counted-gated").unwrap().id.expect("id");
+        mgr.start_task(&id).await.expect("started");
+        wait_for_runs(&runs, 1).await;
+        mgr.start_task(&id)
+            .await
+            .expect("already running is not an error");
+        gate.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "no second run");
+        assert_eq!(mgr.get("counted-gated").unwrap().state, TaskState::Idle);
+    }
+
     /// `TaskManager.QueueScheduledTask`: a request for a busy task is
     /// remembered, coalesced per task, and started when the run completes.
     #[tokio::test]
@@ -2783,7 +2839,8 @@ mod tests {
         let (mgr, runs, gate) = counted_gated();
         mgr.queue("counted-gated").expect("started");
         wait_for_runs(&runs, 1).await;
-        // The explicit (StartTask) path still refuses a running task.
+        // `queue` still refuses a running task; `start_task` answers that
+        // refusal as success.
         assert!(matches!(
             mgr.queue("counted-gated"),
             Err(ServiceError::InvalidInput(_))
@@ -3472,16 +3529,63 @@ mod tests {
             },
             TaskTriggerInfo {
                 type_: TaskTriggerInfoType::WeeklyTrigger,
+                time_of_day_ticks: Some(0),
                 day_of_week: Some(ferrofin_model::dto::DayOfWeek::Unrecognized(99)),
                 ..TaskTriggerInfo::default()
             },
+            // gl-2018: `GetTrigger`'s other `ArgumentException`s, the fields
+            // each trigger type needs.
+            TaskTriggerInfo {
+                type_: TaskTriggerInfoType::DailyTrigger,
+                ..TaskTriggerInfo::default()
+            },
+            TaskTriggerInfo {
+                type_: TaskTriggerInfoType::WeeklyTrigger,
+                day_of_week: Some(ferrofin_model::dto::DayOfWeek::Monday),
+                ..TaskTriggerInfo::default()
+            },
+            TaskTriggerInfo {
+                type_: TaskTriggerInfoType::WeeklyTrigger,
+                time_of_day_ticks: Some(0),
+                ..TaskTriggerInfo::default()
+            },
+            TaskTriggerInfo {
+                type_: TaskTriggerInfoType::IntervalTrigger,
+                ..TaskTriggerInfo::default()
+            },
         ] {
-            assert!(mgr2.set_triggers("counting", &[trigger]).is_err());
+            // An `ArgumentException`: a 400 upstream, not a server error.
+            assert!(matches!(
+                mgr2.set_triggers("counting", &[trigger]),
+                Err(ServiceError::InvalidInput(_))
+            ));
             assert_eq!(
                 mgr2.get("counting").expect("info").triggers[0].interval_ticks,
                 Some(42)
             );
         }
+
+        // What jellyfin-web's trigger dialog saves is accepted.
+        let complete = [
+            TaskTriggerInfo {
+                type_: TaskTriggerInfoType::DailyTrigger,
+                time_of_day_ticks: Some(36_000_000_000),
+                ..TaskTriggerInfo::default()
+            },
+            TaskTriggerInfo {
+                type_: TaskTriggerInfoType::WeeklyTrigger,
+                time_of_day_ticks: Some(0),
+                day_of_week: Some(ferrofin_model::dto::DayOfWeek::Sunday),
+                ..TaskTriggerInfo::default()
+            },
+            TaskTriggerInfo {
+                type_: TaskTriggerInfoType::StartupTrigger,
+                ..TaskTriggerInfo::default()
+            },
+        ];
+        mgr2.set_triggers("counting", &complete)
+            .expect("complete triggers");
+        assert_eq!(mgr2.get("counting").expect("info").triggers.len(), 3);
 
         // A missing task is NotFound.
         assert!(matches!(
