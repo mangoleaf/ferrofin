@@ -22,10 +22,10 @@ use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
-use ferrofin_traits::net::WebSocketConnection;
-use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
+use ferrofin_traits::options::DtoOptions;
 use ferrofin_traits::persistence::ItemPersistenceService;
 use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
+use ferrofin_traits::session_bus::SessionMessageBus;
 use ferrofin_traits::system::ServerApplicationPaths;
 
 use super::FerrofinSessionManager;
@@ -106,46 +106,6 @@ impl DtoService for UnusedDtoService {
                 ..BaseItemDto::default()
             })
             .collect())
-    }
-}
-
-/// A fake WebSocket connection that records every pushed frame.
-struct FakeConnection {
-    auth: AuthorizationInfo,
-    open: bool,
-    sent: Mutex<Vec<Vec<u8>>>,
-}
-
-impl FakeConnection {
-    fn new(auth: AuthorizationInfo) -> Arc<Self> {
-        Arc::new(Self {
-            auth,
-            open: true,
-            sent: Mutex::new(Vec::new()),
-        })
-    }
-    fn sent_count(&self) -> usize {
-        self.sent.lock().unwrap().len()
-    }
-}
-
-#[async_trait]
-impl WebSocketConnection for FakeConnection {
-    fn remote_endpoint(&self) -> Option<&str> {
-        None
-    }
-    fn authorization_info(&self) -> &AuthorizationInfo {
-        &self.auth
-    }
-    fn is_open(&self) -> bool {
-        self.open
-    }
-    async fn send(&self, message: &[u8]) -> Result<(), ServiceError> {
-        self.sent.lock().unwrap().push(message.to_vec());
-        Ok(())
-    }
-    async fn apply_request_culture(&self) -> Result<(), ServiceError> {
-        Ok(())
     }
 }
 
@@ -1095,33 +1055,113 @@ async fn get_sessions_admin_sees_all() {
 }
 
 #[tokio::test]
-async fn broadcast_pushes_to_attached_connections() {
+async fn broadcast_pushes_to_the_sessions_bus_sink() {
     let db = test_db().await;
-    let mgr = manager(&db);
+    let (mgr, bus) = cast_manager(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
-    let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
-        .await
-        .unwrap();
-    let session_id = dto.id.unwrap();
-
-    let conn = FakeConnection::new(AuthorizationInfo::default());
-    mgr.add_web_socket(&session_id, conn.clone() as Arc<dyn WebSocketConnection>)
-        .await
-        .unwrap();
+    let (_, pushes) = cast_target(&mgr, bus.as_ref(), &user, "dev-1").await;
 
     mgr.send_message_to_user_sessions(&[user_id], SessionMessageType::RestartRequired, "")
         .await
         .unwrap();
-    assert_eq!(conn.sent_count(), 1);
-    let frame: serde_json::Value = serde_json::from_slice(&conn.sent.lock().unwrap()[0]).unwrap();
+    let pushes = pushes.lock().unwrap();
+    assert_eq!(pushes.len(), 1);
+    let frame: serde_json::Value = serde_json::from_str(&pushes[0]).unwrap();
     assert_eq!(frame["MessageType"], "RestartRequired");
 }
 
+/// A bus that reports every session connected, or none, and records at each
+/// delivery whether the session table's lock was free.
+struct ProbeBus {
+    connected: bool,
+    sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, super::SessionInfo>>>,
+    lock_free_at_send: Mutex<Vec<bool>>,
+}
+
+impl SessionMessageBus for ProbeBus {
+    fn register(
+        &self,
+        _session_id: String,
+        _sink: ferrofin_traits::session_bus::MessageSink,
+    ) -> ferrofin_traits::session_bus::SinkToken {
+        0
+    }
+    fn unregister(
+        &self,
+        _session_id: &str,
+        _token: ferrofin_traits::session_bus::SinkToken,
+    ) -> bool {
+        false
+    }
+    fn send(&self, _session_id: &str, _message: String) -> bool {
+        let free = self.sessions.try_lock().is_ok();
+        self.lock_free_at_send.lock().unwrap().push(free);
+        self.connected
+    }
+    fn is_connected(&self, _session_id: &str) -> bool {
+        self.connected
+    }
+}
+
+/// A copy of [`manager`] over `db` wired to a [`ProbeBus`], plus that bus,
+/// with one session of a new user, whose id it returns.
+async fn probed_manager(
+    db: &Database,
+    connected: bool,
+) -> (FerrofinSessionManager, Arc<ProbeBus>, Uuid) {
+    let plain = manager(db);
+    let bus = Arc::new(ProbeBus {
+        connected,
+        sessions: Arc::clone(&plain.sessions),
+        lock_free_at_send: Mutex::new(Vec::new()),
+    });
+    let mgr = plain
+        .as_ref()
+        .clone()
+        .with_session_bus(Arc::clone(&bus) as Arc<dyn SessionMessageBus>);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(db, user_id, "alice").await;
+    mgr.log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    (mgr, bus, user_id)
+}
+
+/// A broadcast hands its message to the bus with the session lock released,
+/// so delivery never holds up playback reports, session upserts or
+/// capability reports.
+#[tokio::test]
+async fn broadcast_delivers_with_the_session_lock_released() {
+    let db = test_db().await;
+    let (mgr, bus, user_id) = probed_manager(&db, true).await;
+
+    mgr.send_message_to_user_sessions(&[user_id], SessionMessageType::RestartRequired, "")
+        .await
+        .unwrap();
+    assert_eq!(*bus.lock_free_at_send.lock().unwrap(), [true]);
+}
+
+/// The session pool keeps every client active within the idle window, so a
+/// broadcast's predicate routinely matches sessions that have no live socket
+/// at all. Those must cost nothing: no bus delivery is attempted for them.
+#[tokio::test]
+async fn a_broadcast_no_one_can_receive_attempts_no_delivery() {
+    let db = test_db().await;
+    let (mgr, bus, user_id) = probed_manager(&db, false).await;
+
+    mgr.send_message_to_user_sessions(&[user_id], SessionMessageType::RestartRequired, "")
+        .await
+        .unwrap();
+    assert!(
+        bus.lock_free_at_send.lock().unwrap().is_empty(),
+        "no session has a registered sink, so the bus must never be asked to deliver",
+    );
+}
+
 /// C# `SendMessageToAdminSessions` reaches every session holding an
-/// administrator, as its primary or an additional user, over either delivery
-/// route, and no other; a policy saved through the server reaches the next push.
+/// administrator, as its primary or an additional user, and no other; a
+/// policy saved through the server reaches the next push.
 #[tokio::test]
 async fn an_admin_push_reaches_the_sessions_holding_an_administrator() {
     let db = test_db().await;
@@ -1132,7 +1172,7 @@ async fn an_admin_push_reaches_the_sessions_holding_an_administrator() {
     let viewer = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
     let (_, admin_pushes) = cast_target(&mgr, bus.as_ref(), &admin, "admin").await;
     let (_, viewer_pushes) = cast_target(&mgr, bus.as_ref(), &viewer, "viewer").await;
-    // The viewer's TV, which the admin joined, attached directly.
+    // The viewer's TV, which the admin joined.
     let shared = mgr
         .log_session_activity("Web", "1.0", "shared", "TV", "e", Some(&viewer))
         .await
@@ -1142,10 +1182,7 @@ async fn an_admin_push_reaches_the_sessions_holding_an_administrator() {
     mgr.add_additional_user(&shared, Uuid::parse_str(&admin.id).unwrap())
         .await
         .unwrap();
-    let socket = FakeConnection::new(AuthorizationInfo::default());
-    mgr.add_web_socket(&shared, socket.clone() as Arc<dyn WebSocketConnection>)
-        .await
-        .unwrap();
+    let shared_pushes = listen(bus.as_ref(), &shared);
 
     for administrator in [true, false] {
         set_permission(
@@ -1165,7 +1202,11 @@ async fn an_admin_push_reaches_the_sessions_holding_an_administrator() {
         1,
         "only while an administrator"
     );
-    assert_eq!(socket.sent_count(), 1, "an additional administrator counts");
+    assert_eq!(
+        shared_pushes.lock().unwrap().len(),
+        1,
+        "an additional administrator counts"
+    );
     assert!(viewer_pushes.lock().unwrap().is_empty());
 }
 
@@ -1234,27 +1275,33 @@ async fn an_admin_push_reads_only_the_uncached_policies_it_can_reach() {
 }
 
 /// [`manager`] whose user-data manager announces its saves to the manager's
-/// sessions, as the composition root wires them.
-fn manager_announcing_user_data(db: &Database) -> Arc<FerrofinSessionManager> {
+/// sessions, as the composition root wires them, plus the bus it pushes on.
+fn manager_announcing_user_data(
+    db: &Database,
+) -> (Arc<FerrofinSessionManager>, Arc<dyn SessionMessageBus>) {
     let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
         config: default_server_configuration(),
     });
     let user_data = Arc::new(FerrofinUserDataManager::new(db.clone(), config));
-    let mgr = Arc::new(FerrofinSessionManager::new(
-        Arc::new(FerrofinUserManager::new(db.clone())),
-        Arc::new(FerrofinDeviceManager::new(db.clone())),
-        user_data.clone(),
-        library_manager(db),
-        Arc::new(UnusedDtoService),
-        Arc::new(FerrofinEventManager::new()),
-        db.clone(),
-        "server-1".to_owned(),
-    ));
+    let bus: Arc<dyn SessionMessageBus> = Arc::new(crate::FerrofinSessionMessageBus::new());
+    let mgr = Arc::new(
+        FerrofinSessionManager::new(
+            Arc::new(FerrofinUserManager::new(db.clone())),
+            Arc::new(FerrofinDeviceManager::new(db.clone())),
+            user_data.clone(),
+            library_manager(db),
+            Arc::new(UnusedDtoService),
+            Arc::new(FerrofinEventManager::new()),
+            db.clone(),
+            "server-1".to_owned(),
+        )
+        .with_session_bus(Arc::clone(&bus)),
+    );
     let sessions: Arc<dyn SessionManager> = mgr.clone();
     user_data.set_user_data_changed_sink(Arc::new(crate::user_data_manager::SessionUserDataSink(
         Arc::downgrade(&sessions),
     )));
-    mgr
+    (mgr, bus)
 }
 
 // A stop reported from one device reaches the same user's OTHER sessions as
@@ -1268,7 +1315,7 @@ async fn playback_stop_pushes_user_data_changed_to_the_users_other_sessions_and_
     use ferrofin_model::session::PlaybackProgressInfo;
 
     let db = test_db().await;
-    let mgr = manager_announcing_user_data(&db);
+    let (mgr, bus) = manager_announcing_user_data(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "shared").await;
     let other_id = Uuid::new_v4();
@@ -1290,20 +1337,8 @@ async fn playback_stop_pushes_user_data_changed_to_the_users_other_sessions_and_
         .await
         .unwrap();
 
-    let web_conn = FakeConnection::new(AuthorizationInfo::default());
-    mgr.add_web_socket(
-        &web.id.unwrap(),
-        web_conn.clone() as Arc<dyn WebSocketConnection>,
-    )
-    .await
-    .unwrap();
-    let other_conn = FakeConnection::new(AuthorizationInfo::default());
-    mgr.add_web_socket(
-        &other_session.id.unwrap(),
-        other_conn.clone() as Arc<dyn WebSocketConnection>,
-    )
-    .await
-    .unwrap();
+    let web_pushes = listen(bus.as_ref(), &web.id.unwrap());
+    let other_pushes = listen(bus.as_ref(), &other_session.id.unwrap());
 
     let info = PlaybackProgressInfo {
         session_id: tv.id.clone(),
@@ -1314,7 +1349,7 @@ async fn playback_stop_pushes_user_data_changed_to_the_users_other_sessions_and_
     mgr.on_playback_progress(&info, false).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     // A progress report is never announced (`UserDataChangeNotifier`) …
-    assert_eq!(web_conn.sent_count(), 0);
+    assert!(web_pushes.lock().unwrap().is_empty());
 
     let stop = ferrofin_model::session::PlaybackStopInfo {
         session_id: tv.id.clone(),
@@ -1326,15 +1361,14 @@ async fn playback_stop_pushes_user_data_changed_to_the_users_other_sessions_and_
     // … the stop is, to the same user's other device, once its batch window
     // closes (polled up to a deadline, so a loaded host does not fail it) …
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while web_conn.sent_count() == 0 && tokio::time::Instant::now() < deadline {
+    while web_pushes.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let frames: Vec<serde_json::Value> = web_conn
-        .sent
+    let frames: Vec<serde_json::Value> = web_pushes
         .lock()
         .unwrap()
         .iter()
-        .map(|raw| serde_json::from_slice(raw).unwrap())
+        .map(|raw| serde_json::from_str(raw).unwrap())
         .filter(|frame: &serde_json::Value| frame["MessageType"] == "UserDataChanged")
         .collect();
     assert_eq!(frames.len(), 1);
@@ -1344,7 +1378,7 @@ async fn playback_stop_pushes_user_data_changed_to_the_users_other_sessions_and_
         item_id.simple().to_string()
     );
     // … and the unrelated user's session hears nothing.
-    assert_eq!(other_conn.sent_count(), 0);
+    assert!(other_pushes.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1728,7 +1762,7 @@ async fn progress_reports_pay_no_read_for_a_push() {
     });
     let counting =
         CountingUserData::new(Arc::new(FerrofinUserDataManager::new(db.clone(), config)));
-    let mgr = manager_counting(&db, counting.clone());
+    let (mgr, bus) = with_bus(&manager_counting(&db, counting.clone()));
 
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "solo").await;
@@ -1750,17 +1784,11 @@ async fn progress_reports_pay_no_read_for_a_push() {
     assert_eq!(counting.dto_reads(), 0);
 
     // A socket on that same session changes nothing.
-    let conn = FakeConnection::new(AuthorizationInfo::default());
-    mgr.add_web_socket(
-        session.id.as_deref().unwrap(),
-        conn.clone() as Arc<dyn WebSocketConnection>,
-    )
-    .await
-    .unwrap();
+    let pushes = listen(bus.as_ref(), session.id.as_deref().unwrap());
     mgr.on_playback_progress(&info, false).await.unwrap();
     assert_eq!(counting.play_state_writes(), 2);
     assert_eq!(counting.dto_reads(), 0);
-    assert_eq!(conn.sent_count(), 0);
+    assert!(pushes.lock().unwrap().is_empty());
 }
 
 /// "Remember audio/subtitle selections": a progress report saves the tracks
@@ -2842,28 +2870,36 @@ impl ferrofin_traits::library::MusicManager for CannedMix {
     }
 }
 
-/// A bus-wired manager plus that bus — the shape every cast test needs.
-fn cast_manager(
-    db: &Database,
-) -> (
-    Arc<FerrofinSessionManager>,
-    Arc<dyn ferrofin_traits::session_bus::SessionMessageBus>,
-) {
-    let bus: Arc<dyn ferrofin_traits::session_bus::SessionMessageBus> =
-        Arc::new(crate::FerrofinSessionMessageBus::new());
-    let mgr = Arc::new(
-        manager(db)
-            .as_ref()
-            .clone()
-            .with_session_bus(Arc::clone(&bus)),
-    );
+/// A copy of `mgr` (sharing its sessions) wired to a fresh bus, plus that bus.
+fn with_bus(
+    mgr: &FerrofinSessionManager,
+) -> (Arc<FerrofinSessionManager>, Arc<dyn SessionMessageBus>) {
+    let bus: Arc<dyn SessionMessageBus> = Arc::new(crate::FerrofinSessionMessageBus::new());
+    let mgr = Arc::new(mgr.clone().with_session_bus(Arc::clone(&bus)));
     (mgr, bus)
+}
+
+/// A bus-wired manager plus that bus — the shape every cast test needs.
+fn cast_manager(db: &Database) -> (Arc<FerrofinSessionManager>, Arc<dyn SessionMessageBus>) {
+    with_bus(&manager(db))
+}
+
+/// Registers a sink for `session_id` on `bus`, as the `/socket` handler does,
+/// returning the messages it receives.
+fn listen(bus: &dyn SessionMessageBus, session_id: &str) -> Arc<Mutex<Vec<String>>> {
+    let received = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&received);
+    bus.register(
+        session_id.to_owned(),
+        Box::new(move |msg| sink.lock().unwrap().push(msg)),
+    );
+    received
 }
 
 /// Opens a bus-connected session for `user`, returning `(session id, its pushes)`.
 async fn cast_target(
     mgr: &FerrofinSessionManager,
-    bus: &dyn ferrofin_traits::session_bus::SessionMessageBus,
+    bus: &dyn SessionMessageBus,
     user: &UserEntity,
     device_id: &str,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
@@ -2873,12 +2909,7 @@ async fn cast_target(
         .unwrap()
         .id
         .unwrap();
-    let received = Arc::new(Mutex::new(Vec::<String>::new()));
-    let sink = Arc::clone(&received);
-    bus.register(
-        session_id.clone(),
-        Box::new(move |msg| sink.lock().unwrap().push(msg)),
-    );
+    let received = listen(bus, &session_id);
     (session_id, received)
 }
 
@@ -4415,28 +4446,22 @@ async fn an_idle_stop_keeps_the_position_against_the_version_played() {
 async fn each_minute_runs_the_checks_that_are_due() {
     let db = test_db().await;
     let (mgr, events) = manager_with_events(&db);
+    let (mgr, bus) = with_bus(&mgr);
     let stopped = record_event(&events, "PlaybackStopped");
     let (idle_id, _, _) = playing_session(&db, &mgr, "dev-tick-idle", Some(1), false).await;
     let (paused_id, _, _) = playing_session(&db, &mgr, "dev-tick-paused", Some(2), true).await;
-    let connection = FakeConnection::new(AuthorizationInfo::default());
-    mgr.add_web_socket(
-        &paused_id,
-        connection.clone() as Arc<dyn WebSocketConnection>,
-    )
-    .await
-    .unwrap();
+    let pushes = listen(bus.as_ref(), &paused_id);
     let now = Utc::now();
     checked_in_at(&mgr, &idle_id, now - chrono::Duration::minutes(6)).await;
     checked_in_at(&mgr, &paused_id, now).await;
     paused_since(&mgr, &paused_id, now - chrono::Duration::hours(1)).await;
-    let stops_sent = |connection: &FakeConnection| {
-        connection
-            .sent
+    let stops_sent = || {
+        pushes
             .lock()
             .unwrap()
             .iter()
             .filter(|frame| {
-                serde_json::from_slice::<serde_json::Value>(frame).unwrap()["MessageType"]
+                serde_json::from_str::<serde_json::Value>(frame).unwrap()["MessageType"]
                     == "Playstate"
             })
             .count()
@@ -4446,19 +4471,19 @@ async fn each_minute_runs_the_checks_that_are_due() {
     mgr.run_playback_checks_at(4, 0, chrono::TimeDelta::hours(24), now)
         .await;
     assert!(stopped.lock().unwrap().is_empty());
-    assert_eq!(stops_sent(&connection), 0);
+    assert_eq!(stops_sent(), 0);
 
     // Minute 4 with a threshold: only the inactive check.
     mgr.run_playback_checks_at(4, 30, chrono::TimeDelta::hours(24), now)
         .await;
     assert!(stopped.lock().unwrap().is_empty());
-    assert_eq!(stops_sent(&connection), 1);
+    assert_eq!(stops_sent(), 1);
 
     // Minute 5: the idle check too.
     mgr.run_playback_checks_at(5, 0, chrono::TimeDelta::hours(24), now)
         .await;
     assert_eq!(stopped.lock().unwrap().len(), 1);
-    assert_eq!(stops_sent(&connection), 1);
+    assert_eq!(stops_sent(), 1);
 }
 
 /// `CheckForInactiveSteams`: a session paused longer than
@@ -4468,22 +4493,16 @@ async fn each_minute_runs_the_checks_that_are_due() {
 async fn a_session_paused_past_the_threshold_is_told_to_stop() {
     let db = test_db().await;
     let (mgr, _) = manager_with_events(&db);
+    let (mgr, bus) = with_bus(&mgr);
     let (session_id, _, user_id) = playing_session(&db, &mgr, "dev-paused", Some(42), true).await;
-    let connection = FakeConnection::new(AuthorizationInfo::default());
-    mgr.add_web_socket(
-        &session_id,
-        connection.clone() as Arc<dyn WebSocketConnection>,
-    )
-    .await
-    .unwrap();
+    let pushes = listen(bus.as_ref(), &session_id);
     let now = Utc::now();
-    let playstates = |connection: &FakeConnection| -> Vec<serde_json::Value> {
-        connection
-            .sent
+    let playstates = || -> Vec<serde_json::Value> {
+        pushes
             .lock()
             .unwrap()
             .iter()
-            .map(|frame| serde_json::from_slice::<serde_json::Value>(frame).unwrap())
+            .map(|frame| serde_json::from_str::<serde_json::Value>(frame).unwrap())
             .filter(|frame| frame["MessageType"] == "Playstate")
             .collect()
     };
@@ -4491,13 +4510,13 @@ async fn a_session_paused_past_the_threshold_is_told_to_stop() {
     // Paused nine minutes against a ten-minute threshold: nothing.
     paused_since(&mgr, &session_id, now - chrono::Duration::minutes(9)).await;
     mgr.check_for_inactive_streams(10, now).await;
-    let found = playstates(&connection);
+    let found = playstates();
     assert!(found.is_empty(), "{found:?}");
 
     // Past it: one `Stop`, at the paused position, from the session's user.
     paused_since(&mgr, &session_id, now - chrono::Duration::minutes(11)).await;
     mgr.check_for_inactive_streams(10, now).await;
-    let sent = playstates(&connection);
+    let sent = playstates();
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0]["Data"]["Command"], "Stop");
     assert_eq!(sent[0]["Data"]["SeekPositionTicks"], 42);
