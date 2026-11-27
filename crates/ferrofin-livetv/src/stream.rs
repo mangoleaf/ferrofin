@@ -109,6 +109,11 @@ pub trait TunerStreamSource: Send + Sync {
 }
 
 /// The real tuner source: `reqwest`, streaming the response body.
+///
+/// Its client has `NamedClient.Default`'s defaults
+/// ([`ferrofin_util::http_client::builder`]), which `SharedHttpStream`,
+/// `M3UTunerHost`'s HEAD probe and `DirectRecorder` ask through: the server's
+/// `User-Agent` unless the source requires another, and the `Accept` list.
 #[derive(Debug, Clone)]
 pub struct ReqwestTunerSource {
     client: reqwest::Client,
@@ -127,17 +132,20 @@ impl ReqwestTunerSource {
     #[must_use]
     pub fn new() -> Self {
         let timeout = std::time::Duration::from_secs(TUNER_RESPONSE_TIMEOUT_SECONDS);
-        let client = reqwest::Client::builder()
+        let client = ferrofin_util::http_client::builder(ferrofin_health::USER_AGENT)
             .connect_timeout(timeout)
             .read_timeout(timeout)
             .build()
-            // A client with default settings is still a working client; the
-            // only thing lost is the bound, and playback must not die for it.
+            // A client with default settings is still a working client; what
+            // is lost is the bound and `NamedClient.Default`'s defaults, and
+            // playback must not die for them.
             .unwrap_or_default();
         Self { client }
     }
 
-    /// Applies the tuner's `RequiredHttpHeaders` to a request builder.
+    /// Applies the tuner's `RequiredHttpHeaders` to a request builder, which
+    /// upstream's `SharedHttpStream` and HEAD probe do not send (a Jellyfin
+    /// bug not ported, as for the recorder).
     fn with_headers(
         mut builder: reqwest::RequestBuilder,
         headers: &HashMap<String, String>,
@@ -180,9 +188,17 @@ impl TunerStreamSource for ReqwestTunerSource {
         let response = Self::with_headers(self.client.get(url), headers)
             .send()
             .await
-            .map_err(failed)?
-            .error_for_status()
             .map_err(failed)?;
+        // A redirect the client did not follow fails as an error status does;
+        // `error_for_status` passes a 3xx.
+        if response.status().is_redirection() {
+            return Err(ServiceError::Backend(format!(
+                "open tuner stream {}: HTTP {}",
+                crate::fetch::redact_url(url),
+                response.status()
+            )));
+        }
+        let response = response.error_for_status().map_err(failed)?;
         Ok(Box::new(ReqwestTunerBody { response }))
     }
 
@@ -659,7 +675,7 @@ async fn copy_to_temp_file(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        LiveStreamHandle, LiveStreamKind, TunerStreamBody, TunerStreamSource,
+        LiveStreamHandle, LiveStreamKind, ReqwestTunerSource, TunerStreamBody, TunerStreamSource,
         create_media_source_info, extension_can_share, is_manifest_path, mime_type_can_share,
         open_shared_http_stream,
     };
@@ -807,6 +823,79 @@ pub(crate) mod tests {
 
         let ts_source = create_media_source_info("http://tuner/live.ts", &tuner, false);
         assert!(ts_source.supports_direct_play);
+    }
+
+    /// `SharedHttpStream` and `M3UTunerHost`'s HEAD probe ask through
+    /// `NamedClient.Default`: a source requiring no `User-Agent` (an HDHomeRun
+    /// stream) gets the server's, and every request the `Accept` list. A
+    /// required agent replaces the server's.
+    #[tokio::test]
+    async fn a_tuner_request_has_the_default_client_headers() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/live.ts", listener.local_addr().expect("addr"));
+        let heads = tokio::spawn(async move {
+            let mut heads = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buffer = [0_u8; 4096];
+                let read = stream.read(&mut buffer).await.expect("read");
+                heads.push(String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase());
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: 1\r\nConnection: close\r\n\r\nG")
+                    .await;
+            }
+            heads
+        });
+        let source = ReqwestTunerSource::new();
+        let required = HashMap::from([("User-Agent".to_owned(), "VLC/3.0".to_owned())]);
+        let mut body = source.open(&url, &HashMap::new()).await.expect("open");
+        while body.next_chunk().await.expect("chunk").is_some() {}
+        assert_eq!(
+            source.content_type(&url, &HashMap::new()).await.as_deref(),
+            Some("video/mp2t")
+        );
+        source.open(&url, &required).await.expect("open");
+
+        let heads = heads.await.expect("heads");
+        let agent = format!(
+            "\r\nuser-agent: {}\r\n",
+            ferrofin_health::USER_AGENT.to_ascii_lowercase()
+        );
+        for head in &heads[..2] {
+            assert!(head.contains(&agent), "{head}");
+        }
+        assert!(
+            heads[2].contains("\r\nuser-agent: vlc/3.0\r\n"),
+            "{}",
+            heads[2]
+        );
+        assert_eq!(
+            heads[2].matches("\r\nuser-agent:").count(),
+            1,
+            "{}",
+            heads[2]
+        );
+        for head in &heads {
+            assert!(
+                head.contains(
+                    "\r\naccept: application/json; q=1.0, application/xml; q=0.9, */*; q=0.8\r\n"
+                ),
+                "{head}"
+            );
+        }
+    }
+
+    /// A tuner that answers a redirect the client does not follow (https to
+    /// http, or past the limit) fails to open, as one answering an error
+    /// status does: its page is not the stream.
+    #[tokio::test]
+    async fn a_redirect_the_client_does_not_follow_fails_the_tuner_stream() {
+        let url = crate::fetch::tests::redirect_loop();
+        let opened = ReqwestTunerSource::new().open(&url, &HashMap::new()).await;
+        assert!(opened.is_err());
     }
 
     #[test]

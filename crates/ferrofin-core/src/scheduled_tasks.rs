@@ -76,9 +76,9 @@ const SHUTDOWN_RUN_WAIT: Duration = Duration::from_secs(2);
 /// upstream's shutdown wait ([`SHUTDOWN_RUN_WAIT`]); whether it becomes a
 /// setting is the owner's call (gl-1710). Fix path for the limit itself:
 /// every body checks [`TaskProgress::stop_requested`] between its items
-/// (gl-2005, gl-2013) and hands its token to each item's work (gl-2006: the
-/// Keyframe Extractor, the five library bodies, Update Plugins and Migrate
-/// Trickplay Image Location).
+/// (gl-2005) and hands its token to each item's work (gl-2006: the
+/// Keyframe Extractor, the five library bodies, Update Plugins, Migrate
+/// Trickplay Image Location and the guide refresh's writes).
 pub(crate) const STOP_WAIT: Duration = Duration::from_secs(2);
 
 /// How long after startup an interval task that has **never completed** first
@@ -1870,14 +1870,18 @@ impl ScheduledTask for RefreshLibraryTask {
             self.library.run_library_scan(trigger, Some(report))
         };
         // A stop withdraws the run's wait, and a scan nobody else waits for
-        // stops at its next item. The run ends before that item does, which
-        // upstream's waits for (fix path: gl-2013); the scan queue starts the
+        // stops at its next item. The run waits for that scan to end, so it
+        // stays Cancelling until then, as upstream's does until
+        // `ValidateMediaLibraryInternal` returns; the scan queue starts the
         // next scan after it.
         let finished = progress
             .cancel_token()
             .unless_cancelled(scan)
             .await
             .transpose()?;
+        if finished.is_none() {
+            self.library.stopped_scan_ended().await;
+        }
         // Stopped by the task's own stop, by the library manager's own
         // shutdown or refused (already shut down): cancelled, not completed.
         // A host shutdown never gets here: the task registry's `shutdown`

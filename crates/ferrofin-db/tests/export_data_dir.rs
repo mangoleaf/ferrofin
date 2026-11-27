@@ -23,6 +23,27 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The build these tests export as, whose start each source records.
+const BUILD: &str = "v0.0.0-test";
+
+/// What makes a test database one this build's start left, which the export
+/// requires (gl-1910): Ferrofin's migration table at this build's last
+/// migration, and the record of a start of [`BUILD`].
+fn started() -> [String; 4] {
+    [
+        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
+        format!(
+            "INSERT INTO _sqlx_migrations VALUES ({})",
+            ferrofin_db::schema_head()
+        ),
+        r#"CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL)"#.to_owned(),
+        format!(
+            r#"INSERT INTO "FerrofinMeta" VALUES ('{}', '{BUILD}')"#,
+            ferrofin_db::STARTED_KEY
+        ),
+    ]
+}
+
 /// Every file under `root`, relative to it, with its bytes.
 fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     let mut found = BTreeMap::new();
@@ -53,11 +74,13 @@ async fn database_with_unfolded_log(scratch: &Path, database: &Path) {
         .connect()
         .await
         .unwrap();
-    // Ferrofin's own bookkeeping table: what makes it a Ferrofin database.
-    sqlx::query("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)")
-        .execute(&mut conn)
-        .await
-        .unwrap();
+    // Ferrofin's own bookkeeping: a Ferrofin database this build started.
+    for statement in started() {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+    }
     sqlx::query("CREATE TABLE Items (Name TEXT NOT NULL)")
         .execute(&mut conn)
         .await
@@ -137,6 +160,7 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -177,12 +201,20 @@ async fn the_export_copies_the_tree_and_folds_the_log_into_the_snapshot() {
                 left_to_run: Vec::new(),
             },
             dropped: DroppedObjects {
-                tables: vec![DroppedTable {
-                    name: "_sqlx_migrations".to_owned(),
-                    rows: 0
-                }],
+                tables: vec![
+                    DroppedTable {
+                        name: "FerrofinMeta".to_owned(),
+                        rows: 1
+                    },
+                    DroppedTable {
+                        name: "_sqlx_migrations".to_owned(),
+                        rows: 1
+                    },
+                ],
                 indexes: Vec::new(),
             },
+            // It holds none of Jellyfin's tables.
+            rebuilt: Vec::new(),
             paths: PathRewrite {
                 moves: summary.edits.paths.moves.clone(),
                 ..PathRewrite::default()
@@ -213,12 +245,18 @@ async fn two_exports_of_one_source_hold_the_same_database() {
     let database = source.join(EXPORTED_DATABASE);
     let (first, second) = (scratch.path().join("first"), scratch.path().join("second"));
 
-    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &first)
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &first, BUILD)
         .await
         .unwrap();
-    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &second)
-        .await
-        .unwrap();
+    export_data_dir(
+        &SourceDirs::new(&source),
+        &DOCKER,
+        &database,
+        &second,
+        BUILD,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(files(&first), files(&second));
 }
@@ -243,6 +281,7 @@ async fn a_native_database_is_exported_in_place_of_a_leftover_jellyfin_one() {
         &DOCKER,
         &source.join("ferrofin.db"),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -266,6 +305,7 @@ async fn a_source_that_changes_during_the_export_fails_it() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap_err();
@@ -299,6 +339,7 @@ async fn a_linked_data_directory_is_copied_and_its_target_left_alone() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -331,6 +372,7 @@ async fn a_linked_database_is_read_where_sqlite_keeps_its_log() {
         &DOCKER,
         &source.join("ferrofin.db"),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -350,7 +392,7 @@ async fn a_missing_or_foreign_database_is_refused_before_anything_is_written() {
     let out = scratch.path().join("out");
 
     for database in [source.join("missing.db"), source.join("ferrofin.db")] {
-        let error = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+        let error = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out, BUILD)
             .await
             .unwrap_err();
         assert!(matches!(error, DbError::Export { .. }), "{error}");
@@ -368,7 +410,7 @@ async fn the_snapshot_keeps_the_database_files_permissions() {
     std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
     let out = scratch.path().join("out");
 
-    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out, BUILD)
         .await
         .unwrap();
 
@@ -388,7 +430,7 @@ async fn a_read_only_database_is_exported_with_its_mode() {
     }
     let out = scratch.path().join("out");
 
-    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+    export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out, BUILD)
         .await
         .unwrap();
 
@@ -411,6 +453,7 @@ async fn a_database_linked_to_a_file_inside_the_source_is_not_copied_raw() {
         &DOCKER,
         &source.join("ferrofin.db"),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -444,6 +487,7 @@ async fn the_database_directory_keeps_its_mode_and_time_after_the_snapshot() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await;
 
@@ -471,7 +515,6 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
     let meta = scratch.path().join("meta");
     let image = format!("{}/library/ab/poster.jpg", meta.display());
     let statements = [
-        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
         r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT, "Data" TEXT)"#.to_owned(),
         r#"CREATE TABLE "BaseItemImageInfos" ("Path" TEXT NOT NULL)"#.to_owned(),
         r#"CREATE TABLE "ImageInfos" ("Path" TEXT)"#.to_owned(),
@@ -486,7 +529,10 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
             .to_owned(),
         format!(r#"INSERT INTO "BaseItemImageInfos" VALUES ('{image}')"#),
         r#"INSERT INTO "ImageInfos" VALUES ('/data/config/users/a/profile.png')"#.to_owned(),
-    ];
+    ]
+    .into_iter()
+    .chain(started())
+    .collect::<Vec<_>>();
     let source = source_with_database(
         scratch.path(),
         &statements.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -511,7 +557,7 @@ async fn the_export_is_in_the_docker_layout_and_every_stored_path_resolves_in_it
     };
     let (out, before) = (scratch.path().join("out"), files(&source));
 
-    let summary = export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out)
+    let summary = export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out, BUILD)
         .await
         .unwrap();
 
@@ -616,14 +662,14 @@ async fn source_with_images(
     extra: &[(String, &str)],
 ) -> PathBuf {
     let library = scratch.join("source/metadata/library");
-    let mut statements = vec![
-        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
+    let mut statements = started().to_vec();
+    statements.extend([
         r#"CREATE TABLE "BaseItems" ("Id" TEXT PRIMARY KEY, "Type" TEXT NOT NULL, "Path" TEXT)"#
             .to_owned(),
         r#"CREATE TABLE "BaseItemImageInfos" ("ItemId" TEXT NOT NULL,
            "ImageType" INTEGER NOT NULL, "Path" TEXT NOT NULL)"#
             .to_owned(),
-    ];
+    ]);
     for (id, kind) in [
         (GENRE, "Genre"),
         (ALBUM, "Audio.MusicAlbum"),
@@ -718,6 +764,7 @@ async fn the_art_earlier_builds_saved_moves_into_jellyfins_layout() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -804,6 +851,7 @@ async fn the_folders_the_art_moves_into_are_finished_and_two_exports_agree() {
             &DOCKER,
             &source.join(EXPORTED_DATABASE),
             out,
+            BUILD,
         )
         .await
         .unwrap();
@@ -855,7 +903,7 @@ async fn a_configuration_directory_kept_elsewhere_is_copied_without_its_migratio
     };
     let out = scratch.path().join("out");
 
-    let summary = export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out)
+    let summary = export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out, BUILD)
         .await
         .unwrap();
 
@@ -900,7 +948,7 @@ async fn files_not_needed_are_left_out_of_every_tree_copied() {
     };
     let (out, before) = (scratch.path().join("out"), files(&etc));
 
-    export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out)
+    export_data_dir(&dirs, &DOCKER, &source.join(EXPORTED_DATABASE), &out, BUILD)
         .await
         .unwrap();
 
@@ -949,6 +997,7 @@ async fn refusal(source: &Path, out: &Path) -> String {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         out,
+        BUILD,
     )
     .await;
     assert_eq!(files(source), before, "the source is left as it was");
@@ -987,15 +1036,81 @@ async fn a_database_the_export_cannot_vouch_for_is_refused() {
     let scratch = tempfile::tempdir().unwrap();
     let source = source_with_database(
         scratch.path(),
-        &[
-            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)",
-            r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT PRIMARY KEY, "ProductVersion" TEXT)"#,
-            r#"INSERT INTO "__EFMigrationsHistory" VALUES ('20991231000000_FromTheFuture', '99.0')"#,
-        ],
+        &started()
+            .iter()
+            .map(String::as_str)
+            .chain([
+                r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT PRIMARY KEY, "ProductVersion" TEXT)"#,
+                r#"INSERT INTO "__EFMigrationsHistory" VALUES ('20991231000000_FromTheFuture', '99.0')"#,
+            ])
+            .collect::<Vec<_>>(),
     )
     .await;
     let reason = refusal(&source, &scratch.path().join("out")).await;
     assert!(reason.contains("matches no Jellyfin release"), "{reason}");
+}
+
+/// A database this version's start has not left is refused, with the step to
+/// take, and the source left as it was (gl-1910): one an earlier release last
+/// started, one a newer release migrated, and one at this build's last
+/// migration that records no start, or the start of another build.
+#[tokio::test]
+async fn a_database_this_version_has_not_started_is_refused() {
+    let head = ferrofin_db::schema_head();
+    let meta = r#"CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL)"#;
+    let mark = |value: &str| {
+        format!(
+            r#"INSERT INTO "FerrofinMeta" VALUES ('{}', '{value}')"#,
+            ferrofin_db::STARTED_KEY
+        )
+    };
+    // The migration head, then the record: `None` no `FerrofinMeta`, `""` the
+    // table without the key, anything else the build it names.
+    let cases = [
+        (head - 1, None, "an earlier Ferrofin release last started"),
+        (head + 1, None, "migrated by a newer Ferrofin release"),
+        (
+            head,
+            None,
+            "records no start of this Ferrofin release (v0.0.0-test)",
+        ),
+        (
+            head,
+            Some(""),
+            "records no start of this Ferrofin release (v0.0.0-test)",
+        ),
+        (
+            head,
+            Some("v0.0.0-other"),
+            "another Ferrofin build (v0.0.0-other) last started on the database, not this one (v0.0.0-test)",
+        ),
+    ];
+    for (version, recorded, expected) in cases {
+        let mut statements = vec![
+            "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
+            format!("INSERT INTO _sqlx_migrations VALUES ({version})"),
+        ];
+        if let Some(recorded) = recorded {
+            statements.push(meta.to_owned());
+            if !recorded.is_empty() {
+                statements.push(mark(recorded));
+            }
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let source = source_with_database(
+            scratch.path(),
+            &statements.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .await;
+        let reason = refusal(&source, &scratch.path().join("out")).await;
+        assert!(reason.contains(expected), "{expected}: {reason}");
+        let newer = expected.contains("newer");
+        assert_eq!(
+            reason.contains("start this release on the data directory once"),
+            !newer,
+            "{reason}"
+        );
+    }
 }
 
 /// A database damaged anywhere (its header, a middle page, a truncated end)
@@ -1070,8 +1185,7 @@ async fn database_with_containers(database: &Path, source: &Path, media: &Path) 
         .connect()
         .await
         .unwrap();
-    for statement in [
-        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)".to_owned(),
+    for statement in started().into_iter().chain([
         r#"CREATE TABLE "BaseItems" ("Type" TEXT NOT NULL, "Path" TEXT)"#.to_owned(),
         format!(
             r#"INSERT INTO "BaseItems" VALUES
@@ -1084,7 +1198,7 @@ async fn database_with_containers(database: &Path, source: &Path, media: &Path) 
             media = media.display(),
             source = source.display()
         ),
-    ] {
+    ]) {
         sqlx::query(sqlx::AssertSqlSafe(statement))
             .execute(&mut conn)
             .await
@@ -1131,6 +1245,7 @@ async fn playlist_and_collection_files_in_the_data_directory_are_left_out() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
@@ -1201,7 +1316,7 @@ async fn live_tv_and_identity_rows_are_carried_and_the_items_kept() {
     let before = files(&source);
     let out = scratch.path().join("out");
 
-    let summary = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out)
+    let summary = export_data_dir(&SourceDirs::new(&source), &DOCKER, &database, &out, BUILD)
         .await
         .unwrap();
 
@@ -1292,6 +1407,7 @@ async fn live_tv_database(database: &Path, user: &str) {
             .await
             .unwrap();
     }
+    db.record_started(BUILD).await.unwrap();
     db.close().await;
 }
 

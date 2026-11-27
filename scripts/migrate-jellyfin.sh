@@ -23,7 +23,7 @@ keeps its relative position:
   JELLYFIN/metadata/            -> DATA_DIR/metadata/       (images)
   JELLYFIN_CONFIG/              -> CONFIG_DIR/              (XML configuration)
   JELLYFIN/plugins/configurations/LDAP-Auth.xml, Jellyfin.Plugin.{Tmdb,Omdb,
-    MusicBrainz,AudioDb,StudioImages}.xml, IntroSkipper.xml,
+    MusicBrainz,AudioDb,StudioImages,ListenBrainz}.xml, IntroSkipper.xml,
     Jellyfin.Plugin.{MergeVersions,FileTransformation,OpenSubtitles}.xml
                                 -> DATA_DIR/plugins/configurations/
                                    (the settings of the metadata plugins Jellyfin
@@ -142,7 +142,7 @@ fi
 # key, so only the service user may read them.
 for plugin_xml in LDAP-Auth.xml Jellyfin.Plugin.Tmdb.xml Jellyfin.Plugin.Omdb.xml \
         Jellyfin.Plugin.MusicBrainz.xml Jellyfin.Plugin.AudioDb.xml Jellyfin.Plugin.StudioImages.xml \
-        IntroSkipper.xml Jellyfin.Plugin.MergeVersions.xml Jellyfin.Plugin.FileTransformation.xml \
+        Jellyfin.Plugin.ListenBrainz.xml IntroSkipper.xml Jellyfin.Plugin.MergeVersions.xml Jellyfin.Plugin.FileTransformation.xml \
         Jellyfin.Plugin.OpenSubtitles.xml; do
     source_xml=$source_data/plugins/configurations/$plugin_xml
     if [[ -f "$source_xml" ]]; then

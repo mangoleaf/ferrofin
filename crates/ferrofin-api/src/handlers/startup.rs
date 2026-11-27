@@ -18,7 +18,7 @@
 //!   Ungated, `POST /Startup/User` let an anonymous caller rename the first
 //!   administrator and set its password on a fully configured server.
 //! - `RemoteAccess` writes the separate `NetworkConfiguration` store in C#; here
-//!   that config lives in the named-config store (`named/network.json`), so the
+//!   that config lives in the named-config store (`{config}/network.json`), so the
 //!   toggle persists `EnableRemoteAccess` there.
 
 use axum::extract::State;
@@ -145,7 +145,7 @@ async fn update_initial_configuration(
 ///
 /// Port of `StartupController.SetRemoteAccess`: persists `EnableRemoteAccess`
 /// onto the `NetworkConfiguration` — and only that, as upstream does. Ferrofin
-/// keeps the config in the named-config store (`{config}/named/network.json`,
+/// keeps the config in the named-config store (`{config}/network.json`,
 /// the same file `GET/POST /System/Configuration/network` reads) and saves it
 /// through that route's save, so the toggle reaches the live network policy at
 /// once, as it does upstream.
