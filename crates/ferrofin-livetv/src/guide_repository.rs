@@ -1005,6 +1005,16 @@ pub mod test_support {
         .map_err(db_err)
     }
 
+    /// Every channel's `(Name, ImageUrl)`, name-ordered.
+    pub async fn channel_logos(
+        db: &Database,
+    ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
+        sqlx::query_as(r#"SELECT "Name", "ImageUrl" FROM "FerrofinLiveTvChannels" ORDER BY "Name""#)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)
+    }
+
     /// Every stored image row as `(Path, DateModified)`, the date as its stored
     /// text, path-ordered.
     pub async fn image_rows(db: &Database) -> Result<Vec<(String, Option<String>)>, ServiceError> {
