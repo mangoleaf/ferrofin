@@ -1117,10 +1117,28 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    save, the existence filter, stale rows removed) at the pinned v12.4 tag. \
                    Upstream writes the row only when it saves a channel (new, re-parented or \
                    changed); every refresh writing it gives the same rows, and fills a \
-                   channel an earlier Ferrofin stored without one. The rest of GetChannel \
-                   (names, tags, external ids, the logo) is not part of this row.",
+                   channel an earlier Ferrofin stored without one. Also the channel item's \
+                   Data, where Jellyfin alone keeps a channel's number and type: \
+                   projection.rs channel_entity writes the serialised LiveTvChannel \
+                   (channel_data: Number, left out when null, ChannelType as the enum's \
+                   name, then BaseItem's IsHD, IsShortcut, Width, Height and RemoteTrailers \
+                   at their defaults, in the serialiser's order), and channel_item_update \
+                   merges Number and ChannelType into a stored Data and keeps its other keys \
+                   (merged_channel_data; a row stored with none takes the whole at the next \
+                   refresh). Compared with GetChannel's Number and ChannelType assignments, \
+                   LiveTvChannel's and BaseItem's serialised properties, BaseItemMapper.Map \
+                   (Serialize with JsonDefaults.Options: nulls left out, enums by name) and \
+                   its read (DateLastSaved, Width and Height from their columns), and a \
+                   stock 12.4's own channel rows. The rest of GetChannel (names, tags, \
+                   external ids, the logo) is not part of this row.",
         date: "2026-11-26",
-        divergences: &[],
+        divergences: &[
+            "A channel's Data leaves out DateLastSaved, which Jellyfin serialises with the \
+             save time and reads back from its column instead (BaseItemMapper.cs:120); \
+             Ferrofin stamps that column in the save's SQL. A Data merged into stored keys \
+             is written in serde_json's key order, not the serialiser's. The rest of the \
+             serialised item's shape is gl-1630's.",
+        ],
     },
     VerifiedSubsystem {
         key: "paging-sort",
