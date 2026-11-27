@@ -1990,6 +1990,16 @@ impl FerrofinSyncPlayManager {
         out
     }
 
+    /// Port of `SyncPlayManager.OnSessionEnded`: a session that ended leaves
+    /// its group as [`SyncPlayManager::leave_group`] does, and one in no group
+    /// is told nothing, where `leave_group` pushes it `NotInGroup`.
+    pub fn session_ended(&self, session: &SyncPlaySession) {
+        let notices = leave_locked_with_notices(&mut self.lock(), session, Utc::now());
+        if let Some(n) = notices {
+            self.deliver_leave(&session.session_id, n);
+        }
+    }
+
     /// The registry guard; see [`lock_registry`] for poison recovery.
     fn lock(&self) -> std::sync::MutexGuard<'_, Registry> {
         lock_registry(&self.registry)
@@ -3218,6 +3228,31 @@ mod tests {
         let s = session("s1", "alice");
         m.leave_group(&s).await.unwrap();
         assert!(bus.bodies()[0].contains("NotInGroup"));
+    }
+
+    /// `SyncPlayManager.OnSessionEnded` calls `LeaveGroup` only for a session
+    /// in a group, so an ended session in none is told nothing, where
+    /// `LeaveGroup` itself pushes `NotInGroup`.
+    #[tokio::test]
+    async fn an_ended_session_in_no_group_is_told_nothing() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        m.session_ended(&a);
+        assert!(bus.bodies().is_empty(), "{:?}", bus.bodies());
+
+        // One in a group leaves it, as `LeaveGroup` does.
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        let before = bus.count_for("s1");
+        m.session_ended(&b);
+        let alice = &bus.bodies_for("s1")[before..];
+        assert!(alice.iter().any(|x| x.contains("UserLeft")), "{alice:?}");
+        assert!(bus.bodies_for("s2").iter().any(|x| x.contains("GroupLeft")));
+        assert!(!m.is_user_active(b.user_id).await.unwrap());
+        // The last member ending drops the group.
+        m.session_ended(&a);
+        assert!(m.list_groups(&b).await.unwrap().is_empty());
     }
 
     /// `WaitingGroupState.HandleRequest(PlayGroupRequest)`
