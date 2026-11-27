@@ -5,7 +5,8 @@
 //! `ResolveVideos<Episode>(parent, files, true, tvshows, true)`
 //! (`MovieResolver.cs:232-235`): episodes with no series, hanging off the
 //! folder, `IsInMixedFolder = Count > 1 || parent.IsTopParent` (`:287`), their
-//! extras set aside.
+//! extras set aside. Below a folder that is no top parent an extras folder is
+//! ignored (`CoreResolutionIgnoreRule.cs:45-61`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -263,7 +264,8 @@ async fn a_video_in_a_tv_location_is_an_episode_without_a_series() {
 
 /// Jellyfin 12.4, live: in a folder set to "Content type: Shows" a lone video
 /// is an `Episode` with no series hanging off the folder, not in a mixed
-/// folder (the folder is no top parent); with a second one both are.
+/// folder (the folder is no top parent); with a second one both are. Its
+/// extras folder is ignored, where the location's is a series.
 #[rstest::rstest]
 #[case::lone(&["Kids/Kids Special S01E02.mkv"], false)]
 #[case::two(&["Kids/Kids Special S01E02.mkv", "Kids/Kids Recap S01E03.mkv"], true)]
@@ -272,7 +274,11 @@ async fn a_video_in_a_folder_of_shows_is_an_episode_without_a_series(
     #[case] videos: &[&str],
     #[case] mixed: bool,
 ) {
-    let mut files = vec!["Kids/Show B/Season 1/Show B S01E01.mkv"];
+    let mut files = vec![
+        "Kids/Show B/Season 1/Show B S01E01.mkv",
+        "Kids/trailers/Kids Trailer.mkv",
+        "trailers/Root Trailer S01E01.mkv",
+    ];
     files.extend(videos);
     let library = Library::new(
         CollectionTypeOptions::tvshows,
@@ -297,10 +303,23 @@ async fn a_video_in_a_folder_of_shows_is_an_episode_without_a_series(
             (Some(2), Some(1))
         )
     );
+    assert!(
+        stored.iter().all(|video| !video
+            .2
+            .as_deref()
+            .is_some_and(|p| p.starts_with("Kids/trailers"))),
+        "the extras folder is ignored: {stored:?}"
+    );
     let folders = library.folders().await;
     assert!(
         folders.contains(&("Folder".to_owned(), "Kids".to_owned(), "tv".to_owned()))
-            && folders.contains(&("Series".to_owned(), "Show B".to_owned(), "Kids".to_owned())),
+            && folders.contains(&("Series".to_owned(), "Show B".to_owned(), "Kids".to_owned()))
+            && folders.contains(&("Series".to_owned(), "trailers".to_owned(), "tv".to_owned()))
+            && !folders.contains(&(
+                "Series".to_owned(),
+                "trailers".to_owned(),
+                "Kids".to_owned()
+            )),
         "{folders:?}"
     );
 }

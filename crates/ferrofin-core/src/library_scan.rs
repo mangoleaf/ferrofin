@@ -17725,11 +17725,12 @@ impl LibraryScanner {
         // A location, whose rows hang off the library until
         // `place_under_location` moves them, is a top parent (`IsTopParent`).
         let top_parent = parent.0 == cf;
-        // Extra files are no items.
+        // Extra files are no items, and below a folder that is no top parent
+        // neither is an extras folder (`CoreResolutionIgnoreRule.cs:45-61`).
         let set_aside = set_aside_extras(
             &entries
                 .iter()
-                .filter(|entry| entry.type_ != FileSystemEntryType::Directory)
+                .filter(|entry| !top_parent || entry.type_ != FileSystemEntryType::Directory)
                 .cloned()
                 .collect::<Vec<_>>(),
             dir,
@@ -17738,7 +17739,9 @@ impl LibraryScanner {
         let dirs: Vec<_> = entries
             .iter()
             .filter(|entry| {
-                entry.type_ == FileSystemEntryType::Directory && ctx.scope.visits(&entry.path)
+                entry.type_ == FileSystemEntryType::Directory
+                    && !set_aside.contains(&entry.path)
+                    && ctx.scope.visits(&entry.path)
             })
             .collect();
         for rows in fanout::map(&dirs, ctx, |entry, ctx| {
