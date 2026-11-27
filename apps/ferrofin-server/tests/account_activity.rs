@@ -3,7 +3,8 @@
 //! Jellyfin writes "Password has been changed for user …" from a consumer of
 //! the `UserPasswordChangedEventArgs` that every `UserManager.ChangePassword`
 //! publishes, so each route that sets a password writes exactly one, the ones
-//! that set it at creation included.
+//! that set it at creation included. Its session loggers format "IP address:
+//! {0}" whatever the endpoint, so a session with none still gets the line.
 //!
 //! Boots the real composition root over a temp data dir and drives the routes
 //! over the real router (`tower::oneshot`), reading the entries back from
@@ -287,4 +288,48 @@ async fn the_startup_wizard_logs_the_password_it_sets() {
         .map(|(_, name, _)| name)
         .collect();
     assert_eq!(changes, ["Password has been changed for user owner"]);
+}
+
+/// A Quick Connect authorization opens its session with no remote endpoint
+/// (`AuthenticateDirect`'s request carries none, upstream as here). The
+/// session and sign-in loggers format "IP address: {0}" all the same.
+#[tokio::test]
+async fn a_session_without_an_endpoint_still_gets_the_ip_line() {
+    let harness = boot(ADMIN_PASSWORD).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let auth = authenticate(&router, ADMIN_USER, ADMIN_PASSWORD).await;
+
+    let device = r#"MediaBrowser Client="Account Log", Device="Quick Rig", DeviceId="rig-qc", Version="2.5.0""#;
+    let (status, initiated) = send(&router, device, "POST", "/QuickConnect/Initiate", None).await;
+    assert_eq!(status, StatusCode::OK, "{initiated}");
+    let code = initiated["Code"].as_str().expect("code");
+    let before = entries(&router, &auth).await.len();
+    let (status, body) = send(
+        &router,
+        &auth,
+        "POST",
+        &format!("/QuickConnect/Authorize?code={code}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let written: Vec<_> = entries(&router, &auth)
+        .await
+        .into_iter()
+        .skip(before)
+        .collect();
+    let ip = |type_: &str| {
+        written
+            .iter()
+            .find(|(t, _, _)| t == type_)
+            .unwrap_or_else(|| panic!("no {type_} entry in {written:?}"))
+            .2
+            .clone()
+    };
+    assert_eq!(ip("SessionStarted").as_deref(), Some("IP address: "));
+    assert_eq!(
+        ip("AuthenticationSucceeded").as_deref(),
+        Some("IP address: ")
+    );
 }

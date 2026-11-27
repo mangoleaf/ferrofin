@@ -2952,10 +2952,13 @@ pub async fn build_app_state(
                             name: template(&user_name, &device),
                             type_: type_.to_owned(),
                             user_id,
-                            short_overview: session
-                                .remote_end_point
-                                .filter(|e| !e.is_empty())
-                                .map(|endpoint| format!("IP address: {endpoint}")),
+                            // `LabelIpAddressValue`, formatted whatever the
+                            // endpoint: a session with none (Quick Connect's)
+                            // gets a bare "IP address: ", as upstream's does.
+                            short_overview: Some(format!(
+                                "IP address: {}",
+                                session.remote_end_point.as_deref().unwrap_or_default()
+                            )),
                             ..Default::default()
                         };
                         let activity = Arc::clone(&activity);
