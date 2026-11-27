@@ -77,6 +77,12 @@ impl ScheduledTask for RefreshGuideTask {
     }
 
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `RefreshGuide(progress, cancellationToken)` throws for a run already
+        // stopped: the check before its first service does (gl-2004). The
+        // checks inside the refresh are gl-2013's.
+        if progress.stop_requested() {
+            return Ok(());
+        }
         // Divergence: upstream's `GuideManager.RefreshGuide(progress, ct)`
         // reports across its tuner and listing passes, so the dashboard shows a
         // moving bar; Ferrofin's `refresh_guide` takes no progress handle, so
@@ -306,6 +312,19 @@ mod tests {
         async fn delete_recording(&self, _id: uuid::Uuid) -> Result<(), ServiceError> {
             unimplemented!()
         }
+    }
+
+    /// gl-2004: a run stopped before it starts refreshes no guide, and is
+    /// recorded Cancelled.
+    #[tokio::test]
+    async fn a_stopped_run_refreshes_no_guide() {
+        let fake = Arc::new(FakeLiveTv::default());
+        let task = RefreshGuideTask::new(fake.clone());
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+        assert_eq!(fake.refreshes.load(Ordering::Relaxed), 0);
+        assert!(progress.was_stopped(), "recorded Cancelled");
     }
 
     #[tokio::test]

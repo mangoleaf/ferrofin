@@ -6930,13 +6930,19 @@ pub const VERIFIED: &[Verified] = &[
          upstream's Cancel throws InvalidOperationException there, a 500. Jellyfin bug not \
          ported.",
             "A body still running STOP_WAIT (2 s) after the stop is dropped and recorded \
-         Cancelled; upstream waits for ExecuteAsync however long it takes. The Keyframe \
-         Extractor (gl-129) and the five library bodies gl-1709 made check between items \
-         hand their per-item work no token, so an item running when the wait ends is cut \
-         off mid-item (gl-2006); the bodies that check no token are cut off wherever they \
-         are. Fix path: gl-2004 (the other \
-         ferrofin-core bodies), gl-2005 (the extensions' and WASM bodies) and gl-2006; the \
-         value is a candidate setting (gl-1710).",
+         Cancelled; upstream waits for ExecuteAsync however long it takes. The ferrofin-core \
+         bodies check their token where upstream's do (gl-129, gl-1709, gl-2004), but the \
+         Keyframe Extractor, the five library bodies, Update Plugins and Migrate Trickplay \
+         Image Location hand their per-item work no token, Optimize database checks only \
+         before its first statement (gl-2006) and the guide refresh \
+         checks none inside its refresh (gl-2013), so work \
+         running when the wait ends is cut off mid-item; the extensions' and WASM bodies \
+         check none (gl-2005). Fix path: gl-2005, gl-2006 and gl-2013; the value is a \
+         candidate setting (gl-1710).",
+            "Optimize database records a run stopped before its optimisation Cancelled; \
+         upstream's catch (Exception) around RunScheduledOptimisation swallows the \
+         cancellation, logs it as an error and records the run Completed. Jellyfin bug not \
+         ported.",
             "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
          id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -6960,7 +6966,7 @@ pub const VERIFIED: &[Verified] = &[
             "A Scan Media Library run the refresh cancels ends when its scan wait is \
          withdrawn, before the scan's item in progress does; upstream's run stays Cancelling \
          until ValidateMediaLibraryInternal returns. The scan queue still starts the new \
-         scan after the stopping one. Fix path: gl-2004.",
+         scan after the stopping one. Fix path: gl-2013.",
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
          error shape, not upstream's. Fix path: gl-666.",
         ],

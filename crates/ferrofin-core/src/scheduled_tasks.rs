@@ -76,7 +76,9 @@ const SHUTDOWN_RUN_WAIT: Duration = Duration::from_secs(2);
 /// upstream's shutdown wait ([`SHUTDOWN_RUN_WAIT`]); whether it becomes a
 /// setting is the owner's call (gl-1710). Fix path for the limit itself:
 /// every body checks [`TaskProgress::stop_requested`] between its items
-/// (gl-2004, gl-2005) and hands its token to each item's work (gl-2006).
+/// (gl-2005, gl-2013) and hands its token to each item's work (gl-2006: the
+/// Keyframe Extractor, the five library bodies, Update Plugins and Migrate
+/// Trickplay Image Location).
 pub(crate) const STOP_WAIT: Duration = Duration::from_secs(2);
 
 /// How long after startup an interval task that has **never completed** first
@@ -1841,7 +1843,7 @@ impl ScheduledTask for RefreshLibraryTask {
         };
         // A stop withdraws the run's wait, and a scan nobody else waits for
         // stops at its next item. The run ends before that item does, which
-        // upstream's waits for (fix path: gl-2004); the scan queue starts the
+        // upstream's waits for (fix path: gl-2013); the scan queue starts the
         // next scan after it.
         let finished = progress
             .cancel_token()
