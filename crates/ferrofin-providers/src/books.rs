@@ -442,15 +442,15 @@ enum LineEnds {
 /// what it holds. That is an open difference: owner decision pending, tracked
 /// in gl-2032.
 fn xml_document(bytes: &[u8], line_ends: LineEnds) -> Result<XmlCursor, &'static str> {
-    let mut xml = decode_xml(bytes).ok_or("the bytes do not decode in the document's encoding")?;
+    let xml = decode_xml(bytes).ok_or("the bytes do not decode in the document's encoding")?;
     if xml.trim().is_empty() {
         return Err("the document is empty");
     }
-    // Before parsing, as the XML rule has it: a reference is still `&#13;` here.
-    if matches!(line_ends, LineEnds::Normalized) && xml.contains('\r') {
-        xml = xml.replace("\r\n", "\n").replace('\r', "\n");
+    match line_ends {
+        LineEnds::Normalized => XmlCursor::new(&xml),
+        LineEnds::AsWritten => XmlCursor::as_written(&xml),
     }
-    XmlCursor::new(&xml).map_err(|_| "the document is not well-formed XML")
+    .map_err(|_| "the document is not well-formed XML")
 }
 
 /// Decodes an XML document as `XmlReader`/`XmlDocument.Load` do
@@ -716,7 +716,7 @@ fn comic_book_info_metadata(format: ComicBookInfoFormat) -> Option<BookMetadata>
 /// Jellyfin looks for (`calibre:series`/`series_index`/`rating`).
 #[must_use]
 pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
-    opf_metadata(XmlCursor::new(xml).ok()?)
+    opf_metadata(XmlCursor::as_written(xml).ok()?)
 }
 
 /// [`parse_opf`] over a document already loaded.
@@ -1506,7 +1506,7 @@ pub fn read_epub_cover(path: &str) -> Option<(String, Vec<u8>)> {
 
 /// The manifest id an EPUB's `<meta name="cover" content="…"/>` points at.
 fn epub_cover_id(opf: &str) -> Option<String> {
-    let Ok(mut cursor) = XmlCursor::new(opf) else {
+    let Ok(mut cursor) = XmlCursor::as_written(opf) else {
         return None;
     };
     while !cursor.eof() {
@@ -1530,7 +1530,7 @@ fn epub_cover_id(opf: &str) -> Option<String> {
 /// The `href` of the manifest item carrying `properties="…"` — the EPUB 3
 /// declaration, which most modern books use instead of the `<meta>` pointer.
 fn epub_manifest_href_by_property(opf: &str, property: &str) -> Option<String> {
-    let Ok(mut cursor) = XmlCursor::new(opf) else {
+    let Ok(mut cursor) = XmlCursor::as_written(opf) else {
         return None;
     };
     while !cursor.eof() {
@@ -1557,7 +1557,7 @@ fn epub_manifest_href_by_property(opf: &str, property: &str) -> Option<String> {
 /// `href` when a manifest image item has exactly that `href`
 /// (`//opf:item[@href='…']` with an image media type).
 fn epub_manifest_image_at(opf: &str, href: &str) -> Option<String> {
-    let Ok(mut cursor) = XmlCursor::new(opf) else {
+    let Ok(mut cursor) = XmlCursor::as_written(opf) else {
         return None;
     };
     while !cursor.eof() {
@@ -1582,7 +1582,7 @@ fn is_image_media_type(media_type: &str) -> bool {
 
 /// The `href` of the manifest item with `id`.
 fn epub_manifest_href(opf: &str, id: &str) -> Option<String> {
-    let Ok(mut cursor) = XmlCursor::new(opf) else {
+    let Ok(mut cursor) = XmlCursor::as_written(opf) else {
         return None;
     };
     while !cursor.eof() {

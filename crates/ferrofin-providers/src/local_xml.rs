@@ -1508,6 +1508,24 @@ mod tests {
         assert_eq!(reparsed.shares, []);
     }
 
+    /// `BaseItemXmlParser.Fetch` loads through `XmlReader.Create`, so a
+    /// `collection.xml` or `playlist.xml` saved with CR LF line ends reads with
+    /// line feeds, in a CDATA section too; a character reference is no line
+    /// end (gl-2033, measured on Jellyfin 12.4 for both files).
+    #[rstest::rstest]
+    #[case::collection_xml(BaseItemKind::BoxSet)]
+    #[case::playlist_xml(BaseItemKind::Playlist)]
+    fn a_container_xmls_line_ends_are_read_as_line_feeds(#[case] kind: BaseItemKind) {
+        let xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Item>\r\n  \
+                   <Overview>one\r\ntwo\rthree\nfour [&#13;&#10;] [<![CDATA[x\ry\r\nz]]>]</Overview>\r\n\
+                   </Item>\r\n";
+        let parsed = parse_container_xml(xml, kind, &[]).expect("parses");
+        assert_eq!(
+            parsed.item.item.overview.as_deref(),
+            Some("one\ntwo\nthree\nfour [\r\n] [x\ny\nz]")
+        );
+    }
+
     /// A provider key `XmlWriter` cannot name an element after is left out.
     #[test]
     fn a_provider_key_that_is_no_xml_name_is_not_written() {

@@ -1084,3 +1084,115 @@ fn a_malformed_block_of_a_multi_episode_nfo_merges_nothing() {
     assert_eq!(result.item.name, None);
     assert_eq!(result.item.index_number, None);
 }
+
+// ---------------------------------------------------------------------------
+// Line ends (gl-2033)
+// ---------------------------------------------------------------------------
+
+/// CR LF, a lone CR and an LF as a document holds them, then as character
+/// references and in a CDATA section.
+const MIXED_LINE_ENDS: &str = "one\r\ntwo\rthree\nfour [&#13;&#10;] [<![CDATA[x\ry\r\nz]]>]";
+
+/// What `XmlReader` reads [`MIXED_LINE_ENDS`] as: CR LF and a lone CR in the
+/// document are one line feed, in a CDATA section too; a character reference
+/// is no line end.
+const READ_LINE_ENDS: &str = "one\ntwo\nthree\nfour [\r\n] [x\ny\nz]";
+
+/// An NFO saved with CR LF line ends, holding `content` in `element`.
+fn crlf_nfo(root: &str, element: &str, content: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<{root}>\r\n  <title>T</title>\r\n  \
+         <{element}>{content}</{element}>\r\n</{root}>\r\n"
+    )
+}
+
+/// Reads `nfo` with the parser of `kind`.
+fn fetch_kind(kind: NfoItemKind, nfo: &str) -> MetadataResult<NfoBaseItem> {
+    let fetch = match kind {
+        NfoItemKind::Movie => fetch_movie,
+        NfoItemKind::Series => fetch_series,
+        NfoItemKind::Season => fetch_season,
+        NfoItemKind::Episode => fetch_episode,
+        _ => fetch_music,
+    };
+    let mut result = new_result(kind);
+    fetch(
+        &mut result,
+        "item.nfo",
+        nfo,
+        &NfoConfiguration::default(),
+        &StaticExternalIds::new(["Tmdb"]),
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    result
+}
+
+/// Every NFO parser loads through `XmlReader.Create`, which reads CR LF and a
+/// lone CR in the document as one line feed (XML 1.0, section 2.11): the
+/// string reader of the path that allows a URL after the document (a movie, a
+/// series), the plain path's stream reader (a season, an album) and the
+/// episode parser's reader per `<episodedetails>` block (gl-2033, measured on
+/// Jellyfin 12.4 for each).
+#[rstest::rstest]
+#[case::movie(NfoItemKind::Movie, crlf_nfo("movie", "plot", MIXED_LINE_ENDS), READ_LINE_ENDS.to_owned())]
+#[case::series(NfoItemKind::Series, crlf_nfo("tvshow", "plot", MIXED_LINE_ENDS), READ_LINE_ENDS.to_owned())]
+#[case::season(NfoItemKind::Season, crlf_nfo("season", "plot", MIXED_LINE_ENDS), READ_LINE_ENDS.to_owned())]
+#[case::album(NfoItemKind::MusicAlbum, crlf_nfo("album", "review", MIXED_LINE_ENDS), READ_LINE_ENDS.to_owned())]
+#[case::single_block_episode(
+    NfoItemKind::Episode,
+    crlf_nfo("episodedetails", "plot", MIXED_LINE_ENDS),
+    READ_LINE_ENDS.to_owned()
+)]
+#[case::multi_block_episode(
+    NfoItemKind::Episode,
+    crlf_nfo("episodedetails", "plot", MIXED_LINE_ENDS)
+        + "<episodedetails>\r\n  <plot>b1\r\nb2\rb3</plot>\r\n</episodedetails>\r\n",
+    format!("{READ_LINE_ENDS} / b1\nb2\nb3")
+)]
+fn an_nfos_line_ends_are_read_as_line_feeds(
+    #[case] kind: NfoItemKind,
+    #[case] nfo: String,
+    #[case] overview: String,
+) {
+    assert_eq!(
+        fetch_kind(kind, &nfo).item.overview.as_deref(),
+        Some(overview.as_str())
+    );
+}
+
+/// A movie's `<set>` goes through two readers upstream: `ReadInnerXml` writes
+/// what the first one read back out, and `ParseSetXml` reads that string with
+/// an `XmlReader` of its own. A carriage return the name holds as a character
+/// reference is written raw by the first, so it is a line end to the second
+/// (Jellyfin 12.4 names the collection `a\nb\nc\nd`).
+#[test]
+fn a_movie_sets_name_is_read_by_two_readers() {
+    let nfo = crlf_nfo("movie", "set", "\r\n    <name>a\r\nb\rc&#13;d</name>\r\n  ");
+    assert_eq!(
+        fetch_kind(NfoItemKind::Movie, &nfo)
+            .item
+            .collection_name
+            .as_deref(),
+        Some("a\nb\nc\nd")
+    );
+}
+
+/// An attribute value follows the attribute rule, not the text's: a line end
+/// or a tab the document holds is one space, CR LF one too, and a character
+/// reference stays (the same on Jellyfin 12.4, read as provider ids).
+#[test]
+fn an_nfo_attributes_line_ends_are_spaces() {
+    let ids = "<uniqueid type=\"crlf[\r\n]\">1</uniqueid><uniqueid type=\"cr[\r]\">2</uniqueid>\
+               <uniqueid type=\"lf[\n]\">3</uniqueid><uniqueid type=\"tab[\t]\">4</uniqueid>\
+               <uniqueid type=\"ref[&#13;&#10;&#9;]\">5</uniqueid>";
+    let result = fetch_kind(NfoItemKind::Movie, &format!("<movie>{ids}</movie>"));
+    let mut keys: Vec<&str> = result
+        .item
+        .provider_ids
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["cr[ ]", "crlf[ ]", "lf[ ]", "ref[\r\n\t]", "tab[ ]"]);
+}

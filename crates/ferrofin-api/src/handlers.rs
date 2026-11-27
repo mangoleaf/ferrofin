@@ -958,8 +958,10 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// or a playlist file is read in, the tables its legacy Chinese and Korean
 /// text is decoded with, and what is written for bytes with no character in
 /// their charset, which the subtitle stream operations and the playlist scan
-/// share; and how an XML document that declares a legacy encoding is read
-/// with the same decoder, a book's `ComicInfo.xml` or OPF and an XMLTV guide.
+/// share; how an XML document that declares a legacy encoding is read
+/// with the same decoder, a book's `ComicInfo.xml` or OPF and an XMLTV guide;
+/// and which line ends the text of an XML metadata file is read with (a
+/// book's, an NFO, a `collection.xml` or a `playlist.xml`).
 /// `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
@@ -2927,9 +2929,27 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    archive, reads CR LF and a lone CR in the document as one line feed, in a \
                    CDATA section too and not in a character reference, where \
                    XmlDocument.Load, which loads an OPF, keeps them; books.rs xml_document \
-                   normalises by LineEnds accordingly, before tokenizing, and with it the 237 \
-                   sweep cells that kept a carriage return where Jellyfin reads a line feed \
-                   are Jellyfin's. Behind an M3U tuner, the programme titles and overviews of \
+                   takes the cursor by LineEnds accordingly (xbmc/xml_reader.rs XmlCursor::new \
+                   normalises before tokenizing, XmlCursor::as_written does not), and with it \
+                   the 237 sweep cells that kept a carriage return where Jellyfin reads a \
+                   line feed are Jellyfin's. The NFO parsers and the local XML parser load \
+                   through XmlReader.Create as well (gl-2033): BaseNfoParser.Fetch's stream \
+                   reader and, where a URL may follow the document, its string reader, \
+                   EpisodeNfoParser.ReadEpisodeDetailsFromXml for each <episodedetails> block, \
+                   MovieNfoParser.ParseSetXml over the <set>'s ReadInnerXml, and \
+                   BaseItemXmlParser.Fetch for a collection.xml and a playlist.xml; \
+                   xbmc/base_parser.rs fetch, xbmc/parsers.rs read_details and parse_set_xml \
+                   and local_xml.rs parse_container_xml read through XmlCursor::new and \
+                   up_to_error. Measured on Jellyfin 12.4 and equal with it: the overview of \
+                   a movie's, a series', a season's, an album's and an artist's NFO, of a \
+                   single-block and a two-block episode NFO, of a collection.xml and of a \
+                   playlist.xml holds a line feed for CR LF and for a lone CR, in a CDATA \
+                   section too, and keeps a referenced carriage return; a <set>'s name holds \
+                   a line feed for a referenced carriage return as well, which ReadInnerXml \
+                   writes out raw for the second reader; and an attribute value (a \
+                   <uniqueid>'s type) holds one space for a line end or a tab and keeps a \
+                   referenced one, on both servers before and after. \
+                   Behind an M3U tuner, the programme titles and overviews of \
                    guides in nine legacy encodings, each holding a sequence with no \
                    character, are the same on both servers after a guide refresh, where none \
                    of them was stored before. A lead byte right before markup takes its < in \

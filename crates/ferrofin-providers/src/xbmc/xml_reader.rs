@@ -8,8 +8,15 @@
 //! flat `XmlToken` list (entities unescaped, adjacent text coalesced) and then
 //! exposes an [`XmlCursor`] over it that re-creates the reader contract.
 //!
+//! Line ends are the reader's too: [`XmlCursor::new`] and
+//! [`XmlCursor::up_to_error`] read CR LF and a lone CR as one line feed, as
+//! `XmlReader.Create` does; [`XmlCursor::as_written`] is for the one loader
+//! that does not (`XmlDocument.Load`).
+//!
 //! Only the surface the parsers actually use is implemented; unused `XmlReader`
 //! features (namespaces, attribute-node navigation, DTDs) are omitted.
+
+use std::borrow::Cow;
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -169,6 +176,17 @@ fn local_name(e: &quick_xml::events::BytesStart<'_>) -> String {
     e.local_name().as_ref().to_owned()
 }
 
+/// `xml` with each CR LF and each lone CR as one line feed: what an XML
+/// processor does to a document before parsing it (XML 1.0, section 2.11). A
+/// character reference is still `&#13;` here, so it stays a carriage return.
+fn line_feeds(xml: &str) -> Cow<'_, str> {
+    if xml.contains('\r') {
+        Cow::Owned(xml.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        Cow::Borrowed(xml)
+    }
+}
+
 /// Appends `text` to the token stream, coalescing with a preceding text node.
 fn push_text(tokens: &mut Vec<XmlToken>, text: String) {
     if let Some(XmlToken::Text { value }) = tokens.last_mut() {
@@ -189,12 +207,25 @@ pub struct XmlCursor {
 }
 
 impl XmlCursor {
-    /// Tokenizes `xml` and positions the cursor on the first node.
+    /// Tokenizes `xml` as `XmlReader.Create` reads it and positions the cursor
+    /// on the first node: CR LF and a lone CR in the document are one line
+    /// feed, in a CDATA section too, and a character reference (`&#13;`) is
+    /// not a line end (measured on Jellyfin 12.4, gl-2029 and gl-2033).
     ///
     /// # Errors
     /// Returns [`XmlError`] if the document cannot be tokenized (the parsers
     /// treat this the same as a caught `XmlException`).
     pub fn new(xml: &str) -> Result<Self, XmlError> {
+        Self::as_written(&line_feeds(xml))
+    }
+
+    /// [`Self::new`] for a document `XmlDocument.Load` reads: its
+    /// `XmlTextReader` has `Normalization` off, so the text keeps the line
+    /// ends the document holds (an OPF, measured on Jellyfin 12.4, gl-2029).
+    ///
+    /// # Errors
+    /// Returns [`XmlError`] if the document cannot be tokenized.
+    pub fn as_written(xml: &str) -> Result<Self, XmlError> {
         Ok(Self {
             tokens: tokenize(xml)?,
             pos: 0,
@@ -203,10 +234,11 @@ impl XmlCursor {
 
     /// A cursor over the elements read before the first malformed spot, and
     /// whether the whole document was well-formed: the reader a C# parser
-    /// that catches `XmlException` has walked when the exception lands.
+    /// that catches `XmlException` has walked when the exception lands. Line
+    /// ends are read as [`Self::new`] reads them.
     #[must_use]
     pub fn up_to_error(xml: &str) -> (Self, bool) {
-        let (tokens, clean) = tokenize_until_error(xml);
+        let (tokens, clean) = tokenize_until_error(&line_feeds(xml));
         (Self { tokens, pos: 0 }, clean)
     }
 
