@@ -711,24 +711,26 @@ async fn create_user_by_name(
 ) -> Result<Json<UserDto>, ApiError> {
     let new_user = state.users.create_user(&body.name).await?;
     let id = user_uuid(&new_user)?;
-    if let Some(password) = &body.password {
-        state.users.change_password(id, password.expose()).await?;
-    }
-    // Reload so the DTO reflects the password just set.
-    let reloaded = load_user(&state, id).await?;
-    // Port of `UserCreatedLogger`.
+    // Port of `UserCreatedLogger`, written before the password is set: C#
+    // `CreateUserAsync` publishes `UserCreatedEventArgs` before the action's
+    // `ChangePassword` writes "Password has been changed".
     log_activity(
         &state,
         ferrofin_traits::activity::ActivityLogCreate {
             name: state
                 .localization
-                .format_server_localized("UserCreatedWithName", &[&reloaded.username]),
+                .format_server_localized("UserCreatedWithName", &[&new_user.username]),
             type_: "UserCreated".to_owned(),
             user_id: Some(id),
             ..Default::default()
         },
     )
     .await;
+    if let Some(password) = &body.password {
+        state.users.change_password(id, password.expose()).await?;
+    }
+    // Reload so the DTO reflects the password just set.
+    let reloaded = load_user(&state, id).await?;
     Ok(Json(state.users.get_user_dto(&reloaded, None).await?))
 }
 
@@ -927,9 +929,10 @@ async fn update_user_password(
     let user = load_user(&state, user_id).await?;
     assert_can_update_user(&state, &auth, &user).await?;
 
+    // The password change writes its own activity entry, as C#'s
+    // `ChangePassword` publishes `UserPasswordChangedEventArgs`.
     if body.reset_password {
         state.users.reset_password(user_id).await?;
-        log_password_changed(&state, user_id, &user.username).await;
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -966,25 +969,7 @@ async fn update_user_password(
         .sessions
         .revoke_user_tokens(user_id, auth.token.as_ref().map_or("", Secret::expose))
         .await?;
-    log_password_changed(&state, user_id, &user.username).await;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Records the `UserPasswordChanged` activity entry (port of
-/// `UserPasswordChangedLogger`).
-async fn log_password_changed(state: &AppState, user_id: Uuid, username: &str) {
-    log_activity(
-        state,
-        ferrofin_traits::activity::ActivityLogCreate {
-            name: state
-                .localization
-                .format_server_localized("UserPasswordChangedWithName", &[username]),
-            type_: "UserPasswordChanged".to_owned(),
-            user_id: Some(user_id),
-            ..Default::default()
-        },
-    )
-    .await;
 }
 
 /// `POST /Users/ForgotPassword` — begin password recovery.

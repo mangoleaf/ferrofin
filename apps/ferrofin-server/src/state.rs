@@ -1165,7 +1165,8 @@ pub async fn build_app_state(
             .with_password_reset_dir(paths.program_data_path())
             .with_auth_cache(Arc::clone(&auth_cache))
             .with_login_backoff(config.login_backoff_settings())
-            // A lockout is a dashboard Alert, not just a log line.
+            // A lockout is a dashboard Alert, not just a log line, and every
+            // password change writes its entry (`UserPasswordChangedLogger`).
             .with_activity(Arc::clone(&activity))
             .with_localization(Arc::clone(&localization))
             // A rename or policy save is announced (`UserUpdated`).
@@ -2958,14 +2959,13 @@ pub async fn build_app_state(
                             name: template(localization.as_ref(), &user_name, &device),
                             type_: type_.to_owned(),
                             user_id,
-                            short_overview: session.remote_end_point.filter(|e| !e.is_empty()).map(
-                                |endpoint| {
-                                    localization.format_server_localized(
-                                        "LabelIpAddressValue",
-                                        &[&endpoint],
-                                    )
-                                },
-                            ),
+                            // `LabelIpAddressValue`, formatted whatever the
+                            // endpoint: a session with none (Quick Connect's)
+                            // gets a bare "IP address: ", as upstream's does.
+                            short_overview: Some(localization.format_server_localized(
+                                "LabelIpAddressValue",
+                                &[session.remote_end_point.as_deref().unwrap_or_default()],
+                            )),
                             ..Default::default()
                         };
                         let activity = Arc::clone(&activity);

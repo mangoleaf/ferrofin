@@ -4130,7 +4130,7 @@ pub const VERIFIED: &[Verified] = &[
          publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
          AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
          refusal skips it, so those attempts never reach the Alerts feed. Jellyfin bug not \
-         ported.",
+         ported; whether to keep it is an owner decision, gl-1981.",
         ],
         refs: &[],
     },
@@ -4197,9 +4197,10 @@ pub const VERIFIED: &[Verified] = &[
                RequiredString and body_parameter) → ferrofin-core user_manager.rs \
                redeem_password_reset_pin (UserManager.RedeemPasswordResetPin), redeem_with → \
                password_reset.rs \
-               DefaultPasswordResetProvider (redeem_reset_pins), change_password, \
-               log_password_changed. Compared: the [Required] required string Pin (missing, \
-               null, empty and whitespace are 400s before the action, with Jellyfin 12.4's \
+               DefaultPasswordResetProvider (redeem_reset_pins), change_password (which \
+               writes the UserPasswordChanged activity entry). Compared: the [Required] \
+               required string Pin (missing, null, empty and whitespace are 400s before the \
+               action, with Jellyfin 12.4's \
                messages, measured), the body's forgotPasswordPinRequest entry when it fails \
                to bind (measured), every provider asked in order whether enabled or not, \
                the first success answered, an expired record deleted, the PIN compared \
@@ -7421,7 +7422,8 @@ pub const VERIFIED: &[Verified] = &[
                update_user (UpdateUserAsync) → rename_user (RenameUser, announcing \
                UserUpdated) only when the sent name differs from the stored one under \
                ferrofin-util string_extensions.rs equals_invariant_ignore_case \
-               (InvariantCultureIgnoreCase) → change_password (ChangePassword) → 204",
+               (InvariantCultureIgnoreCase) → change_password (ChangePassword, and the \
+               UserPasswordChanged activity entry of UserPasswordChangedLogger) → 204",
         date: "2026-11-26",
         divergences: &[
             "The 403 (a password already set), 400 (no password, or a name the rename refuses \
@@ -7437,8 +7439,6 @@ pub const VERIFIED: &[Verified] = &[
          name's directory, and a move that fails answers 500 and rolls the rename back. \
          Upstream's RenameUser leaves the file where it is, and a later user given the old \
          name then overwrites the renamed user's image. Jellyfin bug not ported.",
-            "Setting the password writes no UserPasswordChanged activity entry, where \
-         ChangePassword publishes UserPasswordChangedEventArgs. Fix path: gl-1602.",
             "Names that differ only in character width or kana type (ｂｏｂ and bob, あき \
          and アキ) compare equal, so the stored name is kept, where .NET's ICU tailoring \
          tells them apart and upstream renames. Fix path: gl-1793.",

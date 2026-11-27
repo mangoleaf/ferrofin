@@ -1875,10 +1875,15 @@ pub trait UserManager: Send + Sync {
     /// Deletes a user by id.
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError>;
 
-    /// Resets a user's password to empty.
+    /// Resets a user's password to empty: [`Self::change_password`] with an
+    /// empty password.
     async fn reset_password(&self, user_id: Uuid) -> Result<(), ServiceError>;
 
     /// Changes a user's password.
+    ///
+    /// Once the password is saved the implementation writes the
+    /// "Password has been changed" activity entry, as C# `ChangePassword`
+    /// publishes `UserPasswordChangedEventArgs`, so callers write none.
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError>;
 
     /// Authenticates a user by name/password, returning the row on success.
