@@ -3890,6 +3890,61 @@ mod tests {
         assert_eq!(page.members.entries, vec![0, 1, 2, 1]);
     }
 
+    /// gl-425: a member whose stored `Type` names no kind is left out, as
+    /// `ResolveLinkedChildren` drops an item it cannot read, and the access
+    /// columns still come back when it is the only member.
+    #[tokio::test]
+    async fn get_playlist_items_leaves_out_a_member_of_an_unknown_type() {
+        let db = test_db().await;
+        let (a, b, gone) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b, gone] {
+            seed_item(&db, id, BaseItemKind::Audio).await;
+        }
+        let (mgr, _root) = playlist_manager(&db).await;
+        let owner = Uuid::new_v4();
+        let mut playlists = Vec::new();
+        for members in [vec![a, gone, a, b], vec![gone]] {
+            let created = mgr
+                .create_playlist(&PlaylistCreationRequest {
+                    name: Some("Mixed".to_owned()),
+                    item_id_list: members,
+                    user_id: owner,
+                    ..PlaylistCreationRequest::default()
+                })
+                .await
+                .expect("create");
+            playlists.push(Uuid::parse_str(&created.id).expect("uuid"));
+        }
+        let mut row = crate::test_support::fetch_item(&db, gone).await;
+        row.type_ = "Jellyfin.Plugin.Gone.Track".to_owned();
+        crate::test_support::save_item(&db, &row).await;
+
+        let repository = item_repository_over(db.clone());
+        let page = repository
+            .get_playlist_items_with_access(playlists[0], owner, super::LINKED_CHILD_MANUAL)
+            .await
+            .expect("read");
+        let rows: Vec<Uuid> = page
+            .members
+            .items
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        assert_eq!(rows, vec![a, b]);
+        assert_eq!(page.members.entries, vec![0, 0, 1]);
+        let only = repository
+            .get_playlist_items_with_access(playlists[1], owner, super::LINKED_CHILD_MANUAL)
+            .await
+            .expect("read");
+        assert!(only.access.is_some());
+        assert!(only.members.items.is_empty() && only.members.entries.is_empty());
+        let listed = mgr
+            .get_playlist_items(playlists[1], owner)
+            .await
+            .expect("items");
+        assert_eq!(listed.entries, Vec::<usize>::new());
+    }
+
     #[tokio::test]
     async fn remove_by_dashless_playlist_item_id_removes_member() {
         // `GetPlaylistItems` emits `PlaylistItemId` dashless (`Guid('N')`), but

@@ -2949,6 +2949,9 @@ const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
      pixels differ from upstream's. These rows never enlarge (GetNewImageSize caps the size \
      at the source); where Ferrofin does, neither side shrinking (a collage cell or \
      splashscreen tile drawn from a smaller image), it uses upstream's Mitchell.",
+    "An anonymous request serves an image of an item whose stored Type names no item \
+     kind (a removed plugin's item); upstream's GetItemById is null for it, a 404. A \
+     signed-in request is a 404 here too. Fix path: gl-1967.",
     "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
 ];
 
@@ -5905,6 +5908,9 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "A user named twice in the shares is listed once, with the combined CanEdit; \
          upstream's Shares lists every stored entry. Fix path: gl-949.",
+            "A member whose stored Type names no item kind (a removed plugin's item) is listed \
+         in ItemIds; upstream's ResolveLinkedChildren drops it, as GET /Playlists/{id}/Items \
+         does here. Fix path: gl-1967.",
             "The 404 (no playlist the caller can see) body is Ferrofin's error shape, not \
          upstream's \"Playlist not found\" string. Fix path: gl-666.",
         ],
@@ -5969,16 +5975,18 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/playlists.rs get_playlist_items (effective_user_id: \
                RequestHelpers.GetUserId) → ferrofin-core collection_manager.rs \
                FerrofinPlaylistManager::get_playlist_items (GetPlaylistForUser and \
-               GetManageableItems: manual links, in order, missing items out, each distinct \
-               member's row read once and its entries pointing at it, as \
-               ResolveLinkedChildren's byId lookup shares one BaseItem between repeats), \
+               GetManageableItems: manual links, in order, missing items and items of an \
+               unknown stored Type out, as ResolveLinkedChildren drops what GetItemList \
+               cannot deserialize, each distinct member's row read once and its entries \
+               pointing at it, as ResolveLinkedChildren's byId lookup shares one BaseItem \
+               between repeats), \
                then LibraryManager::filter_visible_items_standalone over those rows \
                (ItemVisibility::visible, one answer per distinct id) before the paging, as \
                upstream filters before Skip and Take (the count taken first; a negative \
                startIndex skips nothing, a negative limit takes nothing), and the page's \
                entries through tv_shows::build_dto_options + get_linked_children_dtos + the \
                PlaylistItemId tag",
-        date: "2026-11-11",
+        date: "2026-11-26",
         divergences: &[
             "A member the caller may not open is left out with the standalone check, which also \
          walks its library, where upstream's IsVisible reads only its rating and tags and \
@@ -6807,8 +6815,10 @@ pub const VERIFIED: &[Verified] = &[
                (UserViewManager.GetItemsForLatestItems, LibraryManager.GetLatestItemList, \
                SetTopParentIdsOrAncestors) → item_repository.rs get_latest_item_list, \
                latest_movie_items, latest_tv_repository.rs \
-               (BaseItemRepository.GetLatestItemList, GetLatestMovieItems, GetLatestTvShowItems)",
-        date: "2026-11-03",
+               (BaseItemRepository.GetLatestItemList, GetLatestMovieItems, GetLatestTvShowItems; \
+               each row through mapped_rows, as DeserializeBaseItem: a row of an unknown \
+               stored Type is skipped)",
+        date: "2026-11-26",
         divergences: &[
             "The plain query over-fetches 10.11.8's limit * 5 where v12 fetches limit * 2, so \
          a request answered by it can reach containers upstream's cut leaves out. Fix path: \
