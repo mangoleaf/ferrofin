@@ -3,7 +3,9 @@
 //! `ResolvePath` gives an untyped folder the override set for it or a folder
 //! above it, `Folder.GetNonCachedChildren` resolves a folder's children with
 //! `GetContentType(folder)`, and `SeriesResolver` makes a folder of a shows
-//! context a series unless its own override is `tvshows`.
+//! context a series unless its own override is `tvshows`. `homevideos` and
+//! `photos` resolve videos as `Video`s and photos (`PhotoResolver`,
+//! `PhotoAlbumResolver`), as Jellyfin 12.4 does live.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -29,6 +31,17 @@ type Overrides = Arc<Mutex<Vec<NameValuePair>>>;
 async fn library(
     root: &Path,
     collection_type: Option<CollectionTypeOptions>,
+    files: &[&str],
+    overrides: &[(&str, &str)],
+) -> (LibraryScanner, Database, Overrides) {
+    library_with_photos(root, collection_type, true, files, overrides).await
+}
+
+/// [`library`], with the library's `EnablePhotos` set to `enable_photos`.
+async fn library_with_photos(
+    root: &Path,
+    collection_type: Option<CollectionTypeOptions>,
+    enable_photos: bool,
     files: &[&str],
     overrides: &[(&str, &str)],
 ) -> (LibraryScanner, Database, Overrides) {
@@ -58,6 +71,7 @@ async fn library(
             path_infos: vec![MediaPathInfo {
                 path: media.to_string_lossy().into_owned(),
             }],
+            enable_photos,
             ..LibraryOptions::default()
         },
     )
@@ -89,8 +103,8 @@ fn entries(media: &Path, overrides: &[(&str, &str)]) -> Vec<NameValuePair> {
         .collect()
 }
 
-/// Every scanned video, series, season and plain folder as (kind, name, the
-/// name of what it hangs off), sorted.
+/// Every scanned video, series, season, plain folder, photo, album, audio
+/// track and playlist as (kind, name, the name of what it hangs off), sorted.
 async fn tree(db: &Database) -> Vec<(String, String, String)> {
     let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
         r#"SELECT b."Type", b."Name", p."Name" FROM "BaseItems" b
@@ -102,7 +116,11 @@ async fn tree(db: &Database) -> Vec<(String, String, String)> {
                'MediaBrowser.Controller.Entities.TV.Series',
                'MediaBrowser.Controller.Entities.TV.Season',
                'MediaBrowser.Controller.Entities.TV.Episode',
-               'MediaBrowser.Controller.Entities.Folder')"#,
+               'MediaBrowser.Controller.Entities.Folder',
+               'MediaBrowser.Controller.Entities.Photo',
+               'MediaBrowser.Controller.Entities.PhotoAlbum',
+               'MediaBrowser.Controller.Entities.Audio.Audio',
+               'MediaBrowser.Controller.Playlists.Playlist')"#,
     )
     .fetch_all(db.pool())
     .await
@@ -396,4 +414,273 @@ async fn a_scoped_scan_of_the_folder_follows_its_override() {
         tree(&db).await,
         vec![row("Movie", "Blade (1998)", "Library")]
     );
+}
+
+/// The tree a mixed library's folder holds, and what Jellyfin 12.4 makes of it
+/// with "Content type: Home videos" on the folder: the folder resolves with
+/// the override (`ResolvePath`), so holding a photo it is a `PhotoAlbum`; its
+/// clips are `Video`s, never a movie in its own folder; a subfolder holding a
+/// photo is an album; and the audio and the playlist file no longer resolve.
+const HOME_FILES: [&str; 7] = [
+    "Home/clip.mkv",
+    "Home/pic.jpg",
+    "Home/song.mp3",
+    "Home/list.m3u",
+    "Home/Album/a.jpg",
+    "Home/Film (2000)/Film (2000).mkv",
+    "Home/Disc/01 - One.mp3",
+];
+
+fn home_tree() -> Vec<(String, String, String)> {
+    let mut rows = vec![
+        row("PhotoAlbum", "Home", "Library"),
+        row("Video", "clip", "Home"),
+        row("Photo", "pic", "Home"),
+        row("PhotoAlbum", "Album", "Home"),
+        row("Photo", "a", "Album"),
+        row("Folder", "Film (2000)", "Home"),
+        row("Video", "Film (2000)", "Film (2000)"),
+        row("Folder", "Disc", "Home"),
+    ];
+    rows.sort();
+    rows
+}
+
+#[tokio::test]
+async fn a_mixed_folder_set_to_home_videos_holds_photos_and_videos() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, _) = library(tmp.path(), None, &HOME_FILES, &[("Home", "homevideos")]).await;
+    scanner.scan_all().await.expect("scan");
+    assert_eq!(tree(&db).await, home_tree());
+}
+
+/// Setting the override after a scan, then removing it, rescans the folder
+/// each time to what a first scan makes of it: the movies, audio and playlist
+/// it held go, then the photos and albums.
+#[tokio::test]
+async fn setting_and_removing_a_home_video_override_rescans_the_folder() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, overrides) = library(tmp.path(), None, &HOME_FILES, &[]).await;
+    scanner.scan_all().await.expect("first scan");
+    let untyped = tree(&db).await;
+    assert!(
+        untyped.contains(&row("Movie", "clip", "Home"))
+            && untyped.contains(&row("Audio", "song", "Home"))
+            && untyped.contains(&row("Playlist", "list", "Home")),
+        "{untyped:?}"
+    );
+    let media = tmp.path().join("media");
+    *overrides.lock().expect("overrides") = entries(&media, &[("Home", "homevideos")]);
+    scanner.scan_all().await.expect("second scan");
+    assert_eq!(tree(&db).await, home_tree());
+    overrides.lock().expect("overrides").clear();
+    scanner.scan_all().await.expect("third scan");
+    assert_eq!(tree(&db).await, untyped);
+}
+
+/// `photos` takes photos whatever the library's `EnablePhotos` says
+/// (`PhotoResolver.cs:64-65`), where `homevideos` follows it.
+#[tokio::test]
+async fn a_folder_set_to_photos_holds_photos_without_enable_photos() {
+    let files = [
+        "Pics/pic.jpg",
+        "Pics/clip.mkv",
+        "Pics/Album/a.jpg",
+        "Clips/pic.jpg",
+        "Clips/clip.mkv",
+        "Clips/Album/a.jpg",
+    ];
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, _) = library_with_photos(
+        tmp.path(),
+        Some(CollectionTypeOptions::homevideos),
+        false,
+        &files,
+        &[("Pics", "photos"), ("Clips", "homevideos")],
+    )
+    .await;
+    scanner.scan_all().await.expect("scan");
+    let mut expected = vec![
+        row("Folder", "Pics", "Library"),
+        row("Photo", "pic", "Pics"),
+        row("Video", "clip", "Pics"),
+        row("PhotoAlbum", "Album", "Pics"),
+        row("Photo", "a", "Album"),
+        row("Folder", "Clips", "Library"),
+        row("Video", "clip", "Clips"),
+        row("Folder", "Album", "Clips"),
+    ];
+    expected.sort();
+    assert_eq!(tree(&db).await, expected);
+}
+
+/// `MovieResolver` makes no video of a `photos` folder (`MovieResolver.cs:
+/// 96-140`): a disc rip there is a plain folder whose files are videos, where
+/// under `homevideos` it is one `Video`.
+#[tokio::test]
+async fn a_disc_rip_in_a_photos_folder_is_a_folder_of_videos() {
+    let files = [
+        "Pics/Rip/VIDEO_TS/VIDEO_TS.IFO",
+        "Pics/Rip/VIDEO_TS/VTS_01_1.VOB",
+        "Clips/Rip/VIDEO_TS/VIDEO_TS.IFO",
+        "Clips/Rip/VIDEO_TS/VTS_01_1.VOB",
+    ];
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, _) = library(
+        tmp.path(),
+        None,
+        &files,
+        &[("Pics", "photos"), ("Clips", "homevideos")],
+    )
+    .await;
+    scanner.scan_all().await.expect("scan");
+    let mut expected = vec![
+        row("Folder", "Pics", "Library"),
+        row("Folder", "Rip", "Pics"),
+        row("Folder", "VIDEO_TS", "Rip"),
+        row("Video", "VIDEO_TS", "VIDEO_TS"),
+        row("Video", "VTS_01_1", "VIDEO_TS"),
+        row("Folder", "Clips", "Library"),
+        row("Video", "Rip", "Clips"),
+    ];
+    expected.sort();
+    assert_eq!(tree(&db).await, expected);
+}
+
+/// In a home-video library a folder set to Movies still resolves with its
+/// parent's type, so holding a photo it stays a `PhotoAlbum`, while what it
+/// holds resolves as in a movies library: movies, no photo, no album.
+#[tokio::test]
+async fn a_home_video_folder_set_to_movies_holds_movies() {
+    let files = [
+        "Films/pic.jpg",
+        "Films/clip.mkv",
+        "Films/Album/a.jpg",
+        "Films/Film (2000)/Film (2000).mkv",
+    ];
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, overrides) = library(
+        tmp.path(),
+        Some(CollectionTypeOptions::homevideos),
+        &files,
+        &[],
+    )
+    .await;
+    scanner.scan_all().await.expect("first scan");
+    *overrides.lock().expect("overrides") =
+        entries(&tmp.path().join("media"), &[("Films", "movies")]);
+    scanner.scan_all().await.expect("second scan");
+    let mut expected = vec![
+        row("PhotoAlbum", "Films", "Library"),
+        row("Movie", "clip", "Films"),
+        row("Folder", "Album", "Films"),
+        row("Movie", "Film (2000)", "Films"),
+    ];
+    expected.sort();
+    assert_eq!(tree(&db).await, expected);
+}
+
+/// An album's children resolve with its `GetContentType` too, and an entry
+/// for a folder above matches before a nearer one listed after it
+/// (`GetContentTypeOverride` takes the first): `Sub`'s movies are movies, but
+/// `Sub/Pics` takes `Home`'s `homevideos`, listed first, and its photo.
+#[tokio::test]
+async fn an_album_set_to_movies_holds_movies() {
+    let files = [
+        "Home/pic.jpg",
+        "Home/Sub/pic.jpg",
+        "Home/Sub/Movie (2001)/Movie (2001).mkv",
+        "Home/Sub/Pics/x.jpg",
+    ];
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, _) = library(
+        tmp.path(),
+        None,
+        &files,
+        &[("Home", "homevideos"), ("Home/Sub", "movies")],
+    )
+    .await;
+    scanner.scan_all().await.expect("scan");
+    let mut expected = vec![
+        row("PhotoAlbum", "Home", "Library"),
+        row("Photo", "pic", "Home"),
+        row("PhotoAlbum", "Sub", "Home"),
+        row("Movie", "Movie (2001)", "Sub"),
+        row("Folder", "Pics", "Sub"),
+        row("Photo", "x", "Pics"),
+    ];
+    expected.sort();
+    assert_eq!(tree(&db).await, expected);
+}
+
+/// In a movies or a music-video library the folder itself resolves with the
+/// library's type (a plain folder here), and what it holds as the override
+/// says: videos of the walk's kind become `Video`s, never a movie in its own
+/// folder, and its photos resolve.
+#[tokio::test]
+async fn a_video_library_folder_set_to_home_videos_or_photos_holds_photos() {
+    let files = [
+        "Pics/clip.mkv",
+        "Pics/pic.jpg",
+        "Pics/Album/a.jpg",
+        "Pics/Film (2000)/Film (2000).mkv",
+    ];
+    for (library_type, content_type) in [
+        (CollectionTypeOptions::movies, "photos"),
+        (CollectionTypeOptions::musicvideos, "homevideos"),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (scanner, db, _) = library(
+            tmp.path(),
+            Some(library_type),
+            &files,
+            &[("Pics", content_type)],
+        )
+        .await;
+        scanner.scan_all().await.expect("scan");
+        let mut expected = vec![
+            row("Folder", "Pics", "Library"),
+            row("Video", "clip", "Pics"),
+            row("Photo", "pic", "Pics"),
+            row("PhotoAlbum", "Album", "Pics"),
+            row("Photo", "a", "Album"),
+            row("Folder", "Film (2000)", "Pics"),
+            row("Video", "Film (2000)", "Film (2000)"),
+        ];
+        expected.sort();
+        assert_eq!(
+            tree(&db).await,
+            expected,
+            "{library_type:?} → {content_type}"
+        );
+    }
+}
+
+/// An album set to Shows holds series (`SeriesResolver`, the album's
+/// `GetContentType`), which hang off the album; its photo no longer
+/// resolves.
+#[tokio::test]
+async fn an_album_set_to_shows_holds_series() {
+    let files = ["Shows/pic.jpg", "Shows/Show A/Season 1/Show A S01E01.mkv"];
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (scanner, db, _) = library(
+        tmp.path(),
+        Some(CollectionTypeOptions::homevideos),
+        &files,
+        &[("Shows", "tvshows")],
+    )
+    .await;
+    scanner.scan_all().await.expect("scan");
+    let tree = tree(&db).await;
+    assert!(
+        tree.contains(&row("PhotoAlbum", "Shows", "Library")),
+        "{tree:?}"
+    );
+    assert!(tree.contains(&row("Series", "Show A", "Shows")), "{tree:?}");
+    assert!(
+        tree.iter()
+            .any(|(kind, _, parent)| kind == "Episode" && parent == "Season 1"),
+        "{tree:?}"
+    );
+    assert!(!tree.iter().any(|(kind, _, _)| kind == "Photo"), "{tree:?}");
 }

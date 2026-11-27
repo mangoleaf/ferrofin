@@ -844,7 +844,25 @@ async fn exclusions_are_not_pruned_after_failed_listing_missing_mount_or_cancell
     assert!(result.stopped);
     assert_eq!(result.removed, 0);
     assert!(f.has(&id).await);
-    assert_eq!(f.scanner.scan_all().await.unwrap().removed, 1);
+    let folder = f.media.join("Heat (1995)").to_string_lossy().into_owned();
+    let folders = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM BaseItems WHERE Path = ?1 AND Type LIKE '%.Folder'",
+        )
+        .bind(&folder)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        folders().await,
+        1,
+        "the failed listing planned the title's folder as a plain folder"
+    );
+    // The legacy exclusion, and that folder, which stayed only because it is
+    // on disk: the title takes it in whole again.
+    assert_eq!(f.scanner.scan_all().await.unwrap().removed, 2);
+    assert_eq!(folders().await, 0);
 }
 
 async fn play(db: &Database, item: &str) {
@@ -1825,6 +1843,74 @@ async fn a_home_video_library_resolves_clips_albums_and_rips() {
     .await
     .unwrap();
     assert_eq!(unresolved, 0);
+}
+
+/// An album below a plain folder hangs off that folder
+/// (`Folder.GetNonCachedChildren` resolves a folder's children with it as
+/// their parent), and its photos off the album, in a scan of one photo too.
+#[tokio::test]
+async fn an_album_below_a_plain_folder_hangs_off_it() {
+    let f = Fixture::with_type(
+        &[
+            "Trips/Plain/Pics/x.jpg",
+            "Trips/Plain/Pics/y.jpg",
+            "Trips/Plain/clip.mkv",
+        ],
+        CollectionTypeOptions::homevideos,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    for scoped in [false, true] {
+        if scoped {
+            let photo = f.media.join("Trips/Plain/Pics/x.jpg");
+            let outcome = f
+                .scanner
+                .scan_paths(&[photo.to_string_lossy().into_owned()])
+                .await
+                .unwrap();
+            assert_eq!(outcome.removed, 0);
+        }
+        let plain = f.row("Trips/Plain").await;
+        assert!(plain.type_.ends_with("Entities.Folder"), "{}", plain.type_);
+        let album = f.row("Trips/Plain/Pics").await;
+        assert!(album.type_.ends_with(".PhotoAlbum"), "{}", album.type_);
+        assert_eq!(
+            album.parent_id.as_ref(),
+            Some(&plain.id),
+            "scoped: {scoped}"
+        );
+        for photo in ["Trips/Plain/Pics/x.jpg", "Trips/Plain/Pics/y.jpg"] {
+            let photo = f.row(photo).await;
+            assert_eq!(
+                photo.parent_id.as_ref(),
+                Some(&album.id),
+                "scoped: {scoped}"
+            );
+        }
+        let clip = f.row("Trips/Plain/clip.mkv").await;
+        assert_eq!(clip.parent_id.as_ref(), Some(&plain.id), "scoped: {scoped}");
+    }
+}
+
+/// Below the top an extras-named folder of a home-video library is never
+/// resolved (`CoreResolutionIgnoreRule.cs:57-61`): a photo an older scan
+/// planned in one goes, though its file stays.
+#[tokio::test]
+async fn a_photo_in_an_albums_extras_folder_is_reconciled_away() {
+    let f = Fixture::with_type(
+        &["Album/a.jpg", "Album/extras/still.jpg"],
+        CollectionTypeOptions::homevideos,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let mut row = f.row("Album/a.jpg").await;
+    let path = f.media.join("Album/extras/still.jpg");
+    row.id = guid_to_db(Uuid::new_v4());
+    row.path = Some(path.to_string_lossy().into_owned());
+    row.name = Some("still".into());
+    f.store.save_items(&[row]).await.unwrap();
+    assert_eq!(f.scanner.scan_all().await.unwrap().removed, 1);
+    assert!(path.exists());
 }
 
 /// Without `EnablePhotos` a home-video library has no albums

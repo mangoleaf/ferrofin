@@ -3607,8 +3607,8 @@ struct PlanCtx<'a> {
     tv_library: std::cell::Cell<bool>,
     /// Every configured library, which a series' presentation key reads.
     key_folders: &'a [VirtualFolderInfo],
-    /// Each photo album's ancestors as [`LibraryScanner::plan_photos`]
-    /// planned them, which a video in the album extends.
+    /// Each photo album's ancestors as [`LibraryScanner::plan_photo_album`]
+    /// planned them, which what is in the album extends.
     album_ancestors: std::cell::RefCell<HashMap<Uuid, Vec<Uuid>>>,
     /// Each plain `Folder`'s ancestors as the movie walk planned it
     /// ([`LibraryScanner::plan_folder`]), which what is in it extends.
@@ -10971,6 +10971,7 @@ impl LibraryScanner {
         // `IOException` before it removes a child).
         let unlisted = PathRoots::of(unlisted);
         let excluded = PathRoots::of(excluded);
+        let content_types = self.content_types.as_ref().map_or_default(|read| read());
         let listed = |row_path: Option<&str>| row_path.is_none_or(|rp| !unlisted.covers(rp));
         let planned_paths: std::collections::HashSet<&str> = planned
             .iter()
@@ -10986,11 +10987,46 @@ impl LibraryScanner {
         // plan also holds ([`held_by_unscanned`]) is that library's, kept
         // while its file is (a library whose location is inside a disc rip
         // another library resolves, say).
+        // Built only if a plain folder row nothing planned is found: the
+        // folders a video this scan planned on its own sits in. A plain
+        // folder that became a movie's own folder (`FindMovie` takes it in
+        // whole, so upstream's validation drops the `Folder` child) is
+        // stale though it is on disk: an older scan planned it while a
+        // content-type override resolved the folder without movies, or
+        // while its listing failed. A lone video's plain folder is planned
+        // with it ([`Self::plan_folder`]), so it is live and never judged
+        // here.
+        let video_folders = std::sync::OnceLock::new();
+        let own_folder = |path: &str| {
+            video_folders
+                .get_or_init(|| {
+                    planned
+                        .iter()
+                        .filter(|p| {
+                            p.entity.owner_id.is_none()
+                                && !p.entity.is_in_mixed_folder
+                                && matches!(
+                                    item_type_lookup::kind_from_type_name(&p.entity.type_),
+                                    Some(
+                                        BaseItemKind::Movie
+                                            | BaseItemKind::Video
+                                            | BaseItemKind::MusicVideo
+                                    )
+                                )
+                        })
+                        .filter_map(|p| Path::new(p.entity.path.as_deref()?).parent()?.to_str())
+                        .collect::<std::collections::HashSet<&str>>()
+                })
+                .contains(trimmed_dir(path))
+        };
         let keep_on_disk = |row: &ItemPathRow| {
             let path = row.path.as_deref();
             !path.is_some_and(|path| {
                 (excluded.covers(path)
-                    || (superseded.contains(trimmed_dir(path)) && planner_resolves(&row.item_type)))
+                    || (superseded.contains(trimmed_dir(path)) && planner_resolves(&row.item_type))
+                    || (item_type_lookup::kind_from_type_name(&row.item_type)
+                        == Some(BaseItemKind::Folder)
+                        && own_folder(path)))
                     && !held_by_unscanned(path, folders, key_folders)
             }) && self.still_on_disk(path, &planned_paths, &planned_folded)
         };
@@ -11050,21 +11086,33 @@ impl LibraryScanner {
             };
             let own = LibraryFolders::of(&top_parents, &folder.locations, folders);
             // PhotoResolver/PhotoAlbumResolver stop resolving existing photos
-            // too when the home-video option is disabled. Their source files
-            // remaining on disk must not preserve catalog rows after a scan.
-            let photos_disabled = folder.collection_type == Some(CollectionTypeOptions::homevideos)
-                && folder
-                    .library_options
-                    .as_ref()
-                    .is_some_and(|options| !options.enable_photos);
+            // too where their folder no longer resolves photos: the
+            // home-video option disabled, or a folder content-type override
+            // set or removed. Their source files remaining on disk must not
+            // preserve catalog rows after a scan.
+            let library = folder
+                .collection_type
+                .and_then(CollectionTypeOptions::collection_type);
+            let enable_photos = folder
+                .library_options
+                .as_ref()
+                .is_none_or(|options| options.enable_photos);
+            let takes_photos = |path: &str| {
+                resolves_photos(
+                    path_content_type(&content_types, path, library),
+                    enable_photos,
+                )
+            };
             // Nor does a photo whose file `PhotoResolver.IsImageFile` no
             // longer takes (an `.svg` older scans listed) keep its row.
             let keep_row = |row: &ItemPathRow| {
                 let kind = item_type_lookup::kind_from_type_name(&row.item_type);
-                let unresolved = (photos_disabled
-                    && matches!(kind, Some(BaseItemKind::Photo | BaseItemKind::PhotoAlbum)))
-                    || (kind == Some(BaseItemKind::Photo)
-                        && row.path.as_deref().is_some_and(|path| !is_photo_file(path)));
+                let unresolved =
+                    matches!(kind, Some(BaseItemKind::Photo | BaseItemKind::PhotoAlbum))
+                        && row.path.as_deref().is_some_and(|path| {
+                            !takes_photos(path)
+                                || (kind == Some(BaseItemKind::Photo) && !is_photo_file(path))
+                        });
                 !unresolved && keep_on_disk(row)
             };
             let Some((ids, children)) = self
@@ -16051,29 +16099,24 @@ impl LibraryScanner {
                             Some(CollectionTypeOptions::homevideos) => BaseItemKind::Video,
                             _ => BaseItemKind::Movie,
                         };
-                        // Upstream folds the separate `photos` collection type
-                        // into `homevideos`, where photos are resolved only when
-                        // the library enables them (`PhotoResolver.Resolve`).
-                        let photos = folder.collection_type
-                            == Some(CollectionTypeOptions::homevideos)
-                            && folder
-                                .library_options
-                                .as_ref()
-                                .is_none_or(|o| o.enable_photos);
+                        // A home-video library resolves photos only when it
+                        // enables them (`PhotoResolver.Resolve`).
+                        let collection_type = folder
+                            .collection_type
+                            .and_then(CollectionTypeOptions::collection_type);
                         let walk = MovieWalk {
                             kind,
-                            collection_type: folder.collection_type,
-                            library: folder.collection_type,
-                            photos,
+                            collection_type,
+                            library: collection_type,
+                            enable_photos: folder
+                                .library_options
+                                .as_ref()
+                                .is_none_or(|o| o.enable_photos),
                             album: None,
                             folder: None,
                             under_title: false,
                             per_file: false,
                         };
-                        // Albums first: a clip in one hangs off it.
-                        if photos {
-                            self.plan_photos(location, location, cf, &[cf], &ctx, &mut out);
-                        }
                         self.plan_movies(location, location, cf, walk, &ctx, &mut out);
                     }
                     // `boxsets` is the only type left: a BoxSet's members are
@@ -16767,10 +16810,8 @@ impl LibraryScanner {
             && !extras_folder
             && !walk.under_title
             && !ctx.content_types.is_empty()
-            && matches!(
-                walk.collection_type,
-                None | Some(CollectionTypeOptions::mixed)
-            ) {
+            && walk.collection_type.is_none()
+        {
             match retype(walk, resolved_content_type(ctx.content_types, dir)) {
                 Retype::Same => walk,
                 Retype::Walk(typed) => typed,
@@ -16786,25 +16827,37 @@ impl LibraryScanner {
         // Without a collection type a folder `SeriesResolver` takes (priority
         // Second, before `MovieResolver`) is a series, planned as a tvshows
         // library's is, hanging where the walk puts what it resolves.
-        let untyped = matches!(
-            walk.collection_type,
-            None | Some(CollectionTypeOptions::mixed)
-        );
+        let untyped = walk.collection_type.is_none();
         if untyped && dir != root && !extras_folder && is_untyped_series(dir, &entries, naming) {
             self.plan_untyped_series(dir, cf, walk.parent(cf, ctx), ctx, out);
             return;
         }
-        let (walk, album) = if walk.photos && dir != root && !extras_folder {
-            self.enter_photo_album(dir, walk, ctx, movies_by_dir)
+        // The images no sibling video owns, listed once for the folder's
+        // album and its photos.
+        let mut unowned: Option<std::collections::HashSet<String>> = None;
+        let (walk, album) = if walk.photos()
+            && dir != root
+            && !extras_folder
+            && !unowned
+                .insert(unowned_photo_paths(&entries, naming))
+                .is_empty()
+        {
+            self.plan_photo_album(dir, cf, walk, ctx, out, movies_by_dir)
         } else {
             (walk, None)
         };
+        // `MovieResolver` resolves no folder of a `photos` walk as a video
+        // (`MovieResolver.cs:96-140`): a disc rip or multi-disc set there is a
+        // plain folder whose files resolve one by one.
+        let finds_movie =
+            walk.collection_type != Some(ferrofin_model::data::CollectionType::photos);
         // A disc rip (`…/Movie (2009)/BDMV/` or `VIDEO_TS/`) is ONE item for the
         // containing folder, not one per .vob/.m2ts inside — port of
         // `BaseVideoResolver.ResolveVideo`'s directory arm.
         if dir != root
             && !extras_folder
             && album.is_none()
+            && finds_movie
             && let Some(video_type) = self.disc_video_type(&entries, ctx)
         {
             self.plan_disc_movie(
@@ -16823,7 +16876,7 @@ impl LibraryScanner {
         }
         // `FindExtras` counts every file of an extras folder (listed above).
         let extras_folder_mixed = extras_folder && holds_several_files(dir, ctx);
-        // A home-video library has no movie in its own folder
+        // A home-video or photo walk has no movie in its own folder
         // (`FindMovie`'s `isPhotosCollection`).
         // Without a collection type a folder holding `tvshow.nfo` or
         // `season.nfo` resolves its files one by one, as plain videos
@@ -16832,7 +16885,13 @@ impl LibraryScanner {
         let movie = (dir != root
             && !extras_folder
             && !per_file
-            && walk.collection_type != Some(CollectionTypeOptions::homevideos))
+            && !matches!(
+                walk.collection_type,
+                Some(
+                    ferrofin_model::data::CollectionType::homevideos
+                        | ferrofin_model::data::CollectionType::photos
+                )
+            ))
         .then(|| movie_in_own_folder(&entries, naming, root, kind != BaseItemKind::MusicVideo))
         .flatten();
         let own_folder = movie.is_some();
@@ -16870,6 +16929,7 @@ impl LibraryScanner {
         if dir != root
             && !extras_folder
             && album.is_none()
+            && finds_movie
             && movie.is_none()
             && videos.iter().all(|video| video.extra_type.is_some())
             && let Some(set) = self.multi_disc_movie(&entries, ctx)
@@ -16892,8 +16952,9 @@ impl LibraryScanner {
         // location holds, resolves with `GetContentType(folder)`, which a
         // folder content-type override can change ([`children_content_type`]).
         // The checks above resolve the folder itself, with its parent's type;
-        // this one only applies once it is known to be a plain folder.
-        let children = if (dir == root || (plain_folder && album.is_none() && !walk.under_title))
+        // this one only applies once it is known to be a plain folder or a
+        // photo album.
+        let children = if (dir == root || (plain_folder && !walk.under_title))
             && !ctx.content_types.is_empty()
         {
             retype(
@@ -16906,10 +16967,7 @@ impl LibraryScanner {
         let (walk, untyped, per_file, has_movie_files, videos) = match children {
             Retype::Same => (walk, untyped, per_file, has_movie_files, videos),
             Retype::Walk(typed) => {
-                let untyped = matches!(
-                    typed.collection_type,
-                    None | Some(CollectionTypeOptions::mixed)
-                );
+                let untyped = typed.collection_type.is_none();
                 let per_file = untyped && holds_tv_nfo(&entries);
                 let videos = if extras_folder || per_file {
                     Vec::new()
@@ -16925,6 +16983,8 @@ impl LibraryScanner {
                 // library's top level.
                 let parent = if dir == root {
                     (cf, vec![cf])
+                } else if album.is_some() {
+                    walk.parent(cf, ctx)
                 } else {
                     self.plan_folder(dir, cf, walk, ctx, out).parent(cf, ctx)
                 };
@@ -16980,6 +17040,19 @@ impl LibraryScanner {
             },
             groups: VideoGroups::of(videos, naming),
         };
+        // `PhotoResolver`: an image no sibling video owns is a photo where
+        // the folder's files resolve with a type that takes photos.
+        let photos = if !folder.walk.photos() {
+            std::collections::HashSet::new()
+        } else if extras_folder {
+            // Below the top an extras-named folder is never resolved
+            // (`CoreResolutionIgnoreRule.cs:57-61`): photos an older scan
+            // planned in one are reconciled away.
+            ctx.excluded.borrow_mut().push(dir.to_owned());
+            std::collections::HashSet::new()
+        } else {
+            unowned.unwrap_or_else(|| unowned_photo_paths(&entries, naming))
+        };
         // The subfolders resolve independently: up to the library fanout
         // limit at once, their rows taken back in listing order. An item's
         // own refresh reads the extras folders of the folder it owns.
@@ -17029,8 +17102,49 @@ impl LibraryScanner {
                 }
                 continue;
             }
+            if photos.contains(&entry.path) {
+                self.plan_photo(&entry.path, &folder, ctx, out);
+                continue;
+            }
             self.plan_movie_walk_file(entry, &folder, ctx, out, extras);
         }
+    }
+
+    /// The `Photo` at `path`, a file of `folder` ([`unowned_photos`]),
+    /// hanging where the walk puts what it resolves: the album or plain
+    /// folder it sits in, or the library.
+    fn plan_photo(
+        &self,
+        path: &str,
+        folder: &MovieFolder<'_>,
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
+        if !ctx.scope.keeps(path) {
+            return;
+        }
+        let (parent, ancestors) = folder.walk.parent(folder.cf, ctx);
+        let Some((id, mut entity)) = self.base_item(
+            ctx,
+            BaseItemKind::Photo,
+            folder.cf,
+            parent,
+            file_stem(path),
+            path,
+            false,
+        ) else {
+            return;
+        };
+        entity.media_type = Some("Photo".to_owned());
+        ctx.emit(
+            out,
+            Planned {
+                id,
+                entity,
+                ancestors,
+                generated_names: Vec::new(),
+            },
+        );
     }
 
     /// One file of a folder the movie walk lists: an extra, a movie (or
@@ -17052,6 +17166,16 @@ impl LibraryScanner {
                 let parent = folder.walk.parent(folder.cf, ctx);
                 self.plan_playlist(&entry.path, None, folder.cf, parent, ctx, out);
             }
+            return;
+        }
+        // Where a folder content-type override gives an untyped library's
+        // folder a type, its playlist and audio files resolve as nothing
+        // (`PlaylistResolver` and `AudioResolver.cs:108-130` take them only
+        // without a type, or in music): a row an older scan planned at one
+        // is reconciled away.
+        let retyped = !folder.untyped && folder.walk.library.is_none();
+        if retyped && playlists::is_playlist_file(&entry.path) {
+            ctx.excluded.borrow_mut().push(entry.path);
             return;
         }
         // Upstream resolves EXTRAS first, over every file in the folder —
@@ -17086,6 +17210,8 @@ impl LibraryScanner {
             if folder.untyped && !folder.own_folder {
                 let parent = folder.walk.parent(folder.cf, ctx);
                 self.plan_untyped_audio(&entry, folder.cf, parent, ctx, out);
+            } else if retyped {
+                ctx.excluded.borrow_mut().push(entry.path);
             }
             return;
         }
@@ -17184,7 +17310,8 @@ impl LibraryScanner {
         ctx: &PlanCtx<'_>,
     ) -> Option<Planned<BaseItemEntity>> {
         let parsed = video_resolver::resolve_file(Some(path), ctx.naming, None);
-        let movies = folder.walk.collection_type == Some(CollectionTypeOptions::movies);
+        let movies =
+            folder.walk.collection_type == Some(ferrofin_model::data::CollectionType::movies);
         let (name, year) = match parsed {
             Some(info) if movies => (info.name, info.year),
             parsed => (
@@ -17328,33 +17455,53 @@ impl LibraryScanner {
         );
     }
 
-    /// The walk below `dir` when it is a folder of a home-video library the
-    /// photo walk made a `PhotoAlbum` (`PhotoAlbumResolver`, priority Second, before
-    /// `MovieResolver`; [`Self::plan_photos`] plans the row): what is in it
-    /// hangs off the album, and the album — not a video in it — owns the
-    /// folder's extras (`BaseItem.RefreshedOwnedItems`). Also the album's id.
-    fn enter_photo_album(
+    /// `dir`, a folder of a walk that resolves photos and holding a photo
+    /// ([`unowned_photos`]), as the `PhotoAlbum` it is (`PhotoAlbumResolver`,
+    /// priority Second, before `MovieResolver`), hanging where the walk puts
+    /// what it resolves. Returns the walk below it, where what is in it hangs
+    /// off the album, and the album's id; the album, not a video in it, owns
+    /// the folder's extras (`BaseItem.RefreshedOwnedItems`). The walk as it
+    /// is when no row is planned for the album.
+    fn plan_photo_album(
         &self,
         dir: &str,
+        cf: Uuid,
         walk: MovieWalk,
         ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
         movies_by_dir: &mut std::collections::HashMap<String, Vec<(Uuid, String)>>,
     ) -> (MovieWalk, Option<Uuid>) {
-        // Only an album the photo walk planned: its own listing decided, and
-        // a folder that changed between the two listings must not point a
-        // clip at a row no plan has.
-        let Some(id) = item_type_lookup::derive_item_id_with(
-            &self.id_derivation,
+        let (parent, ancestors) = walk.parent(cf, ctx);
+        // A directory name is not a filename: `file_stem` would truncate
+        // "Trip 2024. Iceland" at the dot.
+        let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
+        let Some((id, album)) = self.base_item(
+            ctx,
             BaseItemKind::PhotoAlbum,
+            cf,
+            parent,
+            name.clone(),
             dir,
-        )
-        .filter(|id| ctx.album_ancestors.borrow().contains_key(id)) else {
+            true,
+        ) else {
             return (walk, None);
         };
+        ctx.album_ancestors
+            .borrow_mut()
+            .insert(id, ancestors.clone());
+        ctx.emit(
+            out,
+            Planned {
+                id,
+                entity: album,
+                ancestors,
+                generated_names: Vec::new(),
+            },
+        );
         movies_by_dir
             .entry(dir.to_owned())
             .or_default()
-            .push((id, folder_name(dir).unwrap_or_else(|| file_stem(dir))));
+            .push((id, name));
         let walk = MovieWalk {
             album: Some(id),
             ..walk
@@ -17841,10 +17988,7 @@ impl LibraryScanner {
             extras_root: rip.root,
             extras_folder: false,
             extras_folder_mixed: false,
-            untyped: matches!(
-                rip.walk.collection_type,
-                None | Some(CollectionTypeOptions::mixed)
-            ),
+            untyped: rip.walk.collection_type.is_none(),
             own_folder: true,
             has_movie_files: false,
             mixed: false,
@@ -19153,127 +19297,6 @@ impl LibraryScanner {
         }]
     }
 
-    /// Resolves the photos under `dir` — port of `PhotoResolver` and
-    /// `PhotoAlbumResolver`.
-    ///
-    /// Every image file that is not artwork owned by a sibling video becomes a
-    /// `Photo`; a **sub**directory holding at least one such image becomes a
-    /// `PhotoAlbum` its photos hang off (the library root is the collection
-    /// folder itself and never an album, matching upstream's `args.Parent.IsRoot`
-    /// guard elsewhere in the resolver chain).
-    fn plan_photos(
-        &self,
-        dir: &str,
-        root: &str,
-        cf: Uuid,
-        chain: &[Uuid],
-        ctx: &PlanCtx<'_>,
-        out: &mut Vec<Planned>,
-    ) {
-        // `chain`: the ancestors of what is planned directly in `dir`, the
-        // library first, its parent (the nearest enclosing album) last.
-        let parent = chain.last().copied().unwrap_or(cf);
-        let naming = ctx.naming;
-        let entries = self.list(dir, ctx);
-        // A playlist folder (`PlaylistResolver`, priority First, before
-        // `PhotoAlbumResolver`) is no album, and nothing in it resolves: the
-        // movie walk plans it.
-        if dir != root
-            && playlists::playlist_folder_name(dir, || playlists::holds_playlist_xml(&entries))
-                .is_some()
-        {
-            return;
-        }
-        let photos = unowned_photos(&entries, naming);
-        // A folder that is no album but a disc rip is one video
-        // (`FindMovie<Video>`): nothing below it resolves.
-        if dir != root && photos.is_empty() && self.disc_video_type(&entries, ctx).is_some() {
-            // Rows older scans planned below it are reconciled away.
-            for entry in entries {
-                if entry.type_ == FileSystemEntryType::Directory {
-                    ctx.excluded.borrow_mut().push(entry.path);
-                }
-            }
-            return;
-        }
-
-        // A sub-directory with photos in it is a PhotoAlbum; the library root
-        // is the collection folder itself and never an album, so its loose
-        // photos hang off it directly.
-        let (photo_parent, ancestors) = if !photos.is_empty() && dir != root {
-            // A directory name is not a filename: `file_stem` would truncate
-            // "Trip 2024. Iceland" at the dot.
-            let name = folder_name(dir).unwrap_or_else(|| file_stem(dir));
-            match self.base_item(ctx, BaseItemKind::PhotoAlbum, cf, parent, name, dir, true) {
-                Some((album_id, album)) => {
-                    ctx.album_ancestors
-                        .borrow_mut()
-                        .insert(album_id, chain.to_vec());
-                    ctx.emit(
-                        out,
-                        Planned {
-                            id: album_id,
-                            entity: album,
-                            ancestors: chain.to_vec(),
-                            generated_names: Vec::new(),
-                        },
-                    );
-                    let mut ancestors = chain.to_vec();
-                    ancestors.push(album_id);
-                    (album_id, ancestors)
-                }
-                None => (parent, chain.to_vec()),
-            }
-        } else {
-            (parent, chain.to_vec())
-        };
-
-        for path in photos {
-            if !ctx.scope.keeps(path) {
-                continue;
-            }
-            let Some((id, mut entity)) = self.base_item(
-                ctx,
-                BaseItemKind::Photo,
-                cf,
-                photo_parent,
-                file_stem(path),
-                path,
-                false,
-            ) else {
-                continue;
-            };
-            entity.media_type = Some("Photo".to_owned());
-            ctx.emit(
-                out,
-                Planned {
-                    id,
-                    entity,
-                    ancestors: ancestors.clone(),
-                    generated_names: Vec::new(),
-                },
-            );
-        }
-
-        // Below the top an extras-named folder is never resolved
-        // (`CoreResolutionIgnoreRule.cs:56-61`); rows older scans planned
-        // in one are reconciled away.
-        let mut dirs = Vec::new();
-        for entry in &entries {
-            if entry.type_ != FileSystemEntryType::Directory {
-                continue;
-            }
-            if is_extras_folder_below_top(&entry.path, root, naming) {
-                ctx.excluded.borrow_mut().push(entry.path.clone());
-                continue;
-            }
-            dirs.push(entry.clone());
-        }
-        fanout::directories(&dirs, ctx, out, |path, ctx, out| {
-            self.plan_photos(path, root, cf, &ancestors, ctx, out);
-        });
-    }
-
     /// Resolves one directory beneath a music library: a `MusicArtist` (port of
     /// `MusicArtistResolver`), a `MusicAlbum` (port of `MusicAlbumResolver`), or
     /// a plain `Folder` (port of `FolderResolver`, priority Last) — one of an
@@ -20483,6 +20506,17 @@ fn unowned_photos<'e>(entries: &'e [FileSystemEntryInfo], naming: &NamingOptions
         .collect()
 }
 
+/// [`unowned_photos`] as owned paths, for a folder the walk lists again.
+fn unowned_photo_paths(
+    entries: &[FileSystemEntryInfo],
+    naming: &NamingOptions,
+) -> std::collections::HashSet<String> {
+    unowned_photos(entries, naming)
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Whether `path` is artwork belonging to one of the `siblings` videos — port of
 /// `PhotoResolver.IsOwnedByMedia`: a video file in the same directory whose own
 /// stem is a prefix of the image's stem (so `Movie-thumb.jpg` belongs to
@@ -21008,19 +21042,19 @@ fn place_under_location(items: &mut [Planned], cf: Uuid, location_folder: Uuid, 
 /// and the collection type it resolves with.
 #[derive(Debug, Clone, Copy)]
 struct MovieWalk {
-    /// `Movie`, `MusicVideo` or (home videos) `Video`.
+    /// `Movie`, `MusicVideo` or (home videos and photos) `Video`.
     kind: BaseItemKind,
     /// The collection type the walk resolves with (`None` untyped): the
     /// library's, or a folder content-type override's ([`retype`]).
-    collection_type: Option<CollectionTypeOptions>,
+    collection_type: Option<ferrofin_model::data::CollectionType>,
     /// The library's own collection type, what a folder without an override
     /// passes to its children ([`children_content_type`]).
-    library: Option<CollectionTypeOptions>,
-    /// Whether the library resolves photos (a home-video library with
-    /// `EnablePhotos`), which makes a folder holding some a `PhotoAlbum`.
-    photos: bool,
-    /// The nearest enclosing `PhotoAlbum`, which a video below it hangs off,
-    /// as [`LibraryScanner::plan_photos`] parents its photos.
+    library: Option<ferrofin_model::data::CollectionType>,
+    /// The library's `EnablePhotos`, which a `homevideos` walk resolves
+    /// photos by ([`Self::photos`]).
+    enable_photos: bool,
+    /// The nearest enclosing `PhotoAlbum`, which what is resolved below it
+    /// hangs off ([`LibraryScanner::plan_photo_album`]).
     album: Option<Uuid>,
     /// The nearest enclosing plain `Folder` (`FolderResolver`), which what
     /// is resolved below it hangs off (`Folder.GetNonCachedChildren`), as
@@ -21035,9 +21069,14 @@ struct MovieWalk {
 }
 
 impl MovieWalk {
+    /// Whether the walk resolves photos ([`resolves_photos`]).
+    fn photos(self) -> bool {
+        resolves_photos(self.collection_type, self.enable_photos)
+    }
+
     /// What a video resolved in this walk hangs off, and its ancestors: the
-    /// nearest album's chain as the photo walk planned it, then the album;
-    /// else the nearest plain folder's chain, then the folder.
+    /// nearest album's chain, then the album; else the nearest plain
+    /// folder's chain, then the folder.
     fn parent(self, cf: Uuid, ctx: &PlanCtx<'_>) -> (Uuid, Vec<Uuid>) {
         let container = match (self.album, self.folder) {
             (Some(album), _) => Some((album, &ctx.album_ancestors)),
@@ -21070,44 +21109,37 @@ enum Retype {
 /// What resolving with `content_type` makes of `walk`
 /// (`LibraryManager.ResolvePath`'s collection type, `Folder.GetNonCachedChildren`).
 ///
-/// The movie walk takes the video types it resolves itself: `movies` and
-/// `musicvideos`, and no type, where it resolves as in an untyped library.
-/// `tvshows` goes to the TV walk.
+/// The movie walk takes the types it resolves itself: `movies`,
+/// `musicvideos`, `homevideos` and `photos` (videos, and photos where
+/// [`MovieWalk::photos`] says), and no type, where it resolves as in an
+/// untyped library. `tvshows` goes to the TV walk.
 ///
-/// TODO(parity, open work item gl-764): the other types are not followed yet.
-/// `homevideos` and `photos` need the photo walk, `music` and `books` their
-/// own walks. The walk then goes on with its type, as before overrides were
-/// read. A home-video library that resolves photos keeps its walk, because
-/// its photo walk has already run over the folder. The un-defer path:
-/// retype into [`LibraryScanner::plan_photos`], `plan_music` and
-/// `plan_books` from here.
+/// TODO(parity, open work item gl-764): `music` and `books` need their own
+/// walks (`MusicArtistResolver`, `MusicAlbumResolver` and `AudioResolver`;
+/// `BookResolver` and `AudioResolver`), and the types no resolver takes
+/// (`boxsets`, `folders`, `unknown`, an unnamed number, …) make every
+/// subfolder a plain `Folder` and resolve no file. The walk goes on with its
+/// type for them, as before overrides were read. The un-defer path: retype
+/// into `plan_music_node` and `plan_books` from here, and a walk that plans
+/// folders only.
 fn retype(walk: MovieWalk, content_type: Option<ferrofin_model::data::CollectionType>) -> Retype {
     use ferrofin_model::data::CollectionType;
-    if walk.photos
-        || content_type
-            == walk
-                .collection_type
-                .and_then(CollectionTypeOptions::collection_type)
-    {
+    if content_type == walk.collection_type {
         return Retype::Same;
     }
-    let typed = |kind, collection_type| {
+    let typed = |kind| {
         Retype::Walk(MovieWalk {
             kind,
-            collection_type,
+            collection_type: content_type,
             per_file: false,
             ..walk
         })
     };
     match content_type {
-        None => typed(BaseItemKind::Movie, walk.library),
-        Some(CollectionType::movies) => {
-            typed(BaseItemKind::Movie, Some(CollectionTypeOptions::movies))
-        }
-        Some(CollectionType::musicvideos) => typed(
-            BaseItemKind::MusicVideo,
-            Some(CollectionTypeOptions::musicvideos),
-        ),
+        None | Some(CollectionType::movies) => typed(BaseItemKind::Movie),
+        Some(CollectionType::musicvideos) => typed(BaseItemKind::MusicVideo),
+        // `ResolveVideos<Video>` (`MovieResolver.cs:206-209`).
+        Some(CollectionType::homevideos | CollectionType::photos) => typed(BaseItemKind::Video),
         Some(CollectionType::tvshows) => Retype::Shows,
         Some(_) => Retype::Same,
     }
@@ -21127,12 +21159,41 @@ fn retype(walk: MovieWalk, content_type: Option<ferrofin_model::data::Collection
 fn children_content_type(
     content_types: &[NameValuePair],
     dir: &str,
-    library: Option<CollectionTypeOptions>,
+    library: Option<ferrofin_model::data::CollectionType>,
 ) -> Option<ferrofin_model::data::CollectionType> {
     use ferrofin_model::content_type_overrides::content_type_override;
     content_type_override(content_types, dir, false)
         .or_else(|| content_type_override(content_types, dir, true))
-        .or_else(|| library.and_then(CollectionTypeOptions::collection_type))
+        .or(library)
+}
+
+/// Whether what resolves with `collection_type` takes photos: `photos`, or
+/// `homevideos` in a library with `EnablePhotos` (`PhotoResolver.cs:64-65`,
+/// `PhotoAlbumResolver.cs:49-50`).
+fn resolves_photos(
+    collection_type: Option<ferrofin_model::data::CollectionType>,
+    enable_photos: bool,
+) -> bool {
+    use ferrofin_model::data::CollectionType;
+    match collection_type {
+        Some(CollectionType::photos) => true,
+        Some(CollectionType::homevideos) => enable_photos,
+        _ => false,
+    }
+}
+
+/// The collection type the item at `path`, in a library of type `library`,
+/// resolves with: its folder's ([`children_content_type`]), else, in an
+/// untyped library, the override set for it or a folder above it
+/// ([`resolved_content_type`]).
+fn path_content_type(
+    content_types: &[NameValuePair],
+    path: &str,
+    library: Option<ferrofin_model::data::CollectionType>,
+) -> Option<ferrofin_model::data::CollectionType> {
+    let dir = Path::new(path).parent().and_then(Path::to_str)?;
+    children_content_type(content_types, dir, library)
+        .or_else(|| resolved_content_type(content_types, path))
 }
 
 /// The collection type a folder of an untyped walk resolves with:
@@ -21157,12 +21218,11 @@ fn movie_walk_resolution(
         return (false, false, None);
     }
     match walk.collection_type {
-        Some(CollectionTypeOptions::musicvideos) => {
-            (true, false, Some(CollectionType::musicvideos))
+        Some(CollectionType::musicvideos) => (true, false, Some(CollectionType::musicvideos)),
+        Some(home @ (CollectionType::homevideos | CollectionType::photos)) => {
+            (false, false, Some(home))
         }
-        Some(CollectionTypeOptions::homevideos) => (false, false, Some(CollectionType::homevideos)),
-        // `mixed.collection` parses to no collection type upstream.
-        None | Some(CollectionTypeOptions::mixed) => (false, true, None),
+        None => (false, true, None),
         Some(_) => (true, true, Some(CollectionType::movies)),
     }
 }
@@ -28428,11 +28488,22 @@ mod tests {
         let root_str = root.to_string_lossy().into_owned();
         let cf = uuid::Uuid::from_u128(0x7000);
         let naming = super::NamingOptions::new();
-        scanner.plan_photos(
+        let home = Some(ferrofin_model::data::CollectionType::homevideos);
+        let walk = super::MovieWalk {
+            kind: BaseItemKind::Video,
+            collection_type: home,
+            library: home,
+            enable_photos: true,
+            album: None,
+            folder: None,
+            under_title: false,
+            per_file: false,
+        };
+        scanner.plan_movies(
             &root_str,
             &root_str,
             cf,
-            &[cf],
+            walk,
             &super::PlanCtx::new(&naming, super::PlanScope::ALL),
             &mut out,
         );
