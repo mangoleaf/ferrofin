@@ -18,19 +18,27 @@ names it. An entry is a Rule: its name, the windows it applies in, the table, th
 a changed row the columns it may change (within a relative tolerance, for a number; or, for a JSON object such as
 BaseItems.Data, only in the keys it names), the rows it applies to
 (`where`: (column, a regular expression the whole value must match) pairs, read from the row before a change or
-removal and after an addition), its kind and its cause:
+removal and after an addition; in a table with an ItemId, ITEM_TYPE also names the BaseItems Type of the row's
+item), for a changed row the values a covered column may take (`becomes`, a regular expression the new value must
+match; both patterns match the value as str() writes it, a blob as b'...' and NULL as None), its kind and its cause:
 
     timestamp    a stamp or a key Jellyfin writes anew whenever it saves or refreshes a row, whatever changed
     session      what signing in or presenting a token writes
     gate         what the gate's own requests write
     checked      a change another of the gate's checks judges one by one
+    jellyfin-alone
+                 what Jellyfin does to its own rows when the gate asks: the Jellyfin release alone, on a copy of the
+                 fixture with no Ferrofin in between, makes the same change (README.md, "Controls"), its cause naming
+                 that run ("Jellyfin <version> alone")
     allowlisted  a difference the owner decided to accept, or an audit verdict (gl-1573 adds these), its cause
                  naming the issue that decided it (gl-<iid>)
 
 A changed row is explained when every column it changed is covered by an entry that applies to it. The entries
 are checked before a run (`allowlist.py check --schema FILE`, run.sh and the gate's tests): each has a name of
 its own, names a table and columns Jellyfin's schema has, a window, a change and a kind this file knows, and a
-cause (an allowlisted one citing its issue); a tolerance only on a numeric column, JSON keys only on a text one. Exit status 0 when every entry holds; 1 with a line per problem.
+cause (an allowlisted one citing its issue, a jellyfin-alone one the run of Jellyfin alone); a tolerance only on a
+numeric column, JSON keys only on a text one, `becomes` only on a changed row. Exit status 0 when every entry holds;
+1 with a line per problem.
 """
 
 import argparse
@@ -43,12 +51,17 @@ import sys
 
 WINDOWS = ("start", "capture", "scan", "stop", "restart")
 CHANGES = ("added", "removed", "changed")
-KINDS = ("timestamp", "session", "gate", "checked", "allowlisted")
+KINDS = ("timestamp", "session", "gate", "checked", "jellyfin-alone", "allowlisted")
 #: The windows the gate's own requests run in: its playlist refresh, answers, Live TV check and probes, and its
 #: answers again after the scan.
 GATE_WINDOWS = ("capture", "stop")
 #: The windows of Jellyfin's first start, when it saves and refreshes items; a second start must touch none.
 FIRST_RUN = ("start", "capture", "scan", "stop")
+#: What `where` may name beside a table's own columns, in a table with an ItemId: the BaseItems Type of the row's item
+#: (None, matching no pattern but one that takes it, when no copy holds that item).
+ITEM_TYPE = "ItemType"
+#: A playlist's stored type, as a pattern.
+PLAYLIST = re.escape("MediaBrowser.Controller.Playlists.Playlist")
 
 
 @dataclass(frozen=True)
@@ -66,6 +79,7 @@ class Rule:
     where: tuple = ()
     within: float = None
     keys: tuple = ()
+    becomes: str = None
 
     def applies(self, window, table, change, row):
         """Whether the entry applies to a change of this kind to `row` ({column: value}) in this window."""
@@ -75,6 +89,8 @@ class Rule:
     def covers(self, column, before, after):
         """Whether the entry lets `column` go from `before` to `after`."""
         if column not in self.columns:
+            return False
+        if self.becomes is not None and not re.fullmatch(self.becomes, str(after)):
             return False
         if self.keys:   # some named key changed, and only named keys: a mere rewrite is no stamp's doing
             old, new = json_object(before), json_object(after)
@@ -151,6 +167,32 @@ RULES = (
                "Session{Started,Ended}Logger.cs); a request from a client and device it holds no session for starts "
                "one (Emby.Server.Implementations/Session/SessionManager.cs:500-511): the answers' sign-ins and "
                "smoke.sh's requests"),
+    Rule("playlist-collage", ("capture",), "BaseItemImageInfos", "changed", "jellyfin-alone", columns=("DateModified",),
+         where=((ITEM_TYPE, PLAYLIST), ("ImageType", "0")),
+         cause="the gate's full metadata refresh of every playlist (api.py refresh-playlists) has Jellyfin draw its "
+               "collage again whatever drew it, as long as the image is a file in the playlist's own metadata folder "
+               "(Emby.Server.Implementations/Images/BaseDynamicImageProvider.cs:79-123), and date the row by the new "
+               "file (Emby.Server.Implementations/Library/LibraryManager.cs:2641-2644): Jellyfin 12.4 alone does "
+               "the same to every playlist of the 10.11.8 and 12.4-from-123 fixtures"),
+    Rule("playlist-runtime", ("capture",), "BaseItems", "changed", "jellyfin-alone", columns=("RunTimeTicks",),
+         where=(("Type", PLAYLIST), ("Name", "Synthetic (linked|path-less) playlist"), ("RunTimeTicks", "80000000")),
+         becomes="[1-9][0-9]*",   # a sum of the members' runtimes, never none
+         cause="the same full refresh sums the runtimes of a playlist's linked members into its own "
+               "(MediaBrowser.Providers/Manager/MetadataService.cs:150, 360-363, 440-453, 485-503; "
+               "MediaBrowser.Providers/Playlists/PlaylistMetadataService.cs:55-56; "
+               "MediaBrowser.Controller/Playlists/Playlist.cs:79), and the fixtures' Jellyfin left these two seeded "
+               "playlists with a runtime that is not that sum, which Ferrofin kept: Jellyfin 12.4 alone changes the "
+               "same two rows the same way on the 10.11.8 and 12.4-from-123 fixtures. Every other playlist's runtime "
+               "is judged, the ones Ferrofin made or emptied among them"),
+    Rule("blurhash", ("capture", "scan"), "BaseItemImageInfos", "changed", "allowlisted", columns=("Blurhash",),
+         where=(("Blurhash", r"b'.+'"),), becomes=r"b'.+'",   # a hash on both sides: none filled in or lost
+         cause="a Jellyfin save that measures an image again "
+               "(Emby.Server.Implementations/Library/LibraryManager.cs:2556-2562, 2802) stores its own BlurHash of the "
+               "same file, which differs from Ferrofin's: recorded in "
+               "docs/investigations/jellyfin-writer-parity-relations.md (the Blurhash row) and "
+               "docs/investigations/jellyfin-parity-album-covers.md (\"The playlist collage\"), its cause not "
+               "isolated, under the owner's decision of 2026-10-31 that matching Jellyfin's hash strings is not a "
+               "goal (gl-1058)"),
     Rule("trickplay-bandwidth", WINDOWS, "TrickplayInfos", "changed", "allowlisted", columns=("Bandwidth",), within=0.05,
          cause="the owner accepted a trickplay Bandwidth within 5% of Ferrofin's: the tiles come from another JPEG "
                "encoder (gl-1596)"),
@@ -194,16 +236,22 @@ def problems(rules, schema):
             out.append(f"{name}: no cause")
         elif rule.kind == "allowlisted" and not re.search(r"\bgl-\d+\b", rule.cause):
             out.append(f"{name}: an allowlisted entry's cause names the issue that decided it (gl-<iid>)")
+        elif rule.kind == "jellyfin-alone" and not re.search(r"\bJellyfin \d+(\.\d+)* alone\b", rule.cause):
+            out.append(f"{name}: a jellyfin-alone entry's cause names the run of Jellyfin <version> alone that shows it")
         if (rule.change == "changed") != bool(rule.columns):
             out.append(f"{name}: a changed row needs the columns it may change, and only a changed row has them")
         for column in (*rule.columns, *(column for column, _ in rule.where)):
-            if column not in columns:
+            virtual = column == ITEM_TYPE and column not in rule.columns and "ItemId" in columns
+            if column not in columns and not virtual:
                 out.append(f"{name}: no column {column} in {rule.table}")
-        for column, pattern in rule.where:
+        for label, pattern in (*((f"where {c}", p) for c, p in rule.where),
+                               *((("becomes", rule.becomes),) if rule.becomes is not None else ())):
             try:
                 re.compile(pattern)
             except re.error as error:
-                out.append(f"{name}: where {column}: {error}")
+                out.append(f"{name}: {label}: {error}")
+        if rule.becomes is not None and rule.change != "changed":
+            out.append(f"{name}: becomes only on a changed row")
         if rule.keys and (rule.within is not None or any(columns.get(c) != "TEXT" for c in rule.columns)):
             out.append(f"{name}: JSON keys only on text columns, and not with a tolerance")
         if rule.within is not None:

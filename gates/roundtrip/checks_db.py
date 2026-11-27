@@ -188,10 +188,11 @@ def changed_row(key, before, after, columns):
             before, after)
 
 
-def explain(rules, window, table, change, changed, before, after):
+def explain(rules, window, table, change, changed, before, after, item_type=None):
     """(the entries that explain one change; what none explains: the columns of a changed row, or "the row" for one
-    added or removed). An added or removed row is explained by the first entry that applies."""
-    row = after if change == "added" else before
+    added or removed). An added or removed row is explained by the first entry that applies. `item_type` is the
+    BaseItems Type of the row's item, for a table with an ItemId (allowlist.ITEM_TYPE)."""
+    row = {**(after if change == "added" else before), allowlist.ITEM_TYPE: item_type}
     used, left = [], list(changed) if change == "changed" else ["the row"]
     if not left:
         return [], ["the row"]   # a changed row whose columns all compare equal: never explained by nothing
@@ -239,6 +240,11 @@ def rows(window, before, after, out, rules=allowlist.RULES):
         for side, other in (("before", "after"), ("after", "before")):
             if only := sorted(named[side] - named[other]):
                 problems.append(f"the {window}: {len(only)} table(s) only {side} it, first: {shown(only)}")
+        types = {}   # an item's Type, from either copy: what an entry's ITEM_TYPE names on a row of its own tables
+        for side in ("before", "after"):
+            if ITEM in named[side]:
+                types.update((str(key).upper(), kind) for key, kind in db.execute(
+                    f'SELECT "Id", "Type" FROM "{side}"."{ITEM}"'))
         with gzip.open(f"{out}.jsonl.gz", "wt", encoding="utf-8") as record:
             for table in sorted(named["before"] & named["after"]):
                 columns = columns_of(db, "before", table)
@@ -246,7 +252,8 @@ def rows(window, before, after, out, rules=allowlist.RULES):
                     problems.append(f"the {window}: {table} has other columns after it")
                     continue
                 for change, key, changed, old, new in table_changes(db, table, columns):
-                    used, left = explain(rules, window, table, change, changed, old, new)
+                    used, left = explain(rules, window, table, change, changed, old, new,
+                                         types.get(str((new if change == "added" else old).get("ItemId")).upper()))
                     record.write(json.dumps({
                         "window": window, "table": table, "change": change, "key": [value(k) for k in key],
                         "columns": changed, "unexplained": left,

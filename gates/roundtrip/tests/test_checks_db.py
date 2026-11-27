@@ -214,6 +214,67 @@ class Rows(Databases):
         self.assertIsNone(explained("capture", "ActivityLogs", "removed",
                                     before={"Type": "SessionStarted", "Name": "y"}))
 
+    def test_an_entry_names_the_type_of_an_image_row_s_item(self):
+        """ITEM_TYPE: a row of a table with an ItemId is matched by its item's BaseItems Type, read from the copies."""
+        rules = (Rule("collage", ("capture",), "BaseItemImageInfos", "changed", "gate", "a playlist's collage drawn again",
+                      columns=("DateModified",), where=((allowlist.ITEM_TYPE, r".*\.Playlist"),)),)
+        image = {"ImageType": 0, "DateModified": "1"}
+        before, after = self.pair(item("P", "A playlist", kind="MediaBrowser.Controller.Playlists.Playlist"), item("M"),
+                                  ("BaseItemImageInfos", {"Id": "I1", "ItemId": "p", "Path": "/config/p.png", **image}),
+                                  ("BaseItemImageInfos", {"Id": "I2", "ItemId": "M", "Path": "/config/m.jpg", **image}),
+                                  ("BaseItemImageInfos", {"Id": "I3", "ItemId": "GONE", "Path": "/config/g.png", **image}))
+        self.edit(after, "UPDATE BaseItemImageInfos SET DateModified = '2'")
+        problems, _, record = self.diff("capture", before, after, rules)
+        self.assertEqual(problems, ["2 row(s) the capture changed that no allowlist entry explains: BaseItemImageInfos 2 "
+                                    "changed (rows-capture.txt)"])
+        # the item found whatever the id's case; a movie's image, and one whose item no copy holds, not explained
+        self.assertEqual(sorted((r["key"], [e["name"] for e in r["explained_by"]]) for r in record),
+                         [(["I1"], ["collage"]), (["I2"], []), (["I3"], [])])
+        self.assertNotIn(allowlist.ITEM_TYPE, record[0]["before"])   # matched on, never recorded as a column
+
+    def test_the_audit_and_gate_entries_explain_only_the_rows_they_name(self):
+        """The production entries gl-1573 added, on rows shaped as a round trip wrote them."""
+        def explained(window, table, change, before=None, after=None, changed=(), item_type=None):
+            used, left = checks_db.explain(allowlist.RULES, window, table, change, list(changed), before, after, item_type)
+            return [rule.name for rule in used] if not left else None
+
+        playlist = "MediaBrowser.Controller.Playlists.Playlist"
+        collage = {"ImageType": 0, "DateModified": "1", "Blurhash": b"a"}
+        drawn = {**collage, "DateModified": "2", "Blurhash": b"b"}
+        self.assertEqual(explained("capture", "BaseItemImageInfos", "changed", collage, drawn,
+                                   ("DateModified", "Blurhash"), playlist), ["playlist-collage", "blurhash"])
+        for window, kind, image_type in (("scan", playlist, 0), ("capture", MOVIE, 0), ("capture", playlist, 2)):
+            self.assertIsNone(explained(window, "BaseItemImageInfos", "changed", {**collage, "ImageType": image_type},
+                                        {**drawn, "ImageType": image_type}, ("DateModified",), kind), (window, kind))
+        for window in ("capture", "scan"):
+            self.assertEqual(explained(window, "BaseItemImageInfos", "changed", collage, {**collage, "Blurhash": b"b"},
+                                       ("Blurhash",), MOVIE), ["blurhash"], window)
+        for window in ("stop", "restart"):   # Jellyfin measured images again only at the gate's requests and its scan
+            self.assertIsNone(explained(window, "BaseItemImageInfos", "changed", collage,
+                                        {**collage, "Blurhash": b"b"}, ("Blurhash",), MOVIE), window)
+        for old, new in ((None, b"a"), (b"", b"a"), (b"a", None), (b"a", b"")):   # filled in or lost: no gl-1058 case
+            self.assertIsNone(explained("capture", "BaseItemImageInfos", "changed", {**collage, "Blurhash": old},
+                                        {**collage, "Blurhash": new}, ("Blurhash",), MOVIE), (old, new))
+        self.assertIsNone(explained("capture", "BaseItemImageInfos", "changed", collage, drawn,
+                                    ("DateModified",), None))   # an image of no item either copy holds
+        seeded = {"Type": playlist, "Name": "Synthetic linked playlist", "RunTimeTicks": 80000000}
+        self.assertEqual(explained("capture", "BaseItems", "changed", seeded, {**seeded, "RunTimeTicks": 320000000},
+                                   ("RunTimeTicks",)), ["playlist-runtime"])
+        for name in ("Round trip playlist renamed", "Synthetic private playlist"):   # made or emptied in Ferrofin
+            made = {**seeded, "Name": name}
+            self.assertIsNone(explained("capture", "BaseItems", "changed", made, {**made, "RunTimeTicks": 1},
+                                        ("RunTimeTicks",)), name)
+        for value in (0, None):   # a sum of the members, never none
+            self.assertIsNone(explained("capture", "BaseItems", "changed", seeded, {**seeded, "RunTimeTicks": value},
+                                        ("RunTimeTicks",)), value)
+        self.assertIsNone(explained("capture", "BaseItems", "changed", {**seeded, "RunTimeTicks": 1}, seeded,
+                                    ("RunTimeTicks",)))   # the fixtures' stale value only
+        movie = {**seeded, "Type": MOVIE}
+        self.assertIsNone(explained("capture", "BaseItems", "changed", movie, {**movie, "RunTimeTicks": 1},
+                                    ("RunTimeTicks",)))
+        self.assertIsNone(explained("scan", "BaseItems", "changed", seeded, {**seeded, "RunTimeTicks": 320000000},
+                                    ("RunTimeTicks",)))
+
     def test_a_removed_row_is_explained_only_where_its_entry_applies(self):
         log = {"Name": "x", "UserId": "u", "DateCreated": "d", "LogSeverity": 1}
         before, after = self.pair(("ActivityLogs", {"Id": 1, "Type": "Old", **log}),
@@ -314,6 +375,10 @@ class Allowlist(unittest.TestCase):
             Rule("six", ("scan",), "BaseItems", "changed", "gate", "why", columns=("Width",), keys=("X",)),
             Rule("seven", ("scan",), "BaseItems", "changed", "allowlisted", "a verdict", columns=("Name",)),
             Rule("one", ("scan",), "Users", "added", "gate", "why"),
+            Rule("eight", ("scan",), "Users", "added", "gate", "why", where=((allowlist.ITEM_TYPE, ".*"),)),
+            Rule("nine", ("scan",), "BaseItemImageInfos", "changed", "gate", "why", columns=(allowlist.ITEM_TYPE,)),
+            Rule("ten", ("scan",), "Users", "added", "jellyfin-alone", "Jellyfin does it"),
+            Rule("eleven", ("scan",), "Users", "added", "jellyfin-alone", "Jellyfin 13.0 alone does it", becomes="("),
         )
         found = allowlist.problems(bad + bad[:1], self.SCHEMA)
         for wanted in ("entry 1 (one: NoSuchTable added): no table NoSuchTable in Jellyfin's schema",
@@ -330,6 +395,11 @@ class Allowlist(unittest.TestCase):
                        "entry 5 (five: TrickplayInfos changed): a tolerance is a fraction between 0 and 1, not 5",
                        "entry 6 (six: BaseItems changed): JSON keys only on text columns",
                        "entry 7 (seven: BaseItems changed): an allowlisted entry's cause names the issue that decided it",
+                       "entry 9 (eight: Users added): no column ItemType in Users",   # a table with no ItemId
+                       "entry 10 (nine: BaseItemImageInfos changed): no column ItemType in BaseItemImageInfos",
+                       "entry 11 (ten: Users added): a jellyfin-alone entry's cause names the run of Jellyfin <version> alone",
+                       "entry 12 (eleven: Users added): becomes only on a changed row",
+                       "entry 12 (eleven: Users added): becomes: ",
                        "an entry is listed twice",
                        "two entries share a name"):
             self.assertTrue(any(problem.startswith(wanted) for problem in found), (wanted, found))

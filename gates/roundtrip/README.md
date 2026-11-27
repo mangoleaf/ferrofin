@@ -193,11 +193,15 @@ Every change must be explained by an entry of [`allowlist.py`](allowlist.py) `RU
 the table, the change, for a changed row the columns it may change (for a number, within a relative tolerance;
 for a JSON object such as `BaseItems.Data`, only in the keys it names, at least one of which changed: the same
 object written in another order is not a stamp's doing), the rows it applies to (`where`: a
-regular expression a column's whole value must match), its kind and its cause. A changed row is explained when
+regular expression a column's whole value must match), for a changed row the values a covered column may take
+(`becomes`), its kind and its cause; both patterns match the value as Python's `str()` writes it (a blob as
+`b'…'`, NULL as `None`). A changed row is explained when
 every column it changed is covered. The kinds are `timestamp` (a stamp or key Jellyfin writes anew on every save
 or refresh, whatever changed), `session` (what presenting a token writes), `gate` (what the gate's own requests
-write), `checked` (a change another check judges one by one, the migrations its start records) and `allowlisted`
-(a difference the owner accepted, or an audit verdict). The gate's own writes are told apart from Jellyfin's in two
+write), `checked` (a change another check judges one by one, the migrations its start records), `jellyfin-alone`
+(what Jellyfin does to its own rows when the gate asks: Jellyfin 12.4 alone, on a copy of the fixture with no
+Ferrofin in between, makes the same change, the control below) and `allowlisted` (a difference the owner accepted,
+or an audit verdict). The gate's own writes are told apart from Jellyfin's in two
 ways: by window (the playlist refresh, answers, Live TV check and probes run only in the "gate's requests" window, and
 the answers again in "until its stop"; the start, scan and second start windows have no request of the gate's but its
 polls of the scheduled tasks and the scan's own `POST /Library/Refresh`), and by the `gate` entries, which apply only
@@ -206,13 +210,32 @@ in those two windows and only to the accounts and devices the answers sign in (`
 playlist row, is Jellyfin's and must be explained like any other.
 
 The entries today are the artefact rules, each pointing at the upstream code that writes it (the save and refresh
-stamps only in the first start's windows: a second start that saves or refreshes an item fails), and two owner
-decisions: a trickplay `TrickplayInfos.Bandwidth` within 5% (gl-1596) and `DateLastSaved` on guide programmes
-(gl-1628, within the general `DateLastSaved` rule). Differences the audits judge are added as `allowlisted`
-entries citing their verdict. An entry is checked before every run (`allowlist.py check --schema
-"$RT_SCHEMA"`; `run.sh` refuses a run when one fails): it names a table and columns Jellyfin's schema has, a
-window, change and kind the file knows, and a cause (an `allowlisted` one naming its issue), a tolerance only on a
-number, JSON keys only on text, and a name of its own, which the row diff's files use.
+stamps only in the first start's windows: a second start that saves or refreshes an item fails); two `jellyfin-alone`
+entries, in the gate's requests only, for what Jellyfin does when the gate refreshes every playlist in full (each
+playlist's collage drawn again, so its image row's `DateModified` is new; and the runtime of the two playlists the
+fixtures seeded with a stale `80000000` summed again from their members: every other playlist's runtime is judged,
+the ones Ferrofin made or emptied among them); and three owner decisions: a trickplay `TrickplayInfos.Bandwidth`
+within 5% (gl-1596, every window), `DateLastSaved` on guide programmes (gl-1628, within the general `DateLastSaved`
+rule) and Jellyfin's own BlurHash of an image whose hash it measures again, at the gate's requests or its scan
+(gl-1058, recorded in the relations ledger: a hash on both sides, so a missing one filled in, or one lost, is not
+covered). A difference with neither an owner decision nor an audit verdict gets no entry: it is a bug, filed, and the
+route stays red until it is fixed. An entry's `where` may name `ItemType` on a table with an `ItemId`: the
+`BaseItems.Type` of the row's item, read from either copy (none when neither holds it). The other differences the
+owner accepted, and the rows the audits recorded as Jellyfin bugs not ported, change no row in any window of the
+matrix's routes today, so they have no entry: a summed `MusicArtist` runtime (gl-1594), extras copying their owner's
+metadata after its refresh (gl-1595), a container's own play state cleared (gl-1064), an EXIF UserComment's character
+set (gl-1613) and the EXIF fields of WebP and AVIF photos (gl-1614), no sidecar for a playlist file (gl-1915), stored
+artists keeping their ids (gl-1928), and the scan's pruning hold (gl-1929). No route shows the `PLACEHOLDER` row's
+`CleanName` either, which a database an earlier Ferrofin created keeps (gl-1585's fix converges only the databases
+that had not filled it yet, as its comment on gl-1552 says): no route's source is one, and it is no accepted
+divergence, so a route that showed it would stay red on it. The `native` route, whose library rows Ferrofin wrote
+from scratch, stops at its export until gl-1969 is fixed (a scratch run with the column order ignored reached
+Jellyfin and showed none of them either), and the scale route runs no scan. One gets an entry, citing its decision,
+when a route shows its row. An entry is checked before every run (`allowlist.py check --schema "$RT_SCHEMA"`;
+`run.sh` refuses a run when one fails): it names a table and columns Jellyfin's schema has, a window, change and kind
+the file knows, and a cause (an `allowlisted` one naming its issue, a `jellyfin-alone` one the run of Jellyfin
+alone), a tolerance only on a number, JSON keys only on text, `becomes` only on a changed row, and a name of its own,
+which the row diff's files use.
 `rows-<window>.txt` counts the rows of each table, change and set of columns by the entries that explained them (each
 by its kind and name; the `.jsonl.gz` gives every change the name, kind and cause of each), so an entry that never
 appears there explained nothing in that window.
@@ -231,8 +254,8 @@ lands in the next window.
 
 ### Controls
 
-These runs show that each check can fail. None is part of a run; they are done by hand when the history rule or
-the checks above change:
+These runs show that each check can fail, and "Jellyfin alone" is the evidence of the `jellyfin-alone` entries. None
+is part of a run; they are done by hand when the history rule, the checks above or those entries change:
 
 - **The history left as the source had it:** run the gate with `--image` of a build whose export does not
   rewrite the history, or, in a scratch copy of `gates/`, have `export_stage` copy the history of
@@ -270,6 +293,14 @@ the checks above change:
   `video` lines (both pairs merged again, `Stacked Relay` with no part); `FixIncorrectOwnerIdRelationships` fails
   the answers on the `videos` line (`Stacked Relay - part2`). On the `12.0` and `12.1` routes `MigrateRatingLevels`
   fails as on `10.11.8`.
+- **Jellyfin alone** (the evidence of the `jellyfin-alone` entries): boot the image `run.sh` runs for Jellyfin on a
+  copy of a fixture (`jellyfin-10.11.8`, `jellyfin-12.4-from-123`) with the fixtures' `media/` at `/media`, and take
+  the windows the route takes, with no Ferrofin in between: `api.py settle`, `checks_db.py snapshot`, `api.py
+  refresh-playlists`, a snapshot, `api.py scan` and `settle`, a snapshot, then `checks_db.py rows` over each pair. On
+  both fixtures the playlists' refresh draws every playlist's collage again and changes the same two playlists'
+  `RunTimeTicks` (`80000000` to `320000000` and to `160000000`) as on the route; it also derives the private
+  playlist's rating from its members, which the route's usage stage removes first. The 12.4 fixture's scan changes
+  nothing.
 - **Every id recorded:** in a scratch copy of the repository's `gates/`, never in a commit, have
   `export_stage` insert every row of `crates/ferrofin-db/tests/data/jellyfin-12.4-fresh-history.tsv` the
   history lacks into `$dst/jellyfin/data/jellyfin.db` after the export (`INSERT OR IGNORE`). Jellyfin then runs none of its code migrations, and
