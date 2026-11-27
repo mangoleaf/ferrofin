@@ -1084,3 +1084,20 @@ fn a_malformed_block_of_a_multi_episode_nfo_merges_nothing() {
     assert_eq!(result.item.name, None);
     assert_eq!(result.item.index_number, None);
 }
+
+/// gl-2020: `_validProviderIds` is an `OrdinalIgnoreCase` dictionary, so a
+/// plugin provider's id tag matches in another case beyond ASCII.
+#[test]
+fn a_plugin_id_tag_matches_in_another_non_ascii_case() {
+    let mut result = new_result(NfoItemKind::Movie);
+    fetch_movie(
+        &mut result,
+        "plugin.nfo",
+        "<movie><title>T</title><äRZTEID>42</äRZTEID></movie>",
+        &NfoConfiguration::default(),
+        &StaticExternalIds::new(["Ärzte"]),
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(get_provider_id(&result.item, "Ärzte"), Some("42"));
+}

@@ -566,6 +566,22 @@ fn set_provider_ids_folds_names_ordinal_ignore_case() {
     );
 }
 
+/// gl-2020: `MergeBaseItemData`'s ProviderIds rule writes into the
+/// `StringComparer.OrdinalIgnoreCase` dictionary, so two spellings of one
+/// non-ASCII name are one id, the stored spelling kept.
+#[test]
+fn merge_provider_ids_folds_names_ordinal_ignore_case() {
+    let stored = ids(&[("Ärzte", "1")]);
+    assert_eq!(
+        merge_provider_ids(&ids(&[("äRZTE", "2")]), &stored, true),
+        ids(&[("Ärzte", "2")])
+    );
+    assert_eq!(
+        merge_provider_ids(&ids(&[("äRZTE", "2")]), &stored, false),
+        stored
+    );
+}
+
 /// `ProviderIdsExtensionsTests.IsValidProviderId_ChecksKnownFormats`
 /// (`null` is the empty string here).
 #[rstest]

@@ -19,7 +19,7 @@
 
 use ferrofin_traits::providers::ItemUpdateType;
 use ferrofin_util::directory_path::DirectoryPath;
-use ferrofin_util::string_extensions::ordinal_ignore_case_key;
+use ferrofin_util::string_extensions::{equals_ordinal_ignore_case, ordinal_ignore_case_key};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -662,7 +662,8 @@ impl EnrichedView {
 /// through `TrySetProviderId`, trimmed and validated).
 fn search_result_ids(result: &RemoteSearchResult) -> Vec<(String, String)> {
     // A `HashMap` has no order; the lookups read by key, so a stable one keeps
-    // logs and tests deterministic.
+    // logs and tests deterministic. Upstream's dictionary keeps the posted
+    // order, which decides two spellings of one name (fix path: gl-2028).
     let mut pairs: Vec<(&str, &str)> = result
         .provider_ids
         .iter()
@@ -748,7 +749,7 @@ fn recorded_provider_id(cache: &ArtworkCache, id: &str, provider: &str) -> Optio
 /// The numeric `provider` id among `ids`.
 fn provider_id_in(ids: &[(String, String)], provider: &str) -> Option<i64> {
     ids.iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(provider))
+        .find(|(key, _)| equals_ordinal_ignore_case(key, provider))
         .and_then(|(_, value)| value.trim().parse().ok())
 }
 
@@ -12599,7 +12600,9 @@ impl LibraryScanner {
         let id_of = |provider: &str| {
             known_ids
                 .iter()
-                .find(|(key, value)| key.eq_ignore_ascii_case(provider) && !value.trim().is_empty())
+                .find(|(key, value)| {
+                    equals_ordinal_ignore_case(key, provider) && !value.trim().is_empty()
+                })
                 .map(|(_, value)| value.trim().to_owned())
         };
         let find = async |source: &str, id: String| {
@@ -12906,7 +12909,7 @@ impl LibraryScanner {
                     known_ids
                         .iter()
                         .find(|(key, value)| {
-                            key.eq_ignore_ascii_case(provider) && !value.trim().is_empty()
+                            equals_ordinal_ignore_case(key, provider) && !value.trim().is_empty()
                         })
                         .map(|(_, value)| value.trim())
                 };
@@ -17820,7 +17823,7 @@ impl LibraryScanner {
         );
         let mut ids: Vec<(String, String)> = provider_ids.to_vec();
         for (key, value) in known_ids {
-            if !ids.iter().any(|(k, _)| k.eq_ignore_ascii_case(key)) {
+            if !ids.iter().any(|(k, _)| equals_ordinal_ignore_case(k, key)) {
                 ids.push((key.clone(), value.clone()));
             }
         }
@@ -23998,14 +24001,17 @@ fn settle_provider_ids(
     for (key, value) in tag_ids {
         let has = ids
             .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case(key) && !v.is_empty());
+            .any(|(k, v)| equals_ordinal_ignore_case(k, key) && !v.is_empty());
         if !rule.replace_all_metadata && has {
             continue;
         }
         for (name, value) in
             ferrofin_providers::metadata_merge::set_provider_ids([(key.as_str(), value.as_str())])
         {
-            match ids.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(&name)) {
+            match ids
+                .iter_mut()
+                .find(|(k, _)| equals_ordinal_ignore_case(k, &name))
+            {
                 Some(existing) => existing.1 = value,
                 None => ids.push((name, value)),
             }
@@ -24021,7 +24027,7 @@ fn settle_provider_ids(
     let recorded: &[(String, String)] = stored.map_or(&[], Vec::as_slice);
     let drops_stored = recorded
         .iter()
-        .any(|(k, _)| !merged.iter().any(|(m, _)| m.eq_ignore_ascii_case(k)));
+        .any(|(k, _)| !merged.iter().any(|(m, _)| equals_ordinal_ignore_case(m, k)));
     let upserts: Vec<(String, String)> = merged
         .iter()
         .filter(|pair| !recorded.contains(pair))
@@ -24056,7 +24062,10 @@ fn prefer_local_ids(
     remote: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
     for (key, value) in remote {
-        if !local.iter().any(|(k, _)| k.eq_ignore_ascii_case(&key)) {
+        if !local
+            .iter()
+            .any(|(k, _)| equals_ordinal_ignore_case(k, &key))
+        {
             local.push((key, value));
         }
     }
@@ -35440,6 +35449,47 @@ mod tests {
             .filter(|pair| !recorded.contains(pair))
             .collect();
         assert_eq!(settled.upserts, upserts);
+    }
+
+    /// gl-2020: a tag id whose name differs from a recorded one only in
+    /// non-ASCII case is that id (`ProviderIds` is an `OrdinalIgnoreCase`
+    /// dictionary): kept unless the pass replaces all metadata, and never
+    /// added beside it.
+    #[test]
+    fn a_tag_id_folds_onto_its_recorded_name_beyond_ascii() {
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        for (replace_all_metadata, expected) in [(false, "1"), (true, "2")] {
+            let mut cache = super::ArtworkCache::default();
+            cache
+                .item_provider_ids
+                .insert("ID".to_owned(), vec![pair("Ärzte", "1")]);
+            let settled = super::settle_provider_ids(
+                &mut cache,
+                "ID",
+                &[],
+                &[],
+                &[],
+                &[pair("äRZTE", "2")],
+                super::IdSettle {
+                    merges: false,
+                    replace: false,
+                    replace_all_metadata,
+                },
+            );
+            assert_eq!(settled.merged, vec![pair("Ärzte", expected)]);
+            assert!(!settled.drops_stored);
+        }
+    }
+
+    /// gl-2020: a remote id never sits beside a local one of the same name
+    /// in another case, non-ASCII included.
+    #[test]
+    fn prefer_local_ids_folds_names_beyond_ascii() {
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        assert_eq!(
+            super::prefer_local_ids(vec![pair("Ärzte", "1")], vec![pair("äRZTE", "2")]),
+            vec![pair("Ärzte", "1")]
+        );
     }
 
     /// An unusable recorded id is dropped only by a pass that merges, and a

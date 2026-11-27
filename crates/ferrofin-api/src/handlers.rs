@@ -7105,6 +7105,12 @@ pub const VERIFIED: &[Verified] = &[
             "An item whose path no library location covers, or a file-backed item in no \
          library, answers 409 and is not refreshed; upstream refreshes it. Fix path: \
          gl-1770.",
+            "Of two spellings of one provider name in the chosen result's ProviderIds, the \
+         spelling kept and the value it takes follow byte order for an item the scan queue \
+         refreshes (one with a path, or an artist known only by name) and the map's \
+         iteration order for any other item (ProviderManager::refresh_full_item): the body \
+         binds into an unordered map, where upstream's SetProviderIds keeps the first \
+         spelling and the later value in document order. Fix path: gl-2028.",
             "The 400 (an itemId, replaceAllImages or body the binder cannot read, or the nil \
          id), 401 (no or bad token), 403 (not an administrator, or a remote caller the \
          user's remote-access restriction refuses) and 404 bodies are Ferrofin's error \

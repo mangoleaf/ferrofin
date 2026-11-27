@@ -27,6 +27,7 @@
 //! ([`refresh_by_name_artist`](LibraryScanner::refresh_by_name_artist)).
 
 use ferrofin_traits::providers::ItemUpdateType;
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
@@ -188,7 +189,9 @@ struct MusicAnswer {
 /// (`MusicBrainzId` in `AlbumInfoExtensions.cs:87-88`).
 fn valid_id(ids: &[(String, String)], name: &str) -> Option<String> {
     ids.iter()
-        .find(|(key, value)| key.eq_ignore_ascii_case(name) && is_valid_provider_id(key, value))
+        .find(|(key, value)| {
+            equals_ordinal_ignore_case(key, name) && is_valid_provider_id(key, value)
+        })
         .map(|(_, value)| value.trim().to_owned())
 }
 
@@ -214,8 +217,15 @@ fn first_song_id(
 pub(super) fn fill_ids(target: &mut Vec<(String, String)>, ids: &[(String, String)]) {
     for (key, value) in ids {
         if is_valid_provider_id(key, value) && valid_id(target, key).is_none() {
-            target.retain(|(k, _)| !k.eq_ignore_ascii_case(key));
-            target.push((key.clone(), value.clone()));
+            // The `OrdinalIgnoreCase` dictionary: an unusable id already there
+            // keeps its spelling and takes the value.
+            match target
+                .iter_mut()
+                .find(|(k, _)| equals_ordinal_ignore_case(k, key))
+            {
+                Some(existing) => existing.1.clone_from(value),
+                None => target.push((key.clone(), value.clone())),
+            }
         }
     }
 }
@@ -2103,10 +2113,27 @@ impl LibraryScanner {
 #[cfg(test)]
 mod tests {
     use super::{MusicKind, heals_from_children, ids_from_songs, restore_from_children, same_ids};
+
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::entities::MetadataField;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    /// gl-2020: `MergeData`'s ProviderIds rule writes into the
+    /// `OrdinalIgnoreCase` dictionary: a valid id under another non-ASCII
+    /// case of its name is kept, and an unusable one keeps its spelling and
+    /// takes the value.
+    #[test]
+    fn fill_ids_folds_names_beyond_ascii() {
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        let mut target = vec![pair("Ärzte", "1")];
+        super::fill_ids(&mut target, &[pair("äRZTE", "2")]);
+        assert_eq!(target, vec![pair("Ärzte", "1")]);
+
+        let mut target = vec![pair("Ärzte", " ")];
+        super::fill_ids(&mut target, &[pair("äRZTE", "2")]);
+        assert_eq!(target, vec![pair("Ärzte", "2")]);
+    }
 
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
         values

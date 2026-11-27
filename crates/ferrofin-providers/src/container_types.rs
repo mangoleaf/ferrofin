@@ -205,9 +205,10 @@ pub struct LocalImageInfo {
 ///
 /// Port of `ProviderIdsExtensions.SetProviderId(string, string)`. Upstream
 /// throws on null/whitespace keys or values and on keys containing `'='`; a
-/// pure-data-type port drops such calls instead. Existing keys that differ only
-/// in case are replaced so the map never holds case-variant duplicates (upstream
-/// uses an `OrdinalIgnoreCase` dictionary).
+/// pure-data-type port drops such calls instead. A key already there that
+/// differs only in case keeps its spelling and takes the value, as upstream's
+/// `OrdinalIgnoreCase` dictionary does, so the map never holds case-variant
+/// duplicates.
 pub fn set_provider_id<S: BuildHasher>(
     provider_ids: &mut HashMap<String, String, S>,
     name: &str,
@@ -219,9 +220,14 @@ pub fn set_provider_id<S: BuildHasher>(
 
     let key = canonical_provider_key(name);
 
-    // Emulate the OrdinalIgnoreCase dictionary: drop any case-variant of the key
-    // before inserting the canonical spelling.
-    provider_ids.retain(|existing, _| !existing.eq_ignore_ascii_case(&key));
+    // `ProviderIds[name] = value` on the `OrdinalIgnoreCase` dictionary.
+    if let Some(existing) = provider_ids
+        .iter_mut()
+        .find_map(|(existing, id)| equals_ordinal_ignore_case(existing, &key).then_some(id))
+    {
+        value.clone_into(existing);
+        return;
+    }
     provider_ids.insert(key, value.to_owned());
 }
 
@@ -385,6 +391,17 @@ mod tests {
         assert_eq!(ids.len(), 2);
     }
 
+    /// gl-2020: upstream's `OrdinalIgnoreCase` `ProviderIds` dictionary folds
+    /// case beyond ASCII too.
+    #[test]
+    fn set_provider_id_replaces_a_non_ascii_case_variant() {
+        let mut ids = HashMap::new();
+        set_provider_id(&mut ids, "Ärzte", "1");
+        set_provider_id(&mut ids, "äRZTE", "2");
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        assert_eq!(ids.get("Ärzte"), Some(&"2".to_owned()));
+    }
+
     #[test]
     fn set_provider_id_drops_invalid_input() {
         let mut ids = HashMap::new();
@@ -397,12 +414,13 @@ mod tests {
     #[test]
     fn set_provider_id_replaces_case_variants() {
         let mut ids = HashMap::new();
-        // An arbitrary (non-enum) provider name keeps its spelling but is still
-        // de-duped case-insensitively.
+        // An arbitrary (non-enum) provider name is de-duped case-insensitively,
+        // the first spelling kept with the later value, as upstream's
+        // `OrdinalIgnoreCase` dictionary keeps it.
         set_provider_id(&mut ids, "MyProvider", "1");
         set_provider_id(&mut ids, "myprovider", "2");
         assert_eq!(ids.len(), 1);
-        assert_eq!(ids.get("myprovider"), Some(&"2".to_owned()));
+        assert_eq!(ids.get("MyProvider"), Some(&"2".to_owned()));
     }
 
     #[test]

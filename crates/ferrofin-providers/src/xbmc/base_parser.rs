@@ -19,6 +19,7 @@ use ferrofin_common::providers;
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities::MetadataField;
 use ferrofin_util::finite::finite_or_none;
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use ferrofin_util::ticks::TICKS_PER_SECOND;
 
 use crate::container_types::{FileSystemMetadata, LocalImageInfo, MetadataResult, PersonInfo};
@@ -125,7 +126,7 @@ pub struct BaseNfoParser<'a> {
     config: &'a NfoConfiguration,
     directory_service: &'a dyn DirectoryService,
     /// Map of NFO id-tag name → canonical provider key (`_validProviderIds`),
-    /// keyed case-insensitively (lower-cased here).
+    /// keyed `OrdinalIgnoreCase`, in the spelling first given (`TryAdd`).
     valid_provider_ids: Vec<(String, String)>,
 }
 
@@ -139,10 +140,14 @@ impl<'a> BaseNfoParser<'a> {
         directory_service: &'a dyn DirectoryService,
     ) -> Self {
         let mut valid_provider_ids: Vec<(String, String)> = Vec::new();
+        // `_validProviderIds` is an `OrdinalIgnoreCase` dictionary filled with
+        // `TryAdd`: the first spelling of a name stays.
         let mut add = |key: &str, value: &str| {
-            let key = key.to_ascii_lowercase();
-            if !valid_provider_ids.iter().any(|(k, _)| *k == key) {
-                valid_provider_ids.push((key, value.to_owned()));
+            if !valid_provider_ids
+                .iter()
+                .any(|(k, _)| equals_ordinal_ignore_case(k, key))
+            {
+                valid_provider_ids.push((key.to_owned(), value.to_owned()));
             }
         };
 
@@ -166,10 +171,9 @@ impl<'a> BaseNfoParser<'a> {
 
     /// Looks up an NFO id-tag name in `_validProviderIds` (case-insensitively).
     fn lookup_provider(&self, tag: &str) -> Option<&str> {
-        let tag = tag.to_ascii_lowercase();
         self.valid_provider_ids
             .iter()
-            .find(|(k, _)| *k == tag)
+            .find(|(k, _)| equals_ordinal_ignore_case(k, tag))
             .map(|(_, v)| v.as_str())
     }
 

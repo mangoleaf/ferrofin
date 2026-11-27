@@ -1181,7 +1181,10 @@ pub fn merge_provider_ids(
         if !is_valid_provider_id(key, value) {
             continue;
         }
-        match out.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(key)) {
+        match out
+            .iter_mut()
+            .find(|(k, _)| equals_ordinal_ignore_case(k, key))
+        {
             Some(existing) => {
                 if replace || !is_valid_provider_id(&existing.0, &existing.1) {
                     existing.1.clone_from(value);
@@ -1240,7 +1243,7 @@ pub fn is_valid_provider_id(name: &str, value: &str) -> bool {
     if name.trim().is_empty() || value.trim().is_empty() {
         return false;
     }
-    let is = |known: &str| name.eq_ignore_ascii_case(known);
+    let is = |known: &str| equals_ordinal_ignore_case(name, known);
     if is("Imdb") {
         is_imdb_id(value)
     } else if is("Tmdb") || is("TmdbCollection") || is("AudioDbArtist") || is("AudioDbAlbum") {
