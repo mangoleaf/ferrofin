@@ -10421,7 +10421,7 @@ mod tests {
         let only_second = ListingsProviderInfo {
             path: Some("http://guide/xmltv.xml".to_owned()),
             enable_all_tuners: false,
-            enabled_tuners: vec![second.clone()],
+            enabled_tuners: vec![Some(second.clone())],
             ..ListingsProviderInfo::default()
         };
         store_provider_as(&mgr, &id_led_by('2'), only_second).await;
