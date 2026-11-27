@@ -661,17 +661,16 @@ impl EnrichedView {
 /// lookup and the controller sets them on the item (`SetProviderIds`: each
 /// through `TrySetProviderId`, trimmed and validated).
 fn search_result_ids(result: &RemoteSearchResult) -> Vec<(String, String)> {
-    // A `HashMap` has no order; the lookups read by key, so a stable one keeps
-    // logs and tests deterministic. Upstream's dictionary keeps the posted
-    // order, which decides two spellings of one name (fix path: gl-2028).
-    let mut pairs: Vec<(&str, &str)> = result
-        .provider_ids
-        .iter()
-        .flatten()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect();
-    pairs.sort_unstable();
-    ferrofin_providers::metadata_merge::set_provider_ids(pairs)
+    // In the order the result holds them (the posted document's), as
+    // `SetProviderIds` takes upstream's dictionary: of two spellings of one
+    // name, the first spelling stays with the later value (gl-2028).
+    ferrofin_providers::metadata_merge::set_provider_ids(
+        result
+            .provider_ids
+            .iter()
+            .flatten()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )
 }
 
 /// A series' TMDB id as resolved so far this scan: the direct TMDB match if
@@ -35481,6 +35480,28 @@ mod tests {
         }
     }
 
+    /// gl-2028: an Identify result's ids are set in the order it was posted
+    /// in, as `SetProviderIds` takes upstream's dictionary: of two spellings
+    /// of one name, the first spelling stays and the later value wins.
+    #[test]
+    fn search_result_ids_keep_the_posted_order() {
+        let result = ferrofin_model::providers::RemoteSearchResult {
+            provider_ids: Some(FromIterator::from_iter([
+                ("zz".to_owned(), "1".to_owned()),
+                ("Tmdb".to_owned(), "3".to_owned()),
+                ("ZZ".to_owned(), "2".to_owned()),
+            ])),
+            ..ferrofin_model::providers::RemoteSearchResult::default()
+        };
+        assert_eq!(
+            super::search_result_ids(&result),
+            vec![
+                ("zz".to_owned(), "2".to_owned()),
+                ("Tmdb".to_owned(), "3".to_owned()),
+            ]
+        );
+    }
+
     /// gl-2020: a remote id never sits beside a local one of the same name
     /// in another case, non-ASCII included.
     #[test]
@@ -41596,10 +41617,7 @@ mod tests {
             remove_old_metadata: true,
             search_result: Some(ferrofin_model::providers::RemoteSearchResult {
                 name: Some("Dune".into()),
-                provider_ids: Some(std::collections::HashMap::from([pair(
-                    "ISBN",
-                    "9780000000002",
-                )])),
+                provider_ids: Some(FromIterator::from_iter([pair("ISBN", "9780000000002")])),
                 ..Default::default()
             }),
             ..Default::default()

@@ -2106,7 +2106,10 @@ async fn identify_pins_the_chosen_id_skips_the_nfo_and_keeps_locked_fields() {
     let chosen = ferrofin_model::providers::RemoteSearchResult {
         name: Some("Heat".into()),
         production_year: Some(1995),
-        provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "949".to_owned())])),
+        provider_ids: Some(FromIterator::from_iter([(
+            "Tmdb".to_owned(),
+            "949".to_owned(),
+        )])),
         search_provider_name: Some("TheMovieDb".into()),
         ..Default::default()
     };
@@ -2149,7 +2152,10 @@ async fn identify_with_an_imdb_id_resolves_through_tmdb_find() {
     let fx = scanned_once(tmp.path(), 0).await;
     let chosen = ferrofin_model::providers::RemoteSearchResult {
         name: Some("Heat".into()),
-        provider_ids: Some(HashMap::from([("Imdb".to_owned(), "tt0113277".to_owned())])),
+        provider_ids: Some(FromIterator::from_iter([(
+            "Imdb".to_owned(),
+            "tt0113277".to_owned(),
+        )])),
         search_provider_name: Some("The Open Movie Database".into()),
         ..Default::default()
     };
@@ -2177,7 +2183,10 @@ async fn a_movie_imdb_id_tmdb_cannot_resolve_is_not_searched_by_name() {
     let fx = scanned_once(tmp.path(), 0).await;
     let chosen = ferrofin_model::providers::RemoteSearchResult {
         name: Some("Heat".into()),
-        provider_ids: Some(HashMap::from([("Imdb".to_owned(), "tt0000404".to_owned())])),
+        provider_ids: Some(FromIterator::from_iter([(
+            "Imdb".to_owned(),
+            "tt0000404".to_owned(),
+        )])),
         search_provider_name: Some("The Open Movie Database".into()),
         ..Default::default()
     };
@@ -2278,7 +2287,10 @@ async fn identify_with_omdb_first_then_tmdb_fills_what_omdb_left() {
 
     let chosen = ferrofin_model::providers::RemoteSearchResult {
         name: Some("Heat".into()),
-        provider_ids: Some(HashMap::from([("Imdb".to_owned(), "tt0113277".to_owned())])),
+        provider_ids: Some(FromIterator::from_iter([(
+            "Imdb".to_owned(),
+            "tt0113277".to_owned(),
+        )])),
         search_provider_name: Some("The Open Movie Database".into()),
         ..Default::default()
     };
@@ -2360,7 +2372,10 @@ fn identify_as(title: Title) -> MetadataRefreshOptions {
     apply(ferrofin_model::providers::RemoteSearchResult {
         name: Some(title.name.into()),
         production_year: Some(title.year),
-        provider_ids: Some(HashMap::from([("Tmdb".to_owned(), title.tmdb.to_owned())])),
+        provider_ids: Some(FromIterator::from_iter([(
+            "Tmdb".to_owned(),
+            title.tmdb.to_owned(),
+        )])),
         search_provider_name: Some("TheMovieDb".into()),
         ..Default::default()
     })
@@ -2720,7 +2735,10 @@ async fn an_identified_series_episodes_never_take_the_old_shows_season() {
     };
     let right = ferrofin_model::providers::RemoteSearchResult {
         name: Some("Right Show".into()),
-        provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "200".to_owned())])),
+        provider_ids: Some(FromIterator::from_iter([(
+            "Tmdb".to_owned(),
+            "200".to_owned(),
+        )])),
         search_provider_name: Some("TheMovieDb".into()),
         ..Default::default()
     };
@@ -2813,7 +2831,10 @@ async fn an_identify_that_clears_the_year_holds_through_a_quiet_rescan() {
     let fx = scanned_once(tmp.path(), 0).await;
     let nameless = ferrofin_model::providers::RemoteSearchResult {
         name: Some("Nameless".into()),
-        provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "111".to_owned())])),
+        provider_ids: Some(FromIterator::from_iter([(
+            "Tmdb".to_owned(),
+            "111".to_owned(),
+        )])),
         search_provider_name: Some("TheMovieDb".into()),
         ..Default::default()
     };

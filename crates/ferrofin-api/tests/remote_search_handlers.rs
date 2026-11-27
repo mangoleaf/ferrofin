@@ -233,7 +233,10 @@ impl ProviderManager for SearchProviders {
                 request.artists.join(","),
                 request.series_name.clone().unwrap_or_default()
             )),
-            provider_ids: request.artist_provider_ids.clone(),
+            provider_ids: request
+                .artist_provider_ids
+                .clone()
+                .map(|ids| ids.into_iter().collect()),
             search_provider_name: Some("TheMovieDb".to_owned()),
             ..RemoteSearchResult::default()
         }])
@@ -499,6 +502,40 @@ async fn apply_refreshes_existing_item() {
     assert_eq!(chosen.name.as_deref(), Some("The Matrix"));
     assert_eq!(chosen.production_year, Some(1999));
     assert_eq!(chosen.provider_ids.unwrap()["Tmdb"], "603");
+}
+
+/// gl-2028: the chosen result's ids reach the refresh in the order they were
+/// posted, as upstream's `Dictionary<string, string>` binds them; a key
+/// posted twice keeps its first place and takes the later value.
+#[tokio::test]
+async fn apply_keeps_the_posted_order_of_the_chosen_ids() {
+    for (posted, expected) in [
+        (
+            r#"{"ProviderIds":{"zz":"1","Tmdb":"603","ZZ":"2"}}"#,
+            vec![("zz", "1"), ("Tmdb", "603"), ("ZZ", "2")],
+        ),
+        (
+            r#"{"ProviderIds":{"k":"1","x":"2","k":"3"}}"#,
+            vec![("k", "3"), ("x", "2")],
+        ),
+    ] {
+        let library = Arc::new(OneItemLibrary::default());
+        let uri = format!("/Items/RemoteSearch/Apply/{ITEM_ID}");
+        let (status, _) = send_to(state_over(&library), "POST", &uri, Body::from(posted)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{posted}");
+        let chosen = the_refresh(&library)
+            .1
+            .search_result
+            .expect("chosen result");
+        let ids: Vec<(&str, &str)> = chosen
+            .provider_ids
+            .as_ref()
+            .expect("ids")
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(ids, expected, "{posted}");
+    }
 }
 
 /// `replaceAllImages=false` reaches the refresh, and the chosen ids ride in

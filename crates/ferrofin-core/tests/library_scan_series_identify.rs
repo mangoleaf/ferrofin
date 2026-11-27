@@ -7,7 +7,6 @@
 //! `MetadataService.cs:272-293`). So their providers resolve the series by
 //! the chosen ids alone, not by an id the series' own refresh found.
 
-use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::sync::{Arc, Mutex};
 
@@ -156,7 +155,7 @@ async fn a_series_identify_resolves_its_children_by_the_chosen_ids(
             provider_ids: Some(
                 ids.iter()
                     .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-                    .collect::<HashMap<_, _>>(),
+                    .collect(),
             ),
             search_provider_name: Some(provider.into()),
             ..RemoteSearchResult::default()

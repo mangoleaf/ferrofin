@@ -1820,6 +1820,7 @@ dependencies = [
  "ferrofin-util",
  "flate2",
  "futures-util",
+ "indexmap 2.14.2",
  "md-5",
  "opentelemetry",
  "opentelemetry_sdk",

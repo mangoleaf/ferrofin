@@ -243,7 +243,7 @@ impl RemoteSearchProvider for TmdbSearchProvider {
                     if self.kind == TmdbKind::Series {
                         result
                             .provider_ids
-                            .get_or_insert_with(HashMap::new)
+                            .get_or_insert_with(indexmap::IndexMap::new)
                             .insert(key.to_owned(), external.to_owned());
                     }
                     result
@@ -280,7 +280,7 @@ impl TmdbSearchProvider {
             premiere_date: hit.premiere_date.as_deref().and_then(parse_ymd),
             image_url: hit.poster_url,
             overview: hit.overview,
-            provider_ids: Some(HashMap::from([(
+            provider_ids: Some(indexmap::IndexMap::from([(
                 "Tmdb".to_owned(),
                 hit.tmdb_id.to_string(),
             )])),
@@ -294,7 +294,7 @@ impl TmdbSearchProvider {
     /// TMDB knows it; the series mapper adds the TVDB id too. Both set
     /// `ProductionYear` from the release / first air date.
     fn pinned_result(&self, tmdb_id: i64, details: TmdbDetails) -> RemoteSearchResult {
-        let mut provider_ids = HashMap::from([("Tmdb".to_owned(), tmdb_id.to_string())]);
+        let mut provider_ids = indexmap::IndexMap::from([("Tmdb".to_owned(), tmdb_id.to_string())]);
         // `TrySetProviderId` — only when TMDB actually has the id.
         if let Some(imdb) = details.imdb_id.filter(|v| !v.is_empty()) {
             provider_ids.insert("Imdb".to_owned(), imdb);
@@ -390,8 +390,7 @@ impl RemoteSearchProvider for TvdbSearchProvider {
             let Some(details) = self.tvdb.series_details(id, "usa").await else {
                 return Ok(Vec::new());
             };
-            let mut provider_ids =
-                std::collections::HashMap::from([("Tvdb".to_owned(), id.to_string())]);
+            let mut provider_ids = indexmap::IndexMap::from([("Tvdb".to_owned(), id.to_string())]);
             for (key, value) in [
                 ("Imdb", details.imdb_id),
                 ("Tmdb", details.tmdb_id),
@@ -436,7 +435,7 @@ impl RemoteSearchProvider for TvdbSearchProvider {
                 production_year: hit.year,
                 image_url: hit.image_url,
                 overview: hit.overview,
-                provider_ids: Some(std::collections::HashMap::from([(
+                provider_ids: Some(indexmap::IndexMap::from([(
                     "Tvdb".to_owned(),
                     hit.tvdb_id.to_string(),
                 )])),
@@ -509,7 +508,7 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
                 name: Some(collection.name),
                 // `GetPosterUrl(collection.PosterPath)` — TMDB's own pick only.
                 image_url: collection.poster_url,
-                provider_ids: Some(HashMap::from([(
+                provider_ids: Some(indexmap::IndexMap::from([(
                     "Tmdb".to_owned(),
                     collection.tmdb_id.to_string(),
                 )])),
@@ -537,7 +536,7 @@ impl RemoteSearchProvider for TmdbBoxSetSearchProvider {
                 // box set itself — `TmdbCollection` is the key a *movie* uses
                 // to point at its collection, and is not read back for a
                 // BoxSet by the links table or the image path.
-                provider_ids: Some(std::collections::HashMap::from([(
+                provider_ids: Some(indexmap::IndexMap::from([(
                     "Tmdb".to_owned(),
                     hit.tmdb_id.to_string(),
                 )])),
@@ -663,7 +662,7 @@ impl RemoteSearchProvider for OmdbSearchProvider {
                 provider_ids: hit
                     .imdb_id
                     .clone()
-                    .map(|id| std::collections::HashMap::from([("Imdb".to_owned(), id)])),
+                    .map(|id| indexmap::IndexMap::from([("Imdb".to_owned(), id)])),
                 name: hit.title,
                 // `ResultToMetadataResult` echoes the caller's index numbers
                 // back on every row (the Identify dialog carries an episode's
@@ -826,11 +825,11 @@ fn release_search_result(hit: crate::musicbrainz::ReleaseHit) -> RemoteSearchRes
             name: credit.name,
             provider_ids: credit
                 .artist_id
-                .map(|id| HashMap::from([("MusicBrainzArtist".to_owned(), id)])),
+                .map(|id| indexmap::IndexMap::from([("MusicBrainzArtist".to_owned(), id)])),
             ..RemoteSearchResult::default()
         })
         .collect();
-    let mut provider_ids = HashMap::from([("MusicBrainzAlbum".to_owned(), hit.id)]);
+    let mut provider_ids = indexmap::IndexMap::from([("MusicBrainzAlbum".to_owned(), hit.id)]);
     if let Some(rg) = hit.release_group_id {
         provider_ids.insert("MusicBrainzReleaseGroup".to_owned(), rg);
     }
@@ -865,7 +864,10 @@ fn artist_search_result(hit: crate::musicbrainz::ArtistHit) -> RemoteSearchResul
             .nearest()
             .and_then(crate::musicbrainz::PartialDate::to_utc),
         search_provider_name: Some(MUSICBRAINZ_PROVIDER_NAME.to_owned()),
-        provider_ids: Some(HashMap::from([("MusicBrainzArtist".to_owned(), hit.id)])),
+        provider_ids: Some(indexmap::IndexMap::from([(
+            "MusicBrainzArtist".to_owned(),
+            hit.id,
+        )])),
         ..RemoteSearchResult::default()
     }
 }
@@ -1117,7 +1119,8 @@ impl RemoteSearchProvider for TmdbPersonSearchProvider {
             .and_then(parse_numeric_provider_id)
             && let Some(person) = self.tmdb.person_lookup(tmdb_id, language.as_deref()).await
         {
-            let mut provider_ids = HashMap::from([("Tmdb".to_owned(), person.tmdb_id.to_string())]);
+            let mut provider_ids =
+                indexmap::IndexMap::from([("Tmdb".to_owned(), person.tmdb_id.to_string())]);
             // `TrySetProviderId(Imdb, …)` — only when TMDB knows it.
             if let Some(imdb) = person.imdb_id {
                 provider_ids.insert("Imdb".to_owned(), imdb);
@@ -1142,7 +1145,7 @@ impl RemoteSearchProvider for TmdbPersonSearchProvider {
             .map(|person| RemoteSearchResult {
                 name: person.name,
                 image_url: person.profile_url,
-                provider_ids: Some(HashMap::from([(
+                provider_ids: Some(indexmap::IndexMap::from([(
                     "Tmdb".to_owned(),
                     person.tmdb_id.to_string(),
                 )])),
@@ -6329,7 +6332,7 @@ mod tests {
     }
 
     fn result_with(name: &str, ids: &[(&str, &str)], image: Option<&str>) -> RemoteSearchResult {
-        let mut map = HashMap::new();
+        let mut map = indexmap::IndexMap::new();
         for (k, v) in ids {
             map.insert((*k).to_owned(), (*v).to_owned());
         }
@@ -9734,7 +9737,10 @@ mod tests {
 
         let chosen = RemoteSearchResult {
             name: Some("The Matrix Collection".to_owned()),
-            provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "2344".to_owned())])),
+            provider_ids: Some(indexmap::IndexMap::from([(
+                "Tmdb".to_owned(),
+                "2344".to_owned(),
+            )])),
             ..RemoteSearchResult::default()
         };
         mgr.refresh_full_item(
@@ -13297,7 +13303,10 @@ mod tests {
             replace_all_metadata: true,
             search_result: Some(RemoteSearchResult {
                 name: Some("The Matrix Collection".to_owned()),
-                provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "2344".to_owned())])),
+                provider_ids: Some(indexmap::IndexMap::from([(
+                    "Tmdb".to_owned(),
+                    "2344".to_owned(),
+                )])),
                 ..RemoteSearchResult::default()
             }),
             remove_old_metadata: true,
@@ -13373,7 +13382,10 @@ mod tests {
             search_result: Some(RemoteSearchResult {
                 name: Some("Inception".to_owned()),
                 production_year: Some(2010),
-                provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "27205".to_owned())])),
+                provider_ids: Some(indexmap::IndexMap::from([(
+                    "Tmdb".to_owned(),
+                    "27205".to_owned(),
+                )])),
                 ..RemoteSearchResult::default()
             }),
             remove_old_metadata: true,
@@ -13439,7 +13451,10 @@ mod tests {
         let (item_id, mgr) = box_set_manager(stored, tmdb, Arc::clone(&store));
         let options = MetadataRefreshOptions {
             search_result: Some(RemoteSearchResult {
-                provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "2344".to_owned())])),
+                provider_ids: Some(indexmap::IndexMap::from([(
+                    "Tmdb".to_owned(),
+                    "2344".to_owned(),
+                )])),
                 ..RemoteSearchResult::default()
             }),
             remove_old_metadata: true,
@@ -16222,7 +16237,10 @@ mod tests {
                 image_refresh_mode: MetadataRefreshMode::FullRefresh,
                 replace_all_images: true,
                 search_result: identified_by.map(|name| RemoteSearchResult {
-                    provider_ids: Some(HashMap::from([("Tmdb".to_owned(), "603".to_owned())])),
+                    provider_ids: Some(indexmap::IndexMap::from([(
+                        "Tmdb".to_owned(),
+                        "603".to_owned(),
+                    )])),
                     search_provider_name: Some(name.to_owned()),
                     ..Default::default()
                 }),

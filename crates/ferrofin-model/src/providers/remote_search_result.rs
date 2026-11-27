@@ -1,13 +1,10 @@
 //! `RemoteSearchResult` — port of
 //! `MediaBrowser.Model.Providers.RemoteSearchResult`.
 
-use std::collections::HashMap;
-
 use chrono::{DateTime, Utc};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-
-use crate::entities_media::IHasProviderIds;
 
 /// A candidate result from a remote metadata search.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
@@ -18,8 +15,12 @@ pub struct RemoteSearchResult {
     pub name: Option<String>,
 
     /// Gets or sets the provider ids.
+    // In the order they were set or posted: upstream's `Dictionary<string,
+    // string>` keeps insertion order, which decides the value `SetProviderIds`
+    // keeps of two spellings of one name (gl-2028).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_ids: Option<HashMap<String, String>>,
+    #[schema(value_type = Option<std::collections::HashMap<String, String>>)]
+    pub provider_ids: Option<IndexMap<String, String>>,
 
     /// Gets or sets the production year.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,26 +69,12 @@ pub struct RemoteSearchResult {
     pub artists: Vec<RemoteSearchResult>,
 }
 
-impl IHasProviderIds for RemoteSearchResult {
-    fn provider_ids(&self) -> Option<&HashMap<String, String>> {
-        self.provider_ids.as_ref()
-    }
-
-    fn provider_ids_mut(&mut self) -> &mut HashMap<String, String> {
-        self.provider_ids.get_or_insert_with(HashMap::new)
-    }
-
-    fn provider_ids_opt_mut(&mut self) -> &mut Option<HashMap<String, String>> {
-        &mut self.provider_ids
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn sample() -> RemoteSearchResult {
-        let mut ids = HashMap::new();
+        let mut ids = IndexMap::new();
         ids.insert("Imdb".to_owned(), "tt0111161".to_owned());
         RemoteSearchResult {
             name: Some("The Shawshank Redemption".to_owned()),
@@ -132,15 +119,24 @@ mod tests {
         assert_eq!(json["Artists"], serde_json::json!([]));
     }
 
+    /// gl-2028: the ids keep the order they were posted in, as upstream's
+    /// `Dictionary<string, string>` does, in and out.
     #[test]
-    fn provider_ids_trait_accessors() {
-        let mut value = RemoteSearchResult::default();
-        assert!(value.provider_ids().is_none());
-        value
-            .provider_ids_mut()
-            .insert("Tmdb".to_owned(), "278".to_owned());
-        assert_eq!(value.provider_ids().unwrap()["Tmdb"], "278");
-        *value.provider_ids_opt_mut() = None;
-        assert!(value.provider_ids().is_none());
+    fn provider_ids_keep_their_document_order() {
+        let value: RemoteSearchResult =
+            serde_json::from_str(r#"{"ProviderIds":{"zz":"1","Tmdb":"2","ZZ":"3","aa":"4"}}"#)
+                .unwrap();
+        let keys: Vec<&str> = value
+            .provider_ids
+            .as_ref()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["zz", "Tmdb", "ZZ", "aa"]);
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"ProviderIds":{"zz":"1","Tmdb":"2","ZZ":"3","aa":"4"},"Artists":[]}"#
+        );
     }
 }
