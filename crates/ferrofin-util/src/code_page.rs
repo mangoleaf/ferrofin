@@ -1,9 +1,12 @@
-//! What .NET's code pages read otherwise than `encoding_rs` (gl-2000, gl-2010).
+//! What .NET's code pages read otherwise than `encoding_rs` (gl-2000, gl-2010,
+//! gl-2011).
 //!
-//! Jellyfin decodes a legacy-encoded subtitle or playlist with .NET's code
-//! pages (`System.Text.Encoding.CodePages`), and Ferrofin with `encoding_rs`,
-//! whose tables and error handling are the WHATWG Encoding Standard's.
-//! [`decode`] reads three things as .NET does:
+//! Jellyfin decodes a legacy-encoded subtitle or playlist, and an XML
+//! document that declares a legacy encoding, with .NET's code pages
+//! (`System.Text.Encoding.CodePages`), and Ferrofin with `encoding_rs`, whose
+//! tables and error handling are the WHATWG Encoding Standard's. [`decode`],
+//! and [`Decoder`] for a document that names its encoding, read three things
+//! as .NET does:
 //! - the user-defined rows of code page 949, which the WHATWG index leaves
 //!   out ([`user_defined`]);
 //! - the GB18030 sequence 81 35 F4 37, which is `ḿ` in .NET's table and a
@@ -14,11 +17,18 @@
 //!   `encoding_rs` writes U+FFFD and reads an ASCII byte again.
 //!
 //! The oracle is Jellyfin 12.4 itself: sidecar subtitles holding every byte
-//! pair of each charset, served by a stock server and by Ferrofin, and the
-//! text compared pair by pair. The `escape-charsets` parity row lists what
-//! else that comparison found.
+//! pair of each charset, and books and XMLTV guides whose XML declares each
+//! encoding, served by a stock server and by Ferrofin, and the text compared
+//! pair by pair. The `escape-charsets` parity row lists what else that
+//! comparison found.
+//!
+//! Inside this module [`encoding_rs::GB18030`] stands for .NET's
+//! `GB18030Encoding` and [`encoding_rs::GBK`] for its code page 936, which
+//! replace what they cannot decode differently. A charset detector's GBK is
+//! the former ([`decode`]); a document names one or the other
+//! ([`Decoder::declared`]).
 
-use encoding_rs::{DecoderResult, Encoding};
+use encoding_rs::{CoderResult, DecoderResult, Encoding};
 
 /// The first code point of the Private Use Area, where code page 949 puts
 /// its user-defined characters.
@@ -55,15 +65,18 @@ type LoneBytes = (u8, u8, u32);
 
 /// The bytes `encoding_rs` has no character for and `encoding`'s .NET code
 /// page reads alone, as Jellyfin 12.4 serves them (gl-2010): from sidecars it
-/// named `cp949`, `big5`, `shift-jis` and `euc-jp`, and for the single-byte
-/// code pages from a `ComicInfo.xml` declaring each one. Code page 51932
-/// (`euc-jp`) reads 932's table. All but the three U+0080 are Private Use
-/// Area code points.
+/// named `cp949`, `big5`, `shift-jis` and `euc-jp`, and for code page 936 and
+/// the single-byte code pages from a `ComicInfo.xml` declaring each one
+/// (gl-2011 for 936, ISO-8859-3 and ISO-8859-8-I). Code page 51932 (`euc-jp`)
+/// reads 932's table. All but the three U+0080 are Private Use Area code
+/// points.
 ///
 /// Empty for an encoding [`decode`] leaves to `encoding_rs`.
 fn lone_bytes(encoding: &'static Encoding) -> &'static [LoneBytes] {
     if encoding == encoding_rs::EUC_KR {
         &[(0x80, 0x80, 0x80), (0xFF, 0xFF, 0xF8F7)]
+    } else if encoding == encoding_rs::GBK {
+        &[(0xFF, 0xFF, 0xF8F5)]
     } else if encoding == encoding_rs::BIG5 {
         &[(0x80, 0x80, 0x80), (0xFF, 0xFF, 0xF8F8)]
     } else if encoding == encoding_rs::SHIFT_JIS {
@@ -90,6 +103,16 @@ fn lone_bytes(encoding: &'static Encoding) -> &'static [LoneBytes] {
         &[(0xA1, 0xA1, 0xF8FC), (0xA5, 0xA5, 0xF8FD)]
     } else if encoding == encoding_rs::WINDOWS_874 {
         &[(0xDB, 0xDE, 0xF8C1), (0xFC, 0xFF, 0xF8C5)]
+    } else if encoding == encoding_rs::ISO_8859_3 {
+        &[
+            (0xA5, 0xA5, 0xF7F5),
+            (0xAE, 0xAE, 0xF7F6),
+            (0xBE, 0xBE, 0xF7F7),
+            (0xC3, 0xC3, 0xF7F8),
+            (0xD0, 0xD0, 0xF7F9),
+            (0xE3, 0xE3, 0xF7FA),
+            (0xF0, 0xF0, 0xF7FB),
+        ]
     } else if encoding == encoding_rs::ISO_8859_6 {
         &[
             (0xA1, 0xA3, 0xF7C8),
@@ -106,7 +129,7 @@ fn lone_bytes(encoding: &'static Encoding) -> &'static [LoneBytes] {
             (0xD2, 0xD2, 0xF7C6),
             (0xFF, 0xFF, 0xF7C7),
         ]
-    } else if encoding == encoding_rs::ISO_8859_8 {
+    } else if encoding == encoding_rs::ISO_8859_8 || encoding == encoding_rs::ISO_8859_8_I {
         &[
             (0xA1, 0xA1, 0xF79C),
             (0xBF, 0xDE, 0xF79D),
@@ -121,7 +144,10 @@ fn lone_bytes(encoding: &'static Encoding) -> &'static [LoneBytes] {
 /// Whether `encoding`'s .NET decoder reads `byte` as the first of two. Code
 /// page 51932 has no three-byte form, so 8F is no lead byte there.
 fn is_lead_byte(encoding: &'static Encoding, byte: u8) -> bool {
-    if encoding == encoding_rs::EUC_KR || encoding == encoding_rs::BIG5 {
+    if encoding == encoding_rs::EUC_KR
+        || encoding == encoding_rs::BIG5
+        || encoding == encoding_rs::GBK
+    {
         matches!(byte, 0x81..=0xFE)
     } else if encoding == encoding_rs::SHIFT_JIS {
         matches!(byte, 0x81..=0x9F | 0xE0..=0xFC)
@@ -136,20 +162,22 @@ fn is_lead_byte(encoding: &'static Encoding, byte: u8) -> bool {
 /// which `encoding_rs` cannot decode, and how many of them it takes. `None`
 /// leaves the sequence to `encoding_rs`.
 ///
-/// Measured on Jellyfin 12.4 (gl-2010), every high byte before every other
-/// byte and at the end of the text, and as .NET 10's `GetChars` reads:
+/// Measured on Jellyfin 12.4 (gl-2010, and gl-2011 for code page 936), every
+/// high byte before every other byte and at the end of the text, and as .NET
+/// 10's `GetChars` reads:
 /// - `GB18030Encoding` writes `?` for the first byte alone, and for the four
 ///   bytes of a well-formed sequence that has no character;
-/// - `DBCSCodePageEncoding` (code pages 949, 950, 932 and 51932) writes one
-///   character for a lead byte and the byte after it, whatever that byte is
-///   (a line feed too), and for a lead byte the text ends in;
+/// - `DBCSCodePageEncoding` (code pages 949, 936, 950, 932 and 51932) writes
+///   one character for a lead byte and the byte after it, whatever that byte
+///   is (a line feed too), and for a lead byte the text ends in. Code page 936
+///   has no four-byte form, so one that has no character is two such pairs;
 /// - a byte that is no lead byte is what [`lone_bytes`] holds.
 ///
 /// The character is `?`, and code page 932's default character U+30FB for
 /// `shift-jis` and `euc-jp`.
 fn dotnet_fallback(encoding: &'static Encoding, tail: &[u8]) -> Option<(char, usize)> {
     let (&first, rest) = tail.split_first()?;
-    if encoding == encoding_rs::GBK {
+    if encoding == encoding_rs::GB18030 {
         let four_bytes = matches!(
             tail,
             [0x81..=0xFE, b'0'..=b'9', 0x81..=0xFE, b'0'..=b'9', ..]
@@ -186,6 +214,12 @@ fn dotnet_fallback(encoding: &'static Encoding, tail: &[u8]) -> Option<(char, us
     Some((replacement, 2))
 }
 
+/// Whether `encoding_rs` reads `encoding` as its .NET code page does, bytes
+/// with no character included, so that nothing here applies to it.
+fn is_left_to_encoding_rs(encoding: &'static Encoding) -> bool {
+    encoding != encoding_rs::GB18030 && lone_bytes(encoding).is_empty()
+}
+
 /// `bytes` decoded from `encoding` as [`Encoding::decode`] decodes them, but
 /// for what .NET reads otherwise:
 /// - in Korean text, the pairs [`user_defined`] knows, where `encoding_rs`
@@ -200,15 +234,126 @@ fn dotnet_fallback(encoding: &'static Encoding, tail: &[u8]) -> Option<(char, us
 ///   after the bytes .NET takes, so a stray lead byte takes the character
 ///   after it with it.
 ///
-/// A byte order mark is not looked for in those charsets: callers rule one
-/// out before they detect a charset.
+/// `encoding` is what a charset detector named: [`encoding_rs::GBK`] is read
+/// with .NET's `GB18030Encoding`, the only name `UTF.Unknown` has for 8-bit
+/// Simplified Chinese. A byte order mark is not looked for in those charsets:
+/// callers rule one out before they detect a charset.
 #[must_use]
 pub fn decode(encoding: &'static Encoding, bytes: &[u8]) -> String {
-    if encoding != encoding_rs::GBK && lone_bytes(encoding).is_empty() {
+    let encoding = if encoding == encoding_rs::GBK {
+        encoding_rs::GB18030
+    } else {
+        encoding
+    };
+    if is_left_to_encoding_rs(encoding) {
         return encoding.decode(bytes).0.into_owned();
     }
-    let mut decoder = encoding.new_decoder_without_bom_handling();
     let mut out = String::new();
+    Decoder::declared(encoding).decode(bytes, true, &mut out);
+    out
+}
+
+/// A legacy-encoded text decoded as it arrives, piece by piece, to the text
+/// [`decode`] gives it whole: for an XML document, which names its encoding
+/// and may be too large to hold.
+pub struct Decoder {
+    /// The encoding, as this module reads [`encoding_rs::GBK`] and
+    /// [`encoding_rs::GB18030`].
+    encoding: &'static Encoding,
+    /// `encoding_rs`'s own decoder, for an encoding it reads as .NET does: it
+    /// keeps what one piece leaves for the next, ISO-2022-JP's state too.
+    /// `None` for the encodings [`decode_some`] reads.
+    whatwg: Option<encoding_rs::Decoder>,
+    /// The end of the last piece, when .NET's decoder would look past it:
+    /// three bytes at most.
+    held: Vec<u8>,
+}
+
+impl Decoder {
+    /// The decoder for the encoding a document's declaration names, where
+    /// .NET's `Encoding.GetEncoding` tells two code pages apart that a
+    /// detector cannot: [`encoding_rs::GBK`] (`gb2312`, `gbk`) is code page
+    /// 936 here, which takes a lead byte and the byte after it for one `?`
+    /// and has no four-byte form, and only [`encoding_rs::GB18030`] is
+    /// `GB18030Encoding`.
+    ///
+    /// A byte with no character is never an error: the text holds what
+    /// .NET's decoder writes for it, and U+FFFD in an encoding this module
+    /// leaves to `encoding_rs`.
+    ///
+    /// Read as before, and decided elsewhere:
+    /// - [`encoding_rs::EUC_KR`] is code page 949 whichever name the document
+    ///   uses; .NET reads `euc-kr` and `cseuckr` with code page 51949
+    ///   (gl-2008, questions B and C);
+    /// - a four-byte GB18030 sequence that has a character keeps it in a
+    ///   document naming code page 936, where .NET writes `??` (gl-2008,
+    ///   question E), and 81 35 F4 37 stays U+E7C7 there;
+    /// - a pair or a byte `encoding_rs` decodes to another character than the
+    ///   .NET code page (gl-2008, question A, and gl-2012 for Big5).
+    #[must_use]
+    pub fn declared(encoding: &'static Encoding) -> Self {
+        Self {
+            encoding,
+            whatwg: is_left_to_encoding_rs(encoding)
+                .then(|| encoding.new_decoder_without_bom_handling()),
+            held: Vec::new(),
+        }
+    }
+
+    /// Appends the text of `bytes`, the next piece of the document, to `out`.
+    /// `last` says no piece follows, so a sequence the bytes end in is read
+    /// as it stands.
+    pub fn decode(&mut self, bytes: &[u8], last: bool, out: &mut String) {
+        if let Some(decoder) = self.whatwg.as_mut() {
+            let mut rest = bytes;
+            loop {
+                out.reserve(
+                    decoder
+                        .max_utf8_buffer_length(rest.len())
+                        .unwrap_or(rest.len()),
+                );
+                let (result, read, _) = decoder.decode_to_string(rest, out, last);
+                rest = rest.get(read..).unwrap_or_default();
+                if result == CoderResult::InputEmpty {
+                    return;
+                }
+            }
+        }
+        let from = out.len();
+        let joined;
+        let window = if self.held.is_empty() {
+            bytes
+        } else {
+            joined = [self.held.as_slice(), bytes].concat();
+            joined.as_slice()
+        };
+        let read = decode_some(self.encoding, window, last, out);
+        self.held = window.get(read..).unwrap_or_default().to_vec();
+        if self.encoding == encoding_rs::GB18030
+            && let Some(decoded) = out.get(from..)
+            && decoded.contains('\u{E7C7}')
+        {
+            let decoded = decoded.replace('\u{E7C7}', "\u{1E3F}");
+            out.truncate(from);
+            out.push_str(&decoded);
+        }
+    }
+}
+
+/// How far past the first byte of a sequence [`dotnet_fallback`] looks: the
+/// four bytes of a GB18030 sequence.
+const FALLBACK_BYTES: usize = 4;
+
+/// Appends to `out` the text of `bytes` in `encoding`, an encoding
+/// [`lone_bytes`] or [`dotnet_fallback`] knows, and returns how many bytes it
+/// read. With `last` false it stops before a sequence that the next bytes may
+/// complete, or that [`dotnet_fallback`] would look past the end of `bytes`
+/// to replace: fewer than [`FALLBACK_BYTES`] are then left unread.
+///
+/// None of these encodings keeps state between characters, so the bytes left
+/// unread start a character and a later call can begin at them.
+fn decode_some(encoding: &'static Encoding, bytes: &[u8], last: bool, out: &mut String) -> usize {
+    let mut decoder = encoding.new_decoder_without_bom_handling();
     let mut position = 0;
     loop {
         let rest = bytes.get(position..).unwrap_or_default();
@@ -217,15 +362,20 @@ pub fn decode(encoding: &'static Encoding, bytes: &[u8]) -> String {
                 .max_utf8_buffer_length_without_replacement(rest.len())
                 .unwrap_or(rest.len()),
         );
-        let (result, read) = decoder.decode_to_string_without_replacement(rest, &mut out, true);
+        // Flushed whatever `last` says: a sequence the bytes end in then
+        // comes back as malformed, which tells where it starts.
+        let (result, read) = decoder.decode_to_string_without_replacement(rest, out, true);
         position += read;
         match result {
-            DecoderResult::InputEmpty => break,
+            DecoderResult::InputEmpty => return position,
             DecoderResult::OutputFull => {}
             DecoderResult::Malformed(length, after) => {
                 // The sequence ends `after` bytes before the last byte read.
                 let end = position.saturating_sub(usize::from(after));
                 let start = end.saturating_sub(usize::from(length));
+                if !last && bytes.len() - start < FALLBACK_BYTES {
+                    return start;
+                }
                 let (character, taken) =
                     dotnet_fallback(encoding, bytes.get(start..).unwrap_or_default())
                         .unwrap_or((char::REPLACEMENT_CHARACTER, end - start));
@@ -236,16 +386,23 @@ pub fn decode(encoding: &'static Encoding, bytes: &[u8]) -> String {
             }
         }
     }
-    if encoding == encoding_rs::GBK {
-        out.replace('\u{E7C7}', "\u{1E3F}")
-    } else {
-        out
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, user_defined};
+    use super::{Decoder, decode, user_defined};
+
+    /// `bytes` as a document naming `encoding` is read, in pieces of `step`
+    /// bytes.
+    fn declared(encoding: &'static encoding_rs::Encoding, bytes: &[u8], step: usize) -> String {
+        let mut decoder = Decoder::declared(encoding);
+        let mut out = String::new();
+        let mut pieces = bytes.chunks(step).peekable();
+        while let Some(piece) = pieces.next() {
+            decoder.decode(piece, pieces.peek().is_none(), &mut out);
+        }
+        out
+    }
 
     /// The corners of both rows, as Jellyfin 12.4 serves them from a `cp949`
     /// sidecar, and their neighbours, which code page 949 does not map.
@@ -404,12 +561,128 @@ mod tests {
         b"\xa1\xbf\xde\xfb\xfc\xff",
         "\u{F79C}\u{F79D}\u{F7BC}\u{F7BD}\u{F7BE}\u{F7C1}"
     )]
+    #[case(
+        encoding_rs::ISO_8859_8_I,
+        b"\xa1\xbf\xde\xfb\xfc\xff",
+        "\u{F79C}\u{F79D}\u{F7BC}\u{F7BD}\u{F7BE}\u{F7C1}"
+    )]
+    #[case(
+        encoding_rs::ISO_8859_3,
+        b"\xa5\xae\xbe\xc3\xd0\xe3\xf0",
+        "\u{F7F5}\u{F7F6}\u{F7F7}\u{F7F8}\u{F7F9}\u{F7FA}\u{F7FB}"
+    )]
     fn single_byte_code_pages_read_their_unassigned_bytes_as_dotnet_does(
         #[case] encoding: &'static encoding_rs::Encoding,
         #[case] bytes: &[u8],
         #[case] expected: &str,
     ) {
         assert_eq!(decode(encoding, bytes), expected);
+    }
+
+    /// Code page 936, which a document names `gb2312` or `gbk` (gl-2011), as
+    /// Jellyfin 12.4 reads a `ComicInfo.xml` and an XMLTV guide declaring it:
+    /// one `?` for a lead byte and the byte after it, as the other double-byte
+    /// code pages write, where `gb18030` writes it for the lead byte alone;
+    /// no four-byte form; 80 and FF read alone.
+    #[rstest::rstest]
+    #[case::lead_before_ascii(b"\x81 a", "?a")]
+    #[case::lead_before_ff(b"\x81\xffa", "?a")]
+    #[case::lead_before_a_digit(b"\x81\x30a", "?a")]
+    #[case::line_feed(b"\x81\na", "?a")]
+    #[case::four_bytes_with_no_character(b"\x84\x31\xa5\x30a", "??a")]
+    #[case::broken_four_bytes(b"\x81\x30\x81\x41", "?\u{4E04}")]
+    #[case::lone_bytes(b"\x80a\xffa", "\u{20AC}a\u{F8F5}a")]
+    #[case::lone_80_before_a_lead_byte(b"\x80\x81 a", "\u{20AC}?a")]
+    #[case::end(b"\xd6\xd0\x81", "中?")]
+    fn a_document_naming_code_page_936_is_read_as_dotnet_reads_it(
+        #[case] bytes: &[u8],
+        #[case] expected: &str,
+        #[values(1, 2, 3, usize::MAX)] step: usize,
+    ) {
+        assert_eq!(declared(encoding_rs::GBK, bytes, step), expected);
+    }
+
+    /// A document naming `gb18030` is read as a detector's GBK is: every byte
+    /// pair, before a digit pair that may make a four-byte sequence of it.
+    #[test]
+    fn a_document_naming_gb18030_is_read_as_detected_chinese_text_is() {
+        for first in 0x80..=0xFF_u8 {
+            for second in 0x00..=0xFF_u8 {
+                let bytes = [first, second, 0x81, b'0', b' '];
+                assert_eq!(
+                    declared(encoding_rs::GB18030, &bytes, usize::MAX),
+                    decode(encoding_rs::GBK, &bytes),
+                    "{first:02X}{second:02X}"
+                );
+            }
+        }
+        assert_eq!(
+            declared(encoding_rs::GB18030, b"\x81\x35\xf4\x37", usize::MAX),
+            "\u{1E3F}"
+        );
+    }
+
+    /// Text read in pieces is the text read whole, wherever the pieces end:
+    /// every byte pair of each charset before a digit pair, so that a
+    /// character, a replaced sequence and a four-byte form are all cut.
+    #[test]
+    fn text_read_in_pieces_is_the_text_read_whole() {
+        let charsets = [
+            encoding_rs::EUC_KR,
+            encoding_rs::GBK,
+            encoding_rs::GB18030,
+            encoding_rs::BIG5,
+            encoding_rs::SHIFT_JIS,
+            encoding_rs::EUC_JP,
+            encoding_rs::WINDOWS_1255,
+            encoding_rs::WINDOWS_1252,
+        ];
+        for encoding in charsets {
+            for first in 0x80..=0xFF_u8 {
+                for second in 0x00..=0xFF_u8 {
+                    let bytes = [first, second, 0x81, b'0', b' ', first];
+                    let whole = declared(encoding, &bytes, usize::MAX);
+                    for step in 1..=3 {
+                        assert_eq!(
+                            declared(encoding, &bytes, step),
+                            whole,
+                            "{} {first:02X}{second:02X} by {step}",
+                            encoding.name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// An encoding left to `encoding_rs` keeps its decoder from one piece to
+    /// the next, ISO-2022-JP's state with it, and writes U+FFFD for what it
+    /// cannot decode.
+    #[rstest::rstest]
+    #[case(encoding_rs::ISO_2022_JP, b"\x1b$B0!0!\x1b(Ba\xe9", "亜亜a\u{FFFD}")]
+    #[case(encoding_rs::WINDOWS_1252, b"caf\xe9 \x81", "café \u{81}")]
+    #[case(encoding_rs::GB18030, b"\x81\x35\xf4\x37", "\u{1E3F}")]
+    fn a_decoder_keeps_what_one_piece_leaves_for_the_next(
+        #[case] encoding: &'static encoding_rs::Encoding,
+        #[case] bytes: &[u8],
+        #[case] expected: &str,
+        #[values(1, 2, 3, usize::MAX)] step: usize,
+    ) {
+        assert_eq!(declared(encoding, bytes, step), expected);
+    }
+
+    /// What stays as it was in a document naming code page 936, each an open
+    /// question (gl-2008): a pair 936 has in the Private Use Area and
+    /// `encoding_rs` decodes to a character, and GB18030's four-byte form,
+    /// which 936 does not have (81 35 F4 37 keeps `encoding_rs`'s code point
+    /// there).
+    #[test]
+    fn code_page_936_differences_that_wait_for_a_decision_are_left_alone() {
+        let read = |bytes: &[u8]| declared(encoding_rs::GBK, bytes, usize::MAX);
+        assert_eq!(read(b"\xa2\xe3a"), "\u{20AC}a");
+        assert_eq!(read(b"\xfe\x50a"), "\u{2E81}a");
+        assert_eq!(read(b"\x81\x30\x81\x30a"), "\u{80}a");
+        assert_eq!(read(b"\x81\x35\xf4\x37a"), "\u{E7C7}a");
     }
 
     /// What stays as it was, each an open question of its own: GB18030's lone
