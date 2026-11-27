@@ -248,7 +248,12 @@ pub async fn import_membership_once(
     .await
     .map_err(db_err)?;
 
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut written = 0usize;
     let mut dropped = 0usize;
     for (id, type_, path, is_folder, data) in rows {
@@ -719,7 +724,12 @@ pub async fn fix_owner_id_relationships(db: &Database) -> Result<usize, ServiceE
     let video = stored_type_name(BaseItemKind::Video).unwrap_or_default();
     let movie = stored_type_name(BaseItemKind::Movie).unwrap_or_default();
     let folder = stored_type_name(BaseItemKind::Folder).unwrap_or_default();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let deleted = dedupe_paths(&mut tx, folder).await?;
     // Step 2: videos/movies (not extras) owned by a video/movie or by nothing
     // — except the owner's own local versions and stacked parts (its
@@ -1164,7 +1174,12 @@ pub async fn reunite_split_versions(db: &Database) -> Result<usize, ServiceError
         return Ok(0);
     }
     let video = stored_type_name(BaseItemKind::Video).unwrap_or_default();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     // (stale video, standalone row, primary, path, primary's path, primary's Data)
     let splits: Vec<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
         r#"SELECT v."Id", m."Id", p."Id", v."Path", p."Path", p."Data"
@@ -1262,7 +1277,12 @@ pub async fn backfill_alternate_version_links(db: &Database) -> Result<usize, Se
     .fetch_all(db.pool())
     .await
     .map_err(db_err)?;
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut written = 0usize;
     for (child, primary) in &pairs {
         let (Ok(child_id), Ok(primary_id)) = (Uuid::parse_str(child), Uuid::parse_str(primary))
@@ -1334,7 +1354,12 @@ pub async fn repair_alternate_version_links(db: &Database) -> Result<(usize, usi
         .collect();
     item_ids.sort_unstable();
     item_ids.dedup();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let (mut repaired, mut promoted) = (0usize, 0usize);
     for id in item_ids {
         let Some((primary_version_id, key, owner_id)) =
@@ -4424,7 +4449,12 @@ async fn place_owned(
     mut copies: Option<&mut BTreeSet<Uuid>>,
 ) -> Result<usize, ServiceError> {
     let versions = copies.is_some();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut changed = 0usize;
     let mut owed = false;
     for pair in pairs {
@@ -4652,7 +4682,12 @@ async fn merge_case_duplicates(
             .or_default()
             .push((id, created));
     }
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut deleted = 0usize;
     for members in groups.into_values().filter(|g| g.len() > 1) {
         let mut candidates = Vec::with_capacity(members.len());
@@ -4965,7 +5000,12 @@ async fn harmonize_groups(
     db: &Database,
     groups: &[(String, String)],
 ) -> Result<usize, ServiceError> {
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut updated = 0u64;
     for (item, user) in groups {
         let rows: Vec<UserDataEntity> =
