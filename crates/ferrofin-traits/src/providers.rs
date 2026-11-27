@@ -258,14 +258,19 @@ pub trait ProviderManager: Send + Sync {
         priority: RefreshPriority,
     ) -> Result<(), ServiceError>;
 
-    /// Refreshes an item and all of its children.
+    /// Refreshes an item and all of its children. An Identify's result in
+    /// `options` was chosen for this item, whose ids it becomes.
     async fn refresh_full_item(
         &self,
         item_id: Uuid,
         options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError>;
 
-    /// Refreshes a single item, returning what changed.
+    /// Refreshes a single item, returning what changed. An Identify's result
+    /// in `options` was chosen for an item above this one, whose refresh
+    /// hands its options to its children (`Series.RefreshAllMetadata`): a
+    /// season or an episode looks its series up by the result's ids
+    /// (`ApplySearchResult`), and no item takes them as its own.
     async fn refresh_single_item(
         &self,
         item_id: Uuid,

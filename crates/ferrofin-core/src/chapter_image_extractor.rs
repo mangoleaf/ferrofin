@@ -228,7 +228,7 @@ impl ChapterImageExtractor {
             match result {
                 Ok(changed) => outcome.changed |= changed,
                 Err(error) => {
-                    tracing::warn!(item = %video.id, %error, "chapter image could not be extracted or stored");
+                    tracing::warn!(item_id = %video.id, %error, "chapter image could not be extracted or stored");
                     outcome.success = false;
                     break;
                 }

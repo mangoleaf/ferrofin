@@ -93,6 +93,7 @@ impl Extension for FileTransformationExtension {
             bytes: include_bytes!(concat!(env!("OUT_DIR"), "/filetransformation/config.html"))
                 .to_vec(),
             enable_in_main_menu: true,
+            content_type: None,
         }]
     }
 

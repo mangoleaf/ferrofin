@@ -103,10 +103,14 @@ pub fn export_plugin(
 }
 
 /// An enum setting as the name `XmlSerializer` reads: one of `names` in any
-/// case, or its index (as .NET numbers an enum); `None` for anything else.
+/// case, or its index (as .NET numbers an enum), as a number or as the text a
+/// save stores a posted number as; `None` for anything else.
 fn enum_name(value: &Value, names: &[&str]) -> Option<Value> {
     let name = match value {
-        Value::String(text) => names.iter().find(|n| n.eq_ignore_ascii_case(text.trim())),
+        Value::String(text) => names
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(text.trim()))
+            .or_else(|| text.trim().parse::<usize>().ok().and_then(|i| names.get(i))),
         Value::Number(n) => n
             .as_u64()
             .and_then(|i| usize::try_from(i).ok())
@@ -213,7 +217,8 @@ mod tests {
         );
     }
 
-    /// An enum is written by its exact name, from any case or its index.
+    /// An enum is written by its exact name, from any case or its index, a
+    /// number or its text.
     #[test]
     fn an_enum_takes_its_exact_name() {
         let names = &["Default", "Binary", "Base64", "Url"];
@@ -221,7 +226,9 @@ mod tests {
             (json!("URL"), Some("Url")),
             (json!(" base64 "), Some("Base64")),
             (json!(1), Some("Binary")),
+            (json!("2"), Some("Base64")),
             (json!(9), None),
+            (json!("9"), None),
             (json!("nonsense"), None),
             (json!(true), None),
         ] {
