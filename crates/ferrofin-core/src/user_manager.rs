@@ -486,9 +486,9 @@ impl FerrofinUserManager {
     }
 
     /// Writes the dashboard's "Password has been changed" entry (upstream's
-    /// `UserPasswordChangedLogger`, which every `ChangePassword` raises) for a
-    /// password a recovery PIN set. A failed write is not the reset's failure.
-    pub(crate) async fn log_password_changed(&self, user_id: Uuid, username: &str) {
+    /// `UserPasswordChangedLogger`, which every `ChangePassword` raises). A
+    /// failed write is not the password change's failure.
+    async fn log_password_changed(&self, user_id: Uuid, username: &str) {
         if let Some(activity) = &self.activity
             && let Err(error) = activity
                 .create_entry(ferrofin_traits::activity::ActivityLogCreate {
@@ -499,7 +499,8 @@ impl FerrofinUserManager {
                 })
                 .await
         {
-            tracing::debug!(%error, %user_id, "could not write the password-changed activity entry");
+            // Warn, not error: its volume follows the request rate.
+            tracing::warn!(%error, %user_id, activity_type = "UserPasswordChanged", "could not write the activity entry");
         }
     }
 
@@ -1541,7 +1542,7 @@ impl UserManager for FerrofinUserManager {
 
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError> {
         let login_lock = self.login_lock(&guid_to_db(user_id));
-        let _login_guard = login_lock.lock().await;
+        let login_guard = login_lock.lock().await;
         let user = self.require_user(user_id).await?;
 
         if new_password.trim().is_empty()
@@ -1555,20 +1556,22 @@ impl UserManager for FerrofinUserManager {
         let candidates = self.authentication_providers_for(Some(&user)).await?;
         let provider = candidates[0]; // The invalid-provider fallback guarantees a candidate.
         provider.change_password(&user, new_password).await?;
-        if provider.id() != DEFAULT_AUTH_PROVIDER_ID {
-            self.users_changed();
-            return Ok(());
-        }
         // The built-in provider supplies the hash while this manager owns its
         // database write. External providers own their credential store.
-        let hash = self
-            .default_provider
-            .format_password_hash(new_password)
-            .await?;
-        user_repository::set_password(self.db.writer(), &guid_to_db(user_id), hash.as_deref())
-            .await
-            .map_err(db_err)?;
+        if provider.id() == DEFAULT_AUTH_PROVIDER_ID {
+            let hash = self
+                .default_provider
+                .format_password_hash(new_password)
+                .await?;
+            user_repository::set_password(self.db.writer(), &guid_to_db(user_id), hash.as_deref())
+                .await
+                .map_err(db_err)?;
+        }
         self.users_changed();
+        // C# publishes `UserPasswordChangedEventArgs` once the user lock is
+        // released, whichever provider saved the password.
+        drop(login_guard);
+        self.log_password_changed(user_id, &user.username).await;
         Ok(())
     }
 
@@ -3853,14 +3856,25 @@ mod tests {
         );
 
         // The lockout is an Error-severity dashboard Alert, not just a log line
-        // (port of `UserLockedOutLogger`).
+        // (port of `UserLockedOutLogger`), after the password set above
+        // (`UserPasswordChangedLogger`).
         {
             let entries = activity.entries.lock().unwrap();
-            assert_eq!(entries.len(), 1, "one lockout entry: {entries:?}");
-            assert_eq!(entries[0].type_, "UserLockedOut");
-            assert_eq!(entries[0].name, "User dan has been locked out");
+            assert_eq!(
+                entries.len(),
+                2,
+                "password and lockout entries: {entries:?}"
+            );
+            assert_eq!(entries[0].type_, "UserPasswordChanged");
+            assert_eq!(entries[0].name, "Password has been changed for user dan");
             assert_eq!(
                 entries[0].severity,
+                ferrofin_model::activity::LogLevel::Information
+            );
+            assert_eq!(entries[1].type_, "UserLockedOut");
+            assert_eq!(entries[1].name, "User dan has been locked out");
+            assert_eq!(
+                entries[1].severity,
                 ferrofin_model::activity::LogLevel::Error
             );
         }

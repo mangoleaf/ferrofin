@@ -2442,7 +2442,8 @@ async fn write_entries(
 
 /// [`write_entries`] on a connection the caller holds, normally a writer
 /// transaction that commits more than the entries. A box set's membership
-/// changes write their rows through it too.
+/// changes write their rows through it too. An entry whose item row is gone
+/// is skipped ([`INSERT_ENTRIES_SQL`]).
 async fn write_entries_in(
     conn: &mut sqlx::SqliteConnection,
     playlist_id: &str,
@@ -2453,23 +2454,43 @@ async fn write_entries_in(
         .execute(&mut *conn)
         .await
         .map_err(db_err)?;
-    // One statement for the whole list, not one per entry (gl-1264): each
-    // entry is a `[ChildId, ChildType]` pair, and `json_each` yields them in
-    // order with the array index as `key`, the dense `SortOrder`.
     let pairs = serde_json::to_string(entries)
         .map_err(|e| ServiceError::Backend(format!("serialize linked children: {e}")))?;
-    sqlx::query(
-        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
-           SELECT ?1, "key", json_extract("value", '$[0]'), json_extract("value", '$[1]')
-           FROM json_each(?2)"#,
-    )
-    .bind(playlist_id)
-    .bind(pairs)
-    .execute(&mut *conn)
-    .await
-    .map_err(db_err)?;
+    let inserted = sqlx::query(INSERT_ENTRIES_SQL)
+        .bind(playlist_id)
+        .bind(pairs)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+    let skipped = u64::try_from(entries.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(inserted);
+    if skipped > 0 {
+        tracing::warn!(
+            item_id = playlist_id,
+            skipped,
+            "skipped linked children whose item no longer exists"
+        );
+    }
     Ok(())
 }
+
+/// [`write_entries_in`]'s insert, one statement for the whole list, not one
+/// per entry (gl-1264): each entry is a `[ChildId, ChildType]` pair, and
+/// `json_each` yields them in order with the array index as `key`. An entry
+/// whose item row is gone (deleted or re-keyed after the caller resolved it)
+/// is skipped and the rest keep a dense `SortOrder`, as upstream's save skips a
+/// child missing from `BaseItems` (`ItemPersistenceService`'s
+/// `existingChildIds`, 12.4) where the foreign key would fail the write
+/// (gl-1858). The check runs in the writer's transaction, so no deletion
+/// lands between it and the insert.
+const INSERT_ENTRIES_SQL: &str = r#"
+    INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+    SELECT ?1, ROW_NUMBER() OVER (ORDER BY "key") - 1,
+           json_extract("value", '$[0]'), json_extract("value", '$[1]')
+    FROM json_each(?2)
+    WHERE EXISTS (SELECT 1 FROM "BaseItems" WHERE "Id" = json_extract("value", '$[0]'))"#;
 
 #[cfg(test)]
 mod tests {
@@ -3888,6 +3909,61 @@ mod tests {
             .collect();
         assert_eq!(rows, vec![c, a, b]);
         assert_eq!(page.members.entries, vec![0, 1, 2, 1]);
+    }
+
+    /// gl-425: a member whose stored `Type` names no kind is left out, as
+    /// `ResolveLinkedChildren` drops an item it cannot read, and the access
+    /// columns still come back when it is the only member.
+    #[tokio::test]
+    async fn get_playlist_items_leaves_out_a_member_of_an_unknown_type() {
+        let db = test_db().await;
+        let (a, b, gone) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for id in [a, b, gone] {
+            seed_item(&db, id, BaseItemKind::Audio).await;
+        }
+        let (mgr, _root) = playlist_manager(&db).await;
+        let owner = Uuid::new_v4();
+        let mut playlists = Vec::new();
+        for members in [vec![a, gone, a, b], vec![gone]] {
+            let created = mgr
+                .create_playlist(&PlaylistCreationRequest {
+                    name: Some("Mixed".to_owned()),
+                    item_id_list: members,
+                    user_id: owner,
+                    ..PlaylistCreationRequest::default()
+                })
+                .await
+                .expect("create");
+            playlists.push(Uuid::parse_str(&created.id).expect("uuid"));
+        }
+        let mut row = crate::test_support::fetch_item(&db, gone).await;
+        row.type_ = "Jellyfin.Plugin.Gone.Track".to_owned();
+        crate::test_support::save_item(&db, &row).await;
+
+        let repository = item_repository_over(db.clone());
+        let page = repository
+            .get_playlist_items_with_access(playlists[0], owner, super::LINKED_CHILD_MANUAL)
+            .await
+            .expect("read");
+        let rows: Vec<Uuid> = page
+            .members
+            .items
+            .iter()
+            .filter_map(|i| Uuid::parse_str(&i.id).ok())
+            .collect();
+        assert_eq!(rows, vec![a, b]);
+        assert_eq!(page.members.entries, vec![0, 0, 1]);
+        let only = repository
+            .get_playlist_items_with_access(playlists[1], owner, super::LINKED_CHILD_MANUAL)
+            .await
+            .expect("read");
+        assert!(only.access.is_some());
+        assert!(only.members.items.is_empty() && only.members.entries.is_empty());
+        let listed = mgr
+            .get_playlist_items(playlists[1], owner)
+            .await
+            .expect("items");
+        assert_eq!(listed.entries, Vec::<usize>::new());
     }
 
     #[tokio::test]
@@ -5760,6 +5836,87 @@ mod tests {
         assert_eq!(rekeyed.expect("rekey").len(), 1);
         assert_eq!(rerouted.expect("reroute"), vec![playlist]);
         assert_eq!(rows(&db, playlist).await, vec![primary, new_id]);
+    }
+
+    /// An add whose item is deleted after the add resolved it, but before it
+    /// writes, saves its other items, as upstream's save skips a child whose
+    /// row is gone: no foreign-key failure, no `500` (gl-1858).
+    #[tokio::test]
+    async fn an_add_racing_the_deletion_of_its_item_skips_it() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let (a, b, gone) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let (mgr, playlist, owner, _root) = seeded_playlist(&db, &[a]).await;
+        seed_item(&db, b, BaseItemKind::Audio).await;
+        seed_item(&db, gone, BaseItemKind::Audio).await;
+        let persistence =
+            crate::item_persistence_service::FerrofinItemPersistenceService::new(db.clone());
+        let mgr = mgr.with_entry_edits(persistence.playlist_entry_edits());
+        // The lock is fair: the deletion queues on it first, then the add,
+        // once it has resolved its items.
+        let edit = mgr.entry_edits.lock().await;
+        let doomed = [gone];
+        let delete = persistence.delete_items(&doomed);
+        let added = [gone, b];
+        let add = mgr.add_item_to_playlist(playlist, &added, None, owner);
+        tokio::pin!(delete, add);
+        let wait = std::time::Duration::from_millis(200);
+        assert!(
+            tokio::time::timeout(wait, &mut delete).await.is_err(),
+            "the deletion wrote during an entry edit"
+        );
+        assert!(
+            tokio::time::timeout(wait, &mut add).await.is_err(),
+            "the add wrote during an entry edit"
+        );
+        drop(edit);
+        // Bounded: nextest has no slow-timeout, so a leaked guard would hang.
+        let (deleted, add) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(&mut delete, &mut add)
+        })
+        .await
+        .expect("the deletion and the add finish once the edit ends");
+        assert_eq!(deleted.expect("delete"), vec![gone]);
+        add.expect("the add saves without the deleted item");
+        assert_eq!(rows(&db, playlist).await, vec![a, b]);
+    }
+
+    /// The entries' rewrite skips an entry whose item row is gone and keeps
+    /// `SortOrder` dense, as upstream's save does, and finds each item by the
+    /// primary key (`EXPLAIN QUERY PLAN`): no scan of `BaseItems`.
+    #[tokio::test]
+    async fn write_entries_skips_a_gone_item_by_primary_key() {
+        use ferrofin_db::store::guid_to_db;
+        let db = test_db().await;
+        let (parent, a, gone, b) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_item(&db, parent, BaseItemKind::Playlist).await;
+        seed_item(&db, a, BaseItemKind::Audio).await;
+        seed_item(&db, b, BaseItemKind::Audio).await;
+        let entries: Vec<super::Entry> = [a, gone, b, a]
+            .iter()
+            .map(|id| (guid_to_db(*id), 0))
+            .collect();
+        super::write_entries(db.writer(), &guid_to_db(parent), &entries)
+            .await
+            .expect("write");
+        assert_eq!(
+            crate::library_structure_repository::linked_children_in_order(&db, parent).await,
+            vec![(guid_to_db(a), 0), (guid_to_db(b), 1), (guid_to_db(a), 2)]
+        );
+
+        let plan =
+            crate::latest_tv_repository::explain_sql(&db, super::INSERT_ENTRIES_SQL, &["p", "[]"])
+                .await;
+        assert!(!plan.contains("SCAN BaseItems"), "{plan}");
+        assert!(
+            plan.contains("USING COVERING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+            "{plan}"
+        );
     }
 
     /// C# `RemoveItemFromPlaylistAsync`: every occurrence of the item goes.

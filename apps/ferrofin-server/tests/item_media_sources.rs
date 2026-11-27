@@ -431,3 +431,58 @@ async fn item_media_sources_follow_the_users_playback_policy() {
     assert_eq!(detail["SupportsTranscoding"], true, "{detail}");
     assert_eq!(detail["SupportsDirectStream"], true, "{detail}");
 }
+
+/// A library folder has no media sources: `GetStaticMediaSources` throws for
+/// an item that is not `IHasMediaSources` (`MediaSourceManager.cs:387-393`),
+/// so PlaybackInfo, the static stream and the attachment route answer 400, as
+/// a stock Jellyfin 12.4 does, where Ferrofin used to make up a source from the
+/// folder's path. The folder's DTO still asks no media source of it.
+#[tokio::test]
+async fn an_item_without_media_sources_is_refused_by_the_media_source_routes() {
+    let f = fixture().await;
+    let (status, folders) = call(
+        &f.router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{folders}");
+    let library = folders[0]["ItemId"].as_str().expect("library id");
+    let user = &f.admin_id;
+    for (method, uri, body) in [
+        (
+            "GET",
+            format!("/Items/{library}/PlaybackInfo?userId={user}"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/Items/{library}/PlaybackInfo?userId={user}"),
+            Some(json!({})),
+        ),
+        ("GET", format!("/Videos/{library}/stream?static=true"), None),
+        (
+            "GET",
+            format!("/Videos/{library}/{library}/Attachments/0"),
+            None,
+        ),
+    ] {
+        let (status, answer) = call(&f.router, method, &uri, Some(&f.admin), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}: {answer}");
+    }
+    let (status, dto) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{user}/Items/{library}"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dto}");
+    assert_eq!(dto["Id"], library, "{dto}");
+    assert_eq!(dto["MediaSources"], Value::Null, "{dto}");
+    // The movie in it still plays.
+    playback_source(&f, &f.admin, user).await;
+}

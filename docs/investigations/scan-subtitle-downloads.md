@@ -27,15 +27,18 @@ a usable hash cannot satisfy perfect-match mode.
 
 ## Scan safety
 
-Subtitle attachment follows item, provider-ID and probe-stream persistence so the
-new item can be resolved and a later probe save cannot erase its downloaded streams.
-A shared gate prevents overlap with the scheduled task. A probe preserves subtitle
-rows attached after its external-file snapshot when their files still exist.
-Deleted sidecars are not preserved. Libraries without download languages take the
-existing stream-save path without extra database queries.
+Subtitle downloads follow item, provider-ID and probe-stream persistence so the
+new item can be resolved. A download saves the file alone; once one is saved, the
+scan resolves the external streams again and saves them ahead of the probe's own,
+as `FFProbeVideoInfo.AddExternalSubtitlesAsync` rescans (gl-1641). The scheduled
+task refreshes a video it saved a subtitle for instead. A shared gate keeps the
+scan and the task from downloading for one video at once. A probe preserves
+subtitle rows a refresh recorded after its external-file snapshot when their files
+still exist. Deleted sidecars are not preserved. Libraries without download
+languages take the existing stream-save path without extra database queries.
 
 Cancellation interrupts search/download waits and gate acquisition. Once subtitle
-bytes are available, the local file and stream-row save finishes together. Provider
+bytes are available, the file save finishes. Provider
 errors are logged and do not fail the media scan or clear its metadata refresh stamp.
 The manager reference is weak to avoid a scanner/library/manager ownership cycle.
 

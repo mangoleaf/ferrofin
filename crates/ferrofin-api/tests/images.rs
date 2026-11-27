@@ -1436,6 +1436,37 @@ async fn item_image_by_index_serves_the_file() {
     assert_eq!(body, b"IDX0");
 }
 
+/// `{imageIndex}` binds as ASP.NET binds an `int` route value, with the rules
+/// of its query binder: trimmed, and the `0x`, `#` and `&h` hex forms read
+/// (gl-1664; measured on Jellyfin 12.4: each of these is a 200). A value no
+/// form reads is the binder's 400.
+#[rstest::rstest]
+#[case::hex("0x0", StatusCode::OK)]
+#[case::hash("%230", StatusCode::OK)]
+#[case::basic_hex("%26h0", StatusCode::OK)]
+#[case::padded("%20%200", StatusCode::OK)]
+#[case::plus("%2B0", StatusCode::OK)]
+#[case::word("first", StatusCode::BAD_REQUEST)]
+#[tokio::test]
+async fn item_image_by_index_binds_its_index_as_the_query_binder(
+    #[case] index: &str,
+    #[case] expected: StatusCode,
+) {
+    let img = TempImage::new(b"IDX0");
+    let s = stubs(img.path(), String::new());
+    let (status, body) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Primary/{index}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+    if expected == StatusCode::OK {
+        assert_eq!(body, b"IDX0");
+    }
+}
+
 // A chapter thumbnail is not an item image row — it lives on the chapter
 // itself, so serving one has to resolve through the chapter seam (upstream
 // `BaseItem.GetImageInfo(ImageType.Chapter, index)`). Without this the player's
@@ -1723,6 +1754,18 @@ async fn by_name_genre_image_serves_the_file() {
     let (status, body) = send(&s, "GET", "/Genres/Drama/Images/Primary", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"GENREIMG");
+}
+
+/// The by-name kinds' `{imageIndex}` binds as the item's does (gl-1664).
+#[tokio::test]
+async fn by_name_image_by_index_binds_its_index_as_the_query_binder() {
+    let img = TempImage::new(b"GENREIMG");
+    let s = stubs(img.path(), String::new());
+    let (status, body) = send(&s, "GET", "/Genres/Drama/Images/Primary/0x0", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"GENREIMG");
+    let (status, _) = send(&s, "GET", "/Genres/Drama/Images/Primary/zero", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
