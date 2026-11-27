@@ -372,16 +372,18 @@ impl PersonRequest {
     }
 }
 
-/// `GetSeriesStatus`: null or empty is no status, else a member name
-/// ignoring case or its number, 0–2 only (`Enum.Parse<SeriesStatus>(…,
-/// true)` also takes any integer and comma lists, meaningless here).
+/// `GetSeriesStatus`: null or `""` is no status (`string.IsNullOrEmpty`),
+/// else a member name ignoring case and surrounding whitespace, or its
+/// number, 0–2 only (`Enum.Parse<SeriesStatus>(…, true)` also takes any
+/// integer and comma lists, meaningless here).
 ///
 /// # Errors
 ///
-/// Any other value: upstream's `Enum.Parse` throws `ArgumentException`
-/// there, which `ExceptionMiddleware` answers 400, as the handler does.
+/// Any other value. For a name that is no member, or a value that is
+/// whitespace alone, upstream's `Enum.Parse` throws `ArgumentException`,
+/// which `ExceptionMiddleware` answers 400, as the handler does.
 fn parse_series_status(value: Option<&str>) -> Result<Option<SeriesStatus>, String> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(value) = value.filter(|value| !value.is_empty()).map(str::trim) else {
         return Ok(None);
     };
     [
@@ -1361,10 +1363,29 @@ crate::query::query_parameters! {
 #[cfg(test)]
 mod tests {
     use super::{
-        TagEdit, UpdateItemRequest, distinct_ordinal_ignore_case, non_blank, propagate_rating,
-        split_list, trimmed_distinct,
+        TagEdit, UpdateItemRequest, distinct_ordinal_ignore_case, non_blank, parse_series_status,
+        propagate_rating, split_list, trimmed_distinct,
     };
+    use ferrofin_model::entities::SeriesStatus;
     use rstest::rstest;
+
+    /// `GetSeriesStatus` (v12.4 `ItemUpdateController.cs:501-509`): only null
+    /// or `""` is no status (`string.IsNullOrEmpty`); anything else goes to
+    /// `Enum.Parse<SeriesStatus>(value, true)`, which trims, so whitespace
+    /// alone is no member and throws.
+    #[rstest]
+    #[case::null(None, Ok(None))]
+    #[case::empty(Some(""), Ok(None))]
+    #[case::padded_name(Some(" ended "), Ok(Some(SeriesStatus::Ended)))]
+    #[case::number(Some("2"), Ok(Some(SeriesStatus::Unreleased)))]
+    #[case::whitespace(Some("  "), Err(()))]
+    #[case::unknown(Some("Cancelled"), Err(()))]
+    fn a_series_status_parses_as_get_series_status_does(
+        #[case] value: Option<&str>,
+        #[case] expected: Result<Option<SeriesStatus>, ()>,
+    ) {
+        assert_eq!(parse_series_status(value).map_err(|_| ()), expected);
+    }
 
     /// `ItemUpdateController.UpdateItem` (v12.4 :417-420): a video
     /// (`IHasAspectRatio`) takes the request's `AspectRatio`, a null clearing
