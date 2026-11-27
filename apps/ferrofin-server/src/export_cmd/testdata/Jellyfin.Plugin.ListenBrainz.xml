@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PluginConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <LabsServer>https://labs.example.org</LabsServer>
+  <Algorithm>SessionBased75Days</Algorithm>
+  <RateLimit>0.25</RateLimit>
+  <SimilarItemsCacheDays>30</SimilarItemsCacheDays>
+</PluginConfiguration>

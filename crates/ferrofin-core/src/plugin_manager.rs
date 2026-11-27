@@ -1198,7 +1198,7 @@ impl PluginManager for FerrofinPluginManager {
         // request" and returns, while `PluginsController.UninstallPlugin` goes
         // on to answer `204` (v10.11.8 InstallationManager.cs +
         // PluginsController.cs:136-152). That is not a Jellyfin bug to skip:
-        // every plugin compiled into Jellyfin's own server tree — the five
+        // every plugin compiled into Jellyfin's own server tree — the six
         // in-tree metadata providers Ferrofin now registers — takes this exact
         // path, so `DELETE /Plugins/{shared id}` is a `204` no-op on a stock
         // server and used to be a `400` here.
@@ -1464,15 +1464,19 @@ impl PluginManager for FerrofinPluginManager {
         let Some(plugin) = self.find(id) else {
             return Err(ServiceError::not_found(format!("plugin {id}")));
         };
-        match tokio::fs::read(self.config_path(id)).await {
+        let config = match tokio::fs::read(self.config_path(id)).await {
             // Overlay the stored values onto the current defaults, so a config
             // saved by an older plugin version (missing newly-added keys) still
             // returns every field at its default — matching how C# deserializes a
             // partial `PluginConfiguration`.
-            Ok(bytes) => Ok(merge_config(&plugin.default_config, &bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(plugin.default_config.clone()),
-            Err(e) => Err(ServiceError::backend(format!("read plugin config: {e}"))),
-        }
+            Ok(bytes) => merge_config(&plugin.default_config, &bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => plugin.default_config.clone(),
+            Err(e) => return Err(ServiceError::backend(format!("read plugin config: {e}"))),
+        };
+        Ok(match plugin.config_view {
+            Some(view) => with_view(config, view),
+            None => config,
+        })
     }
 
     async fn set_plugin_configuration(
@@ -1782,7 +1786,10 @@ impl PluginManager for FerrofinPluginManager {
         Ok(pages)
     }
 
-    async fn get_configuration_page(&self, name: &str) -> Result<Option<Vec<u8>>, ServiceError> {
+    async fn get_configuration_page(
+        &self,
+        name: &str,
+    ) -> Result<Option<PluginConfigPage>, ServiceError> {
         // Same disabled-plugin gate as `get_configuration_pages`: this
         // endpoint is unauthenticated (matching Jellyfin), so a disabled
         // plugin's page must not remain fetchable by name.
@@ -1795,8 +1802,22 @@ impl PluginManager for FerrofinPluginManager {
                     .config_pages
                     .iter()
                     .find(|page| page.name.eq_ignore_ascii_case(name))
-                    .map(|page| page.bytes.clone())
+                    .cloned()
             }))
+    }
+}
+
+/// `config` with the members `view` computes added, when it is an object.
+fn with_view(
+    config: Vec<u8>,
+    view: fn(&mut serde_json::Map<String, serde_json::Value>),
+) -> Vec<u8> {
+    match serde_json::from_slice::<serde_json::Value>(&config) {
+        Ok(serde_json::Value::Object(mut members)) => {
+            view(&mut members);
+            serde_json::to_vec(&members).unwrap_or(config)
+        }
+        _ => config,
     }
 }
 
@@ -2395,7 +2416,7 @@ mod tests {
     /// A plugin reporting `CanUninstall: false` is ignored, not refused —
     /// upstream's `InstallationManager.UninstallPlugin` logs
     /// "Attempt to delete non removable plugin … ignoring request" and returns,
-    /// while `PluginsController` still answers `204`. That is the path all five
+    /// while `PluginsController` still answers `204`. That is the path all six
     /// of Jellyfin's in-tree provider plugins take, so `DELETE /Plugins/{id}`
     /// on a shared id must be `204` here too (it was `400`).
     #[tokio::test]
@@ -4072,6 +4093,55 @@ mod tests {
         assert!(err.to_string().contains("redirect"), "{err}");
     }
 
+    /// A get-only C# property is in every read of the configuration, computed
+    /// from what is stored, and a save ignores it, as `System.Text.Json` does
+    /// (ListenBrainz's `AlgorithmString`, measured on a stock 12.4: a posted
+    /// `"zzz"` reads back as the chosen algorithm's string).
+    #[tokio::test]
+    async fn a_config_view_computes_members_a_save_ignores() {
+        fn view(config: &mut serde_json::Map<String, serde_json::Value>) {
+            let doubled = config["Size"].as_i64().unwrap_or(0) * 2;
+            config.insert("Doubled".to_owned(), doubled.into());
+        }
+        let plugin = RegisteredPlugin::new(descriptor(PKG_ID, "Viewed", true), None)
+            .with_default_config(br#"{"Size":1}"#.to_vec())
+            .with_config_view(view);
+        let (mgr, _dir) = manager(vec![plugin]);
+        let read = |bytes: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        assert_eq!(
+            read(mgr.get_plugin_configuration(PKG_ID).await.unwrap()),
+            serde_json::json!({"Size": 1, "Doubled": 2})
+        );
+        mgr.set_plugin_configuration(PKG_ID, br#"{"Size":5,"Doubled":99}"#.to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            read(mgr.get_plugin_configuration(PKG_ID).await.unwrap()),
+            serde_json::json!({"Size": 5, "Doubled": 10})
+        );
+    }
+
+    /// A page served with the type its resource has, not its name's
+    /// (ListenBrainz's notice: `NOTICE.md`, named `…Notice`).
+    #[tokio::test]
+    async fn a_configuration_page_keeps_its_declared_type() {
+        let plugin = RegisteredPlugin::new(descriptor(PKG_ID, "Paged", true), None)
+            .with_config_page(super::PluginConfigPage {
+                name: "PagedNotice".to_owned(),
+                bytes: b"# Notice".to_vec(),
+                enable_in_main_menu: false,
+                content_type: Some("text/markdown"),
+            });
+        let (mgr, _dir) = manager(vec![plugin]);
+        let page = mgr
+            .get_configuration_page("pagednotice")
+            .await
+            .unwrap()
+            .expect("page");
+        assert_eq!(page.content_type, Some("text/markdown"));
+        assert_eq!(page.bytes, b"# Notice");
+    }
+
     #[tokio::test]
     async fn disabled_plugins_hide_their_configuration_pages() {
         let plugin = RegisteredPlugin::new(descriptor(PKG_ID, "Paged", true), None)
@@ -4079,6 +4149,7 @@ mod tests {
                 name: "paged-settings".to_owned(),
                 bytes: b"<div data-role=\"page\">x</div>".to_vec(),
                 enable_in_main_menu: false,
+                content_type: None,
             });
         let (mgr, _dir) = manager(vec![plugin]);
         // Enabled: listed and fetchable.
@@ -4112,6 +4183,7 @@ mod tests {
             name: name.to_owned(),
             bytes: b"x".to_vec(),
             enable_in_main_menu: false,
+            content_type: None,
         };
         let base_id = Uuid::from_u128(1);
         let mut registered = vec![

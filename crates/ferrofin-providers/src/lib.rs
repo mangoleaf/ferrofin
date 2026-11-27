@@ -84,9 +84,7 @@ pub use musicbrainz::{
     ReleaseArtistCredit, ReleaseHit,
 };
 pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit, OmdbSearchKey};
-pub use similarity::{
-    ListenBrainzSimilarArtistProvider, TMDB_SIMILAR_CACHE_DAYS, TmdbSimilarProvider,
-};
+pub use similarity::{ListenBrainzSimilarArtistProvider, TmdbSimilarProvider};
 pub use studios::StudiosClient;
 pub use tmdb::{
     EpisodeDetails, RemoteImage, SeasonDetails, TmdbClient, TmdbCollection, TmdbCollectionHit,

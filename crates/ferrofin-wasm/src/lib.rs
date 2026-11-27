@@ -1244,6 +1244,7 @@ fn config_pages_for(
             name: page.name.clone(),
             bytes: page.content.clone(),
             enable_in_main_menu: page.enable_in_main_menu,
+            content_type: None,
         })
         .collect();
     if kept.is_empty() {
@@ -1314,6 +1315,7 @@ fn fallback_config_page(descriptor: &PluginDescriptor) -> PluginConfigPage {
         name: format!("wasm-settings-{id}"),
         bytes: html.into_bytes(),
         enable_in_main_menu: false,
+        content_type: None,
     }
 }
 

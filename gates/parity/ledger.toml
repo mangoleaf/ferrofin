@@ -497,42 +497,13 @@ kind = "value"
 issue = 666
 reason = "Jellyfin answers this error with its exception middleware's text (or an empty body); Ferrofin with a JSON object."
 
-# The bundled ListenBrainz plugin and its two settings pages are missing, so the pages shift.
+# Ferrofin's own plugin lists its settings page, the one in the dashboard menu, after the in-tree ones.
 [[entry]]
 request = "GetConfigurationPages"
 path = "$"
 kind = "length"
-issue = 220
-reason = "The bundled ListenBrainz plugin and its two settings pages are missing, so the pages shift."
-
-[[entry]]
-request = "GetConfigurationPages"
-path = "[].DisplayName"
-kind = "value"
-issue = 220
-reason = "The bundled ListenBrainz plugin and its two settings pages are missing, so the pages shift."
-
-[[entry]]
-request = "GetConfigurationPages"
-path = "[].Name"
-kind = "value"
-issue = 220
-reason = "The bundled ListenBrainz plugin and its two settings pages are missing, so the pages shift."
-
-[[entry]]
-request = "GetConfigurationPages"
-path = "[].PluginId"
-kind = "value"
-issue = 220
-reason = "The bundled ListenBrainz plugin and its two settings pages are missing, so the pages shift."
-
-# Ferrofin's own plugin lists its settings page, the one in the dashboard menu, after the in-tree ones.
-[[entry]]
-request = "GetConfigurationPages"
-path = "[].EnableInMainMenu"
-kind = "value"
 issue = 540
-reason = "Ferrofin's own plugin lists its settings page, the one in the dashboard menu, after the in-tree ones."
+reason = "Ferrofin's own plugin lists its settings page, the one in the dashboard menu, after the in-tree ones, so the list is one longer."
 
 # The HLS ffmpeg arguments lack upstream's -map_metadata -1 -map_chapters -1 and -max_delay 5000000.
 [[entry]]
@@ -869,21 +840,21 @@ kind = "value"
 issue = 487
 reason = "In-tree plugins carry no embedded logo."
 
-# The bundled ListenBrainz plugin is missing, so the plugin rows shift.
+# Ferrofin's own plugin, its settings, sorts after AudioDB, so the plugin rows after it shift.
 [[entry]]
 request = "GetPlugins"
 path = "[].Id"
 kind = "value"
-issue = 220
-reason = "The bundled ListenBrainz plugin is missing, so the plugin rows shift."
+issue = 539
+reason = "Ferrofin's own plugin, its settings, sorts after AudioDB, so the plugin rows after it shift."
 
-# Ferrofin's own plugin, its settings, is listed beside the in-tree ones, so the list is one longer.
+# Ferrofin's own plugins, its settings and OpenSubtitles, are listed beside the in-tree ones, so the list is longer.
 [[entry]]
 request = "GetPlugins"
 path = "$"
 kind = "length"
 issue = 539
-reason = "Ferrofin's own plugin, its settings, is listed beside the in-tree ones, so the list is one longer."
+reason = "Ferrofin's own plugins, its settings and OpenSubtitles, are listed beside the in-tree ones, so the list is longer."
 
 # A task's raw key stands in for its name, so it sorts elsewhere and the task rows shift.
 [[entry]]
