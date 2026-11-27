@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use ferrofin_model::activity::LogLevel;
 use ferrofin_traits::activity::{ActivityLogCreate, ActivityManager};
+use ferrofin_traits::localization::LocalizationManager;
 use uuid::Uuid;
 
 use crate::event_manager::{FerrofinEventManager, consumer_done};
@@ -72,14 +73,20 @@ struct LibraryItem {
 }
 
 /// Registers the two playback loggers on `bus`, for `PlaybackStart` and
-/// `PlaybackStopped`. Their writes are awaited, as the session loggers' are,
-/// so the entries land in the order the events are published.
-pub fn subscribe(bus: &FerrofinEventManager, activity: &Arc<dyn ActivityManager>) {
+/// `PlaybackStopped`, writing in the server UI culture `localization` reads.
+/// Their writes are awaited, as the session loggers' are, so the entries land
+/// in the order the events are published.
+pub fn subscribe(
+    bus: &FerrofinEventManager,
+    activity: &Arc<dyn ActivityManager>,
+    localization: &Arc<dyn LocalizationManager>,
+) {
     for (event, phase) in [
         ("PlaybackStart", Phase::Start),
         ("PlaybackStopped", Phase::Stop),
     ] {
         let activity = Arc::clone(activity);
+        let localization = Arc::clone(localization);
         bus.subscribe(
             event,
             Arc::new(move |payload: &str| {
@@ -87,8 +94,9 @@ pub fn subscribe(bus: &FerrofinEventManager, activity: &Arc<dyn ActivityManager>
                     return consumer_done();
                 };
                 let activity = Arc::clone(&activity);
+                let localization = Arc::clone(&localization);
                 Box::pin(async move {
-                    record(activity.as_ref(), event, phase).await;
+                    record(activity.as_ref(), localization.as_ref(), event, phase).await;
                     Ok(())
                 })
             }),
@@ -98,7 +106,12 @@ pub fn subscribe(bus: &FerrofinEventManager, activity: &Arc<dyn ActivityManager>
 
 /// Writes one playback entry, best-effort: a logging failure never fails the
 /// playback report that raised the event.
-async fn record(activity: &dyn ActivityManager, event: PlaybackEvent, phase: Phase) {
+async fn record(
+    activity: &dyn ActivityManager,
+    localization: &dyn LocalizationManager,
+    event: PlaybackEvent,
+    phase: Phase,
+) {
     // `eventArgs.Users.Count == 0`: a user-less session writes nothing.
     let Some(user_name) = event.user_name.filter(|name| !name.is_empty()) else {
         return;
@@ -129,18 +142,21 @@ async fn record(activity: &dyn ActivityManager, event: PlaybackEvent, phase: Pha
         // `GetPlaybackStoppedNotificationType` returned null: no entry at all.
         return;
     };
-    let action = match phase {
-        Phase::Start => "is playing",
-        Phase::Stop => "has finished playing",
+    let template = match phase {
+        Phase::Start => "UserStartedPlayingItemWithValues",
+        Phase::Stop => "UserStoppedPlayingItemWithValues",
     };
-    let name = format!(
-        "{user_name} {action} {} on {}",
-        item_name(
-            item.name.as_deref(),
-            item.series_name.as_deref(),
-            &item.artists
-        ),
-        event.device_name.unwrap_or_default()
+    let name = localization.format_server_localized(
+        template,
+        &[
+            &user_name,
+            &item_name(
+                item.name.as_deref(),
+                item.series_name.as_deref(),
+                &item.artists,
+            ),
+            &event.device_name.unwrap_or_default(),
+        ],
     );
     let entry = ActivityLogCreate {
         name,
@@ -239,12 +255,21 @@ mod tests {
     /// `eventArgs.MediaInfo`: an audio item is named from its first artist and
     /// its series. The library item (`eventArgs.Item`) gives the entry its
     /// `ItemId`, none for an item the library does not have, and theme media
-    /// writes nothing.
+    /// writes nothing. The text is the server UI culture's
+    /// (`UserStartedPlayingItemWithValues`, `UserStoppedPlayingItemWithValues`
+    /// through `GetServerLocalizedString`).
     #[tokio::test]
     async fn the_loggers_write_from_the_events_media_info() {
         let bus = FerrofinEventManager::new();
         let recorded = Arc::new(Recorded::default());
-        subscribe(&bus, &(Arc::clone(&recorded) as Arc<dyn ActivityManager>));
+        let german: Arc<dyn ferrofin_traits::localization::LocalizationManager> = Arc::new(
+            crate::localization_manager::LocalizationManager::default().with_ui_culture("de"),
+        );
+        subscribe(
+            &bus,
+            &(Arc::clone(&recorded) as Arc<dyn ActivityManager>),
+            &german,
+        );
         let library_item = Uuid::new_v4();
         let event = |item: serde_json::Value| {
             serde_json::json!({
@@ -277,12 +302,12 @@ mod tests {
             *recorded.0.lock().unwrap(),
             [
                 (
-                    "viewer has finished playing A - Show - Track on TV".to_owned(),
+                    "viewer hat die Wiedergabe von A - Show - Track auf TV beendet".to_owned(),
                     "AudioPlaybackStopped".to_owned(),
                     Some(library_item)
                 ),
                 (
-                    "viewer is playing A - Show - Track on TV".to_owned(),
+                    "viewer hat die Wiedergabe von A - Show - Track auf TV gestartet".to_owned(),
                     "AudioPlayback".to_owned(),
                     None
                 )

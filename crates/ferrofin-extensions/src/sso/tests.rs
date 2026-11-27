@@ -43,6 +43,7 @@ pub(super) async fn service(
         ),
         sessions,
         Arc::new(ferrofin_core::FerrofinActivityManager::new(db)),
+        Arc::new(ferrofin_core::LocalizationManager::default()),
         published_url.map(str::to_owned),
     );
     (sso, plugins, dir)

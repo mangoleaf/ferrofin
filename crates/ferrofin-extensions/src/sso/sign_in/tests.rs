@@ -235,6 +235,7 @@ impl Harness {
             Arc::clone(&identities) as Arc<dyn ExternalIdentityStore>,
             Arc::clone(&sessions) as Arc<dyn SessionManager>,
             Arc::clone(&activity) as Arc<dyn ActivityManager>,
+            Arc::new(ferrofin_core::LocalizationManager::default()),
             published_url.map(str::to_owned),
         );
         sso.save_oidc_provider("fake", fake_provider(&fake, edit))

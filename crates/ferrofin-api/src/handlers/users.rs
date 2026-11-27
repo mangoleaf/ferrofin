@@ -352,12 +352,17 @@ async fn authenticate(
             log_activity(
                 state,
                 ferrofin_traits::activity::ActivityLogCreate {
-                    name: format!("Failed login attempt from {username}"),
+                    name: state
+                        .localization
+                        .format_server_localized("FailedLoginAttemptWithUserName", &[&username]),
                     type_: "AuthenticationFailed".to_owned(),
                     severity: ferrofin_model::activity::LogLevel::Error,
-                    // `LabelIpAddressValue` = "IP address: {0}", filled from
-                    // `AuthenticationRequestEventArgs.RemoteEndPoint`.
-                    short_overview: Some(format!("IP address: {remote_ip}")),
+                    // Filled from `AuthenticationRequestEventArgs.RemoteEndPoint`.
+                    short_overview: Some(
+                        state
+                            .localization
+                            .format_server_localized("LabelIpAddressValue", &[&remote_ip]),
+                    ),
                     ..Default::default()
                 },
             )
@@ -664,7 +669,9 @@ async fn delete_user(
     log_activity(
         &state,
         ferrofin_traits::activity::ActivityLogCreate {
-            name: format!("User {} has been deleted", user.username),
+            name: state
+                .localization
+                .format_server_localized("UserDeletedWithName", &[&user.username]),
             type_: "UserDeleted".to_owned(),
             user_id: None,
             ..Default::default()
@@ -713,7 +720,9 @@ async fn create_user_by_name(
     log_activity(
         &state,
         ferrofin_traits::activity::ActivityLogCreate {
-            name: format!("User {} has been created", reloaded.username),
+            name: state
+                .localization
+                .format_server_localized("UserCreatedWithName", &[&reloaded.username]),
             type_: "UserCreated".to_owned(),
             user_id: Some(id),
             ..Default::default()
@@ -967,7 +976,9 @@ async fn log_password_changed(state: &AppState, user_id: Uuid, username: &str) {
     log_activity(
         state,
         ferrofin_traits::activity::ActivityLogCreate {
-            name: format!("Password has been changed for user {username}"),
+            name: state
+                .localization
+                .format_server_localized("UserPasswordChangedWithName", &[username]),
             type_: "UserPasswordChanged".to_owned(),
             user_id: Some(user_id),
             ..Default::default()

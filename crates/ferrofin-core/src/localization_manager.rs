@@ -1043,6 +1043,81 @@ mod tests {
         assert_eq!(server.get_localized_string("Default"), "Standard");
     }
 
+    /// An activity entry's text is the server culture's template, filled
+    /// positionally, even inside a French request; a culture whose template
+    /// .NET cannot format (Cornish `LabelIpAddressValue`, where Jellyfin 12.4
+    /// throws `FormatException` and writes no entry), or one naming an argument
+    /// upstream never passes (Maltese `AuthenticationSucceededWithUserName`),
+    /// takes the en-US one.
+    #[rstest]
+    #[case::german("de", "FailedLoginAttemptWithUserName", &["bob"], "Anmeldung von bob fehlgeschlagen")]
+    #[case::french("fr", "UserOnlineFromDevice", &["bob", "TV"], "bob s'est connecté depuis TV")]
+    #[case::three_args(
+        "de",
+        "UserStartedPlayingItemWithValues",
+        &["bob", "Dune", "TV"],
+        "bob hat die Wiedergabe von Dune auf TV gestartet"
+    )]
+    #[case::english_default("", "UserCreatedWithName", &["bob"], "User bob has been created")]
+    #[case::malformed_template_takes_en_us("kw", "LabelIpAddressValue", &["1.2.3.4"], "IP address: 1.2.3.4")]
+    #[case::an_argument_upstream_never_passes(
+        "mt",
+        "AuthenticationSucceededWithUserName",
+        &["bob"],
+        "bob successfully authenticated"
+    )]
+    #[case::unknown_phrase("de", "NoSuchPhrase", &["bob"], "NoSuchPhrase")]
+    #[tokio::test]
+    async fn activity_text_is_the_server_cultures_template_filled_positionally(
+        #[case] culture: &str,
+        #[case] phrase: &str,
+        #[case] args: &[&str],
+        #[case] expected: &str,
+    ) {
+        let server = LocalizationManager::default().with_ui_culture(culture);
+        let via_trait: &dyn LocalizationManagerTrait = &server;
+        let in_a_french_request =
+            ferrofin_util::current_culture::scope_with_ui("fr".into(), Some("fr".into()), async {
+                via_trait.format_server_localized(phrase, args)
+            })
+            .await;
+        assert_eq!(in_a_french_request, expected);
+    }
+
+    /// On an en-US server each activity entry's text is what Ferrofin wrote
+    /// before it was localized, byte for byte.
+    #[rstest]
+    #[case("FailedLoginAttemptWithUserName", &["bob"], "Failed login attempt from bob")]
+    #[case("LabelIpAddressValue", &["1.2.3.4"], "IP address: 1.2.3.4")]
+    #[case("AuthenticationSucceededWithUserName", &["bob"], "bob successfully authenticated")]
+    #[case("UserOnlineFromDevice", &["bob", "TV"], "bob is online from TV")]
+    #[case("UserOfflineFromDevice", &["bob", "TV"], "bob has disconnected from TV")]
+    #[case("UserCreatedWithName", &["bob"], "User bob has been created")]
+    #[case("UserDeletedWithName", &["bob"], "User bob has been deleted")]
+    #[case("UserPasswordChangedWithName", &["bob"], "Password has been changed for user bob")]
+    #[case("UserLockedOutWithName", &["bob"], "User bob has been locked out")]
+    #[case("ScheduledTaskFailedWithName", &["Scan"], "Scan failed")]
+    #[case("UserStartedPlayingItemWithValues", &["bob", "Dune", "TV"], "bob is playing Dune on TV")]
+    #[case(
+        "UserStoppedPlayingItemWithValues",
+        &["bob", "Dune", "TV"],
+        "bob has finished playing Dune on TV"
+    )]
+    #[case(
+        "SubtitleDownloadFailureFromForItem",
+        &["Open Subtitles", "Dune"],
+        "Subtitles failed to download from Open Subtitles for Dune"
+    )]
+    fn activity_text_on_an_english_server_is_unchanged(
+        #[case] phrase: &str,
+        #[case] args: &[&str],
+        #[case] expected: &str,
+    ) {
+        let server = LocalizationManager::default();
+        let via_trait: &dyn LocalizationManagerTrait = &server;
+        assert_eq!(via_trait.format_server_localized(phrase, args), expected);
+    }
+
     /// `GetLocalizedString`: the server UI culture, BCP-47 → resource mapping,
     /// case-insensitive phrase keys, en-US fallback, then the phrase itself.
     /// Expected values are the vendored `Core/*.json` entries.

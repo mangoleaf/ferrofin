@@ -267,10 +267,15 @@ impl SsoService {
             return Err(error);
         };
         let entry = ActivityLogCreate {
-            name: format!("Failed login attempt from {}", user.username),
+            name: self
+                .localization
+                .format_server_localized("FailedLoginAttemptWithUserName", &[&user.username]),
             type_: "AuthenticationFailed".to_owned(),
             severity: LogLevel::Error,
-            short_overview: Some(format!("IP address: {remote_endpoint}")),
+            short_overview: Some(
+                self.localization
+                    .format_server_localized("LabelIpAddressValue", &[remote_endpoint]),
+            ),
             ..ActivityLogCreate::default()
         };
         // Best-effort, as the password handler's: the feed never fails a

@@ -254,6 +254,63 @@ impl Registration {
     }
 }
 
+/// A run's length as `TaskCompletedLogger.ToUserFriendlyString` words it, in
+/// English whatever the culture ("1 hour and 2 minutes"): years of 365 days,
+/// months of 30, then days, hours, minutes and seconds, each only when at
+/// least 1, the seconds also when nothing else is.
+fn user_friendly_duration(span: chrono::TimeDelta) -> String {
+    const DAYS_IN_YEAR: i64 = 365;
+    const DAYS_IN_MONTH: i64 = 30;
+    let mut values = Vec::new();
+    let mut days = span.num_days();
+    if days >= DAYS_IN_YEAR {
+        values.push(value_string(days / DAYS_IN_YEAR, "year"));
+        days %= DAYS_IN_YEAR;
+    }
+    if days >= DAYS_IN_MONTH {
+        values.push(value_string(days / DAYS_IN_MONTH, "month"));
+        days %= DAYS_IN_MONTH;
+    }
+    if days >= 1 {
+        values.push(value_string(days, "day"));
+    }
+    // `TimeSpan.Hours`, `.Minutes`, `.Seconds`: truncated toward zero.
+    let hours = span.num_hours() % 24;
+    if hours >= 1 {
+        values.push(value_string(hours, "hour"));
+    }
+    let minutes = span.num_minutes() % 60;
+    if minutes >= 1 {
+        values.push(value_string(minutes, "minute"));
+    }
+    let seconds = span.num_seconds() % 60;
+    if seconds >= 1 || values.is_empty() {
+        values.push(value_string(seconds, "second"));
+    }
+    let last = values.len() - 1;
+    let mut out = String::new();
+    for (i, value) in values.iter().enumerate() {
+        if !out.is_empty() {
+            out.push_str(if i == last { " and " } else { ", " });
+        }
+        out.push_str(value);
+    }
+    out
+}
+
+/// `TaskCompletedLogger.CreateValueString`: `{0:#,##0} {1}`, the unit plural
+/// unless the value is 1.
+///
+/// shortcut: no thousands separator, which only a run of 1,000 years would
+/// show.
+fn value_string(value: i64, unit: &str) -> String {
+    if value == 1 {
+        format!("{value} {unit}")
+    } else {
+        format!("{value} {unit}s")
+    }
+}
+
 /// A task's `text` as it is shown: a core task's localization key in the
 /// ambient UI culture (upstream's `GetLocalizedString(key)`, which falls back
 /// to the server culture, then `en-US`, then the key), any other task's string
@@ -888,7 +945,9 @@ impl FerrofinTaskManager {
 
     /// Writes the `TaskFailed` activity entry for a failed run (best-effort,
     /// spawned — recording never blocks on the write). Only `Failed` outcomes
-    /// are logged, matching upstream's `TaskCompletedLogger`.
+    /// are logged, matching upstream's `TaskCompletedLogger`, whose text is in
+    /// the server UI culture: the task's name, the run's length, and the error
+    /// with its details on the next line.
     fn log_failed_task(&self, result: &TaskResult) {
         if result.status != TaskCompletionStatus::Failed {
             return;
@@ -896,11 +955,25 @@ impl FerrofinTaskManager {
         let Some(activity) = lock(&self.activity).clone() else {
             return;
         };
+        let localization = self.localizer();
+        let running_time = user_friendly_duration(result.end_time_utc - result.start_time_utc);
+        // `string.Join(Environment.NewLine, vals)` of the non-empty messages.
+        let overview = [&result.error_message, &result.long_error_message]
+            .into_iter()
+            .filter_map(|message| message.as_deref().filter(|m| !m.is_empty()))
+            .collect::<Vec<_>>()
+            .join("\n");
         let entry = ferrofin_traits::activity::ActivityLogCreate {
-            name: format!("{} failed", result.name.clone().unwrap_or_default()),
+            name: localization.format_server_localized(
+                "ScheduledTaskFailedWithName",
+                &[result.name.as_deref().unwrap_or_default()],
+            ),
             type_: "TaskFailed".to_owned(),
             severity: ferrofin_model::activity::LogLevel::Error,
-            overview: result.error_message.clone(),
+            overview: Some(overview),
+            short_overview: Some(
+                localization.format_server_localized("LabelRunningTimeValue", &[&running_time]),
+            ),
             ..Default::default()
         };
         let task = result.key.clone().unwrap_or_default();
@@ -2491,6 +2564,68 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// `TaskCompletedLogger`'s entry is in the server UI culture: the name is
+    /// `ScheduledTaskFailedWithName`, the short overview `LabelRunningTimeValue`
+    /// over the run's length in English words, and the overview the error and
+    /// its details (`LongErrorMessage`) on two lines.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_runs_entry_is_in_the_server_culture_with_its_running_time_and_details() {
+        let mgr = FerrofinTaskManager::new();
+        let activity = Arc::new(RecordingActivity::default());
+        mgr.set_activity_manager(activity.clone());
+        mgr.set_localization_manager(Arc::new(
+            crate::localization_manager::LocalizationManager::new("US").with_ui_culture("de"),
+        ));
+        mgr.register(Arc::new(ChainedFailureTask));
+
+        mgr.run_now("chained").await.expect_err("the body fails");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let entry = loop {
+            if let Some(entry) = crate::scheduled_tasks::lock(&activity.entries).first() {
+                break entry.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "TaskFailed entry never written"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(entry.name, "Chained Task ist fehlgeschlagen");
+        assert_eq!(
+            entry.overview.as_deref(),
+            Some(
+                "guide refresh failed\ncould not read the guide\n\
+                 connection refused: https://guide.example"
+            )
+        );
+        let short = entry.short_overview.expect("running time");
+        assert!(
+            short == "Laufzeit: 0 seconds" || short == "Laufzeit: 1 second",
+            "{short}"
+        );
+    }
+
+    /// `TaskCompletedLogger.ToUserFriendlyString`, worked through its C# for
+    /// each case (Jellyfin ships no test of it).
+    #[rstest::rstest]
+    #[case::nothing(0, "0 seconds")]
+    #[case::one_second(1, "1 second")]
+    #[case::seconds(59, "59 seconds")]
+    #[case::a_minute_and_a_second(61, "1 minute and 1 second")]
+    #[case::an_hour_alone(3_600, "1 hour")]
+    #[case::three_parts(3_661, "1 hour, 1 minute and 1 second")]
+    #[case::two_hours_no_seconds(7_320, "2 hours and 2 minutes")]
+    #[case::a_day(86_400, "1 day")]
+    #[case::months_of_thirty_days(86_400 * 61, "2 months and 1 day")]
+    #[case::years_of_365_days(86_400 * 400 + 7_200, "1 year, 1 month, 5 days and 2 hours")]
+    #[case::a_clock_set_back(-5, "-5 seconds")]
+    fn a_runs_length_is_worded_as_upstream_words_it(#[case] seconds: i64, #[case] expected: &str) {
+        assert_eq!(
+            super::user_friendly_duration(chrono::TimeDelta::seconds(seconds)),
+            expected
+        );
     }
 
     /// A task whose body panics, after waiting for its gate when it has one.

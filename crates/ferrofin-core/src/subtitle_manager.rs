@@ -65,6 +65,10 @@ pub struct FerrofinSubtitleManager {
     /// Where a failed download is recorded (`SubtitleDownloadFailureLogger`).
     /// `None` in unit tests.
     activity: Option<Arc<dyn ActivityManager>>,
+    /// That entry's text, in the server UI culture. `en-US` until
+    /// [`with_localization`](FerrofinSubtitleManager::with_localization) sets
+    /// it.
+    localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
 }
 
 impl std::fmt::Debug for FerrofinSubtitleManager {
@@ -96,6 +100,7 @@ impl FerrofinSubtitleManager {
             metadata_path: metadata_path.into(),
             self_writes: None,
             activity: None,
+            localization: Arc::new(crate::localization_manager::LocalizationManager::default()),
         }
     }
 
@@ -105,6 +110,18 @@ impl FerrofinSubtitleManager {
     #[must_use]
     pub fn with_activity(mut self, activity: Arc<dyn ActivityManager>) -> Self {
         self.activity = Some(activity);
+        self
+    }
+
+    /// Writes the failed-download entry in the server UI culture this
+    /// localizer reads, as upstream's logger does through
+    /// `GetServerLocalizedString`.
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) -> Self {
+        self.localization = localization;
         self
     }
 
@@ -611,9 +628,9 @@ impl SubtitleManager for FerrofinSubtitleManager {
             .flatten()
             .map_or_default(|item| item_name(&item));
         let entry = ActivityLogCreate {
-            name: format!(
-                "Subtitles failed to download from {} for {item}",
-                provider.name()
+            name: self.localization.format_server_localized(
+                "SubtitleDownloadFailureFromForItem",
+                &[provider.name(), &item],
             ),
             type_: "SubtitleDownloadFailure".to_owned(),
             item_id: Some(item_id),
@@ -1134,7 +1151,8 @@ mod tests {
     /// for a failed fetch or save, and `SubtitleDownloadFailureLogger` records
     /// it; a spent quota (`catch (RateLimitExceededException) { throw; }`) and
     /// an id naming no provider (`GetProvider`, before the `try`) record
-    /// nothing.
+    /// nothing. The entry is in the server UI culture
+    /// (`SubtitleDownloadFailureFromForItem`).
     #[tokio::test]
     async fn a_failed_download_records_an_activity_entry_but_a_spent_quota_does_not() {
         let db = test_db().await;
@@ -1157,7 +1175,11 @@ mod tests {
         )
         .await;
         let activity = Arc::new(crate::FerrofinActivityManager::new(db.clone()));
-        let mgr = manager(db, vec![Arc::new(FailingProvider)]).with_activity(activity.clone());
+        let mgr = manager(db, vec![Arc::new(FailingProvider)])
+            .with_activity(activity.clone())
+            .with_localization(Arc::new(
+                crate::localization_manager::LocalizationManager::default().with_ui_culture("de"),
+            ));
         let namespace = provider_id("Failing");
 
         for local in ["auth", "quota", "nfo"] {
@@ -1186,7 +1208,8 @@ mod tests {
         for entry in &entries {
             assert_eq!(
                 entry.name,
-                "Subtitles failed to download from Failing for Show - S1, Ep2 - Pilot"
+                "Untertitel von Failing für Show - S1, Ep2 - Pilot konnten nicht \
+                 heruntergeladen werden"
             );
             assert_eq!(entry.type_, "SubtitleDownloadFailure");
             assert_eq!(entry.item_id, Some(item.simple().to_string()));

@@ -467,11 +467,14 @@ impl SessionManager for NoopSessions {
     ) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
+    /// Every sign-in is a wrong password.
     async fn authenticate_new_session(
         &self,
         _request: &AuthenticationRequest,
     ) -> Result<AuthenticationResultData, ServiceError> {
-        unimplemented!("fake")
+        Err(ServiceError::Unauthorized(
+            "Invalid username or password entered.".to_owned(),
+        ))
     }
     async fn authenticate_direct(
         &self,
@@ -590,11 +593,12 @@ fn state_with_sessions(
         auth,
         sessions,
         Arc::new(ferrofin_api::test_support::FakePlaylists),
+        Arc::new(ferrofin_api::test_support::FakeLocalization),
     )
 }
 
 /// [`state_with_sessions`] with a caller-supplied [`PlaylistManager`]
-/// (`ferrofin_traits::collections::PlaylistManager`).
+/// (`ferrofin_traits::collections::PlaylistManager`) and localizer.
 fn state_with_playlists(
     users: Arc<MemUsers>,
     config: Arc<MemConfig>,
@@ -602,6 +606,7 @@ fn state_with_playlists(
     auth: Arc<dyn AuthService>,
     sessions: Arc<dyn SessionManager>,
     playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager>,
+    localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
 ) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
@@ -631,11 +636,27 @@ fn state_with_playlists(
         Arc::new(ferrofin_api::test_support::FakeDevices),
         Arc::new(ferrofin_api::test_support::FakeClientEventLogger),
         Arc::new(ferrofin_api::test_support::FakeApiKeys),
-        Arc::new(ferrofin_api::test_support::FakeLocalization),
+        localization,
         Arc::new(ferrofin_api::test_support::FakeDisplayPreferences),
         activity,
         Arc::new(ferrofin_api::test_support::FakeFileSystem),
         Arc::new(ferrofin_api::test_support::FakeTasks),
+    )
+}
+
+/// [`state_with_activity`] on a server whose UI culture is German
+/// ([`GermanServer`]).
+fn german_state_with_activity(
+    activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+) -> AppState {
+    state_with_playlists(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        activity,
+        Arc::new(admin_auth()),
+        Arc::new(NoopSessions::default()),
+        Arc::new(ferrofin_api::test_support::FakePlaylists),
+        Arc::new(GermanServer),
     )
 }
 
@@ -1491,18 +1512,15 @@ async fn delete_user_writes_a_user_deleted_activity_entry() {
     // user's id. Live Jellyfin 10.11.8 puts
     // `UserId: "00000000000000000000000000000000"` on this entry; tagging it
     // with the real id also leaked it into the `hasUserId=true` filter.
+    // The name is `UserDeletedWithName` in the server UI culture.
     let activity = Arc::new(ferrofin_api::test_support::RecordingActivity::default());
-    let router = create_router(state_with_activity(
-        Arc::new(MemUsers::default()),
-        Arc::new(MemConfig::new(true)),
-        activity.clone(),
-    ));
-    let response = router
+    let response = create_router(german_state_with_activity(activity.clone()))
         .oneshot(
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/Users/{BOB_ID}"))
                 .header("X-Emby-Token", "t")
+                .header(header::ACCEPT_LANGUAGE, "fr-FR")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1512,11 +1530,95 @@ async fn delete_user_writes_a_user_deleted_activity_entry() {
     let entries = activity.entries.lock().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].type_, "UserDeleted");
-    assert_eq!(entries[0].name, "User bob has been deleted");
+    assert_eq!(entries[0].name, "Benutzer bob wurde gelöscht");
     assert_eq!(
         entries[0].user_id, None,
         "UserDeletedLogger passes Guid.Empty"
     );
+}
+
+/// Port of `AuthenticationFailedLogger`: a refused sign-in's entry is in the
+/// server UI culture (`FailedLoginAttemptWithUserName`, `LabelIpAddressValue`),
+/// whatever culture the request asks for.
+#[tokio::test]
+async fn a_failed_login_is_logged_in_the_server_culture() {
+    let activity = Arc::new(ferrofin_api::test_support::RecordingActivity::default());
+    let response = create_router(german_state_with_activity(activity.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/AuthenticateByName")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT_LANGUAGE, "fr-FR")
+                .body(Body::from(r#"{"Username":"bob","Pw":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let entries = activity.entries.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].type_, "AuthenticationFailed");
+    assert_eq!(entries[0].name, "Anmeldung von bob fehlgeschlagen");
+    assert_eq!(
+        entries[0].short_overview.as_deref(),
+        Some("IP-Adresse: 127.0.0.1")
+    );
+}
+
+/// A server whose UI culture is German, with Jellyfin's `de.json` templates
+/// for the entries these tests check. A lookup in the request's culture
+/// panics: no entry is written in it.
+struct GermanServer;
+
+impl ferrofin_traits::localization::LocalizationManager for GermanServer {
+    fn get_cultures(&self) -> Vec<ferrofin_model::globalization::CultureDto> {
+        unimplemented!("fake")
+    }
+    fn get_countries(&self) -> Vec<ferrofin_model::globalization::CountryInfo> {
+        unimplemented!("fake")
+    }
+    fn get_parental_ratings(&self) -> Vec<ferrofin_model::entities_media::ParentalRating> {
+        unimplemented!("fake")
+    }
+    fn get_localization_options(&self) -> Vec<ferrofin_model::globalization::LocalizationOption> {
+        unimplemented!("fake")
+    }
+    /// What `AppState` snapshots at construction.
+    fn get_supported_ui_cultures(&self) -> Vec<String> {
+        vec!["en-US".to_owned()]
+    }
+    fn get_localized_string(&self, phrase: &str) -> String {
+        unreachable!("{phrase} looked up in the request's culture")
+    }
+    fn get_server_localized_string(&self, phrase: &str) -> String {
+        match phrase {
+            "FailedLoginAttemptWithUserName" => "Anmeldung von {0} fehlgeschlagen",
+            "LabelIpAddressValue" => "IP-Adresse: {0}",
+            "UserDeletedWithName" => "Benutzer {0} wurde gelöscht",
+            other => other,
+        }
+        .to_owned()
+    }
+    fn get_localized_string_for(&self, phrase: &str, _culture: &str) -> String {
+        phrase.to_owned()
+    }
+    fn find_language_info(
+        &self,
+        _language: &str,
+    ) -> Option<ferrofin_model::globalization::CultureDto> {
+        None
+    }
+    fn get_language_display_name(&self, _language: &str) -> Option<String> {
+        None
+    }
+    fn get_rating_score(
+        &self,
+        _rating: &str,
+        _country_code: Option<&str>,
+    ) -> Option<ferrofin_model::entities_media::ParentalRatingScore> {
+        None
+    }
 }
 
 /// An [`ActivityManager`](ferrofin_traits::activity::ActivityManager) whose
@@ -1698,6 +1800,7 @@ fn recording_state(
         Arc::new(admin_auth()),
         Arc::new(NoopSessions::default()),
         playlists,
+        Arc::new(ferrofin_api::test_support::FakeLocalization),
     )
 }
 

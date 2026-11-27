@@ -1542,6 +1542,7 @@ fn server(harness: &Harness, step: &Step) -> SsoService {
         }),
         Arc::clone(&harness.sso.sessions),
         Arc::clone(&harness.sso.activity),
+        Arc::clone(&harness.sso.localization),
         Some(PUBLIC_URL.to_owned()),
     )
 }

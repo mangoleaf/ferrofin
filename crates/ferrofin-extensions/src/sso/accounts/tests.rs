@@ -296,6 +296,7 @@ fn over(harness: &mut Harness, store: LateLinks) {
         Arc::new(store),
         Arc::clone(&harness.sso.sessions),
         Arc::clone(&harness.sso.activity),
+        Arc::clone(&harness.sso.localization),
         Some(PUBLIC_URL.to_owned()),
     );
 }

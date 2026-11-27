@@ -272,6 +272,7 @@ async fn two_syncs_at_once_store_the_picture_once() {
         Arc::clone(&links) as Arc<dyn ExternalIdentityStore>,
         Arc::clone(&harness.sso.sessions),
         Arc::clone(&harness.sso.activity),
+        Arc::clone(&harness.sso.localization),
         Some(PUBLIC_URL.to_owned()),
     )
     .with_remote_images(Arc::new(Gated {

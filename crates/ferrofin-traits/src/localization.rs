@@ -49,6 +49,19 @@ pub trait LocalizationManager: Send + Sync {
     /// the ambient UI culture (C# `CultureInfo.CurrentUICulture`).
     fn get_server_localized_string(&self, phrase: &str) -> String;
 
+    /// An activity-log entry's text, as every upstream `Events/Consumers`
+    /// logger builds it: `string.Format(CultureInfo.InvariantCulture,
+    /// GetServerLocalizedString(phrase), args)`, so the entry stays in the
+    /// server UI culture whatever culture the request or worker runs under.
+    /// Where the culture's template is malformed, .NET throws and upstream
+    /// writes no entry; the `en-US` template fills it instead, then the phrase.
+    fn format_server_localized(&self, phrase: &str, args: &[&str]) -> String {
+        use ferrofin_util::composite_format::format;
+        format(&self.get_server_localized_string(phrase), args)
+            .or_else(|| format(&self.get_localized_string_for(phrase, "en-US"), args))
+            .unwrap_or_else(|| phrase.to_owned())
+    }
+
     /// A phrase localized in `culture` (empty ⇒ the server UI culture), with
     /// the same fallbacks (C# `GetLocalizedString(phrase, culture)`).
     fn get_localized_string_for(&self, phrase: &str, culture: &str) -> String;

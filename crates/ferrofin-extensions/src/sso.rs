@@ -59,6 +59,7 @@ use ferrofin_traits::activity::ActivityManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::ExternalIdentityStore;
 use ferrofin_traits::library::UserManager;
+use ferrofin_traits::localization::LocalizationManager;
 use ferrofin_traits::plugins::{PluginConfigPage, PluginDescriptor, PluginManager};
 use ferrofin_traits::security::{AuthenticationManager, QuickConnect};
 use ferrofin_traits::session::{AuthenticationRequest, SessionManager};
@@ -354,6 +355,8 @@ pub struct SsoService {
     /// The dashboard's activity log, for a refused sign-in of a known
     /// account, and each link made or removed.
     activity: Arc<dyn ActivityManager>,
+    /// The refused sign-in entry's text, in the server UI culture.
+    localization: Arc<dyn LocalizationManager>,
     /// Held while an account is created and linked, so two first sign-ins of
     /// one identity end at one account, while a link is made, and while a
     /// removal unlinks and signs the account out ([`links`]), so no link
@@ -391,8 +394,9 @@ pub struct SsoService {
 impl SsoService {
     /// A service over the plugin manager (the enabled flag, the configuration
     /// and the private data), the accounts and their identity links, the
-    /// sessions a sign-in opens, the activity log, and the server's published
-    /// URL, which the callback URLs fall back to. Never the request's `Host` header.
+    /// sessions a sign-in opens, the activity log and the server UI culture its
+    /// entries are written in, and the server's published URL, which the
+    /// callback URLs fall back to. Never the request's `Host` header.
     #[must_use]
     pub fn new(
         plugins: Arc<dyn PluginManager>,
@@ -400,6 +404,7 @@ impl SsoService {
         identities: Arc<dyn ExternalIdentityStore>,
         sessions: Arc<dyn SessionManager>,
         activity: Arc<dyn ActivityManager>,
+        localization: Arc<dyn LocalizationManager>,
         published_url: Option<String>,
     ) -> Self {
         Self {
@@ -408,6 +413,7 @@ impl SsoService {
             identities,
             sessions,
             activity,
+            localization,
             provisioning: Arc::default(),
             published_url,
             saving: tokio::sync::Mutex::new(()),

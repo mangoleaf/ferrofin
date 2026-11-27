@@ -16,13 +16,15 @@
 //! [`invariant_float`] is .NET's `double`/`float` parse in the invariant
 //! culture, which ASP.NET's query binder, the DLNA profile conditions, the
 //! requested transcode level, the Live TV channel numbers and the image
-//! foreground layer use. With the `tokio`
-//! feature, `keyed_locks` is the async keyed lock the C# takes from
+//! foreground layer use. [`composite_format`] is `string.Format` in the
+//! invariant culture, which fills Jellyfin's localized templates. With the
+//! `tokio` feature, `keyed_locks` is the async keyed lock the C# takes from
 //! `AsyncKeyedLock`, and `change_watch` tells a run whether its key changed
 //! while it ran.
 
 #[cfg(feature = "tokio")]
 pub mod change_watch;
+pub mod composite_format;
 pub mod current_culture;
 pub mod directory_path;
 pub mod error;

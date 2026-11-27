@@ -149,6 +149,9 @@ pub struct FerrofinUserManager {
     /// Optional activity-log seam: a lockout is recorded as a dashboard Alert
     /// (port of upstream's `UserLockedOutLogger`). `None` in tests.
     activity: Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>,
+    /// The activity entries' text, in the server UI culture. `en-US` until
+    /// [`with_localization`](FerrofinUserManager::with_localization) sets it.
+    localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
     /// Where a rename or a policy save is announced
     /// ([`USER_UPDATED_EVENT`](crate::user_updated::USER_UPDATED_EVENT)).
     /// `None` in tests, which then announce nothing.
@@ -373,7 +376,9 @@ impl FerrofinUserManager {
             if let Some(activity) = &self.activity
                 && let Err(error) = activity
                     .create_entry(ferrofin_traits::activity::ActivityLogCreate {
-                        name: format!("User {} has been locked out", user.username),
+                        name: self
+                            .localization
+                            .format_server_localized("UserLockedOutWithName", &[&user.username]),
                         type_: "UserLockedOut".to_owned(),
                         user_id: Uuid::parse_str(&user.id).ok(),
                         severity: ferrofin_model::activity::LogLevel::Error,
@@ -426,6 +431,7 @@ impl FerrofinUserManager {
             password_reset_lock: Arc::default(),
             server_id: None,
             activity: None,
+            localization: Arc::new(crate::localization_manager::LocalizationManager::default()),
             events: None,
             config: None,
             profile_image_dir: None,
@@ -492,7 +498,9 @@ impl FerrofinUserManager {
         if let Some(activity) = &self.activity
             && let Err(error) = activity
                 .create_entry(ferrofin_traits::activity::ActivityLogCreate {
-                    name: format!("Password has been changed for user {username}"),
+                    name: self
+                        .localization
+                        .format_server_localized("UserPasswordChangedWithName", &[username]),
                     type_: "UserPasswordChanged".to_owned(),
                     user_id: Some(user_id),
                     ..Default::default()
@@ -696,6 +704,17 @@ impl FerrofinUserManager {
         activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
     ) -> Self {
         self.activity = Some(activity);
+        self
+    }
+
+    /// Writes the activity entries in the server UI culture this localizer
+    /// reads, as upstream's loggers do through `GetServerLocalizedString`.
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) -> Self {
+        self.localization = localization;
         self
     }
 
@@ -1431,7 +1450,9 @@ impl UserManager for FerrofinUserManager {
         if let Some(activity) = &self.activity
             && let Err(error) = activity
                 .create_entry(ferrofin_traits::activity::ActivityLogCreate {
-                    name: format!("User {} has been created", user.username),
+                    name: self
+                        .localization
+                        .format_server_localized("UserCreatedWithName", &[&user.username]),
                     type_: "UserCreated".to_owned(),
                     user_id: Uuid::parse_str(&user.id).ok(),
                     ..Default::default()
@@ -3790,7 +3811,12 @@ mod tests {
 
         let db = test_db().await;
         let activity = Arc::new(RecordingActivity::default());
-        let mgr = FerrofinUserManager::new(db.clone()).with_activity(activity.clone());
+        // The entry is in the server UI culture (`UserLockedOutWithName`).
+        let mgr = FerrofinUserManager::new(db.clone())
+            .with_activity(activity.clone())
+            .with_localization(Arc::new(
+                crate::localization_manager::LocalizationManager::default().with_ui_culture("fr"),
+            ));
         let user = mgr.create_user("dan").await.expect("create");
         mgr.change_password(Uuid::parse_str(&user.id).expect("uuid"), "pw")
             .await
@@ -3822,7 +3848,7 @@ mod tests {
             let entries = activity.entries.lock().unwrap();
             assert_eq!(entries.len(), 1, "one lockout entry: {entries:?}");
             assert_eq!(entries[0].type_, "UserLockedOut");
-            assert_eq!(entries[0].name, "User dan has been locked out");
+            assert_eq!(entries[0].name, "L'utilisateur dan a été verrouillé");
             assert_eq!(
                 entries[0].severity,
                 ferrofin_model::activity::LogLevel::Error

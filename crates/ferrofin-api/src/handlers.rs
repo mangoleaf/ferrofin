@@ -4001,9 +4001,15 @@ pub const VERIFIED: &[Verified] = &[
                minted, as a store error elsewhere in the sign-in fails it upstream. The \
                minted Devices row, compared on 2026-11-26 (gl-1600), is the Device \
                constructor's: one instant in DateCreated, DateModified and \
-               DateLastActivity, and IsActive never set (0)",
+               DateLastActivity, and IsActive never set (0). The AuthenticationFailed \
+               entry's text, compared on 2026-11-26 (gl-429) with AuthenticationFailedLogger, \
+               is FailedLoginAttemptWithUserName and LabelIpAddressValue in the server's \
+               UICulture (LocalizationManager format_server_localized, \
+               GetServerLocalizedString with string.Format), whatever the request's culture, \
+               the same on a live 12.4 set to de",
         date: "2026-11-05",
         divergences: &[
+            MALFORMED_ACTIVITY_TEMPLATE,
             "User reads the database (the user's permissions, preferences, access schedules \
          and profile image) where upstream's GetUserDto reads the user it holds in memory, \
          so a read error there answers 500 with nothing minted; upstream cannot fail at that \
@@ -4117,7 +4123,8 @@ pub const VERIFIED: &[Verified] = &[
                to bind (measured), every provider asked in order whether enabled or not, \
                the first success answered, an expired record deleted, the PIN compared \
                ordinally with its dashes removed, the password set to the PIN as entered, \
-               the UserPasswordChanged activity entry, the record removed once the password \
+               the UserPasswordChanged activity entry (UserPasswordChangedWithName in the \
+               server's UICulture, gl-429), the record removed once the password \
                is saved, a record whose user is gone or that reads as null a 404, and no \
                match a 404",
         date: "2026-11-02",
@@ -6486,8 +6493,7 @@ pub const VERIFIED: &[Verified] = &[
                GetSubtitles: a plugin outside the Jellyfin tree, not compared yet, gl-1644)",
         date: "2026-11-14",
         divergences: &[
-            "The failed download's activity entry is written in English, not the server's UI \
-         culture. Fix path: gl-429.",
+            MALFORMED_ACTIVITY_TEMPLATE,
             "The entry names the OpenSubtitles provider opensubtitles; the plugin's Name, which \
          upstream's entry shows, is Open Subtitles. Fix path: gl-1704.",
             "The subtitle is recorded as an external stream as soon as it is written; upstream \
@@ -7560,7 +7566,6 @@ const PLAYBACK_START_DIVERGENCES: &[&str] = &[
     NOW_PLAYING_ITEM_BUILT_ON_READ,
     "SessionInfo.StartAutomaticProgress is not run, so the session's position does not \
      advance between reports. Fix path: gl-803.",
-    "The activity entry is written in English, not the server's UI culture. Fix path: gl-429.",
     "The 400 bodies (a body or query member that does not bind) are Ferrofin's error shape. \
      Fix path: gl-666.",
 ];
@@ -7576,7 +7581,7 @@ const PLAYBACK_PROGRESS_DIVERGENCES: &[&str] = &[
 
 /// The divergences of the two playback-stop reports.
 const PLAYBACK_STOP_DIVERGENCES: &[&str] = &[
-    "The activity entry is written in English, not the server's UI culture. Fix path: gl-429.",
+    MALFORMED_ACTIVITY_TEMPLATE,
     "The live stream is released and the stop published even when the user-data save fails, \
      and the item is always read again rather than taken from the session, so an item deleted \
      mid-play saves nothing; upstream skips the release when the save throws and throws on the \
@@ -7587,6 +7592,21 @@ const PLAYBACK_STOP_DIVERGENCES: &[&str] = &[
      waits keeps its files, as on DELETE /Videos/ActiveEncodings; upstream deletes them. \
      Jellyfin bug not ported (gl-1876).",
 ];
+
+/// An activity entry whose template is malformed in the server UI culture
+/// (gl-429), on the rows of the routes whose entries use one: the sign-in
+/// (its AuthenticationFailed, SessionStarted and AuthenticationSucceeded
+/// entries), the playback stop and the subtitle download. The other writers
+/// it reaches (`POST /Users/New`, `DELETE /Users/{userId}`, the SessionEnded
+/// of `POST /Sessions/Logout`, the Single Sign-On extension's refusal) have
+/// no `VERIFIED` row yet; it applies to them too.
+const MALFORMED_ACTIVITY_TEMPLATE: &str = "An activity entry whose template is malformed in \
+     the server's UICulture (Cornish LabelIpAddressValue and \
+     SubtitleDownloadFailureFromForItem; Malayalam SubtitleDownloadFailureFromForItem, \
+     UserCreatedWithName, UserDeletedWithName and UserStoppedPlayingItemWithValues; Maltese \
+     AuthenticationSucceededWithUserName, which names an argument upstream does not pass) is \
+     written from the en-US template; upstream's string.Format throws FormatException there and \
+     the entry is never written, as a live 12.4 set to kw shows. Jellyfin bug not ported.";
 
 /// Where a session's `NowPlayingItem` is built (owner decision 2026-11-04,
 /// gl-1242): shared by the playback reports, `GET /Sessions` and the Sessions

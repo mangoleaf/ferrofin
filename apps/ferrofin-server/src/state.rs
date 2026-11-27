@@ -1167,6 +1167,7 @@ pub async fn build_app_state(
             .with_login_backoff(config.login_backoff_settings())
             // A lockout is a dashboard Alert, not just a log line.
             .with_activity(Arc::clone(&activity))
+            .with_localization(Arc::clone(&localization))
             // A rename or policy save is announced (`UserUpdated`).
             .with_events(Arc::clone(&event_manager))
             // Resolves each user's CastReceiverId against the configured
@@ -2359,7 +2360,8 @@ pub async fn build_app_state(
         )
         .with_virtual_folders(Arc::clone(&virtual_folders))
         .with_self_writes(Arc::clone(&self_writes_guard))
-        .with_activity(Arc::clone(&activity)),
+        .with_activity(Arc::clone(&activity))
+        .with_localization(Arc::clone(&localization)),
     );
     let subtitle_downloader = Arc::new(
         ferrofin_core::subtitle_downloader::SubtitleDownloader::new(
@@ -2863,6 +2865,7 @@ pub async fn build_app_state(
     // concrete bus and spawn the async send so publication never blocks.
     {
         use ferrofin_model::session::SessionMessageType;
+        use ferrofin_traits::localization::LocalizationManager as Localizer;
         let forward = |bus: &FerrofinEventManager,
                        event: &'static str,
                        message_type: SessionMessageType,
@@ -2925,13 +2928,15 @@ pub async fn build_app_state(
 
         // Session start/end also land in the dashboard's activity feed — the
         // bulk of what Jellyfin's feed shows (port of the SessionStartedLogger
-        // / SessionEndedLogger event consumers).
+        // / SessionEndedLogger event consumers). `template` formats the entry's
+        // name from the user and the device, in the server UI culture.
         let log_session_event =
             |bus: &FerrofinEventManager,
              event: &'static str,
              type_: &'static str,
-             template: fn(&str, &str) -> String| {
+             template: fn(&dyn Localizer, &str, &str) -> String| {
                 let activity = Arc::clone(&activity);
+                let localization = Arc::clone(&localization);
                 bus.subscribe(
                     event,
                     Arc::new(move |payload: &str| {
@@ -2948,13 +2953,17 @@ pub async fn build_app_state(
                         let user_id = (!session.user_id.is_nil()).then_some(session.user_id);
                         let device = session.device_name.unwrap_or_default();
                         let entry = ferrofin_traits::activity::ActivityLogCreate {
-                            name: template(&user_name, &device),
+                            name: template(localization.as_ref(), &user_name, &device),
                             type_: type_.to_owned(),
                             user_id,
-                            short_overview: session
-                                .remote_end_point
-                                .filter(|e| !e.is_empty())
-                                .map(|endpoint| format!("IP address: {endpoint}")),
+                            short_overview: session.remote_end_point.filter(|e| !e.is_empty()).map(
+                                |endpoint| {
+                                    localization.format_server_localized(
+                                        "LabelIpAddressValue",
+                                        &[&endpoint],
+                                    )
+                                },
+                            ),
                             ..Default::default()
                         };
                         let activity = Arc::clone(&activity);
@@ -2982,13 +2991,13 @@ pub async fn build_app_state(
             &event_bus,
             "SessionStarted",
             "SessionStarted",
-            |user, device| format!("{user} is online from {device}"),
+            |l, user, device| l.format_server_localized("UserOnlineFromDevice", &[user, device]),
         );
         log_session_event(
             &event_bus,
             "SessionEnded",
             "SessionEnded",
-            |user, device| format!("{user} has disconnected from {device}"),
+            |l, user, device| l.format_server_localized("UserOfflineFromDevice", &[user, device]),
         );
         // Port of `AuthenticationSucceededLogger`. It lives here, on the same
         // awaited bus, rather than in the `/Users/AuthenticateByName` handler:
@@ -3001,12 +3010,14 @@ pub async fn build_app_state(
             &event_bus,
             "AuthenticationSucceeded",
             "AuthenticationSucceeded",
-            |user, _device| format!("{user} successfully authenticated"),
+            |l, user, _device| {
+                l.format_server_localized("AuthenticationSucceededWithUserName", &[user])
+            },
         );
         // Port of `PlaybackStartLogger` / `PlaybackStopLogger`, on the same
         // awaited bus, so every route that reports playback (the obsolete
         // `/PlayingItems/{itemId}` forms included) writes its entry.
-        ferrofin_core::playback_activity::subscribe(&event_bus, &activity);
+        ferrofin_core::playback_activity::subscribe(&event_bus, &activity, &localization);
     }
 
     // These two maintenance tasks gate on active playback, so they register
@@ -3459,6 +3470,7 @@ pub async fn build_app_state(
             Arc::clone(&extension_cx.external_identities),
             Arc::clone(&state.sessions),
             Arc::clone(&state.activity),
+            Arc::clone(&state.localization),
             config.published_url.clone(),
         )
         .with_quick_connect(Arc::clone(&state.quick_connect))
