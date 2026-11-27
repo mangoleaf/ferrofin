@@ -192,8 +192,14 @@ impl CappedServer {
         body["AccessToken"].as_str().expect("token").to_owned()
     }
 
-    /// Adds `folder` as a library and waits for the scan to find its `count`
-    /// photos and their images. Returns each one's item id, by file name.
+    /// Adds `folder` as a library and waits for its scan to end, with its
+    /// `count` photos and their images found. Returns each one's item id, by
+    /// file name.
+    ///
+    /// The scan's last passes draw the library's own image from a photo,
+    /// decoded in full with a resize's copy beside it, and each test's cap
+    /// leaves room for the requests the test makes, not for that as well
+    /// (gl-2015).
     async fn add_photos(&self, folder: &Path, count: usize) -> HashMap<String, String> {
         let status = self
             .client
@@ -226,12 +232,30 @@ impl CappedServer {
                     )
                 })
                 .collect();
-            if found.len() == count && self.all_have_images(found.values()).await {
+            if found.len() == count
+                && self.all_have_images(found.values()).await
+                && self.scan_ended().await
+            {
                 return found;
             }
-            assert!(Instant::now() < deadline, "the scan found {found:?}");
+            assert!(
+                Instant::now() < deadline,
+                "the scan did not end; it found {found:?}"
+            );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// Whether the "Scan Media Library" task is idle. A new library's scan is
+    /// a run of it, so once that scan's photos are there, idle means the run
+    /// is over, its post-scan passes included.
+    async fn scan_ended(&self) -> bool {
+        let tasks: Value = self.json("/ScheduledTasks").await;
+        tasks
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .any(|task| task["Key"] == "RefreshLibrary" && task["State"] == "Idle")
     }
 
     async fn all_have_images(&self, ids: impl Iterator<Item = &String>) -> bool {

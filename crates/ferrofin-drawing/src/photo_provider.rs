@@ -28,9 +28,12 @@
 //!
 //! C# reads the tags through TagLib#; this port uses `kamadak-exif`, which
 //! reads the same TIFF/EXIF IFDs, and walks a JPEG's segments as TagLib# does
-//! to decide whether it opens (`jpeg_header`). Two upstream fields have no EXIF source and
-//! are therefore not mapped: `Genres` and `Tags` come from TagLib#'s XMP/IPTC
-//! keyword aggregation, which `kamadak-exif` does not parse.
+//! to decide whether it opens (`jpeg_header`). TagLib#'s combined tag takes
+//! every field from the first of its tags that has it, the XMP tag before the
+//! IFD one (`CombinedImageTag.AllTags`). This port reads the XMP, IPTC-IIM and
+//! PNG text tags for the comment only (`comment`); the other fields, and
+//! `Genres` and `Tags`, which only those tags hold, are not mapped yet
+//! (gl-1975).
 
 use chrono::{DateTime, Datelike as _, NaiveDateTime, TimeZone as _, Utc};
 use ferrofin_model::drawing::ImageOrientation;
@@ -44,6 +47,8 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
+
+mod comment;
 
 /// The provider's display name. Port of the C# `Name => "Embedded Information"`.
 const PROVIDER_NAME: &str = "Embedded Information";
@@ -325,8 +330,8 @@ impl PhotoProvider {
 pub struct ExifTags {
     /// The EXIF-only fields.
     pub exif: PhotoExif,
-    /// TagLib#'s comment: `IFDTag.Comment` (see `ifd_comment`), and "" for a
-    /// file TagLib would open that holds none (see `read_exif`).
+    /// TagLib#'s combined comment, "" for a file TagLib would open that holds
+    /// none (see `read_exif`).
     pub comment: Option<String>,
     /// `XPTitle`/`ImageDescription` — C# `ImageTag.Title`.
     pub title: Option<String>,
@@ -340,6 +345,10 @@ pub struct ExifTags {
     /// C# `Properties.PhotoHeight`: a JPEG's frame height, else
     /// `PixelYDimension`.
     pub height: Option<i32>,
+    /// IFD0's `XMLPacket` when it is `BYTE`-typed: the XMP packet TagLib#'s
+    /// TIFF reader takes (`Tiff/File.cs`, `Read`), which `read_exif` reads for
+    /// a `.tiff` only.
+    xmp: Option<Vec<u8>>,
 }
 
 /// Reads `path`'s EXIF tags, or `None` when TagLib would fail to open it.
@@ -364,7 +373,8 @@ pub struct ExifTags {
 /// which it cannot open, and a PNG's `eXIf` chunk, which its PNG reader skips.
 /// That is an accepted divergence (owner decision, gl-1614): the files hold the
 /// date taken, caption, rating, camera and GPS data, and upstream lists these
-/// formats to read them.
+/// formats to read them. A PNG's `eXIf` comment takes the IFD tag's place in
+/// the combined comment.
 fn read_exif(path: &str) -> Option<ExifTags> {
     let file = std::fs::File::open(path).ok()?;
     // A failed stat skips the IFD walk and leaves the full read to decide, and
@@ -379,7 +389,8 @@ fn read_exif(path: &str) -> Option<ExifTags> {
     {
         return None;
     }
-    let mut tags = if matches!(extension_of(path).as_str(), ".jpg" | ".jpeg") {
+    let extension = extension_of(path);
+    let mut tags = if matches!(extension.as_str(), ".jpg" | ".jpeg") {
         jpeg_tags(&mut reader, len)?
     } else {
         exif_tags(&mut reader, len)?
@@ -387,11 +398,25 @@ fn read_exif(path: &str) -> Option<ExifTags> {
     // TagLib#'s combined `ImageTag.Comment` (`CombinedImageTag.cs:621-631`) is
     // never null: it is "" when no tag holds a comment. A WebP or an AVIF,
     // which TagLib cannot open, keeps only a comment its EXIF holds (gl-1614).
-    if header.is_some() {
-        tags.comment.get_or_insert_default();
-    } else {
+    if header.is_none() {
         tags.comment = tags.comment.filter(|comment| !comment.is_empty());
+        return Some(tags);
     }
+    let ifd = tags.comment.take();
+    tags.comment = Some(match extension.as_str() {
+        ".png" => {
+            reader.rewind().ok()?;
+            let text = comment::png_text(&mut reader, len);
+            comment::first_comment([text.xmp, ifd, text.comment])
+        }
+        ".tiff" => {
+            let xmp = tags.xmp.as_deref().map(comment::xmp_bytes_comment);
+            comment::first_comment([xmp.and_then(Result::ok).flatten(), ifd])
+        }
+        // A JPEG's comes combined (`jpeg_tags`). A CR2 reads no XMP: its
+        // combined tag allows the IFD tag only.
+        _ => comment::first_comment([ifd]),
+    });
     Some(tags)
 }
 
@@ -436,6 +461,10 @@ fn tiff_header(head: &[u8]) -> bool {
 /// Upstream has already assigned the aperture, shutter speed, camera make and
 /// model when it throws at a missing size; such a file is left alone whole
 /// here (gl-1951).
+///
+/// The comment is the combined one: the XMP tag's, an IPTC-IIM caption
+/// filling in for it (`CombinedImageTag.AddTag`), the IFD tag's, then the COM
+/// segment's.
 fn jpeg_tags<R: Read + Seek>(reader: &mut BufReader<R>, len: u64) -> Option<ExifTags> {
     let header = jpeg_header(reader, len)?;
     if header.width == 0 || header.height == 0 {
@@ -447,8 +476,18 @@ fn jpeg_tags<R: Read + Seek>(reader: &mut BufReader<R>, len: u64) -> Option<Exif
     };
     tags.width = Some(i32::from(header.width));
     tags.height = Some(i32::from(header.height));
+    let xmp = header.xmp.as_deref().map(comment::xmp_bytes_comment);
+    tags.comment = Some(comment::first_comment([
+        xmp.and_then(Result::ok).flatten(),
+        header.caption,
+        tags.comment.take(),
+        header.comment,
+    ]));
     Some(tags)
 }
+
+/// What an APP1 segment holding XMP starts with: `XmpTag.XAP_NS` and a NUL.
+const XMP_APP1: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 
 /// What TagLibSharp 2.3.0's `ReadMetadata` (`Jpeg/File.cs`) takes from a
 /// JPEG's header segments.
@@ -461,6 +500,15 @@ struct JpegHeader {
     /// The TIFF data of the first APP1 segment `ReadAPP1Segment` reads as
     /// Exif.
     exif: Option<Vec<u8>>,
+    /// The packet of the first one it reads as XMP.
+    xmp: Option<Vec<u8>>,
+    /// The first non-empty IPTC-IIM caption of an APP13 segment
+    /// (`ReadAPP13Segment`): each one fills in for the XMP comment while it is
+    /// empty. A caption TagLib# throws on is none here (gl-1973).
+    caption: Option<String>,
+    /// The first COM segment's text up to its first NUL (`ReadCOMSegment`),
+    /// "" for an empty one.
+    comment: Option<String>,
 }
 
 /// Walks a JPEG's segments as TagLibSharp 2.3.0's `ValidateHeader` and
@@ -500,14 +548,35 @@ fn jpeg_header<R: Read + Seek>(reader: &mut BufReader<R>, len: u64) -> Option<Jp
             return None;
         }
         let data = i64::from(size - 2);
+        let length = usize::from(size - 2);
+        let exif_room = header.exif.is_none() && length >= 14;
         let read = match marker[1] {
-            // APP1: only the first with room for an Exif header (14 bytes).
-            0xe1 if header.exif.is_none() && data >= 14 => {
-                let mut segment = vec![0; usize::from(size - 2)];
+            // APP1: the first with room for an Exif header (14 bytes) that
+            // has one, else the first XMP one.
+            0xe1 if exif_room || (header.xmp.is_none() && length >= XMP_APP1.len()) => {
+                let mut segment = vec![0; length];
                 reader.read_exact(&mut segment).ok()?;
-                if segment.starts_with(b"Exif\0\0") {
+                if exif_room && segment.starts_with(b"Exif\0\0") {
                     header.exif = Some(segment.split_off(6));
+                } else if header.xmp.is_none() && segment.starts_with(XMP_APP1) {
+                    header.xmp = Some(segment.split_off(XMP_APP1.len()));
                 }
+                data
+            }
+            // APP13, until one holds a caption.
+            0xed if header.caption.is_none() => {
+                let mut segment = vec![0; length];
+                reader.read_exact(&mut segment).ok()?;
+                let caption = comment::iim_caption(&segment).ok().flatten();
+                header.caption = caption.filter(|caption| !caption.is_empty());
+                data
+            }
+            // COM: the first.
+            0xfe if header.comment.is_none() => {
+                let mut segment = vec![0; length];
+                reader.read_exact(&mut segment).ok()?;
+                let text = segment.split(|byte| *byte == 0).next().unwrap_or_default();
+                header.comment = Some(comment::decode_text(text));
                 data
             }
             // SOF0-3 and SOF9-11: the precision, height and width, read
@@ -686,8 +755,9 @@ struct TiffWalk<'a, R> {
     little_endian: bool,
     /// The offsets of the IFDs walked so far.
     seen: HashSet<u32>,
-    /// The [`PRIMARY_TAGS`] entries found, one per tag: the last one, which
-    /// is the one the parser returns.
+    /// The [`PRIMARY_TAGS`] entries found, at most one per tag: the last
+    /// entry's, which is the one the parser returns, when it is one the read
+    /// uses.
     kept: Vec<KeptEntry>,
 }
 
@@ -769,8 +839,11 @@ impl<R: Read + Seek> TiffWalk<'_, R> {
                 }
                 continue;
             }
-            let keep = ifd_num == 0 && PRIMARY_TAGS.contains(&tag);
             let size = field_unit_len(kind) * u64::from(count);
+            let listed = ifd_num == 0 && PRIMARY_TAGS.contains(&tag);
+            // Only a BYTE `XMLPacket` under the cap is read (`read_exif`).
+            let xmp_read = kind == 1 && size <= comment::TEXT_LIMIT as u64;
+            let keep = listed && (tag != XMP_PACKET || xmp_read);
             let value = if size <= 4 {
                 inline.to_vec()
             } else {
@@ -780,13 +853,17 @@ impl<R: Read + Seek> TiffWalk<'_, R> {
                 if at + size > self.len {
                     return None;
                 }
-                if !keep {
-                    continue;
+                if keep {
+                    self.read_at(at, size)?
+                } else {
+                    Vec::new()
                 }
-                self.read_at(at, size)?
             };
-            if keep {
+            // The last entry of a tag wins, one not kept included.
+            if listed {
                 self.kept.retain(|(kept, ..)| *kept != tag);
+            }
+            if keep {
                 self.kept.push((tag, kind, count, value));
             }
         }
@@ -904,7 +981,7 @@ fn field_unit_len(kind: u16) -> u64 {
 
 /// Every primary-image tag [`tags_from`] reads. [`primary_tiff`] keeps only
 /// these, so a TIFF-based file's other values are never loaded.
-const PRIMARY_TAGS: [exif::Tag; 23] = [
+const PRIMARY_TAGS: [exif::Tag; 24] = [
     exif::Tag::Make,
     exif::Tag::Model,
     exif::Tag::Software,
@@ -928,6 +1005,7 @@ const PRIMARY_TAGS: [exif::Tag; 23] = [
     exif::Tag::GPSLongitudeRef,
     exif::Tag::GPSAltitude,
     exif::Tag::GPSAltitudeRef,
+    XMP_PACKET,
 ];
 
 /// The primary image's `tag`. Every lookup [`tags_from`] makes goes through
@@ -1005,6 +1083,12 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
         date_taken: exif_datetime(exif),
         width: integer(Tag::PixelXDimension),
         height: integer(Tag::PixelYDimension),
+        xmp: match primary(exif, XMP_PACKET).map(|field| &field.value) {
+            Some(exif::Value::Byte(packet)) if packet.len() <= comment::TEXT_LIMIT => {
+                Some(packet.clone())
+            }
+            _ => None,
+        },
     }
 }
 
@@ -1122,6 +1206,8 @@ fn utf16(bytes: &[u8], little_endian: bool) -> String {
 const XP_TITLE: exif::Tag = exif::Tag(exif::Context::Tiff, 0x9c9b);
 /// The Windows `Rating` TIFF tag (`0x4746`), 0–5.
 const RATING: exif::Tag = exif::Tag(exif::Context::Tiff, 0x4746);
+/// The TIFF `XMLPacket` tag (700), a TIFF's XMP packet.
+const XMP_PACKET: exif::Tag = exif::Tag(exif::Context::Tiff, 0x02bc);
 
 /// The TIFF orientation value as an [`ImageOrientation`]. `0` (the "None" value
 /// C# maps to `null`) and anything out of range yield `None`.
@@ -2119,6 +2205,26 @@ mod tests {
     #[case::no_ifd(b"II\x2a\x00\x00\x00\x00\x00".to_vec())]
     #[case::header_only(b"II\x2a\x00".to_vec())]
     #[case::jpeg(jpeg_with_exif(&[(0x0110, 2, 3, *b"X1\0\0")], b"", 26))]
+    #[case::a_byte_xmp_packet(tiff_with_xmp(1, "xmp"))]
+    #[case::an_undefined_xmp_packet(tiff_with_xmp(7, "xmp"))]
+    // The second entry of a tag wins, one the walk does not keep included.
+    #[case::a_byte_then_an_undefined_xmp_packet(tiff_file(
+        true,
+        0,
+        &[image_description_row(), xmp_row(1, "first"), xmp_row(7, "second")],
+        &[],
+        &[],
+        &[],
+    ))]
+    #[case::an_undefined_then_a_byte_xmp_packet(tiff_file(
+        true,
+        0,
+        &[image_description_row(), xmp_row(7, "first"), xmp_row(1, "second")],
+        &[],
+        &[],
+        &[],
+    ))]
+    #[case::an_xmp_packet_over_the_limit(tiff_with_big_xmp())]
     fn a_streamed_read_finds_what_the_whole_file_read_finds(#[case] file: Vec<u8>) {
         assert_eq!(streamed_tags(&file).0, whole_file_tags(&file));
     }
@@ -2766,5 +2872,295 @@ mod tests {
         assert!(item.exif_was_read);
         assert_eq!(item.exif.camera_make.as_deref(), Some("ACME"));
         assert_eq!(item.overview.as_deref(), Some("caption"));
+    }
+
+    use super::comment::tests::{chunk, raw_profile, zlib};
+
+    /// A JPEG segment of `marker` holding `data`.
+    fn segment(marker: u8, data: &[u8]) -> Vec<u8> {
+        let size = u16::try_from(data.len() + 2).unwrap().to_be_bytes();
+        [&[0xff, marker], size.as_slice(), data].concat()
+    }
+
+    /// An XMP packet whose one `rdf:Description` holds `props`.
+    fn xmp_packet(props: &str) -> String {
+        format!(
+            "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\
+             <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
+             <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+             <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">{props}\
+             </rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+        )
+    }
+
+    /// An XMP `rdf:Alt` property `name` whose `x-default` item is `text`.
+    fn xmp_alt(name: &str, text: &str) -> String {
+        format!(
+            "<{name}><rdf:Alt><rdf:li xml:lang=\"x-default\">{text}</rdf:li></rdf:Alt></{name}>"
+        )
+    }
+
+    /// The APP1 segment of an XMP packet whose `dc:description` is `text`.
+    fn xmp_app1(text: &str) -> Vec<u8> {
+        let packet = xmp_packet(&xmp_alt("dc:description", text));
+        segment(
+            0xe1,
+            &[b"http://ns.adobe.com/xap/1.0/\0", packet.as_bytes()].concat(),
+        )
+    }
+
+    /// An APP13 segment whose IPTC-IIM caption is `caption`.
+    fn iptc_app13(caption: &[u8]) -> Vec<u8> {
+        let size = u16::try_from(caption.len()).unwrap().to_be_bytes();
+        let iim = [b"\x1c\x02\x78".as_slice(), size.as_slice(), caption].concat();
+        let length = u32::try_from(iim.len()).unwrap().to_be_bytes();
+        let data = [
+            b"Photoshop 3.0\x008BIM\x04\x04\0\0".as_slice(),
+            length.as_slice(),
+            &iim,
+        ];
+        segment(0xed, &data.concat())
+    }
+
+    /// A one-pixel JPEG holding `segments` after its start of image.
+    fn jpeg_of(segments: &[Vec<u8>]) -> Vec<u8> {
+        [SOI, &segments.concat(), SOF_1X1, EOI].concat()
+    }
+
+    /// [`png_without_exif`] with `chunks` (type, data) before its IEND.
+    fn png_of(chunks: &[(&[u8], Vec<u8>)]) -> Vec<u8> {
+        let png = png_without_exif();
+        let (head, iend) = png.split_at(png.len() - 12);
+        let mut out = head.to_vec();
+        for (kind, data) in chunks {
+            out.extend(chunk(kind, data));
+        }
+        out.extend_from_slice(iend);
+        out
+    }
+
+    /// A one-pixel TIFF-based file of IFD0 tag 700 (`XMLPacket`) typed `kind`
+    /// holding an XMP packet whose `dc:description` is `xmp`, and an
+    /// `ImageDescription`.
+    fn tiff_with_xmp(kind: u16, xmp: &str) -> Vec<u8> {
+        let one = vec![1, 0, 0, 0];
+        let ifd0 = [
+            (0x0100, 3, 1, one.clone()),
+            (0x0101, 3, 1, one),
+            image_description_row(),
+            xmp_row(kind, xmp),
+        ];
+        tiff_file(true, 0, &ifd0, &[], &[], &[])
+    }
+
+    /// [`tiff_with_xmp`] with a BYTE packet one byte over the cap.
+    fn tiff_with_big_xmp() -> Vec<u8> {
+        let one = vec![1, 0, 0, 0];
+        let (tag, kind, _, mut packet) = xmp_row(1, "too big");
+        packet.resize(comment::TEXT_LIMIT + 1, b' ');
+        let count = u32::try_from(packet.len()).unwrap();
+        let ifd0 = [
+            (0x0100, 3, 1, one.clone()),
+            (0x0101, 3, 1, one),
+            image_description_row(),
+            (tag, kind, count, packet),
+        ];
+        tiff_file(true, 0, &ifd0, &[], &[], &[])
+    }
+
+    #[test]
+    fn an_xmp_packet_over_the_limit_is_not_loaded() {
+        let (tags, read) = streamed_tags(&tiff_with_big_xmp());
+        assert_eq!(tags.and_then(|tags| tags.xmp), None);
+        assert!(read < 128 << 10, "read {read} bytes");
+    }
+
+    /// An IFD0 `ImageDescription` row of "tiff image description".
+    fn image_description_row() -> Row {
+        (0x010e, 2, 23, b"tiff image description\0".to_vec())
+    }
+
+    /// An IFD0 tag 700 row typed `kind` holding an XMP packet whose
+    /// `dc:description` is `xmp`.
+    fn xmp_row(kind: u16, xmp: &str) -> Row {
+        let packet = xmp_packet(&xmp_alt("dc:description", xmp)).into_bytes();
+        (0x02bc, kind, u32::try_from(packet.len()).unwrap(), packet)
+    }
+
+    /// [`cr2_without_a_comment`] with an `ImageDescription` and a BYTE tag 700
+    /// XMP packet in IFD0.
+    fn cr2_with_xmp() -> Vec<u8> {
+        let one = vec![1, 0, 0, 0];
+        let dimensions = [(0xa002, 4, 1, one.clone()), (0xa003, 4, 1, one)];
+        let ifd0 = [image_description_row(), xmp_row(1, "cr2 xmp description")];
+        let mut cr2 = tiff_file(true, 8, &ifd0, &dimensions, &[], &[]);
+        cr2[8..16].copy_from_slice(b"CR\x02\x00\0\0\0\0");
+        cr2
+    }
+
+    /// gl-1612: TagLib#'s combined comment (`CombinedImageTag.Comment`), the
+    /// first non-empty one of the XMP tag (an IPTC-IIM caption filling in
+    /// for it), the EXIF IFD and the others (a JPEG's COM segment, a PNG's
+    /// text keywords). Each case is a photo a stock Jellyfin 12.4 scanned, and
+    /// `expected` the `Overview` it stored, but where a case says otherwise.
+    #[rstest::rstest]
+    #[case::jpeg_xmp("photo.jpg", jpeg_of(&[xmp_app1("xmp description")]), "xmp description")]
+    #[case::jpeg_com("photo.jpg", jpeg_of(&[segment(0xfe, b"a jpeg comment")]), "a jpeg comment")]
+    #[case::jpeg_xmp_before_exif(
+        "photo.jpg",
+        jpeg_of(&[comment_segment("exif comment"), xmp_app1("xmp description")]),
+        "xmp description"
+    )]
+    #[case::jpeg_exif_before_com(
+        "photo.jpg",
+        jpeg_of(&[comment_segment("exif comment"), segment(0xfe, b"com text")]),
+        "exif comment"
+    )]
+    #[case::jpeg_iptc("photo.jpg", jpeg_of(&[iptc_app13(b"iptc caption")]), "iptc caption")]
+    #[case::jpeg_iptc_fills_in_for_the_xmp(
+        "photo.jpg",
+        jpeg_of(&[
+            segment(0xe1, &[b"http://ns.adobe.com/xap/1.0/\0".as_slice(), xmp_packet(&xmp_alt("dc:title", "a title")).as_bytes()].concat()),
+            iptc_app13(b"iptc caption"),
+        ]),
+        "iptc caption"
+    )]
+    #[case::jpeg_xmp_before_the_exif_segment(
+        "photo.jpg",
+        jpeg_of(&[xmp_app1("xmp description"), comment_segment("exif comment")]),
+        "xmp description"
+    )]
+    #[case::jpeg_the_first_xmp(
+        "photo.jpg",
+        jpeg_of(&[xmp_app1(""), xmp_app1("second xmp"), segment(0xfe, b"com text")]),
+        "com text"
+    )]
+    #[case::jpeg_the_first_caption_that_holds_one(
+        "photo.jpg",
+        jpeg_of(&[iptc_app13(b""), iptc_app13(b"second caption")]),
+        "second caption"
+    )]
+    #[case::jpeg_the_first_com(
+        "photo.jpg",
+        jpeg_of(&[segment(0xfe, b"first comment"), segment(0xfe, b"second comment")]),
+        "first comment"
+    )]
+    #[case::jpeg_an_empty_xmp_description(
+        "photo.jpg",
+        jpeg_of(&[xmp_app1(""), segment(0xfe, b"com text")]),
+        "com text"
+    )]
+    // Jellyfin reads the caption as Latin-1, "cafÃ© caption", and the COM as
+    // UTF-8, "caf\u{fffd} comment": the rule of the EXIF comment (gl-1613).
+    #[case::jpeg_a_utf8_iptc_caption("photo.jpg", jpeg_of(&[iptc_app13("caf\u{e9} caption".as_bytes())]), "caf\u{e9} caption")]
+    #[case::jpeg_a_latin1_com("photo.jpg", jpeg_of(&[segment(0xfe, b"caf\xe9 comment")]), "caf\u{e9} comment")]
+    #[case::png_comment("photo.png", png_of(&[(b"tEXt", b"Comment\0png comment".to_vec())]), "png comment")]
+    #[case::png_description_first(
+        "photo.png",
+        png_of(&[(b"tEXt", b"Comment\0png comment".to_vec()), (b"tEXt", b"Description\0png description".to_vec())]),
+        "png description"
+    )]
+    #[case::png_compressed_comment(
+        "photo.png",
+        png_of(&[(b"zTXt", [b"Comment\0\0".as_slice(), &zlib(b"compressed comment")].concat())]),
+        "compressed comment"
+    )]
+    // Jellyfin keeps the flags, language and translated keyword before the
+    // text, "\0\0\0\0itxt comment": not ported.
+    #[case::png_itxt_comment("photo.png", png_of(&[(b"iTXt", b"Comment\0\0\0\0\0itxt comment".to_vec())]), "itxt comment")]
+    #[case::png_xmp_first(
+        "photo.png",
+        png_of(&[
+            (b"tEXt", b"Comment\0png comment".to_vec()),
+            (b"iTXt", [b"XML:com.adobe.xmp\0\0\0\0\0".as_slice(), xmp_packet(&xmp_alt("dc:description", "png xmp description")).as_bytes()].concat()),
+        ]),
+        "png xmp description"
+    )]
+    #[case::png_raw_profile_xmp(
+        "photo.png",
+        png_of(&[(b"zTXt", [b"Raw profile type xmp\0\0".as_slice(), &zlib(&raw_profile(xmp_packet(&xmp_alt("dc:description", "raw profile xmp")).as_bytes()))].concat())]),
+        "raw profile xmp"
+    )]
+    #[case::tiff_xmp_first(
+        "photo.tiff",
+        tiff_with_xmp(1, "tiff xmp description"),
+        "tiff xmp description"
+    )]
+    #[case::tiff_undefined_xmp_is_unread(
+        "photo.tiff",
+        tiff_with_xmp(7, "tiff xmp description"),
+        "tiff image description"
+    )]
+    // Source-read, not measured: a CR2's combined tag allows the IFD tag only.
+    #[case::cr2_reads_no_xmp("photo.cr2", cr2_with_xmp(), "tiff image description")]
+    // Not upstream's: a packet over the cap is not read (gl-1974).
+    #[case::tiff_xmp_over_the_limit_is_unread(
+        "photo.tiff",
+        tiff_with_big_xmp(),
+        "tiff image description"
+    )]
+    #[tokio::test]
+    async fn the_overview_is_the_first_comment_of_every_tag(
+        #[case] name: &str,
+        #[case] bytes: Vec<u8>,
+        #[case] expected: &str,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, name, &bytes);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert!(item.exif_was_read);
+        assert_eq!(item.overview.as_deref(), Some(expected));
+    }
+
+    /// gl-1973, until the owner decides: Jellyfin 12.4 leaves both photos
+    /// alone (`Overview` and `CameraMake` NULL), as TagLib# throws on the
+    /// malformed XMP packet and on the compressed iTXt chunk. Ferrofin reads
+    /// such a block as holding no comment and the rest of the file as before.
+    #[rstest::rstest]
+    #[case::a_malformed_xmp_packet(
+        "photo.jpg",
+        jpeg_of(&[
+            exif_segment(
+                &[(0x010f, 2, b"ExifMake\0".as_slice())],
+                &[(0x9286, 7, b"ASCII\0\0\0exif comment".as_slice())],
+            ),
+            segment(0xe1, b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF"),
+        ]),
+        "exif comment",
+        Some("ExifMake")
+    )]
+    #[case::a_compressed_itxt_chunk(
+        "photo.png",
+        png_of(&[(b"iTXt", [b"Comment\0\x01\0\0\0".as_slice(), &zlib(b"compressed itxt")].concat())]),
+        "",
+        None
+    )]
+    #[tokio::test]
+    async fn a_block_taglib_refuses_is_read_as_no_comment(
+        #[case] name: &str,
+        #[case] bytes: Vec<u8>,
+        #[case] overview: &str,
+        #[case] camera_make: Option<&str>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, name, &bytes);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert!(item.exif_was_read);
+        assert_eq!(item.overview.as_deref(), Some(overview));
+        assert_eq!(item.exif.camera_make.as_deref(), camera_make);
     }
 }

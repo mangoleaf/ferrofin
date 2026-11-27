@@ -22,9 +22,14 @@ use ferrofin_traits::library::{
 use crate::listenbrainz::ListenBrainzClient;
 use crate::tmdb::{TmdbClient, TmdbKind};
 
-/// How many days a TMDB similarity result is cached — C#
-/// `Plugins/Tmdb/Configuration/PluginConfiguration.SimilarItemsCacheDays`.
-pub const TMDB_SIMILAR_CACHE_DAYS: i64 = 7;
+/// A plugin's `SimilarItemsCacheDays` as a provider's `CacheDuration`:
+/// `days > 0 ? TimeSpan.FromDays(days) : null`.
+fn cache_days(days: i32) -> Option<Duration> {
+    u64::try_from(days)
+        .ok()
+        .filter(|days| *days > 0)
+        .map(|days| Duration::from_secs(days * 24 * 60 * 60))
+}
 
 /// TMDB's recommendations for a movie or series (Jellyfin 12 reads them, not
 /// TMDB's keyword-based "similar" list).
@@ -32,15 +37,13 @@ pub struct TmdbSimilarProvider {
     tmdb: Arc<TmdbClient>,
     kind: TmdbKind,
     supported: BaseItemKind,
-    cache_days: i64,
 }
 
 impl TmdbSimilarProvider {
-    /// A TMDB similarity provider for `kind`, caching its references for
-    /// `cache_days` (Jellyfin's `SimilarItemsCacheDays`, default 7; `0`
-    /// disables caching).
+    /// A TMDB similarity provider for `kind`, caching its references for the
+    /// TMDb plugin's `SimilarItemsCacheDays`.
     #[must_use]
-    pub fn new(tmdb: Arc<TmdbClient>, kind: TmdbKind, cache_days: i64) -> Self {
+    pub fn new(tmdb: Arc<TmdbClient>, kind: TmdbKind) -> Self {
         let supported = match kind {
             TmdbKind::Movie => BaseItemKind::Movie,
             TmdbKind::Series => BaseItemKind::Series,
@@ -49,7 +52,6 @@ impl TmdbSimilarProvider {
             tmdb,
             kind,
             supported,
-            cache_days,
         }
     }
 }
@@ -65,10 +67,10 @@ impl RemoteSimilarItemsProvider for TmdbSimilarProvider {
         item_kind == self.supported
     }
 
-    fn cache_duration(&self) -> Option<Duration> {
-        (self.cache_days > 0).then(|| {
-            Duration::from_secs(u64::try_from(self.cache_days).unwrap_or(0) * 24 * 60 * 60)
-        })
+    /// `TmdbMovieSimilarProvider.CacheDuration` /
+    /// `TmdbSeriesSimilarProvider.CacheDuration`, read each time.
+    async fn cache_duration(&self) -> Option<Duration> {
+        cache_days(self.tmdb.settings().await.similar_items_cache_days)
     }
 
     async fn similar_items_page(
@@ -129,8 +131,9 @@ impl RemoteSimilarItemsProvider for ListenBrainzSimilarArtistProvider {
         item_kind == BaseItemKind::MusicArtist
     }
 
-    fn cache_duration(&self) -> Option<Duration> {
-        self.client.cache_duration()
+    /// `ListenBrainzSimilarArtistProvider.CacheDuration`, read each time.
+    async fn cache_duration(&self) -> Option<Duration> {
+        cache_days(self.client.settings().await.cache_days)
     }
 
     async fn similar_items_page(
@@ -204,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn tmdb_similar_yields_nothing_without_a_tmdb_id() {
-        let provider = TmdbSimilarProvider::new(Arc::new(TmdbClient::new()), TmdbKind::Movie, 7);
+        let provider = TmdbSimilarProvider::new(Arc::new(TmdbClient::new()), TmdbKind::Movie);
         assert!(provider.supports(BaseItemKind::Movie));
         assert!(!provider.supports(BaseItemKind::Series));
         // No id → no request, so this resolves without touching the network.
@@ -230,7 +233,7 @@ mod tests {
         )])
         .await;
         let tmdb = Arc::new(TmdbClient::new().with_base_url(&server.base_url));
-        let provider = TmdbSimilarProvider::new(tmdb, TmdbKind::Movie, 7);
+        let provider = TmdbSimilarProvider::new(tmdb, TmdbKind::Movie);
         let page = provider
             .similar_items_page(
                 &row("Movies.Movie"),
@@ -266,19 +269,57 @@ mod tests {
         assert!(page.references.is_empty(), "{:?}", page.references);
     }
 
-    #[test]
-    fn a_zero_cache_day_setting_disables_caching() {
-        let tmdb = Arc::new(TmdbClient::new());
+    /// The cache length is each plugin's `SimilarItemsCacheDays`, read when
+    /// the manager asks: TMDb's 90 days and ListenBrainz's 14 by default, `0`
+    /// (or less) no cache, as upstream's `days > 0` test.
+    #[tokio::test]
+    async fn each_plugins_cache_days_set_the_cache_duration() {
+        const DAY: u64 = 24 * 60 * 60;
+        let tmdb = |config: &str| {
+            let client = TmdbClient::new();
+            client.attach_plugin_manager(crate::plugin_config::tests_support::manager_with(
+                crate::builtin_plugins::TMDB.id,
+                config.as_bytes().to_vec(),
+            ));
+            TmdbSimilarProvider::new(Arc::new(client), TmdbKind::Series)
+        };
+        let listenbrainz = |config: &str| {
+            let client = ListenBrainzClient::new();
+            client.attach_plugin_manager(crate::plugin_config::tests_support::manager_with(
+                crate::builtin_plugins::LISTENBRAINZ.id,
+                config.as_bytes().to_vec(),
+            ));
+            ListenBrainzSimilarArtistProvider::new(Arc::new(client))
+        };
+        let secs = |d: Option<Duration>| d.map(|d| d.as_secs());
+        assert_eq!(secs(tmdb("{}").cache_duration().await), Some(90 * DAY));
         assert_eq!(
-            TmdbSimilarProvider::new(Arc::clone(&tmdb), TmdbKind::Movie, 0).cache_duration(),
-            None
+            secs(
+                tmdb(r#"{"SimilarItemsCacheDays":3}"#)
+                    .cache_duration()
+                    .await
+            ),
+            Some(3 * DAY)
         );
         assert_eq!(
-            TmdbSimilarProvider::new(tmdb, TmdbKind::Movie, 7)
-                .cache_duration()
-                .map(|d| d.as_secs()),
-            Some(7 * 24 * 60 * 60)
+            secs(listenbrainz("{}").cache_duration().await),
+            Some(14 * DAY)
         );
+        assert_eq!(
+            secs(
+                listenbrainz(r#"{"SimilarItemsCacheDays":365}"#)
+                    .cache_duration()
+                    .await
+            ),
+            Some(365 * DAY)
+        );
+        for off in ["0", "-3"] {
+            let config = format!(r#"{{"SimilarItemsCacheDays":{off}}}"#);
+            assert_eq!(tmdb(&config).cache_duration().await, None, "{off}");
+            assert_eq!(listenbrainz(&config).cache_duration().await, None, "{off}");
+        }
+        // The largest C# `int` fits.
+        assert_eq!(secs(cache_days(i32::MAX)), Some(2_147_483_647 * DAY));
     }
 
     #[tokio::test]

@@ -384,5 +384,23 @@ pub(crate) async fn explain(db: &Database, mut qb: QueryBuilder<Sqlite>) -> Stri
         .join(" | ")
 }
 
+/// [`explain`] of a statement kept as a string, with `binds` in order.
+#[cfg(test)]
+pub(crate) async fn explain_sql(db: &Database, sql: &str, binds: &[&str]) -> String {
+    use sqlx::Row as _;
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")));
+    for bind in binds {
+        query = query.bind(*bind);
+    }
+    query
+        .fetch_all(db.pool())
+        .await
+        .expect("explain")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 #[cfg(test)]
 mod tests;
