@@ -2023,9 +2023,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    scope's get_user_views_with_query call that writes the user's views as \
                    AddUserToQuery's GetUserViews call writes them (LibraryManager.AddUserToQuery, \
                    UserViewManager.GetUserViews, compared 2026-11-10), with \
-                   user_view_manager.rs ensure_user_playlists_view and view_refresh_due dating \
-                   and refreshing the Playlists view (LibraryManager.GetNamedView, compared \
-                   2026-11-11), reading a library's options at its \
+                   user_view_manager.rs view_refresh_due, stamp_view_refresh and \
+                   save_view_refresh dating and refreshing the views it writes: \
+                   ensure_user_playlists_view the Playlists \
+                   view (LibraryManager.GetNamedView, compared 2026-11-11), grouped_view a \
+                   grouped view and shadow_view a shadow view (GetNamedView's user overload, \
+                   GetShadowView), folders_view and provision_live_tv_view the Folders and \
+                   Live TV views (GetNamedView(name, viewType, sortName), \
+                   MetadataService.RefreshMetadata; compared 2026-11-26), reading a library's \
+                   options at its \
                    Path expanded as BaseItemMapper.Map expands it \
                    (CollectionFolder.GetLibraryOptions, compared 2026-11-05); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
@@ -2096,13 +2102,26 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              /UserViews rather than the next query; a write its query was cancelled in is \
              retried. The query \
              that writes them is scoped by the rows read before the write (gl-1584). \
-             GetNamedView's refresh of the Playlists view (when it is new, 24 hours after its last refresh, \
-             or once its display parent was saved since) is the view's save, made at once \
-             rather than queued (gl-1625); the collage that refresh draws upstream is \
-             TODO(gl-1656), and the other views' dates and refresh TODO(gl-1655). It falls \
-             due only where the views are read: on every GET /UserViews, and on the query \
-             path when that writes them, so a refresh due while the set stays the same \
-             waits for the next GET /UserViews.",
+             The refresh GetNamedView and GetShadowView queue for a view is the view's save, \
+             made at once rather than queued: the Playlists, grouped and shadow views' when \
+             the view is new, was never refreshed or was last refreshed 24 hours ago, and \
+             the Playlists and shadow views' also once their display parent was saved since \
+             (gl-1625, gl-1655); the Folders and Live TV views' when the view is new, and \
+             when one is stored without a refresh, as an earlier Ferrofin left them, which \
+             upstream leaves alone (it refreshes those two only when new or renamed, and \
+             renaming one already refreshed saves only its name here, as upstream's refresh \
+             then has nothing to save). The collage that refresh draws upstream on the \
+             Playlists views and the movies and TV shows grouped views is TODO(gl-1656). It \
+             falls due only where the views are read: on every GET /UserViews (a shadow \
+             view only on one naming presetViews), and on the query path when that writes \
+             them, so a refresh due while the set stays the same waits for the next GET \
+             /UserViews.",
+            "A movies or TV shows shadow view's refresh stamps its DateLastRefreshed. \
+             Upstream's fails in DynamicImageProvider, whose query for the collage reaches \
+             UserViewBuilder.GetMovieFolders or GetTvView with no user (a shadow view has \
+             none) and throws in SetUser, so the stamp is never saved and every GET \
+             /UserViews that lists the view refreshes and saves it again (seen on a 12.4 \
+             server, 2026-11-26). Jellyfin bug not ported (gl-1655).",
             "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, or \
              as the signed-in caller when a POST body names no user, so a series that user \
              cannot open (library, rating or tag rules) answers like an id that is no series: \
