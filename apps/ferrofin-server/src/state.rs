@@ -653,8 +653,8 @@ pub async fn build_app_state(
         }
     }
     // One-shot: earlier builds folded every combining mark out of a name's
-    // `CleanName`/`CleanValue`/`SortName`; move those keys to upstream's
-    // `Diacritics` table, which keeps them (gl-1908).
+    // `CleanName`/`CleanValue`/`SortName`, and kept the letters outside the
+    // BMP in its clean values; move those keys to upstream's (gl-1908).
     match item_persistence_impl.repair_diacritic_folds().await {
         Ok(0) => {}
         Ok(repaired) => {
@@ -665,7 +665,7 @@ pub async fn build_app_state(
         }
         Err(err) => {
             converted = false;
-            tracing::warn!(%err, "diacritic-fold repair failed; names with combining marks may miss by-name lookups until the next boot retries it");
+            tracing::warn!(%err, "diacritic-fold repair failed; names with combining marks or characters outside the BMP may miss by-name lookups until the next boot retries it");
         }
     }
     // One-shot: box sets and playlists an older build created had no dates,

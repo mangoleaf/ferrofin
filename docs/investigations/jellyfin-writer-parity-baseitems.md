@@ -131,7 +131,7 @@ The gate's row-level diff (gl-1568) will automate these comparisons.
 | gl-1597 | fix | by-name Genre, Studio and MusicGenre ids not derived as upstream derives them |
 | gl-1598 | fix | the first collection's Collections library gets no library scan |
 | gl-1599 | fix | the 10.11.8 route: the alternate-version movie's name and bitrate and its streams' values, kept from 10.11 where 12.4 re-creates the row (the `Playlists` view's id: not a difference) |
-| gl-1908 | fixed | `CleanName`, `CleanValue` and `SortName` of names with combining marks or letters outside the `Diacritics` package's table, which `RemoveDiacritics` keeps and Ferrofin folded |
+| gl-1908 | fixed | `CleanName`, `CleanValue` and `SortName` of names with combining marks or letters outside the `Diacritics` package's table, which `RemoveDiacritics` keeps and Ferrofin folded; and the `CleanName` of names with characters outside the Basic Multilingual Plane, which .NET's regex cleans to spaces |
 | gl-1594 | decision | music artists' `RunTimeTicks`: Ferrofin sums; upstream's refresh order, read from the code, leaves 0 |
 | gl-1595 | decision | extras copy their owner's metadata after the owner's refresh (Ferrofin) or before it (upstream) |
 
@@ -162,7 +162,7 @@ the inherited ratings scored from them.
 | `Artists` | Map:377, `IHasArtist` | upsert | E1 equal | match |
 | `Audio` | Map:324, Live TV `ProgramAudio` | never written for programmes | static | fix: gl-763 |
 | `ChannelId` | Map:309, a `Guid` (zero when unset) | NULL off Live TV; the channel's id on programmes | E1: 65 rows zero GUID vs NULL; E4: the `Playlists` view; programmes static | fix: gl-1580 (Playlist and BoxSet rows: gl-1562) |
-| `CleanName` | Map:279, `GetCleanValue` (`src/Jellyfin.Extensions/StringExtensions.cs:159-176`) over `RemoveDiacritics` (the `Diacritics` 4.1.8 table) | `get_clean_value` (`crates/ferrofin-util/src/string_extensions.rs`), the same algorithm; the package's table since gl-1908 | E1, E3 equal except the PLACEHOLDER row; E4 the alternate-version movie; the `10.11.11-messy` route's person stored with combining marks (`zoe saldan a`, gl-1908) | fix: gl-1585 (placeholder); fix: gl-1599 (E4); fixed: gl-1908 |
+| `CleanName` | Map:279, `GetCleanValue` (`src/Jellyfin.Extensions/StringExtensions.cs:159-176`) over `RemoveDiacritics` (the `Diacritics` 4.1.8 table) | `get_clean_value` (`crates/ferrofin-util/src/string_extensions.rs`), the same algorithm; the package's table, and characters outside the BMP cleaned to spaces as .NET's UTF-16 regex does, since gl-1908 | E1, E3 equal except the PLACEHOLDER row; E4 the alternate-version movie; the `10.11.11-messy` route's person stored with combining marks (`zoe saldan a`, gl-1908) | fix: gl-1585 (placeholder); fix: gl-1599 (E4); fixed: gl-1908 |
 | `CommunityRating` | Map:274; Live TV programmes from the guide (`src/Jellyfin.LiveTv/Guide/GuideManager.cs:535`) | upsert, NFO, TMDB; never for programmes | E1 equal except the extra (NULL vs 7.5); programmes static | match; extras: gl-1595; Live TV: gl-763 |
 | `CriticRating` | Map:293, `float` widened | editor, NFO, OMDb (f32 widened) | static; copied to extras upstream and here | match; extras: gl-1595 |
 | `CustomRating` | Map:275 | editor, NFO | static; copied to extras | match; extras: gl-1595 |

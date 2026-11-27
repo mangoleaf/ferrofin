@@ -1801,7 +1801,9 @@ impl FerrofinItemPersistenceService {
     /// upstream's `RemoveDiacritics`, the `Diacritics` package's table, which
     /// keeps combining marks and the letters it does not list (gl-1908): a
     /// person stored as `Zoe\u{308} Saldan\u{303}a` was cleaned to
-    /// `zoe saldana`, and Jellyfin 12.4 derives `zoe saldan a`.
+    /// `zoe saldana`, and Jellyfin 12.4 derives `zoe saldan a`. A clean value
+    /// also drops the characters outside the Basic Multilingual Plane now, as
+    /// .NET's regex does (`𠀀大` cleans to `大`).
     ///
     /// A column is rewritten only when it holds the key those builds derived
     /// (with [`ferrofin_util::string_extensions::remove_diacritics_nfd`]:
@@ -13882,7 +13884,7 @@ mod tests {
         let muhammad = "\u{645}\u{64F}\u{62D}\u{64E}\u{645}\u{651}\u{64E}\u{62F}";
         // (kind, name, forced sort name, stored clean, stored sort, clean after, sort after)
         #[allow(clippy::type_complexity)]
-        let rows: [(BaseItemKind, &str, Option<&str>, &str, &str, &str, &str); 9] = [
+        let rows: [(BaseItemKind, &str, Option<&str>, &str, &str, &str, &str); 10] = [
             // The fold dropped the marks; Jellyfin keeps them, and cleans each
             // to a space. A person's sort name is its name, verbatim.
             (Person, zoe, None, "zoe saldana", zoe, "zoe saldan a", zoe),
@@ -13908,6 +13910,16 @@ mod tests {
             (Movie, shalom, None, "שלום", "slwm", "ש לו ם", "slwm"),
             // `Đ` was kept; the table maps it.
             (Movie, "Đorđe", None, "đorđe", "dorde", "dorde", "dorde"),
+            // A letter outside the BMP was kept; .NET's regex cleans it away.
+            (
+                Movie,
+                "\u{20000}大",
+                None,
+                "\u{20000}大",
+                "custom",
+                "大",
+                "custom",
+            ),
             // Jellyfin's keys, and keys no derivation gave: left alone.
             (
                 Movie,
@@ -13961,8 +13973,8 @@ mod tests {
             .expect("value");
         }
 
-        // Five clean names, the two Arabic sort names and Saldaña's clean value.
-        assert_eq!(service.repair_diacritic_folds().await.expect("repair"), 8);
+        // Six clean names, the two Arabic sort names and Saldaña's clean value.
+        assert_eq!(service.repair_diacritic_folds().await.expect("repair"), 9);
         for (id, (_, name, _, _, _, clean, sort)) in ids.into_iter().zip(rows) {
             let stored: (Option<String>, Option<String>) = sqlx::query_as(
                 r#"SELECT "CleanName", "SortName" FROM "BaseItems" WHERE "Id" = ?1"#,

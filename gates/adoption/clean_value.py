@@ -330,9 +330,12 @@ def get_clean_value(value):
     if not value.strip():
         return value  # empty or all whitespace is returned unchanged, as in Rust
     cleaned = lower_invariant(remove_diacritics(value))
-    # [^\p{L}\p{N}\s] -> ' ', then collapse whitespace runs and trim.
+    # [^\p{L}\p{N}\s] -> ' ', then collapse whitespace runs and trim. .NET matches UTF-16 units, so a
+    # character outside the BMP (two surrogates) is never a letter or a number.
     spaced = "".join(
-        ch if (unicodedata.category(ch)[0] in ("L", "N") or ch.isspace()) else " "
+        ch
+        if ord(ch) <= 0xFFFF and (unicodedata.category(ch)[0] in ("L", "N") or ch.isspace())
+        else " "
         for ch in cleaned
     )
     return " ".join(spaced.split())

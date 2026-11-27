@@ -15,8 +15,15 @@ use regex::Regex;
 use unicode_normalization::UnicodeNormalization;
 
 /// C# `@"[^\p{L}\p{N}\s]"` in `GetCleanValue` — anything that is not a Unicode
-/// letter, number or whitespace.
+/// letter, number or whitespace. .NET matches it against UTF-16 units, so a
+/// character outside the Basic Multilingual Plane, two surrogates of category
+/// `Cs`, never counts as a letter or a number.
 static NOT_LETTER_DIGIT_SPACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[^\p{L}\p{N}\s]|[\x{10000}-\x{10FFFF}]").expect("valid regex"));
+
+/// [`NOT_LETTER_DIGIT_SPACE`] as builds before gl-1908 matched it, by code
+/// point, for [`get_clean_value_nfd`].
+static NOT_LETTER_DIGIT_SPACE_BY_CODE_POINT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[^\p{L}\p{N}\s]").expect("valid regex"));
 
 /// C# `@"\s+"` in `GetCleanValue` — a run of whitespace to collapse.
@@ -571,28 +578,36 @@ pub fn truncate_at_null(text: &str) -> &str {
 /// *Letter* category, which excludes combining marks (`Mn`/`Mc`) that
 /// [`char::is_alphabetic`] would keep — a Devanagari vowel sign is replaced by
 /// a space here exactly as .NET does it, and so is a combining mark the
-/// diacritic fold keeps (`Saldan\u{303}a` stores as `saldan a`).
+/// diacritic fold keeps (`Saldan\u{303}a` stores as `saldan a`). A character
+/// outside the Basic Multilingual Plane is a space too, letter or not: .NET's
+/// regex sees its two surrogates (`𠀀大` stores as `大`).
 ///
 /// Returns the original string unchanged if it is empty or all whitespace.
 #[must_use]
 pub fn get_clean_value(value: &str) -> String {
-    clean_value_with(value, remove_diacritics)
+    clean_value_with(value, remove_diacritics, &NOT_LETTER_DIGIT_SPACE)
 }
 
-/// [`get_clean_value`] over [`remove_diacritics_nfd`], the fold builds before
-/// gl-1908 used, kept only so the one-shot repair can recognise the clean
-/// values they stored. Never use it for a new write or a query parameter.
+/// [`get_clean_value`] as builds before gl-1908 derived it: over
+/// [`remove_diacritics_nfd`], with a character outside the Basic Multilingual
+/// Plane kept when it is a letter or a number. Kept only so the one-shot repair
+/// can recognise the clean values they stored. Never use it for a new write or
+/// a query parameter.
 #[must_use]
 pub fn get_clean_value_nfd(value: &str) -> String {
-    clean_value_with(value, remove_diacritics_nfd)
+    clean_value_with(
+        value,
+        remove_diacritics_nfd,
+        &NOT_LETTER_DIGIT_SPACE_BY_CODE_POINT,
+    )
 }
 
-fn clean_value_with(value: &str, fold: fn(&str) -> String) -> String {
+fn clean_value_with(value: &str, fold: fn(&str) -> String, not_word: &Regex) -> String {
     if value.trim().is_empty() {
         return value.to_owned();
     }
     let cleaned = lower_invariant(&fold(value));
-    let cleaned = NOT_LETTER_DIGIT_SPACE.replace_all(&cleaned, " ");
+    let cleaned = not_word.replace_all(&cleaned, " ");
     WHITESPACE_RUN.replace_all(&cleaned, " ").trim().to_owned()
 }
 
@@ -998,6 +1013,13 @@ mod tests {
     #[case("\u{FB2A}לום", "\u{FB2A}לום", "\u{FB2A}לום")]
     #[case("किताब", "किताब", "क त ब")]
     #[case("é\u{301}", "e\u{301}", "e")]
+    // Outside the Basic Multilingual Plane every character is two surrogates
+    // to .NET's regex, so letters and numbers there clean to spaces too.
+    #[case("\u{10400} Zoë", "\u{10400} Zoe", "zoe")]
+    #[case("\u{20000}大", "\u{20000}大", "大")]
+    #[case("\u{1D400}bc", "\u{1D400}bc", "bc")]
+    #[case("a\u{1F600}b", "a\u{1F600}b", "a b")]
+    #[case("x\u{1D7CE}2", "x\u{1D7CE}2", "x 2")]
     fn diacritics_match_jellyfin_12_4(
         #[case] input: &str,
         #[case] removed: &str,
@@ -1018,6 +1040,7 @@ mod tests {
     #[case("\u{212B}", "A", "a")]
     #[case("Gísli Örn Garðarsson", "Gisli Orn Garðarsson", "gisli orn garðarsson")]
     #[case("a\u{FFFD}b", "ab", "ab")]
+    #[case("\u{10400} Zoë", "\u{10400} Zoe", "\u{10428} zoe")]
     fn the_nfd_fold_is_frozen(#[case] input: &str, #[case] removed: &str, #[case] clean: &str) {
         assert_eq!(remove_diacritics_nfd(input), removed, "{input}");
         assert_eq!(get_clean_value_nfd(input), clean, "{input}");
@@ -1135,7 +1158,7 @@ mod tests {
     #[case("H. Jon Benjamin", "h jon benjamin")]
     #[case("Warner Bros. Pictures", "warner bros pictures")]
     #[case("ΟΣ", "οσ")] // simple casing: no final-sigma context
-    #[case("𐐀", "𐐨")]
+    #[case("𐐀", "")] // .NET's regex sees two surrogates, neither a letter
     #[case("Béla   Tarr!!", "bela tarr")] // fold, lowercase, punctuation to space, collapse
     #[case("A,B;C", "a b c")]
     #[case(

@@ -14,7 +14,7 @@ CLEAN_VALUE = [
     ("H. Jon Benjamin", "h jon benjamin"),
     ("Warner Bros. Pictures", "warner bros pictures"),
     ("ΟΣ", "οσ"),  # simple casing: no final-sigma context
-    ("𐐀", "𐐨"),
+    ("𐐀", ""),  # .NET's regex sees two surrogates, neither a letter
     ("Béla   Tarr!!", "bela tarr"),
     ("A,B;C", "a b c"),
     ("Spider-Man: Across the Spider-Verse", "spider man across the spider verse"),
@@ -65,6 +65,9 @@ JELLYFIN_12_4 = [
     ("\uf900", "\uf900", "\uf900"),
     ("\u0915\u093f\u0924\u093e\u092c", "\u0915\u093f\u0924\u093e\u092c", "\u0915 \u0924 \u092c"),
     ("\u00e9\u0301", "e\u0301", "e"),
+    ("\U00010400 Zo\u00eb", "\U00010400 Zoe", "zoe"),  # outside the BMP: two surrogates
+    ("\U00020000\u5927", "\U00020000\u5927", "\u5927"),
+    ("a\U0001f600b", "a\U0001f600b", "a b"),
 ]
 
 # The lower half of `invariant_casing` (input -> lower), the cases that exercise simple casing.
