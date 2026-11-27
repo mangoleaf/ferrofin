@@ -1930,8 +1930,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    (BuildLeafIsPlayedFilter), src/Jellyfin.Database/\
                    Jellyfin.Database.Implementations/DescendantQueryHelper.cs \
                    (GetAllDescendantIds) and MediaBrowser.Controller/Entities/Folder.cs \
-                   (IsPlayed)",
-        date: "2026-11-20",
+                   (IsPlayed). And the played state of a folder's played/total counts \
+                   (UnplayedItemCount, PlayedPercentage, Played): item_count_service.rs \
+                   get_played_and_total_count_batch (folder_played_count_query, and \
+                   WHOLE_SERVER_PLAYED_COUNT_SQL for the AggregateFolder), \
+                   get_played_and_total_count and \
+                   get_played_and_total_count_from_linked_children (translate_query.rs \
+                   build_leaf_played_and_total_query), each leaf through push_is_played_by, \
+                   compared with Jellyfin.Server.Implementations/Item/ItemCountService.cs \
+                   (GetPlayedAndTotalCountBatch, GetPlayedAndTotalCountFromQuery) and \
+                   DescendantQueryHelper.cs (IsPlayedBy, PlayedStateBy); which leaves are \
+                   counted is not part of this row",
+        date: "2026-11-26",
         divergences: &[
             "After a scan or boot-repair fold, which upstream does not have (it deletes the \
              duplicate, and ReconcileUserDataAsync gives the user's rows the most recent play when \
@@ -7637,10 +7647,6 @@ const RESUME_DIVERGENCES: &[&str] = &[
     "BuildHasDescendantFilter's LinkedChildren arm is not emitted: the only folder kinds \
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",
-    "A resumable Series or Season row's UnplayedItemCount / PlayedPercentage / Played \
-     count each leaf's own played row; v12.4's ItemCountService counts a leaf played \
-     through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
-     alternate-version arm in item_count_service's played statements (gl-441).",
     "Resume positions that Ferrofin builds before gl-46 saved for songs and for Sample, \
      ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
      until they are played again; new plays no longer save one. Fix path: gl-717.",

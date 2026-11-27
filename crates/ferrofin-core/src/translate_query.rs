@@ -352,11 +352,9 @@ pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuild
 /// over the rows `filter` matches: `SELECT COUNT(*), <played count>` in one
 /// statement over the row set of [`QueryShape::Count`] (ungrouped, no order),
 /// each row's played state tested beside it as upstream's
-/// `Select(IsPlayedBy(userId))` and `Count(isPlayed => isPlayed)` test it.
-/// The played test is [`push_leaf_is_played_per_row`], the leaf rule of the
-/// `IsPlayed` filter (`BuildLeafIsPlayedFilter`) rather than `IsPlayedBy`, as
-/// the per-item count has always read it. With no user on `filter`, nothing is
-/// played.
+/// `Select(IsPlayedBy(userId))` and `Count(isPlayed => isPlayed)` test it
+/// ([`push_is_played_by`], the rule of the batch counts too). With no user on
+/// `filter`, nothing is played.
 ///
 /// For the per-item folder counts, whose `filter` holds countable leaves
 /// (`IsFolder = false`) below one anchored `DescendantOfId` closure: the test
@@ -373,7 +371,7 @@ pub(crate) fn build_leaf_played_and_total_query(
     match filter.user_id() {
         Some(user_id) => {
             qb.push("COUNT(CASE WHEN ");
-            push_leaf_is_played_per_row(&mut qb, "bi", &guid_to_db(user_id));
+            push_is_played_by(&mut qb, r#"bi."Id""#, &guid_to_db(user_id));
             qb.push(" THEN 1 END)");
         }
         None => {
@@ -2423,17 +2421,12 @@ fn push_version_group_played(qb: &mut QueryBuilder<Sqlite>, user_id: &str) {
 /// watch history.
 ///
 /// Only for small anchored row sets, where the lists cost more to build than
-/// the rows cost to test: one folder's closure
-/// ([`build_leaf_played_and_total_query`]), one folder's descendants or
-/// children ([`build_is_played_query`]) and the newest series' recent
-/// episodes ([`build_latest_tv_episodes_query`]). The folder count was run
-/// alone, outside the server, on a copy of the bench corpus database (a 4,031-row
-/// history): for a 39-leaf series the list-form played count took 0.33 ms,
-/// and one statement counting both this way 0.06 ms. On folders of 3,001 and
-/// 7,490 leaves the one statement measured within 5 % in either form, since
-/// reading the closure is most of its cost; what those folders gain is
-/// reading it once, not twice. The `IsPlayed` filter and sort keys elsewhere
-/// keep the list form, which suits the large result sets they range over.
+/// the rows cost to test: one folder's descendants or children
+/// ([`build_is_played_query`]) and the newest series' recent episodes
+/// ([`build_latest_tv_episodes_query`]); the counts' per-row test,
+/// [`push_is_played_by`], is per row for the same reason. The `IsPlayed`
+/// filter and sort keys elsewhere keep the list form, which suits the large
+/// result sets they range over.
 fn push_leaf_is_played_per_row(qb: &mut QueryBuilder<Sqlite>, alias: &str, user_id: &str) {
     qb.push(format!(
         r#"(EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = {alias}."Id" AND ud."UserId" = "#
@@ -2448,6 +2441,39 @@ fn push_leaf_is_played_per_row(qb: &mut QueryBuilder<Sqlite>, alias: &str, user_
     ));
     push_version_group_played(qb, user_id);
     qb.push(")))");
+}
+
+/// v12.4 `DescendantQueryHelper.IsPlayedBy` on the row whose id is `id`, the
+/// played test of every played/total count (`ItemCountService.cs:417, :620,
+/// :738`): a played row of its own, or of a version linked under it
+/// (`LinkedChildren` types 2 and 3). A version listed on its own (its primary
+/// in another library, or gone) is played by its own rows alone, as it
+/// renders (`GetResumeUserDataBatch` leaves a queried version its own data);
+/// the `IsPlayed` filter's [`push_leaf_is_played`] also credits it its
+/// group's plays, as upstream's `BuildLeafIsPlayedFilter` does.
+///
+/// Correlated seeks per row, so the counted rows drive: the leaf's own
+/// `(UserId, Played, ItemId)` rows, then its version links by `ParentId`.
+/// Why per row: with the version-group rule this replaced, measured alone on
+/// a copy of the bench corpus database (a 4,031-row history), a 39-leaf
+/// series' played count alone took 0.33 ms in the list form, against 0.06 ms
+/// for one statement counting both per row.
+/// This rule's own cost on that corpus is unmeasured; the release
+/// measurement reads it.
+pub(crate) fn push_is_played_by(qb: &mut QueryBuilder<Sqlite>, id: &str, user_id: &str) {
+    qb.push(format!(
+        r#"(EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = {id} AND ud."UserId" = "#
+    ))
+    .push_bind(user_id.to_owned())
+    // `CROSS JOIN`: the item's few links stay the outer loop, never the
+    // user's played rows.
+    .push(format!(
+        r#" AND ud."Played" = 1) OR EXISTS (SELECT 1 FROM "LinkedChildren" vl CROSS JOIN "UserData" vu ON vu."ItemId" = vl."ChildId" WHERE vl."ParentId" = {id} AND vl."ChildType" IN ({}, {}) AND vu."UserId" = "#,
+        i32::from(LinkedChildType::LocalAlternateVersion),
+        i32::from(LinkedChildType::LinkedAlternateVersion)
+    ))
+    .push_bind(user_id.to_owned())
+    .push(r#" AND vu."Played" = 1))"#);
 }
 
 /// The ids [`push_leaf_is_played`] holds for, as one uncorrelated list: the
