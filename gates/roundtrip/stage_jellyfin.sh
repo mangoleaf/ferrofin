@@ -30,6 +30,7 @@ jellyfin_start() {
       else why+=("$(rt_not_up "$name" "$READY_TIMEOUT")"); fi
     fi
   else
+    # the start error's first 300 bytes: docker's reason, short enough for the route's line
     why+=("did not start: $(head -c 300 "$dst/$role-start.err")")
   fi
   [ -s "$dst/$role-start.err" ] || rm -f -- "$dst/$role-start.err"

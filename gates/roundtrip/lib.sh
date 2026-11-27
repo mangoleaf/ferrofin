@@ -108,6 +108,7 @@ rt_run_once() {
 rt_wait_up() {
   local name=$1 port=$2 deadline=$((SECONDS + $3)) give_up=${4:-} log
   while [ "$SECONDS" -lt "$deadline" ]; do
+    # 5 s per probe: a server that answers does so in milliseconds, and one that hangs is polled again
     curl -sf --max-time 5 "http://127.0.0.1:$port/System/Ping" >/dev/null &&
       curl -sf --max-time 5 "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0
     [ "$(rt_docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] || return 1

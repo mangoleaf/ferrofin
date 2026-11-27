@@ -141,6 +141,7 @@ def errors(log, earlier=None):
     if not unexpected:
         return []
     more = f"; and {len(unexpected) - MAX_SHOWN} more" if len(unexpected) > MAX_SHOWN else ""
+    # 200 characters of each error: its level, source and the start of its message, not a whole stack
     return [f"{len(unexpected)} unexpected error(s): {'; '.join(e[:200] for e in unexpected[:MAX_SHOWN])}{more}"]
 
 

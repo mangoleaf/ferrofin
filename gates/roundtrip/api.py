@@ -128,7 +128,7 @@ def main(argv=None):
     parser.add_argument("mode", choices=("scan", "settle", "refresh-playlists"))
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--data-dir", required=True)
-    parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--timeout", type=float, default=600)   # seconds a wait may take; the stages pass SCAN_TIMEOUT
     args = parser.parse_args(argv)
     try:
         server = Server(args.base_url, args.data_dir)

@@ -182,7 +182,7 @@ def main(argv=None):
     parser.add_argument("--data-dir")
     parser.add_argument("--out")
     parser.add_argument("--ferrofin")
-    parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--timeout", type=float, default=600)   # seconds a guide refresh may take; the stages pass SCAN_TIMEOUT
     args = parser.parse_args(argv)
     if args.mode == "fixture":
         fixture(args.directory)

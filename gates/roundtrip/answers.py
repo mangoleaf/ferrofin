@@ -143,6 +143,7 @@ def smoke_user(data_dir):
 def smoke_auth(data_dir, account=None):
     """The Authorization header of that account's (or `account`'s) own web session, as smoke.sh sends it."""
     _, token, device, _ = smoke_credentials(data_dir, account)
+    # Version: the client version smoke.sh sends for a web session (gates/adoption/smoke.sh USERH)
     return f'MediaBrowser Token="{token}", Client="Jellyfin Web", Device="Chrome", DeviceId="{device}", Version="10.11.8"'
 
 
@@ -377,6 +378,7 @@ def stream_lines(server, user_id):
         error.close()
     except (OSError, http.client.HTTPException) as error:
         raise api.CheckError(f"GET /Videos/<id>/stream: no answer ({type(error).__name__})") from None
+    # 16 hex digits of the hash: enough to tell two files apart on one line
     return [f"stream {found[0].get('Name')} {status} bytes={len(body)} sha256={hashlib.sha256(body).hexdigest()[:16]}"]
 
 
