@@ -3601,13 +3601,17 @@ const REMOTE_IMAGES_DIVERGENCES: &[&str] = remote_image_provider_divergences!(
      23 clear art, which TheTVDB's own Kodi scraper numbers the other way round; not yet \
      confirmed against /artwork/types), where the plugin maps each by its name through \
      /artwork/types. Fix path: gl-1856.",
-    "TheTVDB's lookups follow plugin 5c4592f, but for a season's or an episode's own Tvdb id, \
-     which they look up first as v24 does (228f7b3), and differ from 5c4592f only where a \
-     request fails or TheTVDB's data is unusual: a series' artwork comes from \
-     /series/{id}/extended rather than /series/{id}/artworks, a failed display-order season \
-     falls back to the aired one where the plugin answers none, a season's type is matched \
-     ignoring case, an episode row must match its numbers, an artwork language TheTVDB's \
-     /languages does not list is kept, and artwork with no URL is dropped. Fix path: gl-2003.",
+    "TheTVDB's lookups differ from plugin v24 where a request fails or TheTVDB's data is \
+     unusual: a series' artwork comes from /series/{id}/extended rather than \
+     /series/{id}/artworks; a season whose request fails (by its own Tvdb id or not), or a \
+     display-order season the series does not list, falls back to the aired one where the \
+     plugin answers none; a season's type is matched ignoring case; an episode row must match \
+     its numbers; and an artwork language TheTVDB's /languages does not list is kept. Fix \
+     path: gl-2003.",
+    "TheTVDB's image URLs are not validated as the plugin's are: one that is not an absolute \
+     http(s) URL naming a file (such as TheTVDB's image base URL, answered for a record \
+     without an image) is offered, and a thumbnail URL like it passed on, where the plugin \
+     drops the image and nulls the thumbnail (b2996a3). Fix path: gl-2003.",
     "TheTVDB's series artwork carries its score as CommunityRating and keeps a missing width \
      or height unknown, so it is ordered by score within each language, where the plugin \
      sets no rating and 0 (owner decision 2026-11-19, gl-1873).",
@@ -7920,11 +7924,10 @@ pub const VERIFIED: &[Verified] = &[
                preview, the dimensions only at the original size, vote average and count, \
                GetImageLanguage with the region added only when it contradicts the request \
                and \"\" for an untagged image, a languaged backdrop as a Thumb, RatingType \
-               Score), tvdb_images and tvdb.rs (jellyfin-plugin-tvdb 5c4592f \
-               TvdbSeriesImageProvider; TvdbSeasonImageProvider and TvdbEpisodeImageProvider \
-               as v24's 228f7b3 has them, by the item's own Tvdb id, else by its numbers in \
-               the series' display order, a season's art else the aired season's; no \
-               IHasOrder so 50; \
+               Score), tvdb_images and tvdb.rs (jellyfin-plugin-tvdb v24 \
+               TvdbSeriesImageProvider, TvdbSeasonImageProvider and TvdbEpisodeImageProvider, \
+               a season or an episode by its own Tvdb id, else by its numbers in the series' \
+               display order, a season's art else the aired season's; no IHasOrder so 50; \
                tvdb_image_language, NormalizeToJellyfin's culture match and its zhtw, pt and \
                por overrides), fanart_images and fanart_season_images through fanart.rs \
                (jellyfin-plugin-fanart 15, the release Jellyfin 12.4's plugin catalogue \

@@ -2458,7 +2458,8 @@ impl LocalProviderManager {
     /// SeriesProviderIds`): the series row's, or — identifying — the chosen
     /// result's (`ApplySearchResult`, `:272-293`). TheMovieDb's needs the
     /// series' `Tmdb` id and never searches (`TmdbSeasonProvider.cs:49-56`).
-    /// TheTVDB's needs the series' `Tvdb` id.
+    /// TheTVDB's needs the series' `Tvdb` id when the season has none of
+    /// its own (below).
     /// Neither provider declares an `IHasOrder`, so the library's saved
     /// order ranks them and registration — TheTVDB first, a plugin in
     /// Jellyfin, whose plugins register before the server's providers
@@ -5378,17 +5379,18 @@ fn refresh_target_of(
     let series_id = Uuid::parse_str(&series.id).ok();
     let number = |v: Option<i64>| v.and_then(|n| i32::try_from(n).ok());
     if kind == "Season" {
-        // The season providers resolve by the series' ids alone, never by
-        // its name (`TmdbSeasonProvider.cs:49-56`, `TvdbSeasonProvider.cs:
-        // 55-62`).
+        // The season providers resolve by ids, never by the series' name
+        // (`TmdbSeasonProvider.cs:49-56`, `TvdbSeasonProvider.cs:55-62`):
+        // the series', and TheTVDB's by the season's own `Tvdb` id first.
         return Some(RefreshTarget::Season {
             series_id,
             season_number: number(entity.index_number)?,
         });
     }
     // Episode: `parent_index_number` is the season, `index_number` the
-    // episode within it. The episode providers resolve by the series' ids
-    // alone, never by its name.
+    // episode within it. The episode providers resolve by ids, never by the
+    // series' name: the series', and TheTVDB's by the episode's own `Tvdb`
+    // id first.
     Some(RefreshTarget::Episode {
         series_id,
         season_number: number(entity.parent_index_number)?,
