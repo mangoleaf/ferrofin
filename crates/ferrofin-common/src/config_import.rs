@@ -25,7 +25,10 @@
 //! an entry of a collection whose default is empty — the value has to be
 //! inferred from the element itself, and XML alone cannot say whether
 //! `<Foo />` means `""` or `[]`. Instead of guessing once, the import tries the
-//! `READINGS` in order and keeps the first that `T` accepts.
+//! `READINGS` in order and keeps the first that `T` accepts. Within a reading, a
+//! member `T` refuses as the number or bool its text was read as (a `ZipCode`
+//! of `02134` in a string member) is read as its text, in every entry of its
+//! list, and `T` asked again (gl-1965).
 //!
 //! ## The rest of `config/`
 //!
@@ -351,7 +354,7 @@ where
         let value = convert(schema, child, reading);
         let mut candidate = obj.clone();
         candidate.insert(child.name.clone(), value);
-        match serde_json::from_value::<T>(Value::Object(candidate.clone())) {
+        match from_candidate::<T>(&mut candidate, child) {
             // A name that differs from ours only in casing deserializes
             // without error and is then silently dropped, so an unfamiliar name
             // has to survive a round trip before it counts as imported. This
@@ -373,6 +376,122 @@ where
         }
     }
     last_error.map(|e| Accepted::Rejected(e.to_string()))
+}
+
+/// Deserializes `candidate` as `T`. Where `T` rejects a number or a bool a
+/// member's text was read as, the member is read as that text instead and `T`
+/// asked again (gl-1965): an entry of a list whose default is empty has no
+/// schema, so a US `ZipCode` (`02134`) or a station id is guessed a number its
+/// string member refuses, and with it the whole list. The text is the
+/// element's own, so a leading zero survives, and the member is read as text
+/// in every entry of its list at once, so the retries grow with the members a
+/// document has, not with its entries. A member its text does not fit either
+/// reports the error its number or bool met.
+fn from_candidate<T: DeserializeOwned>(
+    candidate: &mut Map<String, Value>,
+    child: &Node,
+) -> Result<T, serde_json::Error> {
+    let mut whole = Value::Object(std::mem::take(candidate));
+    // The error each member read as text first met, by its path with list
+    // indices left out.
+    let mut first_errors: std::collections::HashMap<String, serde_json::Error> =
+        std::collections::HashMap::new();
+    let result = loop {
+        match serde_path_to_error::deserialize::<_, T>(&whole) {
+            Ok(parsed) => break Ok(parsed),
+            Err(err) => {
+                let member = member_path(err.path());
+                if let Some(first) = first_errors.remove(&member) {
+                    break Err(first);
+                }
+                let Value::Object(members) = &mut whole else {
+                    break Err(err.into_inner());
+                };
+                if !as_text(members, child, err.path()) {
+                    break Err(err.into_inner());
+                }
+                first_errors.insert(member, err.into_inner());
+            }
+        }
+    };
+    if let Value::Object(members) = whole {
+        *candidate = members;
+    }
+    result
+}
+
+/// `path` with its list indices left out: the member it names in every entry.
+fn member_path(path: &serde_path_to_error::Path) -> String {
+    use serde_path_to_error::Segment;
+    path.iter()
+        .map(|segment| match segment {
+            Segment::Seq { .. } => "[]".to_owned(),
+            Segment::Map { key } => format!(".{key}"),
+            Segment::Enum { variant } => format!("::{variant}"),
+            Segment::Unknown => "?".to_owned(),
+        })
+        .collect()
+}
+
+/// Reads as its element's text the number or bool at `path` (whose first
+/// segment is `child`'s member), and at the same member of every other entry
+/// of the lists on the way; `false` when that reads nothing: `path` names a
+/// value from the default, an object or a list, a nil element, or a string
+/// already.
+fn as_text(
+    candidate: &mut Map<String, Value>,
+    child: &Node,
+    path: &serde_path_to_error::Path,
+) -> bool {
+    use serde_path_to_error::Segment;
+    let segments: Vec<&Segment> = path.iter().collect();
+    let [Segment::Map { key }, rest @ ..] = segments.as_slice() else {
+        return false;
+    };
+    if *key != child.name {
+        return false;
+    }
+    candidate
+        .get_mut(&child.name)
+        .is_some_and(|value| as_text_at(value, child, rest))
+}
+
+/// [`as_text`] below `value`, read from `node`, along `rest`.
+fn as_text_at(value: &mut Value, node: &Node, rest: &[&serde_path_to_error::Segment]) -> bool {
+    use serde_path_to_error::Segment;
+    let Some((segment, deeper)) = rest.split_first() else {
+        if node.nil
+            || !node.children.is_empty()
+            || !matches!(value, Value::Number(_) | Value::Bool(_))
+        {
+            return false;
+        }
+        *value = Value::String(node.text.clone());
+        return true;
+    };
+    match (segment, value) {
+        // `convert` maps a list's elements to its entries in order; the
+        // member is read as text in each of them.
+        (Segment::Seq { .. }, Value::Array(items)) => {
+            let mut read = false;
+            for (item, element) in items.iter_mut().zip(&node.children) {
+                read |= as_text_at(item, element, deeper);
+            }
+            read
+        }
+        // An object's members come from the children they are named for, the
+        // last of a repeated name winning.
+        (Segment::Map { key }, Value::Object(members)) => {
+            match (
+                members.get_mut(key),
+                node.children.iter().rev().find(|c| &c.name == key),
+            ) {
+                (Some(inner), Some(element)) => as_text_at(inner, element, deeper),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Whether `field` is still present once `parsed` is serialized again.
@@ -627,6 +746,178 @@ mod tests {
         let node = super::parse("<Name><![CDATA[  keep spaces  ]]></Name>").expect("CDATA");
         assert_eq!(node.text, "  keep spaces  ");
         assert!(super::parse("<Name>&missing;</Name>").is_err());
+    }
+
+    /// Entries of a list whose default is empty have no schema, so their
+    /// members are guessed from their text. A member `T` types as a string
+    /// keeps its text when the guess made it a number or a bool, the leading
+    /// zero of `02134` included, beside members that are numbers and bools
+    /// (gl-1965).
+    #[test]
+    fn a_guessed_scalar_a_string_member_rejects_is_read_as_its_text() {
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Entry {
+            enabled: bool,
+            zip: Option<String>,
+            count: i32,
+            label: String,
+            pairs: Vec<Pair>,
+        }
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Pair {
+            name: Option<String>,
+            value: Option<String>,
+        }
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Doc {
+            entries: Vec<Entry>,
+        }
+        let xml = "<Doc><Entries>\
+                   <Entry><Enabled>true</Enabled><Zip>02134</Zip><Count>3</Count>\
+                   <Label>false</Label><Pairs><Pair><Name>1</Name><Value>2.5</Value></Pair>\
+                   <Pair><Name>a</Name><Value>b</Value></Pair></Pairs></Entry>\
+                   <Entry><Enabled>false</Enabled><Zip>90210</Zip><Count>0</Count></Entry>\
+                   </Entries></Doc>";
+        let doc: Doc = super::import_over(&Doc::default(), xml, "Doc", &[]).expect("imports");
+        assert_eq!(doc.entries.len(), 2, "{doc:?}");
+        let first = &doc.entries[0];
+        assert!(first.enabled);
+        assert_eq!(first.zip.as_deref(), Some("02134"));
+        assert_eq!(first.count, 3);
+        assert_eq!(first.label, "false");
+        assert_eq!(first.pairs[0].name.as_deref(), Some("1"));
+        assert_eq!(first.pairs[0].value.as_deref(), Some("2.5"));
+        assert_eq!(doc.entries[1].zip.as_deref(), Some("90210"));
+        assert!(!doc.entries[1].enabled);
+    }
+
+    /// A number read as text and still refused (an `i32` member given `1.5`)
+    /// is rejected with the error the number met, and the field keeps its
+    /// default.
+    #[test]
+    fn a_member_its_text_does_not_fit_either_is_rejected() {
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Entry {
+            count: i32,
+        }
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Doc {
+            entries: Vec<Entry>,
+        }
+        let xml = "<Doc><Entries><Entry><Count>1.5</Count></Entry>\
+                   <Entry><Count>1</Count></Entry></Entries></Doc>";
+        let doc: Doc = super::import_over(&Doc::default(), xml, "Doc", &[]).expect("imports");
+        assert_eq!(doc, Doc::default(), "the field keeps its default");
+        let mut candidate = serde_json::Map::new();
+        let node = super::parse(xml).expect("xml");
+        let entries = &node.children[0];
+        candidate.insert(
+            "Entries".to_owned(),
+            super::convert(&serde_json::Value::Null, entries, super::Reading::Inferred),
+        );
+        let err = super::from_candidate::<Doc>(&mut candidate, entries).expect_err("refused");
+        assert!(err.to_string().contains("floating point"), "{err}");
+    }
+
+    /// Text read into a list of strings, a repeated element (the last wins)
+    /// and a nil one: each keeps what `convert` gives it.
+    #[test]
+    fn a_number_in_a_string_list_and_a_repeated_member_read_as_text() {
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Entry {
+            tags: Vec<String>,
+            zip: Option<String>,
+            note: Option<String>,
+            kind: String,
+        }
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Doc {
+            entries: Vec<Entry>,
+        }
+        let xml = "<Doc xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"><Entries><Entry>\
+                   <Tags><string>1080</string><string>hd</string></Tags>\
+                   <Kind>a</Kind><Zip>1</Zip><Zip>02</Zip><Note xsi:nil=\"true\" />\
+                   </Entry></Entries></Doc>";
+        let doc: Doc = super::import_over(&Doc::default(), xml, "Doc", &[]).expect("imports");
+        let [entry] = doc.entries.as_slice() else {
+            panic!("expected one entry, got {doc:?}");
+        };
+        assert_eq!(entry.tags, ["1080", "hd"]);
+        assert_eq!(
+            entry.zip.as_deref(),
+            Some("02"),
+            "the last of a repeated name"
+        );
+        assert_eq!(entry.note, None);
+        assert_eq!(entry.kind, "a");
+    }
+
+    /// A thousand entries with numeric-looking members import, each member
+    /// read as text in every entry at once (about 30 ms in a debug build).
+    #[test]
+    fn a_thousand_numeric_mappings_import() {
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Pair {
+            name: Option<String>,
+            value: Option<String>,
+        }
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Entry {
+            enabled: bool,
+            mappings: Vec<Pair>,
+        }
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Doc {
+            entries: Vec<Entry>,
+        }
+        let mut pairs = String::new();
+        for i in 0..1000 {
+            use std::fmt::Write as _;
+            let _ = write!(
+                pairs,
+                "<Pair><Name>{i}.1</Name><Value>{}</Value></Pair>",
+                20000 + i
+            );
+        }
+        let xml = format!(
+            "<Doc><Entries><Entry><Enabled>true</Enabled><Mappings>{pairs}</Mappings>\
+             </Entry></Entries></Doc>"
+        );
+        let doc: Doc = super::import_over(&Doc::default(), &xml, "Doc", &[]).expect("imports");
+        let mappings = &doc.entries[0].mappings;
+        assert_eq!(mappings.len(), 1000);
+        assert_eq!(mappings[999].name.as_deref(), Some("999.1"));
+        assert_eq!(mappings[999].value.as_deref(), Some("20999"));
+    }
+
+    /// A value no reading of its text fits stays rejected: only a guessed
+    /// number or bool where a string belongs is read as its text.
+    #[test]
+    fn a_member_no_text_fits_is_still_rejected() {
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Entry {
+            count: i32,
+        }
+        #[derive(Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+        #[serde(rename_all = "PascalCase", default)]
+        struct Doc {
+            entries: Vec<Entry>,
+        }
+        let xml = "<Doc><Entries><Entry><Count>many</Count></Entry>\
+                   <Entry><Count>1</Count></Entry></Entries></Doc>";
+        let doc: Doc = super::import_over(&Doc::default(), xml, "Doc", &[]).expect("imports");
+        assert_eq!(doc, Doc::default(), "the field keeps its default");
     }
 
     #[test]
