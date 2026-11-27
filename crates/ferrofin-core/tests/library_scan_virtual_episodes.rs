@@ -133,6 +133,28 @@ impl Fixture {
     }
 }
 
+/// The series' own refresh (`POST /Items/{seriesId}/Refresh`, or the library
+/// monitor's for its folder) is a path-scoped scan, whose closing passes are
+/// the touched ones: it removes the obsolete virtual episodes too.
+#[tokio::test]
+async fn the_series_own_refresh_removes_its_obsolete_virtual_episodes() {
+    let f = Fixture::new().await;
+    let covered = f.add_virtual(Some(1), Some(1), &[]).await;
+    let missing = f.add_virtual(Some(1), Some(2), &[]).await;
+    let series = f
+        .episode
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("series folder");
+
+    f.scanner
+        .scan_paths(&[series.to_string_lossy().into_owned()])
+        .await
+        .expect("series refresh");
+    assert!(!f.exists(covered).await, "S01E01 is on disk");
+    assert!(f.exists(missing).await, "S01E02 is still missing");
+}
+
 #[tokio::test]
 async fn a_series_refresh_removes_its_obsolete_virtual_episodes() {
     let f = Fixture::new().await;

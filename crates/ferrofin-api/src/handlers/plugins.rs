@@ -34,15 +34,15 @@
 //!   none tracked — installs are synchronous)
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use ferrofin_model::plugins::{PluginInfo, PluginManifest, PluginStatus};
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::plugins::PluginDescriptor;
+use ferrofin_traits::plugins::{PluginDescriptor, PluginImageSource};
 use uuid::Uuid;
 
 use crate::auth::RequireAdmin;
@@ -51,6 +51,7 @@ use crate::extract::{
     DotnetGuid, JsonSeqBody, ProblemDetails, Query, RequiredRouteString, RouteParameter,
     blank_route_values,
 };
+use crate::handlers::streaming::serve_static_file_without_ranges;
 use crate::state::AppState;
 
 /// Ports Jellyfin's `RequiresElevation` policy for the plugin-mutating
@@ -217,11 +218,18 @@ async fn get_plugins(
     require_admin(&state, &auth).await?;
     let mut plugins = state.plugins.list_plugins().await?;
     // `PluginsController.GetPlugins` is `_pluginManager.Plugins.OrderBy(p => p.Name)`
-    // (v10.11.8 PluginsController.cs:55-57). Registration order is not the wire
+    // (v12.4 PluginsController.cs:56-58). Registration order is not the wire
     // order: a stock Jellyfin answers AudioDB, MusicBrainz, OMDb, Studio Images,
     // TMDb for the same five plugins Ferrofin registers TMDb-first, and the
-    // dashboard renders the list in the order it arrives.
-    plugins.sort_by(|a, b| a.name.cmp(&b.name));
+    // dashboard renders the list in the order it arrives. `OrderBy` compares
+    // with `string.CompareTo`, in the request's culture, not bytewise.
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    plugins.sort_by(|a, b| {
+        comparer
+            .as_ref()
+            .map_or_else(|| a.name.cmp(&b.name), |c| c.compare(&a.name, &b.name))
+    });
     Ok(Json(plugins.into_iter().map(to_plugin_info).collect()))
 }
 
@@ -384,7 +392,7 @@ async fn disable_plugin(
 /// `DELETE /Plugins/{pluginId}` — uninstall a plugin.
 ///
 /// A staged WASM plugin is really removed. A plugin that reports
-/// `CanUninstall: false` — Jellyfin's five in-tree metadata providers — is
+/// `CanUninstall: false` — Jellyfin's six in-tree metadata providers — is
 /// ignored with a warning and answered `204`, which is what upstream's
 /// `InstallationManager.UninstallPlugin` + `PluginsController` do. A
 /// compiled-in extension (which reports `CanUninstall: true` only to surface
@@ -475,6 +483,7 @@ async fn uninstall_plugin_by_version(
 async fn get_plugin_image(
     State(state): State<AppState>,
     Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
+    request: Request,
 ) -> Result<Response, ApiError> {
     // No auth extractor: this is the ONE action upstream marks
     // `[AllowAnonymous]` (v10.11.8 PluginsController.cs:221), against the
@@ -482,19 +491,35 @@ async fn get_plugin_image(
     if let Some(rejection) = version_rejection(&state, plugin_id, &version).await? {
         return Ok(rejection);
     }
-    match state.plugins.plugin_image(plugin_id).await? {
-        Some(image) => Ok((
-            [
-                (header::CONTENT_TYPE, image.content_type),
-                // `Response.Headers.ContentDisposition = "attachment"` before
-                // the `PhysicalFile(...)`, in both trees.
-                (header::CONTENT_DISPOSITION, "attachment".to_owned()),
-            ],
-            image.data,
-        )
-            .into_response()),
-        None => Err(ApiError::NotFound(format!("image for plugin {plugin_id}"))),
-    }
+    let Some(image) = state.plugins.plugin_image(plugin_id).await? else {
+        return Err(ApiError::NotFound(format!("image for plugin {plugin_id}")));
+    };
+    let mut response = match image.source {
+        // `PhysicalFile(imagePath, MimeTypes.GetMimeType(imagePath))`: the
+        // two-argument overload, so a `Range` is ignored, and the file's
+        // `Last-Modified` answers an `If-Modified-Since` with a `304`.
+        PluginImageSource::File(path) => {
+            let mut response =
+                serve_static_file_without_ranges(&path.to_string_lossy(), request).await?;
+            if let (Some(value), Ok(content_type)) = (
+                response.headers_mut().get_mut(header::CONTENT_TYPE),
+                HeaderValue::from_str(&image.content_type),
+            ) {
+                *value = content_type;
+            }
+            response
+        }
+        PluginImageSource::Bytes(data) => {
+            ([(header::CONTENT_TYPE, image.content_type)], data).into_response()
+        }
+    };
+    // `Response.Headers.ContentDisposition = "attachment"` before either
+    // file result, so a `304` carries it too.
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment"),
+    );
+    Ok(response)
 }
 
 /// `POST /Plugins/{pluginId}/Manifest` — read a plugin's manifest.

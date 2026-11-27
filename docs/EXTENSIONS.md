@@ -286,6 +286,15 @@ without it. It removes none while a `*.wasm` file fails to load or the directory
 listed. A plugin taken out by moving its file away or renaming it to something other than
 `*.wasm` loses its segment output the same way and has to analyse the library again.
 
+**The plugin's image.** A package whose repository entry has an `imageUrl` gets that image
+as its dashboard icon, as on Jellyfin: the install downloads it into the plugin's directory
+(`{config_dir}/plugins/{id}/`), and a catalog fetch downloads it for an installed plugin
+that has none. The start that loads the plugin serves it at `GET /Plugins/{id}/{version}/Image`
+and reports `HasImage`. It is fetched over HTTPS, like the artifact, and as artwork is: no
+private address unless `image_private_http_allow` lists it, no more than
+`image_download_max_mb`, and only an image is kept. A failed download leaves the plugin
+without an icon until a later catalog fetch gets it. Uninstalling the plugin removes it.
+
 **"Disabled" and load.** Enable/disable governs the runtime work — tasks don't run, events
 aren't delivered, and metadata lookups are skipped for a disabled plugin. But a disabled
 plugin's *identity* exports (`descriptor`/`default-config`/`tasks`) still run at every boot,
@@ -316,7 +325,9 @@ that a nested object's default ships comes back after a save that removed it. Gi
 whose entries a user may remove (per-library settings keyed by id, say) an empty default,
 `{}`: an empty object has nothing to fill from and is stored exactly as posted. Jellyfin
 replaces a settable `Dictionary` property outright, but a JSON default cannot tell a map
-from a class, and upstream's nested settings are classes in practice.
+from a class, and upstream's nested settings are classes in practice. A read fills the
+same way, so a configuration saved by an older version of the plugin is read back with the
+keys a newer `default-config` added, nested ones included.
 
 **The sandbox is the point.** A WASM plugin gets *no filesystem, no direct network, no
 environment, no stdio* — its only capabilities are the functions the WIT `host` interface
@@ -534,7 +545,8 @@ and size-capped:
   declare it in their documentation and that you trust. A finer-grained per-plugin
   grant is planned (same status as the egress-`*` UX).
 - **`write-lyrics` / `write-subtitles`** — save a sidecar next to the media file
-  (payload ≤ `FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 MiB). The host sanitizes the
+  (payload ≤ `FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 MiB). A saved subtitle
+  queues the item's refresh, whose probe lists it as a stream. The host sanitizes the
   file name: the format is allowlisted to real lyric/subtitle extensions and the
   language reduced to a plain tag, so a plugin can never choose a path or drop a
   scanner-authoritative file (`.nfo`, `.strm`) next to your media.

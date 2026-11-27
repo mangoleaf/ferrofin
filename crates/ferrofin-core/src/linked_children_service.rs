@@ -193,7 +193,13 @@ impl LinkedChildrenService for FerrofinLinkedChildrenService {
         to_child_id: Uuid,
     ) -> Result<Vec<Uuid>, ServiceError> {
         let _edits = self.entry_edits.lock().await;
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
 
         let affected: Vec<String> = sqlx::query_scalar(
             r#"SELECT DISTINCT "ParentId" FROM "LinkedChildren"

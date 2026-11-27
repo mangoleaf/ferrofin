@@ -297,10 +297,6 @@ impl FerrofinServerConfigurationManager {
     /// The on-disk configuration file name (JSON counterpart of C# `system.xml`).
     pub(crate) const CONFIG_FILE_NAME: &'static str = "system.json";
 
-    /// The subdirectory of the user config dir holding named configs
-    /// (`branding`/`encoding`), matching the `/System/Configuration/{key}` API.
-    pub(crate) const NAMED_SUBDIR: &'static str = "named";
-
     /// The on-disk branding configuration file name (Jellyfin's named
     /// `branding` configuration, stored as a sibling JSON document).
     pub(crate) const BRANDING_FILE_NAME: &'static str = "branding.json";
@@ -351,17 +347,17 @@ impl FerrofinServerConfigurationManager {
             std::path::Path::to_path_buf,
         );
         let config_file = config_dir.join(Self::CONFIG_FILE_NAME);
-        // Named configs (`branding`/`encoding`) are persisted by the
-        // `/System/Configuration/{key}` API under `{user-config-dir}/named/`, so
-        // the typed readers must look there too — reading `{config-dir}/*.json`
-        // silently missed a client-saved config (e.g. NVENC never took effect).
-        let named_dir = user_config_dir.join(Self::NAMED_SUBDIR);
-        let branding_file = named_dir.join(Self::BRANDING_FILE_NAME);
-        let encoding_file = named_dir.join(Self::ENCODING_FILE_NAME);
-        let metadata_file = named_dir.join(Self::METADATA_FILE_NAME);
+        // Named configs are `{config-dir}/{key}.json`, where the
+        // `/System/Configuration/{key}` API saves them, as upstream keeps
+        // `{config-dir}/{key}.xml` (`BaseConfigurationManager.GetConfigurationFile`);
+        // releases before 1.6.0 kept them in `{user-config-dir}/named/`
+        // (`crate::named_configuration_files`).
+        let branding_file = config_dir.join(Self::BRANDING_FILE_NAME);
+        let encoding_file = config_dir.join(Self::ENCODING_FILE_NAME);
+        let metadata_file = config_dir.join(Self::METADATA_FILE_NAME);
 
         // Before `system.json` is written below: see `seed_named_configurations`.
-        seed_named_configurations(&config_dir, &named_dir).await;
+        seed_named_configurations(&config_dir).await;
 
         // No `system.json` means this data directory has never been served by
         // Ferrofin, so it may be a Jellyfin one we are adopting. Jellyfin kept
@@ -427,9 +423,9 @@ impl FerrofinServerConfigurationManager {
             branding_file,
             encoding_file,
             metadata_file,
-            network_file: named_dir.join(Self::NETWORK_FILE_NAME),
-            xbmc_metadata_file: named_dir.join(Self::XBMC_METADATA_FILE_NAME),
-            live_tv_file: named_dir.join(Self::LIVE_TV_FILE_NAME),
+            network_file: config_dir.join(Self::NETWORK_FILE_NAME),
+            xbmc_metadata_file: config_dir.join(Self::XBMC_METADATA_FILE_NAME),
+            live_tv_file: config_dir.join(Self::LIVE_TV_FILE_NAME),
             metadata_warned: std::sync::Mutex::new(None),
             branding_warned: std::sync::Mutex::new(None),
             encoding_warned: std::sync::Mutex::new(None),
@@ -1083,7 +1079,7 @@ where
     Ok(imported)
 }
 
-/// Seeds every named configuration (`named/<key>.json`) from Jellyfin's XML.
+/// Seeds every named configuration (`{config}/<key>.json`) from Jellyfin's XML.
 ///
 /// The named configurations live in their own files and are read on
 /// demand, so adoption has to materialize them or the imported values
@@ -1105,13 +1101,13 @@ where
 /// retried on every boot; the cost of carrying on is that document's settings
 /// until the operator fixes the file. Refusing to start over that would be
 /// worse than the problem.
-async fn seed_named_configurations(config_dir: &std::path::Path, named_dir: &std::path::Path) {
+async fn seed_named_configurations(config_dir: &std::path::Path) {
     let seeds = [
         (
             "encoding",
             seed_named(
                 &config_dir.join("encoding.xml"),
-                &named_dir.join(FerrofinServerConfigurationManager::ENCODING_FILE_NAME),
+                &config_dir.join(FerrofinServerConfigurationManager::ENCODING_FILE_NAME),
                 EncodingOptions::default(),
                 "EncodingOptions",
                 config_import::ENCODING_XML_DENY,
@@ -1122,7 +1118,7 @@ async fn seed_named_configurations(config_dir: &std::path::Path, named_dir: &std
             "branding",
             seed_named(
                 &config_dir.join("branding.xml"),
-                &named_dir.join(FerrofinServerConfigurationManager::BRANDING_FILE_NAME),
+                &config_dir.join(FerrofinServerConfigurationManager::BRANDING_FILE_NAME),
                 BrandingOptions::default(),
                 "BrandingOptions",
                 config_import::BRANDING_XML_DENY,
@@ -1139,7 +1135,7 @@ async fn seed_named_configurations(config_dir: &std::path::Path, named_dir: &std
             "network",
             seed_named(
                 &config_dir.join("network.xml"),
-                &named_dir.join(FerrofinServerConfigurationManager::NETWORK_FILE_NAME),
+                &config_dir.join(FerrofinServerConfigurationManager::NETWORK_FILE_NAME),
                 ferrofin_networking::NetworkConfiguration::default(),
                 "NetworkConfiguration",
                 config_import::NETWORK_XML_DENY,
@@ -1153,7 +1149,7 @@ async fn seed_named_configurations(config_dir: &std::path::Path, named_dir: &std
             "metadata",
             seed_named(
                 &config_dir.join("metadata.xml"),
-                &named_dir.join(FerrofinServerConfigurationManager::METADATA_FILE_NAME),
+                &config_dir.join(FerrofinServerConfigurationManager::METADATA_FILE_NAME),
                 MetadataConfiguration::default(),
                 "MetadataConfiguration",
                 &[],
@@ -1166,7 +1162,7 @@ async fn seed_named_configurations(config_dir: &std::path::Path, named_dir: &std
             "xbmcmetadata",
             seed_named(
                 &config_dir.join("xbmcmetadata.xml"),
-                &named_dir.join(FerrofinServerConfigurationManager::XBMC_METADATA_FILE_NAME),
+                &config_dir.join(FerrofinServerConfigurationManager::XBMC_METADATA_FILE_NAME),
                 ferrofin_model::configuration::XbmcMetadataOptions::default(),
                 "XbmcMetadataOptions",
                 &[],
@@ -1181,7 +1177,7 @@ async fn seed_named_configurations(config_dir: &std::path::Path, named_dir: &std
             "livetv",
             seed_named(
                 &config_dir.join("livetv.xml"),
-                &named_dir.join(FerrofinServerConfigurationManager::LIVE_TV_FILE_NAME),
+                &config_dir.join(FerrofinServerConfigurationManager::LIVE_TV_FILE_NAME),
                 ferrofin_model::live_tv::LiveTvOptions::default(),
                 "LiveTvOptions",
                 config_import::LIVETV_OPTIONS_XML_DENY,
@@ -1838,7 +1834,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = test_paths(tmp.path());
         let encoding_file =
-            PathBuf::from(paths.user_configuration_directory_path()).join("named/encoding.json");
+            PathBuf::from(paths.configuration_directory_path()).join("encoding.json");
         let first = tmp.path().join("first-transcodes");
         let first_json = serde_json::to_string(&EncodingOptions {
             transcoding_temp_path: Some(first.to_string_lossy().into_owned()),
@@ -2094,8 +2090,6 @@ mod tests {
         let file = tmp
             .path()
             .join("config")
-            .join("users")
-            .join(FerrofinServerConfigurationManager::NAMED_SUBDIR)
             .join(FerrofinServerConfigurationManager::ENCODING_FILE_NAME);
         std::fs::create_dir_all(file.parent().expect("named dir")).expect("named dir");
         std::fs::write(&file, b"{ not json").expect("encoding.json");
@@ -2283,14 +2277,8 @@ mod tests {
             .await
             .expect("load");
 
-        let written = std::fs::read_to_string(
-            tmp.path()
-                .join("config")
-                .join("users")
-                .join("named")
-                .join("network.json"),
-        )
-        .expect("network.json");
+        let written = std::fs::read_to_string(tmp.path().join("config").join("network.json"))
+            .expect("network.json");
         let config: ferrofin_networking::NetworkConfiguration =
             serde_json::from_str(&written).expect("parses back");
 
@@ -2983,11 +2971,7 @@ mod tests {
 
     /// The named JSON document `load` wrote for `key`, parsed.
     fn seeded_named<T: serde::de::DeserializeOwned>(root: &std::path::Path, key: &str) -> T {
-        let path = root
-            .join("config")
-            .join("users")
-            .join("named")
-            .join(format!("{key}.json"));
+        let path = root.join("config").join(format!("{key}.json"));
         let json = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} was not seeded: {e}", path.display()));
         serde_json::from_str(&json).expect("parses back")

@@ -8,8 +8,8 @@
 //! client then asks for thumbnails of them. Decoding a 24 MP photo in full
 //! costs about 72 MB for a 128 px result. The encoder decodes a JPEG at the
 //! smallest DCT scale that still covers its target, which this test sees
-//! through the heap: a counting global allocator records the peak while each
-//! call runs.
+//! through the heap: a counting global allocator records the peak of the
+//! bitmap-sized buffers (`COUNTED_MIN`) while each call runs.
 //!
 //! This binary holds one test, because the allocator counts every thread of
 //! the process and a second test running beside it would show in the peak.
@@ -24,12 +24,25 @@ use ferrofin_traits::drawing::ImageEncoder;
 use ferrofin_traits::options::{ImageCollageOptions, ImageProcessingOptions};
 use image::{Rgb, RgbImage};
 
-/// The system allocator, counting the bytes live now and the most live since
-/// the last [`start_peak`].
+/// The system allocator, counting the bytes live now in buffers of at least
+/// [`COUNTED_MIN`] and the most live since the last [`start_peak`].
 struct CountingAllocator;
 
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// The smallest buffer counted (gl-1980). Every bitmap that would fail a
+/// check is larger. A scaled decode's small buffers depend on thread scheduling:
+/// `jpeg-decoder` sends each MCU row's coefficients (77 KB at most for these
+/// photos) to a thread per colour component over an unbounded channel. On a
+/// loaded host, where those threads fall behind, the queue can hold up to the
+/// whole frame, 2 bytes a sample, which at 4:2:0 is the full bitmap's size.
+const COUNTED_MIN: usize = 256 * 1024;
+
+/// The bytes of a `size`-byte buffer the counters take in.
+fn counted(size: usize) -> usize {
+    if size >= COUNTED_MIN { size } else { 0 }
+}
 
 // SAFETY: every call is forwarded unchanged to `System`; the counters are
 // only arithmetic on the sizes the caller passes.
@@ -38,7 +51,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
         // SAFETY: forwarded with the caller's layout.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() {
-            let live = LIVE.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
+            let size = counted(layout.size());
+            let live = LIVE.fetch_add(size, Ordering::SeqCst) + size;
             PEAK.fetch_max(live, Ordering::SeqCst);
         }
         ptr
@@ -47,19 +61,20 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: forwarded with the pointer and layout the caller allocated.
         unsafe { System.dealloc(ptr, layout) };
-        LIVE.fetch_sub(layout.size(), Ordering::SeqCst);
+        LIVE.fetch_sub(counted(layout.size()), Ordering::SeqCst);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: forwarded with the caller's pointer, layout and size.
         let new = unsafe { System.realloc(ptr, layout, new_size) };
         if !new.is_null() {
-            if new_size >= layout.size() {
-                let grown = new_size - layout.size();
+            let (old_size, new_size) = (counted(layout.size()), counted(new_size));
+            if new_size >= old_size {
+                let grown = new_size - old_size;
                 let live = LIVE.fetch_add(grown, Ordering::SeqCst) + grown;
                 PEAK.fetch_max(live, Ordering::SeqCst);
             } else {
-                LIVE.fetch_sub(layout.size() - new_size, Ordering::SeqCst);
+                LIVE.fetch_sub(old_size - new_size, Ordering::SeqCst);
             }
         }
         new
@@ -154,7 +169,7 @@ async fn a_large_jpeg_is_decoded_no_larger_than_its_output_needs() {
 
     // A full decode alone would hold FULL_BITMAP; the scaled ones hold 1/64
     // (blur hash) and 1/16 (thumbnail) of it plus the resize and encode
-    // buffers.
+    // buffers. The blur hash's are all below `COUNTED_MIN`.
     for (what, peak) in [("blur hash", blur_hash_peak), ("thumbnail", thumbnail_peak)] {
         assert!(
             peak < FULL_BITMAP / 4,

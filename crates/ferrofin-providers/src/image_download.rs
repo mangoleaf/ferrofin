@@ -750,8 +750,8 @@ mod quota_tests {
 mod destination_tests {
     use super::*;
     use crate::destination::{self, DestinationPolicy};
-    use crate::guarded_http::MAX_REDIRECTS;
     use crate::mock_http::MockServer;
+    use ferrofin_util::http_client::MAX_REDIRECTS;
     use rstest::rstest;
     use std::net::IpAddr;
     use std::sync::atomic::Ordering;
@@ -1226,7 +1226,15 @@ pub enum ArtworkDownloadFailure {
     Stop,
 }
 
-pub(crate) async fn download_artwork(url: &str) -> Result<ArtworkDownload, ArtworkDownloadFailure> {
+/// Downloads an image `url` under the server's image limits: no private
+/// address unless the [`ImageDestinations`](crate::destination::ImageDestinations)
+/// let it, no body over `image_download_max_mb`, and nothing that is not an
+/// image. Also how a repository plugin's image is fetched.
+///
+/// # Errors
+/// [`Skip`](ArtworkDownloadFailure::Skip) for a missing, refused or oversized
+/// image, [`Stop`](ArtworkDownloadFailure::Stop) for any other failure.
+pub async fn download_artwork(url: &str) -> Result<ArtworkDownload, ArtworkDownloadFailure> {
     let image = open_image(url).await.map_err(artwork_failure)?;
     let content_type = image.content_type.clone();
     let content_length = image.content_length;

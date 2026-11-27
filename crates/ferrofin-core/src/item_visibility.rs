@@ -180,9 +180,9 @@ impl ItemVisibility {
     }
 
     /// [`Self::visible_item`], with the rows the check read: the item's chain, item
-    /// included, without the placeholder row and with their paths expanded, as
-    /// `ItemRepository::retrieve_item` returns them. A caller takes a row above the item
-    /// from it instead of reading that row again (gl-982).
+    /// included, without the placeholder row or a row of an unknown stored `Type` and with
+    /// their paths expanded, as `ItemRepository::retrieve_item` returns them. A caller takes
+    /// a row above the item from it instead of reading that row again (gl-982).
     ///
     /// # Errors
     /// Returns storage errors or an error for cyclic hierarchy/channel corruption.
@@ -212,6 +212,9 @@ impl ItemVisibility {
         let Some(index) = chain.iter().position(|row| row_id(row) == id) else {
             return Ok(None);
         };
+        if !crate::item_repository::has_known_type(&chain[index]) {
+            return Ok(None);
+        }
         let libraries = self.rating_libraries().await?;
         let context = self
             .load_known(
@@ -232,7 +235,9 @@ impl ItemVisibility {
         // which reads the stored rows.
         let (mut item, mut kept) = if keep_chain {
             let item = chain[index].clone();
-            chain.retain(|row| row_id(row) != placeholder);
+            chain.retain(|row| {
+                row_id(row) != placeholder && crate::item_repository::has_known_type(row)
+            });
             (item, chain)
         } else {
             (chain.swap_remove(index), Vec::new())
@@ -3016,6 +3021,46 @@ mod tests {
             folder_row.path.as_deref(),
             Some("/server/data/livetv/recordings")
         );
+    }
+
+    /// gl-425: `GetItemById(id, user)` finds nothing for a row whose stored `Type` names no
+    /// kind (`DeserializeBaseItem` returns null for it), and the chain handed back leaves such
+    /// an ancestor out, as `retrieve_item` does.
+    #[tokio::test]
+    async fn visible_item_skips_a_row_of_an_unknown_type() {
+        let f = Fixture::new().await;
+        let library = f
+            .item(90, BaseItemKind::CollectionFolder, Some("/media"), None)
+            .await;
+        let mut folder = f
+            .item(
+                91,
+                BaseItemKind::Folder,
+                Some("/media/gone"),
+                Some(&library),
+            )
+            .await;
+        let movie = f
+            .item(
+                92,
+                BaseItemKind::Movie,
+                Some("/media/gone/a.mkv"),
+                Some(&folder),
+            )
+            .await;
+        folder.type_ = "Jellyfin.Plugin.Gone.Folder".to_owned();
+        f.save(&folder).await;
+
+        let gone = f.service.visible_item(row_id(&folder), &f.user).await;
+        assert!(gone.expect("lookup").is_none());
+        let (_, chain) = f
+            .service
+            .visible_item_with_chain(row_id(&movie), &f.user)
+            .await
+            .expect("lookup")
+            .expect("visible");
+        assert!(chain.iter().all(|row| row_id(row) != row_id(&folder)));
+        assert!(chain.iter().any(|row| row_id(row) == row_id(&library)));
     }
 
     /// A layout under a server rooted at `/server` whose library row and root row store
