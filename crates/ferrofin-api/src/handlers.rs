@@ -7270,12 +7270,21 @@ pub const VERIFIED: &[Verified] = &[
                C# HttpError does, except the lookup's 404 (NotFoundAsNullAsync), so a 404 or \
                malformed id falls to the name search; a blank name finds nothing; the phrase \
                search, then artistaccent: for a name with diacritics) and \
-               AudioDbSearchProvider",
-        date: "2026-11-11",
+               AudioDbSearchProvider (AudioDbArtistProvider.GetSearchResults, Order 1: \
+               audiodb.rs search_artists asks artist.php?i= for a non-blank AudioDbArtist \
+               id, else artist-mb.php?i= for artist_mbid, else search.php?s= for a \
+               non-blank name, each answer whole and none falling through to the next; \
+               a failed request fails the provider, as EnsureSuccessStatusCode does, and \
+               a 404 is no artists, where upstream's throw is logged, the same empty \
+               contribution; \
+               audiodb_artist_result is ToRemoteSearchResult: strArtist, strArtistThumb as \
+               given, the strBiographyEN text HTML-stripped or \"\", the non-empty \
+               idArtist and strMusicBrainzID ids, intFormedYear through \
+               NumberStyles.Integer)",
+        date: "2026-11-26",
         divergences: &[
-            "TheAudioDB contributes no artists: v12.4's AudioDbArtistProvider.GetSearchResults \
-         looks the artist up by its AudioDbArtist id, else its MusicBrainz id, else searches \
-         by name. Fix path: gl-497.",
+            "TheAudioDB's answer to a MusicBrainz id is asked for each search; upstream \
+         reads it from the copy GetMetadata keeps on disk for 2 days. Fix path: gl-1987.",
             "A body with no SearchInfo is searched as an empty lookup (200); upstream \
          dereferences the null SearchInfo and answers 500.",
             "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \

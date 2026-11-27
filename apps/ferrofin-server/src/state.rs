@@ -986,8 +986,8 @@ pub async fn build_app_state(
         Arc::new(ferrofin_providers::TmdbPersonSearchProvider::new(
             Arc::clone(&tmdb_client),
         )),
-        // Albums/artists identify against MusicBrainz; TheAudioDb is listed
-        // (selectable by name) but, as in Jellyfin, has no name search.
+        // Albums/artists identify against MusicBrainz and TheAudioDb, which,
+        // as in Jellyfin, finds artists only (its album search is empty).
         Arc::new(ferrofin_providers::MusicBrainzAlbumSearchProvider::new(
             Arc::clone(&musicbrainz_client),
         )),
@@ -996,9 +996,11 @@ pub async fn build_app_state(
         )),
         Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
             ferrofin_model::data::BaseItemKind::MusicAlbum,
+            Arc::clone(&audiodb_client),
         )),
         Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
             ferrofin_model::data::BaseItemKind::MusicArtist,
+            Arc::clone(&audiodb_client),
         )),
     ];
     let item_visibility = Arc::new(
