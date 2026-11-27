@@ -799,11 +799,13 @@ pub trait LibraryManager: Send + Sync {
     }
 
     /// Deletes an item, honoring the given [`DeleteOptions`]. The core
-    /// implementation holds the item's metadata
+    /// implementation holds the item's refresh
+    /// ([`ProviderManager::lock_item_refresh`]) and then its metadata
     /// ([`ProviderManager::lock_item_metadata`]) from before it reads the row
     /// until the delete is done, so a refresh that loaded the row first
-    /// cannot save the deleted item back.
+    /// cannot save the deleted item back or write its images again.
     ///
+    /// [`ProviderManager::lock_item_refresh`]: crate::providers::ProviderManager::lock_item_refresh
     /// [`ProviderManager::lock_item_metadata`]: crate::providers::ProviderManager::lock_item_metadata
     async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError>;
 

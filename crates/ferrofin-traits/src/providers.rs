@@ -292,11 +292,29 @@ pub trait ProviderManager: Send + Sync {
     /// per caller instead. A manager that runs no refresh has nothing to
     /// exclude, so the default holds a lock no one else shares.
     ///
-    /// A delete (`LibraryManager::delete_item`) holds it too, from before it
-    /// reads the row until the delete is done: a refresh's save inserts a row
-    /// that is gone, so one that loaded the row first would bring the
-    /// deleted item back. Upstream has that window; Ferrofin closes it.
+    /// A delete (`LibraryManager::delete_item`) holds it too, after the
+    /// item's refresh lock ([`lock_item_refresh`](Self::lock_item_refresh)),
+    /// from before it reads the row until the delete is done, so no refresh
+    /// saves the deleted item back. Upstream has that window; Ferrofin closes
+    /// it.
     async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        let _ = item_id;
+        std::sync::Arc::new(tokio::sync::Mutex::new(()))
+            .lock_owned()
+            .await
+    }
+
+    /// Holds `item_id`'s refresh. The provider manager's single-item refresh
+    /// holds it from its start to its last save, its fetches and image writes
+    /// included, so two refreshes of one item run one after the other; a
+    /// delete (`LibraryManager::delete_item`) holds it, then
+    /// [`lock_item_metadata`](Self::lock_item_metadata), until the delete is
+    /// done, so no refresh writes the deleted item's images or folder back.
+    /// An edit never takes it. Take it before
+    /// [`lock_item_metadata`](Self::lock_item_metadata), never while holding
+    /// that. The default holds a lock no one else shares, as
+    /// [`lock_item_metadata`](Self::lock_item_metadata)'s does.
+    async fn lock_item_refresh(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         let _ = item_id;
         std::sync::Arc::new(tokio::sync::Mutex::new(()))
             .lock_owned()

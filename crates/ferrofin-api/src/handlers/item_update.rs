@@ -74,8 +74,9 @@ pub(crate) async fn update_item(
 ) -> Result<StatusCode, ApiError> {
     // Upstream edits the cached item a running refresh also holds, so that
     // refresh's save carries the edit. Here each loads its own row: wait out
-    // the provider manager's refresh of this item and the library scan's save
-    // of it, and keep them out until the edit is written.
+    // the save of the provider manager's refresh of this item (never its
+    // fetches) and the library scan's save of it, and keep them out until the
+    // edit is written.
     let metadata = state.providers.lock_item_metadata(item_id).await;
     let mut item = state
         .library

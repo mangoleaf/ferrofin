@@ -292,9 +292,10 @@ async fn a_field_locked_during_the_fetch_is_left_as_stored() {
     );
 }
 
-/// A delete made while the refresh waits for TheMovieDb (the library
-/// manager's delete holds the lock too) is not undone by the refresh's
-/// save: the refresh finds the row gone and stops.
+/// A row deleted while the refresh waits for TheMovieDb, by a writer that
+/// takes only the metadata lock (the library manager's delete waits for the
+/// refresh instead), is not undone by the refresh's save: the refresh finds
+/// the row gone and stops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delete_during_the_fetch_is_not_saved_back() {
     let mut library = Library::scanned().await;

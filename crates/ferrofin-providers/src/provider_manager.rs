@@ -1268,7 +1268,8 @@ pub struct LocalProviderManager {
     item_metadata_locks: Arc<ferrofin_util::keyed_locks::KeyedLocks>,
     /// Per-item locks a single-item refresh holds throughout, so two
     /// refreshes of one item (the queue's and an Identify's) never read and
-    /// save its images over each other; an edit never takes them.
+    /// save its images over each other, and a delete waits for a running one
+    /// ([`ProviderManager::lock_item_refresh`]); an edit never takes them.
     item_refresh_locks: Arc<ferrofin_util::keyed_locks::KeyedLocks>,
     nfo_saver: Option<Arc<crate::nfo_save::NfoSaver>>,
     /// A box set's `collection.xml` and a playlist folder's `playlist.xml`
@@ -2893,11 +2894,7 @@ impl LocalProviderManager {
         let (_refresh, replay_lock) = if replay.is_some() {
             (None, Some(self.lock_item_metadata(item_id).await))
         } else {
-            let key = item_id.to_string();
-            (
-                Some(self.item_refresh_locks.get(&key).lock_owned().await),
-                None,
-            )
+            (Some(self.lock_item_refresh(item_id).await), None)
         };
         // "Identify → Apply": the chosen result's ids become the item's, and
         // they are persisted BEFORE anything else — including every gate and
@@ -3463,7 +3460,8 @@ impl LocalProviderManager {
                     image_saved,
                     failures,
                 };
-                return Box::pin(self.refresh_item(item_id, options, identified, Some(replay))).await;
+                return Box::pin(self.refresh_item(item_id, options, identified, Some(replay)))
+                    .await;
             }
             held
         };
@@ -5828,6 +5826,13 @@ impl ProviderManager for LocalProviderManager {
 
     async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         self.item_metadata_locks
+            .get(&item_id.to_string())
+            .lock_owned()
+            .await
+    }
+
+    async fn lock_item_refresh(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.item_refresh_locks
             .get(&item_id.to_string())
             .lock_owned()
             .await
@@ -14244,8 +14249,9 @@ mod tests {
         }
     }
 
-    /// A refresh holds the item's metadata lock from its load to its save, so
-    /// an edit waits for it and lands on the saved row instead of under it
+    /// A refresh holds the item's metadata lock from its re-read after its
+    /// fetches to its save, so an edit waits for that save and lands on the
+    /// saved row instead of under it
     /// (gl-1852: a box set's edited Overview was lost to the refresh a
     /// membership change had queued).
     #[tokio::test]
