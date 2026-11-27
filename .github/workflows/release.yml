@@ -52,6 +52,22 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - run: cargo deny --locked check advisories
+      # No advisory database covers the libjpeg-turbo the build links (scripts/libjpeg-turbo.sh):
+      # its security fixes are announced in its releases' change logs. A release newer than the
+      # pin is flagged here, and RELEASE.md (step 1) says what to read before tagging.
+      - name: note a libjpeg-turbo release newer than the pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pinned=$(sed -n 's/^VERSION=//p' scripts/libjpeg-turbo.sh)
+          # A failed lookup is a notice too, never a failed job: this step decides nothing.
+          latest=$(gh api repos/libjpeg-turbo/libjpeg-turbo/releases/latest --jq .tag_name) || latest=
+          echo "libjpeg-turbo: pinned $pinned, latest release ${latest:-not found}"
+          if [ -z "$latest" ]; then
+            echo "::warning::could not read libjpeg-turbo's latest release: compare it with the pinned $pinned by hand (RELEASE.md, step 1)"
+          elif [ "$latest" != "$pinned" ]; then
+            echo "::warning::libjpeg-turbo $latest is out and the build pins $pinned: read its change log before tagging (RELEASE.md, step 1)"
+          fi
 
   # ── the manual gate: derive next version, tag, push (mirrors create-release) ──
   create-release:
@@ -336,9 +352,9 @@ jobs:
       # cargo-about writes the third-party notices every archive and the .deb ship; the version ci.yml
       # and the Dockerfile install, built from crates.io as ci.yml does (see the note there).
       - run: cargo install --locked --features cli cargo-about@0.9.3 # the binary needs `cli`
-      # turbojpeg-sys builds its vendored libjpeg-turbo with cmake (on the macOS and
-      # Windows images already). Its x86-64 SIMD is assembled with nasm, which
-      # require-simd makes a hard requirement; aarch64 uses Neon intrinsics.
+      # scripts/libjpeg-turbo.sh (below) builds libjpeg-turbo with cmake (on the macOS and
+      # Windows images already). Its x86-64 SIMD is assembled with nasm, which the script
+      # makes a hard requirement; aarch64 uses Neon intrinsics.
       - if: contains(matrix.target, 'linux')
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
       - if: matrix.target == 'x86_64-pc-windows-msvc'
@@ -347,15 +363,32 @@ jobs:
           choco install nasm --no-progress -y
           echo 'C:\Program Files\NASM' >> "$GITHUB_PATH"
       # Linux builds use zig as the C toolchain, linked against GLIBC_FLOOR (the
-      # aarch64 cross-build also needs it for the C in bundled SQLite, aws-lc-sys
-      # and libjpeg-turbo).
+      # aarch64 cross-build also needs it for the C in bundled SQLite and aws-lc-sys).
+      # Before each build, scripts/libjpeg-turbo.sh builds the libjpeg-turbo the binary
+      # links, from the official release it pins and checks: with the same zig and glibc
+      # floor on Linux, and with the runner's compiler elsewhere.
       - if: contains(matrix.target, 'linux')
         run: |
           # The pair v1.3.2's aarch64 build used; move both together, deliberately.
           pip install cargo-zigbuild==0.23.4 ziglang==0.16.0
+          target="${{ matrix.target }}"
+          scripts/libjpeg-turbo.sh --zig-target "${target/-unknown/}.$GLIBC_FLOOR"
           cargo auditable zigbuild --locked --release -p ferrofin-server --target "${{ matrix.target }}.$GLIBC_FLOOR"
       - if: ${{ !contains(matrix.target, 'linux') }}
-        run: cargo auditable build --locked --release -p ferrofin-server --target ${{ matrix.target }}
+        shell: bash # the script is bash; Windows' default shell is PowerShell
+        run: |
+          # cmake reads the variable: the library is built for the oldest macOS that Rust's
+          # aarch64-apple-darwin target runs on, not for the runner's own. Nothing reads it on
+          # Windows, and the cargo build below does not get it.
+          MACOSX_DEPLOYMENT_TARGET=11.0 scripts/libjpeg-turbo.sh
+          cargo auditable build --locked --release -p ferrofin-server --target ${{ matrix.target }}
+      # What ships must link the pinned libjpeg-turbo, whatever the runner offered.
+      - name: check the linked libjpeg-turbo
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/ferrofin-server"
+          [ -x "$bin" ] || bin="$bin.exe"
+          scripts/libjpeg-turbo.sh --check "$bin"
       # target/THIRD-PARTY-NOTICES.txt, for the .deb and the archive (the image writes its own).
       - name: third-party notices
         shell: bash
