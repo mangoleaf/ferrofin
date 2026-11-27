@@ -28,7 +28,7 @@ mod wal_checkpoints;
 
 pub use database::{
     AdoptionState, DEFAULT_STATEMENT_CACHE_CAPACITY, Database, ImageParentRow,
-    JELLYFIN_GENERATIONS, JellyfinGeneration, MigrationHistory, init_sqlite,
+    JELLYFIN_GENERATIONS, JellyfinGeneration, MigrationHistory, STARTED_KEY, init_sqlite,
     inspect_migration_history, schema_head,
 };
 

@@ -111,9 +111,14 @@ pub async fn run(config: &Config, args: &ExportJellyfinArgs) -> anyhow::Result<(
         .await
         .with_context(nothing_written)?;
     let written = async {
-        let summary =
-            ferrofin_db::export::export_data_dir(&dirs, &DOCKER, &config.database_path(), &partial)
-                .await?;
+        let summary = ferrofin_db::export::export_data_dir(
+            &dirs,
+            &DOCKER,
+            &config.database_path(),
+            &partial,
+            ferrofin_health::build_version(),
+        )
+        .await?;
         let libraries = library_options(config, &summary, libraries).await?;
         configuration.files.extend(libraries.files);
         configuration.not_exported.extend(libraries.not_exported);

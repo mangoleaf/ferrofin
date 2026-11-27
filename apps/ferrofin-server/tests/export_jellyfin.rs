@@ -68,8 +68,23 @@ async fn source(scratch: &Path) -> PathBuf {
         .connect()
         .await
         .unwrap();
-    // Ferrofin's own bookkeeping table: what makes it a Ferrofin database.
-    sqlx::query("CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)")
+    // Ferrofin's own bookkeeping: a Ferrofin database this build's start left,
+    // at its last migration with a start of the server's build recorded, as
+    // the export requires (gl-1910).
+    for statement in [
+        "CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY)",
+        r#"CREATE TABLE "FerrofinMeta" ("Key" TEXT PRIMARY KEY, "Value" TEXT NOT NULL)"#,
+    ] {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+    sqlx::query("INSERT INTO _sqlx_migrations VALUES (?1)")
+        .bind(ferrofin_db::schema_head())
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    sqlx::query(r#"INSERT INTO "FerrofinMeta" VALUES (?1, ?2)"#)
+        .bind(ferrofin_db::STARTED_KEY)
+        .bind(ferrofin_health::build_version())
         .execute(&mut conn)
         .await
         .unwrap();
@@ -284,7 +299,7 @@ async fn export_jellyfin_copies_a_stopped_data_directory_and_leaves_it_untouched
         report.contains("  CertificatePath in config/network.xml: "),
         "{report}"
     );
-    assert!(report.contains("  _sqlx_migrations (0 rows): "), "{report}");
+    assert!(report.contains("  _sqlx_migrations (1 row): "), "{report}");
     assert!(
         report.ends_with("Backups and scheduled tasks:\n  None.\n"),
         "{report}"
@@ -979,6 +994,92 @@ async fn export_jellyfin_refuses_a_database_it_cannot_vouch_for() {
     );
 }
 
+/// Starts a server's state on `config`'s data directory as `ferrofin-server`
+/// does (the database opened, migrated and repaired, then everything wired
+/// and the start-time conversions run by `build_app_state`), after running
+/// `statements` on the opened database, and stops it: its background tasks
+/// and scheduled tasks stopped and every connection closed.
+async fn start(config: &ferrofin_server::config::Config, statements: &[&str]) {
+    let db = ferrofin_server::bootstrap::open_database(config)
+        .await
+        .unwrap();
+    for statement in statements {
+        sqlx::query(sqlx::AssertSqlSafe(*statement))
+            .execute(db.writer())
+            .await
+            .unwrap();
+    }
+    let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
+        ffmpeg: "ffmpeg".into(),
+        ffprobe: "ffprobe".into(),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+        chromaprint_muxer: false,
+    };
+    let (shutdown, _signal) = tokio::sync::oneshot::channel();
+    let wired = ferrofin_server::state::build_app_state(&db, config, &ffmpeg, None, shutdown)
+        .await
+        .unwrap();
+    for task in &wired.background {
+        task.abort();
+    }
+    wired.task_manager.shutdown().await;
+    db.close().await;
+}
+
+/// A start where a start-time conversion failed, warned and carried on
+/// records no start for the export, and drops the record an earlier start of
+/// the same build left: the export refuses the directory until a start runs
+/// every conversion, and takes it once one did (gl-1952). The conversion made
+/// to fail is the `HasSubtitles` backfill (due again, a video stored without
+/// the key, and a trigger refusing the write).
+#[tokio::test]
+async fn export_jellyfin_refuses_a_directory_whose_last_start_had_a_conversion_fail() {
+    let scratch = tempfile::tempdir().unwrap();
+    let source = scratch.path().join("source");
+    let config = ferrofin_server::config::Config {
+        data_dir: source.clone(),
+        config_dir: source.join("config"),
+        cache_dir: source.join("cache"),
+        config_file: source.join("config.toml"),
+        ..ferrofin_server::config::Config::test_stub(&source)
+    };
+    // A clean start records itself.
+    start(&config, &[]).await;
+
+    start(
+        &config,
+        &[
+            r#"DELETE FROM "FerrofinMeta" WHERE "Key" = 'has_subtitles_stored_v160'"#,
+            r#"INSERT INTO "BaseItems" ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked",
+                "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "Data")
+               VALUES ('0E5D2F6A-3B1C-4D7E-8F9A-1B2C3D4E5F60',
+                       'MediaBrowser.Controller.Entities.Movies.Movie', 0, 0, 0, 1, 0, 0, 0,
+                       'Film', '{}')"#,
+            r#"CREATE TRIGGER "refuse_has_subtitles" BEFORE UPDATE OF "Data" ON "BaseItems"
+               WHEN NEW."Data" LIKE '%HasSubtitles%'
+               BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+        ],
+    )
+    .await;
+    let out = scratch.path().join("out");
+    let stderr = refused(&source, &out, || export(&source, &out));
+    assert!(
+        stderr.contains("records no start of this Ferrofin release")
+            && stderr.contains("that got through its start-time conversions"),
+        "{stderr}"
+    );
+
+    // The next start runs it clean and records itself again.
+    start(&config, &[r#"DROP TRIGGER "refuse_has_subtitles""#]).await;
+    let run = export(&source, &out);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
 /// Whether permissions bind this process (they do not bind root): a file
 /// made unreadable cannot be read.
 fn permissions_bind(scratch: &Path) -> bool {
@@ -1181,6 +1282,9 @@ async fn adopted_source(scratch: &Path) -> PathBuf {
         };
         query.execute(db.writer()).await.unwrap();
     }
+    db.record_started(ferrofin_health::build_version())
+        .await
+        .unwrap();
     db.pool().close().await;
     db.writer().close().await;
     source

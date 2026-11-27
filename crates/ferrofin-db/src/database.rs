@@ -30,6 +30,21 @@ pub fn schema_head() -> i64 {
         .map_or(0, |migration| migration.version)
 }
 
+/// The `FerrofinMeta` key holding the build (its `git describe`, the
+/// server's version) of the last start that got through its start-time
+/// conversions and imports ([`Database::record_started`]). The export
+/// refuses a database that records another build, so a data directory is
+/// exported only as this version's start left it (gl-1910).
+///
+/// shortcut: a build stamped with no version (no `FERROFIN_GIT_DESCRIBE` and
+/// no `.git`, such as a plain `docker build .`) reports the crate's
+/// placeholder version, and a local build keeps the describe of the commit it
+/// was first built at, so two such builds can record the same and only the
+/// migration head tells them apart; release builds are always stamped. Stamp
+/// every build, or record a hash of the binary, if an unstamped build ever
+/// has to export.
+pub const STARTED_KEY: &str = "started_by";
+
 /// A `BaseItems` row projected down to what the inherited-images walk and
 /// the Episode/Season/Audio parent blocks of the DTO service read off a
 /// parent: its kind, the three ids the walk follows, the album-artist name
@@ -988,6 +1003,33 @@ impl Database {
             out.extend(query.fetch_all(self.pool()).await?);
         }
         Ok(out)
+    }
+
+    /// Records that a start of `build` (the server's version) got through its
+    /// start-time conversions and imports on this database, under
+    /// [`STARTED_KEY`], which the export requires of the build exporting it.
+    /// Only for a start where every one succeeded: a start where one failed
+    /// (it warned, and runs again at the next start) calls
+    /// [`Database::clear_started`] instead (gl-1952).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the write fails.
+    pub async fn record_started(&self, build: &str) -> Result<()> {
+        self.meta_set(STARTED_KEY, build).await
+    }
+
+    /// Removes the record [`Database::record_started`] left, for a start
+    /// where a start-time conversion failed, so the export refuses the
+    /// database until a start gets through them all (gl-1952).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the write fails.
+    pub async fn clear_started(&self) -> Result<()> {
+        sqlx::query(r#"DELETE FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+            .bind(STARTED_KEY)
+            .execute(&self.writer)
+            .await?;
+        Ok(())
     }
 
     /// Reads a `FerrofinMeta` value (Ferrofin's own key/value table), or [`None`]
@@ -2466,6 +2508,24 @@ pub fn init_sqlite() -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A start's record is written, replaced by a later build's, and removed
+    /// by a start whose conversions did not all succeed (gl-1952); removing
+    /// it again is a no-op.
+    #[tokio::test]
+    async fn a_start_record_is_written_and_cleared() {
+        let db = Database::connect_in_memory().await.expect("memory");
+        db.run_migrations().await.expect("migrate");
+        db.record_started("v1").await.expect("record");
+        db.record_started("v2").await.expect("record again");
+        assert_eq!(
+            db.meta_get(STARTED_KEY).await.expect("read").as_deref(),
+            Some("v2")
+        );
+        db.clear_started().await.expect("clear");
+        db.clear_started().await.expect("clear again");
+        assert_eq!(db.meta_get(STARTED_KEY).await.expect("read"), None);
+    }
 
     /// The gate on the post-migration `foreign_key_check`.
     ///
