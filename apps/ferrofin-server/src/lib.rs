@@ -634,6 +634,10 @@ async fn serve_once(
     // below would give it a passwordless administrator. Checked after the
     // restore, which may have just brought the database back.
     existing_database::ensure_existing_database(config).await?;
+    // Before anything but the listeners reads them, and after the restore,
+    // which may bring an earlier release's back (gl-319).
+    let named_links = ferrofin_core::named_configuration_files::move_legacy(&config.config_dir)
+        .context("could not move the named configurations out of config/users/named")?;
     // Opening/migrating the database, probing ffmpeg and probing `fpcalc` share
     // no state, and all three are dominated by waiting (SQLite I/O; five
     // `ffmpeg`/`ffprobe` spawns; one `fpcalc` spawn). Run them CONCURRENTLY —
@@ -795,6 +799,10 @@ async fn serve_once(
     // The handover: the listeners serving the startup answers serve the
     // lifetime's router from the next request on, and HTTPS starts with it.
     let app = lifetime_app(router, &wired.base_url, https_redirect(&wired));
+    // The links an earlier lifetime left for a previous release serving
+    // beside it, gone now that this one takes over; this lifetime's stay
+    // until the next.
+    ferrofin_core::named_configuration_files::remove_links(&config.config_dir, &named_links);
     serving.serve(https_listeners, &app);
     // `ready` is this lifetime's own, so this is its only `set`.
     let _ = ready.set(app);

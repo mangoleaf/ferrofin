@@ -385,9 +385,9 @@ impl ImageFileSaver {
         let path = PathBuf::from(
             self.configuration
                 .application_paths()
-                .user_configuration_directory_path(),
+                .configuration_directory_path(),
         )
-        .join("named/xbmcmetadata.json");
+        .join("xbmcmetadata.json");
         let extra_thumbs = match tokio::fs::read(&path).await {
             Ok(bytes) => {
                 serde_json::from_slice::<XbmcMetadataOptions>(&bytes)

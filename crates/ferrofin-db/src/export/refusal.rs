@@ -1,9 +1,9 @@
 //! The conditions under which an export refuses to run (gl-1550): an output
 //! it would mix into or nest with the source, an interrupted earlier export, a
 //! database another process holds open, too little free space, and a database
-//! it cannot export (damaged, inconsistent, not Ferrofin's, from a Jellyfin
-//! release Ferrofin does not know, or with a write-ahead log it cannot fold
-//! in whole).
+//! it cannot export (damaged, inconsistent, not Ferrofin's, not as this
+//! version's start left it, from a Jellyfin release Ferrofin does not know, or
+//! with a write-ahead log it cannot fold in whole).
 //!
 //! The first four are checked before anything is written ([`super::refuse_unsafe`]).
 //! The database is checked on the copy the snapshot stages, never on the
@@ -451,14 +451,17 @@ pub(super) fn damaged_or(error: sqlx::Error) -> DbError {
 
 /// Refuses a database the export cannot vouch for, on the staged copy the
 /// snapshot opens: one that fails `integrity_check` or `foreign_key_check`,
-/// one that is not Ferrofin's (no `_sqlx_migrations`), an adopted one whose
-/// Jellyfin history matches no release Ferrofin adopts, so the export cannot
-/// tell which Jellyfin it came from, and an adopted one lacking the proof that
-/// Ferrofin did the work of a code migration the export records as applied
-/// ([`super::proof`]). Returns that history, for the steps that change the
-/// copy; `None` for a Ferrofin-native database, which has no Jellyfin history.
+/// one that is not Ferrofin's (no `_sqlx_migrations`), one a start of
+/// `build`, the exporter's version, has not left ([`started`]), an adopted
+/// one whose Jellyfin history matches no release Ferrofin adopts, so the
+/// export cannot tell which Jellyfin it came from, and an adopted one lacking
+/// the proof that Ferrofin did the work of a code migration the export
+/// records as applied ([`super::proof`]). Returns that history, for the steps
+/// that change the copy; `None` for a Ferrofin-native database, which has no
+/// Jellyfin history.
 pub(super) async fn database(
     conn: &mut sqlx::SqliteConnection,
+    build: &str,
 ) -> Result<Option<super::history::SourceHistory>> {
     let integrity: Vec<String> = sqlx::query_scalar("PRAGMA integrity_check")
         .fetch_all(&mut *conn)
@@ -501,6 +504,11 @@ pub(super) async fn database(
             "the database is not a Ferrofin database (it has no _sqlx_migrations)".to_owned(),
         ));
     }
+    let has_meta = table("FerrofinMeta")
+        .fetch_optional(&mut *conn)
+        .await?
+        .is_some();
+    started(conn, has_meta, build).await?;
     if table("__EFMigrationsHistory")
         .fetch_optional(&mut *conn)
         .await?
@@ -522,6 +530,58 @@ pub(super) async fn database(
     let history = super::history::SourceHistory { generation, ids };
     super::proof::require(conn, &history).await?;
     Ok(Some(history))
+}
+
+/// Refuses a database this version's start has not left (gl-1910): one whose
+/// `_sqlx_migrations` stops short of or past this build's last migration
+/// ([`crate::schema_head`]), or that does not record a start of `build`, the
+/// exporter's own version ([`crate::STARTED_KEY`]; `has_meta` says whether
+/// `FerrofinMeta` exists), which only a start whose start-time conversions
+/// all succeeded records (gl-1952). The export takes the database as its last
+/// start left it and runs neither the migrations nor the start-time
+/// conversions, so an upgrade exported before the new version started would
+/// carry the older rows, and a newer version's database could hold rows this
+/// build does not know.
+async fn started(conn: &mut sqlx::SqliteConnection, has_meta: bool, build: &str) -> Result<()> {
+    const START_FIRST: &str = "start this release on the data directory once, stop it and export \
+                               again (its start runs the migrations and conversions the export \
+                               needs)";
+    let head: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&mut *conn)
+        .await?;
+    let (head, last) = (head.unwrap_or(0), crate::schema_head());
+    if head > last {
+        return Err(refused(format!(
+            "the database was migrated by a newer Ferrofin release (migration {head}, past this \
+             release's last, {last}): export it with that release"
+        )));
+    }
+    if head < last {
+        return Err(refused(format!(
+            "an earlier Ferrofin release last started on the database (migration {head} of this \
+             release's {last}): {START_FIRST}"
+        )));
+    }
+    let recorded: Option<String> = if has_meta {
+        sqlx::query_scalar(r#"SELECT "Value" FROM "FerrofinMeta" WHERE "Key" = ?1"#)
+            .bind(crate::STARTED_KEY)
+            .fetch_optional(&mut *conn)
+            .await?
+    } else {
+        None
+    };
+    match recorded {
+        Some(recorded) if recorded == build => Ok(()),
+        Some(recorded) => Err(refused(format!(
+            "another Ferrofin build ({recorded}) last started on the database, not this one \
+             ({build}): export it with that build, or {START_FIRST}"
+        ))),
+        None => Err(refused(format!(
+            "the database records no start of this Ferrofin release ({build}) that got \
+             through its start-time conversions (one that fails warns in the server's log): \
+             {START_FIRST}"
+        ))),
+    }
 }
 
 /// Refuses a write-ahead log the snapshot would not fold in whole.

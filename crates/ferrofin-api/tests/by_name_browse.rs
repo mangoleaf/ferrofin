@@ -1015,6 +1015,11 @@ async fn years_list_and_by_value() {
     assert_eq!(get("/Years/0").await.status(), StatusCode::BAD_REQUEST);
     assert_eq!(get("/Years/-1").await.status(), StatusCode::BAD_REQUEST);
     assert_eq!(get("/Years/2020").await.status(), StatusCode::NOT_FOUND);
+    // `{year}` binds as the query binder does: `0x7CF` and a padded value are
+    // 1999, as Jellyfin 12.4 reads them (gl-1664); a word is the binder's 400.
+    assert_eq!(json_body(get("/Years/0x7CF").await).await["Name"], "1999");
+    assert_eq!(json_body(get("/Years/%201999").await).await["Name"], "1999");
+    assert_eq!(get("/Years/ninety").await.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
