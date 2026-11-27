@@ -52,8 +52,6 @@ struct OneItemLibrary {
     refreshes: std::sync::Mutex<Vec<(Uuid, MetadataRefreshOptions)>>,
     /// The scanner is stopped: the refresh reports it did not finish.
     stopped: bool,
-    /// The scan cannot reach the item: the refresh is refused.
-    unreachable: bool,
     /// How long a refresh takes before it records itself.
     refresh_delay: std::time::Duration,
     /// The culture the last refresh ran under.
@@ -96,11 +94,6 @@ impl LibraryManager for OneItemLibrary {
         item: &BaseItemEntity,
         options: &MetadataRefreshOptions,
     ) -> Result<bool, ServiceError> {
-        if self.unreachable {
-            return Err(ServiceError::conflict(
-                "the item is not under any library location",
-            ));
-        }
         tokio::time::sleep(self.refresh_delay).await;
         *self.refresh_culture.lock().unwrap() = Some(ferrofin_util::current_culture::capture());
         self.refreshes
@@ -541,22 +534,6 @@ async fn apply_when_the_scanner_is_stopped_is_503() {
         library.ids_set.lock().unwrap().is_empty(),
         "nothing written"
     );
-}
-
-/// An item the scan cannot reach (its library's folder was removed or
-/// moved) is refused by the library's refresh: a `409`, not a silent `204`.
-#[tokio::test]
-async fn apply_on_an_item_the_scan_cannot_reach_is_409() {
-    let library = Arc::new(OneItemLibrary {
-        unreachable: true,
-        ..OneItemLibrary::default()
-    });
-    let uri = format!("/Items/RemoteSearch/Apply/{ITEM_ID}");
-    let body = Body::from(r#"{"Name":"Heat","ProviderIds":{"Tmdb":"949"}}"#);
-    let (status, _) = send_to(state_over(&library), "POST", &uri, body).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert!(library.refreshes.lock().unwrap().is_empty());
-    assert!(library.ids_set.lock().unwrap().is_empty());
 }
 
 /// Apply respects the `replaceAllImages` query flag (still `204`).

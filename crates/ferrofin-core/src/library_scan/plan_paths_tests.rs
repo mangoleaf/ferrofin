@@ -1242,3 +1242,113 @@ async fn a_dot_ignore_edited_during_a_pass_decides_the_listings_after_it() {
         "{heat} planned"
     );
 }
+
+/// gl-1770: the library an item no library location covers is planned in
+/// (`outside_library`): the folder under the root its parents lead to, with
+/// default options and the walk of the nearest typed kind among it and its
+/// parents, and none for a row whose parents reach no folder under the
+/// root, or whose path holds a listed location.
+#[test]
+fn an_item_outside_every_library_is_planned_under_its_folder_under_the_root() {
+    use ferrofin_db::store::guid_to_db;
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_traits::persistence::ItemPathRow;
+
+    let entity = |id: u128, kind: BaseItemKind, path: Option<&str>| BaseItemEntity {
+        id: guid_to_db(Uuid::from_u128(id)),
+        type_: crate::item_type_lookup::stored_type_name(kind)
+            .expect("type")
+            .to_owned(),
+        path: path.map(str::to_owned),
+        ..BaseItemEntity::default()
+    };
+    let at = |id: u128, kind: BaseItemKind, path: &str| ItemPathRow {
+        id: Uuid::from_u128(id),
+        item_type: crate::item_type_lookup::stored_type_name(kind)
+            .expect("type")
+            .to_owned(),
+        path: Some(path.to_owned()),
+        parent_id: None,
+        extra_type: None,
+    };
+    let root = entity(0xA, BaseItemKind::AggregateFolder, None);
+    let location = entity(0x1, BaseItemKind::Folder, Some("/old"));
+    let series = entity(0x2, BaseItemKind::Series, Some("/old/Show"));
+    let season = entity(0x3, BaseItemKind::Season, Some("/old/Show/S1"));
+    let episode = at(0x4, BaseItemKind::Episode, "/old/Show/S1/e1.mkv");
+    let chain = [season.clone(), series, location, root.clone()];
+
+    let library = super::outside_library(&episode, &chain, &[]).expect("planned");
+    assert_eq!(library.locations, vec!["/old".to_owned()]);
+    assert_eq!(library.item_id, Some(guid_to_db(Uuid::from_u128(0x1))));
+    assert_eq!(
+        library.collection_type,
+        Some(CollectionTypeOptions::tvshows)
+    );
+    assert_eq!(
+        library.library_options,
+        Some(ferrofin_model::configuration::LibraryOptions::default())
+    );
+
+    // The folder under the root refreshes in itself.
+    let own = at(0x1, BaseItemKind::Folder, "/old");
+    let library = super::outside_library(&own, std::slice::from_ref(&root), &[]).expect("planned");
+    assert_eq!(library.locations, vec!["/old".to_owned()]);
+    assert_eq!(library.collection_type, None);
+
+    // Parents that reach no folder under the root, or a library location
+    // under the item's path, plan nothing.
+    assert!(super::outside_library(&episode, std::slice::from_ref(&season), &[]).is_none());
+    let collection = entity(0x8, BaseItemKind::CollectionFolder, Some("/old"));
+    assert!(super::outside_library(&episode, &[season, collection, root.clone()], &[]).is_none());
+    let listed = VirtualFolderInfo {
+        locations: vec!["/old/Inner".to_owned()],
+        ..VirtualFolderInfo::default()
+    };
+    assert!(super::outside_library(&own, &[root], &[listed]).is_none());
+}
+
+/// gl-1770: the walk a refresh outside every library plans a plain folder
+/// with, from what is stored under it (`stored_walk_type`, over
+/// `walk_type`): the one type its items name, else untyped; an extra
+/// follows its owner.
+#[rstest::rstest]
+#[case(&["Series", "Season", "Episode"], Some(CollectionTypeOptions::tvshows))]
+#[case(&["MusicArtist", "MusicAlbum", "Audio"], Some(CollectionTypeOptions::music))]
+#[case(&["Book", "AudioBook"], Some(CollectionTypeOptions::books))]
+#[case(&["MusicVideo"], Some(CollectionTypeOptions::musicvideos))]
+#[case(&["Video", "Photo", "PhotoAlbum"], Some(CollectionTypeOptions::homevideos))]
+#[case(&["Movie", "Folder"], Some(CollectionTypeOptions::movies))]
+#[case(&["Movie", "Series", "Episode"], None)]
+#[case(&["Folder"], None)]
+#[case(&[], None)]
+fn the_walk_outside_every_library_keeps_stored_kinds(
+    #[case] kinds: &[&str],
+    #[case] expected: Option<CollectionTypeOptions>,
+) {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_traits::persistence::ItemPathRow;
+    let rows: Vec<ItemPathRow> = kinds
+        .iter()
+        .map(|name| {
+            let kind: BaseItemKind = serde_json::from_value(serde_json::json!(name)).expect("kind");
+            ItemPathRow {
+                id: Uuid::nil(),
+                item_type: crate::item_type_lookup::stored_type_name(kind)
+                    .expect("type")
+                    .to_owned(),
+                path: None,
+                parent_id: None,
+                extra_type: None,
+            }
+        })
+        .collect();
+    assert_eq!(super::stored_walk_type(&rows), expected, "{kinds:?}");
+    if let Some(first) = rows.first() {
+        let extra = ItemPathRow {
+            extra_type: Some(1),
+            ..first.clone()
+        };
+        assert_eq!(super::stored_walk_type(&[extra]), None, "an extra");
+    }
+}

@@ -1665,3 +1665,372 @@ async fn a_removed_locations_history_is_detached_once_and_recovered() {
     );
     assert_eq!(snapshots().await, 0, "the snapshot is consumed");
 }
+
+/// The full refresh an item's `POST /Items/{id}/Refresh` with "Replace all
+/// metadata" runs, and the options of the folders planned around it.
+fn full_refresh() -> (
+    ferrofin_traits::providers::MetadataRefreshOptions,
+    ferrofin_traits::providers::MetadataRefreshOptions,
+) {
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+    (
+        MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+            replace_all_metadata: true,
+            ..MetadataRefreshOptions::default()
+        },
+        MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::None,
+            image_refresh_mode: MetadataRefreshMode::None,
+            ..MetadataRefreshOptions::default()
+        },
+    )
+}
+
+impl Library {
+    /// Adds the location `more` holding `Ronin (1998)` and its NFO to the
+    /// library, which reads no NFO, scans, and takes the location out of the
+    /// library again (no scan): the location's path, its folder's id and
+    /// Ronin's path and id.
+    async fn a_location_left_behind(&self) -> (String, Uuid, String, Uuid) {
+        let more = self.media.with_file_name("more");
+        let file = more.join("Ronin (1998)/Ronin (1998).mkv");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, b"").expect("write");
+        std::fs::write(
+            more.join("Ronin (1998)/Ronin (1998).nfo"),
+            "<movie><title>Ronin</title><plot>From the NFO.</plot></movie>",
+        )
+        .expect("nfo");
+        let more_path = more.to_string_lossy().into_owned();
+        self.vf
+            .update_library_options(
+                "Movies",
+                &LibraryOptions {
+                    path_infos: vec![
+                        MediaPathInfo {
+                            path: self.media.to_string_lossy().into_owned(),
+                        },
+                        MediaPathInfo {
+                            path: more_path.clone(),
+                        },
+                    ],
+                    disabled_local_metadata_readers: vec!["Nfo".to_owned()],
+                    ..LibraryOptions::default()
+                },
+            )
+            .await
+            .expect("options");
+        self.scanner.scan_all().await.expect("scan");
+        let path = file.to_string_lossy().into_owned();
+        let ronin = derive_item_id(BaseItemKind::Movie, &path).expect("id");
+        assert_eq!(
+            self.row(ronin).await.expect("scanned").overview,
+            None,
+            "the library reads no NFO"
+        );
+        self.vf
+            .remove_media_path("Movies", &more_path)
+            .await
+            .expect("remove location");
+        let folder = derive_item_id(BaseItemKind::Folder, &more_path).expect("id");
+        (more_path, folder, path, ronin)
+    }
+}
+
+/// gl-1770: an item whose location left its library, and that no scan has
+/// pruned yet, refreshes all the same, as `RefreshItem` runs on any item
+/// `GetItemById` returns. No library holds it, so it refreshes with
+/// `new LibraryOptions()` (`LibraryManager.GetLibraryOptions` when
+/// `GetCollectionFolders` finds none) — its NFO, which its library had
+/// disabled, is read — and its ancestors name no collection folder
+/// (`GetAncestorIds`); its parent and top parent stay its location's folder,
+/// which nothing removes.
+#[tokio::test]
+async fn an_item_whose_location_left_its_library_refreshes_with_default_options() {
+    use ferrofin_core::{ScanCancel, ScanPasses, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    let lib = Library::new(&["Heat (1995)/Heat (1995).mkv"]).await;
+    let (_, folder, path, ronin) = lib.a_location_left_behind().await;
+    let heat = derive_item_id(
+        BaseItemKind::Movie,
+        &lib.media
+            .join("Heat (1995)/Heat (1995).mkv")
+            .to_string_lossy(),
+    )
+    .expect("id");
+    let heat_before = lib.row(heat).await.expect("Heat");
+    let (options, around) = full_refresh();
+
+    lib.scanner
+        .scan_target(
+            &ScanTarget::Items(vec![path]),
+            ScanRun::new(&options, &around, &ScanCancel::new()).with_passes(ScanPasses::Touched),
+        )
+        .await
+        .expect("refresh");
+
+    let row = lib.row(ronin).await.expect("still there");
+    assert_eq!(row.overview.as_deref(), Some("From the NFO."));
+    assert_eq!(row.parent_id, Some(guid_to_db(folder)));
+    assert_eq!(row.top_parent_id, Some(guid_to_db(folder)));
+    let mut expected = vec![guid_to_db(folder), guid_to_db(lib.aggregate)];
+    expected.sort();
+    assert_eq!(lib.ancestors(ronin).await, expected, "no collection folder");
+    assert!(lib.row(folder).await.is_some(), "nothing is removed");
+    assert_eq!(
+        lib.row(heat).await,
+        Some(heat_before),
+        "the library's own items are left alone"
+    );
+}
+
+/// gl-1770: a folder outside every library location validates its children
+/// (`RefreshItem` → `ValidateChildren`): a new file under it is added and a
+/// gone one removed, outside every library as above. A folder holding a
+/// location a library still lists is that library's to scan: its refresh
+/// plans nothing there, nor does a refresh naming a path in it beside one
+/// in that location (gl-2030).
+#[tokio::test]
+async fn a_folder_whose_location_left_its_library_validates_its_children() {
+    use ferrofin_traits::library::ScanTarget;
+    let lib = Library::new(&["Heat (1995)/Heat (1995).mkv"]).await;
+    let (more, folder, ronin_path, ronin) = lib.a_location_left_behind().await;
+    let added = format!("{more}/Collateral (2004)/Collateral (2004).mkv");
+    std::fs::create_dir_all(format!("{more}/Collateral (2004)")).expect("mkdir");
+    std::fs::write(&added, b"").expect("write");
+    std::fs::remove_file(&ronin_path).expect("remove Ronin");
+
+    refresh(&lib, ScanTarget::Paths(vec![more.clone()])).await;
+
+    let collateral = derive_item_id(BaseItemKind::Movie, &added).expect("id");
+    let row = lib.row(collateral).await.expect("added");
+    assert_eq!(row.parent_id, Some(guid_to_db(folder)));
+    let mut expected = vec![guid_to_db(folder), guid_to_db(lib.aggregate)];
+    expected.sort();
+    assert_eq!(lib.ancestors(collateral).await, expected);
+    assert!(lib.row(ronin).await.is_none(), "the gone file's row goes");
+
+    // The library takes a folder under `more` as a location of its own.
+    let inner = format!("{more}/Inner");
+    std::fs::create_dir_all(format!("{inner}/Drive (2011)")).expect("mkdir");
+    std::fs::write(format!("{inner}/Drive (2011)/Drive (2011).mkv"), b"").expect("write");
+    let late = format!("{more}/Thief (1981)/Thief (1981).mkv");
+    std::fs::create_dir_all(format!("{more}/Thief (1981)")).expect("mkdir");
+    std::fs::write(&late, b"").expect("write");
+    lib.vf
+        .add_media_path(
+            "Movies",
+            &MediaPathInfo {
+                path: inner.clone(),
+            },
+        )
+        .await
+        .expect("add location");
+    refresh(&lib, ScanTarget::Paths(vec![more.clone()])).await;
+    let thief = derive_item_id(BaseItemKind::Movie, &late).expect("id");
+    assert!(
+        lib.row(thief).await.is_none(),
+        "nothing is planned under a folder holding a library's location"
+    );
+
+    // A refresh naming a path of each: the library plans its own, and no
+    // stand-in plans the folder holding it, which would plan it again.
+    std::fs::write(
+        format!("{more}/Collateral (2004)/Collateral (2004).nfo"),
+        "<movie><title>Collateral</title><plot>From the NFO.</plot></movie>",
+    )
+    .expect("nfo");
+    let drive = format!("{inner}/Drive (2011)/Drive (2011).mkv");
+    refresh(&lib, ScanTarget::Items(vec![added, drive.clone()])).await;
+    let drive = derive_item_id(BaseItemKind::Movie, &drive).expect("id");
+    assert!(lib.row(drive).await.is_some(), "the library's own path");
+    assert_eq!(
+        lib.row(collateral).await.expect("kept").overview,
+        None,
+        "not planned outside the library"
+    );
+}
+
+/// The refresh `scan_target` runs for `target` with [`full_refresh`]'s
+/// options, as a refresh route queues it.
+async fn refresh(lib: &Library, target: ferrofin_traits::library::ScanTarget) {
+    use ferrofin_core::{ScanCancel, ScanPasses, ScanRun};
+    let (options, around) = full_refresh();
+    lib.scanner
+        .scan_target(
+            &target,
+            ScanRun::new(&options, &around, &ScanCancel::new()).with_passes(ScanPasses::Touched),
+        )
+        .await
+        .expect("refresh");
+}
+
+/// gl-1770: a TV item outside every library keeps what it is: an episode's
+/// refresh, and its series' (`ValidateChildren`), plan them as a TV library
+/// does, so the episode keeps its id, season and series, and a new episode
+/// joins the season.
+#[tokio::test]
+async fn a_series_whose_location_left_its_library_keeps_its_episodes() {
+    use ferrofin_traits::library::ScanTarget;
+    let lib = Library::of_type(
+        &["Firefly (2002)/Season 1/Firefly S01E01.mkv"],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    lib.scanner.scan_all().await.expect("scan");
+    let path = |p: &str| lib.media.join(p).to_string_lossy().into_owned();
+    let id = |kind, p: &str| derive_item_id(kind, &path(p)).expect("id");
+    let series = id(BaseItemKind::Series, "Firefly (2002)");
+    let season = id(BaseItemKind::Season, "Firefly (2002)/Season 1");
+    let first = "Firefly (2002)/Season 1/Firefly S01E01.mkv";
+    let before = lib
+        .row(id(BaseItemKind::Episode, first))
+        .await
+        .expect("scanned");
+    assert_eq!(before.season_id, Some(guid_to_db(season)));
+    lib.vf
+        .remove_media_path("Movies", &lib.media.to_string_lossy())
+        .await
+        .expect("remove location");
+
+    refresh(&lib, ScanTarget::Items(vec![path(first)])).await;
+    let after = lib
+        .row(id(BaseItemKind::Episode, first))
+        .await
+        .expect("kept");
+    assert_eq!(
+        (
+            &after.type_,
+            &after.parent_id,
+            &after.season_id,
+            &after.series_id
+        ),
+        (
+            &before.type_,
+            &before.parent_id,
+            &before.season_id,
+            &before.series_id
+        )
+    );
+    let mut expected = vec![
+        guid_to_db(series),
+        guid_to_db(season),
+        guid_to_db(lib.location()),
+        guid_to_db(lib.aggregate),
+    ];
+    expected.sort();
+    assert_eq!(
+        lib.ancestors(id(BaseItemKind::Episode, first)).await,
+        expected
+    );
+
+    let second = "Firefly (2002)/Season 1/Firefly S01E02.mkv";
+    std::fs::write(path(second), b"").expect("write");
+    refresh(&lib, ScanTarget::Paths(vec![path("Firefly (2002)")])).await;
+    let added = lib
+        .row(id(BaseItemKind::Episode, second))
+        .await
+        .expect("a new episode");
+    assert_eq!(added.season_id, Some(guid_to_db(season)));
+    assert_eq!(added.series_id, Some(guid_to_db(series)));
+    assert!(
+        lib.row(id(BaseItemKind::Episode, first)).await.is_some(),
+        "the first episode keeps its id"
+    );
+}
+
+/// gl-1770: an artist whose library was removed refreshes as `RefreshArtist`
+/// does (`ScanTarget::Artist`), planned as a music library would: it reads
+/// its NFO, its album and track keep their ids and kinds, and its ancestors
+/// name no collection folder.
+#[tokio::test]
+async fn an_artist_whose_library_was_removed_refreshes_as_music() {
+    use ferrofin_traits::library::ScanTarget;
+    let lib = Library::of_type(
+        &["Artist/Album/01 - Song.mp3"],
+        CollectionTypeOptions::music,
+    )
+    .await;
+    lib.scanner.scan_all().await.expect("scan");
+    let path = |p: &str| lib.media.join(p).to_string_lossy().into_owned();
+    let id = |kind, p: &str| derive_item_id(kind, &path(p)).expect("id");
+    let artist = id(BaseItemKind::MusicArtist, "Artist");
+    let album = id(BaseItemKind::MusicAlbum, "Artist/Album");
+    let track = id(BaseItemKind::Audio, "Artist/Album/01 - Song.mp3");
+    for item in [artist, album, track] {
+        assert!(lib.row(item).await.is_some(), "scanned");
+    }
+    lib.vf
+        .remove_virtual_folder("Movies")
+        .await
+        .expect("remove the library");
+    std::fs::write(
+        path("Artist/artist.nfo"),
+        "<artist><name>Artist</name><biography>From the NFO.</biography></artist>",
+    )
+    .expect("nfo");
+
+    refresh(
+        &lib,
+        ScanTarget::Artist {
+            id: artist,
+            path: Some(path("Artist")),
+            folders: vec![path("Artist")],
+        },
+    )
+    .await;
+
+    assert_eq!(
+        lib.row(artist).await.expect("artist").overview.as_deref(),
+        Some("From the NFO."),
+        "refreshed"
+    );
+    for item in [album, track] {
+        assert!(lib.row(item).await.is_some(), "kept under its id");
+    }
+    let mut expected = vec![guid_to_db(lib.location()), guid_to_db(lib.aggregate)];
+    expected.sort();
+    assert_eq!(
+        lib.ancestors(artist).await,
+        expected,
+        "no collection folder"
+    );
+
+    // The location's own folder names no type: what is stored under it
+    // does, so its artist and album stay what they are.
+    refresh(
+        &lib,
+        ScanTarget::Paths(vec![lib.media.to_string_lossy().into_owned()]),
+    )
+    .await;
+    for item in [artist, album, track] {
+        assert!(lib.row(item).await.is_some(), "kept under its id");
+    }
+    for folder in ["Artist", "Artist/Album"] {
+        assert!(
+            lib.row(id(BaseItemKind::Folder, folder)).await.is_none(),
+            "no plain folder beside the {folder} row"
+        );
+    }
+}
+
+/// gl-1770: a folder whose location moved away (or whose share is not
+/// mounted) removes nothing when refreshed outside every library: its
+/// directory lists as gone, which is no proof its items are.
+#[tokio::test]
+async fn a_folder_outside_every_library_whose_directory_is_gone_removes_nothing() {
+    use ferrofin_traits::library::ScanTarget;
+    let lib = Library::new(&["Heat (1995)/Heat (1995).mkv"]).await;
+    let (more, folder, ronin_path, ronin) = lib.a_location_left_behind().await;
+    std::fs::rename(&more, format!("{more}-moved")).expect("move the location away");
+
+    refresh(&lib, ScanTarget::Paths(vec![more])).await;
+    refresh(&lib, ScanTarget::Items(vec![ronin_path])).await;
+
+    assert!(
+        lib.row(folder).await.is_some(),
+        "the location's folder stays"
+    );
+    assert!(lib.row(ronin).await.is_some(), "and what hangs off it");
+}

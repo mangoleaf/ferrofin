@@ -2811,6 +2811,13 @@ impl<'a> PathScope<'a> {
         }
     }
 
+    /// Whether this is an item's or a folder's own refresh (`RefreshItem`,
+    /// `RefreshArtist`), which runs on any item, as against the library
+    /// monitor's changed paths.
+    fn is_item_refresh(self) -> bool {
+        self.roots_requested || self.also.is_some()
+    }
+
     /// Whether `item` is an item a refresh was asked for: it stands at a
     /// root. `ProviderManager.RefreshItem` awaits that item's `RefreshMetadata`
     /// with no catch, while `LimitedConcurrencyLibraryScheduler.ProcessItem`
@@ -6512,7 +6519,9 @@ impl LibraryScanner {
 
     /// The path-scoped half of [`scan_target`](Self::scan_target): plans the
     /// libraries holding `scope.roots` (or `also_path`, the extra item's own
-    /// folder) and keeps the items at or under a root, the folders above
+    /// folder) — for an item's own refresh, also the ones standing in for a
+    /// library where none holds them ([`scoped_libraries`](Self::scoped_libraries))
+    /// — and keeps the items at or under a root, the folders above
     /// them, and the item at `also_path`. `changed` is how many paths the
     /// request named, for the log. `listed` is the run's library listing when
     /// the caller has already read it; otherwise the libraries are listed here.
@@ -6529,17 +6538,17 @@ impl LibraryScanner {
             Some(folders) => folders,
             None => self.virtual_folders.get_virtual_folders().await?,
         };
-        let affected = affected_libraries(&folders, roots, also_path);
+        let affected = self.scoped_libraries(&folders, scope, also_path).await?;
         if affected.is_empty() {
-            if prune {
+            if scope.is_item_refresh() {
+                tracing::warn!(
+                    paths = ?roots,
+                    "item refresh: no library location or folder under the root holds the path; nothing refreshed"
+                );
+            } else {
                 tracing::debug!(
                     paths = roots.len(),
                     "changed paths match no library; nothing to scan"
-                );
-            } else {
-                tracing::warn!(
-                    paths = ?roots,
-                    "item refresh: the item's path is under no library location; nothing refreshed"
                 );
             }
             return Ok(ScanOutcome::default());
@@ -6624,6 +6633,111 @@ impl LibraryScanner {
             .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
             .await;
         result
+    }
+
+    /// The libraries a path-scoped scan plans `scope` in: those whose
+    /// locations hold its roots or `also_path` ([`affected_libraries`]), and
+    /// for an item's own refresh, which runs on any item, the libraries
+    /// standing in for those paths no location holds
+    /// ([`libraries_outside`](Self::libraries_outside)) — but none whose
+    /// location holds a path a library holds too, which that library plans.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure reading the items outside every library.
+    async fn scoped_libraries(
+        &self,
+        folders: &[VirtualFolderInfo],
+        scope: PathScope<'_>,
+        also_path: Option<&str>,
+    ) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
+        let mut affected = affected_libraries(folders, scope.roots, also_path);
+        if !scope.is_item_refresh() {
+            return Ok(affected);
+        }
+        let held = |path: &str| {
+            folders
+                .iter()
+                .flat_map(|folder| &folder.locations)
+                .any(|location| path_is_under(path, location))
+        };
+        let (inside, outside): (Vec<&str>, Vec<&str>) = scope
+            .roots
+            .iter()
+            .map(String::as_str)
+            .chain(also_path)
+            .partition(|path| held(path));
+        if outside.is_empty() {
+            return Ok(affected);
+        }
+        let mut standing = self.libraries_outside(&outside, folders).await?;
+        standing.retain(|library| {
+            let holds = library
+                .locations
+                .iter()
+                .any(|location| inside.iter().any(|path| path_is_under(path, location)));
+            if holds {
+                tracing::debug!(
+                    path = ?library.locations,
+                    "item refresh: a library holds another path of this refresh under the \
+                     folder outside every library; the folder is not planned"
+                );
+            }
+            !holds
+        });
+        affected.extend(standing);
+        Ok(affected)
+    }
+
+    /// The libraries a refresh plans `paths` in, which no library location
+    /// holds: one per folder under the root their stored items hang off
+    /// ([`outside_library`]), as upstream's `RefreshItem` runs on any item
+    /// `GetItemById` returns. Empty when no item is stored at them.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure reading the items or their parents.
+    async fn libraries_outside(
+        &self,
+        paths: &[&str],
+        folders: &[VirtualFolderInfo],
+    ) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
+        let Some(items) = &self.item_repository else {
+            return Ok(Vec::new());
+        };
+        let paths: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+        let rows = self.persistence.items_at_paths(&paths).await?;
+        let mut libraries: Vec<VirtualFolderInfo> = Vec::new();
+        for row in rows.iter().flatten() {
+            let parents = items.get_ancestor_chain(row.id).await?.unwrap_or_default();
+            let Some(mut library) = outside_library(row, &parents, folders) else {
+                tracing::debug!(
+                    item_id = %row.id,
+                    path = row.path.as_deref().unwrap_or_default(),
+                    "item refresh: no folder under the root holds the item outside every \
+                     library, or its path holds a library's location; it is not planned"
+                );
+                continue;
+            };
+            // A plain folder and its parents name no type: what is stored
+            // under it does.
+            if library.collection_type.is_none()
+                && let (Some(top), Some(path)) = (
+                    library.item_id.as_deref().and_then(parse_id),
+                    row.path.clone(),
+                )
+            {
+                let below = self.persistence.items_in_scope(&[top], &[path]).await?;
+                library.collection_type = stored_walk_type(&below.unwrap_or_default());
+            }
+            if !libraries
+                .iter()
+                .any(|known| known.item_id == library.item_id)
+            {
+                libraries.push(library);
+            }
+        }
+        Ok(libraries)
     }
 
     /// Moves a stored video the scan now resolves as another kind to the id
@@ -20727,6 +20841,108 @@ fn write_video_type(entity: &mut BaseItemEntity, video_type: VideoType) {
     {
         entity.data = Some(data);
     }
+}
+
+/// The library a refresh plans `row` in when no library location covers it
+/// ([`LibraryScanner::libraries_outside`]), from its `parents` (nearest
+/// first). Its one location is the folder under the `AggregateFolder` they
+/// lead up to — the physical folder `LibraryManager.GetCollectionFolders`
+/// walks up to and finds in no library's `PhysicalLocations` — whose id
+/// stands in for the library's, so the item keeps that folder as its parent
+/// and top parent and its ancestors name no collection folder
+/// (`GetAncestorIds`). Its options are `new LibraryOptions()`, what
+/// `GetLibraryOptions` returns then. Its type is the walk of the nearest
+/// kind among the item and its parents that a typed walk resolves
+/// ([`walk_type`]): upstream's refresh leaves the item the kind it is, where
+/// this planner resolves what it plans by its library's type (upstream keeps
+/// its cached locations until they are read again, and resolves with no
+/// content type after: gl-2031). When none of them names one (a plain
+/// folder), [`LibraryScanner::libraries_outside`] takes it from what is
+/// stored under the item ([`stored_walk_type`]).
+///
+/// `None` when the parents lead to no folder under the root (a row no scan
+/// of a library location saved), or when the item's path holds a location
+/// a library still lists: that library's to scan.
+fn outside_library(
+    row: &ItemPathRow,
+    parents: &[BaseItemEntity],
+    folders: &[VirtualFolderInfo],
+) -> Option<VirtualFolderInfo> {
+    let path = row.path.as_deref().filter(|path| !path.is_empty())?;
+    if folders
+        .iter()
+        .flat_map(|folder| &folder.locations)
+        .any(|location| path_is_under(location, path))
+    {
+        return None;
+    }
+    let kind = |type_name: &str| item_type_lookup::kind_from_type_name(type_name);
+    let root = parents
+        .iter()
+        .position(|parent| kind(&parent.type_) == Some(BaseItemKind::AggregateFolder))?;
+    let (id, location, top_type) = match root.checked_sub(1) {
+        // The item is the folder under the root itself.
+        None => (row.id, path, row.item_type.as_str()),
+        Some(top) => {
+            let top = &parents[top];
+            (parse_id(&top.id)?, top.path.as_deref()?, top.type_.as_str())
+        }
+    };
+    if kind(top_type) != Some(BaseItemKind::Folder) || !path_is_under(path, location) {
+        return None;
+    }
+    let collection_type = std::iter::once(kind(&row.item_type))
+        .flatten()
+        .chain(
+            parents[..root]
+                .iter()
+                .filter_map(|parent| kind(&parent.type_)),
+        )
+        .find_map(walk_type);
+    Some(VirtualFolderInfo {
+        name: folder_name(location),
+        locations: vec![location.to_owned()],
+        collection_type,
+        library_options: Some(LibraryOptionsModel::default()),
+        item_id: Some(guid_to_db(id)),
+        ..VirtualFolderInfo::default()
+    })
+}
+
+/// The collection type whose walk resolves an item of `kind` as that kind
+/// ([`outside_library`]); `None` for a kind no typed walk owns (a plain
+/// folder).
+fn walk_type(kind: BaseItemKind) -> Option<CollectionTypeOptions> {
+    match kind {
+        BaseItemKind::Series | BaseItemKind::Season | BaseItemKind::Episode => {
+            Some(CollectionTypeOptions::tvshows)
+        }
+        BaseItemKind::MusicAlbum | BaseItemKind::MusicArtist | BaseItemKind::Audio => {
+            Some(CollectionTypeOptions::music)
+        }
+        BaseItemKind::Book | BaseItemKind::AudioBook => Some(CollectionTypeOptions::books),
+        BaseItemKind::MusicVideo => Some(CollectionTypeOptions::musicvideos),
+        BaseItemKind::Video | BaseItemKind::Photo | BaseItemKind::PhotoAlbum => {
+            Some(CollectionTypeOptions::homevideos)
+        }
+        BaseItemKind::Movie => Some(CollectionTypeOptions::movies),
+        _ => None,
+    }
+}
+
+/// The walk of the items stored under a plain folder refreshed outside every
+/// library ([`LibraryScanner::libraries_outside`]), so they keep their
+/// kinds: the one collection type their kinds name ([`walk_type`]; an extra
+/// follows its owner), or `None` — an untyped library's walk, which resolves
+/// a mixed library's movies and shows — when they name several or none.
+fn stored_walk_type(rows: &[ItemPathRow]) -> Option<CollectionTypeOptions> {
+    let mut types = rows
+        .iter()
+        .filter(|row| row.extra_type.is_none())
+        .filter_map(|row| item_type_lookup::kind_from_type_name(&row.item_type))
+        .filter_map(walk_type);
+    let first = types.next()?;
+    types.all(|other| other == first).then_some(first)
 }
 
 /// The libraries a path-scoped scan walks: those with a location holding

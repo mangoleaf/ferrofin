@@ -34,64 +34,6 @@ impl FerrofinLibraryManager {
         Ok(scan_target(item, id))
     }
 
-    /// The scan Identify's refresh of `item` is (`RefreshFullItem`), or
-    /// `None` when it refreshes through the provider manager. An artist
-    /// known only by name has no folder of its own: the scanner refreshes it
-    /// as `RefreshFullItem` → `RefreshItem` does — itself, with the chosen
-    /// ids — in the scan queue's priority lane (its by-name folder validation
-    /// is a no-op upstream).
-    ///
-    /// # Errors
-    ///
-    /// [`ServiceError::Conflict`] when the scan cannot reach the item: its
-    /// path lies under no library location, or it is a file- or
-    /// folder-backed item in no library.
-    pub(super) async fn identify_target(
-        &self,
-        item: &BaseItemEntity,
-    ) -> Result<Option<ScanTarget>, ServiceError> {
-        let id = item_id(item)?;
-        let by_name_artist = BaseItemKind::from_stored_type_name(&item.type_)
-            == Some(BaseItemKind::MusicArtist)
-            && item.top_parent_id.as_deref().is_none_or(str::is_empty);
-        let target = if by_name_artist {
-            Some(ScanTarget::Artist {
-                id,
-                path: None,
-                folders: Vec::new(),
-            })
-        } else {
-            scan_target(item, id)
-        };
-        let path = item.path.as_deref().unwrap_or_default();
-        match target {
-            Some(target) => {
-                if !self.scan_reaches(&target).await? {
-                    tracing::warn!(
-                        item_id = %id,
-                        path,
-                        "identify refused: the item's path is under no library location"
-                    );
-                    return Err(ServiceError::conflict(format!(
-                        "item {id} is not under any library location, so it cannot be refreshed"
-                    )));
-                }
-                Ok(Some(target))
-            }
-            None if needs_the_scan(item) => {
-                tracing::warn!(
-                    item_id = %id,
-                    path,
-                    "identify refused: the item belongs to no library"
-                );
-                Err(ServiceError::conflict(format!(
-                    "item {id} belongs to no library, so it cannot be refreshed"
-                )))
-            }
-            None => Ok(None),
-        }
-    }
-
     /// Queues `item`'s refresh through the provider manager at high
     /// priority, as `QueueRefresh` does for an item no scan covers.
     pub(super) async fn queue_provider_refresh(
@@ -197,29 +139,32 @@ impl FerrofinLibraryManager {
         }
         Ok(None)
     }
+}
 
-    /// Whether the library scan can reach `target`: every path of it lies
-    /// under a location of a configured library (the scan plans nothing
-    /// anywhere else). A library or the root always can.
-    async fn scan_reaches(&self, target: &ScanTarget) -> Result<bool, ServiceError> {
-        let (ScanTarget::Paths(paths) | ScanTarget::Items(paths)) = target else {
-            return Ok(true);
-        };
-        let Some(virtual_folders) = &self.virtual_folders else {
-            return Err(ServiceError::backend(
-                "an Identify needs the library locations, which this library manager has none of",
-            ));
-        };
-        let folders = virtual_folders.get_virtual_folders().await?;
-        Ok(paths.iter().all(|path| {
-            folders.iter().any(|folder| {
-                folder
-                    .locations
-                    .iter()
-                    .any(|location| crate::library_scan::path_is_under(path, location))
-            })
-        }))
+/// The scan Identify's refresh of `item` is (`RefreshFullItem`), or `None`
+/// when it refreshes through the provider manager. An artist known only by
+/// name has no folder of its own: the scanner refreshes it as
+/// `RefreshFullItem` → `RefreshItem` does — itself, with the chosen ids — in
+/// the scan queue's priority lane (its by-name folder validation is a no-op
+/// upstream).
+///
+/// Nothing is refused: `ApplySearchCriteria` refreshes any item
+/// `GetItemById` returns. An item whose path no library location covers
+/// refreshes through the scan of its path all the same, which plans it
+/// outside every library (the scanner's `libraries_outside`).
+pub(super) fn identify_target(item: &BaseItemEntity) -> Result<Option<ScanTarget>, ServiceError> {
+    let id = item_id(item)?;
+    let by_name_artist = BaseItemKind::from_stored_type_name(&item.type_)
+        == Some(BaseItemKind::MusicArtist)
+        && item.top_parent_id.as_deref().is_none_or(str::is_empty);
+    if by_name_artist {
+        return Ok(Some(ScanTarget::Artist {
+            id,
+            path: None,
+            folders: Vec::new(),
+        }));
     }
+    Ok(scan_target(item, id))
 }
 
 /// `item`'s id.
@@ -272,10 +217,11 @@ fn scan_target(item: &BaseItemEntity, id: Uuid) -> Option<ScanTarget> {
 }
 
 /// The path an item refreshes through the library scan by: its own
-/// filesystem path, when it has one inside a library. `None` for an item
-/// with no file of its own — a person, a genre or studio, a channel or
-/// live-TV item streamed from a URL, a row outside every library — which the
-/// provider manager refreshes.
+/// filesystem path, when it has one and a top parent (a library's item, or
+/// one whose location left its library, which the scan plans outside every
+/// library). `None` for an item with no file of its own — a person, a genre
+/// or studio, a channel or live-TV item streamed from a URL — or a row with
+/// no top parent, which the provider manager refreshes (gl-2030).
 pub(super) fn refresh_scan_path(item: &BaseItemEntity) -> Option<String> {
     let in_library = item
         .top_parent_id
@@ -284,32 +230,4 @@ pub(super) fn refresh_scan_path(item: &BaseItemEntity) -> Option<String> {
     item.path
         .clone()
         .filter(|path| in_library && !path.is_empty() && !path.contains("://"))
-}
-
-/// Whether `item`'s metadata comes only from the library scan: a file- or
-/// folder-backed kind with a path of its own (a movie, a series, an album…)
-/// — as against the kinds the provider manager refreshes (a box set, a
-/// person, a by-name artist, a path-less season or episode).
-fn needs_the_scan(item: &BaseItemEntity) -> bool {
-    let has_path = item
-        .path
-        .as_deref()
-        .is_some_and(|path| !path.is_empty() && !path.contains("://"));
-    has_path
-        && matches!(
-            BaseItemKind::from_stored_type_name(&item.type_),
-            Some(
-                BaseItemKind::Movie
-                    | BaseItemKind::Trailer
-                    | BaseItemKind::MusicVideo
-                    | BaseItemKind::Video
-                    | BaseItemKind::Series
-                    | BaseItemKind::Episode
-                    | BaseItemKind::MusicAlbum
-                    | BaseItemKind::Audio
-                    | BaseItemKind::AudioBook
-                    | BaseItemKind::Book
-                    | BaseItemKind::Photo
-            )
-        )
 }

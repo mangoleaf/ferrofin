@@ -1,7 +1,7 @@
 //! What an item's refresh covers (`ProviderManager.RefreshItem`,
 //! `RefreshArtist`, `RefreshFullItem`), over real repositories: the scan
 //! each kind of item refreshes through, the provider manager for an item no
-//! scan covers, and Identify's refusals.
+//! scan covers, and Identify's targets.
 
 use std::sync::{Arc, Mutex};
 
@@ -61,7 +61,7 @@ fn row(
     }
 }
 
-/// [`row`] outside every library (no `TopParentId`).
+/// [`row`] with no `TopParentId`.
 fn outside(mut row: BaseItemEntity) -> BaseItemEntity {
     row.top_parent_id = None;
     row
@@ -77,7 +77,7 @@ async fn save(db: &Database, rows: &[BaseItemEntity]) {
 /// The scan each item's refresh is: a library scans itself, the root and
 /// the aggregate folder every library, another folder its subtree, a file
 /// its own path; a box set, a playlist, a view, a virtual season, a person
-/// and a file outside every library have no scan (the provider manager
+/// and a file with no top parent have no scan (the provider manager
 /// refreshes them).
 #[tokio::test]
 async fn each_kind_of_item_refreshes_through_its_own_scan() {
@@ -143,7 +143,11 @@ async fn each_kind_of_item_refreshes_through_its_own_scan() {
         target(row(7, BaseItemKind::Person, false, None, None)).await,
         None
     );
-    assert_eq!(target(outside(episode)).await, None, "a file in no library");
+    assert_eq!(
+        target(outside(episode)).await,
+        None,
+        "a file with no top parent"
+    );
     let streamed = row(
         8,
         BaseItemKind::Video,
@@ -330,59 +334,27 @@ async fn an_artist_refreshes_the_artist_folders_above_its_albums() {
 }
 
 /// Identify refreshes a file, a folder's subtree or a library through the
-/// scan, a by-name artist alone through the scanner, and refuses an item the
-/// scan cannot reach: a path under no library location, or a file in no
-/// library. An item with no file of its own has no scan.
-#[tokio::test]
-async fn identify_targets_and_refusals() {
-    use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
-    use ferrofin_traits::library::VirtualFolderManager as _;
-    let tmp = tempfile::tempdir().expect("tmp");
-    let media = tmp.path().join("media");
-    std::fs::create_dir_all(&media).expect("media");
-    let vf = Arc::new(crate::FerrofinVirtualFolderManager::new(
-        tmp.path().join("views"),
-    ));
-    vf.add_virtual_folder(
-        "Movies",
-        Some(ferrofin_model::entities::CollectionTypeOptions::movies),
-        &LibraryOptions {
-            path_infos: vec![MediaPathInfo {
-                path: media.to_string_lossy().into_owned(),
-            }],
-            ..LibraryOptions::default()
-        },
-    )
-    .await
-    .expect("library");
-    let db = test_db().await;
-    let mgr = manager(&db).with_virtual_folders(vf);
-
-    let inside = format!("{}/Movie/movie.mkv", media.display());
-    let movie = row(1, BaseItemKind::Movie, false, None, Some(&inside));
-    assert_eq!(
-        mgr.identify_target(&movie).await.expect("target"),
-        Some(ScanTarget::Items(vec![inside]))
-    );
-    let elsewhere = row(
-        2,
-        BaseItemKind::Movie,
-        false,
-        None,
-        Some("/elsewhere/m.mkv"),
-    );
-    assert!(matches!(
-        mgr.identify_target(&elsewhere).await,
-        Err(ServiceError::Conflict(_))
-    ));
+/// scan, a by-name artist alone through the scanner, and refuses nothing
+/// (`ApplySearchCriteria` refreshes any item `GetItemById` returns): a path
+/// under no library location still refreshes through the scan of it, which
+/// plans it outside every library (gl-1770), and a file with no top parent
+/// through the provider manager, as its `POST /Items/{id}/Refresh` does. An
+/// item with no file of its own has no scan.
+#[test]
+fn identify_targets() {
+    use super::item_refresh::identify_target;
+    let target = |row: &BaseItemEntity| identify_target(row).expect("target");
+    let items = |path: &str| Some(ScanTarget::Items(vec![path.to_owned()]));
+    let paths = |path: &str| Some(ScanTarget::Paths(vec![path.to_owned()]));
+    let movie = row(1, BaseItemKind::Movie, false, None, Some("/media/m.mkv"));
+    assert_eq!(target(&movie), items("/media/m.mkv"));
+    let elsewhere = row(2, BaseItemKind::Movie, false, None, Some("/gone/m.mkv"));
+    assert_eq!(target(&elsewhere), items("/gone/m.mkv"));
     let unfiled = outside(row(3, BaseItemKind::Movie, false, None, Some("/x/m.mkv")));
-    assert!(matches!(
-        mgr.identify_target(&unfiled).await,
-        Err(ServiceError::Conflict(_))
-    ));
+    assert_eq!(target(&unfiled), None);
     let by_name = outside(row(4, BaseItemKind::MusicArtist, false, None, None));
     assert_eq!(
-        mgr.identify_target(&by_name).await.expect("target"),
+        target(&by_name),
         Some(ScanTarget::Artist {
             id: Uuid::from_u128(4),
             path: None,
@@ -390,15 +362,13 @@ async fn identify_targets_and_refusals() {
         })
     );
     let person = outside(row(5, BaseItemKind::Person, false, None, None));
-    assert_eq!(mgr.identify_target(&person).await.expect("target"), None);
-    // A folder inside a library location identifies with its subtree; a
-    // library always reaches.
-    let folder = format!("{}/Show", media.display());
-    let series = row(6, BaseItemKind::Series, true, None, Some(&folder));
-    assert_eq!(
-        mgr.identify_target(&series).await.expect("target"),
-        Some(ScanTarget::Paths(vec![folder]))
-    );
+    assert_eq!(target(&person), None);
+    // A folder identifies with its subtree, inside a library location or
+    // outside every one; a library scans itself.
+    let series = row(6, BaseItemKind::Series, true, None, Some("/media/Show"));
+    assert_eq!(target(&series), paths("/media/Show"));
+    let gone = row(7, BaseItemKind::Series, true, None, Some("/gone/Show"));
+    assert_eq!(target(&gone), paths("/gone/Show"));
     let library = row(
         0x11B,
         BaseItemKind::CollectionFolder,
@@ -406,10 +376,7 @@ async fn identify_targets_and_refusals() {
         None,
         Some("/x"),
     );
-    assert_eq!(
-        mgr.identify_target(&library).await.expect("target"),
-        Some(ScanTarget::Library(LIBRARY))
-    );
+    assert_eq!(target(&library), Some(ScanTarget::Library(LIBRARY)));
 }
 
 /// A file's refresh runs through the scan of its path; an item no scan
@@ -522,8 +489,7 @@ async fn the_aggregate_folders_refresh_is_told_apart_from_the_user_roots() {
 }
 
 /// Without a provider manager, an item no scan covers is refused rather
-/// than silently left unrefreshed; without the library locations, so is an
-/// Identify that has to check them.
+/// than silently left unrefreshed.
 #[tokio::test]
 async fn a_provider_refresh_without_a_provider_manager_is_refused() {
     let db = test_db().await;
@@ -532,12 +498,6 @@ async fn a_provider_refresh_without_a_provider_manager_is_refused() {
     assert!(matches!(
         mgr.queue_item_refresh(&box_set, &MetadataRefreshOptions::default())
             .await,
-        Err(ServiceError::Backend(_))
-    ));
-    // Nor is an Identify that cannot read the library locations.
-    let movie = row(3, BaseItemKind::Movie, false, None, Some("/media/m.mkv"));
-    assert!(matches!(
-        mgr.identify_target(&movie).await,
         Err(ServiceError::Backend(_))
     ));
 }

@@ -1386,12 +1386,14 @@ pub trait LibraryManager: Send + Sync {
     /// - any other folder with a path validates its own subtree, the folder
     ///   included (`ValidateChildren`), and a file item refreshes itself
     ///   (`RefreshSingleItem`) through the scan of its own path — both
-    ///   through [`queue_refresh_scan`](Self::queue_refresh_scan);
+    ///   through [`queue_refresh_scan`](Self::queue_refresh_scan), which
+    ///   plans an item whose path no library location covers outside every
+    ///   library, with default library options;
     /// - a music artist validates the children of the artist folders above
     ///   the albums credited to it, then refreshes itself (`RefreshArtist`);
     /// - an item with no file and no physical children (a box set, a
     ///   playlist, a view, a virtual season, a person, a genre, a studio, a
-    ///   channel, an item outside every library) refreshes through the
+    ///   channel, a file with no top parent) refreshes through the
     ///   provider manager's queue at high priority.
     ///
     /// The default refuses: a manager without a scanner and a provider
@@ -1416,8 +1418,9 @@ pub trait LibraryManager: Send + Sync {
     /// Runs `item`'s own metadata refresh with `options` and returns once it
     /// has run: `item.RefreshMetadata(options, CancellationToken.None)`,
     /// which a caller awaits rather than queues. An item with a path of its
-    /// own in a library refreshes through the scan of that path in the scan queue's
-    /// priority lane ([`run_refresh_scan`](Self::run_refresh_scan)); any
+    /// own and a top parent refreshes through the scan of that path in the
+    /// scan queue's priority lane ([`run_refresh_scan`](Self::run_refresh_scan)),
+    /// outside every library when no location holds it; any
     /// other item is queued through the provider manager at high priority,
     /// and this returns once it is queued. A folder's children are not
     /// validated. Returns `Ok(false)` when the refresh was stopped before it
@@ -1455,9 +1458,6 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`ServiceError::Conflict`] when the item's path lies under no library
-    /// location, or when it is a file- or folder-backed item that belongs to
-    /// no library: the scan cannot reach it, so it is not refreshed.
     /// [`ServiceError::Backend`] from a manager without a scanner and a
     /// provider manager, or the refresh failed.
     async fn refresh_full_item(

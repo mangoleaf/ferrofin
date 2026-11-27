@@ -6453,7 +6453,7 @@ pub const VERIFIED: &[Verified] = &[
                release/10.0, not measured on 12.4)) → \
                handlers.rs run_item_refresh (the awaited \
                item.RefreshMetadata, whose re-probe drops the stream and renumbers the rest; \
-               queued instead for an item outside every library, as for the lyrics delete) → \
+               queued instead for an item with no TopParentId, as for the lyrics delete) → \
                subtitle_manager.rs drop_missing_subtitle_rows (the item's external subtitle \
                rows whose absolute path is gone dropped, the rest kept with their indexes; \
                nothing to drop after a refresh that probed; when it drops one, \
@@ -7030,17 +7030,45 @@ pub const VERIFIED: &[Verified] = &[
                library_manager/item_refresh.rs identify_target: an item with a path \
                through run_refresh_scan of scan_target in the scan queue's priority lane \
                (RefreshItem: the item, then ValidateChildren with the same options, so a \
-               folder's children refresh under the chosen result too), an artist known only \
-               by name through the scanner's ScanTarget::Artist, any other item through \
-               ProviderManager::refresh_full_item; the chosen ids replace the item's \
+               folder's children refresh under the chosen result too; nothing is refused: \
+               an item whose path no library location covers is planned outside every \
+               library, library_scan.rs libraries_outside and outside_library, under the \
+               folder below the AggregateFolder its parents lead to, which \
+               GetCollectionFolders walks up to and finds in no library's \
+               PhysicalLocations, so it refreshes with GetLibraryOptions' new \
+               LibraryOptions(), keeps that folder as its parent and top parent and names \
+               no collection folder in its ancestors, GetAncestorIds; a folder there \
+               validates its subtree, adding and removing children, as in a library, \
+               and nothing is removed while its directory cannot be listed), an artist \
+               known only \
+               by name through the scanner's ScanTarget::Artist, any other item (a file \
+               with no TopParentId too) through ProviderManager::refresh_full_item; the \
+               chosen ids replace the item's \
                (item.SetProviderIds) with the refresh's save of it, a path-less item's \
                before its providers run → 204. A refresh stopped by the server shutting \
                down answers 503.",
-        date: "2026-11-14",
+        date: "2026-11-27",
         divergences: &[
-            "An item whose path no library location covers, or a file-backed item in no \
-         library, answers 409 and is not refreshed; upstream refreshes it. Fix path: \
-         gl-1770.",
+            "A media file with no TopParentId refreshes through the provider manager, \
+         without the probe and local readers upstream's metadata service runs, and an \
+         item outside every library location is not refreshed when its stored parents \
+         lead to no folder under the AggregateFolder, when its path holds a location a \
+         library still lists, or when that folder holds a path of the same refresh a \
+         library holds, and Apply still answers 204; upstream refreshes each in full. \
+         Fix path: gl-2030.",
+            "An item whose path no library location covers refreshes at once as in no \
+         library: with new LibraryOptions(), no collection folder in its ancestors (so \
+         a series' presentation key names no library), and a folder's children \
+         resolved with the library type of its own kind or, for a plain folder, of \
+         what is stored under it (untyped, a mixed library's walk, when that names \
+         several), so they keep their kinds; upstream still finds the \
+         item in its old library, with that library's type (and its options while the \
+         library exists), until the library's cached \
+         CollectionFolder.PhysicalLocationsList is read again (its own refresh, \
+         ValidateTopLibraryFolders, the next scan), and resolves the children with no \
+         content type after, under which a music folder's albums become plain folders, \
+         its books are dropped and home or music videos change kind. Fix path: gl-2031, \
+         an owner decision.",
             "The 400 (an itemId, replaceAllImages or body the binder cannot read, or the nil \
          id), 401 (no or bad token), 403 (not an administrator, or a remote caller the \
          user's remote-access restriction refuses) and 404 bodies are Ferrofin's error \
@@ -7083,17 +7111,37 @@ pub const VERIFIED: &[Verified] = &[
                Folder.RefreshChildMetadata and IsLibraryFolderAccessible), another \
                folder's subtree (the folder, then ValidateChildren with the same options) \
                and a file's own path (RefreshSingleItem's metadata service), each as a scan \
-               through queue_refresh_scan; a music artist by artist_target \
+               through queue_refresh_scan, which plans an item whose path no library \
+               location covers outside every library as the Identify row says \
+               (library_scan.rs libraries_outside: new LibraryOptions(), no collection \
+               folder in its ancestors); a music artist by artist_target \
                (RefreshArtist: the artist folders above its credited albums, found from \
                one read of the ancestors per album folder as MusicAlbum.GetMusicArtist \
                walks them, validate their children, then the artist refreshes); a box set, \
-               playlist, view, virtual season, person, genre, studio or channel through \
-               ProviderManager::queue_refresh at High priority → 204 without waiting for \
-               the refresh.",
-        date: "2026-11-26",
+               playlist, view, virtual season, person, genre, studio or channel (and a \
+               file with no TopParentId) through ProviderManager::queue_refresh at High \
+               priority → 204 without waiting for the refresh.",
+        date: "2026-11-27",
         divergences: &[
-            "An item whose path no library location covers is answered 204 and not \
-         refreshed; upstream refreshes it. Fix path: gl-1770.",
+            "A media file with no TopParentId refreshes through the provider manager, \
+         without the probe and local readers upstream's metadata service runs, and an \
+         item outside every library location is not refreshed when its stored parents \
+         lead to no folder under the AggregateFolder, when its path holds a location a \
+         library still lists, or when that folder holds a path of the same refresh a \
+         library holds; upstream refreshes each in full. Fix path: gl-2030.",
+            "An item whose path no library location covers refreshes at once as in no \
+         library: with new LibraryOptions(), no collection folder in its ancestors (so \
+         a series' presentation key names no library), and a folder's children \
+         resolved with the library type of its own kind or, for a plain folder, of \
+         what is stored under it (untyped, a mixed library's walk, when that names \
+         several), so they keep their kinds; upstream still finds the \
+         item in its old library, with that library's type (and its options while the \
+         library exists), until the library's cached \
+         CollectionFolder.PhysicalLocationsList is read again (its own refresh, \
+         ValidateTopLibraryFolders, the next scan), and resolves the children with no \
+         content type after, under which a music folder's albums become plain folders, \
+         its books are dropped and home or music videos change kind. Fix path: gl-2031, \
+         an owner decision.",
             "Upstream runs every queued item refresh on one queue, started at once and one \
          after another; Ferrofin runs a file's refresh in the scan queue's priority lane \
          (ahead of queued scans, inside a running one), queues a folder's like a scan, \

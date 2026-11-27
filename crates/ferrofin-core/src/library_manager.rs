@@ -3858,7 +3858,7 @@ impl LibraryManager for FerrofinLibraryManager {
         item: &BaseItemEntity,
         options: &MetadataRefreshOptions,
     ) -> Result<bool, ServiceError> {
-        if let Some(target) = self.identify_target(item).await? {
+        if let Some(target) = item_refresh::identify_target(item)? {
             return self.run_refresh_scan(target, options).await;
         }
         self.providers()?
