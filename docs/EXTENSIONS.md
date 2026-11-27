@@ -543,7 +543,8 @@ and size-capped:
   declare it in their documentation and that you trust. A finer-grained per-plugin
   grant is planned (same status as the egress-`*` UX).
 - **`write-lyrics` / `write-subtitles`** — save a sidecar next to the media file
-  (payload ≤ `FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 MiB). The host sanitizes the
+  (payload ≤ `FERROFIN_WASM_WRITE_CONTENT_MB`, default 2 MiB). A saved subtitle
+  queues the item's refresh, whose probe lists it as a stream. The host sanitizes the
   file name: the format is allowlisted to real lyric/subtitle extensions and the
   language reduced to a plain tag, so a plugin can never choose a path or drop a
   scanner-authoritative file (`.nfo`, `.strm`) next to your media.

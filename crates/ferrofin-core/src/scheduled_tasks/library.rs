@@ -1291,9 +1291,19 @@ impl ScheduledTask for SubtitleDownloadTask {
                 if !self.downloader.is_task_candidate(video, options).await? {
                     continue;
                 }
-                self.downloader
+                // `SubtitleScheduledTask.DownloadSubtitles`' rescan: a saved
+                // subtitle has no stream until the video's refresh probes it.
+                if self
+                    .downloader
                     .download_missing(video, options, progress.cancel_token())
-                    .await;
+                    .await
+                    && let Err(error) = self
+                        .library
+                        .refresh_item_metadata(video, &MetadataRefreshOptions::default())
+                        .await
+                {
+                    tracing::error!(item_id = %video.id, path = video.path.as_deref().unwrap_or_default(), %error, "error refreshing a video after its subtitle download");
+                }
             }
         }
         progress.report(100.0);
@@ -3642,6 +3652,74 @@ mod tests {
         assert!(searches[0].is_automated);
         let downloads = subtitles.downloads.lock().expect("lock");
         assert_eq!(downloads.as_slice(), &[(movie, "sub-1".to_owned())]);
+    }
+
+    /// The scans a library manager was asked to run, by scope.
+    #[derive(Default)]
+    struct RecordingScans(Mutex<Vec<ferrofin_traits::library::ScanTarget>>);
+
+    #[async_trait]
+    impl crate::library_manager::ScanRunner for RecordingScans {
+        async fn run(
+            &self,
+            scope: &ferrofin_traits::library::ScanTarget,
+            _run: crate::library_scan::ScanRun<'_>,
+        ) -> Result<crate::library_scan::ScanOutcome, ServiceError> {
+            self.0.lock().expect("lock").push(scope.clone());
+            Ok(crate::library_scan::ScanOutcome::default())
+        }
+    }
+
+    /// `SubtitleScheduledTask.DownloadSubtitles`: a video a subtitle was
+    /// saved for is refreshed, whose probe records the new stream (gl-1641).
+    #[tokio::test]
+    async fn subtitle_download_refreshes_the_video_it_saved_for() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let scans = Arc::new(RecordingScans::default());
+        let library: Arc<dyn LibraryManager> = Arc::new(
+            crate::test_support::concrete_library_manager_over(db.clone())
+                .with_scan_runner(scans.clone()),
+        );
+        let (folder, movie) = (Uuid::from_u128(0x5F), Uuid::from_u128(0x52));
+        // A video in a library refreshes through the scan of its path.
+        crate::test_support::seed_top_parented_item(
+            &db,
+            movie,
+            BaseItemKind::Movie,
+            "Film",
+            folder,
+        )
+        .await;
+        let path = media.path().join("film.mkv");
+        std::fs::write(&path, b"x").expect("write");
+        set_path(&db, movie, &path.to_string_lossy()).await;
+        set_media_type(&db, movie, "Video").await;
+        let subtitles = Arc::new(FakeSubtitles::default());
+        let task = SubtitleDownloadTask::new(
+            library,
+            Arc::new(folder_with(
+                LibraryOptions {
+                    subtitle_download_languages: Some(vec!["eng".to_owned()]),
+                    ..LibraryOptions::default()
+                },
+                Some(folder),
+                &media.path().to_string_lossy(),
+            )),
+            Arc::new(crate::subtitle_downloader::SubtitleDownloader::new(
+                &(subtitles.clone() as Arc<dyn SubtitleManager>),
+                Arc::new(FakeStreams::new(Vec::new())),
+            )),
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        assert_eq!(subtitles.downloads.lock().expect("lock").len(), 1);
+        assert_eq!(
+            *scans.0.lock().expect("lock"),
+            [ferrofin_traits::library::ScanTarget::Items(vec![
+                path.to_string_lossy().into_owned()
+            ])]
+        );
     }
 
     #[tokio::test]

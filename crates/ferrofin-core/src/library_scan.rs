@@ -8400,7 +8400,7 @@ impl LibraryScanner {
                 guesses.index_number_end = info.ending_episode_number.filter(|_| !info.is_by_date);
             }
         }
-        let rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio, policy);
+        let mut rows = Self::apply_probe(&mut entity, probe.info.as_ref(), probe.is_audio, policy);
         // `if (audio.AlbumEntity is not null && !audio.AlbumEntity.
         // NormalizationGain.HasValue)` in `FetchDataFromTags`, which runs for
         // an unlocked track only: the first tagged track names its album's
@@ -9236,9 +9236,9 @@ impl LibraryScanner {
         self.persist_probe_rows(item.id, &rows, subtitle_downloader.map(AsRef::as_ref))
             .await?;
         // Like FFProbeVideoInfo.AddExternalSubtitlesAsync, only a successful
-        // video probe in Default/FullRefresh downloads. Save first: attachment
-        // reads the item and appends streams, so it must follow the probe's
-        // full stream replacement. Failed probes cannot establish absence.
+        // video probe in Default/FullRefresh downloads. Save first: the
+        // download reads the saved item, and a subtitle it saves then joins
+        // the probe's streams. Failed probes cannot establish absence.
         if probe_ran
             && matches!(
                 options.metadata_refresh_mode,
@@ -9248,7 +9248,7 @@ impl LibraryScanner {
         {
             // Upstream downloads before applying AllowEmbeddedSubtitles. A
             // hidden embedded stream still satisfies its language during this
-            // scan; the downloader also reads newly attached external streams
+            // scan; the downloader also reads the stored external streams
             // before each language rather than trusting the probe snapshot.
             let unfiltered = probe.info.as_ref().map_or_else(Vec::new, |info| {
                 info.media_source
@@ -9257,12 +9257,27 @@ impl LibraryScanner {
                     .map(|s| stream_dto_to_entity(&entity.id, s))
                     .collect::<Vec<_>>()
             });
-            downloader
+            let saved = downloader
                 .download_missing_from_probe_locked(&entity, options, cancel, &unfiltered)
                 .await;
             // A subtitle saved beside the video lands in its folder's listing.
             if let (Some(dirs), Some(path)) = (&state.art_cache.dirs, &entity.path) {
                 dirs.invalidate(path);
+            }
+            if saved
+                && let (Some(info), Some(seam)) =
+                    (probe.info.as_mut(), state.refresh.externals.as_ref())
+            {
+                self.add_downloaded_subtitles(
+                    item.id,
+                    &mut entity,
+                    &mut rows,
+                    info,
+                    seam,
+                    policy,
+                    downloader,
+                )
+                .await?;
             }
         }
         self.persist_video_chapters(
@@ -9681,7 +9696,7 @@ impl LibraryScanner {
                 repo.save_media_streams(item_id, &probe.streams).await?;
             }
             // The item's row went first, with the flag the probe's snapshot
-            // gave (`FFProbeVideoInfo.cs:270`); a subtitle a download attached
+            // gave (`FFProbeVideoInfo.cs:270`); a subtitle a refresh recorded
             // since, kept above or replaced, must not leave the two apart.
             if probe.save_attachments {
                 repo.sync_has_subtitles(item_id).await?;
@@ -9694,6 +9709,87 @@ impl LibraryScanner {
                 .await?;
         }
         Ok(())
+    }
+
+    /// `AddExternalSubtitlesAsync`'s rescan (`FFProbeVideoInfo.cs:567-577`),
+    /// once an automatic download saved a subtitle: the video's external
+    /// streams are resolved again and lead its own, numbered from 0, as the
+    /// probe orders them. The streams saved and the video's
+    /// `DefaultVideoStreamIndex` and `HasSubtitles` follow, as
+    /// [`apply_probe`](Self::apply_probe) sets them; the item's row is saved
+    /// already, so those two keys are written into its `Data` here.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a storage failure from the stream or `Data` write.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_downloaded_subtitles(
+        &self,
+        item_id: Uuid,
+        entity: &mut BaseItemEntity,
+        rows: &mut ProbeRows,
+        info: &mut MediaInfo,
+        seam: &ExternalProbeSeam,
+        policy: FetcherPolicy<'_>,
+        downloader: &crate::subtitle_downloader::SubtitleDownloader,
+    ) -> Result<(), ServiceError> {
+        let Some(path) = entity.path.clone() else {
+            return Ok(());
+        };
+        let internal = seam.internal_metadata_path(item_id);
+        // `TrySaveToFiles` invalidates the file it saved, beside the video or
+        // in the item's metadata folder.
+        if let Some(dirs) = &seam.dirs {
+            dirs.invalidate(&path);
+            if let Some(internal) = &internal {
+                dirs.invalidate(internal);
+            }
+        }
+        let target =
+            crate::media_info_resolver::ExternalMediaTarget::for_video(entity, &path, internal);
+        let externals = seam.resolvers.external_streams(&target, 0).await;
+        let embedded = std::mem::take(&mut info.media_source.media_streams)
+            .into_iter()
+            .filter(|s| !s.is_external)
+            .collect();
+        info.media_source.media_streams =
+            ExternalStreamResolvers::merge_with_embedded(externals, embedded);
+        let streams = &info.media_source.media_streams;
+        let video = streams
+            .iter()
+            .find(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Video)
+            .map(|s| s.index);
+        let kept = saved_streams(streams, false, policy);
+        let has_subtitles = kept
+            .iter()
+            .any(|s| s.stream_type == ferrofin_model::entities::MediaStreamType::Subtitle);
+        let fields = serde_json::Map::from_iter([
+            (
+                "DefaultVideoStreamIndex".to_owned(),
+                serde_json::json!(video),
+            ),
+            ("HasSubtitles".to_owned(), serde_json::json!(has_subtitles)),
+        ]);
+        let merge: Vec<_> = fields
+            .iter()
+            .map(|(key, value)| (key.as_str(), Some(value.clone())))
+            .collect();
+        if let Some(data) = crate::item_data::merge_data_fields(entity.data.as_deref(), &merge) {
+            entity.data = Some(data);
+        }
+        rows.streams = kept
+            .into_iter()
+            .map(|s| stream_dto_to_entity(&entity.id, s))
+            .collect();
+        downloader
+            .save_probed_streams(item_id, &rows.streams)
+            .await?;
+        self.persistence.merge_data_fields(item_id, &fields).await?;
+        // The gated save can keep a stored subtitle this listing missed.
+        match &self.media_streams {
+            Some(repo) => repo.sync_has_subtitles(item_id).await,
+            None => Ok(()),
+        }
     }
 
     /// Chapter generation uses the same pure generator as the media-info
@@ -35150,7 +35246,7 @@ mod tests {
 
     /// A video probe's stream save leaves the video's `HasSubtitles` agreeing
     /// with the rows it saved (gl-1914): the item's row went first, with the
-    /// probe snapshot's flag, and a subtitle a download attached in between
+    /// probe snapshot's flag, and a subtitle a refresh recorded in between
     /// (whose flag the row overwrote) or one the save replaced must not leave
     /// them apart, on the plain save and on the download gate's, which keeps a
     /// subtitle the snapshot lacked. Every other key of `Data` stays, and an
@@ -35221,8 +35317,8 @@ mod tests {
         if probe_kind == "subtitle" {
             probe.streams.push(stream(1, 2));
         }
-        // What a download attached after the probe's snapshot: its sidecar
-        // and row, the row the gate's save keeps.
+        // What a refresh recorded after the probe's snapshot (a scheduled
+        // download's): its sidecar and row, the row the gate's save keeps.
         let manager: Arc<dyn ferrofin_traits::subtitles::SubtitleManager> =
             Arc::new(crate::FerrofinSubtitleManager::new(
                 db.clone(),
@@ -35250,6 +35346,189 @@ mod tests {
             serde_json::from_str(data.as_deref().expect("data")).expect("json");
         assert_eq!(data["HasSubtitles"].as_bool(), expected, "{data}");
         assert_eq!(data["VideoType"], "VideoFile", "{data}");
+    }
+
+    /// ffprobe of a sidecar subtitle: one subtitle stream, whatever the file.
+    struct SidecarProbe;
+
+    #[async_trait]
+    impl MediaEncoder for SidecarProbe {
+        fn encoder_path(&self) -> String {
+            "ffmpeg".to_owned()
+        }
+        fn probe_path(&self) -> String {
+            "ffprobe".to_owned()
+        }
+        async fn set_ffmpeg_path(&self) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn get_media_info(
+            &self,
+            _request: &MediaInfoRequest,
+        ) -> Result<MediaSourceInfo, ServiceError> {
+            Ok(MediaSourceInfo {
+                media_streams: vec![MediaStream {
+                    stream_type: MediaStreamType::Subtitle,
+                    codec: Some("subrip".to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        }
+        async fn extract_audio_image(
+            &self,
+            _path: &str,
+            _image_stream_index: Option<i32>,
+        ) -> Result<String, ServiceError> {
+            unreachable!()
+        }
+        async fn extract_video_image(
+            &self,
+            _input_file: &str,
+            _container: &str,
+            _media_source: &MediaSourceInfo,
+            _video_stream: &MediaStream,
+            _threed_format: Option<ferrofin_model::entities::Video3DFormat>,
+            _offset_ticks: Option<i64>,
+        ) -> Result<String, ServiceError> {
+            unreachable!()
+        }
+        fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
+            input_file.to_owned()
+        }
+        fn get_time_parameter(&self, _ticks: i64) -> String {
+            String::new()
+        }
+        async fn convert_image(&self, _i: &str, _o: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// `AddExternalSubtitlesAsync`'s rescan (gl-1641): a subtitle a scan's
+    /// download saved leads the probe's own streams, which are numbered after
+    /// it, with the hole `AllowEmbeddedSubtitles` leaves kept; the video's
+    /// `DefaultVideoStreamIndex` and `HasSubtitles` follow, in memory and in
+    /// `Data`.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_downloaded_subtitle_leads_the_probes_streams() {
+        use ferrofin_model::configuration::EmbeddedSubtitleOptions;
+        use ferrofin_model::media_info::MediaInfo;
+        use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let tmp = tempfile::tempdir().unwrap();
+        let movie = tmp.path().join("Heat (1995).mkv");
+        std::fs::write(&movie, b"video").unwrap();
+        std::fs::write(tmp.path().join("Heat (1995).eng.srt"), b"1\n").unwrap();
+        let id = uuid::Uuid::new_v4();
+        let mut entity = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            parent_id: None,
+            path: Some(movie.to_string_lossy().into_owned()),
+            data: Some(
+                r#"{"VideoType":"VideoFile","DefaultVideoStreamIndex":0,"HasSubtitles":false}"#
+                    .to_owned(),
+            ),
+            ..planned_movie()
+        };
+        persistence
+            .save_items(std::slice::from_ref(&entity))
+            .await
+            .unwrap();
+        let folders = Arc::new(FerrofinVirtualFolderManager::new(tmp.path().join("views")));
+        let mut scanner =
+            LibraryScanner::new(folders, Arc::new(FerrofinFileSystem::new()), persistence);
+        let streams: Arc<dyn MediaStreamRepository> =
+            Arc::new(crate::FerrofinMediaStreamRepository::new(db.clone()));
+        scanner.media_streams = Some(Arc::clone(&streams));
+        let manager: Arc<dyn ferrofin_traits::subtitles::SubtitleManager> =
+            Arc::new(crate::FerrofinSubtitleManager::new(
+                db.clone(),
+                crate::test_support::library_manager_over(db.clone()),
+                Arc::clone(&streams),
+                Vec::new(),
+                tmp.path().join("metadata"),
+            ));
+        let downloader =
+            crate::subtitle_downloader::SubtitleDownloader::new(&manager, Arc::clone(&streams));
+        let seam = super::ExternalProbeSeam {
+            resolvers: Arc::new(crate::media_info_resolver::ExternalStreamResolvers::new(
+                Arc::clone(ferrofin_naming::common::NamingOptions::shared()),
+                Arc::new(crate::localization_manager::LocalizationManager::new("")),
+                Arc::new(SidecarProbe),
+                Arc::new(FerrofinFileSystem::new()),
+            )),
+            metadata_dir: Some(tmp.path().join("metadata").into()),
+            dirs: None,
+        };
+        // The probe as it stood before the download: no sidecar, and an
+        // embedded image subtitle the library's AllowText option drops.
+        let stream = |index, stream_type, codec: &str| MediaStream {
+            index,
+            stream_type,
+            codec: Some(codec.to_owned()),
+            ..Default::default()
+        };
+        let mut info = MediaInfo::default();
+        info.media_source.media_streams = vec![
+            stream(0, MediaStreamType::Video, "h264"),
+            stream(1, MediaStreamType::Subtitle, "hdmv_pgs_subtitle"),
+            stream(2, MediaStreamType::Audio, "aac"),
+        ];
+        let options = ferrofin_model::configuration::LibraryOptions {
+            allow_embedded_subtitles: EmbeddedSubtitleOptions::AllowText,
+            ..Default::default()
+        };
+        let policy = super::FetcherPolicy {
+            options: Some(&options),
+            ..super::FetcherPolicy::default()
+        };
+        let mut rows = super::ProbeRows::default();
+
+        scanner
+            .add_downloaded_subtitles(
+                id,
+                &mut entity,
+                &mut rows,
+                &mut info,
+                &seam,
+                policy,
+                &downloader,
+            )
+            .await
+            .unwrap();
+
+        let shape = |rows: &[ferrofin_db::entities::base_items::MediaStreamInfoEntity]| {
+            rows.iter()
+                .map(|s| (s.stream_index, s.stream_type, s.is_external))
+                .collect::<Vec<_>>()
+        };
+        let disc = crate::db_error::media_stream_type_disc;
+        let expected = vec![
+            (0, disc(MediaStreamType::Subtitle), true),
+            (1, disc(MediaStreamType::Video), false),
+            (3, disc(MediaStreamType::Audio), false),
+        ];
+        assert_eq!(shape(&rows.streams), expected);
+        let stored = streams
+            .get_media_streams(&MediaStreamQuery {
+                item_id: id,
+                stream_type: None,
+                index: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(shape(&stored), expected);
+        for data in [
+            entity.data.clone(),
+            crate::test_support::fetch_item(&db, id).await.data,
+        ] {
+            let data = crate::item_data::parse_data(data.as_deref());
+            assert_eq!(data["DefaultVideoStreamIndex"], 1, "{data:?}");
+            assert_eq!(data["HasSubtitles"], true, "{data:?}");
+            assert_eq!(data["VideoType"], "VideoFile", "{data:?}");
+        }
     }
 
     /// `FFProbeVideoInfo.Fetch` (`FFProbeVideoInfo.cs:263-266`): a video's

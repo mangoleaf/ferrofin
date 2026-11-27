@@ -6583,23 +6583,22 @@ pub const VERIFIED: &[Verified] = &[
                {stem}.{language}[.forced][.sdh].{format} with the language lowercased and a \
                path separator refused, the format checked against \
                NamingOptions.SubtitleFileExtensions, a taken name moved to {name}.{n}.{format}, \
-               the name written bracketed as a self-write; a failed fetch or save, but a \
+               the name written bracketed as a self-write, and no stream recorded; a failed \
+               fetch or save, but a \
                RateLimitExceeded, raises SubtitleDownloadFailure, which \
                SubtitleDownloadFailureLogger records: SubtitleDownloadFailureFromForItem with \
                the provider's name and GetItemName, type SubtitleDownloadFailure, no user, the \
                item id, the error message as ShortOverview) → handlers.rs \
-               queue_high_priority_refresh (QueueRefresh at RefreshPriority.High) → \
+               queue_high_priority_refresh (QueueRefresh at RefreshPriority.High, whose \
+               probe records the new file as a stream) → \
                ferrofin-providers opensubtitles.rs get_subtitles (the OpenSubtitles plugin's \
                GetSubtitles: a plugin outside the Jellyfin tree, not compared yet, gl-1644)",
-        date: "2026-11-14",
+        date: "2026-11-26",
         divergences: &[
             "The failed download's activity entry is written in English, not the server's UI \
          culture. Fix path: gl-429.",
             "The entry names the OpenSubtitles provider opensubtitles; the plugin's Name, which \
          upstream's entry shows, is Open Subtitles. Fix path: gl-1704.",
-            "The subtitle is recorded as an external stream as soon as it is written; upstream \
-         leaves that to the queued refresh's probe, so the item lists it here before the \
-         refresh has run, and also when queueing the refresh failed. Fix path: gl-1641.",
             "A nil itemId is a 404, not GetItemById's 400. Fix path: gl-1695.",
             "A whitespace-only subtitleId is taken (a logged failed download and a 204, or a \
          404 for a missing or hidden item); upstream's model validation answers 400 before \
