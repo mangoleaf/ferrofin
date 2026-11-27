@@ -370,7 +370,7 @@ def stream_lines(server, user_id):
     request = urllib.request.Request(f"{server.base}/Videos/{found[0].get('Id')}/stream?static=true",
                                      headers={"Authorization": server.auth})
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=api.REQUEST_SECONDS) as response:
             status, body = response.status, response.read(STREAM_BYTES)
     except urllib.error.HTTPError as error:
         status, body = error.code, b""

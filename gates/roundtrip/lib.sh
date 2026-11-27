@@ -115,7 +115,7 @@ rt_wait_up() {
       log=$(rt_docker logs "$name" 2>&1)   # whole, not piped: grep -q's early exit would fail the pipe
       ! grep -qE -- "$give_up" <<<"$log" || return 1
     fi
-    sleep 2
+    sleep 2   # between readiness polls, as api.py's POLL_SECONDS
   done
   return 1
 }

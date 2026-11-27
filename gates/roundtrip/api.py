@@ -30,6 +30,10 @@ import metadata  # noqa: E402  (gates/adoption/metadata.py: Api, CheckError)
 CheckError = metadata.CheckError
 #: A playlist's stored type in BaseItems.
 PLAYLIST = "MediaBrowser.Controller.Playlists.Playlist"
+#: How long one request may take, in seconds, before the server counts as not answering it.
+REQUEST_SECONDS = 30
+#: How often a wait polls the scheduled tasks or the playlists' refresh, in seconds.
+POLL_SECONDS = 2
 
 
 def database(data_dir):
@@ -62,7 +66,7 @@ class Server(metadata.Api):
             headers["Content-Type"] = content_type
         request = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=REQUEST_SECONDS) as response:
                 raw = response.read()
                 status = response.status
         except urllib.error.HTTPError as error:
@@ -76,7 +80,7 @@ class Server(metadata.Api):
         except (json.JSONDecodeError, UnicodeDecodeError):   # binary bytes fail decoding before parsing
             return status, None
 
-    def settle(self, timeout, interval=2):
+    def settle(self, timeout, interval=POLL_SECONDS):
         """Wait until no scheduled task is running (a library scan, a startup task): idle on two polls
         `interval` apart, since a startup task can begin a moment after the server first answers."""
         deadline, idle = time.monotonic() + timeout, 0
@@ -91,7 +95,7 @@ class Server(metadata.Api):
                 raise CheckError(f"a scheduled task was still running after {timeout:.0f} s")
             time.sleep(interval)
 
-    def refresh_playlists(self, db, timeout, interval=2):
+    def refresh_playlists(self, db, timeout, interval=POLL_SECONDS):
         """A full metadata refresh of every playlist the copy's database `db` holds, replacing nothing: jellyfin-web's
         "Refresh metadata" without "Replace existing metadata", for the metadata only (no image refresh, which could
         build a playlist collage Ferrofin lacks), waited for: no task shows a queued refresh, so each

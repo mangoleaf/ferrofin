@@ -33,8 +33,8 @@ MOUNT = "/livetv"
 #: The most programmes one request asks for: the fixture has 8, and a capture that holds fewer than the server
 #: counts fails rather than compare part of the guide.
 PROGRAMME_PAGE = 500
-#: How often the guide refresh's state is polled, in seconds: as api.py polls a scan.
-POLL_SECONDS = 2
+#: How often the guide refresh's state is polled, in seconds: api.py's interval for its waits.
+POLL_SECONDS = api.POLL_SECONDS
 #: The answers compared, per timer and series timer.
 TIMER_KEYS = ("Id", "ExternalId", "ChannelId", "ExternalChannelId", "ProgramId", "ExternalProgramId",
               "SeriesTimerId", "ExternalSeriesTimerId", "Name", "StartDate", "EndDate", "Status")
