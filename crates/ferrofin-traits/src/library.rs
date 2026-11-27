@@ -801,7 +801,13 @@ pub trait LibraryManager: Send + Sync {
         Ok(())
     }
 
-    /// Deletes an item, honoring the given [`DeleteOptions`].
+    /// Deletes an item, honoring the given [`DeleteOptions`]. The core
+    /// implementation holds the item's metadata
+    /// ([`ProviderManager::lock_item_metadata`]) from before it reads the row
+    /// until the delete is done, so a refresh that loaded the row first
+    /// cannot save the deleted item back.
+    ///
+    /// [`ProviderManager::lock_item_metadata`]: crate::providers::ProviderManager::lock_item_metadata
     async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError>;
 
     /// Merges several videos into one version group.

@@ -553,7 +553,13 @@ impl FerrofinPeopleRepository {
         }
         let mut created = 0;
         for name in names {
-            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            // Reads before it writes: lock first (see `Database::writer`).
+            let mut tx = self
+                .db
+                .writer()
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(db_err)?;
             let item_id = self.person_item_id_for_write(&mut tx, name, "").await?;
             let inserted = self
                 .insert_person_item(&mut tx, PERSON_TYPE_NAME, name, &item_id)
@@ -697,7 +703,13 @@ impl FerrofinPeopleRepository {
         .await
         .map_err(db_err)?;
 
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         let mut collapsed: u64 = 0;
         let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (old_id, name) in rows {

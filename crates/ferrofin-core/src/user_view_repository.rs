@@ -102,7 +102,12 @@ pub async fn consolidate_localized_user_views(
         return Ok(0);
     }
 
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut dropped = 0u64;
     for (view_type, group) in typed_views(&mut tx).await? {
         let folder = item_type_lookup::valid_filename(&view_type);

@@ -748,8 +748,7 @@ fn log_connect(caller: Result<&SocketCaller, &SessionlessReason>, registered: bo
 /// watchlist (SessionWebSocketListener.cs:168-176), before the watchdog ever
 /// ticks — it is how the client learns the timeout it must answer within.
 ///
-/// `ferrofin-core`'s listener port sends one, but that listener is not what
-/// serves this route, so on the wire Ferrofin's first frame arrived 48 s late.
+/// Without it, Ferrofin's first frame arrived 48 s late on the wire.
 /// Measured against the oracle on one socket for 160 s: Jellyfin at
 /// `[0.2, 48.0, 96.0, 144.1]`, Ferrofin at `[48.0, 96.1, 144.1]` — the same
 /// cadence, one frame short, every run.
