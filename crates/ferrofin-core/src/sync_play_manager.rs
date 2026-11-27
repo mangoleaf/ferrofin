@@ -1697,11 +1697,13 @@ impl Group {
         // Marked buffering BEFORE the AllReady command is addressed, so the
         // joiner is not one of the sessions told to pause.
         self.set_buffering(session_id, true);
+        // `NewSyncPlayCommand` stamps `When = LastActivity`: now for a group
+        // that was playing (moved above), the group's unchanged one otherwise.
         vec![
             Outbound::to(Target::CurrentSession, queue),
             Outbound::to(
                 Target::AllReady,
-                self.command_env(SendCommandType::Pause, now, now),
+                self.command_env(SendCommandType::Pause, self.last_activity, now),
             ),
         ]
     }
@@ -2991,6 +2993,40 @@ mod tests {
             m.get_group(&a, info.group_id).await.unwrap().state,
             GroupStateType::Waiting
         );
+    }
+
+    /// The `When` of the last `command` among `bodies`.
+    fn command_when(bodies: &[String], command: &str) -> String {
+        let body = bodies
+            .iter()
+            .rev()
+            .find(|b| is_cmd(b, command))
+            .expect("the command was pushed");
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["Data"]["When"].as_str().unwrap().to_owned()
+    }
+
+    /// `WaitingGroupState.SessionJoined` pauses the ready members with
+    /// `NewSyncPlayCommand`, whose `When` is the group's `LastActivity`. Only a
+    /// group that was playing moves that to now first; any other keeps its own,
+    /// for a paused group the time it paused at.
+    #[tokio::test]
+    async fn joining_a_paused_group_pauses_the_ready_at_its_last_activity() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        start_playing(&m, &bus, &[&a], 2).await;
+        m.handle_request(&a, PlaybackRequest::Pause).await.unwrap();
+        let paused_at = command_when(&bus.bodies_for("s1"), "Pause");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let before = bus.count_for("s1");
+
+        m.join_group(&session("s2", "bob"), info.group_id)
+            .await
+            .unwrap();
+
+        let after = &bus.bodies_for("s1")[before..];
+        assert_eq!(command_when(after, "Pause"), paused_at, "{after:?}");
     }
 
     /// `WaitingGroupState.SessionLeaving`: the buffering member the group was
