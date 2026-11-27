@@ -12,17 +12,19 @@
 //! [`list_packages`](PluginManager::list_packages) reads the configured
 //! repositories, [`install_package`](PluginManager::install_package)
 //! downloads, verifies and stages an artifact the host loads at the next
-//! start, and [`remove_plugin`](PluginManager::remove_plugin) uninstalls a
+//! start (both also store the package's image, which the next start serves),
+//! and [`remove_plugin`](PluginManager::remove_plugin) uninstalls a
 //! WASM plugin. `remove_plugin` rejects a compiled-in extension, and, like
 //! upstream, silently ignores a plugin that reports `CanUninstall: false`.
 //! See `docs/EXTENSIONS.md` for the two tiers and `docs/PLUGINS_UPSTREAM.md`
 //! for the compiled-in plugin design.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use ferrofin_model::net::mime_types;
 use ferrofin_model::updates::{InstallationInfo, PackageInfo, RepositoryInfo, VersionInfo};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -31,7 +33,8 @@ use uuid::Uuid;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::{
-    PluginArtifactValidator, PluginDescriptor, PluginImage, PluginManager, PluginUpdateInfo,
+    PluginArtifactValidator, PluginDescriptor, PluginImage, PluginImageSource, PluginManager,
+    PluginUpdateInfo,
 };
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 
@@ -296,6 +299,69 @@ async fn download_and_verify(
     Ok(bytes)
 }
 
+/// The stem of the file a repository plugin's image is stored under, in the
+/// plugin's own directory (`{plugins_dir}/{id}/`).
+const IMAGE_STEM: &str = "image";
+
+/// The name a plugin's image from `url` is stored under: [`IMAGE_STEM`] plus
+/// the extension of the URL's last segment. Upstream stores the file under
+/// that segment (`Path.Join(path, url.Segments[^1])`) and serves it typed by
+/// its extension; here the repository picks only the extension, letters and
+/// digits, so it can name neither another of the plugin's files nor a path
+/// outside its directory, and only one that names an image type, so the
+/// anonymous image route never answers with another (`.html`, `.js`): any
+/// other is served as `application/octet-stream`, upstream's type for an
+/// unknown extension.
+fn image_file_name(url: &str) -> String {
+    let extension = reqwest::Url::parse(url).ok().and_then(|url| {
+        let segment = url.path_segments()?.next_back()?;
+        let (_, extension) = segment.rsplit_once('.')?;
+        (!extension.is_empty()
+            && extension.bytes().all(|b| b.is_ascii_alphanumeric())
+            && mime_types::is_image(mime_types::get_mime_type(&format!(".{extension}"))))
+        .then(|| extension.to_owned())
+    });
+    extension.map_or_else(
+        || IMAGE_STEM.to_owned(),
+        |extension| format!("{IMAGE_STEM}.{extension}"),
+    )
+}
+
+/// The image stored in a plugin's directory `dir`, if one is there and not
+/// empty (`PluginManager.ImageExists`: an interrupted download may leave an
+/// empty file behind).
+fn stored_image(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_stem().is_some_and(|stem| stem == IMAGE_STEM)
+                && std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+        })
+        .min()
+}
+
+/// The image [`stored_image`] finds in `dir`, served from its file and typed
+/// by its extension, as `GetPluginImage` serves a manifest's `ImagePath`
+/// (`PhysicalFile(imagePath, MimeTypes.GetMimeType(imagePath))`).
+fn stored_plugin_image(dir: &Path) -> Option<PluginImage> {
+    stored_image(dir).map(|path| PluginImage {
+        content_type: mime_types::get_mime_type(&path.to_string_lossy()).to_owned(),
+        source: PluginImageSource::File(path),
+    })
+}
+
+/// `PluginManager.GetPlugin(id, version)`'s `p.Version.Equals(version)`: two
+/// `System.Version`s, or, where one is not a version (upstream fails to
+/// parse it), the strings as written.
+fn same_version(a: &str, b: &str) -> bool {
+    match (parse_dotnet_version(a, -1), parse_dotnet_version(b, -1)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// Sort key for version strings: numeric segments compared numerically
 /// (`10.2.0` > `9.9.9`); a prerelease (`1.0.0-rc1`) sorts *below* the
 /// release it precedes (the semver rule), and remaining ties break textually.
@@ -411,7 +477,17 @@ impl FerrofinPluginManager {
     /// `state.json.corrupt`, since the next save would overwrite the enabled
     /// overrides and install ledger it holds.
     #[must_use]
-    pub fn new(plugins: Vec<RegisteredPlugin>, plugins_dir: PathBuf) -> Self {
+    pub fn new(mut plugins: Vec<RegisteredPlugin>, plugins_dir: PathBuf) -> Self {
+        // `LocalPlugin.GetPluginInfo` reports `HasImage` from the manifest's
+        // `ImagePath`, the image a repository install or catalog fetch stored
+        // (`PopulateManifest`): a runtime-loaded plugin's is in its directory.
+        for plugin in plugins
+            .iter_mut()
+            .filter(|plugin| plugin.artifact.is_some() && plugin.image.is_none())
+        {
+            plugin.image = stored_plugin_image(&plugins_dir.join(plugin.descriptor.id.to_string()));
+            plugin.descriptor.has_image = plugin.image.is_some();
+        }
         let path = plugins_dir.join("state.json");
         let state = match std::fs::read(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => PersistedState::default(),
@@ -716,6 +792,121 @@ impl FerrofinPluginManager {
         state.enabled.insert(id.to_string(), enabled);
         self.persist(&state)
     }
+
+    /// The image half of `PluginManager.PopulateManifest`: fetches
+    /// `image_url` into the plugin's own directory unless an image is already
+    /// there (`ImageExists`), so the catalog fetched on every dashboard visit
+    /// downloads only a missing one. A failure only costs the image, as
+    /// upstream's `DownloadImage` then records no path; the caller logs it.
+    async fn store_image(
+        &self,
+        id: Uuid,
+        image_url: Option<&str>,
+        loopback_ok: bool,
+    ) -> Result<(), ServiceError> {
+        let Some(url) = image_url.filter(|url| !url.is_empty()) else {
+            return Ok(());
+        };
+        let dir = self.plugins_dir.join(id.to_string());
+        if stored_image(&dir).is_some() {
+            return Ok(());
+        }
+        Self::download_image(&dir, url, loopback_ok)
+            .await
+            .map_err(|error| {
+                let url = ferrofin_util::source_url::redact_url(url);
+                ServiceError::backend(format!("{error} from {url}"))
+            })
+    }
+
+    /// `PopulateManifest` into the fresh folder an install extracts each
+    /// version into: the image the version installed before left goes, and
+    /// `package`'s is fetched. Its http-loopback exemption needs every
+    /// repository listing the package to be loopback, since the `imageUrl` is
+    /// the first one's.
+    async fn replace_image(&self, package: &PackageInfo) {
+        if let Some(previous) = stored_image(&self.plugins_dir.join(package.id.to_string()))
+            && let Err(error) = std::fs::remove_file(&previous)
+        {
+            tracing::warn!(
+                plugin = %package.id,
+                path = %previous.display(),
+                %error,
+                "could not remove the image of the version installed before; it stays"
+            );
+        }
+        let loopback_ok = !package.versions.is_empty()
+            && package
+                .versions
+                .iter()
+                .all(|v| is_loopback_url(&v.repository_url));
+        if let Err(error) = self
+            .store_image(package.id, package.image_url.as_deref(), loopback_ok)
+            .await
+        {
+            tracing::warn!(
+                plugin = %package.id,
+                %error,
+                "could not download the plugin's image; it has none until a catalog fetch after the restart gets it"
+            );
+        }
+    }
+
+    /// `GetAvailablePackages`' populate step for one repository's `package`:
+    /// the manifest of an installed plugin whose id and version the
+    /// repository lists is populated before the versions are filtered, and
+    /// for a runtime plugin (`installed`: each one's id and version) that is
+    /// its image. Every dashboard visit fetches the catalog and tries a
+    /// failed one again, as upstream does, so a failure is logged at `debug`.
+    async fn populate_image(
+        &self,
+        package: &PackageInfo,
+        installed: &[(Uuid, String)],
+        repository_url: &str,
+    ) {
+        let listed = installed.iter().any(|(id, version)| {
+            *id == package.id
+                && package
+                    .versions
+                    .iter()
+                    .any(|v| same_version(&v.version_number, version))
+        });
+        if !listed {
+            return;
+        }
+        let loopback_ok = is_loopback_url(repository_url);
+        if let Err(error) = self
+            .store_image(package.id, package.image_url.as_deref(), loopback_ok)
+            .await
+        {
+            tracing::debug!(plugin = %package.id, %error, "plugin image not downloaded");
+        }
+    }
+
+    /// Downloads a plugin's image from `url` into `dir`: over https, as every
+    /// plugin download ([`require_https`]; the image client never follows
+    /// https to http), and as artwork is downloaded
+    /// ([`ferrofin_providers::download_artwork`]: no private address, no body
+    /// over `image_download_max_mb`, nothing that is not an image), then
+    /// written to a temporary file renamed into place, as `DownloadImage`
+    /// does.
+    async fn download_image(dir: &Path, url: &str, loopback_ok: bool) -> Result<(), ServiceError> {
+        require_https(url, loopback_ok)
+            .map_err(|_| ServiceError::invalid_input("not an https URL"))?;
+        let image = ferrofin_providers::download_artwork(url)
+            .await
+            .map_err(|failure| {
+                ServiceError::backend(match failure {
+                    ferrofin_providers::ArtworkDownloadFailure::Skip => {
+                        "no image there: missing, at a private address or over image_download_max_mb"
+                    }
+                    ferrofin_providers::ArtworkDownloadFailure::Stop => {
+                        "the download failed or did not answer an image"
+                    }
+                })
+            })?;
+        Self::atomic_write(&dir.join(image_file_name(url)), &image.bytes)
+    }
 }
 
 impl FerrofinPluginManager {
@@ -943,8 +1134,9 @@ impl PluginManager for FerrofinPluginManager {
                     }
                 }
                 // Best-effort cleanup of the plugin's KV state, segment cache,
-                // config dir + enabled override; the artifact removal above is
-                // the load-bearing part.
+                // its directory (configuration, private data and image) and
+                // enabled override; the artifact removal above is the
+                // load-bearing part.
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.json")));
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.lock")));
                 // The segment cache is the directory `CachedMediaSegmentProvider`
@@ -1246,6 +1438,8 @@ impl PluginManager for FerrofinPluginManager {
         self.record_installed_egress(package.id, artifact.declared_egress);
         self.record_completed_installation(package, chosen, source_url);
 
+        self.replace_image(package).await;
+
         // 7. Activate on next restart (Jellyfin's model).
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.mark_restart_required();
@@ -1397,6 +1591,12 @@ impl PluginManager for FerrofinPluginManager {
             .filter(|r| r.enabled)
             .collect();
         let mut packages: Vec<PackageInfo> = Vec::new();
+        // The runtime-loaded plugins, whose images the catalog populates.
+        let installed: Vec<(Uuid, String)> = self
+            .live_plugins()
+            .filter(|plugin| plugin.artifact.is_some())
+            .map(|plugin| (plugin.descriptor.id, plugin.descriptor.version.clone()))
+            .collect();
         // Manifests are small JSON documents: a total deadline plus a
         // streamed size cap, so a hostile/hung repository can neither OOM
         // the server nor pin the task (GET /Packages is admin-only, but the
@@ -1436,7 +1636,7 @@ impl PluginManager for FerrofinPluginManager {
                 }
             };
             for mut package in list {
-                package.versions.retain_mut(|v| {
+                for v in &mut package.versions {
                     // Stamp provenance from the repository we actually fetched
                     // from — the manifest's own repositoryName/Url claims are
                     // attacker-controlled, and the install path's repositoryUrl
@@ -1448,9 +1648,12 @@ impl PluginManager for FerrofinPluginManager {
                     // `VersionNumber` is a computed getter in C#, so it is on the
                     // wire for every entry; a manifest never carries the key.
                     v.fill_version_number();
-                    // "Only show plugins that are greater than or equal to
-                    // targetAbi" — the compatibility filter Ferrofin was missing,
-                    // which over-listed versions built for a newer server.
+                }
+                self.populate_image(&package, &installed, url).await;
+                // "Only show plugins that are greater than or equal to
+                // targetAbi" — the compatibility filter Ferrofin was missing,
+                // which over-listed versions built for a newer server.
+                package.versions.retain(|v| {
                     abi_is_compatible(&self.application_version, v.target_abi.as_deref())
                 });
                 // "Don't add a package that doesn't have any compatible versions."
@@ -1836,13 +2039,17 @@ fn same_json_kind(slot: &serde_json::Value, value: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod repository_images;
+
     use super::{
         FerrofinPluginManager, RegisteredPlugin, abi_is_compatible, merge_config,
         parse_dotnet_version, project_config,
     };
     use ferrofin_model::updates::RepositoryInfo;
     use ferrofin_traits::error::ServiceError;
-    use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
+    use ferrofin_traits::plugins::{
+        PluginDescriptor, PluginImage, PluginImageSource, PluginManager,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -2579,7 +2786,7 @@ mod tests {
         let id = Uuid::from_u128(5);
         let image = PluginImage {
             content_type: "image/png".to_owned(),
-            data: vec![1, 2, 3],
+            source: PluginImageSource::Bytes(vec![1, 2, 3]),
         };
         let (mgr, _dir) = manager(vec![RegisteredPlugin::new(
             descriptor(id, "Demo", true),
