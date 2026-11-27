@@ -1,7 +1,8 @@
 //! Path spelling, end to end: Jellyfin's routes are case-insensitive (ASP.NET)
 //! and axum's are not, so the server re-cases a path before routing it. Over real
-//! HTTP, every route answers the same however it is spelled, and a
-//! `/web/*` asset, whose case is the file's, is left alone.
+//! HTTP, every route answers the same however it is spelled, a spelling with an
+//! empty segment finds none, and a `/web/*` asset, whose case is the file's, is
+//! left alone.
 
 use std::time::Duration;
 
@@ -27,6 +28,26 @@ fn filled(path: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The spellings of `path`, the filled `route`, with an empty segment: a
+/// leading one, a doubled trailing `/` and one at each `/`. A catch-all's tail
+/// is its handler's, so nothing from the `/` before it on is doubled.
+fn empty_segment_spellings(route: &str, path: &str) -> Vec<String> {
+    let tail = route
+        .find("/{*")
+        .map_or(path.len(), |at| filled(&route[..at]).len());
+    let mut spellings = vec![format!("/{path}")];
+    if tail == path.len() {
+        spellings.push(format!("{path}//"));
+    }
+    spellings.extend(
+        path.match_indices('/')
+            .map(|(at, _)| at)
+            .filter(|&at| at > 0 && at < tail)
+            .map(|at| format!("{}/{}", &path[..at], &path[at..])),
+    );
+    spellings
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -79,6 +100,21 @@ async fn a_route_answers_the_same_in_any_spelling_and_an_asset_keeps_its_case() 
             assert_eq!(status(spelling.clone()).await, canonical, "{spelling}");
         }
     }
+    // ASP.NET's router matches no route to an empty segment, wherever it sits;
+    // only a lone trailing `/` is not one (gl-1675).
+    let gets = VENDORED_ROUTES
+        .iter()
+        .filter(|(method, _)| *method == "get")
+        .map(|(_, path)| *path);
+    for route in gets.chain(UNLISTED_ROUTES.iter().copied()) {
+        for spelling in empty_segment_spellings(route, &filled(route)) {
+            assert_eq!(
+                status(spelling.clone()).await,
+                StatusCode::NOT_FOUND,
+                "{spelling}"
+            );
+        }
+    }
 
     // The asset's own spelling is the only one that finds it.
     let asset = client
@@ -93,4 +129,11 @@ async fn a_route_answers_the_same_in_any_spelling_and_an_asset_keeps_its_case() 
         StatusCode::NOT_FOUND
     );
     assert_eq!(status("/web/".to_owned()).await, StatusCode::OK);
+    // The web client's files are not routed, so an empty segment there is the
+    // file server's to read, as Jellyfin's static files are (gl-1675).
+    assert_eq!(status("/web//index.html".to_owned()).await, StatusCode::OK);
+    assert_eq!(
+        status("//web/index.html".to_owned()).await,
+        StatusCode::NOT_FOUND
+    );
 }

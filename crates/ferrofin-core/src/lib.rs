@@ -230,6 +230,7 @@ pub mod media_stream_repository;
 mod media_stream_selector;
 pub mod mount_table;
 pub mod music_manager;
+pub mod named_configuration_files;
 pub mod next_up_service;
 pub mod notify_watcher;
 pub mod password_reset;
