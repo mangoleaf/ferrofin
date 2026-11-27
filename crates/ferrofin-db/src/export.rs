@@ -19,6 +19,8 @@
 //! - `proof`: what proves Ferrofin did the work of a code migration the history
 //!   records as applied;
 //! - `drop_objects`: removing Ferrofin's own tables and indexes from the copy;
+//! - `shapes`: a native database's Jellyfin tables, rebuilt in the shape of
+//!   Jellyfin's (column order, `AUTOINCREMENT`);
 //! - `paths`: the stored paths, rewritten onto the output's layout;
 //! - `earlier_art`: the art earlier builds saved in an item's `{ID}` folder,
 //!   moved into the item's own folder in the output, its rows with it;
@@ -71,6 +73,7 @@ mod paths;
 mod proof;
 mod refusal;
 mod report;
+mod shapes;
 mod snapshot;
 mod tree;
 
@@ -187,6 +190,10 @@ pub struct DatabaseEdits {
     pub history: HistoryRewrite,
     /// Ferrofin's own tables and indexes, removed.
     pub dropped: DroppedObjects,
+    /// The Jellyfin tables of a Ferrofin-native database rebuilt in the shape
+    /// of Jellyfin's (its columns in Jellyfin's order, its `AUTOINCREMENT`
+    /// key), rows and all, in name order; none for an adopted database.
+    pub rebuilt: Vec<String>,
     /// The stored paths, rewritten onto the output's layout.
     pub paths: PathRewrite,
     /// What Ferrofin's own tables held that Jellyfin keeps in files, read
@@ -215,6 +222,15 @@ async fn edit_staged(
     out: &Path,
     (dirs, layout): (&SourceDirs, &Layout),
 ) -> Result<DatabaseEdits> {
+    let native = history.is_none();
+    if native {
+        // Outside the transaction, where SQLite ignores it: the shapes'
+        // rebuild drops tables that others reference, which would delete
+        // their rows.
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *conn)
+            .await?;
+    }
     let mut tx = sqlx::Connection::begin(conn).await?;
     let history = history::rewrite(&mut tx, history).await?;
     // Before the drop, which removes the tables it reads.
@@ -222,6 +238,12 @@ async fn edit_staged(
     let edits = DatabaseEdits {
         history,
         dropped: drop_objects::remove(&mut tx).await?,
+        // After the drop, which counts the indexes of Ferrofin's on them.
+        rebuilt: if native {
+            shapes::rebuild(&mut tx).await?
+        } else {
+            Vec::new()
+        },
         paths: paths::rewrite(&mut tx, dirs, layout).await?,
         carried,
         counts: counts::read(&mut tx).await?,
@@ -264,10 +286,13 @@ async fn edit_staged(
 /// The snapshot's `__EFMigrationsHistory` is rewritten ([`HistoryRewrite`]),
 /// what Ferrofin's own tables hold that Jellyfin keeps in files is read
 /// ([`CarriedRows`]) before those tables and Ferrofin's indexes are removed
-/// from it ([`DroppedObjects`]), and its stored paths are rewritten onto the
-/// layout ([`PathRewrite`]). The art earlier builds saved in an item's `{ID}`
-/// or `{id}` folder is then moved in the output into the item's own folder,
-/// where Jellyfin keeps it, and its rows follow ([`ArtRelocation`]).
+/// from it ([`DroppedObjects`]). In a database Ferrofin created itself, the
+/// Jellyfin tables `0001` made in another shape are then rebuilt in
+/// Jellyfin's ([`DatabaseEdits::rebuilt`]), and its stored paths are
+/// rewritten onto the layout ([`PathRewrite`]). The art earlier builds saved
+/// in an item's `{ID}` or `{id}` folder is then moved in the output into the
+/// item's own folder, where Jellyfin keeps it, and its rows follow
+/// ([`ArtRelocation`]).
 ///
 /// What is copied is digested while it is copied and again once the database
 /// snapshot is written, and so are the files SQLite keeps beside the
