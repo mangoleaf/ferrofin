@@ -39,10 +39,15 @@
 //!   folders" (`SaveLocalMetadata`), so nothing is written into a media
 //!   folder the library did not open to it.
 //!
-//! A playlist FILE (`.m3u`, …) has neither: upstream reads and writes a
-//! `<name>.xml` beside it (`PlaylistXmlSaver.GetSavePath`), and reading it
-//! back is the upstream bug `ferrofin-core`'s `library_scan/playlists.rs`
-//! does not port. Whether to write it is the owner's decision (gl-1915).
+//! ACCEPTED DIVERGENCE (upstream bug, not ported; owner decision 2026-11-24,
+//! gl-1915): a playlist FILE (`.m3u`, …) has no `<name>.xml` here: none is
+//! written and none is read. Jellyfin 12.4 writes and reads one beside it
+//! (`PlaylistXmlSaver.GetSavePath`) holding the playlist's fields but no
+//! `PlaylistItems`, and `PlaylistXmlProvider` outranks
+//! `PlaylistItemsProvider`, so a replacing refresh empties the playlist.
+//! Here the members come from the playlist file alone (`ferrofin-core`'s
+//! `library_scan/playlists.rs`). Writing the file would also leave it in the
+//! media folder for a Jellyfin to read back.
 //!
 //! ACCEPTED DIVERGENCE (owner decision 2026-11-19, gl-1870): an edit or a
 //! member or share change (`MetadataEdit`) never rewrites a `collection.xml`
@@ -439,12 +444,8 @@ impl ContainerXmlSaver {
             .await?
             .remove(&item_id)
             .unwrap_or_default();
-        let people = self
-            .people
-            .get_people_batch(&[item_id])
-            .await?
-            .remove(&item_id)
-            .unwrap_or_default();
+        let people =
+            crate::metadata_merge::stored_people(self.people.as_ref(), item_id, &row).await?;
         let links = self
             .linked_children
             .get_linked_children_ids(item_id, Some(MANUAL_LINK))
@@ -667,9 +668,9 @@ mod tests {
     }
 
     /// `PlaylistXmlSaver.GetSavePath`: a folder's `playlist.xml`; a playlist
-    /// FILE (an extension, no directory) has none here (the `<name>.xml`
-    /// sidecar is the owner's decision), while a folder whose name has a dot
-    /// is still a folder.
+    /// FILE (an extension, no directory) has none here (its `<name>.xml`
+    /// sidecar is an accepted divergence: see the module doc), while a folder
+    /// whose name has a dot is still a folder.
     #[test]
     fn a_playlist_folder_has_a_playlist_xml_and_a_file_none() {
         let dir = tempfile::tempdir().expect("tempdir");

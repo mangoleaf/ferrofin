@@ -1,0 +1,124 @@
+# cargo-about: the third-party notices shipped with every build of ferrofin-server (the image, the .deb
+# and the release archives), generated from Cargo.lock by scripts/third-party-notices.sh with the
+# template about.hbs. CI's `dependencies` job generates it on every push, so a crate whose license is
+# not accepted here, or a clarification below whose file changed or whose crate left the graph, fails
+# there and not at a release.
+
+# deny.toml's [licenses] allow list, in the same order. cargo-about takes the first one listed that
+# satisfies a crate's expression (Apache-2.0 for the usual "MIT OR Apache-2.0"). A new license is a
+# decision there first (CONTRIBUTING.md, "Dependencies"); then add it here too.
+accepted = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-only",
+    "IJG",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "bzip2-1.0.6",
+]
+
+# Every target release.yml builds, so one file covers every artifact.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+# Build and dev dependencies are not in the binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# Ferrofin's own crates (publish = false) are GPL-3.0-only, in the copyright file and LICENSE.
+private = { ignore = true }
+
+# Clarifications. A crate listed here takes its license and texts from these files only, and each file
+# must match its checksum, so a release that changes one fails the generation until it is read again.
+# The -sys crates also add the license of the C library they vendor and compile into the binary, which
+# their own `license` field leaves out.
+
+# libjpeg-turbo, the TurboJPEG API (BSD-3-Clause, whose text binary distributions must reproduce) over the
+# IJG code (whose license asks for the statement about.hbs prints). Its SIMD code's Zlib license is
+# subsumed by the IJG one (LICENSE.md). The binding itself is "Unlicense OR MIT", ships no license file,
+# and is taken under the Unlicense.
+[turbojpeg-sys.clarify]
+license = "Unlicense AND BSD-3-Clause AND IJG"
+
+[[turbojpeg-sys.clarify.files]]
+path = "libjpeg-turbo/LICENSE.md"
+license = "BSD-3-Clause"
+checksum = "96f5b328adbb78eeaaec6980d73fd558cb1e4d62560ed615646bc3cf5e532430"
+
+[[turbojpeg-sys.clarify.files]]
+path = "libjpeg-turbo/README.ijg"
+license = "IJG"
+checksum = "75815e3bf6484201a3c3d17a1bbf10f2e8e3237f84df10a2357ea896db2a81d6"
+
+# libwebp (BSD-3-Clause). The binding is MIT and ships no license file.
+[libwebp-sys.clarify]
+license = "MIT AND BSD-3-Clause"
+
+[[libwebp-sys.clarify.files]]
+path = "vendor/COPYING"
+license = "BSD-3-Clause"
+checksum = "5aec868f669e384a22372a4e8a1a6cd7d44c64cd451f960ca69cc170d1e13acf"
+
+# jemalloc (BSD-2-Clause).
+[tikv-jemalloc-sys.clarify]
+license = "Apache-2.0 AND BSD-2-Clause"
+
+[[tikv-jemalloc-sys.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+
+[[tikv-jemalloc-sys.clarify.files]]
+path = "jemalloc/COPYING"
+license = "BSD-2-Clause"
+checksum = "94aa2caa98c25d942f58b956c71dba6a99ff98fc3a31cbc669fe2a4cd0268b53"
+
+# AWS-LC: its LICENSE is the roll-up of every license and notice in the library (its own, BoringSSL's,
+# OpenSSL's and SSLeay's, and the third-party code it carries) and ends with their full texts, so it is
+# reproduced whole, once, under ISC; the expression's other licenses add their standard texts.
+[aws-lc-sys.clarify]
+license = "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)"
+
+[[aws-lc-sys.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+checksum = "728536b4160e051f86d7c9c388f704866b3d512cd7df97ac3516c65279523c4e"
+
+# aws-lc-rs: one file holding both of its licenses (Apache-2.0 first, then ISC with the copyright line),
+# which the harvest cannot tell apart.
+[aws-lc-rs.clarify]
+license = "ISC AND (Apache-2.0 OR ISC)"
+
+[[aws-lc-rs.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+checksum = "b50b376e7d24a0598488b730c3034ffcd0b58dd36c0913a24b9903a3cfd04bf7"
+
+# License files the harvest does not recognise: libm's names the musl and CORE-MATH code it ports, and
+# sha1_smol's BSD text points at its AUTHORS file.
+[libm.clarify]
+license = "MIT"
+
+[[libm.clarify.files]]
+path = "LICENSE.txt"
+checksum = "3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7"
+
+[sha1_smol.clarify]
+license = "BSD-3-Clause"
+
+[[sha1_smol.clarify.files]]
+path = "LICENSE"
+checksum = "282a21b0710441c364025461a447362daf18f5798a7b72ae2f801a2aa536da51"

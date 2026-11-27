@@ -352,12 +352,7 @@ impl NfoSaver {
             .await?
             .remove(&id)
             .unwrap_or_default();
-        let credits = self
-            .people
-            .get_people_batch(&[id])
-            .await?
-            .remove(&id)
-            .unwrap_or_default();
+        let credits = crate::metadata_merge::stored_people(self.people.as_ref(), id, row).await?;
         let actor_images = if save_images {
             self.actor_primary_images(&credits).await?
         } else {

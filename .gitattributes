@@ -1,0 +1,5 @@
+# Kept LF on every checkout, Windows included (core.autocrlf): release.yml's Windows leg runs
+# scripts/third-party-notices.sh through Git Bash, where CRLF breaks its `#!/bin/sh` and `set -eu` lines,
+# and renders about.hbs, whose lines would otherwise end CRLF among the LF license texts.
+*.sh text eol=lf
+about.hbs text eol=lf

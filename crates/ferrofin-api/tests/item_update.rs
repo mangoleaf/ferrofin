@@ -685,6 +685,15 @@ impl ProviderManager for RecordingProviders {
     }
     async fn save_metadata(
         &self,
+        _item_id: Uuid,
+        _update_type: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        unreachable!("the editor's saves, the cascades' included, end in update_to_repository")
+    }
+    /// `UpdateToRepositoryAsync(MetadataEdit)`, which measures the images
+    /// (`UpdateImagesAsync`) where `save_metadata` only runs the savers.
+    async fn update_to_repository(
+        &self,
         item_id: Uuid,
         update_type: ItemUpdateType,
     ) -> Result<(), ServiceError> {

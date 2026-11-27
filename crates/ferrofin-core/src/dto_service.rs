@@ -153,7 +153,8 @@ struct Prefetched {
     /// `Settings` field is requested — the gate `LockedFields` rides on).
     locked_fields: HashMap<Uuid, Vec<ferrofin_model::entities::MetadataField>>,
     /// Credited people per item id (populated only when the `People` field is
-    /// requested), so a page's cast/crew loads in one query.
+    /// requested, and only for items whose kind supports people), so a page's
+    /// cast/crew loads in one query.
     people: HashMap<Uuid, Vec<ferrofin_db::entities::base_items::PeopleEntity>>,
     /// Image rows per *person* id, for the whole page's cast/crew at once, so the
     /// primary-image tag lookup does not re-query per person per item.
@@ -4350,7 +4351,14 @@ impl FerrofinDtoService {
         };
         let people_fut = async {
             if options.contains_field(ItemFields::People) {
-                self.library.get_people_batch(&ids).await
+                // Only the items that support people (`DtoService.cs:253`); the
+                // rest answer an empty list, as `GetPeople(item)` does.
+                let people_ids: Vec<Uuid> = items
+                    .iter()
+                    .filter(|item| kinds::supports_people(row_kind(item)))
+                    .map(row_id)
+                    .collect();
+                self.library.get_people_batch(&people_ids).await
             } else {
                 Ok(HashMap::new())
             }
@@ -12723,6 +12731,44 @@ mod tests {
                 people[i].id, expected[i],
                 "by-name Person id for {credited_as:?}"
             );
+        }
+    }
+
+    /// `GetBaseItemDtos` reads the credits of the items that support people
+    /// only (`DtoService.cs:253`; `GetPeople(item)` answers `[]` for the
+    /// rest): a credit stored on a music artist, as an `artist.nfo` scanned
+    /// before the scan checked `SupportsPeople` left one, is not shown, while
+    /// a movie's is, on the same page.
+    #[tokio::test]
+    async fn a_kind_without_people_shows_no_credits() {
+        let db = test_db().await;
+        let (movie, artist) = (Uuid::from_u128(0xB_9601), Uuid::from_u128(0xB_9602));
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        seed_named_item(&db, artist, BaseItemKind::MusicArtist, "A").await;
+        let rows = [fetch_item(&db, movie).await, fetch_item(&db, artist).await];
+        let library = Arc::new(FakeLibrary {
+            people: vec![PeopleEntity {
+                name: "Nfo Actor".into(),
+                person_type: Some("Actor".into()),
+                ..Default::default()
+            }],
+            named_items: person_rows(&db, &["Nfo Actor"]).await,
+        });
+        let svc = service_with(db, library);
+        let dtos = svc
+            .get_base_item_dtos(&rows, &DtoOptions::default(), None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(dtos.len(), rows.len());
+        for ((row, dto), expected) in rows.iter().zip(&dtos).zip([vec!["Nfo Actor"], vec![]]) {
+            let names: Vec<&str> = dto
+                .people
+                .as_deref()
+                .expect("People is requested")
+                .iter()
+                .filter_map(|person| person.name.as_deref())
+                .collect();
+            assert_eq!(names, expected, "{}", row.type_);
         }
     }
 

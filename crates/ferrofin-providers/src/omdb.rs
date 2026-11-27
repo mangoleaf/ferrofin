@@ -302,7 +302,7 @@ impl OmdbClient {
         let value = match serde_json::from_slice(&body) {
             Ok(value) => value,
             Err(error) => {
-                tracing::warn!(provider = "omdb", imdb_id, %error, "Metadata provider response could not be parsed");
+                tracing::warn!(provider = "omdb", item_id = crate::rate_limit::request_item(), imdb_id, %error, "Metadata provider response could not be parsed");
                 return None;
             }
         };

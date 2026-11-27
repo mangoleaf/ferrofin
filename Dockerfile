@@ -80,6 +80,10 @@ RUN apt-get update \
 # cargo-auditable embeds the crate list in the binary (a .dep-v0 section) for `cargo audit bin`
 # and image scanners; release.yml installs the same version. Before COPY, so a rebuild keeps it.
 RUN cargo install --locked cargo-auditable@0.7.7
+# cargo-about writes the third-party notices the image ships, as for the .deb and the release
+# archives (scripts/third-party-notices.sh); ci.yml and release.yml install the same version. Its
+# binary is behind the crate's `cli` feature.
+RUN cargo install --locked --features cli cargo-about@0.9.3
 WORKDIR /src
 COPY . .
 # .git is excluded from the build context, so bake the release version in from
@@ -89,11 +93,14 @@ ARG SERVICE_VERSION=
 ENV FERROFIN_GIT_DESCRIBE=${SERVICE_VERSION}
 # Strip the container binary while leaving local profiling builds unchanged (the record survives).
 RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo auditable build --locked --release -p ferrofin-server
+RUN scripts/third-party-notices.sh
 
 # ── runtime ─────────────────────────────────────────────────────────────
 FROM ${RUNTIME_IMAGE}
 COPY --from=build /src/target/release/ferrofin-server /usr/local/bin/ferrofin-server
 COPY --from=web /dist /usr/share/ferrofin/web
+# The licenses of the binary: Ferrofin's own and the third-party code it is built from.
+COPY --from=build /src/contrib/debian/copyright /src/target/THIRD-PARTY-NOTICES.txt /usr/share/doc/ferrofin/
 # The release version, passed from CI (--build-arg SERVICE_VERSION=<tag>). The
 # binary reports it (falling back to the crate version when unset for local builds).
 ARG SERVICE_VERSION=

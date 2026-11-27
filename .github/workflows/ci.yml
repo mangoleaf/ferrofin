@@ -193,10 +193,12 @@ jobs:
   # The supply chain, without a build: cargo-deny checks the crates the workspace and the
   # wasm-hello guest build against the RustSec advisory database (yanked versions included) and
   # deny.toml's license, ban and source rules, cargo-machete looks for declared but unused
-  # dependencies, and check-workspace-deps.py for a dependency a crate declares itself instead
-  # of taking the workspace's. Outside `lint`, so an advisory published today turns every branch
-  # red without blocking merges; it does block a release, which needs this whole run green and
-  # re-checks the advisories before tagging (release.yml).
+  # dependencies, check-workspace-deps.py for a dependency a crate declares itself instead
+  # of taking the workspace's, and third-party-notices.sh generates the license notices every
+  # artifact ships (about.toml), failing on a license or a clarification it cannot use. Outside
+  # `lint`, so an advisory published today turns every branch red without blocking merges; it does
+  # block a release, which needs this whole run green and re-checks the advisories before tagging
+  # (release.yml).
   dependencies:
     if: *not-release-pr
     runs-on: ubuntu-latest
@@ -225,6 +227,12 @@ jobs:
         run: cargo machete apps crates # vendor/ holds upstream code as published
       - if: ${{ !cancelled() }}
         run: scripts/check-workspace-deps.py
+      # Built from crates.io, as for cargo-vet below: the install-action release pinned above predates
+      # cargo-about 0.9.3. The Dockerfile and release.yml install the same version.
+      - if: ${{ !cancelled() }}
+        run: cargo install --locked --features cli cargo-about@0.9.3 # the binary needs `cli`
+      - if: ${{ !cancelled() }}
+        run: scripts/third-party-notices.sh
 
   # cargo-vet: every crate in Cargo.lock needs an audit (gates/supply-chain/audits.toml, or one
   # imported from the organisations gates/supply-chain/config.toml names) or an exemption there, so
@@ -272,7 +280,8 @@ jobs:
 
   shell-tests:
     if: *not-release-pr
-    # The shell tooling has its own tests: scripts/version.sh (release versioning), gates/lib.sh (the
+    # The shell tooling has its own tests: scripts/version.sh (release versioning),
+    # scripts/third-party-notices.sh (its failure rules, against a fake cargo), gates/lib.sh (the
     # gates' output root, and how each gate's script takes its directories from it), gates/run (the
     # one entry point: its preflight and session folder, against fake gates and a fake docker),
     # gates/adoption/ (the Jellyfin-adoption harness — its checks are driven with canned logs and
@@ -299,8 +308,8 @@ jobs:
           fetch-depth: 0   # version.bats reads tags
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil python3-icu python3-yaml
       - run: pip install git-cliff==2.14.2   # = mise.toml and release.yml; git-cliff.bats runs it
-      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh
-      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats scripts/tests/git-cliff.bats
+      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh scripts/third-party-notices.sh
+      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats scripts/tests/git-cliff.bats scripts/tests/third-party-notices.bats
       - run: bats scripts/tests
       - run: make test-gates-offline   # the gates' own shellcheck, bats and Python tests: one list, in the Makefile
       - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
