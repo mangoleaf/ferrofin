@@ -645,7 +645,7 @@ async fn a_provider_enabled_for_one_tuner_binds_only_its_channels() {
         ListingsProviderInfo {
             listings_id: Some("USA-OTA-90210".to_owned()),
             enable_all_tuners: false,
-            enabled_tuners: vec![ids[0].clone()],
+            enabled_tuners: vec![Some(ids[0].clone())],
             ..sd_account()
         },
         false,
@@ -681,10 +681,10 @@ async fn an_hdhomerun_channel_binds_to_the_station_mapped_to_its_hdhr_id() {
     mgr.save_listing_provider(
         ListingsProviderInfo {
             listings_id: Some("USA-OTA-90210".to_owned()),
-            channel_mappings: vec![NameValuePair {
+            channel_mappings: vec![Some(NameValuePair {
                 name: Some("hdhr_4.1".to_owned()),
                 value: Some("20454".to_owned()),
-            }],
+            })],
             ..sd_account()
         },
         false,

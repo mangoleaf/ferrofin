@@ -442,8 +442,43 @@ async fn null_tuner_and_mapping_lists_bind_as_empty() {
     assert_eq!(saved["ChannelMappings"], serde_json::json!([]));
 
     let calls = manager.saved.lock().unwrap();
-    assert_eq!(calls[0].0.enabled_tuners, Vec::<String>::new());
+    assert_eq!(calls[0].0.enabled_tuners, Vec::<Option<String>>::new());
     assert_eq!(calls[0].0.channel_mappings, Vec::new());
+}
+
+/// A `null` ELEMENT in one of the lists binds too (gl-1677): System.Text.Json
+/// assigns it into the C# `string[]` / `NameValuePair[]`, Jellyfin 12.4 saves
+/// the provider and answers 200 with `[null]` in it (and keeps it through
+/// `livetv.xml`). Ferrofin keeps the element and hands it to the manager.
+#[tokio::test]
+async fn a_null_list_element_binds_and_is_kept() {
+    let manager = CountriesLiveTv::serving(SD_COUNTRIES);
+    let state = elevated_fake_state().with_live_tv(manager.clone());
+    let (status, body) = send(
+        state,
+        "POST",
+        "/LiveTv/ListingProviders",
+        Some(
+            r#"{"Type":"xmltv","Path":"http://example.invalid/d.xml","EnabledTuners":[null],"NewsCategories":[null],"SportsCategories":[null],"KidsCategories":[null],"MovieCategories":[null],"ChannelMappings":[null]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let saved: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    for list in [
+        "EnabledTuners",
+        "NewsCategories",
+        "SportsCategories",
+        "KidsCategories",
+        "MovieCategories",
+        "ChannelMappings",
+    ] {
+        assert_eq!(saved[list], serde_json::json!([null]), "{list}");
+    }
+
+    let calls = manager.saved.lock().unwrap();
+    assert_eq!(calls[0].0.enabled_tuners, [None]);
+    assert_eq!(calls[0].0.channel_mappings, [None]);
 }
 
 /// `RequiresElevation`: a plain user cannot save a provider.

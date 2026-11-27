@@ -105,6 +105,10 @@ pub struct OneMovieLibrary {
     pub seen: Mutex<Option<InternalItemsQuery>>,
 }
 
+/// The ids of the items a [`OneMovieLibrary`] was asked to refresh, in the
+/// test process that asked.
+pub static QUEUED_REFRESHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 #[async_trait::async_trait]
 #[allow(clippy::unimplemented)]
 impl LibraryManager for OneMovieLibrary {
@@ -126,6 +130,14 @@ impl LibraryManager for OneMovieLibrary {
             run_time_ticks: Some(5_000_000_000),
             ..BaseItemEntity::default()
         }))
+    }
+    async fn queue_item_refresh(
+        &self,
+        item: &BaseItemEntity,
+        _options: &ferrofin_traits::providers::MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        QUEUED_REFRESHES.lock().unwrap().push(item.id.clone());
+        Ok(())
     }
     async fn query_items(
         &self,

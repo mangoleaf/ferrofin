@@ -5,11 +5,11 @@
 //! `NowPlayingQueueFullItems`, a 10.11 member 12.x dropped, is never sent.
 
 use chrono::Utc;
-use ferrofin_model::session::PlaybackStartInfo;
+use ferrofin_model::session::{ClientCapabilities, PlaybackStartInfo};
 use ferrofin_traits::session::SessionManager;
 use uuid::Uuid;
 
-use super::{manager_with_events, record_event, seed_named_user, test_db};
+use super::{manager_with_events, record_event, seed_named_user, test_db, with_bus};
 
 #[tokio::test]
 async fn the_check_in_is_the_minimum_date_until_a_playback_report() {
@@ -51,4 +51,81 @@ async fn the_check_in_is_the_minimum_date_until_a_playback_report() {
     );
     let json = serde_json::to_value(&listed[0]).expect("json");
     assert!(json.get("NowPlayingQueueFullItems").is_none(), "{json}");
+}
+
+/// `IsActive` and `SupportsRemoteControl` as reads and the session events
+/// carry them (C# `SessionInfo.IsActive`, `SupportsRemoteControl`): a session
+/// with no socket is active but cannot be remote-controlled; with a socket (a
+/// sink on the bus) and media control reported it can be; the `SessionEnded`
+/// raised once its socket is gone says it is no longer active, and the one a
+/// logout raises while the socket is open says it still is.
+#[tokio::test]
+async fn liveness_in_reads_and_session_events() {
+    let db = test_db().await;
+    let (mgr, events) = manager_with_events(&db);
+    let (mgr, bus) = with_bus(&mgr);
+    let started = record_event(&events, "SessionStarted");
+    let ended = record_event(&events, "SessionEnded");
+    let user = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+
+    let signed_in = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+        .await
+        .expect("session");
+    let id = signed_in.id.clone().expect("session id");
+    assert!(signed_in.is_active && !signed_in.supports_remote_control);
+    {
+        let started = started.lock().expect("events");
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0]["IsActive"], true);
+        assert_eq!(started[0]["SupportsRemoteControl"], false);
+    }
+
+    mgr.report_capabilities(
+        &id,
+        &ClientCapabilities {
+            supports_media_control: true,
+            ..ClientCapabilities::default()
+        },
+    )
+    .await
+    .expect("capabilities");
+    let token = bus.register(id.clone(), Box::new(|_| {}));
+    let listed = mgr
+        .get_sessions(Uuid::nil(), None, None, None, true)
+        .await
+        .expect("sessions");
+    assert!(listed[0].is_active && listed[0].supports_remote_control);
+
+    assert!(!bus.unregister(&id, token), "that was the last socket");
+    mgr.close_if_needed(&id).await.expect("ended");
+    {
+        let ended = ended.lock().expect("events");
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0]["IsActive"], false);
+        assert_eq!(ended[0]["SupportsRemoteControl"], false);
+    }
+
+    // A logout ends a session whose socket is still open.
+    let open = mgr
+        .log_session_activity("Web", "1.0", "dev-2", "TV", "e", Some(&user))
+        .await
+        .expect("session")
+        .id
+        .expect("session id");
+    mgr.report_capabilities(
+        &open,
+        &ClientCapabilities {
+            supports_media_control: true,
+            ..ClientCapabilities::default()
+        },
+    )
+    .await
+    .expect("capabilities");
+    bus.register(open.clone(), Box::new(|_| {}));
+    mgr.report_session_ended(&open).await.expect("logged out");
+    let ended = ended.lock().expect("events");
+    assert_eq!(ended.len(), 2);
+    assert_eq!(ended[1]["IsActive"], true);
+    assert_eq!(ended[1]["SupportsRemoteControl"], true);
 }

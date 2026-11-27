@@ -13,7 +13,7 @@ use ferrofin_api::create_router;
 use ferrofin_api::test_support::{FixedAuth, authed_state_with_plugins};
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
+use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginImageSource, PluginManager};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -35,6 +35,9 @@ struct RecordingPlugins {
     /// Plugins an install staged and no restart has loaded: unknown to the
     /// registry, removable all the same.
     staged: Mutex<Vec<Uuid>>,
+    /// The file the known plugin's image is stored in, when it has one (a
+    /// repository plugin's); otherwise its image is bytes it carries.
+    image_file: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl RecordingPlugins {
@@ -126,7 +129,10 @@ impl PluginManager for RecordingPlugins {
     async fn plugin_image(&self, id: Uuid) -> Result<Option<PluginImage>, ServiceError> {
         Ok((id == known_id()).then(|| PluginImage {
             content_type: "image/png".to_owned(),
-            data: vec![1, 2, 3, 4],
+            source: match self.image_file.lock().unwrap().clone() {
+                Some(path) => PluginImageSource::File(path),
+                None => PluginImageSource::Bytes(vec![1, 2, 3, 4]),
+            },
         }))
     }
     async fn get_repositories(&self) -> Result<Vec<RepositoryInfo>, ServiceError> {
@@ -507,6 +513,59 @@ async fn plugin_image_served_and_missing() {
         .await
         .expect("resp");
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+/// A repository plugin's image is its stored file, served as
+/// `PhysicalFile(imagePath, MimeTypes.GetMimeType(imagePath))` is (measured
+/// on a stock 12.4): with the file's `Last-Modified`, a `304` to an
+/// `If-Modified-Since` at that time, and the whole file for a `Range`, always
+/// as an attachment.
+#[tokio::test]
+async fn a_stored_plugin_image_is_served_as_its_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("image.png");
+    std::fs::write(&path, b"\x89PNG\r\n\x1a\nicon").expect("image");
+    let fake = Arc::new(RecordingPlugins::default());
+    *fake.image_file.lock().unwrap() = Some(path);
+    let uri = format!("/Plugins/{}/1.2.3/Image", known_id());
+    let get = |headers: &[(&str, &str)]| {
+        let mut request = Request::builder().method("GET").uri(&uri);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        router(fake.clone()).oneshot(request.body(Body::empty()).expect("request"))
+    };
+    let header = |resp: &axum::response::Response, name: &str| {
+        resp.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_owned())
+    };
+
+    let ok = get(&[]).await.expect("resp");
+    assert_eq!(ok.status(), StatusCode::OK);
+    assert_eq!(header(&ok, "content-type").as_deref(), Some("image/png"));
+    assert_eq!(
+        header(&ok, "content-disposition").as_deref(),
+        Some("attachment")
+    );
+    let modified = header(&ok, "last-modified").expect("Last-Modified");
+    let body = axum::body::to_bytes(ok.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"\x89PNG\r\n\x1a\nicon");
+
+    let unchanged = get(&[("If-Modified-Since", &modified)])
+        .await
+        .expect("resp");
+    assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        header(&unchanged, "content-disposition").as_deref(),
+        Some("attachment")
+    );
+
+    let ranged = get(&[("Range", "bytes=0-1")]).await.expect("resp");
+    assert_eq!(ranged.status(), StatusCode::OK);
+    assert_eq!(header(&ranged, "accept-ranges"), None);
 }
 
 /// The `{version}` segment is a `Version`, not decoration.
@@ -1345,13 +1404,14 @@ fn urlencoding_all(value: &str) -> String {
 }
 
 /// `GET /Plugins` is `_pluginManager.Plugins.OrderBy(p => p.Name)`
-/// (v10.11.8 `PluginsController.cs:55-57`) — the wire order is alphabetical, not
-/// registration order.
+/// (v12.4 `PluginsController.cs:56-58`) — the wire order is alphabetical, not
+/// registration order, and alphabetical in the request's culture:
+/// `OrderBy` compares with `Comparer<string>.Default`, `string.CompareTo`.
 ///
-/// Measured on the lane-3 lab pair before the fix: Jellyfin returned AudioDB,
-/// MusicBrainz, OMDb, Studio Images, TMDb for its five in-tree provider plugins
-/// while Ferrofin returned them TMDb-first, in the order the composition root
-/// registers them.
+/// Measured on the lane-3 lab pair before `GetPlugins` sorted at all: Jellyfin
+/// returned AudioDB, MusicBrainz, OMDb, Studio Images, TMDb for its five in-tree
+/// provider plugins while Ferrofin returned them TMDb-first, in the order the
+/// composition root registers them.
 #[tokio::test]
 async fn plugins_are_listed_by_name() {
     let fake = Arc::new(RecordingPlugins::default());
@@ -1381,11 +1441,10 @@ async fn plugins_are_listed_by_name() {
         .iter()
         .map(|p| p["Name"].as_str().expect("name"))
         .collect();
-    // `Ord` on `String` is bytewise, which puts every capitalised name before a
-    // lowercase one — the same order .NET's default string comparer produces
-    // for this set, and the same order the live Jellyfin returned.
+    // The culture's collation puts `alpha` first; a bytewise `Ord` would put
+    // every capitalised name before it.
     assert_eq!(
         names,
-        vec!["AudioDB", "Demo", "Studio Images", "Zulu", "alpha"]
+        vec!["alpha", "AudioDB", "Demo", "Studio Images", "Zulu"]
     );
 }

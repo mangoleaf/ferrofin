@@ -111,6 +111,8 @@ impl Music {
                     format!(r#"{{"artists":[{{"id":"{ARTIST}","name":"Miles Davis"}}]}}"#)
                 } else if line.contains("/album-mb.php") {
                     r#"{"album":[{"strDescription":"Album text.","strGenre":"Jazz"}]}"#.to_owned()
+                } else if line.contains("/artist.php") {
+                    r#"{"artists":[{"idArtist":"113159","strBiography":"Found by its TheAudioDB id.","strWebsite":"www.milesdavis.com"}]}"#.to_owned()
                 } else {
                     r#"{"artists":[{"strBiography":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned()
                 };
@@ -867,6 +869,52 @@ async fn a_music_artist_without_type_options_asks_theaudiodb_despite_the_server_
         fx.row(artist).await.overview.as_deref(),
         Some("Artist bio.")
     );
+}
+
+/// `AudioDbArtistProvider.GetArtist` (v12.4): an artist with no MusicBrainz
+/// id is looked up by its `AudioDbArtist` id (`artist.php`), here read from
+/// its `artist.nfo` in a library that asks only TheAudioDB about artists, and
+/// takes the answer's biography and home page (`strWebsite`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_artist_known_only_by_its_audiodb_id_is_looked_up_by_it() {
+    use ferrofin_providers::library_options::fetcher_names::AUDIODB;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fetching = |kind: &str, fetchers: &[&str]| TypeOptions {
+        type_: Some(kind.to_owned()),
+        metadata_fetchers: fetchers.iter().map(|f| (*f).to_owned()).collect(),
+        ..TypeOptions::default()
+    };
+    let fx = Fixture::new(
+        tmp.path(),
+        LibraryOptions {
+            type_options: vec![
+                fetching("MusicAlbum", &[]),
+                fetching("MusicArtist", &[AUDIODB]),
+            ],
+            ..LibraryOptions::default()
+        },
+    )
+    .await;
+    std::fs::write(
+        fx.artist_dir.join("artist.nfo"),
+        "<artist><title>Miles Davis</title><audiodbartistid>111239</audiodbartistid></artist>",
+    )
+    .expect("nfo");
+    fx.scan().await;
+    let asked = fx.music.take();
+    assert!(
+        asked.iter().any(|l| l.contains("/artist.php?i=111239")),
+        "{asked:?}"
+    );
+    assert!(musicbrainz(&asked).is_empty(), "{asked:?}");
+    let artist = fx.row(fx.artist_id()).await;
+    assert_eq!(
+        artist.overview.as_deref(),
+        Some("Found by its TheAudioDB id.")
+    );
+    let data: serde_json::Value =
+        serde_json::from_str(artist.data.as_deref().unwrap_or("{}")).expect("data");
+    assert_eq!(data["HomePageUrl"], "www.milesdavis.com");
 }
 
 /// "Identify → Apply" on an album is the scan of its folder with the chosen

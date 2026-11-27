@@ -143,14 +143,17 @@ pub trait SubtitleManager: Send + Sync {
         request: &SubtitleSearchRequest,
     ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError>;
 
-    /// Downloads a remote subtitle and attaches it to the item.
+    /// Downloads a remote subtitle and saves it beside the item. Like
+    /// upstream's `TrySaveSubtitle`, no stream is recorded: the caller refreshes
+    /// the item, whose probe records it.
     async fn download_subtitles(
         &self,
         item_id: Uuid,
         subtitle_id: &str,
     ) -> Result<(), ServiceError>;
 
-    /// Uploads a caller-supplied subtitle for the item.
+    /// Uploads a caller-supplied subtitle for the item, saved as
+    /// [`download_subtitles`](Self::download_subtitles) saves one.
     async fn upload_subtitle(
         &self,
         item_id: Uuid,
