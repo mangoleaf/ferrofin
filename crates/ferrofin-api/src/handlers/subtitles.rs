@@ -11,8 +11,9 @@
 //! Delete, upload, remote search, download and get go through the
 //! [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager) seam, which
 //! searches the registered subtitle providers (OpenSubtitles), routes a
-//! download or fetch to the provider the id names, and attaches or removes the
-//! external subtitle.
+//! download or fetch to the provider the id names, and saves or removes the
+//! external subtitle file; the item refresh that follows records the change in
+//! its streams.
 //!
 //! On-the-fly subtitle *conversion*: the
 //! `Videos/{itemId}/{container}/Subtitles/{index}/{format}` (with and without a
@@ -189,10 +190,11 @@ struct UploadSubtitleDto {
 /// Port of `SubtitleController.UploadSubtitle`: `404` when the item is missing,
 /// `400` when the `Data` is not valid base64. The decoded bytes are handed to the
 /// [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager), which
-/// attaches them to the item as an external subtitle (the sidecar file and its
-/// stream row); then a metadata refresh is queued and `204` returned. Subtitle
-/// management is checked before decoding or writing the upload. The save and
-/// the refresh finish for a client that hangs up, as upstream's do.
+/// writes them beside the item as an external subtitle file. Then a metadata
+/// refresh is queued, whose probe records the file as a stream, and `204` is
+/// returned. Subtitle management is checked before decoding or writing the
+/// upload. The save and the refresh finish for a client that hangs up, as
+/// upstream's do.
 #[utoipa::path(
     post,
     path = "/Videos/{itemId}/Subtitles",
