@@ -1073,7 +1073,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    XmlTvReader.ParseDate (parse_xmltv_time, copyright_year; gl-1646) that \
                    upstream's XmlTvReaderDateTimeTests pin, with PopulateHeader's \
                    MinValue for a missing time in the guide window (manager.rs \
-                   in_guide_window) and the previously-shown check.",
+                   in_guide_window) and the previously-shown check. The guide reads (GET and \
+                   POST /LiveTv/Programs, /LiveTv/Programs/Recommended, \
+                   /LiveTv/Programs/{programId}, a channel's CurrentProgram and a timer's \
+                   ProgramInfo) project those stored items: manager.rs program_dtos reads the \
+                   page's programme items in one ItemRepository retrieve_items call \
+                   (program_items_by_id), and program_entity projects only an airing \
+                   with none, compared with LiveTvManager.GetPrograms, GetProgram, \
+                   GetRecommendedProgramsInternal and AddChannelInfo and \
+                   LiveTvDtoService.GetTimerInfoDto on 2026-11-26 (gl-1690).",
         date: "2026-11-11",
         divergences: &[
             "Jellyfin.XmlTv drops the element right after an <image> or <url> when no \
@@ -1096,6 +1104,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              counts as updated. No known client reads either, and keeping the save to a \
              changed programme avoids one full-row write per airing per refresh (owner \
              decision 2026-11-20, gl-1628).",
+            "The guide reads' (and the /Items seam's) IsNews, IsKids, IsSports, IsLive and \
+             IsPremiere flags and ChannelName, and the IsLive the Recommended ranking scores, \
+             come from the guide \
+             and lineup tables, not the stored items, so a programme's tags or a channel's \
+             name changed through POST /Items/{itemId} does not change them; upstream's \
+             AddInfoToProgramDto and GetRecommendationScore read the stored items. Fix path: \
+             gl-1997.",
         ],
     },
     VerifiedSubsystem {
@@ -4359,9 +4374,11 @@ pub const VERIFIED: &[Verified] = &[
                columns and isKids/isNews/isSports over its Kids/News/Sports tags; \
                channel_user_data; projection.rs filter_channel_rows, sort_channel_rows, \
                remove_fields; channel_entity → DtoService get_base_item_dtos, which runs \
-               AddChannelInfo) (RequestHelpers.GetUserId, LiveTvManager.GetInternalChannels, \
-               BaseItemRepository.TranslateQuery, RemoveFields)",
-        date: "2026-11-10",
+               add_channel_info: CurrentProgram from one query_program_rows read of the page's \
+               airings, projected by program_dtos over the stored programme items) \
+               (RequestHelpers.GetUserId, LiveTvManager.GetInternalChannels, \
+               BaseItemRepository.TranslateQuery, RemoveFields, AddChannelInfo)",
+        date: "2026-11-26",
         divergences: &[
             "type keeps the channels of that ChannelType, as the parameter documents; \
          upstream's GetInternalChannels never passes LiveTvChannelQuery.ChannelType on and \
@@ -4373,11 +4390,14 @@ pub const VERIFIED: &[Verified] = &[
          when true and every channel when false, and enableFavoriteSorting sorts nothing; \
          upstream's TranslateQuery and OrderMapper dereference the null user \
          (filter.User!.Id) and fail the request. Jellyfin bug not ported.",
+            "CurrentProgram is the airing whose guide row is on now, so a programme's EndDate \
+         changed on its item (POST /Items/{itemId}) does not change which airing is picked; \
+         upstream's AddChannelInfo queries the stored items. Fix path: gl-1997.",
             "The 400 (a value the query binder cannot convert) and 403 (another user's id \
          without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
          Fix path: gl-666.",
         ],
-        refs: &["access-filtering", "user-data"],
+        refs: &["access-filtering", "user-data", "guide-programme-items"],
     },
     Verified {
         method: "get",
@@ -4438,7 +4458,9 @@ pub const VERIFIED: &[Verified] = &[
                user_restrictions, program_rows_query (the stored programme item joined by \
                id) over push_program_filters, push_program_order with \
                push_program_sort_key and push_program_paging, the PROGRAM_COUNT total, \
-               projection.rs remove_fields, program_dtos → program_entity and dto_service.rs \
+               projection.rs remove_fields, program_dtos → program_items_by_id (the page's \
+               programme items in one ItemRepository retrieve_items read; projection.rs \
+               program_entity for an airing with none) and dto_service.rs \
                get_base_item_dtos, apply_program_info, add_recording_info → \
                scheduled_timers_for over dvr_repository.rs scheduled_timers_for_programs, \
                timer_program_ids, apply_recording_info, then series_timers_by_name over \
@@ -4449,20 +4471,17 @@ pub const VERIFIED: &[Verified] = &[
                OrderMapper, RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
                AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync, \
                GetSeriesTimersInternal)",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: &[
             "With no user (an API key), sortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags, \
-         PremiereDate, Audio and an HD listing's Width and Height) are read from the guide \
-         table, so a change saved to a programme's item (POST /Items/{itemId}) is not shown \
-         here. CommunityRating, which no listing sets, is never shown. Upstream lists the \
-         stored item, the change included, until a guide refresh that updates the programme \
-         assigns the listing's values over it. A PremiereDate an earlier listing stored is \
-         no longer shown once a later one makes the airing a first-run episode, nor is a \
-         1280x720 size once the listing is not HD; upstream's item keeps both. Fix path: \
-         gl-1690.",
+            "The isNews, isKids and isSports filters, the genres filter (by name; genreIds \
+         reads the stored item), the librarySeriesId name scope and the minEndDate, \
+         maxEndDate, hasAired and isAiring windows match the guide table, so a programme's \
+         tags, genres, name or EndDate changed on its item (POST /Items/{itemId}) does not \
+         change what they keep, though an edited EndDate shows in the DTO; upstream's \
+         TranslateQuery filters the stored items. Fix path: gl-1997.",
             "A malformed id in channelIds or genreIds is a 400; upstream's \
          CommaDelimitedCollectionModelBinder drops it. Fix path: gl-884.",
             "The 400 (a value the query binder cannot convert) and 403 (another user's id \
@@ -4489,7 +4508,9 @@ pub const VERIFIED: &[Verified] = &[
                (the stored programme item joined by id) over push_program_filters, \
                push_program_order with push_program_sort_key and push_program_paging, the \
                PROGRAM_COUNT total, projection.rs remove_fields, program_dtos → \
-               program_entity and dto_service.rs get_base_item_dtos, apply_program_info, \
+               program_items_by_id (the page's programme items in one ItemRepository \
+               retrieve_items read; projection.rs program_entity for an airing with none) and \
+               dto_service.rs get_base_item_dtos, apply_program_info, \
                add_recording_info → scheduled_timers_for over dvr_repository.rs \
                scheduled_timers_for_programs, timer_program_ids, apply_recording_info, then \
                series_timers_by_name over dvr_repository.rs series_timer_series_ids for a \
@@ -4499,7 +4520,7 @@ pub const VERIFIED: &[Verified] = &[
                BaseItemRepository.TranslateQuery and ApplyOrder, OrderMapper, RemoveFields, \
                DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
                GetTimersInternal, DefaultLiveTvService.GetTimersAsync, GetSeriesTimersInternal)",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: &[
             "A body UserId naming another user, sent without the administrator role, is a 403 \
          (the RequestHelpers.GetUserId rule GET applies); upstream's GetPrograms reads \
@@ -4513,15 +4534,12 @@ pub const VERIFIED: &[Verified] = &[
             "With no body UserId, SortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags, \
-         PremiereDate, Audio and an HD listing's Width and Height) are read from the guide \
-         table, so a change saved to a programme's item (POST /Items/{itemId}) is not shown \
-         here. CommunityRating, which no listing sets, is never shown. Upstream lists the \
-         stored item, the change included, until a guide refresh that updates the programme \
-         assigns the listing's values over it. A PremiereDate an earlier listing stored is \
-         no longer shown once a later one makes the airing a first-run episode, nor is a \
-         1280x720 size once the listing is not HD; upstream's item keeps both. Fix path: \
-         gl-1690.",
+            "The isNews, isKids and isSports filters, the genres filter (by name; genreIds \
+         reads the stored item), the librarySeriesId name scope and the minEndDate, \
+         maxEndDate, hasAired and isAiring windows match the guide table, so a programme's \
+         tags, genres, name or EndDate changed on its item (POST /Items/{itemId}) does not \
+         change what they keep, though an edited EndDate shows in the DTO; upstream's \
+         TranslateQuery filters the stored items. Fix path: gl-1997.",
             "The 400 (a body that does not bind) body is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
@@ -4872,8 +4890,8 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-livetv manager.rs get_timers_matching (get_timers, \
                DefaultLiveTvService.GetTimersAsync: every timer but a Completed one; \
                ferrofin-traits live_tv.rs filter_timers) → build_timer_dto for each \
-               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos with \
-               DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
+               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos, over \
+               the stored programme item, with DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
                DtoOptions()) with AddInfoToProgramDto, then TimerId and Status unless Cancelled \
                or Error, SeriesTimerId, and for a series timer's timer fill_images, \
                FillImages(BaseItemDto, …) by the timer's name and the programme's \
@@ -4882,12 +4900,8 @@ pub const VERIFIED: &[Verified] = &[
                ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window; \
                ProgramId as GetInternalProgramId(info.ProgramId) through derive_program_id over \
                the stored listing id, as stored without one)",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: &[
-            "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
-         own table, so it shows the listing's fields, not a change saved to the programme's \
-         item, nor a PremiereDate or 1280x720 size an earlier listing stored. Fix path: \
-         gl-1690.",
             "A series timer's timer whose name is blank runs no lookup by name, so its \
          ProgramInfo takes no Thumb or Backdrop from a library series, and without a listings \
          series id no Primary from a guide programme; upstream's FillImages then filters on \
@@ -4933,8 +4947,8 @@ pub const VERIFIED: &[Verified] = &[
                timer but a Completed one; ferrofin-traits live_tv.rs filter_timers: isActive as \
                InProgress, isScheduled as New, channelId and seriesTimerId compared as GUIDs, \
                ordered by StartDate) → build_timer_dto for each \
-               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos with \
-               DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
+               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos, over \
+               the stored programme item, with DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
                DtoOptions()) with AddInfoToProgramDto, then TimerId and Status unless Cancelled \
                or Error, SeriesTimerId, and for a series timer's timer fill_images, \
                FillImages(BaseItemDto, …) by the timer's name and the programme's \
@@ -4943,7 +4957,7 @@ pub const VERIFIED: &[Verified] = &[
                ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window; \
                ProgramId as GetInternalProgramId(info.ProgramId) through derive_program_id over \
                the stored listing id, as stored without one)",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: &[
             "A channelId or seriesTimerId that is no GUID matches no timer; upstream's new Guid \
          throws a FormatException, a 500. Jellyfin bug not ported.",
@@ -4951,10 +4965,6 @@ pub const VERIFIED: &[Verified] = &[
          defaults' Id) matches no timer; upstream hashes each timer's empty SeriesTimerId to \
          that id (GetInternalSeriesTimerId), so it lists every timer of no series timer. \
          Jellyfin bug not ported.",
-            "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
-         own table, so it shows the listing's fields, not a change saved to the programme's \
-         item, nor a PremiereDate or 1280x720 size an earlier listing stored. Fix path: \
-         gl-1690.",
             "A series timer's timer whose name is blank runs no lookup by name, so its \
          ProgramInfo takes no Thumb or Backdrop from a library series, and without a listings \
          series id no Primary from a guide programme; upstream's FillImages then filters on \

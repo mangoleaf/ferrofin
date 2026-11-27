@@ -1,11 +1,14 @@
-//! Guide rows → synthetic [`BaseItemEntity`] rows for the DTO service.
+//! Guide rows → [`BaseItemEntity`] rows for the DTO service.
 //!
 //! Jellyfin stores channels and programmes as `BaseItems` and projects them
 //! through `DtoService`; Ferrofin keeps its guide cache in its own tables and
-//! instead builds the equivalent entity row in memory here — the projection
-//! then runs through the very same `DtoService::get_base_item_dtos` path every
-//! other item takes, which is what makes the channel/programme DTOs carry
-//! `UserData`, the image maps, `SortName`, `CanDelete` and the rest for free.
+//! builds the equivalent entity row here. The guide refresh stores a
+//! programme's row as its item, which the programme reads project; the channel
+//! reads, and a programme read of an airing with no stored item, project the
+//! row built in memory. Either way the projection runs through the very same
+//! `DtoService::get_base_item_dtos` path every other item takes, which is what
+//! makes the channel/programme DTOs carry `UserData`, the image maps,
+//! `SortName`, `CanDelete` and the rest for free.
 //!
 //! The field values are ports of `Jellyfin.LiveTv.Guide.GuideManager.GetChannel`
 //! / `GetProgram` (what the C# scan writes onto the items) and
@@ -863,7 +866,8 @@ pub fn recording_entity(
     }
 }
 
-/// Builds the synthetic `BaseItems` row a programme projects from.
+/// Builds the `BaseItems` row the guide refresh stores for a new airing, which
+/// a guide read also projects for an airing with no stored item.
 ///
 /// Port of `GuideManager.GetProgram`'s item shape: the flag-derived `Tags`
 /// list (in upstream's exact order), pipe-joined `Genres`,

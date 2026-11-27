@@ -4,7 +4,8 @@
 //! src/Jellyfin.LiveTv/Guide/GuideManager.cs:232-339) reads a channel's
 //! existing programmes (`ChannelIds = [currentChannel.Id]`), merges and stores
 //! them, then moves on, so a large guide is never in memory whole. These tests
-//! watch the item repository the mirror reads through.
+//! watch the item repository the mirror, and the guide reads over it, read
+//! through.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -17,7 +18,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::entities::{ImageType, MediaStreamType};
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
+use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemRepository, ItemWithCounts, PlaylistItemsWithAccess};
 use ferrofin_traits::stubs::{LiveTvChannelQuery, LiveTvManager as _};
 use uuid::Uuid;
@@ -328,6 +329,36 @@ async fn a_guide_refresh_reads_the_stored_airings_one_channel_at_a_time() {
         .await
         .expect("genre links");
     assert_eq!(links.len(), 4, "every airing keeps its genre: {links:?}");
+}
+
+/// gl-1690: a guide read projects its page's stored programme items, which it
+/// reads in one batched read for the whole page, not one per airing or per
+/// channel: the guide page is a hot path.
+#[tokio::test]
+async fn a_guide_page_reads_its_programme_items_once() {
+    let mut recorder = None;
+    let lab = item_lab_reading_through(M3U, Some(guide(&guide_day(0), &AIRINGS)), |inner| {
+        let reads = Arc::new(ChannelReads {
+            inner,
+            reads: Mutex::new(Vec::new()),
+        });
+        recorder = Some(Arc::clone(&reads));
+        reads
+    })
+    .await;
+    let reads = recorder.expect("the lab wraps its item reads");
+    lab.mgr.refresh_guide().await.expect("refresh");
+    reads.reads.lock().expect("reads").clear();
+
+    let page = lab
+        .mgr
+        .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+        .await
+        .expect("programs");
+    assert_eq!(page.items.len(), AIRINGS.len());
+    let seen = reads.reads();
+    assert_eq!(seen.len(), 1, "one read for the page: {seen:?}");
+    assert_eq!(seen[0].len(), 2, "both channels' airings in it: {seen:?}");
 }
 
 /// One channel's airings are read through the `("ChannelId", "StartDate")`

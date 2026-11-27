@@ -2024,14 +2024,7 @@ impl FerrofinLiveTvManager {
         // needs them (the C# loads `existingPrograms` before assigning). They
         // are read by id, so an airing finds its item whichever channel the
         // item was stored under.
-        let stored: HashMap<Uuid, BaseItemEntity> = store
-            .items
-            .retrieve_items(&ids)
-            .await?
-            .into_iter()
-            .filter(|row| row.type_ == crate::projection::PROGRAM_TYPE_NAME)
-            .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
-            .collect();
+        let stored = Self::program_items_by_id(store, &ids).await?;
         let tagged: Vec<Uuid> = stored
             .iter()
             .filter(|(_, row)| row.tags.is_some())
@@ -2143,6 +2136,22 @@ impl FerrofinLiveTvManager {
         Ok(written
             .into_iter()
             .map(|id| (id, ends.get(&id).copied().flatten()))
+            .collect())
+    }
+
+    /// The programme items stored under `ids`, by id, in one `retrieve_items`
+    /// call; an id with no programme item is absent.
+    async fn program_items_by_id(
+        store: &LiveTvItemStore,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, BaseItemEntity>, ServiceError> {
+        Ok(store
+            .items
+            .retrieve_items(ids)
+            .await?
+            .into_iter()
+            .filter(|row| row.type_ == crate::projection::PROGRAM_TYPE_NAME)
+            .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
             .collect())
     }
 
@@ -5287,10 +5296,15 @@ impl FerrofinLiveTvManager {
             .map(|resolved| (store.restrictions.as_ref(), resolved)))
     }
 
-    /// Projects guide programme rows into `BaseItemDto`s: the synthetic
-    /// entities run through the DTO service, then the two upstream
+    /// Projects guide programme rows into `BaseItemDto`s: each airing's stored
+    /// programme item runs through the DTO service, then the two upstream
     /// post-passes ([`Self::add_info_to_program_dto`],
     /// [`Self::add_recording_info`]).
+    ///
+    /// Upstream's guide reads project the stored `LiveTvProgram` items
+    /// (`QueryItems`, `GetItemById`), so what the metadata editor wrote onto a
+    /// programme shows here as on `/Items/{id}`. An airing with no stored item,
+    /// or a manager without an item store, projects its guide row.
     async fn program_dtos(
         &self,
         rows: &[GuideProgramRow],
@@ -5300,10 +5314,25 @@ impl FerrofinLiveTvManager {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+        let ids: Vec<Uuid> = rows
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect();
+        let mut stored = match self.item_store.get() {
+            Some(store) => Self::program_items_by_id(store, &ids).await?,
+            None => HashMap::new(),
+        };
         let view_id = self.live_tv_view_id().await;
         let entities: Vec<_> = rows
             .iter()
-            .map(|r| program_entity(r, parse_dt, view_id))
+            .map(|r| {
+                // Taken, not cloned: a guide row's id is its primary key, so
+                // a page names each airing once.
+                Uuid::parse_str(&r.id)
+                    .ok()
+                    .and_then(|id| stored.remove(&id))
+                    .unwrap_or_else(|| program_entity(r, parse_dt, view_id))
+            })
             .collect();
         let mut dtos = self
             .dto_service()?
