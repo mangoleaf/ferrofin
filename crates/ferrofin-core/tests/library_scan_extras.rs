@@ -2737,6 +2737,110 @@ async fn an_extras_nfo_title_change_is_no_rename() {
     assert_eq!(featurette.overview.as_deref(), Some("First plot"));
 }
 
+/// Upstream `RefreshMetadataForOwnedItem` copies the owner's title metadata
+/// onto an extra and then refreshes the extra, so the extra's own NFO is
+/// merged on top by the refresh's mode (gl-742). A scan and "Replace all
+/// metadata" replace: what the NFO sets wins, and the owner's values fill
+/// what it leaves out — under the item refresh route's `RemoveOldMetadata`
+/// too, where upstream erases them. "Search for missing metadata" only fills
+/// (`shouldReplace` false), so there the owner's values stand. The movie's
+/// own refresh refreshes its extras the same way.
+#[tokio::test]
+async fn an_extras_own_nfo_is_merged_over_its_owners_title_metadata() {
+    let f = Fixture::new(&[BR, BR_FEATURETTE]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    std::fs::write(
+        f.media
+            .join("Blade Runner (1982)/featurettes/Making of.nfo"),
+        "<movie><title>Making of</title><plot>Its own plot</plot>\
+         <genre>Documentary</genre></movie>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    let featurette = f.row(BR_FEATURETTE).await;
+    assert_eq!(featurette.overview.as_deref(), Some("Its own plot"));
+    assert_eq!(genre_links(&f, &featurette.id).await, ["Documentary"]);
+    assert_eq!(featurette.studios.as_deref(), Some("Warner"));
+    assert_eq!(featurette.official_rating.as_deref(), Some("R"));
+    assert_eq!(featurette.production_year, Some(1982));
+
+    f.scanner.scan_all().await.unwrap();
+    let featurette = f.row(BR_FEATURETTE).await;
+    assert_eq!(featurette.overview.as_deref(), Some("Its own plot"));
+
+    let missing = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    f.scanner.scan_with(None, &missing).await.unwrap();
+    let featurette = f.row(BR_FEATURETTE).await;
+    assert_eq!(featurette.overview.as_deref(), Some("First plot"));
+    assert_eq!(genre_links(&f, &featurette.id).await, ["Sci-Fi"]);
+
+    let replace = MetadataRefreshOptions::for_item_refresh(
+        MetadataRefreshMode::FullRefresh,
+        MetadataRefreshMode::None,
+        true,
+        false,
+        false,
+    );
+    f.scanner.scan_with(None, &replace).await.unwrap();
+    let featurette = f.row(BR_FEATURETTE).await;
+    assert_eq!(featurette.overview.as_deref(), Some("Its own plot"));
+    assert_eq!(genre_links(&f, &featurette.id).await, ["Documentary"]);
+    assert_eq!(featurette.studios.as_deref(), Some("Warner"));
+    assert_eq!(featurette.official_rating.as_deref(), Some("R"));
+    assert_eq!(featurette.production_year, Some(1982));
+
+    refresh_item_with(&f, BR, &missing).await;
+    let featurette = f.row(BR_FEATURETTE).await;
+    assert_eq!(featurette.overview.as_deref(), Some("First plot"));
+    refresh_item_with(&f, BR, &replace).await;
+    let featurette = f.row(BR_FEATURETTE).await;
+    assert_eq!(featurette.overview.as_deref(), Some("Its own plot"));
+    assert_eq!(featurette.official_rating.as_deref(), Some("R"));
+}
+
+/// The owner's dates are authoritative for an extra (`InheritDatesFromOwner`):
+/// a new extra's file-name year is the resolver's, which the owner's replaces
+/// on its first scan as on every later one.
+#[tokio::test]
+async fn a_new_extras_file_name_year_gives_way_to_its_owners() {
+    const MAKING_OF: &str = "Blade Runner (1982)/featurettes/Making of (1999).mkv";
+    let f = Fixture::new(&[BR, MAKING_OF]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    let featurette = f.row(MAKING_OF).await;
+    assert_eq!(featurette.production_year, Some(1982));
+    assert_eq!(featurette.overview.as_deref(), Some("First plot"));
+}
+
+/// A locked extra keeps its stored values through its own refresh, but the
+/// owner's copy is no provider: it writes past the lock, as upstream's
+/// `RefreshMetadataForOwnedItem` does.
+#[tokio::test]
+async fn a_locked_extra_still_takes_its_owners_title_metadata() {
+    let f = Fixture::new(&[BR, BR_FEATURETTE]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Path" = ?"#)
+        .bind(f.media.join(BR_FEATURETTE).to_string_lossy().as_ref())
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    write_movie_nfo(&f, "Second plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    f.scanner.scan_with(None, &full).await.unwrap();
+    assert_eq!(
+        f.row(BR_FEATURETTE).await.overview.as_deref(),
+        Some("Second plot")
+    );
+}
+
 /// A rescan that finds the owner and its extras as they were writes no
 /// extra: the copy writes only rows that differ, so the dates it gives are
 /// already theirs.

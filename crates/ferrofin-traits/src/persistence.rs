@@ -1153,6 +1153,9 @@ pub trait ItemPersistenceService: Send + Sync {
     /// - Otherwise each takes only the owner's year and premiere date
     ///   (`InheritDatesFromOwner`), which an owner often learns after its
     ///   extras were created.
+    /// - An extra the refresh lists as [`titled`](OwnerExtrasRefresh::titled)
+    ///   takes nothing: its saved row is the owner's title metadata with its
+    ///   own readers' values merged on.
     ///
     /// Each written row's parental score follows the ratings it was given,
     /// and its genre and studio links follow its genres and studios. Only a
@@ -2658,6 +2661,11 @@ pub struct OwnerExtrasRefresh {
     /// Whether the refresh created, re-owned or renamed one of them, or
     /// ran in full (`FullRefresh` or "Replace all metadata").
     pub changed: bool,
+    /// The extras of `owner` the refresh already saved from its title
+    /// metadata, copied onto each before its own readers merged on
+    /// (`RefreshMetadataForOwnedItem` copies, then refreshes the extra), so
+    /// the copy leaves them as they are.
+    pub titled: Vec<Uuid>,
 }
 
 /// One stored season with no folder of its own

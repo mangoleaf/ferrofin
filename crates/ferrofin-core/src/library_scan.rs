@@ -3108,6 +3108,11 @@ struct ItemState<'s, 'a> {
     /// `renamedExtraIds`, the extras whose corrected name differs from the
     /// persisted one, whatever a local reader then makes of it.
     renamed_extra: bool,
+    /// Set by [`LibraryScanner::scan_item`] for an extra whose row it built
+    /// from its owner's title metadata, copied in before its own readers ran
+    /// ([`LibraryScanner::extras_title_source`]): the copy after the walk
+    /// leaves the row it saved as it is.
+    titled_extra: bool,
     /// Set by [`LibraryScanner::scan_item`] just before it saves the item's
     /// row: from then on a failure may leave the row behind, even a failure
     /// of the save itself, which writes the row before the names it pushes to
@@ -7489,6 +7494,7 @@ impl LibraryScanner {
                 folders: key_folders,
                 refresh: &refresh,
                 renamed_extra: false,
+                titled_extra: false,
                 save_attempted: false,
                 playlist_xml: None,
             };
@@ -7497,6 +7503,7 @@ impl LibraryScanner {
             // `large_futures` ceiling.
             let scanned_item = Box::pin(self.scan_item(pass, &mut state)).await;
             let extra_renamed = state.renamed_extra;
+            let titled_extra = state.titled_extra;
             let mut playlist_xml = state.playlist_xml.take();
             let save_attempted = state.save_attempted;
             if undecodable || scanned_item.is_err() {
@@ -7724,6 +7731,10 @@ impl LibraryScanner {
                     item,
                     extra_changed(stored, item, extra_renamed, request.options),
                 );
+                // An edit that landed mid-pass left the row as it wrote it.
+                if titled_extra && matches!(saved, ItemSaved::Saved | ItemSaved::Unchanged) {
+                    owners.titled.insert(item.id);
+                }
             }
             // An item left as an edit wrote it keeps its stored owner link,
             // so its owner keeps it too until a later refresh saves it.
@@ -7967,19 +7978,16 @@ impl LibraryScanner {
                 owner,
                 found: found(owner).then(Vec::new),
                 changed: false,
+                titled: Vec::new(),
             });
             refresh.changed |= changed;
             if let Some(found) = &mut refresh.found {
                 found.push(extra);
             }
+            if owners.titled.contains(&extra) {
+                refresh.titled.push(extra);
+            }
         }
-        // TODO(parity, open work item — NOT an accepted divergence; gl-742):
-        // upstream gives the title metadata as the start of each extra's own
-        // refresh (`RefreshMetadataForOwnedItem` copies, then refreshes the
-        // extra), so an extra's own NFO wins; copied here after the walk, the
-        // owner's values win. Un-defer path: apply the copy to the extra
-        // before its own readers run in the walk, and test an extra NFO's
-        // plot surviving a full refresh.
         let refreshes: Vec<OwnerExtrasRefresh> = by_owner.into_values().collect();
         if let Err(err) = self
             .persistence
@@ -8552,7 +8560,32 @@ impl LibraryScanner {
         // takes it: the save compares the result with the stored row.
         let renamed = stored_row.and_then(|row| renamed_extra(row, item, locked_fields));
         state.renamed_extra = renamed.is_some();
-        let named_row = renamed.as_ref().or(stored_row);
+        // `RefreshMetadataForOwnedItem`: an extra its owner's refresh gives
+        // the title metadata takes it BEFORE its own refresh, so the probe
+        // and the readers below merge onto the owner's values by the pass's
+        // mode, as they would onto the stored ones: on a scan or a "Replace
+        // all metadata" its own NFO's plot wins, on "Search for missing
+        // metadata" the owner's. A locked extra's save keeps its stored
+        // columns, so it takes the copy after the walk, which writes past the
+        // lock as upstream's copy does.
+        let title_source = if item.entity.extra_type.is_some()
+            && !locked
+            && extra_changed(stored, item, renamed.is_some(), options)
+        {
+            self.extras_title_source(item, state.refresh.version_groups)
+                .await
+        } else {
+            None
+        };
+        let titled = title_source
+            .as_ref()
+            .zip(renamed.as_ref().or(stored_row))
+            .map(|(owner, row)| {
+                let mut row = row.clone();
+                crate::video_versions::copy_title_metadata(owner, &mut row);
+                row
+            });
+        let named_row = titled.as_ref().or(renamed.as_ref()).or(stored_row);
         let mut video_base = named_row.filter(|_| video_info.is_some()).cloned();
         let embedded_title = if let Some(info) = video_info {
             let base = video_base.as_mut().unwrap_or(&mut entity);
@@ -8990,6 +9023,9 @@ impl LibraryScanner {
             entity.premiere_date.is_some(),
             entity.production_year.is_some(),
         );
+        // The dates this pass's readers supplied: a new extra's file-name year
+        // is the resolver's guess, which its owner's dates replace.
+        let read_dates = (entity.production_year, entity.premiere_date);
         entity = match &local_row {
             // The local change first, by the pass's mode; then the
             // backfill's answers fill what is still empty.
@@ -9016,6 +9052,35 @@ impl LibraryScanner {
             }
             None => saved_row(metadata_stored, &guesses, &entity, facts),
         };
+        // A new extra's row is the pass's own result: the owner's title
+        // metadata it held before its refresh is merged under it as a stored
+        // row's would be ([`saved_row`]), a theme song's tags filling only
+        // the genres it lacks.
+        if metadata_stored.is_none()
+            && let Some(owner) = &title_source
+        {
+            let mut under_owner = entity.clone();
+            crate::video_versions::copy_title_metadata(owner, &mut under_owner);
+            let mut tags = std::mem::take(&mut entity);
+            (tags.production_year, tags.premiere_date) = read_dates;
+            entity = merge_onto_stored(&under_owner, &tags, facts, under_owner.parent_index_number);
+            if !facts.locked {
+                keep_stored_audio_tags(
+                    &mut entity,
+                    &under_owner,
+                    &tags,
+                    guesses.folder_album.as_deref(),
+                    facts,
+                );
+            }
+        }
+        // "Replace all metadata" (`RemoveOldMetadata`) replaces with only
+        // what the extra's readers supplied, which erases the rest of the
+        // owner's copy upstream; Ferrofin keeps it (Jellyfin bug not ported).
+        if let Some(owner) = &title_source {
+            crate::video_versions::fill_title_metadata(owner, &mut entity);
+        }
+        state.titled_extra = title_source.is_some();
         if metadata_stored.is_none()
             && let Some(tagged) = &new_item_tags
         {
@@ -9763,6 +9828,41 @@ impl LibraryScanner {
                 }
             }
         };
+    }
+
+    /// The row whose title metadata the extra `item` takes before its own
+    /// refresh (`RefreshMetadataForOwnedItem`'s `this`): its owner's, as the
+    /// walk has saved it so far — an owner is planned before its extras, so
+    /// its values are the ones this scan read for it. `None` when the owner
+    /// is an alternate version, linked or in a group this walk resolved (its
+    /// primary gives it, `GetOwnedVersionIds`), or cannot be read: the copy
+    /// after the walk gives that extra its title metadata instead.
+    async fn extras_title_source(
+        &self,
+        item: &Planned,
+        groups: &VersionGroups,
+    ) -> Option<BaseItemEntity> {
+        let owner = owner_of(item)?;
+        // TODO(parity, open work item — NOT an accepted divergence; gl-1988):
+        // an extra a version owns takes its primary's title metadata after
+        // the walk, over its own NFO. Un-defer path: resolve the primary here
+        // (the resolved groups, else the stored local-version link), record
+        // it with the titled extra, and skip the copy only for that primary.
+        if groups.members.contains(&owner) && !groups.primaries.contains(&owner) {
+            return None;
+        }
+        let row = match self.item_repository.as_ref()?.retrieve_item(owner).await {
+            Ok(row) => row?,
+            Err(err) => {
+                tracing::debug!(
+                    item_id = %item.id,
+                    %err,
+                    "could not read the extra's owner; the copy after the walk gives its title metadata"
+                );
+                return None;
+            }
+        };
+        row.primary_version_id.is_none().then_some(row)
     }
 
     /// Whether writing `people` would change the credits stored for
@@ -23914,6 +24014,9 @@ struct OwnedCopies {
     /// Each extra the walk refreshed: its owner, its id, and whether the
     /// walk created, re-owned or renamed it or refreshed it in full.
     extras: Vec<(Uuid, Uuid, bool)>,
+    /// The extras the walk saved from their owner's title metadata with
+    /// their own readers merged on ([`ItemState::titled_extra`]).
+    titled: std::collections::HashSet<Uuid>,
 }
 
 impl OwnedCopies {

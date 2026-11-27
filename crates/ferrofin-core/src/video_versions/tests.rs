@@ -531,6 +531,52 @@ fn copy_title_metadata_takes_the_owners_title_fields() {
     assert!(!copy_title_metadata(&owner, &mut part));
 }
 
+/// The fill after a `RemoveOldMetadata` merge: every title field the extra
+/// lacks (none, or an empty string) comes from the owner, and every one it
+/// has stays its own.
+#[test]
+fn fill_title_metadata_fills_only_what_the_extra_lacks() {
+    let owner = BaseItemEntity {
+        genres: Some("Crime|Drama".to_owned()),
+        studios: Some("Warner".to_owned()),
+        production_locations: Some("USA".to_owned()),
+        community_rating: Some(8.3),
+        critic_rating: Some(87.0),
+        overview: Some("A heist.".to_owned()),
+        official_rating: Some("R".to_owned()),
+        custom_rating: Some("Adults".to_owned()),
+        production_year: Some(1995),
+        premiere_date: Some("1995-12-15T00:00:00Z".parse().unwrap()),
+        tagline: Some("Not copied".to_owned()),
+        ..BaseItemEntity::default()
+    };
+    let mut empty = BaseItemEntity {
+        overview: Some(String::new()),
+        ..BaseItemEntity::default()
+    };
+    fill_title_metadata(&owner, &mut empty);
+    let mut expected = owner.clone();
+    expected.tagline = None;
+    assert_eq!(empty, expected);
+
+    let own = BaseItemEntity {
+        genres: Some("Documentary".to_owned()),
+        studios: Some("Indie".to_owned()),
+        production_locations: Some("UK".to_owned()),
+        community_rating: Some(6.0),
+        critic_rating: Some(50.0),
+        overview: Some("The making of.".to_owned()),
+        official_rating: Some("PG".to_owned()),
+        custom_rating: Some("Kids".to_owned()),
+        production_year: Some(1996),
+        premiere_date: Some("1996-01-01T00:00:00Z".parse().unwrap()),
+        ..BaseItemEntity::default()
+    };
+    let mut kept = own.clone();
+    fill_title_metadata(&owner, &mut kept);
+    assert_eq!(kept, own);
+}
+
 /// `Video.UpdateToRepositoryAsync`'s columns: taken as they are, an empty
 /// value included; critic rating and studios are not among them.
 #[test]

@@ -1138,6 +1138,38 @@ pub fn copy_title_metadata(owner: &BaseItemEntity, item: &mut BaseItemEntity) ->
     inherit_dates_from_owner(owner, item) || changed
 }
 
+/// Fills what an extra lacks of the title metadata [`copy_title_metadata`]
+/// gives it, from `owner`: the values its own refresh erased under
+/// `RemoveOldMetadata`, which replaces with only what its readers supplied.
+pub fn fill_title_metadata(owner: &BaseItemEntity, item: &mut BaseItemEntity) {
+    for (from, to) in [
+        (&owner.genres, &mut item.genres),
+        (&owner.studios, &mut item.studios),
+        (&owner.production_locations, &mut item.production_locations),
+        (&owner.overview, &mut item.overview),
+        (&owner.official_rating, &mut item.official_rating),
+        (&owner.custom_rating, &mut item.custom_rating),
+    ] {
+        if to.as_deref().is_none_or(str::is_empty) {
+            to.clone_from(from);
+        }
+    }
+    for (from, to) in [
+        (owner.community_rating, &mut item.community_rating),
+        (owner.critic_rating, &mut item.critic_rating),
+    ] {
+        if to.is_none() {
+            *to = from;
+        }
+    }
+    if item.production_year.is_none() {
+        item.production_year = owner.production_year;
+    }
+    if item.premiere_date.is_none() {
+        item.premiere_date = owner.premiere_date;
+    }
+}
+
 /// Gives a local alternate version its primary's metadata, returning whether
 /// any column changed — the column half of `Video.UpdateToRepositoryAsync`
 /// (`Video.cs:704-726`), which every save of a primary runs for each of its

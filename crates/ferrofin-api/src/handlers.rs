@@ -2599,8 +2599,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    (InheritDatesFromOwner); the stored ones it did not find (removedExtraIds, \
                    ExtraType set: gone_extras) are removed through prune_deleted on their \
                    paths alone, and a set found smaller gives the rest the title metadata \
-                   (copy_to_owned_videos' found). Compared with RefreshMetadata, \
-                   BaseItem.RefreshMetadata, RefreshedOwnedItems, RefreshExtras, \
+                   (copy_to_owned_videos' found). An extra a scan or an item's refresh \
+                   gives the title metadata takes it before its own refresh, as \
+                   RefreshMetadataForOwnedItem copies it onto the extra and then refreshes the \
+                   extra: scan_item copies the owner's row as the walk saved it \
+                   (extras_title_source) onto the extra's stored row, or merges it under a new \
+                   extra's own result, before the probe and the readers, so the extra's NFO \
+                   merges on by the pass's shouldReplace (on a scan or under \
+                   ReplaceAllMetadata its values win, on a FullRefresh without it the owner's), \
+                   and copy_owner_metadata_to_extras leaves those extras \
+                   (OwnerExtrasRefresh::titled) as they were saved. Compared with \
+                   RefreshMetadata, BaseItem.RefreshMetadata, RefreshedOwnedItems, \
+                   RefreshExtras, RefreshMetadataForOwnedItem, \
                    Video.RefreshedOwnedItems, MediaSourceManager.GetPlaybackMediaSources, \
                    SaveItemAsync, LibraryManager.UpdatePeopleAsync, LibraryManager.GetPeople, \
                    BaseNfoSaver.AddCommonNodes, BaseXmlSaver.AddCommonNodesAsync, \
@@ -2678,6 +2688,27 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              listing that came back short, which a folder validation applies too); \
              upstream's RefreshExtras deletes every stored extra FindExtras did not hand \
              back. Fix path: gl-1982 (owner decision pending).",
+            "An extra named after an alternate version takes its primary's title metadata \
+             after the walk, over what its own NFO set, where RefreshMetadataForOwnedItem \
+             copies it before the extra's refresh merges the NFO on: the walk settles the \
+             version links only after it. Fix path: gl-1988.",
+            "An extra whose own NFO changes in the scan that adds or removes a sibling \
+             extra takes the title metadata after the walk, over that NFO: the walk gives the \
+             copy before an extra's own readers only to the extra it creates, re-owns or \
+             renames, or refreshes in full, and learns that the set changed after it, where \
+             RefreshExtras refreshes every extra of a changed set after the copy. Fix path: \
+             gl-1989.",
+            "An extra takes its owner's title metadata as this scan read it (the walk saves \
+             the owner before its extras), where upstream's RefreshExtras runs before the \
+             owner's own refresh and gives the values stored before it, so a first scan leaves \
+             upstream's extras without them. Kept by owner decision 2026-11-20 (gl-1595).",
+            "Under ReplaceAllMetadata with RemoveOldMetadata (the item refresh route's \
+             \"Replace all metadata\"), upstream's merge replaces an extra with only what its \
+             own readers supplied, so the owner's genres, studios, overview, ratings and dates \
+             the copy just gave it are erased (RefreshWithProviders skips the fill under \
+             RemoveOldMetadata); Ferrofin fills what its readers left empty from the owner \
+             (video_versions.rs fill_title_metadata), as InheritDatesFromOwner's 'the owner's \
+             is authoritative' intends. Jellyfin bug not ported.",
         ],
     },
     VerifiedSubsystem {

@@ -3387,6 +3387,7 @@ impl LocalProviderManager {
                     changed: request.options.replace_all_metadata
                         || request.options.metadata_refresh_mode
                             == MetadataRefreshMode::FullRefresh,
+                    titled: Vec::new(),
                 }])
                 .await
         {
@@ -9100,6 +9101,7 @@ mod tests {
                     owner: item_id,
                     found: None,
                     changed,
+                    titled: Vec::new(),
                 }]
             );
         }

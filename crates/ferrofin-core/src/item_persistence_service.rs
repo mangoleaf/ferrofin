@@ -7978,6 +7978,16 @@ async fn plan_extra_copies(
     if groups.is_empty() {
         return Ok(Vec::new());
     }
+    // Saved from their owner's title metadata with their own readers merged
+    // on: they stand as saved.
+    // TODO(parity, open work item — NOT an accepted divergence; gl-1989): an
+    // untitled sibling of a changed set whose own NFO changed in the same
+    // walk loses it here. Un-defer path: let the walk know `extrasChanged`
+    // before it reaches the extras and give every extra of the set the copy.
+    let titled: std::collections::HashSet<Uuid> = refreshes
+        .iter()
+        .flat_map(|r| r.titled.iter().copied())
+        .collect();
     let mut primaries: Vec<Uuid> = groups.keys().copied().collect();
     primaries.sort_unstable();
     let missing: Vec<Uuid> = primaries
@@ -8011,6 +8021,9 @@ async fn plan_extra_copies(
         let (Some(group), Some(owner)) = (groups.get(&primary), rows.get(&primary)) else {
             continue;
         };
+        if Uuid::parse_str(&row.id).is_ok_and(|id| titled.contains(&id)) {
+            continue;
+        }
         let mut copy = OwnedCopy {
             row: row.clone(),
             local: false,
