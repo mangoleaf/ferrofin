@@ -1069,6 +1069,14 @@ impl Database {
     /// rather than colliding inside SQLite and burning the busy timeout. For
     /// the in-memory test database this is the same pool as
     /// [`Database::pool`].
+    ///
+    /// A write transaction that reads before it writes begins with
+    /// `.begin_with("BEGIN IMMEDIATE")`. Another process (the previous version
+    /// during a rolling update) still writes the same file, and SQLite waits
+    /// out the busy timeout only for a lock taken with no transaction open: a
+    /// deferred transaction that has read fails its first write at once, with
+    /// `SQLITE_BUSY` while the other holds the lock, or `SQLITE_BUSY_SNAPSHOT`
+    /// when it committed after the read.
     #[must_use]
     pub fn writer(&self) -> &SqlitePool {
         &self.writer

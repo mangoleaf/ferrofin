@@ -31,6 +31,7 @@ struct Child {
 /// Convert only trees still directly parented by this collection folder.
 /// A missing/malformed location description stops the removal instead of
 /// cascading through media whose physical parent cannot be established.
+#[allow(clippy::too_many_lines)] // one transaction: every child re-parented together
 pub(crate) async fn preserve_children(
     db: &Database,
     collection: Uuid,
@@ -39,7 +40,12 @@ pub(crate) async fn preserve_children(
     virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<(), ServiceError> {
     let cf = guid_to_db(collection);
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let children: Vec<Child> = sqlx::query_as(
         r#"SELECT "Id" AS id, "Path" AS path FROM "BaseItems" WHERE "ParentId" = ?"#,
     )
