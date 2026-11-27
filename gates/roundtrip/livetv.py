@@ -91,22 +91,28 @@ def ok(status, body, what):
 
 
 def refresh_guide(server, timeout):
-    """Runs the RefreshGuide task and waits until it finished again."""
+    """Runs the RefreshGuide task and waits until it finished again. A run under way is waited out first: saving
+    a tuner or a guide queues one, and its end, which may be Cancelled, is not this refresh's."""
     tasks = server.request("/ScheduledTasks")
     task = next((t for t in tasks if isinstance(t, dict) and t.get("Key") == "RefreshGuide"), None)
     if task is None:
         raise api.CheckError("no RefreshGuide task")
-    before = (task.get("LastExecutionResult") or {}).get("EndTimeUtc")
-    ok(*server.send("POST", f"/ScheduledTasks/Running/{task['Id']}"), "starting the guide refresh")
+    started, before = False, None
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        time.sleep(POLL_SECONDS)
         task = server.request(f"/ScheduledTasks/{task['Id']}")
         last = task.get("LastExecutionResult") or {}
-        if task.get("State") == "Idle" and last.get("EndTimeUtc") != before:
+        if task.get("State") == "Idle" and not started:
+            before = last.get("EndTimeUtc")
+            status, _ = server.send("POST", f"/ScheduledTasks/Running/{task['Id']}")
+            if status != 400:   # 400: a queued run took the task first; asked again once that one has ended
+                ok(status, None, "starting the guide refresh")
+                started = True
+        elif task.get("State") == "Idle" and last.get("EndTimeUtc") != before:
             if last.get("Status") != "Completed":
                 raise api.CheckError(f"the guide refresh ended {last.get('Status')}")
             return
+        time.sleep(POLL_SECONDS)
     raise api.CheckError(f"the guide refresh did not finish within {timeout:.0f} s")
 
 

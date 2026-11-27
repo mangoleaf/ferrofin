@@ -12,6 +12,9 @@ use ferrofin_traits::library::ScanTrigger;
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
+#[path = "support/guide_refresh.rs"]
+mod guide_refresh;
+
 const ADMIN_USER: &str = "admin";
 const ADMIN_PASSWORD: &str = "visibility-admin-pw";
 
@@ -2060,6 +2063,7 @@ async fn air_series(f: &Fixture, titles: &[&str]) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let since = chrono::Utc::now();
     let (status, body) = call(
         &f.router,
         "POST",
@@ -2073,26 +2077,10 @@ async fn air_series(f: &Fixture, titles: &[&str]) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    // Each save queued a refresh, and a later refresh supersedes an earlier
-    // one's write. Once a lineup is listed they have all started, so the
-    // refresh below is the newest and has finished when it returns.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let (_, channels) = call(&f.router, "GET", "/LiveTv/Channels", Some(&f.admin), None).await;
-        if channels["TotalRecordCount"].as_i64() > Some(0) {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "no lineup appeared");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    f.h.wired
-        .state
-        .live_tv
-        .as_ref()
-        .expect("live tv is wired")
-        .refresh_guide()
-        .await
-        .expect("guide refresh");
+    // Each save queued the "Refresh Guide" task, and the second stopped the
+    // first's run: the guide is whole once the run that started after it has
+    // completed.
+    guide_refresh::guide_refreshed_since(f.h.wired.state.tasks.as_ref(), since).await;
 }
 
 /// Mints the fixture's only API key and returns it.
@@ -3277,6 +3265,7 @@ async fn stored_channel(f: &Fixture) -> String {
         &guide,
         "<tv><channel id=\"one\"><display-name>One</display-name></channel></tv>",
     );
+    let mut since = chrono::Utc::now();
     for (uri, body) in [
         (
             "/LiveTv/TunerHosts",
@@ -3287,26 +3276,18 @@ async fn stored_channel(f: &Fixture) -> String {
             json!({"Type": "xmltv", "Path": guide.to_string_lossy(), "EnableAllTuners": true}),
         ),
     ] {
+        // Before the guide's save, the later of the two: it stops the run the
+        // tuner's save queued, and the run that starts after it reads both.
+        since = chrono::Utc::now();
         let (status, response) = call(&f.router, "POST", uri, Some(&f.admin), Some(body)).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {response}");
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let (_, page) = call(&f.router, "GET", "/LiveTv/Channels", Some(&f.admin), None).await;
-        if let Some(id) = page["Items"][0]["Id"].as_str() {
-            f.h.wired
-                .state
-                .live_tv
-                .as_ref()
-                .unwrap()
-                .refresh_guide()
-                .await
-                .unwrap();
-            return id.to_owned();
-        }
-        assert!(std::time::Instant::now() < deadline, "no lineup appeared");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    guide_refresh::guide_refreshed_since(f.h.wired.state.tasks.as_ref(), since).await;
+    let (_, page) = call(&f.router, "GET", "/LiveTv/Channels", Some(&f.admin), None).await;
+    page["Items"][0]["Id"]
+        .as_str()
+        .expect("a channel")
+        .to_owned()
 }
 
 /// A recording's id names no `BaseItems` row, and it must still play for every
