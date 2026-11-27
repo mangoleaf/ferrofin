@@ -612,9 +612,10 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Items/{itemId}/MetadataEditor"),
     ("get", "/UserViews/GroupingOptions"),
     // Batch 6 — portable extras: TMDb client image configuration
-    // (`TmdbController`), answered from fixed TMDb values.
-    // TODO(parity, gl-1508): open work item, not an accepted divergence: port
-    // upstream's live `GetConfigAsync` fetch.
+    // (`TmdbController`), TMDb's live `/configuration`.
+    // TODO(parity, gl-1962): open work item, not an accepted divergence: the
+    // TMDb lookups' own `EnsureClientConfigAsync`, the fetched `SecureBaseUrl`
+    // and the settings page reading back the reset size.
     ("get", "/Tmdb/ClientConfiguration"),
     // MergeVersions plugin — bulk merge/split of duplicate versions across the
     // whole library, ported onto the core `PrimaryVersionId` version-group seam
@@ -2677,7 +2678,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ferrofin-core library_scan.rs fetch_tmdb_metadata (a pinned TMDb id, else \
                    find_tmdb_id's /find by an IMDb id, a series also by its TVDB id, else the \
                    parsed-name search and find_best_match, for a movie only without an IMDb \
-                   id), apply_details (a movie's overview \
+                   id; a /find request that fails, not a 404, ends the lookup with no TVDB \
+                   /find, no search and the failure counted, as FindByExternalIdAsync throws \
+                   out of GetMetadata), apply_details (a movie's overview \
                    with its blank lines collapsed), fetch_tmdb_season \
                    with ferrofin-providers season.rs tmdb_answer (ImportSeasonName), and \
                    fetch_tmdb_episode with apply_tmdb_episode; for an episode the provider \
@@ -2694,7 +2697,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
                    TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
                    this row.",
-        date: "2026-11-20",
+        date: "2026-11-26",
         divergences: &[
             "A movie, series, season or episode TMDb has no overview for answers the \
              refresh no Overview, so Identify → Apply and a Replace all metadata refresh \
@@ -3256,6 +3259,42 @@ pub const VERIFIED: &[Verified] = &[
         date: "2026-11-15",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Tmdb/ClientConfiguration",
+        upstream_file: "MediaBrowser.Providers/Plugins/Tmdb/Api/TmdbController.cs",
+        upstream_method: "TmdbClientConfiguration",
+        ferrofin: "handlers/tmdb.rs tmdb_client_configuration → \
+               ProviderManager::tmdb_image_configuration → ferrofin-providers \
+               provider_manager.rs → tmdb.rs TmdbClient::client_image_configuration \
+               (TmdbClientManager.GetClientConfiguration and EnsureClientConfigAsync: one \
+               /configuration request, kept for the process once answered and tried again \
+               after a failure, as HasConfig; GetConfigAsync failing when TMDb answers no \
+               configuration; the Images member, a null one answering 204) and \
+               TmdbClient::settings over plugin_config.rs keep_listed_sizes \
+               (ValidatePreferences once the configuration is known)",
+        date: "2026-11-26",
+        divergences: &[
+            "Only this route fetches the configuration: upstream's TMDb lookups each await \
+             EnsureClientConfigAsync, so the first lookup fetches it, runs \
+             ValidatePreferences and fails when TMDb answers none, and their image URLs \
+             take its SecureBaseUrl; Ferrofin's lookups build them on the fixed CDN root \
+             and keep the configured sizes until this route ran. Fix path: gl-1962.",
+            "ValidatePreferences's reset applies to the sizes the TMDb lookups read, not to \
+             the stored configuration GET /Plugins/{pluginId}/Configuration serves the \
+             settings page, which keeps the configured size; upstream changes the \
+             in-memory configuration that page reads. Fix path: gl-1962.",
+            "The size check reads a configured size as the lookups use it, trimmed and \
+             blank as unset, keeps a size whose kind TMDb lists no sizes for, and is \
+             applied at every read once the configuration is known; upstream compares the \
+             stored string as it is, resets a blank one too, throws on an empty list \
+             (its last-element index) and checks once, at the fetch. A size the settings \
+             page saves gives the same image URL in both; a padded size TMDb lists and an \
+             unlisted size saved after the fetch differ (upstream resets the first and \
+             keeps the second), and a blank size reads as original in both.",
+        ],
+        refs: &[],
     },
     Verified {
         method: "get",

@@ -286,6 +286,11 @@ pub trait ProviderManager: Send + Sync {
     /// refresh's save carries an edit made while it ran. Ferrofin loads a row
     /// per caller instead. A manager that runs no refresh has nothing to
     /// exclude, so the default holds a lock no one else shares.
+    ///
+    /// A delete (`LibraryManager::delete_item`) holds it too, from before it
+    /// reads the row until the delete is done: a refresh's save inserts a row
+    /// that is gone, so one that loaded the row first would bring the
+    /// deleted item back. Upstream has that window; Ferrofin closes it.
     async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         let _ = item_id;
         std::sync::Arc::new(tokio::sync::Mutex::new(()))
@@ -476,6 +481,23 @@ pub trait ProviderManager: Send + Sync {
 
     /// Gets the ids of items currently queued for refresh.
     async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError>;
+
+    /// The image part of TheMovieDb's client configuration
+    /// (`TmdbClientManager.GetClientConfiguration().Images`), which the TMDb
+    /// settings page lists its image sizes from; `None` when TMDb's
+    /// configuration has no images.
+    ///
+    /// # Errors
+    ///
+    /// When TMDb answers with no configuration, or the manager has no TMDb
+    /// client to ask, as the default does.
+    async fn tmdb_image_configuration(
+        &self,
+    ) -> Result<Option<ferrofin_model::dto::ConfigImageTypes>, ServiceError> {
+        Err(ServiceError::backend(
+            "this provider manager has no TheMovieDb client",
+        ))
+    }
 }
 
 fn _assert_object_safe_provider_manager(_: &dyn ProviderManager) {}
