@@ -21,6 +21,7 @@ use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::{MediaProtocol, subtitle_format};
 use ferrofin_traits::media_encoding::TrimmedSubtitle;
+use ferrofin_util::escape_charset::{self, EscapeCharset};
 use ferrofin_util::ticks::UNIX_EPOCH_TICKS;
 
 use crate::encoder::media_encoder::source_input_argument;
@@ -539,6 +540,10 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
                     let (text, _, _) = encoding.decode(&bytes);
                     Ok(SubtitleStream::new(text.into_owned().into_bytes(), true))
                 }
+                DetectedCharset::Escape(charset) => Ok(SubtitleStream::new(
+                    charset.decode(&bytes).into_bytes(),
+                    true,
+                )),
             }
         } else {
             let bytes = self
@@ -631,6 +636,7 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         let charset = match detect_charset(&bytes) {
             DetectedCharset::Utf8OrAscii => String::new(),
             DetectedCharset::Other(encoding) => encoding.name().to_ascii_lowercase(),
+            DetectedCharset::Escape(charset) => charset.name().to_owned(),
         };
 
         // UTF-16 is auto-converted to UTF-8 by ffmpeg for these containers, so no
@@ -1246,12 +1252,16 @@ enum DetectedCharset {
     Utf8OrAscii,
     /// A legacy encoding to decode from.
     Other(&'static encoding_rs::Encoding),
+    /// A 7-bit escape encoding `encoding_rs` has no decoder for (gl-1657).
+    Escape(EscapeCharset),
 }
 
 /// Detects the character set of `bytes`, replacing C# `UtfUnknown.CharsetDetector`.
 ///
-/// A UTF-8/UTF-16 BOM or valid-UTF-8 content without an ESC byte short-circuits
-/// to UTF-8; otherwise [`chardetng`] guesses the encoding, ISO-2022-JP first.
+/// A UTF-8/UTF-16 BOM decides first, then 7-bit ISO-2022-KR or HZ-GB-2312
+/// ([`escape_charset::detect`]). Valid-UTF-8 content without an ESC byte
+/// short-circuits to UTF-8; otherwise [`chardetng`] guesses the encoding,
+/// ISO-2022-JP first.
 /// UTF-16 (with BOM) decodes through `encoding_rs` so wide files round-trip.
 fn detect_charset(bytes: &[u8]) -> DetectedCharset {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -1271,11 +1281,14 @@ fn detect_charset(bytes: &[u8]) -> DetectedCharset {
     if let Some(encoding) = detect_bomless_utf16(bytes) {
         return DetectedCharset::Other(encoding);
     }
-    // 7-bit ISO-2022-JP is valid UTF-8 too, and `UtfUnknown`'s escape prober
-    // finds it first: an ESC, which starts its designations, leaves the choice
-    // to chardetng. It answers ISO-2022-JP only for ASCII that decodes as it,
-    // and UTF-8 for any other valid UTF-8. TODO(gl-1657): the prober's other
-    // 7-bit encodings, ISO-2022-KR and HZ-GB-2312, are not detected yet.
+    // 7-bit ISO-2022-KR and HZ-GB-2312 are valid UTF-8 too, and `UtfUnknown`'s
+    // escape prober finds them first (gl-1657).
+    if let Some(charset) = escape_charset::detect(bytes) {
+        return DetectedCharset::Escape(charset);
+    }
+    // So it does 7-bit ISO-2022-JP: an ESC, which starts its designations,
+    // leaves the choice to chardetng. It answers ISO-2022-JP only for ASCII
+    // that decodes as it, and UTF-8 for any other valid UTF-8.
     if !bytes.contains(&0x1B) && std::str::from_utf8(bytes).is_ok() {
         return DetectedCharset::Utf8OrAscii;
     }

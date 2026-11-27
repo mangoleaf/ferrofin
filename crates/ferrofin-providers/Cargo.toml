@@ -23,7 +23,7 @@ test-util = []
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-naming.workspace = true
-ferrofin-util = { workspace = true, features = ["tokio"] }
+ferrofin-util = { workspace = true, features = ["tokio", "reqwest"] }
 ferrofin-common.workspace = true
 ferrofin-db.workspace = true
 ferrofin-health.workspace = true

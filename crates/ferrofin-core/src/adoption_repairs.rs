@@ -196,6 +196,12 @@ async fn done(db: &Database, key: &str) -> Result<(), ServiceError> {
     Ok(db.meta_set(key, "1").await?)
 }
 
+/// Whether the one-shot repair under `key` is marked done. Once it has run,
+/// one that stopped short (it warned, and the next boot runs it again) is not.
+async fn finished(db: &Database, key: &str) -> Result<bool, ServiceError> {
+    Ok(!once(db, key).await?)
+}
+
 /// A row [`import_membership_once`] reads: `Id`, `Type`, `Path`, `IsFolder`, `Data`.
 type ImportRow = (String, String, Option<String>, bool, Option<String>);
 
@@ -248,7 +254,12 @@ pub async fn import_membership_once(
     .await
     .map_err(db_err)?;
 
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut written = 0usize;
     let mut dropped = 0usize;
     for (id, type_, path, is_folder, data) in rows {
@@ -719,7 +730,12 @@ pub async fn fix_owner_id_relationships(db: &Database) -> Result<usize, ServiceE
     let video = stored_type_name(BaseItemKind::Video).unwrap_or_default();
     let movie = stored_type_name(BaseItemKind::Movie).unwrap_or_default();
     let folder = stored_type_name(BaseItemKind::Folder).unwrap_or_default();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let deleted = dedupe_paths(&mut tx, folder).await?;
     // Step 2: videos/movies (not extras) owned by a video/movie or by nothing
     // — except the owner's own local versions and stacked parts (its
@@ -1125,9 +1141,10 @@ pub async fn cleanup_deleted_item_data(
 
 /// [`cleanup_deleted_item_data`] and its log line, for the composition root.
 /// A failure is a warning and never stops the boot: the folders stay, and
-/// the next boot tries again.
-pub async fn run_cleanup_deleted_item_data(db: &Database, cleanup: &ItemDataCleanup) {
-    match cleanup_deleted_item_data(db, cleanup).await {
+/// the next boot tries again. Returns whether it succeeded.
+pub async fn run_cleanup_deleted_item_data(db: &Database, cleanup: &ItemDataCleanup) -> bool {
+    let result = cleanup_deleted_item_data(db, cleanup).await;
+    match &result {
         Ok(0) => {}
         Ok(items) => tracing::info!(
             items,
@@ -1139,6 +1156,7 @@ pub async fn run_cleanup_deleted_item_data(db: &Database, cleanup: &ItemDataClea
              the next boot tries again"
         ),
     }
+    result.is_ok()
 }
 
 /// Reunites the local alternate versions a Ferrofin v1.0.0 scan split off
@@ -1164,7 +1182,12 @@ pub async fn reunite_split_versions(db: &Database) -> Result<usize, ServiceError
         return Ok(0);
     }
     let video = stored_type_name(BaseItemKind::Video).unwrap_or_default();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     // (stale video, standalone row, primary, path, primary's path, primary's Data)
     let splits: Vec<(String, String, String, String, String, Option<String>)> = sqlx::query_as(
         r#"SELECT v."Id", m."Id", p."Id", v."Path", p."Path", p."Data"
@@ -1262,7 +1285,12 @@ pub async fn backfill_alternate_version_links(db: &Database) -> Result<usize, Se
     .fetch_all(db.pool())
     .await
     .map_err(db_err)?;
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut written = 0usize;
     for (child, primary) in &pairs {
         let (Ok(child_id), Ok(primary_id)) = (Uuid::parse_str(child), Uuid::parse_str(primary))
@@ -1334,7 +1362,12 @@ pub async fn repair_alternate_version_links(db: &Database) -> Result<(usize, usi
         .collect();
     item_ids.sort_unstable();
     item_ids.dedup();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let (mut repaired, mut promoted) = (0usize, 0usize);
     for id in item_ids {
         let Some((primary_version_id, key, owner_id)) =
@@ -1963,7 +1996,7 @@ pub async fn rekey_virtual_seasons(
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
-    const KEY: &str = "virtual_season_ids_v12";
+    const KEY: &str = VIRTUAL_SEASON_IDS_KEY;
     if !once(db, KEY).await? {
         return Ok(0);
     }
@@ -2051,7 +2084,12 @@ pub async fn rekey_virtual_seasons(
     Ok(made.len())
 }
 
+/// The `FerrofinMeta` key of [`rekey_virtual_seasons`].
+const VIRTUAL_SEASON_IDS_KEY: &str = "virtual_season_ids_v12";
+
 /// [`rekey_virtual_seasons`] and its log line, for the composition root.
+/// Returns whether it finished: `false` when it stopped short (it warned),
+/// and the next boot runs it again.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the repair's queries fail.
@@ -2061,7 +2099,7 @@ pub async fn run_rekey_virtual_seasons(
     virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
-) -> Result<(), ServiceError> {
+) -> Result<bool, ServiceError> {
     let moved =
         rekey_virtual_seasons(db, derivation, virtual_paths, art_root, path_manager).await?;
     if moved > 0 {
@@ -2070,7 +2108,7 @@ pub async fn run_rekey_virtual_seasons(
             "re-keyed seasons with no folder to their series, number and name"
         );
     }
-    Ok(())
+    finished(db, VIRTUAL_SEASON_IDS_KEY).await
 }
 
 /// The extension of the database snapshot [`rekey_pathless_playlists`]
@@ -2106,7 +2144,7 @@ pub async fn rekey_pathless_playlists(
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
-    const KEY: &str = "playlist_folders_v1";
+    const KEY: &str = PLAYLIST_FOLDERS_KEY;
     if !once(db, KEY).await? {
         return Ok(0);
     }
@@ -2200,7 +2238,12 @@ pub async fn rekey_pathless_playlists(
     Ok(made.len())
 }
 
+/// The `FerrofinMeta` key of [`rekey_pathless_playlists`].
+const PLAYLIST_FOLDERS_KEY: &str = "playlist_folders_v1";
+
 /// [`rekey_pathless_playlists`] and its log line, for the composition root.
+/// Returns whether it finished: `false` when it stopped short (it warned),
+/// and the next boot runs it again.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the repair's queries fail.
@@ -2211,7 +2254,7 @@ pub async fn run_rekey_pathless_playlists(
     virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
-) -> Result<(), ServiceError> {
+) -> Result<bool, ServiceError> {
     let moved = rekey_pathless_playlists(
         db,
         derivation,
@@ -2227,7 +2270,7 @@ pub async fn run_rekey_pathless_playlists(
             "gave playlists with no folder their folders and the ids Jellyfin keys them by"
         );
     }
-    Ok(())
+    finished(db, PLAYLIST_FOLDERS_KEY).await
 }
 
 /// Moves per transaction in [`rekey_by_name_rows`], keeping each write short.
@@ -2350,9 +2393,9 @@ async fn plan_by_name_moves(
 /// keeps the row, and a move would break saved artist links.
 ///
 /// # Errors
-/// Returns [`ServiceError`] if the planning read fails. A batch whose
-/// transaction cannot be opened or committed is logged, and the repair stops
-/// there for the next boot.
+/// Returns [`ServiceError`] if the planning read fails, or a batch's
+/// transaction cannot be opened or committed: the repair stops there, the
+/// batches made before stay, and the next boot does the rest.
 pub async fn rekey_by_name_rows(
     db: &Database,
     identity: &ByNameIdentity,
@@ -2387,15 +2430,10 @@ pub async fn rekey_by_name_rows(
             // the problem, and the next batch would wait as long again. Stop
             // here; the batches already made stay, the next boot does the rest.
             Err(err) => {
-                tracing::warn!(
-                    %err,
-                    "could not move genre, music genre and studio rows to their ids; \
-                     the next boot does the rest"
-                );
                 for (_, folders) in renamed {
                     folders.undo();
                 }
-                break;
+                return Err(err);
             }
         };
         for (to, folders) in renamed {
@@ -2412,17 +2450,19 @@ pub async fn rekey_by_name_rows(
 
 /// [`rekey_by_name_rows`] and its log line, for the composition root: a
 /// failure is logged and the next boot retries, never stopping this one.
+/// Returns whether it succeeded (or had nothing to do).
 pub async fn run_rekey_by_name_rows(
     db: &Database,
     identity: Option<&ByNameIdentity>,
     virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
-) {
+) -> bool {
     let Some(identity) = identity else {
-        return;
+        return true;
     };
-    match rekey_by_name_rows(db, identity, virtual_paths, art_root, path_manager).await {
+    let result = rekey_by_name_rows(db, identity, virtual_paths, art_root, path_manager).await;
+    match &result {
         Ok(0) => {}
         Ok(moved) => tracing::info!(
             moved,
@@ -2433,6 +2473,7 @@ pub async fn run_rekey_by_name_rows(
             "could not move genre, music genre and studio rows to their ids; the next boot retries"
         ),
     }
+    result.is_ok()
 }
 
 /// The extension of the database snapshot [`expand_saved_playlist_containers`]
@@ -2566,12 +2607,14 @@ pub async fn expand_saved_playlist_containers(
 
 /// [`expand_saved_playlist_containers`] and its log line, for the
 /// composition root. A failure is logged, not returned: the repair is not
-/// needed to serve, and it runs again on the next boot.
+/// needed to serve, and it runs again on the next boot. Returns whether it
+/// succeeded with no playlist left for the next boot.
 pub async fn run_expand_saved_playlist_containers(
     db: &Database,
     playlists: &crate::FerrofinPlaylistManager,
-) {
-    match expand_saved_playlist_containers(db, playlists).await {
+) -> bool {
+    let result = expand_saved_playlist_containers(db, playlists).await;
+    match &result {
         Ok(ExpandedPlaylists {
             expanded: 0,
             stamped: 0,
@@ -2590,6 +2633,7 @@ pub async fn run_expand_saved_playlist_containers(
              the repair runs again on the next boot"
         ),
     }
+    result.is_ok_and(|did| did.pending == 0)
 }
 
 /// What [`save_playlist_xml_once`] did.
@@ -2682,14 +2726,16 @@ pub async fn save_playlist_xml_once(
 
 /// [`save_playlist_xml_once`] and its log line, for the composition root. A
 /// failure is logged, not returned: the repair is not needed to serve, and it
-/// runs again on the next boot.
+/// runs again on the next boot. Returns whether it succeeded with no
+/// playlist left for the next boot.
 pub async fn run_save_playlist_xml_once(
     db: &Database,
     playlists: &crate::FerrofinPlaylistManager,
     saver: &ferrofin_providers::container_xml::ContainerXmlSaver,
     persistence: &dyn ItemPersistenceService,
-) {
-    match save_playlist_xml_once(db, playlists, saver, persistence).await {
+) -> bool {
+    let result = save_playlist_xml_once(db, playlists, saver, persistence).await;
+    match &result {
         Ok(SavedPlaylistXml {
             written: 0,
             pending: 0,
@@ -2711,6 +2757,7 @@ pub async fn run_save_playlist_xml_once(
             "could not write the playlists' playlist.xml; the repair runs again on the next boot"
         ),
     }
+    result.is_ok_and(|did| did.pending == 0)
 }
 
 /// The extension of the database snapshot
@@ -2819,16 +2866,17 @@ pub async fn merge_legacy_collections_library(
 /// [`merge_legacy_collections_library`] and its log line, for the composition
 /// root. A failure is a warning and never stops the boot: the old row keeps
 /// working, as it did before this version, and the next boot tries again.
+/// Returns whether it succeeded.
 pub async fn run_merge_legacy_collections_library(
     db: &Database,
     virtual_folders: &crate::FerrofinVirtualFolderManager,
     derivation: &IdDerivation,
     directories: (&str, &str),
     paths: &VirtualPathExpander,
-) {
-    match merge_legacy_collections_library(db, virtual_folders, derivation, directories, paths)
-        .await
-    {
+) -> bool {
+    let result =
+        merge_legacy_collections_library(db, virtual_folders, derivation, directories, paths).await;
+    match &result {
         Ok(None) => {}
         Ok(Some(merged)) => tracing::info!(
             count = merged.moved,
@@ -2843,7 +2891,11 @@ pub async fn run_merge_legacy_collections_library(
              and the next boot tries again"
         ),
     }
+    result.is_ok()
 }
+
+/// The `FerrofinMeta` key of [`rekey_pathless_box_sets`].
+const BOX_SET_FOLDERS_KEY: &str = "box_set_folders_v1";
 
 /// The extension of the database snapshot [`rekey_pathless_box_sets`]
 /// takes (`jellyfin.db.pre-box-set-folders`).
@@ -2882,7 +2934,7 @@ pub async fn rekey_pathless_box_sets(
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
 ) -> Result<usize, ServiceError> {
-    const KEY: &str = "box_set_folders_v1";
+    const KEY: &str = BOX_SET_FOLDERS_KEY;
     if !once(db, KEY).await? {
         return Ok(0);
     }
@@ -3022,7 +3074,9 @@ async fn give_box_set_its_folder(
 
 /// [`rekey_pathless_box_sets`] and its log line, for the composition root. A
 /// failure is a warning and never stops the boot: the box sets keep their ids
-/// and work as before, and the next boot tries again.
+/// and work as before, and the next boot tries again. Returns whether it
+/// finished: `false` after a failure it warned about, here or for some box
+/// sets.
 pub async fn run_rekey_pathless_box_sets(
     db: &Database,
     derivation: &IdDerivation,
@@ -3030,8 +3084,8 @@ pub async fn run_rekey_pathless_box_sets(
     virtual_paths: &VirtualPathExpander,
     art_root: Option<&Path>,
     path_manager: Option<&dyn PathManager>,
-) {
-    match rekey_pathless_box_sets(
+) -> bool {
+    let result = rekey_pathless_box_sets(
         db,
         derivation,
         directories,
@@ -3039,8 +3093,8 @@ pub async fn run_rekey_pathless_box_sets(
         art_root,
         path_manager,
     )
-    .await
-    {
+    .await;
+    match &result {
         Ok(0) => {}
         Ok(moved) => tracing::info!(
             items = moved,
@@ -3052,6 +3106,7 @@ pub async fn run_rekey_pathless_box_sets(
              and the next boot tries again"
         ),
     }
+    result.is_ok() && matches!(finished(db, BOX_SET_FOLDERS_KEY).await, Ok(true))
 }
 
 /// The extension of the database snapshot [`sweep_missing_items`] takes
@@ -3184,6 +3239,9 @@ pub async fn run_sweep_missing_items(
     Ok(())
 }
 
+/// The `FerrofinMeta` key of [`remove_orphaned_playlists`].
+const ORPHANED_PLAYLIST_OWNERS_KEY: &str = "orphaned_playlist_owners_v1";
+
 /// The extension of the database snapshot [`remove_orphaned_playlists`]
 /// takes (`jellyfin.db.pre-orphaned-playlists`).
 const ORPHANED_PLAYLISTS_SNAPSHOT_EXTENSION: &str = "db.pre-orphaned-playlists";
@@ -3218,7 +3276,7 @@ pub async fn remove_orphaned_playlists(
     db: &Database,
     playlists: &dyn PlaylistManager,
 ) -> Result<usize, ServiceError> {
-    const KEY: &str = "orphaned_playlist_owners_v1";
+    const KEY: &str = ORPHANED_PLAYLIST_OWNERS_KEY;
     if !once(db, KEY).await? {
         return Ok(0);
     }
@@ -3298,9 +3356,12 @@ pub async fn remove_orphaned_playlists(
 
 /// [`remove_orphaned_playlists`] and its log line, for the composition root.
 /// A failure is a warning and never stops the boot: the playlists stay as
-/// they were, and the next boot tries again.
-pub async fn run_remove_orphaned_playlists(db: &Database, playlists: &dyn PlaylistManager) {
-    match remove_orphaned_playlists(db, playlists).await {
+/// they were, and the next boot tries again. Returns whether it finished:
+/// `false` after a failure it warned about, here or when no user could be
+/// read.
+pub async fn run_remove_orphaned_playlists(db: &Database, playlists: &dyn PlaylistManager) -> bool {
+    let result = remove_orphaned_playlists(db, playlists).await;
+    match &result {
         Ok(0) => {}
         Ok(users) => tracing::info!(
             users,
@@ -3312,6 +3373,7 @@ pub async fn run_remove_orphaned_playlists(db: &Database, playlists: &dyn Playli
              the next boot tries again"
         ),
     }
+    result.is_ok() && matches!(finished(db, ORPHANED_PLAYLIST_OWNERS_KEY).await, Ok(true))
 }
 
 #[cfg(test)]
@@ -3416,14 +3478,15 @@ pub async fn cleanup_orphaned_external_data(
 }
 
 /// [`cleanup_orphaned_external_data`] and its summary line, for the
-/// composition root.
+/// composition root. Returns whether it finished: `false` when a folder could
+/// not be read (it warned), and the next start sweeps again.
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the sweep fails.
 pub async fn run_cleanup_orphaned_external_data(
     db: &Database,
     roots: &ExtractedDataRoots,
-) -> Result<(), ServiceError> {
+) -> Result<bool, ServiceError> {
     let removed = cleanup_orphaned_external_data(db, roots).await?;
     if removed > 0 {
         tracing::info!(
@@ -3431,7 +3494,7 @@ pub async fn run_cleanup_orphaned_external_data(
             "removed extracted data of items that no longer exist"
         );
     }
-    Ok(())
+    finished(db, ORPHANED_EXTERNAL_DATA_KEY).await
 }
 
 /// Every stored item's id (`context.BaseItems.Select(b => b.Id)`).
@@ -4424,7 +4487,12 @@ async fn place_owned(
     mut copies: Option<&mut BTreeSet<Uuid>>,
 ) -> Result<usize, ServiceError> {
     let versions = copies.is_some();
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut changed = 0usize;
     let mut owed = false;
     for pair in pairs {
@@ -4652,7 +4720,12 @@ async fn merge_case_duplicates(
             .or_default()
             .push((id, created));
     }
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut deleted = 0usize;
     for members in groups.into_values().filter(|g| g.len() > 1) {
         let mut candidates = Vec::with_capacity(members.len());
@@ -4965,7 +5038,12 @@ async fn harmonize_groups(
     db: &Database,
     groups: &[(String, String)],
 ) -> Result<usize, ServiceError> {
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut updated = 0u64;
     for (item, user) in groups {
         let rows: Vec<UserDataEntity> =
@@ -9855,9 +9933,11 @@ async fn reverse_virtual_paths_in_partitions(
 
 /// [`reverse_stored_virtual_paths`] and its log line, for the composition
 /// root. A failure is a warning and never stops the boot: every reader
-/// expands both forms, and the next boot runs it again.
-pub async fn run_reverse_stored_virtual_paths(db: &Database, paths: &VirtualPathExpander) {
-    match reverse_stored_virtual_paths(db, paths).await {
+/// expands both forms, and the next boot runs it again. Returns whether it
+/// succeeded.
+pub async fn run_reverse_stored_virtual_paths(db: &Database, paths: &VirtualPathExpander) -> bool {
+    let result = reverse_stored_virtual_paths(db, paths).await;
+    match &result {
         Ok(0) => {}
         Ok(rows) => tracing::info!(
             rows,
@@ -9870,6 +9950,7 @@ pub async fn run_reverse_stored_virtual_paths(db: &Database, paths: &VirtualPath
              directories as %AppDataPath% and %MetadataPath%; the next boot runs it again"
         ),
     }
+    result.is_ok()
 }
 
 // Stores `HasSubtitles` in the `Data` of the videos an earlier Ferrofin probed
@@ -9978,9 +10059,11 @@ async fn store_has_subtitles_in_partitions(
 
 /// [`store_has_subtitles`] and its log line, for the composition root. A
 /// failure is a warning and never stops the boot: Ferrofin reads subtitle
-/// presence from the stream rows, and the next boot runs it again.
-pub async fn run_store_has_subtitles(db: &Database) {
-    match store_has_subtitles(db).await {
+/// presence from the stream rows, and the next boot runs it again. Returns
+/// whether it succeeded.
+pub async fn run_store_has_subtitles(db: &Database) -> bool {
+    let result = store_has_subtitles(db).await;
+    match &result {
         Ok(0) => {}
         Ok(rows) => tracing::info!(
             rows,
@@ -9993,6 +10076,7 @@ pub async fn run_store_has_subtitles(db: &Database) {
              runs it again"
         ),
     }
+    result.is_ok()
 }
 
 #[cfg(test)]

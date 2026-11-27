@@ -4,6 +4,9 @@
 //! The Labs API answers "which artists are similar to this one" from aggregated
 //! listening sessions, keyed by MusicBrainz artist id. Requests use server quota
 //! headers when available, with a one-second minimum for the public Labs server.
+//! The settings are the ListenBrainz plugin's
+//! ([`builtin_plugins::LISTENBRAINZ`](crate::builtin_plugins::LISTENBRAINZ)),
+//! read per call.
 
 use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::RateLimiter;
@@ -16,7 +19,7 @@ pub const DEFAULT_LABS_SERVER: &str = "https://labs.api.listenbrainz.org";
 
 /// The default number of days a similar-artist result is cached
 /// (C# `PluginConfiguration.SimilarItemsCacheDays`).
-pub const DEFAULT_CACHE_DAYS: i64 = 14;
+pub const DEFAULT_CACHE_DAYS: i32 = 14;
 
 /// The similarity algorithms the Labs API exposes — port of
 /// `Configuration.SimilarityAlgorithm`.
@@ -62,20 +65,61 @@ impl SimilarityAlgorithm {
             }
         }
     }
+
+    /// The algorithms in declaration order, by name: the C# enum's values are
+    /// their indexes.
+    const NAMED: [(&'static str, Self); 6] = [
+        ("SessionBased1825Days", Self::SessionBased1825Days),
+        ("SessionBased1800Days", Self::SessionBased1800Days),
+        ("SessionBased7500Days", Self::SessionBased7500Days),
+        (
+            "SessionBased7500DaysHighContribution",
+            Self::SessionBased7500DaysHighContribution,
+        ),
+        ("SessionBased9000Days", Self::SessionBased9000Days),
+        ("SessionBased75Days", Self::SessionBased75Days),
+    ];
+
+    /// A stored `Algorithm`, as `JsonStringEnumConverter` reads one: its name
+    /// in any case, or its value, as a number or a string. Anything else is the
+    /// default, as `ToApiString`'s `_` arm makes an undefined value.
+    #[must_use]
+    pub fn from_json(value: &serde_json::Value) -> Self {
+        let index = match value {
+            serde_json::Value::String(text) => {
+                if let Some((_, algorithm)) = Self::NAMED
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(text))
+                {
+                    return *algorithm;
+                }
+                text.parse::<u64>().ok()
+            }
+            serde_json::Value::Number(n) => n.as_u64(),
+            _ => None,
+        };
+        index
+            .and_then(|i| usize::try_from(i).ok())
+            .and_then(|i| Self::NAMED.get(i))
+            .map_or_else(Self::default, |(_, algorithm)| *algorithm)
+    }
 }
 
-/// The ListenBrainz provider's settings — port of its `PluginConfiguration`.
-#[derive(Debug, Clone)]
+/// The ListenBrainz plugin's settings — port of its `PluginConfiguration`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ListenBrainzConfig {
-    /// The Labs API root. Empty falls back to [`DEFAULT_LABS_SERVER`].
+    /// The Labs API root (`LabsServer`). Blank falls back to
+    /// [`DEFAULT_LABS_SERVER`].
     pub labs_server: String,
-    /// The similarity algorithm to request.
+    /// The similarity algorithm to request (`Algorithm`).
     pub algorithm: SimilarityAlgorithm,
-    /// Minimum request spacing in seconds; defaults to one. The public Labs
-    /// server always retains at least one second, even without quota headers.
+    /// Minimum request spacing in seconds (`RateLimit`); defaults to one. The
+    /// public Labs server always retains at least one second, even without
+    /// quota headers.
     pub rate_limit_seconds: f64,
-    /// How many days a result may be cached; `0` disables caching.
-    pub cache_days: i64,
+    /// How many days a result may be cached (`SimilarItemsCacheDays`); `0`
+    /// disables caching.
+    pub cache_days: i32,
 }
 
 impl Default for ListenBrainzConfig {
@@ -90,8 +134,34 @@ impl Default for ListenBrainzConfig {
 }
 
 impl ListenBrainzConfig {
+    /// The settings a stored configuration document holds. A member that is
+    /// missing or of another kind keeps its default, as a C# property keeps
+    /// its initializer, so one bad value never resets the others.
+    #[must_use]
+    pub fn from_document(document: &serde_json::Map<String, serde_json::Value>) -> Self {
+        let defaults = Self::default();
+        Self {
+            labs_server: document
+                .get("LabsServer")
+                .and_then(serde_json::Value::as_str)
+                .map_or(defaults.labs_server, str::to_owned),
+            algorithm: document
+                .get("Algorithm")
+                .map_or(defaults.algorithm, SimilarityAlgorithm::from_json),
+            rate_limit_seconds: document
+                .get("RateLimit")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(defaults.rate_limit_seconds),
+            cache_days: document
+                .get("SimilarItemsCacheDays")
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|days| i32::try_from(days).ok())
+                .unwrap_or(defaults.cache_days),
+        }
+    }
+
     /// The server root with any trailing slash trimmed, falling back to the
-    /// default when unset.
+    /// default when unset (the `LabsServer` setter).
     #[must_use]
     pub fn server(&self) -> &str {
         let server = self.labs_server.trim().trim_end_matches('/');
@@ -117,38 +187,63 @@ impl ListenBrainzConfig {
     }
 }
 
-/// A ListenBrainz Labs client. Cheap to clone (shares the rate-limit gate).
-#[derive(Debug, Clone)]
+/// Adds `AlgorithmString`, the configuration's get-only member, to a read of
+/// it: the `Algorithm`'s API string (`PluginConfiguration.AlgorithmString`).
+pub fn add_algorithm_string(config: &mut serde_json::Map<String, serde_json::Value>) {
+    let algorithm = config
+        .get("Algorithm")
+        .map_or_else(SimilarityAlgorithm::default, SimilarityAlgorithm::from_json);
+    config.insert(
+        "AlgorithmString".to_owned(),
+        algorithm.as_api_string().into(),
+    );
+}
+
+/// A ListenBrainz Labs client, reading the ListenBrainz plugin's settings per
+/// call.
+#[derive(Debug)]
 pub struct ListenBrainzClient {
     http: reqwest::Client,
     limiter: RateLimiter,
-    config: ListenBrainzConfig,
+    plugin: crate::plugin_config::ConfigSource,
 }
 
 impl Default for ListenBrainzClient {
     fn default() -> Self {
-        Self::new(ListenBrainzConfig::default())
+        Self::new()
     }
 }
 
 impl ListenBrainzClient {
-    /// A client over `config`.
+    /// A client on the plugin's defaults until
+    /// [`attach_plugin_manager`](Self::attach_plugin_manager) is called.
     #[must_use]
-    pub fn new(config: ListenBrainzConfig) -> Self {
+    pub fn new() -> Self {
         Self {
             http: crate::http_client::client(),
             limiter: RateLimiter::new("listenbrainz"),
-            config,
+            plugin: crate::plugin_config::ConfigSource::new(),
         }
     }
 
-    /// How long a similar-artist result may be cached, or `None` when caching
-    /// is disabled.
-    #[must_use]
-    pub fn cache_duration(&self) -> Option<Duration> {
-        (self.config.cache_days > 0).then(|| {
-            Duration::from_secs(u64::try_from(self.config.cache_days).unwrap_or(0) * 24 * 60 * 60)
-        })
+    /// Binds the plugin manager, making the ListenBrainz settings page live.
+    /// Called once by the composition root.
+    pub fn attach_plugin_manager(
+        &self,
+        plugins: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager>,
+    ) {
+        self.plugin.attach(plugins);
+    }
+
+    /// The plugin's settings for this call, read the way
+    /// `ListenBrainzPlugin.Instance.Configuration` is: an admin's save changes
+    /// the next lookup, with no restart.
+    pub(crate) async fn settings(&self) -> ListenBrainzConfig {
+        let document: serde_json::Map<String, serde_json::Value> = self
+            .plugin
+            .load(crate::builtin_plugins::LISTENBRAINZ.id)
+            .await;
+        ListenBrainzConfig::from_document(&document)
     }
 
     /// The MusicBrainz artist ids similar to `artist_mbid`, most similar first.
@@ -161,14 +256,15 @@ impl ListenBrainzClient {
         if mbid.is_empty() {
             return Vec::new();
         }
-        let url = format!("{}/similar-artists/json", self.config.server());
+        let config = self.settings().await;
+        let url = format!("{}/similar-artists/json", config.server());
         let request = self.http.get(&url).query(&[
             ("artist_mbids", mbid),
-            ("algorithm", self.config.algorithm.as_api_string()),
+            ("algorithm", config.algorithm.as_api_string()),
         ]);
         let resp = match self
             .limiter
-            .send_request(request, self.config.request_interval())
+            .send_request(request, config.request_interval())
             .await
         {
             Ok(resp) => resp,
@@ -215,6 +311,16 @@ mod tests {
     use super::*;
     use crate::mock_http::MockServer;
 
+    /// A client reading `config` as the ListenBrainz plugin's settings.
+    fn client_with(config: &serde_json::Value) -> ListenBrainzClient {
+        let client = ListenBrainzClient::new();
+        client.attach_plugin_manager(crate::plugin_config::tests_support::manager_with(
+            crate::builtin_plugins::LISTENBRAINZ.id,
+            config.to_string().into_bytes(),
+        ));
+        client
+    }
+
     #[test]
     fn an_empty_server_falls_back_to_the_default() {
         let config = ListenBrainzConfig {
@@ -224,33 +330,102 @@ mod tests {
         assert_eq!(config.server(), DEFAULT_LABS_SERVER);
     }
 
+    /// The stored members as a stock 12.4 binds them (each measured with a
+    /// `POST /Plugins/{id}/Configuration`): the algorithm by name in any case
+    /// or by value, a number or a string. One unusable member keeps its
+    /// default and leaves the others alone.
     #[test]
-    fn cache_duration_follows_the_configured_days() {
+    fn a_stored_document_is_read_member_by_member() {
+        let read = |json: serde_json::Value| {
+            ListenBrainzConfig::from_document(json.as_object().expect("object"))
+        };
+        assert_eq!(read(serde_json::json!({})), ListenBrainzConfig::default());
+        let config = read(serde_json::json!({
+            "LabsServer": "https://labs.example.org",
+            "Algorithm": "SessionBased75Days",
+            "RateLimit": 0.25,
+            "SimilarItemsCacheDays": 30,
+            "AlgorithmString": "ignored"
+        }));
         assert_eq!(
-            ListenBrainzClient::default()
-                .cache_duration()
-                .map(|d| d.as_secs()),
-            Some(14 * 24 * 60 * 60)
+            config,
+            ListenBrainzConfig {
+                labs_server: "https://labs.example.org".to_owned(),
+                algorithm: SimilarityAlgorithm::SessionBased75Days,
+                rate_limit_seconds: 0.25,
+                cache_days: 30,
+            }
         );
-        let no_cache = ListenBrainzClient::new(ListenBrainzConfig {
-            cache_days: 0,
-            ..ListenBrainzConfig::default()
-        });
-        assert_eq!(no_cache.cache_duration(), None);
+        for (stored, algorithm) in [
+            (
+                serde_json::json!(2),
+                SimilarityAlgorithm::SessionBased7500Days,
+            ),
+            (
+                serde_json::json!("3"),
+                SimilarityAlgorithm::SessionBased7500DaysHighContribution,
+            ),
+            (
+                serde_json::json!("sessionbased9000days"),
+                SimilarityAlgorithm::SessionBased9000Days,
+            ),
+            // Undefined: `ToApiString`'s `_` arm.
+            (
+                serde_json::json!(9),
+                SimilarityAlgorithm::SessionBased1825Days,
+            ),
+            (
+                serde_json::json!("Bogus"),
+                SimilarityAlgorithm::SessionBased1825Days,
+            ),
+            (
+                serde_json::json!(null),
+                SimilarityAlgorithm::SessionBased1825Days,
+            ),
+        ] {
+            assert_eq!(
+                read(serde_json::json!({"Algorithm": stored, "SimilarItemsCacheDays": 3}))
+                    .algorithm,
+                algorithm,
+                "{stored}"
+            );
+        }
+        let config = read(serde_json::json!({
+            "LabsServer": null,
+            "RateLimit": "fast",
+            "SimilarItemsCacheDays": 1.5,
+            "Algorithm": "SessionBased9000Days"
+        }));
+        assert_eq!(config.server(), DEFAULT_LABS_SERVER);
+        assert!((config.rate_limit_seconds - 1.0).abs() < f64::EPSILON);
+        assert_eq!(config.cache_days, DEFAULT_CACHE_DAYS);
+        assert_eq!(config.algorithm, SimilarityAlgorithm::SessionBased9000Days);
+    }
+
+    #[test]
+    fn the_view_adds_the_chosen_algorithms_api_string() {
+        let mut config =
+            serde_json::json!({"Algorithm": "SessionBased75Days", "AlgorithmString": "zzz"});
+        add_algorithm_string(config.as_object_mut().expect("object"));
+        assert_eq!(
+            config["AlgorithmString"],
+            SimilarityAlgorithm::SessionBased75Days.as_api_string()
+        );
+        let mut config = serde_json::json!({"Algorithm": 9});
+        add_algorithm_string(config.as_object_mut().expect("object"));
+        assert_eq!(
+            config["AlgorithmString"],
+            SimilarityAlgorithm::SessionBased1825Days.as_api_string()
+        );
     }
 
     #[test]
     fn every_algorithm_has_a_distinct_api_string() {
-        let all = [
-            SimilarityAlgorithm::SessionBased1825Days,
-            SimilarityAlgorithm::SessionBased1800Days,
-            SimilarityAlgorithm::SessionBased7500Days,
-            SimilarityAlgorithm::SessionBased7500DaysHighContribution,
-            SimilarityAlgorithm::SessionBased9000Days,
-            SimilarityAlgorithm::SessionBased75Days,
-        ];
-        let strings: std::collections::HashSet<_> = all.iter().map(|a| a.as_api_string()).collect();
-        assert_eq!(strings.len(), all.len());
+        let strings: std::collections::HashSet<_> = SimilarityAlgorithm::NAMED
+            .iter()
+            .map(|(_, a)| a.as_api_string())
+            .collect();
+        assert_eq!(strings.len(), SimilarityAlgorithm::NAMED.len());
         assert!(
             SimilarityAlgorithm::default()
                 .as_api_string()
@@ -258,6 +433,8 @@ mod tests {
         );
     }
 
+    /// The settings are read per call: the server, the algorithm and the
+    /// spacing the plugin holds now.
     #[tokio::test]
     async fn similar_artists_drops_the_seed_and_orders_by_score() {
         let body = r#"[
@@ -265,11 +442,15 @@ mod tests {
             {"artist_mbid":"SEED","score":99.0},
             {"artist_mbid":"bbbbbbbb-0000-0000-0000-000000000002","score":50.0}
         ]"#;
-        let server = MockServer::start(vec![("/similar-artists", body.to_owned())]).await;
-        let client = ListenBrainzClient::new(ListenBrainzConfig {
-            labs_server: server.base_url.clone(),
-            ..ListenBrainzConfig::default()
-        });
+        let server = MockServer::start(vec![(
+            "/similar-artists/json?artist_mbids=seed&algorithm=session_based_days_75_",
+            body.to_owned(),
+        )])
+        .await;
+        let client = client_with(&serde_json::json!({
+            "LabsServer": format!("{}/", server.base_url),
+            "Algorithm": "SessionBased75Days"
+        }));
         let similar = client.similar_artists("seed").await;
         assert_eq!(
             similar,
@@ -285,26 +466,20 @@ mod tests {
     async fn labs_retains_default_spacing_without_headers_and_honors_quota() {
         let body = r#"[{"artist_mbid":"other","score":1}]"#;
         let open = MockServer::always(body).await;
-        let client = ListenBrainzClient::new(ListenBrainzConfig {
-            labs_server: open.base_url.clone(),
-            ..ListenBrainzConfig::default()
-        });
+        let client = client_with(&serde_json::json!({"LabsServer": open.base_url}));
         let started = tokio::time::Instant::now();
         assert_eq!(client.similar_artists("seed").await, ["other"]);
-        assert_eq!(client.clone().similar_artists("seed").await, ["other"]);
+        assert_eq!(client.similar_artists("seed").await, ["other"]);
         assert!(
             started.elapsed() >= Duration::from_secs(1),
-            "clones must share the one-second pacing gate without response headers"
+            "the one-second pacing gate holds without response headers"
         );
         let limited = MockServer::with_headers(
             vec![("/", body.to_owned())],
             "X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-In: 120\r\n",
         )
         .await;
-        let client = ListenBrainzClient::new(ListenBrainzConfig {
-            labs_server: limited.base_url.clone(),
-            ..ListenBrainzConfig::default()
-        });
+        let client = client_with(&serde_json::json!({"LabsServer": limited.base_url}));
         assert_eq!(client.similar_artists("seed").await, ["other"]);
         let similar_artists = client.similar_artists("seed").await;
         assert!(similar_artists.is_empty(), "{similar_artists:?}");
@@ -329,10 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_mbid_is_never_looked_up() {
-        let client = ListenBrainzClient::new(ListenBrainzConfig {
-            labs_server: "http://127.0.0.1:1".to_owned(),
-            ..ListenBrainzConfig::default()
-        });
+        let client = client_with(&serde_json::json!({"LabsServer": "http://127.0.0.1:1"}));
         let similar_artists = client.similar_artists("  ").await;
         assert!(similar_artists.is_empty(), "{similar_artists:?}");
     }

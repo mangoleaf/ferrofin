@@ -1,7 +1,7 @@
 //! Adoption import for Jellyfin's `config/livetv.xml`.
 //!
 //! The document's scalar options (guide days, padding, the post-processor) are
-//! seeded as `named/livetv.json` like every other named configuration (see
+//! seeded as `livetv.json` like every other named configuration (see
 //! [`crate::config_import`]). Ferrofin keeps the tuners and listing providers
 //! in the database rather than in that file, so this import writes them there.
 //!

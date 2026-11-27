@@ -361,6 +361,17 @@ impl FerrofinMediaSourceManager {
         // alternate (or a part) by its own id defaults to that file, and a
         // version's sources list the whole group.
         let item_id = Uuid::parse_str(&item.id).unwrap_or(item_id);
+        // `item is not IHasMediaSources`: a container or a by-name item a
+        // client asked to play has no sources, and upstream refuses it with an
+        // `ArgumentException`, a 400 (`MediaSourceManager.cs:387-393`).
+        if !crate::item_type_lookup::kind_from_type_name(&item.type_)
+            .is_some_and(crate::kinds::implements_has_media_sources)
+        {
+            let type_name = item.type_.rsplit('.').next().unwrap_or_default();
+            return Err(ServiceError::invalid_input(format!(
+                "{type_name} {item_id} has no media sources and cannot be played."
+            )));
+        }
         let versions = crate::video_versions::VersionRows::load(
             &crate::video_versions::RepositoryVersionReader(self.items.as_ref()),
             &[item],
@@ -4150,6 +4161,66 @@ mod tests {
             .await
             .expect("sources");
         assert!(sources.is_empty(), "{sources:?}");
+    }
+
+    /// `GetStaticMediaSources` refuses an item that is not `IHasMediaSources`
+    /// with an `ArgumentException`, a 400 (`MediaSourceManager.cs:387-393`),
+    /// on every path that reads it: a container, a by-name item, a photo, a
+    /// book or a programme gets no source made up from its row. A stock
+    /// Jellyfin 12.4 answered 400 for each of the containers and by-name
+    /// kinds here, through PlaybackInfo, the static stream and attachments.
+    #[tokio::test]
+    async fn an_item_that_cannot_have_media_sources_is_refused() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let refused = [
+            BaseItemKind::Series,
+            BaseItemKind::Season,
+            BaseItemKind::MusicAlbum,
+            BaseItemKind::BoxSet,
+            BaseItemKind::CollectionFolder,
+            BaseItemKind::Folder,
+            BaseItemKind::Genre,
+            BaseItemKind::MusicGenre,
+            BaseItemKind::MusicArtist,
+            BaseItemKind::Person,
+            BaseItemKind::Studio,
+            BaseItemKind::Year,
+            BaseItemKind::Photo,
+            BaseItemKind::Book,
+            BaseItemKind::LiveTvProgram,
+        ];
+        let played = [
+            BaseItemKind::Movie,
+            BaseItemKind::Episode,
+            BaseItemKind::Video,
+            BaseItemKind::MusicVideo,
+            BaseItemKind::Trailer,
+            BaseItemKind::Audio,
+            BaseItemKind::AudioBook,
+        ];
+        for (n, kind) in (0x3970_u128..).zip(refused.into_iter().chain(played)) {
+            let id = Uuid::from_u128(n);
+            seed_item(&db, id, kind).await;
+            let answers = [
+                mgr.get_static_media_sources(id, false, None).await.err(),
+                mgr.get_playback_media_sources(id, Uuid::new_v4(), false, false)
+                    .await
+                    .err(),
+                mgr.get_stream_media_source(id, None, None).await.err(),
+            ];
+            for answer in answers {
+                if refused.contains(&kind) {
+                    assert!(
+                        matches!(&answer, Some(ServiceError::InvalidInput(m))
+                            if m.ends_with(&format!("{id} has no media sources and cannot be played."))),
+                        "{kind:?}: {answer:?}"
+                    );
+                } else {
+                    assert!(answer.is_none(), "{kind:?} has a source: {answer:?}");
+                }
+            }
+        }
     }
 
     /// `OpenLiveStreamInternal` opens only through the provider the token

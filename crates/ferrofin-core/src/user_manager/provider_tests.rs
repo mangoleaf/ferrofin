@@ -136,6 +136,8 @@ async fn saved_provider_selects_only_enabled_matches(
 #[tokio::test]
 async fn selected_provider_owns_password_changes_and_reset() {
     let (mgr, provider) = manager(true, false).await;
+    let activity = Arc::new(RecordingActivity::default());
+    let mgr = mgr.with_activity(activity.clone());
     let user = mgr.create_user("password-owner").await.unwrap();
     let uid = Uuid::parse_str(&user.id).unwrap();
     let mut policy = UserPolicy {
@@ -171,6 +173,18 @@ async fn selected_provider_owns_password_changes_and_reset() {
             .is_none()
     );
     assert_eq!(provider.passwords.lock().unwrap().len(), 2);
+    // C# `ChangePassword` publishes `UserPasswordChangedEventArgs` once the
+    // provider's change is saved, whichever provider it was: one entry each.
+    let entries = activity.entries.lock().unwrap();
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    for entry in entries.iter() {
+        assert_eq!(entry.type_, "UserPasswordChanged");
+        assert_eq!(
+            entry.name,
+            "Password has been changed for user password-owner"
+        );
+        assert_eq!(entry.user_id, Some(uid));
+    }
 }
 
 #[tokio::test]
@@ -894,6 +908,27 @@ impl ferrofin_traits::activity::ActivityManager for RecordingActivity {
     async fn clean(&self, _before: chrono::DateTime<chrono::Utc>) -> Result<u64, ServiceError> {
         Ok(0)
     }
+}
+
+/// A refused change writes no entry: C# `ChangePassword` throws before it
+/// publishes `UserPasswordChangedEventArgs`.
+#[tokio::test]
+async fn a_refused_password_change_writes_no_entry() {
+    let (mgr, _) = manager(true, false).await;
+    let activity = Arc::new(RecordingActivity::default());
+    let mgr = mgr.with_activity(activity.clone());
+    let admin = mgr.create_first_admin("owner").await.unwrap();
+    let uid = Uuid::parse_str(&admin.id).unwrap();
+
+    assert!(matches!(
+        mgr.change_password(uid, "  ").await,
+        Err(ServiceError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        mgr.reset_password(uid).await,
+        Err(ServiceError::InvalidInput(_))
+    ));
+    assert!(activity.entries.lock().unwrap().is_empty());
 }
 
 /// A user an outside provider creates is its user from the first write, with
