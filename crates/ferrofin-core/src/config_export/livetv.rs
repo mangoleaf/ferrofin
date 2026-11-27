@@ -98,7 +98,7 @@ pub struct LiveTvExport {
 ///
 /// # Errors
 ///
-/// Returns [`ServiceError::Backend`] when `named/livetv.json` cannot be read
+/// Returns [`ServiceError::Backend`] when `livetv.json` cannot be read
 /// (one that does not parse is exported as its defaults, as the server serves
 /// it), or a value cannot be written.
 pub fn export_live_tv(
@@ -106,8 +106,10 @@ pub fn export_live_tv(
     carried: &CarriedRows,
     paths: &PathRewrite,
 ) -> Result<LiveTvExport, ServiceError> {
-    let named = config_dir.join("users").join(Manager::NAMED_SUBDIR);
-    let options: LiveTvOptions = read_named(&named.join(Manager::LIVE_TV_FILE_NAME))?;
+    let options: LiveTvOptions = read_named(&crate::named_configuration_files::readable(
+        config_dir,
+        Manager::LIVE_TV_FILE_NAME,
+    ))?;
     let mut export = LiveTvExport::default();
     let mut fields = object(&options)?;
     for setting in PATH_OPTIONS {
@@ -438,13 +440,11 @@ mod tests {
     const GOLDEN_TIMERS: &str = include_str!("testdata/timers.json");
     const GOLDEN_SERIES: &str = include_str!("testdata/seriestimers.json");
 
-    /// A config directory whose `named/livetv.json` is `options`.
+    /// A config directory whose `livetv.json` is `options`.
     fn config_dir(options: &LiveTvOptions) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
-        let named = dir.path().join("users").join("named");
-        std::fs::create_dir_all(&named).expect("named");
         std::fs::write(
-            named.join("livetv.json"),
+            dir.path().join("livetv.json"),
             serde_json::to_vec(options).expect("serialize"),
         )
         .expect("write");

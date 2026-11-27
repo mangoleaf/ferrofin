@@ -3387,8 +3387,7 @@ mod tests {
             root.join("cache"),
             root.join("web"),
         ));
-        let file =
-            PathBuf::from(paths.user_configuration_directory_path()).join("named/encoding.json");
+        let file = PathBuf::from(paths.configuration_directory_path()).join("encoding.json");
         planner.config = Arc::new(
             ferrofin_core::FerrofinServerConfigurationManager::load(Arc::clone(&paths))
                 .await

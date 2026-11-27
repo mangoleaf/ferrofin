@@ -31,7 +31,7 @@
 //!
 //! - **The named documents** (`encoding.xml`, `branding.xml`, `network.xml`,
 //!   `metadata.xml`, `xbmcmetadata.xml` and `livetv.xml`) are seeded as
-//!   `named/<key>.json` by `FerrofinServerConfigurationManager::load`, each
+//!   `{config}/<key>.json` by `FerrofinServerConfigurationManager::load`, each
 //!   with its own deny list. `livetv.xml`'s tuners and listing providers go to
 //!   the database instead (`live_tv_import`).
 //! - **`database.xml` is deliberately skipped**: it selects Jellyfin's database
@@ -90,7 +90,7 @@ pub const NETWORK_XML_DENY: &[&str] = &["CertificatePath", "CertificatePassword"
 pub const LIVETV_XML_DENY: &[&str] =
     &["RecordingPath", "MovieRecordingPath", "SeriesRecordingPath"];
 
-/// Fields of `livetv.xml` left out of the seeded `named/livetv.json`: the
+/// Fields of `livetv.xml` left out of the seeded `livetv.json`: the
 /// recording paths of [`LIVETV_XML_DENY`], and the tuners and listing
 /// providers, which Ferrofin keeps in the database (`live_tv_import`) and
 /// merges into the document when it is served.
@@ -526,7 +526,7 @@ fn backend(action: &str, err: &serde_json::Error) -> ConfigImportError {
 
 #[cfg(test)]
 mod tests {
-    /// The seeded `named/livetv.json` leaves out at least what the tuner
+    /// The seeded `livetv.json` leaves out at least what the tuner
     /// import does: a recording path added to one list belongs in both.
     #[test]
     fn the_live_tv_options_seed_denies_every_recording_path() {

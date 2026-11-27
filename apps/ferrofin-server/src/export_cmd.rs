@@ -573,7 +573,7 @@ fn loss_report(
         "  Settings given to Ferrofin in config.toml, FERROFIN_* environment variables or command-line flags are not exported, but for the MusicBrainz server and the Studio Images repository, which outrank those plugins' own settings and are written into them.\n",
     );
     report.push_str(
-        "  Ferrofin's own files for the documents and plugin settings written as XML (system.json, the documents in config/users/named, a written plugin's config.json) are left out of the copy, so the settings listed above from those documents and plugins are not in the output in any form.\n",
+        "  Ferrofin's own files for the documents and plugin settings written as XML (system.json, the named documents beside it, a written plugin's config.json) are left out of the copy, so the settings listed above from those documents and plugins are not in the output in any form.\n",
     );
 
     live_tv(&mut report, edits, inputs);

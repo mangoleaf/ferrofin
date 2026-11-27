@@ -405,7 +405,7 @@ pub struct LiveTvPaths {
     /// The server data directory, under which `livetv/recordings` is the
     /// default DVR target (C# `CommonApplicationPaths.DataPath`).
     pub data_dir: PathBuf,
-    /// The `named/livetv.json` file holding the dashboard's `LiveTvOptions`.
+    /// The `livetv.json` file holding the dashboard's `LiveTvOptions`.
     pub options_file: PathBuf,
     /// The internal metadata directory, the only place a Live TV image row's
     /// local file is read from
@@ -495,7 +495,7 @@ pub struct FerrofinLiveTvManager {
     recording_folders_lock: Arc<tokio::sync::Mutex<()>>,
     /// One `EnforceKeepUpTo` pass at a time (`_recordingDeleteSemaphore`).
     keep_up_to_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Serializes writing `named/livetv.json` with a save over the API, which
+    /// Serializes writing `livetv.json` with a save over the API, which
     /// holds the same lock
     /// ([`set_recording_library`](Self::set_recording_library)).
     options_write_lock: Arc<OnceLock<Arc<tokio::sync::Mutex<()>>>>,
