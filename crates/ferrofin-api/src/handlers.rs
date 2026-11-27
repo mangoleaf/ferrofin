@@ -2519,16 +2519,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    series' own refresh run for every series they reach): the walk \
                    refreshes those it plans; library_scan/series_children.rs \
                    refresh_pathless_series_children refreshes the rest after the TMDb \
-                   missing-episode provider (and, in a library validation, \
-                   RemoveObsoleteEpisodes), as the series' own refresh runs them first \
-                   upstream: every path-less season the walk did not plan, then every \
-                   missing episode but one aired over 30 days ago outside a FullRefresh \
-                   or ReplaceAllMetadata (skipItem), each by refresh_single_item with the \
-                   refresh's options, an Identify's result included. refresh_item takes \
-                   that result as the item's own ids only from refresh_full_item (the \
-                   controller's SetProviderIds is the identified item's); a child's \
-                   lookup gets it as its series' ids (ApplySearchResult). \
-                   A box set's or playlist folder's \
+                   missing-episode provider and RemoveObsoleteEpisodes (a library's \
+                   post_scan_passes, a series' own touched_passes), as the series' own \
+                   refresh runs them first upstream: every path-less season the walk did \
+                   not plan, then every missing episode but one aired over 30 days ago \
+                   outside a FullRefresh or ReplaceAllMetadata (skipItem), each by \
+                   refresh_single_item with the refresh's options, an Identify's result \
+                   included. refresh_item takes that result as the item's own ids only \
+                   from refresh_full_item (the controller's SetProviderIds is the \
+                   identified item's); a child's lookup gets it as its series' ids \
+                   (ApplySearchResult). A box set's or playlist folder's \
                    local XML file: ferrofin-providers container_xml.rs (BoxSetXmlProvider and \
                    PlaylistXmlProvider, HasChanged as LocalMetadataFormat::Xml; the saver gate \
                    IsSaverEnabledForItem) read in provider_manager.rs refresh_item and, for a \

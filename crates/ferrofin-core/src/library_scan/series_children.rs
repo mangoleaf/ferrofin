@@ -11,9 +11,8 @@
 //! (`plan_loose_episodes`). What is left are the path-less children: a
 //! virtual season, a path-less season whose files are gone, a missing
 //! episode. Those refresh here through the provider manager, after the TMDb
-//! missing-episode provider (and, in a library validation,
-//! `RemoveObsoleteEpisodes`), which upstream runs within the series' own
-//! refresh, before its children.
+//! missing-episode provider and `RemoveObsoleteEpisodes`, which upstream runs
+//! within the series' own refresh, before its children.
 
 use std::collections::HashSet;
 

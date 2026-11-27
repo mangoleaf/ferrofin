@@ -7940,8 +7940,8 @@ impl LibraryScanner {
 
     /// The closing passes of an item or folder refresh, and of the library
     /// monitor's scan ([`ScanPasses::Touched`]): the music refresh of the
-    /// albums and artists it refreshed, the missing episodes and path-less
-    /// seasons of the series it refreshed,
+    /// albums and artists it refreshed, the missing and obsolete episodes and
+    /// path-less seasons of the series it refreshed,
     /// the children-derived columns of the folders it planned, the generated
     /// Primaries of the music and photo albums, folders and playlists it
     /// refreshed, and
@@ -7970,6 +7970,11 @@ impl LibraryScanner {
             .await
         {
             tracing::warn!(%err, "missing episode pass failed");
+        }
+        // Then its obsolete virtual episodes go, as every refresh of a series
+        // ends (`SeriesMetadataService.AfterMetadataRefresh`).
+        if let Err(err) = self.remove_obsolete_episodes(&work.series, run).await {
+            tracing::warn!(%err, "obsolete episode pass failed");
         }
         // Then the path-less seasons and missing episodes of each, which the
         // walk does not refresh (`Series.RefreshAllMetadata`).
