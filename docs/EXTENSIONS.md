@@ -286,6 +286,15 @@ without it. It removes none while a `*.wasm` file fails to load or the directory
 listed. A plugin taken out by moving its file away or renaming it to something other than
 `*.wasm` loses its segment output the same way and has to analyse the library again.
 
+**The plugin's image.** A package whose repository entry has an `imageUrl` gets that image
+as its dashboard icon, as on Jellyfin: the install downloads it into the plugin's directory
+(`{config_dir}/plugins/{id}/`), and a catalog fetch downloads it for an installed plugin
+that has none. The start that loads the plugin serves it at `GET /Plugins/{id}/{version}/Image`
+and reports `HasImage`. It is fetched over HTTPS, like the artifact, and as artwork is: no
+private address unless `image_private_http_allow` lists it, no more than
+`image_download_max_mb`, and only an image is kept. A failed download leaves the plugin
+without an icon until a later catalog fetch gets it. Uninstalling the plugin removes it.
+
 **"Disabled" and load.** Enable/disable governs the runtime work — tasks don't run, events
 aren't delivered, and metadata lookups are skipped for a disabled plugin. But a disabled
 plugin's *identity* exports (`descriptor`/`default-config`/`tasks`) still run at every boot,
