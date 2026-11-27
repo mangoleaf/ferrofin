@@ -1057,8 +1057,8 @@ fn live_tv_rows() -> (
             ..row(&[&OPEN_TUNER_MEMBERS, &BLANKED_TUNER_MEMBERS])
         }],
         vec![ListingsProviderInfo {
-            enabled_tuners: vec!["tuner".to_owned()],
-            channel_mappings: vec![ferrofin_model::dto::NameValuePair::new("1", "one")],
+            enabled_tuners: vec![Some("tuner".to_owned())],
+            channel_mappings: vec![Some(ferrofin_model::dto::NameValuePair::new("1", "one"))],
             ..row(&[&OPEN_PROVIDER_MEMBERS, &BLANKED_PROVIDER_MEMBERS])
         }],
     )

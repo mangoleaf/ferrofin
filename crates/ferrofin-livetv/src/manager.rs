@@ -970,9 +970,12 @@ struct CategoryClasses {
 impl CategoryClasses {
     fn from_provider(provider: &ListingsProviderInfo) -> Self {
         let defaults = ListingsProviderInfo::default();
-        let pick = |own: &Option<Vec<String>>, default: &Option<Vec<String>>| {
+        // A null entry matches no category: upstream's span `Contains` reads it
+        // as empty, and an airing's blank categories are dropped before it.
+        let pick = |own: &Option<Vec<Option<String>>>, default: &Option<Vec<Option<String>>>| {
             own.as_ref().or(default.as_ref()).map_or_default(|list| {
                 list.iter()
+                    .flatten()
                     .map(|entry| ordinal_ignore_case_key(entry))
                     .collect()
             })
@@ -3623,7 +3626,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
                     id: Some(c.id),
                 })
                 .collect(),
-            mappings: info.channel_mappings,
+            // A null mapping is always left out. Upstream lists it (`[null]`)
+            // only when no listed tuner channel's lookup reaches it; one that
+            // does dereferences it and throws (a Jellyfin bug not ported).
+            mappings: info.channel_mappings.into_iter().flatten().collect(),
             provider_name: Some(provider_name.to_owned()),
         })
     }
@@ -3639,8 +3645,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // removed first, and a replacement is stored only when the two ids
         // differ and the pair is new — so re-posting a channel onto itself is
         // the documented "unmap" gesture.
+        // A null mapping matches neither test and is kept as stored; upstream's
+        // `.Any(...)`, or its `.Where(...)` when `.Any` stops at an earlier
+        // match, dereferences it and fails the save, a Jellyfin bug not ported.
         let mut info = self.listing_provider_by_id(provider_id).await?;
-        let already = info.channel_mappings.iter().any(|pair| {
+        let already = info.channel_mappings.iter().flatten().any(|pair| {
             pair.name
                 .as_deref()
                 .is_some_and(|n| eq_ordinal_ignore_case(n, tuner_channel_id))
@@ -3650,16 +3659,17 @@ impl LiveTvManager for FerrofinLiveTvManager {
                     .is_some_and(|v| eq_ordinal_ignore_case(v, provider_channel_id))
         });
         info.channel_mappings.retain(|pair| {
-            !pair
-                .name
-                .as_deref()
-                .is_some_and(|n| eq_ordinal_ignore_case(n, tuner_channel_id))
+            !pair.as_ref().is_some_and(|pair| {
+                pair.name
+                    .as_deref()
+                    .is_some_and(|n| eq_ordinal_ignore_case(n, tuner_channel_id))
+            })
         });
         if !eq_ordinal_ignore_case(tuner_channel_id, provider_channel_id) && !already {
-            info.channel_mappings.push(NameValuePair {
+            info.channel_mappings.push(Some(NameValuePair {
                 name: Some(tuner_channel_id.to_owned()),
                 value: Some(provider_channel_id.to_owned()),
-            });
+            }));
         }
         // Stored as it is: `SetChannelMapping` saves the configuration
         // without running the provider's `Validate`.
@@ -12005,7 +12015,7 @@ mod tests {
         };
         let provider = |all: bool, tuners: &[&str]| ListingsProviderInfo {
             enable_all_tuners: all,
-            enabled_tuners: tuners.iter().map(|t| (*t).to_owned()).collect(),
+            enabled_tuners: tuners.iter().map(|t| Some((*t).to_owned())).collect(),
             ..ListingsProviderInfo::default()
         };
         let mut lineups = vec![(
@@ -17036,6 +17046,44 @@ mod tests {
         ));
     }
 
+    /// A null channel mapping (gl-1677) is left out of the options' `Mappings`
+    /// and matches nothing in a mapping save, which keeps it as stored.
+    #[tokio::test]
+    async fn a_null_channel_mapping_is_listed_nowhere_and_kept_by_a_save() {
+        use ferrofin_model::dto::NameValuePair;
+        let (mgr, _tuner_id, provider_id) = mapping_manager().await;
+        let mut provider = mgr
+            .listing_provider_by_id(&provider_id)
+            .await
+            .expect("provider");
+        provider.channel_mappings = vec![None, Some(NameValuePair::new("m3u_kept", "one.tv"))];
+        mgr.store_listing_provider(provider).await.expect("stored");
+
+        let opts = mgr
+            .get_channel_mapping_options(&provider_id)
+            .await
+            .expect("options");
+        assert_eq!(opts.mappings, [NameValuePair::new("m3u_kept", "one.tv")]);
+
+        let two = crate::mapping::m3u_channel_id("http://tuner/playlist.m3u", "http://tuner/two");
+        mgr.set_channel_mapping(&provider_id, &two, "one.tv")
+            .await
+            .expect("map");
+        let stored = mgr
+            .listing_provider_by_id(&provider_id)
+            .await
+            .expect("provider")
+            .channel_mappings;
+        assert_eq!(
+            stored,
+            [
+                None,
+                Some(NameValuePair::new("m3u_kept", "one.tv")),
+                Some(NameValuePair::new(&two, "one.tv")),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn set_channel_mapping_moves_the_listings_and_a_self_map_unmaps() {
         let (mgr, _tuner_id, provider_id) = mapping_manager().await;
@@ -17080,8 +17128,9 @@ mod tests {
             .channel_mappings
             .clone();
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].name.as_deref(), Some(two.as_str()));
-        assert_eq!(stored[0].value.as_deref(), Some("one.tv"));
+        let stored = stored[0].as_ref().expect("a mapping");
+        assert_eq!(stored.name.as_deref(), Some(two.as_str()));
+        assert_eq!(stored.value.as_deref(), Some("one.tv"));
 
         // Re-posting the SAME pair TOGGLES it off — `channelMappingExists`
         // suppresses the re-add after the unconditional removal
@@ -17141,6 +17190,7 @@ mod tests {
             mgr.get_listing_providers().await.expect("p")[0]
                 .channel_mappings
                 .iter()
+                .flatten()
                 .any(|pair| pair.name.as_deref() == Some("m3u_bogus"))
         );
         assert!(matches!(
@@ -17258,7 +17308,7 @@ mod tests {
                     as_xmltv(ListingsProviderInfo {
                         path: Some("http://guide/xmltv.xml".to_owned()),
                         enable_all_tuners: false,
-                        enabled_tuners: vec![enabled],
+                        enabled_tuners: vec![Some(enabled)],
                         ..ListingsProviderInfo::default()
                     }),
                     false,
@@ -19249,9 +19299,10 @@ mod category_class_tests {
         #[case] categories: &[&str],
         #[case] expected: bool,
     ) {
-        let owned = |values: &[&str]| values.iter().map(|&v| v.to_owned()).collect();
+        let owned =
+            |values: &[&str]| -> Vec<String> { values.iter().map(|&v| v.to_owned()).collect() };
         let classes = CategoryClasses::from_provider(&ListingsProviderInfo {
-            sports_categories: Some(owned(list)),
+            sports_categories: Some(owned(list).into_iter().map(Some).collect()),
             ..ListingsProviderInfo::default()
         });
         let class = classes.classify(&crate::xmltv::XmltvProgramme {
@@ -19259,6 +19310,26 @@ mod category_class_tests {
             ..crate::xmltv::XmltvProgramme::default()
         });
         assert_eq!(class.is_sports, expected);
+    }
+
+    /// A null entry in a category list (gl-1677) matches no category, and
+    /// the list's other entries still do.
+    #[test]
+    fn a_null_category_entry_matches_nothing() {
+        let classes = CategoryClasses::from_provider(&ListingsProviderInfo {
+            sports_categories: Some(vec![None, Some("football".to_owned())]),
+            ..ListingsProviderInfo::default()
+        });
+        let classify = |categories: &[&str]| {
+            classes
+                .classify(&crate::xmltv::XmltvProgramme {
+                    categories: categories.iter().map(|&c| c.to_owned()).collect(),
+                    ..crate::xmltv::XmltvProgramme::default()
+                })
+                .is_sports
+        };
+        assert!(classify(&["Football"]));
+        assert!(!classify(&["news"]));
     }
 
     /// A provider without a list takes Jellyfin's default for it; each class

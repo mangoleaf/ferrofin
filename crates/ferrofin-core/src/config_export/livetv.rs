@@ -526,6 +526,96 @@ mod tests {
         assert_eq!(export.files.not_exported, []);
     }
 
+    /// A `null` element in a guide provider's lists (gl-1677), as Jellyfin
+    /// stores it (`<string xsi:nil="true" />`, `<NameValuePair xsi:nil="true"
+    /// />`), comes in as a null element and goes back out as the same nil
+    /// element, so the file reads back as Jellyfin wrote it.
+    #[test]
+    fn a_nil_list_element_round_trips_through_livetv_xml() {
+        let xml = GOLDEN_XML
+            .replacen(
+                "<EnabledTuners />",
+                "<EnabledTuners><string xsi:nil=\"true\" /><string>t1</string></EnabledTuners>",
+                1,
+            )
+            .replacen(
+                "<ChannelMappings />",
+                "<ChannelMappings><NameValuePair xsi:nil=\"true\" /></ChannelMappings>",
+                1,
+            );
+        let options: LiveTvOptions = import_over(
+            &LiveTvOptions::default(),
+            &xml,
+            "LiveTvOptions",
+            LIVETV_XML_DENY,
+        )
+        .expect("imports");
+        let provider = &options.listing_providers[0];
+        assert_eq!(provider.enabled_tuners, [None, Some("t1".to_owned())]);
+        assert_eq!(provider.channel_mappings, [None]);
+
+        let rows = CarriedRows {
+            listing_providers: vec![serde_json::to_string(provider).expect("serialize")],
+            ..CarriedRows::default()
+        };
+        let dir = config_dir(&LiveTvOptions::default());
+        let export = export_live_tv(dir.path(), &rows, &PathRewrite::default()).expect("exports");
+        let written = file(&export, FILE);
+        let back: LiveTvOptions = import_over(
+            &LiveTvOptions::default(),
+            written,
+            "LiveTvOptions",
+            LIVETV_XML_DENY,
+        )
+        .expect("reads back");
+        assert_eq!(
+            back.listing_providers[0].enabled_tuners,
+            provider.enabled_tuners
+        );
+        assert_eq!(
+            back.listing_providers[0].channel_mappings,
+            provider.channel_mappings
+        );
+        assert!(written.contains("<string xsi:nil=\"true\" />"), "{written}");
+        assert!(
+            written.contains("<NameValuePair xsi:nil=\"true\" />"),
+            "{written}"
+        );
+    }
+
+    /// A guide provider with ONE channel mapping, as Jellyfin writes it
+    /// (`<ChannelMappings><NameValuePair>…</NameValuePair></ChannelMappings>`),
+    /// imports with that mapping: a one-entry list of `NameValuePair` is a list,
+    /// not an object with a `NameValuePair` member.
+    #[test]
+    fn a_provider_with_one_channel_mapping_imports() {
+        let xml = GOLDEN_XML.replacen(
+            "<ChannelMappings />",
+            "<ChannelMappings><NameValuePair><Name>m3u_one</Name><Value>one.tv</Value>\
+             </NameValuePair></ChannelMappings>",
+            1,
+        );
+        let options: LiveTvOptions = import_over(
+            &LiveTvOptions::default(),
+            &xml,
+            "LiveTvOptions",
+            LIVETV_XML_DENY,
+        )
+        .expect("imports");
+        let [provider] = options.listing_providers.as_slice() else {
+            panic!(
+                "expected the one provider, got {:?}",
+                options.listing_providers
+            );
+        };
+        assert_eq!(
+            provider.channel_mappings,
+            [Some(ferrofin_model::dto::NameValuePair::new(
+                "m3u_one", "one.tv"
+            ))]
+        );
+    }
+
     /// The golden film timer as Ferrofin stores it: its `TimerInfoDto`, the
     /// internal ids beside the external ones.
     const FILM_DTO: &str = r#"{"Id":"0f6c8a6e3c2b4f0e9a1d2c3b4a5f6e7d","Type":"Timer","ServerId":"x",
