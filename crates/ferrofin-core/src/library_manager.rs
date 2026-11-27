@@ -3729,6 +3729,22 @@ impl LibraryManager for FerrofinLibraryManager {
         failed.map_or(Ok(true), Err)
     }
 
+    async fn stopped_scan_ended(&self) {
+        // Subscribed before the check, so the scan's end between the check
+        // and the wait is not missed.
+        let mut changed = self.scan_progress.subscribe();
+        loop {
+            let stopping = lock_queue(&self.scan_queue)
+                .running
+                .as_ref()
+                .is_some_and(|running| running.cancel.is_cancelled());
+            // The worker signals after each scan's end, and when it goes away.
+            if !stopping || changed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     fn is_scan_running(&self) -> bool {
         lock_queue(&self.scan_queue)
             .running
@@ -5182,9 +5198,9 @@ mod tests {
 
     /// `POST /Library/Refresh` over a running "Scan Media Library"
     /// (`CancelIfRunningAndQueue`): the stop reaches the run's scan wait, so
-    /// the run ends Cancelled at once rather than after the stop's drop wait;
-    /// the scan it leaves stops at its next item; and the queued run's own
-    /// scan starts only after that one.
+    /// the scan it leaves stops at its next item; the run stays Cancelling
+    /// until then and records Cancelled, well inside the stop's drop wait;
+    /// and the queued run, with its own scan, starts only after that.
     #[tokio::test]
     async fn a_refresh_over_a_running_scan_task_cancels_it_and_scans_after_it() {
         use crate::scheduled_tasks::{FerrofinTaskManager, RefreshLibraryTask};
@@ -5199,12 +5215,15 @@ mod tests {
 
         tasks.queue("RefreshLibrary").expect("queued");
         runner.started(1).await;
-        let stopped = std::time::Instant::now();
         tasks
             .cancel_if_running_and_queue(&id)
             .await
             .expect("refresh");
-        // The first run has recorded Cancelled and the queued one runs.
+        assert_eq!(runner.runs().len(), 1, "no scan beside the stopping one");
+        // The left scan finishes its item in progress, then stops, and the
+        // first run records Cancelled; the queued one runs after it.
+        let stopped = std::time::Instant::now();
+        runner.release(1);
         for _ in 0..500 {
             let info = tasks.get("RefreshLibrary").expect("task");
             if info.state == TaskState::Running
@@ -5220,11 +5239,6 @@ mod tests {
             stopped.elapsed() < crate::scheduled_tasks::STOP_WAIT,
             "the stop reached the scan wait, not the drop"
         );
-        assert_eq!(runner.runs().len(), 1, "no scan beside the stopping one");
-
-        // The left scan finishes its item in progress, then stops; the
-        // replacement's scan runs after it.
-        runner.release(1);
         runner.started(2).await;
         runner.release(GatedRunner::ITEMS);
         for _ in 0..500 {
@@ -5242,6 +5256,115 @@ mod tests {
         let runs = runner.runs();
         assert!(runs[0].stopped, "the left scan stopped at its next item");
         assert_eq!(runs[1].items, GatedRunner::ITEMS);
+    }
+
+    /// A "Scan Media Library" run over a gated scan, stopped from the
+    /// dashboard while the scan is on its first item, with the scan's
+    /// manager and runner.
+    async fn stopped_scan_task() -> (
+        crate::scheduled_tasks::FerrofinTaskManager,
+        FerrofinLibraryManager,
+        Arc<GatedRunner>,
+    ) {
+        use crate::scheduled_tasks::{FerrofinTaskManager, RefreshLibraryTask};
+        use ferrofin_model::tasks::TaskState;
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let tasks = FerrofinTaskManager::new();
+        tasks.register(Arc::new(RefreshLibraryTask::new(Arc::new(mgr.clone()))));
+        tasks.queue("RefreshLibrary").expect("queued");
+        runner.started(1).await;
+        tasks.cancel("RefreshLibrary").expect("stop");
+        // Long enough for a run that does not wait for its scan to end.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            tasks.get("RefreshLibrary").expect("task").state,
+            TaskState::Cancelling,
+            "the run waits for its scan, which is still on its item"
+        );
+        (tasks, mgr, runner)
+    }
+
+    /// The dashboard's Stop on a running "Scan Media Library": the run stays
+    /// `Cancelling` while its scan finishes the item in progress, and records
+    /// Cancelled only once the scan has ended, as upstream's does when
+    /// `ValidateMediaLibraryInternal` returns.
+    #[tokio::test]
+    async fn a_stopped_scan_task_stays_cancelling_until_its_scan_ends() {
+        use ferrofin_model::tasks::{TaskCompletionStatus, TaskState};
+        let (tasks, mgr, runner) = stopped_scan_task().await;
+        assert!(!runner.runs()[0].stopped, "the scan has not ended");
+
+        runner.release(1);
+        for _ in 0..500 {
+            if tasks.get("RefreshLibrary").expect("task").state == TaskState::Idle {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let done = tasks.get("RefreshLibrary").expect("task");
+        assert_eq!(done.state, TaskState::Idle);
+        assert_eq!(
+            done.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Cancelled
+        );
+        assert!(runner.runs()[0].stopped, "the scan ended before the run");
+        until_idle(&mgr).await;
+    }
+
+    /// The host shutting down while a stopped run waits for its scan, whose
+    /// item never ends: the registry's shutdown is not held by the scan. The
+    /// run is dropped when its stop wait ends, inside the shutdown's own
+    /// wait, and scanning shuts down once the item does end.
+    #[tokio::test]
+    async fn shutdown_is_not_held_by_a_stopped_scan_tasks_wait() {
+        use ferrofin_model::tasks::{TaskCompletionStatus, TaskState};
+        let (tasks, mgr, runner) = stopped_scan_task().await;
+
+        // No database work from here on, so the clock can be the test's.
+        tokio::time::pause();
+        let began = tokio::time::Instant::now();
+        tasks.shutdown().await;
+        assert!(
+            began.elapsed() <= crate::scheduled_tasks::STOP_WAIT,
+            "the shutdown waited {:?}",
+            began.elapsed()
+        );
+        tokio::time::resume();
+        let done = tasks.get("RefreshLibrary").expect("task");
+        assert_eq!(done.state, TaskState::Idle);
+        assert_eq!(
+            done.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Cancelled
+        );
+
+        // The scan still on its item ends once that item does.
+        runner.release(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), mgr.shutdown_scans())
+            .await
+            .expect("scanning shut down");
+        assert!(runner.runs()[0].stopped);
+    }
+
+    /// A run stopped while another caller's scan runs has nothing to wait
+    /// for: only a scan that was told to stop is waited on.
+    #[tokio::test]
+    async fn stopped_scan_ended_does_not_wait_for_a_scan_nobody_stopped() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let scan = spawn_scheduled(&mgr);
+        runner.started(1).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), mgr.stopped_scan_ended())
+            .await
+            .expect("no wait for a scan that goes on");
+        assert_eq!(runner.runs()[0].items, 0, "the scan is still on its item");
+
+        runner.release(GatedRunner::ITEMS);
+        scan.await.expect("joined");
+        until_idle(&mgr).await;
     }
 
     /// The host's teardown: the running scan stops at its next item

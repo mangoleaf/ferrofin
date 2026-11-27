@@ -187,11 +187,7 @@ async fn read_capped(
         )));
     }
     let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| download_error(url, &e))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|e| download_error(url, e))? {
         if (bytes.len() + chunk.len()) as u64 > cap_bytes {
             return Err(ServiceError::invalid_input(format!(
                 "download from {url} exceeds the {cap_bytes}-byte limit"
@@ -204,12 +200,13 @@ async fn read_capped(
 
 /// The error for a failed download from `url`. A timeout says so, as
 /// upstream's `TimeoutException` does, rather than reqwest's generic "error
-/// decoding response body".
-fn download_error(url: &str, e: &reqwest::Error) -> ServiceError {
+/// decoding response body". Only `url` names the source: reqwest's own copy
+/// of it is dropped, so a caller passing a redacted one logs no more.
+fn download_error(url: &str, e: reqwest::Error) -> ServiceError {
     if e.is_timeout() {
         ServiceError::backend(format!("downloading {url} timed out"))
     } else {
-        ServiceError::backend(format!("downloading {url}: {e}"))
+        ServiceError::backend(format!("downloading {url}: {}", e.without_url()))
     }
 }
 
@@ -241,10 +238,9 @@ async fn download_and_verify(
     require_https(source_url, loopback_ok)?;
     // GitHub release assets 302 to a CDN, so redirects must be followed —
     // but the default policy would happily follow https → http → an internal
-    // host. Re-run the transport check on every hop instead. (10 = reqwest's
-    // own default hop limit.)
+    // host. Re-run the transport check on every hop instead.
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() > 10 {
+        if attempt.previous().len() > ferrofin_util::http_client::MAX_REDIRECTS {
             attempt.error("too many redirects")
         } else if require_https(attempt.url().as_str(), loopback_ok).is_ok() {
             attempt.follow()
@@ -253,8 +249,9 @@ async fn download_and_verify(
         }
     });
     // Idle timeouts, so the artifact never sits silent, and the total
-    // `budget` a legitimate artifact on a slow link fits in.
-    let client = reqwest::Client::builder()
+    // `budget` a legitimate artifact on a slow link fits in. Otherwise
+    // `NamedClient.Default`'s defaults, as `PerformPackageInstallation` has.
+    let client = ferrofin_util::http_client::builder(ferrofin_health::USER_AGENT)
         .redirect(policy)
         .connect_timeout(REPO_FETCH_TIMEOUT)
         .read_timeout(REPO_FETCH_TIMEOUT)
@@ -265,7 +262,7 @@ async fn download_and_verify(
         .get(source_url)
         .send()
         .await
-        .map_err(|e| download_error(source_url, &e))?;
+        .map_err(|e| download_error(source_url, e))?;
     if !response.status().is_success() {
         return Err(ServiceError::backend(format!(
             "downloading {source_url}: HTTP {}",
@@ -1585,9 +1582,10 @@ impl PluginManager for FerrofinPluginManager {
     async fn list_packages(&self) -> Result<Vec<PackageInfo>, ServiceError> {
         // Fetch and aggregate the enabled repositories' plugin manifests (each a
         // JSON `PackageInfo[]`), mirroring `InstallationManager.GetAvailablePackages`.
-        // A repository that is unreachable or serves malformed JSON is skipped with
-        // a warning rather than failing the whole catalog. What this lists is
-        // installable via `install_package` when the installer is armed.
+        // A repository that is unreachable, answers a non-2xx status or serves
+        // malformed JSON is skipped with a warning rather than failing the whole
+        // catalog. What this lists is installable via `install_package` when the
+        // installer is armed.
         let repos: Vec<RepositoryInfo> = self
             .configured_repositories()
             .await?
@@ -1604,8 +1602,9 @@ impl PluginManager for FerrofinPluginManager {
         // Manifests are small JSON documents: a total deadline plus a
         // streamed size cap, so a hostile/hung repository can neither OOM
         // the server nor pin the task (GET /Packages is admin-only, but the
-        // repository is remote and untrusted).
-        let client = reqwest::Client::builder()
+        // repository is remote and untrusted). Otherwise `NamedClient.Default`'s
+        // defaults, as `InstallationManager.GetPackages` has.
+        let client = ferrofin_util::http_client::builder(ferrofin_health::USER_AGENT)
             .timeout(REPO_FETCH_TIMEOUT)
             .build()
             .map_err(|e| ServiceError::backend(format!("building repository client: {e}")))?;
@@ -1619,23 +1618,36 @@ impl PluginManager for FerrofinPluginManager {
                 .clone()
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| "Unnamed Repo".to_owned());
+            // An operator's URL can carry a token: its scheme and host only.
+            let source = ferrofin_util::source_url::redact_url(url);
             let body = match client.get(url).send().await {
-                Ok(resp) => match read_capped(resp, MAX_MANIFEST_BYTES, url).await {
+                // `GetFromJsonAsync` throws on a non-2xx status, a redirect the
+                // client did not follow included, and `GetPackages` lists nothing.
+                Ok(resp) if !resp.status().is_success() => {
+                    tracing::warn!(
+                        repository = %repo_name,
+                        url = %source,
+                        status = resp.status().as_u16(),
+                        "plugin repository manifest request failed"
+                    );
+                    continue;
+                }
+                Ok(resp) => match read_capped(resp, MAX_MANIFEST_BYTES, &source).await {
                     Ok(body) => body,
                     Err(e) => {
-                        tracing::warn!(url, error = %e, "failed to read plugin repository manifest");
+                        tracing::warn!(repository = %repo_name, url = %source, error = %e, "failed to read plugin repository manifest");
                         continue;
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(url, error = %e, "failed to fetch plugin repository manifest");
+                    tracing::warn!(repository = %repo_name, url = %source, error = %e.without_url(), "failed to fetch plugin repository manifest");
                     continue;
                 }
             };
             let list = match serde_json::from_slice::<Vec<PackageInfo>>(&body) {
                 Ok(list) => list,
                 Err(e) => {
-                    tracing::warn!(url, error = %e, "plugin repository manifest was not valid JSON");
+                    tracing::warn!(repository = %repo_name, url = %source, error = %e, "plugin repository manifest was not valid JSON");
                     continue;
                 }
             };
@@ -4454,6 +4466,144 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    /// `InstallationManager` asks for a manifest and a package through
+    /// `NamedClient.Default`: the server's `User-Agent` and the `Accept` list.
+    #[tokio::test]
+    async fn repository_requests_have_the_default_client_headers() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&seen);
+        let (base, _stop) = raw_server(move |_| {
+            Box::new(move |request| {
+                log.lock().unwrap().push(request.to_ascii_lowercase());
+                http_ok("application/json", b"[]")
+            })
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf());
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("headers".to_owned()),
+            url: Some(format!("{base}/manifest.json")),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        mgr.list_packages().await.unwrap();
+        let version = ferrofin_model::updates::VersionInfo {
+            version: "1.0.0".to_owned(),
+            checksum: Some("0".repeat(32)),
+            ..Default::default()
+        };
+        // The body is no package: only the request matters here.
+        let budget = std::time::Duration::from_secs(5);
+        let _ = super::download_and_verify(
+            &format!("{base}/plugin.wasm"),
+            "Headers",
+            &version,
+            true,
+            1 << 20,
+            budget,
+        )
+        .await;
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        let agent = format!(
+            "\r\nuser-agent: {}\r\n",
+            ferrofin_health::USER_AGENT.to_ascii_lowercase()
+        );
+        for request in seen.iter() {
+            assert!(request.contains(&agent), "{request}");
+            assert!(
+                request.contains(
+                    "\r\naccept: application/json; q=1.0, application/xml; q=0.9, */*; q=0.8\r\n"
+                ),
+                "{request}"
+            );
+        }
+    }
+
+    /// A repository answering anything but a success, a redirect the client
+    /// did not follow included, lists nothing whatever its body holds:
+    /// `GetFromJsonAsync` throws the `HttpRequestException` that
+    /// `GetPackages` answers with no packages. The warning names the
+    /// repository and only the scheme and host of its URL.
+    #[tokio::test]
+    async fn a_manifest_with_a_failure_status_lists_nothing() {
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        for status in ["500 Internal Server Error", "404 Not Found", "302 Found"] {
+            let (base, _stop) = raw_server(move |base| {
+                let manifest = manifest_json(base, &"0".repeat(32), None, TEST_ABI);
+                Box::new(move |_| {
+                    let mut out = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        manifest.len()
+                    )
+                    .into_bytes();
+                    out.extend_from_slice(manifest.as_bytes());
+                    out
+                })
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf());
+            mgr.set_repositories(vec![RepositoryInfo {
+                name: Some("failing".to_owned()),
+                url: Some(format!(
+                    "{base}/path-secret/manifest.json?token=query-secret"
+                )),
+                enabled: true,
+            }])
+            .await
+            .unwrap();
+            let packages = mgr
+                .list_packages()
+                .await
+                .expect("the catalog still answers");
+            assert!(packages.is_empty(), "{status}: {packages:?}");
+        }
+        // A transport failure: nothing listens there any more.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinPluginManager::new(Vec::new(), dir.path().to_path_buf());
+        mgr.set_repositories(vec![RepositoryInfo {
+            name: Some("unreachable".to_owned()),
+            url: Some(format!(
+                "http://{addr}/path-secret/manifest.json?token=query-secret"
+            )),
+            enabled: true,
+        }])
+        .await
+        .unwrap();
+        let packages = mgr.list_packages().await.unwrap();
+        assert!(packages.is_empty(), "{packages:?}");
+
+        let text = logs.text();
+        let count = |message| text.matches(message).count();
+        assert_eq!(
+            count("plugin repository manifest request failed"),
+            3,
+            "{text}"
+        );
+        assert_eq!(
+            count("failed to fetch plugin repository manifest"),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("repository=failing"), "{text}");
+        assert!(text.contains("repository=unreachable"), "{text}");
+        assert!(text.contains("url=http://127.0.0.1:"), "{text}");
+        for secret in ["path-secret", "query-secret"] {
+            assert!(!text.contains(secret), "{secret} logged: {text}");
+        }
     }
 
     #[tokio::test]

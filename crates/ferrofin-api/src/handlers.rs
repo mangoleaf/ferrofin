@@ -986,12 +986,19 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// which of a series timer's recordings a starting capture deletes past its
 /// "Keep up to", and `direct-recording` how the DVR copies an unshared tuner
 /// URL and how that copy's end settles the timer (completed, or failed and
-/// retried), which no HTTP response describes either. `metadata-refresh` is
+/// retried), which no HTTP response describes either. `outbound-http` is what
+/// the requests Ferrofin sends where upstream sends them through
+/// `NamedClient.Default` carry (their headers) and which redirects they
+/// follow, which shows only where a response carries what such a request got
+/// back: the remote static stream, and the Live TV source operations' errors.
+/// `metadata-refresh` is
 /// which metadata and image providers an item's refresh runs, in which order
 /// and with what lookup, the Identify case first, shared by Identify → Apply,
 /// the item refresh and the library scan, and `metadata-providers` what
 /// TheMovieDb's movie, series, season and episode providers write onto an item
-/// from TMDb's answer. `guide-programme-items` is what the guide refresh
+/// from TMDb's answer. `guide-refresh-progress` is the progress a running
+/// Refresh Guide reports, which the two scheduled-task reads and the socket's
+/// task frames show. `guide-programme-items` is what the guide refresh
 /// stores on each programme item and its external ids, which every programme
 /// operation reads. `guide-channel-items` is where the guide refresh puts each
 /// channel item in the item tree (its parent, top parent and ancestors), which
@@ -1024,8 +1031,10 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "recording-images",
     "recording-keep-up-to",
     "direct-recording",
+    "outbound-http",
     "metadata-refresh",
     "metadata-providers",
+    "guide-refresh-progress",
     "guide-programme-items",
     "guide-channel-items",
     "guide-listings",
@@ -1109,7 +1118,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    XmlTvReader.ParseDate (parse_xmltv_time, copyright_year; gl-1646) that \
                    upstream's XmlTvReaderDateTimeTests pin, with PopulateHeader's \
                    MinValue for a missing time in the guide window (manager.rs \
-                   in_guide_window) and the previously-shown check.",
+                   in_guide_window) and the previously-shown check. The guide reads (GET and \
+                   POST /LiveTv/Programs, /LiveTv/Programs/Recommended, \
+                   /LiveTv/Programs/{programId}, a channel's CurrentProgram and a timer's \
+                   ProgramInfo) project those stored items, and GET /LiveTv/Timers/Defaults \
+                   takes their Name, Overview and EndDate: manager.rs program_dtos reads the \
+                   page's programme items in one ItemRepository retrieve_items call \
+                   (program_items_by_id), and program_entity projects only an airing \
+                   with none, compared with LiveTvManager.GetPrograms, GetProgram, \
+                   GetRecommendedProgramsInternal, AddChannelInfo and GetNewTimerDefaults and \
+                   LiveTvDtoService.GetTimerInfoDto on 2026-11-26 (gl-1690).",
         date: "2026-11-11",
         divergences: &[
             "Jellyfin.XmlTv drops the element right after an <image> or <url> when no \
@@ -1132,6 +1150,64 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              counts as updated. No known client reads either, and keeping the save to a \
              changed programme avoids one full-row write per airing per refresh (owner \
              decision 2026-11-20, gl-1628).",
+            "The guide reads' (and the /Items seam's) IsNews, IsKids, IsSports, IsLive and \
+             IsPremiere flags and ChannelName, and the IsLive the Recommended ranking scores, \
+             come from the guide \
+             and lineup tables, not the stored items, so a programme's tags or a channel's \
+             name changed through POST /Items/{itemId} does not change them; upstream's \
+             AddInfoToProgramDto and GetRecommendationScore read the stored items. Fix path: \
+             gl-1997.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "guide-refresh-progress",
+        upstream_file: "src/Jellyfin.LiveTv/Guide/GuideManager.cs",
+        upstream_method: "RefreshGuide",
+        ferrofin: "What a running Refresh Guide reports as its progress. ferrofin-core \
+                   scheduled_tasks/live_tv.rs RefreshGuideTask::execute hands its run, the \
+                   progress handle with the token, to ferrofin-livetv manager.rs \
+                   refresh_guide_until (RefreshGuideScheduledTask.ExecuteAsync, \
+                   RefreshGuide(progress, cancellationToken)), which reports 10 after its \
+                   first stop check and before it reads a tuner (RefreshChannelsInternal's \
+                   Report(10) ahead of GetChannelsAsync), 15 once sync_channel_items has \
+                   stored the channel items (Report(15)), and 100 after sync_program_items \
+                   (RefreshChannelsInternal's closing Report(100), then RefreshGuide's 100 * \
+                   services done / services); sync_program_items reports (85 * channels done \
+                   / channels) + 15 after each channel's programme items, a channel with no \
+                   airing included (Report((85 * percent) + 15)). A stock server has one \
+                   service, so RefreshGuide's innerProgress passes each report on times 1; a \
+                   second ILiveTvService is a plugin's. The task then reports RefreshGuide's \
+                   closing 100, and adds none for a refresh its stop ended (one stopped in \
+                   the image pre-cache already reads 100). A refresh a newer one superseded \
+                   while it fetched writes nothing, and goes from 10 to that 100. \
+                   Compared with RefreshGuide, RefreshChannelsInternal and CleanDatabase at \
+                   the pinned v12.4 tag. Live on a scratch server (gl-2021), GET \
+                   /ScheduledTasks/{taskId} polled through a run over 300 channels and a \
+                   tuner answering in 4 s: 10 from the first poll, then 15, each of the 300 \
+                   per-channel values in order up to 100, and no value once Idle",
+        date: "2026-11-27",
+        divergences: &[
+            "The clean-ups report nothing, so the value never starts again: upstream runs \
+             CleanDatabase over the stored channel items and then the stored programme \
+             items on the task's own progress, after its 100, and reports 100 * items \
+             looked at / items after each. Ferrofin deletes the stale rows as sets, in \
+             clean_guide and sync_channel_items before the 15 and at the end of \
+             sync_program_items. Open: owner decision pending, tracked in gl-2027.",
+            "None of the values between 10 and 15 is reported: upstream reports (5 * \
+             percent) + 10 after each channel item, and Ferrofin stores the channel items \
+             as one batch. Open: owner decision pending, tracked in gl-2027.",
+            "The run reads 10 while the listings are fetched and written to the guide's \
+             own tables, as it does for the tuners, and 100 while programme images are \
+             pre-cached: upstream reads a channel's listings (GetProgramsAsync) and \
+             pre-caches its images (PreCacheImages) inside that channel's turn of the span \
+             from 15 to 100, which here covers only the mirror into items. Ferrofin fetches \
+             every listings provider and writes its airings (insert_programs) before the \
+             15, and pre-caches after the 100; the fetches and the pre-cache run outside \
+             the guide's write lock. Open: owner decision pending, tracked in gl-2027.",
+            "A guide refresh a Live TV configuration write queues is not a run of the task \
+             (handlers/live_tv.rs queue_guide_refresh spawns refresh_guide), so the task \
+             shows no state, progress or result for it; upstream queues the task itself \
+             (CancelIfRunningAndQueue<RefreshGuideScheduledTask>). Fix path: gl-54.",
         ],
     },
     VerifiedSubsystem {
@@ -1241,14 +1317,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    item and its alternate versions over the query's user's UserData rows, or \
                    every user's when there is no user, for \
                    /Items and the other item queries (ferrofin-core translate_query.rs \
-                   push_order_expression), GET /LiveTv/Channels (ferrofin-livetv manager.rs \
-                   get_channels over guide_repository.rs channel_user_data or \
-                   channel_last_played_by_anyone, then projection.rs sort_channel_rows) and \
-                   the guide (manager.rs push_program_sort_key). A channel and a programme \
+                   push_order_expression), and GET /LiveTv/Channels and the guide \
+                   (ferrofin-livetv manager.rs push_item_sort_key, over the channel's or \
+                   programme's stored item, gl-1681). A channel and a programme \
                    have no alternate versions, so their key is their own rows' alone. \
                    Compared with OrderMapper.MapOrderByField's DatePlayed arm at the pinned \
                    v12.4 tag.",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: &[
             "A sortOrder with more entries than a non-empty sortBy has keys has the extra \
              entries ignored; upstream's GetOrderBy indexes past the sortBy array, which \
@@ -1417,11 +1492,73 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              timeout on the body, so a stalled connection records nothing more until the \
              programme ends. Jellyfin bug not ported.",
             "The tuner URL is opened with the source's RequiredHttpHeaders (an M3U tuner's \
-             User-Agent), as playback opens it; upstream's recorder sends none, so a provider \
+             User-Agent), as playback opens it; upstream's recorder sends none of them, so a provider \
              that needs them refuses its recordings. Jellyfin bug not ported.",
             "A tuner answering an error status fails the attempt, which retries; upstream never \
              checks the status, records the error body as the programme and settles it \
              Completed. Jellyfin bug not ported.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "outbound-http",
+        upstream_file: "Jellyfin.Server/Startup.cs",
+        upstream_method: "ConfigureServices",
+        ferrofin: "The defaults of the requests upstream sends through NamedClient.Default. \
+                   ferrofin-util http_client.rs builder names the server in the User-Agent, \
+                   sends DEFAULT_ACCEPT (application/json; q=1.0, application/xml; q=0.9, \
+                   */*; q=0.8, as .NET writes the three MediaTypeWithQualityHeaderValues), \
+                   either of which a request's own header replaces, as \
+                   HttpHeaders.AddHeaders keeps a request's own header, decodes gzip, deflate \
+                   and brotli (AutomaticDecompression = All), and answers a redirect from \
+                   https to http, or past MAX_REDIRECTS, with the 3xx, unfollowed, as \
+                   SocketsHttpHandler returns it: the Live TV fetcher and the subtitle read \
+                   fail on it, as EnsureSuccessStatusCode does, the tuner source fails on it \
+                   as on an error status (below), the remote static stream relays its \
+                   status, as GetStaticRemoteStreamResult copies response.StatusCode, and a \
+                   plugin repository is skipped. Built on \
+                   by ferrofin-providers \
+                   http_client.rs builder (every provider client and the guarded downloads, \
+                   for ProviderManager.SaveImage and the AudioDb, OMDb, Studio Images, \
+                   ListenBrainz and TheMovieDb providers; a redirect it does not follow is an \
+                   error there, which a provider reads as it reads the 3xx), ferrofin-livetv \
+                   fetch.rs ReqwestFetcher (M3uParser.GetListingsStream, HdHomerunHost, \
+                   SchedulesDirect and XmlTvListingsProvider) and stream.rs \
+                   ReqwestTunerSource (SharedHttpStream.Open, M3UTunerHost.GetChannelStream's \
+                   HEAD and DirectRecorder.RecordFromMediaSource), ferrofin-core \
+                   plugin_manager.rs list_packages and download_and_verify \
+                   (InstallationManager.GetPackages and PerformPackageInstallation; the \
+                   download keeps its own redirect rule, below), \
+                   handlers/streaming.rs serve_remote_static \
+                   (FileStreamResponseHelpers.GetStaticRemoteStreamResult, for \
+                   VideosController and AudioHelper) and ferrofin-server media_encoding.rs \
+                   http_get_bytes (SubtitleEncoder.GetSubtitleStream). Compared with \
+                   ConfigureServices' AddHttpClient(NamedClient.Default) and those callers at \
+                   the pinned v12.4 tag, and with the headers Jellyfin 12.4 sent a local \
+                   listener for a plugin repository's manifest, an M3U tuner's playlist and \
+                   shared stream, and a .strm movie's static stream. The WASM plugin host and \
+                   the File Transformation and Single Sign-On clients, which upstream does not \
+                   build from the factory, are not part of this row.",
+        date: "2026-11-27",
+        divergences: &[
+            "The User-Agent names Ferrofin (Ferrofin/<version>, ferrofin-health USER_AGENT), \
+             where upstream's product header is Jellyfin-Server/<version>.",
+            "A request follows at most 10 redirects (MAX_REDIRECTS, reqwest's default), \
+             where .NET's handler follows 50.",
+            "A plugin download refuses a source and any redirect that is not https, except \
+             from a loopback repository (the transport is its trust root, as \
+             docs/EXTENSIONS.md's repository install says), and \
+             fails, rather than answering the 3xx, past MAX_REDIRECTS; \
+             PerformPackageInstallation follows NamedClient.Default's rule.",
+            "A tuner stream or recording whose tuner answers a 3xx (one the client does not \
+             follow) fails, as one answering an error status does; upstream's SharedHttpStream \
+             and DirectRecorder never check the status. Jellyfin bug not ported.",
+            "No traceparent header is sent: outbound trace-context injection is out of scope \
+             (docs/conventions/TRACING.md, section 8), where .NET adds one to every request.",
+            "A tuner's stream and its HEAD probe send the source's RequiredHttpHeaders (an \
+             M3U tuner's configured User-Agent, else its browser-shaped default), as the \
+             recorder does (the direct-recording row): upstream's SharedHttpStream and \
+             M3UTunerHost send only the client's own, so a provider that needs the \
+             configured agent refuses a shared stream. Jellyfin bug not ported.",
         ],
     },
     VerifiedSubsystem {
@@ -3400,6 +3537,83 @@ const LEGACY_HLS_AUDIO_KEEP_ALIVE: &str = "The job whose playlist's file stem pr
      deliberate, response-invisible superset: it only stops the idle reaper from killing a \
      transcode a client is reading.";
 
+/// The divergences of the two `RemoteImageController` read rows: which remote
+/// image providers are offered, unlike upstream, then the row's own `$own`.
+macro_rules! remote_image_provider_divergences {
+    ($($own:expr),* $(,)?) => {
+        &[
+            "TheTVDB (series, seasons and episodes) and fanart.tv (movies, trailers, series, \
+             seasons, artists and albums) are listed and asked too: Ferrofin compiles its remote \
+             providers in (CLAUDE.md, Current scope), where stock v12.4 lists them only with \
+             jellyfin-plugin-tvdb and jellyfin-plugin-fanart installed.",
+            "TheTVDB's movie and person image providers (TvdbMovieImageProvider, \
+             TvdbPersonImageProvider) are not ported, so a movie or a person lists no TheTVDB \
+             where the plugin offers its artwork. Fix paths: gl-1405 (movies), gl-1124 \
+             (people).",
+            "fanart.tv's provider is named FanArt (in the provider list and each candidate's \
+             ProviderName), where every provider of the Fanart plugin is named Fanart. Fix path: \
+             gl-1990.",
+            "fanart.tv's movie artwork is offered for movies and trailers, where the plugin's \
+             MovieProvider supports movies, box sets and music videos. Fix path: gl-1991.",
+            "A season's fanart.tv and TheMovieDb providers, which tie on IHasOrder (1), are \
+             listed and asked TheMovieDb first when no image order is saved; Jellyfin registers \
+             plugin assemblies first, so with the Fanart plugin it lists Fanart first (seen on \
+             12.4 with Fanart 15). Fix path: gl-2001.",
+            "A WASM plugin's remote-images candidates are neither listed nor asked (they serve \
+             the refresh's automatic pick only), where upstream lists and asks every installed \
+             plugin's IRemoteImageProvider. Fix path: gl-1992.",
+            "A nil itemId is a 404; upstream's GetItemById(Guid.Empty) throws, a 400. Fix path: \
+             gl-1695.",
+            "The 401 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+             gl-666.",
+            $($own),*
+        ]
+    };
+}
+
+/// The divergences of `GET /Items/{itemId}/RemoteImages/Providers`.
+const REMOTE_IMAGE_PROVIDERS_DIVERGENCES: &[&str] = remote_image_provider_divergences!();
+
+/// What `GET /Items/{itemId}/RemoteImages` does unlike upstream: which
+/// providers are offered, then the providers' candidates.
+const REMOTE_IMAGES_DIVERGENCES: &[&str] = remote_image_provider_divergences!(
+    "TheMovieDb's image providers look an item with no id up by its name (and a series by an \
+     IMDb or TVDB id through /find), and a season's or an episode's need the series' name, \
+     where upstream's ask only by the Tmdb id (a movie also by its IMDb id through /find) and \
+     return nothing without it. Fix path: gl-1045.",
+    "TheMovieDb's candidates still pass through 10.11's AdjustImageLanguage after \
+     GetImageLanguage, so under a preferred language that is neither two letters nor two \
+     parts (fil, zh-Hans-CN, set through the API) an image whose code is the tag's first two \
+     letters is labelled with the tag and ranked first; v12.4 has no such step. Fix path: \
+     gl-1716.",
+    "An episode's TheMovieDb stills are those of its aired-order numbers, where \
+     TmdbEpisodeImageProvider passes the series' DisplayOrder, mapped through TMDb's episode \
+     group. Fix path: gl-1784.",
+    "TheAudioDB's artist artwork needs the artist's MusicBrainz id, where \
+     AudioDbArtistImageProvider falls back to its TheAudioDB id (artist.php). Fix path: \
+     gl-497.",
+    "TheTVDB's series artwork maps artwork types 22 and 23 through a fixed table (22 a logo, \
+     23 clear art, which TheTVDB's own Kodi scraper numbers the other way round; not yet \
+     confirmed against /artwork/types), where the plugin maps each by its name through \
+     /artwork/types. Fix path: gl-1856.",
+    "TheTVDB's lookups differ from plugin 5c4592f only where a request fails or TheTVDB's \
+     data is unusual: a series' artwork comes from /series/{id}/extended rather than \
+     /series/{id}/artworks, a failed display-order season falls back to the aired one where \
+     the plugin answers none, a season's type is matched ignoring case, an episode row must \
+     match its numbers, an artwork language TheTVDB's /languages does not list is kept, and \
+     artwork with no URL is dropped. Fix path: gl-791.",
+    "TheTVDB's series artwork carries its score as CommunityRating and keeps a missing width \
+     or height unknown, so it is ordered by score within each language, where the plugin \
+     sets no rating and 0 (owner decision 2026-11-19, gl-1873).",
+    "fanart.tv's season artwork is read from the series' fanart.tv document by the series' \
+     TVDb id; the plugin's SeasonProvider looks the season's own Tmdb or Tvdb id up, which \
+     names no fanart.tv show, so it offers nothing (seen on 12.4 with Fanart 15). Jellyfin \
+     bug not ported.",
+    "fanart.tv's documents and TheAudioDB's answers are fetched on every request, where the \
+     Fanart plugin and TheAudioDB's image providers keep each on disk for 2 days, so new \
+     artwork there is offered sooner. Fix path: gl-1987.",
+);
+
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
 /// ([`UPSTREAM_TAG`], or the earlier tag [`VERIFIED_AGAINST_EARLIER_PIN`]
@@ -4572,7 +4786,7 @@ pub const VERIFIED: &[Verified] = &[
          XMLTV file that is not there) bodies are Ferrofin's error shape, not upstream's. \
          Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["outbound-http"],
     },
     Verified {
         method: "get",
@@ -4619,7 +4833,7 @@ pub const VERIFIED: &[Verified] = &[
          local XMLTV file or directory that is not there) bodies are Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["outbound-http"],
     },
     Verified {
         method: "post",
@@ -4639,7 +4853,7 @@ pub const VERIFIED: &[Verified] = &[
             "The 404 (an unknown or missing tuner Type, or an M3U playlist file that is not \
          there) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["outbound-http"],
     },
     Verified {
         method: "get",
@@ -4648,31 +4862,40 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetLiveTvChannels",
         ferrofin: "handlers/live_tv.rs get_channels (items.rs resolve_user_opt, \
                program_dto_options, add_current_program) → ferrofin-livetv manager.rs \
-               get_channels (user_restrictions; guide_repository.rs channel_rows: only the \
-               lineup channels whose item is stored, the user's parental restrictions, and \
-               isMovie/isSeries over the stored channel item's \
-               columns and isKids/isNews/isSports over its Kids/News/Sports tags; \
-               channel_user_data; projection.rs filter_channel_rows, sort_channel_rows, \
+               get_channels (user_restrictions; guide_repository.rs listed_channel_rows: \
+               only the lineup channels whose item is stored, the user's parental \
+               restrictions, isMovie/isSeries over the stored channel item's columns and \
+               isKids/isNews/isSports over its Kids/News/Sports tags, ordered over that \
+               item in SQL: GetInternalChannels' list (the sortBy keys in sortOrder, \
+               IsFavoriteOrLiked descending first for enableFavoriteSorting, SortName \
+               ascending appended whatever was asked) through manager.rs push_apply_order \
+               (ApplyOrder: Default dropped, Name after a leading SortName, \
+               SeriesDatePlayed to SortName) and push_item_sort_key (OrderMapper, StartDate \
+               the item's column), so SortName is the stored one byte-wise and Name is \
+               CleanName (gl-1681); channel_user_data; projection.rs filter_channel_rows, \
                remove_fields; channel_entity → DtoService get_base_item_dtos, which runs \
-               AddChannelInfo) (RequestHelpers.GetUserId, LiveTvManager.GetInternalChannels, \
-               BaseItemRepository.TranslateQuery, RemoveFields)",
-        date: "2026-11-10",
+               add_channel_info: CurrentProgram from one query_program_rows read of the page's \
+               airings, projected by program_dtos over the stored programme items) \
+               (RequestHelpers.GetUserId, LiveTvManager.GetInternalChannels, \
+               BaseItemRepository.TranslateQuery, RemoveFields, AddChannelInfo)",
+        date: "2026-11-26",
         divergences: &[
             "type keeps the channels of that ChannelType, as the parameter documents; \
          upstream's GetInternalChannels never passes LiveTvChannelQuery.ChannelType on and \
          lists every channel. Jellyfin bug not ported.",
-            "Every sortBy key but SortName, Name, IsFavoriteOrLiked and DateCreated compares \
-         equal, so the appended SortName decides; upstream's OrderMapper sorts on them. Fix \
-         path: gl-1354.",
             "isFavorite and isLiked with no user (an API key naming none) match no channel \
-         when true and every channel when false, and enableFavoriteSorting sorts nothing; \
-         upstream's TranslateQuery and OrderMapper dereference the null user \
-         (filter.User!.Id) and fail the request. Jellyfin bug not ported.",
+         when true and every channel when false, enableFavoriteSorting sorts nothing, and a \
+         user-data sortBy key but DatePlayed sorts on SortName, as /Items does; upstream's \
+         TranslateQuery and OrderMapper dereference the null user (filter.User!.Id) and \
+         fail the request. Jellyfin bug not ported.",
+            "CurrentProgram is the airing whose guide row is on now, so a programme's EndDate \
+         changed on its item (POST /Items/{itemId}) does not change which airing is picked; \
+         upstream's AddChannelInfo queries the stored items. Fix path: gl-1997.",
             "The 400 (a value the query binder cannot convert) and 403 (another user's id \
          without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
          Fix path: gl-666.",
         ],
-        refs: &["access-filtering", "user-data"],
+        refs: &["access-filtering", "user-data", "guide-programme-items"],
     },
     Verified {
         method: "get",
@@ -4731,9 +4954,11 @@ pub const VERIFIED: &[Verified] = &[
                StartDate default order, the librarySeriesId block) → ferrofin-livetv \
                manager.rs get_programs (stored_series_timer for seriesTimerId, \
                user_restrictions, program_rows_query (the stored programme item joined by \
-               id) over push_program_filters, push_program_order with \
-               push_program_sort_key and push_program_paging, the PROGRAM_COUNT total, \
-               projection.rs remove_fields, program_dtos → program_entity and dto_service.rs \
+               id) over push_program_filters, push_program_order over push_apply_order \
+               and push_item_sort_key, push_program_paging, the PROGRAM_COUNT total, \
+               projection.rs remove_fields, program_dtos → program_items_by_id (the page's \
+               programme items in one ItemRepository retrieve_items read; projection.rs \
+               program_entity for an airing with none) and dto_service.rs \
                get_base_item_dtos, apply_program_info, add_recording_info → \
                scheduled_timers_for over dvr_repository.rs scheduled_timers_for_programs, \
                timer_program_ids, apply_recording_info, then series_timers_by_name over \
@@ -4744,20 +4969,17 @@ pub const VERIFIED: &[Verified] = &[
                OrderMapper, RemoveFields, DtoService.GetBaseItemDtos, AddInfoToProgramDto, \
                AddRecordingInfo, GetTimersInternal, DefaultLiveTvService.GetTimersAsync, \
                GetSeriesTimersInternal)",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: &[
             "With no user (an API key), sortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags, \
-         PremiereDate, Audio and an HD listing's Width and Height) are read from the guide \
-         table, so a change saved to a programme's item (POST /Items/{itemId}) is not shown \
-         here. CommunityRating, which no listing sets, is never shown. Upstream lists the \
-         stored item, the change included, until a guide refresh that updates the programme \
-         assigns the listing's values over it. A PremiereDate an earlier listing stored is \
-         no longer shown once a later one makes the airing a first-run episode, nor is a \
-         1280x720 size once the listing is not HD; upstream's item keeps both. Fix path: \
-         gl-1690.",
+            "The isNews, isKids and isSports filters, the genres filter (by name; genreIds \
+         reads the stored item), the librarySeriesId name scope and the minEndDate, \
+         maxEndDate, hasAired and isAiring windows match the guide table, so a programme's \
+         tags, genres, name or EndDate changed on its item (POST /Items/{itemId}) does not \
+         change what they keep, though an edited EndDate shows in the DTO; upstream's \
+         TranslateQuery filters the stored items. Fix path: gl-1997.",
             "A malformed id in channelIds or genreIds is a 400; upstream's \
          CommaDelimitedCollectionModelBinder drops it. Fix path: gl-884.",
             "The 400 (a value the query binder cannot convert) and 403 (another user's id \
@@ -4782,9 +5004,12 @@ pub const VERIFIED: &[Verified] = &[
                LibrarySeriesId block) → ferrofin-livetv manager.rs get_programs \
                (stored_series_timer for SeriesTimerId, user_restrictions, program_rows_query \
                (the stored programme item joined by id) over push_program_filters, \
-               push_program_order with push_program_sort_key and push_program_paging, the \
+               push_program_order over push_apply_order and push_item_sort_key, \
+               push_program_paging, the \
                PROGRAM_COUNT total, projection.rs remove_fields, program_dtos → \
-               program_entity and dto_service.rs get_base_item_dtos, apply_program_info, \
+               program_items_by_id (the page's programme items in one ItemRepository \
+               retrieve_items read; projection.rs program_entity for an airing with none) and \
+               dto_service.rs get_base_item_dtos, apply_program_info, \
                add_recording_info → scheduled_timers_for over dvr_repository.rs \
                scheduled_timers_for_programs, timer_program_ids, apply_recording_info, then \
                series_timers_by_name over dvr_repository.rs series_timer_series_ids for a \
@@ -4794,7 +5019,7 @@ pub const VERIFIED: &[Verified] = &[
                BaseItemRepository.TranslateQuery and ApplyOrder, OrderMapper, RemoveFields, \
                DtoService.GetBaseItemDtos, AddInfoToProgramDto, AddRecordingInfo, \
                GetTimersInternal, DefaultLiveTvService.GetTimersAsync, GetSeriesTimersInternal)",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: &[
             "A body UserId naming another user, sent without the administrator role, is a 403 \
          (the RequestHelpers.GetUserId rule GET applies); upstream's GetPrograms reads \
@@ -4808,15 +5033,12 @@ pub const VERIFIED: &[Verified] = &[
             "With no body UserId, SortBy PlayCount, IsFavoriteOrLiked, IsPlayed or \
          IsUnplayed sorts by SortName, as /Items does; upstream's OrderMapper reads the \
          missing user's id (query.User!.Id), which throws. Jellyfin bug not ported.",
-            "The listing's fields (Name, Overview, OfficialRating, Genres, the flags, \
-         PremiereDate, Audio and an HD listing's Width and Height) are read from the guide \
-         table, so a change saved to a programme's item (POST /Items/{itemId}) is not shown \
-         here. CommunityRating, which no listing sets, is never shown. Upstream lists the \
-         stored item, the change included, until a guide refresh that updates the programme \
-         assigns the listing's values over it. A PremiereDate an earlier listing stored is \
-         no longer shown once a later one makes the airing a first-run episode, nor is a \
-         1280x720 size once the listing is not HD; upstream's item keeps both. Fix path: \
-         gl-1690.",
+            "The isNews, isKids and isSports filters, the genres filter (by name; genreIds \
+         reads the stored item), the librarySeriesId name scope and the minEndDate, \
+         maxEndDate, hasAired and isAiring windows match the guide table, so a programme's \
+         tags, genres, name or EndDate changed on its item (POST /Items/{itemId}) does not \
+         change what they keep, though an edited EndDate shows in the DTO; upstream's \
+         TranslateQuery filters the stored items. Fix path: gl-1997.",
             "The 400 (a body that does not bind) body is Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
@@ -4896,7 +5118,7 @@ pub const VERIFIED: &[Verified] = &[
          Type, or a local XMLTV file or directory that is not there) and 500 (a guide that \
          cannot be read) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["outbound-http"],
     },
     Verified {
         method: "post",
@@ -4951,7 +5173,7 @@ pub const VERIFIED: &[Verified] = &[
          guide that cannot be read) bodies are Ferrofin's error shape, not upstream's. Fix \
          path: gl-666.",
         ],
-        refs: &[],
+        refs: &["outbound-http"],
     },
     Verified {
         method: "post",
@@ -5172,8 +5394,8 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-livetv manager.rs get_timers_matching (get_timers, \
                DefaultLiveTvService.GetTimersAsync: every timer but a Completed one; \
                ferrofin-traits live_tv.rs filter_timers) → build_timer_dto for each \
-               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos with \
-               DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
+               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos, over \
+               the stored programme item, with DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
                DtoOptions()) with AddInfoToProgramDto, then TimerId and Status unless Cancelled \
                or Error, SeriesTimerId, and for a series timer's timer fill_images, \
                FillImages(BaseItemDto, …) by the timer's name and the programme's \
@@ -5182,12 +5404,8 @@ pub const VERIFIED: &[Verified] = &[
                ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window; \
                ProgramId as GetInternalProgramId(info.ProgramId) through derive_program_id over \
                the stored listing id, as stored without one)",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: &[
-            "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
-         own table, so it shows the listing's fields, not a change saved to the programme's \
-         item, nor a PremiereDate or 1280x720 size an earlier listing stored. Fix path: \
-         gl-1690.",
             "A series timer's timer whose name is blank runs no lookup by name, so its \
          ProgramInfo takes no Thumb or Backdrop from a library series, and without a listings \
          series id no Primary from a guide programme; upstream's FillImages then filters on \
@@ -5233,8 +5451,8 @@ pub const VERIFIED: &[Verified] = &[
                timer but a Completed one; ferrofin-traits live_tv.rs filter_timers: isActive as \
                InProgress, isScheduled as New, channelId and seriesTimerId compared as GUIDs, \
                ordered by StartDate) → build_timer_dto for each \
-               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos with \
-               DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
+               (LiveTvDtoService.GetTimerInfoDto: program_row_for_timer and program_dtos, over \
+               the stored programme item, with DtoOptions::default and no user for ProgramInfo, GetBaseItemDto(program, new \
                DtoOptions()) with AddInfoToProgramDto, then TimerId and Status unless Cancelled \
                or Error, SeriesTimerId, and for a series timer's timer fill_images, \
                FillImages(BaseItemDto, …) by the timer's name and the programme's \
@@ -5243,7 +5461,7 @@ pub const VERIFIED: &[Verified] = &[
                ChannelPrimaryImageTag, none without the channel; RunTimeTicks from the window; \
                ProgramId as GetInternalProgramId(info.ProgramId) through derive_program_id over \
                the stored listing id, as stored without one)",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: &[
             "A channelId or seriesTimerId that is no GUID matches no timer; upstream's new Guid \
          throws a FormatException, a 500. Jellyfin bug not ported.",
@@ -5251,10 +5469,6 @@ pub const VERIFIED: &[Verified] = &[
          defaults' Id) matches no timer; upstream hashes each timer's empty SeriesTimerId to \
          that id (GetInternalSeriesTimerId), so it lists every timer of no series timer. \
          Jellyfin bug not ported.",
-            "ProgramInfo is the programme DTO GET /LiveTv/Programs projects from the guide's \
-         own table, so it shows the listing's fields, not a change saved to the programme's \
-         item, nor a PremiereDate or 1280x720 size an earlier listing stored. Fix path: \
-         gl-1690.",
             "A series timer's timer whose name is blank runs no lookup by name, so its \
          ProgramInfo takes no Thumb or Backdrop from a library series, and without a listings \
          series id no Primary from a guide programme; upstream's FillImages then filters on \
@@ -5276,11 +5490,12 @@ pub const VERIFIED: &[Verified] = &[
                (LiveTvManager.GetNewTimerDefaults and GetNewTimerDefaultsInternal: \
                ferrofin-traits live_tv.rs new_timer_defaults for \
                DefaultLiveTvService.GetNewTimerDefaultsAsync, with live_tv_options' padding; for \
-               a programme, program_row and its name, overview, channel, window, RecordNewOnly \
-               and SkipEpisodesInLibrary from IsRepeat, ProgramId and ExternalProgramId; then \
-               GetSeriesTimerInfoDto's FillImages(dto, program.Name, null) through fill_images: \
-               first_with_image, item_images and image_tag)",
-        date: "2026-11-14",
+               a programme, program_row for its channel, start, RecordNewOnly and \
+               SkipEpisodesInLibrary from IsRepeat, ProgramId and ExternalProgramId, and \
+               program_items_by_id for the stored item's Name, Overview and EndDate, the guide \
+               row's without one; then GetSeriesTimerInfoDto's FillImages(dto, program.Name, \
+               null) through fill_images: first_with_image, item_images and image_tag)",
+        date: "2026-11-26",
         divergences: &[
             "A programId that does not parse is the binder's 400; upstream's new Guid throws a \
          FormatException, a 500. Jellyfin bug not ported.",
@@ -5291,6 +5506,9 @@ pub const VERIFIED: &[Verified] = &[
          no artwork; upstream's FillImages with no name filters on nothing and gives them the \
          library's first series' Thumb, Backdrop and Primary. Fix path: gl-1790, an owner \
          decision.",
+            "ChannelName comes from the lineup table, so a channel's name changed on its item \
+         (POST /Items/{itemId}) is not shown; upstream takes it from GetProgram's DTO, whose \
+         AddInfoToProgramDto reads the channel item. Fix path: gl-1997.",
             "The 400 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &["images", "guide-programme-items"],
@@ -7233,7 +7451,7 @@ pub const VERIFIED: &[Verified] = &[
          or bad token) and 403 (not an administrator) bodies are Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["guide-refresh-progress"],
     },
     Verified {
         method: "get",
@@ -7254,7 +7472,7 @@ pub const VERIFIED: &[Verified] = &[
             "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
          id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["guide-refresh-progress"],
     },
     Verified {
         method: "delete",
@@ -7269,15 +7487,26 @@ pub const VERIFIED: &[Verified] = &[
                run's token cancelled, State Cancelling until the run returns) → \
                execute_contained and finish (ExecuteInternal: the run records Cancelled when \
                its body stopped for it, else its own outcome, then ExecuteQueuedTasks)",
-        date: "2026-11-11",
+        date: "2026-11-27",
         divergences: &[
             "Stopping a task that is idle or already stopping answers 204 and changes nothing; \
          upstream's Cancel throws InvalidOperationException there, a 500. Jellyfin bug not \
          ported.",
             "A body still running STOP_WAIT (2 s) after the stop is dropped and recorded \
-         Cancelled; upstream waits for ExecuteAsync however long it takes. Fix path: every \
-         task body checks its token as upstream's do (gl-1709); the value is a candidate \
+         Cancelled; upstream waits for ExecuteAsync however long it takes. The ferrofin-core \
+         bodies check their token where upstream's do (gl-129, gl-1709, gl-2004, gl-2013), \
+         but work running when the wait ends is still cut off mid-item. The Keyframe \
+         Extractor, the five library bodies, Update Plugins and Migrate Trickplay Image \
+         Location hand their per-item work no token, and Optimize database checks only \
+         before its first statement (gl-2006). The guide refresh writes a tuner's channels, \
+         and a listings provider's airings, as one write each and checks before it, where \
+         upstream checks before each channel (gl-2006). The extensions' and WASM bodies \
+         check none (gl-2005). Fix path: gl-2005 and gl-2006; the value is a candidate \
          setting (gl-1710).",
+            "Optimize database records a run stopped before its optimisation Cancelled; \
+         upstream's catch (Exception) around RunScheduledOptimisation swallows the \
+         cancellation, logs it as an error and records the run Completed. Jellyfin bug not \
+         ported.",
             "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
          id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -7294,14 +7523,21 @@ pub const VERIFIED: &[Verified] = &[
                TaskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>) → ferrofin-core \
                scheduled_tasks.rs cancel (CancelIfRunning) and queue_scheduled \
                (QueueScheduledTask with new TaskOptions(): started when Idle, else queued \
-               until the cancelled run has ended); a failure is logged as \"Error refreshing \
-               library\" and the answer is 204 either way, as the controller's catch",
-        date: "2026-11-11",
+               until the cancelled run has ended, which RefreshLibraryTask::execute does \
+               once the scan its stop cancelled has: LibraryManager::stopped_scan_ended, as \
+               RefreshMediaLibraryTask.ExecuteAsync returns when \
+               ValidateMediaLibraryInternal does; a scan another request joined while it \
+               was queued is not cancelled and runs on for that request); a failure is \
+               logged as \"Error refreshing library\" and the answer is 204 either way, as \
+               the controller's catch",
+        date: "2026-11-27",
         divergences: &[
-            "A Scan Media Library run the refresh cancels ends when its scan wait is \
-         withdrawn, before the scan's item in progress does; upstream's run stays Cancelling \
-         until ValidateMediaLibraryInternal returns. The scan queue still starts the new \
-         scan after the stopping one. Fix path: gl-1709.",
+            "A Scan Media Library run the refresh cancels waits for its scan to end for \
+         STOP_WAIT (2 s) at most, then is recorded Cancelled while the scan finishes its item \
+         (or the item refresh it is serving); upstream's run stays Cancelling until \
+         ValidateMediaLibraryInternal returns, however long. The scan queue still starts the \
+         new scan after the stopping one. Fix path: the wait goes once every task body \
+         stops on its own (gl-2005, gl-2006); its value is a candidate setting (gl-1710).",
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
          error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -7641,6 +7877,87 @@ pub const VERIFIED: &[Verified] = &[
             "The 401 (no or bad token) body is Ferrofin's error shape, not upstream's. Fix \
          path: gl-666.",
         ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/RemoteImages",
+        upstream_file: "Jellyfin.Api/Controllers/RemoteImageController.cs",
+        upstream_method: "GetRemoteImages",
+        ferrofin: "handlers/remote_images.rs get_remote_images (RequireAuth, the controller's \
+               [Authorize]; type, startIndex, limit, providerName and includeAllLanguages, \
+               false by default; require_item, GetItemById(itemId, User.GetUserId()): a \
+               missing item, or one a signed-in user cannot see, is a 404, and an API key's \
+               caller is not checked; RemoteImageQuery with IncludeDisabledProviders; the \
+               provider list GetRemoteImageProviderInfo filtered to those whose \
+               SupportedImages hold type, its names Distinct(OrdinalIgnoreCase); \
+               TotalRecordCount before paging, then Skip(startIndex) and Take(limit), a \
+               negative skip skipping none and a negative take taking none) → \
+               ferrofin-providers provider_manager.rs get_available_remote_images → \
+               available_images_for (ProviderManager.GetAvailableRemoteImages: \
+               ordered_image_sources, GetRemoteImageProviders through \
+               GetImageProvidersInternal: image_sources_for's Supports per kind in \
+               registration order (a season's fanart.tv and TheMovieDb tie excepted, see the \
+               divergences), then the library's TypeOptions ImageFetcherOrder, else the \
+               server's, matched exactly, \
+               then library_options.rs default_image_order's IHasOrder, a stable sort; \
+               providerName matched OrdinalIgnoreCase; type matched against \
+               GetSupportedImages; IncludeDisabledProviders, so CanRefreshImages' lock, extra \
+               and enabled-fetcher checks do not apply; GetPreferredMetadataLanguage through \
+               preferred_metadata_language; every provider asked together, Task.WhenAll, and \
+               their blocks joined in provider order; per provider GetImages' type filter, \
+               its language filter unless includeAllLanguages (no language, the preferred \
+               one, or en, when the preferred language is not blank) and ferrofin-model \
+               extensions.rs order_by_language_descending, OrderByLanguageDescending) → \
+               images_from, each provider's GetImages: tmdb_images through tmdb.rs \
+               all_images, season_images, episode_images, collection_images and \
+               person_images (TmdbMovieImageProvider, Order 0, a Tmdb id else an Imdb id \
+               through /find; TmdbSeriesImageProvider, 2; TmdbSeasonImageProvider and \
+               TmdbEpisodeImageProvider, 1, by the series' Tmdb id and the season and \
+               episode numbers, an episode with no season number in season 1; \
+               TmdbBoxSetImageProvider and TmdbPersonImageProvider, 0; \
+               ConvertToRemoteImageInfo: the size setting per family, the ThumbnailSizes \
+               preview, the dimensions only at the original size, vote average and count, \
+               GetImageLanguage with the region added only when it contradicts the request \
+               and \"\" for an untagged image, a languaged backdrop as a Thumb, RatingType \
+               Score), tvdb_images and tvdb.rs (jellyfin-plugin-tvdb 5c4592f \
+               TvdbSeriesImageProvider, TvdbSeasonImageProvider in the series' display order \
+               else the aired one, TvdbEpisodeImageProvider, no IHasOrder so 50; \
+               tvdb_image_language, NormalizeToJellyfin's culture match and its zhtw, pt and \
+               por overrides), fanart_images and fanart_season_images through fanart.rs \
+               (jellyfin-plugin-fanart 15, the release Jellyfin 12.4's plugin catalogue \
+               installs: MovieProvider, SeriesProvider, SeasonProvider, ArtistProvider and \
+               AlbumProvider, their Order 1, 1, 1, 0 and 1; each array's fixed width and \
+               height, a series or season thumb added before 2016-01-08 at 500x281, the \
+               series leg's season filter, the URL as given and its /bigpreview/ twin as \
+               the thumbnail, likes read as int.TryParse reads them, 00 as no language, \
+               the album matched by its release or release-group id, the plugin's \
+               width-first sort; RatingType Likes), keyed_images (AudioDbArtistImageProvider, \
+               Order 1, and AudioDbAlbumImageProvider, 2, through audiodb.rs: the artist's \
+               thumb, logo, banner and three fanart, the album's thumb and CD art; \
+               OmdbImageProvider, 90, the Imdb id's Poster, N/A as none; \
+               StudiosImageProvider through studios.rs, GetComparableName against the \
+               repository's thumbs.txt, kept a day). Compared at the pinned v12.4 tag, and \
+               live on 12.4 with Fanart 15.0.0.0 installed",
+        date: "2026-11-26",
+        divergences: REMOTE_IMAGES_DIVERGENCES,
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/RemoteImages/Providers",
+        upstream_file: "Jellyfin.Api/Controllers/RemoteImageController.cs",
+        upstream_method: "GetRemoteImageProviders",
+        ferrofin: "handlers/remote_images.rs get_remote_image_providers (RequireAuth; \
+               require_item's 404, as for GET /Items/{itemId}/RemoteImages) → \
+               ferrofin-providers provider_manager.rs get_remote_image_provider_info \
+               (ProviderManager.GetRemoteImageProviderInfo: GetRemoteImageProviders(item, \
+               true) in ordered_image_sources' order, each provider's Name and \
+               GetSupportedImages, RemoteImageSource::supported_images, each list verbatim \
+               from the C# provider). Compared at the pinned v12.4 tag, and live on 12.4 \
+               with Fanart 15.0.0.0 installed",
+        date: "2026-11-26",
+        divergences: REMOTE_IMAGE_PROVIDERS_DIVERGENCES,
         refs: &[],
     },
     Verified {

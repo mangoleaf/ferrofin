@@ -1528,6 +1528,19 @@ pub trait LibraryManager: Send + Sync {
         self.run_library_scan(ScanTrigger::Api, progress).await
     }
 
+    /// Resolves once no scan that was told to stop is still running: at once
+    /// unless the running scan was cancelled, otherwise when it has ended.
+    ///
+    /// For the "Scan Media Library" run. Its stop withdraws its wait
+    /// ([`run_library_scan`](Self::run_library_scan)), and the scan it leaves
+    /// ends at its next item: the run waits here for that, so it stays
+    /// `Cancelling` until its scan has ended, as upstream's does until
+    /// `ValidateMediaLibraryInternal` returns.
+    ///
+    /// A manager with no scanner runs no scan, so the default resolves at
+    /// once.
+    async fn stopped_scan_ended(&self) {}
+
     /// Whether a full library validation is running: upstream's
     /// `ILibraryManager.IsScanRunning`, which `ValidateMediaLibraryInternal`
     /// holds for the whole of a full scan (the "Scan Media Library" task,

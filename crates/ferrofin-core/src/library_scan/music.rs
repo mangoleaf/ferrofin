@@ -1913,17 +1913,19 @@ impl LibraryScanner {
                 }
                 if fetch.fanart_images
                     && needs(fetcher_names::FANART)
-                    && let (Some(fanart), Some(group), Some(artist)) = (
-                        &self.fanart,
-                        group.as_deref(),
-                        valid_id(ids, "MusicBrainzAlbumArtist"),
-                    )
+                    && let (Some(fanart), Some(artist)) =
+                        (&self.fanart, valid_id(ids, "MusicBrainzAlbumArtist"))
                 {
                     let fanart = fanart
                         .as_ref()
                         .clone()
                         .with_language(&work.policy.metadata_language());
-                    fanart_found.extend(fanart.album_images(&artist, group).await);
+                    let release = valid_id(ids, "MusicBrainzAlbum");
+                    fanart_found.extend(
+                        fanart
+                            .album_images(&artist, release.as_deref(), group.as_deref())
+                            .await,
+                    );
                 }
             }
             MusicKind::Artist | MusicKind::ByNameArtist => {
