@@ -18,10 +18,12 @@
 //! (`AudioLanguages` / `SubtitleLanguages`), `HasSubtitles`, the four
 //! `HasNo*TrackWithLanguage` filters and `HasChapterImages` with v12's
 //! alternate-version and folder roll-up
-//! (`push_item_version_or_folder_matching`), `HasOfficialRating` and
-//! `IsPlaceHolder` with v12's item-or-descendant roll-up
-//! (`push_item_or_descendant_matching`), the provider-id maps
-//! (`WhereProviderMatch`), `TrailerTypes`, `HasDeadParentId`,
+//! (`push_item_version_or_folder_matching`), `OfficialRatings`,
+//! `HasOfficialRating`, `VideoTypes`, `Is3D`, `IsPlaceHolder` and the four
+//! extras filters (`HasTrailer`, `HasThemeSong`, `HasThemeVideo`,
+//! `HasSpecialFeature`, with `WithPrimaryVersions`) with v12's
+//! item-or-descendant roll-up (`push_item_or_descendant_matching`), the
+//! provider-id maps (`WhereProviderMatch`), `TrailerTypes`, `HasDeadParentId`,
 //! `SeriesStatuses`, the parental-rating chain, and the resolution filters
 //! (`IsHD` / `Is4K`, `Min`/`Max` `Width`/`Height`) with v12's
 //! `VersionsMatchingDimension` and, for `IsHD` / `Is4K`, the folder
@@ -1136,9 +1138,16 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
             ));
         });
     }
+    // `OfficialRatings` takes the same roll-up (`TranslateQuery.cs:684-688`).
     if !filter.official_ratings.is_empty() {
         qb.push(" AND ");
-        push_in_list(qb, r#"bi."OfficialRating""#, &filter.official_ratings);
+        push_item_or_descendant_matching(qb, &|qb, alias| {
+            push_in_list(
+                qb,
+                &format!(r#"{alias}."OfficialRating""#),
+                &filter.official_ratings,
+            );
+        });
     }
 
     // `e.TrailerTypes!.Any(w => trailerTypes.Contains(w.Id))`
@@ -1552,15 +1561,21 @@ fn append_resolution_predicate(qb: &mut QueryBuilder<Sqlite>, filter: &InternalI
 
 /// Appends `IncludeItemTypes` / `ExcludeItemTypes` as `Type` in/not-in lists.
 ///
-/// With an `Ids` list in the query the `Type` column is written `+bi."Type"`
-/// so no `Type`-led index can serve it: 12.0 dropped
+/// With an `Ids` list or a person filter in the query the `Type` column is
+/// written `+bi."Type"` so no `Type`-led index can serve it: 12.0 dropped
 /// `IX_BaseItems_Id_Type_IsFolder_IsVirtualItem`, and without it a single
 /// `Type` equality ties with the `Id` primary key in the planner's costing and
 /// wins — a scan of every row of that type (3,001 movies on the bench corpus)
 /// instead of a handful of key lookups. The `Ids` list is always the selective
-/// side, so the pin loses nothing.
+/// side, so the pin loses nothing. A person's credits
+/// ([`append_people_predicates`]) are the same kind of list: unpinned, one
+/// type in one library walks a `Type`-led index for the order it gives for
+/// free (`…_PresentationUniqueKey` for the grouping, `…_SortName` for a
+/// `SortName` page) and tests every row against the list.
 fn append_type_filters(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
-    let column = if filter.item_ids.is_empty() {
+    let credits_listed =
+        non_blank(filter.person.as_ref()).is_some() || !filter.person_ids.is_empty();
+    let column = if filter.item_ids.is_empty() && !credits_listed {
         r#"bi."Type""#
     } else {
         r#"+bi."Type""#
@@ -1858,7 +1873,7 @@ fn build_box_set_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryB
 /// feature), then the `Data`-blob matches ([`append_data_blob_predicates`]).
 ///
 /// Ports of C# `TranslateQuery`'s `HasSubtitles`, `HasChapterImages`,
-/// `ImageTypes` and the `ExtraIds`-backed extra filters; the anti-join
+/// `ImageTypes` and the owned-extra filters; the anti-join
 /// (`not_offered_to_plugin`) is Ferrofin's own.
 fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     // Subtitle presence (v12 `TranslateQuery.cs:897-918`, criteria
@@ -1916,66 +1931,59 @@ fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
         qb.push(")");
     }
 
-    // Owned extras: `ExtraType` discriminants match `extra_type_from_disc`
-    // (2 = Trailer, 8 = ThemeSong, 9 = ThemeVideo).
-    let mut extra_exists = |want: bool, cond: &str| {
-        qb.push(if want {
-            " AND EXISTS "
-        } else {
-            " AND NOT EXISTS "
-        })
-        .push(format!(
-            r#"(SELECT 1 FROM "BaseItems" x
-                WHERE x."OwnerId" = bi."Id" AND {cond})"#
-        ));
-    };
-    if let Some(want) = filter.has_trailer {
-        extra_exists(want, r#"x."ExtraType" = 2"#);
-    }
-    if let Some(want) = filter.has_theme_song {
-        extra_exists(want, r#"x."ExtraType" = 8"#);
-    }
-    if let Some(want) = filter.has_theme_video {
-        extra_exists(want, r#"x."ExtraType" = 9"#);
-    }
-    // A "special feature" is any owned extra that is not unknown/trailer/theme
-    // (C# `BaseItem.DisplayExtraTypes` complement used by `HasSpecialFeature`).
-    if let Some(want) = filter.has_special_feature {
-        extra_exists(
-            want,
-            r#"x."ExtraType" IS NOT NULL AND x."ExtraType" NOT IN (0, 2, 8, 9)"#,
-        );
+    // Owned extras (`TranslateQuery.cs:1210-1274`): `ExtraType` discriminants
+    // match `extra_type_from_disc` (2 = Trailer, 8 = ThemeSong, 9 = ThemeVideo);
+    // a special feature is any other extra but `Unknown` (0).
+    for (want, extra_type) in [
+        (
+            filter.has_special_feature,
+            r#"x."ExtraType" NOT IN (0, 2, 8, 9)"#,
+        ),
+        (filter.has_trailer, r#"x."ExtraType" = 2"#),
+        (filter.has_theme_song, r#"x."ExtraType" = 8"#),
+        (filter.has_theme_video, r#"x."ExtraType" = 9"#),
+    ] {
+        if let Some(want) = want {
+            qb.push(if want { " AND " } else { " AND NOT " });
+            push_item_or_descendant_matching(qb, &|qb, alias| {
+                push_extra_owner(qb, alias, extra_type);
+            });
+        }
     }
 
     append_data_blob_predicates(qb, filter);
 }
 
-/// The filters matched inside the serialized `Data` blob, by substring as C#
-/// does: video types and 3D, placeholders (rolled up), series statuses and
-/// box-set library folders.
+/// The filters matched inside the serialized `Data` blob, by ordinal
+/// substring as C# does: video types, 3D and placeholders (rolled up), series
+/// statuses and box-set library folders.
 fn append_data_blob_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
-    // Video types / 3D live inside the serialized `Data` blob, matched by
-    // substring exactly as C# does (`"VideoType":"BluRay"` / `Video3DFormat`).
+    // `"VideoType":"<t>"` or `"IsoType":"<t>"` in `Data` (a disc is a folder
+    // rip or an image), and `Video3DFormat`, rolled up like `HasOfficialRating`
+    // (`TranslateQuery.cs:1181-1199`).
     if !filter.video_types.is_empty() {
-        qb.push(" AND (");
-        for (i, vt) in filter.video_types.iter().enumerate() {
-            if i > 0 {
-                qb.push(" OR ");
+        qb.push(" AND ");
+        push_item_or_descendant_matching(qb, &|qb, alias| {
+            qb.push("(");
+            for (i, vt) in filter.video_types.iter().enumerate() {
+                if i > 0 {
+                    qb.push(" OR ");
+                }
+                let name = vt.json_name();
+                qb.push(format!(r#"instr({alias}."Data", "#))
+                    .push_bind(format!("\"VideoType\":\"{name}\""))
+                    .push(format!(r#") > 0 OR instr({alias}."Data", "#))
+                    .push_bind(format!("\"IsoType\":\"{name}\""))
+                    .push(") > 0");
             }
-            let name = vt.json_name();
-            qb.push(r#"bi."Data" LIKE "#)
-                .push_bind(format!("%\"VideoType\":\"{name}\"%"))
-                .push(r#" OR bi."Data" LIKE "#)
-                .push_bind(format!("%\"IsoType\":\"{name}\"%"));
-        }
-        qb.push(")");
+            qb.push(")");
+        });
     }
     if let Some(want) = filter.is_3d {
-        if want {
-            qb.push(r#" AND bi."Data" LIKE '%Video3DFormat%'"#);
-        } else {
-            qb.push(r#" AND (bi."Data" IS NULL OR bi."Data" NOT LIKE '%Video3DFormat%')"#);
-        }
+        qb.push(if want { " AND " } else { " AND NOT " });
+        push_item_or_descendant_matching(qb, &|qb, alias| {
+            qb.push(format!(r#"instr({alias}."Data", 'Video3DFormat') > 0"#));
+        });
     }
     // `e.Data!.Contains("IsPlaceHolder\":true")`, rolled up like
     // `HasOfficialRating` (`TranslateQuery.cs:1201-1208`).
@@ -2018,7 +2026,7 @@ fn append_data_blob_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalI
     }
 }
 
-/// v12.2 `FolderAwareFilterExtensions.WhereItemOrDescendantMatches`: the row
+/// v12.4 `FolderAwareFilterExtensions.WhereItemOrDescendantMatches`: the row
 /// matches when it satisfies `condition`, or an item below it (`AncestorIds`)
 /// or linked to it (`LinkedChildren`, any link type) does. `condition` pushes
 /// the predicate over a `BaseItems` alias.
@@ -2041,6 +2049,20 @@ fn push_item_or_descendant_matching(
         UNION SELECT a."ParentItemId" FROM "AncestorIds" a WHERE a."ItemId" IN (SELECT "Id" FROM direct)
         UNION SELECT lc."ParentId" FROM "LinkedChildren" lc WHERE lc."ChildId" IN (SELECT "Id" FROM direct)))"#,
     );
+}
+
+/// The `condition` v12.4 hands the item-or-descendant roll-up for an extras
+/// filter (`TranslateQuery.cs:1210-1274`): `{alias}` owns an extra matching
+/// `extra_type` (over alias `x`), or is the primary of a version that does
+/// (`WithPrimaryVersions`: an extra named after a version belongs to that
+/// version). The owners are read once into `o`, and each owner's row is
+/// sought by id for its `PrimaryVersionId`.
+fn push_extra_owner(qb: &mut QueryBuilder<Sqlite>, alias: &str, extra_type: &str) {
+    qb.push(format!(
+        r#"{alias}."Id" IN (WITH o("Id") AS MATERIALIZED (SELECT x."OwnerId" FROM "BaseItems" x WHERE x."OwnerId" IS NOT NULL AND {extra_type})
+        SELECT "Id" FROM o
+        UNION ALL SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND v."Id" IN (SELECT "Id" FROM o))"#
+    ));
 }
 
 /// The language code standing for "undetermined": a list carrying it also
@@ -2727,11 +2749,20 @@ pub(crate) fn push_user_data_exists(
 }
 
 /// Appends the credited-person predicates: `person` (by name) and `person_ids`
-/// (a person's filmography). Each is an `EXISTS` over the `PeopleBaseItemMap`
-/// join, so `/Items?PersonIds=<id>` returns everything that person is credited
-/// on (port of C# `WhereContainsPerson` / the `people` sub-query). A non-empty
-/// `person_types` restricts the matching credit to those types in both arms
+/// (a person's filmography), so `/Items?PersonIds=<id>` returns everything
+/// that person is credited on (port of C# `WhereContainsPerson` / the `people`
+/// sub-query). A non-empty `person_types` restricts the matching credit to
+/// those types in both arms
 /// (`personTypes.Length == 0 || personTypes.Contains(…PersonType)`).
+///
+/// Each arm is a semi-join, as upstream's `Any` is, written uncorrelated:
+/// `bi."Id" IN (<the person's credited items>)`. SQLite builds the list once
+/// from `IX_Peoples_Name` and the map's `PeopleId` index, then seeks the items
+/// by id ([`append_type_filters`] pins `Type` off its indexes for it). As a
+/// correlated `EXISTS` the plan walked every item in scope and probed its
+/// credits row by row; a movie recommendation's "directed by" statement on a
+/// 3,000-movie library, measured alone, took about 9 ms against 0.6 ms
+/// (gl-1945).
 fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     let push_person_types = |qb: &mut QueryBuilder<Sqlite>| {
         if !filter.person_types.is_empty() {
@@ -2741,9 +2772,9 @@ fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItem
     };
     if let Some(name) = non_blank(filter.person.as_ref()) {
         qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm
-                JOIN "Peoples" pp ON pp."Id" = pm."PeopleId"
-                WHERE pm."ItemId" = bi."Id" AND pp."Name" = "#,
+            r#" AND bi."Id" IN (SELECT pm."ItemId" FROM "Peoples" pp
+                JOIN "PeopleBaseItemMap" pm ON pm."PeopleId" = pp."Id"
+                WHERE pp."Name" = "#,
         );
         qb.push_bind(name.to_owned());
         push_person_types(qb);
@@ -2756,13 +2787,16 @@ fn append_people_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItem
         // *is* a `PeopleId`, e.g. grains that coincide) OR by bridging the
         // requested item id → its `Person` name → the credited `Peoples.Name`.
         // Without the name bridge a person's filmography comes back empty.
+        // `pp."Id"`, the same value as `pm."PeopleId"` through the join, keeps
+        // both disjuncts on `Peoples` (a `MULTI-INDEX OR` over its id and name
+        // indexes); split across the two tables, the `OR` scanned the map.
         let ids = to_guid_strings(&filter.person_ids);
         qb.push(
-            r#" AND EXISTS (SELECT 1 FROM "PeopleBaseItemMap" pm
-                JOIN "Peoples" pp ON pp."Id" = pm."PeopleId"
-                WHERE pm."ItemId" = bi."Id" AND ("#,
+            r#" AND bi."Id" IN (SELECT pm."ItemId" FROM "Peoples" pp
+                JOIN "PeopleBaseItemMap" pm ON pm."PeopleId" = pp."Id"
+                WHERE ("#,
         );
-        push_in_list(qb, r#"pm."PeopleId""#, &ids);
+        push_in_list(qb, r#"pp."Id""#, &ids);
         qb.push(r#" OR pp."Name" IN (SELECT "Name" FROM "BaseItems" WHERE "#);
         push_in_list(qb, r#""Id""#, &ids);
         qb.push("))");

@@ -2,8 +2,9 @@
 //! album artists, performers and composers become its credits; a changed tag
 //! replaces them on the next probe; a `Cast` lock keeps what is stored. And
 //! `AlbumMetadataService.SetPeople`'s: every album refresh credits the album's
-//! album artists, then its artists. The ffprobe seam is a fake that answers
-//! with raw tags.
+//! album artists, then its artists. And `SaveItemAsync`'s `SupportsPeople`
+//! check: an `artist.nfo`'s credits are never stored. The ffprobe seam is a
+//! fake that answers with raw tags.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -432,5 +433,61 @@ async fn an_album_naming_no_artist_keeps_its_credits() {
             None,
             String::new()
         )]
+    );
+}
+
+/// `MusicArtist.SupportsPeople` is false (`MusicArtist.cs:73`), so the
+/// credits an `artist.nfo` lists are read with its other values but never
+/// written (`SaveItemAsync`, `MetadataService.cs:320`;
+/// `LibraryManager.UpdatePeopleAsync`): no credit row, no person.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_artist_nfo_credits_nobody() {
+    let h = harness().await;
+    let artist_dir = h.track.parent().unwrap().parent().unwrap();
+    std::fs::write(
+        artist_dir.join("artist.nfo"),
+        "<artist><biography>NFO artist bio.</biography>\
+         <actor><name>Nfo Actor</name><role>Host</role></actor>\
+         <director>Nfo Director</director></artist>",
+    )
+    .unwrap();
+    h.scanner.scan_all().await.unwrap();
+    let (artist, overview): (String, Option<String>) = sqlx::query_as(
+        r#"SELECT "Id", "Overview" FROM "BaseItems" WHERE "Type" LIKE '%Audio.MusicArtist'"#,
+    )
+    .fetch_one(h.db.pool())
+    .await
+    .expect("the scanned artist");
+    assert_eq!(
+        overview.as_deref(),
+        Some("NFO artist bio."),
+        "the NFO was read"
+    );
+    let artist = Uuid::parse_str(&artist).unwrap();
+    let credited: Vec<String> = h
+        .people
+        .get_people_batch(&[artist])
+        .await
+        .unwrap()
+        .remove(&artist)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|person| person.name)
+        .collect();
+    assert_eq!(
+        credited,
+        Vec::<String>::new(),
+        "the artist is credited with nobody"
+    );
+    let named: Vec<String> = sqlx::query_scalar(
+        r#"SELECT "Name" FROM "Peoples" WHERE "Name" IN ('Nfo Actor', 'Nfo Director')"#,
+    )
+    .fetch_all(h.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        named,
+        Vec::<String>::new(),
+        "no person row for the NFO's credits"
     );
 }

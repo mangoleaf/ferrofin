@@ -28,7 +28,9 @@ is the time from sending the request to having read the whole body, in ms.
 
 The A/B verdict per endpoint (`gate.endpoint_verdicts`) is the release gate's: each run's p50, the D4 rule of
 `gate.verdict` over the interleaved pairs, judged by the `[endpoints]` row of gate.toml (D2) or a
-per-cell band `endpoints/<id>`. An endpoint whose answers differ between runs (another status, a
+per-cell band `endpoints/<id>`. An endpoint of `RANDOM_DRAW` is judged on each run's mean instead
+(owner decision 2026-11-26): its work is drawn at random, so its latency has two modes and a p50
+lands in either one from run to run. An endpoint whose answers differ between runs (another status, a
 status that changed within a run, the request filled differently) cannot be judged, and a gated
 one then blocks, like every gated cell that cannot be judged.
 """
@@ -37,6 +39,7 @@ import argparse
 import http.client
 import json
 import os
+import statistics
 import sys
 import time
 import urllib.parse
@@ -68,6 +71,13 @@ SKIP = {
     "GetHlsAudioSegment": TRANSCODE, "GetHlsVideoSegmentLegacy": TRANSCODE, "GetHlsPlaylistLegacy": TRANSCODE,
     "GetHlsAudioSegmentLegacyAac": TRANSCODE, "GetHlsAudioSegmentLegacyMp3": TRANSCODE,
     "GetRemoteImages": REMOTE, "SearchRemoteSubtitles": REMOTE, "SearchRemoteLyrics": REMOTE, "GetRemoteSubtitles": REMOTE,
+}
+#: The catalogue GETs whose work is drawn at random by design, by request id, each with its reason: judged
+#: on each run's mean, not its p50 (`gate.endpoint_verdicts`).
+RANDOM_DRAW = {
+    "GetMovieRecommendations": "upstream draws the liked baselines in random order and breaks played-date ties at "
+                               "random, and each draw walks a different number of people to fill the categories: "
+                               "two latency modes about equally often, with a p50 that lands in either",
 }
 
 
@@ -120,13 +130,15 @@ def measure(send, path, count, max_s, clock=time.monotonic):
 
 
 def summarise(samples, expect_status):
-    """n, p50/p95/p99 (ms), each status's count (`none`: no answer) and the answers that were not `expect_status`."""
+    """n, the mean and p50/p95/p99 (ms), each status's count (`none`: no answer) and the answers that were not
+    `expect_status`."""
     ms = [t for _, t in samples]
     statuses = {}
     for status, _ in samples:
         key = "none" if status is None else str(status)
         statuses[key] = statuses.get(key, 0) + 1
-    out = {"n": len(samples), "statuses": statuses, "errors": sum(s != expect_status for s, _ in samples)}
+    out = {"n": len(samples), "statuses": statuses, "errors": sum(s != expect_status for s, _ in samples),
+           "mean": statistics.fmean(ms) if ms else None}
     out.update({f"p{q}": percentile(ms, q) for q in PERCENTILES})
     return out
 
@@ -271,6 +283,8 @@ def problem(runs):
         return next(e["skipped"] for e in runs if e.get("skipped"))
     if any(e.get("p50") is None for e in runs):
         return "not measured in a run"
+    if runs[0]["id"] in RANDOM_DRAW and any(e.get("mean") is None for e in runs):
+        return "judged on the mean, which a run measured before it was recorded does not hold"
     if len({e.get("target") for e in runs}) > 1:
         return "asked differently: " + " vs ".join(sorted({e.get("target") or "?" for e in runs}))
     statuses = [uniform_status(e) for e in runs]

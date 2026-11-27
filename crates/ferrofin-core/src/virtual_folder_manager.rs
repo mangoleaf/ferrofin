@@ -1436,11 +1436,15 @@ impl FerrofinVirtualFolderManager {
     /// background work; [`get_virtual_folders`](VirtualFolderManager::get_virtual_folders)
     /// re-sorts its response in the request's culture, as upstream's `.Order()` does.
     async fn resolve_locations(&self, folder_path: &Path) -> Result<Vec<String>, ServiceError> {
-        Ok(self.read_locations(folder_path).await?.0)
+        let mut locations = self.read_locations(folder_path).await?.0;
+        locations.sort();
+        Ok(locations)
     }
 
-    /// [`Self::resolve_locations`], with the first shortcut that resolved to
-    /// no location: one that could not be read, or an empty one.
+    /// [`Self::resolve_locations`] in the order the folder lists its
+    /// shortcuts, as `FileData.GetFilteredFileSystemEntries` adds them to the
+    /// root's locations, with the first shortcut that resolved to no
+    /// location: one that could not be read, or an empty one.
     async fn read_locations(
         &self,
         folder_path: &Path,
@@ -1476,7 +1480,6 @@ impl FerrofinVirtualFolderManager {
                 }
             }
         }
-        locations.sort();
         Ok((locations, unresolved))
     }
 
@@ -1884,7 +1887,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     /// pass, so a shortcut that fails between two reads cannot drop out of the
     /// list unnoticed, and outside a structure change, whose half-done folder
     /// (a rename's) could. What stops the removal is logged here, naming the
-    /// library.
+    /// library. The libraries and each one's shortcuts come in the order their
+    /// folders list them, unsorted, as `AggregateFolder.CreateResolveArgs`
+    /// gathers the root's locations.
     async fn locations_for_removal(&self) -> Result<Option<Vec<String>>, ServiceError> {
         let _no_change = self.structure_change.read().await;
         let mut dir = match tokio::fs::read_dir(&self.root).await {

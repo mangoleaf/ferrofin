@@ -54,8 +54,8 @@ persist media segments, register background tasks — without reaching into impl
 crates. The contracts an extension implements (`Extension`'s `ScheduledTask` and
 `PluginConfigPage`) come from `ferrofin-traits`, and so does every manager an extension calls;
 the helpers it shares with core sit below core (`ferrofin-common`, `ferrofin-db`). A new
-extension adds no `ferrofin-core` import (the two left are listed in
-[`ARCHITECTURE.md`](ARCHITECTURE.md)).
+extension adds no `ferrofin-core` import: the crate takes core only as a dev-dependency, for
+its tests.
 
 The curated set is registered **statically** in one place (`builtin_extensions()`); there is
 no discovery, no filesystem scan, no dynamic loading. Consequences:
@@ -588,7 +588,8 @@ itself** (the request resolves to the addresses that were checked, not a second
 DNS answer), closing the classic DNS-rebinding TOCTOU. When the server's
 environment sets an HTTP proxy (`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`), the proxy
 resolves the destination itself: the check then runs on the server's own DNS answer before
-the request is sent, and the pin covers the hosts the proxy settings exclude. (Referencing plugins by
+the request is sent, and a host the server reaches directly (one `NO_PROXY` lists, or of a scheme
+no proxy variable covers) is checked again, and pinned, when the server connects to it. (Referencing plugins by
 UUID in the allowlist is acknowledged UX debt — accepting plugin names is a
 planned improvement.)
 

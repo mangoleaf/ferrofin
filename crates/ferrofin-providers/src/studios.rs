@@ -221,7 +221,12 @@ impl StudiosClient {
                         .collect(),
                 )),
                 Err(e) => {
-                    tracing::warn!(url, error = %e, "studios: manifest body read failed");
+                    tracing::warn!(
+                        item_id = crate::rate_limit::request_item(),
+                        url,
+                        error = %e,
+                        "studios: manifest body read failed"
+                    );
                     return Arc::default();
                 }
             },

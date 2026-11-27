@@ -18,7 +18,7 @@
 //! plugin's defaults, which are the counterpart's too. A plugin with settings and no
 //! counterpart (Single Sign-On, Ferrofin Settings, a WASM plugin) is reported.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use ferrofin_core::config_export::{
@@ -383,7 +383,7 @@ pub(super) async fn export(
             continue;
         };
         let defaults = object(defaults);
-        let stored = state.join(counterpart.id.to_string()).join("config.json");
+        let stored = settings_file(&state, counterpart.id);
         let mut settings = defaults.clone();
         let mut holds = match tokio::fs::read(&stored).await {
             // The server's own reading of a saved document
@@ -434,6 +434,25 @@ pub(super) async fn export(
     }
     export.without_counterpart = without_counterpart(&state, &registered).await?;
     Ok(export)
+}
+
+/// The settings files [`export`] writes as XML wherever one exists, so the
+/// copy leaves them out (gl-1949): the `config.json` of each registered
+/// plugin with a counterpart, in `config`'s plugin directory. A later adoption
+/// by Ferrofin reads a plugin's XML only while that file is absent.
+pub(super) fn exported_sources(config: &Config) -> Vec<PathBuf> {
+    let (state, registered) = (config.config_dir.join("plugins"), registered());
+    counterparts()
+        .iter()
+        .filter(|counterpart| registered.iter().any(|(id, ..)| *id == counterpart.id))
+        .map(|counterpart| settings_file(&state, counterpart.id))
+        .collect()
+}
+
+/// The settings file the plugin manager keeps for the plugin `id` in its
+/// directory `state` (`FerrofinPluginManager::get_plugin_configuration`).
+fn settings_file(state: &Path, id: Uuid) -> PathBuf {
+    state.join(id.to_string()).join("config.json")
 }
 
 /// Applies the server settings that outrank a bundled plugin's own

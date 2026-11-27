@@ -602,11 +602,13 @@ pub(crate) fn is_artwork_url(value: &str) -> bool {
 }
 
 /// A remote image row for `url`: upstream's `new ItemImageInfo { Path = url,
-/// Type = type }`. The image routes serve it through the remote-image cache.
+/// Type = type }`, its `DateModified` left at `default(DateTime)`, .NET's
+/// `MinValue`. The image routes serve it through the remote-image cache.
 fn remote_image(image_type: ImageType, url: &str) -> ItemImageInfo {
     ItemImageInfo {
         path: url.to_owned(),
         image_type,
+        date_modified: ferrofin_model::json::datetime::dotnet_min(),
         ..ItemImageInfo::default()
     }
 }

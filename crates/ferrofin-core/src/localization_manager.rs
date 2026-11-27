@@ -908,22 +908,19 @@ fn build_parental_ratings_from(table: Option<&RatingTable>) -> Vec<ParentalRatin
     ratings
 }
 
-/// An item's parental rating score — `BaseItem.GetParentalRatingScore`
-/// (`BaseItem.cs:1916-1931`) over the item's OWN ratings: its custom rating
-/// when it has one, else its official rating, scored by the localization
-/// tables against the item's own metadata country, else the server's; `None`
-/// when it has neither or the rating is unknown.
+/// The score of an item's OWN ratings: its custom rating when it has one,
+/// else its official rating, scored by the localization tables against the
+/// item's own metadata country, else the server's; `None` when it has
+/// neither or the rating is unknown.
 ///
-/// TODO(parity, gl-194): open work item: upstream reads
-/// `CustomRatingForComparison` and `OfficialRatingForComparison`, which fall
-/// back to the item's `DisplayParent` (an episode or season with no rating of
-/// its own takes its series'), and scores against
-/// `GetPreferredMetadataCountryCode()` (the item's, else its library's, else
-/// the server's country). The library scan scores that way
-/// (`ItemVisibility::update_rating_scores`); this function, which the
-/// owned-video copy (`settle_rating_score`) uses, reads only the item's own
-/// ratings and country. Un-defer path: score the owned-video copy the way the
-/// scan does, so no writer disagrees with another.
+/// This is not `BaseItem.GetParentalRatingScore` (`BaseItem.cs:1949-1964`),
+/// which takes the rating along the item's `DisplayParent` and scores it
+/// against `GetPreferredMetadataCountryCode()`, the library's country
+/// included. Every stored score follows that rule
+/// (`ItemVisibility::update_rating_scores`: the scan, a refresh, a metadata
+/// edit and the owned-video copies). This is the library scan's fallback for
+/// a rated item whose hierarchy cannot be read, and for a scanner wired
+/// without that resolver.
 #[must_use]
 pub fn parental_rating_score(
     item: &ferrofin_db::entities::base_items::BaseItemEntity,
