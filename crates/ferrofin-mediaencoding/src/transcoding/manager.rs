@@ -1406,11 +1406,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         );
 
         // 7. Wait until the target file exists OR the process exits, bounded.
-        let target = state
-            .wait_for_path
-            .clone()
-            .unwrap_or_else(|| output_path.to_path_buf());
-        self.wait_for_first_output(&handle, &target).await?;
+        let target = state.wait_for_path.as_deref().unwrap_or(output_path);
+        self.wait_for_first_output(&handle, target).await?;
 
         self.wait_for_progressive_buffer(&handle, state).await;
 
