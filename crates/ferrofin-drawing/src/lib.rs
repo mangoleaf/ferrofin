@@ -1,8 +1,9 @@
 //! Image processing for Ferrofin — port of `Jellyfin.Drawing` + `Emby.Photos`.
 //!
 //! Implements the `ferrofin-traits` `ImageProcessor` / `ImageEncoder` traits via
-//! the `image` crate (decode, crop, PNG), `fast_image_resize`, libwebp for WebP
-//! and libjpeg-turbo, Skia's own JPEG codec, for JPEG; no native Skia.
+//! the `image` crate (decoding every format but JPEG, crop, PNG),
+//! `fast_image_resize`, libwebp for writing WebP and libjpeg-turbo, Skia's own
+//! JPEG codec, for reading and writing JPEG; no native Skia.
 
 pub mod error;
 pub mod image_encoder;
@@ -12,7 +13,6 @@ pub mod photo_provider;
 pub mod processor;
 mod scaled_jpeg;
 mod splashscreen;
-mod split_scans;
 
 pub use error::DrawingError;
 pub use image_encoder::ImageCrateEncoder;
