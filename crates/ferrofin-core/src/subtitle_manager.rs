@@ -203,6 +203,32 @@ impl FerrofinSubtitleManager {
             .map(|p| (p, local.to_owned()))
     }
 
+    /// [`route`](Self::route) to a provider that takes part: a disabled
+    /// plugin's provider is not registered upstream, so its ids name no
+    /// provider (gl-2025).
+    async fn route_enabled(
+        &self,
+        id: &str,
+    ) -> Result<(&Arc<dyn SubtitleProvider>, String), ServiceError> {
+        match self.route(id) {
+            Some((provider, local)) if provider.is_enabled().await => Ok((provider, local)),
+            _ => Err(ServiceError::invalid_input(
+                "unknown subtitle provider for id",
+            )),
+        }
+    }
+
+    /// The registered providers that take part (gl-2025).
+    async fn enabled_providers(&self) -> Vec<&Arc<dyn SubtitleProvider>> {
+        let mut enabled = Vec::with_capacity(self.providers.len());
+        for provider in &self.providers {
+            if provider.is_enabled().await {
+                enabled.push(provider);
+            }
+        }
+        enabled
+    }
+
     /// A failed provider contributes no candidates, letting ordered fallback
     /// proceed. An all-provider search calls this concurrently but keeps the
     /// configured provider order when assembling results.
@@ -514,8 +540,9 @@ impl SubtitleManager for FerrofinSubtitleManager {
             return Ok(Vec::new());
         }
         let mut providers: Vec<_> = self
-            .providers
-            .iter()
+            .enabled_providers()
+            .await
+            .into_iter()
             .filter(|provider| {
                 provider
                     .supported_media_types()
@@ -556,9 +583,7 @@ impl SubtitleManager for FerrofinSubtitleManager {
         item_id: Uuid,
         subtitle_id: &str,
     ) -> Result<(), ServiceError> {
-        let (provider, local) = self
-            .route(subtitle_id)
-            .ok_or_else(|| ServiceError::invalid_input("unknown subtitle provider for id"))?;
+        let (provider, local) = self.route_enabled(subtitle_id).await?;
         let downloaded = async {
             let response = provider.get_subtitles(&local).await?;
             self.attach(item_id, &response).await
@@ -580,9 +605,7 @@ impl SubtitleManager for FerrofinSubtitleManager {
     }
 
     async fn get_remote_subtitles(&self, id: &str) -> Result<SubtitleResponse, ServiceError> {
-        let (provider, local) = self
-            .route(id)
-            .ok_or_else(|| ServiceError::invalid_input("unknown subtitle provider for id"))?;
+        let (provider, local) = self.route_enabled(id).await?;
         provider.get_subtitles(&local).await
     }
 
@@ -725,8 +748,9 @@ impl SubtitleManager for FerrofinSubtitleManager {
             return Ok(Vec::new());
         };
         Ok(self
-            .providers
-            .iter()
+            .enabled_providers()
+            .await
+            .into_iter()
             .filter(|provider| provider.supported_media_types().contains(&content_type))
             .map(|p| SubtitleProviderInfo {
                 name: Some(p.name().to_owned()),
@@ -735,14 +759,26 @@ impl SubtitleManager for FerrofinSubtitleManager {
             .collect())
     }
 
+    async fn enabled_provider_names(&self) -> Option<Vec<String>> {
+        Some(
+            self.enabled_providers()
+                .await
+                .into_iter()
+                .map(|provider| provider.name().to_owned())
+                .collect(),
+        )
+    }
+
     async fn validate_provider_login(
         &self,
         provider_name: &str,
         config_json: &[u8],
     ) -> Result<ProviderLogin, ServiceError> {
+        // A disabled plugin's controller is not loaded upstream either.
         let provider = self
-            .providers
-            .iter()
+            .enabled_providers()
+            .await
+            .into_iter()
             .find(|p| p.name() == provider_name)
             .ok_or_else(|| ServiceError::not_found(format!("subtitle provider {provider_name}")))?;
         provider.validate_login(config_json).await
@@ -1761,6 +1797,73 @@ mod tests {
         assert_eq!(resp.format, "srt");
         assert!(matches!(
             mgr.get_remote_subtitles("unknown_1").await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+    }
+
+    /// A provider a disabled plugin supplies.
+    struct DisabledProvider;
+
+    #[async_trait]
+    impl SubtitleProvider for DisabledProvider {
+        fn name(&self) -> &'static str {
+            "off"
+        }
+        async fn is_enabled(&self) -> bool {
+            false
+        }
+        async fn search(
+            &self,
+            _request: &SubtitleSearchRequest,
+        ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError> {
+            panic!("a disabled provider is never searched")
+        }
+        async fn get_subtitles(&self, _local: &str) -> Result<SubtitleResponse, ServiceError> {
+            panic!("a disabled provider never downloads")
+        }
+    }
+
+    /// gl-2025: a disabled plugin's provider is not loaded upstream, so it is
+    /// in no list, and an id it would own names no provider.
+    #[tokio::test]
+    async fn a_disabled_provider_is_listed_nowhere_and_owns_no_id() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = manager(db, vec![Arc::new(FakeProvider), Arc::new(DisabledProvider)]);
+        let listed: Vec<_> = mgr
+            .get_supported_providers(item)
+            .await
+            .expect("providers")
+            .into_iter()
+            .filter_map(|provider| provider.name)
+            .collect();
+        assert_eq!(listed, ["fake"]);
+        assert_eq!(
+            mgr.enabled_provider_names().await,
+            Some(vec!["fake".to_owned()])
+        );
+        assert!(matches!(
+            mgr.validate_provider_login("off", b"{}").await,
+            Err(ServiceError::NotFound(_))
+        ));
+        // `DisabledProvider::search` panics if it is asked.
+        let found = mgr
+            .search_subtitles(&SubtitleSearchRequest {
+                item_id: item,
+                language: "eng".to_owned(),
+                ..Default::default()
+            })
+            .await
+            .expect("search");
+        assert_eq!(found.len(), 1);
+        let id = format!("{}_1", provider_id("off"));
+        assert!(matches!(
+            mgr.get_remote_subtitles(&id).await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            mgr.download_subtitles(item, &id).await,
             Err(ServiceError::InvalidInput(_))
         ));
     }

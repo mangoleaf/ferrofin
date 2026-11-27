@@ -233,6 +233,14 @@ pub trait SubtitleManager: Send + Sync {
             "login validation is not supported",
         ))
     }
+
+    /// The names of the providers that take part, or `None` when the manager
+    /// does not filter: the subtitle fetchers `GET /Libraries/AvailableOptions`
+    /// lists. A provider a disabled plugin supplies is left out, as upstream
+    /// never loads a disabled plugin. The default filters nothing.
+    async fn enabled_provider_names(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 fn _assert_object_safe_subtitle_manager(_: &dyn SubtitleManager) {}
@@ -280,6 +288,14 @@ pub trait SubtitleProvider: Send + Sync {
         &self,
         provider_local_id: &str,
     ) -> Result<SubtitleResponse, ServiceError>;
+
+    /// Whether the provider takes part at all. One a disabled plugin supplies
+    /// answers `false`, so it is gone from searches, downloads and the lists
+    /// of providers, as upstream's `PluginManager.LoadAssemblies` never loads a
+    /// disabled plugin's `ISubtitleProvider`. The default is `true`.
+    async fn is_enabled(&self) -> bool {
+        true
+    }
 
     /// Validates a candidate configuration (e.g. account login) — backs the
     /// plugin "validate login" action. Providers that need no auth accept any

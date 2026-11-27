@@ -65,7 +65,10 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
   their settings page (served via `GET /web/ConfigurationPage`).
 - **Runtime enable/disable, no restart.** The persisted enabled flag lives in the
   `PluginManager`; each extension self-gates on it (disabled → its routes return `404`, its
-  scheduled tasks no-op).
+  scheduled tasks no-op). OpenSubtitles, registered by the server rather than as an
+  extension, follows it too: disabled, its subtitle provider is gone from searches,
+  downloads, its login check and the library options' subtitle fetchers, as Jellyfin's
+  unloaded plugin is.
 - **Vendored settings pages.** The upstream plugin's HTML settings page is committed into
   `crates/ferrofin-extensions/assets/<name>/` at build time, so normal builds are hermetic
   (no network fetch). Refresh with `FERROFIN_REFRESH_PLUGIN_ASSETS=1 cargo build -p ferrofin-extensions`.
