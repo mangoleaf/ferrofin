@@ -182,6 +182,11 @@ where
 /// `INSERT` (each on its own pooled connection — the pair is idempotent, so it
 /// needs no surrounding transaction).
 ///
+/// `RowVersion` follows EF's concurrency token (`JellyfinDbContext.
+/// HandleConcurrencyToken`): a new row starts at 0, and the `UPDATE` adds 1
+/// only when the value changes, as EF marks a tracked row `Modified` only for a
+/// changed property.
+///
 /// # Errors
 /// Returns [`ServiceError::Db`] if either statement fails.
 pub async fn set_permission(
@@ -191,17 +196,20 @@ pub async fn set_permission(
     value: bool,
 ) -> Result<(), ServiceError> {
     let pool = db.writer();
-    sqlx::query(r#"UPDATE "Permissions" SET "Value" = ?3 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
-        .bind(user_id)
-        .bind(i32::from(kind))
-        .bind(value)
-        .execute(pool)
-        .await
-        .map_err(db_err)?;
+    sqlx::query(
+        r#"UPDATE "Permissions" SET "Value" = ?3, "RowVersion" = "RowVersion" + 1
+           WHERE "UserId" = ?1 AND "Kind" = ?2 AND "Value" IS NOT ?3"#,
+    )
+    .bind(user_id)
+    .bind(i32::from(kind))
+    .bind(value)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
 
     let inserted = sqlx::query(
         r#"INSERT INTO "Permissions" ("Kind", "RowVersion", "UserId", "Value")
-           SELECT ?2, 1, ?1, ?3
+           SELECT ?2, 0, ?1, ?3
            WHERE NOT EXISTS (
                SELECT 1 FROM "Permissions" WHERE "UserId" = ?1 AND "Kind" = ?2
            )"#,
@@ -339,7 +347,10 @@ fn day_matches(day: i32, weekday: chrono::Weekday) -> bool {
 }
 
 /// Seeds the default permissions and (empty) preferences for a freshly created
-/// user (C# `AddDefaultPermissions` + `AddDefaultPreferences`).
+/// user (C# `AddDefaultPermissions` + `AddDefaultPreferences`), with each of
+/// `granted` set true: `InitializeAsync` sets its grants on the entity before
+/// its `Add`, so they are inserted, not updated. Every row starts at
+/// `RowVersion` 0, as an added entity does.
 ///
 /// Runs inside the caller's transaction so a half-seeded user is never
 /// committed.
@@ -349,15 +360,16 @@ fn day_matches(day: i32, weekday: chrono::Weekday) -> bool {
 pub async fn seed_defaults(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     user_id: &str,
+    granted: &[PermissionKind],
 ) -> Result<(), ServiceError> {
     for (kind, value) in DEFAULT_PERMISSIONS {
         sqlx::query(
             r#"INSERT INTO "Permissions" ("Kind", "RowVersion", "UserId", "Value")
-               VALUES (?1, 1, ?2, ?3)"#,
+               VALUES (?1, 0, ?2, ?3)"#,
         )
         .bind(i32::from(*kind))
         .bind(user_id)
-        .bind(*value)
+        .bind(*value || granted.contains(kind))
         .execute(&mut **tx)
         .await
         .map_err(db_err)?;
@@ -366,7 +378,7 @@ pub async fn seed_defaults(
     for kind in ALL_PREFERENCE_KINDS {
         sqlx::query(
             r#"INSERT INTO "Preferences" ("Kind", "RowVersion", "UserId", "Value")
-               VALUES (?1, 1, ?2, '')"#,
+               VALUES (?1, 0, ?2, '')"#,
         )
         .bind(i32::from(*kind))
         .bind(user_id)
@@ -380,7 +392,8 @@ pub async fn seed_defaults(
 
 /// Writes a list-valued preference inside a caller-owned transaction: an
 /// `UPDATE`, then a conditional `INSERT` for a kind the user's row set lacks (a
-/// database adopted from Jellyfin may not carry every kind).
+/// database adopted from Jellyfin may not carry every kind). `RowVersion` is
+/// kept as [`set_permission`] keeps it.
 ///
 /// # Errors
 ///
@@ -392,16 +405,19 @@ pub async fn set_preference_tx(
     values: &[String],
 ) -> Result<(), ServiceError> {
     let joined = values.join(&PREFERENCE_DELIMITER.to_string());
-    sqlx::query(r#"UPDATE "Preferences" SET "Value" = ?3 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
-        .bind(user_id)
-        .bind(i32::from(kind))
-        .bind(&joined)
-        .execute(&mut **tx)
-        .await
-        .map_err(db_err)?;
+    sqlx::query(
+        r#"UPDATE "Preferences" SET "Value" = ?3, "RowVersion" = "RowVersion" + 1
+           WHERE "UserId" = ?1 AND "Kind" = ?2 AND "Value" IS NOT ?3"#,
+    )
+    .bind(user_id)
+    .bind(i32::from(kind))
+    .bind(&joined)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
     sqlx::query(
         r#"INSERT INTO "Preferences" ("Kind", "RowVersion", "UserId", "Value")
-           SELECT ?2, 1, ?1, ?3
+           SELECT ?2, 0, ?1, ?3
            WHERE NOT EXISTS (
                SELECT 1 FROM "Preferences" WHERE "UserId" = ?1 AND "Kind" = ?2
            )"#,
@@ -415,10 +431,10 @@ pub async fn set_preference_tx(
     Ok(())
 }
 
-/// Sets a permission during first-run bootstrap, inside the caller's
-/// transaction (used by [`crate::user_manager`]'s `initialize`, where the whole
-/// user is created atomically). Runs the same `UPDATE`-then-conditional-`INSERT`
-/// as [`set_permission`] against the transaction connection.
+/// Sets a permission inside the caller's transaction (a policy save, or the
+/// creation of a user an outside provider signs in). Runs the same
+/// `UPDATE`-then-conditional-`INSERT` as [`set_permission`], `RowVersion`
+/// included, against the transaction connection.
 ///
 /// # Errors
 /// Returns [`ServiceError::Db`] if either statement fails.
@@ -428,17 +444,20 @@ pub async fn set_permission_tx(
     kind: PermissionKind,
     value: bool,
 ) -> Result<(), ServiceError> {
-    sqlx::query(r#"UPDATE "Permissions" SET "Value" = ?3 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
-        .bind(user_id)
-        .bind(i32::from(kind))
-        .bind(value)
-        .execute(&mut **tx)
-        .await
-        .map_err(db_err)?;
+    sqlx::query(
+        r#"UPDATE "Permissions" SET "Value" = ?3, "RowVersion" = "RowVersion" + 1
+           WHERE "UserId" = ?1 AND "Kind" = ?2 AND "Value" IS NOT ?3"#,
+    )
+    .bind(user_id)
+    .bind(i32::from(kind))
+    .bind(value)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
 
     sqlx::query(
         r#"INSERT INTO "Permissions" ("Kind", "RowVersion", "UserId", "Value")
-           SELECT ?2, 1, ?1, ?3
+           SELECT ?2, 0, ?1, ?3
            WHERE NOT EXISTS (
                SELECT 1 FROM "Permissions" WHERE "UserId" = ?1 AND "Kind" = ?2
            )"#,
@@ -465,7 +484,9 @@ mod tests {
         let id = Uuid::from_u128(1);
         seed_user(&db, id).await;
         let mut tx = db.writer().begin().await.expect("begin");
-        seed_defaults(&mut tx, &guid_to_db(id)).await.expect("seed");
+        seed_defaults(&mut tx, &guid_to_db(id), &[])
+            .await
+            .expect("seed");
         tx.commit().await.expect("commit");
 
         assert!(
@@ -580,7 +601,7 @@ mod tests {
         seed_user(&db, id).await;
         let user = guid_to_db(id);
         let mut tx = db.writer().begin().await.expect("begin");
-        seed_defaults(&mut tx, &user).await.expect("seed");
+        seed_defaults(&mut tx, &user, &[]).await.expect("seed");
         tx.commit().await.expect("commit");
 
         // Permission granted, no tuner configured.

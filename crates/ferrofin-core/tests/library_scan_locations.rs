@@ -148,6 +148,11 @@ impl Library {
             .expect("add an empty library");
         self.scanner.scan_all().await.expect("scan");
         assert!(self.row(removed.1).await.is_some(), "scanned");
+        assert_eq!(
+            self.root_data().await["PhysicalLocationsList"],
+            self.listed_locations(),
+            "the root lists the library's location"
+        );
         self.vf
             .remove_virtual_folder("More")
             .await
@@ -157,6 +162,34 @@ impl Library {
 
     async fn row(&self, id: Uuid) -> Option<BaseItemEntity> {
         self.items.retrieve_item(id).await.expect("read")
+    }
+
+    /// The aggregate root's `Data`.
+    async fn root_data(&self) -> serde_json::Value {
+        let root = self.row(self.aggregate).await.expect("the root");
+        serde_json::from_str(root.data.as_deref().expect("data")).expect("json")
+    }
+
+    /// The root's locations as Jellyfin's root gathers them
+    /// (`AggregateFolder.CreateResolveArgs`): its own path, then each
+    /// library's shortcut targets, the libraries and their shortcuts in the
+    /// order their folders list them.
+    fn listed_locations(&self) -> serde_json::Value {
+        let root = self.tmp.path().join("root");
+        let mut list = vec![root.to_string_lossy().into_owned()];
+        for library in std::fs::read_dir(root.join("default")).expect("libraries") {
+            let library = library.expect("library").path();
+            if !library.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(library).expect("library folder") {
+                let path = entry.expect("entry").path();
+                if path.extension().is_some_and(|ext| ext == "mblink") {
+                    list.push(std::fs::read_to_string(path).expect("shortcut"));
+                }
+            }
+        }
+        serde_json::json!(list)
     }
 
     async fn ancestors(&self, id: Uuid) -> Vec<String> {
@@ -362,6 +395,52 @@ async fn a_removed_library_goes_beside_a_library_with_no_folder() {
     );
 }
 
+/// Each scan stores the root's `PhysicalLocationsList` as Jellyfin's root
+/// gathers it: its own path, then every library's locations, the libraries
+/// and each one's shortcuts in the order their folders list them, unsorted.
+/// A removed library leaves it at the next scan, and the root keeps `IsRoot`.
+#[tokio::test]
+async fn each_scan_stores_the_roots_locations() {
+    let lib = Library::new(&["Heat (1995)/Heat (1995).mkv"]).await;
+    assert_eq!(
+        lib.root_data().await,
+        serde_json::json!({ "IsRoot": true }),
+        "nothing before a scan"
+    );
+    // Two more shortcuts in the Movies folder, which neither their creation
+    // order nor its reverse lists sorted.
+    for name in ["zeta", "alpha"] {
+        let location = lib.media.with_file_name(name);
+        std::fs::create_dir_all(&location).expect("mkdir");
+        lib.vf
+            .add_media_path(
+                "Movies",
+                &MediaPathInfo {
+                    path: location.to_string_lossy().into_owned(),
+                },
+            )
+            .await
+            .expect("add location");
+    }
+    lib.add_library("Shows").await;
+    lib.scanner.scan_all().await.expect("scan");
+    let listed = lib.listed_locations();
+    assert_eq!(listed.as_array().map(Vec::len), Some(5), "{listed}");
+    assert_eq!(
+        lib.root_data().await,
+        serde_json::json!({ "IsRoot": true, "PhysicalLocationsList": listed })
+    );
+
+    lib.vf
+        .remove_virtual_folder("Shows")
+        .await
+        .expect("remove the library");
+    lib.scanner.scan_all().await.expect("rescan");
+    let listed = lib.listed_locations();
+    assert_eq!(listed.as_array().map(Vec::len), Some(4), "{listed}");
+    assert_eq!(lib.root_data().await["PhysicalLocationsList"], listed);
+}
+
 /// A library listing no location holds every removal back unless its options
 /// read and list no folder either: options that cannot be read, that are
 /// gone, or that name a folder no shortcut gives may hide a location, which
@@ -377,6 +456,7 @@ async fn a_library_with_no_location_and_no_readable_empty_options_holds_removals
 ) {
     let lib = Library::new(&["Heat (1995)/Heat (1995).mkv"]).await;
     let (folder, movie) = lib.remove_a_library_beside_an_empty_one().await;
+    let stored = lib.root_data().await;
     let file = lib.library_dir("Empty").join("options.json");
     std::fs::remove_file(&file).expect("rm options");
     match options {
@@ -396,6 +476,11 @@ async fn a_library_with_no_location_and_no_readable_empty_options_holds_removals
     lib.scanner.scan_all().await.expect("held");
     assert!(lib.row(folder).await.is_some(), "{options}: folder held");
     assert!(lib.row(movie).await.is_some(), "{options}: movie held");
+    assert_eq!(
+        lib.root_data().await,
+        stored,
+        "{options}: the root keeps its list"
+    );
 
     if file.is_dir() {
         std::fs::remove_dir(&file).expect("rm");
@@ -405,6 +490,11 @@ async fn a_library_with_no_location_and_no_readable_empty_options_holds_removals
     lib.scanner.scan_all().await.expect("rescan");
     assert!(lib.row(folder).await.is_none(), "{options}: pruned");
     assert!(lib.row(movie).await.is_none(), "{options}: pruned");
+    assert_eq!(
+        lib.root_data().await["PhysicalLocationsList"],
+        lib.listed_locations(),
+        "{options}: the root's list follows"
+    );
 }
 
 /// A shortcut that resolves to no location (one that cannot be read, or an
@@ -417,6 +507,7 @@ async fn a_library_with_no_location_and_no_readable_empty_options_holds_removals
 async fn an_unresolved_shortcut_holds_removals(#[case] unreadable: bool) {
     let lib = Library::new(&["Heat (1995)/Heat (1995).mkv"]).await;
     let (folder, movie) = lib.remove_a_library_beside_an_empty_one().await;
+    let stored = lib.root_data().await;
     let shortcut = lib.library_dir("Movies").join("broken.mblink");
     if unreadable {
         std::os::unix::fs::symlink(lib.media.with_file_name("gone"), &shortcut).expect("link");
@@ -426,11 +517,18 @@ async fn an_unresolved_shortcut_holds_removals(#[case] unreadable: bool) {
     lib.scanner.scan_all().await.expect("held");
     assert!(lib.row(folder).await.is_some(), "folder held");
     assert!(lib.row(movie).await.is_some(), "movie held");
+    // Upstream's root leaves the shortcut out and stores a shorter list.
+    assert_eq!(lib.root_data().await, stored, "the root keeps its list");
 
     std::fs::remove_file(&shortcut).expect("rm shortcut");
     lib.scanner.scan_all().await.expect("rescan");
     assert!(lib.row(folder).await.is_none(), "pruned");
     assert!(lib.row(movie).await.is_none(), "pruned");
+    assert_eq!(
+        lib.root_data().await["PhysicalLocationsList"],
+        lib.listed_locations(),
+        "the root's list follows"
+    );
 }
 
 /// A location whose shortcut stops resolving keeps its folder and items while
@@ -706,6 +804,8 @@ async fn the_first_path_refresh_provisions_its_physical_parent() {
 async fn removing_the_last_library_prunes_its_media_once_a_library_is_configured() {
     let lib = Library::new(&["Heat/Heat.mkv"]).await;
     lib.scanner.scan_all().await.unwrap();
+    let stored = lib.root_data().await;
+    assert_eq!(stored["PhysicalLocationsList"], lib.listed_locations());
     let movie = derive_item_id(
         BaseItemKind::Movie,
         &lib.media.join("Heat/Heat.mkv").to_string_lossy(),
@@ -721,6 +821,7 @@ async fn removing_the_last_library_prunes_its_media_once_a_library_is_configured
         lib.row(movie).await.is_some(),
         "held while no library is configured"
     );
+    assert_eq!(lib.root_data().await, stored, "the root keeps its list");
     let other = lib.media.parent().expect("media parent").join("other");
     std::fs::create_dir_all(&other).unwrap();
     lib.vf
@@ -740,6 +841,11 @@ async fn removing_the_last_library_prunes_its_media_once_a_library_is_configured
     assert!(lib.row(movie).await.is_none());
     assert!(lib.row(lib.location()).await.is_none());
     assert!(lib.media.join("Heat/Heat.mkv").is_file());
+    assert_eq!(
+        lib.root_data().await["PhysicalLocationsList"],
+        lib.listed_locations(),
+        "the root's list follows"
+    );
 }
 
 /// Disabling photos invalidates the previously resolved photo rows as well as

@@ -2931,7 +2931,7 @@ mod tests {
         seed_user(&db, user_id).await;
         let user = guid_to_db(user_id);
         let mut tx = db.writer().begin().await.expect("begin");
-        crate::user_entity_ext::seed_defaults(&mut tx, &user)
+        crate::user_entity_ext::seed_defaults(&mut tx, &user, &[])
             .await
             .expect("permissions");
         tx.commit().await.expect("commit");
@@ -5523,7 +5523,7 @@ mod tests {
         let user_id = Uuid::from_u128(0x5111);
         seed_user(&db, user_id).await;
         let mut tx = db.writer().begin().await.expect("begin");
-        crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(user_id))
+        crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(user_id), &[])
             .await
             .expect("permissions");
         tx.commit().await.expect("commit");
@@ -6037,7 +6037,7 @@ mod tests {
         let user = Uuid::from_u128(0x7821);
         seed_user(&db, user).await;
         let mut tx = db.writer().begin().await.expect("begin");
-        crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(user))
+        crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(user), &[])
             .await
             .expect("permissions");
         tx.commit().await.expect("commit");

@@ -2765,11 +2765,13 @@ impl LocalProviderManager {
         options: &MetadataRefreshOptions,
         identified: bool,
     ) -> Result<ItemUpdateType, ServiceError> {
-        use crate::metadata_merge::{MetadataResult, RefreshAnswers, RefreshMerge};
+        use crate::metadata_merge::{
+            MetadataResult, RefreshAnswers, RefreshMerge, supports_people,
+        };
         // Held from the id write and the load below to the last save, so an
         // edit made meanwhile waits and then applies to the saved row. It
         // spans the remote fetches too, so the edit waits for them, minutes at
-        // worst under `rate_limit.rs`'s timeouts and retries; gl-1504 has the
+        // worst under `rate_limit.rs`'s timeouts and retries; gl-1961 has the
         // re-read-under-the-lock shape that would end that wait.
         let _metadata = self.lock_item_metadata(item_id).await;
         // "Identify → Apply": the chosen result's ids become the item's, and
@@ -3151,8 +3153,12 @@ impl LocalProviderManager {
         // The credits the answers carried, as the scan folds them
         // ([`pass_credits`](crate::metadata_merge::pass_credits)): `None`
         // keeps the stored ones. A locked item and a `Cast` lock keep them
-        // too (`MetadataService.cs:1235`).
-        let credits = if stored.is_locked || locked_fields.contains(&MetadataField::Cast) {
+        // too (`MetadataService.cs:1235`), and a kind without people never
+        // saves any (`SaveItemAsync`, `:320`): a `playlist.xml`'s are dropped.
+        let credits = if stored.is_locked
+            || locked_fields.contains(&MetadataField::Cast)
+            || !supports_people(BaseItemKind::from_stored_type_name(&stored.type_))
+        {
             None
         } else {
             crate::metadata_merge::pass_credits(local_people, &fetched.credits, merge.keep_existing)
@@ -3475,8 +3481,8 @@ impl LocalProviderManager {
     }
 
     /// `LibraryManager.UpdateImagesAsync`, which upstream runs on every save of
-    /// an item (`RunMetadataSavers`), here on `update_to_repository` and a
-    /// refresh's save (not yet the metadata editor's, gl-1922): each local
+    /// an item (`RunMetadataSavers`), here on `update_to_repository` (the
+    /// metadata editor's save among them) and a refresh's save: each local
     /// image whose size or blurhash is missing or whose file changed or is gone
     /// (`ImageNeedsRefresh`), or every one for a save from `ImageUpdate` up (an
     /// image, download or edit save, in upstream's order), is measured and
@@ -5540,11 +5546,15 @@ impl ProviderManager for LocalProviderManager {
         options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
         // Boxed: the refresh future holds the whole fetch-merge-save state
-        // (`clippy::large_futures`). The Identify's and the queue's entry: the
-        // item is the one an Identify's result was chosen for.
-        Box::pin(self.refresh_item(item_id, options, true))
-            .await
-            .map(|_| ())
+        // (`clippy::large_futures`). Its provider failures name the item. The
+        // Identify's and the queue's entry: the item is the one an Identify's
+        // result was chosen for.
+        Box::pin(crate::rate_limit::for_item(
+            item_id,
+            self.refresh_item(item_id, options, true),
+        ))
+        .await
+        .map(|_| ())
     }
 
     async fn refresh_single_item(
@@ -5557,7 +5567,11 @@ impl ProviderManager for LocalProviderManager {
         // into children, so this is the full refresh with its verdict kept,
         // as a child's (`RefreshAllMetadata`'s `item.RefreshMetadata`): an
         // Identify's result in `options` is its series'.
-        Box::pin(self.refresh_item(item_id, options, false)).await
+        Box::pin(crate::rate_limit::for_item(
+            item_id,
+            self.refresh_item(item_id, options, false),
+        ))
+        .await
     }
 
     async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
@@ -9099,6 +9113,41 @@ mod tests {
                 assert!(copied.is_empty(), "{copied:?}");
             }
         }
+    }
+
+    /// A refresh's provider failures name the refreshed item (gl-1880): the
+    /// refresh queue, the people task and a scan's box sets all come here.
+    #[tokio::test]
+    async fn a_refreshs_provider_failure_names_the_item() {
+        use crate::log_capture::{LogBuffer, init_log_capture};
+        use crate::mock_http::MockServer;
+        use tracing::instrument::WithSubscriber as _;
+        init_log_capture();
+        let server = MockServer::start_raw(vec![MockServer::raw_status("401 Unauthorized")]).await;
+        let tmdb = Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url));
+        let store = Arc::new(RecordingStore::default());
+        let (item_id, mgr) = box_set_manager(row("Movies.BoxSet", "Matrix"), tmdb, store);
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+
+        let refreshed = mgr
+            .refresh_full_item(item_id, &full_metadata_refresh())
+            .with_subscriber(subscriber)
+            .await;
+
+        assert!(refreshed.is_ok(), "{refreshed:?}");
+        assert!(server.requests() > 0);
+        let logs = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("utf-8");
+        assert!(
+            logs.lines().any(|line| line.contains("request rejected")
+                && line.contains(&format!("item_id={item_id}"))),
+            "{logs}"
+        );
     }
 
     /// Every refresh of an owner reaches its extras (`BaseItem.RefreshExtras`):

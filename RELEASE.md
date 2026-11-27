@@ -141,7 +141,7 @@ from.
    | Row | Measures | Relative | Absolute |
    |---|---|---:|---:|
    | `screens` | screen p50 | 15 % | 2 ms |
-   | `endpoints` | endpoint p50 (the screens' endpoints, and each endpoint of the per-endpoint pass) | 15 % | 0.5 ms |
+   | `endpoints` | endpoint p50 (the screens' endpoints, and each endpoint of the per-endpoint pass; the mean for one whose work is drawn at random) | 15 % | 0.5 ms |
    | `memory` | peak (under load) and steady idle anon memory; scan and migration peak anon | 25 % | 40 MiB |
    | `scan` | library-scan and adoption-migration wall time | 15 % | 1 s |
    | `ramp` | throughput ceiling (higher is better; *Throughput ceiling* below) | 15 % | 5 screens/s |
@@ -197,7 +197,9 @@ from.
    `python3 gates/bench/gate.py endpoints ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc`.
    Three interleaved pairs of `gates/bench/run.sh --servers ferrofin --only endpoints`; after one
    shared warm-up each endpoint gets 200 sequential requests or 10 s, whichever comes first.
-   Each endpoint's p50 is judged by the `endpoints` row on the same rule as the other cells.
+   Each endpoint's p50 is judged by the `endpoints` row on the same rule as the other cells; an
+   endpoint whose work is drawn at random (`RANDOM_DRAW` in `gates/bench/endpoints.py`) is judged on
+   its mean instead, and the report marks it.
    Only the `gates/bench/screens.js` shapes and the parity edge-case GETs block: a regressed one, or
    one that cannot be judged because its answers differ between runs. Every other endpoint is
    reported; file a regression there as an issue. The oracle-pin record and the rule that a

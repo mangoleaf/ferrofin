@@ -26,12 +26,14 @@ RUN curl -LsSf --retry 5 --retry-all-errors --proto '=https' --tlsv1.2 \
  && cargo install --locked cargo-llvm-cov \
  && rm -rf "$CARGO_HOME/registry"
 
-# The `dependencies` job's tools (cargo-deny, cargo-machete) and the `vet` job's cargo-vet, at
-# the versions GitHub's `dependencies` and `vet` jobs pin in ci.yml. Built from crates.io for the
-# same reason as cargo-llvm-cov.
+# The `dependencies` job's tools (cargo-deny, cargo-machete, cargo-about) and the `vet` job's
+# cargo-vet, at the versions GitHub's `dependencies` and `vet` jobs pin in ci.yml. Built from
+# crates.io for the same reason as cargo-llvm-cov. cargo-about's binary is behind its `cli` feature,
+# which the others lack, so it is installed on its own.
 RUN cargo install --locked cargo-deny@0.20.2 cargo-machete@0.9.2 cargo-vet@0.10.3 \
+ && cargo install --locked --features cli cargo-about@0.9.3 \
  && rm -rf "$CARGO_HOME/registry"
 
 # Smoke-check the tools exist at build time (fails the image build if any is missing).
 RUN cargo nextest --version && cargo llvm-cov --version && cargo deny --version && cargo machete --version \
- && cargo vet --version && rustfmt --version && cargo clippy --version && cmake --version && nasm -v
+ && cargo vet --version && cargo about --version && rustfmt --version && cargo clippy --version && cmake --version && nasm -v

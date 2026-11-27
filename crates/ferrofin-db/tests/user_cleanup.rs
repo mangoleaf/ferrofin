@@ -4,7 +4,8 @@
 //! without 0044 the boot's `foreign_key_check` refuses it. Migrations run with
 //! foreign keys OFF, so nothing cascades: these tests hold 0044 to every foreign key
 //! to `Users` and to the children of the rows it deletes. 0045 re-points an `OwnerId`
-//! that names no item at the placeholder item, which the boot repair then deletes.
+//! that names no item at the placeholder item, which the boot repair then deletes, and
+//! 0053 gives every `PrimaryVersionId` the spelling upstream's conversion gives it.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -355,6 +356,106 @@ async fn adoption_re_points_a_dangling_owner_at_the_placeholder(
         7,
         "the migration deletes nothing: the repair does, later"
     );
+}
+
+/// A `PrimaryVersionId` that a Jellyfin 12.x database holds in another spelling than
+/// upstream's `ChangePrimaryVersionIdToGuid` leaves (a lower-case dashed id, 32 undashed
+/// characters, the all-zero Guid, no Guid at all) adopts as that routine leaves it on a
+/// 10.11 source: 0053 runs 0032's copy of it on every source. A version then names its
+/// primary in the primary's spelling, so lookups that compare the column with an `Id`
+/// byte for byte find it. The 10.11.8 case is a control: 0032 already does all of this
+/// there, so it holds the two chains to one end state.
+#[rstest::rstest]
+#[case::jellyfin_10_11_8("10.11.8", SCHEMA_10_11_8)]
+#[case::jellyfin_12_2("12.2.0", SCHEMA_12_2)]
+#[tokio::test]
+async fn adoption_re_spells_primary_version_ids_as_upstream_converts_them(
+    #[case] generation: &str,
+    #[case] schema: &str,
+) {
+    const LOWER: &str = "BBBBBBBB-0000-0000-0000-0000000000F1";
+    const UNDASHED: &str = "BBBBBBBB-0000-0000-0000-0000000000F2";
+    const DANGLING: &str = "BBBBBBBB-0000-0000-0000-0000000000F3";
+    const ZERO: &str = "BBBBBBBB-0000-0000-0000-0000000000F4";
+    const EMPTY: &str = "BBBBBBBB-0000-0000-0000-0000000000F5";
+    let generation = JELLYFIN_GENERATIONS
+        .iter()
+        .find(|g| g.name == generation)
+        .expect("generation");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("jellyfin.db");
+    let mut history = generation.migration_ids.to_vec();
+    history.extend(generation.additional_ids);
+    seed_jellyfin_fixture(&path, schema, &history).await;
+    {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .foreign_keys(false),
+            )
+            .await
+            .expect("open fixture");
+        insert(&pool, "BaseItems", &[("Id", ITEM), ("Type", "Movie")]).await;
+        for (id, primary) in [
+            (LOWER, ITEM.to_lowercase()),
+            (UNDASHED, ITEM.replace('-', "").to_lowercase()),
+            (DANGLING, GONE_ITEM.to_lowercase()),
+            (ZERO, ZERO_GUID.to_owned()),
+            (EMPTY, String::new()),
+        ] {
+            insert(
+                &pool,
+                "BaseItems",
+                &[
+                    ("Id", id),
+                    ("Type", "Movie"),
+                    ("PrimaryVersionId", &primary),
+                ],
+            )
+            .await;
+        }
+        pool.close().await;
+    }
+
+    let url = format!("sqlite://{}", path.display());
+    let db = Database::connect_sized(&url, Some(2))
+        .await
+        .expect("adoption succeeds");
+    let pool = db.pool();
+
+    let primary_of = |id: &str| format!(r#""Id" = '{id}' AND "PrimaryVersionId""#);
+    for id in [LOWER, UNDASHED] {
+        assert_eq!(
+            count(
+                pool,
+                "BaseItems",
+                &format!(r#"{} IN (SELECT "Id" FROM "BaseItems")"#, primary_of(id))
+            )
+            .await,
+            1,
+            "a primary version spelled another way names its primary byte for byte: {id}"
+        );
+    }
+    assert_eq!(
+        count(
+            pool,
+            "BaseItems",
+            &format!("{} = '{GONE_ITEM}'", primary_of(DANGLING))
+        )
+        .await,
+        1,
+        "one that names no item is upper-cased too, as upstream's routine does"
+    );
+    for id in [ZERO, EMPTY] {
+        assert_eq!(
+            count(pool, "BaseItems", &format!("{} IS NULL", primary_of(id))).await,
+            1,
+            "the all-zero Guid and a value that is no Guid are cleared: {id}"
+        );
+    }
+    assert_eq!(count(pool, "BaseItems", "1").await, 6, "nothing is deleted");
 }
 
 /// The tables with a foreign key to `Users` that a migration after 0044 creates,

@@ -151,8 +151,8 @@ either runs Jellyfin's docker image or points the package at the export placed a
 export (option B) is the docker export with the configuration written apart and another target prefix.
 It needs no other file class. That is an estimate from the code: the Debian layout was not booted here.
 
-`scripts/migrate-jellyfin.sh` copies no `data/trickplay`, going into Ferrofin. It costs a rebuild or the
-loss of every trickplay set (the Trickplay row). Filed as gl-1576.
+At the pin, `scripts/migrate-jellyfin.sh` copied no `data/trickplay`, going into Ferrofin. It cost a
+rebuild or the loss of every trickplay set (the Trickplay row). Fixed in gl-1576.
 
 ## Copy or link
 
