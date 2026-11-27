@@ -24,6 +24,8 @@
 //! - `paths`: the stored paths, rewritten onto the output's layout;
 //! - `earlier_art`: the art earlier builds saved in an item's `{ID}` folder,
 //!   moved into the item's own folder in the output, its rows with it;
+//! - `data_shape`: each item's `Data`, in the shape Jellyfin's serialiser
+//!   writes it;
 //! - `carried`: what Ferrofin's own tables hold that Jellyfin keeps in files
 //!   (Live TV tuners, guides and timers, LDAP-Auth's uid map), read before
 //!   they are removed;
@@ -65,6 +67,7 @@ mod carried;
 mod classify;
 mod containers;
 mod counts;
+mod data_shape;
 mod drop_objects;
 mod earlier_art;
 mod history;
@@ -205,6 +208,10 @@ pub struct DatabaseEdits {
     /// The art earlier builds saved in an item's `{ID}` or `{id}` folder,
     /// moved into the item's own folder in the output, with its rows.
     pub art: ArtRelocation,
+    /// How many items had their `Data` rewritten in the shape Jellyfin 12.4
+    /// serialises it: every key of their kind, in its order, with the values
+    /// Jellyfin's own scan stores.
+    pub data: u64,
 }
 
 /// The export's changes to its staged copy of the database, in order, on the
@@ -249,6 +256,8 @@ async fn edit_staged(
         counts: counts::read(&mut tx).await?,
         // After the paths' rewrite, which spells them on the layout.
         art: earlier_art::relocate(&mut tx, out, layout).await?,
+        // Last: it reads the paths and links the steps before leave.
+        data: data_shape::rewrite(&mut tx, layout).await?,
     };
     tx.commit().await?;
     Ok(edits)
@@ -292,7 +301,8 @@ async fn edit_staged(
 /// rewritten onto the layout ([`PathRewrite`]). The art earlier builds saved
 /// in an item's `{ID}` or `{id}` folder is then moved in the output into the
 /// item's own folder, where Jellyfin keeps it, and its rows follow
-/// ([`ArtRelocation`]).
+/// ([`ArtRelocation`]). Last, each item's `Data` is written in the shape
+/// Jellyfin 12.4 serialises it in ([`DatabaseEdits::data`]).
 ///
 /// What is copied is digested while it is copied and again once the database
 /// snapshot is written, and so are the files SQLite keeps beside the

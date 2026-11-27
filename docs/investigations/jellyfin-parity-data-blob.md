@@ -115,3 +115,13 @@ Ferrofin writes other `Data` keys that the probe's rows did not exercise: `Video
 - **gl-1632:** store a video's `HasSubtitles` in `Data`, as upstream's prober sets it, so a return keeps it.
 - **gl-1629:** write the root `AggregateFolder`'s `Data` as Jellyfin does, `IsRoot` true at least, so a fresh database's root reads back as Jellyfin's does.
 - **gl-1630:** write `Data` per kind as Jellyfin's serialiser does: the generic keys, each kind's own fields, and Jellyfin's key order. A returned row is then not rewritten. This issue also covers the kinds not probed here. Allowlisting the difference instead is the owner's call.
+
+## Resolution (gl-1630)
+
+The owner decided on 2026-11-27 that the export writes the shape: `crates/ferrofin-db/src/export/data_shape.rs` rewrites every row of a serialised kind in the exported copy as Jellyfin 12.4 holds it after its own scan, and Ferrofin's own database keeps its writers' shape. Its oracle test writes rows Jellyfin 12.4 stored itself back byte for byte.
+
+The kinds this investigation did not probe, compared the same way (Ferrofin's native scan of the round-trip gate's media against Jellyfin 12.4's scan of it, and each `Data`-only property's writer):
+- **Series, Episode, Photo, MusicVideo, extras:** every `Data`-only property is stored under Jellyfin's key (`AirDays`, `AirTime`, `DisplayOrder`, `Status`; `AirsBeforeSeasonNumber`, `AirsAfterSeasonNumber`, `AirsBeforeEpisodeNumber`, `IndexNumberEnd`; the twelve EXIF keys). Nothing is lost. The export leaves out the keys Jellyfin does not serialise, as its next save would: `LinkedChildren` and `ExtraIds`, which 12.4 strips itself, and Ferrofin's `HomePageUrl`, which Jellyfin keeps in no column and marks `[JsonIgnore]` (`BaseItem.cs:678`).
+- **Trailer:** both servers make a trailer extra a `Trailer` (`ExtraResolver.cs:35,51`). Its `TrailerTypes` is overlaid from `BaseItemTrailerTypes`, which only a channel's trailers fill (`ChannelManager.cs:1072`), so a trailer extra's is empty on both sides. Nothing is lost.
+- **Movie:** Ferrofin keeps the TMDb collection name as `CollectionName`, the `[JsonIgnore]` property over `TmdbCollectionName`. The export writes it as `TmdbCollectionName`; Ferrofin's reading of an adopted row's `TmdbCollectionName` is gl-2036.
+- **Every video:** `SubtitleFiles` and `AudioFiles` are written from the item's external streams, as the probe sets them, and a track's `HasLyrics` from its streams. A `.ts`/`.m2ts` file's `Timestamp`, which Jellyfin keeps only in `Data`, is never stored: gl-2037.
