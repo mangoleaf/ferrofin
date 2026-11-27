@@ -11,8 +11,9 @@
 //! Delete, upload, remote search, download and get go through the
 //! [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager) seam, which
 //! searches the registered subtitle providers (OpenSubtitles), routes a
-//! download or fetch to the provider the id names, and attaches or removes the
-//! external subtitle.
+//! download or fetch to the provider the id names, and saves or removes the
+//! external subtitle file; the item refresh that follows records the change in
+//! its streams.
 //!
 //! On-the-fly subtitle *conversion*: the
 //! `Videos/{itemId}/{container}/Subtitles/{index}/{format}` (with and without a
@@ -142,8 +143,12 @@ async fn require_video(
 async fn delete_subtitle(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((DotnetGuid(item_id), index)): Path<(DotnetGuid, i32)>,
+    Path((DotnetGuid(item_id), index)): Path<(DotnetGuid, String)>,
 ) -> Response {
+    let index: i32 = match crate::query::bind_route_number(&index, "index") {
+        Ok(index) => index,
+        Err(err) => return err.into_response(),
+    };
     let deleted = async move {
         if item_id.is_nil() {
             return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
@@ -189,10 +194,11 @@ struct UploadSubtitleDto {
 /// Port of `SubtitleController.UploadSubtitle`: `404` when the item is missing,
 /// `400` when the `Data` is not valid base64. The decoded bytes are handed to the
 /// [`SubtitleManager`](ferrofin_traits::subtitles::SubtitleManager), which
-/// attaches them to the item as an external subtitle (the sidecar file and its
-/// stream row); then a metadata refresh is queued and `204` returned. Subtitle
-/// management is checked before decoding or writing the upload. The save and
-/// the refresh finish for a client that hangs up, as upstream's do.
+/// writes them beside the item as an external subtitle file. Then a metadata
+/// refresh is queued, whose probe records the file as a stream, and `204` is
+/// returned. Subtitle management is checked before decoding or writing the
+/// upload. The save and the refresh finish for a client that hangs up, as
+/// upstream's do.
 #[utoipa::path(
     post,
     path = "/Videos/{itemId}/Subtitles",
@@ -572,10 +578,11 @@ async fn get_subtitle(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
     RequiredRouteString(media_source_id, _): RequiredRouteString<RouteMediaSourceId>,
-    Path((DotnetGuid(item_id), _, index, route_format)): Path<(DotnetGuid, String, i32, String)>,
+    Path((DotnetGuid(item_id), _, index, route_format)): Path<(DotnetGuid, String, String, String)>,
     Query(query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    let index: i32 = crate::query::bind_route_number(&index, "routeIndex")?;
     // `Stream.{routeFormat}`: a required string after the literal, which
     // matches only with something after it (the same `stream.` literal).
     if let Some(value) = stream_route_container(&route_format)
@@ -630,13 +637,16 @@ async fn get_subtitle_with_ticks(
     Path((DotnetGuid(item_id), _, index, start_position_ticks, route_format)): Path<(
         DotnetGuid,
         String,
-        i32,
-        i64,
+        String,
+        String,
         String,
     )>,
     Query(mut query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    let index: i32 = crate::query::bind_route_number(&index, "routeIndex")?;
+    let start_position_ticks: i64 =
+        crate::query::bind_route_number(&start_position_ticks, "routeStartPositionTicks")?;
     // `Stream.{routeFormat}`: a required string after the literal, which
     // matches only with something after it (the same `stream.` literal).
     if let Some(value) = stream_route_container(&route_format)
@@ -715,10 +725,11 @@ async fn get_subtitle_playlist(
     // playlist body (the segments all point at the same `stream.vtt`); the C#
     // suppresses the same unused parameter (CA1801).
     RequiredRouteString(media_source_id, _): RequiredRouteString<PlaylistMediaSourceId>,
-    Path((DotnetGuid(item_id), _, _index)): Path<(DotnetGuid, String, i32)>,
+    Path((DotnetGuid(item_id), _, index)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<SubtitlePlaylistQuery>,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    let _index: i32 = crate::query::bind_route_number(&index, "index")?;
     require_streamable_item(
         &state,
         &auth,

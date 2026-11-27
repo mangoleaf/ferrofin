@@ -89,7 +89,7 @@ fn start_network_change_monitor(
 
 /// Reads the saved network configuration, or the default when there is none.
 ///
-/// The same `{config}/users/named/network.json` that
+/// The same `{config}/network.json` that
 /// `GET/POST /System/Configuration/network` reads and writes — so what the
 /// dashboard's policy settings feed the shared network manager. `AutoDiscovery`,
 /// `BaseUrl` (`base_url::resolve`) and the ports (`listen::ports`) are sampled
@@ -101,15 +101,16 @@ fn start_network_change_monitor(
 pub(crate) async fn load_network_configuration(
     paths: &impl ferrofin_traits::system::ServerApplicationPaths,
 ) -> ferrofin_networking::NetworkConfiguration {
-    let user_dir = std::path::PathBuf::from(paths.user_configuration_directory_path());
-    let path = user_dir.join("named").join("network.json");
+    let config_dir = std::path::PathBuf::from(paths.configuration_directory_path());
+    // The listeners bind before the boot moves an earlier release's file, and
+    // the export never moves it.
+    let path = ferrofin_core::named_configuration_files::readable(&config_dir, "network.json");
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         // As the seeding, which imports `network.xml` only while there is no
         // `network.json`.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let xml = user_dir.parent().map(|config| config.join("network.xml"));
-            return adopted_network_configuration(xml.as_deref()).await;
+            return adopted_network_configuration(Some(&config_dir.join("network.xml"))).await;
         }
         Err(_) => return ferrofin_networking::NetworkConfiguration::default(),
     };
@@ -487,6 +488,10 @@ pub async fn build_app_state(
         paths.root_folder_path(),
         paths.data_path(),
     );
+    // Whether every start-time conversion below succeeded: one that fails
+    // warns, runs again at the next start, and clears this, so the start is
+    // not recorded for the export at the end (gl-1952).
+    let mut converted = true;
     // One-shot, on a database's first boot: Jellyfin's timers and series
     // timers (`data/livetv/*.json`), which nothing else reads. Before the path
     // rebase below, which moves a completed recording's file onto this
@@ -515,10 +520,13 @@ pub async fn build_app_state(
             series_timers,
             "imported jellyfin's live tv timers"
         ),
-        Err(err) => tracing::warn!(
-            %err,
-            "live tv timer import failed; it runs again at the next start"
-        ),
+        Err(err) => {
+            converted = false;
+            tracing::warn!(
+                %err,
+                "live tv timer import failed; it runs again at the next start"
+            );
+        }
     }
     // A database whose program-data directory moved (an adopted Debian
     // `/var/lib/jellyfin`, or a relocated data_dir) keeps its ids but stores
@@ -613,6 +621,7 @@ pub async fn build_app_state(
             );
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "clean-value repair failed; punctuated by-name lookups may miss until the next boot retries it");
         }
     }
@@ -624,6 +633,7 @@ pub async fn build_app_state(
             tracing::info!(repaired, "recomputed sort names from forced sort names");
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "forced sort-name repair failed; items with a sort-title override may sort by the 10.11.8 key until the next boot retries it");
         }
     }
@@ -638,6 +648,7 @@ pub async fn build_app_state(
             tracing::info!(repaired, "romanised the sort names of non-Latin titles");
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "sort-name transliteration repair failed; non-Latin titles may sort as written until the next boot retries it");
         }
     }
@@ -653,6 +664,7 @@ pub async fn build_app_state(
             );
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "box set and playlist repair failed; a renamed playlist may not be found by its new name until the next boot retries it");
         }
     }
@@ -671,6 +683,7 @@ pub async fn build_app_state(
             );
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "container date repair failed; the playlists folder or the collections library stays undated until the next boot retries it");
         }
     }
@@ -692,6 +705,7 @@ pub async fn build_app_state(
             );
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "user view consolidation failed; localized views stay duplicated until the next boot");
         }
     }
@@ -709,6 +723,7 @@ pub async fn build_app_state(
             tracing::info!(collapsed, "unified person identities onto per-name ids");
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "person identity unification failed; person favorites may not round-trip");
         }
     }
@@ -724,6 +739,7 @@ pub async fn build_app_state(
             tracing::info!(repaired, "repaired person metadata paths and sort keys");
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "person metadata repair failed; person sort order and Path may diverge until the next scan");
         }
     }
@@ -970,8 +986,8 @@ pub async fn build_app_state(
         Arc::new(ferrofin_providers::TmdbPersonSearchProvider::new(
             Arc::clone(&tmdb_client),
         )),
-        // Albums/artists identify against MusicBrainz; TheAudioDb is listed
-        // (selectable by name) but, as in Jellyfin, has no name search.
+        // Albums/artists identify against MusicBrainz and TheAudioDb, which,
+        // as in Jellyfin, finds artists only (its album search is empty).
         Arc::new(ferrofin_providers::MusicBrainzAlbumSearchProvider::new(
             Arc::clone(&musicbrainz_client),
         )),
@@ -980,9 +996,11 @@ pub async fn build_app_state(
         )),
         Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
             ferrofin_model::data::BaseItemKind::MusicAlbum,
+            Arc::clone(&audiodb_client),
         )),
         Arc::new(ferrofin_providers::AudioDbSearchProvider::new(
             ferrofin_model::data::BaseItemKind::MusicArtist,
+            Arc::clone(&audiodb_client),
         )),
     ];
     let item_visibility = Arc::new(
@@ -1020,7 +1038,7 @@ pub async fn build_app_state(
     .context("failed to re-home local alternate versions")?;
     // Likewise: a season with no folder an older Ferrofin scan keyed by a
     // synthetic path takes the id Jellyfin keys it by.
-    ferrofin_core::adoption_repairs::run_rekey_virtual_seasons(
+    converted &= ferrofin_core::adoption_repairs::run_rekey_virtual_seasons(
         db,
         &id_derivation,
         &virtual_paths,
@@ -1031,7 +1049,7 @@ pub async fn build_app_state(
     .context("failed to re-key seasons with no folder")?;
     // …and a playlist an older Ferrofin created with no folder gets the one
     // Jellyfin's `CreatePlaylist` makes, and the id Jellyfin keys it by.
-    ferrofin_core::adoption_repairs::run_rekey_pathless_playlists(
+    converted &= ferrofin_core::adoption_repairs::run_rekey_pathless_playlists(
         db,
         &id_derivation,
         &format!("{}/playlists", paths.data_path()),
@@ -1045,7 +1063,7 @@ pub async fn build_app_state(
     // version wrote under its own ids move to the ids Jellyfin derives, their
     // art folders with them. Rows the version beside this one in a rolling
     // update writes after this point move on the next boot.
-    ferrofin_core::adoption_repairs::run_rekey_by_name_rows(
+    converted &= ferrofin_core::adoption_repairs::run_rekey_by_name_rows(
         db,
         by_name_identity.as_ref(),
         &virtual_paths,
@@ -1165,7 +1183,8 @@ pub async fn build_app_state(
             .with_password_reset_dir(paths.program_data_path())
             .with_auth_cache(Arc::clone(&auth_cache))
             .with_login_backoff(config.login_backoff_settings())
-            // A lockout is a dashboard Alert, not just a log line.
+            // A lockout is a dashboard Alert, not just a log line, and every
+            // password change writes its entry (`UserPasswordChangedLogger`).
             .with_activity(Arc::clone(&activity))
             // A rename or policy save is announced (`UserUpdated`).
             .with_events(Arc::clone(&event_manager))
@@ -1244,8 +1263,8 @@ pub async fn build_app_state(
         // `ReleaseDateFormat`, as the NFO savers write theirs.
         .with_release_date_format({
             let nfo = Arc::new(ferrofin_providers::xbmc::config::NfoConfigurationFile::new(
-                std::path::PathBuf::from(paths.user_configuration_directory_path())
-                    .join("named/xbmcmetadata.json"),
+                std::path::PathBuf::from(paths.configuration_directory_path())
+                    .join("xbmcmetadata.json"),
             ));
             Arc::new(move |date| {
                 ferrofin_providers::xbmc::dotnet_date::format_date_time(
@@ -1266,8 +1285,7 @@ pub async fn build_app_state(
                 })
             },
             data_dir: std::path::PathBuf::from(paths.data_path()),
-            options_file: std::path::PathBuf::from(paths.user_configuration_directory_path())
-                .join("named")
+            options_file: std::path::PathBuf::from(paths.configuration_directory_path())
                 .join("livetv.json"),
             metadata_dir: metadata_root.clone(),
         }),
@@ -1417,7 +1435,7 @@ pub async fn build_app_state(
     // A bare `CollectionFolder` an older build made for the Collections library
     // becomes the real library: before any scan, and before the sweep below
     // reads the libraries' locations.
-    ferrofin_core::adoption_repairs::run_merge_legacy_collections_library(
+    converted &= ferrofin_core::adoption_repairs::run_merge_legacy_collections_library(
         db,
         &virtual_folders_impl,
         &id_derivation,
@@ -1428,7 +1446,7 @@ pub async fn build_app_state(
     // Then a box set an older Ferrofin created with no folder gets the one
     // Jellyfin's `CreateCollectionAsync` makes in that library's folder, and
     // the id Jellyfin keys it by.
-    ferrofin_core::adoption_repairs::run_rekey_pathless_box_sets(
+    converted &= ferrofin_core::adoption_repairs::run_rekey_pathless_box_sets(
         db,
         &id_derivation,
         (&paths.data_path(), &paths.root_folder_path()),
@@ -1453,6 +1471,7 @@ pub async fn build_app_state(
             );
         }
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "parental rating level repair failed; max-rating filters may misjudge until the next scan");
         }
     }
@@ -1471,10 +1490,12 @@ pub async fn build_app_state(
                 tracing::info!(repaired, "recomputed series presentation keys");
             }
             Err(err) => {
+                converted = false;
                 tracing::warn!(%err, "series presentation key repair failed; grouped series may list per library until the next scan");
             }
         },
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "could not list libraries; series presentation key repair skipped until the next boot");
         }
     }
@@ -1609,6 +1630,12 @@ pub async fn build_app_state(
                 let config_mgr = Arc::clone(&config_mgr);
                 move || config_mgr.snapshot_shared().metadata_options.clone()
             })
+            // A season's refresh reads its episodes (`Season.GetEpisodes`),
+            // with the specials airing within it when the setting is on.
+            .with_display_specials_within_seasons({
+                let config_mgr = Arc::clone(&config_mgr);
+                move || config_mgr.snapshot_shared().display_specials_within_seasons
+            })
             // Enables the kind-filtered built-in external-id descriptors the
             // Identify dialog renders as id input fields.
             .with_item_types(item_type_lookup.as_ref())
@@ -1696,19 +1723,18 @@ pub async fn build_app_state(
     // Similar items: the local weighted-overlap scorer always runs; the remote
     // providers below run only for a library that ticked them in its
     // "Similarity providers" list, in the admin's configured order.
+    let listenbrainz_client = Arc::new(ferrofin_providers::ListenBrainzClient::new());
     let similar_providers: Vec<Arc<dyn ferrofin_traits::library::RemoteSimilarItemsProvider>> = vec![
         Arc::new(ferrofin_providers::TmdbSimilarProvider::new(
             Arc::clone(&tmdb_client),
             ferrofin_providers::TmdbKind::Movie,
-            ferrofin_providers::TMDB_SIMILAR_CACHE_DAYS,
         )),
         Arc::new(ferrofin_providers::TmdbSimilarProvider::new(
             Arc::clone(&tmdb_client),
             ferrofin_providers::TmdbKind::Series,
-            ferrofin_providers::TMDB_SIMILAR_CACHE_DAYS,
         )),
         Arc::new(ferrofin_providers::ListenBrainzSimilarArtistProvider::new(
-            Arc::new(ferrofin_providers::ListenBrainzClient::default()),
+            Arc::clone(&listenbrainz_client),
         )),
     ];
     let similar_items: Arc<dyn ferrofin_traits::library::SimilarItemsManager> = Arc::new(
@@ -1880,9 +1906,9 @@ pub async fn build_app_state(
             std::path::PathBuf::from(
                 config_mgr
                     .application_paths()
-                    .user_configuration_directory_path(),
+                    .configuration_directory_path(),
             )
-            .join("named/xbmcmetadata.json"),
+            .join("xbmcmetadata.json"),
         ));
         move || source.current()
     })
@@ -2094,13 +2120,21 @@ pub async fn build_app_state(
     let changing_network = Arc::clone(&network);
     if let Some(mut rx) = fs_events {
         let monitor = Arc::clone(&library_monitor);
-        background.push(tokio::spawn(async move {
-            while let Some(path) = rx.recv().await {
-                if let Err(err) = monitor.report_file_system_changed(&path).await {
-                    tracing::warn!(%err, path, "failed to report filesystem change");
+        background.push(tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                while let Some(path) = rx.recv().await {
+                    if let Err(err) = monitor.report_file_system_changed(&path).await {
+                        tracing::warn!(%err, path, "failed to report filesystem change");
+                    }
                 }
-            }
-        }));
+            },
+            tracing::info_span!(
+                parent: None,
+                "file_system_events",
+                task = "library_monitor",
+                trigger = "watcher"
+            ),
+        )));
     }
     // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
     // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
@@ -2205,20 +2239,20 @@ pub async fn build_app_state(
         )
         .with_default_config(OPENSUBTITLES_DEFAULT_CONFIG.to_vec()),
     ];
-    // Jellyfin's five IN-TREE provider plugins (TMDb, Studio Images, OMDb,
-    // MusicBrainz, AudioDB). They are compiled into `MediaBrowser.Providers`
-    // upstream, so every stock server has them and every dashboard shows their
-    // settings pages; Ferrofin ports all five as native providers but had never
-    // given them a plugin identity, which is why `/web/ConfigurationPages`,
-    // `/Plugins` and `/Plugins/{id}/Configuration` came back empty against
-    // Jellyfin's five entries.
+    // Jellyfin's six IN-TREE provider plugins (TMDb, Studio Images, OMDb,
+    // MusicBrainz, ListenBrainz, AudioDB). They are compiled into
+    // `MediaBrowser.Providers` upstream, so every stock server has them and
+    // every dashboard shows their settings pages; Ferrofin ports all six as
+    // native providers but had never given them a plugin identity, which is why
+    // `/web/ConfigurationPages`, `/Plugins` and `/Plugins/{id}/Configuration`
+    // came back empty against Jellyfin's entries.
     //
     // Registered UNCONDITIONALLY — outside the `disable_extensions` branch
     // above. That flag exists so a benchmark leg compares against a
-    // plugin-free Jellyfin; these five are never absent from Jellyfin, so
+    // plugin-free Jellyfin; these six are never absent from Jellyfin, so
     // suppressing them would recreate the exact divergence being closed.
     registered_plugins.extend(ferrofin_providers::builtin_plugins::ALL.iter().map(|p| {
-        ferrofin_core::RegisteredPlugin::new(
+        let plugin = ferrofin_core::RegisteredPlugin::new(
             ferrofin_traits::plugins::PluginDescriptor {
                 id: p.id,
                 name: p.name.to_owned(),
@@ -2237,13 +2271,29 @@ pub async fn build_app_state(
         .non_removable()
         .with_default_config(p.default_config.as_bytes().to_vec())
         .with_config_page(ferrofin_core::PluginConfigPage {
-            // C# `GetPages()` yields exactly one page, named `Name`, with no
-            // main-menu flag — `GET /web/ConfigurationPage?name=TMDb` matches
-            // it case-insensitively.
+            // C# `GetPages()` yields a page named `Name`, with no main-menu
+            // flag — `GET /web/ConfigurationPage?name=TMDb` matches it
+            // case-insensitively.
             name: p.name.to_owned(),
             bytes: p.config_page.to_vec(),
             enable_in_main_menu: false,
-        })
+            content_type: None,
+        });
+        // ListenBrainz's second page, `Name + "Notice"`, served with the type
+        // its resource's name gives (`MimeTypes.GetMimeType`).
+        let plugin = match p.notice {
+            Some(notice) => plugin.with_config_page(ferrofin_core::PluginConfigPage {
+                name: format!("{}Notice", p.name),
+                bytes: notice.to_vec(),
+                enable_in_main_menu: false,
+                content_type: Some(ferrofin_model::net::mime_types::get_mime_type("NOTICE.md")),
+            }),
+            None => plugin,
+        };
+        match p.config_view {
+            Some(view) => plugin.with_config_view(view),
+            None => plugin,
+        }
     }));
     // Every curated extension surfaces as a plugin here.
     registered_plugins.extend(ferrofin_extensions::registered_plugins(&extensions));
@@ -2334,7 +2384,7 @@ pub async fn build_app_state(
             // A saved configuration is announced in-process (`ConfigurationChanged`).
             .with_events(Arc::clone(&event_manager)),
     );
-    // Jellyfin's five in-tree provider plugins read their settings through
+    // Jellyfin's six in-tree provider plugins read their settings through
     // `Plugin.Instance.Configuration` at call time, so an admin's save on a
     // settings page takes effect on the next lookup with no restart. The
     // metadata clients are built far above this line (they are leaves with no
@@ -2346,6 +2396,7 @@ pub async fn build_app_state(
     musicbrainz_client.attach_plugin_manager(Arc::clone(&plugins));
     audiodb_client.attach_plugin_manager(Arc::clone(&plugins));
     studios_client.attach_plugin_manager(Arc::clone(&plugins));
+    listenbrainz_client.attach_plugin_manager(Arc::clone(&plugins));
 
     // The download link OpenSubtitles answers with refuses private addresses
     // but those its own allow-list names (gl-1160); the image list does not
@@ -2463,7 +2514,9 @@ pub async fn build_app_state(
     ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, users_impl.as_ref());
     // One-shot, before the server takes a request: an adopted Jellyfin's
     // LDAP-Auth settings and uid map come across from the plugin's XML, so its
-    // directory users sign in with no admin action (B7).
+    // directory users sign in with no admin action (B7). This and the import
+    // below do not clear `converted`: until one succeeds, the export keeps the
+    // source's own document as it is (`export_cmd::plugins`).
     ferrofin_extensions::ldap_auth::adoption::import_adopted_config(
         &std::path::Path::new(&paths.plugins_path())
             .join("configurations")
@@ -2538,11 +2591,12 @@ pub async fn build_app_state(
     // with no media type, takes what a create or add stores today. It needs
     // the playlist manager's expansion, so it runs here, before the scheduler
     // can start a scan.
-    ferrofin_core::adoption_repairs::run_expand_saved_playlist_containers(db, &playlists).await;
+    converted &=
+        ferrofin_core::adoption_repairs::run_expand_saved_playlist_containers(db, &playlists).await;
     // The playlists folder's playlist.xml files, which no earlier Ferrofin
     // wrote, written from the database before a refresh reads one (gl-341).
     // Boxed: inlined, its future puts startup's over `large_futures`.
-    Box::pin(ferrofin_core::adoption_repairs::run_save_playlist_xml_once(
+    converted &= Box::pin(ferrofin_core::adoption_repairs::run_save_playlist_xml_once(
         db,
         &playlists,
         &container_xml,
@@ -2693,7 +2747,9 @@ pub async fn build_app_state(
     // The rows the repairs deleted while the database opened (orphaned
     // extras, path duplicates) take their metadata folders and extracted
     // data, now that the configured directories and the cleanup are known.
-    ferrofin_core::adoption_repairs::run_cleanup_deleted_item_data(db, &item_data_cleanup).await;
+    converted &=
+        ferrofin_core::adoption_repairs::run_cleanup_deleted_item_data(db, &item_data_cleanup)
+            .await;
     // Jellyfin 12.0's sweeps of a 10.11 database's items whose library or
     // file is gone delete through the library manager, so they run once it
     // removes extracted data too, and before a startup trigger can scan.
@@ -2711,13 +2767,15 @@ pub async fn build_app_state(
     // gl-131 (or by a hand-over that failed) are handed over or deleted, as
     // deleting their owner now does. It deletes through the library manager
     // too; a failure only warns.
-    ferrofin_core::adoption_repairs::run_remove_orphaned_playlists(db, playlists.as_ref()).await;
+    converted &=
+        ferrofin_core::adoption_repairs::run_remove_orphaned_playlists(db, playlists.as_ref())
+            .await;
     // Jellyfin 12.0's `CleanupOrphanedExternalData`, once per database: the
     // extracted data and chapter images left behind for items no longer
     // stored (every earlier Ferrofin left them when a scan removed an item).
     // After the sweeps that delete items, and before a startup trigger can
     // scan; under the configured metadata path.
-    ferrofin_core::adoption_repairs::run_cleanup_orphaned_external_data(
+    converted &= ferrofin_core::adoption_repairs::run_cleanup_orphaned_external_data(
         db,
         &ferrofin_core::adoption_repairs::ExtractedDataRoots {
             data: std::path::PathBuf::from(paths.data_path()),
@@ -2731,11 +2789,12 @@ pub async fn build_app_state(
     // version stored resolved under the data and metadata directories take
     // the `%AppDataPath%`/`%MetadataPath%` form every save writes. Last of the
     // repairs that store a path, and before a scan.
-    ferrofin_core::adoption_repairs::run_reverse_stored_virtual_paths(db, &virtual_paths).await;
+    converted &=
+        ferrofin_core::adoption_repairs::run_reverse_stored_virtual_paths(db, &virtual_paths).await;
     // Once per database (gl-1911): the videos an earlier version probed get the
     // `HasSubtitles` a probe stores in `Data` since gl-1632, from their stored
     // subtitle streams, before a scan.
-    ferrofin_core::adoption_repairs::run_store_has_subtitles(db).await;
+    converted &= ferrofin_core::adoption_repairs::run_store_has_subtitles(db).await;
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
@@ -2881,7 +2940,10 @@ pub async fn build_app_state(
                 Arc::new(move |payload: &str| {
                     let sessions = Arc::clone(&sessions);
                     let payload = payload.to_owned();
-                    tokio::spawn(async move {
+                    // In the publisher's span (a scan, a task run, a request):
+                    // the push is the tail of its work, and a root per event
+                    // would be a trace per progress report.
+                    tokio::spawn(tracing::Instrument::in_current_span(async move {
                         let result = if admin_only {
                             sessions
                                 .send_message_to_admin_sessions(message_type, &payload)
@@ -2894,7 +2956,7 @@ pub async fn build_app_state(
                         if let Err(err) = result {
                             tracing::debug!(%err, ?message_type, "failed to push event to sessions");
                         }
-                    });
+                    }));
                     // A client push is best-effort and must never hold up the
                     // publisher (a scan publishes RefreshProgress repeatedly),
                     // so this one stays spawned.
@@ -2959,10 +3021,13 @@ pub async fn build_app_state(
                             name: template(&user_name, &device),
                             type_: type_.to_owned(),
                             user_id,
-                            short_overview: session
-                                .remote_end_point
-                                .filter(|e| !e.is_empty())
-                                .map(|endpoint| format!("IP address: {endpoint}")),
+                            // `LabelIpAddressValue`, formatted whatever the
+                            // endpoint: a session with none (Quick Connect's)
+                            // gets a bare "IP address: ", as upstream's does.
+                            short_overview: Some(format!(
+                                "IP address: {}",
+                                session.remote_end_point.as_deref().unwrap_or_default()
+                            )),
                             ..Default::default()
                         };
                         let activity = Arc::clone(&activity);
@@ -3293,6 +3358,7 @@ pub async fn build_app_state(
         Ok(0) => {}
         Ok(rows) => tracing::info!(rows, "imported jellyfin's live tv configuration"),
         Err(err) => {
+            converted = false;
             tracing::warn!(%err, "live tv configuration import failed; live tv starts unconfigured");
         }
     }
@@ -3394,10 +3460,10 @@ pub async fn build_app_state(
                     user_name: session.user_name,
                 };
                 let sync_play = Arc::clone(&sync_play);
-                tokio::spawn(async move {
+                tokio::spawn(tracing::Instrument::in_current_span(async move {
                     // Not a member of any group: a successful no-op.
                     let _ = sync_play.leave_group(&member).await;
-                });
+                }));
                 ferrofin_core::event_manager::consumer_done()
             }),
         );
@@ -3530,6 +3596,23 @@ pub async fn build_app_state(
     // a task that never ends on its own.
     if let Some(source) = network_changes {
         background.extend(start_network_change_monitor(source, &changing_network));
+    }
+    // Last of `build_app_state`, after every start-time conversion and import
+    // above (keep it last): the export takes this data directory only once a start
+    // of the exporting build has recorded it (gl-1910), and only a start where
+    // every one succeeded records it. One where one failed removes the record
+    // an earlier start left, so the export refuses until a start gets through
+    // them all (gl-1952).
+    if converted {
+        if let Err(err) = db.record_started(ferrofin_health::build_version()).await {
+            tracing::warn!(%err, "could not record this start; an export will refuse the data directory until a start records it");
+        }
+    } else if let Err(err) = db.clear_started().await {
+        tracing::warn!(%err, "could not remove the record of an earlier start; an export may take the data directory without the start-time conversion that failed");
+    } else {
+        tracing::warn!(
+            "a start-time conversion failed (warned above); an export will refuse the data directory until a start gets through them all"
+        );
     }
 
     Ok(WiredApp {
@@ -3702,9 +3785,9 @@ fn subscribe_intro_skipper(
                     ids(&info.items_updated),
                     ids(&info.items_removed),
                 );
-                tokio::spawn(async move {
+                tokio::spawn(tracing::Instrument::in_current_span(async move {
                     analysis.items_changed(&added, &updated, &removed).await;
-                });
+                }));
             }
             ferrofin_core::event_manager::consumer_done()
         }),
@@ -3722,9 +3805,9 @@ fn subscribe_intro_skipper(
                 let completed =
                     result.status == ferrofin_model::tasks::TaskCompletionStatus::Completed;
                 let key = result.key.unwrap_or_default();
-                tokio::spawn(async move {
+                tokio::spawn(tracing::Instrument::in_current_span(async move {
                     analysis.task_completed(&key, completed).await;
-                });
+                }));
             }
             ferrofin_core::event_manager::consumer_done()
         }),
@@ -3748,9 +3831,9 @@ fn subscribe_intro_skipper(
             }
             if let Some(id) = id {
                 let analysis = Arc::clone(&settings);
-                tokio::spawn(async move {
+                tokio::spawn(tracing::Instrument::in_current_span(async move {
                     analysis.plugin_configuration_changed(id).await;
-                });
+                }));
             }
             ferrofin_core::event_manager::consumer_done()
         }),
@@ -3890,8 +3973,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = crate::config::Config::test_stub(tmp.path());
         let paths = crate::bootstrap::application_paths(&config);
-        let named = config.config_dir.join("users").join("named");
-        std::fs::create_dir_all(&named).expect("named configuration directory");
+        let legacy = config.config_dir.join("users").join("named");
+        std::fs::create_dir_all(&legacy).expect("legacy named configuration directory");
         let port = || async {
             super::load_network_configuration(&paths)
                 .await
@@ -3910,9 +3993,23 @@ mod tests {
         .expect("write network.xml");
         assert_eq!(port().await, 8097, "Jellyfin's network.xml");
 
-        std::fs::write(named.join("network.json"), r#"{"InternalHttpPort":8098}"#)
-            .expect("write network.json");
-        assert_eq!(port().await, 8098, "the seeded or saved network.json");
+        // gl-319: a release before 1.6.0 kept it in `users/named/`, read
+        // until the boot moves it.
+        std::fs::write(legacy.join("network.json"), r#"{"InternalHttpPort":8098}"#)
+            .expect("write the legacy network.json");
+        assert_eq!(
+            port().await,
+            8098,
+            "the network.json an earlier release saved"
+        );
+        ferrofin_core::named_configuration_files::move_legacy(&config.config_dir).expect("move");
+        assert_eq!(port().await, 8098, "the moved network.json");
+        std::fs::write(
+            config.config_dir.join("network.json"),
+            r#"{"InternalHttpPort":8099}"#,
+        )
+        .expect("write network.json");
+        assert_eq!(port().await, 8099, "the seeded or saved network.json");
     }
 
     /// The storage page lists the libraries from the snapshot, not the full
@@ -4286,6 +4383,15 @@ mod tests {
         let _router = ferrofin_api::create_router(wired.state.clone());
         // The host starts un-flagged; the composition root flips it after mount.
         wired.app_host.mark_core_startup_complete();
+        // The start recorded its build once the boot repairs ran, which the
+        // export requires of the build exporting the directory (gl-1910).
+        assert_eq!(
+            db.meta_get(ferrofin_db::STARTED_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(ferrofin_health::build_version())
+        );
     }
 
     /// A stop signals the drain and records the restart decision, and leaves

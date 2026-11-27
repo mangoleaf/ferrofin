@@ -63,9 +63,10 @@ struct TrickplayQuery {
 async fn get_trickplay_hls_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((DotnetGuid(item_id), width)): Path<(DotnetGuid, i32)>,
+    Path((DotnetGuid(item_id), width)): Path<(DotnetGuid, String)>,
     Query(query): Query<TrickplayQuery>,
 ) -> Result<Response, ApiError> {
+    let width: i32 = crate::query::bind_route_number(&width, "width")?;
     let source_id = query.media_source_id.unwrap_or(item_id);
     let playlist = state
         .trickplay
@@ -124,13 +125,14 @@ async fn get_trickplay_hls_playlist(
 async fn get_trickplay_tile_image(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((DotnetGuid(item_id), width, index)): Path<(DotnetGuid, i32, String)>,
+    Path((DotnetGuid(item_id), width, index)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<TrickplayQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    let width: i32 = crate::query::bind_route_number(&width, "width")?;
     // The vendored route is `{index}.jpg`; axum captures the whole segment, so
     // the `.jpg` literal is parsed off here (as the HLS segment handlers do).
-    let index = parse_segment_index(&index)?;
+    let index = parse_segment_index(&index, "index")?;
     let source_id = query.media_source_id.unwrap_or(item_id);
     crate::handlers::items::require_visible_item(&state, source_id, auth.user.as_deref()).await?;
     let Some(path) = state

@@ -4,7 +4,7 @@ Ferrofin answers Jellyfin clients' IPv4 discovery requests on UDP **7359**, retu
 its server ID, name and advertised HTTP(S) URL. Discovery is enabled by default.
 The persisted network configuration's `AutoDiscovery` setting applies at server
 startup; restart the server after changing it. The configuration is stored at
-`{config}/users/named/network.json` and exposed through
+`{config}/network.json` and exposed through
 `GET/POST /System/Configuration/network`. This is Jellyfin server discovery,
 separate from DLNA/SSDP and tuner discovery.
 

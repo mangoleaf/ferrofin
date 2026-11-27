@@ -131,6 +131,7 @@ pub fn is_listing_provider_enabled_for_tuner(
         || info
             .enabled_tuners
             .iter()
+            .flatten()
             .any(|t| eq_ordinal_ignore_case(t, tuner_host_id))
 }
 
@@ -138,11 +139,13 @@ pub fn is_listing_provider_enabled_for_tuner(
 ///
 /// Port of `ListingsManager.GetMappedChannel`: the first pair whose `Name`
 /// matches (case-insensitively) contributes its `Value`; an unmapped id is
-/// returned unchanged.
+/// returned unchanged. A `null` mapping (`None`) maps nothing: upstream
+/// dereferences it and fails, a Jellyfin bug not ported (gl-1677).
 #[must_use]
-pub fn mapped_channel<'a>(channel_id: &'a str, mappings: &'a [NameValuePair]) -> &'a str {
+pub fn mapped_channel<'a>(channel_id: &'a str, mappings: &'a [Option<NameValuePair>]) -> &'a str {
     mappings
         .iter()
+        .flatten()
         .find(|m| {
             m.name
                 .as_deref()
@@ -228,7 +231,7 @@ pub fn normalize_name(value: &str) -> String {
 /// the raw key when the mapping resolves to blank.
 #[must_use]
 pub fn epg_channel_for_tuner_channel<'a>(
-    mappings: &[NameValuePair],
+    mappings: &[Option<NameValuePair>],
     tuner: &TunerChannel,
     epg: &'a EpgChannelData,
 ) -> Option<&'a EpgChannel> {
@@ -287,7 +290,7 @@ pub fn epg_channel_for_tuner_channel<'a>(
 #[must_use]
 pub fn tuner_channel_mapping(
     tuner: &TunerChannel,
-    mappings: &[NameValuePair],
+    mappings: &[Option<NameValuePair>],
     epg: &EpgChannelData,
 ) -> TunerChannelMapping {
     let name = if tuner.number.trim().is_empty() {
@@ -350,10 +353,7 @@ mod tests {
     }
 
     fn pair(name: &str, value: &str) -> NameValuePair {
-        NameValuePair {
-            name: Some(name.to_owned()),
-            value: Some(value.to_owned()),
-        }
+        NameValuePair::new(name, value)
     }
 
     #[test]
@@ -423,7 +423,7 @@ mod tests {
         let epg = EpgChannelData::new(&[epg(guide, "Guide", "1")]);
         assert_eq!(epg.by_id(tuner).is_some(), equal, "by id");
         assert_eq!(
-            mapped_channel(tuner, &[pair(guide, "mapped")]) == "mapped",
+            mapped_channel(tuner, &[Some(pair(guide, "mapped"))]) == "mapped",
             equal,
             "by mapping"
         );
@@ -466,7 +466,7 @@ mod tests {
             ..tuner
         };
         assert_eq!(
-            epg_channel_for_tuner_channel(&[pair("ö-1", "örf.at")], &mapped, &epg)
+            epg_channel_for_tuner_channel(&[Some(pair("ö-1", "örf.at"))], &mapped, &epg)
                 .map(|c| c.id.as_str()),
             Some("ÖRF.at"),
         );
@@ -474,7 +474,7 @@ mod tests {
         assert!(is_listing_provider_enabled_for_tuner(
             &ListingsProviderInfo {
                 enable_all_tuners: false,
-                enabled_tuners: vec!["TÜNER-1".to_owned()],
+                enabled_tuners: vec![None, Some("TÜNER-1".to_owned())],
                 ..ListingsProviderInfo::default()
             },
             "tüner-1",
@@ -498,10 +498,14 @@ mod tests {
 
     #[test]
     fn mapped_channel_is_case_insensitive_and_falls_through() {
-        let mappings = [pair("TunerA", "provider-a")];
+        let mappings = [Some(pair("TunerA", "provider-a"))];
         assert_eq!(mapped_channel("tunera", &mappings), "provider-a");
         assert_eq!(mapped_channel("other", &mappings), "other");
         assert_eq!(mapped_channel("tunera", &[]), "tunera");
+        // A null mapping maps nothing and stops no later one (gl-1677).
+        let with_null = [None, Some(pair("TunerA", "provider-a"))];
+        assert_eq!(mapped_channel("tunera", &with_null), "provider-a");
+        assert_eq!(mapped_channel("other", &[None]), "other");
     }
 
     #[test]
@@ -593,7 +597,7 @@ mod tests {
             Some("parity1")
         );
         // Mapped on the external id: the FIRST arm now resolves, to parity2.
-        let mappings = [pair("m3u_one", "parity2")];
+        let mappings = [Some(pair("m3u_one", "parity2"))];
         assert_eq!(
             epg_channel_for_tuner_channel(&mappings, &tuner, &data).map(|c| c.id.as_str()),
             Some("parity2")
@@ -639,7 +643,7 @@ mod tests {
 
         let listed = ListingsProviderInfo {
             enable_all_tuners: false,
-            enabled_tuners: vec!["ABC".to_owned()],
+            enabled_tuners: vec![Some("ABC".to_owned())],
             ..ListingsProviderInfo::default()
         };
         assert!(is_listing_provider_enabled_for_tuner(&listed, "abc"));
