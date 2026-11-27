@@ -583,6 +583,60 @@ mod tests {
         );
     }
 
+    /// A guide provider or tuner whose strings look like numbers (a US
+    /// `ZipCode`, a numeric `ListingsId`, a Schedules Direct station id as a
+    /// mapping's `Value`, an HDHomeRun `DeviceId`) imports with them as the
+    /// text Jellyfin wrote, a leading zero included (gl-1965). The entries'
+    /// default lists are empty, so their members are read without a schema.
+    #[test]
+    fn numeric_looking_strings_in_a_provider_or_tuner_import_as_text() {
+        let xml = GOLDEN_XML
+            .replacen(
+                "<EnabledTuners />",
+                "<EnabledTuners /><ZipCode>02134</ZipCode><ListingsId>123456</ListingsId>",
+                1,
+            )
+            .replacen(
+                "<ChannelMappings />",
+                "<ChannelMappings><NameValuePair><Name>hdhr_4.1</Name><Value>20454</Value>\
+                 </NameValuePair></ChannelMappings>",
+                1,
+            )
+            .replacen(
+                "<FriendlyName>Trial tuner</FriendlyName>",
+                "<DeviceId>10760000</DeviceId><FriendlyName>2024</FriendlyName>",
+                1,
+            );
+        let options: LiveTvOptions = import_over(
+            &LiveTvOptions::default(),
+            &xml,
+            "LiveTvOptions",
+            LIVETV_XML_DENY,
+        )
+        .expect("imports");
+        let [provider] = options.listing_providers.as_slice() else {
+            panic!(
+                "expected the one provider, got {:?}",
+                options.listing_providers
+            );
+        };
+        assert_eq!(provider.zip_code.as_deref(), Some("02134"));
+        assert_eq!(provider.listings_id.as_deref(), Some("123456"));
+        assert!(provider.enable_all_tuners, "a bool stays a bool");
+        assert_eq!(
+            provider.channel_mappings,
+            [Some(ferrofin_model::dto::NameValuePair::new(
+                "hdhr_4.1", "20454"
+            ))]
+        );
+        let [tuner] = options.tuner_hosts.as_slice() else {
+            panic!("expected the one tuner, got {:?}", options.tuner_hosts);
+        };
+        assert_eq!(tuner.device_id.as_deref(), Some("10760000"));
+        assert_eq!(tuner.friendly_name.as_deref(), Some("2024"));
+        assert_eq!(tuner.tuner_count, 2, "a number stays a number");
+    }
+
     /// A guide provider with ONE channel mapping, as Jellyfin writes it
     /// (`<ChannelMappings><NameValuePair>…</NameValuePair></ChannelMappings>`),
     /// imports with that mapping: a one-entry list of `NameValuePair` is a list,
