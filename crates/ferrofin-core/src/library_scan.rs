@@ -3091,6 +3091,12 @@ struct ItemPass<'a> {
     /// (a first refresh stays first; owner decision D1 — a provider that
     /// fails leaves it unstamped).
     music_pending: bool,
+    /// Its generated Primary is drawn by the closing passes, the last of its
+    /// providers (`RefreshWithProviders`' custom providers): the stamp is
+    /// left for that pass to write, which withholds it when the draw fails
+    /// (`RunCustomProvider`), so a scan stopped between the two leaves it
+    /// due, as for [`music_pending`](Self::music_pending).
+    draw_pending: bool,
     /// The edits recorded before its stored row was read
     /// ([`StoredRows::edit_mark`]).
     edit_mark: u64,
@@ -3114,6 +3120,10 @@ struct ItemState<'s, 'a> {
     /// its children. Its stamp is withheld until the end, except a stamp the
     /// scan could not read, which the save keeps.
     save_attempted: bool,
+    /// Set by [`LibraryScanner::scan_item`] once it decided the save: the
+    /// refresh earned its `DateLastRefreshed` stamp (no provider failed),
+    /// which a pending draw writes ([`ItemPass::draw_pending`]).
+    stamp_earned: bool,
     /// Set by [`LibraryScanner::scan_item`] when it read a playlist folder's
     /// `playlist.xml`: what the walk merges once every row is saved.
     playlist_xml: Option<playlists::PlaylistXmlRead>,
@@ -4326,12 +4336,13 @@ struct ScanWork<'r> {
     served: Served,
     /// The fetcher policy of an item in no library (a by-name artist).
     outside: FetcherPolicy<'r>,
-    /// The rows with a generated Primary (a photo album, folder or playlist,
-    /// [`DynamicImageKind`](crate::dynamic_images::DynamicImageKind)) the walk
-    /// refreshed, each with whether that refresh ran every provider
-    /// (`runAllProviders`, which forces the redraw). Their providers run in
-    /// the closing passes, once the art they draw from is saved.
-    generated_images: Vec<(Uuid, bool)>,
+    /// The rows with a generated Primary (a music or photo album, folder or
+    /// playlist, [`DynamicImageKind`](crate::dynamic_images::DynamicImageKind))
+    /// the walk refreshed, each with whether that refresh ran every provider
+    /// (`runAllProviders`, which forces the redraw) and the stamp it left to
+    /// the draw ([`ItemPass::draw_pending`]). Their providers run in the
+    /// closing passes, once the art they draw from is saved.
+    generated_images: Vec<crate::dynamic_images::RefreshedRow>,
     /// The series this scan refreshes, not those it carries for context:
     /// each one's refresh ends removing its obsolete virtual episodes
     /// ([`obsolete_episodes`]), once the walk saved every row.
@@ -4344,6 +4355,23 @@ struct ScanWork<'r> {
 }
 
 impl ScanWork<'_> {
+    /// The rows whose generated Primary the closing passes draw, with the
+    /// stamps the music pass earned and left to the draw (`left_to_draw`,
+    /// [`refresh_music`](LibraryScanner::refresh_music)), each saved.
+    fn rows_to_draw(
+        &self,
+        left_to_draw: &std::collections::HashSet<Uuid>,
+    ) -> Vec<crate::dynamic_images::RefreshedRow> {
+        self.generated_images
+            .iter()
+            .map(|&row| crate::dynamic_images::RefreshedRow {
+                stamp: row.stamp || left_to_draw.contains(&row.id),
+                saved: row.saved || left_to_draw.contains(&row.id),
+                ..row
+            })
+            .collect()
+    }
+
     /// The series the TMDb missing/unaired episode provider runs for: those
     /// the walk refreshed with their custom providers that the scan
     /// refreshes rather than carries for context.
@@ -4868,6 +4896,32 @@ impl LibraryScanner {
     ) -> Self {
         self.metadata_savers = Some(providers);
         self
+    }
+
+    /// The generated Primaries of the rows a scan refreshed, the last of
+    /// their providers ([`refresh_rows_between`](crate::dynamic_images::DynamicImageProviders::refresh_rows_between)),
+    /// then the metadata savers of each row drawn, as its `ImageUpdate` save
+    /// runs them (`SaveItemAsync`). Whether the pass read its rows; a failure
+    /// is logged.
+    async fn draw_refreshed_rows<'b>(
+        &self,
+        providers: &crate::dynamic_images::DynamicImageProviders,
+        rows: &[crate::dynamic_images::RefreshedRow],
+        between: &'b (dyn Fn() -> crate::dynamic_images::BetweenFuture<'b> + Send + Sync),
+    ) -> bool {
+        match providers.refresh_rows_between(rows, between).await {
+            Ok((_, drawn)) => {
+                for id in drawn {
+                    self.save_metadata_sidecars(id, ItemUpdateType::ImageUpdate)
+                        .await;
+                }
+                true
+            }
+            Err(err) => {
+                tracing::warn!(%err, "dynamic image pass over the refreshed rows failed");
+                false
+            }
+        }
     }
 
     async fn save_metadata_sidecars(
@@ -7320,6 +7374,8 @@ impl LibraryScanner {
         // ([`PathScope::is_requested`]).
         let mut target_failure: Option<ServiceError> = None;
         let targeted = |item: &Planned| scope.is_some_and(|scope| scope.is_requested(item));
+        // Whether the closing passes draw generated Primaries at all.
+        let has_image_providers = self.dynamic_image_providers().is_some();
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
             probes.pause_foreground();
@@ -7468,6 +7524,18 @@ impl LibraryScanner {
                 crate::refresh_plan::full_refresh(&plan, &request)
                     || self.music_fetch(kind, &plan, policy, locked).any()
             });
+            // `RefreshWithProviders`' custom providers (`MetadataService.cs:
+            // 922-925`), skipped for a locked item (`:785-788`) and with
+            // metadata mode `None`: the generated Primary, drawn by the
+            // closing passes. An artist's provider draws nothing
+            // (`ArtistSources`), so it is not asked.
+            let draw_pending = !locked
+                && !undecodable
+                && request.options.metadata_refresh_mode != MetadataRefreshMode::None
+                && has_image_providers
+                && crate::dynamic_images::DynamicImageKind::for_entity(&entity).is_some_and(
+                    |kind| kind != crate::dynamic_images::DynamicImageKind::MusicArtist,
+                );
             art_cache.next_episode =
                 self.next_episode_for_images(&planned, scanned + 1, &stored_rows, &refresh);
             let pass = ItemPass {
@@ -7480,6 +7548,7 @@ impl LibraryScanner {
                 locked,
                 policy,
                 music_pending,
+                draw_pending,
                 edit_mark: stored_rows.edit_mark,
             };
             let mut state = ItemState {
@@ -7490,6 +7559,7 @@ impl LibraryScanner {
                 refresh: &refresh,
                 renamed_extra: false,
                 save_attempted: false,
+                stamp_earned: false,
                 playlist_xml: None,
             };
             // Boxed: the per-item pipeline is the deepest future the scan
@@ -7499,6 +7569,7 @@ impl LibraryScanner {
             let extra_renamed = state.renamed_extra;
             let mut playlist_xml = state.playlist_xml.take();
             let save_attempted = state.save_attempted;
+            let stamp_earned = state.stamp_earned;
             if undecodable || scanned_item.is_err() {
                 self.keep_stored_series_key(item, &mut series_keys).await;
             }
@@ -7603,6 +7674,7 @@ impl LibraryScanner {
                         || matches!(saved, ItemSaved::Saved),
                     owns_stamp: music_pending,
                     owns_save: false,
+                    draw: draw_pending,
                 });
             }
             // A playlist's local readers run with the rest of its refresh
@@ -7625,32 +7697,26 @@ impl LibraryScanner {
                     xml,
                 });
             }
-            // `RefreshWithProviders`' custom providers (`MetadataService.cs:
-            // 922-925`), skipped for a locked item (`:785-788`) and with
-            // metadata mode `None`: the generated Primary, drawn by the
-            // closing passes. An artist's provider draws nothing
-            // (`ArtistSources`), so it is not asked.
+            // The draw writes the stamp the walk left it: an album's music
+            // pass hands on its own. An item edited since keeps the edit's.
             //
             // TODO(parity, open work item — NOT an accepted divergence;
-            // gl-593): the walk has already decided this row's save and stamped its
-            // `DateLastRefreshed` when the closing pass draws, so a failed
-            // draw does not withhold the stamp and a drawn image does not
-            // re-save the row, as `RunCustomProvider` and `SaveInternal` do in
-            // the same `RefreshMetadata` upstream. Un-defer path: leave these
-            // rows' stamp and save to the closing pass, as `music_pending`
-            // leaves an album's to the music pass, which stamps only a
-            // successful draw and saves on `ImageUpdate`; test it with a draw
-            // that fails.
-            if !locked
-                && !undecodable
-                && !matches!(saved, ItemSaved::Cancelled)
-                && request.options.metadata_refresh_mode != MetadataRefreshMode::None
-                && crate::dynamic_images::DynamicImageKind::for_entity(&entity).is_some_and(
-                    |kind| kind != crate::dynamic_images::DynamicImageKind::MusicArtist,
-                )
-            {
+            // gl-1993): the save is still decided before the draw, so a full
+            // refresh that changes nothing saves the row for its stamp, and a
+            // draw that then fails leaves it saved without one, where
+            // upstream's failed provider drops that save too. Fix path: skip
+            // a stamp-only save here (and in the music pass) and let the draw
+            // write the stamp with `DateLastSaved`.
+            if draw_pending && !matches!(saved, ItemSaved::Cancelled) {
                 work.generated_images
-                    .push((item.id, plan.run_all_providers));
+                    .push(crate::dynamic_images::RefreshedRow {
+                        id: item.id,
+                        force: plan.run_all_providers,
+                        stamp: stamp_earned
+                            && !music_pending
+                            && matches!(saved, ItemSaved::Saved | ItemSaved::Unchanged),
+                        saved: matches!(saved, ItemSaved::Saved),
+                    });
             }
             // `TmdbMissingEpisodeProvider`, a series' custom provider (and an
             // `IHasItemChangeMonitor`, so it runs on every refresh of a series
@@ -8294,7 +8360,8 @@ impl LibraryScanner {
             return false;
         }
         let mut served = work.served.clone();
-        self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
+        let left_to_draw = self
+            .refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
             .await;
         // The TMDb missing/unaired episodes of each series it refreshed (a
         // series' own refresh is a touched scan).
@@ -8320,12 +8387,8 @@ impl LibraryScanner {
             if run.cancel.is_cancelled() {
                 return false;
             }
-            if let Err(err) = providers
-                .refresh_rows_between(&work.generated_images, &between)
-                .await
-            {
-                tracing::warn!(%err, "dynamic image pass failed");
-            }
+            self.draw_refreshed_rows(&providers, &work.rows_to_draw(&left_to_draw), &between)
+                .await;
             let runs = run.options.metadata_refresh_mode != MetadataRefreshMode::None;
             // `CollectionFolderImageProvider`, of each library a library's or
             // the root's refresh validated.
@@ -8455,6 +8518,7 @@ impl LibraryScanner {
             locked,
             policy,
             music_pending,
+            draw_pending,
             edit_mark,
         } = pass;
         if matches!(stored, Stored::Undecodable) {
@@ -9286,6 +9350,7 @@ impl LibraryScanner {
             save = decision.save,
             "item refresh decided"
         );
+        state.stamp_earned = decision.stamp_refreshed;
         if !decision.save {
             return Ok(ItemSaved::Unchanged);
         }
@@ -9544,10 +9609,11 @@ impl LibraryScanner {
         // A cancel may have cut the chapters, the subtitle downloads or the
         // trickplay short, so it leaves the row unstamped. Otherwise the
         // stamp this refresh earned is written, or the stored one is put
-        // back: a refresh with a failed provider keeps it, and an album's or
-        // artist's is the music pass's to write. Only that column: the row's
-        // save moved `DateLastSaved`, and so the Etag, once.
-        let stamp = if decision.stamp_refreshed && !music_pending {
+        // back: a refresh with a failed provider keeps it, an album's or
+        // artist's is the music pass's to write, and a row with a generated
+        // Primary the draw's. Only that column: the row's save moved
+        // `DateLastSaved`, and so the Etag, once.
+        let stamp = if decision.stamp_refreshed && !music_pending && !draw_pending {
             Some(Utc::now())
         } else {
             kept_stamp
@@ -10183,7 +10249,7 @@ impl LibraryScanner {
     /// | first refreshes | the genres and music genres never refreshed, stamped; the root and user root too where their opening refresh cannot run; the Playlists folder never refreshed, once its directory holds an entry | `GenresValidator.cs:79-83`, `MusicGenresValidator.cs:64-67`, `ValidateTopLibraryFolders`; `Folder.cs:400-412` |
     /// | studio images | the studios never refreshed | `StudiosValidator.cs:69-84` (new studios) |
     /// | library tiles | their own 7-day staleness (`HasChangedByDate`), every tile when the validation runs every provider; never a locked library's | `CollectionFolderImageProvider` |
-    /// | dynamic images | first the music and photo albums, folders and playlist files the walk refreshed with every provider (`runAllProviders`), forced; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`, never for a music album); never a locked row; never the two root folders, which the validation refreshes at its opening | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders`; `ValidateTopLibraryFolders` |
+    /// | dynamic images | first the music and photo albums, folders and playlist files the walk refreshed, forced where that refresh ran every provider (`runAllProviders`), each writing the stamp its refresh left the draw and saved when drawn; then per item: no generated Primary yet, or its file changed (`HasChangedByDate`, never for a music album); never a locked row; never the two root folders, which the validation refreshes at its opening | `BaseDynamicImageProvider.HasChanged`, `MetadataService.GetProviders`; `ValidateTopLibraryFolders` |
     /// | collections | movies in libraries with automatic collections enabled | `CollectionPostScanTask` |
     /// | splashscreen | 30 random movies and series rated at most 13, for posters and thumbs (backdrops when no thumb); rebuilt on every validation, as upstream's | `SplashscreenPostScanTask` |
     // One straight sequence of the closing passes, each timed and logged by
@@ -10221,9 +10287,11 @@ impl LibraryScanner {
         let phase = std::time::Instant::now();
         let mut timings = PassTimings::default();
         let mut served = work.served.clone();
+        let mut left_to_draw = std::collections::HashSet::new();
         // Music: each album's and artist's providers as the walk decided.
         timings.music = post_scan_pass(music, done + 1, run.cancel, async {
-            self.refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
+            left_to_draw = self
+                .refresh_music(&work.music, &art_cache.album_gains, run, &mut served)
                 .await;
             true
         })
@@ -10360,20 +10428,14 @@ impl LibraryScanner {
                         Box::pin(self.serve_lane(run)).await;
                     })
                 };
-            // The rows the walk refreshed with every provider redraw first;
-            // the gated pass over every other row follows.
-            let forced: Vec<(Uuid, bool)> = work
-                .generated_images
-                .iter()
-                .copied()
-                .filter(|&(_, force)| force)
-                .collect();
-            let mut succeeded = true;
-            if let Err(err) = providers.refresh_rows_between(&forced, &between).await {
-                tracing::warn!(%err, "forced dynamic image pass failed");
-                succeeded = false;
-            }
-            let drawn = forced.iter().map(|&(id, _)| id).collect();
+            // The rows the walk refreshed draw first, each forced as its
+            // refresh was, and write the stamps their refresh left them; the
+            // gated pass over every other row follows.
+            let walked = work.rows_to_draw(&left_to_draw);
+            let mut succeeded = self
+                .draw_refreshed_rows(&providers, &walked, &between)
+                .await;
+            let drawn = walked.iter().map(|row| row.id).collect();
             if let Err(err) = providers.refresh_all_between(&drawn, &between).await {
                 tracing::warn!(%err, "dynamic image pass failed");
                 succeeded = false;

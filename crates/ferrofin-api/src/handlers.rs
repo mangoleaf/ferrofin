@@ -2599,7 +2599,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    (InheritDatesFromOwner); the stored ones it did not find (removedExtraIds, \
                    ExtraType set: gone_extras) are removed through prune_deleted on their \
                    paths alone, and a set found smaller gives the rest the title metadata \
-                   (copy_to_owned_videos' found). Compared with RefreshMetadata, \
+                   (copy_to_owned_videos' found). The generated Primary of a row a scan \
+                   refreshes (a music or photo album, a folder, a playlist file) is drawn in \
+                   its closing passes as the last of its providers (ferrofin-core \
+                   dynamic_images.rs refresh_rows_between), which writes the \
+                   DateLastRefreshed stamp the walk (library_scan.rs ItemPass::draw_pending) \
+                   or an album's music pass (library_scan/music.rs MusicRefresh::draw) left \
+                   it, withheld when the draw failed (RunCustomProvider's Failures), and \
+                   on an ImageUpdate makes the row's repository save (SaveInternal's \
+                   updateType > None: touch_item_updated moves DateLastSaved and announces \
+                   ItemUpdated) and runs its metadata savers (SaveItemAsync's \
+                   SaveMetadataAsync, library_scan.rs draw_refreshed_rows). Compared with \
+                   RefreshMetadata, RunCustomProvider, BaseDynamicImageProvider.FetchAsync, \
                    BaseItem.RefreshMetadata, RefreshedOwnedItems, RefreshExtras, \
                    Video.RefreshedOwnedItems, MediaSourceManager.GetPlaybackMediaSources, \
                    SaveItemAsync, LibraryManager.UpdatePeopleAsync, LibraryManager.GetPeople, \
@@ -2614,6 +2625,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    the answers merge field by field (gl-1813) are not part of this row.",
         date: "2026-11-26",
         divergences: &[
+            "A full refresh that changes nothing saves a row with a generated Primary for its \
+             DateLastRefreshed stamp before the closing pass draws it, so a draw that then \
+             fails leaves the row saved (DateLastSaved and Etag moved) without the stamp; \
+             upstream's failed provider drops the stamp-only save too. Fix path: gl-1993.",
             "An album below an identified artist is looked up by its own ids, name and year; \
              upstream's ApplySearchResult gives every child but a season or an episode the \
              artist's result, its ids replacing the album's and its name and year the \
