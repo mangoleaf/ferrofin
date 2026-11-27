@@ -4475,6 +4475,30 @@ impl RemoteImageSource {
             Self::Studios => &[Thumb],
         }
     }
+
+    /// `RemoteImageInfo.RatingType`: the fanart.tv plugin rates its
+    /// candidates by likes; every other provider leaves the default score.
+    fn rating_type(self) -> ferrofin_model::dto::RatingType {
+        match self {
+            Self::FanartMovie
+            | Self::FanartSeries
+            | Self::FanartSeason
+            | Self::FanartArtist
+            | Self::FanartAlbum => ferrofin_model::dto::RatingType::Likes,
+            Self::TmdbTitle(_)
+            | Self::TmdbBoxSet
+            | Self::TmdbPerson
+            | Self::TmdbSeason
+            | Self::TmdbEpisode
+            | Self::TvdbSeries
+            | Self::TvdbSeason
+            | Self::TvdbEpisode
+            | Self::AudioDbArtist
+            | Self::AudioDbAlbum
+            | Self::Omdb
+            | Self::Studios => ferrofin_model::dto::RatingType::Score,
+        }
+    }
 }
 
 impl LocalProviderManager {
@@ -4660,7 +4684,7 @@ impl LocalProviderManager {
         // provider for the item, narrowed to `ProviderName` when given
         // (`OrdinalIgnoreCase`) and to those whose `GetSupportedImages` lists
         // the requested `ImageType`, before any is asked for its images.
-        let name_filter = Some(query.provider_name.trim()).filter(|n| !n.is_empty());
+        let name_filter = Some(query.provider_name.as_str()).filter(|n| !n.is_empty());
         let sources: Vec<RemoteImageSource> = self
             .ordered_image_sources(entity)
             .await
@@ -4721,11 +4745,12 @@ impl LocalProviderManager {
                 for image in &mut images {
                     image.language = adjust_tmdb_image_language(image.language.take(), &preferred);
                     if matches!(image.image_type, ImageType::Backdrop | ImageType::Thumb) {
-                        image.image_type = if image.language.is_some() {
-                            ImageType::Thumb
-                        } else {
-                            ImageType::Backdrop
-                        };
+                        image.image_type =
+                            if image.language.as_deref().is_some_and(|l| !l.is_empty()) {
+                                ImageType::Thumb
+                            } else {
+                                ImageType::Backdrop
+                            };
                     }
                 }
             }
@@ -4747,7 +4772,7 @@ impl LocalProviderManager {
                     vote_count: img.vote_count,
                     language: img.language,
                     type_: img.image_type,
-                    ..RemoteImageInfo::default()
+                    rating_type: source.rating_type(),
                 })
                 .collect();
             // `if (!includeAllLanguages && hasPreferredLanguage)`: keep images
@@ -5069,7 +5094,7 @@ impl LocalProviderManager {
 
     /// The fanart.tv image providers, each keyed by the id the plugin reads:
     /// movies by Tmdb (else Imdb), series by Tvdb, artists by MusicBrainz
-    /// artist, albums by album-artist + release-group.
+    /// artist, albums by album artist, then release or release group.
     async fn fanart_images(
         &self,
         source: RemoteImageSource,
@@ -5092,9 +5117,12 @@ impl LocalProviderManager {
                 Some(artist) => fanart.artist_images(artist).await,
                 None => Vec::new(),
             },
-            _ => match (id("MusicBrainzAlbumArtist"), id("MusicBrainzReleaseGroup")) {
-                (Some(artist), Some(group)) => fanart.album_images(artist, group).await,
-                _ => Vec::new(),
+            _ => match id("MusicBrainzAlbumArtist") {
+                Some(artist) => {
+                    let (release, group) = (id("MusicBrainzAlbum"), id("MusicBrainzReleaseGroup"));
+                    fanart.album_images(artist, release, group).await
+                }
+                None => Vec::new(),
             },
         }
     }
@@ -5190,8 +5218,12 @@ fn ranking_fields(image: &RemoteImageInfo) -> (Option<&str>, Option<f64>, Option
 
 /// `TmdbUtils.AdjustImageLanguage`: expose regional requested tags when the
 /// provider reports only their language prefix, and treat TMDB's xx as untagged.
+/// An untagged image keeps `GetImageLanguage`'s `""`.
 fn adjust_tmdb_image_language(language: Option<String>, requested: &str) -> Option<String> {
-    let language = language.filter(|language| !language.is_empty())?;
+    let language = language?;
+    if language.is_empty() {
+        return Some(language);
+    }
     if requested.len() > 2
         && language.len() == 2
         && requested
@@ -10379,6 +10411,154 @@ mod tests {
             ],
             "season 1 only; the 'all' background and season 2's poster are not its own"
         );
+    }
+
+    /// fanart.tv's candidates are rated by likes (`RatingType.Likes`, which
+    /// jellyfin-web prints as "N likes"), and carry the plugin's fixed size and
+    /// `/bigpreview/` thumbnail; TheMovieDb's stay `Score`.
+    #[tokio::test]
+    async fn fanart_candidates_are_rated_by_likes() {
+        let server = crate::mock_http::MockServer::start(vec![
+            (
+                "/movie/603/images",
+                r#"{"posters":[{"file_path":"/p.jpg","iso_639_1":"en","vote_average":5.0}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/movies/603",
+                r#"{"hdmovielogo":[{"url":"https://assets.fanart.tv/fanart/l.png","lang":"en","likes":"3"}]}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let base = server.base_url.clone();
+        let (item_id, mgr) = image_manager(
+            "Movies.Movie",
+            "The Matrix",
+            &[("Tmdb", "603")],
+            Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&base)),
+            |mgr| {
+                mgr.with_fanart(Arc::new(
+                    crate::fanart::FanartClient::new(None).with_base_url(&base),
+                ))
+            },
+        );
+        let images = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::default())
+            .await
+            .unwrap();
+        let fanart = images
+            .iter()
+            .find(|i| i.provider_name.as_deref() == Some("FanArt"))
+            .expect("a fanart.tv candidate");
+        assert_eq!(fanart.rating_type, ferrofin_model::dto::RatingType::Likes);
+        assert_eq!(fanart.community_rating, Some(3.0));
+        assert_eq!((fanart.width, fanart.height), (Some(800), Some(310)));
+        assert_eq!(
+            fanart.thumbnail_url.as_deref(),
+            Some("https://assets.fanart.tv/bigpreview/l.png")
+        );
+        let tmdb = images
+            .iter()
+            .find(|i| i.provider_name.as_deref() == Some("TheMovieDb"))
+            .expect("a TMDb candidate");
+        assert_eq!(tmdb.rating_type, ferrofin_model::dto::RatingType::Score);
+    }
+
+    /// `GetAvailableRemoteImages` narrows to `ProviderName` only when it is not
+    /// empty (`IsNullOrEmpty`, no trim): a blank name matches no provider.
+    #[tokio::test]
+    async fn a_blank_provider_name_matches_no_provider() {
+        let server = crate::mock_http::MockServer::always(
+            r#"{"posters":[{"file_path":"/p.jpg","iso_639_1":"en"}]}"#,
+        )
+        .await;
+        let (item_id, mgr) = image_manager(
+            "Movies.Movie",
+            "The Matrix",
+            &[("Tmdb", "603")],
+            Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url)),
+            |mgr| mgr,
+        );
+        let query = |name: &str| RemoteImageQuery {
+            provider_name: name.to_owned(),
+            ..RemoteImageQuery::default()
+        };
+        let all = mgr
+            .get_available_remote_images(item_id, &query(""))
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        let blank = mgr
+            .get_available_remote_images(item_id, &query(" "))
+            .await
+            .unwrap();
+        assert!(blank.is_empty(), "{blank:?}");
+    }
+
+    /// The Fanart plugin's `AlbumProvider` needs only the album artist's id and
+    /// finds the album by its release id when it has no release group.
+    #[tokio::test]
+    async fn a_music_albums_fanart_artwork_is_found_by_its_release_id() {
+        let fanart = crate::mock_http::MockServer::always(FANART_MUSIC).await;
+        let (item_id, mgr) = image_manager(
+            "Audio.MusicAlbum",
+            "Kind of Blue",
+            &[
+                ("MusicBrainzAlbum", "RG-1"),
+                ("MusicBrainzAlbumArtist", "artist-mbid"),
+            ],
+            Arc::new(crate::tmdb::TmdbClient::new()),
+            |mgr| {
+                mgr.with_fanart(Arc::new(
+                    crate::fanart::FanartClient::new(None).with_base_url(&fanart.base_url),
+                ))
+            },
+        );
+        let images = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::default())
+            .await
+            .unwrap();
+        let urls: Vec<&str> = images.iter().filter_map(|i| i.url.as_deref()).collect();
+        assert_eq!(urls, ["https://f/cover.jpg", "https://f/cd.png"]);
+    }
+
+    /// `TmdbUtils.GetImageLanguage` labels an untagged TMDb image (`xx`, or no
+    /// tag) `""`, which the API answers as `"Language": ""`; an untagged
+    /// backdrop stays a `Backdrop` and ranks below English.
+    #[tokio::test]
+    async fn untagged_tmdb_candidates_answer_an_empty_language() {
+        let server = crate::mock_http::MockServer::always(
+            r#"{"backdrops":[{"file_path":"/none.jpg","iso_639_1":"xx"},
+                             {"file_path":"/bare.jpg"},
+                             {"file_path":"/en.jpg","iso_639_1":"en"}]}"#,
+        )
+        .await;
+        let (item_id, mgr) = image_manager(
+            "Movies.Movie",
+            "The Matrix",
+            &[("Tmdb", "603")],
+            Arc::new(crate::tmdb::TmdbClient::new().with_base_url(&server.base_url)),
+            |mgr| mgr,
+        );
+        let images = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::default())
+            .await
+            .unwrap();
+        let shape: Vec<(Option<&str>, ImageType)> = images
+            .iter()
+            .map(|i| (i.language.as_deref(), i.type_))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (Some("en"), ImageType::Thumb),
+                (Some(""), ImageType::Backdrop),
+                (Some(""), ImageType::Backdrop),
+            ]
+        );
+        let json = serde_json::to_value(&images[1]).unwrap();
+        assert_eq!(json["Language"], "");
     }
 
     const FANART_MUSIC: &str = r#"{"artistthumb":[{"url":"https://f/thumb.jpg","likes":"5"}],"musicbanner":[{"url":"https://f/banner.jpg"}],"albums":[{"release_group_id":"rg-1","albumcover":[{"url":"https://f/cover.jpg"}],"cdart":[{"url":"https://f/cd.png"}]}]}"#;
@@ -17076,7 +17256,11 @@ mod tests {
                 );
                 // Jellyfin 12's ladder: English (3) before untagged (2).
                 assert_eq!(images[1].language.as_deref(), Some("en"));
-                assert_eq!(images[2].language, None, "xx is untagged");
+                assert_eq!(
+                    images[2].language.as_deref(),
+                    Some(""),
+                    "xx is untagged: GetImageLanguage's \"\""
+                );
                 if language == "fr-CA" {
                     assert_eq!(images[0].width, Some(1600));
                     assert_eq!(images[0].height, Some(2400));
