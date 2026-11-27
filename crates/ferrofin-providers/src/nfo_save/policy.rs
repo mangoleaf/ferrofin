@@ -2,7 +2,9 @@
 use std::path::{Path, PathBuf};
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::item_data;
 use ferrofin_model::configuration::{LibraryOptions, MetadataOptions};
+use ferrofin_model::entities::VideoType;
 use ferrofin_traits::providers::ItemUpdateType;
 
 use crate::xbmc::item::NfoItemKind;
@@ -29,11 +31,6 @@ pub(super) fn save_path(row: &BaseItemEntity) -> Option<PathBuf> {
     if !path.is_absolute() || (kind.is_video() && row.extra_type.is_some()) {
         return None;
     }
-    let data: serde_json::Value = row
-        .data
-        .as_deref()
-        .and_then(|data| serde_json::from_str(data).ok())
-        .unwrap_or_default();
     if row.channel_id.as_deref().is_some_and(|channel| {
         !channel.is_empty() && uuid::Uuid::parse_str(channel).map_or(true, |id| !id.is_nil())
     }) {
@@ -46,20 +43,20 @@ pub(super) fn save_path(row: &BaseItemEntity) -> Option<PathBuf> {
         NfoItemKind::MusicArtist => Some(path.join("artist.nfo")),
         NfoItemKind::Episode => Some(path.with_extension("nfo")),
         _ => {
-            let video_type = data["VideoType"].as_str().unwrap_or("VideoFile");
-            let disc = matches!(video_type, "Dvd" | "BluRay")
-                && data["IsPlaceHolder"].as_bool() != Some(true);
-            let folder = if row.is_folder || disc {
-                path
-            } else {
-                path.parent()?
-            };
-            if disc && video_type == "Dvd" {
+            // `GetMovieSavePaths` builds every path in `ContainingFolderPath`:
+            // a stacked rip's is its set's folder, not its first disc's.
+            let disc = item_data::is_disc_folder(row.data.as_deref());
+            let folder = item_data::containing_folder_path_at(row, path.to_str()?);
+            let folder = Path::new(&folder);
+            if folder.as_os_str().is_empty() {
+                return None;
+            }
+            if disc && item_data::video_format(row.data.as_deref()).video_type == VideoType::Dvd {
                 Some(folder.join("VIDEO_TS/VIDEO_TS.nfo"))
             } else if kind == NfoItemKind::Movie && !row.is_in_mixed_folder {
                 Some(folder.join("movie.nfo"))
             } else if disc {
-                Some(folder.join(format!("{}.nfo", path.file_name()?.to_string_lossy())))
+                Some(folder.join(format!("{}.nfo", folder.file_name()?.to_string_lossy())))
             } else {
                 Some(path.with_extension("nfo"))
             }
@@ -166,6 +163,36 @@ mod tests {
         true,
         Some(r#"{"VideoType":"BluRay"}"#),
         "/media/Movie.2020/Movie.2020.nfo"
+    )]
+    // A stacked rip's folder is the set's (`Video.ContainingFolderPath`:
+    // `IsStacked` first), the folder `GetMovieSavePaths` builds every path in.
+    #[case(
+        "Movie",
+        "/media/Set/Set - Disc 1",
+        false,
+        Some(r#"{"VideoType":"Dvd","AdditionalParts":["/media/Set/Set - Disc 2"]}"#),
+        "/media/Set/VIDEO_TS/VIDEO_TS.nfo"
+    )]
+    #[case(
+        "Movie",
+        "/media/Set/Set - Disc 1",
+        false,
+        Some(r#"{"VideoType":"BluRay","AdditionalParts":["/media/Set/Set - Disc 2"]}"#),
+        "/media/Set/movie.nfo"
+    )]
+    #[case(
+        "Video",
+        "/media/Set/Set - Disc 1",
+        false,
+        Some(r#"{"VideoType":"BluRay","AdditionalParts":["/media/Set/Set - Disc 2"]}"#),
+        "/media/Set/Set.nfo"
+    )]
+    #[case(
+        "Movie",
+        "/media/Movie",
+        false,
+        Some(r#"{"VideoType":"Dvd","AdditionalParts":[]}"#),
+        "/media/Movie/VIDEO_TS/VIDEO_TS.nfo"
     )]
     fn destinations(
         #[case] kind: &str,

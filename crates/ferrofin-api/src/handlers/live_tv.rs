@@ -2734,7 +2734,7 @@ mod tests {
     async fn default_listing_provider_seeds_categories() {
         let p = get_default_listing_provider(auth()).await.0;
         assert!(p.enable_all_tuners);
-        assert_eq!(p.movie_categories.unwrap(), ["movie"]);
+        assert_eq!(p.movie_categories.unwrap(), [Some("movie".to_owned())]);
         assert!(p.news_categories.is_some());
     }
 

@@ -22,12 +22,6 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-/// Most redirects one fetch follows: reqwest's default policy
-/// (`redirect::Policy::default()`), which downloads went by until they followed
-/// redirects themselves, to vet each hop, and which the provider client
-/// ([`crate::http_client`]) keeps.
-pub(crate) const MAX_REDIRECTS: usize = 10;
-
 /// Why a URL, or a redirect, whose scheme is not http or https is not sent.
 const OTHER_SCHEME: &str = "a URL with a scheme other than http or https";
 
@@ -153,8 +147,10 @@ pub(crate) enum SendError {
     Request(RequestError),
     /// No request could be made: a URL that does not parse or whose scheme
     /// is not http or https, a redirect to another scheme, from https to
-    /// http or past [`MAX_REDIRECTS`], a name a proxy would resolve that the
-    /// server cannot, or a client that could not be built.
+    /// http or past
+    /// [`MAX_REDIRECTS`](ferrofin_util::http_client::MAX_REDIRECTS), a name
+    /// a proxy would resolve that the server cannot, or a client that could
+    /// not be built.
     Failed(&'static str),
 }
 
@@ -234,7 +230,8 @@ impl GuardedHttp {
     }
 
     /// GETs `url` through its origin's limiter, following redirects up to
-    /// [`MAX_REDIRECTS`] and vetting the destination of each.
+    /// [`MAX_REDIRECTS`](ferrofin_util::http_client::MAX_REDIRECTS) and
+    /// vetting the destination of each.
     pub(crate) async fn send(&self, url: &str) -> Result<Fetched, SendError> {
         let mut current =
             reqwest::Url::parse(url).map_err(|_| SendError::Failed("a URL that does not parse"))?;
@@ -268,7 +265,7 @@ impl GuardedHttp {
                 });
             };
             // The provider client's rule: past MAX_REDIRECTS, or https to http.
-            if let Some(reason) = crate::http_client::redirect_refusal(&previous, &next) {
+            if let Some(reason) = ferrofin_util::http_client::redirect_refusal(&previous, &next) {
                 return Err(self.kind.unsent(reason));
             }
             previous.push(next.clone());

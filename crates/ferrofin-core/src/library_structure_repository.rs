@@ -500,6 +500,20 @@ pub(crate) async fn linked_children(db: &Database, last: Uuid) -> Vec<(String, S
         .expect("links")
 }
 
+/// Test-only: `parent`'s `LinkedChildren` rows as `(ChildId, SortOrder)`, in
+/// `SortOrder`.
+#[cfg(test)]
+pub(crate) async fn linked_children_in_order(db: &Database, parent: Uuid) -> Vec<(String, i64)> {
+    sqlx::query_as(
+        r#"SELECT "ChildId", "SortOrder" FROM "LinkedChildren"
+           WHERE "ParentId" = ?1 ORDER BY "SortOrder""#,
+    )
+    .bind(guid_to_db(parent))
+    .fetch_all(db.pool())
+    .await
+    .expect("links")
+}
+
 /// Test-only: marks every user's row of `item` a favourite.
 #[cfg(test)]
 pub(crate) async fn favourite_item(db: &Database, item: Uuid) {
