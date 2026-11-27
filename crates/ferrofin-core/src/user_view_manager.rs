@@ -310,6 +310,33 @@ pub(crate) fn shadow_view_id(
     )
 }
 
+/// The id of a view's sub-view (`UserViewManager.GetUserSubViewWithName`,
+/// `UserViewManager.cs:187-192`, v12.4): `GetNamedView(name, parentId,
+/// viewType, sortName, uniqueId)`'s `GetNewItemId("37_namedview_" +
+/// parent("N") + viewType + uniqueId, typeof(UserView))`
+/// (`LibraryManager.cs:3199-3215`), `uniqueId` being `parentId + "subview" +
+/// viewType` with the parent in its default (`D`) form. A nil parent has no
+/// `N` part.
+pub(crate) fn sub_view_id(
+    derivation: &item_type_lookup::IdDerivation,
+    parent_id: Uuid,
+    view_type: &str,
+) -> Option<Uuid> {
+    let parent = if parent_id.is_nil() {
+        String::new()
+    } else {
+        parent_id.simple().to_string()
+    };
+    item_type_lookup::derive_item_id_with(
+        derivation,
+        BaseItemKind::UserView,
+        &format!(
+            "37_namedview_{parent}{view_type}{}subview{view_type}",
+            parent_id.hyphenated()
+        ),
+    )
+}
+
 impl FerrofinUserViewManager {
     /// Creates a user-view manager over the injected item repository.
     #[must_use]
@@ -951,6 +978,126 @@ impl FerrofinUserViewManager {
             forced_sort_name: Some(String::new()),
             name: Some(name),
             path: Some(path.to_owned()),
+            parent_id: None,
+            is_folder: true,
+            date_created: Some(created),
+            date_modified: Some(modified),
+            date_last_saved: Some(refreshed),
+            data: Some(data.to_string()),
+            ..BaseItemEntity::default()
+        };
+        stamp_view_refresh(&mut entity, refreshed).await;
+        persistence
+            .save_items(std::slice::from_ref(&entity))
+            .await?;
+        Ok(Some(entity))
+    }
+
+    /// `UserViewManager.GetUserSubView(parentId, type, localizationKey,
+    /// sortName)` (`UserViewManager.cs:194-199`, v12.4): the sub-view of
+    /// `parent` named by the server-localized `localization_key` (the key
+    /// itself when it has no translation). See [`Self::user_sub_view_with_name`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the view's directory cannot be created or its row
+    /// cannot be read or written.
+    pub async fn user_sub_view(
+        &self,
+        parent: &BaseItemEntity,
+        view_type: CollectionType,
+        localization_key: &str,
+        sort_name: &str,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let name = self.localization.as_ref().map_or_else(
+            || localization_key.to_owned(),
+            |localization| localization.get_server_localized_string(localization_key),
+        );
+        self.user_sub_view_with_name(&name, parent, view_type, sort_name)
+            .await
+    }
+
+    /// `UserViewManager.GetUserSubViewWithName` → `LibraryManager.GetNamedView(
+    /// name, parentId, viewType, sortName, uniqueId)` (`LibraryManager.cs:3199-
+    /// 3266`, v12.4): the row with [`sub_view_id`], created on first read under
+    /// `{InternalMetadataPath}/views/{id N}`, dated from that directory, with
+    /// `ViewType`, `ForcedSortName` and `DisplayParentId`, and no parent. A
+    /// stored row whose name or view type differs takes both and is saved.
+    /// It is refreshed when new and then whenever [`view_refresh_due`] says,
+    /// `parent` being its display parent; the refresh is its save
+    /// ([`save_view_refresh`]). `None` without an item store and a metadata
+    /// path, or for a parent with no id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty name (`ThrowIfNullOrEmpty(name)`), or if
+    /// the view's directory cannot be created or its row cannot be read or
+    /// written.
+    pub async fn user_sub_view_with_name(
+        &self,
+        name: &str,
+        parent: &BaseItemEntity,
+        view_type: CollectionType,
+        sort_name: &str,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if name.is_empty() {
+            return Err(ServiceError::invalid_input("a sub-view needs a name"));
+        }
+        let (Some(persistence), Some(metadata_path)) = (&self.persistence, &self.metadata_path)
+        else {
+            return Ok(None);
+        };
+        let Ok(parent_id) = Uuid::parse_str(&parent.id) else {
+            return Ok(None);
+        };
+        let view_type = view_type.json_name();
+        let Some(id) = sub_view_id(&self.id_derivation, parent_id, &view_type) else {
+            return Ok(None);
+        };
+        if let Some(mut row) = self.items.retrieve_item(id).await? {
+            let stored_type = crate::user_view_repository::view_type_of(row.data.as_deref());
+            if stored_type.as_deref() != Some(view_type.as_ref())
+                || row.name.as_deref() != Some(name)
+            {
+                let mut data = crate::item_data::parse_data(row.data.as_deref());
+                data.insert("ViewType".to_owned(), serde_json::json!(view_type));
+                row.data = Some(serde_json::Value::Object(data).to_string());
+                row.name = Some(name.to_owned());
+                persistence.save_items(std::slice::from_ref(&row)).await?;
+            }
+            let now = Utc::now();
+            if view_refresh_due(&row, Some(parent), now) {
+                save_view_refresh(persistence.as_ref(), &mut row, now, "sub-view").await;
+            }
+            return Ok(Some(row));
+        }
+        let view_path = metadata_path.join("views").join(id.simple().to_string());
+        tokio::fs::create_dir_all(&view_path)
+            .await
+            .map_err(|e| ServiceError::backend(format!("create sub-view directory: {e}")))?;
+        let metadata = tokio::fs::metadata(&view_path)
+            .await
+            .map_err(|e| ServiceError::backend(format!("read sub-view directory: {e}")))?;
+        let (created, modified) = crate::library_scan::created_and_modified(&metadata);
+        // The refresh follows the creation, as upstream's queued one does.
+        let refreshed = Utc::now();
+        let data = serde_json::json!({
+            "ViewType": view_type,
+            "DisplayParentId": parent_id.simple().to_string(),
+        });
+        let mut entity = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            type_: item_type_lookup::stored_type_name(BaseItemKind::UserView)
+                .unwrap_or_default()
+                .to_owned(),
+            sort_name: Some(kinds::saved_sort_name(
+                BaseItemKind::UserView,
+                name,
+                Some(sort_name),
+            )),
+            forced_sort_name: Some(sort_name.to_owned()),
+            name: Some(name.to_owned()),
+            path: Some(view_path.to_string_lossy().into_owned()),
             parent_id: None,
             is_folder: true,
             date_created: Some(created),
@@ -6765,6 +6912,116 @@ mod tests {
         assert!(
             row.date_last_refreshed.expect("refreshed") >= now,
             "never refreshed: its first refresh"
+        );
+    }
+
+    /// `GetUserSubView`'s ids, pinned against a stock Jellyfin 12.4: its
+    /// movies and shows libraries' shadow views browsed without `Recursive`
+    /// listed these sub-views, keyed by the library (the views' display
+    /// parent) and the view type alone.
+    #[rstest]
+    #[case::movie_resume(
+        "f137a2dd21bbc1b99aa5c0f6bf02a805",
+        "movieresume",
+        "4dc8c5ea6415c7b1da9ea1d7af00b494"
+    )]
+    #[case::movie_genres(
+        "f137a2dd21bbc1b99aa5c0f6bf02a805",
+        "moviegenres",
+        "046448c43083b73d3ceda56b3b1a05b7"
+    )]
+    #[case::movie_genre(
+        "f137a2dd21bbc1b99aa5c0f6bf02a805",
+        "moviegenre",
+        "3550a16052be8e682f3950b15fe41165"
+    )]
+    #[case::tv_next_up(
+        "a656b907eb3a73532e40e44b968d0225",
+        "tvnextup",
+        "1ede8252e3849578aef6768600397165"
+    )]
+    #[case::tv_genres(
+        "a656b907eb3a73532e40e44b968d0225",
+        "tvgenres",
+        "03ad7a33b0ba8bd1b69c34516aa640e1"
+    )]
+    fn sub_view_ids_match_jellyfin_12_4(
+        #[case] parent: &str,
+        #[case] view_type: &str,
+        #[case] expected: &str,
+    ) {
+        let mode = item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        };
+        let parent = Uuid::parse_str(parent).expect("parent");
+        assert_eq!(
+            sub_view_id(&mode, parent, view_type),
+            Some(Uuid::parse_str(expected).expect("id"))
+        );
+    }
+
+    /// `GetNamedView(name, parentId, viewType, sortName, uniqueId)`: the first
+    /// read makes the row (no parent, the library as its display parent, the
+    /// forced sort name kept and padded as 12.4 lists it, dated and refreshed);
+    /// a later read finds it, and one with another name renames it.
+    #[tokio::test]
+    async fn a_sub_view_is_made_once_and_renamed_in_place() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let library = Uuid::from_u128(0x7710);
+        seed_named_item(&db, library, BaseItemKind::CollectionFolder, "Movies").await;
+        let library_row = crate::test_support::fetch_item(&db, library).await;
+        let mgr = manager(&db)
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
+            .with_metadata_path(tmp.path());
+        let made = mgr
+            .user_sub_view_with_name("Latest", &library_row, CollectionType::Movielatest, "1")
+            .await
+            .expect("made")
+            .expect("a view");
+        let id = sub_view_id(&mgr.id_derivation, library, "movielatest").expect("id");
+        assert_eq!(made.id, guid_to_db(id));
+        let stored = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(stored.name.as_deref(), Some("Latest"));
+        assert_eq!(stored.sort_name.as_deref(), Some("0000000001"));
+        assert_eq!(stored.forced_sort_name.as_deref(), Some("1"));
+        assert_eq!(stored.parent_id, None);
+        assert!(stored.is_folder && stored.date_last_refreshed.is_some());
+        let data = crate::item_data::parse_data(stored.data.as_deref());
+        assert_eq!(data["ViewType"], "movielatest");
+        assert_eq!(data["DisplayParentId"], library.simple().to_string());
+        let path = tmp.path().join("views").join(id.simple().to_string());
+        assert_eq!(stored.path.as_deref(), path.to_str());
+        assert!(path.is_dir(), "its directory is made");
+
+        let again = mgr
+            .user_sub_view_with_name("Latest", &library_row, CollectionType::Movielatest, "9")
+            .await
+            .expect("found")
+            .expect("a view");
+        assert_eq!(
+            again.sort_name.as_deref(),
+            Some("0000000001"),
+            "found, not remade"
+        );
+        let renamed = mgr
+            .user_sub_view_with_name("Neueste", &library_row, CollectionType::Movielatest, "1")
+            .await
+            .expect("renamed")
+            .expect("a view");
+        assert_eq!(renamed.id, made.id);
+        assert_eq!(
+            crate::test_support::fetch_item(&db, id)
+                .await
+                .name
+                .as_deref(),
+            Some("Neueste")
+        );
+        assert!(
+            mgr.user_sub_view_with_name("", &library_row, CollectionType::Movielatest, "1")
+                .await
+                .is_err(),
+            "ThrowIfNullOrEmpty(name)"
         );
     }
 }

@@ -1652,7 +1652,7 @@ pub async fn build_app_state(
     // The virtual-folder manager gives `/Items/Latest` each library's collection
     // type (C# `CollectionFolder.CollectionType`), which is why the user-view
     // manager is built after it.
-    let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> = Arc::new(
+    let user_views_impl = Arc::new(
         FerrofinUserViewManager::new(Arc::clone(&item_repository))
             .with_dashboard_configuration(Arc::clone(&config_trait), Arc::clone(&localization))
             .with_visibility(Arc::clone(&item_visibility))
@@ -1670,6 +1670,8 @@ pub async fn build_app_state(
             .with_users(Arc::clone(&users))
             .with_database(db.clone()),
     );
+    let user_views: Arc<dyn ferrofin_traits::library::UserViewManager> =
+        Arc::clone(&user_views_impl) as _;
     scope_user_views.bind(&user_views);
 
     // Close the Live TV <-> item-layer cycle: the guide refresh mirrors the
@@ -2000,6 +2002,8 @@ pub async fn build_app_state(
         .with_user_root(user_root_store)
         .with_years(year_store)
         .with_by_name_store(by_name_store)
+        // A movies or TV view browsed without `Recursive` lists its sub-views.
+        .with_user_views(Arc::clone(&user_views_impl))
         // A stacked video's parts are found by the ids their paths derive to.
         .with_id_derivation(id_derivation)
         // `DELETE /Items` removes the item's files (`DeleteFileLocation`),

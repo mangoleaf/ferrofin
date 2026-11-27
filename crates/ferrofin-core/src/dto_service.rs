@@ -4025,15 +4025,22 @@ impl FerrofinDtoService {
     /// `UserView.GetChildCount(user)`, which is `GetChildren(user, true).Count`
     /// (`UserView.cs:90-93`): how many items the view's own browse lists, for
     /// a view with no count source. Those are the Playlists view, the folders
-    /// view and Live TV.
+    /// view, Live TV and a movies or TV view's sub-views.
     ///
-    /// The query is what the plain `GET /Items?parentId=<view>` browse runs
-    /// for every view Ferrofin builds. A view over a playlists folder lists
-    /// every playlist the user may open (`PlaylistsFolder.GetItemsInternal`,
-    /// re-rooted at the user root as that browse is). Any other view is
-    /// browsed as itself. The handler's other view arms (a default-type view
-    /// over a library, the `moviemovies`/`tvshowseries` sub-views) apply only
-    /// to views an adopted database can hold, and are not mirrored here.
+    /// The query is what the plain `GET /Items?parentId=<view>` browse runs.
+    /// A view over a playlists folder lists every playlist the user may open
+    /// (`PlaylistsFolder.GetItemsInternal`, re-rooted at the user root as that
+    /// browse is). Any other view runs its `UserViewBuilder` arm
+    /// ([`LibraryManager::apply_user_view_builder`](ferrofin_traits::library::LibraryManager::apply_user_view_builder)),
+    /// as `GetItemsInternal` does: a sub-view counts what it lists (the latest
+    /// and resume views at most 50, their list's length; a genres view reads
+    /// every movie or series of its library for their genres, as upstream's
+    /// count does), and a view over a folder counts that folder's children.
+    /// The folders and Live TV views' builders leave the query as it is.
+    ///
+    /// Divergence: a TV view's Next Up sub-view counts 0; upstream counts its
+    /// next-up queue, which only the TV manager computes, as DTOs. TODO(parity,
+    /// open work item gl-1995): count the queue here.
     ///
     /// Divergence: upstream's `UserViewBuilder` has no `livetv` case, so its
     /// Live TV view takes the default branch and lists, and counts, the
@@ -4069,6 +4076,12 @@ impl FerrofinDtoService {
         } else {
             query.parent_id = id;
             query.parent_type = Some(BaseItemKind::UserView);
+            let (kind, folder_policy) = self
+                .library
+                .apply_user_view_builder(&mut query, view)
+                .await?;
+            query.parent_type = kind;
+            query.apply_folder_display_options = folder_policy;
         }
         Ok(self.library.query_items(&query).await?.total_record_count)
     }
@@ -5480,6 +5493,14 @@ mod tests {
             _query: &ferrofin_traits::options::InternalItemsQuery,
         ) -> Result<ferrofin_model::querying::QueryResult<BaseItemEntity>, ServiceError> {
             Ok(ferrofin_model::querying::QueryResult::default())
+        }
+        /// Every view is browsed as itself, its query left as asked.
+        async fn apply_user_view_builder(
+            &self,
+            _query: &mut ferrofin_traits::options::InternalItemsQuery,
+            _view: &BaseItemEntity,
+        ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
+            Ok((Some(BaseItemKind::UserView), false))
         }
         async fn get_item_ids(
             &self,
@@ -11373,6 +11394,49 @@ mod tests {
         assert_eq!(dto.child_count, Some(8));
     }
 
+    /// `UserView.GetChildCount` is `GetChildren(user, true).Count`, which runs
+    /// the view's builder: a view with no count source over a folder (the
+    /// default builder) counts that folder's children, not its own (none).
+    #[tokio::test]
+    async fn a_view_with_no_count_source_counts_what_its_builder_lists() {
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let folder = Uuid::new_v4();
+        seed_folder_item(&db, folder, BaseItemKind::Folder, "Shown", None).await;
+        for name in ["One", "Two"] {
+            crate::test_support::seed_child_item(
+                &db,
+                Uuid::new_v4(),
+                BaseItemKind::Movie,
+                name,
+                folder,
+            )
+            .await;
+        }
+        let view = Uuid::new_v4();
+        seed_folder_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Shown",
+            &format!(r#"{{"DisplayParentId":"{folder}"}}"#),
+            None,
+        )
+        .await;
+        let item = fetch_item(&db, view).await;
+        let svc = service_with(
+            db.clone(),
+            Arc::new(crate::test_support::concrete_library_manager_over(db)),
+        );
+
+        let dto = svc
+            .get_base_item_dto(&item, &child_count_options(), Some(&user), None)
+            .await
+            .unwrap();
+
+        assert_eq!(dto.child_count, Some(2));
+    }
+
     /// Upstream `DtoServiceTests.GetBaseItemDtos_SubViewOfALibrary_DoesNotCountTheLibrary`:
     /// a sub-view such as "Continue Watching" hangs off the library its view
     /// was built over, but it holds a query, so it never counts the library. It
@@ -11756,6 +11820,14 @@ mod tests {
             _query: &ferrofin_traits::options::InternalItemsQuery,
         ) -> Result<ferrofin_model::querying::QueryResult<BaseItemEntity>, ServiceError> {
             Ok(ferrofin_model::querying::QueryResult::default())
+        }
+        /// Every view is browsed as itself, its query left as asked.
+        async fn apply_user_view_builder(
+            &self,
+            _query: &mut ferrofin_traits::options::InternalItemsQuery,
+            _view: &BaseItemEntity,
+        ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
+            Ok((Some(BaseItemKind::UserView), false))
         }
         async fn get_item_ids(
             &self,

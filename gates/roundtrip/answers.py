@@ -44,6 +44,10 @@ The lines (README.md, "The usage-stage contract"):
                                                                    its additional parts
     videos <names>                                                the videos the smoke user lists that are no movie
                                                                    or episode, "-" for none
+    subviews <view> = <name>/<type>/<id>=<total>,…                each movies or TV view the smoke user lists with
+                                                                   presetViews: the sub-views its browse without
+                                                                   Recursive lists, in that order, and how many items
+                                                                   each lists
     config <document> <setting>=<value> …                         server settings a dashboard shows, per document
 The smoke probes run as ADOPTION_USER when it is set (run.sh sets the fixture's oracle user), as smoke.sh
 does. Exit status 0 when the file was written; 1 with one line on stdout when the server could not be
@@ -292,6 +296,32 @@ def movie_lines(server, user_id):
     return out
 
 
+def subview_lines(server, user_id):
+    """The `subviews` line of each movies and TV view the account's /UserViews lists with presetViews (its shadow
+    views): the sub-views a browse of it without Recursive lists, which the server writes as it lists them, in
+    their order, and each one's TotalRecordCount."""
+    by_user = [("userId", user_id)]
+    query = urllib.parse.urlencode([*by_user, ("presetViews", "movies"), ("presetViews", "tvshows")])
+    status, views = items(server, "/UserViews?" + query)
+    if status != 200:
+        return [f"subviews /UserViews {status}"]
+    out = []
+    for view in sorted(views, key=lambda v: (v.get("Name") or "", v.get("Id") or "")):
+        if view.get("Type") != "UserView" or view.get("CollectionType") not in ("movies", "tvshows"):
+            continue
+        status, subs = items(server, "/Items?" + urllib.parse.urlencode([*by_user, ("ParentId", view.get("Id"))]))
+        if status != 200:
+            out.append(f"subviews {view.get('Name')} error={status}")
+            continue
+        listed = []
+        for sub in subs:
+            status, body = server.send("GET", "/Items?" + urllib.parse.urlencode([*by_user, ("ParentId", sub.get("Id"))]))
+            total = body.get("TotalRecordCount") if status == 200 and isinstance(body, dict) else f"error={status}"
+            listed.append(f"{sub.get('Name')}/{sub.get('CollectionType')}/{uuid_hex(sub.get('Id'))}={total}")
+        out.append(f"subviews {view.get('Name')} = {','.join(listed) or '-'}")
+    return out
+
+
 def rated_lines(server):
     """What each account limited by parental rating lists of seasons and episodes, by series and name. /Items
     filters on the scores stored on each row and checks no item against its parents, so a season or an
@@ -381,7 +411,7 @@ def capture(base_url, data_dir):
     return (smoke_lines(base_url, data_dir) + user_data_lines(server) + user_plays_lines(server)
             + account_lines(server) + rated_lines(server) + login_lines(server) + preference_lines(server)
             + server_lines(server) + collection_lines(server, user_id) + share_lines(server, data_dir)
-            + movie_lines(server, user_id))
+            + movie_lines(server, user_id) + subview_lines(server, user_id))
 
 
 def write(path, lines):

@@ -640,14 +640,17 @@ pub trait LibraryManager: Send + Sync {
     ///
     /// - a direct builder (`GetMovieMovies`, `GetTvSeries`, `GetBooks`, and
     ///   the other builders that select items without Folder's policy) sets
-    ///   its own kinds and recursion, if it has any, and reports the view
-    ///   itself, with no Folder policy;
+    ///   its own kinds, recursion, filters, order and limit, if it has any,
+    ///   and reports the view itself, with no Folder policy;
+    ///   `GetMovieCollections` clears the parent and reports none;
     /// - a `movies` or `tvshows` view browsed recursively runs Folder's
     ///   recursive query, with the view's default kinds when the request
     ///   names none, and reports the kind of the folder it shows (the view's
     ///   own when there is none), with Folder policy. Browsed without
     ///   `recursive` it is left as asked and reports itself, with no Folder
-    ///   policy;
+    ///   policy: [`Self::query_items`] then lists its sub-views
+    ///   (`GetMovieFolders`, `GetTvView`), as it lists a genres view's genre
+    ///   views;
     /// - any other view reports the kind of the folder it shows, with Folder
     ///   policy unless that folder is a channel or in one. A non-recursive
     ///   browse, any browse of a Season, and any browse of a playlists folder

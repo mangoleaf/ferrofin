@@ -3044,6 +3044,15 @@ const TRAILERS_DIVERGENCES: &[&str] = &[
      parentId naming an item that is not a folder stays the parent, where upstream answers at \
      the user root; and contradictory filters answer 400 before the parent's visibility is \
      checked. Fix path: gl-1851.",
+    "With no user (an API key naming none), a movies or TV view's latest, resume, favourites, \
+     movies, shows, collections or genre sub-view lists its items; upstream's builder calls \
+     query.SetUser(null), which throws, and answers 500 (seen on 12.4). Jellyfin bug not \
+     ported, as for the movies, shows and books views before. Its Next Up sub-view answers \
+     400, as upstream's does (measured on 12.4).",
+    "A TV view's Next Up sub-view under a grouped TV view takes its queue from every library \
+     the user grouped into the view, an untyped one included, where GetTvNextUp's \
+     GetMediaFolders takes only the grouped tvshows libraries; and its DTO's ChildCount is 0, \
+     where upstream counts the queue. Fix path: gl-1995.",
 ];
 
 /// The divergences the six `/{kind}/{itemId}/Similar` rows share.
@@ -3254,7 +3263,14 @@ pub const VERIFIED: &[Verified] = &[
                    apply_media_stream_filter_rules, apply_location_types, apply_filters, \
                    check_parent_visibility (GetParentItem, IsVisible, and a UserView parent's \
                    UserViewBuilder through LibraryManager apply_user_view_builder, \
-                   ferrofin-core library_manager/user_view_builder.rs), redirect_container_browse \
+                   ferrofin-core library_manager/user_view_builder.rs: apply_sub_view_builder \
+                   forces the movies, shows, books, favourites, latest, resume, genre and \
+                   collections sub-views' queries; user_view_list_result answers a movies or TV \
+                   view browsed without Recursive with its sub-views and a genres view with its \
+                   genre views, through GetResult's Filter and SortAndPage, the sub-views made by \
+                   user_view_manager.rs user_sub_view and user_sub_view_with_name, \
+                   GetUserSubView's GetNamedView with its uniqueId; next_up_view_result answers a \
+                   Next Up view with GetTvNextUp's queue), redirect_container_browse \
                    (the BoxSet and Playlist re-root), list_playlists_folder_as_playlists \
                    (the playlists collection type's recursive [Playlist] listing, and with no \
                    user PlaylistsFolder.GetItemsInternal's own children unless the browse is \
@@ -3265,7 +3281,7 @@ pub const VERIFIED: &[Verified] = &[
                    → LibraryManager query_items and DtoService get_base_item_dtos, or \
                    get_linked_children_dtos for a box set's or playlist's own non-recursive \
                    listing",
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: TRAILERS_DIVERGENCES,
         refs: &["access-filtering", "images", "paging-sort", "user-data"],
     },

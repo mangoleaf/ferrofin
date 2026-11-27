@@ -142,6 +142,10 @@ pub struct FerrofinLibraryManager {
     /// (`CreateItemByName<T>`), set by the composition root. `None` (unit
     /// tests) resolves only persisted rows.
     by_name: Option<crate::by_name_store::ByNameStore>,
+    /// The user-view manager whose `GetUserSubView` makes the sub-views a
+    /// movies or TV view lists, set by the composition root. `None` (unit
+    /// tests) refuses those listings.
+    user_views: Option<Arc<crate::FerrofinUserViewManager>>,
     /// The debounced `LibraryChanged` push (`LibraryChangedNotifier`), set by
     /// the composition root. `None` (unit tests) means item writes announce
     /// nothing, which is what every test that does not assert on the push wants.
@@ -1412,6 +1416,7 @@ impl FerrofinLibraryManager {
                 program_data_path: None,
             },
             by_name: None,
+            user_views: None,
             changed: None,
             app_paths: None,
             item_data: None,
@@ -2036,6 +2041,15 @@ impl FerrofinLibraryManager {
     #[must_use]
     pub fn with_by_name_store(mut self, store: crate::by_name_store::ByNameStore) -> Self {
         self.by_name = Some(store);
+        self
+    }
+
+    /// Attaches the user-view manager whose sub-views a movies or TV view
+    /// lists when browsed without `Recursive` (`UserViewBuilder.GetMovieFolders`,
+    /// `GetTvView`), and its genres views theirs.
+    #[must_use]
+    pub fn with_user_views(mut self, user_views: Arc<crate::FerrofinUserViewManager>) -> Self {
+        self.user_views = Some(user_views);
         self
     }
 
@@ -3074,6 +3088,9 @@ impl LibraryManager for FerrofinLibraryManager {
         &self,
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        if let Some(result) = self.user_view_list_result(query).await? {
+            return Ok(result);
+        }
         if let Some(result) = self.folder_display_result(query).await? {
             return Ok(result);
         }

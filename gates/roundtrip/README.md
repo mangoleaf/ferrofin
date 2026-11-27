@@ -273,6 +273,12 @@ video <name> sources=<n> parts=<n>                             each of them: its
 videos <names>                                                 the videos the probed account lists that are no
                                                                 movie or episode, "-" for none: an additional part
                                                                 or a version that lost its owner or its primary
+subviews <view> = <name>/<type>/<id>=<total>,…                 each movies or TV view the probed account lists
+                                                                with presetViews (its shadow views): the sub-views
+                                                                its browse without Recursive lists, in that order
+                                                                (the server writes them as it lists them, so
+                                                                Jellyfin reads Ferrofin's rows), and how many items
+                                                                each lists
 ```
 
 Lists inside a line are sorted unless they say otherwise. The sign-in probes write device rows, tokens and

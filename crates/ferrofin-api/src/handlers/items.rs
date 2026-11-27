@@ -799,8 +799,6 @@ pub(crate) async fn get_items(
         return Ok(Json(empty_page(&internal)));
     }
 
-    let mut result = state.library.query_items(&internal).await?;
-    sort_items_by_request(&internal, &mut result.items);
     // The requested `Fields` plus the four image/user-data toggles (an
     // `EnableImageTypes=Primary,Backdrop` browse must not answer with a
     // `Logo` tag, and `ImageTypeLimit=1` caps the backdrops).
@@ -814,6 +812,11 @@ pub(crate) async fn get_items(
     {
         options.fields.push(ItemFields::Tags);
     }
+    if let Some(next_up) = next_up_view_result(&state, &internal, &options).await? {
+        return Ok(Json(next_up));
+    }
+    let mut result = state.library.query_items(&internal).await?;
+    sort_items_by_request(&internal, &mut result.items);
     // A playlist's or box set's own listing is its linked children
     // (`Folder.GetItemsInternal` → `GetChildren` → `GetLinkedChildren(user)`),
     // which upstream resolves with every field loaded; a recursive listing is
@@ -845,6 +848,88 @@ pub(crate) async fn get_items(
         Some(result.start_index),
         Some(result.total_record_count),
         dtos,
+    )))
+}
+
+/// `UserViewBuilder.GetTvNextUp` (`UserViewBuilder.cs:345-361`, v12.4): a TV
+/// view's Next Up sub-view lists the user's next-up queue under the folder the
+/// view stands for (`UserView.GetItemsInternal`'s display parent, else its
+/// parent, when it is a folder; else the view), through
+/// `TVSeriesManager.GetNextUp` with `NextUpQuery`'s own defaults (no date
+/// cutoff, no resumable or rewatched episodes) and the request's paging. With
+/// no user upstream's `NextUpQuery.User` is null and the request fails with a
+/// 400. `None` for any other browse.
+///
+/// It is answered here rather than by the library manager's builder because
+/// the next-up queue comes back as DTOs ([`TvSeriesManager`](ferrofin_traits::tv::TvSeriesManager)).
+async fn next_up_view_result(
+    state: &AppState,
+    internal: &InternalItemsQuery,
+    options: &DtoOptions,
+) -> Result<Option<QueryResult<BaseItemDto>>, ApiError> {
+    use ferrofin_model::data::CollectionType;
+    if internal.parent_type != Some(BaseItemKind::UserView) || !internal.item_ids.is_empty() {
+        return Ok(None);
+    }
+    let Some(view) = internal.known_parent_row() else {
+        return Ok(None);
+    };
+    if CollectionType::from_item_data(view.data.as_deref(), "ViewType")
+        != Some(CollectionType::Tvnextup)
+    {
+        return Ok(None);
+    }
+    let Some(user) = internal.user.as_ref() else {
+        return Err(ApiError::BadRequest("Error processing request.".to_owned()));
+    };
+    let user_id = user_uuid(user)?;
+    let shown = view
+        .data
+        .as_deref()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|data| {
+            data.get("DisplayParentId")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+        })
+        .filter(|id| !id.is_nil())
+        .or_else(|| {
+            view.parent_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .filter(|id| !id.is_nil())
+        });
+    let parent_id = match shown {
+        Some(id)
+            if state
+                .library
+                .get_item_by_id(id)
+                .await?
+                .is_some_and(|row| row.is_folder) =>
+        {
+            id
+        }
+        _ => internal.parent_id,
+    };
+    let next_up = state
+        .tv_series
+        .get_next_up(
+            &ferrofin_traits::tv::NextUpQuery {
+                user_id,
+                parent_id: Some(parent_id),
+                start_index: internal.start_index,
+                limit: internal.limit,
+                enable_image_types: options.image_types.clone(),
+                enable_total_record_count: true,
+                ..ferrofin_traits::tv::NextUpQuery::default()
+            },
+            options,
+        )
+        .await?;
+    Ok(Some(QueryResult::new(
+        Some(internal.start_index.unwrap_or(0)),
+        Some(next_up.total_record_count),
+        next_up.items,
     )))
 }
 

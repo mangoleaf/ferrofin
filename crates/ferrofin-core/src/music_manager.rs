@@ -52,7 +52,7 @@ impl std::fmt::Debug for FerrofinMusicManager {
 }
 
 /// The display genres of a row (its `Genres` column, pipe-split).
-fn row_genres(row: &BaseItemEntity) -> Vec<String> {
+pub(crate) fn row_genres(row: &BaseItemEntity) -> Vec<String> {
     row.genres.as_deref().map_or_default(|g| {
         g.split('|')
             .filter(|p| !p.is_empty())
@@ -63,7 +63,7 @@ fn row_genres(row: &BaseItemEntity) -> Vec<String> {
 
 /// C# `Jellyfin.Extensions.DistinctNames` — distinct, case-insensitive, first
 /// spelling wins, input order preserved. Diacritics are removed only from the key.
-fn distinct_names(names: Vec<String>) -> Vec<String> {
+pub(crate) fn distinct_names(names: Vec<String>) -> Vec<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     names
         .into_iter()
