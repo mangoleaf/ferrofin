@@ -2749,6 +2749,13 @@ impl LocalProviderManager {
     /// set or playlist takes its members' values and a season its virtual
     /// flag from its episodes (`UpdateMetadataFromChildren`).
     ///
+    /// `identified` says the item is the one an Identify's result in
+    /// `options` was chosen for, which takes the result's ids as its own (the
+    /// controller's `SetProviderIds`). A child of it, a series' season or
+    /// episode its `RefreshAllMetadata` refreshes with the same options, takes
+    /// the result only as `ApplySearchResult` hands it on: a season's or an
+    /// episode's series ids, its own left as stored.
+    ///
     /// [`fetch_season_providers`]: Self::fetch_season_providers
     // One gate-fetch-merge-save sequence, read top to bottom.
     #[allow(clippy::too_many_lines)]
@@ -2756,6 +2763,7 @@ impl LocalProviderManager {
         &self,
         item_id: Uuid,
         options: &MetadataRefreshOptions,
+        identified: bool,
     ) -> Result<ItemUpdateType, ServiceError> {
         use crate::metadata_merge::{MetadataResult, RefreshAnswers, RefreshMerge};
         // Held from the id write and the load below to the last save, so an
@@ -2782,9 +2790,8 @@ impl LocalProviderManager {
                 .flatten()
                 .map(|(k, v)| (k.as_str(), v.as_str())),
         );
-        if options.search_result.is_some()
-            && let Some(store) = &self.image_store
-        {
+        let identified = identified && options.search_result.is_some();
+        if identified && let Some(store) = &self.image_store {
             store.replace_provider_ids(item_id, &chosen_ids).await?;
         }
         // The item store comes with the TMDB client (`with_remote_images`):
@@ -2806,8 +2813,8 @@ impl LocalProviderManager {
             && self.remove_own_images(item_id, &stored).await?;
         // The item's `LockedFields`: the merge leaves them as stored.
         let locked_fields = self.stored_locked_fields(item_id).await;
-        let stored_ids = if options.search_result.is_some() {
-            chosen_ids
+        let stored_ids = if identified {
+            chosen_ids.clone()
         } else {
             self.stored_provider_ids(item_id).await
         };
@@ -2902,9 +2909,12 @@ impl LocalProviderManager {
                 && plan.remote_images != ImageFetch::None
                 && wants_fetch(gated.image_refresh_mode),
         };
+        // A child is looked up by its own name and year, never the chosen
+        // result's (the first divergence of the `metadata-refresh` row).
         let chosen_name = options
             .search_result
             .as_ref()
+            .filter(|_| identified)
             .and_then(|r| r.name.as_deref())
             .map(str::trim)
             .filter(|n| !n.is_empty());
@@ -2940,7 +2950,7 @@ impl LocalProviderManager {
                 // identified season looks up by the chosen result's ids as
                 // its SERIES' ids.
                 let series_ids = match (&options.search_result, series_id) {
-                    (Some(_), _) => stored_ids.clone(),
+                    (Some(_), _) => chosen_ids.clone(),
                     (None, Some(series)) => self.stored_provider_ids(series).await,
                     (None, None) => Vec::new(),
                 };
@@ -2971,7 +2981,7 @@ impl LocalProviderManager {
                 // `ApplySearchResult`: an identified episode looks up by the
                 // chosen result's ids as its SERIES' ids and has none of its own.
                 let (series_ids, own_ids) = match (&options.search_result, series_id) {
-                    (Some(_), _) => (stored_ids.clone(), Vec::new()),
+                    (Some(_), _) => (chosen_ids.clone(), Vec::new()),
                     (None, Some(series)) => {
                         (self.stored_provider_ids(series).await, stored_ids.clone())
                     }
@@ -5530,8 +5540,9 @@ impl ProviderManager for LocalProviderManager {
         options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
         // Boxed: the refresh future holds the whole fetch-merge-save state
-        // (`clippy::large_futures`).
-        Box::pin(self.refresh_item(item_id, options))
+        // (`clippy::large_futures`). The Identify's and the queue's entry: the
+        // item is the one an Identify's result was chosen for.
+        Box::pin(self.refresh_item(item_id, options, true))
             .await
             .map(|_| ())
     }
@@ -5543,8 +5554,10 @@ impl ProviderManager for LocalProviderManager {
     ) -> Result<ItemUpdateType, ServiceError> {
         // `ProviderManager.RefreshSingleItem`: the item's own metadata service
         // runs and reports what changed. Ferrofin's refresh never recurses
-        // into children, so this is the full refresh with its verdict kept.
-        Box::pin(self.refresh_item(item_id, options)).await
+        // into children, so this is the full refresh with its verdict kept,
+        // as a child's (`RefreshAllMetadata`'s `item.RefreshMetadata`): an
+        // Identify's result in `options` is its series'.
+        Box::pin(self.refresh_item(item_id, options, false)).await
     }
 
     async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {

@@ -28,7 +28,7 @@ use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_model::updates::{PackageInfo, RepositoryInfo};
 use ferrofin_providers::{LocalProviderManager, TmdbClient};
 use ferrofin_traits::ServiceError;
-use ferrofin_traits::library::VirtualFolderManager;
+use ferrofin_traits::library::{LibraryManager as _, VirtualFolderManager};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService as _, ItemRepository};
 use ferrofin_traits::plugins::{PluginDescriptor, PluginImage, PluginManager};
@@ -243,6 +243,13 @@ impl Library {
         )
         .with_items(Arc::clone(&self.items))
         .with_metadata(self.tmdb(base), self.tmp.join("metadata"))
+    }
+
+    /// [`Self::scanner`] with the provider manager the server gives it,
+    /// which refreshes what has no file of its own.
+    fn scanner_with_providers(&self, base: &str) -> LibraryScanner {
+        self.scanner(base)
+            .with_metadata_savers(Arc::new(providers(self, base)))
     }
 
     /// The library manager over [`Self::scanner`], as the server builds it.
@@ -624,4 +631,156 @@ async fn a_refresh_that_finds_new_season_art_makes_a_locked_season_virtual() {
         refreshed.is_locked && refreshed.is_virtual_item,
         "{refreshed:?}"
     );
+}
+
+/// A library scan ends each series' refresh with its path-less children
+/// (`Series.RefreshAllMetadata`, gl-1957): the unaired episode the TMDb
+/// provider just made takes its first refresh through the provider manager,
+/// while the episode that aired in 2011 is left out of a plain refresh, as
+/// upstream leaves a missing episode aired over 30 days ago
+/// (`Series.cs:386-392`).
+#[tokio::test]
+async fn a_library_scan_refreshes_the_unaired_episodes_and_not_the_long_missing_ones() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lib = Library::new(tmp.path()).await;
+    let base = spawn_tmdb();
+    lib.set(settings(true, true, &[lib.folder_id.as_str()]));
+    lib.scanner_with_providers(&base)
+        .scan_all()
+        .await
+        .expect("scan");
+
+    let unaired = lib.row(lib.provider_id(1, Some(3))).await.expect("S01E03");
+    assert!(unaired.date_last_refreshed.is_some(), "{unaired:?}");
+    let aired = lib.row(lib.provider_id(1, Some(2))).await.expect("S01E02");
+    assert!(aired.date_last_refreshed.is_none(), "{aired:?}");
+}
+
+/// A series' full refresh (`POST /Items/{seriesId}/Refresh` with "Search for
+/// missing metadata" or "Replace all metadata", gl-1957) refreshes every
+/// season and every missing episode of it, path-less ones included: the
+/// season left with only placeholders becomes virtual (its own refresh's
+/// `SaveIsVirtualItem`), and the episode that aired in 2011 takes its first
+/// refresh (TheMovieDb's episode provider answers nothing for a missing
+/// episode, `TmdbEpisodeProvider.cs:87-90`, so only its stamp shows it).
+#[tokio::test]
+async fn a_series_full_refresh_refreshes_its_path_less_season_and_missing_episodes() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lib = Library::new(tmp.path()).await;
+    let base = spawn_tmdb();
+    let (season, _) = season_left_with_only_missing_episodes(&lib, &base).await;
+    let library = FerrofinLibraryManager::new(
+        Arc::clone(&lib.items),
+        Arc::new(FerrofinItemCountService::new(lib.db.clone())),
+        lib.persistence.clone(),
+        Arc::new(FerrofinPeopleRepository::new(lib.db.clone())),
+    )
+    .with_virtual_folders(Arc::clone(&lib.vf))
+    .with_scanner(Arc::new(lib.scanner_with_providers(&base)));
+    let series = lib.row(lib.series_id()).await.expect("series");
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    library
+        .refresh_full_item(&series, &full)
+        .await
+        .expect("series refresh");
+
+    let refreshed = lib.row(season).await.expect("season 1");
+    assert!(refreshed.is_virtual_item, "{refreshed:?}");
+    let missing = lib.row(lib.provider_id(1, Some(2))).await.expect("S01E02");
+    assert!(missing.date_last_refreshed.is_some(), "{missing:?}");
+}
+
+/// An Identify of the series hands its path-less children the chosen result
+/// as the series' (`ApplySearchResult`), never as their own ids, which only
+/// the identified item takes (`ItemLookupController.ApplySearchCriteria`): a
+/// locked season, which runs no provider, keeps the ids it had, and a
+/// missing episode, whose own ids `ApplySearchResult` clears, keeps only what
+/// its providers answer (TheMovieDb's answers nothing for it).
+#[tokio::test]
+async fn a_series_identify_gives_its_path_less_children_no_ids_of_its_own() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lib = Library::new(tmp.path()).await;
+    let base = spawn_tmdb();
+    let (season, _) = season_left_with_only_missing_episodes(&lib, &base).await;
+    let mut row = lib.row(season).await.expect("season");
+    row.is_locked = true;
+    lib.persistence.save_items(&[row]).await.expect("lock");
+    let persistence = &lib.persistence;
+    let ids = |id: Uuid| async move {
+        persistence
+            .provider_ids_for_items(&[id])
+            .await
+            .expect("ids")
+            .remove(&id)
+            .unwrap_or_default()
+    };
+    let before = ids(season).await;
+    let missing = lib.provider_id(1, Some(2));
+    assert_eq!(
+        ids(missing).await,
+        [("Tmdb".to_owned(), "63057".to_owned())]
+    );
+    let library = FerrofinLibraryManager::new(
+        Arc::clone(&lib.items),
+        Arc::new(FerrofinItemCountService::new(lib.db.clone())),
+        lib.persistence.clone(),
+        Arc::new(FerrofinPeopleRepository::new(lib.db.clone())),
+    )
+    .with_virtual_folders(Arc::clone(&lib.vf))
+    .with_scanner(Arc::new(lib.scanner_with_providers(&base)));
+    let series = lib.row(lib.series_id()).await.expect("series");
+    let identify = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::None,
+        replace_all_metadata: true,
+        search_result: Some(ferrofin_model::providers::RemoteSearchResult {
+            name: Some("Show".to_owned()),
+            provider_ids: Some(std::collections::HashMap::from([(
+                "Tmdb".to_owned(),
+                "1399".to_owned(),
+            )])),
+            ..Default::default()
+        }),
+        ..MetadataRefreshOptions::default()
+    };
+    library
+        .refresh_full_item(&series, &identify)
+        .await
+        .expect("identify");
+
+    assert_eq!(ids(season).await, before);
+    assert_eq!(ids(missing).await, Vec::new());
+}
+
+/// A refresh below the series (the library monitor's for a new file in its
+/// season folder) carries the series for context only, and refreshes none of
+/// its path-less children; the series' own refresh does.
+#[tokio::test]
+async fn only_the_series_own_refresh_refreshes_its_path_less_children() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let lib = Library::new(tmp.path()).await;
+    let base = spawn_tmdb();
+    lib.set(settings(true, true, &[lib.folder_id.as_str()]));
+    lib.scanner(&base).scan_all().await.expect("scan");
+    let unaired = lib.provider_id(1, Some(3));
+    let refreshed = || async { lib.row(unaired).await.expect("S01E03").date_last_refreshed };
+    assert_eq!(refreshed().await, None);
+
+    let show = tmp.path().join("tv").join("Show");
+    let file = show.join("Season 1").join("Show S01E01.mkv");
+    lib.scanner_with_providers(&base)
+        .scan_paths(&[file.to_string_lossy().into_owned()])
+        .await
+        .expect("the file's refresh");
+    assert_eq!(refreshed().await, None);
+
+    lib.scanner_with_providers(&base)
+        .scan_paths(&[show.to_string_lossy().into_owned()])
+        .await
+        .expect("the series' refresh");
+    assert!(refreshed().await.is_some());
 }

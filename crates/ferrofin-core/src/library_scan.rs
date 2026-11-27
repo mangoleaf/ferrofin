@@ -7940,7 +7940,8 @@ impl LibraryScanner {
 
     /// The closing passes of an item or folder refresh, and of the library
     /// monitor's scan ([`ScanPasses::Touched`]): the music refresh of the
-    /// albums and artists it refreshed,
+    /// albums and artists it refreshed, the missing episodes and path-less
+    /// seasons of the series it refreshed,
     /// the children-derived columns of the folders it planned, the generated
     /// Primaries of the music and photo albums, folders and playlists it
     /// refreshed, and
@@ -7969,6 +7970,14 @@ impl LibraryScanner {
             .await
         {
             tracing::warn!(%err, "missing episode pass failed");
+        }
+        // Then the path-less seasons and missing episodes of each, which the
+        // walk does not refresh (`Series.RefreshAllMetadata`).
+        if let Err(err) = self
+            .refresh_pathless_series_children(&work.series, planned, run)
+            .await
+        {
+            tracing::warn!(%err, "series' path-less children pass failed");
         }
         if let Err(err) = self.update_folder_aggregates(planned, run).await {
             tracing::warn!(%err, "folder aggregates pass failed");
@@ -9751,6 +9760,7 @@ impl LibraryScanner {
     /// | music | the walk's per-item decision for each album and artist ([`music`]); the item keeps what made it due until this pass writes it; then every album the scan planned, its artist credits written where they moved | `MetadataService.RefreshMetadata`; `AlbumMetadataService.SetPeople` |
     /// | artists | the by-name artists a library artist supersedes; the by-name artists never refreshed (`DateLastRefreshed IS NULL`) | `ArtistsValidator.cs:86-91` (`isNew \|\| neverRefreshed`) |
     /// | dead by-name rows | the unlocked genres, music genres and studios no item value names, and the by-name artists no item credits | `GenresValidator.cs:107-119`, `StudiosValidator.cs:108-120`, `ArtistsValidator.cs:130-143` |
+    /// | series' path-less children | of every series the scan refreshed, the path-less seasons the walk did not plan and the missing episodes but those aired over 30 days ago (every one on a full or replacing refresh), each refreshed by the provider manager with the scan's options; each one's refresh decides what it fetches | `Series.RefreshAllMetadataInternal` (`Series.cs:347-406`) |
     /// | folder aggregates | every series, album and artist the scan planned, written where the value moved | `UpdateMetadataFromChildren` in each folder's `RefreshMetadata` |
     /// | by-name paths | the by-name rows with no `Path` | `CreateItemByName` sets it at insert |
     /// | first refreshes | the genres and music genres never refreshed, stamped; the root and user root too where their opening refresh cannot run; the Playlists folder never refreshed, once its directory holds an entry | `GenresValidator.cs:79-83`, `MusicGenresValidator.cs:64-67`, `ValidateTopLibraryFolders`; `Folder.cs:400-412` |
@@ -9840,8 +9850,9 @@ impl LibraryScanner {
             return false;
         }
         // Each refreshed series' obsolete virtual episodes go
-        // (`SeriesMetadataService.AfterMetadataRefresh`), then the
-        // children-derived columns of every folder the scan planned:
+        // (`SeriesMetadataService.AfterMetadataRefresh`), its path-less
+        // seasons and missing episodes refresh (`Series.RefreshAllMetadata`),
+        // then the children-derived columns of every folder the scan planned:
         // cumulative runtime (albums, artists) and last media added
         // (series).
         timings.aggregates = post_scan_pass(aggregates, done + 1, run.cancel, async {
@@ -9855,6 +9866,13 @@ impl LibraryScanner {
             }
             if let Err(err) = self.remove_obsolete_episodes(&work.series, run).await {
                 tracing::warn!(%err, "obsolete episode pass failed");
+                succeeded = false;
+            }
+            if let Err(err) = self
+                .refresh_pathless_series_children(&work.series, planned, run)
+                .await
+            {
+                tracing::warn!(%err, "series' path-less children pass failed");
                 succeeded = false;
             }
             if let Err(err) = self.update_folder_aggregates(planned, run).await {
@@ -25024,6 +25042,7 @@ mod music;
 mod obsolete_episodes;
 mod playlists;
 mod provider_cache;
+mod series_children;
 mod trickplay;
 
 #[cfg(test)]
