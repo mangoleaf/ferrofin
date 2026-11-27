@@ -4794,9 +4794,10 @@ pub const VERIFIED: &[Verified] = &[
                run_detached's task; otherwise save_named_configuration, on \
                handlers.rs run_detached's task so it finishes for a client that hangs up, in \
                the request's span and culture \
-               (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
-               the live network policy (ferrofin-networking NetworkManager::update_settings: \
-               UpdateSettings, warning of each LAN or exclusion entry InitializeLan ignores \
+               (BaseConfigurationManager.SaveConfiguration: the validating store, the write \
+               of {config}/{key}.json, beside system.json as GetConfigurationFile's \
+               {config}/{key}.xml, the live network policy (ferrofin-networking \
+               NetworkManager::update_settings: UpdateSettings, warning of each LAN or exclusion entry InitializeLan ignores \
                and logging an error for each override InitializeOverrides cannot parse, the \
                loop stopping at the first without exactly one '=' as upstream's does, then \
                PrintNetworkInformation(config, false): its seven Information lines), the \
@@ -4808,7 +4809,7 @@ pub const VERIFIED: &[Verified] = &[
                LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
                RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
                and provider saves run too, as upstream's save of livetv does)",
-        date: "2026-11-20",
+        date: "2026-11-26",
         divergences: &[
             "database is refused with a 400: Ferrofin has no other database provider (owner \
          decision 2026-10-23).",

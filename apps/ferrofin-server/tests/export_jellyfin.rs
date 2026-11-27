@@ -120,7 +120,7 @@ async fn source(scratch: &Path) -> PathBuf {
         br#"{"SaveLocalMetadata": true, "PathInfos": [{"Path": "/media/movies"}]}"#,
     )
     .unwrap();
-    std::fs::create_dir_all(source.join("config/users/named")).unwrap();
+    std::fs::create_dir_all(source.join("config")).unwrap();
     std::fs::write(
         source.join("config/system.json"),
         br#"{"ServerName": "Living room", "IsStartupWizardCompleted": true}"#,
@@ -128,12 +128,12 @@ async fn source(scratch: &Path) -> PathBuf {
     .unwrap();
     std::fs::write(source.join("config/system_id"), format!("{SERVER_ID}\n")).unwrap();
     std::fs::write(
-        source.join("config/users/named/encoding.json"),
+        source.join("config/encoding.json"),
         br#"{"EncoderPreset": "slow"}"#,
     )
     .unwrap();
     std::fs::write(
-        source.join("config/users/named/network.json"),
+        source.join("config/network.json"),
         format!(r#"{{"CertificatePath": "/certs/a.pfx", "CertificatePassword": "{CERTIFICATE_PASSWORD}"}}"#),
     )
     .unwrap();
@@ -174,8 +174,8 @@ const CONFIGURATION: [&str; 11] = [
 /// [`CONFIGURATION`]'s XML, relative to the source.
 const EXPORTED_JSON: [&str; 3] = [
     "config/system.json",
-    "config/users/named/encoding.json",
-    "config/users/named/network.json",
+    "config/encoding.json",
+    "config/network.json",
 ];
 
 /// Runs `ferrofin-server export-jellyfin --data-dir <source> --out <out>` with
@@ -355,7 +355,7 @@ async fn export_jellyfin_copies_a_stopped_data_directory_and_leaves_it_untouched
 async fn export_jellyfin_warns_about_a_document_that_does_not_parse() {
     let scratch = tempfile::tempdir().unwrap();
     let source = source(scratch.path()).await;
-    std::fs::write(source.join("config/users/named/encoding.json"), "{not json").unwrap();
+    std::fs::write(source.join("config/encoding.json"), "{not json").unwrap();
     let out = scratch.path().join("out");
     let run = export(&source, &out);
 
@@ -663,7 +663,7 @@ async fn export_jellyfin_probes_the_networking_pages_port_and_base_url() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::fs::write(
-        source.join("config/users/named/network.json"),
+        source.join("config/network.json"),
         format!(r#"{{"InternalHttpPort": {port}, "BaseUrl": "saved dir/"}}"#),
     )
     .unwrap();

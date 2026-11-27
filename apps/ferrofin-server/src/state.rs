@@ -89,7 +89,7 @@ fn start_network_change_monitor(
 
 /// Reads the saved network configuration, or the default when there is none.
 ///
-/// The same `{config}/users/named/network.json` that
+/// The same `{config}/network.json` that
 /// `GET/POST /System/Configuration/network` reads and writes — so what the
 /// dashboard's policy settings feed the shared network manager. `AutoDiscovery`,
 /// `BaseUrl` (`base_url::resolve`) and the ports (`listen::ports`) are sampled
@@ -101,15 +101,16 @@ fn start_network_change_monitor(
 pub(crate) async fn load_network_configuration(
     paths: &impl ferrofin_traits::system::ServerApplicationPaths,
 ) -> ferrofin_networking::NetworkConfiguration {
-    let user_dir = std::path::PathBuf::from(paths.user_configuration_directory_path());
-    let path = user_dir.join("named").join("network.json");
+    let config_dir = std::path::PathBuf::from(paths.configuration_directory_path());
+    // The listeners bind before the boot moves an earlier release's file, and
+    // the export never moves it.
+    let path = ferrofin_core::named_configuration_files::readable(&config_dir, "network.json");
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         // As the seeding, which imports `network.xml` only while there is no
         // `network.json`.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let xml = user_dir.parent().map(|config| config.join("network.xml"));
-            return adopted_network_configuration(xml.as_deref()).await;
+            return adopted_network_configuration(Some(&config_dir.join("network.xml"))).await;
         }
         Err(_) => return ferrofin_networking::NetworkConfiguration::default(),
     };
@@ -1259,8 +1260,8 @@ pub async fn build_app_state(
         // `ReleaseDateFormat`, as the NFO savers write theirs.
         .with_release_date_format({
             let nfo = Arc::new(ferrofin_providers::xbmc::config::NfoConfigurationFile::new(
-                std::path::PathBuf::from(paths.user_configuration_directory_path())
-                    .join("named/xbmcmetadata.json"),
+                std::path::PathBuf::from(paths.configuration_directory_path())
+                    .join("xbmcmetadata.json"),
             ));
             Arc::new(move |date| {
                 ferrofin_providers::xbmc::dotnet_date::format_date_time(
@@ -1281,8 +1282,7 @@ pub async fn build_app_state(
                 })
             },
             data_dir: std::path::PathBuf::from(paths.data_path()),
-            options_file: std::path::PathBuf::from(paths.user_configuration_directory_path())
-                .join("named")
+            options_file: std::path::PathBuf::from(paths.configuration_directory_path())
                 .join("livetv.json"),
             metadata_dir: metadata_root.clone(),
         }),
@@ -1897,9 +1897,9 @@ pub async fn build_app_state(
             std::path::PathBuf::from(
                 config_mgr
                     .application_paths()
-                    .user_configuration_directory_path(),
+                    .configuration_directory_path(),
             )
-            .join("named/xbmcmetadata.json"),
+            .join("xbmcmetadata.json"),
         ));
         move || source.current()
     })
@@ -3961,8 +3961,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config = crate::config::Config::test_stub(tmp.path());
         let paths = crate::bootstrap::application_paths(&config);
-        let named = config.config_dir.join("users").join("named");
-        std::fs::create_dir_all(&named).expect("named configuration directory");
+        let legacy = config.config_dir.join("users").join("named");
+        std::fs::create_dir_all(&legacy).expect("legacy named configuration directory");
         let port = || async {
             super::load_network_configuration(&paths)
                 .await
@@ -3981,9 +3981,23 @@ mod tests {
         .expect("write network.xml");
         assert_eq!(port().await, 8097, "Jellyfin's network.xml");
 
-        std::fs::write(named.join("network.json"), r#"{"InternalHttpPort":8098}"#)
-            .expect("write network.json");
-        assert_eq!(port().await, 8098, "the seeded or saved network.json");
+        // gl-319: a release before 1.6.0 kept it in `users/named/`, read
+        // until the boot moves it.
+        std::fs::write(legacy.join("network.json"), r#"{"InternalHttpPort":8098}"#)
+            .expect("write the legacy network.json");
+        assert_eq!(
+            port().await,
+            8098,
+            "the network.json an earlier release saved"
+        );
+        ferrofin_core::named_configuration_files::move_legacy(&config.config_dir).expect("move");
+        assert_eq!(port().await, 8098, "the moved network.json");
+        std::fs::write(
+            config.config_dir.join("network.json"),
+            r#"{"InternalHttpPort":8099}"#,
+        )
+        .expect("write network.json");
+        assert_eq!(port().await, 8099, "the seeded or saved network.json");
     }
 
     /// The storage page lists the libraries from the snapshot, not the full
