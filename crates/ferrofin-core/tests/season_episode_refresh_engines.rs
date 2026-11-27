@@ -308,9 +308,10 @@ async fn an_episode_maps_tmdbs_answer_the_same_in_both_engines(#[case] replace: 
 /// sets it to the episodes' earliest before the providers run (`BeforeSave`,
 /// `MetadataService.cs:150,341-363,543-575`), so a provider's date only
 /// replaces it when replacing everything. The scan ports that
-/// (`update_season_premiere_date`); the provider manager's refresh never
-/// reads the episodes, so it fills the cleared date with TheMovieDb's season
-/// date. gl-1838 tracks the port; its fix gives both cases one date.
+/// (`update_season_premiere_date`); the provider manager's refresh reads the
+/// episodes only for `SaveIsVirtualItem` and takes no date from them, so it
+/// fills the cleared date with TheMovieDb's season date. gl-1838 tracks the
+/// port; its fix gives both cases one date.
 #[rstest::rstest]
 #[case::replace_all_metadata(true, "2011-04-10", "2011-04-10")]
 #[case::search_for_missing_metadata(false, "2011-04-17", "2011-04-10")]

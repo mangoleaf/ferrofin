@@ -103,6 +103,41 @@ impl From<EpisodeOrderRow> for BaseItemEntity {
     }
 }
 
+/// Whether `row`'s stored `Type` names an item kind. A read skips a row that
+/// does not (a removed plugin's item, an old server's, a corrupt row), as
+/// `DeserializeBaseItem` returns null for it (jellyfin/jellyfin#15956), and
+/// this logs it. Upstream warns on every read; a removed plugin leaves all its
+/// items behind, so here only the first row of each type per process is a
+/// warning and the rest are debug (LOGGING.md §1).
+pub(crate) fn has_known_type(row: &BaseItemEntity) -> bool {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    if crate::item_type_lookup::kind_from_type_name(&row.type_).is_some() {
+        return true;
+    }
+    let first = {
+        let mut warned = WARNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !warned.contains(&row.type_) && warned.insert(row.type_.clone())
+    };
+    if first {
+        tracing::warn!(
+            item_id = %row.id,
+            item_type = ?row.type_,
+            "skipping item with unknown type; this may indicate a removed plugin or database \
+             corruption (later items of this type are logged at debug)"
+        );
+    } else {
+        tracing::debug!(
+            item_id = %row.id,
+            item_type = ?row.type_,
+            "skipping item with unknown type"
+        );
+    }
+    false
+}
+
 /// The concrete item repository.
 ///
 /// Holds a cheaply-cloneable [`Database`] handle plus the shared
@@ -534,17 +569,23 @@ impl FerrofinItemRepository {
     /// [`ItemRepository`] read returns goes through here; the save stores the
     /// token form again (`FerrofinItemPersistenceService::upsert_item`,
     /// `GetPathToSave`).
-    fn mapped(&self, mut row: BaseItemEntity) -> BaseItemEntity {
+    ///
+    /// `None` for a row whose stored `Type` names no kind ([`has_known_type`]):
+    /// every caller drops it, as upstream's callers drop `DeserializeBaseItem`'s
+    /// null. The row itself is left as it is.
+    fn mapped(&self, mut row: BaseItemEntity) -> Option<BaseItemEntity> {
+        if !has_known_type(&row) {
+            return None;
+        }
         self.virtual_paths.expand_in_place(&mut row.path);
-        row
+        Some(row)
     }
 
-    /// [`Self::mapped`] over every row.
-    fn mapped_rows(&self, mut rows: Vec<BaseItemEntity>) -> Vec<BaseItemEntity> {
-        for row in &mut rows {
-            self.virtual_paths.expand_in_place(&mut row.path);
-        }
-        rows
+    /// [`Self::mapped`] over every row, dropping the unknown ones.
+    fn mapped_rows(&self, rows: Vec<BaseItemEntity>) -> Vec<BaseItemEntity> {
+        rows.into_iter()
+            .filter_map(|row| self.mapped(row))
+            .collect()
     }
 
     /// Installs the slot the composition root later fills with Live TV's
@@ -1786,10 +1827,12 @@ impl FerrofinItemRepository {
         let filter = resolved.as_ref().unwrap_or(filter);
         // The window is whole rows whatever the shape: a `FullRows` caller
         // needs them, and an `EpisodeOrder` caller reads a subset of them.
-        if let Some(window) = window {
-            return Ok(sql_page(self.rows_in_order(&window).await?, filter));
-        }
-        self.fetch_rows_resolved(filter, shape).await
+        let rows = if let Some(window) = window {
+            sql_page(self.rows_in_order(&window).await?, filter)
+        } else {
+            self.fetch_rows_resolved(filter, shape).await?
+        };
+        Ok(self.mapped_rows(rows))
     }
 
     /// The SQL path's `AdjacentTo` (v12.2 `ApplyAdjacencyFilter`, which
@@ -1824,9 +1867,11 @@ impl FerrofinItemRepository {
     /// The rows of an adjacency window, in the window's order. Upstream
     /// re-reads the window by id alone and orders it again; keeping the first
     /// pass's order is the same for every deterministic sort, and keeps a
-    /// `Random` or linked-order window as the pass that chose it.
+    /// `Random` or linked-order window as the pass that chose it. The rows are
+    /// as stored: the caller pages them, then maps them ([`Self::mapped`]), as
+    /// upstream pages before it deserializes.
     async fn rows_in_order(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let mut rows = self.retrieve_items(ids).await?;
+        let mut rows = self.stored_rows(ids).await?;
         rows.sort_by_key(|row| {
             Uuid::parse_str(&row.id)
                 .ok()
@@ -1835,10 +1880,30 @@ impl FerrofinItemRepository {
         Ok(rows)
     }
 
+    /// The stored rows of `ids`, in no particular order and not yet mapped
+    /// ([`Self::mapped`]): [`ItemRepository::retrieve_items`] and the
+    /// adjacency window ([`Self::rows_in_order`]) read them.
+    async fn stored_rows(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut rows = Vec::new();
+        for chunk in ferrofin_db::padded_in_chunks(ids) {
+            let sql = format!(
+                r#"SELECT * FROM "BaseItems" WHERE "Id" IN ({})"#,
+                placeholders(chunk.len())
+            );
+            let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql.as_str()));
+            for id in chunk {
+                query = query.bind(guid_to_db(*id));
+            }
+            rows.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
+        }
+        Ok(rows)
+    }
+
     /// [`Self::fetch_rows`] for a filter whose views are already resolved.
     ///
     /// Resolving twice is harmless — it is idempotent — but it is a wasted
     /// round trip, and `get_items` runs both this and the count off one scope.
+    /// The rows are as SQL produced them, not yet mapped ([`Self::mapped`]).
     async fn fetch_rows_resolved(
         &self,
         filter: &InternalItemsQuery,
@@ -1859,15 +1924,16 @@ impl FerrofinItemRepository {
                 .await
                 .map_err(db_err)?
         };
-        Ok(self.mapped_rows(rows))
+        Ok(rows)
     }
 
     /// Runs a translated query returning only the id and clean-name columns.
     ///
     /// Same statement as [`Self::fetch_rows`] but for the projection, so the
     /// rows — and their order — are identical to what `get_item_list` would
-    /// have returned. An `AdjacentTo` window (a few rows) is read as whole
-    /// rows, as `fetch_rows` reads it.
+    /// have returned, except that a row of an unknown stored `Type` is kept, as
+    /// the ids-only reads keep it. An `AdjacentTo` window (a few rows) is read
+    /// as whole rows, as `fetch_rows` reads it.
     async fn fetch_id_clean_names(
         &self,
         filter: &InternalItemsQuery,
@@ -2369,15 +2435,17 @@ impl FerrofinItemRepository {
         let counts_by_clean_name = self.page_counts(&scope, value_types, filter, &rows).await?;
         let items: Vec<ItemWithCounts> = rows
             .into_iter()
-            .map(|r| ItemWithCounts {
-                counts: r
-                    .item
-                    .clean_name
-                    .as_deref()
-                    .and_then(|name| counts_by_clean_name.get(name))
-                    .copied()
-                    .unwrap_or_default(),
-                item: self.mapped(r.item),
+            .filter_map(|r| {
+                Some(ItemWithCounts {
+                    counts: r
+                        .item
+                        .clean_name
+                        .as_deref()
+                        .and_then(|name| counts_by_clean_name.get(name))
+                        .copied()
+                        .unwrap_or_default(),
+                    item: self.mapped(r.item)?,
+                })
             })
             .collect();
         Ok(QueryResult::new(Some(start_index), Some(total), items))
@@ -4008,23 +4076,11 @@ impl ItemRepository for FerrofinItemRepository {
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(row.map(|row| self.mapped(row)))
+        Ok(row.and_then(|row| self.mapped(row)))
     }
 
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let mut rows = Vec::new();
-        for chunk in ferrofin_db::padded_in_chunks(ids) {
-            let sql = format!(
-                r#"SELECT * FROM "BaseItems" WHERE "Id" IN ({})"#,
-                placeholders(chunk.len())
-            );
-            let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql.as_str()));
-            for id in chunk {
-                query = query.bind(guid_to_db(*id));
-            }
-            rows.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
-        }
-        Ok(self.mapped_rows(rows))
+        Ok(self.mapped_rows(self.stored_rows(ids).await?))
     }
 
     async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
@@ -4074,12 +4130,13 @@ impl ItemRepository for FerrofinItemRepository {
                 Ok(None)
             };
         }
-        // Deduplicate by id (nearest-first) in case the tree has a cycle.
+        // Deduplicate by id (nearest-first) in case the tree has a cycle. An
+        // unknown ancestor ends the chain, as `GetParent()` is null there.
         let mut seen = std::collections::HashSet::new();
         let deduped = rows
             .into_iter()
             .filter(|r| seen.insert(r.id.clone()))
-            .map(|r| self.mapped(r))
+            .map_while(|r| self.mapped(r))
             .collect();
         Ok(Some(deduped))
     }
@@ -4116,7 +4173,7 @@ impl ItemRepository for FerrofinItemRepository {
         if let Some(window) = window {
             // `GetItems` counts the trimmed set, then pages it.
             let window_len = window.len();
-            let items = sql_page(self.rows_in_order(&window).await?, filter);
+            let items = self.mapped_rows(sql_page(self.rows_in_order(&window).await?, filter));
             let total = if filter.enable_total_record_count
                 && (filter.limit.is_some() || start_index > 0)
             {
@@ -4127,15 +4184,19 @@ impl ItemRepository for FerrofinItemRepository {
             };
             return Ok(QueryResult::new(Some(start_index), Some(total), items));
         }
-        let items = self
+        let rows = self
             .fetch_rows_resolved(filter, QueryShape::FullRows)
             .await?;
+        // What SQL produced, before `mapped_rows` drops a row of an unknown
+        // type: that is what tells a short page, as upstream counts in SQL.
+        let sql_len = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+        let items = self.mapped_rows(rows);
         let page_len = i32::try_from(items.len()).unwrap_or(i32::MAX);
         // A page that came back SHORT of its own `LIMIT` has nothing after it,
-        // so the total is already in hand: `start_index + page_len`, exactly what
-        // the `COUNT(*)` would return. `fetch_rows` hands back precisely what SQL
-        // produced — no Rust-side dedup or filtering — so a short page can only
-        // mean the result set is exhausted.
+        // so the total is already in hand: `start_index + sql_len`, exactly what
+        // the `COUNT(*)` would return. `sql_len` is precisely what SQL produced
+        // — no Rust-side dedup or filtering — so a short page can only mean the
+        // result set is exhausted.
         //
         // The count is otherwise a second full pass over the page query's
         // predicate, and unlike the page it cannot stop at `LIMIT` rows: 2.367 ms
@@ -4150,20 +4211,20 @@ impl ItemRepository for FerrofinItemRepository {
         // number above the real total, not the total. That case still counts.
         // (`by_name_total_survives_offset_past_end` records the same trap on the
         // by-name path.)
-        let count_is_known = filter.limit.is_some_and(|limit| page_len < limit)
-            && (page_len > 0 || start_index == 0);
-        let total = if filter.enable_total_record_count
-            && (filter.limit.is_some() || start_index > 0)
-            && !count_is_known
-        {
-            self.fetch_count_resolved(filter).await?
-        } else if filter.enable_total_record_count {
-            page_len + start_index
-        } else {
-            // Uncounted: `GetItems` answers `GetItemList`'s page and its length
-            // (v12.4 `BaseItemRepository.Querying.cs:34-40`), whatever the offset.
-            page_len
-        };
+        let count_is_known =
+            filter.limit.is_some_and(|limit| sql_len < limit) && (sql_len > 0 || start_index == 0);
+        let total =
+            if filter.enable_total_record_count && (filter.limit.is_some() || start_index > 0) {
+                if count_is_known {
+                    sql_len + start_index
+                } else {
+                    self.fetch_count_resolved(filter).await?
+                }
+            } else {
+                // Uncounted or unpaged: `GetItems` answers `GetItemList`'s page and
+                // its length (v12.4 `BaseItemRepository.Querying.cs:34-40`).
+                page_len
+            };
         Ok(QueryResult::new(Some(start_index), Some(total), items))
     }
 
@@ -4220,9 +4281,11 @@ impl ItemRepository for FerrofinItemRepository {
             .map_err(db_err)
             .map(|rows| {
                 rows.into_iter()
-                    .map(|row| FolderChild {
-                        item: self.mapped(row.item),
-                        linked: row.linked,
+                    .filter_map(|row| {
+                        Some(FolderChild {
+                            item: self.mapped(row.item)?,
+                            linked: row.linked,
+                        })
                     })
                     .collect()
             })
@@ -4397,8 +4460,9 @@ impl ItemRepository for FerrofinItemRepository {
                     .primary_version_id
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok())
+                    && let Some(row) = self.mapped(row)
                 {
-                    map.entry(primary).or_default().push(self.mapped(row));
+                    map.entry(primary).or_default().push(row);
                 }
             }
         }
@@ -4410,8 +4474,11 @@ impl ItemRepository for FerrofinItemRepository {
         primary_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
         let mut map = rows_by_primary_flagged(&self.db, primary_ids).await?;
-        for (row, _) in map.values_mut().flatten() {
-            self.virtual_paths.expand_in_place(&mut row.path);
+        for rows in map.values_mut() {
+            rows.retain(|(row, _)| has_known_type(row));
+            for (row, _) in rows {
+                self.virtual_paths.expand_in_place(&mut row.path);
+            }
         }
         Ok(map)
     }
@@ -4898,9 +4965,14 @@ impl ItemRepository for FerrofinItemRepository {
             let index = if let Some(&seen) = index_of.get(id) {
                 seen
             } else {
+                // An unknown member has no entry, as `ResolveLinkedChildren`
+                // drops an item `GetItemById` cannot read.
+                let Some(item) = self.mapped(BaseItemEntity::from_row(&row).map_err(db_err)?)
+                else {
+                    continue;
+                };
                 index_of.insert(id.to_owned(), members.items.len());
-                let item = BaseItemEntity::from_row(&row).map_err(db_err)?;
-                members.items.push(self.mapped(item));
+                members.items.push(item);
                 members.items.len() - 1
             };
             members.entries.push(index);
@@ -17599,3 +17671,7 @@ mod folder_sort_key_tests;
 #[cfg(test)]
 #[path = "item_repository/folder_sql_order_tests.rs"]
 mod folder_sql_order_tests;
+
+#[cfg(test)]
+#[path = "item_repository/unknown_type_tests.rs"]
+mod unknown_type_tests;

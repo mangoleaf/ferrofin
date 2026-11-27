@@ -155,7 +155,7 @@ Upstream paths are in `jellyfin/jellyfin` at `v12.4` unless another repository i
 - Tuners and listing providers are database rows (`FerrofinLiveTvTunerHosts`, `FerrofinLiveTvListingProviders`)
   whose `Data` column is the whole upstream DTO (`crates/ferrofin-core/src/live_tv_import.rs:72-105`; the import
   test checks the DTO round-trips).
-- The scalar options are `named/livetv.json`, and the served document merges the rows back in. Adoption seeds that
+- The scalar options are `config/livetv.json`, and the served document merges the rows back in. Adoption seeds that
   document without the three recording paths (`crates/ferrofin-core/src/config_import.rs:84-96`). An admin can set
   them later in Ferrofin (`crates/ferrofin-livetv/src/dvr.rs:650-657` reads `RecordingPath`).
 - A timer row's `Id` is the internal DTO id, and `Data` is the whole `TimerInfoDto`, external ids included
@@ -305,7 +305,7 @@ keeps, and it is lossless for scheduled timers and series timers, provided Jelly
 
 | Ferrofin source | Jellyfin target | How |
 |---|---|---|
-| `named/livetv.json` + `FerrofinLiveTvTunerHosts.Data` + `FerrofinLiveTvListingProviders.Data` | `config/livetv.xml` | the served merged document, as XML (the import, reversed); the recording paths rewritten, the tuner URLs unchanged (below) |
+| `config/livetv.json` + `FerrofinLiveTvTunerHosts.Data` + `FerrofinLiveTvListingProviders.Data` | `config/livetv.xml` | the served merged document, as XML (the import, reversed); the recording paths rewritten, the tuner URLs unchanged (below) |
 | `FerrofinLiveTvTimers` | `data/livetv/timers.json` | upstream's `GetTimerInfo` on `Data`, `Id` = `ExternalId`, plus `IsManual` from its column, completed timers included |
 | `FerrofinLiveTvRecordings` for a `Completed` timer | that timer's `RecordingPath` and programme facts | joined on `TimerId` = the timer row's `Id`; the path rewritten into the target layout (D5) |
 | `FerrofinLiveTvSeriesTimers` | `data/livetv/seriestimers.json` | upstream's `GetSeriesTimerInfo` on `Data`, `Id` = `ExternalId`, plus `SeriesId` from its column |

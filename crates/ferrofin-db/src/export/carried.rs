@@ -152,14 +152,15 @@ pub(super) async fn read(conn: &mut SqliteConnection) -> Result<CarriedRows> {
     })
 }
 
-/// The `Data` of every row of `table`, in id order.
+/// The `Data` of every row of `table`, in the order the rows were added: the
+/// order Jellyfin keeps its `livetv.xml` arrays in.
 async fn data_column(conn: &mut SqliteConnection, table: &str) -> Result<Vec<String>> {
     if !has_table(conn, table).await? {
         return Ok(Vec::new());
     }
     // The table name is one of the two above.
     Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        r#"SELECT "Data" FROM "{table}" ORDER BY "Id""#
+        r#"SELECT "Data" FROM "{table}" ORDER BY rowid"#
     )))
     .fetch_all(&mut *conn)
     .await?)
@@ -379,6 +380,33 @@ mod tests {
         assert_eq!(carried.series_timers[0].external_id, "");
         assert_eq!(carried.series_timers[0].series_id, None);
         assert_eq!(carried.identity_links, []);
+    }
+
+    /// `livetv.xml` lists the tuners and the listing providers in the order
+    /// they were added, as Jellyfin keeps them, not in id order.
+    #[tokio::test]
+    async fn tuners_and_listing_providers_are_read_in_the_order_they_were_added() {
+        let mut conn = SqliteConnectOptions::new()
+            .in_memory(true)
+            .connect()
+            .await
+            .unwrap();
+        for table in ["FerrofinLiveTvTunerHosts", "FerrofinLiveTvListingProviders"] {
+            for statement in [
+                format!(r#"CREATE TABLE "{table}" ("Id" TEXT NOT NULL PRIMARY KEY, "Data" TEXT)"#),
+                format!(
+                    r#"INSERT INTO "{table}" VALUES ('z', 'first'), ('a', 'second'), ('m', 'third')"#
+                ),
+            ] {
+                sqlx::query(sqlx::AssertSqlSafe(statement))
+                    .execute(&mut conn)
+                    .await
+                    .unwrap();
+            }
+        }
+        let carried = read(&mut conn).await.unwrap();
+        assert_eq!(carried.tuner_hosts, ["first", "second", "third"]);
+        assert_eq!(carried.listing_providers, ["first", "second", "third"]);
     }
 
     /// A debug line counts the rows and never shows their settings.

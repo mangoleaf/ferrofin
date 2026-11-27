@@ -1128,6 +1128,13 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// after server shutdown. A tick that panics is logged and ends alone
     /// (`survive_panic`): the next tick runs as usual. One job's panicking
     /// step ends only that step ([`Self::update_transcoding_jobs`]).
+    // No `task` field: `survive_panic` names the loop on the lines it logs.
+    #[tracing::instrument(
+        parent = None,
+        name = "transcode_controls",
+        skip_all,
+        fields(trigger = "startup")
+    )]
     pub async fn run_transcode_controls(manager: std::sync::Weak<Self>) {
         let mut failing = false;
         loop {
@@ -2015,6 +2022,13 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// them. The job it was tearing down is already out of the registry and
     /// is not retried; a panic while stopping its process does not reach the
     /// sweep, since `tear_down` contains it and still tells the session layer.
+    // No `task` field: `survive_panic` names the loop on the lines it logs.
+    #[tracing::instrument(
+        parent = None,
+        name = "transcode_idle_reaper",
+        skip_all,
+        fields(trigger = "startup")
+    )]
     pub async fn run_idle_reaper(manager: std::sync::Weak<Self>, interval: Duration) {
         let mut failing = false;
         loop {
@@ -2848,6 +2862,11 @@ mod tests {
         let errors = reaper_lines("ERROR");
         assert!(
             errors.len() == 1 && errors[0].contains("teardown of /t/a.m3u8 failed"),
+            "{errors:#?}"
+        );
+        // In the loop's own root span (LOGGING.md, rule 4).
+        assert!(
+            errors[0].contains(r#" transcode_idle_reaper{trigger="startup"}: "#),
             "{errors:#?}"
         );
         let repeats = reaper_lines("DEBUG");
@@ -5228,6 +5247,11 @@ pub(super) mod throttle_tests {
             .collect();
         assert!(
             errors.len() == 1 && errors[0].contains("reading ffmpeg progress failed"),
+            "{errors:#?}"
+        );
+        // In the loop's own root span (LOGGING.md, rule 4).
+        assert!(
+            errors[0].contains(r#" transcode_controls{trigger="startup"}: "#),
             "{errors:#?}"
         );
     }

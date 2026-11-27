@@ -3,10 +3,12 @@
 //! `a629c0da-fac5-4c7e-931a-7174223f14c8`).
 //!
 //! Supplies artist biography/genre + album metadata and artwork, looked up
-//! **by MusicBrainz id** (so MusicBrainz must resolve first). Uses the plugin's
-//! built-in free API key.
+//! by MusicBrainz id (an artist also by TheAudioDB's own id), and the artist
+//! half of "Identify". Uses the plugin's built-in free API key.
 //!
-//! - artist: `GET /artist-mb.php?i={musicbrainz_artist_id}`
+//! - artist: `GET /artist-mb.php?i={musicbrainz_artist_id}`, else
+//!   `GET /artist.php?i={audiodb_artist_id}`
+//! - artist search: `GET /search.php?s={name}`
 //! - album:  `GET /album-mb.php?i={musicbrainz_release_group_id}`
 
 use crate::rate_limit::CountedBody as _;
@@ -22,10 +24,16 @@ use crate::tmdb::TmdbImage;
 const API_BASE: &str = "https://www.theaudiodb.com/api/v1/json/195003";
 
 /// Mapped artist metadata + artwork — what `AudioDbArtistProvider.
-/// ProcessResult` (`AudioDbArtistProvider.cs:197-233`) reads. Its
-/// `strWebsite` → `HomePageUrl` is not read: Ferrofin stores no home page.
+/// ProcessResult` and `ToRemoteSearchResult` read.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioDbArtist {
+    /// The artist's name (`strArtist`), as TheAudioDB has it.
+    pub name: Option<String>,
+    /// The thumb's URL (`strArtistThumb`) as TheAudioDB has it, blank
+    /// included: an Identify result's image.
+    pub thumb: Option<String>,
+    /// The home page (`strWebsite`), if any: the artist's `HomePageUrl`.
+    pub website: Option<String>,
     /// Every non-blank biography TheAudioDB has, keyed by its field suffix:
     /// `""` for the unsuffixed English `strBiography`, `"EN"`, `"DE"`, ….
     /// [`Self::biography`] picks one for a language.
@@ -92,6 +100,10 @@ struct ArtistResult {
 
 #[derive(Debug, Deserialize)]
 struct ArtistWire {
+    #[serde(rename = "strArtist")]
+    name: Option<String>,
+    #[serde(rename = "strWebsite")]
+    website: Option<String>,
     #[serde(rename = "strGenre")]
     genre: Option<String>,
     #[serde(rename = "strSubGenre")]
@@ -201,11 +213,16 @@ impl AudioDbClient {
         }
     }
 
-    async fn fetch<T: for<'de> Deserialize<'de>>(&self, path: &str, mb_id: &str) -> Option<T> {
+    async fn fetch<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        key: &str,
+        value: &str,
+    ) -> Option<T> {
         let resp = self
             .http
             .get(format!("{}{path}", self.base_url))
-            .query(&[("i", mb_id)])
+            .query(&[(key, value)])
             .send_limited(&self.limiter)
             .await
             .ok()?;
@@ -215,36 +232,60 @@ impl AudioDbClient {
         resp.counted_json().await.ok()
     }
 
-    /// Artist metadata + artwork by MusicBrainz artist id.
-    pub async fn artist(&self, mb_artist_id: &str) -> Option<AudioDbArtist> {
-        let result: ArtistResult = self.fetch("/artist-mb.php", mb_artist_id).await?;
-        let wire = result.artists?.into_iter().next()?;
-        let mut images = Vec::new();
-        push_image(&mut images, wire.thumb, ImageType::Primary);
-        push_image(&mut images, wire.logo, ImageType::Logo);
-        push_image(&mut images, wire.banner, ImageType::Banner);
-        push_image(&mut images, wire.fanart, ImageType::Backdrop);
-        push_image(&mut images, wire.fanart2, ImageType::Backdrop);
-        push_image(&mut images, wire.fanart3, ImageType::Backdrop);
-        Some(AudioDbArtist {
-            biographies: localized_texts(&wire.rest, "strBiography"),
-            genre: non_blank(wire.genre),
-            sub_genre: non_blank(wire.sub_genre),
-            // `int.TryParse(result.intFormedYear, NumberStyles.Integer, …)`.
-            formed_year: wire
-                .formed_year
-                .as_deref()
-                .and_then(|y| y.trim().parse().ok()),
-            country: non_blank(wire.country),
-            audiodb_id: non_blank(wire.id),
-            musicbrainz_id: non_blank(wire.musicbrainz_id),
-            images,
-        })
+    /// Every artist TheAudioDB answers `path` with (`FetchArtists`), none
+    /// when the request fails.
+    async fn artists(&self, path: &str, key: &str, value: &str) -> Vec<AudioDbArtist> {
+        let result: Option<ArtistResult> = self.fetch(path, key, value).await;
+        result
+            .and_then(|result| result.artists)
+            .unwrap_or_default()
+            .into_iter()
+            .map(AudioDbArtist::from_wire)
+            .collect()
+    }
+
+    /// Artist metadata + artwork (`AudioDbArtistProvider.GetArtist`): by the
+    /// MusicBrainz artist id, else by TheAudioDB's own artist id
+    /// (`EnsureArtistInfoByAudioDbId`); the first artist of the answer.
+    pub async fn artist(
+        &self,
+        musicbrainz_id: Option<&str>,
+        audiodb_id: Option<&str>,
+    ) -> Option<AudioDbArtist> {
+        let (path, id) = match given(musicbrainz_id) {
+            Some(id) => ("/artist-mb.php", id),
+            None => ("/artist.php", given(audiodb_id)?),
+        };
+        self.artists(path, "i", id).await.into_iter().next()
+    }
+
+    /// The artists of an "Identify" search
+    /// (`AudioDbArtistProvider.GetSearchResults`): every artist under the
+    /// artist's own TheAudioDB id, else under its MusicBrainz id, else every
+    /// one a search by its name finds. A lookup that finds nothing does not
+    /// go on to the next.
+    pub async fn search_artists(
+        &self,
+        audiodb_id: Option<&str>,
+        musicbrainz_id: Option<&str>,
+        name: Option<&str>,
+    ) -> Vec<AudioDbArtist> {
+        if let Some(id) = given(audiodb_id) {
+            self.artists("/artist.php", "i", id).await
+        } else if let Some(id) = given(musicbrainz_id) {
+            self.artists("/artist-mb.php", "i", id).await
+        } else if let Some(name) = given(name) {
+            self.artists("/search.php", "s", name).await
+        } else {
+            Vec::new()
+        }
     }
 
     /// Album metadata + artwork by MusicBrainz release-group id.
     pub async fn album(&self, mb_release_group_id: &str) -> Option<AudioDbAlbum> {
-        let result: AlbumResult = self.fetch("/album-mb.php", mb_release_group_id).await?;
+        let result: AlbumResult = self
+            .fetch("/album-mb.php", "i", mb_release_group_id)
+            .await?;
         let wire = result.album?.into_iter().next()?;
         let mut images = Vec::new();
         push_image(&mut images, wire.thumb, ImageType::Primary);
@@ -294,6 +335,36 @@ fn push_image(out: &mut Vec<TmdbImage>, url: Option<String>, image_type: ImageTy
 }
 
 impl AudioDbArtist {
+    /// One artist of an answer, as `ProcessResult`, `ToRemoteSearchResult`
+    /// and `AudioDbArtistImageProvider.GetImages` read it.
+    fn from_wire(wire: ArtistWire) -> Self {
+        let mut images = Vec::new();
+        let thumb = wire.thumb.clone();
+        push_image(&mut images, wire.thumb, ImageType::Primary);
+        push_image(&mut images, wire.logo, ImageType::Logo);
+        push_image(&mut images, wire.banner, ImageType::Banner);
+        push_image(&mut images, wire.fanart, ImageType::Backdrop);
+        push_image(&mut images, wire.fanart2, ImageType::Backdrop);
+        push_image(&mut images, wire.fanart3, ImageType::Backdrop);
+        Self {
+            name: wire.name,
+            thumb,
+            website: non_blank(wire.website),
+            biographies: localized_texts(&wire.rest, "strBiography"),
+            genre: non_blank(wire.genre),
+            sub_genre: non_blank(wire.sub_genre),
+            // `int.TryParse(result.intFormedYear, NumberStyles.Integer, …)`.
+            formed_year: wire
+                .formed_year
+                .as_deref()
+                .and_then(|y| y.trim().parse().ok()),
+            country: non_blank(wire.country),
+            audiodb_id: non_blank(wire.id),
+            musicbrainz_id: non_blank(wire.musicbrainz_id),
+            images,
+        }
+    }
+
     /// The biography for an item in `language` and its `ResultLanguage`
     /// (`AudioDbArtistProvider.ProcessResult`/`GetBiography`): the text in the
     /// language's subtag when TheAudioDB has it, marked with that subtag, else
@@ -374,6 +445,11 @@ fn localized(texts: &BTreeMap<String, String>, language: Option<&str>) -> (Optio
 
 /// `Some(s)` when `s` is non-blank, else `None`.
 fn non_blank(s: Option<String>) -> Option<String> {
+    s.filter(|s| !s.trim().is_empty())
+}
+
+/// `s` when it is given and non-blank (`string.IsNullOrWhiteSpace`).
+fn given(s: Option<&str>) -> Option<&str> {
     s.filter(|s| !s.trim().is_empty())
 }
 
@@ -470,7 +546,7 @@ mod tests {
         .await;
         let c = AudioDbClient::with_base_url(&server.base_url);
 
-        let a = c.artist("mb-artist").await.expect("artist");
+        let a = c.artist(Some("mb-artist"), None).await.expect("artist");
         assert_eq!(a.biography(None).0.as_deref(), Some("Trumpeter."));
         assert_eq!(a.genre.as_deref(), Some("Jazz"));
         assert_eq!(a.sub_genre.as_deref(), Some("Bebop"));
@@ -503,10 +579,75 @@ mod tests {
         let empty = MockServer::always(r#"{"artists":null}"#).await;
         assert!(
             AudioDbClient::with_base_url(&empty.base_url)
-                .artist("x")
+                .artist(Some("x"), None)
                 .await
                 .is_none()
         );
+    }
+
+    /// `GetArtist`: the MusicBrainz id first, else TheAudioDB's own id
+    /// (`artist.php`), else nothing asked; the name, home page and raw thumb
+    /// ride along. `GetSearchResults`: TheAudioDB's id, else the MusicBrainz
+    /// id, else the name, each answered whole and none falling through.
+    #[tokio::test]
+    async fn an_artist_is_found_by_either_id_or_searched_by_name() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            (
+                "/artist.php",
+                r#"{"artists":[{"idArtist":"113159","strArtist":"Miles Davis",
+                    "strWebsite":"www.milesdavis.com/fr","strArtistThumb":""}]}"#
+                    .to_owned(),
+            ),
+            ("/artist-mb.php", r#"{"artists":null}"#.to_owned()),
+            (
+                "/search.php",
+                r#"{"artists":[{"strArtist":"Miles Davis"},{"strArtist":"Miles Davis Quintet"}]}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let c = AudioDbClient::with_base_url(&server.base_url);
+
+        let artist = c.artist(None, Some("113159")).await.expect("by its id");
+        assert_eq!(artist.name.as_deref(), Some("Miles Davis"));
+        assert_eq!(artist.website.as_deref(), Some("www.milesdavis.com/fr"));
+        assert_eq!(artist.thumb.as_deref(), Some(""));
+        assert_eq!(artist.images, Vec::<TmdbImage>::new());
+        assert!(c.artist(Some("mb"), Some("113159")).await.is_none());
+        assert!(c.artist(Some(" "), None).await.is_none());
+
+        let names = |artists: Vec<AudioDbArtist>| {
+            artists
+                .into_iter()
+                .filter_map(|a| a.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(c.search_artists(None, None, Some("Miles Davis")).await),
+            ["Miles Davis", "Miles Davis Quintet"]
+        );
+        assert_eq!(
+            names(
+                c.search_artists(Some("113159"), Some("mb"), Some("x"))
+                    .await
+            ),
+            ["Miles Davis"]
+        );
+        assert_eq!(
+            c.search_artists(None, Some("mb"), Some("x")).await,
+            Vec::new()
+        );
+        assert_eq!(
+            c.search_artists(Some(""), None, Some(" ")).await,
+            Vec::new()
+        );
+        assert_eq!(
+            server.query_values("/artist.php", "i"),
+            ["113159", "113159"]
+        );
+        assert_eq!(server.query_values("/artist-mb.php", "i"), ["mb", "mb"]);
+        assert_eq!(server.query_values("/search.php", "s"), ["Miles Davis"]);
     }
 
     /// TheAudioDB now returns its English text unsuffixed (`strBiography`,
@@ -529,7 +670,7 @@ mod tests {
         ])
         .await;
         let c = AudioDbClient::with_base_url(&server.base_url);
-        let artist = c.artist("mb-artist").await.expect("artist");
+        let artist = c.artist(Some("mb-artist"), None).await.expect("artist");
         assert_eq!(
             artist.biography(Some("en-US")),
             (Some("English bio.".to_owned()), "en".to_owned())
@@ -614,7 +755,7 @@ mod tests {
     async fn live_miles_davis_artist() {
         // Miles Davis's MusicBrainz artist id.
         let a = AudioDbClient::new()
-            .artist("561d854a-6a28-4aa7-8c99-323e6ce46c2a")
+            .artist(Some("561d854a-6a28-4aa7-8c99-323e6ce46c2a"), None)
             .await;
         let a = a.expect("artist");
         assert!(a.biography(None).0.is_some());
@@ -635,9 +776,9 @@ mod quota_tests {
         )
         .await;
         let client = AudioDbClient::with_base_url(&server.base_url);
-        let first: Option<serde_json::Value> = client.fetch("/artist-mb.php", "id").await;
+        let first: Option<serde_json::Value> = client.fetch("/artist-mb.php", "i", "id").await;
         assert!(first.is_some());
-        let second: Option<serde_json::Value> = client.fetch("/artist-mb.php", "id").await;
+        let second: Option<serde_json::Value> = client.fetch("/artist-mb.php", "i", "id").await;
         assert!(second.is_none());
         // An independently constructed provider can use the same test origin.
         let other = RateLimiter::new("fanart");
@@ -668,7 +809,7 @@ mod quota_tests {
         .await;
         let client = AudioDbClient::with_base_url(&server.base_url);
 
-        let answer: Option<serde_json::Value> = client.fetch("/artist-mb.php", "id").await;
+        let answer: Option<serde_json::Value> = client.fetch("/artist-mb.php", "i", "id").await;
 
         assert_eq!(answer, Some(serde_json::json!({"ok": true})));
         let head = &server.heads()[0];

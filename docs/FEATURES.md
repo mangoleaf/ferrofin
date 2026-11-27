@@ -292,8 +292,13 @@ Wired and working, with a documented limitation or lighter verification:
     absent or cannot decode RAR). The Docker image ships 7z with its RAR plugin; without a
     tool, a RAR comic gets no cover and the server logs that once
     ([`INSTALL.md`](INSTALL.md#rar-comics) for bare metal).
-- **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
-  `Tags`, which upstream aggregates from XMP/IPTC keywords.
+- **Photo keywords** — a photo's comment (its `Overview`) is the first of its XMP packet's
+  (`dc:description`, else `exif:UserComment`), its IPTC caption's, its EXIF comment's, then a JPEG's
+  COM segment's or a PNG's `Description` or `Comment` text, as Jellyfin's is. Its other fields come
+  from the EXIF alone, where Jellyfin takes an XMP or IPTC value first, and `Genres` and `Tags` are
+  not set: Jellyfin empties a photo's genres and makes its XMP or IPTC keywords its tags. A photo
+  whose XMP packet, IPTC caption or PNG text chunk Jellyfin's tag library cannot read is left
+  alone there, its EXIF fields too; Ferrofin reads the rest of such a photo.
 - **Photo comment character sets** — **Accepted divergence:** a photo's EXIF comment
   (its `Overview`) reads as Jellyfin reads it where Jellyfin's text is readable, and as the
   text where it is not. Jellyfin 12.4 reads a comment under the `ASCII` or the all-zero code
@@ -302,7 +307,11 @@ Wired and working, with a documented limitation or lighter verification:
   UTF-8 when the text is valid UTF-8, else Latin-1 as Jellyfin does; under `UNICODE` it reads
   UTF-8 only when the text also holds no NUL, and UTF-16 in the EXIF block's byte order
   otherwise, unless a byte-order mark says which. So UTF-8 padded with a NUL under `UNICODE`,
-  which Jellyfin reads, comes out garbled.
+  which Jellyfin reads, comes out garbled. The texts that name no character set follow the same
+  rule, UTF-8 when valid, else Latin-1: an IPTC caption, which Jellyfin reads as Latin-1, and a
+  JPEG COM segment or a PNG text chunk, which it reads as UTF-8 (a Latin-1 `é` shows as `�`).
+  A PNG `iTXt` comment reads as its text; Jellyfin's tag library keeps four NUL characters before
+  it, a bug not ported.
 - **Photo EXIF in WebP, AVIF and PNG** — **Accepted divergence:** Ferrofin reads the EXIF a
   WebP, an AVIF or a PNG's `eXIf` chunk holds (date taken, title, caption, rating, camera,
   GPS, exposure). Jellyfin 12.4 lists these formats as photos, but its tag library cannot

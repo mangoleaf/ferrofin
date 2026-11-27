@@ -1,13 +1,14 @@
 //! `GET`/`POST /LiveTv/Programs` and `GET /LiveTv/Programs/Recommended` list
 //! the guide as upstream lists the stored `LiveTvProgram` items:
 //! `BaseItemRepository.TranslateQuery` filters them by genre id
-//! (`WhereReferencedItem`) and `ApplyOrder`/`OrderMapper` sort them (v12.4).
+//! (`WhereReferencedItem`), `ApplyOrder`/`OrderMapper` sort them, and the DTO
+//! service projects them (v12.4).
 
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::dto::SortOrder;
+use ferrofin_model::dto::{BaseItemDto, SortOrder};
 use ferrofin_model::live_tv::ItemSortBy as By;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
-use ferrofin_traits::stubs::LiveTvManager as _;
+use ferrofin_traits::stubs::{LiveTvChannelQuery, LiveTvManager as _};
 use uuid::Uuid;
 
 use super::{ChannelItemLab, M3U, item_lab, relative_guide};
@@ -564,4 +565,124 @@ async fn an_uncounted_guide_page_totals_its_own_length(
     };
     let (titles, listed_total) = listed(&lab, &query).await;
     assert_eq!((titles.len(), listed_total), (page, total), "{titles:?}");
+}
+
+/// The fields of a programme DTO the metadata editor can change.
+type Edited = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<Vec<String>>,
+);
+
+/// `dto`'s [`Edited`] fields.
+fn edited_fields(dto: &BaseItemDto) -> Edited {
+    (
+        dto.name.clone(),
+        dto.overview.clone(),
+        dto.official_rating.clone(),
+        dto.genres.clone(),
+    )
+}
+
+/// gl-1690: every guide read projects the stored `LiveTvProgram` items
+/// upstream. `LiveTvManager.GetPrograms` and `GetRecommendedProgramsInternal`
+/// run `QueryItems` over them, `GetProgram` reads `GetItemById`, and
+/// `AddChannelInfo` lists the current airings (v12.4). A metadata editor's
+/// change to a programme therefore shows on each read, as it does on
+/// `/Items/{id}`. An airing whose item is not stored is still served from its
+/// guide row.
+#[tokio::test]
+async fn the_guide_reads_project_the_stored_programme_items() {
+    let lab = guide_lab().await;
+    let options = DtoOptions::default();
+    let page = lab
+        .mgr
+        .get_programs(&InternalItemsQuery::default(), &options)
+        .await
+        .expect("programs");
+    let id_of = |title: &str| {
+        page.items
+            .iter()
+            .find(|p| p.name.as_deref() == Some(title))
+            .expect(title)
+            .id
+    };
+    let (edited, unstored) = (id_of("Now Playing"), id_of("Later"));
+    let mut row = lab
+        .items
+        .retrieve_item(edited)
+        .await
+        .expect("read")
+        .expect("stored");
+    row.name = Some("Edited Title".to_owned());
+    row.overview = Some("Edited overview.".to_owned());
+    row.official_rating = Some("TV-14".to_owned());
+    row.genres = Some("Edited Genre".to_owned());
+    lab.persistence
+        .save_items(&[row])
+        .await
+        .expect("editor write");
+    lab.persistence
+        .delete_items(&[unstored])
+        .await
+        .expect("delete");
+    let expected: Edited = (
+        Some("Edited Title".to_owned()),
+        Some("Edited overview.".to_owned()),
+        Some("TV-14".to_owned()),
+        Some(vec!["Edited Genre".to_owned()]),
+    );
+    let find = |items: &[BaseItemDto], id: Uuid| items.iter().find(|p| p.id == id).cloned();
+
+    let listed = lab
+        .mgr
+        .get_programs(&InternalItemsQuery::default(), &options)
+        .await
+        .expect("programs");
+    assert_eq!(
+        find(&listed.items, edited).as_ref().map(edited_fields),
+        Some(expected.clone()),
+        "/LiveTv/Programs"
+    );
+    assert_eq!(
+        find(&listed.items, unstored)
+            .and_then(|p| p.name)
+            .as_deref(),
+        Some("Later"),
+        "an airing without a stored item"
+    );
+
+    let airing = InternalItemsQuery {
+        is_airing: Some(true),
+        ..InternalItemsQuery::default()
+    };
+    let recommended = lab
+        .mgr
+        .get_recommended_programs(&airing, &options)
+        .await
+        .expect("recommended");
+    assert_eq!(
+        find(&recommended.items, edited).as_ref().map(edited_fields),
+        Some(expected.clone()),
+        "/LiveTv/Programs/Recommended"
+    );
+
+    let single = lab
+        .mgr
+        .get_program(edited, None, &options)
+        .await
+        .expect("program")
+        .expect("found");
+    assert_eq!(edited_fields(&single), expected, "/LiveTv/Programs/{{id}}");
+
+    let channels =
+        super::channels_with_info(&lab.mgr, &LiveTvChannelQuery::default(), &options).await;
+    let current = channels
+        .items
+        .iter()
+        .filter_map(|c| c.current_program.as_deref())
+        .find(|p| p.id == edited)
+        .expect("current programme");
+    assert_eq!(edited_fields(current), expected, "CurrentProgram");
 }
