@@ -12208,8 +12208,33 @@ mod tests {
         let mgr = remote_image_manager(&dir, Duration::from_hours(1));
         let url = format!("{}/logo.png", server.base_url);
 
-        let answers = ask_at_once(&mgr, &url, 8).await;
-        assert!(answers.iter().all(Result::is_err));
+        // gl-2014: hold the URL's download lock until all 8 wait on it, or a
+        // request that arrives after the 401 is "the next request" and gets the
+        // PNG. `remote_image_file` takes `arrived` just before
+        // `downloads.get` clones the lock's `Arc` (keep that order), so one
+        // clone per request means all of them arrived first.
+        let name = ferrofin_common::extensions::get_md5(&url)
+            .simple()
+            .to_string();
+        let lock = mgr.remote_image_requests.downloads.get(&name);
+        let guard = lock.lock().await;
+        let base = Arc::strong_count(&lock);
+        let waiters = 8;
+        let requests: Vec<_> = Vec::from_fn(waiters, |_| {
+            let (mgr, url) = (mgr.clone(), url.clone());
+            tokio::spawn(async move { mgr.cached_remote_image(&url).await })
+        });
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while Arc::strong_count(&lock) < base + waiters {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every request waits on the download");
+        drop(guard);
+        for request in requests {
+            assert!(request.await.expect("request").is_err());
+        }
         assert_eq!(server.requests(), 1);
 
         let cached = mgr.cached_remote_image(&url).await.expect("the image");
