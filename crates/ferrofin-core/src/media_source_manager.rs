@@ -298,6 +298,7 @@ impl FerrofinMediaSourceManager {
     /// item's row and the user's row when the caller has read them already (`known`, `user`).
     /// `read_timestamps` (PlaybackInfo only: nothing on the streaming, session or
     /// DTO paths reads the value) reads each local TS/M2TS source's `Timestamp`.
+    #[allow(clippy::too_many_lines)] // the Live TV branches, then `GetStaticMediaSources`' steps
     async fn static_sources(
         &self,
         item_id: Uuid,
