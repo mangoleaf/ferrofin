@@ -4637,19 +4637,38 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let Some(program) = self.program_row(program_id).await? else {
             return Ok(defaults);
         };
+        // `GetNewTimerDefaults(programId)` takes `Name`, `Overview` and
+        // `EndDate` from the stored programme item (`GetItemById`), a metadata
+        // editor's change included; an airing with no stored item keeps its
+        // guide row's.
+        let stored = match self.item_store.get() {
+            Some(store) => Self::program_items_by_id(store, &[program_id])
+                .await?
+                .remove(&program_id),
+            None => None,
+        };
+        let (name, overview, end) = match stored {
+            Some(item) => (item.name, item.overview, item.end_date),
+            None => (
+                Some(program.title.clone()),
+                program.overview.clone(),
+                program.end_date.as_deref().and_then(parse_dt),
+            ),
+        };
 
         // `LiveTvManager.GetNewTimerDefaults(programId)`: the programme's own
         // identity replaces the standing defaults.
         defaults.record_new_only = !program.is_repeat;
         defaults.skip_episodes_in_library = defaults.record_new_only;
-        defaults.base.name = Some(program.title.clone());
-        defaults.base.overview.clone_from(&program.overview);
+        defaults.base.name.clone_from(&name);
+        defaults.base.overview = overview;
         defaults.base.channel_id = Uuid::parse_str(&program.channel_id).unwrap_or_default();
         defaults.base.channel_name = Some(program.channel_name.clone());
         if let Some(start) = parse_dt(&program.start_date) {
             defaults.base.start_date = start;
         }
-        if let Some(end) = program.end_date.as_deref().and_then(parse_dt) {
+        // `if (program.EndDate.HasValue) info.EndDate = program.EndDate.Value`.
+        if let Some(end) = end {
             defaults.base.end_date = end;
         }
         // The client posts these straight back as the new timer, so the
@@ -4663,7 +4682,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // `GetSeriesTimerInfoDto`'s `FillImages(dto, info.Name, info.SeriesId)`.
         // The defaults take the programme's name, but no series id:
         // `GetNewTimerDefaultsInternal` builds its `ProgramInfo` without one.
-        self.fill_images(Some(&program.title), None, true, false)
+        self.fill_images(name.as_deref(), None, true, false)
             .await?
             .onto_series_timer(&mut defaults);
         Ok(defaults)
@@ -12795,6 +12814,121 @@ mod tests {
         assert_eq!(bare.base.name, None);
         assert_eq!(bare.base.program_id, None);
         assert!(bare.base.server_id.is_some());
+    }
+
+    /// `GetNewTimerDefaults(programId)` reads the stored programme item
+    /// (`GetItemById`, v12.4 LiveTvManager.cs:1083-1110): the Name, Overview
+    /// and EndDate the metadata editor saved on it are the defaults' (gl-1690).
+    /// An airing whose item is not stored keeps its guide row's.
+    #[tokio::test]
+    async fn timer_defaults_take_the_stored_programme_item() {
+        use ferrofin_db::store::guid_to_db;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let lab = item_lab(M3U, Some(relative_guide())).await;
+        let art = Arc::new(ArtServices::default());
+        lab.mgr.set_images(art.clone(), art.clone());
+        lab.mgr.refresh_guide().await.expect("refresh");
+        let program = now_playing(&lab.mgr).await;
+        let program_id = Uuid::parse_str(&program.id).expect("guid");
+        // A library series named as the edit, whose Thumb `FillImages`
+        // finds by the defaults' name.
+        let series = Uuid::new_v4();
+        lab.persistence
+            .save_items(&[BaseItemEntity {
+                id: guid_to_db(series),
+                type_: "MediaBrowser.Controller.Entities.TV.Series".to_owned(),
+                name: Some("Edited Title".to_owned()),
+                clean_name: Some("edited title".to_owned()),
+                sort_name: Some("edited title".to_owned()),
+                is_folder: true,
+                ..BaseItemEntity::default()
+            }])
+            .await
+            .expect("series");
+        lab.persistence
+            .save_item_images(
+                series,
+                &[ItemImageInfo {
+                    path: "http://img/edited-thumb.png".to_owned(),
+                    image_type: ImageType::Thumb,
+                    ..ItemImageInfo::default()
+                }],
+            )
+            .await
+            .expect("thumb");
+        // Whole seconds: the stored column keeps microseconds.
+        let end = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + 3 * 3600, 0)
+            .expect("end");
+        let mut row = lab
+            .items
+            .retrieve_item(program_id)
+            .await
+            .expect("read")
+            .expect("stored");
+        row.name = Some("Edited Title".to_owned());
+        row.overview = Some("Edited overview.".to_owned());
+        row.end_date = Some(end);
+        lab.persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("editor write");
+
+        let defaults = lab
+            .mgr
+            .get_new_timer_defaults(Some(program_id))
+            .await
+            .expect("defaults");
+        assert_eq!(defaults.base.name.as_deref(), Some("Edited Title"));
+        assert_eq!(defaults.base.overview.as_deref(), Some("Edited overview."));
+        assert_eq!(defaults.base.end_date, end);
+        assert_eq!(
+            defaults.base.start_date,
+            parse_dt(&program.start_date).expect("start"),
+            "the start is the airing's"
+        );
+        assert_eq!(
+            defaults.parent_thumb_item_id,
+            Some(series.simple().to_string()),
+            "FillImages looks the edited name up"
+        );
+
+        // `if (program.EndDate.HasValue)`: an item with no end keeps the
+        // standing default, not the guide row's; a cleared overview stays
+        // cleared (`info.Overview = program.Overview`).
+        row.end_date = None;
+        row.overview = None;
+        lab.persistence
+            .save_items(&[row])
+            .await
+            .expect("editor write");
+        let endless = lab
+            .mgr
+            .get_new_timer_defaults(Some(program_id))
+            .await
+            .expect("defaults");
+        let standing = lab
+            .mgr
+            .get_new_timer_defaults(None)
+            .await
+            .expect("defaults");
+        assert_eq!(endless.base.end_date, standing.base.end_date);
+        assert_eq!(endless.base.overview, None);
+
+        lab.persistence
+            .delete_items(&[program_id])
+            .await
+            .expect("delete");
+        let unstored = lab
+            .mgr
+            .get_new_timer_defaults(Some(program_id))
+            .await
+            .expect("defaults");
+        assert_eq!(unstored.base.name.as_deref(), Some("Now Playing"));
+        assert_eq!(
+            Some(unstored.base.end_date),
+            program.end_date.as_deref().and_then(parse_dt)
+        );
     }
 
     #[tokio::test]

@@ -1076,11 +1076,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    in_guide_window) and the previously-shown check. The guide reads (GET and \
                    POST /LiveTv/Programs, /LiveTv/Programs/Recommended, \
                    /LiveTv/Programs/{programId}, a channel's CurrentProgram and a timer's \
-                   ProgramInfo) project those stored items: manager.rs program_dtos reads the \
+                   ProgramInfo) project those stored items, and GET /LiveTv/Timers/Defaults \
+                   takes their Name, Overview and EndDate: manager.rs program_dtos reads the \
                    page's programme items in one ItemRepository retrieve_items call \
                    (program_items_by_id), and program_entity projects only an airing \
                    with none, compared with LiveTvManager.GetPrograms, GetProgram, \
-                   GetRecommendedProgramsInternal and AddChannelInfo and \
+                   GetRecommendedProgramsInternal, AddChannelInfo and GetNewTimerDefaults and \
                    LiveTvDtoService.GetTimerInfoDto on 2026-11-26 (gl-1690).",
         date: "2026-11-11",
         divergences: &[
@@ -4986,11 +4987,12 @@ pub const VERIFIED: &[Verified] = &[
                (LiveTvManager.GetNewTimerDefaults and GetNewTimerDefaultsInternal: \
                ferrofin-traits live_tv.rs new_timer_defaults for \
                DefaultLiveTvService.GetNewTimerDefaultsAsync, with live_tv_options' padding; for \
-               a programme, program_row and its name, overview, channel, window, RecordNewOnly \
-               and SkipEpisodesInLibrary from IsRepeat, ProgramId and ExternalProgramId; then \
-               GetSeriesTimerInfoDto's FillImages(dto, program.Name, null) through fill_images: \
-               first_with_image, item_images and image_tag)",
-        date: "2026-11-14",
+               a programme, program_row for its channel, start, RecordNewOnly and \
+               SkipEpisodesInLibrary from IsRepeat, ProgramId and ExternalProgramId, and \
+               program_items_by_id for the stored item's Name, Overview and EndDate, the guide \
+               row's without one; then GetSeriesTimerInfoDto's FillImages(dto, program.Name, \
+               null) through fill_images: first_with_image, item_images and image_tag)",
+        date: "2026-11-26",
         divergences: &[
             "A programId that does not parse is the binder's 400; upstream's new Guid throws a \
          FormatException, a 500. Jellyfin bug not ported.",
@@ -5001,6 +5003,9 @@ pub const VERIFIED: &[Verified] = &[
          no artwork; upstream's FillImages with no name filters on nothing and gives them the \
          library's first series' Thumb, Backdrop and Primary. Fix path: gl-1790, an owner \
          decision.",
+            "ChannelName comes from the lineup table, so a channel's name changed on its item \
+         (POST /Items/{itemId}) is not shown; upstream takes it from GetProgram's DTO, whose \
+         AddInfoToProgramDto reads the channel item. Fix path: gl-1997.",
             "The 400 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &["images", "guide-programme-items"],
