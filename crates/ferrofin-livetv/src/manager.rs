@@ -11044,6 +11044,69 @@ mod tests {
         );
     }
 
+    /// Each channel item's `Data` holds what Jellyfin serialises for a
+    /// `LiveTvChannel` (`BaseItemMapper.cs:266-268`): `Number` and
+    /// `ChannelType` are kept nowhere else in a Jellyfin database, so a
+    /// returned Jellyfin reads a channel without them as unnumbered TV
+    /// (gl-1966). A row an earlier build stored with no `Data` gets it at the
+    /// next refresh, and a row Jellyfin wrote takes the lineup's number and
+    /// keeps its other keys.
+    #[tokio::test]
+    async fn a_guide_refresh_stores_each_channels_number_and_type_in_its_data() {
+        const LINEUP: &str = "#EXTM3U\n\
+            #EXTINF:-1 tvg-id=\"news.tv\" tvg-chno=\"101\",Test News\nhttp://tuner/news\n\
+            #EXTINF:-1 tvg-id=\"jazz.fm\" tvg-chno=\"102\" radio=\"true\",Test Jazz\nhttp://tuner/jazz\n";
+        let lab = item_lab(LINEUP, None).await;
+        let (mgr, persistence, items) = (&lab.mgr, &lab.persistence, &lab.items);
+        let by_name = || async {
+            let mut rows = HashMap::new();
+            for (id, ..) in stored_channel_items(mgr).await {
+                let row = channel_item(items, Uuid::parse_str(&id).expect("guid")).await;
+                rows.insert(row.name.clone().expect("name"), row);
+            }
+            rows
+        };
+        mgr.refresh_guide().await.expect("refresh");
+        let rows = by_name().await;
+        assert_eq!(
+            rows["Test News"].data.as_deref(),
+            Some(
+                r#"{"Number":"101","ChannelType":"TV","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}"#
+            )
+        );
+        assert_eq!(
+            rows["Test Jazz"].data.as_deref(),
+            Some(
+                r#"{"Number":"102","ChannelType":"Radio","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}"#
+            )
+        );
+
+        let mut earlier = rows["Test News"].clone();
+        earlier.data = None;
+        let mut jellyfin = rows["Test Jazz"].clone();
+        jellyfin.data = Some(
+            r#"{"Number":"99","ChannelType":"Radio","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"DateLastSaved":"2026-11-27T00:09:50.4414863Z","RemoteTrailers":[]}"#
+                .to_owned(),
+        );
+        persistence
+            .save_items(&[earlier, jellyfin])
+            .await
+            .expect("rows as stored before");
+        mgr.refresh_guide().await.expect("second refresh");
+        let rows = by_name().await;
+        assert_eq!(
+            rows["Test News"].data.as_deref(),
+            Some(
+                r#"{"Number":"101","ChannelType":"TV","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}"#
+            ),
+            "a row stored with no Data gets it at the next refresh"
+        );
+        let kept = ferrofin_db::item_data::parse_data(rows["Test Jazz"].data.as_deref());
+        assert_eq!(kept["Number"], "102", "the refresh owns the number");
+        assert_eq!(kept["ChannelType"], "Radio");
+        assert_eq!(kept["DateLastSaved"], "2026-11-27T00:09:50.4414863Z");
+    }
+
     /// `CleanDatabase` runs on an empty-but-successful lineup too.
     ///
     /// The upstream guard is the `cleanDatabase` flag, which ONLY a thrown

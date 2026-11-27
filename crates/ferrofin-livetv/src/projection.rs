@@ -393,11 +393,62 @@ pub fn channel_sort_name(number: Option<&str>, name: &str) -> String {
     }
 }
 
+/// A channel item's `Data`: the `LiveTvChannel` Jellyfin serialises into that
+/// column (`BaseItemMapper.cs:266-268`, `JsonDefaults.Options`), in its key
+/// order. `Number` and `ChannelType` have no column, so a Jellyfin reading the
+/// row takes them from here only; a null `Number` is left out
+/// (`WhenWritingNull`) and the type is the enum's name. The other keys are
+/// `BaseItem`'s defaults on a channel. `DateLastSaved` is left out: Jellyfin
+/// reads it from its column (`BaseItemMapper.cs:120`), which the save stamps.
+fn channel_data(number: Option<&str>, channel_type: &str) -> String {
+    let number = number.map_or_else(String::new, |number| {
+        format!(r#""Number":{},"#, serde_json::Value::from(number))
+    });
+    let channel_type = if channel_type == "Radio" {
+        "Radio"
+    } else {
+        "TV"
+    };
+    format!(
+        r#"{{{number}"ChannelType":"{channel_type}","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}}"#
+    )
+}
+
+/// `fresh`'s channel `Data` ([`channel_data`]) applied to the `stored` one.
+/// `GetChannel` assigns `Number` and `ChannelType`, so those two follow the
+/// lineup; every other key is the item's own and keeps its stored value, a
+/// missing one taking the default. A row stored with no `Data` (by an earlier
+/// Ferrofin) takes `fresh`'s whole, and one already holding these values keeps
+/// its bytes.
+fn merged_channel_data(stored: Option<&str>, fresh: Option<&str>) -> Option<String> {
+    let mut data = ferrofin_db::item_data::parse_data(stored);
+    if data.is_empty() {
+        return fresh.map(str::to_owned);
+    }
+    let before = data.clone();
+    let fresh = ferrofin_db::item_data::parse_data(fresh);
+    for key in ["Number", "ChannelType"] {
+        match fresh.get(key) {
+            Some(value) => data.insert(key.to_owned(), value.clone()),
+            None => data.remove(key),
+        };
+    }
+    for (key, value) in fresh {
+        data.entry(key).or_insert(value);
+    }
+    if data == before {
+        stored.map(str::to_owned)
+    } else {
+        Some(serde_json::Value::Object(data).to_string())
+    }
+}
+
 /// Builds the synthetic `BaseItems` row a channel projects from.
 ///
 /// Port of `GuideManager.GetChannel`'s item shape: `LiveTvChannel` type, no
 /// path (the tuner URL is resolved at stream time, not stored on the item),
-/// the `CreateSortName` sort key, and the first-seen `DateCreated`.
+/// the `CreateSortName` sort key, the first-seen `DateCreated`, and the
+/// serialised channel in `Data` ([`channel_data`]).
 ///
 /// `CleanName` and `PresentationUniqueKey` are deliberately left unset: the
 /// item store derives both at write time (C# `SaveItem` likewise stamps
@@ -438,6 +489,7 @@ pub fn channel_entity(
         external_service_id: Some("Emby".to_owned()),
         // `LiveTvChannel.GetBlockUnratedType() => UnratedItem.LiveTvChannel`.
         unrated_type: Some("LiveTvChannel".to_owned()),
+        data: Some(channel_data(row.number.as_deref(), &row.channel_type)),
         date_created: row.date_created.as_deref().and_then(parse_dt),
         parent_id: parent.clone(),
         top_parent_id: parent,
@@ -465,10 +517,12 @@ pub fn channel_entity(
 /// and `Data` onto it, and the next `RefreshGuide` would put every one of them
 /// back to `NULL`.
 ///
-/// `Number`/`ChannelType` are not `BaseItems` columns here — they reach the
-/// wire through `LiveTvManager::add_channel_info` from
-/// `FerrofinLiveTvChannels`, which the same refresh rewrites. The primary
-/// image is an image row, written by [`channel_images_update`]'s caller.
+/// `Number`/`ChannelType` are no `BaseItems` columns: Jellyfin keeps them only
+/// in the serialised item, so the refresh merges them into the stored `Data`
+/// ([`merged_channel_data`]). Ferrofin's own answers take them from
+/// `FerrofinLiveTvChannels` (`LiveTvManager::add_channel_info`), which the same
+/// refresh rewrites. The primary image is an image row, written by
+/// [`channel_images_update`]'s caller.
 #[must_use]
 pub fn channel_item_update(
     stored: &BaseItemEntity,
@@ -485,6 +539,7 @@ pub fn channel_item_update(
     item.parent_id.clone_from(&fresh.parent_id);
     item.top_parent_id.clone_from(&fresh.top_parent_id);
     item.is_folder = fresh.is_folder;
+    item.data = merged_channel_data(stored.data.as_deref(), fresh.data.as_deref());
     // `SortName` is a lazy property upstream, not a stored assignment:
     // `ForcedSortName` when the metadata editor set one, else
     // `CreateSortName()` off Number/Name. Re-deriving it unconditionally would
@@ -1731,6 +1786,56 @@ mod tests {
         );
     }
 
+    /// What Jellyfin 12.4 wrote into a channel's `Data` at its guide refresh
+    /// (the round-trip gate's capture), for channel number 1.
+    const JELLYFIN_CHANNEL_DATA: &str = r#"{"Number":"1","ChannelType":"TV","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"DateLastSaved":"2026-11-27T00:09:50.4414863Z","RemoteTrailers":[]}"#;
+
+    /// A channel item's `Data` is the `LiveTvChannel` Jellyfin serialises
+    /// (`BaseItemMapper.cs:266-268`, `JsonDefaults.Options`) but its
+    /// `DateLastSaved`, in its key order: a null `Number` is not written and
+    /// the type is the enum's name. A refresh moves those two keys in a stored
+    /// `Data` and keeps the rest.
+    #[test]
+    fn channel_data_is_the_serialised_live_tv_channel() {
+        let row = ChannelRow {
+            id: "CCCCCCCC-0000-0000-0000-000000000003".to_owned(),
+            tvg_id: String::new(),
+            external_id: "m3u_1".to_owned(),
+            name: "Parity One".to_owned(),
+            number: Some("1".to_owned()),
+            channel_type: "Tv".to_owned(),
+            date_created: None,
+            image_url: None,
+        };
+        let fresh = channel_entity(&row, parse, None);
+        assert_eq!(
+            fresh.data.as_deref(),
+            Some(
+                r#"{"Number":"1","ChannelType":"TV","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}"#
+            )
+        );
+        let radio = ChannelRow {
+            number: None,
+            channel_type: "Radio".to_owned(),
+            ..row
+        };
+        let radio = channel_entity(&radio, parse, None);
+        assert_eq!(
+            radio.data.as_deref(),
+            Some(
+                r#"{"ChannelType":"Radio","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}"#
+            )
+        );
+
+        let mut stored = fresh;
+        stored.data = Some(JELLYFIN_CHANNEL_DATA.to_owned());
+        let updated = channel_item_update(&stored, &radio).expect("the type moved");
+        let data = ferrofin_db::item_data::parse_data(updated.data.as_deref());
+        assert_eq!(data.get("Number"), None, "a number gone from the lineup");
+        assert_eq!(data["ChannelType"], "Radio");
+        assert_eq!(data["DateLastSaved"], "2026-11-27T00:09:50.4414863Z");
+    }
+
     /// A refresh assigns only the properties `GuideManager.GetChannel` assigns,
     /// and writes at all only when one of them changed.
     #[test]
@@ -1760,7 +1865,7 @@ mod tests {
         stored.custom_rating = Some("PG".to_owned());
         stored.official_rating = Some("TV-14".to_owned());
         stored.is_locked = true;
-        stored.data = Some("{}".to_owned());
+        stored.data = Some(JELLYFIN_CHANNEL_DATA.to_owned());
         stored.date_created = Some(
             DateTime::parse_from_rfc3339("2019-01-02T03:04:05Z")
                 .expect("date")
@@ -1784,7 +1889,7 @@ mod tests {
         assert_eq!(updated.custom_rating.as_deref(), Some("PG"));
         assert_eq!(updated.official_rating.as_deref(), Some("TV-14"));
         assert!(updated.is_locked);
-        assert_eq!(updated.data.as_deref(), Some("{}"));
+        assert_eq!(updated.data.as_deref(), Some(JELLYFIN_CHANNEL_DATA));
         // `DateCreated` is stamped on a NEW item only.
         assert_eq!(updated.date_created, stored.date_created);
 
