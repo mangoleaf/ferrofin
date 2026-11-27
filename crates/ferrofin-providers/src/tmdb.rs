@@ -269,7 +269,8 @@ pub struct TmdbImage {
     pub community_rating: Option<f64>,
     /// The vote count backing the rating.
     pub vote_count: Option<i32>,
-    /// The ISO-639-1 language of the image, if tagged.
+    /// The ISO-639-1 language of the image, if tagged. TheMovieDb's own
+    /// candidates always carry one, `""` when untagged (`GetImageLanguage`).
     pub language: Option<String>,
 }
 
@@ -1302,28 +1303,32 @@ fn non_empty(value: Option<String>) -> Option<String> {
 /// Port of `TmdbUtils.GetImageLanguage`: the region (`iso_3166_1`) is appended
 /// only when it contradicts the requested region, so a `pt-PT` image for a
 /// `pt-BR` request returns `"pt-PT"` while an `en-US` image for an `en-US`
-/// request returns the plain request code.
+/// request returns the plain request code. An untagged image (TMDb's `xx`)
+/// is `""`, `string.Empty`, which the API answers as `"Language": ""`.
 fn get_image_language(
     image_language: Option<&str>,
     image_region: Option<&str>,
     request_language: Option<&str>,
-) -> Option<String> {
-    let lang = image_language.filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("xx"))?;
+) -> String {
+    let Some(lang) = image_language.filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("xx"))
+    else {
+        return String::new();
+    };
 
     let Some(request) = request_language.filter(|r| !r.is_empty()) else {
-        return Some(lang.to_owned());
+        return lang.to_owned();
     };
 
     let parts: Vec<&str> = request.split('-').collect();
     if parts.len() != 2 || !parts[0].eq_ignore_ascii_case(lang) {
-        return Some(lang.to_owned());
+        return lang.to_owned();
     }
 
     match image_region.filter(|r| !r.is_empty()) {
         Some(region) if !region.eq_ignore_ascii_case(parts[1]) => {
-            Some(format!("{}-{}", lang, region.to_uppercase()))
+            format!("{}-{}", lang, region.to_uppercase())
         }
-        _ => Some(request.to_owned()),
+        _ => request.to_owned(),
     }
 }
 
@@ -1508,6 +1513,45 @@ pub struct TmdbClient {
     image_root: Option<String>,
     /// The last `/person/{id}` response ([`person_response`](Self::person_response)).
     last_person: std::sync::Mutex<Option<CachedPerson>>,
+    /// The image part of TMDb's `/configuration` (`TMDbClient.Config`), kept
+    /// for the process once a fetch answered; a failed fetch is tried again
+    /// by the next caller, as `HasConfig` is set only by a fetch that answered
+    /// ([`client_image_configuration`](Self::client_image_configuration)).
+    client_config: tokio::sync::OnceCell<Option<ferrofin_model::dto::ConfigImageTypes>>,
+}
+
+/// TMDb's `/configuration` response (`TMDbLib.Objects.General.TMDbConfig`):
+/// only its images are read.
+#[derive(Debug, Deserialize)]
+struct ClientConfigResponse {
+    images: Option<ClientImagesResponse>,
+}
+
+/// The `images` member of TMDb's `/configuration`
+/// (`TMDbLib.Objects.General.ConfigImageTypes`, in TMDb's snake case).
+#[derive(Debug, Deserialize)]
+struct ClientImagesResponse {
+    base_url: Option<String>,
+    secure_base_url: Option<String>,
+    backdrop_sizes: Option<Vec<String>>,
+    logo_sizes: Option<Vec<String>>,
+    poster_sizes: Option<Vec<String>>,
+    profile_sizes: Option<Vec<String>>,
+    still_sizes: Option<Vec<String>>,
+}
+
+impl From<ClientImagesResponse> for ferrofin_model::dto::ConfigImageTypes {
+    fn from(images: ClientImagesResponse) -> Self {
+        Self {
+            backdrop_sizes: images.backdrop_sizes,
+            base_url: images.base_url,
+            logo_sizes: images.logo_sizes,
+            poster_sizes: images.poster_sizes,
+            profile_sizes: images.profile_sizes,
+            secure_base_url: images.secure_base_url,
+            still_sizes: images.still_sizes,
+        }
+    }
 }
 
 /// A `/person/{id}` response as [`TmdbClient::person_response`] keeps it.
@@ -1587,6 +1631,7 @@ impl TmdbClient {
             plugin: crate::plugin_config::ConfigSource::new(),
             image_root: None,
             last_person: std::sync::Mutex::default(),
+            client_config: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -1604,11 +1649,67 @@ impl TmdbClient {
     /// Read per call, the way `Plugin.Instance.Configuration` is: an admin
     /// saving the settings page changes the next lookup, with no restart. The
     /// read is a few hundred bytes off disk in front of a TMDB round trip.
+    ///
+    /// Once TMDb's client configuration was fetched, a configured image size
+    /// it does not list reads as the last size it lists
+    /// ([`keep_listed_sizes`](crate::plugin_config::TmdbConfig::keep_listed_sizes)):
+    /// upstream's `ValidatePreferences` resets it in the plugin's in-memory
+    /// configuration at that fetch.
     pub(crate) async fn settings(&self) -> crate::plugin_config::TmdbConfig {
         let mut cfg: crate::plugin_config::TmdbConfig =
             self.plugin.load(crate::builtin_plugins::TMDB.id).await;
         cfg.image_root.clone_from(&self.image_root);
+        if let Some(Some(images)) = self.client_config.get() {
+            cfg.keep_listed_sizes(images);
+        }
         cfg
+    }
+
+    /// `TmdbClientManager.GetClientConfiguration().Images`: the image part of
+    /// TMDb's client configuration, fetched from `/configuration` by the first
+    /// call and kept for the process (`EnsureClientConfigAsync`). `None` when
+    /// TMDb's configuration has no images.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`](ferrofin_traits::error::ServiceError) when TMDb answers
+    /// with no configuration: the request failed, its status was not a success,
+    /// or its body did not decode (`TMDbClient.GetConfigAsync`'s "Unable to
+    /// retrieve configuration"). The next call asks again.
+    pub async fn client_image_configuration(
+        &self,
+    ) -> Result<Option<ferrofin_model::dto::ConfigImageTypes>, ferrofin_traits::error::ServiceError>
+    {
+        self.client_config
+            .get_or_try_init(|| self.fetch_client_configuration())
+            .await
+            .cloned()
+    }
+
+    /// One `/configuration` request ([`client_image_configuration`](Self::client_image_configuration)).
+    async fn fetch_client_configuration(
+        &self,
+    ) -> Result<Option<ferrofin_model::dto::ConfigImageTypes>, ferrofin_traits::error::ServiceError>
+    {
+        let failed = |why: &dyn std::fmt::Display| {
+            ferrofin_traits::error::ServiceError::backend(format!(
+                "could not retrieve TheMovieDb's configuration: {why}"
+            ))
+        };
+        let cfg: crate::plugin_config::TmdbConfig =
+            self.plugin.load(crate::builtin_plugins::TMDB.id).await;
+        let resp = self
+            .http
+            .get(format!("{}/configuration", self.base_url))
+            .query(&[("api_key", cfg.api_key(self.api_key.expose_secret()))])
+            .send_limited(&self.limiter)
+            .await
+            .map_err(|err| failed(&err))?;
+        if !resp.status().is_success() {
+            return Err(failed(&resp.status()));
+        }
+        let config: ClientConfigResponse = resp.counted_json().await.map_err(|err| failed(&err))?;
+        Ok(config.images.map(Into::into))
     }
 
     /// The TMDb settings page's `ImportSeasonName`: whether
@@ -1856,11 +1957,11 @@ impl TmdbClient {
                     height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
-                    language: get_image_language(
+                    language: Some(get_image_language(
                         image.iso_639_1.as_deref(),
                         image.iso_3166_1.as_deref(),
                         request_language,
-                    ),
+                    )),
                 })
             })
         };
@@ -2047,7 +2148,7 @@ impl TmdbClient {
                 );
                 // A backdrop with a language carries text — C#
                 // `ConvertToRemoteImageInfo` returns those as `Thumb`.
-                let image_type = if image_type == ImageType::Backdrop && language.is_some() {
+                let image_type = if image_type == ImageType::Backdrop && !language.is_empty() {
                     ImageType::Thumb
                 } else {
                     image_type
@@ -2060,7 +2161,7 @@ impl TmdbClient {
                     height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
-                    language,
+                    language: Some(language),
                 })
             })
         };
@@ -2174,11 +2275,11 @@ impl TmdbClient {
                     height: e.height.filter(|_| original),
                     community_rating: e.vote_average,
                     vote_count: e.vote_count,
-                    language: get_image_language(
+                    language: Some(get_image_language(
                         e.iso_639_1.as_deref(),
                         e.iso_3166_1.as_deref(),
                         request_language,
-                    ),
+                    )),
                 })
             })
             .collect()
@@ -2613,11 +2714,11 @@ impl TmdbClient {
                     height: image.height.filter(|_| original),
                     community_rating: image.vote_average,
                     vote_count: image.vote_count,
-                    language: get_image_language(
+                    language: Some(get_image_language(
                         image.iso_639_1.as_deref(),
                         image.iso_3166_1.as_deref(),
                         request_language,
-                    ),
+                    )),
                 })
             })
             .collect()
@@ -2835,29 +2936,153 @@ fn year_from(date: Option<&str>) -> Option<i32> {
 mod tests {
     use super::*;
 
+    /// TMDb's `/configuration`, as it answers it (abridged), with a poster size
+    /// no fixed list had.
+    const CLIENT_CONFIG: &str = r#"{"images": {
+        "base_url": "http://image.tmdb.org/t/p/",
+        "secure_base_url": "https://image.tmdb.org/t/p/",
+        "backdrop_sizes": ["w300", "w780", "w1280", "original"],
+        "logo_sizes": ["w45", "w92", "original"],
+        "poster_sizes": ["w92", "w2000", "original"],
+        "profile_sizes": ["w45", "h632", "original"],
+        "still_sizes": ["w92", "original"]
+    }, "change_keys": ["adult"]}"#;
+
+    /// A `200` with `body` as JSON, as [`MockServer::start_raw`] serves it.
+    ///
+    /// [`MockServer::start_raw`]: crate::mock_http::MockServer::start_raw
+    fn json_ok(body: &str) -> Vec<u8> {
+        crate::mock_http::MockServer::raw_ok("Content-Type: application/json\r\n", body.as_bytes())
+    }
+
+    /// `GetClientConfiguration`: the first call fetches `/configuration` and
+    /// the answer is kept for the process (`HasConfig`), mapped field by field.
+    #[tokio::test]
+    async fn the_client_configuration_is_fetched_once_and_kept() {
+        let server = crate::mock_http::MockServer::start_raw(vec![json_ok(CLIENT_CONFIG)]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+
+        let images = client
+            .client_image_configuration()
+            .await
+            .expect("configuration")
+            .expect("images");
+        assert_eq!(
+            images.secure_base_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/")
+        );
+        assert_eq!(
+            images.base_url.as_deref(),
+            Some("http://image.tmdb.org/t/p/")
+        );
+        assert_eq!(
+            images.poster_sizes.as_deref(),
+            Some(["w92".to_owned(), "w2000".to_owned(), "original".to_owned()].as_slice())
+        );
+        assert_eq!(images.still_sizes.as_deref().map(<[String]>::len), Some(2));
+        let again = client.client_image_configuration().await.expect("kept");
+        assert_eq!(again, Some(images));
+        assert_eq!(server.requests(), 1);
+        assert!(
+            server.heads()[0].starts_with("get /configuration?"),
+            "{:?}",
+            server.heads()
+        );
+    }
+
+    /// A configuration TMDb answers without images is kept too: `Images` is
+    /// null and nothing is asked again.
+    #[tokio::test]
+    async fn a_configuration_without_images_is_kept_as_none() {
+        let server = crate::mock_http::MockServer::start_raw(vec![json_ok("{}")]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+
+        assert_eq!(
+            client.client_image_configuration().await.expect("answered"),
+            None
+        );
+        assert_eq!(
+            client.client_image_configuration().await.expect("kept"),
+            None
+        );
+        assert_eq!(server.requests(), 1);
+    }
+
+    /// A fetch TMDb does not answer with a configuration fails
+    /// (`GetConfigAsync`'s "Unable to retrieve configuration"): an error
+    /// status or a body that does not decode. It is not kept: the next call
+    /// asks again.
     #[rstest::rstest]
-    #[case(Some("pt"), Some("BR"), Some("pt-BR"), Some("pt-BR"))]
-    #[case(Some("pt"), Some("PT"), Some("pt-BR"), Some("pt-PT"))]
-    #[case(Some("en"), Some("GB"), Some("en-US"), Some("en-GB"))]
-    #[case(Some("en"), Some("US"), Some("en-US"), Some("en-US"))]
-    #[case(Some("en"), None, Some("en-US"), Some("en-US"))]
-    #[case(Some("en"), Some("US"), Some("en"), Some("en"))]
-    #[case(Some("pt"), Some("PT"), Some("pt"), Some("pt"))]
-    #[case(Some("en"), Some("US"), Some("pt-BR"), Some("en"))]
-    #[case(Some("de"), Some("DE"), Some("en-US"), Some("de"))]
-    #[case(Some("xx"), Some("US"), Some("en-US"), None)]
-    #[case(Some(""), Some("US"), Some("en-US"), None)]
-    #[case(None, None, Some("en-US"), None)]
-    #[case(Some("en"), None, None, Some("en"))]
+    #[case::status(crate::mock_http::MockServer::raw_status("404 Not Found"))]
+    #[case::body(json_ok("not json"))]
+    #[tokio::test]
+    async fn a_failed_client_configuration_fetch_is_tried_again(#[case] failure: Vec<u8>) {
+        let server =
+            crate::mock_http::MockServer::start_raw(vec![failure, json_ok(CLIENT_CONFIG)]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+
+        assert!(client.client_image_configuration().await.is_err());
+        assert!(
+            client
+                .client_image_configuration()
+                .await
+                .expect("answered")
+                .is_some()
+        );
+        assert_eq!(server.requests(), 2);
+    }
+
+    /// `ValidatePreferences`: once the configuration is fetched, a configured
+    /// size TMDb does not list reads as the last one it lists; a listed one and
+    /// an unset one stay. Before the fetch the configured sizes stand.
+    #[tokio::test]
+    async fn a_size_tmdb_does_not_list_reads_as_its_last_size_once_fetched() {
+        let server = crate::mock_http::MockServer::start_raw(vec![json_ok(CLIENT_CONFIG)]).await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        client.attach_plugin_manager(crate::plugin_config::tests_support::manager_with(
+            crate::builtin_plugins::TMDB.id,
+            br#"{"PosterSize": "w500", "BackdropSize": "w780"}"#.to_vec(),
+        ));
+
+        let before = client.settings().await;
+        assert_eq!(before.poster_size.as_deref(), Some("w500"));
+        client
+            .client_image_configuration()
+            .await
+            .expect("configuration");
+        let after = client.settings().await;
+        assert_eq!(
+            after.poster_size.as_deref(),
+            Some("original"),
+            "w500 is not listed"
+        );
+        assert_eq!(after.backdrop_size.as_deref(), Some("w780"), "listed");
+        assert_eq!(after.logo_size, None, "unset");
+    }
+
+    #[rstest::rstest]
+    #[case(Some("pt"), Some("BR"), Some("pt-BR"), "pt-BR")]
+    #[case(Some("pt"), Some("PT"), Some("pt-BR"), "pt-PT")]
+    #[case(Some("en"), Some("GB"), Some("en-US"), "en-GB")]
+    #[case(Some("en"), Some("US"), Some("en-US"), "en-US")]
+    #[case(Some("en"), None, Some("en-US"), "en-US")]
+    #[case(Some("en"), Some("US"), Some("en"), "en")]
+    #[case(Some("pt"), Some("PT"), Some("pt"), "pt")]
+    #[case(Some("en"), Some("US"), Some("pt-BR"), "en")]
+    #[case(Some("de"), Some("DE"), Some("en-US"), "de")]
+    #[case(Some("xx"), Some("US"), Some("en-US"), "")]
+    #[case(Some(""), Some("US"), Some("en-US"), "")]
+    #[case(None, None, Some("en-US"), "")]
+    #[case(Some("en"), None, None, "en")]
     fn image_language_region(
         #[case] image_language: Option<&str>,
         #[case] image_region: Option<&str>,
         #[case] request_language: Option<&str>,
-        #[case] expected: Option<&str>,
+        #[case] expected: &str,
     ) {
         assert_eq!(
             get_image_language(image_language, image_region, request_language),
-            expected.map(str::to_owned),
+            expected,
         );
     }
 

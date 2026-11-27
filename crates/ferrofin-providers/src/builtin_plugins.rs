@@ -1,31 +1,33 @@
-//! The five metadata plugins Jellyfin ships **inside its own server tree**, as
+//! The six metadata plugins Jellyfin ships **inside its own server tree**, as
 //! Ferrofin plugin registrations.
 //!
 //! `MediaBrowser.Providers/Plugins/{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages}/
-//! Plugin.cs` are each a `BasePlugin<PluginConfiguration>, IHasWebPages`
-//! compiled into `MediaBrowser.Providers` — not external plugins, not optional.
+//! Plugin.cs` and `Plugins/ListenBrainz/ListenBrainzPlugin.cs` are each a
+//! `BasePlugin<PluginConfiguration>, IHasWebPages` compiled into
+//! `MediaBrowser.Providers` — not external plugins, not optional.
 //! Every stock Jellyfin therefore answers `GET /Plugins`,
 //! `GET /Plugins/{id}/Configuration`, `GET /web/ConfigurationPages` and
-//! `GET /web/ConfigurationPage?name=TMDb` with these five, and an admin has a
+//! `GET /web/ConfigurationPage?name=TMDb` with these six, and an admin has a
 //! settings page for each.
 //!
-//! Ferrofin ports all five as native providers
-//! (`tmdb`/`omdb`/`musicbrainz`/`audiodb`/`studios`) but gave none of them a
-//! plugin *identity*, so all four of those endpoints came back empty or `404`
-//! while Jellyfin returned five entries — the parity row's real content, and
-//! the opposite of the "extension route not on the stock Jellyfin surface"
-//! story that had been recorded against it.
+//! Ferrofin ports all six as native providers
+//! (`tmdb`/`omdb`/`musicbrainz`/`audiodb`/`studios`/`listenbrainz`) but gave
+//! none of them a plugin *identity*, so all four of those endpoints came back
+//! empty or `404` while Jellyfin returned their entries — the parity row's real
+//! content, and the opposite of the "extension route not on the stock Jellyfin
+//! surface" story that had been recorded against it.
 //!
 //! This module is plain data: the ids, names, descriptions, configuration file
 //! names, default configuration JSON, and the **verbatim** `config.html` bytes
-//! taken from the 10.11.8 tag (both projects are GPL-3.0-only). The composition
-//! root turns each [`BuiltinPlugin`] into a
-//! `ferrofin_traits::plugins::RegisteredPlugin`.
+//! (and ListenBrainz's `NOTICE.md`) taken from the `UPSTREAM_TAG` tree (both
+//! projects are GPL-3.0-only). The composition root turns each
+//! [`BuiltinPlugin`] into a `ferrofin_traits::plugins::RegisteredPlugin`.
 //!
 //! **The configurations are live.** The composition root
 //! (`apps/ferrofin-server/src/state.rs`) hands the plugin manager to
-//! `TmdbClient`, `OmdbClient`, `MusicBrainzClient`, `AudioDbClient` and
-//! `StudiosClient` through [`ConfigSource`](crate::plugin_config::ConfigSource), and each reads its
+//! `TmdbClient`, `OmdbClient`, `MusicBrainzClient`, `AudioDbClient`,
+//! `StudiosClient` and `ListenBrainzClient` through
+//! [`ConfigSource`](crate::plugin_config::ConfigSource), and each reads its
 //! settings at call time the way `Plugin.Instance.Configuration` is read
 //! upstream — an admin's save on a settings page changes the next lookup, with
 //! no restart. Wired settings, with the C# read site each was ported from:
@@ -43,12 +45,15 @@
 //! | TMDb | `MissingEpisodeRefreshIntervalDays` | the `TmdbRefreshUpcomingEpisodes` task's interval (`TmdbUpcomingEpisodesTask.GetDefaultTriggers`) |
 //! | TMDb | `ExcludeTagsMovies` / `ExcludeTagsSeries` | leave `keywords` out of the movie / series request, so TMDb's keywords never become Tags (`TmdbClientManager.cs:78-81,152-155`) |
 //! | TMDb | `ImportSeasonName` | name a season after TMDb's season name (`TmdbSeasonProvider.cs:76`) |
+//! | TMDb | `SimilarItemsCacheDays` | how long similar movies and series are cached, `0` none (`TmdbMovieSimilarProvider.CacheDuration`, `TmdbSeriesSimilarProvider.CacheDuration`) |
 //! | OMDb | `CastAndCrew` | whether OMDb's director/writer/actors are imported (`OmdbProvider.cs:417`) |
 //! | MusicBrainz | `Server` | the web-service base URL (`MusicBrainzArtistProvider.ReloadConfig`) |
 //! | MusicBrainz | `RateLimit` | seconds between requests (same) |
 //! | MusicBrainz | `ReplaceArtistName` | rename a searched artist to MusicBrainz's spelling (`:146`) |
 //! | AudioDB | `ReplaceAlbumName` | rename an album to `strAlbum` (`AudioDbAlbumProvider.cs:90`) |
 //! | Studio Images | `RepositoryUrl` | the artwork repository (`StudiosImageProvider.cs:190`) |
+//! | ListenBrainz | `LabsServer` / `Algorithm` / `RateLimit` | the Labs server, its similarity algorithm and the seconds between requests (`ListenBrainzLabsClient.GetSimilarArtistsAsync`) |
+//! | ListenBrainz | `SimilarItemsCacheDays` | how long similar artists are cached, `0` none (`ListenBrainzSimilarArtistProvider.CacheDuration`) |
 //!
 //! For `Server`, `RepositoryUrl` and the OMDb key, an operator who set the
 //! pre-existing server config (`FERROFIN_MUSICBRAINZ_URL`,
@@ -79,6 +84,12 @@ pub struct BuiltinPlugin {
     pub default_config: &'static str,
     /// The `Configuration/config.html` embedded resource, byte-for-byte.
     pub config_page: &'static [u8],
+    /// The `Configuration/NOTICE.md` embedded resource, byte-for-byte, which
+    /// `GetPages()` yields as a second page named `Name + "Notice"`.
+    pub notice: Option<&'static [u8]>,
+    /// Adds the configuration's get-only members to every read of it
+    /// (`RegisteredPlugin::config_view`).
+    pub config_view: Option<fn(&mut serde_json::Map<String, serde_json::Value>)>,
 }
 
 /// TMDb — `MediaBrowser.Providers/Plugins/Tmdb/Plugin.cs`.
@@ -99,9 +110,11 @@ pub const TMDB: BuiltinPlugin = BuiltinPlugin {
         r#""StillSize":null,"#,
         r#""ImportUnairedEpisodes":false,"ImportMissingEpisodes":false,"ImportSpecials":false,"#,
         r#""EnabledMissingEpisodeLibraries":[],"MissingEpisodeRefreshIntervalDays":7,"#,
-        r#""UpcomingEpisodeGracePeriodDays":7}"#
+        r#""UpcomingEpisodeGracePeriodDays":7,"SimilarItemsCacheDays":90}"#
     ),
     config_page: include_bytes!("../assets/plugins/tmdb.config.html"),
+    notice: None,
+    config_view: None,
 };
 
 /// OMDb — `MediaBrowser.Providers/Plugins/Omdb/Plugin.cs`.
@@ -112,6 +125,8 @@ pub const OMDB: BuiltinPlugin = BuiltinPlugin {
     configuration_file_name: "Jellyfin.Plugin.Omdb.xml",
     default_config: r#"{"CastAndCrew":false}"#,
     config_page: include_bytes!("../assets/plugins/omdb.config.html"),
+    notice: None,
+    config_view: None,
 };
 
 /// MusicBrainz — `MediaBrowser.Providers/Plugins/MusicBrainz/Plugin.cs`.
@@ -122,6 +137,8 @@ pub const MUSICBRAINZ: BuiltinPlugin = BuiltinPlugin {
     configuration_file_name: "Jellyfin.Plugin.MusicBrainz.xml",
     default_config: r#"{"Server":"https://musicbrainz.org","RateLimit":1,"ReplaceArtistName":false}"#,
     config_page: include_bytes!("../assets/plugins/musicbrainz.config.html"),
+    notice: None,
+    config_view: None,
 };
 
 /// `AudioDB` — `MediaBrowser.Providers/Plugins/AudioDb/Plugin.cs`.
@@ -132,6 +149,8 @@ pub const AUDIODB: BuiltinPlugin = BuiltinPlugin {
     configuration_file_name: "Jellyfin.Plugin.AudioDb.xml",
     default_config: r#"{"ReplaceAlbumName":false}"#,
     config_page: include_bytes!("../assets/plugins/audiodb.config.html"),
+    notice: None,
+    config_view: None,
 };
 
 /// Studio Images — `MediaBrowser.Providers/Plugins/StudioImages/Plugin.cs`.
@@ -142,17 +161,44 @@ pub const STUDIO_IMAGES: BuiltinPlugin = BuiltinPlugin {
     configuration_file_name: "Jellyfin.Plugin.StudioImages.xml",
     default_config: r#"{"RepositoryUrl":"https://raw.githubusercontent.com/jellyfin/emby-artwork/master/studios"}"#,
     config_page: include_bytes!("../assets/plugins/studioimages.config.html"),
+    notice: None,
+    config_view: None,
+};
+
+/// ListenBrainz — `MediaBrowser.Providers/Plugins/ListenBrainz/ListenBrainzPlugin.cs`.
+pub const LISTENBRAINZ: BuiltinPlugin = BuiltinPlugin {
+    id: Uuid::from_u128(0xa5b2_e8c1_9d4f_4a3b_8c7e_6f1a_2b3c_4d5e),
+    name: "ListenBrainz Similarity Provider",
+    description: "Get similar artist recommendations from ListenBrainz Labs.",
+    configuration_file_name: "Jellyfin.Plugin.ListenBrainz.xml",
+    // `ListenBrainz/Configuration/PluginConfiguration.cs` defaults. The
+    // get-only `AlgorithmString` is computed on every read instead, so a save
+    // ignores it, as upstream's deserializer does.
+    default_config: concat!(
+        r#"{"LabsServer":"https://labs.api.listenbrainz.org","#,
+        r#""Algorithm":"SessionBased1825Days","RateLimit":1,"SimilarItemsCacheDays":14}"#
+    ),
+    config_page: include_bytes!("../assets/plugins/listenbrainz.config.html"),
+    notice: Some(include_bytes!("../assets/plugins/listenbrainz.NOTICE.md")),
+    config_view: Some(crate::listenbrainz::add_algorithm_string),
 };
 
 /// Every in-tree provider plugin, in the order Jellyfin's plugin manager
 /// enumerates them (`GetExports<IPlugin>` reflection order, measured stable on
-/// 10.11.8). `GET /web/ConfigurationPages` does not sort, so the order is part
-/// of the response.
-pub const ALL: &[BuiltinPlugin] = &[TMDB, STUDIO_IMAGES, OMDB, MUSICBRAINZ, AUDIODB];
+/// 10.11.8, and with ListenBrainz on 12.4). `GET /web/ConfigurationPages` does
+/// not sort, so the order is part of the response.
+pub const ALL: &[BuiltinPlugin] = &[
+    TMDB,
+    STUDIO_IMAGES,
+    OMDB,
+    MUSICBRAINZ,
+    LISTENBRAINZ,
+    AUDIODB,
+];
 
 #[cfg(test)]
 mod tests {
-    use super::{ALL, TMDB};
+    use super::{ALL, LISTENBRAINZ, TMDB};
 
     #[test]
     fn every_default_config_is_valid_json() {
@@ -182,17 +228,21 @@ mod tests {
             super::AUDIODB.id.to_string(),
             "a629c0da-fac5-4c7e-931a-7174223f14c8"
         );
+        assert_eq!(
+            LISTENBRAINZ.id.to_string(),
+            "a5b2e8c1-9d4f-4a3b-8c7e-6f1a2b3c4d5e"
+        );
     }
 
     #[test]
     fn config_pages_are_the_vendored_bytes() {
         // The exact byte lengths of the vendored `Configuration/config.html`
-        // resources, which the live server serves verbatim: 10.11.8's, but
-        // TMDb's is v12.2's (its unaired/missing episode options) without the
-        // Similar Items cache setting Ferrofin does not have yet (gl-220).
+        // resources at v12.4, which the live server serves verbatim.
         let sizes: Vec<usize> = ALL.iter().map(|p| p.config_page.len()).collect();
-        assert_eq!(sizes, vec![18097, 2491, 2179, 3828, 2244]);
+        assert_eq!(sizes, vec![19135, 2491, 2179, 3828, 6708, 2244]);
         assert!(TMDB.config_page.starts_with(b"<!DOCTYPE html>"));
+        let notices: Vec<Option<usize>> = ALL.iter().map(|p| p.notice.map(<[u8]>::len)).collect();
+        assert_eq!(notices, vec![None, None, None, None, Some(1119), None]);
     }
 
     #[test]
@@ -221,5 +271,26 @@ mod tests {
         assert_eq!(v["EnabledMissingEpisodeLibraries"], serde_json::json!([]));
         assert_eq!(v["MissingEpisodeRefreshIntervalDays"], 7);
         assert_eq!(v["UpcomingEpisodeGracePeriodDays"], 7);
+        // `PluginConfiguration.cs:131`.
+        assert_eq!(v["SimilarItemsCacheDays"], 90);
+    }
+
+    /// What a stock 12.4 answers `GET /Plugins/{id}/Configuration` with for
+    /// ListenBrainz before a save, once the view has added `AlgorithmString`.
+    #[test]
+    fn listenbrainz_defaults_match_a_stock_12_4() {
+        let mut config: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(LISTENBRAINZ.default_config).expect("json");
+        (LISTENBRAINZ.config_view.expect("a view"))(&mut config);
+        assert_eq!(
+            serde_json::Value::Object(config),
+            serde_json::json!({
+                "LabsServer": "https://labs.api.listenbrainz.org",
+                "Algorithm": "SessionBased1825Days",
+                "RateLimit": 1,
+                "SimilarItemsCacheDays": 14,
+                "AlgorithmString": "session_based_days_1825_session_300_contribution_3_threshold_10_limit_100_filter_True_skip_30"
+            })
+        );
     }
 }

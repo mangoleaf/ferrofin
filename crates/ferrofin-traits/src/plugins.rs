@@ -77,13 +77,25 @@ pub struct PluginUpdateInfo {
     pub repository_url: Option<String>,
 }
 
-/// A plugin's bundled image, served by `GET /Plugins/{id}/{version}/Image`.
+/// A plugin's image, served by `GET /Plugins/{id}/{version}/Image`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginImage {
     /// The image's MIME type (e.g. `image/png`).
     pub content_type: String,
-    /// The raw image bytes.
-    pub data: Vec<u8>,
+    /// Where the image is, which decides how it is served.
+    pub source: PluginImageSource,
+}
+
+/// Where a [`PluginImage`] is: `GetPluginImage`'s two branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginImageSource {
+    /// Bytes the plugin carries (the `ImageResourceName` branch's
+    /// `File(stream, …)`).
+    Bytes(Vec<u8>),
+    /// The file stored for a repository plugin (the `ImagePath` branch's
+    /// `PhysicalFile`): served with the file's `Last-Modified`, answering a
+    /// conditional request.
+    File(PathBuf),
 }
 
 /// A compiled-in plugin registered with the manager at the composition root.
@@ -110,6 +122,10 @@ pub struct RegisteredPlugin {
     /// The file a runtime-loaded (WASM) plugin was loaded from, whatever its
     /// name; uninstalling the plugin deletes it. `None` for a compiled-in one.
     pub artifact: Option<PathBuf>,
+    /// Adds the members the plugin's configuration type computes from its
+    /// others (C# get-only properties, which `GET /Plugins/{id}/Configuration`
+    /// serializes and a save ignores) to every read of its configuration.
+    pub config_view: Option<fn(&mut serde_json::Map<String, serde_json::Value>)>,
 }
 
 /// One dashboard page (or page resource) a plugin ships. Mirrors the C#
@@ -125,6 +141,9 @@ pub struct PluginConfigPage {
     /// Whether the dashboard drawer shows a direct link to this page
     /// (`EnableInMainMenu`).
     pub enable_in_main_menu: bool,
+    /// The MIME type the page is served with, where its name's extension does
+    /// not give it (upstream takes it from the embedded resource's file name).
+    pub content_type: Option<&'static str>,
 }
 
 impl RegisteredPlugin {
@@ -149,6 +168,7 @@ impl RegisteredPlugin {
             default_config: b"{}".to_vec(),
             config_pages: Vec::new(),
             artifact: None,
+            config_view: None,
         }
     }
 
@@ -176,6 +196,16 @@ impl RegisteredPlugin {
     #[must_use]
     pub fn with_default_config(mut self, config: Vec<u8>) -> Self {
         self.default_config = config;
+        self
+    }
+
+    /// Sets [`Self::config_view`].
+    #[must_use]
+    pub fn with_config_view(
+        mut self,
+        view: fn(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> Self {
+        self.config_view = Some(view);
         self
     }
 
@@ -378,9 +408,12 @@ pub trait PluginManager: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// A configuration page's HTML by its page `name`, for
+    /// A configuration page by its page `name`, for
     /// `GET /web/ConfigurationPage`. Defaults to `None` (no such page).
-    async fn get_configuration_page(&self, _name: &str) -> Result<Option<Vec<u8>>, ServiceError> {
+    async fn get_configuration_page(
+        &self,
+        _name: &str,
+    ) -> Result<Option<PluginConfigPage>, ServiceError> {
         Ok(None)
     }
 }

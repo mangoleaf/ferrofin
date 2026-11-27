@@ -102,7 +102,12 @@ pub async fn consolidate_localized_user_views(
         return Ok(0);
     }
 
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut dropped = 0u64;
     for (view_type, group) in typed_views(&mut tx).await? {
         let folder = item_type_lookup::valid_filename(&view_type);
@@ -603,10 +608,11 @@ pub fn rewrite_view_preference(value: &str, stale: &[Uuid], canonical: Uuid) -> 
     touched.then(|| rewritten.join(","))
 }
 
-/// Seeds the adopted token path and historical save date for the warm-view test.
+/// Seeds the adopted token path and historical refresh and save dates for the
+/// warm-view test: Jellyfin refreshes the view once it creates it.
 #[cfg(test)]
 pub(crate) async fn seed_adopted_folder_view(db: &Database, id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = '%MetadataPath%\views\folders', "IsFolder" = 1, "DateLastSaved" = '2024-01-01 00:00:00' WHERE "Id" = ?1"#)
+    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = '%MetadataPath%\views\folders', "IsFolder" = 1, "DateLastRefreshed" = '2024-01-01 00:00:00', "DateLastSaved" = '2024-01-01 00:00:00' WHERE "Id" = ?1"#)
         .bind(guid_to_db(id))
         .execute(db.writer())
         .await?;

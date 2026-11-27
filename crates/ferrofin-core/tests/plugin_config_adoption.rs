@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 /// `Jellyfin.Plugin.Tmdb.xml` exactly as a stock Jellyfin 12.4 writes it at its
 /// first start, then edited the way its settings page would: missing episodes
-/// on for two libraries, a cast cap of 20, an API key of the admin's own.
-/// `SimilarItemsCacheDays` is upstream's and has no Ferrofin setting.
+/// on for two libraries, a cast cap of 20, an API key of the admin's own, and
+/// similar items cached for 30 days.
 const TMDB_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <PluginConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <TmdbApiKey>admins-own-key</TmdbApiKey>
@@ -34,7 +34,7 @@ const TMDB_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
   <MaxCrewMembers>15</MaxCrewMembers>
   <HideMissingCastMembers>false</HideMissingCastMembers>
   <HideMissingCrewMembers>false</HideMissingCrewMembers>
-  <SimilarItemsCacheDays>90</SimilarItemsCacheDays>
+  <SimilarItemsCacheDays>30</SimilarItemsCacheDays>
 </PluginConfiguration>"#;
 
 /// `Jellyfin.Plugin.MusicBrainz.xml` as Jellyfin 12.4 writes it, pointed at a
@@ -129,7 +129,7 @@ async fn a_stock_12_4_document_edited_by_its_admin_comes_across() {
     );
     // Upstream leaves a null image size out; it keeps Ferrofin's default.
     assert_eq!(tmdb.get("PosterSize"), Some(&Value::Null));
-    assert!(tmdb.get("SimilarItemsCacheDays").is_none(), "{tmdb}");
+    assert_eq!(tmdb["SimilarItemsCacheDays"], 30);
     let musicbrainz = configuration(&plugins, &MUSICBRAINZ).await;
     assert_eq!(
         musicbrainz,
@@ -178,6 +178,14 @@ fn edited_documents() -> Vec<(BuiltinPlugin, String, Value)> {
                 "Studio Images" => (
                     "  <RepositoryUrl>https://art.example/studios</RepositoryUrl>",
                     json!({"RepositoryUrl": "https://art.example/studios"}),
+                ),
+                // As a stock 12.4 writes it after a save on its settings page.
+                "ListenBrainz Similarity Provider" => (
+                    "  <LabsServer>https://labs.example.org</LabsServer>\n  \
+                     <Algorithm>SessionBased75Days</Algorithm>\n  <RateLimit>0.25</RateLimit>\n  \
+                     <SimilarItemsCacheDays>30</SimilarItemsCacheDays>",
+                    json!({"LabsServer": "https://labs.example.org", "Algorithm": "SessionBased75Days",
+                           "RateLimit": 0.25, "SimilarItemsCacheDays": 30}),
                 ),
                 other => panic!("a bundled plugin with no test document: {other}"),
             };

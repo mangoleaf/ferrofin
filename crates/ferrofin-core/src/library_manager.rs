@@ -27,7 +27,8 @@
 //!   (`crate::item_deletion`; the first path's failure stops the delete
 //!   with every row in place), then the extracted data, then the rows and
 //!   everything the persistence delete takes with them (`ParentId`
-//!   descendants, the extras and stacked parts it owns).
+//!   descendants, the extras and stacked parts it owns). Unlike upstream,
+//!   it first waits for a running refresh of the item (gl-1577).
 //! - The `IProgress` scan plumbing is dropped. A scan runs on the scan
 //!   queue's own worker task and is cancelled cooperatively, between two
 //!   items, through a [`ScanCancel`] (the `CancellationToken`'s role).
@@ -38,10 +39,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use async_trait::async_trait;
 use tracing::Instrument as _;
 
-use ferrofin_db::entities::base_items::{
-    BaseItemEntity, PeopleEntity, aired_episode_order, is_virtual_location, presentation_key,
-    relation_id,
-};
+use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::ItemCounts;
@@ -58,7 +56,6 @@ use ferrofin_traits::persistence::{
     ItemCountService, ItemPersistenceService, ItemRepository, ItemWithCounts, PeopleRepository,
 };
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
-use ferrofin_util::stable_sort::stable_sort_by;
 
 use crate::library_scan::{LaneRefresh, PriorityLane, ScanCancel, ScanPasses, ScanRun};
 use ferrofin_traits::library::ScanProgressSink;
@@ -290,170 +287,10 @@ fn folder_name_matches(item: &BaseItemEntity, query: &InternalItemsQuery) -> boo
             .is_none_or(|bound| folder_ordinal_compare(Some(&sort), Some(bound)).is_lt())
 }
 
-/// `Season.GetEpisodes` → `Series.GetSeasonEpisodes(parentSeason, user, options,
-/// shouldIncludeMissingEpisodes: true)`: the series' episodes (its seasons
-/// alongside, to resolve each episode's parent) narrowed to `season`'s by
-/// `FilterEpisodesBySeason` — with `include_specials`
-/// (`DisplaySpecialsWithinSeasons`), a special airing within a numbered
-/// season belongs to it — and sorted in aired order (season 0 keeps the
-/// series' `SortName` order). Empty when the season has no series; a series
-/// row that fails to read is an error here, which the scan's
-/// [`series_season_episode_rows`] caller counts as no series instead.
-/// `season_id` is the season's id; `query` supplies the user and the DTO
-/// options the series query runs with. The series' rows are read with only
-/// the columns the selection reads, and the full rows of the season's
-/// episodes after it (gl-1259).
-pub(crate) async fn season_episode_rows(
-    items: &dyn ItemRepository,
-    season_id: Uuid,
-    season: BaseItemEntity,
-    query: &InternalItemsQuery,
-    include_specials: bool,
-) -> Result<Vec<BaseItemEntity>, ServiceError> {
-    let series = match season_series_column(&season).and_then(|id| relation_id(Some(id))) {
-        Some(id) => items.retrieve_item(id).await?,
-        None => None,
-    };
-    series_season_episode_rows(items, season_id, season, series, query, include_specials).await
-}
-
-/// The column naming `season`'s series (`Season.Series`): its `SeriesId`,
-/// else its `ParentId`, skipping one [`relation_id`] reads as no relation.
-pub(crate) fn season_series_column(season: &BaseItemEntity) -> Option<&str> {
-    [season.series_id.as_deref(), season.parent_id.as_deref()]
-        .into_iter()
-        .flatten()
-        .find(|id| relation_id(Some(id)).is_some())
-}
-
-/// [`season_episode_rows`] with `series`, the row [`season_series_column`]
-/// names, already read (`Season.GetEpisodes(Series series, …)`). Empty when
-/// it is `None` or not a series.
-#[allow(clippy::too_many_lines)] // source relation resolution, then selection
-pub(crate) async fn series_season_episode_rows(
-    items: &dyn ItemRepository,
-    season_id: Uuid,
-    season: BaseItemEntity,
-    series: Option<BaseItemEntity>,
-    query: &InternalItemsQuery,
-    include_specials: bool,
-) -> Result<Vec<BaseItemEntity>, ServiceError> {
-    let Some(series) = series.filter(|row| row.type_.rsplit('.').next() == Some("Series")) else {
-        return Ok(Vec::new());
-    };
-    let series_id = relation_id(Some(&series.id));
-    let rows = items
-        .get_episode_order_rows(&InternalItemsQuery {
-            user: query.user.clone(),
-            series_presentation_unique_key: Some(presentation_key(&series).to_owned()),
-            include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
-            order_by: vec![(
-                ferrofin_model::live_tv::ItemSortBy::SortName,
-                ferrofin_model::dto::SortOrder::Ascending,
-            )],
-            dto_options: query.dto_options.clone(),
-            // Season.GetItemsInternal passes shouldIncludeMissing=true.
-            ..Default::default()
-        })
-        .await?;
-    let series_seasons: Vec<_> = rows
-        .iter()
-        .filter(|row| row.type_.rsplit('.').next() == Some("Season"))
-        .cloned()
-        .collect();
-    let mut seasons: HashMap<_, _> = series_seasons
-        .iter()
-        .filter_map(|row| relation_id(Some(&row.id)).map(|id| (id, row.clone())))
-        .collect();
-    seasons.insert(season_id, season.clone());
-    let mut unknown = std::collections::HashSet::new();
-    for row in &rows {
-        if row.type_.rsplit('.').next() == Some("Episode")
-            && let Some(id) = relation_id(row.season_id.as_deref())
-                .or_else(|| relation_id(row.parent_id.as_deref()))
-            && !seasons.contains_key(&id)
-        {
-            unknown.insert(id);
-        }
-    }
-    if !unknown.is_empty() {
-        for row in items
-            .retrieve_items(&unknown.into_iter().collect::<Vec<_>>())
-            .await?
-        {
-            if row.type_.rsplit('.').next() == Some("Season")
-                && let Some(id) = relation_id(Some(&row.id))
-            {
-                seasons.insert(id, row);
-            }
-        }
-    }
-    let key = presentation_key(&season);
-    let number = season.index_number;
-    let support_specials = include_specials && number.is_some_and(|number| number != 0);
-    let mut matches = Vec::new();
-    for row in rows
-        .into_iter()
-        .filter(|row| row.type_.rsplit('.').next() == Some("Episode"))
-    {
-        let parent = relation_id(row.season_id.as_deref())
-            .or_else(|| relation_id(row.parent_id.as_deref()))
-            .and_then(|id| seasons.get(&id))
-            .or_else(|| {
-                (relation_id(row.parent_id.as_deref()) == series_id)
-                    .then(|| {
-                        series_seasons
-                            .iter()
-                            .find(|parent| parent.index_number == row.parent_index_number)
-                    })
-                    .flatten()
-            });
-        let same_season = parent.is_some_and(|parent| {
-            ferrofin_util::string_extensions::equals_ordinal_ignore_case(
-                presentation_key(parent),
-                key,
-            )
-        });
-        // The disabled source query is restricted to the season's
-        // presentation ancestry, before FilterEpisodesBySeason runs.
-        if !include_specials && !same_season {
-            continue;
-        }
-        let order = aired_episode_order(&row);
-        let current = if support_specials {
-            order
-                .airs_after_season
-                .or(order.airs_before_season)
-                .or(order.season)
-        } else {
-            order.season
-        };
-        let matches_number = current.is_some() && number.is_some() && current == number;
-        let matches_virtual = current.is_none()
-            && number.is_none()
-            && is_virtual_location(&season)
-            && parent.is_none_or(is_virtual_location);
-        if matches_number || matches_virtual || same_season {
-            matches.push((order, row));
-        }
-    }
-    if number != Some(0) {
-        // `LibraryManager.Sort`'s LINQ `OrderBy`: stable, and the aired-order
-        // comparer is not a total order, on which `sort_by` may panic.
-        stable_sort_by(&mut matches, |(left, _), (right, _)| left.compare(right));
-    }
-    let ids: Vec<Uuid> = matches
-        .iter()
-        .filter_map(|(_, row)| Uuid::parse_str(&row.id).ok())
-        .collect();
-    let mut full: HashMap<Uuid, BaseItemEntity> = items
-        .retrieve_items(&ids)
-        .await?
-        .into_iter()
-        .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
-        .collect();
-    Ok(ids.iter().filter_map(|id| full.remove(id)).collect())
-}
+/// `Season.GetEpisodes`, shared with the provider manager's season refresh.
+pub(crate) use ferrofin_providers::season_episodes::{
+    season_episode_rows, season_series_column, series_season_episode_rows,
+};
 
 /// One scan request: what it covers, the options its items refresh with,
 /// and why it was made.
@@ -2972,7 +2809,10 @@ impl LibraryManager for FerrofinLibraryManager {
         // `get_item_by_id` rejects the nil id and `retrieve_item`'s predicate
         // excludes the seeded placeholder row, so both are "not an item" here
         // too. `ItemRepository::item_exists` answers the rest with a
-        // `SELECT 1` existence probe instead of a ~70-column read.
+        // `SELECT 1` existence probe instead of a ~70-column read. A row of
+        // an unknown stored `Type` exists here though `get_item_by_id` skips
+        // it; the image route, its one caller, asks only once no image row
+        // matched, and answers 404 either way.
         if id.is_nil() || id == PLACEHOLDER_ITEM_ID {
             return Ok(false);
         }
@@ -3390,6 +3230,16 @@ impl LibraryManager for FerrofinLibraryManager {
         if id.is_nil() {
             return Err(ServiceError::invalid_input("item id can't be empty"));
         }
+        // A refresh holds the item from loading its row to its last save
+        // (`ProviderManager::lock_item_metadata`), and its save inserts a row
+        // that is gone: wait it out, and hold the next one off until the row
+        // and folder are deleted, so no provider refresh writes them back
+        // (gl-1577).
+        // Upstream has the same window; its scan later drops the orphan.
+        let _metadata = match &self.providers {
+            Some(providers) => Some(providers.lock_item_metadata(id).await),
+            None => None,
+        };
         let Some(row) = self.items.retrieve_item(id).await? else {
             // Already gone — deletion is idempotent.
             return Ok(());
@@ -3877,6 +3727,22 @@ impl LibraryManager for FerrofinLibraryManager {
             }
         }
         failed.map_or(Ok(true), Err)
+    }
+
+    async fn stopped_scan_ended(&self) {
+        // Subscribed before the check, so the scan's end between the check
+        // and the wait is not missed.
+        let mut changed = self.scan_progress.subscribe();
+        loop {
+            let stopping = lock_queue(&self.scan_queue)
+                .running
+                .as_ref()
+                .is_some_and(|running| running.cancel.is_cancelled());
+            // The worker signals after each scan's end, and when it goes away.
+            if !stopping || changed.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     fn is_scan_running(&self) -> bool {
@@ -5332,9 +5198,9 @@ mod tests {
 
     /// `POST /Library/Refresh` over a running "Scan Media Library"
     /// (`CancelIfRunningAndQueue`): the stop reaches the run's scan wait, so
-    /// the run ends Cancelled at once rather than after the stop's drop wait;
-    /// the scan it leaves stops at its next item; and the queued run's own
-    /// scan starts only after that one.
+    /// the scan it leaves stops at its next item; the run stays Cancelling
+    /// until then and records Cancelled, well inside the stop's drop wait;
+    /// and the queued run, with its own scan, starts only after that.
     #[tokio::test]
     async fn a_refresh_over_a_running_scan_task_cancels_it_and_scans_after_it() {
         use crate::scheduled_tasks::{FerrofinTaskManager, RefreshLibraryTask};
@@ -5349,12 +5215,15 @@ mod tests {
 
         tasks.queue("RefreshLibrary").expect("queued");
         runner.started(1).await;
-        let stopped = std::time::Instant::now();
         tasks
             .cancel_if_running_and_queue(&id)
             .await
             .expect("refresh");
-        // The first run has recorded Cancelled and the queued one runs.
+        assert_eq!(runner.runs().len(), 1, "no scan beside the stopping one");
+        // The left scan finishes its item in progress, then stops, and the
+        // first run records Cancelled; the queued one runs after it.
+        let stopped = std::time::Instant::now();
+        runner.release(1);
         for _ in 0..500 {
             let info = tasks.get("RefreshLibrary").expect("task");
             if info.state == TaskState::Running
@@ -5370,11 +5239,6 @@ mod tests {
             stopped.elapsed() < crate::scheduled_tasks::STOP_WAIT,
             "the stop reached the scan wait, not the drop"
         );
-        assert_eq!(runner.runs().len(), 1, "no scan beside the stopping one");
-
-        // The left scan finishes its item in progress, then stops; the
-        // replacement's scan runs after it.
-        runner.release(1);
         runner.started(2).await;
         runner.release(GatedRunner::ITEMS);
         for _ in 0..500 {
@@ -5392,6 +5256,115 @@ mod tests {
         let runs = runner.runs();
         assert!(runs[0].stopped, "the left scan stopped at its next item");
         assert_eq!(runs[1].items, GatedRunner::ITEMS);
+    }
+
+    /// A "Scan Media Library" run over a gated scan, stopped from the
+    /// dashboard while the scan is on its first item, with the scan's
+    /// manager and runner.
+    async fn stopped_scan_task() -> (
+        crate::scheduled_tasks::FerrofinTaskManager,
+        FerrofinLibraryManager,
+        Arc<GatedRunner>,
+    ) {
+        use crate::scheduled_tasks::{FerrofinTaskManager, RefreshLibraryTask};
+        use ferrofin_model::tasks::TaskState;
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let tasks = FerrofinTaskManager::new();
+        tasks.register(Arc::new(RefreshLibraryTask::new(Arc::new(mgr.clone()))));
+        tasks.queue("RefreshLibrary").expect("queued");
+        runner.started(1).await;
+        tasks.cancel("RefreshLibrary").expect("stop");
+        // Long enough for a run that does not wait for its scan to end.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            tasks.get("RefreshLibrary").expect("task").state,
+            TaskState::Cancelling,
+            "the run waits for its scan, which is still on its item"
+        );
+        (tasks, mgr, runner)
+    }
+
+    /// The dashboard's Stop on a running "Scan Media Library": the run stays
+    /// `Cancelling` while its scan finishes the item in progress, and records
+    /// Cancelled only once the scan has ended, as upstream's does when
+    /// `ValidateMediaLibraryInternal` returns.
+    #[tokio::test]
+    async fn a_stopped_scan_task_stays_cancelling_until_its_scan_ends() {
+        use ferrofin_model::tasks::{TaskCompletionStatus, TaskState};
+        let (tasks, mgr, runner) = stopped_scan_task().await;
+        assert!(!runner.runs()[0].stopped, "the scan has not ended");
+
+        runner.release(1);
+        for _ in 0..500 {
+            if tasks.get("RefreshLibrary").expect("task").state == TaskState::Idle {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let done = tasks.get("RefreshLibrary").expect("task");
+        assert_eq!(done.state, TaskState::Idle);
+        assert_eq!(
+            done.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Cancelled
+        );
+        assert!(runner.runs()[0].stopped, "the scan ended before the run");
+        until_idle(&mgr).await;
+    }
+
+    /// The host shutting down while a stopped run waits for its scan, whose
+    /// item never ends: the registry's shutdown is not held by the scan. The
+    /// run is dropped when its stop wait ends, inside the shutdown's own
+    /// wait, and scanning shuts down once the item does end.
+    #[tokio::test]
+    async fn shutdown_is_not_held_by_a_stopped_scan_tasks_wait() {
+        use ferrofin_model::tasks::{TaskCompletionStatus, TaskState};
+        let (tasks, mgr, runner) = stopped_scan_task().await;
+
+        // No database work from here on, so the clock can be the test's.
+        tokio::time::pause();
+        let began = tokio::time::Instant::now();
+        tasks.shutdown().await;
+        assert!(
+            began.elapsed() <= crate::scheduled_tasks::STOP_WAIT,
+            "the shutdown waited {:?}",
+            began.elapsed()
+        );
+        tokio::time::resume();
+        let done = tasks.get("RefreshLibrary").expect("task");
+        assert_eq!(done.state, TaskState::Idle);
+        assert_eq!(
+            done.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Cancelled
+        );
+
+        // The scan still on its item ends once that item does.
+        runner.release(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), mgr.shutdown_scans())
+            .await
+            .expect("scanning shut down");
+        assert!(runner.runs()[0].stopped);
+    }
+
+    /// A run stopped while another caller's scan runs has nothing to wait
+    /// for: only a scan that was told to stop is waited on.
+    #[tokio::test]
+    async fn stopped_scan_ended_does_not_wait_for_a_scan_nobody_stopped() {
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        let scan = spawn_scheduled(&mgr);
+        runner.started(1).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), mgr.stopped_scan_ended())
+            .await
+            .expect("no wait for a scan that goes on");
+        assert_eq!(runner.runs()[0].items, 0, "the scan is still on its item");
+
+        runner.release(GatedRunner::ITEMS);
+        scan.await.expect("joined");
+        until_idle(&mgr).await;
     }
 
     /// The host's teardown: the running scan stops at its next item
@@ -7042,6 +7015,46 @@ mod tests {
             .await
             .expect("delete");
         assert!(mgr.get_item_by_id(id).await.expect("read").is_none());
+    }
+
+    /// gl-1577: a refresh holds its item from loading the row to its last
+    /// save (`ProviderManager::lock_item_metadata`). A delete made meanwhile
+    /// waits for it, so the refresh cannot save the deleted item back.
+    #[tokio::test]
+    async fn delete_item_waits_for_a_running_refresh_of_the_item() {
+        use ferrofin_traits::providers::ProviderManager as _;
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x1577);
+        seed_named_item(&db, id, BaseItemKind::BoxSet, "Collection").await;
+        let providers = Arc::new(ferrofin_providers::LocalProviderManager::default());
+        let mgr = Arc::new(manager(&db).with_providers(providers.clone()));
+
+        // The refresh loads the row, the delete is made while it runs…
+        let refresh = providers.lock_item_metadata(id).await;
+        let loaded = mgr.get_item_by_id(id).await.expect("read").expect("row");
+        let mut delete = tokio::spawn({
+            let mgr = Arc::clone(&mgr);
+            async move { mgr.delete_item(id, &DeleteOptions::default()).await }
+        });
+        let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut delete).await;
+        // …then the refresh saves the row it loaded and lets go.
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(std::slice::from_ref(&loaded))
+            .await
+            .expect("the refresh's save");
+        drop(refresh);
+        let waited = early.is_err();
+        match early {
+            Ok(joined) => joined,
+            Err(_) => delete.await,
+        }
+        .expect("join")
+        .expect("delete");
+        assert!(
+            mgr.get_item_by_id(id).await.expect("read").is_none(),
+            "the refresh's save brought the deleted item back"
+        );
+        assert!(waited, "the delete ran while the refresh held the item");
     }
 
     #[tokio::test]

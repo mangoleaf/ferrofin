@@ -299,6 +299,10 @@ pub struct PlaylistItemsWithAccess {
 /// Port of `IItemRepository`. Generic C# helpers (`GetGenres`/`GetStudios`/…)
 /// collapse to concrete methods returning [`ItemWithCounts`]; the domain
 /// `BaseItem` return type becomes [`BaseItemEntity`].
+///
+/// A row whose stored `Type` names no item kind (a removed plugin's item, say)
+/// reads as absent from every method returning rows, as upstream's
+/// `DeserializeBaseItem` returns null for it; ids and counts still include it.
 #[async_trait]
 pub trait ItemRepository: Send + Sync {
     /// Retrieves a single item row by id, or `None` if it does not exist.
@@ -463,7 +467,8 @@ pub trait ItemRepository: Send + Sync {
 
     /// Returns `(Id, CleanName)` for every row matching the query, in the same
     /// order — and under the same predicates, ordering and paging — as
-    /// [`Self::get_item_list`].
+    /// [`Self::get_item_list`]. Like the ids-only reads, the concrete projection
+    /// keeps a row of an unknown stored `Type`, which `get_item_list` skips.
     ///
     /// The by-name resolvers ([`crate::library::LibraryManager::get_named_item_ids`])
     /// join a page's names against `CleanName` and then read nothing but the id,
@@ -2121,10 +2126,11 @@ pub trait ItemPersistenceService: Send + Sync {
         self.set_item_image(item_id, image).await
     }
 
-    /// Deletes one item image of `image_type`, returning the on-disk path of
-    /// the removed rows so the caller can delete the files
-    /// (`ImageController.DeleteItemImage`). Deletes one slot in insertion order;
-    /// an omitted index selects zero and an invalid index removes nothing.
+    /// Removes `item_id`'s `image_type` image whose path is `path` (as
+    /// [`ItemRepository::get_image_infos`] reads it, expanded), the first in
+    /// insertion order: `RemoveImage` in `BaseItem.DeleteImageAsync`, which
+    /// removes the image its caller read and deleted the file of, wherever it
+    /// sits by then. A path no row names removes nothing.
     ///
     /// The default removes nothing.
     ///
@@ -2135,10 +2141,10 @@ pub trait ItemPersistenceService: Send + Sync {
         &self,
         item_id: Uuid,
         image_type: ferrofin_model::entities::ImageType,
-        index: Option<i32>,
-    ) -> Result<Vec<String>, ServiceError> {
-        let _ = (item_id, image_type, index);
-        Ok(Vec::new())
+        path: &str,
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, image_type, path);
+        Ok(())
     }
 
     /// The external ids already recorded for each of `item_ids`, keyed by item.

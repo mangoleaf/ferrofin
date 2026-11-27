@@ -144,8 +144,7 @@ async fn jellyfins_files_go_back_out_as_jellyfin_wrote_them() {
         });
     }
     let config = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir_all(config.path().join("users/named")).expect("named");
-    std::fs::write(config.path().join("users/named/livetv.json"), "{}").expect("options");
+    std::fs::write(config.path().join("livetv.json"), "{}").expect("options");
     let export = export_live_tv(config.path(), &carried, &PathRewrite::default()).expect("exports");
     let exported = |path: &str| -> Vec<Value> {
         let file = export.files.files.iter().find(|f| f.path == path);
