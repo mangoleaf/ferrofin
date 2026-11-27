@@ -2972,7 +2972,10 @@ impl LibraryManager for FerrofinLibraryManager {
         // `get_item_by_id` rejects the nil id and `retrieve_item`'s predicate
         // excludes the seeded placeholder row, so both are "not an item" here
         // too. `ItemRepository::item_exists` answers the rest with a
-        // `SELECT 1` existence probe instead of a ~70-column read.
+        // `SELECT 1` existence probe instead of a ~70-column read. A row of
+        // an unknown stored `Type` exists here though `get_item_by_id` skips
+        // it; the image route, its one caller, asks only once no image row
+        // matched, and answers 404 either way.
         if id.is_nil() || id == PLACEHOLDER_ITEM_ID {
             return Ok(false);
         }

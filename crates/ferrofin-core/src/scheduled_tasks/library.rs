@@ -99,8 +99,9 @@ impl<'a> Pages<'a> {
         })
     }
 
-    /// The next page, or `None` once the count is walked or a page comes
-    /// back empty (items removed since the count).
+    /// The next page, or `None` once the count is walked. A page can come back
+    /// short or empty (items removed since the count, or rows of an unknown
+    /// stored `Type`, which the read skips) with more after it.
     async fn next(&mut self) -> Result<Option<Vec<BaseItemEntity>>, ServiceError> {
         if self.start_index >= self.total {
             return Ok(None);
@@ -114,7 +115,7 @@ impl<'a> Pages<'a> {
             })
             .await?;
         self.start_index += PAGE_SIZE;
-        Ok((!items.is_empty()).then_some(items))
+        Ok(Some(items))
     }
 
     /// Counts one item done and returns the fraction of the count now done.
