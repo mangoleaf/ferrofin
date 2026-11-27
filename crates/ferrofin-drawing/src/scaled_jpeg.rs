@@ -6,7 +6,10 @@
 //! of 6000×4000 (about 1 MB of pixels instead of 72 MB). A progressive JPEG
 //! still holds its whole frame's DCT coefficients while it decodes (2 bytes a
 //! sample, as a full decode does too), so for one the saving is the output
-//! bitmap and the full-size resize only.
+//! bitmap and the full-size resize only. A baseline JPEG can hold the same
+//! for a moment on a loaded host: `jpeg-decoder` queues each MCU row's
+//! coefficients, unbounded, for a thread per colour component, and those
+//! threads can fall behind the entropy decoding (gl-1980).
 //!
 //! Upstream gets this from Skia. `SkiaEncoder.GetImageBlurHash` calls
 //! `BlurHashEncoder.Encode(xComp, yComp, stream, 128, 128)` (BlurHashSharp's
