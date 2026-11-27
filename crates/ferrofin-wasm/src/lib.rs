@@ -1684,7 +1684,7 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
                 // scan — same rule as every other plugin offer.
                 Err(reason) => warn!(
                     plugin = %self.plugin.descriptor.id,
-                    item = %item.item_id,
+                    item_id = %item.item_id,
                     kind = ?kind,
                     reason,
                     "wasm plugin artwork candidate refused/failed; skipping"
@@ -2185,7 +2185,7 @@ impl WasmMediaAnalysisTask {
                         // library size); one aggregated warn per pass.
                         tracing::debug!(
                             plugin = plugin.descriptor.name,
-                            item = %entity.id,
+                            item_id = %entity.id,
                             error = %e,
                             "scan-media failed for one item (offered once; not retried)"
                         );

@@ -752,7 +752,7 @@ impl ScheduledTask for MoveTrickplayImagesTask {
                     .move_generated_library_trickplay_data(item_id)
                     .await
                 {
-                    tracing::warn!(item = %item_id, error = %e, "error moving trickplay files");
+                    tracing::warn!(%item_id, error = %e, "error moving trickplay files");
                 } else {
                     moved += 1;
                 }

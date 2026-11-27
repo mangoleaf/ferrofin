@@ -1885,14 +1885,14 @@ impl ScheduledTask for MediaSegmentExtractionTask {
                         {
                             Ok(ran) => providers_run += ran,
                             Err(e) => {
-                                tracing::warn!(item = %item.id, path, error = %e, "media segment providers failed");
+                                tracing::warn!(item_id = %item.id, path, error = %e, "media segment providers failed");
                             }
                         },
                         // A row whose id is not a GUID cannot be addressed by
                         // any provider; saying so keeps "4000 items, 0
                         // providers ran" answerable.
                         Err(e) => {
-                            tracing::debug!(item = %item.id, error = %e, "skipping item with an unparseable id");
+                            tracing::debug!(item_id = %item.id, error = %e, "skipping item with an unparseable id");
                         }
                     }
                 }
