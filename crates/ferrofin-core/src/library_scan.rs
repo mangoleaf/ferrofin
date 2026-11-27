@@ -11722,8 +11722,10 @@ impl LibraryScanner {
             }
         };
         if let Err(error) = parsed {
-            // A malformed season/album/artist NFO: upstream's plain `Fetch`
-            // lets the `XmlException` fail the local provider, which is logged.
+            // A malformed season/album/artist NFO (upstream's plain `Fetch`
+            // lets the `XmlException` through), or a value whose exception no
+            // parser catches (an empty `<watched/>`): it fails upstream's local
+            // provider, which is logged.
             tracing::warn!(path = %nfo_path, ?error, "local NFO not read");
             return LocalNfo::default();
         }
