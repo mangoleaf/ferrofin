@@ -111,6 +111,39 @@ pub struct Database {
     file_path: Option<std::path::PathBuf>,
 }
 
+/// The writer pool's options: one connection, which hands its automatic
+/// checkpoints to `checkpoints`' task, and whose every acquire (of a new
+/// connection or an idle one) and release `holds` records for
+/// [`crate::writer_holds::watch`].
+pub(crate) fn writer_pool_options(
+    checkpoints: &Arc<crate::wal_checkpoints::WalCheckpoints>,
+    holds: &Arc<crate::writer_holds::WriterHolds>,
+) -> SqlitePoolOptions {
+    // The callbacks own `checkpoints` and `holds` for the pool's life, which
+    // is what keeps the WAL hook's context alive under every connection.
+    let take_over = Arc::clone(checkpoints);
+    let (connected, acquired, released) = (Arc::clone(holds), Arc::clone(holds), Arc::clone(holds));
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _| {
+            let checkpoints = Arc::clone(&take_over);
+            let holds = Arc::clone(&connected);
+            Box::pin(async move {
+                checkpoints.take_over(conn).await?;
+                holds.acquired();
+                Ok(())
+            })
+        })
+        .before_acquire(move |_, _| {
+            acquired.acquired();
+            Box::pin(std::future::ready(Ok(true)))
+        })
+        .after_release(move |_, _| {
+            released.released();
+            Box::pin(std::future::ready(Ok(true)))
+        })
+}
+
 impl Database {
     /// Opens a pool against the SQLite database at `url`, creating the file if
     /// it does not exist.
@@ -302,21 +335,22 @@ impl Database {
             .max_connections(max_connections)
             .connect_with(read_options)
             .await?;
-        // Every writer connection hands its automatic checkpoints to the task.
-        // The callback owns `checkpoints` for the pool's life, which is what
-        // keeps the hook's context alive under every connection.
-        let take_over = Arc::clone(&checkpoints);
-        let writer = SqlitePoolOptions::new()
-            .max_connections(1)
-            .after_connect(move |conn, _| {
-                let checkpoints = Arc::clone(&take_over);
-                Box::pin(async move { checkpoints.take_over(conn).await })
-            })
+        let writer_holds = Arc::new(crate::writer_holds::WriterHolds::default());
+        let writer = writer_pool_options(&checkpoints, &writer_holds)
             .connect_with(write_options)
             .await?;
         tokio::spawn(tracing::Instrument::instrument(
             crate::wal_checkpoints::run(checkpointer.clone(), Arc::clone(&checkpoints)),
             tracing::info_span!(parent: None, "wal_checkpoints"),
+        ));
+        // Warns once the writer stays out longer than a write waits for it.
+        tokio::spawn(tracing::Instrument::instrument(
+            crate::writer_holds::watch(
+                writer.clone(),
+                Arc::clone(&writer_holds),
+                writer.options().get_acquire_timeout(),
+            ),
+            tracing::info_span!(parent: None, "writer_holds"),
         ));
         // One-time at startup: the reader pool size is the concurrent-read thread
         // count (each sqlx SQLite connection owns a dedicated OS thread), the
