@@ -196,6 +196,13 @@ impl UserManager for OkUsers {
     ) -> Result<Option<UserEntity>, ServiceError> {
         unimplemented!()
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
     async fn get_authentication_providers(
         &self,
     ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {
@@ -677,6 +684,15 @@ impl ProviderManager for RecordingProviders {
         unimplemented!()
     }
     async fn save_metadata(
+        &self,
+        _item_id: Uuid,
+        _update_type: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        unreachable!("the editor's saves, the cascades' included, end in update_to_repository")
+    }
+    /// `UpdateToRepositoryAsync(MetadataEdit)`, which measures the images
+    /// (`UpdateImagesAsync`) where `save_metadata` only runs the savers.
+    async fn update_to_repository(
         &self,
         item_id: Uuid,
         update_type: ItemUpdateType,

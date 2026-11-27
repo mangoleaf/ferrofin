@@ -293,16 +293,12 @@ async fn get_universal_audio_stream(
         query.media_source_id.as_deref(),
     )
     .await?;
-    let containers: Vec<&str> = query
-        .container
-        .as_deref()
-        .map(|c| {
-            c.split(',')
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let containers: Vec<&str> = query.container.as_deref().map_or_default(|c| {
+        c.split(',')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect()
+    });
     let profile = std::sync::Arc::new(universal_device_profile(&query, &containers));
     let negotiated = universal_audio_source(
         &state,
@@ -436,8 +432,7 @@ mod tests {
         let containers: Vec<&str> = query
             .container
             .as_deref()
-            .map(|c| c.split(',').filter(|c| !c.is_empty()).collect())
-            .unwrap_or_default();
+            .map_or_default(|c| c.split(',').filter(|c| !c.is_empty()).collect());
         universal_device_profile(&query, &containers)
     }
 

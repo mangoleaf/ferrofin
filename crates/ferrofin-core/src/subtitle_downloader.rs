@@ -7,6 +7,7 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
 use ferrofin_model::configuration::LibraryOptions;
 use ferrofin_model::entities::{MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
+use ferrofin_providers::rate_limit::for_item;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::stubs::LiveTvManager;
@@ -19,9 +20,13 @@ use crate::ScanCancel;
 use crate::db_error::media_stream_type_from_disc;
 
 /// Downloads missing languages using Jellyfin's `SubtitleDownloader` rules.
-/// A shared gate prevents the scan and scheduled task from spending download
-/// quota twice for the same missing subtitle. The manager is weak because it
-/// owns the library, which in turn owns the scanner.
+/// A shared gate keeps the scan and the scheduled task from downloading for
+/// one video at once, and a scan records its own downloads' streams before it
+/// releases it. A download saves the file alone (gl-1641), so a scan whose
+/// probe listed the folder before the task's download, and which reaches the
+/// gate before the task's refresh records it, downloads that language again,
+/// as upstream's ungated pair can. The manager is weak because it owns the
+/// library, which in turn owns the scanner.
 pub struct SubtitleDownloader {
     manager: Weak<dyn SubtitleManager>,
     streams: Arc<dyn MediaStreamRepository>,
@@ -73,8 +78,9 @@ impl SubtitleDownloader {
         Ok(task_needs_language(&streams, options))
     }
 
-    /// Saves a probe without losing subtitles a scheduled download attached
-    /// after the probe's sidecar snapshot. The caller holds the download gate.
+    /// Saves a probe without losing subtitles a refresh recorded after the
+    /// probe's sidecar snapshot (a scheduled download's). The caller holds
+    /// the download gate.
     pub(crate) async fn save_probed_streams(
         &self,
         item_id: Uuid,
@@ -110,18 +116,20 @@ impl SubtitleDownloader {
     }
 
     /// Checks stored streams before each language. Provider failures are
-    /// best-effort; cancellation interrupts network waits but lets a local
-    /// attachment finish so the sidecar and its stream row stay together.
+    /// best-effort; cancellation interrupts network waits but lets a started
+    /// save finish. Returns whether a subtitle was saved (upstream's
+    /// `downloadedLanguages`): it has no stream until the video's next probe,
+    /// which the caller runs (`SubtitleScheduledTask` refreshes the video).
     pub async fn download_missing(
         &self,
         video: &BaseItemEntity,
         options: &LibraryOptions,
         cancel: &ScanCancel,
-    ) {
+    ) -> bool {
         let Some(_guard) = self.lock(cancel).await else {
-            return;
+            return false;
         };
-        self.download_missing_locked(video, options, cancel).await;
+        self.download_missing_locked(video, options, cancel).await
     }
 
     pub(crate) async fn lock(
@@ -137,23 +145,24 @@ impl SubtitleDownloader {
         video: &BaseItemEntity,
         options: &LibraryOptions,
         cancel: &ScanCancel,
-    ) {
+    ) -> bool {
         self.download_missing_using_streams_locked(video, options, cancel, None)
-            .await;
+            .await
     }
 
     /// Scan downloads consider embedded streams before the library's display
-    /// filter, as FFProbeVideoInfo.AddExternalSubtitlesAsync does. External
-    /// streams are still read afresh for every language.
+    /// filter, as FFProbeVideoInfo.AddExternalSubtitlesAsync does. The stored
+    /// external streams are read before every language. Returns whether a
+    /// subtitle was saved, so the scan adds it to the probe's streams.
     pub(crate) async fn download_missing_from_probe_locked(
         &self,
         video: &BaseItemEntity,
         options: &LibraryOptions,
         cancel: &ScanCancel,
         probed: &[MediaStreamInfoEntity],
-    ) {
+    ) -> bool {
         self.download_missing_using_streams_locked(video, options, cancel, Some(probed))
-            .await;
+            .await
     }
 
     async fn download_missing_using_streams_locked(
@@ -162,12 +171,12 @@ impl SubtitleDownloader {
         options: &LibraryOptions,
         cancel: &ScanCancel,
         probed: Option<&[MediaStreamInfoEntity]>,
-    ) {
+    ) -> bool {
         let Some(languages) = options.subtitle_download_languages.as_ref() else {
-            return;
+            return false;
         };
         if languages.is_empty() || !eligible_video(video, false) {
-            return;
+            return false;
         }
         if let Some(live_tv) = self.live_tv.as_ref().and_then(Weak::upgrade) {
             let Some(recording) = cancel
@@ -176,22 +185,22 @@ impl SubtitleDownloader {
                 )
                 .await
             else {
-                return;
+                return false;
             };
             match recording {
-                Ok(true) => return,
+                Ok(true) => return false,
                 Ok(false) => {}
                 Err(error) => {
                     tracing::warn!(item_id = %video.id, %error, "subtitle recording lookup failed");
-                    return;
+                    return false;
                 }
             }
         }
         let (Ok(item_id), Some(manager)) = (Uuid::parse_str(&video.id), self.manager.upgrade())
         else {
-            return;
+            return false;
         };
-        let mut seen = HashSet::new();
+        let (mut saved, mut seen) = (false, HashSet::new());
         for language in languages {
             let language = language.trim();
             if language.is_empty() || !seen.insert(language.to_ascii_lowercase()) {
@@ -222,9 +231,8 @@ impl SubtitleDownloader {
                 ..SubtitleSearchRequest::default()
             };
             // Only reads and network requests can be dropped on cancellation.
-            let found = cancel
-                .unless_cancelled(self.find_missing(manager.as_ref(), &request, options, probed))
-                .await;
+            let find = self.find_missing(manager.as_ref(), &request, options, probed);
+            let found = cancel.unless_cancelled(for_item(item_id, find)).await;
             let id = match found {
                 None => break,
                 Some(Ok(None)) => continue,
@@ -237,7 +245,7 @@ impl SubtitleDownloader {
             // Upstream's cancelled fetch throws into `catch (Exception)` and so
             // records a failure; a cancelled scan or task records none here.
             let Some(fetched) = cancel
-                .unless_cancelled(manager.get_remote_subtitles(&id))
+                .unless_cancelled(for_item(item_id, manager.get_remote_subtitles(&id)))
                 .await
             else {
                 break;
@@ -245,7 +253,10 @@ impl SubtitleDownloader {
             // `SubtitleManager.DownloadSubtitles`, its fetch and save apart.
             let error = match fetched {
                 Ok(response) => match manager.upload_subtitle(item_id, &response).await {
-                    Ok(()) => continue,
+                    Ok(()) => {
+                        saved = true;
+                        continue;
+                    }
                     Err(error) => {
                         tracing::warn!(%item_id, language, %error, "subtitle save failed");
                         error
@@ -263,6 +274,7 @@ impl SubtitleDownloader {
             };
             manager.report_download_failure(item_id, &id, &error).await;
         }
+        saved
     }
 
     /// The id of the first acceptable remote subtitle for the request's
@@ -283,9 +295,9 @@ impl SubtitleDownloader {
             })
             .await?;
         if let Some(probed) = probed {
-            // Preserve external rows attached since the probe began, including
-            // earlier languages in this download pass. Only the embedded
-            // eligibility snapshot replaces the filtered persisted rows.
+            // Preserve external rows a refresh recorded since the probe began.
+            // Only the embedded eligibility snapshot replaces the filtered
+            // persisted rows.
             streams.retain(|s| s.is_external);
             streams.extend(probed.iter().filter(|s| !s.is_external).cloned());
         }
@@ -650,17 +662,39 @@ mod tests {
         assert_eq!(h.provider.searches.load(Ordering::SeqCst), 0);
     }
 
+    /// A download records no stream; the refresh after it does (gl-1641).
+    /// A probe that listed the folder before the file and saves after that
+    /// refresh keeps the recorded stream, so the next pass does not download
+    /// it again, and once the file is gone it does.
     #[tokio::test]
-    async fn concurrent_downloads_and_stale_probe_do_not_duplicate_or_lose_subtitles() {
+    async fn a_stale_probe_keeps_a_recorded_download() {
         let h = harness().await;
         let cancel = ScanCancel::new();
-        tokio::join!(
-            h.downloader.download_missing(&h.video, &h.options, &cancel),
-            h.downloader.download_missing(&h.video, &h.options, &cancel)
+        assert!(
+            h.downloader
+                .download_missing(&h.video, &h.options, &cancel)
+                .await
         );
-        assert_eq!(h.provider.searches.load(Ordering::SeqCst), 1);
         assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 1);
         let id = Uuid::parse_str(&h.video.id).unwrap();
+        let all = MediaStreamQuery {
+            item_id: id,
+            stream_type: None,
+            index: None,
+        };
+        let rows = h.downloader.streams.get_media_streams(&all).await.unwrap();
+        assert!(rows.is_empty(), "the download records no stream: {rows:?}");
+        let sidecar = h.temp.path().join("Movie.eng.srt");
+        let mut recorded = stream(2, "eng");
+        recorded.stream_index = 1;
+        recorded.is_external = true;
+        recorded.codec = Some("subrip".to_owned());
+        recorded.path = Some(sidecar.to_string_lossy().into_owned());
+        h.downloader
+            .streams
+            .save_media_streams(id, &[stream(1, ""), recorded])
+            .await
+            .unwrap();
         // A probe started before the download and saw no external subtitle.
         {
             let _guard = h.downloader.lock(&cancel).await.unwrap();
@@ -669,27 +703,20 @@ mod tests {
                 .await
                 .unwrap();
         }
-        h.downloader
-            .download_missing(&h.video, &h.options, &cancel)
-            .await;
+        assert!(
+            !h.downloader
+                .download_missing(&h.video, &h.options, &cancel)
+                .await
+        );
         assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 1);
-        let rows = h
-            .downloader
-            .streams
-            .get_media_streams(&MediaStreamQuery {
-                item_id: id,
-                stream_type: None,
-                index: None,
-            })
-            .await
-            .unwrap();
+        let rows = h.downloader.streams.get_media_streams(&all).await.unwrap();
         assert_eq!(rows.len(), 2);
         let subtitle = rows.iter().find(|s| s.is_external).unwrap();
         assert_ne!(
             subtitle.stream_index,
             rows.iter().find(|s| !s.is_external).unwrap().stream_index
         );
-        std::fs::remove_file(subtitle.path.as_ref().unwrap()).unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
         {
             let _guard = h.downloader.lock(&cancel).await.unwrap();
             h.downloader
@@ -697,9 +724,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        h.downloader
-            .download_missing(&h.video, &h.options, &cancel)
-            .await;
+        assert!(
+            h.downloader
+                .download_missing(&h.video, &h.options, &cancel)
+                .await
+        );
         assert_eq!(h.provider.downloads.load(Ordering::SeqCst), 2);
     }
 

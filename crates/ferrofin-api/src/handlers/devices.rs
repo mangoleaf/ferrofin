@@ -1,8 +1,8 @@
 //! `DevicesController` — client-device registration and per-device options.
 //!
 //! Ports the elevation-gated `DevicesController` routes:
-//! - `GET /Devices` — the devices visible to a user (all when the caller is an
-//!   admin querying without a `userId`).
+//! - `GET /Devices` — the devices visible to a user (all for an administrator,
+//!   and for an API key without a `userId`).
 //! - `GET /Devices/Info` — one device's info DTO, by device id.
 //! - `GET /Devices/Options` — a device's custom-options DTO, by device id.
 //! - `POST /Devices/Options` — update a device's custom name.
@@ -77,6 +77,9 @@ struct DeleteDevicesQuery {
 /// here. Measured on the lane-3 pair as the administrator —
 /// `GET /Devices?userId=00000000-0000-0000-0000-000000000000` was `404` on
 /// Ferrofin against `200` with the caller's devices on Jellyfin 10.11.8.
+///
+/// An API key's caller is the nil id, which the manager reads as no user, as
+/// upstream's `GetDevicesForUser` tests `IsNullOrEmpty`: every device.
 #[utoipa::path(
     get,
     path = "/Devices",
@@ -206,16 +209,12 @@ async fn delete_devices(
     Query(query): Query<DeleteDevicesQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     // Comma-delimited id list (Jellyfin's `string[]` query binding).
-    let ids: Vec<&str> = query
-        .id
-        .as_deref()
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids: Vec<&str> = query.id.as_deref().map_or_default(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
 
     // Resolve every id first; a single unknown device fails the whole request
     // (C# returns `BadRequest` when `devices.Any(f => f is null)`).

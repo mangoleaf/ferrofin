@@ -10,11 +10,11 @@
 //! key is one only while a store is registered under it: `branding`,
 //! `encoding`, `network`, `metadata`, `xbmcmetadata`, `livetv` and `database`.
 //! Any other key is not found on read (`404`) and fails on save (`500`), as
-//! upstream. `branding`
-//! has a dedicated typed store; the others use per-key files at
-//! `{config}/users/named/{key}.json`, except `database`, which is SQLite and
-//! read-only. They bind through typed JsonDefaults converters before
-//! persistence and return typed documents on reads.
+//! upstream. `branding` has a dedicated typed store; the others use per-key
+//! files at `{config}/{key}.json`, as upstream's `{config}/{key}.xml`, except
+//! `database`, which is SQLite and read-only. They bind through typed
+//! JsonDefaults converters before persistence and return typed documents on
+//! reads.
 //!
 //! Every route is `[Authorize]`. The writes and
 //! `GET /System/Configuration/MetadataOptions/Default` are also
@@ -33,31 +33,37 @@ use serde_json::Value;
 use crate::auth::{RequireAdminWithDefault, RequireAuth, is_administrator_identity};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, JsonValueBody, RequiredRouteString, RouteParameter};
+use crate::handlers::branding::strip_login_buttons;
 use crate::state::AppState;
 
 /// The on-disk file backing a persisted named configuration, or `None` when
-/// `key` is not a safe single filename segment.
+/// `key` is not one Ferrofin stores in a file.
 ///
-/// `key` comes straight from the URL, so this is the path-traversal guard: only
-/// `[A-Za-z0-9_-]` is allowed (rejecting `..`, `/`, `.`), and the file lives in a
-/// dedicated `named/` subdir of the configuration directory.
+/// `key` comes straight from the URL, so this is the path-traversal guard. The
+/// file sits beside `system.json` in the configuration directory, so only the
+/// registered stores' keys are allowed: `system`, `..` or a path would name
+/// the server configuration or leave the directory.
 pub(crate) fn named_config_file(state: &AppState, key: &str) -> Option<std::path::PathBuf> {
-    if key.is_empty()
-        || !key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    let key = key.to_ascii_lowercase();
+    // The stores `normalize_named_configuration` binds, less `database`, and
+    // ferrofin-core's `named_configuration_files::FILES`: keep them in step.
+    if ![
+        "branding",
+        "encoding",
+        "network",
+        "metadata",
+        "xbmcmetadata",
+        "livetv",
+    ]
+    .contains(&key.as_str())
     {
         return None;
     }
     let dir = state
         .config
         .application_paths()
-        .user_configuration_directory_path();
-    Some(
-        std::path::Path::new(&dir)
-            .join("named")
-            .join(format!("{}.json", key.to_ascii_lowercase())),
-    )
+        .configuration_directory_path();
+    Some(std::path::Path::new(&dir).join(format!("{key}.json")))
 }
 
 /// `GET /System/Configuration` — the current server configuration.
@@ -115,7 +121,12 @@ async fn get_default_metadata_options(_auth: RequireAdminWithDefault) -> Json<Me
 ///
 /// Port of `ConfigurationController.UpdateBrandingConfiguration`: reads the
 /// current branding to preserve `SplashscreenLocation`, overlays the DTO's three
-/// editable fields, and persists.
+/// editable fields, and persists, on [`run_detached`]'s task, so a client that
+/// hangs up does not stop the synchronous action's save. The Single Sign-On
+/// sign-in buttons `GET /Branding/Configuration` served are dropped from the
+/// disclaimer first ([`strip_login_buttons`]).
+///
+/// [`run_detached`]: crate::handlers::run_detached
 #[utoipa::path(
     post,
     path = "/System/Configuration/Branding",
@@ -128,12 +139,16 @@ async fn update_branding_configuration(
     _auth: RequireAdminWithDefault,
     JsonBody(dto): JsonBody<BrandingOptionsDto>,
 ) -> Result<StatusCode, ApiError> {
-    let mut current = state.config.get_branding().await?;
-    current.login_disclaimer = dto.login_disclaimer;
-    current.custom_css = dto.custom_css;
-    current.splashscreen_enabled = dto.splashscreen_enabled;
-    state.config.update_branding(&current).await?;
-    run_committed_checks(&state, "branding")?;
+    crate::handlers::run_detached(async move {
+        let mut current = state.config.get_branding().await?;
+        current.login_disclaimer = dto.login_disclaimer;
+        strip_login_buttons(&mut current.login_disclaimer);
+        current.custom_css = dto.custom_css;
+        current.splashscreen_enabled = dto.splashscreen_enabled;
+        state.config.update_branding(&current).await?;
+        run_committed_checks(&state, "branding")
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -425,10 +440,16 @@ async fn update_named_configuration(
 ) -> Result<StatusCode, ApiError> {
     let body = normalize_named_configuration(&key, raw.get())?;
     if key.eq_ignore_ascii_case("branding") {
-        let branding: BrandingOptions =
+        let mut branding: BrandingOptions =
             serde_json::from_value(body).map_err(|error| configuration_error(&error))?;
-        state.config.update_branding(&branding).await?;
-        run_committed_checks(&state, &key)?;
+        // jellyfin-web's branding page saves here what it was served.
+        strip_login_buttons(&mut branding.login_disclaimer);
+        // A synchronous action upstream: a hang-up does not stop the save.
+        crate::handlers::run_detached(async move {
+            state.config.update_branding(&branding).await?;
+            run_committed_checks(&state, &key)
+        })
+        .await?;
         return Ok(StatusCode::NO_CONTENT);
     }
     // Once accepted, finish persistence and the live update even if the HTTP
@@ -562,4 +583,45 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/System/Configuration/{key}",
             get(get_named_configuration).post(update_named_configuration),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::named_config_file;
+
+    /// gl-319: the named documents sit beside `system.json`, so only the
+    /// stores Ferrofin writes to a file have one.
+    #[test]
+    fn only_a_stored_named_configuration_has_a_file() {
+        let state = crate::test_support::fake_state();
+        for key in [
+            "system",
+            "System",
+            "..",
+            "../system",
+            "users",
+            "named",
+            "database",
+            "plugin-owned",
+            "",
+        ] {
+            assert_eq!(named_config_file(&state, key), None, "{key:?}");
+        }
+        for key in [
+            "branding",
+            "encoding",
+            "network",
+            "metadata",
+            "xbmcmetadata",
+            "livetv",
+        ] {
+            let file = named_config_file(&state, &key.to_ascii_uppercase()).expect(key);
+            let expected = format!("{key}.json");
+            assert_eq!(
+                file.file_name(),
+                Some(std::ffi::OsStr::new(&expected)),
+                "{key}"
+            );
+        }
+    }
 }

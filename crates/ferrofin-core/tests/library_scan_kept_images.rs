@@ -166,8 +166,7 @@ impl Library {
             .await
             .expect("read the rows")
             .and_then(|mut links| links.remove(&movie))
-            .map(|links| links.images)
-            .unwrap_or_default();
+            .map_or_default(|links| links.images);
         rows.sort_by_key(|image| image.path.clone());
         rows
     }

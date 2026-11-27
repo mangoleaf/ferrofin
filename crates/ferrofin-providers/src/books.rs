@@ -1452,8 +1452,7 @@ pub fn read_epub_cover(path: &str) -> Option<(String, Vec<u8>)> {
     // Manifest hrefs are relative to the OPF's own directory.
     let root = Path::new(&opf_path)
         .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|p| p.to_string_lossy().into_owned());
     let entry = if root.is_empty() {
         href.clone()
     } else {
@@ -1693,8 +1692,7 @@ fn read_archive_entry_text(path: &str, wanted_lower: &str) -> Option<String> {
 fn extension_of(path: &str) -> String {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     name.rsplit_once('.')
-        .map(|(_, ext)| ext.to_ascii_lowercase())
-        .unwrap_or_default()
+        .map_or_default(|(_, ext)| ext.to_ascii_lowercase())
 }
 
 /// Splits an OPF `<dc:subject>` on the separators C# uses (`/`, `&`, `,`, `;`

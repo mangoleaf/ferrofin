@@ -47,7 +47,8 @@ use crate::item_type_lookup::stored_type_name;
 
 // The readers live in `ferrofin-db`, so the crates beside core share them.
 pub use ferrofin_db::item_data::{
-    VideoFormat, parse_data, read_data_f64, read_data_i32, read_data_string, video_format,
+    VideoFormat, is_disc_folder, parse_data, read_data_f64, read_data_i32, read_data_string,
+    video_format,
 };
 
 /// One entry of the `LinkedChildren` array (C# `LinkedChild`).
@@ -117,14 +118,13 @@ pub(crate) fn stored_physical_locations(data: Option<&str>) -> Vec<String> {
     parse_data(data)
         .get("PhysicalLocationsList")
         .and_then(Value::as_array)
-        .map(|locations| {
+        .map_or_default(|locations| {
             locations
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -161,7 +161,7 @@ pub fn read_remote_trailers(data: Option<&str>) -> Vec<(Option<String>, String)>
     parse_data(data)
         .get("RemoteTrailers")
         .and_then(Value::as_array)
-        .map(|entries| {
+        .map_or_default(|entries| {
             entries
                 .iter()
                 .filter_map(|e| {
@@ -175,7 +175,6 @@ pub fn read_remote_trailers(data: Option<&str>) -> Vec<(Option<String>, String)>
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// Merges `trailers` into a `Data` column value's `RemoteTrailers` array,
@@ -297,6 +296,76 @@ pub fn with_resolved_video_fields(stored: Option<&str>, resolved: Option<&str>) 
         };
         if !same {
             object.insert(key.to_owned(), new);
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    serde_json::to_string(&Value::Object(object)).ok()
+}
+
+/// The `Data` keys the media probe owns: `Container` (`FFProbeVideoInfo.cs:206`,
+/// `AudioFileProber.cs:138`), a video's `DefaultVideoStreamIndex` and
+/// `HasSubtitles` (`FFProbeVideoInfo.cs:268-270`), a track's `LyricFiles`
+/// (`AudioFileProber.cs:584`) and a `.strm` item's `ShortcutPath`
+/// (`ProbeProvider.FetchShortcutInfo`). Upstream's probe is a pre-refresh
+/// provider, run before a refresh's lock check (`MetadataService.cs:780-788`),
+/// and the item is saved whole after it, so a locked item's keys follow its
+/// file too. No user edits any of them. Each holds a scalar or a list: a
+/// locked row's save sets them whole with a merge patch, which would merge an
+/// object instead.
+pub const PROBE_OWNED_KEYS: [&str; 5] = [
+    "Container",
+    "DefaultVideoStreamIndex",
+    "HasSubtitles",
+    "LyricFiles",
+    "ShortcutPath",
+];
+
+/// The one [`PROBE_OWNED_KEYS`] entry a probe removes when it finds none: a
+/// track with no lyric file stores no `LyricFiles`.
+pub const PROBE_CLEARED_KEY: &str = "LyricFiles";
+
+/// `stored` as a locked row's scan save leaves it: the resolver's video
+/// fields ([`with_resolved_video_fields`]), then each of the
+/// [`PROBE_OWNED_KEYS`] `incoming` carries, as it holds it (a JSON `null`
+/// reads as absent and is stored absent). A key `incoming` does not carry is
+/// kept as stored, since a scan that could not read the stored row sends the
+/// planner's blob, which a failed probe leaves without them; except the
+/// [`PROBE_CLEARED_KEY`], whose absence is the probe's answer (a row a scan
+/// read carries its stored list unless the probe cleared it, and one it could
+/// not read loses the list only until the lyric check re-probes it). Every
+/// other key is kept.
+///
+/// `None` when that changes nothing, or either blob is not a JSON object (an
+/// empty or absent `stored` is an empty object). The SQL twin is the
+/// persistence service's `locked_data_sql`, whose changed-or-not answer this
+/// is; its text can differ (it stores no probe key as a JSON `null`).
+#[must_use]
+pub fn with_locked_scan_fields(stored: Option<&str>, incoming: Option<&str>) -> Option<String> {
+    let Value::Object(probed) = serde_json::from_str::<Value>(incoming?).ok()? else {
+        return None;
+    };
+    let resolved = with_resolved_video_fields(stored, incoming);
+    let mut object = match resolved.as_deref().or(stored).filter(|d| !d.is_empty()) {
+        None => Map::new(),
+        Some(text) => match serde_json::from_str::<Value>(text).ok()? {
+            Value::Object(map) => map,
+            _ => return None,
+        },
+    };
+    let mut changed = resolved.is_some();
+    for key in PROBE_OWNED_KEYS {
+        if key != PROBE_CLEARED_KEY && !probed.contains_key(key) {
+            continue;
+        }
+        let value = probed.get(key).filter(|value| !value.is_null());
+        if object.get(key).filter(|value| !value.is_null()) != value {
+            match value {
+                Some(value) => object.insert(key.to_owned(), value.clone()),
+                None => object.remove(key),
+            };
             changed = true;
         }
     }
@@ -490,26 +559,6 @@ pub fn video_display(data: Option<&str>) -> VideoDisplay {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     }
-}
-
-/// Whether a video's `Data` makes its path a disc rip's folder: a DVD or
-/// Blu-ray `VideoType` on a video that is no placeholder (`.disc` stub) —
-/// the case `Video.ContainingFolderPath` (`Video.cs:201-219`) and
-/// `MovieNfoSaver.GetMovieSavePaths` treat the path itself as the folder.
-/// The text is read first, so a blob naming neither type is not parsed.
-#[must_use]
-pub fn is_disc_folder(data: Option<&str>) -> bool {
-    let Some(text) = data.filter(|t| t.contains("\"Dvd\"") || t.contains("\"BluRay\"")) else {
-        return false;
-    };
-    let data = parse_data(Some(text));
-    matches!(
-        read_data_string(&data, "VideoType").as_deref(),
-        Some("Dvd" | "BluRay")
-    ) && !data
-        .get("IsPlaceHolder")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
 }
 
 /// Whether `item`'s path names a directory: a folder's, or a disc rip's
@@ -932,6 +981,96 @@ pub(crate) async fn add_listed_shares_in(
     Ok(())
 }
 
+/// A playlist's owner and every share row, in share order, from the
+/// permission tables (what the `Data` copy is synced from); `None` when it
+/// has no `FerrofinPlaylists` row.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub(crate) async fn playlist_ownership(
+    db: &Database,
+    playlist: Uuid,
+) -> Result<Option<ferrofin_traits::persistence::PlaylistOwnership>, ServiceError> {
+    let playlist_db = guid_to_db(playlist);
+    let owner: Option<Option<String>> = sqlx::query_scalar(
+        r#"SELECT "OwnerUserId" FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#,
+    )
+    .bind(&playlist_db)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(db_err)?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    let shares: Vec<(String, bool)> = sqlx::query_as(
+        r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
+           WHERE "PlaylistId" = ?1 ORDER BY rowid"#,
+    )
+    .bind(&playlist_db)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(Some(ferrofin_traits::persistence::PlaylistOwnership {
+        owner: owner
+            .as_deref()
+            .and_then(|owner| Uuid::parse_str(owner).ok()),
+        shares: shares
+            .into_iter()
+            .filter_map(|(user, can_edit)| {
+                Uuid::parse_str(&user).ok().map(|user| {
+                    ferrofin_model::entities_media::PlaylistUserPermissions::new(user, can_edit)
+                })
+            })
+            .collect(),
+    }))
+}
+
+/// Merges the shares a playlist's `playlist.xml` names into its share rows,
+/// as `PlaylistMetadataService.MergeData` merges `Shares`: `file` replaces the
+/// stored rows when `replace` is set or none is stored — an empty `file`
+/// removes every share — else its entries come first and the stored shares
+/// of the users it does not name follow, each user once (`DistinctBy(s =>
+/// s.UserId)`, the first entry kept). The playlist has its
+/// `FerrofinPlaylists` row by then (the caller writes it), and `Data`
+/// follows the rows. On a connection the caller holds, normally a writer
+/// transaction.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub(crate) async fn merge_playlist_shares_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist: Uuid,
+    file: &[ferrofin_model::entities_media::PlaylistUserPermissions],
+    replace: bool,
+) -> Result<(), ServiceError> {
+    let playlist_db = guid_to_db(playlist);
+    let stored: Vec<(String, bool)> = sqlx::query_as(
+        r#"SELECT "UserId", "CanEdit" FROM "FerrofinPlaylistShares"
+           WHERE "PlaylistId" = ?1 ORDER BY rowid"#,
+    )
+    .bind(&playlist_db)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    let mut merged: Vec<(Uuid, bool)> = file.iter().map(|s| (s.user_id, s.can_edit)).collect();
+    if !replace && !stored.is_empty() {
+        merged.extend(
+            stored
+                .iter()
+                .filter_map(|(user, can_edit)| Some((Uuid::parse_str(user).ok()?, *can_edit))),
+        );
+        let mut seen = std::collections::HashSet::new();
+        merged.retain(|(user, _)| seen.insert(*user));
+    }
+    sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
+        .bind(&playlist_db)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    add_listed_shares_in(conn, &playlist_db, &merged).await?;
+    sync_container_data_in(conn, playlist).await
+}
+
 /// Folds a playlist's owner / open-access / shares permission rows into its
 /// parsed `Data` object (the `OwnerUserId` / `OpenAccess` / `Shares` keys).
 async fn sync_playlist_meta(
@@ -1092,11 +1231,14 @@ pub(crate) async fn import_membership(
     containing_folder: Option<&str>,
     keep_repeats: bool,
     map: &Map<String, Value>,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<ImportedMembership, ServiceError> {
     let mut resolved: Vec<(i64, String, i64)> = Vec::new();
     let mut dropped = 0usize;
     for child in &read_linked_children(map) {
-        let Some(child_db) = resolve_linked_child(tx, child, containing_folder).await? else {
+        let Some(child_db) =
+            resolve_linked_child(tx, child, containing_folder, virtual_paths).await?
+        else {
             tracing::debug!(
                 item_id = %container_db.to_ascii_lowercase(),
                 child_id = child.item_id.as_deref(),
@@ -1156,12 +1298,13 @@ pub(crate) async fn resolve_linked_child(
     tx: &mut sqlx::SqliteConnection,
     child: &LinkedChildJson,
     containing_folder: Option<&str>,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<Option<String>, ServiceError> {
     if let Some(id) = live_item(tx, child.item_id.as_deref()).await? {
         return Ok(Some(id));
     }
     if let Some(path) = child.path.as_deref().filter(|p| !p.is_empty()) {
-        if let Some(id) = item_by_path(tx, path).await? {
+        if let Some(id) = item_by_path(tx, path, virtual_paths).await? {
             return Ok(Some(id));
         }
         let rooted = matches!(
@@ -1175,7 +1318,7 @@ pub(crate) async fn resolve_linked_child(
             .and_then(|f| std::path::absolute(std::path::Path::new(f).join(path)).ok())
             .map(|p| ferrofin_util::path_helper::get_full_path(&p.to_string_lossy()));
         if let Some(absolute) = absolute
-            && let Some(id) = item_by_path(tx, &absolute.to_string_lossy()).await?
+            && let Some(id) = item_by_path(tx, &absolute.to_string_lossy(), virtual_paths).await?
         {
             return Ok(Some(id));
         }
@@ -1198,16 +1341,23 @@ async fn live_item(
         .map_err(db_err)
 }
 
-/// The id of an item stored at exactly `path` (the lowest id on a tie).
+/// The id of an item stored at exactly `path` (the lowest id on a tie):
+/// `FindByPath` seeks the stored form (`GetPathToSave`), which is how
+/// Jellyfin stores a row under its data or metadata directory, and the
+/// resolved one too (gl-1581).
 pub(crate) async fn item_by_path(
     tx: &mut sqlx::SqliteConnection,
     path: &str,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
 ) -> Result<Option<String>, ServiceError> {
-    sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1 ORDER BY "Id" LIMIT 1"#)
-        .bind(path)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db_err)
+    sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Path" IN (?1, ?2) ORDER BY "Id" LIMIT 1"#,
+    )
+    .bind(virtual_paths.reverse(path))
+    .bind(path)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)
 }
 
 /// Upserts a playlist's owner / open-access row and replaces its shares from
@@ -1601,6 +1751,76 @@ mod tests {
         let _ = child;
     }
 
+    /// `playlist_ownership` reads the permission rows, not a `Data` that lags
+    /// them, and is `None` for a playlist without its row; the share merge
+    /// replaces or unions (file first, each user once), its `Data` copy
+    /// following the rows.
+    #[tokio::test]
+    async fn the_saver_reads_the_rows_and_the_file_merges_into_them() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions as Share;
+        let db = test_db().await;
+        let (playlist, legacy) = (Uuid::new_v4(), Uuid::new_v4());
+        let (owner, a, b, c) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_named_item(&db, playlist, BaseItemKind::Playlist, "Mix").await;
+        seed_named_item(&db, legacy, BaseItemKind::Playlist, "Old").await;
+        assert_eq!(playlist_ownership(&db, legacy).await.expect("read"), None);
+        seed_playlist_owner(&db, playlist, owner).await;
+        let merge = |file: Vec<Share>, replace: bool| {
+            let db = db.clone();
+            async move {
+                let mut tx = db.writer().begin().await.expect("tx");
+                merge_playlist_shares_in(&mut tx, playlist, &file, replace)
+                    .await
+                    .expect("merge");
+                tx.commit().await.expect("commit");
+            }
+        };
+        merge(vec![Share::new(a, true), Share::new(b, false)], false).await;
+        // A `Data` that fell behind the rows is not what the saver writes.
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = '{"Shares":[]}' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(playlist))
+            .execute(db.writer())
+            .await
+            .expect("lag");
+        let read = playlist_ownership(&db, playlist)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(read.owner, Some(owner));
+        assert_eq!(read.shares, [Share::new(a, true), Share::new(b, false)]);
+        merge(vec![Share::new(c, false), Share::new(b, true)], false).await;
+        let read = playlist_ownership(&db, playlist)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            read.shares,
+            [
+                Share::new(c, false),
+                Share::new(b, true),
+                Share::new(a, true)
+            ]
+        );
+        merge(Vec::new(), true).await;
+        let read = playlist_ownership(&db, playlist)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(read.shares, []);
+        let data: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(playlist))
+                .fetch_one(db.pool())
+                .await
+                .expect("data");
+        assert_eq!(parse_data(data.as_deref())["Shares"], serde_json::json!([]));
+    }
+
     /// An entry edit's `Data` sync that starts while a share revoke holds the
     /// writer must not write the pre-revoke `Shares` after the revoke's own
     /// sync: `Data` would then disagree with the tables, and an earlier
@@ -1723,9 +1943,16 @@ mod tests {
 
         let map = parse_data(Some(&blob));
         let mut tx = db.writer().begin().await.expect("tx");
-        import_membership(&mut tx, &guid_to_db(playlist), None, true, &map)
-            .await
-            .expect("import membership");
+        import_membership(
+            &mut tx,
+            &guid_to_db(playlist),
+            None,
+            true,
+            &map,
+            &crate::virtual_paths::VirtualPathExpander::identity(),
+        )
+        .await
+        .expect("import membership");
         import_playlist_meta(&mut tx, &guid_to_db(playlist), &map)
             .await
             .expect("import meta");

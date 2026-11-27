@@ -15,8 +15,8 @@ use ferrofin_model::entities::{ImageType, SeriesStatus, Video3DFormat};
 
 use ferrofin_providers::DirectoryService;
 use ferrofin_providers::container_types::{FileSystemMetadata, MetadataResult};
-use ferrofin_providers::xbmc::base_parser::FetchError;
 use ferrofin_providers::xbmc::base_parser::NoDirectoryService;
+use ferrofin_providers::xbmc::base_parser::{FetchError, FetchResult};
 use ferrofin_providers::xbmc::config::NfoConfiguration;
 use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
 use ferrofin_providers::xbmc::{
@@ -83,8 +83,7 @@ fn people_of(
     result
         .people
         .as_ref()
-        .map(|p| p.iter().filter(|x| x.type_ == kind).collect())
-        .unwrap_or_default()
+        .map_or_default(|p| p.iter().filter(|x| x.type_ == kind).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,4 +1083,282 @@ fn a_malformed_block_of_a_multi_episode_nfo_merges_nothing() {
     .expect("fetch succeeds");
     assert_eq!(result.item.name, None);
     assert_eq!(result.item.index_number, None);
+}
+
+// ---------------------------------------------------------------------------
+// Typed reads: `ReadElementContentAsBoolean` (`<watched>`) and
+// `ReadElementContentAsInt` (fileinfo `<width>`, `<height>`,
+// `<durationinseconds>`) throw where the other reads only skip a value.
+// ---------------------------------------------------------------------------
+
+/// Parses `xml` as a movie NFO.
+fn fetch_movie_xml(xml: &str) -> (FetchResult, MetadataResult<NfoBaseItem>) {
+    let mut result = new_result(NfoItemKind::Movie);
+    let fetched = fetch_movie(
+        &mut result,
+        "movie.nfo",
+        xml,
+        &NfoConfiguration::default(),
+        &StaticExternalIds::new(["Tmdb"]),
+        &NoDirectoryService,
+    );
+    (fetched, result)
+}
+
+/// Parses `xml` as an episode NFO.
+fn fetch_episode_xml(xml: &str) -> (FetchResult, MetadataResult<NfoBaseItem>) {
+    let mut result = new_result(NfoItemKind::Episode);
+    let fetched = fetch_episode(
+        &mut result,
+        "episode.nfo",
+        xml,
+        &NfoConfiguration::default(),
+        &StaticExternalIds::new(["Tmdb"]),
+        &NoDirectoryService,
+    );
+    (fetched, result)
+}
+
+/// Parses `xml` as a season NFO.
+fn fetch_season_xml(xml: &str) -> FetchResult {
+    fetch_season(
+        &mut new_result(NfoItemKind::Season),
+        "season.nfo",
+        xml,
+        &NfoConfiguration::default(),
+        &StaticExternalIds::new(["Tmdb"]),
+        &NoDirectoryService,
+    )
+}
+
+/// `XmlConvert.ToBoolean` takes exactly `true`, `false`, `1` or `0` after
+/// trimming XML whitespace (space, tab, CR, LF). Anything else, a child
+/// element included, is an `XmlException`. The movie parser catches it and
+/// stops: the title before `<watched>` stays, the plot after it is lost (stock
+/// 12.4 read `<watched>True</watched>` that way).
+#[rstest::rstest]
+#[case::lower_true("true", Some("After"))]
+#[case::lower_false("false", Some("After"))]
+#[case::one("1", Some("After"))]
+#[case::zero("0", Some("After"))]
+#[case::xml_whitespace_around(" \ttrue\r\n", Some("After"))]
+#[case::capital("True", None)]
+#[case::upper("FALSE", None)]
+#[case::yes("yes", None)]
+#[case::whitespace_only("  ", None)]
+#[case::no_break_space_around("\u{a0}true", None)]
+#[case::child_element("<b/>", None)]
+#[case::child_after_the_text("true<b/>", None)]
+fn movie_watched_converts_like_xml_convert(#[case] value: &str, #[case] overview: Option<&str>) {
+    let (fetched, result) = fetch_movie_xml(&format!(
+        "<movie><title>Before</title><watched>{value}</watched><plot>After</plot></movie>"
+    ));
+    assert_eq!(fetched, Ok(()), "{value:?}");
+    assert_eq!(result.item.name.as_deref(), Some("Before"), "{value:?}");
+    assert_eq!(result.item.overview.as_deref(), overview, "{value:?}");
+}
+
+/// `XmlConvert.ToInt32` is `int.Parse` with an optional sign, white space
+/// (tab to CR, and space) around it, and ASCII digits. A value that does not
+/// match is an `XmlException`: the movie keeps what came before it, the
+/// `<aspect>` of the same `<video>` included, and loses the rest.
+#[rstest::rstest]
+#[case::digits("1920", Some(1920), Some("After"))]
+#[case::plus_sign("+1920", Some(1920), Some("After"))]
+#[case::minus_sign("-5", Some(-5), Some("After"))]
+#[case::white_space_around(" \t1920\r\n", Some(1920), Some("After"))]
+#[case::letters("abc", None, None)]
+#[case::decimal_point("1920.0", None, None)]
+#[case::no_break_space_around("\u{a0}1920", None, None)]
+#[case::whitespace_only(" ", None, None)]
+#[case::bad_format_beats_overflow("99999999999x", None, None)]
+#[case::child_element("<b/>", None, None)]
+fn movie_fileinfo_width_converts_like_xml_convert(
+    #[case] value: &str,
+    #[case] width: Option<i32>,
+    #[case] overview: Option<&str>,
+) {
+    let (fetched, result) = fetch_movie_xml(&format!(
+        "<movie><title>Before</title><fileinfo><streamdetails><video>\
+         <aspect>2.35</aspect><width>{value}</width></video></streamdetails></fileinfo>\
+         <plot>After</plot></movie>"
+    ));
+    assert_eq!(fetched, Ok(()), "{value:?}");
+    assert_eq!(result.item.name.as_deref(), Some("Before"), "{value:?}");
+    assert_eq!(
+        result.item.aspect_ratio.as_deref(),
+        Some("2.35"),
+        "{value:?}"
+    );
+    assert_eq!(result.item.width, width, "{value:?}");
+    assert_eq!(result.item.overview.as_deref(), overview, "{value:?}");
+}
+
+/// `<height>` and `<durationinseconds>` read the same way.
+#[test]
+fn movie_fileinfo_height_and_duration_stop_at_a_bad_value() {
+    let (fetched, result) = fetch_movie_xml(
+        "<movie><fileinfo><streamdetails><video><height>1080</height>\
+         <durationinseconds>61</durationinseconds></video></streamdetails></fileinfo>\
+         <title>Read</title></movie>",
+    );
+    assert_eq!(fetched, Ok(()));
+    assert_eq!(result.item.height, Some(1080));
+    assert_eq!(result.item.run_time_ticks, Some(61 * TICKS_PER_SECOND));
+    assert_eq!(result.item.name.as_deref(), Some("Read"));
+
+    let (fetched, result) = fetch_movie_xml(
+        "<movie><fileinfo><streamdetails><video><height>1080</height>\
+         <durationinseconds>1h</durationinseconds></video></streamdetails></fileinfo>\
+         <title>Lost</title></movie>",
+    );
+    assert_eq!(fetched, Ok(()));
+    assert_eq!(result.item.height, Some(1080));
+    assert_eq!(result.item.run_time_ticks, None);
+    assert_eq!(result.item.name, None);
+}
+
+/// An empty element is `XmlConvert.ToXxx(string.Empty)`, a `FormatException`
+/// outside the `XmlException` wrapping, and an integer out of range is an
+/// `OverflowException`. No parser catches either, so the local provider fails
+/// and the NFO gives nothing, on the movie and episode paths too. A season is
+/// no `Video`, so `FetchFromVideoNode` reads none of its fileinfo values.
+#[rstest::rstest]
+#[case::self_closing_watched("<watched/>", Err(FetchError::InvalidValue))]
+#[case::empty_watched("<watched></watched>", Err(FetchError::InvalidValue))]
+#[case::comment_only_watched("<watched><!-- x --></watched>", Err(FetchError::InvalidValue))]
+#[case::self_closing_width(
+    "<fileinfo><streamdetails><video><width/></video></streamdetails></fileinfo>",
+    Ok(())
+)]
+#[case::empty_height(
+    "<fileinfo><streamdetails><video><height></height></video></streamdetails></fileinfo>",
+    Ok(())
+)]
+#[case::duration_overflow(
+    "<fileinfo><streamdetails><video><durationinseconds>2147483648</durationinseconds>\
+     </video></streamdetails></fileinfo>",
+    Ok(())
+)]
+#[case::width_overflow_with_white_space(
+    "<fileinfo><streamdetails><video><width> 99999999999 </width></video></streamdetails></fileinfo>",
+    Ok(())
+)]
+fn an_empty_or_overflowing_typed_value_fails_the_fetch(
+    #[case] element: &str,
+    #[case] season: FetchResult,
+) {
+    let failed = Err(FetchError::InvalidValue);
+    let (fetched, _) = fetch_movie_xml(&format!("<movie><title>Before</title>{element}</movie>"));
+    assert_eq!(fetched, failed, "movie {element}");
+    let (fetched, _) = fetch_episode_xml(&format!(
+        "<episodedetails><title>Before</title>{element}</episodedetails>"
+    ));
+    assert_eq!(fetched, failed, "episode {element}");
+    let fetched = fetch_season_xml(&format!("<season><title>Before</title>{element}</season>"));
+    assert_eq!(fetched, season, "season {element}");
+}
+
+/// `EpisodeNfoParser.Fetch` catches the `XmlException` as well: one block
+/// keeps what it read before `<watched>True</watched>`, and a bad block among
+/// several merges nothing.
+#[test]
+fn an_episode_stops_at_an_unconvertible_watched() {
+    let (fetched, result) = fetch_episode_xml(
+        "<episodedetails><title>Pilot</title><episode>2</episode>\
+         <watched>True</watched><plot>After</plot></episodedetails>",
+    );
+    assert_eq!(fetched, Ok(()));
+    assert_eq!(result.item.name.as_deref(), Some("Pilot"));
+    assert_eq!(result.item.index_number, Some(2));
+    assert_eq!(result.item.overview, None);
+
+    let (fetched, result) = fetch_episode_xml(
+        "<episodedetails><title>One</title><episode>1</episode></episodedetails>\
+         <episodedetails><title>Two</title><watched>yes</watched><episode>2</episode>\
+         </episodedetails>",
+    );
+    assert_eq!(fetched, Ok(()));
+    assert_eq!(result.item.name, None);
+    assert_eq!(result.item.index_number, None);
+}
+
+/// Several blocks are all read before any is merged, in file order, so the
+/// first bad block decides: an `XmlException` merges nothing, an uncaught
+/// error fails the fetch.
+#[rstest::rstest]
+#[case::uncaught_second("<watched>true</watched>", "<watched/>", Err(FetchError::InvalidValue))]
+#[case::xml_before_uncaught("<watched>yes</watched>", "<watched/>", Ok(()))]
+#[case::uncaught_before_xml("<watched/>", "<watched>yes</watched>", Err(FetchError::InvalidValue))]
+fn a_multi_episode_nfo_stops_at_its_first_bad_block(
+    #[case] first: &str,
+    #[case] second: &str,
+    #[case] expected: FetchResult,
+) {
+    let (fetched, result) = fetch_episode_xml(&format!(
+        "<episodedetails><title>One</title><episode>1</episode>{first}</episodedetails>\
+         <episodedetails><title>Two</title><episode>2</episode>{second}</episodedetails>"
+    ));
+    assert_eq!(fetched, expected);
+    assert_eq!(result.item.name, None);
+}
+
+/// The series parser takes the movie's path, and `album.nfo`/`artist.nfo`
+/// the plain one.
+#[test]
+fn series_and_music_nfos_stop_at_a_bad_watched() {
+    let mut result = new_result(NfoItemKind::Series);
+    let fetched = fetch_series(
+        &mut result,
+        "tvshow.nfo",
+        "<tvshow><title>Show</title><watched>yes</watched><plot>After</plot></tvshow>",
+        &NfoConfiguration::default(),
+        &StaticExternalIds::new(["Tmdb"]),
+        &NoDirectoryService,
+    );
+    assert_eq!(fetched, Ok(()));
+    assert_eq!(result.item.name.as_deref(), Some("Show"));
+    assert_eq!(result.item.overview, None);
+
+    for (watched, expected) in [
+        ("<watched>yes</watched>", FetchError::MalformedXml),
+        ("<watched/>", FetchError::InvalidValue),
+    ] {
+        let fetched = fetch_music(
+            &mut new_result(NfoItemKind::MusicAlbum),
+            "album.nfo",
+            &format!("<album><title>Kind of Blue</title>{watched}</album>"),
+            &NfoConfiguration::default(),
+            &StaticExternalIds::new(["MusicBrainzAlbum"]),
+            &NoDirectoryService,
+        );
+        assert_eq!(fetched, Err(expected), "{watched}");
+    }
+}
+
+/// `TryReadInt` is `int.TryParse(s, InvariantCulture)`: the same grammar as
+/// `XmlConvert.ToInt32`, with no value where that throws, so the read goes on.
+#[rstest::rstest]
+#[case::digits("2", Some(2))]
+#[case::plus_sign("+2", Some(2))]
+#[case::white_space_around("\t2\r\n", Some(2))]
+#[case::no_break_space_around("\u{a0}2", None)]
+#[case::overflow("2147483648", None)]
+fn episode_numbers_parse_like_int_try_parse(#[case] value: &str, #[case] episode: Option<i32>) {
+    let (fetched, result) = fetch_episode_xml(&format!(
+        "<episodedetails><episode>{value}</episode><title>After</title></episodedetails>"
+    ));
+    assert_eq!(fetched, Ok(()));
+    assert_eq!(result.item.index_number, episode, "{value:?}");
+    assert_eq!(result.item.name.as_deref(), Some("After"), "{value:?}");
+}
+
+/// The plain `Fetch` (season, album, artist) catches nothing: an
+/// unconvertible `<watched>` fails it like a syntax error does.
+#[test]
+fn a_season_with_an_unconvertible_watched_is_a_failed_fetch() {
+    let fetched = fetch_season_xml("<season><title>S1</title><watched>True</watched></season>");
+    assert_eq!(fetched, Err(FetchError::MalformedXml));
+    let fetched = fetch_season_xml("<season><title>S1</title><watched>true</watched></season>");
+    assert_eq!(fetched, Ok(()));
 }

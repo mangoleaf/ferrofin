@@ -4,8 +4,9 @@
 //! Upstream encodes an item, by-name or user image at `quality ?? 100`
 //! (v12.2 `ImageController.GetImageInternal`) and the splashscreen at a fixed
 //! 90 (`GetSplashscreen`). The served JPEG's quantization tables show which:
-//! libjpeg's scaling, which `jpeg-encoder` uses, makes every entry 1 at
-//! quality 100, and the first luminance entry 3 at quality 90.
+//! libjpeg's quality scaling (the server writes JPEGs with libjpeg-turbo, as
+//! Skia does) makes every entry 1 at quality 100, and the first luminance entry
+//! 3 at quality 90.
 
 use std::path::{Path, PathBuf};
 

@@ -96,8 +96,9 @@ tower = "0.5"
 tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 httpdate = "1.0.3"
 # zlib/gzip: the response-compression tests' decoders (the server never decodes
-# a response it just encoded), gzipped Live TV guides (ferrofin-livetv), and a
-# PDF's compressed cross-reference and object streams (ferrofin-providers books).
+# a response it just encoded), gzipped Live TV guides (ferrofin-livetv), a
+# PDF's compressed cross-reference and object streams (ferrofin-providers books),
+# and a PNG photo's compressed text chunks (ferrofin-drawing).
 flate2 = "1.1.11"
 zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-core, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
@@ -178,6 +179,11 @@ ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-
 # The system's trusted roots for an LDAP-Auth TLS configuration Ferrofin builds
 # itself (a client certificate, or the default checks): what ldap3 reads too.
 rustls-native-certs = "0.8.5"
+# The Single Sign-On extension's OpenID Connect client. No default features: they
+# bring a second reqwest (0.12) with ring, which deny.toml bans; its HTTP goes
+# through the extension's own adapter over the reqwest above. It needs rsa 0.9
+# (RUSTSEC-2023-0071, ignored in deny.toml with its reason).
+openidconnect = { version = "4.1.0", default-features = false, features = ["timing-resistant-secret-traits"] }
 # A certificate's validity period, for LDAP-Auth's check of a server certificate
 # given as its own root CA (already built for ldap3 and p12-keystore).
 x509-parser = "0.18.1"
@@ -225,7 +231,7 @@ wat = "1.263.0"            # dev-only in practice: inline-WAT test fixtures (no 
 
 # ── domain helpers ─────────────────────────────────────────────────
 uuid = { version = "1.29.2", features = ["v4", "serde"] }
-url = "2.5.8"
+url = "2.5.9"
 # Unmaintained (RUSTSEC-2026-0543, no fixed release): gl-1860 replaces it, then drops that
 # advisory from deny.toml's ignores.
 chrono = { version = "0.4", features = ["serde"] }
@@ -251,9 +257,11 @@ sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "ico"] }
 kamadak-exif = "0.6.2"                                      # photo EXIF (ferrofin-drawing PhotoProvider)
 webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via libwebp (BSD-3) — image-webp is lossless-only; Skia parity needs Google's encoder
-jpeg-encoder = "0.7"     # JPEG encode with 4:2:0 chroma subsampling — the `image` crate's encoder is hardcoded 4:4:4; Skia's SkJpegEncoder defaults to 4:2:0
+turbojpeg = { version = "1.5.1", default-features = false, features = ["cmake", "require-simd"] }  # JPEG encode with libjpeg-turbo, the codec inside Skia: built from the vendored source with cmake and linked statically (no pkg-config, no runtime library); require-simd fails the build rather than fall back to scalar code, so x86_64 needs nasm
+jpeg-encoder = "0.7"     # tests only: writes the one-scan-per-component JPEG layout split_scans reads
 jpeg-decoder = { version = "0.3.2", default-features = false }  # DCT-scaled JPEG decode (1/2, 1/4, 1/8) for blur hashes and thumbnails, like Skia's GetScaledDimensions; zune-jpeg (the `image` crate's decoder) cannot scale. In maintenance mode upstream. No rayon: without it a decode wider than 128 px runs one short-lived thread per colour component, inside the encode permits that bound concurrent decodes to the cores (a failed spawn falls back to the full decode)
 blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not byte-identical to Jellyfin's Skia)
+fast_image_resize = { version = "6.1.0", features = ["image"] }  # SIMD (SSE4.1/AVX2/NEON, picked at runtime) Lanczos3 and bilinear resampling, 8-12x the `image` crate's scalar resize for the same output
 config = { version = "0.15.27", default-features = false, features = ["toml"] }   # config.toml is TOML only
 clap = { version = "4.6.7", features = ["derive"] }
 clap_mangen = "0.3.3"      # renders the .deb man page from the clap definition (test-maintained)
@@ -280,9 +288,14 @@ icu_collections = "2.4.0"
 icu_locale_fallback = "2.4.0"
 icu_normalizer = "2.4.0"
 icu_provider = "2.4.0"
+# `Script` of each character: the script runs of upstream's `Any-Latin` sort-name step.
+icu_properties = "2.4.0"
+# CLDR's `<Script>-Latin` and `Latin-ASCII` transforms for the sort name's transliteration
+# (upstream's ICU `Any-Latin; Latin-Ascii; …`). Unstable 0.x: it moves with the ICU4X 2.4 above.
+icu_experimental = "0.7.0"
 zerovec = "0.11.9"
 fancy-regex = "0.20.1"    # for C# regexes that use lookaround
-quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
+quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers); a photo's XMP packet (ferrofin-drawing)
 # Embedded lyric tags read from the file (ID3v2 SYLT, frame order), which
 # ffprobe's tag map cannot give — the scan's port of ATL's `Track.Lyrics`.
 lofty = "0.25.5"

@@ -10,11 +10,11 @@
 
 pub mod audiodb;
 pub mod books;
-pub mod box_set_xml;
 pub mod builtin_plugins;
 pub mod cached_media_segment_provider;
 pub mod chapter_names;
 pub mod container_types;
+pub mod container_xml;
 pub mod destination;
 pub mod episode;
 pub mod error;
@@ -23,6 +23,7 @@ pub mod fanart;
 mod guarded_http;
 mod http_client;
 mod image_download;
+pub mod image_metadata;
 pub mod image_policy;
 pub mod image_save;
 pub mod library_options;
@@ -48,6 +49,7 @@ pub mod rate_limit;
 pub mod refresh_plan;
 pub mod remote_images;
 pub mod season;
+pub mod season_episodes;
 pub mod similarity;
 pub mod studios;
 #[cfg(test)]
@@ -60,8 +62,8 @@ pub use books::{BookMetadata, read_book_cover, read_book_metadata};
 pub use error::ProvidersError;
 pub use external_ids::{ExternalIdItem, external_id_infos, external_urls};
 pub use local_xml::{
-    LocalContainerXml, LocalLinkedChild, parse_container_xml, save_collection_xml,
-    save_playlist_xml,
+    LocalContainerXml, LocalLinkedChild, parse_container_xml, playlist_media_type,
+    save_collection_xml, save_playlist_xml,
 };
 pub use playlist_file::{
     decode_playlist, is_playlist_file, playlist_xml_path, read_playlist_file, write_playlist_file,
@@ -74,7 +76,7 @@ pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
 pub use image_download::{
     ArtworkDownload, ArtworkDownloadFailure, DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
-    IMAGE_NEGATIVE_CACHE_TTL_SECS, sniff_image_ext,
+    IMAGE_NEGATIVE_CACHE_TTL_SECS, download_artwork, sniff_image_ext,
 };
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{
@@ -82,9 +84,7 @@ pub use musicbrainz::{
     ReleaseArtistCredit, ReleaseHit,
 };
 pub use omdb::{OmdbClient, OmdbItem, OmdbKind, OmdbPersonKind, OmdbSearchHit, OmdbSearchKey};
-pub use similarity::{
-    ListenBrainzSimilarArtistProvider, TMDB_SIMILAR_CACHE_DAYS, TmdbSimilarProvider,
-};
+pub use similarity::{ListenBrainzSimilarArtistProvider, TmdbSimilarProvider};
 pub use studios::StudiosClient;
 pub use tmdb::{
     EpisodeDetails, RemoteImage, SeasonDetails, TmdbClient, TmdbCollection, TmdbCollectionHit,

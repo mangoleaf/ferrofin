@@ -276,6 +276,7 @@ impl FerrofinMediaSourceManager {
                 )
                 .await?;
         }
+        resolve_symlink_paths(&mut sources, enable_path_substitution).await;
         // `preferredId`: the first static source's id when it is a `Guid` —
         // the queried version's own file — else the item's id
         // (`MediaSourceManager.cs:232-234`).
@@ -360,6 +361,17 @@ impl FerrofinMediaSourceManager {
         // alternate (or a part) by its own id defaults to that file, and a
         // version's sources list the whole group.
         let item_id = Uuid::parse_str(&item.id).unwrap_or(item_id);
+        // `item is not IHasMediaSources`: a container or a by-name item a
+        // client asked to play has no sources, and upstream refuses it with an
+        // `ArgumentException`, a 400 (`MediaSourceManager.cs:387-393`).
+        if !crate::item_type_lookup::kind_from_type_name(&item.type_)
+            .is_some_and(crate::kinds::implements_has_media_sources)
+        {
+            let type_name = item.type_.rsplit('.').next().unwrap_or_default();
+            return Err(ServiceError::invalid_input(format!(
+                "{type_name} {item_id} has no media sources and cannot be played."
+            )));
+        }
         let versions = crate::video_versions::VersionRows::load(
             &crate::video_versions::RepositoryVersionReader(self.items.as_ref()),
             &[item],
@@ -1330,6 +1342,38 @@ fn estimated_video_bitrate(width: i32) -> Option<i32> {
         w if w >= 1200 => Some(8_000_000),
         w if w >= 700 => Some(2_000_000),
         _ => None,
+    }
+}
+
+/// `GetPlaybackMediaSources`' `ResolveSymlinkPaths`: without path substitution, a
+/// file source whose path is a link to an existing file is read from the link's
+/// final target (`FileSystemHelper.ResolveLinkTarget(path, returnFinalTarget: true)`).
+async fn resolve_symlink_paths(sources: &mut [MediaSourceInfo], enable_path_substitution: bool) {
+    if enable_path_substitution {
+        return;
+    }
+    for source in sources {
+        let Some(path) = source.path.as_deref() else {
+            continue;
+        };
+        if source.protocol != MediaProtocol::File
+            || !tokio::fs::symlink_metadata(path)
+                .await
+                .is_ok_and(|meta| meta.is_symlink())
+        {
+            continue;
+        }
+        // shortcut: canonicalize also resolves linked parent directories and `..`,
+        // which upstream's FullName keeps; only an ffmpeg input path differs, so
+        // port the link walk if a caller ever shows the path.
+        if let Ok(target) = tokio::fs::canonicalize(path).await
+            && tokio::fs::metadata(&target)
+                .await
+                .is_ok_and(|meta| meta.is_file())
+            && let Ok(target) = target.into_os_string().into_string()
+        {
+            source.path = Some(target);
+        }
     }
 }
 
@@ -2982,6 +3026,50 @@ mod tests {
         assert_eq!(probed.lock().unwrap().len(), 3, "its stream is present");
     }
 
+    /// `ResolveSymlinkPaths`: playback sources read without path substitution
+    /// follow a file link to its final target; with substitution, a link to a
+    /// directory, a dangling link or a loop, the path stays as stored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn playback_without_path_substitution_reads_a_linked_file_from_its_target() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let real = tmp.path().join("real.mkv");
+        std::fs::write(&real, b"x").unwrap();
+        let linked = |name: &str, target: &std::path::Path| {
+            let link = tmp.path().join(name);
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            link.to_str().unwrap().to_owned()
+        };
+        let hop = linked("hop.mkv", &real);
+        let chain = linked("chain.mkv", std::path::Path::new(&hop));
+        let folder = linked("folder.mkv", tmp.path());
+        let dangling = linked("dangling.mkv", &tmp.path().join("gone.mkv"));
+        let looped = linked("loop-a.mkv", &tmp.path().join("loop-b.mkv"));
+        linked("loop-b.mkv", std::path::Path::new(&looped));
+        let target = std::fs::canonicalize(&real).unwrap();
+        let mgr = manager(&db);
+        let user = Uuid::from_u128(0x2FF);
+        for (n, path, resolved) in [
+            (0x221, &chain, target.to_str().unwrap()),
+            (0x222, &folder, folder.as_str()),
+            (0x223, &dangling, dangling.as_str()),
+            (0x224, &looped, looped.as_str()),
+        ] {
+            let id = Uuid::from_u128(n);
+            seed_strm(&db, id, path, "{}").await;
+            let sources = |substitute| mgr.get_playback_media_sources(id, user, false, substitute);
+            assert_eq!(
+                sources(false).await.unwrap()[0].path.as_deref(),
+                Some(resolved)
+            );
+            assert_eq!(
+                sources(true).await.unwrap()[0].path.as_deref(),
+                Some(path.as_str())
+            );
+        }
+    }
+
     /// The tuner URL every fake channel plays.
     const FAKE_TUNER_URL: &str = "http://tuner/live.ts";
 
@@ -3274,15 +3362,13 @@ mod tests {
         use ferrofin_model::entities::{MediaStreamType, Video3DFormat, VideoType};
         let src = |name: &str, width: Option<i32>| MediaSourceInfo {
             id: Some(name.to_owned()),
-            media_streams: width
-                .map(|w| {
-                    vec![ferrofin_model::entities_media::MediaStream {
-                        stream_type: MediaStreamType::Video,
-                        width: Some(w),
-                        ..Default::default()
-                    }]
-                })
-                .unwrap_or_default(),
+            media_streams: width.map_or_default(|w| {
+                vec![ferrofin_model::entities_media::MediaStream {
+                    stream_type: MediaStreamType::Video,
+                    width: Some(w),
+                    ..Default::default()
+                }]
+            }),
             ..MediaSourceInfo::default()
         };
         // The real HDHomeRun append order, and the widths GetMediaSource gives
@@ -4072,6 +4158,66 @@ mod tests {
             .await
             .expect("sources");
         assert!(sources.is_empty(), "{sources:?}");
+    }
+
+    /// `GetStaticMediaSources` refuses an item that is not `IHasMediaSources`
+    /// with an `ArgumentException`, a 400 (`MediaSourceManager.cs:387-393`),
+    /// on every path that reads it: a container, a by-name item, a photo, a
+    /// book or a programme gets no source made up from its row. A stock
+    /// Jellyfin 12.4 answered 400 for each of the containers and by-name
+    /// kinds here, through PlaybackInfo, the static stream and attachments.
+    #[tokio::test]
+    async fn an_item_that_cannot_have_media_sources_is_refused() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let refused = [
+            BaseItemKind::Series,
+            BaseItemKind::Season,
+            BaseItemKind::MusicAlbum,
+            BaseItemKind::BoxSet,
+            BaseItemKind::CollectionFolder,
+            BaseItemKind::Folder,
+            BaseItemKind::Genre,
+            BaseItemKind::MusicGenre,
+            BaseItemKind::MusicArtist,
+            BaseItemKind::Person,
+            BaseItemKind::Studio,
+            BaseItemKind::Year,
+            BaseItemKind::Photo,
+            BaseItemKind::Book,
+            BaseItemKind::LiveTvProgram,
+        ];
+        let played = [
+            BaseItemKind::Movie,
+            BaseItemKind::Episode,
+            BaseItemKind::Video,
+            BaseItemKind::MusicVideo,
+            BaseItemKind::Trailer,
+            BaseItemKind::Audio,
+            BaseItemKind::AudioBook,
+        ];
+        for (n, kind) in (0x3970_u128..).zip(refused.into_iter().chain(played)) {
+            let id = Uuid::from_u128(n);
+            seed_item(&db, id, kind).await;
+            let answers = [
+                mgr.get_static_media_sources(id, false, None).await.err(),
+                mgr.get_playback_media_sources(id, Uuid::new_v4(), false, false)
+                    .await
+                    .err(),
+                mgr.get_stream_media_source(id, None, None).await.err(),
+            ];
+            for answer in answers {
+                if refused.contains(&kind) {
+                    assert!(
+                        matches!(&answer, Some(ServiceError::InvalidInput(m))
+                            if m.ends_with(&format!("{id} has no media sources and cannot be played."))),
+                        "{kind:?}: {answer:?}"
+                    );
+                } else {
+                    assert!(answer.is_none(), "{kind:?} has a source: {answer:?}");
+                }
+            }
+        }
     }
 
     /// `OpenLiveStreamInternal` opens only through the provider the token

@@ -22,6 +22,7 @@ use std::hash::BuildHasher;
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities::ImageType;
 use ferrofin_model::entities_media::MetadataProvider;
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use uuid::Uuid;
 
 /// A person stub attached to a library item.
@@ -288,7 +289,8 @@ pub fn add_person(people: &mut Vec<PersonInfo>, mut person: PersonInfo) {
     // Check for dupes based on the combination of Name, Type and Role
     // (v12.2, jellyfin/jellyfin#17466).
     let mut existing = people.iter().position(|p| {
-        is_same_credit(p, &person) && credit_role(p).eq_ignore_ascii_case(credit_role(&person))
+        is_same_credit(p, &person)
+            && equals_ordinal_ignore_case(credit_role(p), credit_role(&person))
     });
     if existing.is_none() {
         if credit_role(&person).is_empty() {
@@ -325,7 +327,7 @@ fn credit_role(person: &PersonInfo) -> &str {
 /// GuestStar counting as one (a guest star is a promoted actor).
 fn is_same_credit(existing: &PersonInfo, person: &PersonInfo) -> bool {
     let cast = |kind: PersonKind| matches!(kind, PersonKind::Actor | PersonKind::GuestStar);
-    existing.name.eq_ignore_ascii_case(&person.name)
+    equals_ordinal_ignore_case(&existing.name, &person.name)
         && (existing.type_ == person.type_ || cast(existing.type_) && cast(person.type_))
 }
 
@@ -549,6 +551,19 @@ mod tests {
                 (PersonKind::GuestStar, Some("Villain")),
             ]
         );
+    }
+
+    /// `StringComparison.OrdinalIgnoreCase` folds the case of every letter,
+    /// not only ASCII: an accented name or role in another case is the same
+    /// credit.
+    #[test]
+    fn add_person_matches_names_and_roles_in_any_case() {
+        let mut people = vec![credit("élodie", PersonKind::Actor, Some("ève"))];
+        add_person(
+            &mut people,
+            credit("ÉLODIE", PersonKind::GuestStar, Some("ÈVE")),
+        );
+        assert_eq!(credits(&people), [(PersonKind::GuestStar, Some("ève"))]);
     }
 
     #[test]

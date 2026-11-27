@@ -228,7 +228,7 @@ impl ChapterImageExtractor {
             match result {
                 Ok(changed) => outcome.changed |= changed,
                 Err(error) => {
-                    tracing::warn!(item = %video.id, %error, "chapter image could not be extracted or stored");
+                    tracing::warn!(item_id = %video.id, %error, "chapter image could not be extracted or stored");
                     outcome.success = false;
                     break;
                 }
@@ -457,8 +457,7 @@ pub(crate) fn date_modified_ticks(date: Option<DateTime<Utc>>) -> i64 {
 fn last_write_time(path: &str) -> DateTime<Utc> {
     off_runtime(|| std::fs::metadata(path))
         .and_then(|metadata| metadata.modified())
-        .map(DateTime::<Utc>::from)
-        .unwrap_or_default()
+        .map_or_default(DateTime::<Utc>::from)
 }
 
 fn saved_images(directory: &str) -> Vec<String> {

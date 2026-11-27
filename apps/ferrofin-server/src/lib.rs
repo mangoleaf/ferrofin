@@ -25,6 +25,7 @@ pub mod config;
 mod connection_limits;
 mod encoding_options;
 mod existing_database;
+pub mod export_cmd;
 pub mod listen;
 mod log_file;
 mod log_lines;
@@ -633,6 +634,10 @@ async fn serve_once(
     // below would give it a passwordless administrator. Checked after the
     // restore, which may have just brought the database back.
     existing_database::ensure_existing_database(config).await?;
+    // Before anything but the listeners reads them, and after the restore,
+    // which may bring an earlier release's back (gl-319).
+    let named_links = ferrofin_core::named_configuration_files::move_legacy(&config.config_dir)
+        .context("could not move the named configurations out of config/users/named")?;
     // Opening/migrating the database, probing ffmpeg and probing `fpcalc` share
     // no state, and all three are dominated by waiting (SQLite I/O; five
     // `ffmpeg`/`ffprobe` spawns; one `fpcalc` spawn). Run them CONCURRENTLY —
@@ -794,6 +799,10 @@ async fn serve_once(
     // The handover: the listeners serving the startup answers serve the
     // lifetime's router from the next request on, and HTTPS starts with it.
     let app = lifetime_app(router, &wired.base_url, https_redirect(&wired));
+    // The links an earlier lifetime left for a previous release serving
+    // beside it, gone now that this one takes over; this lifetime's stay
+    // until the next.
+    ferrofin_core::named_configuration_files::remove_links(&config.config_dir, &named_links);
     serving.serve(https_listeners, &app);
     // `ready` is this lifetime's own, so this is its only `set`.
     let _ = ready.set(app);
@@ -1247,9 +1256,7 @@ impl Serving {
                                     request
                                 })
                                 .service(app);
-                            Ok::<_, std::convert::Infallible>(connection_limits::track_requests(
-                                requests, service,
-                            ))
+                            Ok::<_, !>(connection_limits::track_requests(requests, service))
                         }
                     },
                 );
@@ -1392,18 +1399,16 @@ fn listen_addresses(
     network: Option<&ferrofin_networking::NetworkManager>,
     port: u16,
 ) -> Vec<SocketAddr> {
-    let interfaces: Vec<listen::BindInterface> = network
-        .map(|network| {
-            network
-                .get_all_bind_interfaces(false)
-                .into_iter()
-                .map(|interface| listen::BindInterface {
-                    address: interface.address,
-                    index: u32::try_from(interface.index).unwrap_or(0),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let interfaces: Vec<listen::BindInterface> = network.map_or_default(|network| {
+        network
+            .get_all_bind_interfaces(false)
+            .into_iter()
+            .map(|interface| listen::BindInterface {
+                address: interface.address,
+                index: u32::try_from(interface.index).unwrap_or(0),
+            })
+            .collect()
+    });
     listen::plan_addresses(
         config.bind_addr_explicit.then_some(config.bind_addr),
         port,
@@ -2393,8 +2398,8 @@ mod tests {
     struct Upper;
     #[async_trait::async_trait]
     impl ferrofin_traits::plugins::FileTransformer for Upper {
-        async fn transform(&self, _path: &str, contents: String) -> String {
-            contents.to_uppercase()
+        async fn transform(&self, _path: &str, contents: &str) -> Option<String> {
+            Some(contents.to_uppercase())
         }
     }
 
@@ -2402,7 +2407,7 @@ mod tests {
     struct Panics;
     #[async_trait::async_trait]
     impl ferrofin_traits::plugins::FileTransformer for Panics {
-        async fn transform(&self, _path: &str, _contents: String) -> String {
+        async fn transform(&self, _path: &str, _contents: &str) -> Option<String> {
             panic!("a faulty transformation")
         }
     }
@@ -2411,8 +2416,8 @@ mod tests {
     struct Identity;
     #[async_trait::async_trait]
     impl ferrofin_traits::plugins::FileTransformer for Identity {
-        async fn transform(&self, _path: &str, contents: String) -> String {
-            contents
+        async fn transform(&self, _path: &str, _contents: &str) -> Option<String> {
+            None
         }
     }
 

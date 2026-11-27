@@ -133,6 +133,11 @@ criteria = "safe-to-deploy"
 version = "0.5.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.base16ct]]
+version = "1.0.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 1.0.0; lifted by an imported or Ferrofin audit of 1.0.0"
+
 [[exemptions.base64]]
 version = "0.23.1"
 criteria = "safe-to-deploy"
@@ -165,6 +170,11 @@ criteria = "safe-to-deploy"
 version = "6.3.1"
 criteria = "safe-to-deploy"
 notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 6.3.0, a starting exemption, and no imported audit covers 6.3.1; lifted by an imported or Ferrofin audit of 6.3.1"
+
+[[exemptions.bs58]]
+version = "0.5.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.5.1; lifted by an imported or Ferrofin audit of 0.5.1"
 
 [[exemptions.bytemuck]]
 version = "1.25.2"
@@ -256,6 +266,11 @@ version = "0.15.27"
 criteria = "safe-to-deploy"
 
 [[exemptions.const-oid]]
+version = "0.9.6"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.9.6; lifted by an imported or Ferrofin audit of 0.9.6"
+
+[[exemptions.const-oid]]
 version = "0.10.2"
 criteria = "safe-to-deploy"
 
@@ -312,6 +327,11 @@ criteria = "safe-to-deploy"
 version = "0.8.23"
 criteria = "safe-to-deploy"
 
+[[exemptions.crypto-bigint]]
+version = "0.7.11"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.7.11; lifted by an imported or Ferrofin audit of 0.7.11"
+
 [[exemptions.crypto-common]]
 version = "0.1.7"
 criteria = "safe-to-deploy"
@@ -327,6 +347,31 @@ criteria = "safe-to-deploy"
 [[exemptions.ctutils]]
 version = "0.4.8"
 criteria = "safe-to-deploy"
+
+[[exemptions.curve25519-dalek]]
+version = "5.0.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 5.0.0; lifted by an imported or Ferrofin audit of 5.0.0"
+
+[[exemptions.curve25519-dalek-derive]]
+version = "0.1.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.1.1; lifted by an imported or Ferrofin audit of 0.1.1"
+
+[[exemptions.darling]]
+version = "0.24.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.24.1; lifted by an imported or Ferrofin audit of 0.24.1"
+
+[[exemptions.darling_core]]
+version = "0.24.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.24.1; lifted by an imported or Ferrofin audit of 0.24.1"
+
+[[exemptions.darling_macro]]
+version = "0.24.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.24.1; lifted by an imported or Ferrofin audit of 0.24.1"
 
 [[exemptions.data-encoding]]
 version = "2.11.1"
@@ -368,9 +413,34 @@ criteria = "safe-to-deploy"
 version = "0.15.7"
 criteria = "safe-to-deploy"
 
+[[exemptions.dyn-clone]]
+version = "1.0.20"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 1.0.20; lifted by an imported or Ferrofin audit of 1.0.20"
+
+[[exemptions.ecdsa]]
+version = "0.17.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.17.0; lifted by an imported or Ferrofin audit of 0.17.0"
+
+[[exemptions.ed25519]]
+version = "3.0.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 3.0.0; lifted by an imported or Ferrofin audit of 3.0.0"
+
+[[exemptions.ed25519-dalek]]
+version = "3.0.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 3.0.0; lifted by an imported or Ferrofin audit of 3.0.0"
+
 [[exemptions.either]]
 version = "1.19.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.elliptic-curve]]
+version = "0.14.3"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.14.3; lifted by an imported or Ferrofin audit of 0.14.3"
 
 [[exemptions.equivalent]]
 version = "1.0.3"
@@ -389,9 +459,19 @@ version = "0.20.1"
 criteria = "safe-to-deploy"
 notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 0.20.0, a starting exemption, and no imported audit covers 0.20.1; lifted by an imported or Ferrofin audit of 0.20.1"
 
+[[exemptions.fast_image_resize]]
+version = "6.1.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-23: new to the workspace with the SIMD image resize of ferrofin-drawing (gl-1345), and no imported audit covers 6.1.0; lifted by an imported or Ferrofin audit of 6.1.0"
+
 [[exemptions.fastrand]]
 version = "2.5.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.ff]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.14.0; lifted by an imported or Ferrofin audit of 0.14.0"
 
 [[exemptions.filetime]]
 version = "0.2.29"
@@ -400,6 +480,11 @@ criteria = "safe-to-deploy"
 [[exemptions.find-msvc-tools]]
 version = "0.1.15"
 criteria = "safe-to-deploy"
+
+[[exemptions.fixed_decimal]]
+version = "0.7.3"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 0.7.3; lifted by an imported or Ferrofin audit of 0.7.3"
 
 [[exemptions.flagset]]
 version = "0.4.7"
@@ -412,6 +497,11 @@ criteria = "safe-to-deploy"
 [[exemptions.flume]]
 version = "0.12.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.form_urlencoded]]
+version = "1.2.3"
+criteria = "safe-to-deploy"
+notes = "2026-11-23: required by url 2.5.9, the RUSTSEC-2026-0592 bump (gl-1940); no imported audit covers 1.2.3 yet; lifted by an imported or Ferrofin audit of form_urlencoded 1.2.3"
 
 [[exemptions.fs_extra]]
 version = "1.3.0"
@@ -432,6 +522,11 @@ criteria = "safe-to-run"
 [[exemptions.futures-util]]
 version = "0.3.34"
 criteria = "safe-to-deploy"
+
+[[exemptions.gcd]]
+version = "2.3.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-23: new to the workspace with turbojpeg 1.5.1, the libjpeg-turbo JPEG encoder of ferrofin-drawing (gl-1346), and no imported audit covers 2.3.0; lifted by an imported or Ferrofin audit of 2.3.0"
 
 [[exemptions.generic-array]]
 version = "0.14.7"
@@ -460,6 +555,11 @@ criteria = "safe-to-deploy"
 [[exemptions.glob]]
 version = "0.3.4"
 criteria = "safe-to-deploy"
+
+[[exemptions.group]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.14.0; lifted by an imported or Ferrofin audit of 0.14.0"
 
 [[exemptions.h2]]
 version = "0.4.20"
@@ -545,9 +645,49 @@ criteria = "safe-to-deploy"
 version = "2.4.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.icu_decimal]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
+[[exemptions.icu_decimal_data]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
+[[exemptions.icu_experimental]]
+version = "0.7.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 0.7.0; lifted by an imported or Ferrofin audit of 0.7.0"
+
+[[exemptions.icu_experimental_data]]
+version = "0.7.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 0.7.0; lifted by an imported or Ferrofin audit of 0.7.0"
+
+[[exemptions.icu_list]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
+[[exemptions.icu_list_data]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
+[[exemptions.icu_locale]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
 [[exemptions.icu_locale_core]]
 version = "2.4.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.icu_locale_data]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
 
 [[exemptions.icu_locale_fallback]]
 version = "2.4.0"
@@ -564,6 +704,21 @@ criteria = "safe-to-deploy"
 [[exemptions.icu_normalizer_data]]
 version = "2.4.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.icu_pattern]]
+version = "0.5.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 0.5.1; lifted by an imported or Ferrofin audit of 0.5.1"
+
+[[exemptions.icu_plurals]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
+
+[[exemptions.icu_plurals_data]]
+version = "2.4.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: added with icu_experimental for the sort-name transliteration (gl-1582), and no imported audit covers 2.4.0; lifted by an imported or Ferrofin audit of 2.4.0"
 
 [[exemptions.icu_properties]]
 version = "2.4.0"
@@ -598,6 +753,11 @@ version = "0.2.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.indexmap]]
+version = "1.9.3"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 1.9.3; lifted by an imported or Ferrofin audit of 1.9.3"
+
+[[exemptions.indexmap]]
 version = "2.14.2"
 criteria = "safe-to-deploy"
 
@@ -630,6 +790,31 @@ version = "1.0.19"
 criteria = "safe-to-deploy"
 notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 1.0.18, a starting exemption, and no imported audit covers 1.0.19; lifted by an imported or Ferrofin audit of 1.0.19"
 
+[[exemptions.jiff]]
+version = "0.2.43"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.2.43; lifted by an imported or Ferrofin audit of 0.2.43"
+
+[[exemptions.jiff-core]]
+version = "0.1.5"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.1.5; lifted by an imported or Ferrofin audit of 0.1.5"
+
+[[exemptions.jiff-static]]
+version = "0.2.43"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.2.43; lifted by an imported or Ferrofin audit of 0.2.43"
+
+[[exemptions.jiff-tzdb]]
+version = "0.1.9"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.1.9; lifted by an imported or Ferrofin audit of 0.1.9"
+
+[[exemptions.jiff-tzdb-platform]]
+version = "0.1.3"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.1.3; lifted by an imported or Ferrofin audit of 0.1.3"
+
 [[exemptions.jni]]
 version = "0.22.4"
 criteria = "safe-to-deploy"
@@ -656,7 +841,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.jpeg-encoder]]
 version = "0.7.1"
-criteria = "safe-to-deploy"
+criteria = "safe-to-run"
 
 [[exemptions.js-sys]]
 version = "0.3.107"
@@ -713,6 +898,11 @@ criteria = "safe-to-deploy"
 [[exemptions.litemap]]
 version = "0.8.3"
 criteria = "safe-to-deploy"
+
+[[exemptions.litrs]]
+version = "1.0.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-23: new to the workspace with fast_image_resize 6.1.0 (through document-features), the SIMD image resize of ferrofin-drawing (gl-1345), and no imported audit covers 1.0.1; lifted by an imported or Ferrofin audit of 1.0.1"
 
 [[exemptions.lock_api]]
 version = "0.4.14"
@@ -800,9 +990,24 @@ notes = "2026-11-10: the v1.5.1 freeze sweep moved it from 2.2.0, a starting exe
 version = "0.4.8"
 criteria = "safe-to-deploy"
 
+[[exemptions.num-bigint-dig]]
+version = "0.8.6"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.8.6; lifted by an imported or Ferrofin audit of 0.8.6"
+
 [[exemptions.num-integer]]
 version = "0.1.47"
 criteria = "safe-to-deploy"
+
+[[exemptions.num-iter]]
+version = "0.1.46"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.1.46; lifted by an imported or Ferrofin audit of 0.1.46"
+
+[[exemptions.oauth2]]
+version = "5.0.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 5.0.0; lifted by an imported or Ferrofin audit of 5.0.0"
 
 [[exemptions.objc2-core-services]]
 version = "0.3.2"
@@ -828,6 +1033,11 @@ criteria = "safe-to-deploy"
 version = "1.70.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.openidconnect]]
+version = "4.1.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace as the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 4.1.0; lifted by an imported or Ferrofin audit of 4.1.0"
+
 [[exemptions.openssl-probe]]
 version = "0.2.2"
 criteria = "safe-to-deploy"
@@ -852,9 +1062,24 @@ criteria = "safe-to-deploy"
 version = "0.33.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.ordered-float]]
+version = "2.10.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 2.10.1; lifted by an imported or Ferrofin audit of 2.10.1"
+
 [[exemptions.p12-keystore]]
 version = "0.4.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.p256]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.14.0; lifted by an imported or Ferrofin audit of 0.14.0"
+
+[[exemptions.p384]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.14.0; lifted by an imported or Ferrofin audit of 0.14.0"
 
 [[exemptions.parking_lot]]
 version = "0.12.5"
@@ -896,6 +1121,11 @@ criteria = "safe-to-deploy"
 version = "0.2.17"
 criteria = "safe-to-deploy"
 
+[[exemptions.pkcs1]]
+version = "0.7.5"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.7.5; lifted by an imported or Ferrofin audit of 0.7.5"
+
 [[exemptions.pkcs12]]
 version = "0.2.0-rc.0"
 criteria = "safe-to-deploy"
@@ -903,6 +1133,11 @@ criteria = "safe-to-deploy"
 [[exemptions.pkcs5]]
 version = "0.8.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.pkcs8]]
+version = "0.10.2"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.10.2; lifted by an imported or Ferrofin audit of 0.10.2"
 
 [[exemptions.pkcs8]]
 version = "0.11.0"
@@ -935,6 +1170,16 @@ criteria = "safe-to-deploy"
 [[exemptions.ppv-lite86]]
 version = "0.2.21"
 criteria = "safe-to-deploy"
+
+[[exemptions.primefield]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.14.0; lifted by an imported or Ferrofin audit of 0.14.0"
+
+[[exemptions.primeorder]]
+version = "0.14.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.14.0; lifted by an imported or Ferrofin audit of 0.14.0"
 
 [[exemptions.proc-macro-crate]]
 version = "3.5.0"
@@ -989,6 +1234,11 @@ version = "6.0.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.rand]]
+version = "0.8.8"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.8.8; lifted by an imported or Ferrofin audit of 0.8.8"
+
+[[exemptions.rand]]
 version = "0.9.5"
 criteria = "safe-to-deploy"
 
@@ -1008,6 +1258,16 @@ criteria = "safe-to-run"
 version = "0.5.18"
 criteria = "safe-to-deploy"
 
+[[exemptions.ref-cast]]
+version = "1.0.27"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 1.0.27; lifted by an imported or Ferrofin audit of 1.0.27"
+
+[[exemptions.ref-cast-impl]]
+version = "1.0.27"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 1.0.27; lifted by an imported or Ferrofin audit of 1.0.27"
+
 [[exemptions.regex]]
 version = "1.13.1"
 criteria = "safe-to-deploy"
@@ -1024,6 +1284,11 @@ criteria = "safe-to-deploy"
 version = "0.13.5"
 criteria = "safe-to-deploy"
 
+[[exemptions.rfc6979]]
+version = "0.6.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.6.0; lifted by an imported or Ferrofin audit of 0.6.0"
+
 [[exemptions.ring]]
 version = "0.17.14"
 criteria = "safe-to-deploy"
@@ -1031,6 +1296,11 @@ criteria = "safe-to-deploy"
 [[exemptions.roff]]
 version = "1.1.1"
 criteria = "safe-to-run"
+
+[[exemptions.rsa]]
+version = "0.9.10"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.9.10; lifted by an imported or Ferrofin audit of 0.9.10"
 
 [[exemptions.rstest]]
 version = "0.28.0"
@@ -1100,6 +1370,11 @@ criteria = "safe-to-deploy"
 version = "0.1.30"
 criteria = "safe-to-deploy"
 
+[[exemptions.schemars]]
+version = "1.2.3"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 1.2.3; lifted by an imported or Ferrofin audit of 1.2.3"
+
 [[exemptions.scopeguard]]
 version = "1.2.0"
 criteria = "safe-to-deploy"
@@ -1107,6 +1382,11 @@ criteria = "safe-to-deploy"
 [[exemptions.scrypt]]
 version = "0.12.0"
 criteria = "safe-to-deploy"
+
+[[exemptions.sec1]]
+version = "0.8.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.8.1; lifted by an imported or Ferrofin audit of 0.8.1"
 
 [[exemptions.secrecy]]
 version = "0.10.3"
@@ -1140,6 +1420,11 @@ criteria = "safe-to-deploy"
 version = "0.1.20"
 criteria = "safe-to-deploy"
 
+[[exemptions.serde_plain]]
+version = "1.0.2"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 1.0.2; lifted by an imported or Ferrofin audit of 1.0.2"
+
 [[exemptions.serde_spanned]]
 version = "1.1.3"
 criteria = "safe-to-deploy"
@@ -1147,6 +1432,21 @@ criteria = "safe-to-deploy"
 [[exemptions.serde_urlencoded]]
 version = "0.7.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.serde_with]]
+version = "3.24.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 3.24.0; lifted by an imported or Ferrofin audit of 3.24.0"
+
+[[exemptions.serde_with_macros]]
+version = "3.24.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 3.24.0; lifted by an imported or Ferrofin audit of 3.24.0"
+
+[[exemptions.serdect]]
+version = "0.4.3"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.4.3; lifted by an imported or Ferrofin audit of 0.4.3"
 
 [[exemptions.sevenz-rust2]]
 version = "0.25.0"
@@ -1167,6 +1467,11 @@ criteria = "safe-to-deploy"
 [[exemptions.signal-hook-registry]]
 version = "1.4.8"
 criteria = "safe-to-deploy"
+
+[[exemptions.signature]]
+version = "3.0.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 3.0.0; lifted by an imported or Ferrofin audit of 3.0.0"
 
 [[exemptions.simd-adler32]]
 version = "0.3.10"
@@ -1191,6 +1496,11 @@ criteria = "safe-to-deploy"
 [[exemptions.spin]]
 version = "0.9.9"
 criteria = "safe-to-deploy"
+
+[[exemptions.spki]]
+version = "0.7.3"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.7.3; lifted by an imported or Ferrofin audit of 0.7.3"
 
 [[exemptions.spki]]
 version = "0.8.1"
@@ -1409,6 +1719,16 @@ criteria = "safe-to-deploy"
 version = "0.30.0"
 criteria = "safe-to-run"
 
+[[exemptions.turbojpeg]]
+version = "1.5.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-23: new to the workspace with the libjpeg-turbo JPEG encoder of ferrofin-drawing (gl-1346), and no imported audit covers 1.5.1; lifted by an imported or Ferrofin audit of 1.5.1"
+
+[[exemptions.turbojpeg-sys]]
+version = "1.2.0"
+criteria = "safe-to-deploy"
+notes = "2026-11-23: new to the workspace with turbojpeg 1.5.1, the libjpeg-turbo JPEG encoder of ferrofin-drawing (gl-1346); it builds the libjpeg-turbo 3.1.0 it vendors, and no imported audit covers 1.2.0; lifted by an imported or Ferrofin audit of 1.2.0"
+
 [[exemptions.typed-path]]
 version = "0.13.0"
 criteria = "safe-to-deploy"
@@ -1438,8 +1758,9 @@ version = "0.6.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.url]]
-version = "2.5.8"
+version = "2.5.9"
 criteria = "safe-to-deploy"
+notes = "2026-11-23: urgent security bump for RUSTSEC-2026-0592 (gl-1940), no imported audit covers 2.5.9 yet; lifted by an imported or Ferrofin audit of url 2.5.9"
 
 [[exemptions.utoipa]]
 version = "6.0.0"
@@ -1577,6 +1898,11 @@ criteria = "safe-to-deploy"
 [[exemptions.winnow]]
 version = "1.0.5"
 criteria = "safe-to-deploy"
+
+[[exemptions.wnaf]]
+version = "0.14.1"
+criteria = "safe-to-deploy"
+notes = "2026-11-20: new to the workspace with openidconnect 4.1.0, the Single Sign-On extension's OpenID Connect client (gl-1888), and no imported audit covers 0.14.1; lifted by an imported or Ferrofin audit of 0.14.1"
 
 [[exemptions.writeable]]
 version = "0.6.4"

@@ -33,8 +33,9 @@ use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{
-    ALTERNATE_VERSION_HIDDEN, QueryShape, TopParentTerm, append_parental_restrictions,
-    build_leaf_played_and_total_query, build_query, push_access_filter,
+    ALTERNATE_VERSION_HIDDEN, QueryShape, TopParentTerm, alternate_version_hidden,
+    append_parental_restrictions, build_leaf_played_and_total_query, build_query,
+    push_access_filter,
 };
 
 /// Re-opens a bound aggregate and lets `push` add predicates before its
@@ -257,6 +258,9 @@ pub struct FerrofinItemCountService {
     /// The `IsVisible` evaluator the count's library scope asks about
     /// playlists and box sets (see [`FerrofinItemCountService::with_visibility`]).
     visibility: crate::item_repository::VisibilitySlot,
+    /// The user-view manager the count's library scope runs `GetUserViews`
+    /// through (see [`FerrofinItemCountService::with_user_views`]).
+    user_views: crate::item_repository::UserViewsSlot,
     /// Expands a library row stored tokenised before its options are read
     /// (see [`FerrofinItemCountService::with_virtual_paths`]).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
@@ -277,6 +281,7 @@ impl FerrofinItemCountService {
             db,
             roots: None,
             visibility: crate::item_repository::VisibilitySlot::default(),
+            user_views: crate::item_repository::UserViewsSlot::default(),
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
         }
     }
@@ -304,6 +309,16 @@ impl FerrofinItemCountService {
         self
     }
 
+    /// Installs the slot the composition root binds to the server's user-view
+    /// manager, the same one the item repository holds, so a count's library
+    /// scope writes the user's views exactly when a query's does
+    /// (`AddUserToQuery`'s `GetUserViews`). Left empty, it writes none.
+    #[must_use]
+    pub fn with_user_views(mut self, slot: crate::item_repository::UserViewsSlot) -> Self {
+        self.user_views = slot;
+        self
+    }
+
     /// Injects the two root-folder ids resolved once at startup, so the
     /// played/total and whole-server leaf counts can count the
     /// `AggregateFolder`'s leaves by their roots. Both are process constants.
@@ -325,6 +340,7 @@ impl FerrofinItemCountService {
             &self.db,
             &self.virtual_paths,
             visibility.as_deref(),
+            &self.user_views,
             filter,
         )
         .await
@@ -1587,11 +1603,13 @@ fn presentation_key_groups_sql() -> &'static str {
 /// milliseconds to tens of them, while every page that does NOT hold a
 /// library-sized folder gets the 10-100× win above.
 ///
-/// Merged alternate versions (`PrimaryVersionId` set) are hidden duplicates of
-/// their primary — counting them inflated every series/season episode total
-/// after a merge-versions pass. A stacked part or local version (owned, no
-/// `ExtraType`) belongs to its owner and is no item of its own; an extra
-/// is counted (`DescendantQueryHelper.IsDistinctLibraryItem`).
+/// The leaves are v12.4's `IsCountableLeaf` through `ApplyAccessFiltering`
+/// (`GetPlayedAndTotalCountBatch`, `ItemCountService.cs:615-617`). A merged
+/// alternate version is hidden only while its primary is in the same library
+/// ([`ALTERNATE_VERSION_HIDDEN`]): one whose primary is in another library, or
+/// gone, is a leaf of its own, as the per-item path counts it. A stacked part
+/// or local version (owned, no `ExtraType`) belongs to its owner and is no
+/// item of its own; an extra is counted.
 ///
 /// `IsVirtualItem = 0` is upstream's, not an optimisation: v12.2's batch keeps
 /// only `DescendantQueryHelper.IsCountableLeaf` (`!b.IsFolder &&
@@ -1620,8 +1638,7 @@ fn folder_leaf_count_sql(extra_join: &str, extra_where: &str) -> String {
            WHERE EXISTS (SELECT 1 FROM "BaseItems" bi
                          WHERE bi."Id" = a."ItemId"
                            AND bi."IsFolder" = 0
-                           AND bi."IsVirtualItem" = 0
-                           AND bi."PrimaryVersionId" IS NULL
+                           AND bi."IsVirtualItem" = 0{ALTERNATE_VERSION_HIDDEN}
                            AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)){extra_where}
            GROUP BY a."ParentItemId""#
     )
@@ -1686,15 +1703,18 @@ macro_rules! whole_server_roots {
 /// rows as the driving side, and `whole_server_leaf_counts_seek_from_the_user`
 /// pins that shape.
 ///
-/// A leaf counts only with no owner and in the closure of one of the
-/// `whole_server_roots!`: one `AncestorIds` primary-key probe per played
-/// row, which leaves the driving side alone.
+/// A leaf counts only with no owner, unless it is a version of a primary in
+/// its own library ([`ALTERNATE_VERSION_HIDDEN`], as for any folder), and in
+/// the closure of one of the `whole_server_roots!`: one `AncestorIds`
+/// primary-key probe per played row, which leaves the driving side alone.
 const WHOLE_SERVER_PLAYED_COUNT_SQL: &str = concat!(
     whole_server_roots!(),
     r#"
    SELECT COUNT(DISTINCT bi."Id") FROM "BaseItems" bi
    JOIN "UserData" ud ON ud."ItemId" = bi."Id"
-   WHERE bi."IsFolder" = 0 AND bi."PrimaryVersionId" IS NULL
+   WHERE bi."IsFolder" = 0"#,
+    alternate_version_hidden!(),
+    r#"
      AND bi."OwnerId" IS NULL
      AND bi."IsVirtualItem" = 0 AND ud."UserId" = ? AND ud."Played" = 1
      AND EXISTS (SELECT 1 FROM "AncestorIds" anc
@@ -1702,7 +1722,8 @@ const WHOLE_SERVER_PLAYED_COUNT_SQL: &str = concat!(
 );
 
 /// The whole-server leaf count, the `AggregateFolder`'s total arm: the
-/// distinct countable leaves in the closures of the `whole_server_roots!`. It
+/// distinct countable leaves in the closures of the `whole_server_roots!`,
+/// alternate versions hidden as in [`folder_leaf_count_sql`]. It
 /// seeds `AncestorIds` by `ParentItemId` per root and tests each row as a
 /// leaf by primary key, the `EXISTS` keeping `BaseItems."IsFolder"` from
 /// driving, as in [`folder_leaf_count_sql`]; `whole_server_leaf_counts_seek_from_the_roots`
@@ -1713,9 +1734,10 @@ const WHOLE_SERVER_TOTAL_COUNT_SQL: &str = concat!(
    SELECT COUNT(DISTINCT anc."ItemId") FROM "AncestorIds" anc
    WHERE anc."ParentItemId" IN (SELECT "Id" FROM roots)
      AND EXISTS (SELECT 1 FROM "BaseItems" bi
-                 WHERE bi."Id" = anc."ItemId" AND bi."IsFolder" = 0
-                   AND bi."PrimaryVersionId" IS NULL AND bi."IsVirtualItem" = 0
-                   AND bi."OwnerId" IS NULL)"#
+                 WHERE bi."Id" = anc."ItemId" AND bi."IsFolder" = 0"#,
+    alternate_version_hidden!(),
+    r#"
+                   AND bi."IsVirtualItem" = 0 AND bi."OwnerId" IS NULL)"#
 );
 
 /// The per-clean-value count aggregate for the `ItemValues`-backed by-name kinds
@@ -1843,9 +1865,8 @@ mod tests {
         let svc = FerrofinItemCountService::new(db.clone());
         assert!(svc.get_extra_counts_batch(&[]).await.unwrap().is_empty());
         // Distinct fillers, so the list still spans two chunks once deduplicated.
-        let mut owners: Vec<Uuid> = (0..=ferrofin_db::BATCH_BIND_CHUNK)
-            .map(|_| Uuid::new_v4())
-            .collect();
+        let mut owners: Vec<Uuid> =
+            Vec::from_fn(ferrofin_db::BATCH_BIND_CHUNK + 1, |_| Uuid::new_v4());
         owners[0] = owner;
         owners[ferrofin_db::BATCH_BIND_CHUNK] = owner;
         let counts = svc.get_extra_counts_batch(&owners).await.unwrap();
@@ -4812,6 +4833,11 @@ mod tests {
             );
             assert!(
                 plan.iter()
+                    .any(|s| s.starts_with("SEARCH p ") && s.ends_with("(Id=?)")),
+                "{label} count must read an alternate's primary by id, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
                     .filter(|s| s.starts_with("SCAN "))
                     .all(|s| s == "SCAN a" || s.starts_with("SCAN json_each ")),
                 "{label} count must scan nothing but the page and the branches, got: {plan:?}"
@@ -5409,6 +5435,77 @@ mod tests {
         );
     }
 
+    /// v12.4 `GetPlayedAndTotalCountBatch` counts `IsCountableLeaf` through
+    /// `ApplyAccessFiltering` (`ItemCountService.cs:615-617`), so an alternate
+    /// version is hidden only while its primary is in the same library: one
+    /// whose primary is in another library, or gone, is a leaf of the library
+    /// it is in, for the page's folders, the `AggregateFolder` and the
+    /// per-item path alike.
+    #[tokio::test]
+    async fn a_version_whose_primary_is_elsewhere_is_a_leaf_of_its_own() {
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0xC300)).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let films = seed_roots_and_library(&db).await;
+        let four_k = Uuid::from_u128(0xC301);
+        crate::test_support::seed_folder_item(
+            &db,
+            four_k,
+            BaseItemKind::CollectionFolder,
+            "4K",
+            None,
+        )
+        .await;
+        under_user_root(&db, four_k).await;
+        let [primary, same_library, cross_library, orphan] =
+            [0xC302, 0xC303, 0xC304, 0xC305].map(Uuid::from_u128);
+        for (id, library, primary_of) in [
+            (primary, films, None),
+            (same_library, films, Some(primary)),
+            (cross_library, four_k, Some(primary)),
+            (orphan, four_k, Some(Uuid::from_u128(0xC3FF))),
+        ] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_column(&db, id, "TopParentId", Some(guid_to_db(library))).await;
+            set_column(&db, id, "PrimaryVersionId", primary_of.map(guid_to_db)).await;
+            in_library(&db, id, library).await;
+        }
+        seed_user_data(&db, user_id, cross_library, true, None).await;
+
+        let service = svc(&db).with_root_ids(ROOTS);
+        let page = service
+            .get_played_and_total_count_batch(&[films, four_k, ROOTS.aggregate], &user)
+            .await
+            .expect("played/total batch");
+        let counts = |folder| page.get(&folder).map(|c| (c.played, c.total));
+        assert_eq!(
+            counts(films),
+            Some((0, 1)),
+            "the version beside its primary is hidden"
+        );
+        assert_eq!(counts(four_k), Some((1, 2)), "the 4K copy and the orphan");
+        assert_eq!(
+            counts(ROOTS.aggregate),
+            Some((1, 3)),
+            "every library's leaves"
+        );
+
+        let filter = InternalItemsQuery {
+            recursive: true,
+            user: Some(Arc::new(user)),
+            ..Default::default()
+        };
+        let single = service
+            .get_played_and_total_count(&filter, four_k)
+            .await
+            .expect("played/total");
+        assert_eq!(
+            (single.played, single.total),
+            (1, 2),
+            "the per-item path agrees"
+        );
+    }
+
     /// The `AggregateFolder`'s played/total pair, pinned against duplicate
     /// `UserData` key rows.
     ///
@@ -5564,6 +5661,11 @@ mod tests {
                 .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
             "the whole-server played arm must reach BaseItems by id, got: {plan:?}"
         );
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH p ") && s.ends_with("(Id=?)")),
+            "an alternate's primary is read by id, got: {plan:?}"
+        );
     }
 
     /// The whole-server total arm seeds `AncestorIds` from the roots
@@ -5583,6 +5685,11 @@ mod tests {
             plan.iter().any(|s| s.starts_with("SEARCH bi ")
                 && s.ends_with("USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)")),
             "a leaf is tested by its id, got: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH p ") && s.ends_with("(Id=?)")),
+            "an alternate's primary is read by id, got: {plan:?}"
         );
         assert!(
             plan.iter()

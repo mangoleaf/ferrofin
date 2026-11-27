@@ -102,7 +102,12 @@ pub async fn consolidate_localized_user_views(
         return Ok(0);
     }
 
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let mut dropped = 0u64;
     for (view_type, group) in typed_views(&mut tx).await? {
         let folder = item_type_lookup::valid_filename(&view_type);
@@ -129,7 +134,22 @@ pub async fn consolidate_localized_user_views(
         if stale.is_empty() {
             continue;
         }
-        dropped += consolidate(&mut tx, &view_type, &path, canonical, &candidates, &stale).await?;
+        // The id comes from the resolved path; the row stores it as upstream's
+        // save does, through `ReverseVirtualPath` (`%MetadataPath%/views/…`).
+        let stored_path = Path::new(
+            crate::app_paths::FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH,
+        )
+        .join("views")
+        .join(&folder);
+        dropped += consolidate(
+            &mut tx,
+            &view_type,
+            &stored_path,
+            canonical,
+            &candidates,
+            &stale,
+        )
+        .await?;
     }
     sqlx::query(
         r#"INSERT INTO "FerrofinMeta" ("Key", "Value") VALUES (?1, '1')
@@ -378,14 +398,18 @@ async fn create_canonical_copy(
     let presentation_key = Uuid::parse_str(canonical_db)
         .map(|id| id.as_simple().to_string())
         .map_err(|e| ServiceError::backend(format!("canonical view id: {e}")))?;
-    sqlx::query(
+    sqlx::query(concat!(
         r#"INSERT INTO "BaseItems"
            ("Id", "Type", "Name", "SortName", "ForcedSortName", "Path",
             "DateCreated", "DateModified", "Data", "TopParentId",
             "PresentationUniqueKey", "IsFolder", "IsInMixedFolder", "IsLocked",
-            "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem")
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0)"#,
-    )
+            "IsMovie", "IsRepeat", "IsSeries", "IsVirtualItem", "UnratedType", "#,
+        crate::item_persistence_service::unset_columns!(),
+        r#")
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, 0, 0, 0, 0, 0, 0, ?12, "#,
+        crate::item_persistence_service::unset_values!(),
+        ")"
+    ))
     .bind(canonical_db)
     .bind(&source.type_)
     .bind(&source.name)
@@ -397,6 +421,9 @@ async fn create_canonical_copy(
     .bind(&source.data)
     .bind(&source.top_parent_id)
     .bind(&presentation_key)
+    .bind(crate::item_persistence_service::unrated_type_name(
+        crate::item_type_lookup::kind_from_type_name(&source.type_).unwrap_or(BaseItemKind::Folder),
+    ))
     .execute(&mut **tx)
     .await
     .map_err(db_err)?;
@@ -581,10 +608,11 @@ pub fn rewrite_view_preference(value: &str, stale: &[Uuid], canonical: Uuid) -> 
     touched.then(|| rewritten.join(","))
 }
 
-/// Seeds the adopted token path and historical save date for the warm-view test.
+/// Seeds the adopted token path and historical refresh and save dates for the
+/// warm-view test: Jellyfin refreshes the view once it creates it.
 #[cfg(test)]
 pub(crate) async fn seed_adopted_folder_view(db: &Database, id: Uuid) -> Result<(), sqlx::Error> {
-    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = '%MetadataPath%\views\folders', "IsFolder" = 1, "DateLastSaved" = '2024-01-01 00:00:00' WHERE "Id" = ?1"#)
+    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = '%MetadataPath%\views\folders', "IsFolder" = 1, "DateLastRefreshed" = '2024-01-01 00:00:00', "DateLastSaved" = '2024-01-01 00:00:00' WHERE "Id" = ?1"#)
         .bind(guid_to_db(id))
         .execute(db.writer())
         .await?;
@@ -846,12 +874,18 @@ mod tests {
             .expect("canonical view");
         assert_eq!(view.name.as_deref(), Some("TV en direct"));
         assert_eq!(view.forced_sort_name.as_deref(), Some("TV en direct"));
-        assert_eq!(view.path.as_deref(), Some(view_path));
+        // the id from the resolved path, the row as upstream stores it (gl-1581)
+        assert_eq!(view.path.as_deref(), Some("%MetadataPath%/views/livetv"));
         assert_eq!(view.date_created, Some(at(2024, 3, 1)));
         assert_eq!(view.data.as_deref(), Some(r#"{"ViewType":"livetv"}"#));
         assert_eq!(
             view.top_parent_id.as_deref(),
             Some(guid_to_db(canonical).as_str())
+        );
+        // Upstream's values where the view has none (gl-1580).
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, canonical).await,
+            Vec::<&str>::new()
         );
         assert!(
             fetch_item_opt(&db, stale_id).await.is_none(),

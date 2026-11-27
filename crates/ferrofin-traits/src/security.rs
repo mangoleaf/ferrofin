@@ -114,6 +114,18 @@ pub trait AuthenticationManager: Send + Sync {
     /// The default policy to apply to users newly created by this provider, if
     /// it dictates one (folding in `IHasNewUserPolicy`).
     fn new_user_policy(&self) -> Option<UserPolicy>;
+
+    /// Whether a password refused for an account this provider owns counts
+    /// toward the account's lockout (`InvalidLoginAttemptCount`). `true`, as
+    /// upstream counts every refused password. A provider that refuses every
+    /// password answers `false`: no password can be right for its accounts,
+    /// so counting would only let anyone who knows a name lock one out (D20
+    /// of the OIDC sign-in milestone). The user manager reads it for the
+    /// provider the account names, enabled or not; the login backoff paces
+    /// the caller either way.
+    fn counts_failed_passwords(&self) -> bool {
+        true
+    }
 }
 
 fn _assert_object_safe_authentication_manager(_: &dyn AuthenticationManager) {}

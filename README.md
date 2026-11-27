@@ -75,7 +75,8 @@ PRs or plugin development are welcome too if anyone wants to get involved!
 
 ## Quickstart
 
-**Docker** (the release image bundles ffmpeg and the jellyfin-web client at `/web`):
+**Docker** (the release image bundles ffmpeg and the jellyfin-web client at `/web`; it is
+published for `linux/amd64` and, from v1.6.0, `linux/arm64`):
 
 ```sh
 docker run -d --name ferrofin \
@@ -115,8 +116,8 @@ apt repository, ships a systemd unit): add the repository, then
 `apt-get install ./ferrofin_<version>_<arch>.deb` from the releases page. The full walk-through,
 including the plain release tarball, is [`docs/INSTALL.md`](docs/INSTALL.md).
 
-**From source** (needs the pinned Rust toolchain; ffmpeg is optional and its absence only
-disables transcoding):
+**From source** (needs the pinned Rust toolchain, a C compiler, cmake, and on x86-64 nasm;
+ffmpeg is optional and its absence only disables transcoding):
 
 ```sh
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
@@ -146,8 +147,9 @@ Ferrofin reads Jellyfin's database directly. Point it at a data directory contai
 **10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0, 12.3.0 or 12.4.0** `jellyfin.db` and
 on first boot it detects the database, validates its migration set (and refuses loudly rather than
 half-adopting an unexpected version), and adopts it in place: **no re-scan, no re-import**. Users,
-watch state, playlists, and Live TV configuration carry forward. A 10.11 database also loses the
-items whose files are gone (see [below](#items-whose-files-are-gone-1011-databases)). Ferrofin
+watch state, playlists, and Live TV configuration and recording schedule carry forward. A 10.11
+database also loses the items whose files are gone (see
+[below](#items-whose-files-are-gone-1011-databases)). Ferrofin
 retains the `Users.NormalizedUsername` column and unique index from Jellyfin 10.11.10/10.11.11 and
 adds them to older databases. Login, creation, and renaming use Unicode-aware invariant uppercase
 keys compatible with Jellyfin, while the original spelling remains visible. If existing usernames
@@ -175,11 +177,15 @@ support for every 10.11.x or 12.x release.
 >    separately, for example in `/etc/jellyfin` on Debian. Include any external state
 >    directories too.
 > 3. Copy Jellyfin's `data/jellyfin.db`, `data/playlists/`, `data/collections/`,
->    `root/default/`, `metadata/` and, if Jellyfin used LDAP-Auth,
->    `plugins/configurations/LDAP-Auth.xml` to the same relative paths under Ferrofin's data
->    directory, and its XML configuration into Ferrofin's config directory, **before
->    Ferrofin's first startup**. [`scripts/migrate-jellyfin.sh`](scripts/migrate-jellyfin.sh)
->    does this for the Debian layout. Keep the originals and backup intact. An existing
+>    `data/trickplay/`, `root/default/`, `metadata/`, the metadata plugins' settings
+>    (`plugins/configurations/Jellyfin.Plugin.{Tmdb,Omdb,MusicBrainz,AudioDb,StudioImages}.xml`)
+>    and those of the plugins Jellyfin used that Ferrofin has a counterpart of
+>    (`plugins/configurations/LDAP-Auth.xml`, `IntroSkipper.xml` and
+>    `Jellyfin.Plugin.{MergeVersions,FileTransformation,OpenSubtitles}.xml`) to the same
+>    relative paths under Ferrofin's data directory, and its XML configuration into
+>    Ferrofin's config directory, **before Ferrofin's first startup**.
+>    [`scripts/migrate-jellyfin.sh`](scripts/migrate-jellyfin.sh) does this for the Debian
+>    layout. Keep the originals and backup intact. An existing
 >    `ferrofin.db` or Ferrofin JSON configuration takes precedence over copied Jellyfin
 >    files.
 >
@@ -399,3 +405,10 @@ Thank you for the consideration.
 `LICENSE` is GPL-2.0, and the library `.csproj` packages that Ferrofin ports declare
 `GPL-3.0-only`. Ferrofin follows the `GPL-3.0-only` metadata of the packages it derives from.
 See [`LICENSE`](LICENSE).
+
+The server binary is built with third-party Rust crates and C libraries that keep their own
+licenses. Every artifact carries their notices in `THIRD-PARTY-NOTICES.txt`, generated from
+`Cargo.lock` by [`scripts/third-party-notices.sh`](scripts/third-party-notices.sh), beside
+[`contrib/debian/copyright`](contrib/debian/copyright): in `/usr/share/doc/ferrofin/` in the
+image and the `.deb`, and at the top of a release archive. The binary links libjpeg-turbo, so
+this software is based in part on the work of the Independent JPEG Group.

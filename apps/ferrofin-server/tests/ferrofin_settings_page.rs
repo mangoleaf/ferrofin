@@ -315,13 +315,13 @@ async fn the_settings_page_is_listed_served_without_values_and_hidden_with_its_p
     assert!(size.get("Custom").is_none(), "{size}");
     assert_eq!(quality["Value"], "quality", "{quality}");
 
-    dashboard["TrickplayOptions"]["WidthResolutions"] = serde_json::json!([480]);
+    dashboard["TrickplayOptions"]["WidthResolutions"] = serde_json::json!([480, 320]);
     dashboard["TrickplayOptions"]["Qscale"] = serde_json::json!(3);
     post("/System/Configuration", dashboard.to_string())
         .await
         .expect("dashboard save");
     let (size, quality) = trickplay_rows().await;
-    assert_eq!(size["Value"], "480", "{size}");
+    assert_eq!(size["Value"], "320, 480", "{size}");
     assert_eq!(size["Custom"], true, "{size}");
     assert_eq!(quality["Value"], "Qscale 3, 4:4:4", "{quality}");
     assert_eq!(quality["Custom"], true, "{quality}");
@@ -334,9 +334,24 @@ async fn the_settings_page_is_listed_served_without_values_and_hidden_with_its_p
     .await
     .expect("save");
     let options = trickplay_options().await;
-    assert_eq!(options["WidthResolutions"], serde_json::json!([480]));
+    assert_eq!(options["WidthResolutions"], serde_json::json!([480, 320]));
     assert_eq!(options["Qscale"], 4);
     assert!(options.get("FullChroma").is_none(), "{options}");
+
+    // gl-1247: 480 is an option of its own, stored as Jellyfin's `[480]`.
+    post(
+        "/Ferrofin/Settings",
+        r#"{"Changes":{"trickplay_preview_size":"480"}}"#.to_owned(),
+    )
+    .await
+    .expect("save");
+    assert_eq!(
+        trickplay_options().await["WidthResolutions"],
+        serde_json::json!([480])
+    );
+    let (size, _) = trickplay_rows().await;
+    assert_eq!(size["Value"], "480", "{size}");
+    assert!(size.get("Custom").is_none(), "{size}");
 
     // Disabled from the dashboard, the link, the menu entry, the page and
     // its data are gone.

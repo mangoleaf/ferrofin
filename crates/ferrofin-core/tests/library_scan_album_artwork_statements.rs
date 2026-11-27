@@ -1,10 +1,14 @@
 //! A library rescan reads its albums' stored images in one go.
 //!
-//! After the walk, the album-covers pass (`finish_album_artwork`) checks that
-//! each album the scan saw still stores the cover the walk gave it. It read
-//! each album's image rows with a statement of its own, on every scan and for
+//! After the walk, the closing passes check each album's cover: the
+//! album-covers pass did (`finish_album_artwork`), and since gl-1633 the
+//! dynamic image pass does (`MusicAlbumImageProvider`). The first read each
+//! album's image rows with a statement of its own, on every scan and for
 //! unchanged albums too: one read per album, thousands on a music library
-//! (gl-1277). It now reads them in one batched read.
+//! (gl-1277). Each pass reads them in one batched read per window. (An album
+//! with no image and no track cover is still read on its own each scan, as
+//! upstream's `HasChanged` asks its children for one; every album here has a
+//! cover.)
 //!
 //! This binary records the statements one call runs ([`sql_statements`]).
 
@@ -29,14 +33,11 @@ use ferrofin_traits::persistence::ItemRepository;
 use sql_statements::{record_statements, statements_of};
 use uuid::Uuid;
 
-/// The albums of the library.
-const ALBUMS: usize = 3;
-
-/// A music library of [`ALBUMS`] albums, each with a `cover.jpg` and two
+/// A music library of `albums` albums, each with a `cover.jpg` and two
 /// tracks, under `root`, and a scanner over it.
-async fn music_library(root: &Path) -> (LibraryScanner, Arc<dyn ItemRepository>) {
+async fn music_library(root: &Path, albums: usize) -> (LibraryScanner, Arc<dyn ItemRepository>) {
     let media = root.join("music");
-    for album in 0..ALBUMS {
+    for album in 0..albums {
         let dir = media.join("Artist").join(format!("Album {album}"));
         std::fs::create_dir_all(&dir).unwrap();
         image::RgbImage::from_pixel(4, 4, image::Rgb([40, 80, u8::try_from(album).unwrap()]))
@@ -70,7 +71,11 @@ async fn music_library(root: &Path) -> (LibraryScanner, Arc<dyn ItemRepository>)
     ));
     let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), store)
         .with_items(items.clone())
-        .with_metadata_dir(root.join("metadata"));
+        .with_metadata_dir(root.join("metadata"))
+        .with_image_processor(Arc::new(ferrofin_drawing::ImageProcessor::new(
+            Arc::new(ferrofin_drawing::ImageCrateEncoder::new()),
+            root.join("image-cache"),
+        )));
     (scanner, items)
 }
 
@@ -104,18 +109,18 @@ fn one_item_image_reads(statements: &[String]) -> usize {
         .count()
 }
 
-// A multi-thread runtime, as the server runs the scan on.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_rescan_reads_no_album_images_one_album_at_a_time() {
-    record_statements();
+/// How many statements a rescan of a library of `albums` albums runs that
+/// read one item's image rows.
+async fn rescan_one_item_image_reads(albums: usize) -> usize {
     let root = tempfile::tempdir().unwrap();
-    let (scanner, items) = music_library(root.path()).await;
+    let (scanner, items) = music_library(root.path(), albums).await;
     Box::pin(scanner.scan_all()).await.unwrap();
     let before = stored_images(items.as_ref()).await;
-    assert_eq!(before.len(), ALBUMS * 3, "the albums and their tracks");
-    assert!(
-        before.iter().all(|(_, paths)| paths.len() == 1),
-        "every album and track stores its cover: {before:#?}"
+    assert_eq!(before.len(), albums * 3, "the albums and their tracks");
+    assert_eq!(
+        before.iter().filter(|(_, paths)| paths.len() == 1).count(),
+        albums,
+        "every album stores its cover, and no track, which embeds none: {before:#?}"
     );
 
     let (rescanned, statements) = statements_of(Box::pin(scanner.scan_all())).await;
@@ -126,9 +131,18 @@ async fn a_rescan_reads_no_album_images_one_album_at_a_time() {
         before,
         "an unchanged rescan keeps every image"
     );
+    one_item_image_reads(&statements)
+}
+
+// A multi-thread runtime, as the server runs the scan on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rescan_reads_no_album_images_one_album_at_a_time() {
+    record_statements();
+    // The rescan's own reads of single rows (the root folders it refreshes
+    // at its opening) do not grow with the albums.
     assert_eq!(
-        one_item_image_reads(&statements),
-        0,
-        "no album's images are read on their own: {statements:#?}"
+        rescan_one_item_image_reads(3).await,
+        rescan_one_item_image_reads(6).await,
+        "no album's images are read on their own"
     );
 }

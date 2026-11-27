@@ -1,60 +1,60 @@
-# Shared music artwork
+# Music artwork
 
-Music-library scans resolve embedded artwork by the actual MusicAlbum item ID,
-including multi-disc descendants. Album titles are not identities: two albums
-with the same name do not share an artwork decision.
+A library scan stores the same Primary images for an album and its tracks as
+Jellyfin does.
 
-Existing album/local artwork is preferred. Otherwise the first track with a
-usable embedded image supplies the cover. Tracks without a picture or whose
-extraction fails do not prevent a later track from supplying it. The scanner
-extracts once, computes dimensions/blurhash once, and reuses the result for the
-album and tracks. The post-scan pass backfills earlier tracks without pictures.
-An album with only a backdrop can still acquire its missing Primary image.
+## Tracks
 
-## Storage and edits
+A track has a Primary image only when its own file embeds a picture
+(Jellyfin's `AudioImageProvider`). The picture whose comment names the front
+cover is taken, then one naming a cover, then the first. It is stored in the
+track's own art folder under the metadata directory, never beside the media.
 
-Shared covers are immutable files under
-`<metadata-library>/album-covers/<album-id>/<sha256>.<extension>`.
-The database still gives each track an image reference, so track and album image
-URLs remain usable. Existing per-track sidecars and uploads keep precedence;
-standalone audio retains its per-item extraction path. Existing private track
-covers are preserved rather than guessed to be disposable duplicates.
+A track without an embedded picture has no image of its own. Clients show its
+album's cover through the track's `AlbumId` and `AlbumPrimaryImageTag`, as they
+do on Jellyfin.
 
-Uploading a track image writes into its own item directory. Uploading an album
-image produces a new shared cover on the next scan, updates shared track
-references, and preserves explicit track overrides. Deleting an image removes
-its database reference without unlinking a shared cover. Shared files are a
-persistent cache and remain on disk even when no references remain: this avoids
-breaking concurrent readers/scans or other tracks, including during replacement.
-There is no automatic eviction of this shared cache.
+The picture is extracted once per album, `Album` tag and first album artist,
+as Jellyfin shares it: the other tracks with all three and a picture copy that
+file, and its dimensions and blurhash, instead of running ffmpeg again. A track
+whose `Album` tag or album artist is blank extracts its own. The album is the
+track's `MusicAlbum` item, found by id (multi-disc descendants included), never
+by title, so two albums with the same name do not share a cover. A track whose
+copy is already on disk reuses it.
+An audiobook with an embedded picture gets it the same way, extracted for
+itself.
 
-No database migration or library-directory writes are required by sharing.
-The previous fix that routes ffmpeg temporary extraction through server cache
-storage remains in place.
+## Albums
 
-## Validation and measurement
+An album with an image beside it (`folder.jpg`, `cover.jpg` and the other names
+Jellyfin's local image provider reads) names that file in place. An album with
+an uploaded or downloaded image in its own art folder keeps it.
 
-Compared the exact parent `91676c72` with this implementation using separately
-built debug servers, fresh disposable databases, and the same 12 one-second FLAC
-tracks containing an identical 128×128 JPEG. Remote metadata was disabled. Three
-alternating runs per build used `POST /Library/Refresh`, the server's scan elapsed
-log field, and then an unchanged rescan. Every album and track Primary image URL
-returned HTTP 200 with image data.
+An album with neither takes a copy of its first track's cover (files before
+folders, then by sort name) in its own art folder (Jellyfin's
+`MusicAlbumImageProvider`). The copy is made by the scan's closing dynamic image
+pass, whatever "Save artwork into media folders" says: nothing is written into
+the album's media folder. It is not drawn again when its file's date changes,
+only on a refresh that runs every provider, and an image that is not the
+album's own (a `folder.jpg` beside it) is never replaced.
 
-| Metric | Parent | Shared artwork |
-| --- | --- | --- |
-| First scan median (range), ms | 1167 (1153–1171) | 802 (792–811) |
-| Unchanged rescan median (range), ms | 313 (311–342) | 320 (320–322) |
-| Distinct album/track cover files | 12 | 1 |
-| Cover bytes | 3828 | 319 |
-| Album/track image references | 13 | 13 |
+Uploading an image to a track or an album stores it as that item's own image.
+An album's upload leaves its tracks' covers alone.
 
-This small local fixture measures extraction/storage work, not production scan
-throughput or remote-provider latency. First scans were about 31% faster;
-unchanged rescans were comparable, with a 7 ms higher median in this sample.
+## Rows earlier builds stored
 
-The regression test covers multi-disc ownership, early tracks without embedded
-pictures, one extraction per album, dimensions/blurhash, rescans, shared-file
-survival after deleting a reference, track uploads, and album replacements.
-Strict all-targets/all-features Clippy passes for core and providers. Their test
-suites pass with 92.99% and 91.40% line coverage respectively.
+Earlier builds stored every album's cover as a shared copy in
+`<metadata-library>/album-covers/<album-id>/<sha256>.<extension>`, and named
+that copy as the album's Primary and as every track's, with or without an
+embedded picture. No build writes there any more.
+
+The next library scan replaces each such row with the image the item gets
+above: a track without a picture loses its Primary, a track with one gets its
+own copy, and an album names its `folder.jpg` or takes its copy. No migration
+or one-shot repair is needed. A previous version still running beside the new
+one during a rolling update may write such rows again; the new version's next
+scan replaces them again. A locked album or track keeps such a row, as its lock
+keeps the stored row (and refuses an album's copy).
+
+The files in `album-covers/` stay on disk. Deleting an image never removes one,
+as an album's rows not yet scanned again may still name it.

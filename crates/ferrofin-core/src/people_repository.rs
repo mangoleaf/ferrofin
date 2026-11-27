@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use async_trait::async_trait;
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::PeopleEntity;
-use ferrofin_db::store::{guid_to_db, opt_datetime_to_db};
+use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::querying::QueryResult;
 use sqlx::QueryBuilder;
@@ -72,14 +72,30 @@ const PERSON_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Person";
 
 /// A `Person` item insert up to its `VALUES` list, whose rows are
 /// [`PERSON_ITEM_ROW`]s. `INSERT OR IGNORE`: an id already stored keeps its row.
-const PERSON_ITEM_INSERT: &str = r#"INSERT OR IGNORE INTO "BaseItems"
+const PERSON_ITEM_INSERT: &str = concat!(
+    r#"INSERT OR IGNORE INTO "BaseItems"
     ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
+     "DateCreated","DateModified","DateLastSaved",
      "IsFolder","IsInMixedFolder",
-     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-    VALUES "#;
+     "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem","UnratedType","#,
+    crate::item_persistence_service::unset_columns!(),
+    r#")
+    VALUES "#
+);
 
-/// One `Person` item's `VALUES` row: `Id` … `Path` bound, the flags 0.
-const PERSON_ITEM_ROW: &str = "(?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0)";
+/// One `Person` item's `VALUES` row: `Id` … `Path` bound, the three dates bound
+/// (the creation time each: `GetOrCreatePerson` sets `DateCreated` and
+/// `DateModified`, and `SavePeopleMetadataAsync` stamps `DateLastSaved` before
+/// it saves, `LibraryManager.cs:1240-1264,3932`; nothing refreshes a person
+/// there, so `DateLastRefreshed` stays NULL until the people task's refresh,
+/// whose save clears `DateModified`), the flags 0, then what upstream
+/// writes for the columns a person has no value for. A `Person`'s `UnratedType`
+/// is `Other` (`BaseItem.GetBlockUnratedType`, which it does not override).
+const PERSON_ITEM_ROW: &str = concat!(
+    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 'Other', ",
+    crate::item_persistence_service::unset_values!(),
+    ")"
+);
 
 /// The columns a `Peoples` insert writes, in bind order.
 const PEOPLES_COLUMNS: &str = r#""Id", "Name", "PersonType""#;
@@ -224,6 +240,9 @@ pub struct FerrofinPeopleRepository {
     /// ([`item_type_lookup::person_item_id`]). `None` (unit tests) falls back
     /// to per-(name, type) `Peoples` row ids — the pre-unification behavior.
     identity: Option<(item_type_lookup::IdDerivation, String)>,
+    /// How a person row's `Path` is stored (`ReverseVirtualPath`): the
+    /// identity (unit tests) stores it as derived.
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinPeopleRepository {
@@ -237,7 +256,22 @@ impl FerrofinPeopleRepository {
     /// Creates a people repository over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db, identity: None }
+        Self {
+            db,
+            identity: None,
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+        }
+    }
+
+    /// Wires the virtual-path tokens a person row's `Path` is stored with
+    /// (`%MetadataPath%/People/…`, as upstream's mapper writes it).
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// Wires the id derivation + People metadata path, so person by-name items
@@ -426,6 +460,15 @@ impl FerrofinPeopleRepository {
         Some(item_type_lookup::person_path(people_path, name))
     }
 
+    /// [`Self::person_metadata_path`] as the row stores it: through
+    /// `ReverseVirtualPath`, so `%MetadataPath%/People/…` as upstream's mapper
+    /// writes it (`BaseItemMapper.Map` → `GetPathToSave`). The id stays derived
+    /// from the resolved path, as upstream derives it before the save.
+    fn person_stored_path(&self, name: &str) -> Option<String> {
+        self.person_metadata_path(name)
+            .map(|path| self.virtual_paths.reverse(&path))
+    }
+
     /// Every id `name`'s credit may have an item under: the current derivation
     /// first, then the older one the write path keeps. Empty when the identity
     /// seam is unwired.
@@ -510,7 +553,13 @@ impl FerrofinPeopleRepository {
         }
         let mut created = 0;
         for name in names {
-            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            // Reads before it writes: lock first (see `Database::writer`).
+            let mut tx = self
+                .db
+                .writer()
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(db_err)?;
             let item_id = self.person_item_id_for_write(&mut tx, name, "").await?;
             let inserted = self
                 .insert_person_item(&mut tx, PERSON_TYPE_NAME, name, &item_id)
@@ -550,11 +599,18 @@ impl FerrofinPeopleRepository {
                 // `PresentationUniqueKey` too — `Person-{Name}` with the
                 // diacritics removed, exactly as Jellyfin writes it. This
                 // insert bypasses `upsert_item`, so nothing else would set it.
-                r#"INSERT OR IGNORE INTO "BaseItems"
+                concat!(
+                    r#"INSERT OR IGNORE INTO "BaseItems"
                    ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
+                    "DateCreated","DateModified","DateLastSaved",
                     "IsFolder","IsInMixedFolder",
-                    "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
-                   VALUES (?1,?2,?3,?4,?5,?6,?7,0,0,0,0,0,0,0)"#,
+                    "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem","UnratedType","#,
+                    crate::item_persistence_service::unset_columns!(),
+                    r#")
+                   VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?8,0,0,0,0,0,0,0,'Other',"#,
+                    crate::item_persistence_service::unset_values!(),
+                    ")"
+                ),
             )
             .bind(target)
             .bind(person_type)
@@ -563,6 +619,7 @@ impl FerrofinPeopleRepository {
             .bind(person_sort_name(name))
             .bind(person_presentation_key(target, name))
             .bind(path)
+            .bind(datetime_to_db(chrono::Utc::now()))
             .execute(&mut **tx)
             .await
             .map_err(db_err)?;
@@ -575,8 +632,8 @@ impl FerrofinPeopleRepository {
                     (SELECT "PremiereDate" FROM "BaseItems" WHERE "Id" = ?1)),
                  "EndDate" = COALESCE("EndDate",
                     (SELECT "EndDate" FROM "BaseItems" WHERE "Id" = ?1)),
-                 "ProductionLocations" = COALESCE("ProductionLocations",
-                    (SELECT "ProductionLocations" FROM "BaseItems" WHERE "Id" = ?1))
+                 "ProductionLocations" = COALESCE(NULLIF("ProductionLocations", ''),
+                    (SELECT NULLIF("ProductionLocations", '') FROM "BaseItems" WHERE "Id" = ?1), '')
                WHERE "Id" = ?2"#,
         )
         .bind(old_id)
@@ -646,7 +703,13 @@ impl FerrofinPeopleRepository {
         .await
         .map_err(db_err)?;
 
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         let mut collapsed: u64 = 0;
         let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (old_id, name) in rows {
@@ -663,7 +726,7 @@ impl FerrofinPeopleRepository {
             // The target row must exist BEFORE any child rows repoint at it
             // (FK BaseItems.Id) — collapse_person_row handles the ordering.
             let create_target = seen_targets.insert(target.clone());
-            let path = self.person_metadata_path(name);
+            let path = self.person_stored_path(name);
             Self::collapse_person_row(
                 &mut tx,
                 person_type,
@@ -707,6 +770,7 @@ impl FerrofinPeopleRepository {
         name: &str,
         item_id: &str,
     ) -> Result<bool, ServiceError> {
+        let now = datetime_to_db(chrono::Utc::now());
         let inserted = sqlx::query(sqlx::AssertSqlSafe(format!(
             "{PERSON_ITEM_INSERT}{PERSON_ITEM_ROW}"
         )))
@@ -716,7 +780,10 @@ impl FerrofinPeopleRepository {
         .bind(crate::text_util::get_clean_value(name))
         .bind(person_sort_name(name))
         .bind(person_presentation_key(item_id, name))
-        .bind(self.person_metadata_path(name))
+        .bind(self.person_stored_path(name))
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
         .execute(&mut **tx)
         .await
         .map_err(db_err)?
@@ -783,6 +850,7 @@ impl FerrofinPeopleRepository {
         }
         if let Some(type_name) = type_name {
             let columns = PERSON_ITEM_ROW.matches('?').count();
+            let now = datetime_to_db(chrono::Utc::now());
             for chunk in
                 ferrofin_db::power_of_two_chunks(&created, ferrofin_db::BATCH_BIND_CHUNK / columns)
             {
@@ -799,7 +867,10 @@ impl FerrofinPeopleRepository {
                         .bind(clean)
                         .bind(person_sort_name(name))
                         .bind(person_presentation_key(id, name))
-                        .bind(self.person_metadata_path(name));
+                        .bind(self.person_stored_path(name))
+                        .bind(&now)
+                        .bind(&now)
+                        .bind(&now);
                 }
                 query.execute(&mut **tx).await.map_err(db_err)?;
             }
@@ -865,7 +936,7 @@ impl FerrofinPeopleRepository {
                 continue;
             };
             let want_sort = person_sort_name(name);
-            let want_path = self.person_metadata_path(name);
+            let want_path = self.person_stored_path(name);
             let new_path = want_path.filter(|_| path.is_none());
             // `ForcedSortName` wins over the derived name — see the doc above.
             let new_sort = forced
@@ -899,8 +970,9 @@ impl FerrofinPeopleRepository {
         }
         tx.commit().await.map_err(db_err)?;
         for (_, _, path) in &pending {
-            if let Some(path) = path
-                && let Err(e) = tokio::fs::create_dir_all(path).await
+            // the row stores the token; the directory is made where it points
+            if let Some(path) = path.as_deref().map(|path| self.virtual_paths.expand(path))
+                && let Err(e) = tokio::fs::create_dir_all(&path).await
             {
                 tracing::debug!(%path, error = %e, "could not create person metadata directory");
             }
@@ -953,7 +1025,7 @@ fn person_key(person: &PeopleEntity) -> (String, String) {
 
 /// A credit's role as `UpdatePeople` stores it: trimmed, `""` when missing.
 fn credit_role(person: &PeopleEntity) -> &str {
-    person.role.as_deref().map(str::trim).unwrap_or_default()
+    person.role.as_deref().map_or_default(str::trim)
 }
 
 /// A credit's identity: its person key (see `person_key`) and lower-cased
@@ -2092,9 +2164,10 @@ impl PeopleRepository for FerrofinPeopleRepository {
         metadata: PersonMetadata,
     ) -> Result<(), ServiceError> {
         sqlx::query(
+            // No birthplace is the joined empty list upstream's mapper writes, never NULL.
             r#"UPDATE "BaseItems"
                SET "Overview" = ?2, "PremiereDate" = ?3, "EndDate" = ?4,
-                   "ProductionLocations" = ?5
+                   "ProductionLocations" = coalesce(?5, '')
                WHERE "Id" = ?1"#,
         )
         .bind(guid_to_db(person_id))
@@ -3133,6 +3206,57 @@ mod tests {
         );
     }
 
+    /// gl-1581: with the server's directories wired, the `Person` row stores
+    /// its path as upstream's mapper writes it (`%MetadataPath%/People/A/…`,
+    /// `GetPathToSave`), the directory is still made at the resolved path, and
+    /// the id is still the one the resolved path derives.
+    #[tokio::test]
+    async fn a_person_row_stores_its_path_tokenised_under_the_metadata_directory() {
+        use crate::item_type_lookup::IdDerivation;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(tmp.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let people_path = format!("{metadata}/People");
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+        };
+        let repo = FerrofinPeopleRepository::new(db.clone())
+            .with_identity(mode.clone(), people_path.clone())
+            .with_virtual_paths(crate::virtual_paths::VirtualPathExpander::from_paths(
+                std::sync::Arc::clone(&paths),
+            ));
+        let movie = Uuid::from_u128(0x72);
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        repo.update_people(movie, &[person("Alice Parity", "Actor")])
+            .await
+            .expect("credits");
+
+        let (id, path): (String, Option<String>) = sqlx::query_as(
+            r#"SELECT "Id", "Path" FROM "BaseItems"
+                   WHERE "Type" = 'MediaBrowser.Controller.Entities.Person'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("person row");
+        assert_eq!(
+            path.as_deref(),
+            Some("%MetadataPath%/People/A/Alice Parity")
+        );
+        assert_eq!(
+            Some(id),
+            crate::item_type_lookup::person_item_id(&mode, &people_path, "Alice Parity")
+                .map(ferrofin_db::store::guid_to_db),
+            "the id is derived from the resolved path"
+        );
+        assert!(
+            std::path::Path::new(&format!("{people_path}/A/Alice Parity")).is_dir(),
+            "the person metadata directory is created at the resolved path"
+        );
+    }
+
     /// A row written by an older build — lower-cased `SortName`, NULL `Path` —
     /// is repaired at startup, and the repair is idempotent (which is also what
     /// makes it a no-op on a database adopted from Jellyfin, where both already
@@ -3179,6 +3303,55 @@ mod tests {
             0,
             "idempotent: a correct row is not rewritten"
         );
+    }
+
+    /// gl-1581: with the server's directories wired, the repair fills the path
+    /// tokenised, as the row's save would, and makes the directory where the
+    /// token points — never a `%MetadataPath%` directory beside the process.
+    #[tokio::test]
+    async fn repair_person_items_stores_the_token_and_makes_the_resolved_directory() {
+        use crate::item_type_lookup::{IdDerivation, person_item_id};
+        use crate::test_support::seed_named_item;
+
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(tmp.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let people_path = format!("{metadata}/People");
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some(tmp.path().to_string_lossy().into_owned()),
+        };
+        let id = person_item_id(&mode, &people_path, "Alice Parity").expect("derived");
+        seed_named_item(&db, id, BaseItemKind::Person, "Alice Parity").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = NULL WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .execute(db.writer())
+            .await
+            .expect("pathless row");
+        // where the bug made it: relative to the process, named after the token
+        let stray = std::env::current_dir()
+            .expect("cwd")
+            .join("%MetadataPath%/People/A/Alice Parity");
+
+        let repo = FerrofinPeopleRepository::new(db.clone())
+            .with_identity(mode, people_path.clone())
+            .with_virtual_paths(crate::virtual_paths::VirtualPathExpander::from_paths(
+                std::sync::Arc::clone(&paths),
+            ));
+        assert_eq!(repo.repair_person_items().await.expect("repair"), 1);
+        let path: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .fetch_one(db.pool())
+                .await
+                .expect("person row");
+        assert_eq!(
+            path.as_deref(),
+            Some("%MetadataPath%/People/A/Alice Parity")
+        );
+        assert!(std::path::Path::new(&format!("{people_path}/A/Alice Parity")).is_dir());
+        assert!(!stray.exists(), "no directory named after the token");
     }
 
     /// …and it must NOT touch a row whose `SortName` came from the user's
@@ -3253,6 +3426,13 @@ mod tests {
         let dup_b = Uuid::from_u128(0xA2);
         seed_named_item(&db, dup_a, BaseItemKind::Person, "Uma Thurman").await;
         seed_named_item(&db, dup_b, BaseItemKind::Person, "Uma Thurman").await;
+        // A birthplace on one duplicate survives the collapse, though the survivor's own row
+        // is inserted with the empty list (gl-1580).
+        sqlx::query(r#"UPDATE "BaseItems" SET "ProductionLocations" = 'Paris' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(dup_a))
+            .execute(db.writer())
+            .await
+            .expect("birthplace");
         // …one carrying a favorite.
         let user = crate::test_support::seed_user(&db, Uuid::from_u128(0x9)).await;
         let user_id = Uuid::parse_str(&user.id).unwrap();
@@ -3283,6 +3463,21 @@ mod tests {
             vec![target.clone()],
             "duplicates collapsed onto the derived id"
         );
+        // The survivor's row has upstream's values where the duplicates had none (gl-1580).
+        let survivor = Uuid::parse_str(&target).unwrap();
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, survivor).await,
+            Vec::<&str>::new()
+        );
+        let birthplace: Option<String> =
+            sqlx::query_scalar(r#"SELECT "ProductionLocations" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&target)
+                .fetch_one(db.pool())
+                .await
+                .expect("survivor");
+        assert_eq!(birthplace.as_deref(), Some("Paris"));
+        // The survivor row is a person created now (gl-1586).
+        assert_person_dated(&db, survivor).await;
         // The favorite followed the survivor.
         let fav: i64 = sqlx::query_scalar(
             r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "IsFavorite" = 1"#,
@@ -3294,6 +3489,112 @@ mod tests {
         assert_eq!(fav, 1);
         // Idempotent: the marker short-circuits the second run.
         assert_eq!(repo.unify_person_identities().await.expect("again"), 0);
+    }
+
+    /// A person collapsed with no birthplace on any duplicate keeps the empty list, never NULL
+    /// (the collapse's `''` fallback, gl-1580).
+    #[tokio::test]
+    async fn a_collapse_without_a_birthplace_stores_the_empty_list() {
+        use crate::item_type_lookup::{IdDerivation, person_item_id};
+        let db = test_db().await;
+        let mode = IdDerivation::Jellyfin {
+            program_data_path: Some("/data".to_owned()),
+        };
+        crate::test_support::seed_named_item(
+            &db,
+            Uuid::from_u128(0xB1),
+            BaseItemKind::Person,
+            "Solo Person",
+        )
+        .await;
+        let repo = FerrofinPeopleRepository::new(db.clone())
+            .with_identity(mode.clone(), "/data/metadata/People".to_owned());
+        assert_eq!(repo.unify_person_identities().await.expect("unify"), 1);
+        let survivor =
+            person_item_id(&mode, "/data/metadata/People", "Solo Person").expect("derived");
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, survivor).await,
+            Vec::<&str>::new()
+        );
+    }
+
+    /// A person row is written with upstream's values for the columns a person has none of:
+    /// no NULL, and `Other` for its unrated category (gl-1580).
+    #[tokio::test]
+    async fn a_created_person_row_has_the_mappers_defaults() {
+        let db = test_db().await;
+        let people = tempfile::tempdir().unwrap();
+        let repo = FerrofinPeopleRepository::new(db.clone()).with_identity(
+            crate::item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: None,
+            },
+            people.path().to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            repo.create_person_items(&["Ann Example".to_owned()])
+                .await
+                .unwrap(),
+            1
+        );
+        let (id, unrated): (String, Option<String>) = sqlx::query_as(
+            r#"SELECT "Id", "UnratedType" FROM "BaseItems" WHERE "Type" = ?1 AND "Name" = 'Ann Example'"#,
+        )
+        .bind(PERSON_TYPE_NAME)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(unrated.as_deref(), Some("Other"));
+        assert_eq!(
+            crate::item_persistence_service::unrated_type_name(BaseItemKind::Person),
+            "Other",
+            "the literal in PERSON_ITEM_ROW"
+        );
+        let id = Uuid::parse_str(&id).unwrap();
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, id).await,
+            Vec::<&str>::new()
+        );
+        assert_person_dated(&db, id).await;
+    }
+
+    /// A new person row has `GetOrCreatePerson`'s `DateCreated` and
+    /// `DateModified` and the `DateLastSaved` `SavePeopleMetadataAsync` stamps,
+    /// all the same instant, and no `DateLastRefreshed`: nothing refreshes it
+    /// (gl-1586).
+    async fn assert_person_dated(db: &ferrofin_db::Database, id: Uuid) {
+        let row: ferrofin_db::entities::base_items::BaseItemEntity =
+            crate::test_support::fetch_item(db, id).await;
+        let created = row.date_created.expect("DateCreated");
+        assert!(
+            (chrono::Utc::now() - created).num_seconds() < 60,
+            "{created} is the create time"
+        );
+        assert_eq!(row.date_modified, Some(created));
+        assert_eq!(row.date_last_saved, Some(created));
+        assert_eq!(row.date_last_refreshed, None);
+    }
+
+    /// The credits' person rows (`person_items_for_write`) are dated as the
+    /// single insert's are.
+    #[tokio::test]
+    async fn credited_person_rows_are_dated() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        FerrofinPeopleRepository::new(db.clone())
+            .update_people(item, &[person("Alice", "Actor"), person("Bob", "Director")])
+            .await
+            .expect("update");
+        let ids: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1"#)
+                .bind(PERSON_TYPE_NAME)
+                .fetch_all(db.pool())
+                .await
+                .expect("people");
+        assert_eq!(ids.len(), 2);
+        for id in ids {
+            assert_person_dated(&db, Uuid::parse_str(&id).unwrap()).await;
+        }
     }
 
     #[tokio::test]
@@ -3757,6 +4058,11 @@ mod tests {
         )
         .await
         .expect("biography");
+        // A biography with no birthplace stores the empty list, not NULL (gl-1580).
+        assert_eq!(
+            crate::item_persistence_service::null_mapper_columns(&db, first[0].id).await,
+            Vec::<&str>::new()
+        );
         log_people_writes(&db).await;
 
         let again = repo.update_people(item, &credits).await.expect("again");
@@ -5069,7 +5375,7 @@ mod tests {
     #[tokio::test]
     async fn a_large_cast_is_written_whole_and_in_order() {
         let (db, item, repo) = people_lab(true).await;
-        let names: Vec<String> = (0..300).map(|i| format!("Cast Member {i:03}")).collect();
+        let names: Vec<String> = Vec::from_fn(300, |i| format!("Cast Member {i:03}"));
         let cast: Vec<PeopleEntity> = names.iter().map(|n| person(n, "Actor")).collect();
         let written = repo.update_people(item, &cast).await.expect("update");
         let credits: Vec<(String, i64)> = sqlx::query_as(

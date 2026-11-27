@@ -594,11 +594,12 @@ fake_findmnt() { # fake_findmnt <fstype[,fstype…]> — every path reports thes
 
 # --- build-fixtures.sh ------------------------------------------------------------------
 
-@test "every oracle is the same release: the smoke, seeds' and messy-shape oracles and the preflight's default" {
+@test "every oracle is the same release: the smoke, seeds' and messy-shape oracles, the first starts and the preflight's default" {
   # The latest release answers for every row; a bump that misses one place compares against two releases.
   release=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import messy, preservation, synthetic
 v = {n: r for n, r, _ in synthetic.VERSIONS}
 assert messy.ORACLE_RELEASE == preservation.ORACLE_RELEASE, (messy.ORACLE_RELEASE, preservation.ORACLE_RELEASE)
+assert synthetic.RETURN_RELEASE == messy.ORACLE_RELEASE, synthetic.RETURN_RELEASE
 assert messy.ORACLE_IMAGE == "jellyfin/jellyfin:" + messy.ORACLE_RELEASE, messy.ORACLE_IMAGE
 assert v[preservation.ORACLE] == v[preservation.UPGRADED_FROM_10] == preservation.ORACLE_RELEASE
 assert v[dict((n, s) for n, s, _ in messy.DERIVED)[next(n for n, _, l in messy.DERIVED if l == "12.x")]] == messy.ORACLE_RELEASE
@@ -641,6 +642,11 @@ built_fixtures() { # every fixture built at the current recipe, carrying its rel
     printf '{"fixture": "jellyfin-%s", "recipe": "%s"}' "${f%:*}" "$recipe" > "fixtures/jellyfin-${f%:*}/synthetic-ready.json"
     sqlite3 "fixtures/jellyfin-${f%:*}/data/jellyfin.db" "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${f#*:}) INSERT INTO __EFMigrationsHistory SELECT i, '9' FROM n;"
+  done
+  # the first starts are logged, so its synthetic.py first-start step finds nothing to do
+  mkdir -p fixtures/oracle/first-start-12.4
+  for f in $(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import synthetic; print(*synthetic.FIRST_STARTS)' "$ADOPTION"); do
+    touch "fixtures/oracle/first-start-12.4/$f.server.log"
   done
   # the messy copies are built, so build-fixtures.sh's messy.py step finds nothing to do
   for f in jellyfin-10.11.11-messy jellyfin-12.4-messy; do

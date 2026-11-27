@@ -22,6 +22,14 @@ Conventions:
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
 | LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | ported |
 
+Ferrofin's own extensions have no row, since they port nothing: Ferrofin Settings, and Single
+Sign-On, which is not the community SSO-Auth plugin (its own id and routes). Single Sign-On's
+routes in `handlers::PLUGIN_ROUTES` (`/sso/admin/oidc/providers`,
+`/sso/admin/oidc/providers/{provider}`, `/sso/oidc/{provider}/start`,
+`/sso/oidc/{provider}/callback`, `/sso/oidc/exchange`, `/sso/quickconnect`, `/sso/link`, `/sso/links`,
+`/sso/links/{provider}`, `/sso/oidc/{provider}/link` and `/sso/admin/links`) have no upstream to
+compare with.
+
 ## Per-plugin notes
 
 ### Intro Skipper
@@ -66,8 +74,12 @@ Conventions:
     published, as automatic rows with an empty hash (upstream's schema upgrade
     does the same): the first pass replaces each with what it detects, or
     deletes it. Hand edits made before `0037`, and the plugin's own records of
-    them on an adopted database, are therefore not kept; nor are the plugin's
-    settings (`IntroSkipper.xml`). `docs/UPGRADING.md` tells operators.
+    them on an adopted database, are therefore not kept. `docs/UPGRADING.md`
+    tells operators. The plugin's settings are imported: on a boot where it has
+    no `config.json` yet, an adopted Jellyfin's
+    `plugins/configurations/IntroSkipper.xml` comes across once
+    (`crates/ferrofin-core/src/plugin_config_adoption.rs`; the owner lifted D3
+    for the settings file on 2026-11-24, gl-1935).
   - **Hashes:** Ferrofin's analysis hashes carry an analyzer-set token
     (`config_hash::ANALYZERS`), bumped when an analyzer lands, so earlier
     results are analysed again with it.
@@ -145,6 +157,10 @@ Conventions:
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,
   vendored assets `crates/ferrofin-extensions/assets/filetransformation/`.
+- Adoption (`f4f01c3`): on a boot where the plugin has no `config.json` yet, an adopted
+  Jellyfin's `plugins/configurations/Jellyfin.Plugin.FileTransformation.xml` is imported
+  once (`crates/ferrofin-core/src/plugin_config_adoption.rs`): `DebugLoggingState` and the
+  settings page's `Transformations`, each `PluginDefinedTransformation`'s members as text.
 - Ahead of the pin: the `/web` response for a transformed file (`transform_web_file` in
   `apps/ferrofin-server/src/lib.rs`) follows `Infrastructure/FileTransformationMiddleware.cs`
   @ `0900de8f1`: an `ETag` of the first 8 bytes of SHA-256 over the transformed bytes,
@@ -187,6 +203,10 @@ Conventions:
   `POST /Videos/MergeVersions` + `DELETE /Videos/{id}/AlternateSources`) stay
   in `crates/ferrofin-core/src/library_manager.rs` — those are core Jellyfin
   routes, not plugin surface.
+- Adoption (`e6f58d6`): on a boot where the plugin has no `config.json` yet, an adopted
+  Jellyfin's `plugins/configurations/Jellyfin.Plugin.MergeVersions.xml`
+  (`LocationsExcluded`) is imported once
+  (`crates/ferrofin-core/src/plugin_config_adoption.rs`).
 - Ported at 12.0 semantics (`e6f58d6`): provider-first episode merge key
   (Tvdb→Tmdb→Imdb → numbers → title, case-insensitive), transitive
   version-group expansion, existing-primary-preserving primary selection,
@@ -350,8 +370,10 @@ Conventions:
   `AuthenticationProviderId` is LDAP-Auth's (ignoring case), and otherwise stays off. The file
   is only read. A missing file is silent; one that cannot be read or parsed, or a write that
   fails, is a warning, and the next boot tries again (`config.json` is written last, so its
-  presence means the import finished). `scripts/migrate-jellyfin.sh` copies this one file of
-  Jellyfin's `plugins/`.
+  presence means the import finished). `scripts/migrate-jellyfin.sh` copies this file of
+  Jellyfin's `plugins/`, and the settings of the metadata plugins Jellyfin builds in and of
+  Intro Skipper, Merge Versions, File Transformation and OpenSubtitles, which adoption
+  imports the same way, with no uid map (`crates/ferrofin-core/src/plugin_config_adoption.rs`).
 - Profile images (v24, `d11c86a`): the profile-image block of `Authenticate`,
   `LdapUtils.TryDetermineAttributeFormat`, `ProfileImageUpdater.SetProfileImage` and
   `LdapProfileImageSyncTask`. While `EnableLdapProfileImageSync` is on, `LocateLdapUser` also
@@ -638,8 +660,8 @@ Conventions:
     `LdapServer` is still that placeholder is imported with the server empty, and a warning
     names `LdapServer`: the plugin is on for its LDAP users but inactive until an
     administrator sets a server.
-  - **No `LdapUsers` in the configuration** (D12: one store of external identities, which the
-    OIDC sign-in planned next is to share, that links an identity to at most one user, writes
+  - **No `LdapUsers` in the configuration** (D12: one store of external identities, which
+    Single Sign-On's OIDC links share, that links an identity to at most one user, writes
     each link in a transaction so concurrent first sign-ins cannot lose one, and removes a
     user's links with the user): which LDAP uid belongs to which user lives in Ferrofin's
     external-identity table, so `GET /Plugins/{id}/Configuration` does not return it, and a

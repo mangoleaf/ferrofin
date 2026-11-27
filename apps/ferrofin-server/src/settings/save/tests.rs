@@ -775,19 +775,14 @@ fn a_read_only_file_is_a_conflict_naming_it() {
 fn a_directory_that_takes_no_file_is_a_conflict_naming_it() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    /// Gives the directory back, so the test's clean-up can remove it.
-    struct Restore<'a>(&'a Path);
-    impl Drop for Restore<'_> {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
-        }
-    }
-
     let data = DataDir::new(&["log_level = \"debug\"".to_owned()]);
     let before = contents(&data);
     let path = data.config_file();
     let running = load(data.cli(), &FakeEnv::new());
-    let _restore = Restore(data.path());
+    // Gives the directory back, so the test's clean-up can remove it.
+    let _restore = std::mem::DropGuard::new(data.path(), |dir| {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    });
     std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o555)).expect("chmod");
     if crate::settings::directory_accepts_a_file(&path) {
         // Root ignores the mode; nothing here can refuse it.

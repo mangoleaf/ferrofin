@@ -34,6 +34,13 @@ impl<'a> ImageAcquisitionPolicy<'a> {
         }
     }
 
+    /// The item type (its short name) the policy is for, which names the
+    /// files its images are saved under.
+    #[must_use]
+    pub fn kind(self) -> &'a str {
+        self.kind
+    }
+
     /// The saved entry, type-specific default, or upstream default instance.
     #[must_use]
     pub fn option(self, image_type: ImageType) -> ImageOption {

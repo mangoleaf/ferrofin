@@ -63,19 +63,75 @@ where
     Ok(())
 }
 
+/// Locks a user out at the failed-login limit, as upstream's `AuthenticateUser`
+/// does (`UserManager.cs:680-687`): sets `IsDisabled`, adding the row at 0 when
+/// the user has none, and adds 1 to the `RowVersion` of the user and of every
+/// one of its `Permissions` and `Preferences` rows. Upstream's user is the
+/// untracked graph `UserQuery` loaded, so `dbContext.Update(user)` marks all of
+/// it `Modified` before the one `SaveChangesAsync`.
+pub(super) async fn lock_out(pool: &SqlitePool, user_id: &str) -> Result<(), sqlx::Error> {
+    let disabled = i32::from(PermissionKind::IsDisabled);
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        r#"UPDATE "Permissions" SET "RowVersion" = "RowVersion" + 1,
+               "Value" = CASE WHEN "Kind" = ?2 THEN 1 ELSE "Value" END
+           WHERE "UserId" = ?1"#,
+    )
+    .bind(user_id)
+    .bind(disabled)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        r#"INSERT INTO "Permissions" ("Kind", "RowVersion", "UserId", "Value")
+           SELECT ?2, 0, ?1, 1
+           WHERE NOT EXISTS (
+               SELECT 1 FROM "Permissions" WHERE "UserId" = ?1 AND "Kind" = ?2
+           )"#,
+    )
+    .bind(user_id)
+    .bind(disabled)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(r#"UPDATE "Preferences" SET "RowVersion" = "RowVersion" + 1 WHERE "UserId" = ?1"#)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(r#"UPDATE "Users" SET "RowVersion" = "RowVersion" + 1 WHERE "Id" = ?1"#)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
+}
+
 /// Stores a user's password hash (`None` for a password-less user), bumping
 /// `RowVersion` as an EF save of the entity does.
-pub(super) async fn set_password(
-    pool: &SqlitePool,
+pub(super) async fn set_password<'e, E>(
+    executor: E,
     user_id: &str,
     hash: Option<&str>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), sqlx::Error>
+where
+    E: SqliteExecutor<'e>,
+{
     sqlx::query(
         r#"UPDATE "Users" SET "Password" = ?2, "RowVersion" = "RowVersion" + 1
            WHERE "Id" = ?1"#,
     )
     .bind(user_id)
     .bind(hash)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Makes every later write of a password fail, for the test of what such a
+/// failure leaves behind.
+#[cfg(test)]
+pub(super) async fn refuse_password_writes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"CREATE TRIGGER "refuse_passwords" BEFORE UPDATE OF "Password" ON "Users"
+           BEGIN SELECT RAISE(ABORT, 'no password today'); END"#,
+    )
     .execute(pool)
     .await?;
     Ok(())
@@ -143,4 +199,30 @@ where
         .execute(executor)
         .await?;
     Ok(())
+}
+
+/// Test-only: the `RowVersion` of a user's `Users` row, and the `(Kind, RowVersion)` of each of
+/// its `Permissions` and `Preferences` rows, in `Kind` order.
+#[cfg(test)]
+pub(super) async fn row_versions(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Result<(i64, Vec<(i32, i64)>, Vec<(i32, i64)>), sqlx::Error> {
+    let user = sqlx::query_scalar(r#"SELECT "RowVersion" FROM "Users" WHERE "Id" = ?1"#)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
+    let permissions = sqlx::query_as(
+        r#"SELECT "Kind", "RowVersion" FROM "Permissions" WHERE "UserId" = ?1 ORDER BY "Kind""#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    let preferences = sqlx::query_as(
+        r#"SELECT "Kind", "RowVersion" FROM "Preferences" WHERE "UserId" = ?1 ORDER BY "Kind""#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok((user, permissions, preferences))
 }

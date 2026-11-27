@@ -5,8 +5,9 @@
 //! more than one scan: Y in one, Cb and Cr in others. Every DCT decoder must
 //! read that ("Interleaved and non-interleaved scans", ITU-T T.81 Table 1).
 //! libjpeg's `cjpeg` writes it from a scan script, and `jpeg-encoder` writes it
-//! whenever its Huffman tables are optimized, so every JPEG this crate writes
-//! has it (`ImageCrateEncoder::encode_jpeg`).
+//! whenever its Huffman tables are optimized. Every JPEG this crate wrote was in
+//! that layout until it moved to libjpeg-turbo (gl-1346), and those files are
+//! still in image caches and trickplay folders, beside third-party ones.
 //!
 //! zune-jpeg 0.5.15, the `image` crate's JPEG decoder, reads such a file to
 //! the wrong colours and reports no error: with subsampled chroma it leaves
@@ -188,7 +189,8 @@ mod tests {
     }
 
     /// `jpeg-encoder` writes one scan per component whenever its Huffman
-    /// tables are optimized, as `ImageCrateEncoder::encode_jpeg` asks.
+    /// tables are optimized, as `ImageCrateEncoder::encode_jpeg` asked before
+    /// gl-1346.
     #[rstest]
     #[case::subsampled(jpeg_encoder::SamplingFactor::F_2_2)]
     #[case::full_chroma(jpeg_encoder::SamplingFactor::F_1_1)]

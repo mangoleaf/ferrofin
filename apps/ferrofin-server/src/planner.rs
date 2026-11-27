@@ -844,14 +844,13 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             .subtitle_codec
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .map(|value| {
+            .map_or_default(|value| {
                 value
                     .split(',')
                     .filter(|codec| !codec.is_empty())
                     .map(str::to_owned)
                     .collect()
-            })
-            .unwrap_or_default();
+            });
 
         let progressive = kind == PlaylistKind::Progressive;
         let options = self.encoding_options().await;
@@ -1047,8 +1046,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             transcode_reasons: request
                 .transcode_reasons
                 .as_deref()
-                .map(parse_transcode_reasons)
-                .unwrap_or_default(),
+                .map_or_default(parse_transcode_reasons),
             run_time_ticks: media_source.run_time_ticks,
             transcoding_type: if progressive {
                 TranscodingJobType::Progressive
@@ -2040,29 +2038,26 @@ impl FerrofinStreamStatePlanner {
         if hw_filters {
             let seek_offset = segment_seek_ticks.map(round_to_whole_seconds);
             let sub_stream = state.subtitle_stream.as_ref().filter(|_| burn_sub);
-            let (plain, alpha_sub2video) = sub_stream
-                .filter(|_| burn_text)
-                .map(|sub| {
-                    (
-                        Self::text_subtitle_filter(
-                            state,
-                            sub,
-                            media_path,
-                            burned_text,
-                            false,
-                            seek_offset,
-                        ),
-                        Self::text_subtitle_filter(
-                            state,
-                            sub,
-                            media_path,
-                            burned_text,
-                            true,
-                            seek_offset,
-                        ),
-                    )
-                })
-                .unwrap_or_default();
+            let (plain, alpha_sub2video) = sub_stream.filter(|_| burn_text).map_or_default(|sub| {
+                (
+                    Self::text_subtitle_filter(
+                        state,
+                        sub,
+                        media_path,
+                        burned_text,
+                        false,
+                        seek_offset,
+                    ),
+                    Self::text_subtitle_filter(
+                        state,
+                        sub,
+                        media_path,
+                        burned_text,
+                        true,
+                        seek_offset,
+                    ),
+                )
+            });
             let subtitle = if burn_text {
                 hw::sw_chain::SubtitleOverlay::Text {
                     plain: &plain,
@@ -3392,8 +3387,7 @@ mod tests {
             root.join("cache"),
             root.join("web"),
         ));
-        let file =
-            PathBuf::from(paths.user_configuration_directory_path()).join("named/encoding.json");
+        let file = PathBuf::from(paths.configuration_directory_path()).join("encoding.json");
         planner.config = Arc::new(
             ferrofin_core::FerrofinServerConfigurationManager::load(Arc::clone(&paths))
                 .await

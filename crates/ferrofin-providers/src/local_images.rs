@@ -36,8 +36,8 @@ pub use ferrofin_traits::options::file_date_modified;
 pub use item::{ImageItem, ImageItemKind};
 pub use local_image_provider::LocalImageProvider;
 pub use merge::{
-    first_of_each_singular_type, internal_metadata_dirs, legacy_art_dir, local_image_infos,
-    merge_local_images, own_art_dir, remove_images,
+    earlier_art_dir, first_of_each_singular_type, internal_image_stem, internal_metadata_dirs,
+    legacy_art_dir, local_image_infos, merge_local_images, own_art_dir, remove_images,
 };
 pub use other_providers::{
     CollectionFolderLocalImageProvider, InternalMetadataFolderImageProvider,

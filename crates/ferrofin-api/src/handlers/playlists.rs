@@ -109,7 +109,7 @@ async fn create_playlist(
     Query(query): Query<CreatePlaylistQuery>,
     body: Option<JsonBody<CreatePlaylistDto>>,
 ) -> Result<Json<PlaylistCreationResult>, ApiError> {
-    let body = body.map(|JsonBody(b)| b).unwrap_or_default();
+    let body = body.map_or_default(|JsonBody(b)| b);
 
     let query_ids = parse_csv_uuids(query.ids.as_deref())?;
     let item_id_list = if query_ids.is_empty() {
@@ -525,9 +525,7 @@ async fn move_item(
     {
         return Ok(rejection);
     }
-    let new_index: i32 = new_index
-        .parse()
-        .map_err(|_| ApiError::BadRequest(format!("invalid index {new_index:?}")))?;
+    let new_index: i32 = crate::query::bind_route_number(new_index, "newIndex")?;
     let calling_user_id = auth.user_id();
     // `Guid.Parse(playlistId)` here, and `new Guid(playlistId)` in `MoveItemAsync`.
     let playlist_uuid = DotnetGuid::parse(playlist_id)

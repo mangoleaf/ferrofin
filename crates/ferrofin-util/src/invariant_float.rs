@@ -49,7 +49,7 @@ const SYMBOLS: [(&str, &str); 6] = [
 #[must_use]
 pub fn parse<T: FromStr>(text: &str) -> Option<T> {
     let number = text.trim_end_matches('\0').trim_matches(is_white);
-    let unsigned = number.strip_prefix(['+', '-']).unwrap_or(number);
+    let unsigned = number.trim_prefix(['+', '-']);
     if unsigned.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
         let (integer, rest) =
             unsigned.split_at(unsigned.find(['.', 'e', 'E']).unwrap_or(unsigned.len()));

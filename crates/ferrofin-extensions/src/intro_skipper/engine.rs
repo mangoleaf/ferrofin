@@ -15,11 +15,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
 use ferrofin_chromaprint::{AnalysisMode as PrintMode, CompareConfig, TimeRange, compare_episodes};
-use ferrofin_core::TaskProgress;
 use ferrofin_model::entities_media::ChapterInfo;
 use ferrofin_model::intro_skipper::{AnalysisMode as Mode, AnalyzerAction};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::intro_skipper::{self as intro_store, SeasonState, StoredSegment};
+use ferrofin_traits::tasks::TaskProgress;
 use ferrofin_util::change_watch::Watch;
 use futures_util::StreamExt as _;
 use uuid::Uuid;
@@ -1390,19 +1390,17 @@ mod tests {
         category: Category,
         season_number: i64,
     ) -> Vec<Item> {
-        (0..count)
-            .map(|i| {
-                let hours = i64::try_from(i).expect("small");
-                Item::new(QueuedEpisode {
-                    category,
-                    season_number,
-                    // The queue already filtered exclusions, so the flag is moot.
-                    is_excluded: true,
-                    date_added: Some(newest - chrono::Duration::hours(hours)),
-                    ..entry(hours + 1)
-                })
+        Vec::from_fn(count, |i| {
+            let hours = i64::try_from(i).expect("small");
+            Item::new(QueuedEpisode {
+                category,
+                season_number,
+                // The queue already filtered exclusions, so the flag is moot.
+                is_excluded: true,
+                date_added: Some(newest - chrono::Duration::hours(hours)),
+                ..entry(hours + 1)
             })
-            .collect()
+        })
     }
 
     /// `TestSeasonReanalysis.IsSettledForReanalysis_*`: hours since the newest

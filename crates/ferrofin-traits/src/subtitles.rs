@@ -143,14 +143,17 @@ pub trait SubtitleManager: Send + Sync {
         request: &SubtitleSearchRequest,
     ) -> Result<Vec<RemoteSubtitleInfo>, ServiceError>;
 
-    /// Downloads a remote subtitle and attaches it to the item.
+    /// Downloads a remote subtitle and saves it beside the item. Like
+    /// upstream's `TrySaveSubtitle`, no stream is recorded: the caller refreshes
+    /// the item, whose probe records it.
     async fn download_subtitles(
         &self,
         item_id: Uuid,
         subtitle_id: &str,
     ) -> Result<(), ServiceError>;
 
-    /// Uploads a caller-supplied subtitle for the item.
+    /// Uploads a caller-supplied subtitle for the item, saved as
+    /// [`download_subtitles`](Self::download_subtitles) saves one.
     async fn upload_subtitle(
         &self,
         item_id: Uuid,
@@ -200,11 +203,16 @@ pub trait SubtitleManager: Send + Sync {
     /// subtitle delete runs it after the item's refresh: a refresh that probes
     /// the file has already rewritten the rows from the files on disk, as
     /// upstream's does, but one that cannot (no ffprobe, a failed probe)
-    /// leaves them, and the deleted subtitle would stay listed.
+    /// leaves them, and the deleted subtitle would stay listed. When it drops
+    /// one, it stores the item's `HasSubtitles` from the rows left
+    /// ([`MediaStreamRepository::sync_has_subtitles`]).
+    ///
+    /// [`MediaStreamRepository::sync_has_subtitles`]: crate::persistence::MediaStreamRepository::sync_has_subtitles
     ///
     /// # Errors
     ///
-    /// Propagates a storage failure reading or saving the rows.
+    /// Propagates a storage failure reading or saving the rows, or writing
+    /// the flag.
     async fn drop_missing_subtitle_rows(&self, item_id: Uuid) -> Result<(), ServiceError>;
 
     /// Lists the subtitle providers that support the item.

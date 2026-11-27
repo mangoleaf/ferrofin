@@ -35,7 +35,7 @@ pub const TEST_FIXTURE_WAT: &str = include_str!("test_fixture.wat");
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use tracing::{error, info, warn};
@@ -265,15 +265,13 @@ impl WasmSettings {
             event_queue_capacity: event_queue_capacity
                 .filter(|&v| v > 0)
                 .unwrap_or(d.event_queue_capacity),
-            private_http_allow: private_http_allow
-                .map(|s| {
-                    s.split(',')
-                        .map(str::trim)
-                        .filter(|e| !e.is_empty())
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            private_http_allow: private_http_allow.map_or_default(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            }),
             // The remaining caps resolve through their `with_*` builders.
             ..d
         }
@@ -1113,6 +1111,20 @@ fn load_one(
     })
 }
 
+/// Epoch-ticker threads whose loop has not ended, that is whose engine may
+/// still be alive.
+static LIVE_EPOCH_TICKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many epoch-ticker threads in this process have not yet found their
+/// engine gone: a test seam for `tests/idle_host.rs`. Counted from before
+/// each thread starts, where sampling `/proc/self/task` can miss one (a
+/// thread that exits mid-listing hides the one after it). Not a public API.
+#[doc(hidden)]
+#[must_use]
+pub fn live_epoch_tickers_for_test() -> usize {
+    LIVE_EPOCH_TICKERS.load(Ordering::Relaxed)
+}
+
 /// Builds the shared wasm runtime pieces: an epoch-ticked engine (weak-held
 /// by its ticker thread) and the world+WASI linker. Shared by
 /// [`WasmPluginHost::load`] and [`WasmArtifactValidator`] so they can never
@@ -1136,8 +1148,9 @@ fn build_runtime_parts(
     // engine and its compiled code forever.
     {
         let engine = engine.weak();
+        // Counted before the thread exists, so no reader can miss it.
+        LIVE_EPOCH_TICKERS.fetch_add(1, Ordering::Relaxed);
         std::thread::Builder::new()
-            // tests/idle_host.rs finds the ticker by this name.
             .name("wasm-epoch-ticker".to_owned())
             .spawn(move || {
                 loop {
@@ -1147,6 +1160,10 @@ fn build_runtime_parts(
                     };
                     engine.increment_epoch();
                 }
+                LIVE_EPOCH_TICKERS.fetch_sub(1, Ordering::Relaxed);
+            })
+            .inspect_err(|_| {
+                LIVE_EPOCH_TICKERS.fetch_sub(1, Ordering::Relaxed);
             })
             .expect("spawning the wasm epoch ticker cannot fail");
     }
@@ -1227,6 +1244,7 @@ fn config_pages_for(
             name: page.name.clone(),
             bytes: page.content.clone(),
             enable_in_main_menu: page.enable_in_main_menu,
+            content_type: None,
         })
         .collect();
     if kept.is_empty() {
@@ -1297,6 +1315,7 @@ fn fallback_config_page(descriptor: &PluginDescriptor) -> PluginConfigPage {
         name: format!("wasm-settings-{id}"),
         bytes: html.into_bytes(),
         enable_in_main_menu: false,
+        content_type: None,
     }
 }
 
@@ -1667,7 +1686,7 @@ impl ferrofin_traits::providers::DynamicMetadataProvider for WasmMetadataProvide
                 // scan — same rule as every other plugin offer.
                 Err(reason) => warn!(
                     plugin = %self.plugin.descriptor.id,
-                    item = %item.item_id,
+                    item_id = %item.item_id,
                     kind = ?kind,
                     reason,
                     "wasm plugin artwork candidate refused/failed; skipping"
@@ -1697,20 +1716,25 @@ struct LiteralTransform {
     warned: AtomicBool,
 }
 
-#[async_trait]
-impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
-    async fn transform(&self, path: &str, contents: String) -> String {
-        // Checked per serve, like the host's other surfaces: Disable or
-        // uninstall stops the injection at once, and Enable starts it.
-        let enabled = self
-            .plugins
+impl LiteralTransform {
+    /// Whether its plugin is installed and enabled. Checked per serve, like
+    /// the host's other surfaces: Disable or uninstall stops the injection at
+    /// once, and Enable starts it.
+    async fn enabled(&self) -> bool {
+        self.plugins
             .get_plugin(self.plugin)
             .await
             .ok()
             .flatten()
-            .is_some_and(|d| d.enabled);
-        if !enabled {
-            return contents;
+            .is_some_and(|d| d.enabled)
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
+    async fn transform(&self, path: &str, contents: &str) -> Option<String> {
+        if !self.enabled().await {
+            return None;
         }
         // Output is bounded, not just input: a common `search` with a large
         // `replace` multiplies the file, recomputed on every anonymous /web
@@ -1733,9 +1757,15 @@ impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
                      serving it unchanged"
                 );
             }
-            return contents;
+            return None;
         }
-        contents.replace(&self.search, &self.replace)
+        Some(contents.replace(&self.search, &self.replace))
+    }
+
+    /// A disabled or uninstalled plugin's transform changes nothing, so the
+    /// files it matches are served from disk instead of the pipeline.
+    async fn would_transform(&self, _path: &str) -> bool {
+        self.enabled().await
     }
 }
 
@@ -2157,7 +2187,7 @@ impl WasmMediaAnalysisTask {
                         // library size); one aggregated warn per pass.
                         tracing::debug!(
                             plugin = plugin.descriptor.name,
-                            item = %entity.id,
+                            item_id = %entity.id,
                             error = %e,
                             "scan-media failed for one item (offered once; not retried)"
                         );
@@ -2385,26 +2415,33 @@ mod tests {
         let injected = "<script></script></head>";
         let ours = transform(id);
         assert_eq!(
-            ours.transform("index.html", "</head>".into()).await,
-            injected
+            ours.transform("index.html", "</head>").await.as_deref(),
+            Some(injected)
         );
+        assert!(ours.would_transform("index.html").await);
         plugins.disable_plugin(id).await.unwrap();
         assert_eq!(
-            ours.transform("index.html", "</head>".into()).await,
-            "</head>",
+            ours.transform("index.html", "</head>").await,
+            None,
             "disabled: served unchanged"
+        );
+        assert!(
+            !ours.would_transform("index.html").await,
+            "disabled: the file skips the pipeline"
         );
         plugins.enable_plugin(id).await.unwrap();
         assert_eq!(
-            ours.transform("index.html", "</head>".into()).await,
-            injected
+            ours.transform("index.html", "</head>").await.as_deref(),
+            Some(injected)
         );
+        assert!(ours.would_transform("index.html").await);
         let gone = transform(Uuid::from_u128(8));
         assert_eq!(
-            gone.transform("index.html", "</head>".into()).await,
-            "</head>",
+            gone.transform("index.html", "</head>").await,
+            None,
             "uninstalled (unknown to the manager): served unchanged"
         );
+        assert!(!gone.would_transform("index.html").await);
     }
 
     #[tokio::test]
@@ -2429,7 +2466,7 @@ mod tests {
         // A common search amplified by a large replace: 1000 matches × ~1 KiB.
         let file = "<".repeat(1000);
         let amplifier = transform("<", "x".repeat(1024));
-        assert_eq!(amplifier.transform("index.html", file.clone()).await, file);
+        assert_eq!(amplifier.transform("index.html", &file).await, None);
         assert!(
             amplifier.warned.load(Ordering::Relaxed),
             "the skip is logged"
@@ -2438,12 +2475,15 @@ mod tests {
         let insert = "y".repeat(MAX_TRANSFORM_TEXT);
         let injector = transform("</head>", format!("{insert}</head>"));
         assert_eq!(
-            injector.transform("index.html", "</head>".into()).await,
-            format!("{insert}</head>")
+            injector.transform("index.html", "</head>").await,
+            Some(format!("{insert}</head>"))
         );
         // Shrinking or same-size rewrites are never capped.
         let shrinker = transform("<", String::new());
-        assert_eq!(shrinker.transform("index.html", file).await, "");
+        assert_eq!(
+            shrinker.transform("index.html", &file).await.as_deref(),
+            Some("")
+        );
     }
 
     fn descriptor() -> PluginDescriptor {

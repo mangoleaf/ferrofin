@@ -1,7 +1,7 @@
 //! Adoption import for Jellyfin's `config/livetv.xml`.
 //!
 //! The document's scalar options (guide days, padding, the post-processor) are
-//! seeded as `named/livetv.json` like every other named configuration (see
+//! seeded as `livetv.json` like every other named configuration (see
 //! [`crate::config_import`]). Ferrofin keeps the tuners and listing providers
 //! in the database rather than in that file, so this import writes them there.
 //!
@@ -20,6 +20,9 @@ use ferrofin_traits::error::ServiceError;
 ///
 /// Once only: an operator who deletes an imported tuner means it, and a boot
 /// that re-created it would be arguing with them.
+///
+/// `ferrofin_livetv`'s timer import, which runs earlier in the boot, reads it
+/// as "a Ferrofin booted this database before".
 const META_KEY: &str = "livetv_config_imported_v1";
 
 /// Imports the tuners and listing providers from `{config}/livetv.xml`, once.

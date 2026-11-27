@@ -74,10 +74,12 @@ impl ScanTrickplay {
         let replace = replace(options);
         // The shared production extractor's ImageEncodingJobPool bounds
         // running ffmpeg processes, including jobs from scheduled tasks.
-        tokio::spawn(async move {
+        // In the scan's span, whose cancel it follows: its trace then ends
+        // when the last of these does.
+        tokio::spawn(tracing::Instrument::in_current_span(async move {
             let work = manager.refresh_trickplay_data(id, replace, &library);
             outcome(id, cancel.unless_cancelled(work).await)
-        });
+        }));
     }
 }
 
@@ -311,14 +313,9 @@ mod tests {
         dropped: Arc<AtomicBool>,
         /// `(id, replace, extraction enabled, handed the caller's row)`.
         calls: Mutex<Vec<(Uuid, bool, bool, bool)>>,
+        /// The span each call ran in, by name.
+        spans: Mutex<Vec<Option<&'static str>>>,
         fail: bool,
-    }
-
-    struct Dropped(Arc<AtomicBool>);
-    impl Drop for Dropped {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
     }
 
     impl HeldManager {
@@ -329,13 +326,20 @@ mod tests {
             options: &LibraryOptions,
             with_row: bool,
         ) -> Result<(), ServiceError> {
-            let _dropped = Dropped(Arc::clone(&self.dropped));
+            let _dropped = std::mem::DropGuard::new(Arc::clone(&self.dropped), |dropped| {
+                dropped.store(true, Ordering::SeqCst);
+            });
             self.calls.lock().unwrap().push((
                 id,
                 replace,
                 options.enable_trickplay_image_extraction,
                 with_row,
             ));
+            self.spans.lock().unwrap().push(
+                tracing::Span::current()
+                    .metadata()
+                    .map(tracing::Metadata::name),
+            );
             self.entered.notify_one();
             self.release.notified().await;
             if self.fail {
@@ -486,6 +490,26 @@ mod tests {
             }
             assert!(manager.dropped.load(Ordering::SeqCst));
         }
+    }
+
+    /// The detached refresh runs in the span of the scan that spawned it, so
+    /// its lines say which scan it belongs to (LOGGING.md, rule 4).
+    #[tokio::test]
+    async fn a_detached_refresh_runs_in_the_scans_span() {
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        let manager = Arc::new(HeldManager::default());
+        let provider = provider(&manager, TrickplayScanBehavior::NonBlocking);
+        tracing::info_span!("library_scan_pass").in_scope(|| {
+            provider.spawn(
+                Uuid::new_v4(),
+                during_scan(),
+                &MetadataRefreshOptions::default(),
+                &ScanCancel::default(),
+            );
+        });
+        manager.entered.notified().await;
+        assert_eq!(*manager.spans.lock().unwrap(), [Some("library_scan_pass")]);
+        manager.release.notify_one();
     }
 
     #[tokio::test]

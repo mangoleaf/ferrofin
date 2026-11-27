@@ -428,6 +428,78 @@ async fn the_administrator_still_reaches_the_elevated_surface() {
     );
 }
 
+/// A server API key carries no user: with no `userId`, upstream's
+/// `GetDevicesForUser(Guid.Empty)` skips the user filter (`IsNullOrEmpty`) and
+/// lists every device. Looking the nil id up as an account made it a `404`.
+#[tokio::test]
+async fn an_api_key_lists_every_device() {
+    let harness = boot().await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let admin_token = login(&router, ADMIN_USER, ADMIN_PASSWORD, "elev-admin").await;
+    let (status, _) = call_as(
+        &router,
+        "POST",
+        "/Auth/Keys?app=devices",
+        Some(&admin_token),
+        "elev-admin",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = call_as(
+        &router,
+        "GET",
+        "/Auth/Keys",
+        Some(&admin_token),
+        "elev-admin",
+        None,
+    )
+    .await;
+    let keys: serde_json::Value = serde_json::from_slice(&body).expect("keys json");
+    let key = keys["Items"][0]["AccessToken"]
+        .as_str()
+        .expect("AccessToken")
+        .to_owned();
+
+    for query in ["", "?userId=00000000-0000-0000-0000-000000000000"] {
+        let (status, body) = call_as(
+            &router,
+            "GET",
+            &format!("/Devices{query}"),
+            Some(&key),
+            "elev-key",
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "GET /Devices{query} with an API key"
+        );
+        let devices: serde_json::Value = serde_json::from_slice(&body).expect("devices json");
+        assert!(
+            devices["Items"]
+                .as_array()
+                .expect("Items")
+                .iter()
+                .any(|device| device["Id"] == "elev-admin"),
+            "GET /Devices{query} lists the administrator's device: {devices}"
+        );
+    }
+
+    // A userId naming no account is still upstream's ResourceNotFoundException.
+    let (status, _) = call_as(
+        &router,
+        "GET",
+        "/Devices?userId=11111111-2222-3333-4444-555555555555",
+        Some(&key),
+        "elev-key",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 /// An anonymous caller must be rejected as unauthenticated (`401`), not as
 /// unelevated (`403`) — the extractor authenticates before it checks policy.
 #[tokio::test]

@@ -147,7 +147,7 @@ fn hex_digits(text: &str) -> Option<&str> {
 /// `ParseNumbers.StringToInt` at radix 16: an optional `+` (a `-` is refused),
 /// then an optional `0x`, then the digits.
 fn radix16_digits(text: &str) -> Option<&str> {
-    let text = text.strip_prefix('+').unwrap_or(text);
+    let text = text.trim_prefix('+');
     let text = match text.get(..2) {
         Some(prefix) if prefix.eq_ignore_ascii_case("0x") => &text[2..],
         _ => text,

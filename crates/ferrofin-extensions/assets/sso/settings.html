@@ -1,0 +1,1106 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Single Sign-On</title>
+</head>
+
+<body>
+    <!--
+        The Single Sign-On plugin's page, authored in this repository (not
+        vendored from a Jellyfin plugin). jellyfin-web keeps only the
+        `data-role="page"` element and runs the scripts inside it, so the
+        styles and the script live in it too.
+
+        The page is served anonymously (`GET /web/ConfigurationPage`), so it
+        holds no setting: the providers come from the admin-only
+        `GET /sso/admin/oidc/providers`, and every string from a response is
+        set as text, never parsed as HTML. A provider is saved with
+        `PUT /sso/admin/oidc/providers/{key}`, which then tests the provider's
+        discovery document, and removed with `DELETE`; the provider's row shows
+        what the test found until the page is left. The public URL and the
+        login page's sign-in button switch are saved through the plugin
+        configuration. No route returns
+        a stored client secret, so the secret field always starts empty, and an
+        empty one keeps the stored secret. The library mappings list the
+        libraries `GET /Library/MediaFolders` names, as the dashboard's user
+        access page does, and keep their ids.
+    -->
+    <div data-role="page" class="page type-interior pluginConfigurationPage ssoSettingsPage"
+        data-require="emby-input,emby-button,emby-checkbox">
+        <style>
+            .ssoSettingsPage .ssoNotice {
+                padding: 0.75em 1em;
+                margin: 1em 0;
+                border-radius: 0.3em;
+                background: rgba(200, 60, 60, 0.2);
+            }
+
+            .ssoSettingsPage .ssoProvider {
+                padding: 0.75em 1em;
+                margin: 0 0 0.75em;
+                border-radius: 0.3em;
+                background: rgba(128, 128, 128, 0.12);
+            }
+
+            .ssoSettingsPage .ssoProviderTitle {
+                margin: 0 0 0.3em;
+            }
+
+            .ssoSettingsPage .ssoProvider p {
+                margin: 0.25em 0;
+            }
+
+            .ssoSettingsPage .ssoRefused {
+                color: #e57373;
+            }
+
+            .ssoSettingsPage .ssoCallback code {
+                user-select: all;
+                word-break: break-all;
+            }
+
+            .ssoSettingsPage .ssoHttpWarning {
+                color: #ffb74d;
+            }
+
+            .ssoSettingsPage .ssoFound {
+                color: #81c784;
+            }
+
+            .ssoSettingsPage .ssoDiscovery code {
+                word-break: break-all;
+            }
+
+            .ssoSettingsPage .ssoButtons {
+                display: flex;
+                gap: 0.5em;
+                flex-wrap: wrap;
+                margin-top: 0.5em;
+            }
+
+            .ssoSettingsPage .ssoRoleList {
+                display: block;
+                margin: 1em 0;
+            }
+
+            .ssoSettingsPage .ssoRoleList textarea {
+                display: block;
+                width: 100%;
+                box-sizing: border-box;
+                margin-top: 0.3em;
+                resize: vertical;
+            }
+
+            .ssoSettingsPage .ssoFolderRole {
+                padding: 0.5em 1em;
+                margin: 0.75em 0;
+                border-radius: 0.3em;
+                background: rgba(128, 128, 128, 0.12);
+            }
+        </style>
+        <div data-role="content">
+            <div class="content-primary">
+                <div class="verticalSection">
+                    <div class="sectionTitleContainer">
+                        <h2 class="sectionTitle">Single Sign-On</h2>
+                    </div>
+                    <p class="fieldDescription">
+                        Let users sign in with an OpenID Connect identity provider, such as Authentik,
+                        Authelia, Keycloak or Pocket ID. Changes apply at once.
+                    </p>
+                </div>
+                <div class="ssoNotice ssoError hide" role="alert"></div>
+
+                <form class="ssoPublicUrlForm verticalSection" novalidate>
+                    <h3 class="sectionTitle">Public URL</h3>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="url" class="ssoPublicUrl" label="Public URL"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">
+                            The address users reach this server at, base path included, such as
+                            https://media.example.org. Each provider's callback URL is built on it. When it
+                            is empty, the server's published URL is used. Ferrofin Settings shows it,
+                            read-only, as Published server URL; set it with --published-url,
+                            FERROFIN_PUBLISHED_URL or published_url in config.toml, and restart. Dashboard →
+                            Networking's published server URIs are not used.
+                        </div>
+                        <div class="fieldDescription ssoRefused ssoPublicUrlError hide" role="alert"></div>
+                    </div>
+                    <button is="emby-button" type="submit" class="raised button-submit block">
+                        <span>Save</span>
+                    </button>
+                </form>
+
+                <form class="ssoLoginButtonForm verticalSection" novalidate>
+                    <h3 class="sectionTitle">Login page</h3>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoShowLoginButton" />
+                            <span>Show a sign-in button for each provider</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            Adds "Sign in with" and the provider's name under the web client's login form, for each
+                            enabled provider, once a public URL is known. The button is added to the login
+                            disclaimer the server sends every app, so an app that shows the disclaimer on its own
+                            login screen may show the button's text or markup there. Turn this off to remove it
+                            for every app; the branding you saved is never changed.
+                        </div>
+                    </div>
+                    <button is="emby-button" type="submit" class="raised button-submit block">
+                        <span>Save</span>
+                    </button>
+                </form>
+
+                <div class="verticalSection">
+                    <h3 class="sectionTitle">OIDC providers</h3>
+                    <div class="ssoProviders"></div>
+                    <button is="emby-button" type="button" class="raised ssoAdd">
+                        <span>Add provider</span>
+                    </button>
+                </div>
+
+                <form class="ssoEditor verticalSection hide" novalidate>
+                    <h3 class="sectionTitle ssoEditorTitle"></h3>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoKey" label="Key"
+                            autocomplete="off" spellcheck="false" maxlength="32" />
+                        <div class="fieldDescription">
+                            1 to 32 lowercase letters, digits or hyphens, such as "authentik". It is part of the
+                            callback URL, so it cannot be changed once the provider is saved.
+                        </div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoName" label="Name" autocomplete="off" />
+                        <div class="fieldDescription">The name users see on the sign-in button.</div>
+                    </div>
+                    <div class="checkboxContainer">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoEnabled" />
+                            <span>Enabled</span>
+                        </label>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="url" class="ssoIssuer" label="Issuer URL"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">
+                            The provider's issuer, whose discovery document is at
+                            /.well-known/openid-configuration under it, such as
+                            https://auth.example.org/application/o/ferrofin/.
+                        </div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoAllowHttp" />
+                            <span>Allow an http issuer</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription ssoHttpWarning">
+                            Warning: only for an identity provider on a network you trust. Over http, sign-in
+                            codes and tokens travel unencrypted and can be read or changed on the way.
+                        </div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoClientId" label="Client ID"
+                            autocomplete="off" spellcheck="false" />
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="password" class="ssoClientSecret" label="Client secret"
+                            autocomplete="new-password" spellcheck="false" />
+                        <div class="fieldDescription ssoSecretNote"></div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoScopes" label="Scopes"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">Separated by spaces; openid is required.</div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoUsernameClaim" label="Username claim"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">The claim a user's Ferrofin name is taken from.</div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoCreateUsers" />
+                            <span>Create accounts at first sign-in</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            A user no account is linked to gets one, named by the username claim, that only
+                            signs in through this provider. Off, such a user is refused. A name an account already
+                            has is always refused.
+                        </div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoSyncPictures" />
+                            <span>Sync profile pictures</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            After each sign-in, a user's profile picture is set from the image the provider's
+                            picture claim names, whenever that image is new or has changed, or the user has no
+                            picture, replacing a picture the user set in Ferrofin. It is downloaded under the server's image download limits: a
+                            picture on a private address needs that address in the server's
+                            image_private_http_allow. A sign-in without the claim, or whose picture cannot be
+                            downloaded, leaves the picture as it is; the download never holds up the sign-in.
+                            When the ID token has no picture claim, each sign-in also asks the provider's userinfo
+                            endpoint for it, which adds one request to the provider, of up to 10 seconds.
+                        </div>
+                    </div>
+                    <h4>Roles</h4>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoRoleClaim" label="Role claim"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">
+                            The claim a user's roles or groups are read from, in the ID token or the userinfo
+                            answer: a list of names, or one name. A nested claim, such as Keycloak's
+                            realm_access.roles, is not read: map the roles or groups to a top-level claim at the
+                            provider. Some providers send it only for a scope that asks for it, such as groups: add
+                            that scope above. A user whose sign-in carries no such claim has no role.
+                        </div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoRequiredRole" label="Required role"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">
+                            A user without this role is refused, and no account is created or linked for them. Empty lets
+                            every user of the provider sign in. Names are compared exactly.
+                        </div>
+                    </div>
+                    <div class="checkboxContainer checkboxContainer-withDescription">
+                        <label>
+                            <input is="emby-checkbox" type="checkbox" class="ssoRoleSync" />
+                            <span>Sync rights from roles</span>
+                        </label>
+                        <div class="fieldDescription checkboxFieldDescription">
+                            At each sign-in, a user's administrator flag, libraries and Live TV follow the roles
+                            below.
+                            Roles are read only at sign-in, so a change at the provider reaches a user at their
+                            next sign-in. Off, a sign-in never changes a user's rights.
+                        </div>
+                    </div>
+                    <div class="inputContainer">
+                        <input is="emby-input" type="text" class="ssoAdminRole" label="Administrator role"
+                            autocomplete="off" spellcheck="false" />
+                        <div class="fieldDescription">
+                            With role sync on, a user with this role is made an administrator, and a user without
+                            it loses the flag, except the last administrator, who keeps it. Empty never changes
+                            the flag.
+                        </div>
+                    </div>
+                    <h4>Library and Live TV access</h4>
+                    <p class="fieldDescription">
+                        With role sync on, a user's libraries and Live TV access are set from these roles at each
+                        sign-in, and nothing else of their access changes. A user with none of these roles gets no
+                        library and no Live TV, administrators included. Off, they are not used. One role per line;
+                        names are compared exactly.
+                    </p>
+                    <label class="ssoRoleList">
+                        <span>Roles with every library</span>
+                        <textarea class="emby-textarea ssoAllFoldersRoles" rows="2" spellcheck="false"></textarea>
+                    </label>
+                    <div class="ssoFolderRoles"></div>
+                    <button is="emby-button" type="button" class="raised ssoAddFolderRole">
+                        <span>Add a role with some libraries</span>
+                    </button>
+                    <label class="ssoRoleList">
+                        <span>Roles allowed Live TV</span>
+                        <textarea class="emby-textarea ssoLiveTvRoles" rows="2" spellcheck="false"></textarea>
+                    </label>
+                    <label class="ssoRoleList">
+                        <span>Roles allowed to manage Live TV recordings</span>
+                        <textarea class="emby-textarea ssoLiveTvManagementRoles" rows="2" spellcheck="false"></textarea>
+                    </label>
+                    <div class="ssoNotice ssoEditorError hide" role="alert"></div>
+                    <div class="ssoButtons">
+                        <button is="emby-button" type="submit" class="raised button-submit">
+                            <span>Save provider</span>
+                        </button>
+                        <button is="emby-button" type="button" class="raised button-cancel ssoCancel">
+                            <span>Cancel</span>
+                        </button>
+                    </div>
+                </form>
+
+                <!--
+                    Linked accounts: every link between an account and an identity, from the
+                    admin-only `GET /sso/admin/links`; `POST` adds one by hand, `DELETE` removes one
+                    and signs its account out. Self-contained: its script is the second one below.
+                -->
+                <div class="verticalSection ssoLinks">
+                    <h3 class="sectionTitle">Linked accounts</h3>
+                    <p class="fieldDescription">
+                        A linked identity at a provider signs in to its Ferrofin account. Users link their own
+                        account on the page <code class="ssoLinkPage"></code>, giving their password; there a
+                        link is never replaced, so a user removes theirs before linking another sign-in at the
+                        same provider. An account that signs in through Single Sign-On only has no password to
+                        give, so it is linked here. Removing a link signs out every session of its account. An
+                        account that signs in through Single Sign-On only cannot sign in at all without a link,
+                        until it is linked again or given another authentication provider on its profile page.
+                    </p>
+                    <div class="ssoNotice ssoLinksError hide" role="alert"></div>
+                    <div class="ssoLinkList"></div>
+                    <form class="ssoLinkForm" novalidate>
+                        <h4 class="ssoProviderTitle">Link an account by hand</h4>
+                        <div class="selectContainer">
+                            <select is="emby-select" class="ssoLinkUser" label="Account"></select>
+                        </div>
+                        <div class="selectContainer">
+                            <select is="emby-select" class="ssoLinkProvider" label="Provider"></select>
+                        </div>
+                        <div class="inputContainer">
+                            <input is="emby-input" type="text" class="ssoLinkSubject" label="Subject"
+                                autocomplete="off" spellcheck="false" maxlength="255" />
+                            <div class="fieldDescription">
+                                The identity's subject at the provider: the sub claim of its ID tokens, which the
+                                provider's admin console shows as the user's id. It replaces the account's link at
+                                that provider, if it has one. An identity another account has is refused.
+                            </div>
+                        </div>
+                        <button is="emby-button" type="submit" class="raised button-submit">
+                            <span>Link</span>
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+        <script type="text/javascript">
+            (function () {
+                'use strict';
+
+                var PLUGIN_ID = '67a29a1d-e02b-4aaa-bba0-4b2275e765d0';
+                // The defaults a new provider starts with, as the server's.
+                var DEFAULT_SCOPES = 'openid profile';
+                var DEFAULT_USERNAME_CLAIM = 'preferred_username';
+                var DEFAULT_ROLE_CLAIM = 'groups';
+                // jellyfin-web renders a confirm message as HTML and its title
+                // as text, so the provider's name goes in the title only.
+                var DELETE_MESSAGE = 'Its users can no longer sign in with it, and its client secret is deleted too.';
+
+                /** A new `tag` element with `className` and, if given, `text` as its text. */
+                function element(tag, className, text) {
+                    var node = document.createElement(tag);
+                    if (className) {
+                        node.className = className;
+                    }
+                    if (text !== undefined && text !== null) {
+                        node.textContent = String(text);
+                    }
+                    return node;
+                }
+
+                function clear(node) {
+                    while (node.firstChild) {
+                        node.removeChild(node.firstChild);
+                    }
+                }
+
+                function field(page, name) {
+                    return page.querySelector('.' + name);
+                }
+
+                function showError(node, text) {
+                    node.textContent = text;
+                    node.classList.toggle('hide', !text);
+                }
+
+                /** What to show for a refused request: the server's reason, when it gives one. */
+                function failureText(failure, verb) {
+                    var prefix = 'Could not ' + verb;
+                    if (!failure || typeof failure.json !== 'function') {
+                        return Promise.resolve(prefix + '.');
+                    }
+                    var status = ' (HTTP ' + failure.status + ')';
+                    return failure.json().then(function (body) {
+                        if (body && body.error && failure.status < 500) {
+                            return prefix + ': ' + String(body.error).replace(/^invalid input: /, '') + '.';
+                        }
+                        return prefix + status + '.';
+                    }, function () {
+                        return prefix + status + '.';
+                    });
+                }
+
+                /** Whether `text` is an address callback URLs can be built on, as the server judges it. */
+                function usableUrl(text) {
+                    try {
+                        var url = new URL(text);
+                        return (url.protocol === 'https:' || url.protocol === 'http:') && !!url.hostname
+                            && !url.search && !url.hash && !url.username && !url.password;
+                    } catch (e) {
+                        return false;
+                    }
+                }
+
+                var NO_ACCESS_MESSAGE = 'Role sync is on and no role gives a library or Live TV, so every user of '
+                    + 'this provider will have no library and no Live TV after their next sign-in, administrators '
+                    + 'included.';
+
+                /** Whether `body` turns role sync on with no role that gives a library or Live TV. */
+                function withoutAccess(body) {
+                    return body.RoleSync && !body.AllFoldersRoles.length && !body.LiveTvRoles.length
+                        && !body.LiveTvManagementRoles.length && !body.FolderRoles.some(function (mapping) {
+                            return mapping.Folders.length;
+                        });
+                }
+
+                /** A library id as `GET /Library/MediaFolders` writes it, whatever its spelling. */
+                function folderId(id) {
+                    return String(id).replace(/-/g, '').toLowerCase();
+                }
+
+                /** The libraries the dashboard's user access page lists, by id and name; null when they cannot be read. */
+                function loadLibraries() {
+                    return ApiClient.getJSON(ApiClient.getUrl('Library/MediaFolders', { IsHidden: false })).then(function (result) {
+                        return (result && result.Items || []).map(function (item) {
+                            return { Id: folderId(item.Id), Name: item.Name };
+                        });
+                    }, function () {
+                        return null;
+                    });
+                }
+
+                function lines(roles) {
+                    return (roles || []).join('\n');
+                }
+
+                /** The roles a role list's box holds, one per line. */
+                function roleList(page, name) {
+                    return field(page, name).value.split('\n').map(function (role) {
+                        return role.trim();
+                    }).filter(function (role) {
+                        return role;
+                    });
+                }
+
+                /** A library's box in a mapping, named by the library, or as missing when no library has the id. */
+                function folderBox(id, name, checked, missing) {
+                    var container = element('div', 'checkboxContainer');
+                    var label = element('label', missing ? 'ssoRefused' : null);
+                    var box = element('input', 'ssoFolder');
+                    box.type = 'checkbox';
+                    box.setAttribute('is', 'emby-checkbox');
+                    box.setAttribute('data-folder', id);
+                    box.checked = checked;
+                    label.appendChild(box);
+                    label.appendChild(element('span', null, name));
+                    container.appendChild(label);
+                    return container;
+                }
+
+                /** One library mapping: its role, a box for each library, and one for each mapped library that is gone. */
+                function folderRoleRow(libraries, mapping) {
+                    var row = element('div', 'ssoFolderRole');
+                    var roleContainer = element('div', 'inputContainer');
+                    var role = element('input', 'ssoFolderRoleName');
+                    role.type = 'text';
+                    role.setAttribute('is', 'emby-input');
+                    role.setAttribute('label', 'Role');
+                    role.setAttribute('autocomplete', 'off');
+                    role.setAttribute('spellcheck', 'false');
+                    role.value = mapping.Role || '';
+                    roleContainer.appendChild(role);
+                    row.appendChild(roleContainer);
+                    var mapped = (mapping.Folders || []).map(folderId);
+                    var known = (libraries || []).map(function (library) {
+                        return library.Id;
+                    });
+                    (libraries || []).forEach(function (library) {
+                        row.appendChild(folderBox(library.Id, library.Name, mapped.indexOf(library.Id) !== -1, false));
+                    });
+                    mapped.filter(function (id) {
+                        return known.indexOf(id) === -1;
+                    }).forEach(function (id) {
+                        row.appendChild(libraries
+                            ? folderBox(id, 'Missing library ' + id + ': no library has this id any more. Clear the box to remove it.', true, true)
+                            : folderBox(id, 'Library ' + id, true, false));
+                    });
+                    if (!libraries) {
+                        row.appendChild(element('p', 'fieldDescription ssoRefused',
+                            'The libraries could not be loaded: only the ones already mapped are shown.'));
+                    } else if (libraries.length === 0 && mapped.length === 0) {
+                        row.appendChild(element('p', 'fieldDescription', 'The server has no library yet.'));
+                    }
+                    var remove = element('button', 'raised');
+                    remove.type = 'button';
+                    remove.setAttribute('is', 'emby-button');
+                    remove.appendChild(element('span', null, 'Remove this role'));
+                    remove.addEventListener('click', function () {
+                        row.parentNode.removeChild(row);
+                    });
+                    row.appendChild(remove);
+                    return row;
+                }
+
+                /** Shows `mappings` in the editor, once the libraries are read. */
+                function renderFolderRoles(page, state, mappings) {
+                    var list = field(page, 'ssoFolderRoles');
+                    clear(list);
+                    // Only the last editor opened shows its mappings.
+                    var shown = state.folderRolesShown = {};
+                    return state.libraries.then(function (libraries) {
+                        if (state.folderRolesShown !== shown) {
+                            return;
+                        }
+                        (mappings || []).forEach(function (mapping) {
+                            list.appendChild(folderRoleRow(libraries, mapping));
+                        });
+                    });
+                }
+
+                /** The editor's library mappings, without a row left with no role and no library. */
+                function folderRoles(page) {
+                    var rows = field(page, 'ssoFolderRoles').querySelectorAll('.ssoFolderRole');
+                    return Array.prototype.map.call(rows, function (row) {
+                        var boxes = row.querySelectorAll('.ssoFolder');
+                        return {
+                            Role: row.querySelector('.ssoFolderRoleName').value.trim(),
+                            Folders: Array.prototype.filter.call(boxes, function (box) {
+                                return box.checked;
+                            }).map(function (box) {
+                                return box.getAttribute('data-folder');
+                            })
+                        };
+                    }).filter(function (mapping) {
+                        return mapping.Role || mapping.Folders.length;
+                    });
+                }
+
+                function load(page, state) {
+                    Dashboard.showLoadingMsg();
+                    return ApiClient.fetch({
+                        url: ApiClient.getUrl('sso/admin/oidc/providers'),
+                        type: 'GET',
+                        dataType: 'json'
+                    }).then(function (list) {
+                        state.list = list;
+                        showError(field(page, 'ssoError'), '');
+                        render(page, state);
+                    }).catch(function (failure) {
+                        return failureText(failure, 'load the providers').then(function (text) {
+                            showError(field(page, 'ssoError'), text);
+                        });
+                    }).finally(function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                function providerRow(page, state, info) {
+                    var row = element('div', 'ssoProvider');
+                    row.appendChild(element('h4', 'ssoProviderTitle', (info.Name || info.Key) + ' (' + info.Key + ')'));
+                    if (info.ValidationError) {
+                        row.appendChild(element('p', 'ssoRefused', 'Not used: ' + info.ValidationError + '.'));
+                    } else {
+                        row.appendChild(element('p', 'fieldDescription', info.Enabled ? 'Enabled' : 'Disabled'));
+                    }
+                    row.appendChild(element('p', 'fieldDescription', 'Issuer: ' + info.Issuer));
+                    row.appendChild(element('p', 'fieldDescription',
+                        info.HasClientSecret ? 'A client secret is stored.' : 'No client secret is stored.'));
+                    var callback = element('p', 'fieldDescription ssoCallback');
+                    if (info.CallbackUrl) {
+                        callback.appendChild(document.createTextNode('Callback URL to register at the provider: '));
+                        callback.appendChild(element('code', null, info.CallbackUrl));
+                    } else {
+                        callback.textContent = 'Fill in the Public URL above, or start the server with a published '
+                            + 'URL (--published-url, FERROFIN_PUBLISHED_URL or published_url in config.toml), to get '
+                            + 'the callback URL to register at the provider.';
+                    }
+                    row.appendChild(callback);
+                    if (state.discovery[info.Key]) {
+                        row.appendChild(discoveryResult(state.discovery[info.Key]));
+                    }
+                    var buttons = element('div', 'ssoButtons');
+                    var edit = element('button', 'raised');
+                    edit.type = 'button';
+                    edit.setAttribute('is', 'emby-button');
+                    edit.appendChild(element('span', null, 'Edit'));
+                    edit.addEventListener('click', function () {
+                        openEditor(page, state, info);
+                    });
+                    var remove = element('button', 'raised');
+                    remove.type = 'button';
+                    remove.setAttribute('is', 'emby-button');
+                    remove.appendChild(element('span', null, 'Delete'));
+                    remove.addEventListener('click', function () {
+                        deleteProvider(page, state, info);
+                    });
+                    buttons.appendChild(edit);
+                    buttons.appendChild(remove);
+                    row.appendChild(buttons);
+                    return row;
+                }
+
+                /** What the discovery test of the last save found, as the provider's row shows it. */
+                function discoveryResult(discovery) {
+                    var block = element('div', 'ssoDiscovery');
+                    if (discovery.Error) {
+                        block.appendChild(element('p', 'ssoRefused',
+                            'Discovery test failed: ' + discovery.Error + '. The provider is saved.'));
+                        return block;
+                    }
+                    block.appendChild(element('p', 'ssoFound', 'Discovery test passed.'));
+                    [
+                        ['Authorization endpoint', discovery.AuthorizationEndpoint],
+                        ['Token endpoint', discovery.TokenEndpoint],
+                        ['Userinfo endpoint', discovery.UserinfoEndpoint],
+                        ['Key set', discovery.JwksUri]
+                    ].forEach(function (endpoint) {
+                        var line = element('p', 'fieldDescription');
+                        line.appendChild(document.createTextNode(endpoint[0] + ': '));
+                        line.appendChild(element('code', null, endpoint[1] || 'none advertised'));
+                        block.appendChild(line);
+                    });
+                    block.appendChild(element('p', 'fieldDescription',
+                        'Signing keys read: ' + (discovery.SigningKeys || 0) + '.'));
+                    (discovery.Warnings || []).forEach(function (warning) {
+                        block.appendChild(element('p', 'ssoHttpWarning', 'Warning: ' + warning + '.'));
+                    });
+                    return block;
+                }
+
+                function render(page, state) {
+                    field(page, 'ssoPublicUrl').value = state.list.PublicUrl || '';
+                    showError(field(page, 'ssoPublicUrlError'), state.list.PublicUrlError
+                        ? 'Not used: ' + state.list.PublicUrlError + '.' : '');
+                    var list = field(page, 'ssoProviders');
+                    clear(list);
+                    var providers = state.list.Providers || [];
+                    if (providers.length === 0) {
+                        list.appendChild(element('p', 'fieldDescription', 'No provider has been added yet.'));
+                    }
+                    providers.forEach(function (info) {
+                        list.appendChild(providerRow(page, state, info));
+                    });
+                }
+
+                /** Opens the editor on `info`, a listed provider, or on a new one. */
+                function openEditor(page, state, info) {
+                    state.editing = info ? info.Key : null;
+                    field(page, 'ssoEditorTitle').textContent = info ? 'Edit ' + (info.Name || info.Key) : 'Add a provider';
+                    var key = field(page, 'ssoKey');
+                    key.value = info ? info.Key : '';
+                    key.disabled = !!info;
+                    field(page, 'ssoName').value = info ? info.Name : '';
+                    field(page, 'ssoEnabled').checked = info ? !!info.Enabled : true;
+                    field(page, 'ssoIssuer').value = info ? info.Issuer : '';
+                    field(page, 'ssoAllowHttp').checked = info ? !!info.AllowHttpIssuer : false;
+                    field(page, 'ssoClientId').value = info ? info.ClientId : '';
+                    // A stored secret is never sent to the page: empty keeps it.
+                    field(page, 'ssoClientSecret').value = '';
+                    field(page, 'ssoSecretNote').textContent = info && info.HasClientSecret
+                        ? 'A client secret is stored. Leave this empty to keep it, or enter a new one to replace it.'
+                        : 'Required.';
+                    field(page, 'ssoScopes').value = info ? info.Scopes : DEFAULT_SCOPES;
+                    field(page, 'ssoUsernameClaim').value = info ? info.UsernameClaim : DEFAULT_USERNAME_CLAIM;
+                    field(page, 'ssoCreateUsers').checked = info ? !!info.CreateUsers : true;
+                    field(page, 'ssoSyncPictures').checked = info ? !!info.SyncProfilePictures : false;
+                    field(page, 'ssoRoleClaim').value = info ? info.RoleClaim : DEFAULT_ROLE_CLAIM;
+                    field(page, 'ssoRequiredRole').value = info ? info.RequiredRole : '';
+                    field(page, 'ssoRoleSync').checked = info ? !!info.RoleSync : false;
+                    field(page, 'ssoAdminRole').value = info ? info.AdminRole : '';
+                    field(page, 'ssoAllFoldersRoles').value = lines(info && info.AllFoldersRoles);
+                    state.folderRolesReady = renderFolderRoles(page, state, info && info.FolderRoles);
+                    field(page, 'ssoLiveTvRoles').value = lines(info && info.LiveTvRoles);
+                    field(page, 'ssoLiveTvManagementRoles').value = lines(info && info.LiveTvManagementRoles);
+                    showError(field(page, 'ssoEditorError'), '');
+                    field(page, 'ssoEditor').classList.remove('hide');
+                    field(page, 'ssoAdd').classList.add('hide');
+                    (info ? field(page, 'ssoName') : key).focus();
+                }
+
+                function closeEditor(page, state) {
+                    state.editing = null;
+                    field(page, 'ssoClientSecret').value = '';
+                    field(page, 'ssoEditor').classList.add('hide');
+                    field(page, 'ssoAdd').classList.remove('hide');
+                }
+
+                /** Saves the editor's provider; `noAccessConfirmed` once the admin agreed to role sync with no access role. */
+                function saveProvider(page, state, noAccessConfirmed) {
+                    var key = state.editing || field(page, 'ssoKey').value.trim();
+                    var body = {
+                        Name: field(page, 'ssoName').value.trim(),
+                        Enabled: field(page, 'ssoEnabled').checked,
+                        Issuer: field(page, 'ssoIssuer').value.trim(),
+                        AllowHttpIssuer: field(page, 'ssoAllowHttp').checked,
+                        ClientId: field(page, 'ssoClientId').value.trim(),
+                        Scopes: field(page, 'ssoScopes').value.trim(),
+                        UsernameClaim: field(page, 'ssoUsernameClaim').value.trim(),
+                        CreateUsers: field(page, 'ssoCreateUsers').checked,
+                        SyncProfilePictures: field(page, 'ssoSyncPictures').checked,
+                        RoleClaim: field(page, 'ssoRoleClaim').value.trim(),
+                        RequiredRole: field(page, 'ssoRequiredRole').value.trim(),
+                        RoleSync: field(page, 'ssoRoleSync').checked,
+                        AdminRole: field(page, 'ssoAdminRole').value.trim(),
+                        AllFoldersRoles: roleList(page, 'ssoAllFoldersRoles'),
+                        FolderRoles: folderRoles(page),
+                        LiveTvRoles: roleList(page, 'ssoLiveTvRoles'),
+                        LiveTvManagementRoles: roleList(page, 'ssoLiveTvManagementRoles')
+                    };
+                    var secret = field(page, 'ssoClientSecret').value;
+                    if (secret) {
+                        body.ClientSecret = secret;
+                    }
+                    var error = field(page, 'ssoEditorError');
+                    if (!key) {
+                        showError(error, 'Fill in the key.');
+                        return;
+                    }
+                    // A save is create-or-update: adding under a key in use
+                    // would replace that provider.
+                    var taken = !state.editing && (state.list && state.list.Providers || []).some(function (info) {
+                        return info.Key === key;
+                    });
+                    if (taken) {
+                        showError(error, 'A provider with the key ' + key + ' already exists: edit it instead.');
+                        return;
+                    }
+                    if (!noAccessConfirmed && withoutAccess(body)) {
+                        Dashboard.confirm(NO_ACCESS_MESSAGE, 'Save with no library or Live TV role?', function (confirmed) {
+                            if (confirmed) {
+                                saveProvider(page, state, true);
+                            }
+                        });
+                        return;
+                    }
+                    Dashboard.showLoadingMsg();
+                    ApiClient.fetch({
+                        url: ApiClient.getUrl('sso/admin/oidc/providers/' + encodeURIComponent(key)),
+                        type: 'PUT',
+                        data: JSON.stringify(body),
+                        contentType: 'application/json',
+                        dataType: 'json'
+                    }).then(function (saved) {
+                        state.discovery[key] = saved && saved.Discovery;
+                        closeEditor(page, state);
+                        Dashboard.processPluginConfigurationUpdateResult();
+                        return load(page, state);
+                    }, function (failure) {
+                        return failureText(failure, 'save the provider').then(function (text) {
+                            showError(error, text);
+                        });
+                    }).finally(function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                function deleteProvider(page, state, info) {
+                    Dashboard.confirm(DELETE_MESSAGE, 'Delete ' + (info.Name || info.Key) + '?', function (confirmed) {
+                        if (!confirmed) {
+                            return;
+                        }
+                        Dashboard.showLoadingMsg();
+                        ApiClient.fetch({
+                            url: ApiClient.getUrl('sso/admin/oidc/providers/' + encodeURIComponent(info.Key)),
+                            type: 'DELETE'
+                        }).then(function () {
+                            delete state.discovery[info.Key];
+                            if (state.editing === info.Key) {
+                                closeEditor(page, state);
+                            }
+                            return load(page, state);
+                        }, function (failure) {
+                            return failureText(failure, 'delete the provider').then(function (text) {
+                                showError(field(page, 'ssoError'), text);
+                            });
+                        }).finally(function () {
+                            Dashboard.hideLoadingMsg();
+                        });
+                    });
+                }
+
+                function savePublicUrl(page, state) {
+                    var value = field(page, 'ssoPublicUrl').value.trim();
+                    var error = field(page, 'ssoError');
+                    if (value && !usableUrl(value)) {
+                        showError(error, 'The public URL must be an http or https address with no query, such as '
+                            + 'https://media.example.org.');
+                        return;
+                    }
+                    Dashboard.showLoadingMsg();
+                    // The whole configuration goes back as read: a provider
+                    // saved from another window in between would be lost, as
+                    // with any plugin page that saves its configuration.
+                    ApiClient.getPluginConfiguration(PLUGIN_ID).then(function (config) {
+                        config.PublicUrl = value;
+                        return ApiClient.updatePluginConfiguration(PLUGIN_ID, config);
+                    }).then(function (result) {
+                        Dashboard.processPluginConfigurationUpdateResult(result);
+                        return load(page, state);
+                    }, function (failure) {
+                        return failureText(failure, 'save the public URL').then(function (text) {
+                            showError(error, text);
+                        });
+                    }).finally(function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                /** The login page's sign-in button switch, kept in the plugin configuration. */
+                function bindLoginButton(page) {
+                    var checkbox = field(page, 'ssoShowLoginButton');
+                    var error = field(page, 'ssoError');
+                    page.addEventListener('pageshow', function () {
+                        ApiClient.getPluginConfiguration(PLUGIN_ID).then(function (config) {
+                            // On unless saved off, as the server reads it.
+                            checkbox.checked = config.ShowLoginButton !== false;
+                        }, function (failure) {
+                            return failureText(failure, 'load the sign-in button setting').then(function (text) {
+                                showError(error, text);
+                            });
+                        });
+                    });
+                    field(page, 'ssoLoginButtonForm').addEventListener('submit', function (event) {
+                        event.preventDefault();
+                        showError(error, '');
+                        Dashboard.showLoadingMsg();
+                        ApiClient.getPluginConfiguration(PLUGIN_ID).then(function (config) {
+                            config.ShowLoginButton = checkbox.checked;
+                            return ApiClient.updatePluginConfiguration(PLUGIN_ID, config);
+                        }).then(function (result) {
+                            Dashboard.processPluginConfigurationUpdateResult(result);
+                        }, function (failure) {
+                            return failureText(failure, 'save the sign-in button setting').then(function (text) {
+                                showError(error, text);
+                            });
+                        }).finally(function () {
+                            Dashboard.hideLoadingMsg();
+                        });
+                    });
+                }
+
+                function bind(page) {
+                    var state = {
+                        list: null, editing: null, discovery: {},
+                        libraries: Promise.resolve([]), folderRolesReady: Promise.resolve()
+                    };
+                    page.setAttribute('data-sso-bound', 'true');
+                    bindLoginButton(page);
+                    page.addEventListener('pageshow', function () {
+                        state.discovery = {};
+                        state.libraries = loadLibraries();
+                        closeEditor(page, state);
+                        load(page, state);
+                    });
+                    field(page, 'ssoAddFolderRole').addEventListener('click', function () {
+                        state.libraries.then(function (libraries) {
+                            var row = folderRoleRow(libraries, {});
+                            field(page, 'ssoFolderRoles').appendChild(row);
+                            row.querySelector('.ssoFolderRoleName').focus();
+                        });
+                    });
+                    field(page, 'ssoPublicUrlForm').addEventListener('submit', function (event) {
+                        event.preventDefault();
+                        savePublicUrl(page, state);
+                    });
+                    field(page, 'ssoAdd').addEventListener('click', function () {
+                        openEditor(page, state, null);
+                    });
+                    field(page, 'ssoCancel').addEventListener('click', function () {
+                        closeEditor(page, state);
+                    });
+                    field(page, 'ssoEditor').addEventListener('submit', function (event) {
+                        event.preventDefault();
+                        // Not before the library mappings are shown, or none would be sent.
+                        state.folderRolesReady.then(function () {
+                            saveProvider(page, state, false);
+                        });
+                    });
+                }
+
+                // jellyfin-web keeps earlier views in the document, so this
+                // script binds only the page it was loaded with: the one not
+                // bound yet. `pageshow` fires on each visit and reloads.
+                document.querySelectorAll('.ssoSettingsPage').forEach(function (page) {
+                    if (page.getAttribute('data-sso-bound') !== 'true') {
+                        bind(page);
+                    }
+                });
+            }());
+        </script>
+        <script type="text/javascript">
+            // Linked accounts (the section above): lists every link, removes one, adds one.
+            (function () {
+                'use strict';
+
+                // Dashboard.confirm renders its message as HTML and its title as text: names go in
+                // the title only.
+                var REMOVE_MESSAGE = 'Every session of the account is signed out.';
+                var LAST_LINK_MESSAGE = 'Every session of the account is signed out. It signs in through '
+                    + 'Single Sign-On only and has no other link, so it cannot sign in at all until it is linked '
+                    + 'again or given another authentication provider on its profile page.';
+
+                function element(tag, className, text) {
+                    var node = document.createElement(tag);
+                    if (className) {
+                        node.className = className;
+                    }
+                    if (text !== undefined && text !== null) {
+                        node.textContent = String(text);
+                    }
+                    return node;
+                }
+
+                function field(page, name) {
+                    return page.querySelector('.' + name);
+                }
+
+                function showError(page, text) {
+                    var node = field(page, 'ssoLinksError');
+                    node.textContent = text;
+                    node.classList.toggle('hide', !text);
+                }
+
+                /** The server's reason for a refused request, when it gives one. */
+                function failed(page, failure, verb) {
+                    var prefix = 'Could not ' + verb;
+                    if (!failure || typeof failure.json !== 'function') {
+                        showError(page, prefix + '.');
+                        return Promise.resolve();
+                    }
+                    return failure.json().then(function (body) {
+                        showError(page, body && body.error && failure.status < 500
+                            ? prefix + ': ' + String(body.error).replace(/^invalid input: /, '') + '.'
+                            : prefix + ' (HTTP ' + failure.status + ').');
+                    }, function () {
+                        showError(page, prefix + ' (HTTP ' + failure.status + ').');
+                    });
+                }
+
+                function options(select, entries) {
+                    var kept = select.value;
+                    while (select.firstChild) {
+                        select.removeChild(select.firstChild);
+                    }
+                    entries.forEach(function (entry) {
+                        var option = element('option', null, entry[1]);
+                        option.value = entry[0];
+                        select.appendChild(option);
+                    });
+                    if (kept) {
+                        select.value = kept;
+                    }
+                }
+
+                function render(page, links) {
+                    var list = field(page, 'ssoLinkList');
+                    while (list.firstChild) {
+                        list.removeChild(list.firstChild);
+                    }
+                    if (links.length === 0) {
+                        list.appendChild(element('p', 'fieldDescription', 'No account is linked yet.'));
+                    }
+                    links.forEach(function (link) {
+                        var row = element('div', 'ssoProvider');
+                        row.appendChild(element('h4', 'ssoProviderTitle', link.UserName + ' at '
+                            + (link.ProviderName || link.Issuer)));
+                        row.appendChild(element('p', 'fieldDescription', 'Issuer: ' + link.Issuer));
+                        row.appendChild(element('p', 'fieldDescription', 'Subject: ' + link.Subject));
+                        row.appendChild(element('p', 'fieldDescription', 'Linked on '
+                            + new Date(link.DateCreated).toLocaleString()
+                            + (link.SingleSignOnAccount ? '. The account signs in through Single Sign-On only.' : '.')));
+                        var remove = element('button', 'raised');
+                        remove.type = 'button';
+                        remove.setAttribute('is', 'emby-button');
+                        remove.appendChild(element('span', null, 'Remove'));
+                        remove.addEventListener('click', function () {
+                            var last = link.SingleSignOnAccount && !links.some(function (other) {
+                                return other !== link && other.UserId === link.UserId;
+                            });
+                            removeLink(page, link, last);
+                        });
+                        var buttons = element('div', 'ssoButtons');
+                        buttons.appendChild(remove);
+                        row.appendChild(buttons);
+                        list.appendChild(row);
+                    });
+                }
+
+                function load(page) {
+                    field(page, 'ssoLinkPage').textContent = ApiClient.getUrl('sso/link');
+                    return Promise.all([
+                        ApiClient.fetch({ url: ApiClient.getUrl('sso/admin/links'), type: 'GET', dataType: 'json' }),
+                        ApiClient.fetch({ url: ApiClient.getUrl('sso/admin/oidc/providers'), type: 'GET', dataType: 'json' }),
+                        ApiClient.getUsers()
+                    ]).then(function (answers) {
+                        showError(page, '');
+                        render(page, answers[0]);
+                        options(field(page, 'ssoLinkProvider'), (answers[1].Providers || []).filter(function (info) {
+                            return !info.ValidationError;
+                        }).map(function (info) {
+                            return [info.Key, info.Name || info.Key];
+                        }));
+                        options(field(page, 'ssoLinkUser'), answers[2].map(function (user) {
+                            return [user.Id, user.Name];
+                        }));
+                    }, function (failure) {
+                        return failed(page, failure, 'load the linked accounts');
+                    });
+                }
+
+                function removeLink(page, link, last) {
+                    Dashboard.confirm(last ? LAST_LINK_MESSAGE : REMOVE_MESSAGE,
+                        'Remove the link of ' + link.UserName + ' at ' + (link.ProviderName || link.Issuer) + '?',
+                        function (confirmed) {
+                            if (!confirmed) {
+                                return;
+                            }
+                            Dashboard.showLoadingMsg();
+                            // By its issuer, which names a link whose provider is gone too.
+                            ApiClient.fetch({
+                                url: ApiClient.getUrl('sso/admin/links', { userId: link.UserId, issuer: link.Issuer }),
+                                type: 'DELETE'
+                            }).then(function () {
+                                return load(page);
+                            }, function (failure) {
+                                return failed(page, failure, 'remove the link');
+                            }).finally(function () {
+                                Dashboard.hideLoadingMsg();
+                            });
+                        });
+                }
+
+                function addLink(page) {
+                    var subject = field(page, 'ssoLinkSubject').value;
+                    if (!subject.trim()) {
+                        showError(page, 'Fill in the subject.');
+                        return;
+                    }
+                    Dashboard.showLoadingMsg();
+                    ApiClient.fetch({
+                        url: ApiClient.getUrl('sso/admin/links'),
+                        type: 'POST',
+                        data: JSON.stringify({
+                            UserId: field(page, 'ssoLinkUser').value,
+                            Provider: field(page, 'ssoLinkProvider').value,
+                            Subject: subject
+                        }),
+                        contentType: 'application/json',
+                        dataType: 'json'
+                    }).then(function () {
+                        field(page, 'ssoLinkSubject').value = '';
+                        return load(page);
+                    }, function (failure) {
+                        return failed(page, failure, 'link the account');
+                    }).finally(function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                document.querySelectorAll('.ssoSettingsPage').forEach(function (page) {
+                    if (page.getAttribute('data-sso-links-bound') === 'true') {
+                        return;
+                    }
+                    page.setAttribute('data-sso-links-bound', 'true');
+                    page.addEventListener('pageshow', function () {
+                        load(page);
+                    });
+                    field(page, 'ssoLinkForm').addEventListener('submit', function (event) {
+                        event.preventDefault();
+                        addLink(page);
+                    });
+                });
+            }());
+        </script>
+    </div>
+</body>
+
+</html>

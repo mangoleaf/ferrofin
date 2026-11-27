@@ -760,22 +760,15 @@ impl FileSystem for HungListingFs {
 /// admin picks another path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hung_listings_hold_no_more_threads_than_the_cap() {
-    /// Lets the hung calls go whatever the test's outcome: the runtime waits
-    /// for its blocking threads when it is dropped.
-    struct ReleaseAtTheEnd(Arc<HungListingFs>);
-    impl Drop for ReleaseAtTheEnd {
-        fn drop(&mut self) {
-            self.0.release();
-        }
-    }
-
     let fs = Arc::new(HungListingFs::default());
-    let release = ReleaseAtTheEnd(Arc::clone(&fs));
+    // Lets the hung calls go whatever the test's outcome: the runtime waits
+    // for its blocking threads when it is dropped.
+    let release = std::mem::DropGuard::new(Arc::clone(&fs), |fs| fs.release());
     let app = state_with_file_system(Arc::clone(&fs) as _);
     let uri = "/Environment/DirectoryContents?path=/mnt/nas&includeFiles=true";
-    let requests: Vec<_> = (0..MAX_BLOCKING_FILE_SYSTEM_CALLS * 2)
-        .map(|_| tokio::spawn(get(app.clone(), uri)))
-        .collect();
+    let requests: Vec<_> = Vec::from_fn(MAX_BLOCKING_FILE_SYSTEM_CALLS * 2, |_| {
+        tokio::spawn(get(app.clone(), uri))
+    });
 
     let give_up = tokio::time::Instant::now() + Duration::from_secs(30);
     while fs.in_listing.load(Ordering::SeqCst) < MAX_BLOCKING_FILE_SYSTEM_CALLS {

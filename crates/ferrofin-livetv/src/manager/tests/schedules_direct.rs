@@ -86,7 +86,7 @@ impl Upstream {
 }
 
 fn sd_path(url: &str) -> &str {
-    let rest = url.strip_prefix(API_URL).unwrap_or(url);
+    let rest = url.trim_prefix(API_URL);
     rest.split('?').next().unwrap_or(rest)
 }
 
@@ -113,8 +113,7 @@ impl SourceFetcher for Upstream {
         let body = request
             .json
             .as_deref()
-            .map(String::from_utf8_lossy)
-            .unwrap_or_default();
+            .map_or_default(String::from_utf8_lossy);
         let routes = self.sd.lock().unwrap();
         let matches = |(m, p, _, _, _): &&Route| *m == request.method && p == path;
         let (status, body) = routes
@@ -411,7 +410,8 @@ async fn the_guide_refresh_stores_the_bound_stations_airings() {
         200,
         &format!(
             r#"[{{"stationID":"20454","programs":[
-                {{"programID":"EP000014577244","airDateTime":"{}","duration":1800,"new":true}},
+                {{"programID":"EP000014577244","airDateTime":"{}","duration":1800,"new":true,
+                  "md5":"e1TFMdJbWpCuNdChl3/Xbw","audioProperties":["DD 5.1"],"videoProperties":["hdtv"]}},
                 {{"programID":"MV000000010000","airDateTime":"{}","duration":7200}}]}}]"#,
             airing_at(60),
             airing_at(90)
@@ -424,7 +424,7 @@ async fn the_guide_refresh_stores_the_bound_stations_airings() {
         r#"[{"programID":"EP000014577244","titles":[{"title120":"Show"}],"entityType":"Episode",
              "episodeTitle150":"Pilot","genres":["News"],"metadata":[{"Gracenote":{"season":1,"episode":2}}]},
             {"programID":"MV000000010000","titles":[{"title120":"Film"}],"entityType":"Movie",
-             "movie":{"year":"1999"}}]"#,
+             "movie":{"year":"1999"},"originalAirDate":"1999-06-01"}]"#,
     );
 
     mgr.refresh_guide().await.expect("refresh");
@@ -466,6 +466,48 @@ async fn the_guide_refresh_stores_the_bound_stations_airings() {
     // Both on the one bound channel.
     assert!(episode.channel_id.is_some());
     assert_eq!(episode.channel_id, movie.channel_id);
+
+    // gl-763: what `GetProgram` takes from the listing beyond the airing's
+    // columns is stored with it, for the item mirror.
+    let ids: Vec<uuid::Uuid> = crate::guide_repository::all_program_ids(&mgr.db)
+        .await
+        .expect("ids")
+        .iter()
+        .map(|id| uuid::Uuid::parse_str(id).expect("guid"))
+        .collect();
+    let rows = crate::guide_repository::program_rows_by_ids(&mgr.db, &ids)
+        .await
+        .expect("rows");
+    let listing = |title: &str| {
+        let row = rows.values().find(|r| r.title == title).expect(title);
+        (
+            row.etag.clone(),
+            row.audio,
+            row.is_hd,
+            row.original_air_date.as_deref().map(|d| d[..10].to_owned()),
+            row.series_zap2it.clone(),
+        )
+    };
+    assert_eq!(
+        listing("Show"),
+        (
+            Some("e1TFMdJbWpCuNdChl3/Xbw".to_owned()),
+            Some(3), // DolbyDigital
+            Some(true),
+            None,
+            Some("EP00001457".to_owned()),
+        )
+    );
+    assert_eq!(
+        listing("Film"),
+        (
+            None,
+            Some(1),
+            Some(false),
+            Some("1999-06-01".to_owned()),
+            None
+        )
+    );
 }
 
 /// How many airings the guide holds.
@@ -536,7 +578,7 @@ async fn airings(mgr: &FerrofinLiveTvManager) -> Vec<(String, String)> {
         .into_iter()
         .map(|p| {
             (
-                p.channel_id.map(|id| id.to_string()).unwrap_or_default(),
+                p.channel_id.map_or_default(|id| id.to_string()),
                 p.name.unwrap_or_default(),
             )
         })
@@ -603,7 +645,7 @@ async fn a_provider_enabled_for_one_tuner_binds_only_its_channels() {
         ListingsProviderInfo {
             listings_id: Some("USA-OTA-90210".to_owned()),
             enable_all_tuners: false,
-            enabled_tuners: vec![ids[0].clone()],
+            enabled_tuners: vec![Some(ids[0].clone())],
             ..sd_account()
         },
         false,
@@ -639,10 +681,10 @@ async fn an_hdhomerun_channel_binds_to_the_station_mapped_to_its_hdhr_id() {
     mgr.save_listing_provider(
         ListingsProviderInfo {
             listings_id: Some("USA-OTA-90210".to_owned()),
-            channel_mappings: vec![NameValuePair {
+            channel_mappings: vec![Some(NameValuePair {
                 name: Some("hdhr_4.1".to_owned()),
                 value: Some("20454".to_owned()),
-            }],
+            })],
             ..sd_account()
         },
         false,

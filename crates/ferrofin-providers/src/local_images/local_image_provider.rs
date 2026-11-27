@@ -505,7 +505,7 @@ impl LocalImageProvider {
         let season_marker = if season_number == 0 {
             "-specials".to_owned()
         } else {
-            format!("{season_number:02}")
+            ferrofin_util::string_extensions::zero_padded(i64::from(season_number), 2)
         };
 
         if !prefix.eq_ignore_ascii_case(&season_marker) {

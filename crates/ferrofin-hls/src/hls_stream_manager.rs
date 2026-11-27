@@ -678,10 +678,10 @@ where
                     return Ok(file);
                 }
             }
-            // A seek (or the running job died mid-wait): drop the stale job before
+            // A seek (or the running job died mid-wait): stop the stale job before
             // restarting so the two don't write the same files. Keep its produced
-            // segments (delete_files = false) — a later backward seek serves them
-            // straight from disk via the fast path — but the one its exit cut short.
+            // segments — a later backward seek serves them straight from disk
+            // via the fast path — but the one its exit cut short.
             // `DynamicHlsController` kills the old job with `closeLiveStream:
             // false` — the restart below re-opens ffmpeg on the SAME live stream,
             // so releasing the tuner here would make it read a closed source.
@@ -890,7 +890,7 @@ where
                 }
                 if !delivered {
                     // A seek, or the job exited without those segments, or its
-                    // init is still empty: drop it and start afresh, as a
+                    // init is still empty: stop it and start afresh, as a
                     // segment request does, or every retry waits on it.
                     self.kill_for_restart(&handle, &plan.playlist_path, ext, first)
                         .await?;
@@ -979,12 +979,15 @@ where
         }
     }
 
-    /// Kills the job behind `handle`, which writes `playlist_path`'s segments
+    /// Stops the job behind `handle`, which writes `playlist_path`'s segments
     /// from `job_start`, before a restart, so the two never write the same
-    /// files. It keeps the segments the job produced (`delete_files = false`),
-    /// which a later backward seek serves straight from disk, and deletes the
-    /// one its exit cut short (gl-1396). The live stream stays open
-    /// (`closeLiveStream: false`): the restart re-opens ffmpeg on it.
+    /// files. It keeps the segments the job produced, which a later backward
+    /// seek serves straight from disk, and deletes the one its exit cut short
+    /// (gl-1396). The job stays registered, their owner, until the restart's
+    /// job registers on the output, so a restart that is refused, stopped by
+    /// the breaker or fails to start leaves them to a stop or the idle reaper
+    /// (gl-1947; [`TranscodeManagerImpl::supersede`]). The live stream stays
+    /// open (`closeLiveStream: false`): the restart re-opens ffmpeg on it.
     async fn kill_for_restart(
         &self,
         handle: &TranscodingJobHandle,
@@ -997,7 +1000,7 @@ where
         let before = tokio::task::spawn_blocking(move || segment_writes(&listed, ext, job_start))
             .await
             .map_err(|error| ServiceError::backend(format!("list transcode segments: {error}")))?;
-        self.manager.kill_and_remove(handle, false, false).await;
+        self.manager.supersede(handle).await;
         let listed = playlist_path.to_path_buf();
         let cut_short =
             tokio::task::spawn_blocking(move || cut_short_segment(&listed, ext, job_start, before))
@@ -1303,8 +1306,7 @@ where
         }
         let ext = path
             .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
+            .map_or_default(|e| format!(".{}", e.to_string_lossy()));
         let mut file = served(&path, &ext);
         file.progress = progress;
         Ok(file)
@@ -1322,8 +1324,7 @@ where
         let output = plan.state.output_file_path.clone();
         let ext = Path::new(&output)
             .extension()
-            .map(|ext| format!(".{}", ext.to_string_lossy()))
-            .unwrap_or_default();
+            .map_or_default(|ext| format!(".{}", ext.to_string_lossy()));
         // Source GetTranscodedFile answers HEAD before starting ffmpeg.
         if request.is_head_request {
             return Ok(served(Path::new(&output), &ext));
@@ -1529,8 +1530,7 @@ fn live_playlist_text(text: &str, playlist_path: &Path, segment_container: &str)
     }
     let stem = playlist_path
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|s| s.to_string_lossy().into_owned());
     let init_file_name = format!("{stem}-1.mp4");
     let routed_init = format!("hls/{stem}/{init_file_name}");
     text.replace(&init_file_name, &routed_init)
@@ -1541,8 +1541,7 @@ fn segment_file(playlist: &Path, index: i32, extension: &str) -> PathBuf {
     let folder = playlist.parent().unwrap_or_else(|| Path::new(""));
     let stem = playlist
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|s| s.to_string_lossy().into_owned());
     folder.join(format!("{stem}{index}{extension}"))
 }
 
@@ -3056,6 +3055,74 @@ mod tests {
         let error = mgr.failed_start(key, StartFfmpegError::Failed("no input".to_owned()));
         assert!(matches!(error, ServiceError::Backend(_)), "{error:?}");
         assert_eq!(mgr.restart_failures.lock().unwrap()[key].0, 1);
+    }
+
+    /// Why a restart on an output starts no job.
+    #[derive(Debug, Clone, Copy)]
+    enum NoStart {
+        /// Another playback took the only slot.
+        Refused,
+        /// The output's restart breaker is open.
+        BreakerOpen,
+        /// ffmpeg cannot be spawned.
+        SpawnFails,
+    }
+
+    /// A restart stops its output's job and keeps the segments it wrote for
+    /// the job it starts. When none starts, the stopped job stays registered:
+    /// those segments keep the owner a stop or the idle reaper deletes them
+    /// with, instead of waiting for the daily cleanup.
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn a_restart_that_starts_no_job_leaves_the_old_one_the_owner_of_its_files(
+        #[values(StartPath::Segment, StartPath::InitSegment)] path: StartPath,
+        #[values(NoStart::Refused, NoStart::BreakerOpen, NoStart::SpawnFails)] cause: NoStart,
+    ) {
+        use ferrofin_traits::media_encoding::TranscodeManager as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Its job ends once written, as a short clip's does.
+        let mgr = manager_capped_at_one(tmp.path());
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        let playlist = tmp.path().join("out.m3u8").to_string_lossy().into_owned();
+        let _reading = match cause {
+            NoStart::Refused => {
+                let held = take_the_slot(&mgr, tmp.path(), None).await;
+                mgr.manager.begin_request_guard(&held.path, held.job_type)
+            }
+            NoStart::BreakerOpen => {
+                for _ in 0..RESTART_FAILURE_LIMIT {
+                    mgr.record_restart_failure(&playlist);
+                }
+                None
+            }
+            NoStart::SpawnFails => {
+                // The fake ffmpeg cannot write a file where a directory is.
+                std::fs::remove_file(tmp.path().join("out.ts")).unwrap();
+                std::fs::create_dir(tmp.path().join("out.ts")).unwrap();
+                None
+            }
+        };
+
+        let result = if let StartPath::Segment = path {
+            // A seek past what the job wrote.
+            mgr.dynamic_segment(&req(), 10, false).await.map(drop)
+        } else {
+            // The init path restarts once the init that job wrote is gone.
+            std::fs::remove_file(tmp.path().join("out-1.ts")).unwrap();
+            start_through(&mgr, path, &req()).await
+        };
+
+        assert!(result.is_err(), "{path:?} {cause:?}: {result:?}");
+        let owner = mgr
+            .manager
+            .get_transcoding_job_by_path(&playlist, TranscodingJobType::Hls)
+            .await
+            .unwrap();
+        assert!(
+            owner.is_some(),
+            "{path:?} {cause:?}: its files lost their owner"
+        );
     }
 
     /// The manager learns the user from the authorization and the device from

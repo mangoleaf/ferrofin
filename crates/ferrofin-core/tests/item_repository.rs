@@ -388,11 +388,16 @@ async fn grouped_browse_plan_computes_representatives_once() {
     );
 }
 
-/// `Person` + `PersonTypes` (movie recommendations' "directed by") stays a
-/// correlated lookup: the credit is found through the item's own map rows
-/// and the `Peoples` primary key, never by scanning `Peoples` for the type.
+/// `Person` and `PersonIds` (movie recommendations' "directed by" and
+/// "starring", `/Items?person=`, a person's filmography) start from the
+/// person: the credited items are listed once from `IX_Peoples_Name` (and the
+/// `Peoples` primary key for `PersonIds`) and the map's `PeopleId` index, and
+/// the items are sought by id, in a library scope or none (the `+bi."Type"`
+/// pin). Never a walk of every item in scope with its credits tested per row
+/// (gl-1945), never a scan of `Peoples` or of the map.
 #[tokio::test]
-async fn person_type_filter_plan_stays_on_the_items_credits() {
+#[allow(clippy::too_many_lines)] // every person filter shape, scoped and not
+async fn person_filters_plan_starts_from_the_persons_credits() {
     use ferrofin_core::translate_query::{QueryShape, build_query};
     use sqlx::{Execute as _, Row as _};
 
@@ -402,31 +407,112 @@ async fn person_type_filter_plan_stays_on_the_items_credits() {
         user: Some(Arc::new(user.clone())),
         include_item_types: vec![BaseItemKind::Movie],
         person: Some("Chris Maker".to_owned()),
-        person_types: vec!["Director".to_owned()],
         limit: Some(7),
         ..Default::default()
     };
+    // Three ids, padded to four binds.
     let by_id = InternalItemsQuery {
         person: None,
-        person_ids: vec![Uuid::from_u128(0xB11)],
+        person_ids: vec![
+            Uuid::from_u128(0xB11),
+            Uuid::from_u128(0xB13),
+            Uuid::from_u128(0xB14),
+        ],
         ..by_name.clone()
     };
-    for filter in [by_name, by_id] {
-        let mut builder = build_query(&filter, QueryShape::FullRows);
+    // `next_person_category`'s query: unplayed movies of one person, grouped.
+    let recommendation = InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Movie, BaseItemKind::Trailer],
+        is_movie: Some(true),
+        recursive: true,
+        is_played: Some(false),
+        top_parent_ids: vec![Uuid::from_u128(0xB12)],
+        enable_group_by_metadata_key: true,
+        ..by_name.clone()
+    };
+    let scoped = |filter: &InternalItemsQuery| InternalItemsQuery {
+        top_parent_ids: vec![Uuid::from_u128(0xB12)],
+        ..filter.clone()
+    };
+    // jellyfin-web's `sortBy=SortName` page, which leaves the sort index
+    // available for an ordered walk.
+    let by_sort_name = |filter: &InternalItemsQuery| InternalItemsQuery {
+        order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+        ..scoped(filter)
+    };
+    let mut filters = Vec::new();
+    for filter in [
+        scoped(&by_name),
+        scoped(&by_id),
+        by_sort_name(&by_name),
+        by_sort_name(&by_id),
+        by_name,
+        by_id,
+        recommendation,
+    ] {
+        for person_types in [Vec::new(), vec!["Director".to_owned()]] {
+            let filter = InternalItemsQuery {
+                person_types,
+                ..filter.clone()
+            };
+            // Each page's `TotalRecordCount` comes from its own statement.
+            filters.push((filter.clone(), QueryShape::GroupedCount));
+            filters.push((filter, QueryShape::FullRows));
+        }
+    }
+    for (filter, shape) in filters {
+        let mut builder = build_query(&filter, shape);
         let mut query = builder.build();
         let args = query.take_arguments().expect("arguments").expect("binds");
         let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
-        let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+        let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
             .fetch_all(db.pool())
             .await
             .expect("explain")
             .iter()
             .map(|row| row.get::<String, _>("detail"))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        assert!(plan.contains("SEARCH pm USING"), "{plan}");
-        assert!(plan.contains("(ItemId=?"), "{plan}");
-        assert!(!plan.contains("SCAN pp"), "{plan}");
+            .collect();
+        let has = |line: &str| plan.iter().any(|l| l == line);
+        assert!(
+            has("SEARCH pp USING INDEX IX_Peoples_Name (Name=?)"),
+            "{plan:?}"
+        );
+        if !filter.person_ids.is_empty() {
+            assert!(
+                has("SEARCH pp USING INDEX sqlite_autoindex_Peoples_1 (Id=?)"),
+                "{plan:?}"
+            );
+        }
+        assert!(
+            has("SEARCH pm USING COVERING INDEX IX_PeopleBaseItemMap_PeopleId_ItemId (PeopleId=?)"),
+            "{plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|l| l.starts_with("SEARCH pm ") && l.contains("(ItemId=?")),
+            "the map is never probed item by item: {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|l| ["SCAN pp", "SCAN pm", "SCAN bi", "SCAN BaseItems"]
+                    .iter()
+                    .any(|scan| l.starts_with(scan))),
+            "{plan:?}"
+        );
+        // Every `BaseItems` access is a seek by id: the person's items, or
+        // the grouped representatives' fetch.
+        assert!(plan.iter().any(|l| l.starts_with("SEARCH bi ")), "{plan:?}");
+        for access in plan.iter().filter(|l| l.starts_with("SEARCH bi ")) {
+            let terms = access
+                .rsplit_once('(')
+                .map_or("", |(_, terms)| terms.trim_end_matches(')'));
+            assert!(
+                terms.split(" AND ").any(|term| term == "Id=?"),
+                "{access}: {plan:?}"
+            );
+        }
     }
 }
 
@@ -512,6 +598,195 @@ async fn person_types_restrict_the_matching_credit() {
         names(by_id(vec!["Director".to_owned()])).await,
         ["Directed"]
     );
+}
+
+/// The person filters match each credited item once, whatever shape its
+/// credits take, with the same rows as the correlated `EXISTS` they were
+/// before gl-1945: one person credited under two roles, an actor and a
+/// director `Peoples` row of one name, an episode credit, a `PersonIds` id
+/// that is a `Peoples` row id, a name in another case, both arms at once, and
+/// a movie recommendation category's unplayed, grouped query.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one library and cast, every filter shape
+async fn person_filters_match_each_credited_item_once() {
+    use ferrofin_core::people_repository::FerrofinPeopleRepository;
+    use ferrofin_db::entities::base_items::PeopleEntity;
+    use ferrofin_db::store::guid_to_db;
+    use ferrofin_traits::persistence::PeopleRepository as _;
+
+    let db = fresh_db().await;
+    let library = Uuid::from_u128(0xB30);
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB31)).await;
+    let credit = |name: &str, person_type: &str, role: &str| PeopleEntity {
+        name: name.to_owned(),
+        person_type: Some(person_type.to_owned()),
+        role: Some(role.to_owned()),
+        ..PeopleEntity::default()
+    };
+    let cast = [
+        (
+            0xB41,
+            BaseItemKind::Movie,
+            "Acted",
+            vec![credit("Chris Maker", "Actor", "Hero")],
+        ),
+        (
+            0xB42,
+            BaseItemKind::Movie,
+            "Directed",
+            vec![credit("Chris Maker", "Director", "")],
+        ),
+        (
+            0xB43,
+            BaseItemKind::Movie,
+            "Both",
+            vec![
+                credit("Chris Maker", "Actor", "Twin A"),
+                credit("Chris Maker", "Actor", "Twin B"),
+                credit("Chris Maker", "Director", ""),
+                credit("Pat Other", "Actor", "Rival"),
+            ],
+        ),
+        (
+            0xB44,
+            BaseItemKind::Movie,
+            "Other",
+            vec![credit("Pat Other", "Actor", "Lead")],
+        ),
+        (0xB45, BaseItemKind::Movie, "Uncredited", Vec::new()),
+        (
+            0xB46,
+            BaseItemKind::Episode,
+            "Pilot",
+            vec![credit("Chris Maker", "GuestStar", "Self")],
+        ),
+    ];
+    let mut rows = vec![BaseItemEntity {
+        id: guid_to_db(library),
+        ..item(library, BaseItemKind::CollectionFolder, "Library")
+    }];
+    for (id, kind, name, _) in &cast {
+        let id = Uuid::from_u128(*id);
+        rows.push(BaseItemEntity {
+            id: guid_to_db(id),
+            top_parent_id: Some(guid_to_db(library)),
+            ..item(id, *kind, name)
+        });
+    }
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&rows)
+        .await
+        .expect("seed");
+    let people = FerrofinPeopleRepository::new(db.clone());
+    for (id, _, _, credits) in &cast {
+        people
+            .update_people(Uuid::from_u128(*id), credits)
+            .await
+            .expect("credit");
+    }
+    sqlx::query(
+        r#"INSERT INTO "UserData"
+           ("ItemId","UserId","CustomDataKey","IsFavorite","PlayCount","PlaybackPositionTicks","Played")
+           VALUES (?1,?2,?3,0,1,0,1)"#,
+    )
+    .bind(guid_to_db(Uuid::from_u128(0xB41)))
+    .bind(user.id.clone())
+    .bind(Uuid::from_u128(0xB41).to_string())
+    .execute(db.writer())
+    .await
+    .expect("Acted is played");
+    // A browsable Person item of Chris's name, and Pat's `Peoples` row.
+    let person = Uuid::from_u128(0xB33);
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[BaseItemEntity {
+            id: guid_to_db(person),
+            ..item(person, BaseItemKind::Person, "Chris Maker")
+        }])
+        .await
+        .expect("seed person");
+    let pat: String = sqlx::query_scalar(r#"SELECT "Id" FROM "Peoples" WHERE "Name" = ?1"#)
+        .bind("Pat Other")
+        .fetch_one(db.pool())
+        .await
+        .expect("Pat's row");
+    let pat = Uuid::parse_str(&pat).expect("a GUID");
+
+    let types = |types: &[&str]| types.iter().map(|t| (*t).to_owned()).collect::<Vec<_>>();
+    let base = InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Movie, BaseItemKind::Episode],
+        ..Default::default()
+    };
+    let by_name = |name: &str, person_types: &[&str]| InternalItemsQuery {
+        person: Some(name.to_owned()),
+        person_types: types(person_types),
+        ..base.clone()
+    };
+    let by_ids = |person_ids: Vec<Uuid>, person_types: &[&str]| InternalItemsQuery {
+        person_ids,
+        person_types: types(person_types),
+        ..base.clone()
+    };
+    let recommendation = |person_types: &[&str]| InternalItemsQuery {
+        user: Some(Arc::new(user.clone())),
+        include_item_types: vec![BaseItemKind::Movie],
+        is_movie: Some(true),
+        recursive: true,
+        is_played: Some(false),
+        enable_group_by_metadata_key: true,
+        ..by_name("Chris Maker", person_types)
+    };
+    let cases: Vec<(InternalItemsQuery, &[&str])> = vec![
+        (
+            by_name("Chris Maker", &[]),
+            &["Acted", "Both", "Directed", "Pilot"],
+        ),
+        (by_name("Chris Maker", &["Director"]), &["Both", "Directed"]),
+        (
+            by_name("Chris Maker", &["Actor", "GuestStar"]),
+            &["Acted", "Both", "Pilot"],
+        ),
+        (by_name("Chris Maker", &["Producer"]), &[]),
+        (by_name("chris maker", &[]), &[]),
+        (by_name("Pat Other", &[]), &["Both", "Other"]),
+        (by_name("Nobody", &[]), &[]),
+        (
+            by_ids(vec![person], &[]),
+            &["Acted", "Both", "Directed", "Pilot"],
+        ),
+        (by_ids(vec![person], &["Director"]), &["Both", "Directed"]),
+        (by_ids(vec![pat], &[]), &["Both", "Other"]),
+        (
+            by_ids(vec![person, pat], &[]),
+            &["Acted", "Both", "Directed", "Other", "Pilot"],
+        ),
+        (by_ids(vec![pat], &["Director"]), &[]),
+        (by_ids(vec![Uuid::from_u128(0xB4F)], &[]), &[]),
+        (
+            InternalItemsQuery {
+                person_ids: vec![pat],
+                ..by_name("Chris Maker", &[])
+            },
+            &["Both"],
+        ),
+        (recommendation(&[]), &["Both", "Directed"]),
+        (recommendation(&["Director"]), &["Both", "Directed"]),
+        (recommendation(&["Actor"]), &["Both"]),
+    ];
+    for (filter, expected) in cases {
+        let mut names: Vec<String> = repo(&db)
+            .get_item_list(&filter)
+            .await
+            .expect("items")
+            .into_iter()
+            .filter_map(|i| i.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names, expected,
+            "person {:?}, ids {:?}, types {:?}, played {:?}",
+            filter.person, filter.person_ids, filter.person_types, filter.is_played
+        );
+    }
 }
 
 #[tokio::test]
@@ -930,7 +1205,7 @@ async fn named_item_id_lookup_seeks_the_type_clean_name_index() {
     for n in (0..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
         let filter = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Studio],
-            names: (0..n).map(|i| format!("Studio {i}")).collect(),
+            names: Vec::from_fn(n, |i| format!("Studio {i}")),
             ..Default::default()
         };
         let mut builder = build_query(&filter, QueryShape::IdAndCleanName);
@@ -1636,12 +1911,17 @@ async fn child_counts_exclude_merged_alternate_versions() {
     let alternate = Uuid::from_u128(0xD03);
     let mut season_row = item(season, BaseItemKind::Season, "Season 1");
     season_row.id = season_row.id.to_uppercase();
+    // Episodes filed under their season carry its id, as both scanners set it
+    // (`Episode.FindSeasonId`); one without stores the zero GUID, which no
+    // child count includes (`ItemCountService.cs:499,509`).
     let mut primary_row = item(primary, BaseItemKind::Episode, "Pilot");
     primary_row.id = primary_row.id.to_uppercase();
     primary_row.parent_id = Some(season.to_string().to_uppercase());
+    primary_row.season_id = primary_row.parent_id.clone();
     let mut alternate_row = item(alternate, BaseItemKind::Episode, "Pilot");
     alternate_row.id = alternate_row.id.to_uppercase();
     alternate_row.parent_id = Some(season.to_string().to_uppercase());
+    alternate_row.season_id = alternate_row.parent_id.clone();
     // The merge-versions link: the duplicate points at its primary.
     alternate_row.primary_version_id = Some(primary.to_string().to_uppercase());
     persist

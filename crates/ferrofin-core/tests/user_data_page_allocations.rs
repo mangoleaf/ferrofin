@@ -149,17 +149,15 @@ async fn seed_user(db: &Database, id: Uuid) {
 /// Stores `count` movies, each with a TMDB and an IMDb id, and returns their
 /// rows as a page query hands them over.
 async fn seed_movies(db: &Database, count: usize) -> Vec<BaseItemEntity> {
-    let rows: Vec<BaseItemEntity> = (0..count)
-        .map(|n| BaseItemEntity {
-            id: guid_to_db(Uuid::new_v4()),
-            type_: stored_type_name(BaseItemKind::Movie)
-                .expect("movie type")
-                .to_owned(),
-            name: Some(format!("Movie {n}")),
-            path: Some(format!("/movies/Movie {n}.mkv")),
-            ..BaseItemEntity::default()
-        })
-        .collect();
+    let rows: Vec<BaseItemEntity> = Vec::from_fn(count, |n| BaseItemEntity {
+        id: guid_to_db(Uuid::new_v4()),
+        type_: stored_type_name(BaseItemKind::Movie)
+            .expect("movie type")
+            .to_owned(),
+        name: Some(format!("Movie {n}")),
+        path: Some(format!("/movies/Movie {n}.mkv")),
+        ..BaseItemEntity::default()
+    });
     let persistence = FerrofinItemPersistenceService::new(db.clone());
     persistence.save_items(&rows).await.expect("save movies");
     for row in &rows {

@@ -76,7 +76,9 @@ pub async fn library_manager_mid_scan(
 }
 
 /// The concrete manager [`library_manager_over`] hands out.
-fn concrete_library_manager_over(db: Database) -> crate::library_manager::FerrofinLibraryManager {
+pub(crate) fn concrete_library_manager_over(
+    db: Database,
+) -> crate::library_manager::FerrofinLibraryManager {
     use crate::item_count_service::FerrofinItemCountService;
     use crate::people_repository::FerrofinPeopleRepository;
 
@@ -726,7 +728,7 @@ pub async fn seed_user(db: &Database, id: Uuid) -> UserEntity {
 /// libraries comes back empty. Tests that browse as a real user want this.
 pub async fn grant_default_permissions(db: &Database, id: Uuid) {
     let mut tx = db.writer().begin().await.expect("begin");
-    crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(id))
+    crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(id), &[])
         .await
         .expect("default permissions");
     tx.commit().await.expect("commit");
@@ -1052,4 +1054,19 @@ pub fn rooted_library_manager(
     )
     .with_dashboard_configuration(configuration)
     .with_visibility(visibility)
+}
+
+/// The by-name identity the tests use, rooted at `/config` as a stock Jellyfin
+/// is (gl-1597).
+pub fn by_name_identity() -> crate::item_type_lookup::ByNameIdentity {
+    crate::item_type_lookup::ByNameIdentity::new(
+        &crate::item_type_lookup::IdDerivation::Jellyfin {
+            program_data_path: Some("/config".to_owned()),
+        },
+        "/config/metadata/Genre",
+        "/config/metadata/MusicGenre",
+        "/config/metadata/Studio",
+        "/config/metadata/artists",
+    )
+    .expect("a Jellyfin-mode identity")
 }

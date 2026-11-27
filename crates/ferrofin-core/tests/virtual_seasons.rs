@@ -305,6 +305,39 @@ async fn a_stored_season_with_no_folder_keeps_its_id_and_episodes() {
     );
 }
 
+/// A path-less season stored virtual (as the missing-episode pass makes one
+/// before any episode file exists) is no virtual season once the scan finds
+/// its number's episode files, as `CreateSeasonsAsync` turns it (gl-1593);
+/// the next scan writes nothing.
+#[tokio::test]
+async fn a_virtual_season_real_episodes_joined_is_no_longer_virtual() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::scanned(tmp.path()).await;
+    let season = fx.season(1, "Season 1");
+    let is_virtual = || async {
+        sqlx::query_scalar::<_, bool>(r#"SELECT "IsVirtualItem" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(season))
+            .fetch_one(fx.db.pool())
+            .await
+            .expect("season")
+    };
+    sqlx::query(r#"UPDATE "BaseItems" SET "IsVirtualItem" = 1 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(season))
+        .execute(fx.db.pool())
+        .await
+        .expect("made virtual");
+    assert!(is_virtual().await);
+
+    fx.scanner.scan_all().await.expect("rescan");
+    assert!(!is_virtual().await, "a season with real episodes is real");
+    let again = fx.scanner.scan_all().await.expect("again");
+    assert_eq!(
+        (again.created, again.updated, again.removed),
+        (0, 0, 0),
+        "{again:?}"
+    );
+}
+
 /// A season with no folder an older Ferrofin scan keyed by the synthetic
 /// path `{series}/#virtual-season-{n}` moves to Jellyfin's id on the boot
 /// repair, with its user data and its episodes' links; a season already
@@ -366,10 +399,15 @@ async fn an_older_scans_season_with_no_folder_moves_to_jellyfins_id(#[case] mode
         Some(legacy_db.as_str())
     );
 
-    let rekeyed =
-        ferrofin_core::adoption_repairs::rekey_virtual_seasons(&fx.db, &fx.mode, None, None)
-            .await
-            .expect("repair");
+    let rekeyed = ferrofin_core::adoption_repairs::rekey_virtual_seasons(
+        &fx.db,
+        &fx.mode,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
+        None,
+        None,
+    )
+    .await
+    .expect("repair");
     assert_eq!(rekeyed, 1);
     let second_db = guid_to_db(second);
     let mut expected = vec![guid_to_db(first), second_db.clone()];
@@ -395,9 +433,15 @@ async fn an_older_scans_season_with_no_folder_moves_to_jellyfins_id(#[case] mode
         .expect("check");
     assert!(broken.is_empty(), "{broken:?}");
     assert_eq!(
-        ferrofin_core::adoption_repairs::rekey_virtual_seasons(&fx.db, &fx.mode, None, None)
-            .await
-            .expect("again"),
+        ferrofin_core::adoption_repairs::rekey_virtual_seasons(
+            &fx.db,
+            &fx.mode,
+            &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
+            None,
+            None,
+        )
+        .await
+        .expect("again"),
         0,
         "once"
     );
@@ -535,10 +579,15 @@ async fn the_repair_skips_a_season_whose_new_id_is_stored() {
     fx.rekey_season(first, second).await;
     let before = fx.seasons().await;
 
-    let rekeyed =
-        ferrofin_core::adoption_repairs::rekey_virtual_seasons(&fx.db, &fx.mode, None, None)
-            .await
-            .expect("repair");
+    let rekeyed = ferrofin_core::adoption_repairs::rekey_virtual_seasons(
+        &fx.db,
+        &fx.mode,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
+        None,
+        None,
+    )
+    .await
+    .expect("repair");
     assert_eq!(rekeyed, 0);
     assert_eq!(fx.seasons().await, before, "nothing moved");
     assert_eq!(

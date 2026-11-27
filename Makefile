@@ -12,11 +12,11 @@
 cli = $(if $(filter command line,$(origin $(1))),$($(1)))
 GATES_RUN = $(strip gates/run $(if $(call cli,IMAGE),--image '$(IMAGE)') $(if $(call cli,PREVIOUS),--previous '$(PREVIOUS)') $(if $(call cli,RELEASE),--release '$(RELEASE)'))
 
-.PHONY: help run-gates run-verify run-adoption run-parity run-bench test-gates-offline publish-results
+.PHONY: help run-gates run-verify run-adoption run-roundtrip run-parity run-bench test-gates-offline publish-results
 
 help:
 	@echo "make run-gates                 every gate against one image, as one session (gates/run all)"
-	@echo "make run-verify|run-adoption|run-parity|run-bench   one gate, as a session"
+	@echo "make run-verify|run-adoption|run-roundtrip|run-parity|run-bench   one gate, as a session"
 	@echo "    IMAGE=<image>  the image under test; PREVIOUS=<image>  bench as the release A/B gate"
 	@echo "    RELEASE=vX.Y.Z  the release that gate is for, when not on its release/vX.Y.Z branch (a patch cut from main)"
 	@echo "make test-gates-offline        the gates' own tests: no docker, server or fixtures"
@@ -30,6 +30,9 @@ run-verify:
 
 run-adoption:
 	$(GATES_RUN) adoption
+
+run-roundtrip:
+	$(GATES_RUN) roundtrip
 
 run-parity:
 	$(GATES_RUN) parity
@@ -52,8 +55,11 @@ publish-results:
 # standard-library Python tests of every gate. CI's shell-tests job runs this target.
 GATE_SCRIPTS = gates/lib.sh gates/isolation.sh gates/run gates/verify/run.sh gates/verify/lib.sh gates/verify/scan-behaviour.sh gates/bench/run.sh \
 	gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh \
-	gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh gates/bench/testdata/build.sh
-GATE_TESTS = gates/tests gates/verify/tests gates/adoption/tests gates/parity/tests
+	gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh gates/bench/testdata/build.sh \
+	gates/roundtrip/lib.sh gates/roundtrip/run.sh gates/roundtrip/routes.sh gates/roundtrip/stage_ferrofin.sh \
+	gates/roundtrip/stage_export.sh gates/roundtrip/stage_jellyfin.sh gates/roundtrip/stage_drift.sh \
+	gates/roundtrip/tests/fake_docker
+GATE_TESTS = gates/tests gates/verify/tests gates/adoption/tests gates/parity/tests gates/roundtrip/tests
 
 test-gates-offline:
 	shellcheck -x $(GATE_SCRIPTS)
@@ -63,4 +69,5 @@ test-gates-offline:
 	python3 -m unittest discover -s gates/verify/tests
 	python3 -m unittest discover -s gates/adoption/tests
 	python3 -m unittest discover -s gates/parity/tests
+	python3 -m unittest discover -s gates/roundtrip/tests
 	python3 -m unittest discover -s gates/bench -p 'test_*.py'

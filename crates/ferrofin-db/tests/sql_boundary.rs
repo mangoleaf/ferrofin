@@ -31,7 +31,7 @@ const CEILINGS: &[(&str, usize)] = &[
     ("crates/ferrofin-core/src/activity_manager.rs", 5),
     ("crates/ferrofin-core/src/api_key_manager.rs", 3),
     ("crates/ferrofin-core/src/authorization_context.rs", 6),
-    ("crates/ferrofin-core/src/collection_manager.rs", 10),
+    ("crates/ferrofin-core/src/collection_manager.rs", 9),
     ("crates/ferrofin-core/src/device_manager.rs", 8),
     (
         "crates/ferrofin-core/src/display_preferences_manager.rs",
@@ -91,11 +91,7 @@ fn sql_stays_behind_the_repository_boundary() {
 
     let mut violations = Vec::new();
     for path in files {
-        let rel = path
-            .strip_prefix(&root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = path.trim_prefix(&root).to_string_lossy().replace('\\', "/");
         if is_exempt(&rel) {
             continue;
         }

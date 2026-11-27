@@ -47,7 +47,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         # Same master-commit pin as binaries (see the note there).
         with:
-          toolchain: 1.99.1 # = rust-toolchain.toml
+          toolchain: 1.100.0 # = rust-toolchain.toml
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-deny@0.20.2
@@ -96,14 +96,25 @@ jobs:
           git push origin "$NEW"
 
   # ── server image → GHCR (+ Docker Hub when its secrets are configured) ──
-  docker-image:
+  # One leg per platform, each on a runner of that architecture, so nothing is emulated. A leg
+  # builds the Dockerfile, audits the binary, pushes the image by digest (no tag yet) and
+  # boots what it pushed. docker-image, below, tags the two digests once both legs passed.
+  docker-image-arch:
     if: github.event_name == 'push' && startsWith(github.ref_name, 'v')
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # one tag's run shows what is wrong on each platform
+      matrix:
+        include:
+          - { arch: amd64, os: ubuntu-latest }
+          - { arch: arm64, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
       packages: write
-    env:
-      HAVE_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+    outputs:
+      # A matrix job's outputs are combined from its legs, and each leg sets only its own.
+      amd64: ${{ steps.digest.outputs.amd64 }}
+      arm64: ${{ steps.digest.outputs.arm64 }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -119,27 +130,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
-        if: env.HAVE_DOCKERHUB == 'true'
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: compute image tags
-        id: tags
-        env:
-          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: |
-          set -eu
-          ver="$GITHUB_REF_NAME"
-          images="ghcr.io/$GITHUB_REPOSITORY"
-          [ -n "$DH_USER" ] && images="$images docker.io/$DH_USER/ferrofin"
-          tags=""
-          for img in $images; do
-            tags="$tags,$img:$ver"
-            # :latest tracks FINAL releases ONLY — never an -rc.
-            case "$ver" in *-rc.*) ;; *) tags="$tags,$img:latest" ;; esac
-          done
-          echo "tags=${tags#,}" | tee -a "$GITHUB_OUTPUT"
       # Unlike GitLab (prebuilt web/runtime base images for kaniko), this uses
       # the Dockerfile's self-contained path: BuildKit builds only the stages
       # the final image needs, so jellyfin-web + the ffmpeg runtime are built
@@ -150,7 +140,7 @@ jobs:
         with:
           context: .
           load: true
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ferrofin:audit # local only; what is pushed has no tag until docker-image
           build-args: |
             SERVICE_VERSION=${{ github.ref_name }}
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
@@ -160,23 +150,26 @@ jobs:
         run: |
           set -eu
           # Outside the checkout: a new file in the build context would make the push build miss the cache.
-          docker create --name audit "ghcr.io/$GITHUB_REPOSITORY:$GITHUB_REF_NAME" >/dev/null
+          docker create --name audit ferrofin:audit >/dev/null
           docker cp audit:/usr/local/bin/ferrofin-server "$RUNNER_TEMP/ferrofin-server"
           docker rm audit >/dev/null
           scripts/audit-bin.py "$RUNNER_TEMP/ferrofin-server"
+      # By digest, with no tag: a tag would publish this platform before the other passed.
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        id: push
         with:
           context: .
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             SERVICE_VERSION=${{ github.ref_name }}
       # Prove the pushed image boots and reports the tag (the registry is private
       # until the public launch, so this is the only place that can pull it freely).
       - name: boot the pushed image
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -eu
-          img="ghcr.io/$GITHUB_REPOSITORY:$GITHUB_REF_NAME"
+          img="ghcr.io/$GITHUB_REPOSITORY@$DIGEST"
           docker pull "$img"
           docker run -d --name smoke -p 8096:8096 "$img"
           # The server binds at once and answers 503 to everything but its probes until
@@ -195,6 +188,8 @@ jobs:
           # libx264), never Debian's — owner rule.
           docker exec smoke ffmpeg -version | head -1 | tee ffmpeg.txt
           grep -qi jellyfin ffmpeg.txt || { echo "ffmpeg in the image is not jellyfin-ffmpeg"; exit 1; }
+          docker exec smoke test -s /usr/share/doc/ferrofin/THIRD-PARTY-NOTICES.txt \
+            || { echo "the image ships no third-party notices"; exit 1; }
           docker rm -f smoke
       # Upgrade check: a populated install of the PREVIOUS release and of v1.0.0, the oldest,
       # must keep its user data under this one. v1.0.0 shipped with a modified released
@@ -203,10 +198,13 @@ jobs:
       # (invented media and accounts), scans it and gets user state through its API; this
       # image then boots on the same data and must keep the accounts, watch history and
       # metadata (gates/adoption/README.md, "Populated Ferrofin upgrade"). Probed from the runner:
-      # release images have no curl.
+      # release images have no curl. amd64 only: the releases it starts from have no arm64
+      # image, and what it checks, the migrations on existing data, is the same on both.
       - name: upgrade a populated install from earlier releases
+        if: matrix.arch == 'amd64'
         env:
           GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -eu
           prev=$(gh release list --exclude-drafts --exclude-pre-releases --limit 1 --json tagName -q '.[0].tagName')
@@ -221,7 +219,7 @@ jobs:
           python3 gates/adoption/synthetic.py build --fixtures "$RUNNER_TEMP/adoption" --only jellyfin-10.11.8
           # shellcheck disable=SC2086 # starts is a list of --from arguments
           python3 gates/adoption/synthetic.py upgrade --fixtures "$RUNNER_TEMP/adoption" \
-            --image "$img:$GITHUB_REF_NAME" $starts
+            --image "$img@$DIGEST" $starts
           df -h /
       # The failed copy, its server logs and snapshots; all synthetic data.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -230,6 +228,61 @@ jobs:
           name: upgrade-work
           path: ${{ runner.temp }}/adoption/work
           if-no-files-found: ignore
+      # Last, so only a leg whose every check passed hands its digest over.
+      - name: hand the digest to docker-image
+        id: digest
+        env:
+          ARCH: ${{ matrix.arch }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "$ARCH=$DIGEST" >> "$GITHUB_OUTPUT"
+
+  # Tags the two platforms' digests as one image: :vX.Y.Z, and :latest for a final release.
+  # Skipped when a leg of docker-image-arch failed, so no tag exists unless both passed.
+  docker-image:
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'v')
+    needs: [docker-image-arch]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    env:
+      HAVE_DOCKERHUB: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+    steps:
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        if: env.HAVE_DOCKERHUB == 'true'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: tag the image, once a dry run shows the tag would name both platforms
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          AMD64: ${{ needs.docker-image-arch.outputs.amd64 }}
+          ARM64: ${{ needs.docker-image-arch.outputs.arm64 }}
+        run: |
+          set -eu
+          ver="$GITHUB_REF_NAME"
+          src="ghcr.io/$GITHUB_REPOSITORY"
+          [ -n "$AMD64" ] && [ -n "$ARM64" ] || { echo "a platform's digest is missing"; exit 1; }
+          images="$src"
+          [ -n "$DH_USER" ] && images="$images docker.io/$DH_USER/ferrofin"
+          for img in $images; do
+            set -- -t "$img:$ver"
+            # :latest tracks FINAL releases ONLY — never an -rc.
+            case "$ver" in *-rc.*) ;; *) set -- "$@" -t "$img:latest" ;; esac
+            set -- "$@" "$src@$AMD64" "$src@$ARM64"
+            platforms=$(docker buildx imagetools create --dry-run "$@" \
+              | jq -r '.manifests[].platform | "\(.os)/\(.architecture)"')
+            echo "$img:$ver: $(echo "$platforms" | tr '\n' ' ')"
+            for p in linux/amd64 linux/arm64; do
+              echo "$platforms" | grep -qx "$p" || { echo "$p is missing: not tagging $img:$ver"; exit 1; }
+            done
+            docker buildx imagetools create "$@"
+          done
 
   # ── server binaries, one archive per target, attached to the Release ──
   # Linux x86_64 and aarch64 are the supported set. macOS and Windows are
@@ -266,10 +319,10 @@ jobs:
           fetch-depth: 0 # the .deb's changelog is rendered from history + tags
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         # A master commit, deliberately without a ref comment: dtolnay rebuilds
-        # the 1.99.1 branch on every master merge (orphaning its SHAs) and moves
+        # the 1.100.0 branch on every master merge (orphaning its SHAs) and moves
         # master and v1, so any ref named here goes stale. The input picks Rust.
         with:
-          toolchain: 1.99.1 # = rust-toolchain.toml
+          toolchain: 1.100.0 # = rust-toolchain.toml
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -280,8 +333,22 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-auditable@0.7.7
+      # cargo-about writes the third-party notices every archive and the .deb ship; the version ci.yml
+      # and the Dockerfile install, built from crates.io as ci.yml does (see the note there).
+      - run: cargo install --locked --features cli cargo-about@0.9.3 # the binary needs `cli`
+      # turbojpeg-sys builds its vendored libjpeg-turbo with cmake (on the macOS and
+      # Windows images already). Its x86-64 SIMD is assembled with nasm, which
+      # require-simd makes a hard requirement; aarch64 uses Neon intrinsics.
+      - if: contains(matrix.target, 'linux')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+      - if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          choco install nasm --no-progress -y
+          echo 'C:\Program Files\NASM' >> "$GITHUB_PATH"
       # Linux builds use zig as the C toolchain, linked against GLIBC_FLOOR (the
-      # aarch64 cross-build also needs it for the C in bundled SQLite and aws-lc-sys).
+      # aarch64 cross-build also needs it for the C in bundled SQLite, aws-lc-sys
+      # and libjpeg-turbo).
       - if: contains(matrix.target, 'linux')
         run: |
           # The pair v1.3.2's aarch64 build used; move both together, deliberately.
@@ -289,6 +356,10 @@ jobs:
           cargo auditable zigbuild --locked --release -p ferrofin-server --target "${{ matrix.target }}.$GLIBC_FLOOR"
       - if: ${{ !contains(matrix.target, 'linux') }}
         run: cargo auditable build --locked --release -p ferrofin-server --target ${{ matrix.target }}
+      # target/THIRD-PARTY-NOTICES.txt, for the .deb and the archive (the image writes its own).
+      - name: third-party notices
+        shell: bash
+        run: scripts/third-party-notices.sh
       # The .deb depends on jellyfin-ffmpeg8 + jellyfin-web (the same runtime the
       # image bundles); package metadata and contents live in the server manifest.
       - name: build the Debian package
@@ -317,6 +388,8 @@ jobs:
             || { echo "expected version $version, got $deb ($(dpkg-deb -f "$deb" Version))"; exit 1; }
           dpkg-deb -c "$deb" | grep -q ' \./usr/share/doc/ferrofin/copyright$' \
             || { echo "$deb ships no copyright file"; exit 1; }
+          dpkg-deb -c "$deb" | grep -q ' \./usr/share/doc/ferrofin/THIRD-PARTY-NOTICES\.txt$' \
+            || { echo "$deb ships no third-party notices"; exit 1; }
       # Install it the way a user will: Jellyfin's apt repository first, then
       # the package, which must pull jellyfin-ffmpeg8 + jellyfin-web, create the
       # service user, and boot against jellyfin-ffmpeg (libfdk_aac present).
@@ -345,6 +418,7 @@ jobs:
             su -s /bin/sh ferrofin -c "test -r /etc/ferrofin/config.toml && test ! -w /etc/ferrofin/config.toml"
             su -s /bin/sh nobody -c "test ! -r /etc/ferrofin/config.toml"
             test -f /lib/systemd/system/ferrofin.service
+            test -s /usr/share/doc/ferrofin/THIRD-PARTY-NOTICES.txt
             su -s /bin/sh ferrofin -c "FERROFIN_FFMPEG_PATH=/usr/lib/jellyfin-ffmpeg/ffmpeg \
               FERROFIN_WEB_DIR=/usr/share/jellyfin/web \
               /usr/bin/ferrofin-server --config /etc/ferrofin/config.toml --bind 127.0.0.1 --port 8096" \
@@ -392,7 +466,8 @@ jobs:
           set -eu
           name="ferrofin-$GITHUB_REF_NAME-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp LICENSE README.md "dist/$name/"
+          # The licenses of the binary: Ferrofin's own, and the third-party code it is built from.
+          cp LICENSE README.md contrib/debian/copyright target/THIRD-PARTY-NOTICES.txt "dist/$name/"
           case "${{ matrix.target }}" in
             *windows*) cp "target/${{ matrix.target }}/release/ferrofin-server.exe" "dist/$name/"
                        (cd dist && 7z a -bd "$name.zip" "$name" > /dev/null && sha256sum "$name.zip" > "$name.zip.sha256") ;;
@@ -429,7 +504,7 @@ jobs:
           merge-multiple: true
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: cargo-audit@0.22.2 # = docker-image's; scripts/audit-bin.py relies on its behaviour
+          tool: cargo-audit@0.22.2 # = docker-image-arch's; scripts/audit-bin.py relies on its behaviour
       - name: audit every binary
         run: |
           set -eu
@@ -483,12 +558,13 @@ jobs:
   #   install: helm install ferrofin oci://ghcr.io/<owner>/ferrofin/charts/ferrofin --version A.B.C
   helm-chart:
     # Runs for final vX.Y.Z (after the image published) and chart-v* tags
-    # (docker-image skipped — nothing image-side to wait for).
+    # (docker-image skipped — nothing image-side to wait for). On a vX.Y.Z tag a skipped
+    # docker-image means a platform's leg failed and no image was tagged: no chart then.
     if: >-
       !cancelled() && github.event_name == 'push' &&
-      (needs.docker-image.result == 'success' || needs.docker-image.result == 'skipped') &&
       (startsWith(github.ref_name, 'chart-v') ||
-       (startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-rc.')))
+       (startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-rc.') &&
+        needs.docker-image.result == 'success'))
     needs: [docker-image]
     runs-on: ubuntu-latest
     permissions:

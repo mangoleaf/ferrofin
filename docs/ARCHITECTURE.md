@@ -20,8 +20,7 @@ chromaprint      health       │          ├─ drawing
                               └──────────────► core ─► api ─► server (bin)
 ```
 
-`ferrofin-traits` is the keystone: nothing above it imports `ferrofin-core`
-(two imports are left, below).
+`ferrofin-traits` is the keystone: nothing above it imports `ferrofin-core`.
 Jellyfin's C# has a reference cycle (implementations ↔ API) that is legal
 under .NET runtime DI but **forbidden by Cargo**. Porting
 `MediaBrowser.Controller`'s interfaces into a trait-only crate that both
@@ -31,13 +30,10 @@ run on stub implementations while a subsystem is unfinished.
 The plugin contracts live in `ferrofin-traits` too (`ScheduledTask`,
 `TaskProgress`, `RegisteredPlugin`, `PluginConfigPage`, the event consumer
 types, and the `TaskRegistry` and `AuthProviderRegistry` an extension registers
-with), so the WASM plugin host takes `ferrofin-core` only as a dev-dependency
-for its tests. What the plugin crates share with core sits below it: the
-Jellyfin XML importer in `ferrofin-common`, the `BaseItems.Data` readers in
-`ferrofin-db`. `ferrofin-extensions` still lists `ferrofin-core` as a normal
-dependency for two imports of core's re-exports of those contracts (in
-`file_transformation.rs` and `intro_skipper/engine.rs`) until open changes to
-those files land; its `Cargo.toml` says how they switch.
+with), so both plugin crates, `ferrofin-extensions` and the WASM plugin host,
+take `ferrofin-core` only as a dev-dependency for their tests. What the plugin
+crates share with core sits below it: the Jellyfin XML importer in
+`ferrofin-common`, the `BaseItems.Data` readers in `ferrofin-db`.
 
 Every manager trait is object-safe (`Arc<dyn Trait>`); `apps/ferrofin-server`
 is the composition root that constructs the concrete implementations and
@@ -60,7 +56,7 @@ injects them into the API's `AppState`.
 | `ferrofin-traits` | MediaBrowser.Controller (interfaces) | `#[async_trait]` traits; the DI seam |
 | `ferrofin-mediaencoding` | MediaBrowser.MediaEncoding | ffmpeg/ffprobe: probing, transcode arg-building (pure), the live transcode runtime behind a `Transcoder` seam trait |
 | `ferrofin-hls` | Jellyfin.MediaEncoding.Hls | HLS playlist generation + stream manager |
-| `ferrofin-drawing` | Jellyfin.Drawing + Emby.Photos | image resize/crop/format via the `image` crate |
+| `ferrofin-drawing` | Jellyfin.Drawing + Emby.Photos | image resize/crop/format via the `image` crate, resizes via `fast_image_resize` |
 | `ferrofin-providers` | MediaBrowser.Providers + Xbmc/LocalMetadata | local NFO always on; remote providers (TMDB/TVDB/OMDb/MusicBrainz/fanart) compiled in, gated by the per-library fetcher checkboxes |
 | `ferrofin-livetv` | Jellyfin.LiveTv | M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
 | `ferrofin-extensions` | (new — Tier 1a of the plugin design) | compiled-in extensions behind an `Extension` trait; see `docs/PLUGINS_UPSTREAM.md` |

@@ -247,11 +247,14 @@ impl ActivityManager for FerrofinActivityManager {
     }
 
     async fn clean(&self, before: chrono::DateTime<Utc>) -> Result<u64, ServiceError> {
-        // Port of `ActivityManager.CleanAsync`: bulk-delete entries older than
-        // the cutoff. `DateCreated` is stored as canonical
-        // `YYYY-MM-DD HH:MM:SS.fffffff` text, which orders lexicographically for
-        // UTC timestamps, so a text comparison is exact.
-        let result = sqlx::query(r#"DELETE FROM "ActivityLogs" WHERE "DateCreated" < ?1"#)
+        // Port of `ActivityManager.CleanAsync`: bulk-delete the entries dated
+        // at or before the cutoff (`DateCreated <= startDate`). `DateCreated`
+        // is stored as canonical `yyyy-MM-dd HH:mm:ss.FFFFFFF` text, which
+        // orders lexicographically for UTC timestamps, so a text comparison is
+        // exact for rows in that form. A row an older build wrote padded
+        // (`….0000000`) sorts after the same instant's trimmed cutoff and
+        // waits for the next run.
+        let result = sqlx::query(r#"DELETE FROM "ActivityLogs" WHERE "DateCreated" <= ?1"#)
             .bind(datetime_to_db(before))
             .execute(self.db.writer())
             .await
@@ -299,6 +302,32 @@ mod tests {
             .expect("open in-memory db");
         db.run_migrations().await.expect("run migrations");
         db
+    }
+
+    /// C# `CleanAsync` deletes `DateCreated <= startDate`: an entry dated at
+    /// the cutoff goes with the older ones.
+    #[tokio::test]
+    async fn clean_deletes_the_entries_up_to_and_at_the_cutoff() {
+        let db = memory_db().await;
+        let cutoff = Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap()
+            + chrono::Duration::microseconds(123_456);
+        let user = "11111111-1111-1111-1111-111111111111";
+        for (name, date) in [
+            ("older", cutoff - chrono::Duration::seconds(1)),
+            ("at", cutoff),
+            ("newer", cutoff + chrono::Duration::microseconds(1)),
+        ] {
+            insert_entry(&db, name, "T", user, 2, &datetime_to_db(date), None).await;
+        }
+        let manager = FerrofinActivityManager::new(db);
+
+        assert_eq!(manager.clean(cutoff).await.expect("clean"), 2);
+        let page = manager
+            .get_paged_result(&ActivityLogQuery::default())
+            .await
+            .expect("query");
+        let left: Vec<_> = page.items.into_iter().map(|e| e.name).collect();
+        assert_eq!(left, ["newer"]);
     }
 
     #[tokio::test]

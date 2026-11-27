@@ -68,17 +68,27 @@ work across subsystems:
 | `library` | library name/id |
 | `task` | scheduled-task key |
 | `provider` | metadata provider name |
+| `oidc_provider` | Single Sign-On OIDC provider key |
 | `tuner` | Live TV tuner host id |
 | `listings_provider` | Live TV listings provider id |
 | `channel` | Live TV channel name |
 | `job_id` | transcode/other job id |
 | `path` | filesystem path |
 | `config_file` | the bootstrap `config.toml` in use, as context (the startup banner, configuration warnings), when `path` would name the wrong subject |
-| `trigger` | `api` \| `schedule` \| `startup` \| `watcher` \| `webhook` (library scans: `ScanTrigger`) |
+| `trigger` | `api` \| `schedule` \| `startup` \| `watcher` \| `webhook` (library scans: `ScanTrigger`); a scheduled task's run can also be `library_change` (a "Scan Media Library" run a library change queued, whose scan is `api`), and so is Intro Skipper's automatic analysis |
 | `trigger_trace_id` | originating sampled request's trace id (hex), when known |
 
 `Uuid`s via `tracing::field::display()`. Values born inside a function:
 `tracing::field::Empty` + `span.record()`.
+
+An item's metadata provider work runs inside
+`ferrofin_providers::rate_limit::for_item(item_id, …)`: the rate limiter's
+events name only the provider and a redacted context, and the scope adds
+`item_id` to them. This is the one exception to "one span per unit of work"
+(and to TRACING.md's provider-fetch span): a span per refreshed item would put
+one span per item into a scan's trace, so the item is a field, not a span. A new
+caller that fetches for an item wraps that fetch the same way, and a task it
+`tokio::spawn`s opens its own scope: the scope does not cross a spawn.
 
 ## 4. Background work starts a new root trace, tagged with its trigger
 

@@ -1,6 +1,6 @@
 """Regression tests for synthetic coverage and the unchanged-scan write audit."""
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -17,7 +17,8 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from metadata import CheckError
-from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, PAGE_SIZE, RUNS_12_2_ROUTINES, UPGRADED_FROM_10, all_items, comparable,
+from preservation import (FROM_ORACLE, GENERATIONS, MERGED_KEYS, ORACLE, PAGE_SIZE, RUNS_12_2_ROUTINES, UPGRADED_FROM_10,
+                          UPGRADED_FROM_12_0, all_items, before_first_scan, comparable, held_to,
                           compare, expectation, normalize, run_matrix, seed_failures, seed_state, validate,
                           validate_oracle, validate_seed_state, same_artwork, verify_database)
 from synthetic import VERSIONS, FRESH_INSTALL
@@ -398,6 +399,105 @@ class OracleExpectationTest(unittest.TestCase):
         upgraded = {'versions': [self.PRIMARY, self.AS_VIDEO]}
         with self.assertRaisesRegex(CheckError, 'serve different versions'):
             expectation('10.11.8', self.baseline, self.oracle, upgraded)
+
+
+class MergedVersionsExpectationTest(unittest.TestCase):
+    """gl-1954: Jellyfin 12.0's scan lists each pair merged by hand apart; 12.1 on that database
+    and 12.4 list one, and so does Ferrofin. Only the merged movies' entries move."""
+    # One merged pair: 12.0 lists both, 12.4 hides the version.
+    PRIMARY, VERSION, OTHER = 'aa' * 16, 'bb' * 16, 'cc' * 16
+    MERGED = [PRIMARY, VERSION]
+
+    def snapshot(self, listed):
+        return {'visibility': {USERS[1]: sorted([*listed, self.OTHER]), USERS[2]: sorted([*listed])},
+                'relationships': {**{item: {'Name': item} for item in listed}, self.OTHER: {'Name': 'other'}},
+                'subtitles': {**{item: [['eng', True, 'subrip']] for item in listed}, self.OTHER: []},
+                'versions': ['own']}
+
+    def setUp(self):
+        self.baseline = self.snapshot([self.PRIMARY, self.VERSION])   # what 12.0 served
+        self.oracle = self.snapshot([self.PRIMARY])                    # what 12.4 serves
+        self.oracle['versions'] = ['oracle']
+
+    def test_a_12_0_source_takes_the_merged_movies_entries_from_the_oracle(self):
+        self.assertEqual(MERGED_KEYS, ('visibility', 'relationships', 'subtitles'))
+        expected = expectation('12.0', self.baseline, self.oracle, {}, merged=self.MERGED, through_12_0=self.oracle)
+        self.assertEqual(compare(expected, self.snapshot([self.PRIMARY])), [])
+        # Listing the version apart, as 12.0 did, is not what 12.1 and later do on that database.
+        self.assertEqual(sorted(compare(expected, self.snapshot([self.PRIMARY, self.VERSION]))),
+                         ['relationships', 'subtitles', 'visibility'])
+        self.assertEqual(self.baseline['visibility'][USERS[1]], sorted([self.PRIMARY, self.VERSION, self.OTHER]),
+                         'the baseline is not modified')
+
+    def test_every_other_entry_stays_the_12_0_baseline(self):
+        expected = expectation('12.0', self.baseline, self.oracle, {}, merged=self.MERGED, through_12_0=self.oracle)
+        self.assertEqual(expected['versions'], ['own'], 'whole keys never come from the oracle')
+        self.assertEqual(expected['relationships'][self.OTHER], {'Name': 'other'})
+        self.assertIn(self.OTHER, expected['visibility'][USERS[1]])
+        # Another movie that only the 12.0 baseline lists is still expected.
+        self.baseline['visibility'][USERS[1]].append('dd' * 16)
+        expected = expectation('12.0', self.baseline, self.oracle, {}, merged=self.MERGED, through_12_0=self.oracle)
+        self.assertIn('dd' * 16, expected['visibility'][USERS[1]])
+
+    def test_the_oracle_must_agree_with_the_real_upgrade_of_the_12_0_database(self):
+        with self.assertRaisesRegex(CheckError, 'merged movies'):
+            expectation('12.0', self.baseline, self.oracle, {}, merged=self.MERGED, through_12_0=self.baseline)
+
+    def test_a_12_0_source_without_the_merged_ids_or_the_upgrade_is_refused(self):
+        for merged, through in (((), self.oracle), (self.MERGED, None)):
+            with self.assertRaisesRegex(CheckError, 'rebuild the fixtures'):
+                expectation('12.0', self.baseline, self.oracle, {}, merged=merged, through_12_0=through)
+
+    def test_other_12_x_sources_keep_their_own_baseline(self):
+        for version in ('12.1', '12.2', '12.4'):
+            self.assertIs(expectation(version, self.baseline, self.oracle, {}, merged=self.MERGED,
+                                      through_12_0=self.baseline), self.baseline)
+
+
+class BeforeFirstScanTest(unittest.TestCase):
+    """gl-1953: before its first scan a pre-12.2 source serves the rated series' unrated season and
+    episodes to the child, as MigrateRatingLevels leaves them."""
+    SEASON, EPISODES = str(uuid.UUID('11' * 16)).upper(), [str(uuid.UUID(h * 16)).upper() for h in ('22', '33')]
+    MANIFEST = {'rated_series': {'season': SEASON, 'episodes': EPISODES}}
+
+    def expected(self):
+        return normalize({'visibility': {USERS[1]: ['44' * 16], USERS[2]: ['55' * 16]},
+                          'views': {USERS[1]: {'folders': {'66' * 16: {'Played': True, 'UnplayedItemCount': 0}}},
+                                    USERS[2]: {'resume': [], 'folders': {}}}})
+
+    def test_the_child_sees_the_unrated_episodes_and_the_unplayed_season(self):
+        expected = self.expected()
+        held = before_first_scan(expected, self.MANIFEST)
+        episodes = [uuid.UUID(e).hex for e in self.EPISODES]
+        self.assertEqual(held['visibility'][USERS[2]], sorted(['55' * 16, *episodes]))
+        self.assertEqual(held['views'][USERS[2]]['folders'], {'11' * 16: {'Played': False, 'UnplayedItemCount': 2}})
+        self.assertEqual(held['views'][USERS[2]]['resume'], [])
+        self.assertEqual(held['visibility'][USERS[1]], ['44' * 16], 'the adult is unchanged')
+        self.assertEqual(held['views'][USERS[1]], expected['views'][USERS[1]])
+        self.assertEqual(expected['visibility'][USERS[2]], ['55' * 16], 'the expectation is not modified')
+
+    def test_the_post_scan_expectation_still_fails_the_pre_scan_answer(self):
+        # The allowance belongs to the stages before the scan only: the scan's answer must hide them.
+        expected = self.expected()
+        pre_scan = before_first_scan(expected, self.MANIFEST)
+        self.assertEqual(sorted(compare(expected, pre_scan)), ['views', 'visibility'])
+
+    def test_a_fixture_without_the_rated_series_ids_is_refused(self):
+        with self.assertRaisesRegex(CheckError, 'rebuild it'):
+            before_first_scan(self.expected(), {})
+
+    def test_only_the_pre_scan_stages_of_a_pre_12_2_source_take_the_allowance(self):
+        expected = self.expected()
+        allowed = before_first_scan(expected, self.MANIFEST)
+        for version in ('10.11.8', '10.11.11', '12.0', '12.1'):
+            for stage in ('adoption', 'restart'):
+                self.assertEqual(held_to(stage, version, expected, self.MANIFEST), allowed, (version, stage))
+            for stage in ('scan', 'second scan'):
+                self.assertIs(held_to(stage, version, expected, self.MANIFEST), expected, (version, stage))
+        # A source that already ran 12.2's routines was scored by its own scan: every stage is exact.
+        for version in RUNS_12_2_ROUTINES:
+            for stage in ('adoption', 'restart', 'scan', 'second scan'):
+                self.assertIs(held_to(stage, version, expected, self.MANIFEST), expected, (version, stage))
 
 
 class ServerReadyTest(unittest.TestCase):
@@ -870,6 +970,19 @@ class SeededAdoptionTest(unittest.TestCase):
             run_matrix(self.dir, 'unused-image', None, 0)
         self.assertFalse((self.dir / 'work').exists())
 
+    def test_the_matrix_refuses_a_12_0_source_without_the_real_12_0_upgrade(self):
+        from synthetic import recipe
+        for name in (ORACLE, UPGRADED_FROM_10):
+            ready = self.dir / name
+            ready.mkdir()
+            (ready / 'synthetic-ready.json').write_text(json.dumps({'recipe': recipe()}))
+            (ready / 'preservation.json').write_text('{}')
+        # Checked before any container starts, for a full run and for the 12.0 source alone.
+        for only in (None, 'jellyfin-12.0'):
+            with self.assertRaisesRegex(CheckError, f'build {UPGRADED_FROM_12_0} first'):
+                run_matrix(self.dir, 'unused-image', only, 0)
+            self.assertFalse((self.dir / 'work' / 'jellyfin-10.11.8').exists())
+
     def test_a_refused_matrix_leaves_the_last_report_alone(self):
         # a refusal (no oracle; a recipe change; a previous run's copy still in work/) happens before any fixture starts,
         # and starting a report forgets the previous one: the failure report the error tells the user to inspect must survive
@@ -985,6 +1098,8 @@ class SeededAdoptionTest(unittest.TestCase):
     def test_the_12_2_to_12_4_paths_upgrade_from_their_contract_parents(self):
         paths = {name: parent for name, _, parent in VERSIONS}
         versions = {name: version for name, version, _ in VERSIONS}
+        # The merged versions' guard (gl-1954) is 12.1 upgrading the 12.0 fixture's own database.
+        self.assertEqual((versions[UPGRADED_FROM_12_0], paths[UPGRADED_FROM_12_0]), ('12.1', 'jellyfin-12.0'))
         # The 12.2, 12.3 and 12.4 upgrade routes derive from their contract parents (12.3 on the
         # fullest 12.2 route, 12.4 on that 12.3 one); each fresh install (FRESH_INSTALL) is a
         # first run of its release with no parent, the Debian-layout one included.
@@ -1063,6 +1178,64 @@ class FreshInstallBuildTest(unittest.TestCase):
         self.assertEqual(ready["fixture"], fresh)  # still a completed, usable fixture
         self.assertEqual(ready["version"], version)
         self.assertEqual(ready.get("layout"), layout)  # what run.sh reads (adoption_fixture_layout)
+
+
+class FirstStartTest(unittest.TestCase):
+    """synthetic.first_start: the round trip's release started once on a throwaway copy of each fixture of
+    FIRST_STARTS, its log kept as the oracle only when the server came up."""
+
+    def setUp(self):
+        import synthetic
+        self.synthetic = synthetic
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.out = self.root / "oracle/first-start-12.4"
+        for name in synthetic.FIRST_STARTS:
+            (self.root / name / "data").mkdir(parents=True)
+            (self.root / name / "data/jellyfin.db").write_text(name)
+
+    def first_start(self, fail=()):
+        """first_start with a fake server that logs as the real one does, also when it never comes up (a
+        fixture in `fail`); the (image, copy, its database) of each start."""
+        started = []
+
+        @contextmanager
+        def server(image, config, media, name, port, ferrofin=False, layout=None):
+            started.append((image, config.name, (config / "data/jellyfin.db").read_text()))
+            (config.parent / (config.name + "-cache")).mkdir()
+            try:
+                if config.name.removeprefix("first-start-") in fail:
+                    raise CheckError("synthetic server did not become ready")
+                yield
+            finally:
+                (config.parent / (config.name + ".server.log")).write_text(f"{image} on {config.name}\n")
+
+        with patch.object(self.synthetic, "server", server):
+            self.synthetic.first_start(self.root, 0)
+        return started
+
+    def test_each_fixture_gets_one_start_on_a_copy_kept_only_as_its_log(self):
+        fixtures = self.synthetic.FIRST_STARTS
+        self.assertEqual(self.first_start(),
+                         [("jellyfin/jellyfin:12.4", f"first-start-{name}", name) for name in fixtures])
+        for name in fixtures:
+            self.assertEqual((self.out / f"{name}.server.log").read_text(),
+                             f"jellyfin/jellyfin:12.4 on first-start-{name}\n")
+            self.assertEqual((self.root / name / "data/jellyfin.db").read_text(), name)   # the fixture untouched
+        self.assertEqual(list((self.root / "work").iterdir()), [])   # no copy, cache or log left behind
+        self.assertEqual(self.first_start(), [])   # a later build starts none again
+
+    def test_a_start_that_fails_keeps_no_log_and_is_made_again(self):
+        first, failing, *rest = self.synthetic.FIRST_STARTS
+        with self.assertRaises(CheckError):
+            self.first_start(fail={failing})
+        self.assertTrue((self.out / f"{first}.server.log").exists())
+        self.assertFalse((self.out / f"{failing}.server.log").exists())
+        self.assertTrue((self.root / "work" / f"first-start-{failing}.server.log").exists())   # to look into
+        self.assertEqual([copy for _, copy, _ in self.first_start()],
+                         [f"first-start-{name}" for name in [failing, *rest]])
+        self.assertTrue((self.out / f"{failing}.server.log").exists())
 
 
 class LayoutTest(unittest.TestCase):

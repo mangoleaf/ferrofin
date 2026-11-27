@@ -890,9 +890,7 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
         // Frames: per-call cap, then a clamped happy path.
         let req = |n: usize, dim: u32| FrameRequest {
             item_id: ITEM.to_owned(),
-            timestamps_ticks: (0..i64::try_from(n).unwrap())
-                .map(|i| i * 10_000_000)
-                .collect(),
+            timestamps_ticks: Vec::from_fn(n, |i| i64::try_from(i).unwrap() * 10_000_000),
             max_dimension: dim,
             format: FrameFormat::Gray8,
         };
@@ -1003,12 +1001,20 @@ async fn write_family_caps_ownership_and_plumbing() {
         assert_eq!(w.len(), 1);
         assert!(w[0].2.starts_with("lrc:"), "{:?}", w[0]);
 
-        // Subtitles: cap + recorded language/format/size.
+        // Subtitles: cap + recorded language/format/size, then the item's
+        // refresh, whose probe records the stream (gl-1641).
         write_subtitles(&cx, WRITE_CAP, ITEM, "eng", "srt", b"1\n00:00:01 --> 2\nhi").unwrap();
         let w = subtitles.writes.lock().unwrap().clone();
         assert_eq!(
             w[0].2,
             format!("eng:srt:{}", b"1\n00:00:01 --> 2\nhi".len())
+        );
+        assert!(
+            common::QUEUED_REFRESHES
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|id| id == "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEFF01")
         );
 
         // Collections: an over-long name is refused before any manager call.

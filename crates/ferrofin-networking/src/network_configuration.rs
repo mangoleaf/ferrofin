@@ -272,8 +272,7 @@ pub fn escape_base_url(base: &str) -> String {
     let mut chunks = base.split('%');
     let mut escaped: String = chunks
         .next()
-        .map(|chunk| percent_encode(chunk.as_bytes(), URL_PATH).collect())
-        .unwrap_or_default();
+        .map_or_default(|chunk| percent_encode(chunk.as_bytes(), URL_PATH).collect());
     for chunk in chunks {
         let escape = chunk
             .as_bytes()

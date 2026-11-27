@@ -433,7 +433,7 @@ fn extension_of(path: &str) -> String {
 /// sees it: a size that rounds an axis to 0, a source the decoder rejects
 /// (corrupt, truncated, a read error mid-decode), one over the
 /// [`ImageLimits`](crate::ImageLimits), a resize past their budget, a JPEG
-/// output past 65535 px, or a WebP output past 16383 px. A failed encode writes no
+/// output past 65500 px, or a WebP output past 16383 px. A failed encode writes no
 /// cache file, so it recurs on every request for that image and its volume
 /// grows with items × requests; LOGGING.md §1 keeps that at `debug`.
 /// Everything else (cache-dir I/O, an unreadable or removed source, codec or
@@ -1730,9 +1730,9 @@ mod tests {
             // stats on the blocking pool before it takes a slot, so requests
             // spawned together take the slots in no fixed order, and the one
             // aborted below could be the queued one rather than an encode.
-            let mut tasks: Vec<_> = (0..limit)
-                .map(|i| request(Arc::clone(&processor), 100 + i32::try_from(i).unwrap()))
-                .collect();
+            let mut tasks: Vec<_> = Vec::from_fn(limit, |i| {
+                request(Arc::clone(&processor), 100 + i32::try_from(i).unwrap())
+            });
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 work.entered.acquire_many(u32::try_from(limit).unwrap()),
@@ -1824,7 +1824,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .forget();
-        let mut waiters: Vec<_> = (0..WAITERS).map(|_| request(100)).collect();
+        let mut waiters: Vec<_> = Vec::from_fn(WAITERS, |_| request(100));
         let mut first = Some(first);
         if drop_first {
             let first = first.take().unwrap();

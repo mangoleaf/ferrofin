@@ -217,7 +217,7 @@ impl<'de> Deserialize<'de> for ProfileImageFormat {
 /// upstream's C# properties behave for every check that reads them
 /// (`string.IsNullOrEmpty`). A key that is absent keeps the container's
 /// default, upstream's constructor value.
-fn null_as_empty<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn null_as_empty<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de> + Default,
@@ -1206,6 +1206,7 @@ impl Extension for LdapAuthExtension {
             name: "LDAP-Auth".to_owned(),
             bytes: include_bytes!(concat!(env!("OUT_DIR"), "/ldapauth/configPage.html")).to_vec(),
             enable_in_main_menu: false,
+            content_type: None,
         }]
     }
 

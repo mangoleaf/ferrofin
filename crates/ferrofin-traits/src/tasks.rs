@@ -169,8 +169,9 @@ fn _assert_object_safe_task_manager(_: &dyn TaskManager) {}
 /// does. The scan checks it between two items, around each stored-row
 /// window it reads and plans, between its closing passes and inside the
 /// long ones. It races it against every wait of the item in progress: the
-/// ones before anything is written (its probe, its metadata providers) end
-/// the item unwritten, and a cancel inside its artwork pass (image
+/// ones before anything is written (its probe, its metadata providers, and
+/// its metadata lock while an edit or a provider refresh holds it) end the
+/// item unwritten, and a cancel inside its artwork pass (image
 /// providers, cover extraction) stops the fetches where they stand and
 /// saves the item with the artwork already on disk. A cancel after the
 /// item's row was saved leaves the row without its refresh stamp, so an item
@@ -279,7 +280,8 @@ impl TaskProgress {
 
     /// Why this run started: the registry's trigger tag (`api` for the
     /// dashboard or `StartTask`, `schedule` for a configured trigger,
-    /// `startup` for a startup trigger), or `""` when it has none (a test's
+    /// `startup` for a startup trigger, `library_change` for a "Scan Media
+    /// Library" run a library change queued), or `""` when it has none (a test's
     /// foreground `FerrofinTaskManager::run_now`).
     #[must_use]
     pub fn trigger(&self) -> &'static str {

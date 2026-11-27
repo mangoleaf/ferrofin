@@ -229,15 +229,16 @@ const TRICKPLAY_CHANGE: &str = "A change takes full effect after the next Genera
                                 with trickplay images on, at below-normal priority: a large \
                                 library can take days.";
 
-/// Preview Size as `WidthResolutions` holds it: `320`, `640` or `both`, in
-/// any order and counting a width once, else the widths themselves (Custom),
-/// or `none`.
+/// Preview Size as `WidthResolutions` holds it: `320`, `480`, `640` or
+/// `both`, in any order and counting a width once, else the widths themselves
+/// (Custom), or `none`.
 fn trickplay_preview_size(configuration: &ServerConfiguration) -> Value {
     let mut widths = configuration.trickplay_options.width_resolutions.clone();
     widths.sort_unstable();
     widths.dedup();
     json!(match widths.as_slice() {
         [320] => "320".to_owned(),
+        [480] => "480".to_owned(),
         [640] => "640".to_owned(),
         [320, 640] => "both".to_owned(),
         [] => "none".to_owned(),
@@ -656,24 +657,38 @@ pub static SETTINGS: &[SettingSpec] = &[
                 label: "320",
                 note: "Fast to fetch, small on 4K screens. One ffmpeg pass per video.",
             },
+            // The factors in the notes below: docs/CONFIG.md#tile-size-and-the-clients-cache.
+            SettingOption {
+                value: "480",
+                label: "480",
+                note: "Sharper than 320 on a TV. One ffmpeg pass per video. At the default Tile \
+                       width and Tile height (10 x 10, Dashboard → Playback → Trickplay) a tile \
+                       holds 6 x 6 previews, so a scrub fetches about 2.8 times the tiles of \
+                       320, and a client's cache of decoded tiles keeps under half as much video.",
+            },
             SettingOption {
                 value: "640",
                 label: "640",
                 note: "Sharper on 4K. Phones and 1080p screens get a large preview too. \
-                       One ffmpeg pass per video. Its tiles hold fewer previews than a 320 \
-                       tile, so each is about the size of a 320 tile.",
+                       One ffmpeg pass per video. At the default Tile width and Tile height \
+                       (10 x 10, Dashboard → Playback → Trickplay) a tile holds 5 x 5 previews, \
+                       about a 320 tile's size, so a scrub fetches 4 times the tiles of 320, \
+                       and a client's cache of decoded tiles keeps a quarter as much video.",
             },
             SettingOption {
                 value: "both",
                 label: "Both",
-                note: "Clients pick by screen. Two ffmpeg passes per video and the disk of \
-                       both sizes.",
+                note: "Clients pick by screen; Wholphin and the Jellyfin Android and Android \
+                       TV apps take 640, so they fetch 4 times the tiles of 320 (see 640). One \
+                       ffmpeg pass per video makes both sizes (one per size when trickplay uses \
+                       a VAAPI or QSV GPU), at the disk cost of both.",
             },
         ],
         store: SettingStore::ServerConfiguration(ConfigurationField {
             read: trickplay_preview_size,
             write: |configuration, value| {
                 configuration.trickplay_options.width_resolutions = match value.as_str() {
+                    Some("480") => vec![480],
                     Some("640") => vec![640],
                     Some("both") => vec![320, 640],
                     _ => vec![320],
@@ -697,14 +712,16 @@ pub static SETTINGS: &[SettingSpec] = &[
                 label: "Optimize Disk Usage",
                 // Figures: docs/CONFIG.md#trickplay says what was measured.
                 note: "Matches Jellyfin. Blocky colour around edges. \
-                       About 3 MiB per hour of video at 320, 7 at 640.",
+                       About 2.5 MiB per hour of video at 320, 4.5 at 480, 6 at 640.",
             },
             SettingOption {
                 value: "quality",
                 label: "Optimize Quality",
                 note: "Full colour detail, except where trickplay's hardware acceleration \
-                       decodes or encodes the video on the GPU: that stays 4:2:0. About 4 MiB \
-                       per hour of video at 320, 12 at 640. As quick to generate.",
+                       decodes or encodes the video on the GPU: that stays 4:2:0. About 3.5 \
+                       MiB per hour of video at 320, 6.5 at 480, 10 at 640: clients fetch about \
+                       1.5 times Optimize Disk Usage's bytes, and a client's disk cache keeps a \
+                       third less of the video. As quick to generate.",
             },
         ],
         store: SettingStore::ServerConfiguration(ConfigurationField {
@@ -796,8 +813,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: whole_numbers(ferrofin_providers::rate_limit::RequestLimits::DOWNLOAD_MAX_MB),
         unit: Some(Unit::Mebibytes),
         default: "64",
-        description: "Largest remote image downloaded, and largest metadata provider response; \
-                      a larger one is refused and the read stops there.",
+        description: "Largest remote image downloaded, largest metadata provider response, \
+                      and largest subtitle read from a URL; a larger one is refused and the \
+                      read stops there.",
         running: |c| json!(c.image_download_max_mb),
         ..ROW
     },
@@ -1240,8 +1258,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         check: |value| {
             let buckets: Vec<f64> = value
                 .as_array()
-                .map(|list| list.iter().filter_map(Value::as_f64).collect())
-                .unwrap_or_default();
+                .map_or_default(|list| list.iter().filter_map(Value::as_f64).collect());
             ferrofin_core::scan_metrics::validate_duration_buckets(&buckets)
                 .map_err(|why| format!("is not a list of bucket boundaries: {why}"))
         },
@@ -1625,7 +1642,7 @@ fn parses<T: std::str::FromStr>(raw: &str) -> bool {
 /// `ffmpeg_probe_size`): blank for the default, else ffmpeg's syntax inside
 /// `range`, which the loader would otherwise ignore or clamp with a warning.
 fn ffmpeg_count_within(value: &Value, range: &RangeInclusive<FfmpegCount>) -> Result<(), String> {
-    let text = value.as_str().map(str::trim).unwrap_or_default();
+    let text = value.as_str().map_or_default(str::trim);
     if text.is_empty() {
         return Ok(());
     }

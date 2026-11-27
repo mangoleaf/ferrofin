@@ -9,7 +9,15 @@ description = "Curated, compiled-in extensions (Jellyfin plugins) for Ferrofin, 
 [lints]
 workspace = true
 
+[features]
+# The Single Sign-On extension's fake identity provider (`sso::fake_idp`), for
+# other crates' tests. Enable it from `[dev-dependencies]` only: no production
+# build may contain it.
+test-util = ["dep:axum"]
+
 [dependencies]
+# The fake identity provider's HTTP server (`test-util` only).
+axum = { workspace = true, optional = true }
 ferrofin-util = { workspace = true, features = ["tokio"] }
 chrono.workspace = true
 sha2.workspace = true
@@ -18,18 +26,6 @@ fancy-regex.workspace = true
 ferrofin-chromaprint.workspace = true
 ferrofin-common.workspace = true
 ferrofin-traits.workspace = true
-# TODO(gl-1829): two imports are left, each beside lines an open GitHub PR
-# changes, so they switch once those PRs merge:
-# - `file_transformation.rs`: `use ferrofin_core::{PluginConfigPage,
-#   ScheduledTask}` (GitHub PR #1144). That PR adds `FerrofinEventManager`
-#   (take `&dyn ferrofin_traits::events::EventSubscriber` instead) and
-#   `PLUGIN_CONFIGURATION_CHANGED` (move it beside `ITEMS_CHANGED` in
-#   `ferrofin_traits::events`, re-exported from core).
-# - `intro_skipper/engine.rs`: `use ferrofin_core::TaskProgress` (GitHub PRs
-#   #1146 and #1154) becomes `ferrofin_traits::tasks::TaskProgress`.
-# Then this moves to `[dev-dependencies]`, and the notes about it in
-# `docs/ARCHITECTURE.md` and `docs/EXTENSIONS.md` go.
-ferrofin-core.workspace = true
 ferrofin-model.workspace = true
 ferrofin-naming.workspace = true
 ferrofin-db.workspace = true
@@ -40,6 +36,8 @@ regex.workspace = true
 reqwest.workspace = true
 # The LDAP-Auth extension's directory client, its TLS configuration and errors.
 ldap3.workspace = true
+# The Single Sign-On extension's OpenID Connect discovery and keys.
+openidconnect.workspace = true
 # Decoding the DN and filter of the LDAP URLs a referral names.
 percent-encoding.workspace = true
 # LDAP-Auth's profile images: Base64 attributes and avatar hashes, URL attributes.
@@ -57,6 +55,11 @@ tracing.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+# The concrete managers the tests run the extensions against; the extensions
+# themselves reach core only through `ferrofin-traits`.
+ferrofin-core.workspace = true
+# The fake identity provider's HTTP server, for this crate's own tests.
+axum.workspace = true
 rstest.workspace = true
 tracing-subscriber.workspace = true
 # Certificates and in-process TLS servers for the LDAP-Auth connection tests.

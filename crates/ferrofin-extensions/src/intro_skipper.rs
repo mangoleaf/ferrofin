@@ -58,7 +58,12 @@ pub use automatic::Runtime;
 /// The Intro Skipper's stable plugin id (also its `/Plugins` id) — the
 /// **upstream plugin's GUID**, because the vendored dashboard app and third-party
 /// client integrations address the plugin by that id.
-const EXTENSION_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
+pub const EXTENSION_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
+
+/// The Intro Skipper's settings file in Jellyfin's `plugins/configurations`, named after
+/// its assembly (`BasePlugin<T>.ConfigurationFileName`), which `/Plugins`
+/// reports and adoption imports.
+pub const CONFIGURATION_FILE_NAME: &str = "IntroSkipper.xml";
 
 /// The Intro Skipper extension.
 #[derive(Debug, Default, Clone, Copy)]
@@ -89,7 +94,7 @@ impl Extension for IntroSkipperExtension {
             enabled: true,
             has_image: false,
             can_uninstall: false,
-            configuration_file_name: None,
+            configuration_file_name: Some(CONFIGURATION_FILE_NAME.to_owned()),
         }
     }
 
@@ -109,18 +114,21 @@ impl Extension for IntroSkipperExtension {
                 bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/configPage.html"))
                     .to_vec(),
                 enable_in_main_menu: true,
+                content_type: None,
             },
             PluginConfigPage {
                 name: "introskipper.js".to_owned(),
                 bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/introskipper.js"))
                     .to_vec(),
                 enable_in_main_menu: false,
+                content_type: None,
             },
             PluginConfigPage {
                 name: "introskipper.css".to_owned(),
                 bytes: include_bytes!(concat!(env!("OUT_DIR"), "/introskipper/introskipper.css"))
                     .to_vec(),
                 enable_in_main_menu: false,
+                content_type: None,
             },
         ]
     }
@@ -241,11 +249,19 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
         };
         // Background, not bound to the request, as upstream's `Task.Run`.
         let task = self.clone();
-        tokio::spawn(async move {
-            let _release = lease;
-            tracing::info!(%season_id, "intro skipper: rescanning a season");
-            task.rescan_season(season_id).await;
-        });
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                let _release = lease;
+                tracing::info!("intro skipper: rescanning a season");
+                task.rescan_season(season_id).await;
+            },
+            tracing::info_span!(
+                parent: None,
+                "intro_skipper_rescan",
+                item_id = %season_id,
+                trigger = "api"
+            ),
+        ));
         Ok(true)
     }
 
@@ -2187,14 +2203,12 @@ mod tests {
 
     /// The cache files a detection run left behind for `id`.
     pub(super) fn cache_files(h: &Harness, id: Uuid) -> Vec<String> {
-        std::fs::read_dir(h.task.cache_dir.resolve())
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
-                    .filter(|name| name.starts_with(&id.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        std::fs::read_dir(h.task.cache_dir.resolve()).map_or_default(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|name| name.starts_with(&id.to_string()))
+                .collect()
+        })
     }
 
     /// `DeleteForItem` / `DeleteByMode`: by item, by mode, or everything —
@@ -2308,6 +2322,38 @@ mod tests {
             "{modes:?}"
         );
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
+    }
+
+    /// The rescan logs in an `intro_skipper_rescan` root span naming the
+    /// season, not in the request's (LOGGING.md, rule 4).
+    #[tokio::test]
+    async fn a_rescan_logs_in_a_root_span_naming_the_season() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let logs = crate::tests::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let started =
+            tracing::Instrument::instrument(h.task.rescan(SEASON), tracing::info_span!("request"))
+                .await;
+        assert!(started.expect("started"));
+        for _ in 0..200 {
+            if !h.task.is_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|line| line.contains("rescanning a season"))
+            .unwrap_or_else(|| panic!("no rescan line:\n{text}"));
+        let span = format!(" intro_skipper_rescan{{item_id={SEASON} trigger=\"api\"}}: ");
+        assert!(line.contains(&span), "{line}");
+        assert!(!line.contains("request"), "not the request's child: {line}");
     }
 
     /// `QueueManager.GetMediaItems`: a disabled library is skipped, an
@@ -2460,23 +2506,21 @@ mod tests {
         let season = |n: usize| Uuid::from_u128(0x2000 + u128::try_from(n).expect("n"));
         let episode_type =
             ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Episode).expect("type");
-        let mut rows: Vec<BaseItemEntity> = (0..count)
-            .map(|n| {
-                let n128 = u128::try_from(n).expect("n");
-                BaseItemEntity {
-                    id: guid_to_db(Uuid::from_u128(0x1000 + n128)),
-                    type_: episode_type.to_owned(),
-                    path: Some(format!("{}/show {n:03}/s01e01.mkv", roots[n % 3])),
-                    run_time_ticks: Some(1_800 * 10_000_000),
-                    season_id: Some(guid_to_db(season(n))),
-                    series_id: Some(guid_to_db(Uuid::from_u128(0x3000 + n128))),
-                    series_name: Some(format!("Show {n:03}")),
-                    parent_index_number: Some(1),
-                    index_number: Some(1),
-                    ..BaseItemEntity::default()
-                }
-            })
-            .collect();
+        let mut rows: Vec<BaseItemEntity> = Vec::from_fn(count, |n| {
+            let n128 = u128::try_from(n).expect("n");
+            BaseItemEntity {
+                id: guid_to_db(Uuid::from_u128(0x1000 + n128)),
+                type_: episode_type.to_owned(),
+                path: Some(format!("{}/show {n:03}/s01e01.mkv", roots[n % 3])),
+                run_time_ticks: Some(1_800 * 10_000_000),
+                season_id: Some(guid_to_db(season(n))),
+                series_id: Some(guid_to_db(Uuid::from_u128(0x3000 + n128))),
+                series_name: Some(format!("Show {n:03}")),
+                parent_index_number: Some(1),
+                index_number: Some(1),
+                ..BaseItemEntity::default()
+            }
+        });
         // A file under no library's location is never queued.
         rows.push(BaseItemEntity {
             id: guid_to_db(Uuid::from_u128(0x1fff)),

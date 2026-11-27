@@ -23,7 +23,8 @@ use uuid::Uuid;
 /// Resolves an item's playback media sources.
 ///
 /// Port of the `IMediaSourceManager.GetPlaybackMediaSources` call inside
-/// `GetAttachment`; kept behind a seam because the media-source manager is not
+/// `GetAttachment` (and `SubtitleEncoder.GetSubtitles`, which shares the
+/// seam); kept behind a seam because the media-source manager is not
 /// part of this crate. Returns the resolved [`MediaSourceInfo`] for
 /// `(item_id, media_source_id)`.
 #[async_trait]

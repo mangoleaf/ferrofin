@@ -142,7 +142,7 @@ async fn a_playlist_edit_inserts_its_entries_in_one_statement() {
     let manager = FerrofinPlaylistManager::new(db.clone(), library, items, paths);
     let playlist = Uuid::new_v4();
     seed_item(&db, playlist, BaseItemKind::Playlist).await;
-    let tracks: Vec<Uuid> = (0..TRACKS).map(|_| Uuid::new_v4()).collect();
+    let tracks: Vec<Uuid> = Vec::from_fn(TRACKS, |_| Uuid::new_v4());
     for track in &tracks {
         seed_item(&db, *track, BaseItemKind::Audio).await;
     }

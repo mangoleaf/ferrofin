@@ -99,3 +99,88 @@ async fn a_plain_rescan_lists_each_items_art_folders_once_and_keeps_its_upload()
         "the rescan keeps it"
     );
 }
+
+/// Art an earlier build saved in the item's `{ID}` folder, under its own
+/// name, is still the item's: the scan keeps finding it there, beside art in
+/// the folder it saves in now, Jellyfin's `{xx}/{idN}`. Each folder adds the
+/// singular types the folders before it have none of, and every backdrop.
+#[tokio::test]
+async fn a_scan_finds_art_in_the_folder_an_earlier_build_saved_it_in() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let media = tmp.path().join("movies");
+    std::fs::create_dir_all(&media).expect("media dir");
+    std::fs::write(media.join("Alpha (2001).mkv"), b"").expect("movie");
+    let meta = tmp.path().join("metadata");
+    let alpha = derive_item_id(
+        BaseItemKind::Movie,
+        &media.join("Alpha (2001).mkv").to_string_lossy(),
+    )
+    .expect("id");
+    let earlier = crate::dynamic_images::earlier_art_dir(&meta, alpha);
+    let own = crate::dynamic_images::own_art_dir(&meta, alpha);
+    assert!(
+        own.ends_with(format!(
+            "{}/{}",
+            &alpha.simple().to_string()[..2],
+            alpha.simple()
+        )),
+        "{}",
+        own.display()
+    );
+    for (dir, file) in [
+        (&earlier, "logo.png"),
+        (&earlier, "primary.png"),
+        (&earlier, "backdrop.jpg"),
+        (&earlier, "backdrop1.jpg"),
+        (&own, "poster.png"),
+        (&own, "landscape.jpg"),
+        (&own, "backdrop2.png"),
+    ] {
+        std::fs::create_dir_all(dir).expect("art dir");
+        std::fs::write(dir.join(file), file).expect("art");
+    }
+
+    let db = crate::test_support::test_db().await;
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let items = crate::test_support::item_repository_over(db);
+    let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+        FerrofinVirtualFolderManager::new(tmp.path().join("views"))
+            .with_item_store(persistence.clone()),
+    );
+    vf.add_virtual_folder(
+        "Movies",
+        Some(CollectionTypeOptions::movies),
+        &LibraryOptions {
+            path_infos: vec![MediaPathInfo {
+                path: media.to_string_lossy().into_owned(),
+            }],
+            ..LibraryOptions::default()
+        },
+    )
+    .await
+    .expect("library");
+    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+        .with_items(items.clone())
+        .with_metadata_dir(meta);
+    Box::pin(scanner.scan_all()).await.expect("scan");
+
+    let mut found: Vec<_> = items
+        .get_image_infos(alpha)
+        .await
+        .expect("images")
+        .into_iter()
+        .map(|image| (image.image_type, image.path))
+        .collect();
+    found.sort_by(|a, b| a.1.cmp(&b.1));
+    let path = |dir: &std::path::Path, file: &str| dir.join(file).to_string_lossy().into_owned();
+    let mut expected = vec![
+        (ImageType::Primary, path(&own, "poster.png")),
+        (ImageType::Logo, path(&earlier, "logo.png")),
+        (ImageType::Thumb, path(&own, "landscape.jpg")),
+        (ImageType::Backdrop, path(&earlier, "backdrop.jpg")),
+        (ImageType::Backdrop, path(&earlier, "backdrop1.jpg")),
+        (ImageType::Backdrop, path(&own, "backdrop2.png")),
+    ];
+    expected.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(found, expected);
+}

@@ -112,7 +112,8 @@ def stores(db, expected=False):
     """What the database holds, in the form each preservation check compares. The start
     release's (expected=True) history is harmonized: a release before v1.4.0 left the seeded
     conflicting rows apart, and the candidate's boot repair makes them agree, as Jellyfin 12.2
-    and later do (synthetic.py run holds that against the 12.4 oracle)."""
+    and later do (synthetic.py run holds that against the 12.4 oracle). Its dates are in the
+    text form migration 0050 rewrites them into (watch_history.ef_text)."""
     import metadata
     import user_accounts
     import watch_history

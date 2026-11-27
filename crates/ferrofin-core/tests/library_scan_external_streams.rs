@@ -61,7 +61,7 @@ impl ProbeByExtension {
     }
 
     fn probed(&self) -> Vec<(String, bool)> {
-        self.probed.lock().map(|p| p.clone()).unwrap_or_default()
+        self.probed.lock().map_or_default(|p| p.clone())
     }
 
     /// The file names probed since the last call, sorted.
@@ -69,8 +69,7 @@ impl ProbeByExtension {
         let mut names: Vec<String> = self
             .probed
             .lock()
-            .map(|mut p| std::mem::take(&mut *p))
-            .unwrap_or_default()
+            .map_or_default(|mut p| std::mem::take(&mut *p))
             .into_iter()
             .map(|(path, _)| {
                 Path::new(&path)
@@ -482,4 +481,71 @@ async fn scan_finds_sidecars_in_the_items_internal_metadata_folder() {
         rows.iter().map(|r| r.stream_index).collect::<Vec<_>>(),
         vec![0, 1, 2, 3, 4]
     );
+}
+
+/// The stored `Data` of the movie row.
+async fn movie_data(db: &Database) -> serde_json::Value {
+    let data: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#)
+            .fetch_one(db.pool())
+            .await
+            .expect("the movie's data");
+    serde_json::from_str(data.as_deref().unwrap_or("{}")).expect("json")
+}
+
+/// A locked movie's probe keys follow its file, as Jellyfin's do: its probe
+/// is a pre-refresh provider, run and saved before a refresh's lock check
+/// (`MetadataService.RefreshWithProviders`). The sidecars going re-probe the
+/// movie, and its `HasSubtitles` and `DefaultVideoStreamIndex` move with
+/// the streams, while the lock keeps a key the user owns and the lock itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_movies_probe_keys_follow_its_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let h = harness(tmp.path()).await;
+    h.scanner.scan_all().await.expect("scan");
+    let movie = movie_id(&h.db).await;
+    let data = movie_data(&h.db).await;
+    assert_eq!(data["HasSubtitles"], true, "{data}");
+    assert_eq!(data["DefaultVideoStreamIndex"], 2, "after two sidecars");
+    let trailers = serde_json::json!([{ "Url": "https://example.org/trailer" }]);
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "IsLocked" = 1,
+           "Data" = json_set("Data", '$.RemoteTrailers', json(?2)) WHERE "Id" = ?1"#,
+    )
+    .bind(guid_to_db(movie))
+    .bind(trailers.to_string())
+    .execute(h.db.writer())
+    .await
+    .expect("lock");
+    let dir = h.movie.parent().expect("movie folder");
+    for sidecar in ["Heat (1995).eng.forced.srt", "Heat (1995).fra.srt"] {
+        std::fs::remove_file(dir.join(sidecar)).expect("remove sidecar");
+    }
+    h.probe.take_names();
+
+    h.scanner.scan_all().await.expect("rescan");
+
+    assert!(
+        h.probe.take_names().contains(&"Heat (1995).mkv".to_owned()),
+        "a changed sidecar set re-probes the movie"
+    );
+    let data = movie_data(&h.db).await;
+    assert_eq!(data["HasSubtitles"], false, "{data}");
+    assert_eq!(data["DefaultVideoStreamIndex"], 0, "{data}");
+    assert_eq!(data["RemoteTrailers"], trailers, "the user's key stays");
+    let locked: bool = sqlx::query_scalar(r#"SELECT "IsLocked" FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(movie))
+        .fetch_one(h.db.pool())
+        .await
+        .expect("lock state");
+    assert!(locked);
+    h.scanner.scan_all().await.expect("scan again");
+    assert!(h.probe.take_names().is_empty(), "settled");
+    let data = movie_data(&h.db).await;
+    assert_eq!(
+        data["HasSubtitles"], false,
+        "an unprobed scan keeps it: {data}"
+    );
+    assert_eq!(data["DefaultVideoStreamIndex"], 0, "{data}");
+    assert_eq!(data["RemoteTrailers"], trailers);
 }

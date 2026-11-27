@@ -181,6 +181,13 @@ impl UserManager for OkUsers {
     ) -> Result<Option<UserEntity>, ServiceError> {
         unimplemented!()
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
     async fn get_authentication_providers(
         &self,
     ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {
@@ -1020,6 +1027,33 @@ async fn move_item_records_call() {
     assert_eq!(pid, PLAYLIST_ID.to_string());
     assert_eq!(entry, ITEM_A.to_string());
     assert_eq!(idx, 3);
+}
+
+/// `{newIndex}` binds as ASP.NET binds an `int` route value: `0x3` is 3, and a
+/// word is the binder's 400 before the manager is called (gl-1664).
+#[tokio::test]
+async fn move_item_binds_its_index_as_the_query_binder() {
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let (status, _) = send(
+        app.clone(),
+        "POST",
+        &format!("/Playlists/{PLAYLIST_ID}/Items/{ITEM_A}/Move/0x3"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(pl.moved.lock().unwrap().clone().expect("recorded").2, 3);
+    *pl.moved.lock().unwrap() = None;
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Playlists/{PLAYLIST_ID}/Items/{ITEM_A}/Move/third"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(pl.moved.lock().unwrap().is_none());
 }
 
 /// `MoveItem` binds `playlistId` as a string and parses it with `Guid.Parse`

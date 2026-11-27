@@ -588,6 +588,13 @@ impl UserManager for StubUsers {
     ) -> Result<Option<UserEntity>, ServiceError> {
         unimplemented!()
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
     async fn get_authentication_providers(
         &self,
     ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {
@@ -635,6 +642,9 @@ struct StubProviders {
     /// asked for. `None` → no copy can be made.
     remote_copy: Option<String>,
     remote_asked: Arc<Mutex<Vec<String>>>,
+    /// What TheMovieDb's client configuration answers; `Err` → TMDb did not
+    /// answer.
+    tmdb_images: Mutex<Result<Option<ferrofin_model::dto::ConfigImageTypes>, &'static str>>,
 }
 
 #[async_trait]
@@ -698,9 +708,15 @@ impl ProviderManager for StubProviders {
     async fn delete_image(
         &self,
         item_id: Uuid,
-        _image_type: ImageType,
+        image_type: ImageType,
         image_index: Option<i32>,
     ) -> Result<(), ServiceError> {
+        // A Logo's file cannot be deleted; an Art's folder is gone.
+        match image_type {
+            ImageType::Logo => return Err(ServiceError::backend("permission denied")),
+            ImageType::Art => return Err(ServiceError::not_found("image folder not found")),
+            _ => {}
+        }
         self.deleted
             .lock()
             .expect("lock")
@@ -762,6 +778,15 @@ impl ProviderManager for StubProviders {
     }
     async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
         unimplemented!()
+    }
+    async fn tmdb_image_configuration(
+        &self,
+    ) -> Result<Option<ferrofin_model::dto::ConfigImageTypes>, ServiceError> {
+        self.tmdb_images
+            .lock()
+            .expect("lock")
+            .clone()
+            .map_err(ServiceError::backend)
     }
 }
 
@@ -885,6 +910,15 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
             updates: Arc::new(Mutex::new(Vec::new())),
             remote_copy: None,
             remote_asked: Arc::new(Mutex::new(Vec::new())),
+            tmdb_images: Mutex::new(Ok(Some(ferrofin_model::dto::ConfigImageTypes {
+                secure_base_url: Some("https://image.tmdb.org/t/p/".to_owned()),
+                poster_sizes: Some(vec![
+                    "w92".to_owned(),
+                    "w2000".to_owned(),
+                    "original".to_owned(),
+                ]),
+                ..ferrofin_model::dto::ConfigImageTypes::default()
+            }))),
         }),
         elevated: false,
         restricted: false,
@@ -1402,6 +1436,37 @@ async fn item_image_by_index_serves_the_file() {
     assert_eq!(body, b"IDX0");
 }
 
+/// `{imageIndex}` binds as ASP.NET binds an `int` route value, with the rules
+/// of its query binder: trimmed, and the `0x`, `#` and `&h` hex forms read
+/// (gl-1664; measured on Jellyfin 12.4: each of these is a 200). A value no
+/// form reads is the binder's 400.
+#[rstest::rstest]
+#[case::hex("0x0", StatusCode::OK)]
+#[case::hash("%230", StatusCode::OK)]
+#[case::basic_hex("%26h0", StatusCode::OK)]
+#[case::padded("%20%200", StatusCode::OK)]
+#[case::plus("%2B0", StatusCode::OK)]
+#[case::word("first", StatusCode::BAD_REQUEST)]
+#[tokio::test]
+async fn item_image_by_index_binds_its_index_as_the_query_binder(
+    #[case] index: &str,
+    #[case] expected: StatusCode,
+) {
+    let img = TempImage::new(b"IDX0");
+    let s = stubs(img.path(), String::new());
+    let (status, body) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Primary/{index}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+    if expected == StatusCode::OK {
+        assert_eq!(body, b"IDX0");
+    }
+}
+
 // A chapter thumbnail is not an item image row — it lives on the chapter
 // itself, so serving one has to resolve through the chapter seam (upstream
 // `BaseItem.GetImageInfo(ImageType.Chapter, index)`). Without this the player's
@@ -1570,6 +1635,7 @@ async fn remote_image_backdrop_is_served_from_its_local_copy() {
             updates: Arc::new(Mutex::new(Vec::new())),
             remote_copy: Some(copy.path()),
             remote_asked: Arc::clone(&asked),
+            tmdb_images: Mutex::new(Err("TheMovieDb did not answer")),
         }),
         ..stubs(img.path(), String::new())
     };
@@ -1610,6 +1676,7 @@ async fn a_live_tv_items_local_row_is_not_served_outside_the_metadata_directory(
             updates: Arc::new(Mutex::new(Vec::new())),
             remote_copy: Some(copy.path()),
             remote_asked: Arc::new(Mutex::new(Vec::new())),
+            tmdb_images: Mutex::new(Err("TheMovieDb did not answer")),
         }),
         ..stubs(img.path(), String::new())
     };
@@ -1687,6 +1754,18 @@ async fn by_name_genre_image_serves_the_file() {
     let (status, body) = send(&s, "GET", "/Genres/Drama/Images/Primary", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"GENREIMG");
+}
+
+/// The by-name kinds' `{imageIndex}` binds as the item's does (gl-1664).
+#[tokio::test]
+async fn by_name_image_by_index_binds_its_index_as_the_query_binder() {
+    let img = TempImage::new(b"GENREIMG");
+    let s = stubs(img.path(), String::new());
+    let (status, body) = send(&s, "GET", "/Genres/Drama/Images/Primary/0x0", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"GENREIMG");
+    let (status, _) = send(&s, "GET", "/Genres/Drama/Images/Primary/zero", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1925,6 +2004,60 @@ async fn delete_item_image_binds_only_its_image_index(
     assert_eq!(deleted, expected_deleted, "{uri}");
 }
 
+/// gl-1663: `DeleteImageAsync` throws for a file it cannot delete (`500`) or
+/// whose folder is gone (`DirectoryNotFoundException`, `404`), and
+/// `ExceptionMiddleware` answers the throw with its status and text/plain
+/// "Error processing request.", on both routes.
+#[rstest::rstest]
+#[case::unwritable("Logo", StatusCode::INTERNAL_SERVER_ERROR)]
+#[case::folder_gone("Art", StatusCode::NOT_FOUND)]
+#[tokio::test]
+async fn a_failed_item_image_delete_is_answered_as_a_throw(
+    #[case] image_type: &str,
+    #[case] expected: StatusCode,
+) {
+    let s = elevated_stubs(String::new(), String::new());
+    for uri in [
+        format!("/Items/{ITEM_ID}/Images/{image_type}"),
+        format!("/Items/{ITEM_ID}/Images/{image_type}/0"),
+    ] {
+        let (status, body) = send(&s, "DELETE", &uri, None).await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (expected, &b"Error processing request."[..]),
+            "{uri}"
+        );
+    }
+}
+
+/// `DeleteItemImageByIndex` binds the route's `imageIndex` as a route int is
+/// bound: trimmed, and in the `0x`, `#` and `&h` hex forms; anything else is the
+/// binder's `400`, before the item is read.
+#[rstest::rstest]
+#[case::hex(ITEM_ID, "0x1", StatusCode::NO_CONTENT, Some(1))]
+#[case::hash(ITEM_ID, "%231", StatusCode::NO_CONTENT, Some(1))]
+#[case::padded(ITEM_ID, "%201", StatusCode::NO_CONTENT, Some(1))]
+#[case::malformed(ITEM_ID, "x", StatusCode::BAD_REQUEST, None)]
+#[case::malformed_missing_item(MISSING_ID, "x", StatusCode::BAD_REQUEST, None)]
+#[tokio::test]
+async fn delete_item_image_by_index_binds_its_route_index(
+    #[case] item: Uuid,
+    #[case] index: &str,
+    #[case] expected: StatusCode,
+    #[case] deleted_index: Option<i32>,
+) {
+    let s = elevated_stubs(String::new(), String::new());
+    let uri = format!("/Items/{item}/Images/Backdrop/{index}");
+    let (status, _) = send(&s, "DELETE", &uri, None).await;
+    assert_eq!(status, expected, "{uri}");
+    let expected_deleted: Vec<_> = deleted_index.map(|i| (ITEM_ID, i)).into_iter().collect();
+    assert_eq!(
+        *s.providers.deleted.lock().expect("lock"),
+        expected_deleted,
+        "{uri}"
+    );
+}
+
 #[tokio::test]
 async fn delete_item_image_missing_item_is_404() {
     let s = elevated_stubs(String::new(), String::new());
@@ -2007,8 +2140,11 @@ async fn update_item_image_index_missing_item_is_404() {
 
 // ---- TMDb client configuration ------------------------------------------------
 
+/// `TmdbController.TmdbClientConfiguration`: the images of the client
+/// configuration the provider manager's TMDb client fetched, as TMDb answered
+/// them (here a poster size no fixed list had).
 #[tokio::test]
-async fn tmdb_client_configuration_returns_image_config() {
+async fn tmdb_client_configuration_returns_tmdbs_image_config() {
     let s = stubs(String::new(), String::new());
     let (status, body) = send(&s, "GET", "/Tmdb/ClientConfiguration", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -2018,13 +2154,33 @@ async fn tmdb_client_configuration_returns_image_config() {
         config.secure_base_url.as_deref(),
         Some("https://image.tmdb.org/t/p/")
     );
-    assert!(
-        config
-            .poster_sizes
-            .as_deref()
-            .expect("poster sizes")
-            .contains(&"original".to_owned())
+    assert_eq!(
+        config.poster_sizes.as_deref(),
+        Some(["w92".to_owned(), "w2000".to_owned(), "original".to_owned()].as_slice())
     );
+}
+
+/// A configuration without images is a null result: `204`, as ASP.NET
+/// answers one.
+#[tokio::test]
+async fn tmdb_client_configuration_without_images_is_no_content() {
+    let s = stubs(String::new(), String::new());
+    *s.providers.tmdb_images.lock().expect("lock") = Ok(None);
+    let (status, body) = send(&s, "GET", "/Tmdb/ClientConfiguration", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(&body[..], b"", "no body");
+}
+
+/// TMDb answering no configuration fails the request as upstream's
+/// `GetConfigAsync` throw does through `ExceptionMiddleware` (`500`, the plain
+/// text body the settings page shows): no fixed sizes stand in for TMDb's.
+#[tokio::test]
+async fn tmdb_client_configuration_fails_when_tmdb_does_not_answer() {
+    let s = stubs(String::new(), String::new());
+    *s.providers.tmdb_images.lock().expect("lock") = Err("TheMovieDb did not answer");
+    let (status, body) = send(&s, "GET", "/Tmdb/ClientConfiguration", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(&body[..], b"Error processing request.");
 }
 
 // ---- user image upload --------------------------------------------------------

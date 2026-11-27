@@ -37,7 +37,7 @@ Consequences you must respect:
 
 ## Workspace layout
 
-Rust workspace, edition 2024, toolchain pinned to **1.99.1** (stable). Library crates in
+Rust workspace, edition 2024, toolchain pinned to **1.100.0** (stable). Library crates in
 `crates/`, the server binary in `apps/`.
 
 ```
@@ -68,7 +68,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-traits` | the manager/service **traits** — the dependency-injection seam (see below) |
 | `ferrofin-mediaencoding` | ffmpeg/ffprobe: probing, transcode arg-building, the live transcode runtime |
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
-| `ferrofin-drawing` | image resize/crop/format (via the `image` crate) |
+| `ferrofin-drawing` | image resize/crop/format (via the `image` crate; resizes via `fast_image_resize`) |
 | `ferrofin-providers` | metadata providers (local NFO + images always on; remote TMDB/TVDB/MusicBrainz/AudioDb/fanart/Studio Images always compiled, gated per library; OMDb uses a built-in key) |
 | `ferrofin-livetv` | Live TV — M3U/HDHomeRun tuners + XMLTV/Schedules Direct guides, DB-backed DVR timers/recordings |
 | `ferrofin-extensions` | compiled-in extensions behind an `Extension` trait (Tier 1a — see `docs/EXTENSIONS.md`) |
@@ -212,7 +212,7 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
 ## Building, running, testing
 
 ```bash
-cargo build --workspace
+cargo build --workspace   # needs cmake, and nasm on x86-64 (the vendored libjpeg-turbo)
 
 # Run the server. Config via flags, FERROFIN_* env, or {data_dir}/config.toml.
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
@@ -320,6 +320,27 @@ it: run it by hand for changes to `crates/ferrofin-extensions/src/ldap_auth/`:
 cargo test -p ferrofin-extensions --test ldap_directory -- --include-ignored --nocapture
 ```
 
+So is the Single Sign-On extension's identity provider test. `oidc_keycloak` runs the whole OIDC
+flow against a Keycloak holding the test realm of `contrib/oidc-test-realm/`, through Keycloak's
+login form and the server's router: discovery (and its clean failures), a first sign-in that
+creates the account and a second that finds it, no password signing in to it, replayed and
+tampered callbacks and codes refused, provisioning off and a taken name refused, the required
+group, role sync's administrator flag (the last administrator kept) and its library and Live TV
+mappings, a link and an unlink that signs the account out, and a Quick Connect code approved.
+Every test also fails if a secret it handled (the client secret, a password, a code, a token, a
+JWT, a subject) is in what the process logged at `debug`. It takes the Keycloak from the
+environment, not from a container it starts: the realm's issuer, client and test users
+(`FERROFIN_OIDC_TEST_*`, listed in the realm's README), and each test returns early with a message
+while its variables are unset. Steps that need Keycloak's admin login (a user's group or
+`picture` attribute changed) are not in it: the README lists them as by-hand checks. CI does not
+run it: run it by hand for changes to `crates/ferrofin-extensions/src/sso/`, with the realm's
+values in a file outside the repository:
+
+```bash
+set -a; . ~/.config/ferrofin/oidc-test.env; set +a
+cargo test -p ferrofin-server --test oidc_keycloak -- --include-ignored --nocapture
+```
+
 The end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
 toolchain stays server-only). It has an environment-variable gate instead of `#[ignore]`,
@@ -356,7 +377,7 @@ gates/bench/run.sh                                     # ~40 min → $FERROFIN_G
 python3 gates/bench/report.py --serve                  # compare runs at 127.0.0.1:8097
 ```
 
-`gates/run all` runs verify, adoption, parity and bench against one image as one session, after one
+`gates/run all` runs verify, adoption, roundtrip, parity and bench against one image as one session, after one
 preflight, and ends with one report, the session's `index.html` ([`gates/README.md`](gates/README.md));
 each gate's own script still runs alone. `make run-gates` (or `make run-<gate>`) does the same, and
 `make test-gates-offline` runs the gates' own tests (no docker), as CI does.
@@ -436,6 +457,15 @@ requirement is unaffected by the release-branch rule above. The full adoption va
 and a failure there blocks the release (see `RELEASE.md`).
 The shell tests in CI exercise the harness without these live fixtures.
 
+### The round trip has its own live check — `gates/roundtrip/`
+`gates/roundtrip/run.sh --image ferrofin:bench` (or `make run-roundtrip`) runs every route of
+`gates/roundtrip/routes.sh` on the adoption fixtures: Ferrofin adopts and uses a copy, `export-jellyfin` exports
+it, and the Jellyfin release `UPSTREAM_TAG` names boots on the export and must answer as Ferrofin did. Run it,
+on the routes a change touches (`--only`), for any change to the export command, the configuration writers,
+the history table, the migration chain or a writer of a Jellyfin-owned table, with its verdict table in the PR.
+The `Adoption` workflow runs it on every route before every release, and a failure there blocks the release
+(see `RELEASE.md`).
+
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only
 by **running the server and exercising it over real HTTP** (e.g. login once returned no
@@ -505,12 +535,13 @@ The real remaining gaps are **by design**, not un-ported routes:
   (`SaveLocalMetadata`), so with it off the media folders stay untouched and need no write
   permission. The metadata savers follow the same rule: in a library without a saver list
   (`MetadataSavers` null) and with `SaveLocalMetadata` off, no edit or member change writes
-  an `.nfo` or a box set's `collection.xml` into its media folders, not even over a file
-  already there (a library with a saver list writes what the list names). In a library
-  without a saver list, upstream's `ProviderManager.IsSaverEnabledForItem` rewrites a
-  saver's existing file on an edit, and `BoxSet.IsSaveLocalMetadataEnabled()` always writes
-  `collection.xml`; here a file left in place can be read again at a refresh until the
-  library names the saver or turns saving on.
+  an `.nfo`, a box set's `collection.xml` or a playlist folder's `playlist.xml` into its
+  media folders, not even over a file already there (a library with a saver list writes what
+  the list names). In a library without a saver list, upstream's
+  `ProviderManager.IsSaverEnabledForItem` rewrites a saver's existing file on an edit, and
+  `BoxSet.IsSaveLocalMetadataEnabled()` and `Playlist.IsSaveLocalMetadataEnabled()` always
+  write `collection.xml` and `playlist.xml`; here a file left in place can be read again at a
+  refresh until the library names the saver or turns saving on.
 - **Hardware transcoding is NVENC, VAAPI and QSV only.** AMF (AMD on Windows),
   VideoToolbox (macOS), RKMPP (Rockchip) and V4L2M2M are **not supported** — an owner
   decision (2026-08-26), not an un-ported route: their filter chains cannot be verified
@@ -520,6 +551,15 @@ The real remaining gaps are **by design**, not un-ported routes:
   supported set, so an idle GPU is never a silent mystery. Supporting one means porting
   its chain **and** its `GetEncoderParam`/`GetVideoBitrateParam` arms, verifying on real
   hardware, and adding it to `hardware_path_is_ported`.
+- **Images are shrunk with Lanczos3, not Skia's filters** — owner decisions (2026-11-05, narrowed to
+  shrinks 2026-11-23). Upstream's `SkiaEncoder.ResizeImage` shrinks with bilinear sampling over mipmaps
+  and then sharpens with a 3×3 kernel (`SharpenInPlace`); Ferrofin shrinks with Lanczos3
+  (`fast_image_resize`, premultiplied alpha) and does not sharpen. Measured against Jellyfin 12.4's
+  output, it keeps the same detail without the aliasing and halos (a zone plate shrunk by Lanczos3 from
+  the full decode leaks 2–8 % of its stopband against 15–51 %, a step edge overshoots by 2 grey levels
+  against 9), so a shrunk image's pixels differ from Jellyfin's on purpose. Where neither side shrinks
+  (a collage cell or splashscreen tile drawn from a smaller image), Ferrofin follows upstream: Mitchell,
+  B = C = 1/3.
 - **OMDb** uses Jellyfin's shared key by default; `FERROFIN_OMDB_KEY` / config
   `omdb_api_key` optionally overrides it. Remote providers use built-in keys where
   needed and are gated per library by "Metadata downloaders" / "Image fetchers".

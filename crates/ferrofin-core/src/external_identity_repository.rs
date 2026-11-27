@@ -6,12 +6,15 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use ferrofin_common::cryptography::constant_time_eq;
 use ferrofin_db::Database;
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::{
-    ExternalIdentity, ExternalIdentityKey, ExternalIdentityStore,
+    ConditionalLink, ExternalIdentity, ExternalIdentityKey, ExternalIdentityStore, LinkBy,
 };
+use sha2::{Digest, Sha256};
+use sqlx::SqliteConnection;
 use uuid::Uuid;
 
 use crate::db_error::db_err;
@@ -79,6 +82,69 @@ fn to_identity(row: Row) -> Option<ExternalIdentity> {
     })
 }
 
+/// Whether a user has the stored id `user`.
+async fn user_exists(tx: &mut SqliteConnection, user: &str) -> Result<bool, ServiceError> {
+    let exists: Option<i64> = sqlx::query_scalar(r#"SELECT 1 FROM "Users" WHERE "Id" = ?1"#)
+        .bind(user)
+        .fetch_optional(tx)
+        .await
+        .map_err(db_err)?;
+    Ok(exists.is_some())
+}
+
+/// Inserts the link of `identity` to `user_id` (stored as `user`).
+async fn insert(
+    tx: &mut SqliteConnection,
+    user_id: Uuid,
+    user: &str,
+    identity: ExternalIdentityKey<'_>,
+    avatar_hash: Option<&str>,
+) -> Result<ExternalIdentity, ServiceError> {
+    let sql = format!(
+        r#"INSERT INTO "FerrofinExternalIdentities"
+               ("UserId", "ProviderId", "Issuer", "Subject", "AvatarHash", "DateCreated")
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+           RETURNING {COLUMNS}"#
+    );
+    let row: Row = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(user)
+        .bind(identity.provider_id)
+        .bind(identity.issuer)
+        .bind(identity.subject)
+        .bind(stored_hash(avatar_hash))
+        .bind(datetime_to_db(Utc::now()))
+        .fetch_one(tx)
+        .await
+        .map_err(db_err)?;
+    Ok(ExternalIdentity {
+        user_id,
+        provider_id: row.provider_id,
+        issuer: row.issuer,
+        subject: row.subject,
+        avatar_hash: row.avatar_hash,
+        date_created: row.date_created,
+    })
+}
+
+/// Whether one of the devices of the stored user `user` holds the access
+/// token whose SHA-256 is `session`: a sign-out by any route deletes its
+/// device's row.
+async fn session_live(
+    tx: &mut SqliteConnection,
+    user: &str,
+    session: &[u8; 32],
+) -> Result<bool, ServiceError> {
+    let tokens: Vec<String> =
+        sqlx::query_scalar(r#"SELECT "AccessToken" FROM "Devices" WHERE "UserId" = ?1"#)
+            .bind(user)
+            .fetch_all(tx)
+            .await
+            .map_err(db_err)?;
+    Ok(tokens
+        .iter()
+        .any(|token| constant_time_eq(&Sha256::digest(token.as_bytes()), session)))
+}
+
 #[async_trait]
 impl ExternalIdentityStore for FerrofinExternalIdentityStore {
     async fn find(
@@ -118,6 +184,25 @@ impl ExternalIdentityStore for FerrofinExternalIdentityStore {
         Ok(rows.into_iter().filter_map(to_identity).collect())
     }
 
+    async fn list_for_user(
+        &self,
+        provider_id: &str,
+        user_id: Uuid,
+    ) -> Result<Vec<ExternalIdentity>, ServiceError> {
+        // `FerrofinIX_ExternalIdentities_UserId` finds the user's rows.
+        let sql = format!(
+            r#"SELECT {COLUMNS} FROM "FerrofinExternalIdentities"
+               WHERE "UserId" = ?1 AND "ProviderId" = ?2 ORDER BY "Id""#
+        );
+        let rows: Vec<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(guid_to_db(user_id))
+            .bind(provider_id)
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().filter_map(to_identity).collect())
+    }
+
     async fn link(
         &self,
         user_id: Uuid,
@@ -134,23 +219,21 @@ impl ExternalIdentityStore for FerrofinExternalIdentityStore {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(db_err)?;
-        let exists: Option<i64> = sqlx::query_scalar(r#"SELECT 1 FROM "Users" WHERE "Id" = ?1"#)
-            .bind(&user)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        if exists.is_none() {
+        if !user_exists(&mut tx, &user).await? {
             return Err(ServiceError::not_found(format!("user {user_id}")));
         }
         // Upstream's `AddUser`: "Ensure we do not have more than one entry for a
         // given user" — `RemoveUser(userGuid)`, then `RemoveUser(ldapUid)`. The
-        // map was LDAP's own, so here both are scoped to the provider.
+        // map was LDAP's own, so here both are scoped to the provider, and the
+        // user's is scoped to the issuer too: LDAP's is always empty, and an
+        // OIDC user keeps their link at another identity provider.
         sqlx::query(
             r#"DELETE FROM "FerrofinExternalIdentities"
-               WHERE "UserId" = ?1 AND "ProviderId" = ?2"#,
+               WHERE "UserId" = ?1 AND "ProviderId" = ?2 AND "Issuer" = ?3"#,
         )
         .bind(&user)
         .bind(identity.provider_id)
+        .bind(identity.issuer)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -164,30 +247,85 @@ impl ExternalIdentityStore for FerrofinExternalIdentityStore {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        let link = insert(&mut tx, user_id, &user, identity, avatar_hash).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(link)
+    }
+
+    async fn link_unless_taken(
+        &self,
+        user_id: Uuid,
+        identity: ExternalIdentityKey<'_>,
+        by: LinkBy,
+    ) -> Result<ConditionalLink, ServiceError> {
+        let user = guid_to_db(user_id);
+        // The write lock first, so no other link, unlink or sign-out lands
+        // between a check below and the write (CONTRIBUTING.md, "Migrations
+        // and one-shot repairs"). Each refusal rolls back, changing nothing.
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
+        if !user_exists(&mut tx, &user).await? {
+            return Err(ServiceError::not_found(format!("user {user_id}")));
+        }
+        if let LinkBy::Session(session) = &by
+            && !session_live(&mut tx, &user, session).await?
+        {
+            return Ok(ConditionalLink::SessionEnded);
+        }
         let sql = format!(
-            r#"INSERT INTO "FerrofinExternalIdentities"
-                   ("UserId", "ProviderId", "Issuer", "Subject", "AvatarHash", "DateCreated")
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-               RETURNING {COLUMNS}"#
+            r#"SELECT {COLUMNS} FROM "FerrofinExternalIdentities"
+               WHERE "ProviderId" = ?1 AND "Issuer" = ?2 AND "Subject" = ?3"#
         );
-        let row: Row = sqlx::query_as(sqlx::AssertSqlSafe(sql))
-            .bind(&user)
+        let held: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
             .bind(identity.provider_id)
             .bind(identity.issuer)
             .bind(identity.subject)
-            .bind(stored_hash(avatar_hash))
-            .bind(datetime_to_db(Utc::now()))
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
+        if let Some(row) = held {
+            // A row whose user id is not a GUID names no account this can
+            // read: refused as taken, since nothing here moves an identity.
+            return Ok(match to_identity(row) {
+                Some(link) if link.user_id == user_id => ConditionalLink::Kept(link),
+                _ => ConditionalLink::Taken,
+            });
+        }
+        let sql = format!(
+            r#"SELECT {COLUMNS} FROM "FerrofinExternalIdentities"
+               WHERE "UserId" = ?1 AND "ProviderId" = ?2 AND "Issuer" = ?3"#
+        );
+        let earlier: Option<Row> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+            .bind(&user)
+            .bind(identity.provider_id)
+            .bind(identity.issuer)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        if earlier.is_some() {
+            if matches!(by, LinkBy::Session(_)) {
+                return Ok(ConditionalLink::AlreadyLinked);
+            }
+            sqlx::query(
+                r#"DELETE FROM "FerrofinExternalIdentities"
+                   WHERE "UserId" = ?1 AND "ProviderId" = ?2 AND "Issuer" = ?3"#,
+            )
+            .bind(&user)
+            .bind(identity.provider_id)
+            .bind(identity.issuer)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        }
+        let link = insert(&mut tx, user_id, &user, identity, None).await?;
         tx.commit().await.map_err(db_err)?;
-        Ok(ExternalIdentity {
-            user_id,
-            provider_id: row.provider_id,
-            issuer: row.issuer,
-            subject: row.subject,
-            avatar_hash: row.avatar_hash,
-            date_created: row.date_created,
+        Ok(ConditionalLink::Linked {
+            link,
+            replaced: earlier.and_then(to_identity),
         })
     }
 
@@ -320,6 +458,54 @@ mod tests {
         assert_eq!(store.list("Other").await.expect("list other"), Vec::new());
     }
 
+    /// One user's links at a provider, one per issuer, and never another
+    /// user's or another provider's; none once the user is deleted.
+    #[tokio::test]
+    async fn a_users_links_are_listed_by_provider() {
+        let (store, users, ids) = fixture(&["alice", "bob"]).await;
+        let at = |issuer, subject| ExternalIdentityKey {
+            provider_id: OIDC,
+            issuer,
+            subject,
+        };
+        let one = store
+            .link(ids[0], at("https://one.example", "a-1"), None)
+            .await
+            .expect("first issuer");
+        let two = store
+            .link(ids[0], at("https://two.example", "a-2"), Some("hash"))
+            .await
+            .expect("second issuer");
+        store
+            .link(ids[1], at("https://one.example", "b-1"), None)
+            .await
+            .expect("bob");
+        store
+            .link(ids[0], ldap("alice-uid"), None)
+            .await
+            .expect("ldap");
+
+        assert_eq!(
+            store.list_for_user(OIDC, ids[0]).await.expect("alice"),
+            vec![one, two]
+        );
+        let bobs = store.list_for_user(OIDC, ids[1]).await.expect("bob");
+        assert_eq!(bobs.len(), 1);
+        assert_eq!(bobs[0].subject, "b-1");
+        assert_eq!(store.list_for_user(LDAP, ids[1]).await.expect("none"), []);
+        assert_eq!(
+            store
+                .list_for_user(OIDC, Uuid::from_u128(0xDEAD))
+                .await
+                .expect("no such user"),
+            []
+        );
+
+        users.delete_user(ids[0]).await.expect("delete alice");
+        assert_eq!(store.list_for_user(OIDC, ids[0]).await.expect("gone"), []);
+        assert_eq!(store.list_for_user(OIDC, ids[1]).await.expect("bob"), bobs);
+    }
+
     #[tokio::test]
     async fn a_second_link_for_the_same_identity_replaces_the_first() {
         let (store, _users, ids) = fixture(&["alice", "bob"]).await;
@@ -368,6 +554,47 @@ mod tests {
         assert!(store.find(oidc).await.expect("find oidc").is_some());
     }
 
+    /// OIDC: a user linked at one identity provider keeps that link when
+    /// linked at a second, and a relink at the first replaces only its own.
+    #[tokio::test]
+    async fn a_user_keeps_one_link_per_provider_and_issuer() {
+        let (store, _users, ids) = fixture(&["alice"]).await;
+        let at = |issuer, subject| ExternalIdentityKey {
+            provider_id: OIDC,
+            issuer,
+            subject,
+        };
+        store
+            .link(ids[0], at("https://one.example", "sub-1"), None)
+            .await
+            .expect("first issuer");
+        store
+            .link(ids[0], at("https://two.example", "sub-2"), None)
+            .await
+            .expect("second issuer");
+        assert!(
+            store
+                .find(at("https://one.example", "sub-1"))
+                .await
+                .expect("find")
+                .is_some(),
+            "the first issuer's link stays"
+        );
+        store
+            .link(ids[0], at("https://one.example", "sub-3"), None)
+            .await
+            .expect("relink at the first issuer");
+        let mut subjects: Vec<String> = store
+            .list(OIDC)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|l| l.subject)
+            .collect();
+        subjects.sort();
+        assert_eq!(subjects, ["sub-2", "sub-3"]);
+    }
+
     #[tokio::test]
     async fn linking_a_missing_user_is_not_found_and_changes_nothing() {
         let (store, _users, ids) = fixture(&["alice"]).await;
@@ -396,7 +623,7 @@ mod tests {
     async fn concurrent_links_lose_no_entry() {
         let (store, _users, ids) = fixture(&["u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7"]).await;
         let store = Arc::new(store);
-        let uids: Vec<String> = (0..ids.len()).map(|i| format!("uid-{i}")).collect();
+        let uids: Vec<String> = Vec::from_fn(ids.len(), |i| format!("uid-{i}"));
         let mut tasks = Vec::new();
         for (id, uid) in ids.iter().copied().zip(uids.iter().cloned()) {
             let store = Arc::clone(&store);
@@ -595,6 +822,191 @@ mod tests {
         assert!(!store.unlink(ldap("a")).await.expect("unlink again"));
         assert_eq!(store.find(ldap("a")).await.expect("find"), None);
         assert!(store.find(ldap("b")).await.expect("find b").is_some());
+    }
+
+    /// `user_id`'s device holding the access token `token`; its row's id.
+    async fn device(store: &FerrofinExternalIdentityStore, user_id: Uuid, token: &str) -> i64 {
+        use ferrofin_traits::devices::DeviceManager as _;
+        let now = Utc::now();
+        crate::FerrofinDeviceManager::new(store.db.clone())
+            .create_device(&ferrofin_db::entities::security::DeviceEntity {
+                id: 0,
+                access_token: token.into(),
+                app_name: "app".into(),
+                app_version: "1".into(),
+                date_created: now,
+                date_last_activity: now,
+                date_modified: now,
+                device_id: format!("device-{token}"),
+                device_name: "name".into(),
+                is_active: true,
+                user_id: guid_to_db(user_id),
+            })
+            .await
+            .expect("create device")
+            .id
+    }
+
+    fn sha256(token: &str) -> [u8; 32] {
+        Sha256::digest(token.as_bytes()).into()
+    }
+
+    /// A conditional link checks, inside its write, that the identity is not
+    /// another user's and, for a session's link, that the user has no link at
+    /// the issuer and the session is still one of the user's devices; every
+    /// refusal changes nothing.
+    #[tokio::test]
+    async fn a_conditional_link_refuses_a_taken_identity_a_replacement_and_an_ended_session() {
+        let (store, _users, ids) = fixture(&["alice", "bob"]).await;
+        let (alice, bob) = (ids[0], ids[1]);
+        let at = |subject| ExternalIdentityKey {
+            provider_id: OIDC,
+            issuer: "https://idp.example",
+            subject,
+        };
+        device(&store, alice, "alice-token").await;
+        let live = sha256("alice-token");
+        let session = LinkBy::Session(live);
+
+        let gone = sha256("signed-out-token");
+        assert_eq!(
+            store
+                .link_unless_taken(alice, at("a-1"), LinkBy::Session(gone))
+                .await
+                .expect("refused"),
+            ConditionalLink::SessionEnded
+        );
+        assert_eq!(count(&store).await, 0);
+
+        let ConditionalLink::Linked { link, replaced } = store
+            .link_unless_taken(alice, at("a-1"), session)
+            .await
+            .expect("linked")
+        else {
+            panic!("not linked");
+        };
+        assert_eq!((link.user_id, link.subject.as_str()), (alice, "a-1"));
+        assert_eq!(replaced, None);
+        assert_eq!(
+            store
+                .link_unless_taken(alice, at("a-1"), session)
+                .await
+                .expect("kept"),
+            ConditionalLink::Kept(link.clone())
+        );
+        assert_eq!(
+            store
+                .link_unless_taken(alice, at("a-2"), session)
+                .await
+                .expect("refused"),
+            ConditionalLink::AlreadyLinked,
+            "a session's link never replaces one"
+        );
+        device(&store, bob, "bob-token").await;
+        let bobs = sha256("bob-token");
+        for by in [LinkBy::Session(bobs), LinkBy::Administrator] {
+            assert_eq!(
+                store
+                    .link_unless_taken(bob, at("a-1"), by)
+                    .await
+                    .expect("refused"),
+                ConditionalLink::Taken,
+                "{by:?}"
+            );
+        }
+        assert_eq!(store.list(OIDC).await.expect("list"), vec![link.clone()]);
+
+        // An administrator's link replaces the user's at the issuer.
+        let ConditionalLink::Linked {
+            link: second,
+            replaced,
+        } = store
+            .link_unless_taken(alice, at("a-2"), LinkBy::Administrator)
+            .await
+            .expect("replaced")
+        else {
+            panic!("not linked");
+        };
+        assert_eq!(replaced, Some(link));
+        assert_eq!(store.list(OIDC).await.expect("list"), vec![second]);
+
+        let missing = store
+            .link_unless_taken(Uuid::from_u128(0xDEAD), at("x"), LinkBy::Administrator)
+            .await
+            .expect_err("no such user");
+        assert!(matches!(missing, ServiceError::NotFound(_)), "{missing:?}");
+    }
+
+    /// The session check reads the devices inside the write: a device row
+    /// deleted before it (a sign-out) ends the session, and another user's
+    /// device holding the token is not the user's session.
+    #[tokio::test]
+    async fn a_conditional_link_follows_the_sessions_device_row() {
+        let (store, _users, ids) = fixture(&["alice", "bob"]).await;
+        let identity = ExternalIdentityKey {
+            provider_id: OIDC,
+            issuer: "https://idp.example",
+            subject: "a-1",
+        };
+        let row = device(&store, ids[0], "alice-token").await;
+        device(&store, ids[1], "bob-token").await;
+        let bobs = sha256("bob-token");
+        assert_eq!(
+            store
+                .link_unless_taken(ids[0], identity, LinkBy::Session(bobs))
+                .await
+                .expect("refused"),
+            ConditionalLink::SessionEnded
+        );
+        sqlx::query(r#"DELETE FROM "Devices" WHERE "Id" = ?1"#)
+            .bind(row)
+            .execute(store.db.writer())
+            .await
+            .expect("signed out");
+        let alices = sha256("alice-token");
+        assert_eq!(
+            store
+                .link_unless_taken(ids[0], identity, LinkBy::Session(alices))
+                .await
+                .expect("refused"),
+            ConditionalLink::SessionEnded
+        );
+        assert_eq!(count(&store).await, 0);
+    }
+
+    /// Accounts linking one identity from their sessions at once: each is one
+    /// transaction under the write lock, so one links and the rest are
+    /// refused.
+    #[tokio::test]
+    async fn concurrent_conditional_links_link_once() {
+        let (store, _users, ids) = fixture(&["u0", "u1", "u2", "u3"]).await;
+        let store = Arc::new(store);
+        let mut tasks = Vec::new();
+        for (i, id) in ids.iter().copied().enumerate() {
+            let store = Arc::clone(&store);
+            device(&store, id, &format!("token-{i}")).await;
+            tasks.push(tokio::spawn(async move {
+                let session = sha256(&format!("token-{i}"));
+                let shared = ExternalIdentityKey {
+                    provider_id: OIDC,
+                    issuer: "https://idp.example",
+                    subject: "shared",
+                };
+                store
+                    .link_unless_taken(id, shared, LinkBy::Session(session))
+                    .await
+            }));
+        }
+        let mut linked = 0;
+        for task in tasks {
+            match task.await.expect("join").expect("an outcome") {
+                ConditionalLink::Linked { .. } => linked += 1,
+                ConditionalLink::Taken => {}
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(linked, 1);
+        assert_eq!(count(&store).await, 1);
     }
 
     /// `delete_user` removes the links itself, so it does not depend on the

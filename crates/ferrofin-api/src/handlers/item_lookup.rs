@@ -166,10 +166,7 @@ fn to_request<T: IntoLookup>(
     query: RemoteSearchQuery<T>,
     item_kind: BaseItemKind,
 ) -> RemoteSearchRequest {
-    let (search_info, extras) = query
-        .search_info
-        .map(IntoLookup::into_lookup)
-        .unwrap_or_default();
+    let (search_info, extras) = query.search_info.map_or_default(IntoLookup::into_lookup);
     RemoteSearchRequest {
         item_kind,
         search_info,

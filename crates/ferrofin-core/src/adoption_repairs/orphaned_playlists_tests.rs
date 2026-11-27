@@ -199,7 +199,8 @@ async fn without_orphans_no_snapshot_is_taken() {
 /// With owned playlists but no user to be read, every owner would look
 /// missing: nothing is copied or changed and the repair stays undone. With
 /// no owned playlist either (a fresh install, whose administrator is seeded
-/// after the repairs run) it is simply done.
+/// after the repairs run) it is simply done. The composition root's wrapper
+/// reports which, for the record of the start (gl-1952).
 #[tokio::test]
 async fn without_a_user_nothing_is_disposed_of() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -212,6 +213,7 @@ async fn without_a_user_nothing_is_disposed_of() {
         0
     );
     assert!(db.meta_get(MARKER).await.expect("meta").is_some());
+    assert!(super::run_remove_orphaned_playlists(&db, &mgr).await);
 
     let dir = tempfile::tempdir().expect("tempdir");
     let db = file_db(dir.path()).await;
@@ -235,6 +237,7 @@ async fn without_a_user_nothing_is_disposed_of() {
             .exists()
     );
     assert!(db.meta_get(MARKER).await.expect("meta").is_none());
+    assert!(!super::run_remove_orphaned_playlists(&db, &mgr).await);
 }
 
 /// A snapshot that cannot be written (something else at its name) fails the

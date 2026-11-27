@@ -801,6 +801,38 @@ async fn deleting_a_version_reroutes_it_to_its_primary() {
     }
 }
 
+/// gl-1637: upstream saves the primary after taking a merged version out of
+/// its `LinkedAlternateVersions` (`LibraryManager.cs:545-550`), and the save
+/// writes its version rows from 0 (`ItemPersistenceService.cs:702-724`), so
+/// the merged version after it moves up.
+#[tokio::test]
+async fn deleting_a_merged_version_numbers_the_primarys_rows_from_zero() {
+    let f = fixture().await;
+    let g = version_group(&f).await;
+    let other_file = f.library.join("Other/Film.mkv");
+    touch(&other_file);
+    let primary_key = g.primary.as_simple().to_string();
+    let other = row(&f.db, BaseItemKind::Movie, Some(&other_file), |e| {
+        e.primary_version_id = Some(guid_to_db(g.primary));
+        e.presentation_unique_key = Some(primary_key.clone());
+    })
+    .await;
+    link(&f.db, g.primary, other, 3).await;
+
+    f.manager
+        .delete_item(g.merged, &DeleteOptions::default())
+        .await
+        .expect("delete");
+
+    let mut conn = f.db.pool().acquire().await.expect("connection");
+    let rows = crate::item_persistence_service::links_under(&mut conn, &[g.primary])
+        .await
+        .expect("rows")
+        .remove(&g.primary)
+        .unwrap_or_default();
+    assert_eq!(rows, vec![(g.first, 2, 0), (g.second, 2, 1), (other, 3, 2)]);
+}
+
 /// A library (`CollectionFolder` row) over `locations`; with `scanned`, its
 /// completed full scan by this scanner is recorded.
 async fn library(f: &Fixture, locations: &[&Path], scanned: bool) -> Uuid {

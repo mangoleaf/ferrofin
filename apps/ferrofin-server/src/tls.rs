@@ -380,8 +380,7 @@ pub async fn redirect_to_https(
         let query = request
             .uri()
             .query()
-            .map(|query| format!("?{query}"))
-            .unwrap_or_default();
+            .map_or_default(|query| format!("?{query}"));
         // The query is left out of the log: clients send tokens in it.
         tracing::debug!(
             host,
@@ -404,15 +403,13 @@ pub async fn redirect_to_https(
             [(header::LOCATION, location.clone())],
         )
             .into_response();
-        async move { Ok::<_, std::convert::Infallible>(response) }
+        async move { Ok::<_, !>(response) }
     });
     let config = redirect.config.as_ref();
     let cors = tower::service_fn(move |request: Request| {
         let answer = answer.clone();
         async move {
-            Ok::<_, std::convert::Infallible>(
-                ferrofin_api::cors::with_configured_cors(config, request, answer).await,
-            )
+            Ok::<_, !>(ferrofin_api::cors::with_configured_cors(config, request, answer).await)
         }
     });
     let network = redirect.network.as_deref();

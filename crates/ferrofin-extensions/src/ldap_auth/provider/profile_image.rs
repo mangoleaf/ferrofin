@@ -52,21 +52,15 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::ExternalIdentity;
-use ferrofin_traits::library::UserManager;
 use ferrofin_traits::remote_images::{RemoteImageError, RemoteImageFetcher};
 use ferrofin_traits::tasks::{ScheduledTask, TaskProgress};
-use ferrofin_util::source_url::redact_url;
 use ferrofin_util::ticks::TICKS_PER_DAY;
 
 use super::{LdapAuthProvider, PROVIDER_ID, locate_ldap_user};
 use crate::ldap_auth::{BoundSearchError, LdapConfig, LdapEntry, LdapError, ProfileImageFormat};
-
-/// The media type every directory picture is stored as: upstream's
-/// `ProfileImageUpdater` saves each one as `profile.jpg` with
-/// `MediaTypeNames.Image.Jpeg`, whatever its format.
-const STORED_MIME_TYPE: &str = "image/jpeg";
-/// The extension every directory picture is stored under (`profile.jpg`).
-const STORED_EXTENSION: &str = ".jpg";
+// Shared with Single Sign-On's picture sync.
+pub(crate) use crate::profile_images::avatar_hash;
+use crate::profile_images::{quoted, replace_picture, save_picture};
 
 /// `Convert.FromBase64String`'s decoding: padding required, the unused bits of
 /// the last character ignored.
@@ -147,19 +141,6 @@ pub(crate) fn detect_format(value: &[u8]) -> Result<ProfileImageFormat, FormatEr
     }
 }
 
-/// How an error names a value it could not read: a value with `://` as
-/// [`redact_url`] leaves it (a URL by its scheme and host, a `file:` URL
-/// whole), anything else by its length only. Upstream quotes the value whole,
-/// but an attribute that is not the picture (a password hash, a whole encoded
-/// image) does not belong in the log.
-pub(crate) fn quoted(text: &str) -> String {
-    if text.contains("://") {
-        redact_url(text)
-    } else {
-        format!("a value of {} characters", text.chars().count())
-    }
-}
-
 /// .NET's Base64 whitespace, which both `Base64.IsValid` and
 /// `Convert.FromBase64String` skip wherever it is.
 fn without_whitespace(text: &str) -> String {
@@ -180,12 +161,6 @@ fn is_base64(text: &str) -> bool {
 /// bits of the last character are ignored.
 fn from_base64(text: &str) -> Option<Vec<u8>> {
     FROM_BASE64.decode(without_whitespace(text)).ok()
-}
-
-/// The avatar hash of a picture, upstream's `ProfileImageHash`:
-/// `Convert.ToBase64String(MD5.HashData(bytes))`.
-pub(crate) fn avatar_hash(bytes: &[u8]) -> String {
-    STANDARD.encode(ferrofin_common::extensions::md5_digest(bytes))
 }
 
 /// The first value of the entry's picture attribute (Novell's `ByteValue` and
@@ -230,18 +205,6 @@ pub(crate) async fn picture_bytes(
                 })
         }
     }
-}
-
-/// `ProfileImageUpdater.SetProfileImage`: stores `bytes` as the user's
-/// `profile.jpg`.
-async fn save_picture(
-    users: &dyn UserManager,
-    user: &UserEntity,
-    bytes: &[u8],
-) -> Result<(), ServiceError> {
-    users
-        .save_profile_image(user, bytes, STORED_MIME_TYPE, STORED_EXTENSION)
-        .await
 }
 
 /// The task's error for a directory it cannot connect to (`step`
@@ -396,21 +359,20 @@ impl LdapAuthProvider {
                 return Ok(());
             }
         };
-        let hash = avatar_hash(&bytes);
-        if has_picture && link.avatar_hash.as_deref() == Some(hash.as_str()) {
+        let stored = replace_picture(
+            self.users.as_ref(),
+            self.identities.as_ref(),
+            Self::identity(&link.subject),
+            &user,
+            has_picture,
+            link.avatar_hash.as_deref(),
+            &bytes,
+        )
+        .await?;
+        if !stored {
             tracing::debug!(user_id = %link.user_id, "the profile image is already up to date");
             return Ok(());
         }
-        // Upstream's order: the old picture goes before the new one is
-        // stored, so a store that fails leaves none, and the next run tries
-        // again (the hash is written only after).
-        if has_picture {
-            self.users.clear_profile_image(&user).await?;
-        }
-        save_picture(self.users.as_ref(), &user, &bytes).await?;
-        self.identities
-            .set_avatar_hash(Self::identity(&link.subject), Some(&hash))
-            .await?;
         tracing::debug!(user_id = %link.user_id, "synchronized the profile image from LDAP");
         Ok(())
     }

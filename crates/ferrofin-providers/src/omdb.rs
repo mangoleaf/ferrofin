@@ -207,8 +207,7 @@ impl OmdbClient {
         }
         self.get::<OmdbSearchResults>(name, &params)
             .await
-            .map(|r| r.search)
-            .unwrap_or_default()
+            .map_or_default(|r| r.search)
     }
 
     /// The full title record for an IMDb id, or `None` when the id is empty,
@@ -303,7 +302,7 @@ impl OmdbClient {
         let value = match serde_json::from_slice(&body) {
             Ok(value) => value,
             Err(error) => {
-                tracing::warn!(provider = "omdb", imdb_id, %error, "Metadata provider response could not be parsed");
+                tracing::warn!(provider = "omdb", item_id = crate::rate_limit::request_item(), imdb_id, %error, "Metadata provider response could not be parsed");
                 return None;
             }
         };
@@ -659,7 +658,7 @@ fn split_credits(credits: &str) -> Vec<&str> {
 /// Whether a credit is only a generational suffix (`Jr`, `III.`, …) — port
 /// of `OmdbProvider.IsNameSuffix`.
 fn is_name_suffix(value: &str) -> bool {
-    let suffix = value.strip_suffix('.').unwrap_or(value);
+    let suffix = value.trim_suffix('.');
     NAME_SUFFIXES
         .iter()
         .any(|s| equals_ordinal_ignore_case(s, suffix))

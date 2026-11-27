@@ -38,6 +38,7 @@ use ferrofin_db::entities::base_items::{BaseItemEntity, PeopleEntity};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::MetadataField;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use ferrofin_util::string_extensions::zero_padded;
 use serde_json::{Map, Value};
 
 /// A `Data` column value's JSON object; `NULL`, empty and malformed payloads
@@ -513,8 +514,8 @@ pub fn derived_sort_name(entity: &BaseItemEntity, title: &str) -> String {
 /// (a dead Next button and no autoplay).
 #[must_use]
 pub fn episode_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &str) -> String {
-    let season = parent_index.map_or_else(String::new, |n| format!("{n:03} - "));
-    let episode = index.map_or_else(String::new, |n| format!("{n:04} - "));
+    let season = parent_index.map_or_else(String::new, |n| format!("{} - ", zero_padded(n, 3)));
+    let episode = index.map_or_else(String::new, |n| format!("{} - ", zero_padded(n, 4)));
     format!("{season}{episode}{name}")
 }
 
@@ -523,7 +524,7 @@ pub fn episode_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &s
 /// no number, without the article-stripping, lower-casing name pipeline.
 #[must_use]
 pub fn season_sort_name(index: Option<i64>, name: &str) -> String {
-    index.map_or_else(|| name.to_owned(), |n| format!("{n:04}"))
+    index.map_or_else(|| name.to_owned(), |n| zero_padded(n, 4))
 }
 
 /// Port of C# `Audio.CreateSortName` (v10.11.8
@@ -538,8 +539,8 @@ pub fn season_sort_name(index: Option<i64>, name: &str) -> String {
 /// that contains one.
 #[must_use]
 pub fn audio_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &str) -> String {
-    let disc = parent_index.map_or_else(String::new, |n| format!("{n:04} - "));
-    let track = index.map_or_else(String::new, |n| format!("{n:04} - "));
+    let disc = parent_index.map_or_else(String::new, |n| format!("{} - ", zero_padded(n, 4)));
+    let track = index.map_or_else(String::new, |n| format!("{} - ", zero_padded(n, 4)));
     format!("{disc}{track}{name}")
 }
 
@@ -630,6 +631,50 @@ fn has_album_artist(kind: Option<BaseItemKind>) -> bool {
                 | BaseItemKind::MusicVideo
         )
     )
+}
+
+/// `BaseItem.SupportsPeople` and its overrides: every video, audio and
+/// audiobook, book, series, season, box set and music album. A refresh saves
+/// credits only for these (`SaveItemAsync`, `MetadataService.cs:320`), and
+/// `LibraryManager.GetPeople(BaseItem)` reads none for any other kind. This
+/// crate's copy of `ferrofin_core::kinds::supports_people`, which it cannot
+/// reach.
+pub(crate) fn supports_people(kind: Option<BaseItemKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            BaseItemKind::Video
+                | BaseItemKind::Movie
+                | BaseItemKind::Episode
+                | BaseItemKind::MusicVideo
+                | BaseItemKind::Trailer
+                | BaseItemKind::Audio
+                | BaseItemKind::AudioBook
+                | BaseItemKind::Book
+                | BaseItemKind::Series
+                | BaseItemKind::Season
+                | BaseItemKind::BoxSet
+                | BaseItemKind::MusicAlbum
+        )
+    )
+}
+
+/// `LibraryManager.GetPeople(BaseItem)`, which the NFO and XML savers write
+/// from: the stored credits of `row`, none for a kind without people
+/// (`LibraryManager.cs:3655-3668`), whatever an earlier build stored for it.
+pub(crate) async fn stored_people(
+    people: &dyn ferrofin_traits::persistence::PeopleRepository,
+    item_id: uuid::Uuid,
+    row: &BaseItemEntity,
+) -> Result<Vec<PeopleEntity>, ferrofin_traits::error::ServiceError> {
+    if !supports_people(BaseItemKind::from_stored_type_name(&row.type_)) {
+        return Ok(Vec::new());
+    }
+    Ok(people
+        .get_people_batch(&[item_id])
+        .await?
+        .remove(&item_id)
+        .unwrap_or_default())
 }
 
 /// `MergeBaseItemData` over the row's columns and its `Data` blob.
@@ -1344,7 +1389,7 @@ fn guid_x(text: &[char]) -> Option<uuid::Uuid> {
 /// digits (none reads as zero). `None` for any other character, or for more
 /// than eight significant digits (its `overflow`).
 fn guid_hex(s: &[char]) -> Option<u32> {
-    let s = s.strip_prefix(&['+']).unwrap_or(s);
+    let s = s.trim_prefix(&['+']);
     let s = match s {
         ['0', 'x' | 'X', rest @ ..] => rest,
         _ => s,

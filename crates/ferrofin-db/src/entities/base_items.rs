@@ -51,7 +51,9 @@ pub struct BaseItemEntity {
     pub artists: Option<String>,
     /// The program-audio discriminant (`Audio`), if any.
     pub audio: Option<i32>,
-    /// The owning channel's `Guid`, hyphenated (`ChannelId`), if any.
+    /// The owning channel's `Guid`, hyphenated (`ChannelId`), if any (the zero
+    /// GUID an item with no channel stores reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonNilGuid")]
     pub channel_id: Option<String>,
     /// The normalized (clean) name for lookups (`CleanName`), if any.
     pub clean_name: Option<String>,
@@ -91,7 +93,8 @@ pub struct BaseItemEntity {
     pub extra_type: Option<i32>,
     /// A forced sort name overriding `SortName` (`ForcedSortName`), if any.
     pub forced_sort_name: Option<String>,
-    /// The genres, as stored (`Genres`), if any.
+    /// The genres, as stored (`Genres`), if any (`''` reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonEmptyText")]
     pub genres: Option<String>,
     /// The pixel height (`Height`), if any.
     pub height: Option<i64>,
@@ -156,17 +159,23 @@ pub struct BaseItemEntity {
     pub presentation_unique_key: Option<String>,
     /// The primary version item's `Guid`, hyphenated (`PrimaryVersionId`).
     pub primary_version_id: Option<String>,
-    /// The production locations, as stored (`ProductionLocations`), if any.
+    /// The production locations, as stored (`ProductionLocations`), if any
+    /// (`''` reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonEmptyText")]
     pub production_locations: Option<String>,
     /// The production year (`ProductionYear`), if any.
     pub production_year: Option<i64>,
     /// The runtime in ticks (`RunTimeTicks`), if any.
     pub run_time_ticks: Option<i64>,
-    /// The owning season's `Guid`, hyphenated (`SeasonId`), if any.
+    /// The owning season's `Guid`, hyphenated (`SeasonId`), if any (the zero
+    /// GUID reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonNilGuid")]
     pub season_id: Option<String>,
     /// The season name (`SeasonName`), if any.
     pub season_name: Option<String>,
-    /// The owning series' `Guid`, hyphenated (`SeriesId`), if any.
+    /// The owning series' `Guid`, hyphenated (`SeriesId`), if any (the zero
+    /// GUID reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonNilGuid")]
     pub series_id: Option<String>,
     /// The series name (`SeriesName`), if any.
     pub series_name: Option<String>,
@@ -180,11 +189,13 @@ pub struct BaseItemEntity {
     pub sort_name: Option<String>,
     /// The item's start date (`StartDate`), if any.
     pub start_date: Option<DateTime<Utc>>,
-    /// The studios, as stored (`Studios`), if any.
+    /// The studios, as stored (`Studios`), if any (`''` reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonEmptyText")]
     pub studios: Option<String>,
     /// The tagline (`Tagline`), if any.
     pub tagline: Option<String>,
-    /// The tags, as stored (`Tags`), if any.
+    /// The tags, as stored (`Tags`), if any (`''` reads as `None`).
+    #[sqlx(try_from = "crate::entities::unset::NonEmptyText")]
     pub tags: Option<String>,
     /// The top-most parent's `Guid`, hyphenated (`TopParentId`), if any.
     pub top_parent_id: Option<String>,
@@ -538,11 +549,12 @@ pub struct KeyframeDataEntity {
 /// `(ItemValueType discriminant, value)` pairs for the `ItemValues` filter
 /// tables (Artist = 0, AlbumArtist = 1, Genre = 2, Studios = 3, Tags = 4).
 ///
-/// Port of the `GetItemValuesToSave` half of C# `BaseItemRepository.SaveItems`
-/// (v10.11.8 `Jellyfin.Server.Implementations/Item/BaseItemRepository.cs:674-735`;
-/// master's body is unchanged), which upstream runs on EVERY item save — so
-/// both the scanner and a provider refresh re-derive the by-name index from the
-/// row it just wrote.
+/// Port of `GetItemValuesToSave` (v12.4
+/// `Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs:792-815`),
+/// which upstream runs on EVERY item save — so both the scanner and a provider
+/// refresh re-derive the by-name index from the row it just wrote. Each entry
+/// keeps its text; only blank ones go (`RemoveAll(string.IsNullOrWhiteSpace)`
+/// at `:812`, then `Value = f.Value` at `:386`).
 ///
 /// Lives here, beside the entity it reads, because two crates need it and
 /// `ferrofin-providers` cannot depend on `ferrofin-core`.
@@ -552,8 +564,8 @@ pub fn item_values_of(entity: &BaseItemEntity) -> Vec<(i32, String)> {
         field
             .unwrap_or_default()
             .split('|')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
+            // A blank entry goes, the rest keep their padding (gl-1635).
+            .filter(|s| !s.trim().is_empty())
             .map(str::to_owned)
             .collect()
     };
@@ -709,16 +721,16 @@ mod tests {
 
     /// The five pipe-joined columns fan out into their `ItemValues` type
     /// discriminants in C#'s order — artists, album artists, genres, studios,
-    /// tags — with each value trimmed and empty segments dropped, so a
-    /// trailing `|` or a doubled separator never materializes a nameless
-    /// by-name item.
+    /// tags — with each value kept as written and blank segments dropped
+    /// (`RemoveAll(string.IsNullOrWhiteSpace)`, gl-1635), so a trailing `|` or
+    /// a doubled separator never materializes a nameless by-name item.
     #[test]
     fn item_values_fan_out_per_type_and_drop_empty_segments() {
         let entity = BaseItemEntity {
             artists: Some("Nina Simone| Miles Davis |".to_owned()),
             album_artists: Some("Nina Simone".to_owned()),
             genres: Some("Jazz||Soul".to_owned()),
-            studios: Some("  ".to_owned()),
+            studios: Some("  |\u{a0}\u{3000}".to_owned()),
             tags: None,
             ..BaseItemEntity::default()
         };
@@ -726,7 +738,7 @@ mod tests {
             item_values_of(&entity),
             vec![
                 (0, "Nina Simone".to_owned()),
-                (0, "Miles Davis".to_owned()),
+                (0, " Miles Davis ".to_owned()),
                 (1, "Nina Simone".to_owned()),
                 (2, "Jazz".to_owned()),
                 (2, "Soul".to_owned()),

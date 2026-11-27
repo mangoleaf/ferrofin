@@ -1,15 +1,20 @@
-//! Guide rows → synthetic [`BaseItemEntity`] rows for the DTO service.
+//! Guide rows → [`BaseItemEntity`] rows for the DTO service.
 //!
 //! Jellyfin stores channels and programmes as `BaseItems` and projects them
 //! through `DtoService`; Ferrofin keeps its guide cache in its own tables and
-//! instead builds the equivalent entity row in memory here — the projection
-//! then runs through the very same `DtoService::get_base_item_dtos` path every
-//! other item takes, which is what makes the channel/programme DTOs carry
-//! `UserData`, the image maps, `SortName`, `CanDelete` and the rest for free.
+//! builds the equivalent entity row here. The guide refresh stores a
+//! programme's row as its item, which the programme reads project; the channel
+//! reads, and a programme read of an airing with no stored item, project the
+//! row built in memory. Either way the projection runs through the very same
+//! `DtoService::get_base_item_dtos` path every other item takes, which is what
+//! makes the channel/programme DTOs carry `UserData`, the image maps,
+//! `SortName`, `CanDelete` and the rest for free.
 //!
 //! The field values are ports of `Jellyfin.LiveTv.Guide.GuideManager.GetChannel`
 //! / `GetProgram` (what the C# scan writes onto the items) and
 //! `MediaBrowser.Controller.LiveTv.LiveTvChannel.CreateSortName`.
+
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -56,21 +61,6 @@ pub struct ChannelRow {
     /// channel's. Read only by the guide refresh's item mirror.
     #[sqlx(default)]
     pub image_url: Option<String>,
-    /// Whether the guide airs a movie on this channel (upstream
-    /// `LiveTvChannel.IsMovie`, aggregated from the programmes at refresh).
-    ///
-    /// This and the two kinds below are derived only by
-    /// `guide_repository::channel_rows`, and only for the kinds its
-    /// query filters on; everywhere else they read `false`.
-    #[sqlx(default)]
-    pub is_movie: bool,
-    /// Whether the guide airs a series episode on this channel.
-    #[sqlx(default)]
-    pub is_series: bool,
-    /// Whether the guide airs a kids' programme on this channel (upstream
-    /// models this as the channel's "Kids" tag).
-    #[sqlx(default)]
-    pub is_kids: bool,
 }
 
 /// One `FerrofinLiveTvPrograms` row joined to its channel, as the query paths
@@ -127,6 +117,20 @@ pub struct ProgramRow {
     pub date_created: Option<String>,
     /// The listing's showing-identity key (`ProgramInfo.ShowId`), if any.
     pub show_id: Option<String>,
+    /// The listing's `ProgramInfo.Etag` (gl-763), the item's `ProgramEtag`
+    /// provider id.
+    pub etag: Option<String>,
+    /// The listing's `Audio`, as its stored `ProgramAudio` number (Schedules
+    /// Direct only).
+    pub audio: Option<i32>,
+    /// The listing's `IsHD` (Schedules Direct only): a 1280x720 item.
+    #[sqlx(rename = "IsHD")]
+    pub is_hd: Option<bool>,
+    /// The listing's `OriginalAirDate` (DB text form; Schedules Direct only).
+    pub original_air_date: Option<String>,
+    /// The listing's `SeriesProviderIds["Zap2It"]` (Schedules Direct only).
+    #[sqlx(rename = "SeriesZap2It")]
+    pub series_zap2it: Option<String>,
     /// The owning channel's name.
     pub channel_name: String,
     /// The owning channel's number, if any.
@@ -136,39 +140,25 @@ pub struct ProgramRow {
 }
 
 /// One channel's user data for the requesting user: its row under the
-/// channel's own id key. `UserDataManager.SaveUserData` writes the same values
-/// under every key of the item, so this row answers what upstream reads from
-/// the first row by key (`IsFavorite`, `PlayCount`), from any row (`Played`)
-/// and from the newest (`LastPlayedDate`).
+/// channel's own id key, which the favourite and like filters read.
+/// `UserDataManager.SaveUserData` writes the same values under every key of the
+/// item, so this row answers what upstream reads from the first row by key.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChannelUserDataRow {
     /// `UserData.IsFavorite`.
     pub is_favorite: bool,
     /// `UserData.Rating`, on the 0–10 scale.
     pub rating: Option<f64>,
-    /// `UserData.PlayCount`.
-    pub play_count: i32,
-    /// `UserData.Played`.
-    pub played: bool,
-    /// `UserData.LastPlayedDate` as stored. Every writer stores one text
-    /// format, so it orders as SQLite orders the column upstream.
-    pub last_played_date: Option<String>,
 }
 
-/// The requesting user's channel user data, keyed by the stored channel id; with
-/// no user, every user's newest play on each channel and nothing else
-/// ([`crate::guide_repository::channel_last_played_by_anyone`]).
+/// The requesting user's channel user data, keyed by the stored channel id.
 pub type ChannelUserData = std::collections::HashMap<String, ChannelUserDataRow>;
 
 /// Applies `GetInternalChannels`' filters to the loaded lineup.
 ///
-/// The type filter matches the stored `ChannelType`. The kind flags follow
-/// upstream's split (`BaseItemRepository.TranslateQuery` over channel items
-/// `GuideManager.RefreshChannels` aggregated): `IsMovie`/`IsSeries` match the
-/// channel's aggregated columns, `IsKids` matches the aggregated "Kids" tag,
-/// while `IsNews`/`IsSports` translate to the "News"/"Sports" *tags* — which
-/// the guide refresh never writes onto a channel — so a `true` value matches
-/// nothing and a `false` one everything. `IsDisliked` is accepted and
+/// The type filter matches the stored `ChannelType`. The kind flags are
+/// applied by the read itself ([`crate::guide_repository`]'s `listed_channel_rows`,
+/// from the stored channel items). `IsDisliked` is accepted and
 /// dropped, as upstream's `GetInternalChannels` drops it. The favourite/like
 /// filters read `user_data` (`UserItemData.MinLikeValue` upstream is 6.5 on
 /// the 0–10 rating scale).
@@ -188,18 +178,6 @@ pub fn filter_channel_rows(
         };
         rows.retain(|r| r.channel_type == want);
     }
-    if let Some(want) = query.is_movie {
-        rows.retain(|r| r.is_movie == want);
-    }
-    if let Some(want) = query.is_series {
-        rows.retain(|r| r.is_series == want);
-    }
-    if let Some(want) = query.is_kids {
-        rows.retain(|r| r.is_kids == want);
-    }
-    if query.is_news == Some(true) || query.is_sports == Some(true) {
-        rows.clear();
-    }
     if let Some(want) = query.is_favorite {
         rows.retain(|r| user_data.get(&r.id).is_some_and(|d| d.is_favorite) == want);
     }
@@ -211,166 +189,6 @@ pub fn filter_channel_rows(
                 .is_some_and(|x| x >= 6.5)
                 == want
         });
-    }
-}
-
-/// Sorts the lineup the way `GetInternalChannels` builds its order-by list and
-/// `BaseItemRepository.ApplyOrder` applies it: each requested key but
-/// `Default` (which `ApplyOrder` drops) takes the single requested order,
-/// favourite sorting prepends `(IsFavoriteOrLiked, Desc)`, and
-/// `(SortName, Asc)` is appended unless already requested. A
-/// `SeriesDatePlayed` key hands the whole order to
-/// `ApplySeriesDatePlayedOrder`: the series' played date, which no channel
-/// has, then `SortName` ascending.
-///
-/// Each key compares as `OrderMapper.MapOrderByField` maps it for a channel
-/// item. The user-data keys read `user_data`, where a channel without a row
-/// is `NULL` for `DatePlayed` and `PlayCount` (first ascending, last
-/// descending), unplayed for `IsPlayed`/`IsUnplayed` (through
-/// `BuildIsPlayedFilter`) and no favourite. With no user, `user_data` holds
-/// every user's newest play on each channel for `DatePlayed`
-/// ([`crate::guide_repository::channel_last_played_by_anyone`]) and the other
-/// user-data keys tie. `Random` draws a fresh order on
-/// every call. `AirTime` and the keys `OrderMapper` has no arm for fall back
-/// to `SortName`. The keys over columns a channel item never fills
-/// (`RunTimeTicks`, `PremiereDate`, the ratings, the studios, …) or fills
-/// alike (`IsFolder`) tie. `IsFavoriteOrLiked` sorts on the `IsFavorite`
-/// bit, exactly like the item repository's `translate_query`.
-pub fn sort_channel_rows(
-    rows: &mut Vec<ChannelRow>,
-    query: &ferrofin_traits::stubs::LiveTvChannelQuery,
-    user_data: &ChannelUserData,
-) {
-    use ferrofin_model::dto::SortOrder;
-    use ferrofin_model::live_tv::ItemSortBy;
-    use std::cmp::Ordering;
-
-    let requested_order = query.sort_order.unwrap_or(SortOrder::Ascending);
-    let mut order: Vec<(ItemSortBy, SortOrder)> = query
-        .sort_by
-        .iter()
-        .filter(|s| **s != ItemSortBy::Default)
-        .map(|s| (*s, requested_order))
-        .collect();
-    if query.enable_favorite_sorting {
-        order.insert(0, (ItemSortBy::IsFavoriteOrLiked, SortOrder::Descending));
-    }
-    if !order.iter().any(|(s, _)| *s == ItemSortBy::SortName) {
-        order.push((ItemSortBy::SortName, SortOrder::Ascending));
-    }
-    if order
-        .iter()
-        .any(|(s, _)| *s == ItemSortBy::SeriesDatePlayed)
-    {
-        order = vec![(ItemSortBy::SortName, SortOrder::Ascending)];
-    }
-    // A shuffled rank per row is `ORDER BY RANDOM()`'s per-row draw.
-    let mut random: Vec<usize> = Vec::new();
-    if order.iter().any(|(s, _)| *s == ItemSortBy::Random) {
-        random = (0..rows.len()).collect();
-        ferrofin_util::shuffle_extensions::shuffle(&mut random);
-    }
-    // Each row's keys are built once: rebuilding the padded sort name on both
-    // sides of every comparison dominated the sort of a large lineup.
-    let mut keyed: Vec<KeyedChannel<'_>> = rows
-        .drain(..)
-        .enumerate()
-        .map(|(index, row)| KeyedChannel {
-            sort_name: channel_sort_name(row.number.as_deref(), &row.name).to_lowercase(),
-            name: row.name.to_lowercase(),
-            user_data: user_data.get(&row.id),
-            random: random.get(index).copied().unwrap_or_default(),
-            row,
-        })
-        .collect();
-    keyed.sort_by(|a, b| {
-        for (sort, direction) in &order {
-            let ordering = match sort {
-                // Upstream maps `ItemSortBy.Name` to `CleanName` — the plain
-                // display name, not the number-padded channel sort key.
-                ItemSortBy::Name => a.name.cmp(&b.name),
-                ItemSortBy::IsFavoriteOrLiked => a.is_favorite().cmp(&b.is_favorite()),
-                ItemSortBy::DateCreated => a.row.date_created.cmp(&b.row.date_created),
-                ItemSortBy::DatePlayed => a.last_played().cmp(&b.last_played()),
-                ItemSortBy::PlayCount => a.play_count().cmp(&b.play_count()),
-                ItemSortBy::IsPlayed => a.played().cmp(&b.played()),
-                ItemSortBy::IsUnplayed => b.played().cmp(&a.played()),
-                ItemSortBy::Random => a.random.cmp(&b.random),
-                ItemSortBy::Album
-                | ItemSortBy::AlbumArtist
-                | ItemSortBy::Artist
-                | ItemSortBy::OfficialRating
-                | ItemSortBy::PremiereDate
-                | ItemSortBy::StartDate
-                | ItemSortBy::Runtime
-                | ItemSortBy::CommunityRating
-                | ItemSortBy::ProductionYear
-                | ItemSortBy::CriticRating
-                | ItemSortBy::IsFolder
-                | ItemSortBy::SeriesSortName
-                | ItemSortBy::VideoBitRate
-                | ItemSortBy::Studio
-                | ItemSortBy::DateLastContentAdded
-                | ItemSortBy::ParentIndexNumber
-                | ItemSortBy::IndexNumber => Ordering::Equal,
-                // `SortName`, `AirTime`'s arm and `OrderMapper`'s
-                // `_ => e.SortName` (`AiredEpisodeOrder`, an unknown value).
-                _ => a.sort_name.cmp(&b.sort_name),
-            };
-            let ordering = match direction {
-                SortOrder::Ascending => ordering,
-                SortOrder::Descending | SortOrder::Unrecognized(_) => ordering.reverse(),
-            };
-            if ordering != Ordering::Equal {
-                return ordering;
-            }
-        }
-        Ordering::Equal
-    });
-    rows.extend(keyed.into_iter().map(|keyed| keyed.row));
-}
-
-/// Whether [`sort_channel_rows`] reads `user_data` for one of `sort_by`'s
-/// keys, so the caller must load it.
-#[must_use]
-pub fn sort_reads_user_data(sort_by: &[ferrofin_model::live_tv::ItemSortBy]) -> bool {
-    use ferrofin_model::live_tv::ItemSortBy;
-    sort_by.iter().any(|by| {
-        matches!(
-            by,
-            ItemSortBy::IsFavoriteOrLiked
-                | ItemSortBy::DatePlayed
-                | ItemSortBy::PlayCount
-                | ItemSortBy::IsPlayed
-                | ItemSortBy::IsUnplayed
-        )
-    })
-}
-
-/// A lineup row with the keys [`sort_channel_rows`] sorts it on.
-struct KeyedChannel<'a> {
-    sort_name: String,
-    name: String,
-    user_data: Option<&'a ChannelUserDataRow>,
-    random: usize,
-    row: ChannelRow,
-}
-
-impl KeyedChannel<'_> {
-    fn is_favorite(&self) -> bool {
-        self.user_data.is_some_and(|d| d.is_favorite)
-    }
-
-    fn played(&self) -> bool {
-        self.user_data.is_some_and(|d| d.played)
-    }
-
-    fn play_count(&self) -> Option<i32> {
-        self.user_data.map(|d| d.play_count)
-    }
-
-    fn last_played(&self) -> Option<&str> {
-        self.user_data.and_then(|d| d.last_played_date.as_deref())
     }
 }
 
@@ -408,11 +226,62 @@ pub fn channel_sort_name(number: Option<&str>, name: &str) -> String {
     }
 }
 
+/// A channel item's `Data`: the `LiveTvChannel` Jellyfin serialises into that
+/// column (`BaseItemMapper.cs:266-268`, `JsonDefaults.Options`), in its key
+/// order. `Number` and `ChannelType` have no column, so a Jellyfin reading the
+/// row takes them from here only; a null `Number` is left out
+/// (`WhenWritingNull`) and the type is the enum's name. The other keys are
+/// `BaseItem`'s defaults on a channel. `DateLastSaved` is left out: Jellyfin
+/// reads it from its column (`BaseItemMapper.cs:120`), which the save stamps.
+fn channel_data(number: Option<&str>, channel_type: &str) -> String {
+    let number = number.map_or_else(String::new, |number| {
+        format!(r#""Number":{},"#, serde_json::Value::from(number))
+    });
+    let channel_type = if channel_type == "Radio" {
+        "Radio"
+    } else {
+        "TV"
+    };
+    format!(
+        r#"{{{number}"ChannelType":"{channel_type}","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}}"#
+    )
+}
+
+/// `fresh`'s channel `Data` ([`channel_data`]) applied to the `stored` one.
+/// `GetChannel` assigns `Number` and `ChannelType`, so those two follow the
+/// lineup; every other key is the item's own and keeps its stored value, a
+/// missing one taking the default. A row stored with no `Data` (by an earlier
+/// Ferrofin) takes `fresh`'s whole, and one already holding these values keeps
+/// its bytes.
+fn merged_channel_data(stored: Option<&str>, fresh: Option<&str>) -> Option<String> {
+    let mut data = ferrofin_db::item_data::parse_data(stored);
+    if data.is_empty() {
+        return fresh.map(str::to_owned);
+    }
+    let before = data.clone();
+    let fresh = ferrofin_db::item_data::parse_data(fresh);
+    for key in ["Number", "ChannelType"] {
+        match fresh.get(key) {
+            Some(value) => data.insert(key.to_owned(), value.clone()),
+            None => data.remove(key),
+        };
+    }
+    for (key, value) in fresh {
+        data.entry(key).or_insert(value);
+    }
+    if data == before {
+        stored.map(str::to_owned)
+    } else {
+        Some(serde_json::Value::Object(data).to_string())
+    }
+}
+
 /// Builds the synthetic `BaseItems` row a channel projects from.
 ///
 /// Port of `GuideManager.GetChannel`'s item shape: `LiveTvChannel` type, no
 /// path (the tuner URL is resolved at stream time, not stored on the item),
-/// the `CreateSortName` sort key, and the first-seen `DateCreated`.
+/// the `CreateSortName` sort key, the first-seen `DateCreated`, and the
+/// serialised channel in `Data` ([`channel_data`]).
 ///
 /// `CleanName` and `PresentationUniqueKey` are deliberately left unset: the
 /// item store derives both at write time (C# `SaveItem` likewise stamps
@@ -453,6 +322,7 @@ pub fn channel_entity(
         external_service_id: Some("Emby".to_owned()),
         // `LiveTvChannel.GetBlockUnratedType() => UnratedItem.LiveTvChannel`.
         unrated_type: Some("LiveTvChannel".to_owned()),
+        data: Some(channel_data(row.number.as_deref(), &row.channel_type)),
         date_created: row.date_created.as_deref().and_then(parse_dt),
         parent_id: parent.clone(),
         top_parent_id: parent,
@@ -480,10 +350,12 @@ pub fn channel_entity(
 /// and `Data` onto it, and the next `RefreshGuide` would put every one of them
 /// back to `NULL`.
 ///
-/// `Number`/`ChannelType` are not `BaseItems` columns here — they reach the
-/// wire through `LiveTvManager::add_channel_info` from
-/// `FerrofinLiveTvChannels`, which the same refresh rewrites. The primary
-/// image is an image row, written by [`channel_images_update`]'s caller.
+/// `Number`/`ChannelType` are no `BaseItems` columns: Jellyfin keeps them only
+/// in the serialised item, so the refresh merges them into the stored `Data`
+/// ([`merged_channel_data`]). Ferrofin's own answers take them from
+/// `FerrofinLiveTvChannels` (`LiveTvManager::add_channel_info`), which the same
+/// refresh rewrites. The primary image is an image row, written by
+/// [`channel_images_update`]'s caller.
 #[must_use]
 pub fn channel_item_update(
     stored: &BaseItemEntity,
@@ -500,6 +372,7 @@ pub fn channel_item_update(
     item.parent_id.clone_from(&fresh.parent_id);
     item.top_parent_id.clone_from(&fresh.top_parent_id);
     item.is_folder = fresh.is_folder;
+    item.data = merged_channel_data(stored.data.as_deref(), fresh.data.as_deref());
     // `SortName` is a lazy property upstream, not a stored assignment:
     // `ForcedSortName` when the metadata editor set one, else
     // `CreateSortName()` off Number/Name. Re-deriving it unconditionally would
@@ -516,6 +389,94 @@ pub fn channel_item_update(
     (item != *stored).then_some(item)
 }
 
+/// The tag `RefreshChannelsInternal` adds to a channel with a kids airing,
+/// and `GetProgram` to a kids airing.
+const KIDS_TAG: &str = "Kids";
+
+impl ProgramRow {
+    /// The listing's own `ProgramInfo.IsSeries`, which the channel aggregate
+    /// ORs (`GuideManager.cs:276`). The stored `IsSeries` is `GetProgram`'s
+    /// widened `isSeries || EpisodeTitle` (`:546`). The listing's flag is an
+    /// episode number on an XMLTV airing (`Episode is not null`; a movie has
+    /// neither), and a series id on a Schedules Direct one, which sets it only
+    /// for a series. An airing with only a sub-title is no series here.
+    #[must_use]
+    pub fn listed_as_series(&self) -> bool {
+        self.is_series && (self.episode_number.is_some() || self.external_series_id.is_some())
+    }
+}
+
+/// What `GuideManager.RefreshChannelsInternal` aggregates over one channel's
+/// programmes (`isMovie |= program.IsMovie`, …, `GuideManager.cs:275-279`) and
+/// stores on the channel item. `IsNews` and `IsSports` are not `BaseItems`
+/// columns and are left out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChannelAggregate {
+    /// Whether any airing is a movie.
+    pub is_movie: bool,
+    /// Whether any airing is a series episode as the listing marks it
+    /// ([`ProgramRow::listed_as_series`]).
+    pub is_series: bool,
+    /// Whether any airing is for kids.
+    pub is_kids: bool,
+}
+
+impl ChannelAggregate {
+    /// The aggregate of one channel's guide `rows`; none at all is all false.
+    #[must_use]
+    pub fn of(rows: &[ProgramRow]) -> Self {
+        rows.iter().fold(Self::default(), |seen, row| Self {
+            is_movie: seen.is_movie || row.is_movie,
+            is_series: seen.is_series || row.listed_as_series(),
+            is_kids: seen.is_kids || row.is_kids,
+        })
+    }
+}
+
+/// Whether a stored `Tags` column holds a tag value, the only kind `ItemValues`
+/// indexes (`item_values_of` skips blank ones): Jellyfin stores `''` for an
+/// item with none (`BaseItemMapper.cs:334` over an empty list), which carries
+/// no tag, and neither does `|` or a blank.
+#[must_use]
+pub fn carries_tags(tags: Option<&str>) -> bool {
+    tags.is_some_and(|tags| tags.split('|').any(|tag| !tag.trim().is_empty()))
+}
+
+/// Applies a channel's [`ChannelAggregate`] to its STORED item, as
+/// `RefreshChannelsInternal` does before `UpdateToRepositoryAsync`
+/// (`GuideManager.cs:306-316`): `IsMovie` and `IsSeries` take the aggregate,
+/// and a kids airing adds the "Kids" tag the way `AddTag` does (never removing
+/// it, and not again in another case). Every other column, the editor's tags
+/// included, is the stored row's. Returns the row to write back, or `None`
+/// when nothing changed.
+#[must_use]
+pub fn channel_aggregate_update(
+    stored: &BaseItemEntity,
+    aggregate: ChannelAggregate,
+) -> Option<BaseItemEntity> {
+    let mut item = stored.clone();
+    item.is_movie = aggregate.is_movie;
+    item.is_series = aggregate.is_series;
+    if aggregate.is_kids {
+        let mut tags: Vec<String> = item
+            .tags
+            .as_deref()
+            .unwrap_or_default()
+            .split('|')
+            .filter(|tag| !tag.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        if !tags
+            .iter()
+            .any(|tag| crate::mapping::eq_ordinal_ignore_case(tag, KIDS_TAG))
+        {
+            tags.push(KIDS_TAG.to_owned());
+            item.tags = join_multi(&tags);
+        }
+    }
+    (item != *stored).then_some(item)
+}
+
 /// Whether a tuner's or guide's artwork value may become an image row: an
 /// absolute `http` or `https` URL.
 ///
@@ -529,11 +490,13 @@ pub(crate) fn is_artwork_url(value: &str) -> bool {
 }
 
 /// A remote image row for `url`: upstream's `new ItemImageInfo { Path = url,
-/// Type = type }`. The image routes serve it through the remote-image cache.
+/// Type = type }`, its `DateModified` left at `default(DateTime)`, .NET's
+/// `MinValue`. The image routes serve it through the remote-image cache.
 fn remote_image(image_type: ImageType, url: &str) -> ItemImageInfo {
     ItemImageInfo {
         path: url.to_owned(),
         image_type,
+        date_modified: ferrofin_model::json::datetime::dotnet_min(),
         ..ItemImageInfo::default()
     }
 }
@@ -606,14 +569,23 @@ pub struct ProgramImages {
 
 impl ProgramImages {
     /// The listing's URLs, in `UpdateImages` order, with a value that is no URL
-    /// ([`is_artwork_url`]) read as none.
+    /// ([`is_artwork_url`]) read as none. A guide's padding around a URL is
+    /// dropped, so the image loads; upstream stores the padded path, which
+    /// does not (a Jellyfin bug not ported).
     fn urls(&self) -> [(ImageType, Option<&str>); 3] {
         [
             (ImageType::Primary, &self.primary),
             (ImageType::Thumb, &self.thumb),
             (ImageType::Backdrop, &self.backdrop),
         ]
-        .map(|(image_type, url)| (image_type, url.as_deref().filter(|url| is_artwork_url(url))))
+        .map(|(image_type, url)| {
+            (
+                image_type,
+                url.as_deref()
+                    .map(str::trim)
+                    .filter(|url| is_artwork_url(url)),
+            )
+        })
     }
 
     /// How many of the listing's values are neither blank nor a URL.
@@ -621,7 +593,7 @@ impl ProgramImages {
         [&self.primary, &self.thumb, &self.backdrop]
             .into_iter()
             .flatten()
-            .filter(|value| !value.trim().is_empty() && !is_artwork_url(value))
+            .filter(|value| !value.trim().is_empty() && !is_artwork_url(value.trim()))
             .count()
     }
 }
@@ -779,7 +751,8 @@ pub fn recording_entity(
     }
 }
 
-/// Builds the synthetic `BaseItems` row a programme projects from.
+/// Builds the `BaseItems` row the guide refresh stores for a new airing, which
+/// a guide read also projects for an airing with no stored item.
 ///
 /// Port of `GuideManager.GetProgram`'s item shape: the flag-derived `Tags`
 /// list (in upstream's exact order), pipe-joined `Genres`,
@@ -817,6 +790,12 @@ pub fn program_entity(
         .and_then(|g| serde_json::from_str(g).ok())
         .unwrap_or_default();
     let is_series = row.is_series;
+    // `if (info.IsHD ?? false) { Width = 1280; Height = 720; }`.
+    let (width, height) = if row.is_hd == Some(true) {
+        (1280, 720)
+    } else {
+        (0, 0)
+    };
     BaseItemEntity {
         id: row.id.clone(),
         type_: PROGRAM_TYPE_NAME.to_owned(),
@@ -837,12 +816,23 @@ pub fn program_entity(
         is_repeat: row.is_repeat,
         index_number: row.episode_number.map(i64::from),
         parent_index_number: row.season_number.map(i64::from),
+        // `if (!isSeries || info.IsRepeat) item.PremiereDate = info.OriginalAirDate`.
+        premiere_date: (!is_series || row.is_repeat)
+            .then(|| row.original_air_date.as_deref().and_then(parse_dt))
+            .flatten(),
+        audio: row.audio,
         sort_name: Some(item_sort_name(&row.title)),
         external_id: row.external_id.clone(),
-        external_series_id: row.external_series_id.clone(),
+        // `GetProgram` assigns `ExternalSeriesId` only from a non-blank
+        // listing id (`GuideManager.cs:540-545`).
+        external_series_id: row
+            .external_series_id
+            .clone()
+            .filter(|id| !id.trim().is_empty()),
         // `SeriesName = info.Name` for an episode (not projected on the DTO,
         // kept for fidelity of the synthetic row).
-        series_name: (is_series || row.episode_title.is_some()).then(|| row.title.clone()),
+        series_name: (is_series || row.episode_title.as_deref().is_some_and(|t| !t.is_empty()))
+            .then(|| row.title.clone()),
         media_type: Some("Unknown".to_owned()),
         date_created: row.date_created.as_deref().and_then(parse_dt),
         show_id: row.show_id.clone(),
@@ -858,12 +848,10 @@ pub fn program_entity(
         // `item.Width`/`item.Height` are non-nullable `int`s upstream, so a
         // programme stores 0/0 unless the listing declares HD
         // (`if (info.IsHD ?? false) { Width = 1280; Height = 720; }`,
-        // GuideManager.cs:566-570). `XmlTvListingsProvider.GetProgramInfo` never
-        // sets `IsHD`, so an XMLTV guide always takes the 0/0 branch; the DTO
-        // layer only projects a dimension greater than zero, so neither reaches
-        // the wire.
-        width: Some(0),
-        height: Some(0),
+        // GuideManager.cs:596-600). Only Schedules Direct sets `IsHD`; the DTO
+        // layer projects only a dimension greater than zero.
+        width: Some(width),
+        height: Some(height),
         is_folder: false,
         ..BaseItemEntity::default()
     }
@@ -905,7 +893,14 @@ pub fn program_item_update(
     item.production_year = fresh.production_year;
     item.index_number = fresh.index_number;
     item.parent_index_number = fresh.parent_index_number;
-    item.premiere_date = fresh.premiere_date;
+    // Assigned only for a non-series airing or a repeat (`GuideManager.cs:633-636`).
+    if !fresh.is_series || fresh.is_repeat {
+        item.premiere_date = fresh.premiere_date;
+    }
+    item.audio = fresh.audio;
+    // `item.CommunityRating = info.CommunityRating`: neither listings
+    // provider fills it (XMLTV's star rating never parses into a value).
+    item.community_rating = fresh.community_rating;
     item.genres.clone_from(&fresh.genres);
     item.tags.clone_from(&fresh.tags);
     item.is_movie = fresh.is_movie;
@@ -913,15 +908,39 @@ pub fn program_item_update(
     item.is_repeat = fresh.is_repeat;
     item.official_rating.clone_from(&fresh.official_rating);
     item.external_id.clone_from(&fresh.external_id);
-    item.external_series_id
-        .clone_from(&fresh.external_series_id);
-    item.series_name.clone_from(&fresh.series_name);
-    item.show_id.clone_from(&fresh.show_id);
+    // `if (!IsNullOrWhiteSpace(seriesId) && !Equals(item.ExternalSeriesId,
+    // seriesId, OrdinalIgnoreCase))` (`GuideManager.cs:540-545`): a listing
+    // with no series id keeps the stored one, and one differing only in case
+    // keeps its spelling.
+    if let Some(series) = fresh.external_series_id.as_deref()
+        && !stored
+            .external_series_id
+            .as_deref()
+            .is_some_and(|stored| crate::mapping::eq_ordinal_ignore_case(stored, series))
+    {
+        item.external_series_id = Some(series.to_owned());
+    }
+    // Set for an episode only, never cleared (`GuideManager.cs:546-550`).
+    if fresh.series_name.is_some() {
+        item.series_name.clone_from(&fresh.series_name);
+    }
+    // `if (!string.Equals(info.ShowId, item.ShowId, OrdinalIgnoreCase))`: a
+    // difference only in case keeps the stored spelling.
+    let same_show = match (stored.show_id.as_deref(), fresh.show_id.as_deref()) {
+        (Some(stored), Some(fresh)) => crate::mapping::eq_ordinal_ignore_case(stored, fresh),
+        (stored, fresh) => stored == fresh,
+    };
+    if !same_show {
+        item.show_id.clone_from(&fresh.show_id);
+    }
     item.media_type.clone_from(&fresh.media_type);
     item.unrated_type.clone_from(&fresh.unrated_type);
     item.is_virtual_item = fresh.is_virtual_item;
-    item.width = fresh.width;
-    item.height = fresh.height;
+    // An HD listing sets 1280x720; one that is not leaves the stored size.
+    if fresh.width.is_some_and(|w| w > 0) {
+        item.width = fresh.width;
+        item.height = fresh.height;
+    }
     item.is_folder = fresh.is_folder;
     if stored
         .forced_sort_name
@@ -932,6 +951,75 @@ pub fn program_item_update(
         item.sort_name.clone_from(&fresh.sort_name);
     }
     (item != *stored).then_some(item)
+}
+
+/// `GuideManager.EtagKey`: the provider id a programme item keeps its
+/// listing's etag under.
+pub const PROGRAM_ETAG_KEY: &str = "ProgramEtag";
+
+/// A programme item's external ids as `GuideManager.GetProgram` sets them
+/// (`GuideManager.cs:614-619,643-656`): the listing's `ProviderIds`, with each
+/// `SeriesProviderIds` entry as `"Series" + key`, and the etag restored as
+/// [`PROGRAM_ETAG_KEY`]. Only Schedules Direct fills a series id (`Zap2It`);
+/// neither listing fills `ProviderIds`.
+#[must_use]
+pub fn program_provider_ids(row: &ProgramRow) -> Vec<(String, String)> {
+    let non_blank = |v: &Option<String>| v.clone().filter(|v| !v.trim().is_empty());
+    let mut ids = Vec::new();
+    if let Some(series) = non_blank(&row.series_zap2it) {
+        ids.push(("SeriesZap2It".to_owned(), series));
+    }
+    if let Some(etag) = non_blank(&row.etag) {
+        ids.push((PROGRAM_ETAG_KEY.to_owned(), etag));
+    }
+    ids
+}
+
+/// `XmlTvProgramEtag.MatchesStored`: the listing's etag is XMLTV's and equals
+/// the one stored in `current` (ignoring case), so `GetProgram` leaves the
+/// airing as it is (`GuideManager.cs:512-518`).
+#[must_use]
+pub fn xmltv_etag_unchanged(current: &[(String, String)], listed: &[(String, String)]) -> bool {
+    let etag = |ids: &[(String, String)]| {
+        ids.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(PROGRAM_ETAG_KEY))
+            .map(|(_, value)| value.clone())
+    };
+    etag(listed)
+        .filter(|listed| listed.starts_with(crate::xmltv_etag::PREFIX))
+        .is_some_and(|listed| {
+            etag(current).is_some_and(|stored| stored.eq_ignore_ascii_case(&listed))
+        })
+}
+
+/// Whether the guide refresh replaces a programme's stored external ids
+/// (`current`) with the listing's (`listed`, [`program_provider_ids`]).
+///
+/// `GetProgram` skips an airing whose XMLTV etag is the stored one
+/// (`XmlTvProgramEtag.MatchesStored`), so an unchanged XMLTV listing leaves an
+/// editor's extra ids alone; one that is new, `written` for another change,
+/// or whose etag moved has them replaced. Every other airing (a Schedules
+/// Direct `md5`, or no etag) is saved with the listing's ids on every refresh,
+/// because its etag is compared after the ids were replaced; replacing only a
+/// set that differs ends in the same rows without rewriting them.
+#[must_use]
+pub fn program_provider_ids_replaced(
+    current: &[(String, String)],
+    listed: &[(String, String)],
+    written: bool,
+) -> bool {
+    let xmltv = listed.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case(PROGRAM_ETAG_KEY) && value.starts_with(crate::xmltv_etag::PREFIX)
+    });
+    if xmltv {
+        return written || !xmltv_etag_unchanged(current, listed);
+    }
+    let sorted = |ids: &[(String, String)]| {
+        let mut ids = ids.to_vec();
+        ids.sort();
+        ids
+    };
+    sorted(current) != sorted(listed)
 }
 
 /// The flag-derived tag list, in `GuideManager.GetProgram`'s exact order.
@@ -947,7 +1035,7 @@ pub fn program_tags(row: &ProgramRow) -> Vec<String> {
     push(row.is_premiere, "Premiere");
     push(row.is_news, "News");
     push(row.is_sports, "Sports");
-    push(row.is_kids, "Kids");
+    push(row.is_kids, KIDS_TAG);
     push(row.is_repeat, "Repeat");
     push(row.is_movie, "Movie");
     push(row.is_series, "Series");
@@ -970,12 +1058,21 @@ pub fn remove_fields(options: &mut DtoOptions) {
 }
 
 /// Pipe-joins a name list into the entity's multi-value column form, or `None`
-/// when empty (the `BaseItems` storage convention `split_multi` reads back).
+/// when empty (the `BaseItems` storage convention `split_multi` reads back),
+/// each name once: `BaseItemMapper.Map` joins `Genres` and `Tags` after a
+/// `Distinct(StringComparer.OrdinalIgnoreCase)` (`BaseItemMapper.cs:306,334`),
+/// the first spelling kept.
 fn join_multi(values: &[String]) -> Option<String> {
-    if values.is_empty() {
+    let mut seen = HashSet::with_capacity(values.len());
+    let distinct: Vec<&str> = values
+        .iter()
+        .map(String::as_str)
+        .filter(|value| seen.insert(crate::mapping::ordinal_ignore_case_key(value)))
+        .collect();
+    if distinct.is_empty() {
         None
     } else {
-        Some(values.join("|"))
+        Some(distinct.join("|"))
     }
 }
 
@@ -999,8 +1096,6 @@ pub fn item_sort_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrofin_model::dto::SortOrder;
-    use ferrofin_model::live_tv::ItemSortBy;
 
     fn parse(s: &str) -> Option<DateTime<Utc>> {
         s.parse().ok()
@@ -1224,6 +1319,11 @@ mod tests {
             episode_number: None,
             date_created: None,
             show_id: None,
+            etag: None,
+            audio: None,
+            is_hd: None,
+            original_air_date: None,
+            series_zap2it: None,
             channel_name: String::new(),
             channel_number: None,
             channel_media_kind: "Tv".to_owned(),
@@ -1231,6 +1331,159 @@ mod tests {
         assert_eq!(
             program_tags(&row),
             ["Live", "Premiere", "News", "Repeat", "Series"]
+        );
+    }
+
+    /// A guide row for the gl-1591 tests: one airing with `genres` and a
+    /// listing series id.
+    fn guide_row(genres: &str, series: Option<&str>) -> ProgramRow {
+        ProgramRow {
+            id: "AAAAAAAA-0000-0000-0000-000000000009".to_owned(),
+            channel_id: "BBBBBBBB-0000-0000-0000-000000000002".to_owned(),
+            start_date: "2026-08-23T18:00:00Z".to_owned(),
+            end_date: Some("2026-08-23T19:00:00Z".to_owned()),
+            title: "Show".to_owned(),
+            episode_title: None,
+            overview: None,
+            genres: Some(genres.to_owned()),
+            production_year: None,
+            official_rating: None,
+            is_premiere: false,
+            is_repeat: false,
+            is_movie: false,
+            is_series: true,
+            is_news: false,
+            is_kids: false,
+            is_sports: false,
+            is_live: false,
+            external_id: None,
+            external_series_id: series.map(ToOwned::to_owned),
+            season_number: None,
+            episode_number: None,
+            date_created: None,
+            show_id: None,
+            etag: None,
+            audio: None,
+            is_hd: None,
+            original_air_date: None,
+            series_zap2it: None,
+            channel_name: String::new(),
+            channel_number: None,
+            channel_media_kind: "Tv".to_owned(),
+        }
+    }
+
+    /// gl-1591: `BaseItemMapper.Map` joins `Genres` after
+    /// `Distinct(StringComparer.OrdinalIgnoreCase)`, the first spelling kept.
+    #[test]
+    fn program_genres_are_stored_once_whatever_their_case() {
+        let entity = program_entity(
+            &guide_row(r#"["Drama","drama","News","DRAMA"]"#, None),
+            parse,
+            None,
+        );
+        assert_eq!(entity.genres.as_deref(), Some("Drama|News"));
+    }
+
+    /// gl-1591: `GetProgram` sets `ExternalSeriesId` only from a non-blank
+    /// listing id that differs, ignoring case (`GuideManager.cs:540-545`): a
+    /// listing without one keeps the stored id, and so does one in another
+    /// case.
+    #[test]
+    fn a_listing_series_id_replaces_the_stored_one_only_when_it_differs() {
+        let stored = program_entity(&guide_row("[]", Some("ser-1")), parse, None);
+        for (listing, kept) in [
+            (None, "ser-1"),
+            (Some("  "), "ser-1"),
+            (Some("SER-1"), "ser-1"),
+            (Some("ser-2"), "ser-2"),
+        ] {
+            let fresh = program_entity(&guide_row("[]", listing), parse, None);
+            let item = program_item_update(&stored, &fresh).unwrap_or_else(|| stored.clone());
+            assert_eq!(
+                item.external_series_id.as_deref(),
+                Some(kept),
+                "{listing:?}"
+            );
+        }
+        assert_eq!(
+            program_entity(&guide_row("[]", Some(" ")), parse, None).external_series_id,
+            None,
+            "a new airing stores no blank series id"
+        );
+    }
+
+    /// gl-1591: only a tag value counts as tags to index, so a channel stored
+    /// as Jellyfin stores one without tags (`''`) is not re-indexed on every
+    /// guide refresh.
+    #[test]
+    fn an_empty_tags_column_carries_no_tag() {
+        assert!(!carries_tags(None));
+        assert!(!carries_tags(Some("")));
+        assert!(!carries_tags(Some("|")));
+        assert!(!carries_tags(Some(" ")));
+        assert!(carries_tags(Some("Kids")));
+        assert!(carries_tags(Some("|Kids")));
+    }
+
+    /// gl-1591, gl-1503: the channel takes its airings' aggregate; "Kids" is
+    /// added once, in any case, beside the editor's own tags, and never
+    /// removed.
+    #[test]
+    fn a_channel_takes_its_airings_aggregate_and_the_kids_tag() {
+        let mut kids = guide_row("[]", None);
+        kids.is_kids = true;
+        kids.episode_number = Some(1);
+        let mut movie = guide_row("[]", None);
+        movie.is_series = false;
+        movie.is_movie = true;
+        let aggregate = ChannelAggregate::of(&[kids, movie]);
+        assert_eq!(
+            aggregate,
+            ChannelAggregate {
+                is_movie: true,
+                is_series: true,
+                is_kids: true
+            }
+        );
+        assert_eq!(ChannelAggregate::of(&[]), ChannelAggregate::default());
+        // a sub-title alone widens the airing's own `IsSeries`, not the
+        // listing's flag the channel ORs (XMLTV); a Schedules Direct series
+        // id is the listing's flag
+        let subtitled = guide_row("[]", None);
+        assert!(subtitled.is_series && !subtitled.listed_as_series());
+        assert!(!ChannelAggregate::of(&[subtitled]).is_series);
+        assert!(guide_row("[]", Some("SH01234567")).listed_as_series());
+
+        let stored = BaseItemEntity {
+            tags: Some("Favourite".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        let updated = channel_aggregate_update(&stored, aggregate).expect("changed");
+        assert!(updated.is_movie && updated.is_series);
+        assert_eq!(updated.tags.as_deref(), Some("Favourite|Kids"));
+        assert_eq!(
+            channel_aggregate_update(&updated, aggregate),
+            None,
+            "unchanged"
+        );
+
+        let lower = BaseItemEntity {
+            tags: Some("kids".to_owned()),
+            ..updated.clone()
+        };
+        assert_eq!(
+            channel_aggregate_update(&lower, aggregate),
+            None,
+            "not again in another case"
+        );
+        let quiet =
+            channel_aggregate_update(&updated, ChannelAggregate::default()).expect("changed");
+        assert!(!quiet.is_movie && !quiet.is_series);
+        assert_eq!(
+            quiet.tags.as_deref(),
+            Some("Favourite|Kids"),
+            "never removed"
         );
     }
 
@@ -1261,6 +1514,11 @@ mod tests {
             episode_number: None,
             date_created: None,
             show_id: Some("a584069bf4e49f1dbb474bfb43129f3c".to_owned()),
+            etag: None,
+            audio: None,
+            is_hd: None,
+            original_air_date: None,
+            series_zap2it: None,
             channel_name: "Parity One".to_owned(),
             channel_number: Some("1".to_owned()),
             channel_media_kind: "Tv".to_owned(),
@@ -1338,9 +1596,6 @@ mod tests {
             channel_type: "Tv".to_owned(),
             date_created: None,
             image_url: None,
-            is_movie: false,
-            is_series: false,
-            is_kids: false,
         };
         let entity = channel_entity(&row, parse, Some(view));
         assert_eq!(entity.type_, CHANNEL_TYPE_NAME);
@@ -1363,6 +1618,56 @@ mod tests {
         );
     }
 
+    /// What Jellyfin 12.4 wrote into a channel's `Data` at its guide refresh
+    /// (the round-trip gate's capture), for channel number 1.
+    const JELLYFIN_CHANNEL_DATA: &str = r#"{"Number":"1","ChannelType":"TV","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"DateLastSaved":"2026-11-27T00:09:50.4414863Z","RemoteTrailers":[]}"#;
+
+    /// A channel item's `Data` is the `LiveTvChannel` Jellyfin serialises
+    /// (`BaseItemMapper.cs:266-268`, `JsonDefaults.Options`) but its
+    /// `DateLastSaved`, in its key order: a null `Number` is not written and
+    /// the type is the enum's name. A refresh moves those two keys in a stored
+    /// `Data` and keeps the rest.
+    #[test]
+    fn channel_data_is_the_serialised_live_tv_channel() {
+        let row = ChannelRow {
+            id: "CCCCCCCC-0000-0000-0000-000000000003".to_owned(),
+            tvg_id: String::new(),
+            external_id: "m3u_1".to_owned(),
+            name: "Parity One".to_owned(),
+            number: Some("1".to_owned()),
+            channel_type: "Tv".to_owned(),
+            date_created: None,
+            image_url: None,
+        };
+        let fresh = channel_entity(&row, parse, None);
+        assert_eq!(
+            fresh.data.as_deref(),
+            Some(
+                r#"{"Number":"1","ChannelType":"TV","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}"#
+            )
+        );
+        let radio = ChannelRow {
+            number: None,
+            channel_type: "Radio".to_owned(),
+            ..row
+        };
+        let radio = channel_entity(&radio, parse, None);
+        assert_eq!(
+            radio.data.as_deref(),
+            Some(
+                r#"{"ChannelType":"Radio","IsHD":false,"IsShortcut":false,"Width":0,"Height":0,"RemoteTrailers":[]}"#
+            )
+        );
+
+        let mut stored = fresh;
+        stored.data = Some(JELLYFIN_CHANNEL_DATA.to_owned());
+        let updated = channel_item_update(&stored, &radio).expect("the type moved");
+        let data = ferrofin_db::item_data::parse_data(updated.data.as_deref());
+        assert_eq!(data.get("Number"), None, "a number gone from the lineup");
+        assert_eq!(data["ChannelType"], "Radio");
+        assert_eq!(data["DateLastSaved"], "2026-11-27T00:09:50.4414863Z");
+    }
+
     /// A refresh assigns only the properties `GuideManager.GetChannel` assigns,
     /// and writes at all only when one of them changed.
     #[test]
@@ -1377,9 +1682,6 @@ mod tests {
             channel_type: "Tv".to_owned(),
             date_created: None,
             image_url: None,
-            is_movie: false,
-            is_series: false,
-            is_kids: false,
         };
         let fresh = channel_entity(&row, parse, Some(view));
 
@@ -1395,7 +1697,7 @@ mod tests {
         stored.custom_rating = Some("PG".to_owned());
         stored.official_rating = Some("TV-14".to_owned());
         stored.is_locked = true;
-        stored.data = Some("{}".to_owned());
+        stored.data = Some(JELLYFIN_CHANNEL_DATA.to_owned());
         stored.date_created = Some(
             DateTime::parse_from_rfc3339("2019-01-02T03:04:05Z")
                 .expect("date")
@@ -1419,7 +1721,7 @@ mod tests {
         assert_eq!(updated.custom_rating.as_deref(), Some("PG"));
         assert_eq!(updated.official_rating.as_deref(), Some("TV-14"));
         assert!(updated.is_locked);
-        assert_eq!(updated.data.as_deref(), Some("{}"));
+        assert_eq!(updated.data.as_deref(), Some(JELLYFIN_CHANNEL_DATA));
         // `DateCreated` is stamped on a NEW item only.
         assert_eq!(updated.date_created, stored.date_created);
 
@@ -1447,142 +1749,6 @@ mod tests {
         // title sorts as ASCII and interleaves with the rest of the library
         // instead of landing after it under SQLite's BINARY collation.
         assert_eq!(item_sort_name("Café Größe"), "cafe grosse");
-    }
-
-    const ASC: Option<SortOrder> = Some(SortOrder::Ascending);
-    const DESC: Option<SortOrder> = Some(SortOrder::Descending);
-
-    /// The ids of the lineup below, sorted. `e` and `c` share the sort key
-    /// "0000000002.00000-alpha". `c` is a favourite, marked played, and
-    /// watched three times; `a` was watched last but never marked played (as
-    /// playback leaves a channel); `b` has a row with no play; `d` and `e`
-    /// have no row.
-    fn sorted_lineup(
-        sort_by: &[ItemSortBy],
-        sort_order: Option<SortOrder>,
-        enable_favorite_sorting: bool,
-    ) -> Vec<String> {
-        let row = |id: &str, number: Option<&str>, name: &str, created: &str| ChannelRow {
-            id: id.to_owned(),
-            tvg_id: String::new(),
-            external_id: String::new(),
-            name: name.to_owned(),
-            number: number.map(str::to_owned),
-            channel_type: "Tv".to_owned(),
-            date_created: Some(created.to_owned()),
-            image_url: None,
-            is_movie: false,
-            is_series: false,
-            is_kids: false,
-        };
-        let mut rows = vec![
-            row("e", Some("2.0"), "ALPHA", "2026-01-02"),
-            row("a", Some("10"), "bravo", "2026-01-03"),
-            row("b", Some("2"), "Charlie", "2026-01-01"),
-            row("c", Some("2"), "alpha", "2026-01-02"),
-            row("d", None, "Delta", "2026-01-01"),
-        ];
-        let played = |play_count: i32, last: Option<&str>| ChannelUserDataRow {
-            play_count,
-            played: last.is_some(),
-            last_played_date: last.map(str::to_owned),
-            ..ChannelUserDataRow::default()
-        };
-        let user_data: ChannelUserData = [
-            (
-                "c".to_owned(),
-                ChannelUserDataRow {
-                    is_favorite: true,
-                    ..played(3, Some("2026-11-01 08:00:00.0000000"))
-                },
-            ),
-            (
-                "a".to_owned(),
-                ChannelUserDataRow {
-                    played: false,
-                    ..played(1, Some("2026-11-03 08:00:00.0000000"))
-                },
-            ),
-            ("b".to_owned(), played(0, None)),
-        ]
-        .into();
-        let query = ferrofin_traits::stubs::LiveTvChannelQuery {
-            sort_by: sort_by.to_vec(),
-            sort_order,
-            enable_favorite_sorting,
-            ..ferrofin_traits::stubs::LiveTvChannelQuery::default()
-        };
-        sort_channel_rows(&mut rows, &query, &user_data);
-        rows.into_iter().map(|r| r.id).collect()
-    }
-
-    /// Every key the lineup sorts on, in both directions, with favourite-first
-    /// and the appended `SortName`; ties keep the stored order. A channel
-    /// without a row, or without a play, is `NULL` for `DatePlayed` and
-    /// `PlayCount` (last descending, first ascending) and unplayed.
-    #[rstest::rstest]
-    #[case::sort_name(&[], None, false, ["d", "e", "c", "b", "a"])]
-    // `ApplyOrder` drops `Default`: the appended ascending `SortName` is left.
-    #[case::default_dropped(&[ItemSortBy::Default], DESC, false, ["d", "e", "c", "b", "a"])]
-    #[case::sort_name_desc(&[ItemSortBy::SortName], DESC, false, ["a", "b", "e", "c", "d"])]
-    #[case::name(&[ItemSortBy::Name], None, false, ["e", "c", "a", "b", "d"])]
-    #[case::name_desc(&[ItemSortBy::Name], DESC, false, ["d", "b", "a", "e", "c"])]
-    #[case::date_created(&[ItemSortBy::DateCreated], None, false, ["d", "b", "e", "c", "a"])]
-    #[case::date_created_desc(&[ItemSortBy::DateCreated], DESC, false, ["a", "e", "c", "d", "b"])]
-    #[case::favourites_first(&[], None, true, ["c", "d", "e", "b", "a"])]
-    #[case::favourites_then_name(&[ItemSortBy::Name], DESC, true, ["c", "d", "b", "a", "e"])]
-    #[case::favourite_key(&[ItemSortBy::IsFavoriteOrLiked], DESC, false, ["c", "d", "e", "b", "a"])]
-    #[case::date_played_desc(&[ItemSortBy::DatePlayed], DESC, false, ["a", "c", "d", "e", "b"])]
-    #[case::date_played(&[ItemSortBy::DatePlayed], ASC, false, ["d", "e", "b", "c", "a"])]
-    // The guide's "Recently watched" order.
-    #[case::recently_watched(&[ItemSortBy::DatePlayed], DESC, true, ["c", "a", "d", "e", "b"])]
-    #[case::play_count_desc(&[ItemSortBy::PlayCount], DESC, false, ["c", "a", "b", "d", "e"])]
-    #[case::play_count(&[ItemSortBy::PlayCount], ASC, false, ["d", "e", "b", "a", "c"])]
-    // Only the played flag counts: `a`'s plays leave it unplayed.
-    #[case::played_desc(&[ItemSortBy::IsPlayed], DESC, false, ["c", "d", "e", "b", "a"])]
-    #[case::played(&[ItemSortBy::IsPlayed], ASC, false, ["d", "e", "b", "a", "c"])]
-    #[case::unplayed_desc(&[ItemSortBy::IsUnplayed], DESC, false, ["d", "e", "b", "a", "c"])]
-    #[case::unplayed(&[ItemSortBy::IsUnplayed], ASC, false, ["c", "d", "e", "b", "a"])]
-    // `AirTime` and the keys `OrderMapper` has no arm for are `SortName`.
-    #[case::air_time(&[ItemSortBy::AirTime], DESC, false, ["a", "b", "e", "c", "d"])]
-    #[case::unknown_key(&[ItemSortBy::Unrecognized(99)], DESC, false, ["a", "b", "e", "c", "d"])]
-    #[case::aired_episode_order(&[ItemSortBy::AiredEpisodeOrder], None, false, ["d", "e", "c", "b", "a"])]
-    // A key over a column no channel item fills ties.
-    #[case::runtime(&[ItemSortBy::Runtime], DESC, false, ["d", "e", "c", "b", "a"])]
-    // `SeriesDatePlayed` leaves `SortName` ascending alone: favourites and
-    // the other keys are dropped.
-    #[case::series_date_played(
-        &[ItemSortBy::PlayCount, ItemSortBy::SeriesDatePlayed],
-        DESC,
-        true,
-        ["d", "e", "c", "b", "a"]
-    )]
-    fn the_lineup_sorts_on_each_requested_key(
-        #[case] sort_by: &[ItemSortBy],
-        #[case] sort_order: Option<SortOrder>,
-        #[case] enable_favorite_sorting: bool,
-        #[case] expected: [&str; 5],
-    ) {
-        assert_eq!(
-            sorted_lineup(sort_by, sort_order, enable_favorite_sorting),
-            expected
-        );
-    }
-
-    /// `Random` below the favourites: `c` leads, and the rest is a fresh
-    /// order on each call.
-    #[test]
-    fn a_random_lineup_is_a_fresh_order_each_time() {
-        let draws: std::collections::HashSet<Vec<String>> = (0..64)
-            .map(|_| sorted_lineup(&[ItemSortBy::Random], None, true))
-            .collect();
-        assert!(draws.len() > 1, "{draws:?}");
-        for draw in &draws {
-            assert_eq!(draw[0], "c", "{draw:?}");
-            let mut ids = draw.clone();
-            ids.sort();
-            assert_eq!(ids, ["a", "b", "c", "d", "e"]);
-        }
     }
 
     #[test]
@@ -1648,5 +1814,146 @@ mod tests {
         ] {
             assert!(!options.contains_field(f));
         }
+    }
+
+    /// gl-763: `GetProgram` sets the listing's ids, with the etag restored as
+    /// `ProgramEtag`, whenever it saves the programme. It skips only an XMLTV
+    /// airing whose etag is stored; any other airing is saved on every
+    /// refresh, so only a different set is rewritten.
+    #[rstest::rstest]
+    #[case::same_etag_keeps_an_editors_id(&[("Custom", "x"), ("ProgramEtag", "xmltv-sha256-v1:A")], &[("ProgramEtag", "xmltv-sha256-v1:A")], false, false)]
+    #[case::same_etag_case_insensitive(&[("ProgramEtag", "xmltv-sha256-v1:a")], &[("ProgramEtag", "xmltv-sha256-v1:A")], false, false)]
+    #[case::written_programme(&[("ProgramEtag", "xmltv-sha256-v1:A")], &[("ProgramEtag", "xmltv-sha256-v1:A")], true, true)]
+    #[case::moved_etag(&[("ProgramEtag", "xmltv-sha256-v1:A")], &[("ProgramEtag", "xmltv-sha256-v1:B")], false, true)]
+    #[case::first_etag(&[], &[("ProgramEtag", "xmltv-sha256-v1:A")], false, true)]
+    #[case::no_etag_same_set(&[("SeriesZap2It", "EP1")], &[("SeriesZap2It", "EP1")], false, false)]
+    #[case::no_etag_new_set(&[("Custom", "x")], &[], false, true)]
+    #[case::schedules_direct_md5_drops_an_editors_id(&[("Custom", "x"), ("ProgramEtag", "md5")], &[("ProgramEtag", "md5")], false, true)]
+    #[case::schedules_direct_same_set(&[("ProgramEtag", "md5")], &[("ProgramEtag", "md5")], false, false)]
+    fn programme_ids_follow_get_programs_saves(
+        #[case] current: &[(&str, &str)],
+        #[case] listed: &[(&str, &str)],
+        #[case] written: bool,
+        #[case] replaced: bool,
+    ) {
+        let owned = |ids: &[(&str, &str)]| -> Vec<(String, String)> {
+            ids.iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            program_provider_ids_replaced(&owned(current), &owned(listed), written),
+            replaced
+        );
+    }
+
+    /// gl-763: a Schedules Direct listing's audio, HD flag, original air date
+    /// and Zap2It series id reach the item as `GetProgram` assigns them.
+    #[test]
+    fn a_listings_audio_size_air_date_and_ids_reach_the_item() {
+        let listed = ProgramRow {
+            etag: Some("md5".to_owned()),
+            audio: Some(3),
+            is_hd: Some(true),
+            original_air_date: Some("2010-01-05T00:00:00Z".to_owned()),
+            series_zap2it: Some("EP00001457".to_owned()),
+            is_series: false,
+            ..guide_row("[]", None)
+        };
+        let item = program_entity(&listed, parse, None);
+        assert_eq!((item.width, item.height), (Some(1280), Some(720)));
+        assert_eq!(item.audio, Some(3));
+        assert_eq!(item.premiere_date, parse("2010-01-05T00:00:00Z"));
+        assert_eq!(
+            program_provider_ids(&listed),
+            [
+                ("SeriesZap2It".to_owned(), "EP00001457".to_owned()),
+                ("ProgramEtag".to_owned(), "md5".to_owned()),
+            ]
+        );
+
+        // A first-run episode keeps the stored premiere date, and a listing
+        // that is no longer HD keeps the stored size.
+        let episode = ProgramRow {
+            is_series: true,
+            is_repeat: false,
+            is_hd: Some(false),
+            original_air_date: None,
+            audio: Some(1),
+            ..listed
+        };
+        let updated =
+            program_item_update(&item, &program_entity(&episode, parse, None)).expect("changed");
+        assert_eq!((updated.width, updated.height), (Some(1280), Some(720)));
+        assert_eq!(updated.premiere_date, item.premiere_date);
+        assert_eq!(updated.audio, Some(1));
+        // A repeat takes the listing's (here no) air date.
+        let repeat = program_item_update(
+            &item,
+            &program_entity(
+                &ProgramRow {
+                    is_repeat: true,
+                    ..episode
+                },
+                parse,
+                None,
+            ),
+        )
+        .expect("changed");
+        assert_eq!(repeat.premiere_date, None);
+    }
+
+    /// `GetProgram` sets `SeriesName` for an episode and never clears it, and
+    /// keeps a stored `ShowId` that differs only in case.
+    #[test]
+    fn series_name_stays_and_show_id_keeps_its_spelling() {
+        let episode = ProgramRow {
+            show_id: Some("SHOW-A".to_owned()),
+            ..guide_row("[]", None)
+        };
+        let stored = program_entity(&episode, parse, None);
+        assert_eq!(stored.series_name.as_deref(), Some("Show"));
+        let not_an_episode = ProgramRow {
+            is_series: false,
+            show_id: Some("show-a".to_owned()),
+            overview: Some("now a special".to_owned()),
+            ..episode
+        };
+        let updated = program_item_update(&stored, &program_entity(&not_an_episode, parse, None))
+            .expect("changed");
+        assert_eq!(updated.series_name.as_deref(), Some("Show"));
+        assert_eq!(updated.show_id.as_deref(), Some("SHOW-A"));
+    }
+
+    /// gl-1631: a guide's padding around an image URL is dropped, so the
+    /// artwork loads, and a blank one counts as none, not as a refused value.
+    #[test]
+    fn a_padded_image_url_is_read_trimmed() {
+        let images = ProgramImages {
+            primary: None,
+            thumb: Some(" http://img.test/still.jpg ".to_owned()),
+            backdrop: Some("   ".to_owned()),
+        };
+        assert_eq!(
+            images.urls()[1],
+            (ImageType::Thumb, Some("http://img.test/still.jpg"))
+        );
+        assert_eq!(images.urls()[2], (ImageType::Backdrop, None));
+        assert_eq!(images.refused(), 0);
+    }
+
+    /// gl-1631: an empty `<sub-title/>` is `""`, which is no episode title:
+    /// no `SeriesName` (`!string.IsNullOrEmpty(info.EpisodeTitle)`).
+    #[test]
+    fn an_empty_episode_title_makes_no_series_name() {
+        let row = ProgramRow {
+            is_series: false,
+            episode_title: Some(String::new()),
+            ..guide_row("[]", None)
+        };
+        let item = program_entity(&row, parse, None);
+        assert_eq!(item.episode_title.as_deref(), Some(""));
+        assert_eq!(item.series_name, None);
+        assert!(!program_tags(&row).iter().any(|t| t == "Series"));
     }
 }

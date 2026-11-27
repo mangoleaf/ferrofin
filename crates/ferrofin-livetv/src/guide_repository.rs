@@ -46,17 +46,26 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
                       p."IsRepeat",p."IsPremiere",p."IsMovie",p."IsSeries",p."IsNews",p."IsKids",
                       p."IsSports",p."IsLive",p."ExternalId",p."ExternalSeriesId",
                       p."SeasonNumber",p."EpisodeNumber",p."DateCreated",p."ShowId",
+                      p."Etag",p."Audio",p."IsHD",p."OriginalAirDate",p."SeriesZap2It",
                       c."Name" AS "ChannelName",c."Number" AS "ChannelNumber",
                       c."ChannelType" AS "ChannelMediaKind"
                FROM "FerrofinLiveTvPrograms" p
                JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
-/// Every channel in the lineup, in stored (`SortIndex`) order.
+/// The lineup channels the kind filters of `query` keep, in stored
+/// (`SortIndex`) order.
 ///
-/// Each kind `query` filters on (`IsMovie`, `IsSeries`, `IsKids`) is derived
-/// from the guide the way `GuideManager.RefreshChannels` aggregates it onto
-/// upstream channel items (`isMovie |= program.IsMovie; ...`, plus the "Kids"
-/// tag). The kinds it does not filter on read as `false`: only the channel
-/// kind filters read them, and each one costs a pass over the airings.
+/// Upstream's `GetInternalChannels` lists the stored channel items, so its
+/// kind filters read what the guide refresh stored on them
+/// (`save_channel_aggregates`; `TranslateQuery`, v12.4
+/// Jellyfin.Server.Implementations/Item/BaseItemRepository.TranslateQuery.cs:206-258,665-677):
+/// `IsMovie` and `IsSeries` the item's columns, `IsKids`, `IsNews` and
+/// `IsSports` its "Kids", "News" and "Sports" tags: any of the tags asked for,
+/// none of those asked against. The "Kids" tag stays once
+/// added, so a channel whose kids airing left the guide still matches.
+///
+/// With `stored_items_only`, a lineup channel is listed only once its item is
+/// stored, as upstream lists only the items (a guide refresh writes the lineup
+/// before the items). The guide refresh's own mirror reads the whole lineup.
 ///
 /// `restrictions` are the user's parental restrictions, which keep only the
 /// channels whose item that user may list.
@@ -68,55 +77,174 @@ pub(crate) async fn channel_rows(
     db: &Database,
     query: &LiveTvChannelQuery,
     restrictions: UserRestrictions<'_>,
+    stored_items_only: bool,
 ) -> Result<Vec<ChannelRow>, ServiceError> {
-    channel_rows_query(query, restrictions)
+    channel_rows_query(query, restrictions, stored_items_only, ChannelOrder::Lineup)
         .build_query_as()
         .fetch_all(db.pool())
         .await
         .map_err(db_err)
 }
 
-/// [`channel_rows`]' statement, shared with its plan pin.
+/// [`channel_rows`] in the order `GetInternalChannels` asks of the item
+/// repository (v12.4 LiveTvManager.cs:113-154): `query`'s keys in its order,
+/// led by `(IsFavoriteOrLiked, Descending)` when it sorts favourites first for
+/// a user, then `(SortName, Ascending)`, which upstream appends whatever was
+/// asked for, as it checks the new query's still empty order. `ApplyOrder`
+/// applies them over each channel's stored item
+/// ([`crate::manager::push_apply_order`]), the user-data keys over `user`'s
+/// rows (the stored user id) (gl-1681).
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub(crate) async fn listed_channel_rows(
+    db: &Database,
+    query: &LiveTvChannelQuery,
+    restrictions: UserRestrictions<'_>,
+    stored_items_only: bool,
+    user: Option<&str>,
+) -> Result<Vec<ChannelRow>, ServiceError> {
+    channel_rows_query(
+        query,
+        restrictions,
+        stored_items_only,
+        ChannelOrder::Listing { user },
+    )
+    .build_query_as()
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)
+}
+
+/// How [`channel_rows_query`] orders the lineup.
+#[derive(Clone, Copy)]
+pub(crate) enum ChannelOrder<'a> {
+    /// The lineup's stored order, for the guide refresh's own reads.
+    Lineup,
+    /// [`listed_channel_rows`]' order, over the channel items, with the
+    /// user-data keys over `user`'s rows.
+    Listing {
+        /// The requesting user's stored id.
+        user: Option<&'a str>,
+    },
+}
+
+/// [`channel_rows`]' and [`listed_channel_rows`]' statement, shared with its
+/// plan pin.
 fn channel_rows_query(
     query: &LiveTvChannelQuery,
     restrictions: UserRestrictions<'_>,
+    stored_items_only: bool,
+    order: ChannelOrder<'_>,
 ) -> sqlx::QueryBuilder<sqlx::Sqlite> {
     let mut qb = sqlx::QueryBuilder::new(
-        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl""#,
+        r#"SELECT "FerrofinLiveTvChannels"."Id","FerrofinLiveTvChannels"."TvgId",
+                  "FerrofinLiveTvChannels"."ExternalId","FerrofinLiveTvChannels"."Name",
+                  "FerrofinLiveTvChannels"."Number","FerrofinLiveTvChannels"."ChannelType",
+                  "FerrofinLiveTvChannels"."DateCreated","FerrofinLiveTvChannels"."ImageUrl"
+           FROM "FerrofinLiveTvChannels""#,
     );
-    // A kind left out reads as `false` (`ChannelRow`'s `#[sqlx(default)]`).
-    for (filter, kind) in [
-        (query.is_movie, "IsMovie"),
-        (query.is_series, "IsSeries"),
-        (query.is_kids, "IsKids"),
-    ] {
-        if filter.is_some() {
+    // The listing orders on each channel's item. Listing only stored items,
+    // the join is that check too, and `CROSS JOIN` keeps the channel table
+    // the outer loop. Without an item store, which only tests run, every item
+    // column is NULL and the order is SQLite's scan order.
+    let listing = matches!(order, ChannelOrder::Listing { .. });
+    if listing {
+        qb.push(if stored_items_only {
+            r#" CROSS JOIN "BaseItems" item ON item."Id" = "FerrofinLiveTvChannels"."Id""#
+        } else {
+            r#" LEFT JOIN "BaseItems" item ON item."Id" = "FerrofinLiveTvChannels"."Id""#
+        });
+    }
+    let mut joiner = " WHERE ";
+    // The restrictions' `EXISTS` over the item lists only stored items too.
+    if let Some(restrictions) = restrictions {
+        qb.push(std::mem::replace(&mut joiner, " AND "));
+        push_item_restrictions(&mut qb, r#""FerrofinLiveTvChannels"."Id""#, restrictions);
+    } else if stored_items_only && !listing {
+        qb.push(std::mem::replace(&mut joiner, " AND "));
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM "BaseItems" bi WHERE bi."Id" = "FerrofinLiveTvChannels"."Id")"#,
+        );
+    }
+    for (filter, column) in [(query.is_movie, "IsMovie"), (query.is_series, "IsSeries")] {
+        if let Some(want) = filter {
+            qb.push(std::mem::replace(&mut joiner, " AND "));
             qb.push(format_args!(
-                r#",EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
-                     WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."{kind}" = 1) AS "{kind}""#
-            ));
+                r#"COALESCE((SELECT bi."{column}" FROM "BaseItems" bi
+                     WHERE bi."Id" = "FerrofinLiveTvChannels"."Id"), 0) = "#
+            ))
+            .push_bind(want);
         }
     }
-    qb.push(r#" FROM "FerrofinLiveTvChannels""#);
-    if let Some(restrictions) = restrictions {
-        qb.push(" WHERE ");
-        push_item_restrictions(&mut qb, r#""FerrofinLiveTvChannels"."Id""#, restrictions);
+    // Upstream gathers the kinds asked for as one tag list and the kinds asked
+    // against as one excluded list: a channel matches when it carries any of
+    // the first and none of the second.
+    let kinds = [
+        (query.is_kids, "Kids"),
+        (query.is_news, "News"),
+        (query.is_sports, "Sports"),
+    ];
+    for want in [true, false] {
+        let tags: Vec<String> = kinds
+            .iter()
+            .filter(|(filter, _)| *filter == Some(want))
+            .map(|(_, tag)| ferrofin_util::string_extensions::get_clean_value(tag))
+            .collect();
+        if tags.is_empty() {
+            continue;
+        }
+        qb.push(std::mem::replace(&mut joiner, " AND "));
+        if !want {
+            qb.push("NOT ");
+        }
+        qb.push(
+            r#"EXISTS (SELECT 1 FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               WHERE m."ItemId" = "FerrofinLiveTvChannels"."Id" AND v."Type" = "#,
+        )
+        .push_bind(i32::from(ferrofin_db::enums::ItemValueType::Tags))
+        .push(r#" AND v."CleanValue" IN ("#);
+        let mut separated = qb.separated(", ");
+        for tag in tags {
+            separated.push_bind(tag);
+        }
+        qb.push("))");
     }
-    qb.push(r#" ORDER BY "SortIndex", "Name""#);
+    match order {
+        ChannelOrder::Lineup => {
+            qb.push(
+                r#" ORDER BY "FerrofinLiveTvChannels"."SortIndex", "FerrofinLiveTvChannels"."Name""#,
+            );
+        }
+        ChannelOrder::Listing { user } => {
+            use ferrofin_model::dto::SortOrder;
+            use ferrofin_model::live_tv::ItemSortBy;
+
+            let direction = query.sort_order.unwrap_or(SortOrder::Ascending);
+            let mut keys: Vec<(ItemSortBy, SortOrder)> =
+                query.sort_by.iter().map(|by| (*by, direction)).collect();
+            // With no user upstream reads the missing user's id and fails;
+            // here favourite sorting then sorts nothing.
+            if query.enable_favorite_sorting && user.is_some() {
+                keys.insert(0, (ItemSortBy::IsFavoriteOrLiked, SortOrder::Descending));
+            }
+            keys.push((ItemSortBy::SortName, SortOrder::Ascending));
+            crate::manager::push_apply_order(&mut qb, &keys, user, r#"item."StartDate""#);
+        }
+    }
     qb
 }
 
-/// One channel by id, or `None` when unknown. The aggregated kind flags are
-/// not derived here — nothing on the single-channel path reads them (they are
-/// `[JsonIgnore]` upstream, filter-only).
+/// One channel by id, or `None` when unknown.
 ///
 /// # Errors
 ///
 /// Fails when the database read fails.
 pub async fn channel_row(db: &Database, id: Uuid) -> Result<Option<ChannelRow>, ServiceError> {
     sqlx::query_as(
-        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
-                  0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated"
            FROM "FerrofinLiveTvChannels" WHERE "Id" = ?1"#,
     )
     .bind(guid_to_db(id))
@@ -146,8 +274,7 @@ pub async fn channel_rows_by_ids(
     // this lookup to run.
     for chunk in ferrofin_db::padded_in_chunks(ids) {
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
-            r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
-                  0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
+            r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated"
            FROM "FerrofinLiveTvChannels" WHERE "Id" IN ("#,
         );
         let mut separated = qb.separated(", ");
@@ -239,8 +366,8 @@ pub async fn program_rows_by_ids(
 }
 
 /// The user's channel user-data rows, keyed by the stored channel id. Backs
-/// the favourite/like filters, favourite-first sorting and the play-state
-/// sort keys, which upstream pushes into the item repository's SQL.
+/// the favourite and like filters, which upstream pushes into the item
+/// repository's SQL.
 ///
 /// # Errors
 ///
@@ -250,8 +377,7 @@ pub async fn channel_user_data(
     user_id: Uuid,
 ) -> Result<ChannelUserData, ServiceError> {
     let rows = sqlx::query(
-        r#"SELECT ud."ItemId", ud."IsFavorite", ud."Rating", ud."PlayCount", ud."Played",
-                  ud."LastPlayedDate"
+        r#"SELECT ud."ItemId", ud."IsFavorite", ud."Rating"
            FROM "UserData" ud
            JOIN "FerrofinLiveTvChannels" c ON c."Id" = ud."ItemId"
            WHERE ud."UserId" = ?1 AND ud."CustomDataKey" = lower(ud."ItemId")"#,
@@ -268,44 +394,6 @@ pub async fn channel_user_data(
                 ChannelUserDataRow {
                     is_favorite: r.get("IsFavorite"),
                     rating: r.get("Rating"),
-                    play_count: r.get("PlayCount"),
-                    played: r.get("Played"),
-                    last_played_date: r.get("LastPlayedDate"),
-                },
-            )
-        })
-        .collect())
-}
-
-/// [`channel_last_played_by_anyone`]'s statement: each channel's newest
-/// `LastPlayedDate` over every user's rows, seeking the rows by item.
-const CHANNEL_LAST_PLAYED_SQL: &str = r#"SELECT c."Id",
-       (SELECT MAX(ud."LastPlayedDate") FROM "UserData" ud WHERE ud."ItemId" = c."Id")
-           AS "LastPlayedDate"
-   FROM "FerrofinLiveTvChannels" c"#;
-
-/// Every channel's newest play by any user, for a `DatePlayed` sort with no
-/// user: upstream's `OrderMapper.cs:32-48` reads all of `UserData` when the
-/// query has no user (a channel has no alternate versions). Every channel gets
-/// a row and only `last_played_date` is read, so the other user-data keys and
-/// filters see the same values on every channel, as they do with no rows.
-///
-/// # Errors
-///
-/// Fails when the database read fails.
-pub async fn channel_last_played_by_anyone(db: &Database) -> Result<ChannelUserData, ServiceError> {
-    let rows = sqlx::query(CHANNEL_LAST_PLAYED_SQL)
-        .fetch_all(db.pool())
-        .await
-        .map_err(db_err)?;
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            (
-                r.get::<String, _>("Id"),
-                ChannelUserDataRow {
-                    last_played_date: r.get("LastPlayedDate"),
-                    ..ChannelUserDataRow::default()
                 },
             )
         })
@@ -463,9 +551,10 @@ pub async fn delete_programs(db: &Database, ids: &[String]) -> Result<(), Servic
     delete_by_id(db, "FerrofinLiveTvPrograms", ids).await
 }
 
-/// The programme items among `ids` that have a tag in `ItemValues`, which the
-/// blocked and allowed tag rules read. An airing stored before the guide
-/// indexed its tags has none, so the guide refresh writes them once.
+/// The items among `ids` that have a tag in `ItemValues`, which the blocked
+/// and allowed tag rules read: the guide refresh asks it of its programmes and
+/// of its channels. An item stored before the guide indexed its tags has none,
+/// so the refresh writes them once.
 ///
 /// # Errors
 ///
@@ -772,7 +861,7 @@ pub async fn channel_stream_source(
 #[cfg(test)]
 #[allow(clippy::missing_errors_doc)] // test seeding helpers; every error is "the write failed"
 pub mod test_support {
-    use super::{Database, PROGRAM_SELECT, ProgramRow, db_err};
+    use super::{ChannelUserDataRow, Database, PROGRAM_SELECT, ProgramRow, db_err};
     use ferrofin_traits::error::ServiceError;
 
     /// From now on, counts each programme row written to `BaseItems` (an
@@ -834,20 +923,26 @@ pub mod test_support {
         plan(db, super::channel_program_rows_query(channel_id)).await
     }
 
-    /// The `EXPLAIN QUERY PLAN` details of [`super::channel_rows`]' statement
-    /// for `query` and `restrictions`, in plan order.
+    /// The `EXPLAIN QUERY PLAN` details of [`super::listed_channel_rows`]'
+    /// statement for `query`, `restrictions`, `stored_items_only` and `user`,
+    /// in plan order.
     pub(crate) async fn channel_rows_plan(
         db: &Database,
         query: &super::LiveTvChannelQuery,
         restrictions: super::UserRestrictions<'_>,
+        stored_items_only: bool,
+        user: Option<&str>,
     ) -> Result<Vec<String>, ServiceError> {
-        plan(db, super::channel_rows_query(query, restrictions)).await
-    }
-
-    /// The `EXPLAIN QUERY PLAN` details of
-    /// [`super::channel_last_played_by_anyone`]'s statement, in plan order.
-    pub async fn channel_last_played_plan(db: &Database) -> Result<Vec<String>, ServiceError> {
-        plan(db, sqlx::QueryBuilder::new(super::CHANNEL_LAST_PLAYED_SQL)).await
+        plan(
+            db,
+            super::channel_rows_query(
+                query,
+                restrictions,
+                stored_items_only,
+                super::ChannelOrder::Listing { user },
+            ),
+        )
+        .await
     }
 
     /// The `EXPLAIN QUERY PLAN` details of `qb`'s statement, in plan order.
@@ -920,6 +1015,20 @@ pub mod test_support {
         .map_err(db_err)
     }
 
+    /// Every channel item's `AncestorIds` rows as `(ItemId, ParentItemId)`,
+    /// ordered.
+    pub async fn channel_ancestors(db: &Database) -> Result<Vec<(String, String)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT a."ItemId", a."ParentItemId" FROM "AncestorIds" a
+               JOIN "BaseItems" bi ON bi."Id" = a."ItemId"
+               WHERE bi."Type" = ?1 ORDER BY 1, 2"#,
+        )
+        .bind(crate::projection::CHANNEL_TYPE_NAME)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+    }
+
     /// The stored `BaseItems` programme-item rows as
     /// `(Id, ParentId, TopParentId, PresentationUniqueKey)`, id-ordered — what
     /// the guide refresh's `BaseItems` mirror wrote.
@@ -940,6 +1049,25 @@ pub mod test_support {
         .map_err(db_err)
     }
 
+    /// Every channel's `(Name, ImageUrl)`, name-ordered.
+    pub async fn channel_logos(
+        db: &Database,
+    ) -> Result<Vec<(String, Option<String>)>, ServiceError> {
+        sqlx::query_as(r#"SELECT "Name", "ImageUrl" FROM "FerrofinLiveTvChannels" ORDER BY "Name""#)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)
+    }
+
+    /// Every stored image row as `(Path, DateModified)`, the date as its stored
+    /// text, path-ordered.
+    pub async fn image_rows(db: &Database) -> Result<Vec<(String, Option<String>)>, ServiceError> {
+        sqlx::query_as(r#"SELECT "Path", "DateModified" FROM "BaseItemImageInfos" ORDER BY "Path""#)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)
+    }
+
     /// Every programme item's genre links as `(Id, genre)`, ordered — the
     /// `ItemValues` the guide refresh's mirror wrote for its airings.
     pub async fn program_genre_links(db: &Database) -> Result<Vec<(String, String)>, ServiceError> {
@@ -954,6 +1082,35 @@ pub mod test_support {
         .fetch_all(db.pool())
         .await
         .map_err(db_err)
+    }
+
+    /// Inserts `user_id`'s user data on the item `item_id_db` under the item's
+    /// own key, as a channel's is stored: `row`'s favourite and rating, and
+    /// `play_count` plays, the last at `last_played`, `played` or not.
+    pub async fn seed_user_data(
+        db: &Database,
+        item_id_db: &str,
+        user_id: &str,
+        row: &ChannelUserDataRow,
+        (play_count, played, last_played): (i32, bool, Option<&str>),
+    ) -> Result<(), ServiceError> {
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+               ("ItemId","UserId","CustomDataKey","IsFavorite","Rating","PlayCount",
+                "PlaybackPositionTicks","Played","LastPlayedDate")
+               VALUES (?1, ?2, lower(?1), ?3, ?4, ?5, 0, ?6, ?7)"#,
+        )
+        .bind(item_id_db)
+        .bind(user_id)
+        .bind(row.is_favorite)
+        .bind(row.rating)
+        .bind(play_count)
+        .bind(played)
+        .bind(last_played)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+        Ok(())
     }
 
     /// Marks an item favourite for a user, the way the playstate path stores it.

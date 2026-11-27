@@ -144,7 +144,7 @@ create-release:
 
 # ---------------------------------------------------------------------------
 # ci-image — the Rust CI base image (toolchain + rustfmt/clippy/nextest/llvm-cov),
-# built with kaniko and pushed to $CI_REGISTRY_IMAGE/ci:rust-1.99.1. The lint and
+# built with kaniko and pushed to $CI_REGISTRY_IMAGE/ci:rust-1.100.0. The lint and
 # coverage jobs use it as their `image:` so they don't reinstall tools every run.
 # Rebuilds automatically when ci/Dockerfile changes, on main or on the merge-request
 # pipeline that proposes the change; force a rebuild
@@ -162,7 +162,7 @@ ci-image:
     name: gcr.io/kaniko-project/executor:debug
     entrypoint: [""]
   variables:
-    CI_IMAGE: $CI_REGISTRY_IMAGE/ci:rust-1.99.1
+    CI_IMAGE: $CI_REGISTRY_IMAGE/ci:rust-1.100.0
   before_script:
     - mkdir -p /kaniko/.docker
     - AUTH="$(printf "%s:%s" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')"
@@ -348,7 +348,7 @@ benchmark-report:
 
 lint:
   stage: test
-  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # toolchain + nextest/llvm-cov baked in
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.100.0   # toolchain + nextest/llvm-cov baked in
   extends: .sccache
   variables:
     CARGO_TERM_COLOR: always
@@ -381,17 +381,18 @@ lint:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
 
-# The supply chain, without a build: the same three checks as the `dependencies` job in
+# The supply chain, without a build: the same checks as the `dependencies` job in
 # .github/workflows/ci.yml. cargo-deny checks the crates the workspace and the wasm-hello guest build
 # against the RustSec advisory database (yanked versions included) and deny.toml's license, ban and
 # source rules; cargo-machete looks for declared but unused dependencies; check-workspace-deps.py
-# for a dependency a crate declares itself instead of taking the workspace's. A job of its own, not
-# part of `lint`, so an advisory published today turns the pipeline red without hiding the lint
-# result; create-release needs it, so a release never tags past one. Each check runs whatever the
-# one before found, so an advisory never hides the rest.
+# for a dependency a crate declares itself instead of taking the workspace's; third-party-notices.sh
+# generates the license notices every artifact ships (about.toml) and fails on a license or a
+# clarification it cannot use. A job of its own, not part of `lint`, so an advisory published today
+# turns the pipeline red without hiding the lint result; create-release needs it, so a release never
+# tags past one. Each check runs whatever the one before found, so an advisory never hides the rest.
 dependencies:
   stage: test
-  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # cargo-deny + cargo-machete baked in (ci/Dockerfile)
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.100.0   # cargo-deny, cargo-machete + cargo-about baked in (ci/Dockerfile)
   needs:
     # When ci/Dockerfile changed, wait for the image that carries the tools; ignored on runs
     # where ci-image is skipped.
@@ -408,6 +409,7 @@ dependencies:
       cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check || rc=1
       cargo machete apps crates || rc=1   # vendor/ holds upstream code as published
       scripts/check-workspace-deps.py || rc=1
+      scripts/third-party-notices.sh || rc=1
       exit $rc
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -421,7 +423,7 @@ dependencies:
 # changes only with the branch. create-release needs it.
 vet:
   stage: test
-  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # cargo-vet baked in (ci/Dockerfile)
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.100.0   # cargo-vet baked in (ci/Dockerfile)
   needs:
     - job: ci-image   # as in `dependencies`
       optional: true
@@ -436,9 +438,9 @@ vet:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
 
 # The shell tooling has its own tests, the same as GitHub's shell-tests job (ci.yml, which says what each
-# suite covers): scripts/ (version.sh, ci-config-check.sh, coverage-gate.sh, the git-cliff config and the
-# Python helpers) and every gate's own shellcheck, bats and Python tests, one list in the Makefile's
-# test-gates-offline target. None needs docker, a server or fixtures.
+# suite covers): scripts/ (version.sh, ci-config-check.sh, coverage-gate.sh, third-party-notices.sh, the
+# git-cliff config and the Python helpers) and every gate's own shellcheck, bats and Python tests, one
+# list in the Makefile's test-gates-offline target. None needs docker, a server or fixtures.
 shell-tests:
   stage: test
   image: alpine:3.22
@@ -453,8 +455,8 @@ shell-tests:
     # (Alpine's PEP 668 marker needs --break-system-packages in this throwaway container).
     - pip install --break-system-packages git-cliff==2.14.2
   script:
-    - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh
-    - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats scripts/tests/git-cliff.bats
+    - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh scripts/third-party-notices.sh
+    - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats scripts/tests/git-cliff.bats scripts/tests/third-party-notices.bats
     # Without this wrapper, five signal tests fail in this job, and on no other host, exactly as when
     # the step runs as a background job of sh (SIGINT and SIGQUIT ignored on entry, which bash cannot
     # trap) under a PID 1 that never reaps (killed processes stay zombies that pgrep -s still lists).
@@ -476,7 +478,7 @@ shell-tests:
 # re-gated on the release pipeline.
 coverage:
   stage: test
-  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # toolchain + nextest/llvm-cov baked in
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.100.0   # toolchain + nextest/llvm-cov baked in
   extends: .sccache
   parallel:
     matrix:

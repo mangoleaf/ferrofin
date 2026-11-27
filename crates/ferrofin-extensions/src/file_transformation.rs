@@ -29,13 +29,12 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferrofin_core::event_manager::FerrofinEventManager;
-use ferrofin_core::plugin_manager::PLUGIN_CONFIGURATION_CHANGED;
-use ferrofin_core::{PluginConfigPage, ScheduledTask};
+use ferrofin_traits::events::{EventSubscriber, PLUGIN_CONFIGURATION_CHANGED};
 use ferrofin_traits::plugins::{
-    FileTransformationService, FileTransformer, PluginDescriptor, PluginManager,
+    FileTransformationService, FileTransformer, PluginConfigPage, PluginDescriptor, PluginManager,
 };
 use ferrofin_traits::system::LocalApiAccess;
+use ferrofin_traits::tasks::ScheduledTask;
 use ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -45,6 +44,11 @@ use crate::{Extension, ExtensionContext};
 /// The File Transformation plugin's stable id — the **upstream plugin's GUID**
 /// (Intro Skipper detects the plugin's presence by this exact id).
 pub const EXTENSION_ID: Uuid = Uuid::from_u128(0x5e87_cc92_571a_4d8d_8d98_d2d4_147f_9f90);
+
+/// The File Transformation plugin's settings file in Jellyfin's `plugins/configurations`, named after
+/// its assembly (`BasePlugin<T>.ConfigurationFileName`), which `/Plugins`
+/// reports and adoption imports.
+pub const CONFIGURATION_FILE_NAME: &str = "Jellyfin.Plugin.FileTransformation.xml";
 
 /// The Intro Skipper's id, under which its skip-button transformer registers.
 const INTRO_SKIPPER_ID: Uuid = Uuid::from_u128(0xc83d_86bb_a1e0_4c35_a113_e210_1cf4_ee6b);
@@ -70,7 +74,7 @@ impl Extension for FileTransformationExtension {
             enabled: true,
             has_image: false,
             can_uninstall: false,
-            configuration_file_name: None,
+            configuration_file_name: Some(CONFIGURATION_FILE_NAME.to_owned()),
         }
     }
 
@@ -89,6 +93,7 @@ impl Extension for FileTransformationExtension {
             bytes: include_bytes!(concat!(env!("OUT_DIR"), "/filetransformation/config.html"))
                 .to_vec(),
             enable_in_main_menu: true,
+            content_type: None,
         }]
     }
 
@@ -340,9 +345,8 @@ impl WebFileTransformationService {
         let Ok(bytes) = self.plugins.get_plugin_configuration(EXTENSION_ID).await else {
             return Arc::from([]);
         };
-        let mut transformations = serde_json::from_slice::<ServiceConfig>(&bytes)
-            .map(|c| c.transformations)
-            .unwrap_or_default();
+        let mut transformations =
+            serde_json::from_slice::<ServiceConfig>(&bytes).map_or_default(|c| c.transformations);
         for t in &mut transformations {
             t.regex = regex::Regex::new(&t.filename_pattern).ok();
         }
@@ -545,22 +549,19 @@ impl FileTransformationService for WebFileTransformationService {
         let mut contents = contents;
         for (id, pattern, step) in steps {
             contents = match step {
-                TransformStep::Builtin(t) => {
-                    // ponytail: a copy of the file per in-process step, to
-                    // fall back to; a transformer that reported its growth
-                    // up front (as `LiteralTransform` computes it) would not
-                    // need it (gl-1816).
-                    let transformed = t.transform(&path, contents.clone()).await;
-                    if transformed.len() > MAX_TRANSFORMED_BYTES
-                        && transformed.len() > contents.len()
+                TransformStep::Builtin(t) => match t.transform(&path, &contents).await {
+                    Some(transformed)
+                        if transformed.len() > MAX_TRANSFORMED_BYTES
+                            && transformed.len() > contents.len() =>
                     {
                         self.step_over_cap(id, &pattern, transformed.len());
                         contents
-                    } else {
-                        self.step_worked(id, &pattern);
-                        transformed
                     }
-                }
+                    transformed => {
+                        self.step_worked(id, &pattern);
+                        transformed.unwrap_or(contents)
+                    }
+                },
                 TransformStep::Endpoint(url) => match self.call_endpoint(&url, &contents).await {
                     Ok(transformed) => {
                         self.step_worked(id, &pattern);
@@ -820,11 +821,8 @@ impl SkipButtonTransformer {
 
 #[async_trait]
 impl FileTransformer for SkipButtonTransformer {
-    async fn transform(&self, _path: &str, contents: String) -> String {
-        match self.hide_delay().await {
-            Some(delay) => Self::apply(&contents, delay),
-            None => contents,
-        }
+    async fn transform(&self, _path: &str, contents: &str) -> Option<String> {
+        Some(Self::apply(contents, self.hide_delay().await?))
     }
 
     async fn would_transform(&self, _path: &str) -> bool {
@@ -854,7 +852,7 @@ pub async fn register_skip_button_transformer(
 /// what it saved applies from the next `/web` request. Any plugin's save
 /// does: saves are rare, and the next request reads the file once. Called
 /// once by the composition root.
-pub fn subscribe(events: &FerrofinEventManager, service: &Arc<WebFileTransformationService>) {
+pub fn subscribe(events: &dyn EventSubscriber, service: &Arc<WebFileTransformationService>) {
     let service = Arc::clone(service);
     events.subscribe(
         PLUGIN_CONFIGURATION_CHANGED,
@@ -977,8 +975,8 @@ mod tests {
     struct Upper;
     #[async_trait]
     impl FileTransformer for Upper {
-        async fn transform(&self, _path: &str, contents: String) -> String {
-            contents.to_uppercase()
+        async fn transform(&self, _path: &str, contents: &str) -> Option<String> {
+            Some(contents.to_uppercase())
         }
     }
 
@@ -1168,9 +1166,9 @@ mod tests {
         });
         let t = SkipButtonTransformer::new(plugins);
         let out = t
-            .transform("main.jellyfin.bundle.js", TIMEOUT_SNIPPET.to_owned())
+            .transform("main.jellyfin.bundle.js", TIMEOUT_SNIPPET)
             .await;
-        assert_eq!(out, TIMEOUT_SNIPPET);
+        assert_eq!(out, None, "left unchanged");
 
         // Opted in → patched.
         let plugins = Arc::new(FakePlugins {
@@ -1180,8 +1178,9 @@ mod tests {
         });
         let t = SkipButtonTransformer::new(plugins);
         let out = t
-            .transform("main.jellyfin.bundle.js", TIMEOUT_SNIPPET.to_owned())
-            .await;
+            .transform("main.jellyfin.bundle.js", TIMEOUT_SNIPPET)
+            .await
+            .expect("patched");
         assert!(out.contains("5000"), "expected patched timeout: {out}");
     }
 
@@ -1478,8 +1477,8 @@ mod tests {
     struct Huge;
     #[async_trait]
     impl FileTransformer for Huge {
-        async fn transform(&self, _path: &str, _contents: String) -> String {
-            "x".repeat(MAX_TRANSFORMED_BYTES + 1)
+        async fn transform(&self, _path: &str, _contents: &str) -> Option<String> {
+            Some("x".repeat(MAX_TRANSFORMED_BYTES + 1))
         }
     }
 
@@ -1503,6 +1502,36 @@ mod tests {
         let out = svc.run_transformation("main.js", input).await;
 
         assert_eq!(out, format!("{}c", "A".repeat(20_000)));
+    }
+
+    /// A transformer that leaves every file unchanged.
+    struct Unchanged;
+    #[async_trait]
+    impl FileTransformer for Unchanged {
+        async fn transform(&self, _path: &str, _contents: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// A step answering `None` passes the contents on as they were, and the
+    /// steps after it still run.
+    #[tokio::test]
+    async fn an_unchanged_step_passes_the_contents_on() {
+        let svc = service_with(r#"{"Transformations":[]}"#, true);
+        svc.add_transformation(Uuid::from_u128(5), "main.js", Arc::new(Unchanged))
+            .await;
+        assert_eq!(
+            svc.run_transformation("main.js", "original".to_owned())
+                .await,
+            "original"
+        );
+        svc.add_transformation(Uuid::from_u128(6), "main.js", Arc::new(Upper))
+            .await;
+        assert_eq!(
+            svc.run_transformation("main.js", "original".to_owned())
+                .await,
+            "ORIGINAL"
+        );
     }
 
     /// A callback endpoint that accepts each connection and reads the request,

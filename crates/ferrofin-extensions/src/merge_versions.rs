@@ -100,6 +100,11 @@ use crate::{Extension, ExtensionContext};
 /// exact id) and existing dashboards recognize it.
 pub const EXTENSION_ID: Uuid = Uuid::from_u128(0xf21b_bed8_3a97_4d8b_88b2_48aa_a654_27cb);
 
+/// The Merge Versions plugin's settings file in Jellyfin's `plugins/configurations`, named after
+/// its assembly (`BasePlugin<T>.ConfigurationFileName`), which `/Plugins`
+/// reports and adoption imports.
+pub const CONFIGURATION_FILE_NAME: &str = "Jellyfin.Plugin.MergeVersions.xml";
+
 /// The plugin configuration — upstream `PluginConfiguration`: the library
 /// locations excluded from the bulk scans (the settings page's checkbox list).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,7 +136,7 @@ impl Extension for MergeVersionsExtension {
             enabled: true,
             has_image: false,
             can_uninstall: false,
-            configuration_file_name: None,
+            configuration_file_name: Some(CONFIGURATION_FILE_NAME.to_owned()),
         }
     }
 
@@ -151,6 +156,7 @@ impl Extension for MergeVersionsExtension {
             ))
             .to_vec(),
             enable_in_main_menu: false,
+            content_type: None,
         }]
     }
 
@@ -906,8 +912,7 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
             &ferrofin_db::item_data::parse_data(ep.data.as_deref()),
             "IndexNumberEnd",
         )
-        .map(|end| end.to_string())
-        .unwrap_or_default();
+        .map_or_default(|end| end.to_string());
         return format!("{series}|number:{parent}:{index}:{end}");
     }
     // The title fallback also carries the file name's version key — a second
@@ -937,9 +942,7 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
         "{series}|title:{}:{}:{}",
         ep.season_name.as_deref().unwrap_or_default(),
         ep.name.as_deref().unwrap_or_default(),
-        ep.production_year
-            .map(|y| y.to_string())
-            .unwrap_or_default()
+        ep.production_year.map_or_default(|y| y.to_string())
     );
     let Some(path) = ep.path.as_deref() else {
         return key;

@@ -126,7 +126,7 @@ fn write_series(root: &std::path::Path, episodes: usize) {
     let series = root.join("Bench Show (2001)");
     let season = series.join("Season 01");
     std::fs::create_dir_all(&season).expect("season dir");
-    let cast: Vec<String> = (0..3).map(|i| format!("Series Actor {i}")).collect();
+    let cast: Vec<String> = Vec::from_fn(3, |i| format!("Series Actor {i}"));
     std::fs::write(
         series.join("tvshow.nfo"),
         format!(
@@ -145,7 +145,7 @@ fn write_series(root: &std::path::Path, episodes: usize) {
     for episode in 1..=episodes {
         let base = format!("Bench Show (2001) - S01E{episode:02} - Episode {episode}");
         std::fs::write(season.join(format!("{base}.mkv")), [0u8; 1024]).expect("episode");
-        let guests: Vec<String> = (0..2).map(|k| format!("Guest {episode}-{k}")).collect();
+        let guests: Vec<String> = Vec::from_fn(2, |k| format!("Guest {episode}-{k}"));
         std::fs::write(
             season.join(format!("{base}.nfo")),
             format!(

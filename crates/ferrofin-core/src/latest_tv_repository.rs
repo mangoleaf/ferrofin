@@ -46,7 +46,9 @@ struct EpisodeRow {
     id: String,
     series_name: Option<String>,
     date_created: Option<DateTime<Utc>>,
+    #[sqlx(try_from = "ferrofin_db::entities::unset::NonNilGuid")]
     season_id: Option<String>,
+    #[sqlx(try_from = "ferrofin_db::entities::unset::NonNilGuid")]
     series_id: Option<String>,
 }
 
@@ -373,6 +375,24 @@ pub(crate) async fn explain(db: &Database, mut qb: QueryBuilder<Sqlite>) -> Stri
     let args = query.take_arguments().expect("arguments").expect("binds");
     let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
     sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+        .fetch_all(db.pool())
+        .await
+        .expect("explain")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// [`explain`] of a statement kept as a string, with `binds` in order.
+#[cfg(test)]
+pub(crate) async fn explain_sql(db: &Database, sql: &str, binds: &[&str]) -> String {
+    use sqlx::Row as _;
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")));
+    for bind in binds {
+        query = query.bind(*bind);
+    }
+    query
         .fetch_all(db.pool())
         .await
         .expect("explain")

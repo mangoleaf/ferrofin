@@ -153,14 +153,29 @@ impl NfoSaver {
         let Some(row) = self.items.retrieve_item(item_id).await? else {
             return Ok(());
         };
-        let Some(path) = policy::save_path(&row) else {
+        self.save_read(item_id, &row, update).await
+    }
+
+    /// [`save`](Self::save) for an item whose row the caller has just read
+    /// (`read`), so the savers of one save share that read. It only gates:
+    /// the row is read again under the file's lock, and that one is written.
+    ///
+    /// # Errors
+    /// As [`save`](Self::save).
+    pub async fn save_read(
+        &self,
+        item_id: Uuid,
+        read: &BaseItemEntity,
+        update: ItemUpdateType,
+    ) -> Result<(), ServiceError> {
+        let Some(path) = policy::save_path(read) else {
             return Ok(());
         };
         // `IsSaverEnabledForItem` asks the saver first (`saver.IsEnabledFor(
         // item, updateType)`, `ProviderManager.cs:868`), and no option makes it
         // write what the update type refuses: a scan's `MetadataImport` of
         // anything but a season with its `season.nfo`.
-        if policy::kind(&row).is_some_and(|kind| policy::update_refused(kind, update, &path)) {
+        if policy::kind(read).is_some_and(|kind| policy::update_refused(kind, update, &path)) {
             return Ok(());
         }
         let lock = {
@@ -301,9 +316,9 @@ impl NfoSaver {
         let path = PathBuf::from(
             self.configuration
                 .application_paths()
-                .user_configuration_directory_path(),
+                .configuration_directory_path(),
         )
-        .join("named/xbmcmetadata.json");
+        .join("xbmcmetadata.json");
         match tokio::fs::read(&path).await {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|error| ServiceError::backend(format!("read NFO options: {error}"))),
@@ -337,12 +352,7 @@ impl NfoSaver {
             .await?
             .remove(&id)
             .unwrap_or_default();
-        let credits = self
-            .people
-            .get_people_batch(&[id])
-            .await?
-            .remove(&id)
-            .unwrap_or_default();
+        let credits = crate::metadata_merge::stored_people(self.people.as_ref(), id, row).await?;
         let actor_images = if save_images {
             self.actor_primary_images(&credits).await?
         } else {

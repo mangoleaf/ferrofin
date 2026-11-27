@@ -192,8 +192,14 @@ impl CappedServer {
         body["AccessToken"].as_str().expect("token").to_owned()
     }
 
-    /// Adds `folder` as a library and waits for the scan to find its `count`
-    /// photos and their images. Returns each one's item id, by file name.
+    /// Adds `folder` as a library and waits for its scan to end, with its
+    /// `count` photos and their images found. Returns each one's item id, by
+    /// file name.
+    ///
+    /// The scan's last passes draw the library's own image from a photo,
+    /// decoded in full with a resize's copy beside it, and each test's cap
+    /// leaves room for the requests the test makes, not for that as well
+    /// (gl-2015).
     async fn add_photos(&self, folder: &Path, count: usize) -> HashMap<String, String> {
         let status = self
             .client
@@ -226,12 +232,30 @@ impl CappedServer {
                     )
                 })
                 .collect();
-            if found.len() == count && self.all_have_images(found.values()).await {
+            if found.len() == count
+                && self.all_have_images(found.values()).await
+                && self.scan_ended().await
+            {
                 return found;
             }
-            assert!(Instant::now() < deadline, "the scan found {found:?}");
+            assert!(
+                Instant::now() < deadline,
+                "the scan did not end; it found {found:?}"
+            );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+    }
+
+    /// Whether the "Scan Media Library" task is idle. A new library's scan is
+    /// a run of it, so once that scan's photos are there, idle means the run
+    /// is over, its post-scan passes included.
+    async fn scan_ended(&self) -> bool {
+        let tasks: Value = self.json("/ScheduledTasks").await;
+        tasks
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .any(|task| task["Key"] == "RefreshLibrary" && task["State"] == "Idle")
     }
 
     async fn all_have_images(&self, ids: impl Iterator<Item = &String>) -> bool {
@@ -274,7 +298,10 @@ impl CappedServer {
 /// An image past the resize budget, one over the pixel limit and one over the
 /// memory limit are each served as the original file, through the Photo path
 /// that reads the file with its EXIF orientation. A smaller resize of the first
-/// still runs.
+/// still runs. At 512 MiB the first, an RGBA square of 11000 pixels (484 MB
+/// decoded), needs its premultiplied copy, a first pass 11000 wide and its
+/// weights to be resized to 10999 square, about 971 MB, past the budget, and
+/// with the output past the cap too; to 256 square about 497 MB, which fits.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a systemd user session; run with --ignored"]
 async fn images_past_the_limits_are_served_whole_under_a_cap() {
@@ -282,14 +309,19 @@ async fn images_past_the_limits_are_served_whole_under_a_cap() {
     let photos = root.path().join("photos");
     std::fs::create_dir_all(&photos).expect("photos");
     let cases = [
-        ("past-budget.png", 13_000, 1, "width=13000&height=12999"),
+        ("past-budget.png", 11_000, 4, "width=10999&height=10999"),
         ("over-pixels.png", 15_000, 1, "width=15000&height=14999"),
         ("over-memory.png", 14_000, 4, "maxWidth=100"),
     ];
     for (name, side, channels, _) in cases {
         write_png(&photos.join(name), side, side, channels);
     }
-    let mut server = CappedServer::boot(root.path(), "1500M", &[]).await;
+    let mut server = CappedServer::boot(
+        root.path(),
+        "1500M",
+        &[("FERROFIN_IMAGE_RESIZE_BUDGET_MB", "512")],
+    )
+    .await;
     let ids = server.add_photos(&photos, cases.len()).await;
 
     for (name, _, _, query) in cases {
@@ -361,7 +393,11 @@ async fn compositing_is_held_against_the_budget_under_a_cap() {
 }
 
 /// Each resize fits the budget and together they would not fit the cap, so
-/// sharing the budget is what holds. All of them finish, resized.
+/// sharing the budget is what holds. All of them finish, resized. Each request
+/// decodes an RGBA square of 5000 pixels (100 MB) and its resize holds about
+/// 199 MB more (the premultiplied copy and a first pass 5000 wide): 3.6 GB for
+/// the twelve at once, where 512 MiB lets two resize at a time, about 1.6 GB
+/// with every decode.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a systemd user session; run with --ignored"]
 async fn concurrent_resizes_share_the_budget_under_a_cap() {
@@ -369,10 +405,10 @@ async fn concurrent_resizes_share_the_budget_under_a_cap() {
     let photos = root.path().join("photos");
     std::fs::create_dir_all(&photos).expect("photos");
     let source = photos.join("source.png");
-    write_png(&source, 4_000, 4_000, 1);
+    write_png(&source, 5_000, 5_000, 4);
     let mut server = CappedServer::boot(
         root.path(),
-        "1500M",
+        "2500M",
         &[("FERROFIN_IMAGE_RESIZE_BUDGET_MB", "512")],
     )
     .await;
@@ -384,8 +420,8 @@ async fn concurrent_resizes_share_the_budget_under_a_cap() {
     let requests = (0..12).map(|index| {
         let server = &server;
         let query = format!(
-            "/Items/{id}/Images/Primary?width=4000&height={}",
-            3900 + index
+            "/Items/{id}/Images/Primary?width=100&height={}",
+            4900 + index
         );
         async move { server.get(&query).await }
     });

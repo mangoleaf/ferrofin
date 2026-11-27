@@ -2,10 +2,15 @@
 //! straight onto the query (v12.2 `ItemsController.GetItems`) and
 //! `BaseItemRepository.TranslateQuery` translates:
 //! - `SeriesStatuses`: a substring of the `Data` blob (`TranslateQuery.cs:1167-1172`);
-//! - `HasOfficialRating` and `IsPlaceHolder`: the item, or an item below it
-//!   (`AncestorIds`) or linked to it (`LinkedChildren`), matches
+//! - `OfficialRatings`, `HasOfficialRating`, `VideoTypes`, `Is3D` and
+//!   `IsPlaceHolder`: the item, or an item below it (`AncestorIds`) or linked
+//!   to it (`LinkedChildren`), matches
 //!   (`FolderAwareFilterExtensions.WhereItemOrDescendantMatches`,
-//!   `TranslateQuery.cs:761-768, 1201-1208`);
+//!   `TranslateQuery.cs:684-688, 761-768, 1181-1208`);
+//! - `HasTrailer`, `HasThemeSong`, `HasThemeVideo` and `HasSpecialFeature`:
+//!   the same roll-up over the owners of such an extra, each owning version
+//!   standing for its primary too (`WithPrimaryVersions`,
+//!   `TranslateQuery.cs:1210-1274`);
 //! - `MinParentalRating`, `MaxParentalRating` and `HasParentalRating`
 //!   (`TranslateQuery.cs:690-759`), with the maximum clamped to the user's own
 //!   limit;
@@ -148,12 +153,17 @@ async fn seeded() -> Database {
 
 /// The fixture items `GetItemIdsList(query)` returns.
 async fn ids(db: &Database, query: &InternalItemsQuery) -> BTreeSet<Uuid> {
+    ids_among(db, query, &ALL).await
+}
+
+/// The items of `universe` that `GetItemIdsList(query)` returns.
+async fn ids_among(db: &Database, query: &InternalItemsQuery, universe: &[Uuid]) -> BTreeSet<Uuid> {
     FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
         .get_item_ids(query)
         .await
         .expect("query")
         .into_iter()
-        .filter(|id| ALL.contains(id))
+        .filter(|id| universe.contains(id))
         .collect()
 }
 
@@ -232,6 +242,195 @@ async fn is_place_holder_rolls_up_from_linked_children() {
     };
     assert_eq!(ids(&db, &query(true)).await, set([STUB, COLLECTION]));
     assert_eq!(ids(&db, &query(false)).await, all_but([STUB, COLLECTION]));
+}
+
+/// `OfficialRatings` rolls up as `HasOfficialRating` does: an unrated series
+/// takes its episode's rating, and a box set its member's.
+#[tokio::test]
+async fn official_ratings_roll_up_from_descendants_and_linked_children() {
+    let db = seeded().await;
+    let query = |ratings: &[&str]| InternalItemsQuery {
+        official_ratings: ratings.iter().map(|&rating| rating.to_owned()).collect(),
+        ..InternalItemsQuery::default()
+    };
+    assert_eq!(
+        ids(&db, &query(&["TV-14"])).await,
+        set([CONTINUING, RATED_EPISODE])
+    );
+    assert_eq!(ids(&db, &query(&["PG"])).await, set([STUB, COLLECTION]));
+    assert_eq!(
+        ids(&db, &query(&["PG", "TV-MA"])).await,
+        set([STUB, COLLECTION, ENDED_RATED])
+    );
+}
+
+/// A movie with a second version (`Film - 4K`) whose trailer is named after
+/// that version, so the version owns it (`owner_for_extra`), plus a
+/// featurette the movie owns itself.
+const FILM: Uuid = Uuid::from_u128(0x3101);
+const FILM_4K: Uuid = Uuid::from_u128(0x3102);
+const FILM_4K_TRAILER: Uuid = Uuid::from_u128(0x3103);
+const FILM_FEATURETTE: Uuid = Uuid::from_u128(0x3104);
+/// A box set whose only member is the movie.
+const FILM_SET: Uuid = Uuid::from_u128(0x3105);
+/// A series that owns a theme video, with one 3D DVD episode that owns a
+/// theme song.
+const SHOW: Uuid = Uuid::from_u128(0x3106);
+const SHOW_EPISODE: Uuid = Uuid::from_u128(0x3107);
+const SHOW_THEME_VIDEO: Uuid = Uuid::from_u128(0x3108);
+const EPISODE_THEME_SONG: Uuid = Uuid::from_u128(0x3109);
+/// A movie with no extras whose path holds "video3dformat" in lower case:
+/// `Contains("Video3DFormat")` is ordinal, so it is not 3D.
+const PLAIN: Uuid = Uuid::from_u128(0x310A);
+/// A Blu-ray disc image: `VideoType` `Iso`, `IsoType` `BluRay`.
+const DISC: Uuid = Uuid::from_u128(0x310B);
+
+/// The items a browse lists: no extra, no alternate version.
+const LISTED: [Uuid; 6] = [FILM, FILM_SET, SHOW, SHOW_EPISODE, PLAIN, DISC];
+
+async fn seeded_extras() -> Database {
+    use BaseItemKind::{Audio, BoxSet, Episode, Movie, Series, Trailer, Video};
+    let db = fresh_db().await;
+    let extra = |id, kind, extra_type, owner| BaseItemEntity {
+        extra_type: Some(extra_type),
+        owner_id: Some(guid_to_db(owner)),
+        ..row(id, kind, None, None)
+    };
+    let rows = [
+        row(FILM, Movie, None, Some(r#"{"VideoType":"VideoFile"}"#)),
+        BaseItemEntity {
+            primary_version_id: Some(guid_to_db(FILM)),
+            ..row(FILM_4K, Movie, None, None)
+        },
+        extra(FILM_4K_TRAILER, Trailer, 2, FILM_4K),
+        extra(FILM_FEATURETTE, Video, 10, FILM),
+        row(FILM_SET, BoxSet, None, None),
+        row(SHOW, Series, None, None),
+        row(
+            SHOW_EPISODE,
+            Episode,
+            None,
+            Some(r#"{"VideoType":"Dvd","Video3DFormat":"FullSideBySide"}"#),
+        ),
+        extra(SHOW_THEME_VIDEO, Video, 9, SHOW),
+        extra(EPISODE_THEME_SONG, Audio, 8, SHOW_EPISODE),
+        row(
+            PLAIN,
+            Movie,
+            None,
+            Some(r#"{"Path":"/m/plain-video3dformat.mkv","VideoType":"VideoFile"}"#),
+        ),
+        row(
+            DISC,
+            Movie,
+            None,
+            Some(r#"{"VideoType":"Iso","IsoType":"BluRay"}"#),
+        ),
+    ];
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&rows)
+        .await
+        .expect("save");
+    sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+        .bind(guid_to_db(SHOW_EPISODE))
+        .bind(guid_to_db(SHOW))
+        .execute(db.writer())
+        .await
+        .expect("ancestor");
+    sqlx::query(
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+           VALUES (?1, 0, ?2, ?3)"#,
+    )
+    .bind(guid_to_db(FILM_SET))
+    .bind(guid_to_db(FILM))
+    .bind(i32::from(LinkedChildType::Manual))
+    .execute(db.writer())
+    .await
+    .expect("link");
+    db
+}
+
+/// The listed items but `ids`.
+fn listed_but<const N: usize>(ids: [Uuid; N]) -> BTreeSet<Uuid> {
+    LISTED.into_iter().filter(|id| !ids.contains(id)).collect()
+}
+
+/// The four extras filters: an extra owned by an alternate version counts
+/// for its primary (`WithPrimaryVersions`), and a series or box set has one
+/// when an item below it or linked to it does. `false` is the exact
+/// complement.
+#[tokio::test]
+async fn extras_filters_count_a_versions_extras_and_roll_up_to_folders() {
+    type Field = fn(&mut InternalItemsQuery) -> &mut Option<bool>;
+    let db = seeded_extras().await;
+    let cases: [(&str, Field, BTreeSet<Uuid>); 4] = [
+        ("trailer", |q| &mut q.has_trailer, set([FILM, FILM_SET])),
+        (
+            "theme song",
+            |q| &mut q.has_theme_song,
+            set([SHOW, SHOW_EPISODE]),
+        ),
+        ("theme video", |q| &mut q.has_theme_video, set([SHOW])),
+        (
+            "special feature",
+            |q| &mut q.has_special_feature,
+            set([FILM, FILM_SET]),
+        ),
+    ];
+    for (name, field, with) in cases {
+        for want in [true, false] {
+            let mut query = InternalItemsQuery::default();
+            *field(&mut query) = Some(want);
+            let expected = if want {
+                with.clone()
+            } else {
+                LISTED.into_iter().filter(|id| !with.contains(id)).collect()
+            };
+            assert_eq!(
+                ids_among(&db, &query, &LISTED).await,
+                expected,
+                "{name} = {want}"
+            );
+        }
+    }
+}
+
+/// `VideoTypes` and `Is3D` roll up from the episode to its series, and match
+/// `Data` ordinally (EF's `Contains` is `instr`, not `LIKE`).
+#[tokio::test]
+async fn video_types_and_3d_roll_up_and_match_ordinally() {
+    use ferrofin_model::entities::VideoType;
+    let db = seeded_extras().await;
+    let types = |types: &[VideoType]| InternalItemsQuery {
+        video_types: types.to_vec(),
+        ..InternalItemsQuery::default()
+    };
+    assert_eq!(
+        ids_among(&db, &types(&[VideoType::Dvd]), &LISTED).await,
+        set([SHOW, SHOW_EPISODE])
+    );
+    assert_eq!(
+        ids_among(&db, &types(&[VideoType::VideoFile]), &LISTED).await,
+        set([FILM, FILM_SET, PLAIN])
+    );
+    assert_eq!(
+        ids_among(&db, &types(&[VideoType::Dvd, VideoType::BluRay]), &LISTED).await,
+        set([SHOW, SHOW_EPISODE, DISC]),
+        "a disc image matches on its `IsoType`"
+    );
+    let three_d = |is| InternalItemsQuery {
+        is_3d: Some(is),
+        ..InternalItemsQuery::default()
+    };
+    assert_eq!(
+        ids_among(&db, &three_d(true), &LISTED).await,
+        set([SHOW, SHOW_EPISODE]),
+        "a lower-case `video3dformat` in a path is not 3D"
+    );
+    assert_eq!(
+        ids_among(&db, &three_d(false), &LISTED).await,
+        listed_but([SHOW, SHOW_EPISODE])
+    );
 }
 
 /// `MinParentalRating` keeps unrated items and those at or above the
@@ -502,6 +701,18 @@ async fn descendant_roll_up_plan_builds_its_set_once() {
             is_place_holder: Some(true),
             ..InternalItemsQuery::default()
         },
+        InternalItemsQuery {
+            official_ratings: vec!["PG".to_owned(), "TV-14".to_owned()],
+            ..InternalItemsQuery::default()
+        },
+        InternalItemsQuery {
+            video_types: vec![ferrofin_model::entities::VideoType::BluRay],
+            ..InternalItemsQuery::default()
+        },
+        InternalItemsQuery {
+            is_3d: Some(false),
+            ..InternalItemsQuery::default()
+        },
     ] {
         let filter = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Series],
@@ -731,4 +942,43 @@ async fn provider_match_plan_seeks_the_items_rows() {
     assert!(plan.contains("(ItemId=?"), "{plan}");
     assert!(!plan.contains("SCAN p "), "{plan}");
     assert!(plan.contains("(Type=?"), "{plan}");
+}
+
+/// An extras filter reads the extras once (`MATERIALIZE o`) from
+/// `IX_BaseItems_ExtraType_OwnerId`, then seeks each owner's row for its
+/// primary and the owners themselves by id, so a typed browse keeps its own
+/// index seek.
+#[tokio::test]
+async fn extras_roll_up_plan_reads_the_extras_once() {
+    let db = seeded_extras().await;
+    for filter in [
+        InternalItemsQuery {
+            has_trailer: Some(true),
+            ..InternalItemsQuery::default()
+        },
+        InternalItemsQuery {
+            has_special_feature: Some(false),
+            ..InternalItemsQuery::default()
+        },
+    ] {
+        let filter = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            ..filter
+        };
+        let plan = plan(&db, &filter).await;
+        assert!(plan.contains("SEARCH bi USING INDEX"), "{plan}");
+        assert!(plan.contains("(Type=?"), "{plan}");
+        assert!(plan.contains("MATERIALIZE direct"), "{plan}");
+        assert!(plan.contains("MATERIALIZE o"), "{plan}");
+        assert_eq!(
+            plan.matches(" x USING COVERING INDEX IX_BaseItems_ExtraType_OwnerId")
+                .count(),
+            1,
+            "{plan}"
+        );
+        let steps = format!("{plan} |");
+        assert!(!steps.contains("SCAN d |"), "owners are a seek: {plan}");
+        assert!(!steps.contains("SCAN v |"), "versions are a seek: {plan}");
+        assert!(!plan.contains("CORRELATED LIST SUBQUERY"), "{plan}");
+    }
 }

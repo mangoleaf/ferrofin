@@ -52,7 +52,7 @@ use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::handler::Handler;
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
@@ -71,6 +71,7 @@ use crate::error::ApiError;
 use crate::extract::{DotnetGuid, Query, RequiredRouteString, RouteParameter, upload_body_limit};
 use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
 use crate::handlers::items::resolve_user;
+use crate::handlers::run_detached;
 use crate::handlers::users::UserIdQuery;
 use crate::state::AppState;
 
@@ -424,21 +425,6 @@ fn bind_query_image_format(format: Option<&str>) -> Result<Option<ImageFormat>, 
     }
 }
 
-/// Binds one required numeric route segment as ASP.NET binds a route value,
-/// with the rules the query binder ports (an integer trimmed, also in the `0x`,
-/// `#` and `&h` hex forms; a double through `DoubleModelBinder`, with group
-/// separators and no `inf`; measured on 12.4), a failure being the `400` its
-/// model binder produces for `[FromRoute, Required] int`/`double`. A NUL,
-/// which the query binder takes after a number, is a `400` here: Kestrel
-/// refuses a path holding one before any route runs (measured on 12.4).
-fn bind_route_number<T: serde::de::DeserializeOwned>(raw: &str, name: &str) -> Result<T, ApiError> {
-    let invalid = || ApiError::BadRequest(format!("The value '{raw}' is not valid for {name}."));
-    if raw.contains('\0') {
-        return Err(invalid());
-    }
-    T::deserialize(crate::query::value::Value::nullable(raw)).map_err(|_| invalid())
-}
-
 /// Selects the image of `image_type` at `index` (default `0`) from an item's
 /// image rows, mirroring `BaseItem.GetImageInfo(type, index)`.
 ///
@@ -611,11 +597,8 @@ pub(crate) async fn serve_image_file(
     {
         request_headers.remove(axum::http::header::IF_MODIFIED_SINCE);
     }
-    let mut response = ServeFile::new(&serve_path)
-        .oneshot(request)
-        .await
-        .map_err(|e| ApiError::NotFound(e.to_string()))?
-        .map(Body::new);
+    let Ok(response) = ServeFile::new(&serve_path).oneshot(request).await;
+    let mut response = response.map(Body::new);
     // The processor may have converted the format, so trust its MIME over the
     // extension `ServeFile` guessed.
     if let Some(mime) = content_type
@@ -924,10 +907,11 @@ async fn get_item_image(
 async fn get_item_image_by_index(
     State(state): State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
-    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, i32)>,
+    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<ImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    let image_index: i32 = crate::query::bind_route_number(&image_index, "imageIndex")?;
     let image_type = parse_image_type(&image_type)?;
     let resolved = authorize_image_item(&state, item_id, auth).await?;
     serve_item_image(
@@ -997,15 +981,15 @@ async fn get_item_image_parametrized(
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    let image_index: i32 = bind_route_number(&image_index, "imageIndex")?;
+    let image_index: i32 = crate::query::bind_route_number(&image_index, "imageIndex")?;
     let format = parse_image_format(&format)
         .ok_or_else(|| ApiError::BadRequest(format!("The value '{format}' is not valid.")))?;
-    let max_width: i32 = bind_route_number(&max_width, "maxWidth")?;
-    let max_height: i32 = bind_route_number(&max_height, "maxHeight")?;
+    let max_width: i32 = crate::query::bind_route_number(&max_width, "maxWidth")?;
+    let max_height: i32 = crate::query::bind_route_number(&max_height, "maxHeight")?;
     // Bound and validated for parity with the C# route parameters; see the
     // overlay TODO on this handler for why they are not forwarded yet.
-    let _percent_played: f64 = bind_route_number(&percent_played, "percentPlayed")?;
-    let _unplayed_count: i32 = bind_route_number(&unplayed_count, "unplayedCount")?;
+    let _percent_played: f64 = crate::query::bind_route_number(&percent_played, "percentPlayed")?;
+    let _unplayed_count: i32 = crate::query::bind_route_number(&unplayed_count, "unplayedCount")?;
     let query = ImageQuery {
         format: Some(image_format_name(format).to_owned()),
         max_width: Some(max_width),
@@ -1298,10 +1282,11 @@ macro_rules! by_name_image_handlers {
         async fn $indexed(
             State(state): State<AppState>,
             RequiredRouteString(name, _): RequiredRouteString<$name>,
-            Path((_, image_type, image_index)): Path<(String, String, i32)>,
+            Path((_, image_type, image_index)): Path<(String, String, String)>,
             Query(query): Query<ImageQuery>,
             request: Request,
         ) -> Result<Response, ApiError> {
+            let image_index: i32 = crate::query::bind_route_number(&image_index, "imageIndex")?;
             let image_type = parse_image_type(&image_type)?;
             serve_named_image(
                 &state,
@@ -1571,10 +1556,11 @@ async fn get_user_image_legacy(
 async fn get_user_image_by_index_legacy(
     state: State<AppState>,
     auth: Result<AuthenticatedIdentity, ApiError>,
-    Path((DotnetGuid(user_id), image_type, _image_index)): Path<(DotnetGuid, String, i32)>,
+    Path((DotnetGuid(user_id), image_type, image_index)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<LegacyUserImageQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    let _image_index: i32 = crate::query::bind_route_number(&image_index, "imageIndex")?;
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
     parse_image_type(&image_type)?;
     get_user_image(state, auth, Query(query.for_user(user_id)), request).await
@@ -1623,10 +1609,11 @@ async fn delete_user_image_legacy(
 async fn post_user_image_by_index_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((DotnetGuid(user_id), image_type, _image_index)): Path<(DotnetGuid, String, i32)>,
+    Path((DotnetGuid(user_id), image_type, image_index)): Path<(DotnetGuid, String, String)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
+    let _image_index: i32 = crate::query::bind_route_number(&image_index, "index")?;
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
     parse_image_type(&image_type)?;
     let query = UserIdQuery {
@@ -1643,8 +1630,9 @@ async fn post_user_image_by_index_legacy(
 async fn delete_user_image_by_index_legacy(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((DotnetGuid(user_id), image_type, _image_index)): Path<(DotnetGuid, String, i32)>,
+    Path((DotnetGuid(user_id), image_type, image_index)): Path<(DotnetGuid, String, String)>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    let _image_index: i32 = crate::query::bind_route_number(&image_index, "index")?;
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
     parse_image_type(&image_type)?;
     let query = UserIdQuery {
@@ -1736,10 +1724,11 @@ async fn set_item_image(
 async fn set_item_image_by_index(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((DotnetGuid(item_id), image_type, _image_index)): Path<(DotnetGuid, String, i32)>,
+    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, String)>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
+    let _image_index: i32 = crate::query::bind_route_number(&image_index, "imageIndex")?;
     let image_type = parse_image_type(&image_type)?;
     require_item(&state, item_id, auth.user.as_deref()).await?;
     let content_type = headers
@@ -1774,14 +1763,10 @@ async fn delete_item_image(
     RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(item_id), image_type)): Path<(DotnetGuid, String)>,
     Query(query): Query<ImageIndexQuery>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
     require_item(&state, item_id, auth.user.as_deref()).await?;
-    state
-        .providers
-        .delete_image(item_id, image_type, Some(query.image_index.unwrap_or(0)))
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(delete_image_answer(state, item_id, image_type, query.image_index.unwrap_or(0)).await)
 }
 
 /// `DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}` — indexed delete.
@@ -1804,15 +1789,35 @@ async fn delete_item_image(
 async fn delete_item_image_by_index(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, i32)>,
-) -> Result<StatusCode, ApiError> {
+    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, String)>,
+) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
+    let image_index: i32 = crate::query::bind_route_number(&image_index, "imageIndex")?;
     require_item(&state, item_id, auth.user.as_deref()).await?;
-    state
-        .providers
-        .delete_image(item_id, image_type, Some(image_index))
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(delete_image_answer(state, item_id, image_type, image_index).await)
+}
+
+/// `item.DeleteImageAsync(imageType, index)` and the `204` after it. The delete
+/// runs on a task of its own, as upstream finishes it for a client that hangs
+/// up (the file must not go without its image), and its failure is a throw,
+/// answered as `ExceptionMiddleware` answers it.
+async fn delete_image_answer(
+    state: AppState,
+    item_id: Uuid,
+    image_type: ImageType,
+    index: i32,
+) -> Response {
+    let deleted = run_detached(async move {
+        state
+            .providers
+            .delete_image(item_id, image_type, Some(index))
+            .await
+    })
+    .await;
+    match deleted {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_exception_response(),
+    }
 }
 
 /// The query string of the image-reorder route: the destination index.
@@ -1851,9 +1856,10 @@ pub(crate) struct UpdateImageIndexQuery {
 async fn update_item_image_index(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, i32)>,
+    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<UpdateImageIndexQuery>,
 ) -> Result<StatusCode, ApiError> {
+    let image_index: i32 = crate::query::bind_route_number(&image_index, "imageIndex")?;
     let image_type = parse_image_type(&image_type)?;
     require_item(&state, item_id, auth.user.as_deref()).await?;
     let swapped = state
@@ -2189,30 +2195,6 @@ mod tests {
                 "{raw} should be a 400"
             );
         }
-    }
-
-    #[test]
-    fn route_numbers_reject_garbage() {
-        assert_eq!(bind_route_number::<i32>("400", "maxWidth").ok(), Some(400));
-        assert_eq!(
-            bind_route_number::<f64>("50", "percentPlayed").ok(),
-            Some(50.0)
-        );
-        assert!(bind_route_number::<i32>("abc", "unplayedCount").is_err());
-        assert!(bind_route_number::<f64>("xyz", "percentPlayed").is_err());
-        // The binder's forms, measured on 12.4.
-        assert_eq!(bind_route_number::<i32>("0x10", "maxWidth").ok(), Some(16));
-        assert_eq!(bind_route_number::<i32>(" #10 ", "maxWidth").ok(), Some(16));
-        assert_eq!(bind_route_number::<i32>("&h10", "maxWidth").ok(), Some(16));
-        assert!(bind_route_number::<i32>("2147483648", "maxWidth").is_err());
-        assert!(bind_route_number::<f64>("inf", "percentPlayed").is_err());
-        // Kestrel refuses a NUL in the path; the query binder takes one.
-        assert!(bind_route_number::<i32>("1\0", "maxWidth").is_err());
-        assert!(bind_route_number::<f64>("1\0", "percentPlayed").is_err());
-        assert_eq!(
-            bind_route_number::<f64>("1,000", "percentPlayed").ok(),
-            Some(1000.0)
-        );
     }
 
     fn img(path: String) -> ItemImageInfo {

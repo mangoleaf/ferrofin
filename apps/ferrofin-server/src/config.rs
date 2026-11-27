@@ -84,8 +84,12 @@ const DEFAULT_SESSION_IDLE_HOURS: u32 = 24;
 // not the manifest's placeholder version. A plain comment: a doc line would become help text.
 #[command(name = "ferrofin-server", about = "Ferrofin media server", version = ferrofin_health::build_version())]
 pub struct Cli {
+    /// What to run instead of the server. With none, the server runs.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Program-data root directory (overrides `FERROFIN_DATA_DIR`).
-    #[arg(long = "data-dir", value_name = "DIR")]
+    #[arg(long = "data-dir", value_name = "DIR", global = true)]
     pub data_dir: Option<PathBuf>,
 
     /// Address to bind the HTTP listener to (overrides `FERROFIN_BIND_ADDR`).
@@ -110,8 +114,23 @@ pub struct Cli {
     ///
     /// When omitted, `config.toml` in the data directory (`--data-dir`, else
     /// `FERROFIN_DATA_DIR`, else the default location) is read if present.
-    #[arg(long = "config", value_name = "FILE")]
+    #[arg(long = "config", value_name = "FILE", global = true)]
     pub config_file: Option<PathBuf>,
+}
+
+/// The commands `ferrofin-server` runs instead of the server. Each resolves
+/// the data directory as the server does (`--data-dir`, `FERROFIN_DATA_DIR`,
+/// `config.toml`, the default).
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum Command {
+    /// Copy a stopped data directory and a snapshot of its database into a
+    /// new directory, with its configuration as the XML Jellyfin reads,
+    /// leaving the source untouched.
+    // Hidden from `--help` (the man page's synopsis still shows a generic
+    // `[subcommands]`) until the round trip is proven on every route: the export still lacks the removal of Ferrofin's
+    // own objects (gl-1553) and the remaining source generations (gl-1551, gl-1552); gl-1570 documents it.
+    #[command(hide = true)]
+    ExportJellyfin(crate::export_cmd::ExportJellyfinArgs),
 }
 
 /// The `FERROFIN_*` variables whose `config.toml` key is not their stem
@@ -512,8 +531,8 @@ pub struct Config {
     /// original file.
     pub image_resize_budget_mb: u32,
 
-    /// The largest remote image downloaded, and the largest metadata provider
-    /// response, in MiB. Resolved
+    /// The largest remote image downloaded, the largest metadata provider
+    /// response, and the largest subtitle read from a URL, in MiB. Resolved
     /// `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` env > `image_download_max_mb` in
     /// `config.toml` > 64, clamped to [`RequestLimits::DOWNLOAD_MAX_MB`] with a
     /// warning. A larger one is refused, and the read stops at the limit.
@@ -653,9 +672,9 @@ pub struct Config {
     pub enable_metrics: Option<bool>,
 
     /// Suppress the compiled-in extensions (intro skipper, file
-    /// transformation, merge versions, LDAP-Auth) — `true` registers none of them but
-    /// the Ferrofin settings extension, the server's own settings page
-    /// (`ferrofin_extensions::registered_extensions`).
+    /// transformation, merge versions, LDAP-Auth, Single Sign-On) — `true`
+    /// registers none of them but the Ferrofin settings extension, the
+    /// server's own settings page (`ferrofin_extensions::registered_extensions`).
     ///
     /// This exists for measurement. A benchmark leg has to compare like with
     /// like, and the Jellyfin leg runs with no plugins installed; leaving
@@ -779,8 +798,9 @@ pub struct Config {
     /// `config.toml` > default; must be within [`CACHE_TTL_RANGE_SECS`].
     pub row_cache_ttl_secs: Option<u32>,
 
-    /// How many items generate trickplay at once (each one's widths in turn,
-    /// an ffmpeg frame extraction plus tile packing per width). A library scan
+    /// How many items generate trickplay at once (each one's widths' frames
+    /// from one ffmpeg run, or one per width when trickplay uses a VAAPI or QSV
+    /// GPU, then each width's tiles packed). A library scan
     /// runs several; the scheduled task runs one but shares the cap. `None` =
     /// `auto`: as many as the shared image-encoding pool allows
     /// (`ParallelImageEncodingLimit`, else the usable cores).
@@ -2143,8 +2163,7 @@ fn resolve_private_allow(
 /// A resolved private allow-list, its refused entries left out; empty when
 /// unset.
 fn private_allow_list(raw: Option<&str>) -> ferrofin_providers::destination::PrivateAllowList {
-    raw.map(|raw| ferrofin_providers::destination::PrivateAllowList::parse(raw).0)
-        .unwrap_or_default()
+    raw.map_or_default(|raw| ferrofin_providers::destination::PrivateAllowList::parse(raw).0)
 }
 
 /// Resolves the stdout log format: the `FERROFIN_LOG_FORMAT` env var when it
@@ -2702,6 +2721,83 @@ mod tests {
         fn var(&self, key: &str) -> Option<String> {
             self.0.get(key).cloned()
         }
+    }
+
+    #[test]
+    fn the_server_flags_still_run_the_server_with_no_subcommand() {
+        let cli = Cli::try_parse_from([
+            "ferrofin-server",
+            "--data-dir",
+            "/d",
+            "--bind",
+            "0.0.0.0",
+            "--port",
+            "9000",
+            "--published-url",
+            "https://media.example",
+            "--ffmpeg",
+            "/usr/bin/ffmpeg",
+            "--config",
+            "/etc/ferrofin.toml",
+        ])
+        .unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.data_dir, Some(PathBuf::from("/d")));
+        assert_eq!(cli.bind_addr.as_deref(), Some("0.0.0.0"));
+        assert_eq!(cli.port, Some(9000));
+        assert_eq!(cli.published_url.as_deref(), Some("https://media.example"));
+        assert_eq!(cli.ffmpeg_path, Some(PathBuf::from("/usr/bin/ffmpeg")));
+        assert_eq!(cli.config_file, Some(PathBuf::from("/etc/ferrofin.toml")));
+    }
+
+    #[test]
+    fn export_jellyfin_takes_the_data_directory_flags_on_either_side() {
+        for args in [
+            [
+                "ferrofin-server",
+                "export-jellyfin",
+                "--data-dir",
+                "/d",
+                "--config",
+                "/c.toml",
+                "--out",
+                "/o",
+            ],
+            [
+                "ferrofin-server",
+                "--data-dir",
+                "/d",
+                "--config",
+                "/c.toml",
+                "export-jellyfin",
+                "--out",
+                "/o",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Command::ExportJellyfin(export)) = &cli.command else {
+                panic!("{args:?} parsed as {cli:?}");
+            };
+            assert_eq!(export.out, PathBuf::from("/o"));
+            assert_eq!(cli.data_dir, Some(PathBuf::from("/d")));
+            assert_eq!(cli.config_file, Some(PathBuf::from("/c.toml")));
+        }
+        // The server's own flags are not the export's.
+        assert!(
+            Cli::try_parse_from([
+                "ferrofin-server",
+                "export-jellyfin",
+                "--port",
+                "1",
+                "--out",
+                "/o"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["ferrofin-server", "export-jellyfin"]).is_err(),
+            "--out is required"
+        );
     }
 
     #[test]

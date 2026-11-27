@@ -139,8 +139,7 @@ impl ServerApplicationPaths for TempPaths {
     fn log_directory_path(&self) -> String {
         Path::new(&self.transcode)
             .parent()
-            .map(|dir| dir.to_string_lossy().into_owned())
-            .unwrap_or_default()
+            .map_or_default(|dir| dir.to_string_lossy().into_owned())
     }
     fn transcode_path(&self) -> String {
         self.transcode.clone()

@@ -101,12 +101,14 @@ impl ScanTrigger {
     }
 
     /// The scan trigger of a scheduled-task run started by `trigger` (the
-    /// task registry's `api` / `schedule` / `startup`). Anything else — a
-    /// run with no recorded trigger — is the task's own schedule.
+    /// task registry's `api` / `schedule` / `startup`, or `library_change`
+    /// for a "Scan Media Library" run a library change queued, which is a
+    /// request over the API). Anything else — a run with no recorded
+    /// trigger — is the task's own schedule.
     #[must_use]
     pub fn from_task_trigger(trigger: &str) -> Self {
         match trigger {
-            "api" => Self::Api,
+            "api" | "library_change" => Self::Api,
             "startup" => Self::Startup,
             _ => Self::Schedule,
         }
@@ -648,9 +650,10 @@ pub trait LibraryManager: Send + Sync {
     ///   policy;
     /// - any other view reports the kind of the folder it shows, with Folder
     ///   policy unless that folder is a channel or in one. A non-recursive
-    ///   browse, and any browse of a Season, moves `query` onto that folder
-    ///   (`parent_id` and `parent_row`, clearing `user_root_children`); a
-    ///   recursive one stays on the view.
+    ///   browse, any browse of a Season, and any browse of a playlists folder
+    ///   with no user (which lists its own children) moves `query` onto that
+    ///   folder (`parent_id` and `parent_row`, clearing `user_root_children`);
+    ///   any other recursive one stays on the view.
     ///   With no such folder, or one that is gone, the view is left as asked
     ///   and reports itself, with no Folder policy.
     ///
@@ -795,7 +798,13 @@ pub trait LibraryManager: Send + Sync {
         Ok(())
     }
 
-    /// Deletes an item, honoring the given [`DeleteOptions`].
+    /// Deletes an item, honoring the given [`DeleteOptions`]. The core
+    /// implementation holds the item's metadata
+    /// ([`ProviderManager::lock_item_metadata`]) from before it reads the row
+    /// until the delete is done, so a refresh that loaded the row first
+    /// cannot save the deleted item back.
+    ///
+    /// [`ProviderManager::lock_item_metadata`]: crate::providers::ProviderManager::lock_item_metadata
     async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError>;
 
     /// Merges several videos into one version group.
@@ -1157,10 +1166,13 @@ pub trait LibraryManager: Send + Sync {
     /// through `GetYear`, which creates the `Year` item when it does not exist
     /// yet. Here the distinct years come from [`Self::get_distinct_years`]
     /// over the same `query` and are resolved via [`Self::get_named_items`];
-    /// the concrete manager materializes a missing `Year` on that lookup, and
-    /// the library scan creates every scanned year up front, so each year
-    /// resolves. The default still drops a slot no implementation resolved
-    /// (a fake without the provisioner), mirroring `.Where(i => i is not null)`.
+    /// the concrete manager creates a missing `Year` on that lookup, so each
+    /// year resolves. Every distinct year is resolved before the paging, as
+    /// `GetAllItems` runs each through `GetYear` before `Skip`/`Take`, so one
+    /// call creates every year it counts. Only a `/Years` lookup creates one: a
+    /// library scan writes no `Year` row, as upstream's does not. The default still
+    /// drops a slot no implementation resolved (a fake without the
+    /// provisioner), mirroring `.Where(i => i is not null)`.
     async fn get_years(
         &self,
         query: &InternalItemsQuery,
@@ -1192,28 +1204,21 @@ pub trait LibraryManager: Send + Sync {
         // is the number of distinct years, not the size of the page.
         let total = i32::try_from(years.len()).unwrap_or(i32::MAX);
         let start = usize::try_from(query.start_index.unwrap_or(0).max(0)).unwrap_or(0);
-        // Page the year list first, then resolve the slice in one query. Every
-        // year resolves (the scan materializes them and the lookup creates any
-        // straggler), so paging the names is paging the rows.
-        let paged: Vec<String> = match query.limit.filter(|l| *l >= 0) {
-            Some(limit) => years
-                .into_iter()
-                .skip(start)
-                .take(usize::try_from(limit).unwrap_or(usize::MAX))
-                .map(|y| y.to_string())
-                .collect(),
-            None => years
-                .into_iter()
-                .skip(start)
-                .map(|y| y.to_string())
-                .collect(),
-        };
-        let items: Vec<BaseItemEntity> = self
-            .get_named_items(BaseItemKind::Year, &paged)
+        // Resolve every year in one query, then page: `GetYear` creates the
+        // missing rows of the whole list before `Skip`/`Take` upstream.
+        let names: Vec<String> = years.iter().map(ToString::to_string).collect();
+        let page = self
+            .get_named_items(BaseItemKind::Year, &names)
             .await?
             .into_iter()
-            .flatten()
-            .collect();
+            .skip(start);
+        let items: Vec<BaseItemEntity> = match query.limit.filter(|l| *l >= 0) {
+            Some(limit) => page
+                .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                .flatten()
+                .collect(),
+            None => page.flatten().collect(),
+        };
         Ok(QueryResult::new(query.start_index, Some(total), items))
     }
 
@@ -1285,15 +1290,18 @@ pub trait LibraryManager: Send + Sync {
         Ok(map)
     }
 
-    /// Queues a full library scan.
+    /// Queues the scan of every library a library change ends with
+    /// (`ILibraryManager.QueueLibraryScan`). The real manager runs it as a
+    /// run of the "Scan Media Library" task, queued behind a running one
+    /// (see [`run_requested_library_scans`](Self::run_requested_library_scans)).
     async fn queue_library_scan(&self) -> Result<(), ServiceError>;
 
-    /// Queues a scan restricted to one library. `library_id` is the library's
-    /// CollectionFolder id — what jellyfin-web's per-library "Scan Library"
-    /// button refreshes via `POST /Items/{id}/Refresh`. Defaults to the full
+    /// Queues a scan restricted to one library, for a library change that
+    /// touches that library alone (it was added or renamed). `library_id` is the
+    /// library's CollectionFolder id. Defaults to the full
     /// [`queue_library_scan`](Self::queue_library_scan) so existing
     /// implementations need no change; the real manager narrows the filesystem
-    /// walk to that library's folders.
+    /// walk to that library's folders and runs it as the full one runs.
     async fn queue_library_scan_scoped(&self, _library_id: Uuid) -> Result<(), ServiceError> {
         self.queue_library_scan().await
     }
@@ -1495,6 +1503,44 @@ pub trait LibraryManager: Send + Sync {
         self.queue_library_scan().await.map(|()| true)
     }
 
+    /// Runs the scans library changes asked for
+    /// ([`queue_library_scan`](Self::queue_library_scan),
+    /// [`queue_library_scan_scoped`](Self::queue_library_scan_scoped)) that
+    /// no "Scan Media Library" run has started on, one after another, and
+    /// returns only when they have FINISHED: that task's run for a library
+    /// change, as upstream's `QueueLibraryScan` queues
+    /// `RefreshMediaLibraryTask`. An added or renamed library's scan keeps
+    /// its scope, that library alone, where upstream's task scans every
+    /// library. Each scan takes an equal share of `progress`. Nothing is left to scan when a
+    /// [`run_library_scan`](Self::run_library_scan) started after the changes.
+    ///
+    /// Returns as [`run_library_scan`](Self::run_library_scan) does.
+    /// Defaults to a scan of every library; the real manager overrides it.
+    ///
+    /// # Errors
+    ///
+    /// A scan failed (or panicked), so the task records `Failed`: the first
+    /// failure, once the other libraries' scans have run.
+    async fn run_requested_library_scans(
+        &self,
+        progress: Option<ScanProgressSink>,
+    ) -> Result<bool, ServiceError> {
+        self.run_library_scan(ScanTrigger::Api, progress).await
+    }
+
+    /// Resolves once no scan that was told to stop is still running: at once
+    /// unless the running scan was cancelled, otherwise when it has ended.
+    ///
+    /// For the "Scan Media Library" run. Its stop withdraws its wait
+    /// ([`run_library_scan`](Self::run_library_scan)), and the scan it leaves
+    /// ends at its next item: the run waits here for that, so it stays
+    /// `Cancelling` until its scan has ended, as upstream's does until
+    /// `ValidateMediaLibraryInternal` returns.
+    ///
+    /// A manager with no scanner runs no scan, so the default resolves at
+    /// once.
+    async fn stopped_scan_ended(&self) {}
+
     /// Whether a full library validation is running: upstream's
     /// `ILibraryManager.IsScanRunning`, which `ValidateMediaLibraryInternal`
     /// holds for the whole of a full scan (the "Scan Media Library" task,
@@ -1636,7 +1682,8 @@ pub enum AdminFlagOutcome {
 /// How [`UserManager::create_external_user`] sets up a user an outside
 /// authentication provider creates at their first sign-in: what upstream's
 /// LDAP plugin writes onto the new `User` before `UpdateUserAsync`
-/// (jellyfin-plugin-ldapauth v24, `LdapAuthenticationProviderPlugin.Authenticate`).
+/// (jellyfin-plugin-ldapauth v24, `LdapAuthenticationProviderPlugin.Authenticate`),
+/// and Ferrofin's own [`unusable_password`](Self::unusable_password).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExternalUserSetup {
     /// Saved as the user's `AuthenticationProviderId`, so their sign-ins go
@@ -1650,6 +1697,12 @@ pub struct ExternalUserSetup {
     /// upstream's `SetPreference` stores them; `None` keeps the new user's
     /// empty one.
     pub enabled_folders: Option<Vec<String>>,
+    /// Store the hash of a random secret no one keeps
+    /// ([`unusable_password`](ferrofin_common::cryptography::unusable_password))
+    /// as the user's password, in the default provider's format, so the user
+    /// never has an empty password, whatever provider they later belong to.
+    /// Single Sign-On sets it; LDAP, as upstream's plugin, does not.
+    pub unusable_password: bool,
 }
 
 /// The state of the server a policy save is checked against: the user's
@@ -1744,20 +1797,52 @@ pub trait UserManager: Send + Sync {
     /// Creates a user with the given name and returns the new row.
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError>;
 
+    /// Creates the first-run administrator `name` and returns the new row, as
+    /// upstream's `InitializeAsync` creates its user (`UserManager.cs:745-772`):
+    /// `IsAdministrator`, `EnableContentDeletion` and
+    /// `EnableRemoteControlOfOtherUsers` are set on the new user before its one
+    /// save, and no policy is saved after it. [`Self::initialize`] creates the
+    /// same user under the host user's name.
+    ///
+    /// The default creates the user and then grants the three with
+    /// [`Self::update_policy`], so impls without a store of their own compile
+    /// unchanged; the concrete manager writes them with the user's other rows.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::InvalidInput`] for a name that is not valid or is
+    /// already taken, or whatever the save surfaces.
+    async fn create_first_admin(&self, name: &str) -> Result<UserEntity, ServiceError> {
+        let user = self.create_user(name).await?;
+        let user_id =
+            Uuid::parse_str(&user.id).map_err(|error| ServiceError::backend(error.to_string()))?;
+        let mut policy = self
+            .get_user_dto(&user, None)
+            .await?
+            .policy
+            .unwrap_or_default();
+        policy.is_administrator = true;
+        policy.enable_content_deletion = true;
+        policy.enable_remote_control_of_other_users = true;
+        self.update_policy(user_id, &policy).await?;
+        Ok(user)
+    }
+
     /// Creates a user `name` whose sign-ins belong to an outside
     /// authentication provider, set up as `setup` says, and returns the new
     /// row. Upstream's LDAP plugin calls `CreateUserAsync`, sets the provider
     /// ids and the folder access on the user, then saves it with
     /// `UpdateUserAsync`.
     ///
-    /// The concrete manager writes the row and `setup` in one transaction.
-    /// Created first and set up after, the account would for a moment be a
-    /// local one without a password, which the built-in provider signs in
-    /// with an empty password; upstream has that window. It also records the
-    /// "User … has been created" activity entry, as `CreateUserAsync` does.
-    /// The default creates the user and then saves `setup` with
-    /// [`Self::update_policy`], so impls without a store of their own compile
-    /// unchanged.
+    /// The concrete manager writes the row and `setup`, the unusable password
+    /// included, in one transaction. Created first and set up after, the
+    /// account would for a moment be a local one without a password, which
+    /// the built-in provider signs in with an empty password; upstream has
+    /// that window. It also records the "User … has been created" activity
+    /// entry, as `CreateUserAsync` does. The default creates the user, sets
+    /// the unusable password with [`Self::change_password`], and then saves
+    /// `setup` with [`Self::update_policy`], so impls without a store of
+    /// their own compile unchanged.
     ///
     /// # Errors
     ///
@@ -1771,6 +1856,11 @@ pub trait UserManager: Send + Sync {
         let user = self.create_user(name).await?;
         let user_id =
             Uuid::parse_str(&user.id).map_err(|error| ServiceError::backend(error.to_string()))?;
+        if setup.unusable_password {
+            // Still the default provider's user, which stores the hash.
+            self.change_password(user_id, &ferrofin_common::cryptography::unusable_password())
+                .await?;
+        }
         let mut policy = self
             .get_user_dto(&user, None)
             .await?
@@ -1798,10 +1888,15 @@ pub trait UserManager: Send + Sync {
     /// Deletes a user by id.
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError>;
 
-    /// Resets a user's password to empty.
+    /// Resets a user's password to empty: [`Self::change_password`] with an
+    /// empty password.
     async fn reset_password(&self, user_id: Uuid) -> Result<(), ServiceError>;
 
     /// Changes a user's password.
+    ///
+    /// Once the password is saved the implementation writes the
+    /// "Password has been changed" activity entry, as C# `ChangePassword`
+    /// publishes `UserPasswordChangedEventArgs`, so callers write none.
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError>;
 
     /// Authenticates a user by name/password, returning the row on success.
@@ -1817,6 +1912,34 @@ pub trait UserManager: Send + Sync {
         remote_endpoint: &str,
         is_user_session: bool,
     ) -> Result<Option<UserEntity>, ServiceError>;
+
+    /// Applies the account rules of a sign-in to `user`, whatever proved who
+    /// they are: the account is not disabled, a client outside the local
+    /// network (`remote_endpoint`) needs remote access, and the parental
+    /// schedule allows the sign-in now. These are the checks upstream's
+    /// `UserManager.AuthenticateUser` makes once a provider answered, in its
+    /// order.
+    ///
+    /// [`Self::authenticate_user`] applies them before it counts a wrong
+    /// password, so a disabled account is refused as disabled whatever
+    /// password was sent. A caller that signs a user in without
+    /// `authenticate_user` (the SSO flow) calls this itself before
+    /// `SessionManager::authenticate_direct`, which does not apply the rules:
+    /// Quick Connect signs in through it, and upstream's `AuthenticateDirect`
+    /// applies none. The concrete manager logs each refusal's `login failed`
+    /// warning with the rule's `reason`, so a caller need not log it again.
+    ///
+    /// No default body, so no implementation skips the rules unnoticed.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Forbidden`] with the message of the rule that refused,
+    /// or whatever the reads surface.
+    async fn ensure_sign_in_allowed(
+        &self,
+        user: &UserEntity,
+        remote_endpoint: &str,
+    ) -> Result<(), ServiceError>;
 
     /// Lists the available authentication providers.
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError>;
@@ -1896,8 +2019,7 @@ pub trait UserManager: Send + Sync {
             .get_user_dto(user, None)
             .await?
             .configuration
-            .map(|c| c.latest_items_excludes)
-            .unwrap_or_default())
+            .map_or_default(|c| c.latest_items_excludes))
     }
 
     /// The cache tag of `user`'s profile image (C#
@@ -2814,6 +2936,11 @@ pub trait MediaSourceManager: Send + Sync {
     }
 
     /// Gets the static (non-probed) media sources for an item.
+    ///
+    /// An item that cannot have any (one that is not a video, an audio item
+    /// or a Live TV channel: a folder, a by-name item, a photo, a book) is
+    /// [`ServiceError::InvalidInput`], as upstream's `GetStaticMediaSources`
+    /// throws `ArgumentException` for an item that is not `IHasMediaSources`.
     async fn get_static_media_sources(
         &self,
         item_id: Uuid,
@@ -3251,6 +3378,33 @@ pub trait VirtualFolderManager: Send + Sync {
         Ok(self.get_virtual_folders().await?.into())
     }
 
+    /// Every location the libraries list, read afresh, for deleting the folder
+    /// of a location no library lists any more (`AggregateFolder.ValidateChildren`);
+    /// `None` while that list cannot be known whole. A location left out of it
+    /// reads as removed and takes every item under it, so `None` covers no
+    /// library configured, a shortcut that did not resolve, and a library
+    /// listing no location without readable options that list none either.
+    /// A library created with no folder adds no location, as upstream's root
+    /// reads it. The same list, after the root's own path, is the root's
+    /// `PhysicalLocationsList`, so it comes in the order upstream's root
+    /// gathers it: each library and each of its shortcuts as its folder lists
+    /// them.
+    ///
+    /// The default lists the folders afresh through
+    /// [`get_virtual_folders`](Self::get_virtual_folders), each library's
+    /// locations sorted as that listing gives them, so not in upstream's
+    /// order, and answers `None` while any library lists no location, since
+    /// it cannot tell those cases apart.
+    async fn locations_for_removal(&self) -> Result<Option<Vec<String>>, ServiceError> {
+        let folders = self.get_virtual_folders().await?;
+        if folders.is_empty() || folders.iter().any(|f| f.locations.is_empty()) {
+            return Ok(None);
+        }
+        Ok(Some(
+            folders.into_iter().flat_map(|f| f.locations).collect(),
+        ))
+    }
+
     /// Adds a virtual folder with the given name, optional collection type,
     /// media paths, and library options.
     ///
@@ -3452,8 +3606,9 @@ pub trait RemoteSimilarItemsProvider: Send + Sync {
     fn supports(&self, item_kind: BaseItemKind) -> bool;
 
     /// How long the manager may reuse this provider's results from disk.
-    /// `None` disables caching for it.
-    fn cache_duration(&self) -> Option<std::time::Duration> {
+    /// `None` disables caching for it. Async because upstream's
+    /// `CacheDuration` reads the plugin's settings each time it is asked.
+    async fn cache_duration(&self) -> Option<std::time::Duration> {
         None
     }
 

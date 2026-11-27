@@ -1,7 +1,8 @@
 [tools]
 # components repeat rust-toolchain.toml's: mise exports RUSTUP_TOOLCHAIN, so rustup ignores that file's list
-rust = { version = "1.99.1", components = "rustfmt,clippy,llvm-tools-preview" }
+rust = { version = "1.100.0", components = "rustfmt,clippy,llvm-tools-preview" }
 "cargo:cargo-nfpm" = "0.1.3"
+"cargo:cargo-about" = { version = "0.9.3", features = "cli" } # the binary needs `cli`
 git-cliff = "2.14.2"
 
 [tasks.deb]
@@ -12,6 +13,7 @@ mkdir -p dist
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
 export FERROFIN_VERSION="$version"
 contrib/debian/gen-docs.sh
+scripts/third-party-notices.sh
 cargo nfpm package -p ferrofin-server -f deb -o dist/
 find dist -maxdepth 1 -name 'ferrofin_*.deb' -print -quit
 '''
@@ -26,6 +28,7 @@ mkdir -p dist
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
 export FERROFIN_VERSION="$version"
 contrib/debian/gen-docs.sh
+scripts/third-party-notices.sh
 cargo nfpm package --no-build -p ferrofin-server -f deb -o dist/
 find dist -maxdepth 1 -name 'ferrofin_*.deb' -print -quit
 '''

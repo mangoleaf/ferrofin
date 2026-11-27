@@ -626,7 +626,7 @@ fn local_providers() -> Vec<Provider> {
     // `GetPluginSummary<BoxSet>` lists both, so a Collections library's
     // options offer the saver its `MetadataSavers` list must name.
     providers.push(Provider {
-        name: crate::box_set_xml::SAVER_NAME,
+        name: crate::container_xml::SAVER_NAME,
         caps: &[Cap::LocalMetadata, Cap::MetadataSaver],
         types: &["BoxSet"],
         default_enabled: true,

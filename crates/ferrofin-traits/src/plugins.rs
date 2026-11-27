@@ -77,13 +77,25 @@ pub struct PluginUpdateInfo {
     pub repository_url: Option<String>,
 }
 
-/// A plugin's bundled image, served by `GET /Plugins/{id}/{version}/Image`.
+/// A plugin's image, served by `GET /Plugins/{id}/{version}/Image`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginImage {
     /// The image's MIME type (e.g. `image/png`).
     pub content_type: String,
-    /// The raw image bytes.
-    pub data: Vec<u8>,
+    /// Where the image is, which decides how it is served.
+    pub source: PluginImageSource,
+}
+
+/// Where a [`PluginImage`] is: `GetPluginImage`'s two branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginImageSource {
+    /// Bytes the plugin carries (the `ImageResourceName` branch's
+    /// `File(stream, …)`).
+    Bytes(Vec<u8>),
+    /// The file stored for a repository plugin (the `ImagePath` branch's
+    /// `PhysicalFile`): served with the file's `Last-Modified`, answering a
+    /// conditional request.
+    File(PathBuf),
 }
 
 /// A compiled-in plugin registered with the manager at the composition root.
@@ -110,6 +122,10 @@ pub struct RegisteredPlugin {
     /// The file a runtime-loaded (WASM) plugin was loaded from, whatever its
     /// name; uninstalling the plugin deletes it. `None` for a compiled-in one.
     pub artifact: Option<PathBuf>,
+    /// Adds the members the plugin's configuration type computes from its
+    /// others (C# get-only properties, which `GET /Plugins/{id}/Configuration`
+    /// serializes and a save ignores) to every read of its configuration.
+    pub config_view: Option<fn(&mut serde_json::Map<String, serde_json::Value>)>,
 }
 
 /// One dashboard page (or page resource) a plugin ships. Mirrors the C#
@@ -125,6 +141,9 @@ pub struct PluginConfigPage {
     /// Whether the dashboard drawer shows a direct link to this page
     /// (`EnableInMainMenu`).
     pub enable_in_main_menu: bool,
+    /// The MIME type the page is served with, where its name's extension does
+    /// not give it (upstream takes it from the embedded resource's file name).
+    pub content_type: Option<&'static str>,
 }
 
 impl RegisteredPlugin {
@@ -149,6 +168,7 @@ impl RegisteredPlugin {
             default_config: b"{}".to_vec(),
             config_pages: Vec::new(),
             artifact: None,
+            config_view: None,
         }
     }
 
@@ -176,6 +196,16 @@ impl RegisteredPlugin {
     #[must_use]
     pub fn with_default_config(mut self, config: Vec<u8>) -> Self {
         self.default_config = config;
+        self
+    }
+
+    /// Sets [`Self::config_view`].
+    #[must_use]
+    pub fn with_config_view(
+        mut self,
+        view: fn(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> Self {
+        self.config_view = Some(view);
         self
     }
 
@@ -226,6 +256,38 @@ pub trait PluginManager: Send + Sync {
     /// [`ServiceError::InvalidInput`] when `config` is not valid JSON.
     async fn set_plugin_configuration(&self, id: Uuid, config: Vec<u8>)
     -> Result<(), ServiceError>;
+
+    /// A plugin's private data (opaque bytes, JSON by convention), or `None`
+    /// while it has none.
+    ///
+    /// Kept beside the plugin's configuration in a file no route serves:
+    /// [`get_plugin_configuration`](Self::get_plugin_configuration) never
+    /// returns it, and `POST /Plugins/{id}/Configuration` cannot write it. It
+    /// is for what a plugin must keep but no administrator may read back, such
+    /// as the Single Sign-On plugin's client secrets. The default reports
+    /// none, for a manager that keeps no files.
+    ///
+    /// # Errors
+    /// [`ServiceError::NotFound`] when no such plugin is installed; backend
+    /// errors when the file cannot be read.
+    async fn get_plugin_private_data(&self, _id: Uuid) -> Result<Option<Vec<u8>>, ServiceError> {
+        Ok(None)
+    }
+
+    /// Replaces a plugin's private data (see
+    /// [`get_plugin_private_data`](Self::get_plugin_private_data)), written
+    /// whole (a temporary file, then a rename) and readable by the server's
+    /// user only (`0600` on Unix). The default refuses, for a manager that
+    /// keeps no files.
+    ///
+    /// # Errors
+    /// [`ServiceError::NotFound`] when no such plugin is installed; backend
+    /// errors when the file cannot be written.
+    async fn set_plugin_private_data(&self, _id: Uuid, _data: Vec<u8>) -> Result<(), ServiceError> {
+        Err(ServiceError::backend(
+            "this plugin manager keeps no private plugin data",
+        ))
+    }
 
     /// Returns a plugin's bundled image, or `None` when it has none.
     async fn plugin_image(&self, id: Uuid) -> Result<Option<PluginImage>, ServiceError>;
@@ -346,9 +408,12 @@ pub trait PluginManager: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// A configuration page's HTML by its page `name`, for
+    /// A configuration page by its page `name`, for
     /// `GET /web/ConfigurationPage`. Defaults to `None` (no such page).
-    async fn get_configuration_page(&self, _name: &str) -> Result<Option<Vec<u8>>, ServiceError> {
+    async fn get_configuration_page(
+        &self,
+        _name: &str,
+    ) -> Result<Option<PluginConfigPage>, ServiceError> {
         Ok(None)
     }
 }
@@ -446,13 +511,16 @@ fn _assert_object_safe_plugin_offered_item_store(_: &dyn PluginOfferedItemStore)
 ///
 /// Port of the File Transformation plugin's `TransformFile` delegate: given the
 /// served file's (web-root-relative) path and its current textual contents,
-/// returns the transformed contents. Implementations must be pure over their
-/// inputs plus their own configuration — the pipeline may run them on every
-/// request of a matching file.
+/// returns the transformed contents, or `None` for no change. Implementations
+/// must be pure over their inputs plus their own configuration — the pipeline
+/// may run them on every request of a matching file.
 #[async_trait]
 pub trait FileTransformer: Send + Sync {
-    /// Transforms `contents` for the file at `path`.
-    async fn transform(&self, path: &str, contents: String) -> String;
+    /// Transforms `contents` for the file at `path`: the new contents, or
+    /// `None` to leave them unchanged. The contents are borrowed so that the
+    /// pipeline keeps them, without a copy, for a result it refuses (one past
+    /// its output cap).
+    async fn transform(&self, path: &str, contents: &str) -> Option<String>;
 
     /// Whether [`transform`](Self::transform) could change the file at `path`
     /// now. `false` promises that it would return the contents unchanged; a
@@ -607,6 +675,12 @@ impl PluginManager for DisabledPluginManager {
         id: Uuid,
         _config: Vec<u8>,
     ) -> Result<(), ServiceError> {
+        Err(Self::not_found(id))
+    }
+    async fn get_plugin_private_data(&self, id: Uuid) -> Result<Option<Vec<u8>>, ServiceError> {
+        Err(Self::not_found(id))
+    }
+    async fn set_plugin_private_data(&self, id: Uuid, _data: Vec<u8>) -> Result<(), ServiceError> {
         Err(Self::not_found(id))
     }
     async fn plugin_image(&self, _id: Uuid) -> Result<Option<PluginImage>, ServiceError> {

@@ -232,6 +232,7 @@ pub(crate) async fn download_image_or_none(url: &str) -> Option<(Vec<u8>, String
         Ok(image) => Some(image),
         Err(error) => {
             tracing::debug!(
+                item_id = crate::rate_limit::request_item(),
                 url = %ferrofin_util::source_url::redact_url(url),
                 ?error,
                 "remote image dropped"
@@ -667,7 +668,7 @@ mod negative_cache_tests {
     #[test]
     fn the_entry_closest_to_expiring_makes_room() {
         let cache = NegativeImageCache::with_capacity(Duration::from_hours(1), 3);
-        let urls: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let urls: Vec<Uuid> = Vec::from_fn(5, |_| Uuid::new_v4());
         for url in &urls {
             cache.insert(*url);
             std::thread::sleep(Duration::from_millis(1));
@@ -749,8 +750,8 @@ mod quota_tests {
 mod destination_tests {
     use super::*;
     use crate::destination::{self, DestinationPolicy};
-    use crate::guarded_http::MAX_REDIRECTS;
     use crate::mock_http::MockServer;
+    use ferrofin_util::http_client::MAX_REDIRECTS;
     use rstest::rstest;
     use std::net::IpAddr;
     use std::sync::atomic::Ordering;
@@ -769,7 +770,7 @@ mod destination_tests {
     }
 
     fn guarded(allowed_host: &'static str) -> GuardedHttp {
-        GuardedHttp::new(Arc::new(PrivateBut(allowed_host)), false, &IMAGE_FETCH)
+        GuardedHttp::new(Arc::new(PrivateBut(allowed_host)), None, &IMAGE_FETCH)
     }
 
     fn redirect(location: &str) -> Vec<u8> {
@@ -791,7 +792,7 @@ mod destination_tests {
         let server = MockServer::start_raw(vec![MockServer::raw_ok(PNG_HEADER, PNG)]).await;
         let http = GuardedHttp::new(
             Arc::new(destination::ImageDestinations::default()),
-            false,
+            None,
             &IMAGE_FETCH,
         );
         let err = open_image_capped(&http, &format!("{}/a.png", server.base_url), 1024)
@@ -914,15 +915,21 @@ mod destination_tests {
 
     /// With a proxy configured, which would resolve a name out of the
     /// resolver's sight, a name is checked on the server's own answer before
-    /// anything is sent, then reached at the addresses checked (the hosts the
-    /// proxy settings exclude go there directly; this test sets no proxy, so
-    /// all do). An address literal is checked as it is, and a name the server
-    /// cannot resolve is not sent to the proxy unchecked.
+    /// anything is sent (and again at connect for the hosts the proxy
+    /// settings do not cover, which go there directly; this test sets no
+    /// proxy, so all do). An address literal is checked as it is, and a name
+    /// the server cannot resolve is not sent to the proxy unchecked.
     #[tokio::test]
     async fn through_a_proxy_a_destination_is_checked_before_it_is_sent() {
         let server = MockServer::start_raw(vec![MockServer::raw_ok(PNG_HEADER, PNG)]).await;
         let at = |host: &str| format!("http://{host}:{}/a.png", port(&server));
-        let proxied = |allowed| GuardedHttp::new(Arc::new(PrivateBut(allowed)), true, &IMAGE_FETCH);
+        let proxied = |allowed| {
+            GuardedHttp::new(
+                Arc::new(PrivateBut(allowed)),
+                Some(Vec::new()),
+                &IMAGE_FETCH,
+            )
+        };
 
         let image = open_image_capped(&proxied("localhost"), &at("localhost"), 1024)
             .await
@@ -968,7 +975,8 @@ mod destination_tests {
 
     /// The resolver refuses at connect time too: a name whose answer turns
     /// private after the check before sending (DNS rebinding) never reaches
-    /// that address.
+    /// that address, with a proxy configured or not (a host the proxied
+    /// client reaches directly; this test sets no proxy, so all are).
     #[tokio::test]
     async fn a_name_that_turns_private_after_the_check_is_refused_at_connect() {
         /// Allows the first lookup's addresses, then refuses every private one.
@@ -988,20 +996,25 @@ mod destination_tests {
             .await
             .expect("localhost")
             .len();
-        let http = GuardedHttp::new(
-            Arc::new(Rebinding {
-                allowed,
-                checks: std::sync::atomic::AtomicUsize::new(0),
-            }),
-            false,
-            &IMAGE_FETCH,
-        );
-        let url = format!("http://localhost:{}/a.png", port(&server));
-        let err = open_image_capped(&http, &url, 1024)
-            .await
-            .err()
-            .expect("refused at connect");
-        assert!(matches!(err, ImageFetchError::Unavailable), "{err:?}");
+        for proxy in [None, Some(Vec::new())] {
+            let http = GuardedHttp::new(
+                Arc::new(Rebinding {
+                    allowed,
+                    checks: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                proxy.clone(),
+                &IMAGE_FETCH,
+            );
+            let url = format!("http://localhost:{}/a.png", port(&server));
+            let err = open_image_capped(&http, &url, 1024)
+                .await
+                .err()
+                .expect("refused at connect");
+            assert!(
+                matches!(err, ImageFetchError::Unavailable),
+                "{proxy:?}: {err:?}"
+            );
+        }
         assert_eq!(server.requests(), 0, "nothing reached the address");
     }
 }
@@ -1080,7 +1093,7 @@ fn is_svg(head: &[u8]) -> bool {
             .map_or(&[], |at| &text[at + end.len()..])
     }
 
-    let mut rest = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    let mut rest = head.trim_prefix(b"\xEF\xBB\xBF");
     loop {
         rest = rest.trim_ascii_start();
         if rest.starts_with(b"<?") {
@@ -1213,7 +1226,15 @@ pub enum ArtworkDownloadFailure {
     Stop,
 }
 
-pub(crate) async fn download_artwork(url: &str) -> Result<ArtworkDownload, ArtworkDownloadFailure> {
+/// Downloads an image `url` under the server's image limits: no private
+/// address unless the [`ImageDestinations`](crate::destination::ImageDestinations)
+/// let it, no body over `image_download_max_mb`, and nothing that is not an
+/// image. Also how a repository plugin's image is fetched.
+///
+/// # Errors
+/// [`Skip`](ArtworkDownloadFailure::Skip) for a missing, refused or oversized
+/// image, [`Stop`](ArtworkDownloadFailure::Stop) for any other failure.
+pub async fn download_artwork(url: &str) -> Result<ArtworkDownload, ArtworkDownloadFailure> {
     let image = open_image(url).await.map_err(artwork_failure)?;
     let content_type = image.content_type.clone();
     let content_length = image.content_length;
@@ -1234,12 +1255,19 @@ fn artwork_failure(error: ImageFetchError) -> ArtworkDownloadFailure {
     match error {
         ImageFetchError::Missing | ImageFetchError::Refused => ArtworkDownloadFailure::Skip,
         ImageFetchError::TooLarge => {
-            tracing::debug!("artwork is over image_download_max_mb; trying the next candidate");
+            tracing::debug!(
+                item_id = crate::rate_limit::request_item(),
+                "artwork is over image_download_max_mb; trying the next candidate"
+            );
             ArtworkDownloadFailure::Skip
         }
         ImageFetchError::NotAnImage(reason) => {
             crate::rate_limit::note_request_failure();
-            tracing::warn!(%reason, "artwork provider returned a non-image response");
+            tracing::warn!(
+                item_id = crate::rate_limit::request_item(),
+                %reason,
+                "artwork provider returned a non-image response"
+            );
             ArtworkDownloadFailure::Stop
         }
         ImageFetchError::Unavailable | ImageFetchError::Storage(_) => ArtworkDownloadFailure::Stop,

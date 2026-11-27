@@ -410,6 +410,54 @@ async fn get_subtitle_stream_utf8_with_or_without_an_escape_is_preserved() {
     }
 }
 
+// ---- 7-bit escape encodings (gl-1657) ---------------------------------------
+//
+// `UtfUnknown`'s escape prober detects ISO-2022-KR and HZ-GB-2312 besides
+// ISO-2022-JP, and Jellyfin decodes both through .NET's code pages. The
+// fixtures are what Python's `iso2022_kr` and `hz` codecs write.
+
+/// `한국어 자막입니다.`, then an ASCII cue with a tilde, as ISO-2022-KR.
+const ISO_2022_KR_SRT: &[u8] = b"1\n00:00:01,000 --> 00:00:02,500\n\x1b$)C\x0eGQ19>n\x0f \x0e@Z87@T4O4Y\x0f.\n\n2\n00:00:02,600 --> 00:00:02,900\nASCII ~~ tilde line\n\n";
+
+/// `中文字幕。`, then the same ASCII cue, as HZ-GB-2312, where `~~` is one `~`.
+const HZ_GB_2312_SRT: &[u8] = b"1\n00:00:01,000 --> 00:00:02,500\n~{VPNDWVD;!#~}\n\n2\n00:00:02,600 --> 00:00:02,900\nASCII ~~~~ tilde line\n\n";
+
+#[rstest::rstest]
+#[case::iso_2022_kr(ISO_2022_KR_SRT, "한국어 자막입니다.")]
+#[case::hz_gb_2312(HZ_GB_2312_SRT, "中文字幕。")]
+#[tokio::test]
+async fn get_subtitle_stream_converts_a_seven_bit_escape_encoding(
+    #[case] bytes: &[u8],
+    #[case] cue: &str,
+) {
+    let (encoder, file_info) = encoder_for_srt("/media/escape.srt", bytes.to_vec());
+
+    let stream = encoder.get_subtitle_stream(&file_info).await.unwrap();
+
+    assert!(stream.is_converted(), "{cue}");
+    assert_eq!(
+        String::from_utf8(stream.into_bytes()).unwrap(),
+        format!(
+            "1\n00:00:01,000 --> 00:00:02,500\n{cue}\n\n2\n00:00:02,600 --> 00:00:02,900\nASCII ~~ tilde line\n\n"
+        )
+    );
+}
+
+#[rstest::rstest]
+#[case::iso_2022_kr(ISO_2022_KR_SRT, "iso-2022-kr")]
+#[case::hz_gb_2312(HZ_GB_2312_SRT, "hz-gb-2312")]
+#[tokio::test]
+async fn convert_text_subtitle_passes_charenc_for_a_seven_bit_escape_encoding(
+    #[case] bytes: &[u8],
+    #[case] charset: &str,
+) {
+    let args = convert_smi_and_capture_args(bytes.to_vec()).await;
+    assert!(
+        args.contains(&format!("-sub_charenc {charset}")),
+        "expected charset hint in: {args}"
+    );
+}
+
 // ---- ConvertTextSubtitleToSrt charset hint ----------------------------------
 //
 // Port of the C# arg construction: `-y{charenc} -i "{in}" -c:s srt "{out}"`.
@@ -509,9 +557,7 @@ fn generate_srt(stream_index: usize, cue_count: usize) -> String {
 }
 
 fn generate_sources() -> Vec<Vec<u8>> {
-    (0..STREAM_COUNT)
-        .map(|i| generate_srt(i, CUE_COUNT).into_bytes())
-        .collect()
+    Vec::from_fn(STREAM_COUNT, |i| generate_srt(i, CUE_COUNT).into_bytes())
 }
 
 async fn convert(

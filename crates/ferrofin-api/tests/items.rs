@@ -231,6 +231,13 @@ impl UserManager for OkUsers {
     ) -> Result<Option<UserEntity>, ServiceError> {
         unimplemented!()
     }
+    async fn ensure_sign_in_allowed(
+        &self,
+        _user: &UserEntity,
+        _remote_endpoint: &str,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
     async fn get_authentication_providers(
         &self,
     ) -> Result<Vec<ferrofin_model::dto::NameIdPair>, ServiceError> {
@@ -578,6 +585,18 @@ impl LibraryManager for OkLibrary {
         view: &BaseItemEntity,
     ) -> Result<(Option<BaseItemKind>, bool), ServiceError> {
         match Uuid::parse_str(&view.id).ok() {
+            // With no user any browse moves onto the playlists folder, which
+            // then lists its own children.
+            Some(PLAYLISTS_VIEW_ID) if query.user.is_none() => {
+                let folder = self
+                    .get_item_by_id(PLAYLISTS_FOLDER_ID)
+                    .await?
+                    .expect("folder");
+                query.parent_id = PLAYLISTS_FOLDER_ID;
+                query.user_root_children = false;
+                query.parent_row = Some(Arc::new(folder));
+                Ok((Some(BaseItemKind::PlaylistsFolder), true))
+            }
             // A recursive browse reports the playlists folder it displays.
             Some(PLAYLISTS_VIEW_ID) if query.recursive => {
                 Ok((Some(BaseItemKind::PlaylistsFolder), true))
@@ -2317,6 +2336,78 @@ async fn playlists_view_browses_list_its_playlists() {
     assert_eq!(boxsets.parent_id, Uuid::nil());
     assert_eq!(boxsets.include_item_types, [BaseItemKind::BoxSet]);
     assert_eq!(boxsets.linked_child_ancestor_ids, [PLAYLISTS_FOLDER_ID]);
+}
+
+/// An API key without a `userId` (v12.4 `PlaylistsFolder.GetItemsInternal`,
+/// `query.User is null`): a browse of the playlists folder, or of the
+/// Playlists view that displays it, lists the folder's own playlists by
+/// `ParentId`, never recursively, whatever `recursive` and the other types
+/// asked; a browse typed exactly `[Playlist]` is the controller's re-root to
+/// the user root, recursive. Matches a stock Jellyfin 12.4 probed live: two
+/// playlists made with `POST /Playlists` (one without `AncestorIds` rows)
+/// for the first, those and a music library's `.m3u` for the second.
+#[tokio::test]
+async fn an_api_key_lists_the_playlists_folders_own_playlists() {
+    use ferrofin_model::data::BaseItemKind;
+    async fn query_for(params: &str) -> InternalItemsQuery {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            ..Default::default()
+        };
+        let seen = Arc::clone(&library.last_query);
+        let state = ok_state_full(
+            library,
+            Arc::new(OkUsers),
+            Arc::new(OkDto),
+            (
+                Arc::new(ferrofin_api::test_support::FakeAuthContext),
+                Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+            ),
+        );
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?{params}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{params}");
+        seen.lock().unwrap().take().expect("query_items ran")
+    }
+    for params in [
+        format!("parentId={PLAYLISTS_FOLDER_ID}"),
+        format!("parentId={PLAYLISTS_FOLDER_ID}&recursive=true"),
+        format!("parentId={PLAYLISTS_FOLDER_ID}&includeItemTypes=Playlist,Audio"),
+        format!("parentId={PLAYLISTS_VIEW_ID}&recursive=true"),
+    ] {
+        let query = query_for(&params).await;
+        assert!(query.user.is_none(), "{params}");
+        assert_eq!(query.parent_id, PLAYLISTS_FOLDER_ID, "{params}");
+        assert!(!query.recursive, "{params}");
+        assert!(!query.user_root_children, "{params}");
+        assert_eq!(
+            query.include_item_types,
+            [BaseItemKind::Playlist],
+            "{params}"
+        );
+    }
+    for params in [
+        format!("parentId={PLAYLISTS_FOLDER_ID}&includeItemTypes=Playlist"),
+        format!("parentId={PLAYLISTS_VIEW_ID}&includeItemTypes=Playlist"),
+    ] {
+        let query = query_for(&params).await;
+        assert_eq!(query.parent_id, Uuid::nil(), "{params}");
+        assert!(query.recursive, "{params}");
+        assert_eq!(
+            query.include_item_types,
+            [BaseItemKind::Playlist],
+            "{params}"
+        );
+        assert!(query.linked_child_ancestor_ids.is_empty(), "{params}");
+    }
 }
 
 /// Jellyfin 12's `GetItems` dispatch (v12.2 ItemsController.cs:326-340, 592;

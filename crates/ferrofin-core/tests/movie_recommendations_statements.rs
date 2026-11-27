@@ -8,6 +8,10 @@
 //! (gl-1263). The request now reads the user once and its policy from the
 //! cross-request cache.
 //!
+//! The "similar to" categories of a stream are scored and access-filtered
+//! together, one statement each for all its baselines, as upstream's
+//! `IBatchLocalSimilarItemsProvider` does (gl-1357), not once per baseline.
+//!
 //! This binary records the statements one call runs ([`sql_statements`]).
 
 mod sql_statements;
@@ -102,10 +106,28 @@ async fn seed_played(db: &Database, user: Uuid, item: Uuid) {
     .expect("insert user data");
 }
 
+/// Marks `item` a favourite of `user`, unplayed.
+async fn seed_favourite(db: &Database, user: Uuid, item: Uuid) {
+    sqlx::query(
+        r#"INSERT INTO "UserData"
+           ("ItemId", "UserId", "CustomDataKey", "IsFavorite", "PlayCount",
+            "PlaybackPositionTicks", "Played")
+           VALUES (?1, ?2, ?3, 1, 0, 0, 0)"#,
+    )
+    .bind(guid_to_db(item))
+    .bind(guid_to_db(user))
+    .bind(item.to_string())
+    .execute(db.writer())
+    .await
+    .expect("insert user data");
+}
+
 /// Three recently played movies, each of its own genre, and an unplayed one
-/// sharing each genre, all in one library: three "similar to" baselines.
+/// sharing each genre, all in one library: three "similar to recently
+/// played" baselines. The first unplayed one is a favourite, so the liked
+/// stream has a baseline too (its only match is played: no category).
 #[tokio::test]
-async fn recommendations_read_the_user_and_its_policy_once_per_request() {
+async fn recommendations_read_the_user_and_score_each_stream_once_per_request() {
     record_statements();
     let db = Database::connect_in_memory().await.expect("connect");
     db.run_migrations().await.expect("migrations");
@@ -122,6 +144,7 @@ async fn recommendations_read_the_user_and_its_policy_once_per_request() {
         None,
     )
     .await;
+    let mut favourite = None;
     for genre in ["Drama", "Western", "Comedy"] {
         let played = Uuid::new_v4();
         seed_item(
@@ -134,16 +157,19 @@ async fn recommendations_read_the_user_and_its_policy_once_per_request() {
         )
         .await;
         seed_played(&db, user, played).await;
+        let unplayed = Uuid::new_v4();
         seed_item(
             &db,
-            Uuid::new_v4(),
+            unplayed,
             BaseItemKind::Movie,
             &format!("Unplayed {genre}"),
             Some(library),
             Some(genre),
         )
         .await;
+        favourite.get_or_insert(unplayed);
     }
+    seed_favourite(&db, user, favourite.expect("a seeded movie")).await;
     let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
         Arc::new(ItemTypeLookup::new());
     let manager = FerrofinSimilarItemsManager::new(
@@ -190,5 +216,16 @@ async fn recommendations_read_the_user_and_its_policy_once_per_request() {
         reads("Permissions") + reads("Preferences"),
         0,
         "the user's policy comes from the warm cache: {statements:#?}"
+    );
+    let count = |marker: &str| statements.iter().filter(|s| s.contains(marker)).count();
+    assert_eq!(
+        count(r#""ItemValuesMap" ivm0"#),
+        2,
+        "one score pass per stream, not per baseline: {statements:#?}"
+    );
+    assert_eq!(
+        count(r#"FROM "BaseItems" AS bi WHERE bi."Id" <> ? AND +bi."Type""#),
+        2,
+        "one access filter per stream over its baselines' candidates: {statements:#?}"
     );
 }

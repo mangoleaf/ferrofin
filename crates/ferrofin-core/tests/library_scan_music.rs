@@ -111,6 +111,8 @@ impl Music {
                     format!(r#"{{"artists":[{{"id":"{ARTIST}","name":"Miles Davis"}}]}}"#)
                 } else if line.contains("/album-mb.php") {
                     r#"{"album":[{"strDescription":"Album text.","strGenre":"Jazz"}]}"#.to_owned()
+                } else if line.contains("/artist.php") {
+                    r#"{"artists":[{"idArtist":"113159","strBiography":"Found by its TheAudioDB id.","strWebsite":"www.milesdavis.com"}]}"#.to_owned()
                 } else {
                     r#"{"artists":[{"strBiography":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned()
                 };
@@ -869,6 +871,52 @@ async fn a_music_artist_without_type_options_asks_theaudiodb_despite_the_server_
     );
 }
 
+/// `AudioDbArtistProvider.GetArtist` (v12.4): an artist with no MusicBrainz
+/// id is looked up by its `AudioDbArtist` id (`artist.php`), here read from
+/// its `artist.nfo` in a library that asks only TheAudioDB about artists, and
+/// takes the answer's biography and home page (`strWebsite`).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_artist_known_only_by_its_audiodb_id_is_looked_up_by_it() {
+    use ferrofin_providers::library_options::fetcher_names::AUDIODB;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fetching = |kind: &str, fetchers: &[&str]| TypeOptions {
+        type_: Some(kind.to_owned()),
+        metadata_fetchers: fetchers.iter().map(|f| (*f).to_owned()).collect(),
+        ..TypeOptions::default()
+    };
+    let fx = Fixture::new(
+        tmp.path(),
+        LibraryOptions {
+            type_options: vec![
+                fetching("MusicAlbum", &[]),
+                fetching("MusicArtist", &[AUDIODB]),
+            ],
+            ..LibraryOptions::default()
+        },
+    )
+    .await;
+    std::fs::write(
+        fx.artist_dir.join("artist.nfo"),
+        "<artist><title>Miles Davis</title><audiodbartistid>111239</audiodbartistid></artist>",
+    )
+    .expect("nfo");
+    fx.scan().await;
+    let asked = fx.music.take();
+    assert!(
+        asked.iter().any(|l| l.contains("/artist.php?i=111239")),
+        "{asked:?}"
+    );
+    assert!(musicbrainz(&asked).is_empty(), "{asked:?}");
+    let artist = fx.row(fx.artist_id()).await;
+    assert_eq!(
+        artist.overview.as_deref(),
+        Some("Found by its TheAudioDB id.")
+    );
+    let data: serde_json::Value =
+        serde_json::from_str(artist.data.as_deref().unwrap_or("{}")).expect("data");
+    assert_eq!(data["HomePageUrl"], "www.milesdavis.com");
+}
+
 /// "Identify → Apply" on an album is the scan of its folder with the chosen
 /// result: its music providers re-fetch by the chosen release and release
 /// group — never by the matched ones, never by a search — and the chosen
@@ -1072,9 +1120,9 @@ async fn a_series_last_media_date_follows_its_episodes_and_sorts_folders() {
 }
 
 /// The library-wide closing passes run on every library validation, each
-/// by its own persisted selection: a `Year` row deleted behind the scan's
-/// back is put back by the next rescan, though that rescan changes nothing
-/// else.
+/// by its own persisted selection: a genre no item names, added behind the
+/// scan's back, is swept by the next rescan, though that rescan changes
+/// nothing else.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_quiet_rescan_still_runs_the_closing_passes() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -1105,38 +1153,35 @@ async fn a_quiet_rescan_still_runs_the_closing_passes() {
         db.clone(),
         Arc::new(ItemTypeLookup::new()),
     ));
-    let years = ferrofin_core::YearStore::new(
-        persistence.clone(),
-        ferrofin_core::item_type_lookup::IdDerivation::Jellyfin {
-            program_data_path: None,
-        },
-        tmp.path().join("metadata/Year"),
-    );
     let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
         .with_items(items)
-        .with_years(years)
         .with_progress_every(0);
     let count = || async {
-        sqlx::query_scalar::<_, i64>(
-            r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE '%Entities.Year'"#,
-        )
-        .fetch_one(db.pool())
-        .await
-        .expect("years")
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Name" = 'Orphan'"#)
+            .fetch_one(db.pool())
+            .await
+            .expect("orphans")
     };
     scanner.scan_all().await.expect("scan");
+    sqlx::query(
+        r#"INSERT INTO "BaseItems"
+           ("Id", "Type", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
+            "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "CleanName")
+           VALUES ('0D1C0D1C-0000-4000-8000-000000000001',
+                   'MediaBrowser.Controller.Entities.Genre', 1, 0, 0, 0, 0, 0, 0,
+                   'Orphan', 'orphan')"#,
+    )
+    .execute(db.writer())
+    .await
+    .expect("seed dead genre");
     assert_eq!(count().await, 1);
-    sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Type" LIKE '%Entities.Year'"#)
-        .execute(db.writer())
-        .await
-        .expect("delete");
     let quiet = scanner.scan_all().await.expect("rescan");
     assert_eq!(
         quiet.created + quiet.updated + quiet.removed,
         0,
         "{quiet:?}"
     );
-    assert_eq!(count().await, 1, "the missing year is put back");
+    assert_eq!(count().await, 0, "the dead genre is swept");
 }
 
 /// A library scan cancelled once its walk is done — at the 96 % mark,
@@ -2482,6 +2527,16 @@ async fn a_row_that_cannot_be_read_skips_itself_only() {
         )
         .await
         .expect("edit");
+    // The editor saves the lists with their links; a scan save rewrites the
+    // links from the lists (gl-1636).
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "AlbumArtists" = 'Gil Evans|Bill Evans|Tadd Dameron',
+               "Studios" = 'Blue Note|Prestige|Riverside' WHERE "Id" = ?1"#,
+    )
+    .bind(ferrofin_db::store::guid_to_db(track))
+    .execute(fx.db.writer())
+    .await
+    .expect("edit the lists");
     // Corrupt the album walked first, and the first of each selection.
     let corrupt = |id: String| {
         let db = fx.db.clone();

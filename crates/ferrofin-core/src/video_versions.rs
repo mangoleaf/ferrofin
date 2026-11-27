@@ -33,6 +33,7 @@ use ferrofin_traits::persistence::ItemRepository;
 use ferrofin_util::string_extensions::{to_upper_invariant, to_upper_ordinal};
 use uuid::Uuid;
 
+pub(crate) use ferrofin_db::item_data::containing_folder_path_at;
 pub use ferrofin_db::item_data::preferred_primary_version;
 
 /// The delimiters a version label is cut at (`BaseItem.VersionDelimiters`,
@@ -60,13 +61,12 @@ fn data_paths(data: Option<&str>, key: &str) -> Vec<String> {
     crate::item_data::parse_data(data)
         .get(key)
         .and_then(serde_json::Value::as_array)
-        .map(|list| {
+        .map_or_default(|list| {
             list.iter()
                 .filter_map(serde_json::Value::as_str)
                 .map(ToOwned::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// A stacked video's other parts' paths (`Video.AdditionalParts`).
@@ -99,8 +99,7 @@ pub fn additional_part_count(data: Option<&str>) -> usize {
     let value = text[at + "\"AdditionalParts\"".len()..]
         .trim_start()
         .strip_prefix(':')
-        .map(str::trim_start)
-        .unwrap_or_default();
+        .map_or_default(str::trim_start);
     let empty = value.starts_with("null")
         || value
             .strip_prefix('[')
@@ -849,8 +848,7 @@ fn source_order(own: bool, video_type: Option<VideoType>, is_3d: bool) -> (bool,
 fn file_stem(path: &str) -> String {
     std::path::Path::new(path)
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|s| s.to_string_lossy().into_owned())
 }
 
 /// The folder an item lives in — `BaseItem.ContainingFolderPath`
@@ -863,40 +861,12 @@ pub(crate) fn containing_folder_path(video: &BaseItemEntity) -> String {
     containing_folder_path_at(video, video.path.as_deref().unwrap_or_default())
 }
 
-/// [`containing_folder_path`] for `video` stored at `path` — its row path
-/// with the `%AppDataPath%`-style prefixes expanded, as a delete removes it.
-/// A path with no parent (`/`) has none: .NET's `GetDirectoryName` is `null`
-/// there, so the result is empty.
-pub(crate) fn containing_folder_path_at(video: &BaseItemEntity, path: &str) -> String {
-    if video.is_folder {
-        return path.to_owned();
-    }
-    // Only a disc rip (a cheap text test first) can name its own folder;
-    // only then is the blob read for a stack.
-    if crate::item_data::is_disc_folder(video.data.as_deref())
-        && !video.data.as_deref().is_some_and(|text| {
-            text.contains(ADDITIONAL_PARTS)
-                && crate::item_data::parse_data(Some(text))
-                    .get(ADDITIONAL_PARTS)
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|parts| !parts.is_empty())
-        })
-    {
-        return path.to_owned();
-    }
-    std::path::Path::new(path)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
 /// The name of the folder a video lives in (`Path.GetFileName(
 /// ContainingFolderPath)`).
 fn containing_folder_name(video: &BaseItemEntity) -> String {
     std::path::Path::new(&containing_folder_path(video))
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
+        .map_or_default(|n| n.to_string_lossy().into_owned())
 }
 
 /// `text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)`, on chars.

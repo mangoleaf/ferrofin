@@ -220,6 +220,17 @@ Wired and working, with a documented limitation or lighter verification:
   divergences (off by default, an outage not counted toward lockout, the last administrator
   never demoted, timeouts, a blank reset refused, among others) are listed in
   [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md#ldap-auth).
+- **Single Sign-On (OpenID Connect)** — Ferrofin's own internal plugin, compiled in and off
+  until an administrator enables it under Dashboard → Plugins ([`SINGLE_SIGN_ON.md`](SINGLE_SIGN_ON.md)).
+  Jellyfin has no counterpart, so there is nothing to compare against. A "Sign in with" button on
+  jellyfin-web's login page for each provider; accounts created at a first sign-in or linked by
+  hand, matched by issuer and subject; a required role, and role sync for the administrator flag,
+  libraries and Live TV; linking at `/sso/link`; profile pictures from the `picture` claim; native
+  apps signed in by approving their Quick Connect code at `/sso/quickconnect`. Proven against
+  Keycloak 26.7 by the `#[ignore]`d live test and from jellyfin-web 12.4. **Not tried yet: other
+  identity providers, a real native app approving its Quick Connect code (only the requests an app
+  makes), native apps' login screens, the Android app, and a private certificate authority.**
+  Nothing of the community SSO-Auth plugin is imported.
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
@@ -281,19 +292,52 @@ Wired and working, with a documented limitation or lighter verification:
     absent or cannot decode RAR). The Docker image ships 7z with its RAR plugin; without a
     tool, a RAR comic gets no cover and the server logs that once
     ([`INSTALL.md`](INSTALL.md#rar-comics) for bare metal).
-- **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
-  `Tags`, which upstream aggregates from XMP/IPTC keywords.
+- **Photo keywords** — a photo's comment (its `Overview`) is the first of its XMP packet's
+  (`dc:description`, else `exif:UserComment`), its IPTC caption's, its EXIF comment's, then a JPEG's
+  COM segment's or a PNG's `Description` or `Comment` text, as Jellyfin's is. Its other fields come
+  from the EXIF alone, where Jellyfin takes an XMP or IPTC value first, and `Genres` and `Tags` are
+  not set: Jellyfin empties a photo's genres and makes its XMP or IPTC keywords its tags. A photo
+  whose XMP packet, IPTC caption or PNG text chunk Jellyfin's tag library cannot read is left
+  alone there, its EXIF fields too; Ferrofin reads the rest of such a photo.
+- **Photo comment character sets** — **Accepted divergence:** a photo's EXIF comment
+  (its `Overview`) reads as Jellyfin reads it where Jellyfin's text is readable, and as the
+  text where it is not. Jellyfin 12.4 reads a comment under the `ASCII` or the all-zero code
+  as Latin-1, so UTF-8 `café` shows as `cafÃ©`, and one under `UNICODE` as UTF-8, so the
+  UTF-16 that ExifTool and Exiv2 write shows empty or cut to its first letter. Ferrofin reads
+  UTF-8 when the text is valid UTF-8, else Latin-1 as Jellyfin does; under `UNICODE` it reads
+  UTF-8 only when the text also holds no NUL, and UTF-16 in the EXIF block's byte order
+  otherwise, unless a byte-order mark says which. So UTF-8 padded with a NUL under `UNICODE`,
+  which Jellyfin reads, comes out garbled. The texts that name no character set follow the same
+  rule, UTF-8 when valid, else Latin-1: an IPTC caption, which Jellyfin reads as Latin-1, and a
+  JPEG COM segment or a PNG text chunk, which it reads as UTF-8 (a Latin-1 `é` shows as `�`).
+  A PNG `iTXt` comment reads as its text; Jellyfin's tag library keeps four NUL characters before
+  it, a bug not ported.
+- **Photo EXIF in WebP, AVIF and PNG** — **Accepted divergence:** Ferrofin reads the EXIF a
+  WebP, an AVIF or a PNG's `eXIf` chunk holds (date taken, title, caption, rating, camera,
+  GPS, exposure). Jellyfin 12.4 lists these formats as photos, but its tag library cannot
+  open a WebP or an AVIF, so it keeps none of those fields for them, and never reads a PNG's
+  `eXIf` chunk, so a PNG keeps only what its text chunks or XMP hold.
 - **Playlist files are read, never written** — a library scan makes a playlist of each
   `.m3u`/`.m3u8`/`.pls`/`.wpl`/`.zpl` file in a music or untyped library and of each folder
   named `… [playlist]` or holding a `playlist.xml` (members from the file, or from the
-  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. Of a folder's
-  `playlist.xml` only the members and the media type are read so far — its title, overview,
-  shares and lock are not — and Ferrofin does not write it back after a refresh, as Jellyfin
-  does where it saves XML metadata. Such a playlist belongs to nobody and is open to everyone,
-  so, as on Jellyfin, nobody may edit it and the file is never rewritten. Where Jellyfin 12.2
-  saves XML metadata into the library (a library whose metadata savers are unset), the
-  `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
-  playlist stays empty; Ferrofin always reads the entries and never that sidecar.
+  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. A playlist file belongs to
+  nobody and is open to everyone, so, as on Jellyfin, nobody may edit it and the file is never
+  rewritten. Where Jellyfin 12.2 saves XML metadata into the library (a library whose metadata
+  savers are unset), the `<name>.xml` sidecar it writes beside a playlist file hides the
+  file's entries and the playlist stays empty; Ferrofin always reads the entries and neither
+  reads nor writes that sidecar.
+- **A playlist folder's `playlist.xml`** is read as Jellyfin reads it, when it changes or on a
+  full refresh: its title, overview, lock, locked fields, genres, studios, tags, dates and
+  ratings, its media type, its shares (who may see and edit the playlist) and, for a folder in
+  a media library, its members. Shares merge as Jellyfin merges them: a scan or refresh that
+  replaces takes the file's (an empty `<Shares />` removes every share), "Search for missing
+  metadata" adds the file's to the stored ones. Ferrofin writes the file as Jellyfin writes it,
+  with the owner, the members and the shares, on every change to the playlist and every
+  refresh that saves it: always for a playlist made in Ferrofin (`{data}/playlists`), and for a
+  playlist folder in a media library only when that library opts in, as for a box set below.
+  The first start of a version with this writes the file of every playlist in `{data}/playlists`
+  from the database, so a file Jellyfin wrote before the database was adopted cannot bring back
+  a share, name or lock changed in Ferrofin since.
   A collection made in Ferrofin gets
   Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before 1.4.0 get it, and the
   id it derives, at the first boot of 1.5.2 or later), and its membership lives in the

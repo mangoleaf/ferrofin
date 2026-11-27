@@ -5,6 +5,7 @@
 //! start rewrites each path whose file moved, once, and the artwork and the
 //! profile image are served again.
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -114,6 +115,34 @@ async fn start(db: &Database, root: &Path) -> axum::Router {
         .await
         .unwrap();
     ferrofin_api::create_router(wired.state)
+}
+
+/// Waits for the end of the library scan the first box set queues when it
+/// makes the Collections library (gl-1948). Folders moved under that scan
+/// vanish from the server that runs it, which then removes the box set whose
+/// folder is gone; a real move starts from a stopped server. On a fresh data
+/// directory the task has no result until that first run ends.
+async fn first_scan_end(router: &axum::Router, token: &str) {
+    let deadline = Instant::now() + Duration::from_mins(1);
+    loop {
+        let (status, tasks) = send(router, token, "GET", "/ScheduledTasks", None).await;
+        assert_eq!(status, StatusCode::OK, "{tasks}");
+        let scan = tasks
+            .as_array()
+            .and_then(|tasks| tasks.iter().find(|task| task["Key"] == "RefreshLibrary"))
+            .cloned()
+            .expect("RefreshLibrary task");
+        let result = &scan["LastExecutionResult"];
+        if scan["State"] == "Idle" && !result.is_null() {
+            assert_eq!(result["Status"], "Completed", "{result}");
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first scan did not end: {scan}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Every stored path the repair may rewrite, in a fixed order.
@@ -270,7 +299,8 @@ async fn a_start_after_the_program_data_directory_moved_rewrites_the_moved_paths
     assert!(snapshot.is_file(), "the rewrite takes a snapshot first");
     let mut expected = vec![
         format!("{old}/metadata/library/gone/backdrop.png"),
-        format!("{pd}/data/playlists"),
+        // stored as upstream's save writes it, so a move leaves it alone (gl-1581)
+        "%AppDataPath%/playlists".to_owned(),
         format!("{pd}/metadata/library/me/poster.png"),
         format!("{pd}/root"),
         format!("{pd}/root/default"),
@@ -378,6 +408,7 @@ async fn a_box_set_and_a_playlist_follow_a_move_with_no_rewrite() {
     }
 
     // The folders move; the database stays where the handle opened it.
+    first_scan_end(&router, &token).await;
     for folder in ["data", "root"] {
         std::fs::rename(
             program_data(&before).join(folder),

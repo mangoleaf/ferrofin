@@ -258,14 +258,19 @@ pub trait ProviderManager: Send + Sync {
         priority: RefreshPriority,
     ) -> Result<(), ServiceError>;
 
-    /// Refreshes an item and all of its children.
+    /// Refreshes an item and all of its children. An Identify's result in
+    /// `options` was chosen for this item, whose ids it becomes.
     async fn refresh_full_item(
         &self,
         item_id: Uuid,
         options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError>;
 
-    /// Refreshes a single item, returning what changed.
+    /// Refreshes a single item, returning what changed. An Identify's result
+    /// in `options` was chosen for an item above this one, whose refresh
+    /// hands its options to its children (`Series.RefreshAllMetadata`): a
+    /// season or an episode looks its series up by the result's ids
+    /// (`ApplySearchResult`), and no item takes them as its own.
     async fn refresh_single_item(
         &self,
         item_id: Uuid,
@@ -274,17 +279,23 @@ pub trait ProviderManager: Send + Sync {
 
     /// Holds `item_id`'s metadata for one read-modify-write of its row. The
     /// provider manager's refresh holds it from loading the row to saving it,
-    /// and a metadata edit (`POST /Items/{itemId}`) around its own load and
-    /// save, so neither saves over the other with the row it loaded first.
+    /// a metadata edit (`POST /Items/{itemId}`) around its own load and save,
+    /// and the library scan around its check for an edit and the save that
+    /// follows (`scan_item`), so none saves over another with the row it
+    /// loaded first.
     ///
-    /// TODO(gl-1504): the library scan's refresh of a file-backed item
-    /// (`scan_item`) and the edit's cascade to child rows take no lock yet.
+    /// TODO(gl-1961): the edit's cascade to child rows takes no lock yet.
     ///
     /// Upstream needs no lock: the edit and the refresh both change the cached
     /// `BaseItem` that `LibraryManager.GetItemById` hands out, so the
     /// refresh's save carries an edit made while it ran. Ferrofin loads a row
     /// per caller instead. A manager that runs no refresh has nothing to
     /// exclude, so the default holds a lock no one else shares.
+    ///
+    /// A delete (`LibraryManager::delete_item`) holds it too, from before it
+    /// reads the row until the delete is done: a refresh's save inserts a row
+    /// that is gone, so one that loaded the row first would bring the
+    /// deleted item back. Upstream has that window; Ferrofin closes it.
     async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         let _ = item_id;
         std::sync::Arc::new(tokio::sync::Mutex::new(()))
@@ -348,8 +359,10 @@ pub trait ProviderManager: Send + Sync {
     /// Deletes an item's image of `image_type` at `image_index` (default `0`).
     ///
     /// Port of `BaseItem.DeleteImageAsync(imageType, index)` (the fan-in target of
-    /// `ImageController.DeleteItemImage`/`DeleteItemImageByIndex`): removes the
-    /// stored image row and, for a local row, its on-disk file (best-effort).
+    /// `ImageController.DeleteItemImage`/`DeleteItemImageByIndex`): deletes a
+    /// local image's on-disk file, then removes its stored row; a file that
+    /// cannot be deleted fails the call with the row kept. A Chapter image is
+    /// the file its chapter names, deleted with the chapter row left as it is.
     /// Shared album artwork and a Live TV channel's or programme's file
     /// outside the internal metadata directory stay. The default implementation (for
     /// stub/test managers with no image store) reports the operation as unwired;
@@ -473,6 +486,23 @@ pub trait ProviderManager: Send + Sync {
 
     /// Gets the ids of items currently queued for refresh.
     async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError>;
+
+    /// The image part of TheMovieDb's client configuration
+    /// (`TmdbClientManager.GetClientConfiguration().Images`), which the TMDb
+    /// settings page lists its image sizes from; `None` when TMDb's
+    /// configuration has no images.
+    ///
+    /// # Errors
+    ///
+    /// When TMDb answers with no configuration, or the manager has no TMDb
+    /// client to ask, as the default does.
+    async fn tmdb_image_configuration(
+        &self,
+    ) -> Result<Option<ferrofin_model::dto::ConfigImageTypes>, ServiceError> {
+        Err(ServiceError::backend(
+            "this provider manager has no TheMovieDb client",
+        ))
+    }
 }
 
 fn _assert_object_safe_provider_manager(_: &dyn ProviderManager) {}

@@ -35,18 +35,14 @@
 //!   as in C#.
 //! - Synchronous C# methods become `async fn -> Result<_, ServiceError>` (the
 //!   impl paginates the database via its injected repositories).
+//! - `GetPreferredVersion` — continuing in the alternate version the user has
+//!   been watching, matched by media-source name — never moves a pick (the
+//!   order comes from the last watched episode), so it runs on the page's
+//!   picks only, in `page_rows`, and only for those whose last watched episode
+//!   was played as an alternate version
+//!   ([`NextUpEpisodeUserData::played_version`]).
 //!
-//! TODO(next-up-preferred-version): `GetPreferredVersion` — continuing in the
-//! alternate version the user has been watching, matched by media-source
-//! *name* — is not ported yet. It needs v12's version naming
-//! (`Video.GetMediaSourceName` strips the shared file-name prefix so a version
-//! is named `1080p`, not `S01E02 - 1080p`), which lives in the media-source
-//! manager; port that naming first, then swap the pick for the version of the
-//! next episode whose source name equals the played version's. The swap never
-//! moves a pick (the order comes from the last watched episode), so it belongs
-//! with the page's rows in `page_rows`; it also needs the last watched episode's
-//! row, which the batch no longer reads. Until then the pick is always the
-//! primary episode row.
+//! [`NextUpEpisodeUserData::played_version`]: ferrofin_traits::persistence::NextUpEpisodeUserData::played_version
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,9 +89,13 @@ impl std::fmt::Debug for FerrofinTvSeriesManager {
 }
 
 /// A series' pick, an episode or a special of its batch result, whose full row
-/// is read once the page is known; and the date it is ordered by: C#'s
+/// is read once the page is known, with its last watched episode's id and
+/// played version when that version is an alternate ([`played_alternate`]).
+type Pick<'a> = (&'a NextUpEpisode, Option<(uuid::Uuid, uuid::Uuid)>);
+
+/// A [`Pick`] and the date it is ordered by: C#'s
 /// `(DateTime LastWatchedDate, Episode Episode)` tuple.
-type DatedPick<'a> = (DateTime<Utc>, &'a NextUpEpisode);
+type DatedPick<'a> = (DateTime<Utc>, Pick<'a>);
 
 impl FerrofinTvSeriesManager {
     /// Creates a TV-series manager from its injected collaborators.
@@ -195,8 +195,7 @@ impl FerrofinTvSeriesManager {
             .get_user_dto(user, None)
             .await?
             .configuration
-            .map(|c| c.latest_items_excludes)
-            .unwrap_or_default();
+            .map_or_default(|c| c.latest_items_excludes);
 
         scope.top_parent_ids = children
             .iter()
@@ -215,7 +214,8 @@ impl FerrofinTvSeriesManager {
     /// (and, when rewatching is enabled, the "next played" pick), dates each
     /// pick by the last watched episode's most recent play date
     /// (`GetMostRecentlyPlayedVersion`), sorts the whole list by that date,
-    /// and hands it to [`Self::to_result`].
+    /// and hands it to [`Self::to_result`], which applies `GetPreferredVersion`
+    /// to the page.
     async fn next_up_batched(
         &self,
         request: &NextUpQuery,
@@ -258,13 +258,19 @@ impl FerrofinTvSeriesManager {
             if let Some(next) =
                 determine_next_episode(result, include_specials, request.enable_resumable, false)
             {
-                next_up_list.push((last_watched_date(result, false), next));
+                next_up_list.push((
+                    last_watched_date(result, false),
+                    (next, played_alternate(result, false)),
+                ));
             }
             if include_rewatching
                 && let Some(next_played) =
                     determine_next_episode(result, include_specials, false, true)
             {
-                next_up_list.push((last_watched_date(result, true), next_played));
+                next_up_list.push((
+                    last_watched_date(result, true),
+                    (next_played, played_alternate(result, true)),
+                ));
             }
         }
 
@@ -282,7 +288,7 @@ impl FerrofinTvSeriesManager {
     /// are materialised ([`Self::page_rows`]).
     async fn to_result(
         &self,
-        picks: Vec<&NextUpEpisode>,
+        picks: Vec<Pick<'_>>,
         request: &NextUpQuery,
         user: &UserEntity,
         options: &DtoOptions,
@@ -297,7 +303,7 @@ impl FerrofinTvSeriesManager {
             .start_index
             .and_then(|s| usize::try_from(s).ok())
             .unwrap_or(0);
-        let mut page: Vec<&NextUpEpisode> = picks.into_iter().skip(start).collect();
+        let mut page: Vec<Pick<'_>> = picks.into_iter().skip(start).collect();
         if let Some(limit) = request.limit
             && limit > 0
         {
@@ -321,17 +327,39 @@ impl FerrofinTvSeriesManager {
     /// episodes' and specials' rows, each moved out of the answer, where both
     /// of a series' picks can be the same one.
     ///
+    /// A pick whose last watched episode was played as an alternate version
+    /// is first swapped for its version of the same name
+    /// ([`NextUpService::get_preferred_versions`], `GetPreferredVersion`).
+    ///
     /// An episode or special deleted since the batch has no row: it drops out
     /// of the page, and the total, taken from the picks, still counts it.
-    async fn page_rows(
-        &self,
-        page: &[&NextUpEpisode],
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let mut refs: HashMap<uuid::Uuid, usize> = HashMap::new();
-        for pick in page {
-            if let Ok(id) = uuid::Uuid::parse_str(&pick.id) {
-                *refs.entry(id).or_insert(0) += 1;
+    async fn page_rows(&self, page: &[Pick<'_>]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut ids: Vec<Option<uuid::Uuid>> = page
+            .iter()
+            .map(|(pick, _)| uuid::Uuid::parse_str(&pick.id).ok())
+            .collect();
+        let asks: Vec<(usize, (uuid::Uuid, uuid::Uuid, uuid::Uuid))> = page
+            .iter()
+            .zip(&ids)
+            .enumerate()
+            .filter_map(|(at, ((_, played), id))| {
+                let (last, version) = (*played)?;
+                Some((at, ((*id)?, last, version)))
+            })
+            .collect();
+        if !asks.is_empty() {
+            let picks: Vec<_> = asks.iter().map(|(_, ask)| *ask).collect();
+            let preferred = self.next_up_service.get_preferred_versions(&picks).await?;
+            for ((at, _), version) in asks.iter().zip(preferred) {
+                if version.is_some() {
+                    ids[*at] = version;
+                }
             }
+        }
+
+        let mut refs: HashMap<uuid::Uuid, usize> = HashMap::new();
+        for id in ids.iter().flatten() {
+            *refs.entry(*id).or_insert(0) += 1;
         }
         let wanted: Vec<uuid::Uuid> = refs.keys().copied().collect();
         let mut rows = if wanted.is_empty() {
@@ -342,12 +370,9 @@ impl FerrofinTvSeriesManager {
                 .await?
         };
 
-        Ok(page
-            .iter()
-            .filter_map(|pick| {
-                let id = uuid::Uuid::parse_str(&pick.id).ok()?;
-                take_row(&mut rows, &mut refs, id)
-            })
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| take_row(&mut rows, &mut refs, id?))
             .collect())
     }
 }
@@ -448,6 +473,25 @@ fn determine_next_episode(
         return None;
     }
     Some(next)
+}
+
+/// The last watched episode's id and `GetMostRecentlyPlayedVersion`'s played
+/// version, when that version is an alternate: the one case in which
+/// `GetPreferredVersion` looks for another version of the pick.
+fn played_alternate(
+    result: &NextUpEpisodeBatchResult,
+    rewatching: bool,
+) -> Option<(uuid::Uuid, uuid::Uuid)> {
+    let last = if rewatching {
+        result.last_watched_for_rewatching.as_ref()
+    } else {
+        result.last_watched.as_ref()
+    }?;
+    let version = result
+        .user_data
+        .get(&last.id)
+        .and_then(|ud| ud.played_version)?;
+    Some((uuid::Uuid::parse_str(&last.id).ok()?, version))
 }
 
 /// The date a pick is ordered by — `GetNextUpBatched`'s `lastWatchedDate`:
@@ -645,6 +689,7 @@ mod tests {
                     played: true,
                     playback_position_ticks: 0,
                     last_played_date: date,
+                    ..NextUpEpisodeUserData::default()
                 },
             );
             result.last_watched = Some(row);
@@ -714,6 +759,13 @@ mod tests {
             _is_user_session: bool,
         ) -> Result<Option<UserEntity>, ServiceError> {
             Ok(Some(self.user.clone()))
+        }
+        async fn ensure_sign_in_allowed(
+            &self,
+            _user: &UserEntity,
+            _remote_endpoint: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
         }
         async fn get_authentication_providers(
             &self,
@@ -915,6 +967,10 @@ mod tests {
         row_reads: Mutex<Vec<Vec<Uuid>>>,
         /// Episodes with no row left, as if deleted since the batch.
         deleted: Vec<Uuid>,
+        /// The version `get_preferred_versions` names for a pick.
+        preferred: HashMap<Uuid, Uuid>,
+        /// Every `get_preferred_versions` call's picks.
+        preferred_asks: Mutex<Vec<Vec<(Uuid, Uuid, Uuid)>>>,
     }
     impl FakeNextUpService {
         fn new(keys: Vec<String>, batch: HashMap<String, NextUpEpisodeBatchResult>) -> Self {
@@ -924,6 +980,8 @@ mod tests {
                 keys_query: Mutex::new(None),
                 row_reads: Mutex::new(Vec::new()),
                 deleted: Vec::new(),
+                preferred: HashMap::new(),
+                preferred_asks: Mutex::new(Vec::new()),
             }
         }
 
@@ -962,6 +1020,16 @@ mod tests {
                 .iter()
                 .filter(|id| !self.deleted.contains(id))
                 .map(|id| (*id, episode_row(*id, 1, 1)))
+                .collect())
+        }
+        async fn get_preferred_versions(
+            &self,
+            picks: &[(Uuid, Uuid, Uuid)],
+        ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+            self.preferred_asks.lock().unwrap().push(picks.to_vec());
+            Ok(picks
+                .iter()
+                .map(|(next, _, _)| self.preferred.get(next).copied())
                 .collect())
         }
     }
@@ -1074,7 +1142,7 @@ mod tests {
                 batch_result(None, Some(episode(Uuid::new_v4(), 1, 1))),
             );
         }
-        let keys: Vec<String> = (0..n).map(|i| format!("series-{i}")).collect();
+        let keys: Vec<String> = Vec::from_fn(n, |i| format!("series-{i}"));
         (keys, batch)
     }
 
@@ -1194,7 +1262,7 @@ mod tests {
 
         // Five series played a day apart, newest first; the keys run the
         // other way, so the page comes off the sorted picks.
-        let picks: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let picks: Vec<Uuid> = Vec::from_fn(5, |_| Uuid::new_v4());
         let mut batch = HashMap::new();
         let mut keys = Vec::new();
         for (days_ago, pick) in (0_i64..).zip(&picks) {
@@ -1239,6 +1307,128 @@ mod tests {
             vec![rows]
         };
         assert_eq!(next_up.row_reads(), reads, "one read, of this page");
+    }
+
+    /// `GetPreferredVersion`: a series whose last watched episode was played
+    /// as an alternate version shows the pick's version of that name, asked
+    /// for with the last watched episode and its played version; a series
+    /// watched in the primary is not asked about.
+    #[tokio::test]
+    async fn a_pick_continues_in_the_alternate_version_played_last() {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        let (_, library) = one_library();
+
+        let (last, played, next, next_version) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mut alternate = batch_result(
+            Some((episode(last, 1, 1), Some(ts("2024-01-02T00:00:00Z")))),
+            Some(episode(next, 1, 2)),
+        );
+        if let Some(facts) = alternate.user_data.get_mut(&guid_to_db(last)) {
+            facts.played_version = Some(played);
+        }
+        let primary_next = Uuid::new_v4();
+        let primary = batch_result(
+            Some((
+                episode(Uuid::new_v4(), 1, 1),
+                Some(ts("2024-01-01T00:00:00Z")),
+            )),
+            Some(episode(primary_next, 1, 2)),
+        );
+        let batch = HashMap::from([
+            ("alternate".to_owned(), alternate),
+            ("primary".to_owned(), primary),
+        ]);
+        let mut fake =
+            FakeNextUpService::new(vec!["alternate".to_owned(), "primary".to_owned()], batch);
+        fake.preferred = HashMap::from([(next, next_version)]);
+        let next_up = Arc::new(fake);
+        let mgr = manager(user, library, Arc::clone(&next_up), false);
+
+        let result = mgr
+            .get_next_up(
+                &NextUpQuery {
+                    user_id,
+                    ..NextUpQuery::default()
+                },
+                &DtoOptions::default(),
+            )
+            .await
+            .expect("next up");
+
+        let ids: Vec<Uuid> = result.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec![next_version, primary_next]);
+        assert_eq!(
+            *next_up.preferred_asks.lock().unwrap(),
+            vec![vec![(next, last, played)]],
+            "only the pick after an alternate is asked about"
+        );
+        let mut read = vec![next_version, primary_next];
+        read.sort_unstable();
+        assert_eq!(next_up.row_reads(), vec![read], "the version's row is read");
+    }
+
+    /// The rewatching pick continues in the alternate version too, asked for
+    /// with the episode last watched by date (`LastWatchedForRewatching`).
+    #[tokio::test]
+    async fn a_rewatching_pick_continues_in_the_alternate_version_played_last() {
+        let db = test_db().await;
+        let user_id = Uuid::new_v4();
+        let user = seed_user(&db, user_id).await;
+        let (_, library) = one_library();
+
+        let (last, played, next, next_version) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mut result = NextUpEpisodeBatchResult {
+            last_watched_for_rewatching: Some(episode(last, 1, 1)),
+            next_played_for_rewatching: Some(episode(next, 1, 2)),
+            ..NextUpEpisodeBatchResult::default()
+        };
+        result.user_data.insert(
+            guid_to_db(last),
+            NextUpEpisodeUserData {
+                played: true,
+                last_played_date: Some(ts("2024-01-02T00:00:00Z")),
+                played_version: Some(played),
+                ..NextUpEpisodeUserData::default()
+            },
+        );
+        let mut fake = FakeNextUpService::new(
+            vec!["series".to_owned()],
+            HashMap::from([("series".to_owned(), result)]),
+        );
+        fake.preferred = HashMap::from([(next, next_version)]);
+        let next_up = Arc::new(fake);
+        let mgr = manager(user, library, Arc::clone(&next_up), false);
+
+        let result = mgr
+            .get_next_up(
+                &NextUpQuery {
+                    user_id,
+                    enable_rewatching: true,
+                    ..NextUpQuery::default()
+                },
+                &DtoOptions::default(),
+            )
+            .await
+            .expect("next up");
+
+        let ids: Vec<Uuid> = result.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec![next_version]);
+        assert_eq!(
+            *next_up.preferred_asks.lock().unwrap(),
+            vec![vec![(next, last, played)]]
+        );
     }
 
     /// Two series, the newest one's pick a special: its row is read with the
@@ -1554,6 +1744,7 @@ mod tests {
                 played: false,
                 playback_position_ticks: 12_345,
                 last_played_date: None,
+                ..NextUpEpisodeUserData::default()
             },
         );
         batch.insert("series-b".to_owned(), b);
@@ -2037,6 +2228,7 @@ mod tests {
                 played: true,
                 playback_position_ticks: 9,
                 last_played_date: None,
+                ..NextUpEpisodeUserData::default()
             },
         );
         let mut batch = HashMap::new();
