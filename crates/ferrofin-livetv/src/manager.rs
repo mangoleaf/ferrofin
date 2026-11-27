@@ -48,6 +48,7 @@ use ferrofin_traits::stubs::{
     LiveStreamFile, LiveTvChannelQuery, LiveTvManager, RecordingVisibility,
 };
 use ferrofin_traits::system::LocalApiAccess;
+use ferrofin_traits::tasks::ScanCancel;
 use serde::de::DeserializeOwned;
 
 use crate::dvr::{ActiveRecording, RecorderKind, RecordingInput, TimerRecordingInfo};
@@ -1538,9 +1539,13 @@ impl FerrofinLiveTvManager {
     /// `programs` come one group per channel, and each group's images are
     /// read when its turn comes, as upstream pre-caches each channel's
     /// programmes once it has stored them.
-    async fn pre_cache_images(&self, programs: &[RefreshedAirings]) {
+    ///
+    /// A `stop` ends it before the next channel's images, as upstream's
+    /// refresh throws before its next channel; returns whether every
+    /// channel had its turn.
+    async fn pre_cache_images(&self, programs: &[RefreshedAirings], stop: &ScanCancel) -> bool {
         let (Some(store), Some(images)) = (self.item_store.get(), self.images.get()) else {
-            return;
+            return true;
         };
         let max_cache_date = Utc::now() + chrono::Duration::days(PRE_CACHE_DAYS);
         let parallelism = std::thread::available_parallelism()
@@ -1551,7 +1556,12 @@ impl FerrofinLiveTvManager {
         let mut seen: HashSet<String> = HashSet::new();
         let mut failed = 0_usize;
         let mut downloads = tokio::task::JoinSet::new();
+        let mut finished = true;
         for group in programs {
+            if stop.is_cancelled() {
+                finished = false;
+                break;
+            }
             let ids: Vec<Uuid> = group
                 .iter()
                 .filter(|(_, end)| end.is_some_and(|end| end < max_cache_date))
@@ -1604,6 +1614,7 @@ impl FerrofinLiveTvManager {
                 "live tv: some programme images could not be pre-cached"
             );
         }
+        finished
     }
 
     /// The `ChannelPrimaryImageTag` of each of the channels `ids` that has a
@@ -1874,12 +1885,19 @@ impl FerrofinLiveTvManager {
     /// on the programmes the listings returned, and each channel takes its own
     /// out of the map. Returned are the programmes created or updated, with
     /// their end, one group per channel, for `PreCacheImages`.
+    ///
+    /// `None` when `stop` ended it before a channel
+    /// (`cancellationToken.ThrowIfCancellationRequested()` at the top of
+    /// upstream's per-channel loop, :234): the channels before it are
+    /// mirrored whole, and nothing is cleaned, which needs every channel's
+    /// airings.
     async fn sync_program_items(
         &self,
         mut listings: HashMap<Uuid, ProgramImages>,
-    ) -> Result<Vec<RefreshedAirings>, ServiceError> {
+        stop: &ScanCancel,
+    ) -> Result<Option<Vec<RefreshedAirings>>, ServiceError> {
         let Some(store) = self.item_store.get() else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
         warn_refused_artwork(
             listings.values().map(ProgramImages::refused).sum(),
@@ -1893,6 +1911,9 @@ impl FerrofinLiveTvManager {
         // a channel with none included; stored once every channel is done.
         let mut aggregates: Vec<(Uuid, ChannelAggregate)> = Vec::new();
         for channel_id in crate::guide_repository::all_channel_ids(&self.db).await? {
+            if stop.is_cancelled() {
+                return Ok(None);
+            }
             let rows = crate::guide_repository::channel_program_rows(&self.db, &channel_id).await?;
             if let Ok(id) = Uuid::parse_str(&channel_id) {
                 aggregates.push((id, ChannelAggregate::of(&rows)));
@@ -1936,7 +1957,7 @@ impl FerrofinLiveTvManager {
                 store.persistence.delete_items(chunk).await?;
             }
         }
-        Ok(refreshed)
+        Ok(Some(refreshed))
     }
 
     /// `item.SetProviderId(ExternalServiceTag, serviceName)` in `GetChannel`
@@ -4042,8 +4063,22 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
+        // Nobody stops this one (a configuration write's queued refresh).
+        self.refresh_guide_until(&ScanCancel::new())
+            .await
+            .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_lines)] // one pass: the fetches, then the writes under the guide lock
+    async fn refresh_guide_until(&self, stop: &ScanCancel) -> Result<bool, ServiceError> {
         // `GuideManager.RefreshGuide` starts here.
         self.create_recording_folders().await;
+        // `cancellationToken.ThrowIfCancellationRequested()` before each
+        // service (:120), of which a stock server has one. `Ok(false)` is that
+        // throw, here and at every check below.
+        if stop.is_cancelled() {
+            return Ok(false);
+        }
         let generation = self.refresh_generation.fetch_add(1, Ordering::SeqCst) + 1;
         // FETCH FIRST, OUTSIDE THE LOCK. `guide_lock` exists to keep two passes
         // from interleaving their WRITES (see the field doc); holding it across
@@ -4088,7 +4123,13 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 host.get_channels(&tuner),
                 tracing::info_span!("tuner_lineup", tuner = %id),
             );
-            match lineup.await {
+            // The fetch takes the token upstream (`GetChannels(enableCache,
+            // cancellationToken)`): a stop ends the one in flight, and a
+            // stopped refresh starts none.
+            let Some(lineup) = stop.unless_cancelled(lineup).await else {
+                return Ok(false);
+            };
+            match lineup {
                 Ok(channels) => {
                     let listed = listed.entry(host.type_id()).or_default();
                     tuner_lineups.push((id, new_channels(listed, channels)));
@@ -4123,9 +4164,13 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // (`insert_programs`).
         let mut guides: Vec<(ListingsProviderInfo, GuideSource)> = Vec::new();
         for provider in self.get_listing_providers().await? {
-            let (source, complete) = self
-                .fetch_guide_source(&provider, &tuner_lineups, window, generation)
-                .await?;
+            // As for a tuner: the listings fetches take the token upstream
+            // (`AddProviderMetadata`, `GetProgramsAsync`).
+            let fetch = self.fetch_guide_source(&provider, &tuner_lineups, window, generation);
+            let Some(fetched) = stop.unless_cancelled(fetch).await else {
+                return Ok(false);
+            };
+            let (source, complete) = fetched?;
             clean_database &= complete;
             if let Some(source) = source {
                 guides.push((provider, source));
@@ -4142,14 +4187,19 @@ impl LiveTvManager for FerrofinLiveTvManager {
         if self.superseded(generation) {
             // A newer refresh started while this one fetched; it writes the
             // guide from the configuration as it is now. (Should that pass
-            // fail before its write, the guide waits for the next refresh, as
-            // a cancelled task upstream leaves it.)
+            // fail or be stopped before its write, the guide waits for the
+            // next refresh, as a cancelled task upstream leaves it.)
             tracing::debug!("live tv: guide refresh superseded by a newer one; not writing");
-            return Ok(());
+            return Ok(true);
         }
         let guard = self.guide_lock.lock().await;
         let mut kept_channels: HashSet<String> = HashSet::new();
         for (id, channels) in &tuner_lineups {
+            // Before each channel item upstream (:196); a tuner's channels
+            // are one write here.
+            if stop.is_cancelled() {
+                return Ok(false);
+            }
             kept_channels.extend(self.replace_channels(id, channels).await?);
         }
         // The airings this pass wrote, with the artwork their listing gave
@@ -4165,6 +4215,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // By value: each document goes as soon as its airings are written,
         // rather than living through the item mirror below.
         for (provider, source) in guides {
+            // Before each channel's programmes upstream (:234); a provider's
+            // airings are one write here.
+            if stop.is_cancelled() {
+                return Ok(false);
+            }
             let written = match source {
                 GuideSource::XmlTv { document, channels } => {
                     self.insert_programs(document, &channels, &provider, window, &mut filled)
@@ -4188,6 +4243,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
                 kept_programs.extend(written);
             }
         }
+        // `CleanDatabase` checks before each stored item (:356).
+        if stop.is_cancelled() {
+            return Ok(false);
+        }
         if clean_database {
             self.clean_guide(&kept_channels, &kept_programs).await?;
         }
@@ -4199,7 +4258,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // Every provider has spoken, so the programme table now holds exactly
         // upstream's `newProgramIdList` across all services — the set its
         // `CleanDatabase(newProgramIdList, [LiveTvProgram])` is taken over.
-        let refreshed = self.sync_program_items(kept_programs).await?;
+        let Some(refreshed) = self.sync_program_items(kept_programs, stop).await? else {
+            return Ok(false);
+        };
         // `RefreshGuide`'s tail: `RefreshSeriesTimers` then `RefreshTimers`
         // (v12.2 src/Jellyfin.LiveTv/Guide/GuideManager.cs:163-164).
         self.refresh_series_timers().await?;
@@ -4208,8 +4269,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // channel's programmes as it stores them; here they all go once the
         // guide is written.
         drop(guard);
-        self.pre_cache_images(&refreshed).await;
-        Ok(())
+        Ok(self.pre_cache_images(&refreshed, stop).await)
     }
 
     async fn get_guide_info(&self) -> Result<GuideInfo, ServiceError> {
@@ -9089,6 +9149,7 @@ mod tests {
     mod programme_listing;
     mod recording_folders;
     mod recording_images;
+    mod refresh_stop;
     mod schedules_direct;
 
     use std::collections::HashMap;

@@ -3049,6 +3049,9 @@ mod tests {
         ) -> Result<bool, ServiceError> {
             self.0.run_requested_library_scans(progress).await
         }
+        async fn stopped_scan_ended(&self) {
+            self.0.stopped_scan_ended().await;
+        }
         fn is_scan_running(&self) -> bool {
             self.0.is_scan_running()
         }

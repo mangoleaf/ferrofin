@@ -7,9 +7,9 @@
 //!
 //! - [`PluginUpdateTask`] — `PluginUpdateTask` (`PluginUpdates`)
 //!
-//! The C# `IProgress<double>` maps to [`TaskProgress`]; the body does not check
-//! the run's token yet, so a stop drops it when it does not stop in time
-//! (gl-2004).
+//! The C# `IProgress<double>` and `CancellationToken` map to [`TaskProgress`]:
+//! the body checks [`TaskProgress::stop_requested`] where upstream checks its
+//! token, before the catalogue fetch and each package (gl-2004).
 
 use std::sync::Arc;
 
@@ -91,12 +91,21 @@ impl ScheduledTask for PluginUpdateTask {
         ]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `GetAvailablePluginUpdates(cancellationToken)` throws for a run
+        // already stopped (gl-2004).
+        if progress.stop_requested() {
+            return Ok(());
+        }
         progress.report(0.0);
         let updates = self.plugins.available_plugin_updates().await?;
         progress.report(CATALOG_FETCH_PERCENT);
         let total = updates.len();
         let mut failed = 0usize;
         for (index, update) in updates.iter().enumerate() {
+            // `ThrowIfCancellationRequested()` before each package (gl-2004).
+            if progress.stop_requested() {
+                return Ok(());
+            }
             match self
                 .plugins
                 .install_package(
@@ -171,6 +180,8 @@ mod tests {
         updates: Vec<PluginUpdateInfo>,
         installed: Mutex<Vec<InstallCall>>,
         fail: bool,
+        /// A run each install stops, as a Stop pressed during it would.
+        stop_on_install: Mutex<Option<TaskProgress>>,
     }
 
     #[async_trait::async_trait]
@@ -225,6 +236,9 @@ mod tests {
             version: Option<&str>,
             repository_url: Option<&str>,
         ) -> Result<(), ServiceError> {
+            if let Some(run) = self.stop_on_install.lock().expect("lock").as_ref() {
+                run.cancel_token().cancel();
+            }
             self.installed.lock().expect("lock").push(InstallCall {
                 name: name.to_owned(),
                 guid: assembly_guid,
@@ -244,6 +258,7 @@ mod tests {
             updates,
             installed: Mutex::new(Vec::new()),
             fail,
+            stop_on_install: Mutex::new(None),
         });
         (PluginUpdateTask::new(plugins.clone()), plugins)
     }
@@ -256,6 +271,39 @@ mod tests {
             version: to.to_owned(),
             repository_url: Some("https://repo.example/manifest.json".to_owned()),
         }
+    }
+
+    /// gl-2004: a run stopped before it starts fetches no catalogue and
+    /// installs nothing, and is recorded Cancelled.
+    #[tokio::test]
+    async fn a_stopped_run_installs_no_update() {
+        let (task, plugins) = task(vec![update("Alpha", Uuid::from_u128(1), "2.0.0")], false);
+        let progress = TaskProgress::default();
+        progress.cancel_token().cancel();
+        task.execute(&progress).await.expect("run");
+        assert!(plugins.installed.lock().expect("lock").is_empty());
+        assert!(progress.reported().is_none(), "nothing reported");
+        assert!(progress.was_stopped(), "recorded Cancelled");
+    }
+
+    /// gl-2004: a stop during one package's install leaves the next one
+    /// uninstalled (`ThrowIfCancellationRequested` before each package).
+    #[tokio::test]
+    async fn a_stop_during_an_install_installs_no_further_update() {
+        let (task, plugins) = task(
+            vec![
+                update("Alpha", Uuid::from_u128(1), "2.0.0"),
+                update("Beta", Uuid::from_u128(2), "3.0.0"),
+            ],
+            false,
+        );
+        let progress = TaskProgress::default();
+        *plugins.stop_on_install.lock().expect("lock") = Some(progress.clone());
+        task.execute(&progress).await.expect("run");
+        let installed = plugins.installed.lock().expect("lock");
+        assert_eq!(installed.len(), 1, "only the first install ran");
+        assert_eq!(installed[0].name, "Alpha");
+        assert!(progress.was_stopped(), "recorded Cancelled");
     }
 
     #[test]
