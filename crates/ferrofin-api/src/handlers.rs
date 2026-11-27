@@ -6884,6 +6884,7 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             ADOPTED_TRIGGER_FILE_DIVERGENCE,
             ADOPTED_FILE_LENIENCY_DIVERGENCE,
+            GUIDE_PROGRESS_DIVERGENCE,
             "The 400 (an isHidden or isEnabled value the query binder cannot convert), 401 (no \
          or bad token) and 403 (not an administrator) bodies are Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
@@ -6906,6 +6907,7 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             ADOPTED_TRIGGER_FILE_DIVERGENCE,
             ADOPTED_FILE_LENIENCY_DIVERGENCE,
+            GUIDE_PROGRESS_DIVERGENCE,
             "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
          id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -6924,21 +6926,22 @@ pub const VERIFIED: &[Verified] = &[
                run's token cancelled, State Cancelling until the run returns) → \
                execute_contained and finish (ExecuteInternal: the run records Cancelled when \
                its body stopped for it, else its own outcome, then ExecuteQueuedTasks)",
-        date: "2026-11-11",
+        date: "2026-11-27",
         divergences: &[
             "Stopping a task that is idle or already stopping answers 204 and changes nothing; \
          upstream's Cancel throws InvalidOperationException there, a 500. Jellyfin bug not \
          ported.",
             "A body still running STOP_WAIT (2 s) after the stop is dropped and recorded \
          Cancelled; upstream waits for ExecuteAsync however long it takes. The ferrofin-core \
-         bodies check their token where upstream's do (gl-129, gl-1709, gl-2004), but the \
-         Keyframe Extractor, the five library bodies, Update Plugins and Migrate Trickplay \
-         Image Location hand their per-item work no token, Optimize database checks only \
-         before its first statement (gl-2006) and the guide refresh \
-         checks none inside its refresh (gl-2013), so work \
-         running when the wait ends is cut off mid-item; the extensions' and WASM bodies \
-         check none (gl-2005). Fix path: gl-2005, gl-2006 and gl-2013; the value is a \
-         candidate setting (gl-1710).",
+         bodies check their token where upstream's do (gl-129, gl-1709, gl-2004, gl-2013), \
+         but work running when the wait ends is still cut off mid-item. The Keyframe \
+         Extractor, the five library bodies, Update Plugins and Migrate Trickplay Image \
+         Location hand their per-item work no token, and Optimize database checks only \
+         before its first statement (gl-2006). The guide refresh writes a tuner's channels, \
+         and a listings provider's airings, as one write each and checks before it, where \
+         upstream checks before each channel (gl-2006). The extensions' and WASM bodies \
+         check none (gl-2005). Fix path: gl-2005 and gl-2006; the value is a candidate \
+         setting (gl-1710).",
             "Optimize database records a run stopped before its optimisation Cancelled; \
          upstream's catch (Exception) around RunScheduledOptimisation swallows the \
          cancellation, logs it as an error and records the run Completed. Jellyfin bug not \
@@ -6959,14 +6962,21 @@ pub const VERIFIED: &[Verified] = &[
                TaskManager.CancelIfRunningAndQueue<RefreshMediaLibraryTask>) → ferrofin-core \
                scheduled_tasks.rs cancel (CancelIfRunning) and queue_scheduled \
                (QueueScheduledTask with new TaskOptions(): started when Idle, else queued \
-               until the cancelled run has ended); a failure is logged as \"Error refreshing \
-               library\" and the answer is 204 either way, as the controller's catch",
-        date: "2026-11-11",
+               until the cancelled run has ended, which RefreshLibraryTask::execute does \
+               once the scan its stop cancelled has: LibraryManager::stopped_scan_ended, as \
+               RefreshMediaLibraryTask.ExecuteAsync returns when \
+               ValidateMediaLibraryInternal does; a scan another request joined while it \
+               was queued is not cancelled and runs on for that request); a failure is \
+               logged as \"Error refreshing library\" and the answer is 204 either way, as \
+               the controller's catch",
+        date: "2026-11-27",
         divergences: &[
-            "A Scan Media Library run the refresh cancels ends when its scan wait is \
-         withdrawn, before the scan's item in progress does; upstream's run stays Cancelling \
-         until ValidateMediaLibraryInternal returns. The scan queue still starts the new \
-         scan after the stopping one. Fix path: gl-2013.",
+            "A Scan Media Library run the refresh cancels waits for its scan to end for \
+         STOP_WAIT (2 s) at most, then is recorded Cancelled while the scan finishes its item \
+         (or the item refresh it is serving); upstream's run stays Cancelling until \
+         ValidateMediaLibraryInternal returns, however long. The scan queue still starts the \
+         new scan after the stopping one. Fix path: the wait goes once every task body \
+         stops on its own (gl-2005, gl-2006); its value is a candidate setting (gl-1710).",
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
          error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -7582,6 +7592,13 @@ const ADOPTED_FILE_LENIENCY_DIVERGENCE: &str = "An adopted task file that leans 
      System.Text.Json's leniency (a trigger without Type, a numeric Status, a number written \
      as a string) is skipped as unreadable, where upstream reads it; Jellyfin never writes \
      one. Fix path: gl-1845.";
+
+/// The two scheduled-task read rows: the progress a running Refresh Guide
+/// does not report.
+const GUIDE_PROGRESS_DIVERGENCE: &str = "A running Refresh Guide shows no \
+     CurrentProgressPercentage until it ends: its refresh reports none, where upstream's \
+     GuideManager.RefreshGuide reports through its channel and programme passes. Fix path: \
+     gl-2021.";
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
 /// `ArtistsController` + `BaseItemRepository.GetItemValues`.

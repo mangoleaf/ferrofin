@@ -25,7 +25,7 @@ const LIVE_TV: &str = "Live TV";
 /// (XMLTV) and rewrites the channel/guide cache. Port of
 /// `RefreshGuideScheduledTask`, whose `ExecuteAsync` is
 /// `GuideManager.RefreshGuide`; Ferrofin's equivalent is
-/// [`LiveTvManager::refresh_guide`].
+/// [`LiveTvManager::refresh_guide_until`], handed the run's token.
 pub struct RefreshGuideTask {
     live_tv: Arc<dyn LiveTvManager>,
 }
@@ -78,8 +78,7 @@ impl ScheduledTask for RefreshGuideTask {
 
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         // `RefreshGuide(progress, cancellationToken)` throws for a run already
-        // stopped: the check before its first service does (gl-2004). The
-        // checks inside the refresh are gl-2013's.
+        // stopped: the check before its first service does (gl-2004).
         if progress.stop_requested() {
             return Ok(());
         }
@@ -87,8 +86,19 @@ impl ScheduledTask for RefreshGuideTask {
         // reports across its tuner and listing passes, so the dashboard shows a
         // moving bar; Ferrofin's `refresh_guide` takes no progress handle, so
         // the run reads 0% until it finishes. Closing it means widening the
-        // manager seam, not faking intermediate percentages here.
-        self.live_tv.refresh_guide().await?;
+        // manager seam, not faking intermediate percentages here (fix path:
+        // gl-2021).
+        //
+        // The refresh checks the run's token where upstream's does, and says
+        // when a stop ended it: recorded Cancelled, with no closing 100 %.
+        if !self
+            .live_tv
+            .refresh_guide_until(progress.cancel_token())
+            .await?
+        {
+            progress.stopped();
+            return Ok(());
+        }
         progress.report(100.0);
         Ok(())
     }
@@ -106,6 +116,8 @@ mod tests {
     struct FakeLiveTv {
         refreshes: AtomicU32,
         tuners: AtomicBool,
+        /// A Stop arrives while the refresh runs.
+        stopped_inside: AtomicBool,
     }
 
     #[async_trait]
@@ -129,6 +141,16 @@ mod tests {
         async fn refresh_guide(&self) -> Result<(), ServiceError> {
             self.refreshes.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        }
+        async fn refresh_guide_until(
+            &self,
+            stop: &ferrofin_traits::tasks::ScanCancel,
+        ) -> Result<bool, ServiceError> {
+            self.refresh_guide().await?;
+            if self.stopped_inside.load(Ordering::Relaxed) {
+                stop.cancel();
+            }
+            Ok(!stop.is_cancelled())
         }
         async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
             unreachable!("the guide-refresh task never asks for listings countries")
@@ -325,6 +347,25 @@ mod tests {
         task.execute(&progress).await.expect("run");
         assert_eq!(fake.refreshes.load(Ordering::Relaxed), 0);
         assert!(progress.was_stopped(), "recorded Cancelled");
+    }
+
+    /// A stop inside the refresh reaches it through the run's own token
+    /// (`RefreshGuide(progress, cancellationToken)`): the refresh ends early
+    /// and the run is recorded Cancelled, with no closing 100 %.
+    #[tokio::test]
+    async fn a_stop_inside_the_refresh_cancels_the_run() {
+        let fake = Arc::new(FakeLiveTv::default());
+        fake.stopped_inside.store(true, Ordering::Relaxed);
+        let task = RefreshGuideTask::new(fake.clone());
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("run");
+        assert_eq!(fake.refreshes.load(Ordering::Relaxed), 1);
+        assert!(
+            progress.cancel_token().is_cancelled(),
+            "the refresh was handed the run's token"
+        );
+        assert!(progress.was_stopped(), "recorded Cancelled");
+        assert_eq!(progress.reported(), None, "no 100 % for a stopped refresh");
     }
 
     #[tokio::test]

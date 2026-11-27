@@ -20,6 +20,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemRepository, ItemWithCounts, PlaylistItemsWithAccess};
 use ferrofin_traits::stubs::{LiveTvChannelQuery, LiveTvManager as _};
+use ferrofin_traits::tasks::ScanCancel;
 use uuid::Uuid;
 
 use super::{ArtServices, M3U, guide_day, item_lab_reading_through};
@@ -84,6 +85,9 @@ fn guide(day: &str, airings: &[Airing]) -> String {
 struct ChannelReads {
     inner: Arc<dyn ItemRepository>,
     reads: Mutex<Vec<BTreeSet<String>>>,
+    /// Cancelled at the first read recorded: a stop that arrives while one
+    /// channel's airings are being mirrored.
+    stop: Option<ScanCancel>,
 }
 
 impl ChannelReads {
@@ -94,6 +98,9 @@ impl ChannelReads {
             .map(|row| row.channel_id.clone().unwrap_or_default())
             .collect();
         if !channels.is_empty() {
+            if let Some(stop) = &self.stop {
+                stop.cancel();
+            }
             self.reads.lock().expect("reads").push(channels);
         }
     }
@@ -273,6 +280,48 @@ impl ItemRepository for ChannelReads {
     }
 }
 
+/// A stop that arrives while one channel's airings are mirrored ends the
+/// refresh before the next channel's are read, as upstream throws at the top
+/// of its per-channel loop (`cancellationToken.ThrowIfCancellationRequested()`,
+/// GuideManager.cs:234). The channel in progress is written whole, and no
+/// airing's item is removed: the clean-up needs every channel's.
+#[tokio::test]
+async fn a_stop_ends_the_mirror_before_the_next_channel() {
+    let stop = ScanCancel::new();
+    let mut recorder = None;
+    let lab = item_lab_reading_through(M3U, Some(guide(&guide_day(0), &AIRINGS)), |inner| {
+        let reads = Arc::new(ChannelReads {
+            inner,
+            reads: Mutex::new(Vec::new()),
+            stop: Some(stop.clone()),
+        });
+        recorder = Some(Arc::clone(&reads));
+        reads
+    })
+    .await;
+    let reads = recorder.expect("the lab wraps its item reads");
+    // The first import reads no stored airing, so nothing stops it.
+    lab.mgr.refresh_guide().await.expect("first refresh");
+    assert!(reads.reads().is_empty() && !stop.is_cancelled());
+
+    let finished = lab
+        .mgr
+        .refresh_guide_until(&stop)
+        .await
+        .expect("stopped refresh");
+    assert!(!finished, "a stopped refresh says so");
+    assert_eq!(
+        reads.reads().len(),
+        1,
+        "only the channel in progress was read back: {:?}",
+        reads.reads()
+    );
+    let stored = crate::guide_repository::test_support::stored_program_items(&lab.mgr.db)
+        .await
+        .expect("programme items");
+    assert_eq!(stored.len(), 4, "no airing's item was removed: {stored:?}");
+}
+
 /// A refresh that finds the guide already stored reads it back one channel at
 /// a time, as upstream loads `existingPrograms` per channel, and still mirrors
 /// every airing under its own channel.
@@ -287,6 +336,7 @@ async fn a_guide_refresh_reads_the_stored_airings_one_channel_at_a_time() {
         let reads = Arc::new(ChannelReads {
             inner,
             reads: Mutex::new(Vec::new()),
+            stop: None,
         });
         recorder = Some(Arc::clone(&reads));
         reads
