@@ -96,8 +96,9 @@ tower = "0.5"
 tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 httpdate = "1.0.3"
 # zlib/gzip: the response-compression tests' decoders (the server never decodes
-# a response it just encoded), gzipped Live TV guides (ferrofin-livetv), and a
-# PDF's compressed cross-reference and object streams (ferrofin-providers books).
+# a response it just encoded), gzipped Live TV guides (ferrofin-livetv), a
+# PDF's compressed cross-reference and object streams (ferrofin-providers books),
+# and a PNG photo's compressed text chunks (ferrofin-drawing).
 flate2 = "1.1.11"
 zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-core, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
@@ -293,7 +294,7 @@ icu_properties = "2.4.0"
 icu_experimental = "0.7.0"
 zerovec = "0.11.9"
 fancy-regex = "0.20.1"    # for C# regexes that use lookaround
-quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
+quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers); a photo's XMP packet (ferrofin-drawing)
 # Embedded lyric tags read from the file (ID3v2 SYLT, frame order), which
 # ffprobe's tag map cannot give — the scan's port of ATL's `Track.Lyrics`.
 lofty = "0.25.5"

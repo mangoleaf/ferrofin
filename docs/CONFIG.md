@@ -257,7 +257,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 ### HTTPS
 
 Ferrofin serves HTTPS itself, as Jellyfin does, from the dashboard's **Networking** settings
-(`{config}/users/named/network.json`):
+(`{config}/network.json`):
 
 - **Enable HTTPS** with a **Custom SSL certificate path** to a PKCS#12 (`.pfx`/`.p12`) file holding
   the certificate and its private key, plus its password if it has one. At startup the server

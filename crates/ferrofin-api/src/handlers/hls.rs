@@ -871,17 +871,20 @@ async fn get_audio_variant_playlist(
     Ok(playlist_response(playlist))
 }
 
-/// Parses the axum-captured `{segmentId}` segment into a segment index, `400`
-/// on a bad value. The router registers the route without its `.{container}`
-/// literal, so the capture is the whole `{segmentId}.{container}` path segment
-/// ([`segment_pattern_failures`] reads the container from it). Shared with the
-/// trickplay tile handler (`{index}.jpg`).
-pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
+/// Parses the axum-captured `{segmentId}` segment into a segment index, as
+/// ASP.NET binds the route value `name` ([`bind_route_number`]: trimmed, the
+/// hex forms read too), `400` on a bad value. The router registers the route
+/// without its `.{container}` literal, so the capture is the whole
+/// `{segmentId}.{container}` path segment ([`segment_pattern_failures`] reads
+/// the container from it). Shared with the trickplay tile handler
+/// (`{index}.jpg`).
+///
+/// [`bind_route_number`]: crate::query::bind_route_number
+pub(super) fn parse_segment_index(segment_id: &str, name: &str) -> Result<i32, ApiError> {
     // The captured value is `<index>.<ext>`, or `<index>` alone; take the
     // leading integer either way.
     let head = segment_id.split('.').next().unwrap_or(segment_id);
-    head.parse::<i32>()
-        .map_err(|_| ApiError::BadRequest(format!("invalid segment id {segment_id:?}")))
+    crate::query::bind_route_number(head, name)
 }
 
 /// `{playlistId}`, a `[FromRoute, Required] string` of the `hls1` segment
@@ -918,7 +921,7 @@ async fn get_video_hls_segment(
         return Ok(rejection);
     }
     require_query_item(&state, &auth, &parts, &req).await?;
-    let index = parse_segment_index(&segment_id)?;
+    let index = parse_segment_index(&segment_id, "segmentId")?;
     let request = Request::from_parts(parts, body);
     let file = state.hls.dynamic_segment(&req, index, false).await?;
     served_file_response(file, request).await
@@ -942,7 +945,7 @@ async fn get_audio_hls_segment(
         return Ok(rejection);
     }
     require_query_item(&state, &auth, &parts, &req).await?;
-    let index = parse_segment_index(&segment_id)?;
+    let index = parse_segment_index(&segment_id, "segmentId")?;
     let request = Request::from_parts(parts, body);
     let file = state.hls.dynamic_segment(&req, index, true).await?;
     served_file_response(file, request).await
@@ -1121,9 +1124,10 @@ async fn get_video_attachment(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
     RequiredRouteString(media_source_id, _): RequiredRouteString<AttachmentMediaSourceId>,
-    Path((DotnetGuid(video_id), _, index)): Path<(DotnetGuid, String, i32)>,
+    Path((DotnetGuid(video_id), _, index)): Path<(DotnetGuid, String, String)>,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    let index: i32 = crate::query::bind_route_number(&index, "index")?;
     // No token on a font URL: anonymous, as upstream.
     require_streamable_item(
         &state,
@@ -1209,6 +1213,20 @@ crate::query::query_parameters! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A segment index binds as ASP.NET binds the `int` route value: trimmed,
+    /// the hex forms read, the container after the dot left out; a value no
+    /// form reads is the binder's 400, naming the parameter (gl-1664).
+    #[test]
+    fn a_segment_index_binds_as_the_query_binder() {
+        assert_eq!(parse_segment_index("3.ts", "segmentId").ok(), Some(3));
+        assert_eq!(parse_segment_index("0x10.mp4", "segmentId").ok(), Some(16));
+        assert_eq!(parse_segment_index("#2", "index").ok(), Some(2));
+        let Err(ApiError::BadRequest(message)) = parse_segment_index("x.ts", "segmentId") else {
+            panic!("a word is a 400");
+        };
+        assert_eq!(message, "The value 'x' is not valid for segmentId.");
+    }
 
     /// The ordinary stream routes bind `Container` as a scalar: the first value.
     #[test]
