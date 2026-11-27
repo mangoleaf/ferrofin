@@ -153,7 +153,10 @@ pub enum ScanTarget {
     /// (`ProviderManager.RefreshSingleItem`, a non-folder's `RefreshItem`):
     /// a movie's, an episode's, a track's refresh, or an Identify of one. A
     /// file that is gone is never removed by it — upstream's item refresh
-    /// deletes nothing — and it runs no library-wide closing pass.
+    /// deletes no item — and it runs no library-wide closing pass. It finds
+    /// the item's extras in the folder it sits in again, as upstream's
+    /// `RefreshedOwnedItems` → `RefreshExtras` does, and removes the stored
+    /// ones whose files are gone.
     Items(Vec<String>),
     /// `ProviderManager.RefreshArtist`: the CHILDREN of `folders` — the
     /// artist folders the artist's credited albums sit under — and the
