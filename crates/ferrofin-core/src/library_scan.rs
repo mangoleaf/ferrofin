@@ -808,7 +808,7 @@ async fn download_image(
         if let Err(err) =
             off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
         {
-            tracing::warn!(%err, item = %item_id, "failed to write downloaded artwork");
+            tracing::warn!(%err, %item_id, "failed to write downloaded artwork");
             return None;
         }
         dest
@@ -1555,7 +1555,7 @@ fn spawn_probe(
     slots: Option<Arc<tokio::sync::Semaphore>>,
     fanout: Option<fanout::Permit>,
 ) -> tokio::task::JoinHandle<Option<MediaInfo>> {
-    tokio::task::spawn(async move {
+    tokio::task::spawn(tracing::Instrument::in_current_span(async move {
         // Keep the fanout slot inside the task until I/O or cancellation finishes.
         let _fanout = fanout;
         // Held for the probe: the scan's budget of running ffprobes.
@@ -1606,7 +1606,7 @@ fn spawn_probe(
             None => {}
         }
         Some(probed)
-    })
+    }))
 }
 
 /// `AudioFileProber.AddExternalLyrics`: every lyric sidecar of the track is
@@ -7224,7 +7224,7 @@ impl LibraryScanner {
             ))
             .await;
             work.served(&touched);
-            tracing::debug!(item = %item.id, "scanning item");
+            tracing::debug!(item_id = %item.id, "scanning item");
             self.log_scan_progress(scanned, planned.len());
             // Boxed: the read is awaited inside the loop, and inlining its
             // future would grow the scan future (`large_futures`).
@@ -9634,7 +9634,7 @@ impl LibraryScanner {
                 .replace_provider_ids(item_id, &settled.merged)
                 .await
             {
-                tracing::warn!(%err, item = %item_id, "failed to persist provider ids");
+                tracing::warn!(%err, %item_id, "failed to persist provider ids");
             }
         } else {
             // Otherwise only what the record does not hold as it is: a new
@@ -9642,7 +9642,7 @@ impl LibraryScanner {
             // REPLACE on the item and provider).
             for (key, value) in &settled.upserts {
                 if let Err(err) = self.persistence.save_provider_id(item_id, key, value).await {
-                    tracing::warn!(%err, item = %item_id, provider = key, "failed to persist provider id");
+                    tracing::warn!(%err, %item_id, provider = key, "failed to persist provider id");
                 }
             }
         }
@@ -12300,7 +12300,7 @@ impl LibraryScanner {
         };
         let provider = ferrofin_drawing::photo_provider::PhotoProvider::new(Arc::clone(processor));
         if let Err(err) = provider.fetch(&mut photo).await {
-            tracing::warn!(%err, item = %entity.id, "photo embedded-information pass failed");
+            tracing::warn!(%err, item_id = %entity.id, "photo embedded-information pass failed");
             return Vec::new();
         }
         if photo.width > 0 {
@@ -13283,7 +13283,7 @@ impl LibraryScanner {
                             }
                         }
                         Err(err) => {
-                            tracing::warn!(%err, person = %id, "failed to persist person image");
+                            tracing::warn!(%err, item_id = %id, "failed to persist person image");
                         }
                     }
                 }
@@ -13346,7 +13346,7 @@ impl LibraryScanner {
                     asked().insert(person.id);
                 }
                 if let Err(err) = repo.set_person_metadata(person.id, metadata).await {
-                    tracing::warn!(%err, person = %id, "failed to persist person biography");
+                    tracing::warn!(%err, item_id = %id, "failed to persist person biography");
                 }
             }
         }
@@ -13683,7 +13683,7 @@ impl LibraryScanner {
         {
             Ok(extracted) => extracted,
             Err(err) => {
-                tracing::warn!(%err, item = %item_id, ?image_type, "failed to extract embedded image");
+                tracing::warn!(%err, %item_id, ?image_type, "failed to extract embedded image");
                 return None;
             }
         };
@@ -18861,7 +18861,7 @@ impl LibraryScanner {
         }
         let out = dir.join(format!("{stem}.{extension}"));
         if let Err(err) = tokio::fs::write(&out, &bytes).await {
-            tracing::warn!(%err, item = %entity.id, "failed to write book cover");
+            tracing::warn!(%err, item_id = %entity.id, "failed to write book cover");
             return Vec::new();
         }
         vec![ItemImageInfo {
