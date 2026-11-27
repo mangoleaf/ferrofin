@@ -316,12 +316,24 @@ fn walk(root: &Path, out: Option<&Path>, skip: &Skip) -> Result<Copied> {
         };
         copied.digest.0.insert(path, entry);
     }
+    // The report lists them by path; the walk met them in listing order.
+    copied.containers.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(copied)
 }
 
-/// Every path under `root`, relative to it, with its kind, links followed, in
-/// path order (a directory before what it holds), but the directories
-/// `left_out` names and what they hold.
+/// Every path under `root`, relative to it, with its kind, links followed, but
+/// the directories `left_out` names and what they hold: each directory's
+/// entries in the order it lists them, a directory before what it holds. A
+/// copy creates them in that order, so an output that lists by creation order
+/// (btrfs) lists each directory as the source does, and a returned
+/// Jellyfin finds the libraries and their shortcuts in the order of the
+/// `PhysicalLocationsList`s the database stores (gl-1933).
+///
+/// shortcut: only an output that lists by creation order is given the source's
+/// order. ext4 lists by its names' hashes, seeded per filesystem (the source's
+/// own ext4 gives the source's order, another one its own), and tmpfs lists
+/// newest first; reorder the stored lists onto the output's listing for those
+/// (gl-1983).
 fn list(root: &Path, left_out: &HashSet<PathBuf>) -> Result<Vec<(PathBuf, Kind)>> {
     let mut found = Vec::new();
     // Each directory listed, by where it really is, with the path it was reached by.
@@ -376,7 +388,6 @@ fn list(root: &Path, left_out: &HashSet<PathBuf>) -> Result<Vec<(PathBuf, Kind)>
             found.push((path, kind));
         }
     }
-    found.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(found)
 }
 
@@ -450,9 +461,10 @@ fn refused(path: &Path, why: &str) -> DbError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
-    use super::{ContainerFile, Skip, copy, digest, digest_files, finish, walk_all};
+    use super::{ContainerFile, Skip, copy, digest, digest_files, finish, list, walk_all};
 
     fn write(root: &Path, path: &str, bytes: &[u8]) {
         let path = root.join(path);
@@ -608,6 +620,42 @@ mod tests {
             copied.digest.changes(&digest(&source, &skip).unwrap()),
             ["root/default/Movies/options.json"]
         );
+    }
+
+    /// gl-1933: the walk, and so the copy, takes each directory's entries in
+    /// the order the source lists them, so where the output lists by creation
+    /// order (btrfs) a returned Jellyfin finds the libraries and their
+    /// shortcuts in the source's order, the order of the lists the database
+    /// stores (`PhysicalLocationsList`), and does not save them again. Each
+    /// directory still comes before what it holds.
+    #[test]
+    fn walks_each_directory_in_the_sources_listing_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        // Out of path order, as Jellyfin creates a library added after
+        // another and a location added after the first.
+        write(&source, "root/default/Zed/shows.mblink", b"/media/shows");
+        write(&source, "root/default/Zed/extra.mblink", b"/media/extra");
+        write(&source, "root/default/Alpha/films.mblink", b"/media/films");
+
+        let listed = list(&source, &HashSet::new()).unwrap();
+
+        for folder in ["", "root", "root/default", "root/default/Zed"] {
+            let folder = Path::new(folder);
+            let walked: Vec<&Path> = listed
+                .iter()
+                .map(|(path, _)| path.as_path())
+                .filter(|path| path.parent() == Some(folder))
+                .collect();
+            let source_lists: Vec<PathBuf> = std::fs::read_dir(source.join(folder))
+                .unwrap()
+                .map(|entry| folder.join(entry.unwrap().file_name()))
+                .collect();
+            assert_eq!(walked, source_lists, "{}", folder.display());
+        }
+        let at = |path: &str| listed.iter().position(|(p, _)| p == Path::new(path));
+        assert!(at("root/default/Zed") < at("root/default/Zed/shows.mblink"));
+        assert!(at("root/default/Zed") < at("root/default/Zed/extra.mblink"));
     }
 
     #[test]

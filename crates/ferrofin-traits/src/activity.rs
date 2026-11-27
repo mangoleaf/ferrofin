@@ -141,8 +141,9 @@ pub trait ActivityManager: Send + Sync {
         None
     }
 
-    /// Deletes entries created before `before`, returning how many were removed
-    /// (C# `CleanAsync` — the "Clean Activity Log" scheduled task's backend).
+    /// Deletes entries created at or before `before`, returning how many were
+    /// removed (C# `CleanAsync`, `DateCreated <= startDate` — the "Clean
+    /// Activity Log" scheduled task's backend).
     async fn clean(&self, before: DateTime<Utc>) -> Result<u64, ServiceError>;
 }
 

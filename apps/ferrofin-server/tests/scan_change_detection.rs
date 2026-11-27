@@ -2768,15 +2768,25 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     assert_eq!(std::fs::read(&french).unwrap(), b"existing French subtitle");
     let id = h.id(&movie).await;
     let streams = h.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
-    assert_eq!(
-        streams["MediaStreams"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|s| s["Type"] == "Subtitle")
-            .count(),
-        2
-    );
+    // The download joins the probe's streams as the probe orders them, the
+    // external subtitles first (`AddExternalSubtitlesAsync`'s rescan, gl-1641).
+    let mut subtitles: Vec<_> = streams["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["Type"] == "Subtitle")
+        .map(|s| s["Index"].as_i64().unwrap())
+        .collect();
+    subtitles.sort_unstable();
+    assert_eq!(subtitles, [0, 1], "{streams}");
+    let video: Vec<_> = streams["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["Type"] == "Video")
+        .map(|s| s["Index"].as_i64().unwrap())
+        .collect();
+    assert_eq!(video, [2], "{streams}");
 
     for mode in ["Default", "FullRefresh"] {
         let mark = h.mark().await;

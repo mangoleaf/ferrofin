@@ -892,32 +892,40 @@ pub struct ListingsProviderInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
-    /// Gets or sets the enabled tuners.
+    /// Gets or sets the enabled tuners. A `null` element is kept as `None`, as
+    /// System.Text.Json binds one into the C# `string[]`; it enables no tuner.
     #[serde(deserialize_with = "crate::json::value::null_as_default")]
-    pub enabled_tuners: Vec<String>,
+    pub enabled_tuners: Vec<Option<String>>,
 
     /// Gets or sets a value indicating whether all tuners are enabled.
     pub enable_all_tuners: bool,
 
-    /// Gets or sets the news categories.
+    /// Gets or sets the news categories (a `null` element, kept as `None`,
+    /// matches no category).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub news_categories: Option<Vec<String>>,
+    pub news_categories: Option<Vec<Option<String>>>,
 
-    /// Gets or sets the sports categories.
+    /// Gets or sets the sports categories (a `null` element, kept as `None`,
+    /// matches no category).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sports_categories: Option<Vec<String>>,
+    pub sports_categories: Option<Vec<Option<String>>>,
 
-    /// Gets or sets the kids categories.
+    /// Gets or sets the kids categories (a `null` element, kept as `None`,
+    /// matches no category).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub kids_categories: Option<Vec<String>>,
+    pub kids_categories: Option<Vec<Option<String>>>,
 
-    /// Gets or sets the movie categories.
+    /// Gets or sets the movie categories (a `null` element, kept as `None`,
+    /// matches no category).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub movie_categories: Option<Vec<String>>,
+    pub movie_categories: Option<Vec<Option<String>>>,
 
-    /// Gets or sets the channel mappings.
+    /// Gets or sets the channel mappings. A `null` element is kept as `None`,
+    /// as the C# `NameValuePair[]` keeps it, and maps no channel: upstream's
+    /// readers dereference it (`ListingsManager.GetMappedChannel`), a Jellyfin
+    /// bug not ported.
     #[serde(deserialize_with = "crate::json::value::null_as_default")]
-    pub channel_mappings: Vec<NameValuePair>,
+    pub channel_mappings: Vec<Option<NameValuePair>>,
 
     /// Gets or sets the movie prefix.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -930,6 +938,11 @@ pub struct ListingsProviderInfo {
     /// Gets or sets the user agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
+}
+
+/// A seeded category list of [`ListingsProviderInfo::default`].
+fn categories(names: &[&str]) -> Vec<Option<String>> {
+    names.iter().map(|name| Some((*name).to_owned())).collect()
 }
 
 impl Default for ListingsProviderInfo {
@@ -947,26 +960,26 @@ impl Default for ListingsProviderInfo {
             path: None,
             enabled_tuners: Vec::new(),
             enable_all_tuners: true,
-            news_categories: Some(vec![
-                "news".to_owned(),
-                "journalism".to_owned(),
-                "documentary".to_owned(),
-                "current affairs".to_owned(),
-            ]),
-            sports_categories: Some(vec![
-                "sports".to_owned(),
-                "basketball".to_owned(),
-                "baseball".to_owned(),
-                "football".to_owned(),
-            ]),
-            kids_categories: Some(vec![
-                "kids".to_owned(),
-                "family".to_owned(),
-                "children".to_owned(),
-                "childrens".to_owned(),
-                "disney".to_owned(),
-            ]),
-            movie_categories: Some(vec!["movie".to_owned()]),
+            news_categories: Some(categories(&[
+                "news",
+                "journalism",
+                "documentary",
+                "current affairs",
+            ])),
+            sports_categories: Some(categories(&[
+                "sports",
+                "basketball",
+                "baseball",
+                "football",
+            ])),
+            kids_categories: Some(categories(&[
+                "kids",
+                "family",
+                "children",
+                "childrens",
+                "disney",
+            ])),
+            movie_categories: Some(categories(&["movie"])),
             channel_mappings: Vec::new(),
             movie_prefix: None,
             preferred_language: None,
@@ -1155,19 +1168,25 @@ mod tests {
     fn listings_provider_default_matches_jellyfin_ctor() {
         let p = ListingsProviderInfo::default();
         assert!(p.enable_all_tuners);
+        let named = |list: Option<Vec<Option<String>>>| -> Vec<String> {
+            list.expect("seeded")
+                .into_iter()
+                .map(|name| name.expect("named"))
+                .collect()
+        };
         assert_eq!(
-            p.news_categories.unwrap(),
+            named(p.news_categories),
             ["news", "journalism", "documentary", "current affairs"]
         );
         assert_eq!(
-            p.sports_categories.unwrap(),
+            named(p.sports_categories),
             ["sports", "basketball", "baseball", "football"]
         );
         assert_eq!(
-            p.kids_categories.unwrap(),
+            named(p.kids_categories),
             ["kids", "family", "children", "childrens", "disney"]
         );
-        assert_eq!(p.movie_categories.unwrap(), ["movie"]);
+        assert_eq!(named(p.movie_categories), ["movie"]);
         assert!(p.id.is_none());
         assert!(p.enabled_tuners.is_empty(), "{:?}", p.enabled_tuners);
         assert!(p.channel_mappings.is_empty(), "{:?}", p.channel_mappings);
@@ -1184,6 +1203,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(o, LiveTvOptions::default());
+    }
+
+    /// A `null` element in one of the lists binds and is kept, as
+    /// System.Text.Json binds it into the C# array (gl-1677), and writes back
+    /// as `null`.
+    #[test]
+    fn a_null_list_element_is_kept() {
+        let p: ListingsProviderInfo = serde_json::from_str(
+            r#"{"EnabledTuners":[null,"t1"],"NewsCategories":[null],"ChannelMappings":[null]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.enabled_tuners, [None, Some("t1".to_owned())]);
+        assert_eq!(p.news_categories, Some(vec![None]));
+        assert_eq!(p.channel_mappings, [None]);
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["EnabledTuners"], serde_json::json!([null, "t1"]));
+        assert_eq!(json["NewsCategories"], serde_json::json!([null]));
+        assert_eq!(json["ChannelMappings"], serde_json::json!([null]));
     }
 
     #[test]
@@ -1449,7 +1486,7 @@ mod tests {
 
         let listings = ListingsProviderInfo {
             id: Some("l1".to_owned()),
-            enabled_tuners: vec!["t1".to_owned()],
+            enabled_tuners: vec![Some("t1".to_owned())],
             enable_all_tuners: true,
             ..ListingsProviderInfo::default()
         };

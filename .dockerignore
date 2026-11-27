@@ -30,6 +30,9 @@ verify/
 **/*.db-wal
 **/jellyfin-10.*/
 **/jellyfin-12.*/
+# Docker drops a pattern's trailing slash, so the line above also takes this file, Jellyfin's schema, which the
+# export builds into the server (crates/ferrofin-db/src/export/shapes.rs).
+!crates/ferrofin-db/tests/data/jellyfin-12.2-schema.sql
 **/media-mounts.sh
 **/smoke-jellyfin-*.txt
 gates/adoption/oracle/

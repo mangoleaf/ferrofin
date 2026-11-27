@@ -622,7 +622,7 @@ fn spawn_pool_sampler(db: &Database) {
 ///
 /// - The VAAPI driver-name and Vulkan DRM-extension probes need the configured
 ///   render node, `EncodingOptions.vaapi_device`. That lives in the encoding
-///   configuration store (`{config_dir}/named/encoding.json`), which no one has
+///   configuration store (`{config_dir}/encoding.json`), which no one has
 ///   read at this point in boot — `discover_ffmpeg` sees only [`Config`], and
 ///   the configuration manager is not built until `build_app_state` — and it is
 ///   mutable at runtime from the dashboard, so a value captured here could go
@@ -1148,13 +1148,14 @@ fn derive_ffprobe_path(ffmpeg: &Path) -> PathBuf {
 /// (`EncoderAppPath`), which `MediaEncoder.SetFFmpegPath` prefers over `$PATH`
 /// when no command-line/environment path is given.
 ///
-/// Reads `{config}/users/named/encoding.json` (the live store); a server whose
+/// Reads `{config}/encoding.json` (the live store, which the boot has moved
+/// out of an earlier release's `users/named/` by then); a server whose
 /// configuration has not been saved by Ferrofin yet falls back to the adopted
 /// Jellyfin `{config}/encoding.xml`. A missing, unreadable or blank value is
 /// "not configured" — startup must not fail on it.
 #[must_use]
 pub fn persisted_encoder_app_path(config_dir: &Path) -> Option<String> {
-    let json = config_dir.join("users").join("named").join("encoding.json");
+    let json = config_dir.join("encoding.json");
     if let Ok(raw) = std::fs::read_to_string(&json) {
         return serde_json::from_str::<serde_json::Value>(&raw)
             .ok()?
@@ -1395,7 +1396,7 @@ mod tests {
         );
         write(
             tmp.path(),
-            "users/named/encoding.json",
+            "encoding.json",
             r#"{"EncoderAppPath":" /from/json/ffmpeg ","EncoderAppPathDisplay":"/shown"}"#,
         );
         assert_eq!(
@@ -1408,7 +1409,7 @@ mod tests {
             "{}",
             "not json",
         ] {
-            write(tmp.path(), "users/named/encoding.json", unusable);
+            write(tmp.path(), "encoding.json", unusable);
             assert_eq!(persisted_encoder_app_path(tmp.path()), None, "{unusable}");
         }
     }

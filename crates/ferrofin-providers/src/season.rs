@@ -30,7 +30,7 @@
 //! So neither is ever a language fallback in the fold. The scanner and the
 //! single-season refresh pass the resolved metadata language to TMDB.
 
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, is_virtual_location};
 
 use crate::metadata_merge::MetadataResult;
 use crate::tmdb::SeasonDetails;
@@ -66,6 +66,18 @@ pub fn apply_zero_display_name(
     }
     item.name = Some(name.to_owned());
     true
+}
+
+/// `SeasonMetadataService.SaveIsVirtualItem` (`SeasonMetadataService.cs:
+/// 105-115`): a season with no path (`LocationType.Virtual`) is virtual
+/// while every one of its `episodes` (`GetEpisodes`, missing ones included)
+/// has none either, or it has none at all; a season with a path never is.
+/// Returns whether the flag changed (upstream's `MetadataEdit`).
+pub fn save_is_virtual_item(season: &mut BaseItemEntity, episodes: &[BaseItemEntity]) -> bool {
+    let is_virtual = is_virtual_location(season) && episodes.iter().all(is_virtual_location);
+    let changed = season.is_virtual_item != is_virtual;
+    season.is_virtual_item = is_virtual;
+    changed
 }
 
 /// `TmdbSeasonProvider.GetMetadata`'s answer (`:41-158`) for season
@@ -196,6 +208,41 @@ pub async fn tvdb_season(
 
 #[cfg(test)]
 mod tests {
+    /// `SaveIsVirtualItem`'s cases: a season with a path is never virtual;
+    /// a path-less one is while it has no episode or only path-less ones.
+    #[rstest::rstest]
+    #[case::path_less_no_episodes(None, &[], false, true)]
+    #[case::path_less_only_missing_episodes(None, &[None, None], false, true)]
+    #[case::path_less_with_a_file(None, &[None, Some("/tv/S/S S01E01.mkv")], true, false)]
+    #[case::season_folder(Some("/tv/S/Season 1"), &[None], true, false)]
+    #[case::season_folder_stored_virtual(Some("/tv/S/Season 1"), &[], true, false)]
+    #[case::path_less_stored_virtual(None, &[None], true, true)]
+    fn save_is_virtual_item_follows_the_paths(
+        #[case] path: Option<&str>,
+        #[case] episode_paths: &[Option<&str>],
+        #[case] stored: bool,
+        #[case] expected: bool,
+    ) {
+        use ferrofin_db::entities::base_items::BaseItemEntity;
+        let mut season = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Season".to_owned(),
+            path: path.map(str::to_owned),
+            is_virtual_item: stored,
+            ..BaseItemEntity::default()
+        };
+        let episodes: Vec<BaseItemEntity> = episode_paths
+            .iter()
+            .map(|path| BaseItemEntity {
+                type_: "MediaBrowser.Controller.Entities.TV.Episode".to_owned(),
+                path: path.map(str::to_owned),
+                ..BaseItemEntity::default()
+            })
+            .collect();
+        let changed = super::save_is_virtual_item(&mut season, &episodes);
+        assert_eq!(season.is_virtual_item, expected);
+        assert_eq!(changed, stored != expected);
+    }
+
     #[rstest::rstest]
     #[case::renamed(false, false, 0, "Old", "Bonus", "Bonus")]
     #[case::item_lock(true, false, 0, "Mine", "Bonus", "Mine")]

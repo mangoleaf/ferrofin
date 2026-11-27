@@ -586,8 +586,8 @@ async fn a_dvd_ordered_series_is_looked_up_in_dvd_order() {
 /// fanart.tv's `SeasonProvider` in a scan: with FanArt enabled for seasons the
 /// series' fanart document is read once more, for the season, by the series'
 /// TVDB id; with it unticked for the Season type that request is not made (the
-/// series' own request is unaffected). Which images the season keeps, and the
-/// `https` upgrade of their urls, are covered by the provider's unit tests.
+/// series' own request is unaffected). Which images the season keeps, at which
+/// size and url, is covered by the provider's unit tests.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_season_asks_fanart_for_its_artwork_only_when_fanart_is_enabled() {
     let documents = |options: LibraryOptions| async move {

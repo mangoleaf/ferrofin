@@ -1386,10 +1386,13 @@ pub fn write_lyrics(
 }
 
 /// Executes `write-subtitles`. `size_cap` bounds the payload
-/// (`FERROFIN_WASM_WRITE_CONTENT_MB`).
+/// (`FERROFIN_WASM_WRITE_CONTENT_MB`). The save records no stream, so the
+/// item's refresh is queued after it, as the subtitle upload route does: its
+/// probe records the file. A refresh that cannot be queued is logged and the
+/// write still succeeds: the file is saved, and the next scan records it.
 ///
 /// # Errors
-/// Cap violations or a manager failure.
+/// Cap violations or a failed save.
 pub fn write_subtitles(
     cx: &Collaborators,
     size_cap: usize,
@@ -1411,7 +1414,21 @@ pub fn write_subtitles(
     };
     cx.handle
         .block_on(cx.subtitles.upload_subtitle(iid, &response))
-        .map_err(|e| format!("subtitle write failed: {e}"))
+        .map_err(|e| format!("subtitle write failed: {e}"))?;
+    // A retry after a saved file would write a second one (`{name}.0.srt`).
+    let queued = cx.handle.block_on(async {
+        match cx.library.get_item_by_id(iid).await? {
+            Some(item) => {
+                let options = ferrofin_traits::providers::MetadataRefreshOptions::default();
+                cx.library.queue_item_refresh(&item, &options).await
+            }
+            None => Ok(()),
+        }
+    });
+    if let Err(error) = queued {
+        tracing::warn!(item_id = %iid, %error, "subtitle saved, but its item refresh was not queued");
+    }
+    Ok(())
 }
 
 /// The plugin's owned-collection ledger (host-reserved state).
