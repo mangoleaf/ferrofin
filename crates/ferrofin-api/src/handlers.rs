@@ -2978,8 +2978,9 @@ macro_rules! similar_items_path {
          MusicAlbum-, MusicArtist- and AudioSimilarItemsProvider (AudioBook through Audio) \
          and LiveTvProgramSimilarItemsProvider by IsMovie and IsSeries; local_similar's score \
          pass, similar_items_repository.rs weighted_similar_items (genre 10, tag and studio 5, \
-         director 50, actor and guest star 15, the seed's people distinct), its one filter \
-         query, score_filter_query (Movie, plus Trailer and LiveTvProgram under \
+         director 50, actor and guest star 15, the seed's people distinct; no version of a \
+         primary in its own library, ComputeBatchScoresAsync's hiddenVersionIds), its one \
+         filter query, score_filter_query (Movie, plus Trailer and LiveTvProgram under \
          EnableExternalContentInSuggestions; IsMovie; IsPlayed = false; the user's access; \
          TranslateQuery without ApplyGroupingFilter, so never grouped by presentation key), \
          and phase 3, best_scoring_per_key (by score, the primary first on a tie, then \
@@ -3031,7 +3032,6 @@ const TRAILERS_DIVERGENCES: &[&str] = &[
 /// The divergences the six `/{kind}/{itemId}/Similar` rows share.
 const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
     SIMILAR_SCORE_WINDOW_DIVERGENCE,
-    SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
     "A reference-cache entry that exists but cannot be read (a directory at its path, an \
      entry or cache directory the server may not read) warns once with its path and is \
      fetched again from the provider. Upstream reads a directory, or an entry under a \
@@ -3073,12 +3073,6 @@ const SIMILAR_SCORE_WINDOW_DIVERGENCE: &str = "A movie or trailer seed's score p
      every item it scored (an episode or series sharing an actor included) before it filters \
      kinds and excluded ids, cuts a tie in the order the scores were added, and matches clean \
      values, so its page can hold fewer or other movies. Fix path: gl-1786.";
-
-/// The 12.1 alternate-version rule the score pass still lacks (gl-392).
-const SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE: &str = "The score pass scores an alternate \
-     version whose primary is in the same library, which upstream's hiddenVersionIds leaves \
-     out (12.1), so such versions take places in the limit * 3 window before the filter \
-     query drops them. Fix path: gl-392.";
 
 /// The code path the four legacy `HlsSegmentController` rows share after their
 /// handler, from the resolver to the response.
@@ -3187,7 +3181,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3197,7 +3191,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3207,7 +3201,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3217,7 +3211,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3257,7 +3251,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3303,7 +3297,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3332,9 +3326,10 @@ pub const VERIFIED: &[Verified] = &[
                IBatchLocalSimilarItemsProvider and MovieSimilarItemsProvider's \
                GetBatchSimilarItemsAsync for every baseline, whatever its kind, with the user \
                and Limit = itemLimit, no remote provider: similar_items_repository.rs \
-               weighted_scores for all of them, each baseline's top itemLimit * 3 by score then \
-               Id, one score_filter_query get_item_list over the union of those windows, and \
-               each category picked from the rows of that union its baseline scored \
+               weighted_scores for all of them, hiddenVersionIds unscored, each baseline's top \
+               itemLimit * 3 by score then Id, one score_filter_query get_item_list over the \
+               union of those windows, and each category picked from the rows of that union \
+               its baseline scored \
                (scores.ContainsKey), best_scoring_per_key's PrimaryVersionId tie-break and \
                DistinctBy(PresentationUniqueKey), Take(itemLimit), an empty category skipped; \
                next_person_category, the lazy GetPersonRecommendations: Person = name, \
@@ -3344,10 +3339,9 @@ pub const VERIFIED: &[Verified] = &[
                CategoryId = name.GetMD5(); round_robin_categories: recently played, recently \
                played, liked, liked, directors, actors until categoryLimit or a pass adds \
                nothing, then a stable OrderBy RecommendationType)",
-        date: "2026-11-24",
+        date: "2026-11-26",
         divergences: &[
             SIMILAR_SCORE_WINDOW_DIVERGENCE,
-            SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
             "An itemLimit above 715827882 overflows upstream's limit * 3 to a negative Take, so \
          every similar-to category is empty; the oversample saturates here. Jellyfin bug not \
          ported.",
@@ -7729,9 +7723,6 @@ const RESUME_DIVERGENCES: &[&str] = &[
      count each leaf's own played row; v12.4's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
      alternate-version arm in item_count_service's played statements (gl-441).",
-    "Resume positions that Ferrofin builds before gl-46 saved for songs and for Sample, \
-     ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
-     until they are played again; new plays no longer save one. Fix path: gl-717.",
     SEARCH_TERM_ORIGINAL_TITLE_DIVERGENCE,
     "The 400 (an API key with no userId, or a value the query binder cannot convert), \
      403 (another user's id without the administrator role) and 404 (a userId naming no \

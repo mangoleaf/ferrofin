@@ -922,7 +922,13 @@ impl FerrofinUserManager {
             n => Some(i64::from(n)),
         };
 
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         let was_disabled = has_permission(&mut *tx, &id, PermissionKind::IsDisabled).await?;
         if guarded {
             let state = PolicyGuardState {
@@ -1053,7 +1059,13 @@ impl FerrofinUserManager {
         let id = Uuid::new_v4();
         let id_str = guid_to_db(id);
 
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         if Self::user_id_by_name_on(&mut *tx, name, None)
             .await?
             .is_some()
@@ -1205,7 +1217,13 @@ impl UserManager for FerrofinUserManager {
         // transaction: `IX_Users_Username` is UNIQUE, so a guard read from the
         // read pool loses the same way `create_user`'s did — the rename that
         // gets there second fails the index and turns a `400` into a `500`.
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         if Self::user_id_by_name_on(&mut *tx, new_name, Some(guid_to_db(user_id)))
             .await?
             .is_some()
@@ -1261,7 +1279,13 @@ impl UserManager for FerrofinUserManager {
         let id = Uuid::parse_str(&user.id)
             .map_err(|_| ServiceError::invalid_input("user id is not a valid guid"))?;
 
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         let stored = Self::fetch_user_on(&mut *tx, id)
             .await?
             .ok_or_else(|| ServiceError::not_found(format!("user {id}")))?;
@@ -1453,7 +1477,13 @@ impl UserManager for FerrofinUserManager {
         // account and its data gone, with no admin left to recover through).
         // The row deletions are in the same transaction, so a failure part-way
         // no longer strands a user's permissions/preferences either.
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         let user = Self::fetch_user_on(&mut *tx, user_id)
             .await?
             .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))?;
@@ -2003,7 +2033,13 @@ impl UserManager for FerrofinUserManager {
         administrator: bool,
     ) -> Result<AdminFlagOutcome, ServiceError> {
         let id = guid_to_db(user_id);
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         let user = Self::fetch_user_on(&mut *tx, user_id)
             .await?
             .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))?;
