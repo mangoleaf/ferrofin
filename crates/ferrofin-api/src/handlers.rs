@@ -955,7 +955,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// a graphical subtitle's file, most of whose operations have no row of their
 /// own yet.
 /// `escape-charsets` is which 7-bit escape encodings a text subtitle sidecar
-/// or a playlist file is read in, which the subtitle stream operations and the
+/// or a playlist file is read in, and the tables its legacy Chinese and Korean
+/// text is decoded with, which the subtitle stream operations and the
 /// playlist scan share.
 /// `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
@@ -2805,7 +2806,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         upstream_file: "MediaBrowser.MediaEncoding/Subtitles/SubtitleEncoder.cs",
         upstream_method: "GetSubtitleStream",
         ferrofin: "Which 7-bit escape encodings a text subtitle sidecar and a playlist file \
-                   are read in, and how (gl-1657). ferrofin-util escape_charset.rs detect \
+                   are read in, and how (gl-1657), and the tables their legacy Chinese and \
+                   Korean text is decoded with (gl-2000). ferrofin-util escape_charset.rs detect \
                    ports UTF.Unknown 2.7.0, the version Jellyfin 12.4 pins: \
                    CharsetDetector.Feed and FindInputState (1024-byte chunks, a high byte but \
                    0xA0 dropping the escape prober, an ESC or a { after a ~ starting it) and \
@@ -2826,17 +2828,50 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    0, which the state after ESC errors on, so it never names ISO-2022-CN, and \
                    Jellyfin 12.4 serves such a file as it is, as Ferrofin does. Measured on \
                    Jellyfin 12.4: ISO-2022-KR, HZ (with ~~), ISO-2022-JP and ISO-2022-CN \
-                   sidecars serve the same text as Ferrofin's. 8-bit input and the \
-                   multi-byte and single-byte probers are not part of this row.",
-        date: "2026-11-26",
+                   sidecars serve the same text as Ferrofin's. The tables behind the decoders \
+                   were measured too (gl-2000): sidecars holding every byte pair of GBK, HZ, \
+                   the KS X 1001 square, UHC and ISO-2022-KR, and every four-byte GB18030 \
+                   sequence of the Basic Multilingual Plane, served by Jellyfin 12.4 and by \
+                   Ferrofin and compared sequence by sequence. Jellyfin reads 8-bit Simplified \
+                   Chinese with .NET's GB18030Encoding, HZ with code page 936, Korean with code \
+                   page 949 (cp949, and under ISO-2022-KR) or 51949 (euc-kr), where \
+                   encoding_rs's tables are WHATWG's. ferrofin-util code_page.rs holds what \
+                   .NET has and encoding_rs lacks: code page 949's user-defined rows C9 and \
+                   FE, which are U+E000 to U+E0BB (user_defined, read by the ISO-2022-KR \
+                   decoder and by decode for 8-bit Korean text), and the GB18030 sequence 81 \
+                   35 F4 37, which is U+1E3F (decode). get_subtitle_stream and decode_playlist \
+                   decode 8-bit text through code_page decode. With them every ISO-2022-KR \
+                   pair, every four-byte sequence of the Basic Multilingual Plane that has a \
+                   character and a cp949 sidecar holding both user-defined rows serve the same \
+                   text as Jellyfin's. Playlists were served too: an ISO-2022-KR, a cp949 and \
+                   a GB18030 playlist whose entries name files called U+E000, U+E0BB and \
+                   U+1E3F find the same tracks on both servers. Which charset 8-bit input is \
+                   read in (the multi-byte and single-byte probers) is not part of this row: \
+                   chardetng names it.",
+        date: "2026-11-27",
         divergences: &[
             "Two 7-bit ISO-2022-JP variants chardetng rejects, an ISO-2022-JP-2 JIS X 0212 \
              designation and a run left open across a newline, are served as they are, where \
              Jellyfin's escape prober detects ISO-2022-JP and .NET decodes the JIS X 0208 \
              runs (with the 0212 character wrong). Fix path: gl-1998.",
-            "A pair is looked up in encoding_rs's GBK and EUC-KR tables (WHATWG), which may \
-             differ from .NET's code pages 936 and 949 for a few code points (Private Use \
-             Area and GB18030 mappings). Fix path: gl-2000.",
+            "34 Simplified Chinese sequences decode to another code point than Jellyfin's: \
+             in 8-bit text A3A0, A6D9 to A6DF, A6EC, A6ED, A6F3, A8BC, FE59, FE61, FE66, \
+             FE67, FE6D, FE7E, FE90, FEA0 and a lone 80, and under HZ A2E3, the same ten A6 \
+             pairs, A8BC and A8BF. encoding_rs answers U+3000, U+FE10 to U+FE19, U+1E3F, \
+             U+01F9, U+9FB4 to U+9FBB and U+20AC, where .NET answers a Private Use Area code \
+             point (U+E5E5, U+E76C, U+E78D to U+E796, U+E7C7, U+E7C8 and eight from U+E81E \
+             to U+E864) and ? for the lone 80. Owner decision pending, tracked in gl-2008.",
+            "B4D3 is U+B2D2, as code page 949 has it, where code page 51949, which Jellyfin \
+             reads a file it names euc-kr with, answers U+B2D6. Owner decision pending, \
+             tracked in gl-2008.",
+            "Korean text is read as code page 949 reads it whichever of the two Jellyfin would \
+             name, since chardetng answers EUC-KR for both. Code page 51949 reads a byte \
+             below A1 (81 and A0 were measured) and the bytes AD to AF, C9 and FE alone, and \
+             the byte after each starts a new character, where Ferrofin decodes a UHC \
+             syllable or a user-defined pair. Owner decision pending, tracked in gl-2008.",
+            "A sequence with no character in its charset is U+FFFD, and an ASCII byte after a \
+             lead byte is read again, where .NET's decoders answer ? and take both bytes. Fix \
+             path: gl-2010.",
         ],
     },
 ];
