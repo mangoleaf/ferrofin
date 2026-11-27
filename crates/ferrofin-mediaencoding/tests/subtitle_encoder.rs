@@ -520,6 +520,53 @@ async fn get_subtitle_stream_reads_the_four_byte_m_acute_of_gb18030() {
     );
 }
 
+// Bytes with no character in their charset are what .NET's decoders write
+// for them, as Jellyfin 12.4 serves them (gl-2010): `?`, U+30FB in the
+// Japanese code pages, and a code point of its own for a lone byte. Each
+// sequence is one chardetng keeps the charset beside, at a price the text
+// before it has to outweigh.
+#[rstest::rstest]
+#[case::cp949(encoding_rs::EUC_KR, KOREAN_TEXT, b" \x80 \xff", " \u{80} \u{F8F7}")]
+#[case::gb18030(encoding_rs::GBK, "这是中文字幕。我们明天再见。", b" \xff", " ?")]
+#[case::big5(encoding_rs::BIG5, "這是中文字幕。我們明天再見。", b" \xa3\xe2", " ?")]
+#[case::shift_jis(
+    encoding_rs::SHIFT_JIS,
+    "これは日本語の字幕です。あなたはどこにいますか。",
+    b" \x81\xad \xa0",
+    " \u{30FB} \u{F8F0}"
+)]
+#[case::euc_jp(
+    encoding_rs::EUC_JP,
+    "これは日本語の字幕です。あなたはどこにいますか。",
+    b" \xa9\xa1",
+    " \u{30FB}"
+)]
+#[tokio::test]
+async fn get_subtitle_stream_reads_bytes_with_no_character_as_dotnet_does(
+    #[case] encoding: &'static encoding_rs::Encoding,
+    #[case] text: &str,
+    #[case] bytes: &[u8],
+    #[case] expected: &str,
+) {
+    let text = text.repeat(40);
+    let (encoded, _, _) = encoding.encode(&text);
+    let srt = [
+        b"1\n00:00:01,000 --> 00:00:02,500\n",
+        &encoded[..],
+        bytes,
+        b"\n\n",
+    ]
+    .concat();
+    let (encoder, file_info) = encoder_for_srt("/media/legacy.srt", srt);
+
+    let stream = encoder.get_subtitle_stream(&file_info).await.unwrap();
+
+    assert_eq!(
+        String::from_utf8(stream.into_bytes()).unwrap(),
+        format!("1\n00:00:01,000 --> 00:00:02,500\n{text}{expected}\n\n")
+    );
+}
+
 // ---- ConvertTextSubtitleToSrt charset hint ----------------------------------
 //
 // Port of the C# arg construction: `-y{charenc} -i "{in}" -c:s srt "{out}"`.

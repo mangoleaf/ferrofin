@@ -955,9 +955,10 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// a graphical subtitle's file, most of whose operations have no row of their
 /// own yet.
 /// `escape-charsets` is which 7-bit escape encodings a text subtitle sidecar
-/// or a playlist file is read in, and the tables its legacy Chinese and Korean
-/// text is decoded with, which the subtitle stream operations and the
-/// playlist scan share.
+/// or a playlist file is read in, the tables its legacy Chinese and Korean
+/// text is decoded with, and what is written for bytes with no character in
+/// their charset, which the subtitle stream operations and the playlist scan
+/// share.
 /// `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
@@ -2806,8 +2807,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         upstream_file: "MediaBrowser.MediaEncoding/Subtitles/SubtitleEncoder.cs",
         upstream_method: "GetSubtitleStream",
         ferrofin: "Which 7-bit escape encodings a text subtitle sidecar and a playlist file \
-                   are read in, and how (gl-1657), and the tables their legacy Chinese and \
-                   Korean text is decoded with (gl-2000). ferrofin-util escape_charset.rs detect \
+                   are read in, and how (gl-1657), the tables their legacy Chinese and \
+                   Korean text is decoded with (gl-2000), and what is written for bytes with no \
+                   character in their charset (gl-2010). ferrofin-util escape_charset.rs detect \
                    ports UTF.Unknown 2.7.0, the version Jellyfin 12.4 pins: \
                    CharsetDetector.Feed and FindInputState (1024-byte chunks, a high byte but \
                    0xA0 dropping the escape prober, an ESC or a { after a ~ starting it) and \
@@ -2845,9 +2847,49 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    character and a cp949 sidecar holding both user-defined rows serve the same \
                    text as Jellyfin's. Playlists were served too: an ISO-2022-KR, a cp949 and \
                    a GB18030 playlist whose entries name files called U+E000, U+E0BB and \
-                   U+1E3F find the same tracks on both servers. Which charset 8-bit input is \
-                   read in (the multi-byte and single-byte probers) is not part of this row: \
-                   chardetng names it.",
+                   U+1E3F find the same tracks on both servers. Bytes with no character in \
+                   their charset were measured next (gl-2010), in sidecars Jellyfin 12.4 named \
+                   cp949, gb18030, big5, shift-jis and euc-jp: every high byte before every \
+                   other byte, before a line feed, a CR LF and a NUL and at the end of the \
+                   file, and GB18030's four-byte forms. It is what .NET 10's \
+                   System.Text.Encoding.CodePages source says, read beside the measurement: \
+                   the decoder fallback writes ? (InternalDecoderBestFitFallback), or the code \
+                   page's default character, which LoadManagedCodePage sets: U+30FB for 932 \
+                   (shift-jis) and for 51932 (euc-jp, EUCJPEncoding over 932's table). \
+                   DBCSCodePageEncoding.GetChars (949, 950, 932, 51932) looks a lead byte up \
+                   together with the byte after it, whatever that byte is, so one replacement \
+                   takes both, a line feed included, and a lead byte the text ends in is one \
+                   replacement; 51932 has no three-byte form, so 8F is no lead byte there. \
+                   GB18030Encoding.GetChars writes ? for the first byte alone and reads on \
+                   from the next, and one ? for a well-formed four-byte sequence that has no \
+                   character. The code points themselves are in the code page data, so they \
+                   are the measured ones. \
+                   A byte that is no lead byte has a code point of its own: 80 is U+0080 in \
+                   949, 950 and 51932, FF is U+F8F7 in 949 and U+F8F8 in 950, A0 and FD to FF \
+                   are U+F8F0 to U+F8F3 in 932, as A0 and FF are in 51932, and 81 to 8D and 8F \
+                   to 9F are U+30FB in 51932. \
+                   The single-byte code pages were read through a ComicInfo.xml declaring each \
+                   of twenty encodings, since UTF.Unknown drops a single-byte charset at the \
+                   first byte its model marks illegal (SingleByteCharSetProber.HandleData); \
+                   seven code pages a sidecar was served in gave the same 128 bytes both ways. \
+                   .NET has a Private Use Area code point for every byte the WHATWG index \
+                   leaves out of windows-1253, -1255, -1257, -874 and ISO-8859-6, -7 and -8. \
+                   code_page decode runs encoding_rs's decoder without replacement and, for \
+                   each sequence it cannot decode, writes what dotnet_fallback and lone_bytes \
+                   hold of the above, then reads on after the bytes .NET takes. With it \
+                   decode writes the text Jellyfin serves for every swept line of cp949, \
+                   shift-jis and euc-jp (97,320, and the 44,188 of the gl-2000 sweep but JIS X \
+                   0212), and for gb18030's and big5's but for the differences below. chardetng \
+                   keeps a charset beside few of these sequences (an unassigned pair in Big5, \
+                   Shift_JIS and EUC-JP, the lone bytes, a Mac OS single byte before ASCII) and \
+                   never names a single-byte charset for text with a byte it lacks, so a \
+                   subtitle or a playlist reaches only those. Over HTTP, six sidecars holding \
+                   two to four such sequences each, in the five charsets, are byte for byte \
+                   what Jellyfin serves (one holding six in Shift_JIS is not: chardetng names \
+                   windows-1251 for it), and a Shift_JIS playlist whose entry holds an \
+                   unassigned pair finds the same track. Which charset 8-bit input is read in \
+                   (the multi-byte and single-byte probers) is not part of this row: chardetng \
+                   names it.",
         date: "2026-11-27",
         divergences: &[
             "Two 7-bit ISO-2022-JP variants chardetng rejects, an ISO-2022-JP-2 JIS X 0212 \
@@ -2865,13 +2907,34 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              reads a file it names euc-kr with, answers U+B2D6. Owner decision pending, \
              tracked in gl-2008.",
             "Korean text is read as code page 949 reads it whichever of the two Jellyfin would \
-             name, since chardetng answers EUC-KR for both. Code page 51949 reads a byte \
-             below A1 (81 and A0 were measured) and the bytes AD to AF, C9 and FE alone, and \
-             the byte after each starts a new character, where Ferrofin decodes a UHC \
-             syllable or a user-defined pair. Owner decision pending, tracked in gl-2008.",
-            "A sequence with no character in its charset is U+FFFD, and an ASCII byte after a \
-             lead byte is read again, where .NET's decoders answer ? and take both bytes. Fix \
-             path: gl-2010.",
+             name, since chardetng answers EUC-KR for both. Code page 51949 reads the bytes \
+             80 to A0, AD to AF, C9, FE and FF alone (U+0080 to U+009F, U+F8E6, U+F8E7 to \
+             U+F8E9, ?, U+F8EA and U+F8EB), and the byte after each starts a new character, \
+             where Ferrofin decodes a UHC syllable or a user-defined pair, writes one ? for \
+             such a byte and the byte after it when the two make no pair, so that a line \
+             feed or an ASCII character 51949 keeps is gone, and reads FF as U+F8F7. Owner \
+             decision pending, tracked in gl-2008.",
+            "Big5 text is decoded with encoding_rs's Big5, the WHATWG index with the Hong \
+             Kong and ETEN extensions, where Jellyfin reads code page 950: 5,059 pairs \
+             decode to another code point, 33 (A3C0 to A3E0) to a control picture where 950 \
+             answers ?, and 1,159 pairs of 950's user-defined ranges stay U+FFFD, with an \
+             ASCII trail byte read again, where 950 answers a Private Use Area code point. \
+             Fix path: gl-2012, which waits on gl-2008.",
+            "EUC-JP's three-byte form (8F and two bytes) is decoded as JIS X 0212 where it \
+             has a character, 6,067 of the 8,836 sequences, where code page 51932 answers \
+             U+30FB for the 8F and reads the two bytes after it as a pair. The other 2,769 \
+             are read as 51932 reads them, so the form is read two ways until that is \
+             decided. Owner decision pending, tracked in gl-2008 (question D).",
+            "Eight bytes of two single-byte charsets decode to another code point than \
+             .NET's code pages 28597 and 28598: ISO-8859-7's A1, A2, A4, A5 and AA are \
+             U+2018, U+2019, U+20AC, U+20AF and U+037A where .NET answers U+02BD, U+02BC \
+             and U+F7C2 to U+F7C4, and ISO-8859-8's AF, FD and FE are U+00AF, U+200E and \
+             U+200F where .NET answers U+203E, U+F7BF and U+F7C0. Owner decision pending, \
+             tracked in gl-2008 with its question A.",
+            "7-bit ISO-2022-JP text holding a pair encoding_rs has no character for is not \
+             named by chardetng and is served as it is, where Jellyfin detects ISO-2022-JP \
+             and code page 50220 answers U+30FB for such a pair (1,437 of the 8,836) and the \
+             half-width katakana for the 63 pairs of row 2A. Fix path: gl-1998.",
         ],
     },
 ];

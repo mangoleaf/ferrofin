@@ -524,6 +524,22 @@ mod tests {
         );
     }
 
+    /// A byte pair with no character is what .NET's decoder writes for it,
+    /// as Jellyfin 12.4 reads it (gl-2010): U+30FB in Shift_JIS, where
+    /// `encoding_rs` alone answers U+FFFD and reads the `@` again. The folder
+    /// name is enough Japanese that chardetng keeps Shift_JIS beside the
+    /// pair, which it counts against the charset.
+    #[test]
+    fn a_japanese_playlist_reads_an_unassigned_pair_as_dotnet_does() {
+        let folder = "これは日本語の字幕です。あなたはどこにいますか。".repeat(40);
+        let (japanese, _, _) = encoding_rs::SHIFT_JIS.encode(&folder);
+        let playlist = [&japanese[..], b"/\x82\x40.mp3\n"].concat();
+        assert_eq!(
+            decode_playlist(&playlist),
+            format!("{folder}/\u{30FB}.mp3\n")
+        );
+    }
+
     #[test]
     fn the_xml_sits_beside_a_file_and_inside_a_folder() {
         assert_eq!(
