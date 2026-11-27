@@ -52,7 +52,7 @@ use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::handler::Handler;
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
@@ -71,6 +71,7 @@ use crate::error::ApiError;
 use crate::extract::{DotnetGuid, Query, RequiredRouteString, RouteParameter, upload_body_limit};
 use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
 use crate::handlers::items::resolve_user;
+use crate::handlers::run_detached;
 use crate::handlers::users::UserIdQuery;
 use crate::state::AppState;
 
@@ -1771,14 +1772,10 @@ async fn delete_item_image(
     RequireAdmin(auth): RequireAdmin,
     Path((DotnetGuid(item_id), image_type)): Path<(DotnetGuid, String)>,
     Query(query): Query<ImageIndexQuery>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
     require_item(&state, item_id, auth.user.as_deref()).await?;
-    state
-        .providers
-        .delete_image(item_id, image_type, Some(query.image_index.unwrap_or(0)))
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(delete_image_answer(state, item_id, image_type, query.image_index.unwrap_or(0)).await)
 }
 
 /// `DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}` — indexed delete.
@@ -1801,15 +1798,35 @@ async fn delete_item_image(
 async fn delete_item_image_by_index(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, i32)>,
-) -> Result<StatusCode, ApiError> {
+    Path((DotnetGuid(item_id), image_type, image_index)): Path<(DotnetGuid, String, String)>,
+) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
+    let image_index: i32 = bind_route_number(&image_index, "imageIndex")?;
     require_item(&state, item_id, auth.user.as_deref()).await?;
-    state
-        .providers
-        .delete_image(item_id, image_type, Some(image_index))
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(delete_image_answer(state, item_id, image_type, image_index).await)
+}
+
+/// `item.DeleteImageAsync(imageType, index)` and the `204` after it. The delete
+/// runs on a task of its own, as upstream finishes it for a client that hangs
+/// up (the file must not go without its image), and its failure is a throw,
+/// answered as `ExceptionMiddleware` answers it.
+async fn delete_image_answer(
+    state: AppState,
+    item_id: Uuid,
+    image_type: ImageType,
+    index: i32,
+) -> Response {
+    let deleted = run_detached(async move {
+        state
+            .providers
+            .delete_image(item_id, image_type, Some(index))
+            .await
+    })
+    .await;
+    match deleted {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_exception_response(),
+    }
 }
 
 /// The query string of the image-reorder route: the destination index.
