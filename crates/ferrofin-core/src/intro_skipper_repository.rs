@@ -154,7 +154,13 @@ impl IntroSkipperStore for FerrofinIntroSkipperStore {
 
     async fn update_timestamp(&self, segment: StoredSegment) -> Result<bool, ServiceError> {
         // One transaction: the rules read the item's rows, then write.
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         let existing: Vec<SegmentRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             r#"SELECT {SEGMENT_COLUMNS} FROM "FerrofinIntroSkipperSegments" WHERE "ItemId" = ?1"#
         )))

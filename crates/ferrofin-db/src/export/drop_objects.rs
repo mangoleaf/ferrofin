@@ -74,7 +74,7 @@ pub(super) async fn remove(conn: &mut SqliteConnection) -> Result<DroppedObjects
 }
 
 /// `name` as an SQLite identifier, any `"` in it doubled.
-fn quoted(name: &str) -> String {
+pub(super) fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 

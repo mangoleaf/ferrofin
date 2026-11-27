@@ -2411,7 +2411,8 @@ async fn episodes_take_the_resolvers_parsed_name_and_year() {
 /// the other as `AdditionalParts`, which is a `Video` it owns, hung in its
 /// season in its folder state (`Video.RefreshMetadataForOwnedVideo`). The
 /// season counts its distinct episodes — a version group and a stack each
-/// once (`IsDistinctLibraryItem`) — for `ChildCount` and the played counts.
+/// once — for `ChildCount` (`IsDistinctLibraryItem`) and the played counts
+/// (`ApplyAccessFiltering`: the versions share the season's library).
 #[tokio::test]
 async fn a_two_part_episode_is_one_episode_its_season_counts_once() {
     use ferrofin_traits::persistence::ItemCountService as _;
