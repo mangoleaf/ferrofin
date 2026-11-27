@@ -1967,7 +1967,13 @@ impl PlaylistManager for FerrofinPlaylistManager {
         // without its sync, so `Data` stays an exact copy of the tables. A
         // playlist no boot has imported yet is imported first, so its
         // open-access and share changes land on its own rows.
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         item_data::import_playlist_meta_if_missing_in(&mut tx, request.id).await?;
         if let Some(name) = &request.name {
             crate::item_persistence_service::rename_named_item_in(
@@ -2099,7 +2105,13 @@ impl PlaylistManager for FerrofinPlaylistManager {
         require_user(request.user_id)?;
         // The share row, committed with its `Data` sync, so `Data` stays an
         // exact copy of the tables.
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         item_data::import_playlist_meta_if_missing_in(&mut tx, request.id).await?;
         item_data::share_playlist_in(
             &mut tx,
@@ -2120,7 +2132,13 @@ impl PlaylistManager for FerrofinPlaylistManager {
         user_id: Uuid,
         _share: &PlaylistUserPermissions,
     ) -> Result<(), ServiceError> {
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Reads before it writes: lock first (see `Database::writer`).
+        let mut tx = self
+            .db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(db_err)?;
         item_data::import_playlist_meta_if_missing_in(&mut tx, playlist_id).await?;
         sqlx::query(
             r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1 AND "UserId" = ?2"#,

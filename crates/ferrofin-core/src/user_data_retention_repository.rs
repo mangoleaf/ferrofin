@@ -163,7 +163,12 @@ pub(crate) async fn purge_expired(
     db: &ferrofin_db::Database,
     cutoff: &str,
 ) -> Result<u64, ServiceError> {
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // Reads before it writes: lock first (see `Database::writer`).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let snapshots: Vec<i64> = sqlx::query_scalar(
         r#"SELECT "SnapshotId" FROM "FerrofinUserDataRetentionSnapshots" WHERE "RetentionDate" < ?1"#,
     )
