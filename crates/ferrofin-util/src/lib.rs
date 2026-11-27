@@ -28,6 +28,7 @@ pub mod composite_format;
 pub mod current_culture;
 pub mod directory_path;
 pub mod error;
+pub mod escape_charset;
 pub mod file_helper;
 pub mod finite;
 pub mod guid_extensions;

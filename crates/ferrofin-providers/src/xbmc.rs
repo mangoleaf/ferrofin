@@ -47,7 +47,8 @@ fn check_fetch(metadata_file: &str) -> FetchResult {
 /// `xml` is its contents.
 ///
 /// # Errors
-/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty.
+/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty, and
+/// the parse's error otherwise ([`BaseNfoParser::fetch`]).
 pub fn fetch_movie(
     result: &mut MetadataResult<NfoBaseItem>,
     metadata_file: &str,
@@ -68,7 +69,8 @@ pub fn fetch_movie(
 /// so this is the same read with no custom element switch.
 ///
 /// # Errors
-/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty.
+/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty, and
+/// the parse's error otherwise ([`BaseNfoParser::fetch`]).
 pub fn fetch_music(
     result: &mut MetadataResult<NfoBaseItem>,
     metadata_file: &str,
@@ -85,7 +87,8 @@ pub fn fetch_music(
 /// Parses a series NFO document into `result` (`SeriesNfoParser.Fetch`).
 ///
 /// # Errors
-/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty.
+/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty, and
+/// the parse's error otherwise ([`BaseNfoParser::fetch`]).
 pub fn fetch_series(
     result: &mut MetadataResult<NfoBaseItem>,
     metadata_file: &str,
@@ -102,7 +105,8 @@ pub fn fetch_series(
 /// Parses a season NFO document into `result` (`SeasonNfoParser.Fetch`).
 ///
 /// # Errors
-/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty.
+/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty, and
+/// the parse's error otherwise ([`BaseNfoParser::fetch`]).
 pub fn fetch_season(
     result: &mut MetadataResult<NfoBaseItem>,
     metadata_file: &str,
@@ -119,7 +123,8 @@ pub fn fetch_season(
 /// Parses a series `<namedseason>` NFO into a season (`SeriesNfoSeasonParser.Fetch`).
 ///
 /// # Errors
-/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty.
+/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty, and
+/// the parse's error otherwise ([`BaseNfoParser::fetch`]).
 pub fn fetch_series_season(
     result: &mut MetadataResult<NfoBaseItem>,
     metadata_file: &str,
@@ -138,7 +143,9 @@ pub fn fetch_series_season(
 /// Uses the episode-specific multi-block merge rather than the base fetch.
 ///
 /// # Errors
-/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty.
+/// Returns [`FetchError::EmptyMetadataFile`] if `metadata_file` is empty, and
+/// [`FetchError::InvalidValue`] for a value whose exception no parser catches
+/// (an empty `<watched/>`, an integer out of range).
 pub fn fetch_episode(
     result: &mut MetadataResult<NfoBaseItem>,
     metadata_file: &str,
@@ -149,8 +156,7 @@ pub fn fetch_episode(
 ) -> FetchResult {
     check_fetch(metadata_file)?;
     let base = BaseNfoParser::new(config, external_ids, directory_service);
-    EpisodeNfoParser.fetch(&base, result, xml);
-    Ok(())
+    EpisodeNfoParser.fetch(&base, result, xml)
 }
 
 /// Creates an empty [`MetadataResult`] wrapping a fresh item of `kind`.

@@ -38,6 +38,58 @@ pub fn read_data_i32(data: &Map<String, Value>, key: &str) -> Option<i32> {
     i32::try_from(data.get(key)?.as_i64()?).ok()
 }
 
+/// Whether a video's `Data` makes its path a disc rip's folder: a DVD or
+/// Blu-ray `VideoType` on a video that is no placeholder (`.disc` stub) —
+/// the case `Video.ContainingFolderPath` (`Video.cs:201-219`, unless the rip
+/// is stacked) and `MovieNfoSaver.GetMovieSavePaths` treat the path itself as
+/// the folder.
+/// The text is read first, so a blob naming neither type is not parsed.
+#[must_use]
+pub fn is_disc_folder(data: Option<&str>) -> bool {
+    let Some(text) = data.filter(|t| t.contains("\"Dvd\"") || t.contains("\"BluRay\"")) else {
+        return false;
+    };
+    let data = parse_data(Some(text));
+    matches!(
+        read_data_string(&data, "VideoType").as_deref(),
+        Some("Dvd" | "BluRay")
+    ) && !data
+        .get("IsPlaceHolder")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// The folder `video` stored at `path` lives in — `BaseItem.ContainingFolderPath`
+/// (`BaseItem.cs:292-303`) with `Video`'s override (`Video.cs:201-219`): a
+/// folder's own path; for a video, the parent directory of a file — of the
+/// first part for a stacked one (`IsStacked`, checked first), so a multi-disc
+/// set's is the set's folder — and the path itself for a disc rip that is no
+/// placeholder ([`is_disc_folder`]). `path` is the row's path, or it with the
+/// `%AppDataPath%`-style prefixes expanded. A path with no parent (`/`) has
+/// none: .NET's `GetDirectoryName` is `null` there, so the result is empty.
+#[must_use]
+pub fn containing_folder_path_at(video: &BaseItemEntity, path: &str) -> String {
+    if video.is_folder {
+        return path.to_owned();
+    }
+    // Only a disc rip (a cheap text test first) can name its own folder;
+    // only then is the blob read for a stack.
+    if is_disc_folder(video.data.as_deref())
+        && !video.data.as_deref().is_some_and(|text| {
+            text.contains("AdditionalParts")
+                && parse_data(Some(text))
+                    .get("AdditionalParts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| !parts.is_empty())
+        })
+    {
+        return path.to_owned();
+    }
+    std::path::Path::new(path)
+        .parent()
+        .map_or_default(|p| p.to_string_lossy().into_owned())
+}
+
 /// A video's format as its `Data` stores it: `Video.VideoType` (the
 /// `VideoFile` default when the blob names none), `IsoType` and
 /// `Video3DFormat`, each serialized by name (`BaseItemMapper` keeps them in

@@ -814,6 +814,32 @@ async fn call_method(
 
 // ---- Subtitle deletion -----------------------------------------------------
 
+/// `{index}` binds as ASP.NET binds an `int` route value: `0x3` is 3
+/// (gl-1664), and a word is the binder's 400, before anything is deleted.
+#[tokio::test]
+async fn delete_subtitle_binds_its_index_as_the_query_binder() {
+    let deleted = Arc::new(Mutex::new(Vec::new()));
+    let app = admin_state(Arc::new(CannedSubtitles {
+        deleted: deleted.clone(),
+        ..CannedSubtitles::default()
+    }));
+    let (status, body, _) = call_method(
+        app.clone(),
+        "DELETE",
+        &format!("/Videos/{FILED_ITEM_ID}/Subtitles/0x3"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body:?}");
+    let (status, _, _) = call_method(
+        app,
+        "DELETE",
+        &format!("/Videos/{FILED_ITEM_ID}/Subtitles/three"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(*deleted.lock().unwrap(), [(FILED_ITEM_ID, 3)]);
+}
+
 /// `DeleteSubtitle` awaits `DeleteSubtitles`, which deletes the file and then
 /// awaits the item's refresh (`item.RefreshMetadata`) before the `204`. The
 /// rows of subtitle files gone from disk are dropped after the refresh, for
@@ -1028,6 +1054,29 @@ async fn get_subtitle_with_ticks_route_reaches_encoder() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"WEBVTT");
+}
+
+/// `{routeIndex}` and `{routeStartPositionTicks}` bind as ASP.NET binds an
+/// `int` and a `long` route value: their hex forms are read
+/// (`bind_route_number`'s unit test pins the values), and a word is the
+/// binder's 400 (gl-1664).
+#[tokio::test]
+async fn subtitle_stream_routes_bind_their_numbers_as_the_query_binder() {
+    let app = subtitle_state(StubEncoder(Ok(b"WEBVTT".to_vec())));
+    for uri in [
+        format!("/Videos/{ITEM_ID}/msrc/Subtitles/0x0/Stream.vtt"),
+        format!("/Videos/{ITEM_ID}/msrc/Subtitles/%230/0x12C4B0/Stream.vtt"),
+    ] {
+        let (status, body, _) = call(app.clone(), &uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(body, b"WEBVTT", "{uri}");
+    }
+    let (status, _, _) = call(
+        app,
+        &format!("/Videos/{ITEM_ID}/msrc/Subtitles/0/later/Stream.vtt"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

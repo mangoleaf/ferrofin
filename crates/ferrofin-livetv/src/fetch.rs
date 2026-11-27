@@ -497,12 +497,12 @@ impl Default for ReqwestFetcher {
 }
 
 impl ReqwestFetcher {
-    /// Creates a fetcher over a fresh `reqwest` client presenting the
-    /// `USER_AGENT` product header.
+    /// Creates a fetcher over a fresh `reqwest` client with
+    /// `NamedClient.Default`'s defaults ([`ferrofin_util::http_client::builder`]):
+    /// the `USER_AGENT` product header and the `Accept` list.
     #[must_use]
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
+        let client = ferrofin_util::http_client::builder(USER_AGENT)
             .build()
             // A builder failure here means the TLS backend could not
             // initialise; the plain client surfaces the same condition on
@@ -551,9 +551,18 @@ impl ReqwestFetcher {
     }
 
     /// Performs the `GET` within `deadline`, failing on transport errors and
-    /// non-success statuses.
+    /// non-success statuses (`EnsureSuccessStatusCode`), a redirect the
+    /// client did not follow included.
     async fn get(&self, url: &str, deadline: Deadline) -> Result<reqwest::Response, ServiceError> {
         let resp = self.request(url, None, deadline).await?;
+        // `error_for_status` passes a 3xx; the client hands one back unfollowed.
+        if resp.status().is_redirection() {
+            return Err(ServiceError::Backend(format!(
+                "fetch {}: HTTP {}",
+                redact_url(url),
+                resp.status()
+            )));
+        }
         Ok(resp
             .error_for_status()
             .map_err(|e| LiveTvError::http(format!("fetch {}", redact_url(url)), e))?)
@@ -858,7 +867,7 @@ impl SourceFetcher for ReqwestFetcher {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{ReqwestFetcher, SourceFetcher};
     use ferrofin_traits::error::ServiceError;
 
@@ -920,8 +929,8 @@ mod tests {
     }
 
     /// One-shot HTTP server that answers with `200 #EXTM3U` and reports the
-    /// `User-Agent` header it received.
-    fn serve_once() -> (String, std::sync::mpsc::Receiver<Option<String>>) {
+    /// request it received.
+    fn serve_once() -> (String, std::sync::mpsc::Receiver<String>) {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let url = format!("http://{}/list.m3u", listener.local_addr().expect("addr"));
@@ -930,13 +939,7 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buffer = [0_u8; 4096];
                 let read = stream.read(&mut buffer).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                let agent = request.lines().find_map(|line| {
-                    line.split_once(':')
-                        .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-                        .map(|(_, value)| value.trim().to_owned())
-                });
-                let _ = sender.send(agent);
+                let _ = sender.send(String::from_utf8_lossy(&buffer[..read]).into_owned());
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n#EXTM3U",
                 );
@@ -945,10 +948,41 @@ mod tests {
         (url, receiver)
     }
 
+    /// A server answering every request with a redirect to itself, so a
+    /// client stops at its limit with the 3xx in hand.
+    pub(crate) fn redirect_loop() -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/guide.xml", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /guide.xml\r\nContent-Length: 5\r\nConnection: close\r\n\r\nmoved",
+                );
+            }
+        });
+        url
+    }
+
+    /// A redirect the client does not follow (https to http, or past the
+    /// limit) fails the fetch, as `EnsureSuccessStatusCode` fails on it, and
+    /// its page is never read as the guide.
+    #[tokio::test]
+    async fn a_redirect_the_client_does_not_follow_fails_the_fetch() {
+        let url = redirect_loop();
+        let fetcher = ReqwestFetcher::new();
+        assert!(fetcher.fetch(&url).await.is_err());
+        assert!(fetcher.fetch_bytes(&url).await.is_err());
+        assert!(fetcher.fetch_listings(&url).await.is_err());
+    }
+
     /// `M3uParser.GetListingsStream` sends the tuner's configured user agent;
     /// without one (or with a blank one) the client's own product agent goes.
+    /// Either way the request has `NamedClient.Default`'s `Accept` list.
     #[tokio::test]
-    async fn a_configured_user_agent_is_sent_with_the_playlist_request() {
+    async fn a_configured_user_agent_is_sent_with_the_default_client_headers() {
         for (configured, expected) in [
             (Some(" VLC/3.0 "), Some("VLC/3.0".to_owned())),
             (None, Some(super::USER_AGENT.to_owned())),
@@ -963,7 +997,20 @@ mod tests {
                 .expect("open");
             assert_eq!(opened.status, 200);
             assert_eq!(opened.into_bytes().await.expect("read"), b"#EXTM3U");
-            assert_eq!(received.recv().expect("agent"), expected, "{configured:?}");
+            let request = received.recv().expect("request");
+            let header = |wanted: &str| {
+                request.lines().find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case(wanted))
+                        .map(|(_, value)| value.trim().to_owned())
+                })
+            };
+            assert_eq!(header("user-agent"), expected, "{configured:?}");
+            assert_eq!(
+                header("accept").as_deref(),
+                Some("application/json; q=1.0, application/xml; q=0.9, */*; q=0.8"),
+                "{configured:?}"
+            );
         }
     }
 

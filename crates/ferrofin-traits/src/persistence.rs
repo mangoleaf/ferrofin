@@ -299,6 +299,10 @@ pub struct PlaylistItemsWithAccess {
 /// Port of `IItemRepository`. Generic C# helpers (`GetGenres`/`GetStudios`/…)
 /// collapse to concrete methods returning [`ItemWithCounts`]; the domain
 /// `BaseItem` return type becomes [`BaseItemEntity`].
+///
+/// A row whose stored `Type` names no item kind (a removed plugin's item, say)
+/// reads as absent from every method returning rows, as upstream's
+/// `DeserializeBaseItem` returns null for it; ids and counts still include it.
 #[async_trait]
 pub trait ItemRepository: Send + Sync {
     /// Retrieves a single item row by id, or `None` if it does not exist.
@@ -463,7 +467,8 @@ pub trait ItemRepository: Send + Sync {
 
     /// Returns `(Id, CleanName)` for every row matching the query, in the same
     /// order — and under the same predicates, ordering and paging — as
-    /// [`Self::get_item_list`].
+    /// [`Self::get_item_list`]. Like the ids-only reads, the concrete projection
+    /// keeps a row of an unknown stored `Type`, which `get_item_list` skips.
     ///
     /// The by-name resolvers ([`crate::library::LibraryManager::get_named_item_ids`])
     /// join a page's names against `CleanName` and then read nothing but the id,

@@ -1,5 +1,6 @@
 //! fanart.tv remote **image** provider — a port of the Jellyfin `Fanart` plugin
-//! (`jellyfin-plugin-fanart`, GUID `170a157f-ac6c-437a-abdd-ca9c25cebd39`).
+//! (`jellyfin-plugin-fanart`, GUID `170a157f-ac6c-437a-abdd-ca9c25cebd39`), at
+//! its release 15, the one Jellyfin 12.4's plugin catalogue installs.
 //!
 //! Supplies high-quality artwork (posters, logos, clear-art, disc, banners,
 //! backgrounds, thumbs) for movies and series. fanart.tv is keyed off ids other
@@ -13,7 +14,8 @@
 //! Image ordering mirrors the plugin's `GetImages` sort exactly: widest first
 //! (HD variants win), then by language (preferred > `en` > none > other), then
 //! by community likes. The `music` leg (artist by MusicBrainz artist id, album
-//! by album-artist id + release-group id) is served the same way.
+//! by album-artist id, then its release or release-group id) is served the
+//! same way.
 
 use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
@@ -21,6 +23,7 @@ use ferrofin_model::entities::ImageType;
 use serde::Deserialize;
 
 use crate::tmdb::TmdbImage;
+use ferrofin_util::string_extensions::replace_ignore_ascii_case;
 
 /// The fanart.tv v3.2 web-service base; `{type}` is `movies`/`tv`/`music`.
 const API_BASE: &str = "https://webservice.fanart.tv/v3.2";
@@ -205,22 +208,20 @@ impl FanartClient {
             return Vec::new();
         };
         let mut out = Vec::new();
-        // (array, type, fallback width, height) — verbatim from `AddImages`.
-        populate(&mut out, &root.hdmovieclearart, ImageType::Art, 1000, false);
-        populate(&mut out, &root.hdmovielogo, ImageType::Logo, 800, false);
-        populate(&mut out, &root.moviedisc, ImageType::Disc, 1000, false);
-        populate(&mut out, &root.movieposter, ImageType::Primary, 1000, false);
-        populate(&mut out, &root.movielogo, ImageType::Logo, 400, false);
-        populate(&mut out, &root.movieart, ImageType::Art, 500, false);
-        populate(&mut out, &root.moviethumb, ImageType::Thumb, 1000, false);
-        populate(&mut out, &root.moviebanner, ImageType::Banner, 1000, false);
-        populate(
-            &mut out,
-            &root.moviebackground,
-            ImageType::Backdrop,
-            1920,
-            false,
-        );
+        // (array, type, width, height) — verbatim from `AddImages`.
+        for (images, image_type, size) in [
+            (&root.hdmovieclearart, ImageType::Art, (1000, 562)),
+            (&root.hdmovielogo, ImageType::Logo, (800, 310)),
+            (&root.moviedisc, ImageType::Disc, (1000, 1000)),
+            (&root.movieposter, ImageType::Primary, (1000, 1426)),
+            (&root.movielogo, ImageType::Logo, (400, 155)),
+            (&root.movieart, ImageType::Art, (500, 281)),
+            (&root.moviethumb, ImageType::Thumb, (1000, 562)),
+            (&root.moviebanner, ImageType::Banner, (1000, 185)),
+            (&root.moviebackground, ImageType::Backdrop, (1920, 1080)),
+        ] {
+            populate(&mut out, images, image_type, size, Leg::Movie);
+        }
         self.sort(&mut out);
         out
     }
@@ -232,21 +233,30 @@ impl FanartClient {
             return Vec::new();
         };
         let mut out = Vec::new();
-        populate(&mut out, &root.hdtvlogo, ImageType::Logo, 800, false);
-        populate(&mut out, &root.hdclearart, ImageType::Art, 1000, false);
-        populate(&mut out, &root.clearlogo, ImageType::Logo, 400, false);
-        populate(&mut out, &root.clearart, ImageType::Art, 500, false);
-        populate(
-            &mut out,
-            &root.showbackground,
-            ImageType::Backdrop,
-            1920,
-            true,
-        );
-        populate(&mut out, &root.seasonthumb, ImageType::Thumb, 500, false);
-        populate(&mut out, &root.tvthumb, ImageType::Thumb, 1000, false);
-        populate(&mut out, &root.tvbanner, ImageType::Banner, 1000, false);
-        populate(&mut out, &root.tvposter, ImageType::Primary, 1000, false);
+        let leg = Leg::Series {
+            allow_season_all: false,
+        };
+        let backgrounds = Leg::Series {
+            allow_season_all: true,
+        };
+        for (images, image_type, size, leg) in [
+            (&root.hdtvlogo, ImageType::Logo, (800, 310), leg),
+            (&root.hdclearart, ImageType::Art, (1000, 562), leg),
+            (&root.clearlogo, ImageType::Logo, (400, 155), leg),
+            (&root.clearart, ImageType::Art, (500, 281), leg),
+            (
+                &root.showbackground,
+                ImageType::Backdrop,
+                (1920, 1080),
+                backgrounds,
+            ),
+            (&root.seasonthumb, ImageType::Thumb, (500, 281), leg),
+            (&root.tvthumb, ImageType::Thumb, (1000, 562), leg),
+            (&root.tvbanner, ImageType::Banner, (1000, 185), leg),
+            (&root.tvposter, ImageType::Primary, (1000, 1426), leg),
+        ] {
+            populate(&mut out, images, image_type, size, leg);
+        }
         self.sort(&mut out);
         out
     }
@@ -305,44 +315,59 @@ impl FanartClient {
             return Vec::new();
         };
         let mut out = Vec::new();
-        populate(&mut out, &root.artistthumb, ImageType::Primary, 1000, false);
-        populate(&mut out, &root.hdmusiclogo, ImageType::Logo, 800, false);
-        populate(&mut out, &root.musiclogo, ImageType::Logo, 400, false);
-        populate(&mut out, &root.hdmusicarts, ImageType::Art, 1000, false);
-        populate(&mut out, &root.musicarts, ImageType::Art, 500, false);
-        populate(&mut out, &root.musicbanner, ImageType::Banner, 1000, false);
-        populate(
-            &mut out,
-            &root.artistbackground,
-            ImageType::Backdrop,
-            1920,
-            false,
-        );
+        for (images, image_type, size) in [
+            (&root.artistbackground, ImageType::Backdrop, (1920, 1080)),
+            (&root.artistthumb, ImageType::Primary, (500, 281)),
+            (&root.hdmusiclogo, ImageType::Logo, (800, 310)),
+            (&root.musicbanner, ImageType::Banner, (1000, 185)),
+            (&root.musiclogo, ImageType::Logo, (400, 155)),
+            (&root.hdmusicarts, ImageType::Art, (1000, 562)),
+            (&root.musicarts, ImageType::Art, (500, 281)),
+        ] {
+            populate(&mut out, images, image_type, size, Leg::Music);
+        }
         self.sort(&mut out);
         out
     }
 
-    /// Album artwork by the album-artist's MusicBrainz id + the album's
-    /// release-group id (fanart nests albums under the artist). Port of
-    /// `AlbumProvider`: the matching album's `albumcover`→Primary, `cdart`→Disc.
+    /// Album artwork out of the album-artist's MusicBrainz document (fanart
+    /// nests albums under the artist). Port of `AlbumProvider`: the first album
+    /// keyed by the album's release id or its release-group id (`string.Equals`,
+    /// so two absent ids are equal), its `albumcover`→Primary and `cdart`→Disc.
     pub async fn album_images(
         &self,
         mb_album_artist_id: &str,
-        release_group_id: &str,
+        release_id: Option<&str>,
+        release_group_id: Option<&str>,
     ) -> Vec<TmdbImage> {
         let Some(root): Option<MusicRoot> = self.fetch("music", mb_album_artist_id).await else {
             return Vec::new();
         };
+        let same = |a: Option<&str>, b: Option<&str>| match (a, b) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
         let Some(album) = root.albums.into_iter().find(|a| {
-            a.release_group_id
-                .as_deref()
-                .is_some_and(|id| id.eq_ignore_ascii_case(release_group_id))
+            let key = a.release_group_id.as_deref();
+            same(key, release_id) || same(key, release_group_id)
         }) else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        populate(&mut out, &album.albumcover, ImageType::Primary, 1000, false);
-        populate(&mut out, &album.cdart, ImageType::Disc, 1000, false);
+        populate(
+            &mut out,
+            &album.albumcover,
+            ImageType::Primary,
+            (1000, 1000),
+            Leg::Music,
+        );
+        populate(
+            &mut out,
+            &album.cdart,
+            ImageType::Disc,
+            (1000, 1000),
+            Leg::Music,
+        );
         self.sort(&mut out);
         out
     }
@@ -405,16 +430,28 @@ fn added_after_working_thumbs(added: Option<&str>) -> bool {
     })
 }
 
+/// Which of the plugin's providers reads an array: their `PopulateImages`
+/// differ in the season filter and the thumb date rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    /// `MovieProvider`: every image with a URL.
+    Movie,
+    /// `SeriesProvider`: an image with a `season` is dropped unless it is the
+    /// `all` set of an array that allows it (`isSeasonValid`), and a thumb added
+    /// before [`WORKING_THUMB_DIMENSIONS`] is 500×281.
+    Series { allow_season_all: bool },
+    /// `ArtistProvider` and `AlbumProvider`: every image with a URL.
+    Music,
+}
+
 /// `SeasonProvider.PopulateImages`: the images of one fanart array whose
-/// `season` parses to `season`, as [`TmdbImage`]s with the array's fixed size
-/// (a thumb added before the dimensions became reliable is 500×281), the `00`
-/// language normalised away, `http` upgraded to `https` and `likes` as the
-/// rating.
+/// `season` parses to `season`, as [`TmdbImage`]s built by [`candidate`],
+/// with a thumb added before the dimensions became reliable at 500×281.
 fn populate_season(
     out: &mut Vec<TmdbImage>,
     images: &[FanartImage],
     image_type: ImageType,
-    (width, height): (i32, i32),
+    size: (i32, i32),
     season: i32,
 ) {
     for img in images {
@@ -432,85 +469,82 @@ fn populate_season(
         if image_season != season {
             continue;
         }
-        let (width, height) = if image_type == ImageType::Thumb
-            && !added_after_working_thumbs(img.added.as_deref())
-        {
-            (500, 281)
-        } else {
-            (width, height)
-        };
-        let language = img
-            .language
-            .as_deref()
-            .filter(|language| !language.eq_ignore_ascii_case("00"))
-            .map(str::to_owned);
-        out.push(TmdbImage {
-            thumbnail_url: None,
+        out.push(candidate(
+            img,
+            url,
             image_type,
-            url: https_upgrade(url),
-            width: Some(width),
-            height: Some(height),
-            community_rating: img.likes.as_deref().and_then(|likes| likes.parse().ok()),
-            vote_count: None,
-            language,
-        });
+            thumb_size(img, image_type, size),
+        ));
     }
 }
 
-/// `url.Replace("http://", "https://", OrdinalIgnoreCase)`.
-fn https_upgrade(url: &str) -> String {
-    let lower = url.to_ascii_lowercase();
-    let mut out = String::with_capacity(url.len() + 1);
-    let mut rest = 0;
-    while let Some(at) = lower[rest..].find("http://") {
-        out.push_str(&url[rest..rest + at]);
-        out.push_str("https://");
-        rest += at + "http://".len();
-    }
-    out.push_str(&url[rest..]);
-    out
-}
-
-/// Appends one fanart array as [`TmdbImage`]s: empty urls skipped, `"00"`/season
-/// languages normalized, `likes` → community rating, the fixed per-type width as
-/// the sort key. `allow_season_all` keeps `season == "all"` images (backgrounds);
-/// otherwise any season-tagged image is dropped (`isSeasonValid`).
+/// Appends one fanart array as [`TmdbImage`]s built by [`candidate`]: empty
+/// URLs skipped, and on the series leg the season filter and the thumb date
+/// rule ([`Leg::Series`]).
 fn populate(
     out: &mut Vec<TmdbImage>,
     images: &[FanartImage],
     image_type: ImageType,
-    width: i32,
-    allow_season_all: bool,
+    size: (i32, i32),
+    leg: Leg,
 ) {
     for img in images {
         let Some(url) = img.url.as_deref().filter(|u| !u.is_empty()) else {
             continue;
         };
-        // Season-specific artwork is dropped unless it's the "all"-season set of
-        // an array that permits it (backgrounds).
-        let season_valid = match img.season.as_deref() {
-            None | Some("") => true,
-            Some(s) => allow_season_all && s.eq_ignore_ascii_case("all"),
+        let size = match leg {
+            Leg::Series { allow_season_all } => {
+                let season_valid = match img.season.as_deref() {
+                    None | Some("") => true,
+                    Some(s) => allow_season_all && s.eq_ignore_ascii_case("all"),
+                };
+                if !season_valid {
+                    continue;
+                }
+                thumb_size(img, image_type, size)
+            }
+            Leg::Movie | Leg::Music => size,
         };
-        if !season_valid {
-            continue;
-        }
-        let language = img
-            .language
+        out.push(candidate(img, url, image_type, size));
+    }
+}
+
+/// A thumb added before [`WORKING_THUMB_DIMENSIONS`] (or with no readable
+/// date) is 500×281; anything else keeps the array's `size`.
+fn thumb_size(img: &FanartImage, image_type: ImageType, size: (i32, i32)) -> (i32, i32) {
+    if image_type == ImageType::Thumb && !added_after_working_thumbs(img.added.as_deref()) {
+        (500, 281)
+    } else {
+        size
+    }
+}
+
+/// One plugin v15 `RemoteImageInfo`: the array's fixed size, the URL as given
+/// and its `/bigpreview/` twin as the thumbnail, the `00` language as none, and
+/// `likes` read as `int.TryParse` reads it. The provider manager adds the
+/// provider name and `RatingType.Likes`.
+fn candidate(
+    img: &FanartImage,
+    url: &str,
+    image_type: ImageType,
+    (width, height): (i32, i32),
+) -> TmdbImage {
+    TmdbImage {
+        thumbnail_url: Some(replace_ignore_ascii_case(url, "/fanart/", "/bigpreview/")),
+        image_type,
+        url: url.to_owned(),
+        width: Some(width),
+        height: Some(height),
+        community_rating: img
+            .likes
             .as_deref()
-            .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("00"))
-            .map(str::to_owned);
-        let community_rating = img.likes.as_deref().and_then(|l| l.parse::<f64>().ok());
-        out.push(TmdbImage {
-            thumbnail_url: None,
-            image_type,
-            url: url.to_owned(),
-            width: Some(width),
-            height: None,
-            community_rating,
-            vote_count: None,
-            language,
-        });
+            .and_then(|likes| likes.trim().parse::<i32>().ok())
+            .map(f64::from),
+        vote_count: None,
+        language: img
+            .language
+            .clone()
+            .filter(|language| !language.eq_ignore_ascii_case("00")),
     }
 }
 
@@ -541,7 +575,8 @@ mod tests {
     }
 
     /// `SeasonProvider.PopulateImages`: only the requested season's images, at
-    /// the array's size, `https`, with `00` as no language.
+    /// the array's size, the URL as given (v15 dropped the `https` rewrite) with
+    /// its `/bigpreview/` thumbnail, with `00` as no language.
     #[test]
     fn season_images_keep_only_the_requested_season_at_the_plugins_sizes() {
         let images = vec![
@@ -558,7 +593,7 @@ mod tests {
         let mut out = Vec::new();
         populate_season(&mut out, &images, ImageType::Primary, (1000, 1426), 2);
         assert_eq!(out.len(), 2, "season 2 and its zero-padded twin");
-        assert_eq!(out[0].url, "https://assets.fanart.tv/2-en-7.jpg");
+        assert_eq!(out[0].url, "http://assets.fanart.tv/2-en-7.jpg");
         assert_eq!((out[0].width, out[0].height), (Some(1000), Some(1426)));
         assert_eq!(out[0].community_rating, Some(7.0));
         assert_eq!(out[1].language, None, "\"00\" is no language");
@@ -601,16 +636,6 @@ mod tests {
     }
 
     #[test]
-    fn http_is_upgraded_to_https_case_insensitively_everywhere() {
-        assert_eq!(
-            https_upgrade("HTTP://a/b?u=http://c"),
-            "https://a/b?u=https://c"
-        );
-        assert_eq!(https_upgrade("https://a"), "https://a");
-        assert_eq!(https_upgrade("ftp://a"), "ftp://a");
-    }
-
-    #[test]
     fn populate_maps_language_and_likes_and_skips_blank_urls() {
         let images = vec![
             img("en", "10"),
@@ -621,10 +646,16 @@ mod tests {
             },
         ];
         let mut out = Vec::new();
-        populate(&mut out, &images, ImageType::Primary, 1000, false);
+        populate(
+            &mut out,
+            &images,
+            ImageType::Primary,
+            (1000, 1426),
+            Leg::Movie,
+        );
         assert_eq!(out.len(), 2, "blank url dropped");
         assert_eq!(out[0].image_type, ImageType::Primary);
-        assert_eq!(out[0].width, Some(1000));
+        assert_eq!((out[0].width, out[0].height), (Some(1000), Some(1426)));
         assert_eq!(out[0].language.as_deref(), Some("en"));
         assert_eq!(out[0].community_rating, Some(10.0));
         // "00" → no language.
@@ -641,24 +672,27 @@ mod tests {
             season: Some("all".to_owned()),
             ..img("en", "5")
         };
-        // Season "2" is always dropped.
+        let series = |allow_season_all| Leg::Series { allow_season_all };
+        // Season "2" is always dropped from a series.
         let mut out = Vec::new();
+        let size = (500, 281);
         populate(
             &mut out,
             std::slice::from_ref(&seasoned),
             ImageType::Thumb,
-            500,
-            false,
+            size,
+            series(true),
         );
         assert!(out.is_empty(), "{out:?}");
         // Season "all" kept only when allow_season_all.
+        let size = (1920, 1080);
         let mut out = Vec::new();
         populate(
             &mut out,
             std::slice::from_ref(&all),
             ImageType::Backdrop,
-            1920,
-            false,
+            size,
+            series(false),
         );
         assert!(out.is_empty(), "{out:?}");
         let mut out = Vec::new();
@@ -666,10 +700,22 @@ mod tests {
             &mut out,
             std::slice::from_ref(&all),
             ImageType::Backdrop,
-            1920,
-            true,
+            size,
+            series(true),
         );
         assert_eq!(out.len(), 1);
+        // The movie and music legs have no season filter.
+        for leg in [Leg::Movie, Leg::Music] {
+            let mut out = Vec::new();
+            populate(
+                &mut out,
+                std::slice::from_ref(&seasoned),
+                ImageType::Thumb,
+                size,
+                leg,
+            );
+            assert_eq!(out.len(), 1, "{leg:?}");
+        }
     }
 
     #[test]
@@ -814,7 +860,7 @@ mod tests {
             ],
             "{season:?}"
         );
-        assert_eq!(season[1].url, "https://x/sp2.jpg");
+        assert_eq!(season[1].url, "http://x/sp2.jpg");
         let season_images = c.season_images("121361", 9).await;
         assert!(season_images.is_empty(), "{season_images:?}");
 
@@ -823,12 +869,141 @@ mod tests {
         assert!(artist.iter().any(|i| i.image_type == ImageType::Logo));
 
         // Album filtered by release-group id → cover + disc.
-        let album = c.album_images("mbid", "rg-1").await;
+        let album = c.album_images("mbid", None, Some("rg-1")).await;
         assert!(album.iter().any(|i| i.image_type == ImageType::Primary));
         assert!(album.iter().any(|i| i.image_type == ImageType::Disc));
         // A non-matching release group → nothing.
-        let album_images = c.album_images("mbid", "nope").await;
+        let album_images = c.album_images("mbid", None, Some("nope")).await;
         assert!(album_images.is_empty(), "{album_images:?}");
+    }
+
+    /// Each plugin v15 `PopulateImages` table: the array's width and height, the
+    /// URL as given with its `/bigpreview/` twin as the thumbnail, likes read as
+    /// an integer, the season filter and the thumb date rule on the series leg
+    /// only, and the artist arrays in the plugin's order.
+    #[tokio::test]
+    async fn candidates_are_built_as_plugin_v15_builds_them() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start(vec![
+            (
+                "/movies/",
+                r#"{"movieposter":[{"url":"http://assets.fanart.tv/fanart/p.jpg","lang":"en","likes":" 7 ","season":"2"}],
+                    "hdmovielogo":[{"url":"https://assets.fanart.tv/FANART/l.png","lang":"","likes":"5.5"}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/tv/",
+                r#"{"tvthumb":[{"url":"/old.jpg","added":"2015-06-01 00:00:00"},
+                               {"url":"/new.jpg","added":"2017-06-01 00:00:00"}],
+                    "seasonthumb":[{"url":"/st.jpg","added":"2017-06-01 00:00:00"}],
+                    "tvposter":[{"url":"/p.jpg"},{"url":"/p2.jpg","season":"2"}],
+                    "hdtvlogo":[{"url":"/l.png"}]}"#
+                    .to_owned(),
+            ),
+            (
+                "/music/",
+                r#"{"hdmusicarts":[{"url":"/art.png","lang":"en","likes":"1"}],
+                    "musicbanner":[{"url":"/banner.jpg","lang":"en","likes":"1"}],
+                    "artistthumb":[{"url":"/thumb.jpg"}]}"#
+                    .to_owned(),
+            ),
+        ])
+        .await;
+        let c = FanartClient::new(None).with_base_url(&server.base_url);
+        let shape = |images: &[TmdbImage]| -> Vec<(String, Option<i32>, Option<i32>)> {
+            images
+                .iter()
+                .map(|i| (i.url.clone(), i.width, i.height))
+                .collect()
+        };
+
+        let movie = c.movie_images("603").await;
+        assert_eq!(
+            shape(&movie),
+            [
+                (
+                    "http://assets.fanart.tv/fanart/p.jpg".to_owned(),
+                    Some(1000),
+                    Some(1426)
+                ),
+                (
+                    "https://assets.fanart.tv/FANART/l.png".to_owned(),
+                    Some(800),
+                    Some(310)
+                ),
+            ],
+            "the movie leg keeps a season-tagged image and the URL as given"
+        );
+        assert_eq!(
+            movie[0].thumbnail_url.as_deref(),
+            Some("http://assets.fanart.tv/bigpreview/p.jpg")
+        );
+        assert_eq!(
+            movie[1].thumbnail_url.as_deref(),
+            Some("https://assets.fanart.tv/bigpreview/l.png")
+        );
+        assert_eq!(movie[0].community_rating, Some(7.0), "int.TryParse trims");
+        assert_eq!(movie[1].community_rating, None, "5.5 is no integer");
+        assert_eq!(movie[1].language.as_deref(), Some(""), "only 00 is none");
+
+        let series = c.series_images("121361").await;
+        assert_eq!(
+            shape(&series),
+            [
+                ("/new.jpg".to_owned(), Some(1000), Some(562)),
+                ("/p.jpg".to_owned(), Some(1000), Some(1426)),
+                ("/l.png".to_owned(), Some(800), Some(310)),
+                ("/st.jpg".to_owned(), Some(500), Some(281)),
+                ("/old.jpg".to_owned(), Some(500), Some(281)),
+            ],
+            "a thumb added before 2016-01-08 is 500x281, the season poster dropped"
+        );
+
+        let artist = c.artist_images("mbid").await;
+        assert_eq!(
+            shape(&artist),
+            [
+                ("/banner.jpg".to_owned(), Some(1000), Some(185)),
+                ("/art.png".to_owned(), Some(1000), Some(562)),
+                ("/thumb.jpg".to_owned(), Some(500), Some(281)),
+            ],
+            "MusicBanners before HdmusicArts, and an artist thumb is 500x281"
+        );
+    }
+
+    /// `AlbumProvider.AddImages`: the first album whose key is the release id or
+    /// the release-group id (`string.Equals`, so a missing id matches an album
+    /// with no key), its cover and CD art at 1000x1000.
+    #[tokio::test]
+    async fn an_album_is_matched_by_its_release_or_release_group_id() {
+        let server = crate::mock_http::MockServer::always(
+            r#"{"albums":[{"release_group_id":"release-1","albumcover":[{"url":"/cover.jpg"}]},
+                          {"cdart":[{"url":"/keyless.png"}]}]}"#,
+        )
+        .await;
+        let c = FanartClient::new(None).with_base_url(&server.base_url);
+        let shape = |images: Vec<TmdbImage>| -> Vec<(String, Option<i32>, Option<i32>)> {
+            images
+                .into_iter()
+                .map(|i| (i.url, i.width, i.height))
+                .collect()
+        };
+        let album = c
+            .album_images("mbid", Some("RELEASE-1"), Some("other"))
+            .await;
+        assert_eq!(
+            shape(album),
+            [("/cover.jpg".to_owned(), Some(1000), Some(1000))],
+            "an album matches by its release id too"
+        );
+        let unmatched = c.album_images("mbid", Some("other"), Some("other")).await;
+        assert!(unmatched.is_empty(), "{unmatched:?}");
+        let keyless = c.album_images("mbid", None, Some("other")).await;
+        assert_eq!(
+            shape(keyless),
+            [("/keyless.png".to_owned(), Some(1000), Some(1000))],
+            "string.Equals(null, null): a missing release id matches an album with no key"
+        );
     }
 
     #[tokio::test]

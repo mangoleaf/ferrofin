@@ -857,6 +857,7 @@ impl Extension for SsoExtension {
             ))
             .to_vec(),
             enable_in_main_menu: false,
+            content_type: None,
         }]
     }
 

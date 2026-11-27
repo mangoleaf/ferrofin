@@ -67,7 +67,7 @@ struct ConfigurationPageQuery {
 ///
 /// Port of `DashboardController.GetDashboardConfigurationPage`: the page whose
 /// name matches `name` case-insensitively, served with the MIME type its
-/// resource name implies. Anonymous, as upstream — the singular action carries
+/// resource name implies, or the one the page declares. Anonymous, as upstream — the singular action carries
 /// no `[Authorize]` and Jellyfin registers no fallback policy.
 #[utoipa::path(
     get,
@@ -85,7 +85,14 @@ async fn get_dashboard_configuration_page(
 ) -> Result<Response, ApiError> {
     let name = query.name.unwrap_or_default();
     match state.plugins.get_configuration_page(&name).await? {
-        Some(bytes) => Ok(([(header::CONTENT_TYPE, page_mime(&name))], bytes).into_response()),
+        Some(page) => Ok((
+            [(
+                header::CONTENT_TYPE,
+                page.content_type.unwrap_or_else(|| page_mime(&name)),
+            )],
+            page.bytes,
+        )
+            .into_response()),
         None => Err(ApiError::NotFound(format!(
             "configuration page {name:?} not found"
         ))),

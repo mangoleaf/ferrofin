@@ -61,7 +61,7 @@ pub struct NfoConfigurationFile {
 }
 
 impl NfoConfigurationFile {
-    /// Reads `path` (`{config}/named/xbmcmetadata.json`).
+    /// Reads `path` (`{config}/xbmcmetadata.json`).
     #[must_use]
     pub fn new(path: std::path::PathBuf) -> Self {
         Self {
