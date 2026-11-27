@@ -612,9 +612,10 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Items/{itemId}/MetadataEditor"),
     ("get", "/UserViews/GroupingOptions"),
     // Batch 6 — portable extras: TMDb client image configuration
-    // (`TmdbController`), answered from fixed TMDb values.
-    // TODO(parity, gl-1508): open work item, not an accepted divergence: port
-    // upstream's live `GetConfigAsync` fetch.
+    // (`TmdbController`), TMDb's live `/configuration`.
+    // TODO(parity, gl-1962): open work item, not an accepted divergence: the
+    // TMDb lookups' own `EnsureClientConfigAsync`, the fetched `SecureBaseUrl`
+    // and the settings page reading back the reset size.
     ("get", "/Tmdb/ClientConfiguration"),
     // MergeVersions plugin — bulk merge/split of duplicate versions across the
     // whole library, ported onto the core `PrimaryVersionId` version-group seam
@@ -2677,7 +2678,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ferrofin-core library_scan.rs fetch_tmdb_metadata (a pinned TMDb id, else \
                    find_tmdb_id's /find by an IMDb id, a series also by its TVDB id, else the \
                    parsed-name search and find_best_match, for a movie only without an IMDb \
-                   id), apply_details (a movie's overview \
+                   id; a /find request that fails, not a 404, ends the lookup with no TVDB \
+                   /find, no search and the failure counted, as FindByExternalIdAsync throws \
+                   out of GetMetadata), apply_details (a movie's overview \
                    with its blank lines collapsed), fetch_tmdb_season \
                    with ferrofin-providers season.rs tmdb_answer (ImportSeasonName), and \
                    fetch_tmdb_episode with apply_tmdb_episode; for an episode the provider \
@@ -2694,7 +2697,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
                    TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
                    this row.",
-        date: "2026-11-20",
+        date: "2026-11-26",
         divergences: &[
             "A movie, series, season or episode TMDb has no overview for answers the \
              refresh no Overview, so Identify → Apply and a Replace all metadata refresh \
@@ -2850,6 +2853,49 @@ macro_rules! scheduled_task_info {
     };
 }
 
+/// The code path the two item image delete rows share after their binding.
+macro_rules! item_image_delete_tail {
+    () => {
+        "require_item, GetItemById(itemId, User.GetUserId()): a missing item, or one a \
+         signed-in user cannot see, is a 404, and an API key's caller is not checked) → \
+         images.rs delete_image_answer (the delete on handlers.rs run_detached's task, as \
+         upstream finishes it for a client that hangs up; a failure is a throw, answered as \
+         ExceptionMiddleware answers it, its status with text/plain \"Error processing \
+         request.\", error.rs into_exception_response) → ferrofin-providers \
+         provider_manager.rs delete_image (BaseItem.DeleteImageAsync over \
+         GetImageInfo(type, index): a Chapter's image is the file its chapter row names, \
+         ChapterRepository.GetChapter by ChapterIndex through ferrofin-core \
+         chapter_repository.rs get_chapter; any other is GetImages(type) \
+         .ElementAtOrDefault(index) over item_repository.rs get_image_infos_to_serve, the \
+         path expanded as ExpandVirtualPath; a missing slot, a chapter without an image or a \
+         negative index is nothing to do, with no save. A local file with a path not blank \
+         (except the file of a Live TV row outside the metadata directory, recorded by the \
+         images row, and an album cover, recorded below) is deleted first, as \
+         FileSystem.DeleteFile on Linux (settle_image_unlink, the \
+         subtitle delete's port: dotnet/runtime FileSystem.Unix DeleteFile and \
+         Interop.GetExceptionForIoErrno, read, not measured): a file already gone is nothing \
+         to do while its folder exists, and on a read-only mount when an lstat finds \
+         nothing at the path; a missing folder, or a folder in the path that is a file, is \
+         DirectoryNotFoundException's 404, and any other failure the 500, each with the \
+         image kept and the item not saved. Then the image goes, RemoveImage(info): \
+         item_persistence_service.rs delete_item_image removes, by its id, the first row of \
+         the type naming the path read, wherever it sits by then; a chapter keeps its \
+         ImagePath, as upstream's RemoveImage matches nothing for it, until \
+         RefreshChapterImages extracts the image again or clears the path. The item is \
+         saved with ItemUpdateType.ImageUpdate)"
+    };
+}
+
+/// The divergences of the two item image delete rows.
+const ITEM_IMAGE_DELETE_DIVERGENCES: &[&str] = &[
+    "A file in the album-covers directory is kept: earlier builds stored there one copy of an \
+     album's cover that the album and every one of its tracks named, and rows a library scan \
+     has not yet replaced may still name it (docs/MUSIC_ARTWORK.md); DeleteImageAsync deletes \
+     any local file. No build writes there any more (gl-692, gl-1633).",
+    "The 400 and 404 bodies of the binder and of a missing item are Ferrofin's error shape, \
+     not upstream's. Fix path: gl-666.",
+];
+
 /// The code path the item image rows share after their handler.
 macro_rules! item_image_tail {
     () => {
@@ -2931,8 +2977,9 @@ macro_rules! similar_items_path {
          MusicAlbum-, MusicArtist- and AudioSimilarItemsProvider (AudioBook through Audio) \
          and LiveTvProgramSimilarItemsProvider by IsMovie and IsSeries; local_similar's score \
          pass, similar_items_repository.rs weighted_similar_items (genre 10, tag and studio 5, \
-         director 50, actor and guest star 15, the seed's people distinct), its one filter \
-         query, score_filter_query (Movie, plus Trailer and LiveTvProgram under \
+         director 50, actor and guest star 15, the seed's people distinct; no version of a \
+         primary in its own library, ComputeBatchScoresAsync's hiddenVersionIds), its one \
+         filter query, score_filter_query (Movie, plus Trailer and LiveTvProgram under \
          EnableExternalContentInSuggestions; IsMovie; IsPlayed = false; the user's access; \
          TranslateQuery without ApplyGroupingFilter, so never grouped by presentation key), \
          and phase 3, best_scoring_per_key (by score, the primary first on a tie, then \
@@ -2984,7 +3031,6 @@ const TRAILERS_DIVERGENCES: &[&str] = &[
 /// The divergences the six `/{kind}/{itemId}/Similar` rows share.
 const SIMILAR_ITEMS_DIVERGENCES: &[&str] = &[
     SIMILAR_SCORE_WINDOW_DIVERGENCE,
-    SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
     "A reference-cache entry that exists but cannot be read (a directory at its path, an \
      entry or cache directory the server may not read) warns once with its path and is \
      fetched again from the provider. Upstream reads a directory, or an entry under a \
@@ -3026,12 +3072,6 @@ const SIMILAR_SCORE_WINDOW_DIVERGENCE: &str = "A movie or trailer seed's score p
      every item it scored (an episode or series sharing an actor included) before it filters \
      kinds and excluded ids, cuts a tie in the order the scores were added, and matches clean \
      values, so its page can hold fewer or other movies. Fix path: gl-1786.";
-
-/// The 12.1 alternate-version rule the score pass still lacks (gl-392).
-const SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE: &str = "The score pass scores an alternate \
-     version whose primary is in the same library, which upstream's hiddenVersionIds leaves \
-     out (12.1), so such versions take places in the limit * 3 window before the filter \
-     query drops them. Fix path: gl-392.";
 
 /// The code path the four legacy `HlsSegmentController` rows share after their
 /// handler, from the resolver to the response.
@@ -3140,7 +3180,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3150,7 +3190,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3160,7 +3200,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3170,7 +3210,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3210,9 +3250,45 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/Tmdb/ClientConfiguration",
+        upstream_file: "MediaBrowser.Providers/Plugins/Tmdb/Api/TmdbController.cs",
+        upstream_method: "TmdbClientConfiguration",
+        ferrofin: "handlers/tmdb.rs tmdb_client_configuration → \
+               ProviderManager::tmdb_image_configuration → ferrofin-providers \
+               provider_manager.rs → tmdb.rs TmdbClient::client_image_configuration \
+               (TmdbClientManager.GetClientConfiguration and EnsureClientConfigAsync: one \
+               /configuration request, kept for the process once answered and tried again \
+               after a failure, as HasConfig; GetConfigAsync failing when TMDb answers no \
+               configuration; the Images member, a null one answering 204) and \
+               TmdbClient::settings over plugin_config.rs keep_listed_sizes \
+               (ValidatePreferences once the configuration is known)",
+        date: "2026-11-26",
+        divergences: &[
+            "Only this route fetches the configuration: upstream's TMDb lookups each await \
+             EnsureClientConfigAsync, so the first lookup fetches it, runs \
+             ValidatePreferences and fails when TMDb answers none, and their image URLs \
+             take its SecureBaseUrl; Ferrofin's lookups build them on the fixed CDN root \
+             and keep the configured sizes until this route ran. Fix path: gl-1962.",
+            "ValidatePreferences's reset applies to the sizes the TMDb lookups read, not to \
+             the stored configuration GET /Plugins/{pluginId}/Configuration serves the \
+             settings page, which keeps the configured size; upstream changes the \
+             in-memory configuration that page reads. Fix path: gl-1962.",
+            "The size check reads a configured size as the lookups use it, trimmed and \
+             blank as unset, keeps a size whose kind TMDb lists no sizes for, and is \
+             applied at every read once the configuration is known; upstream compares the \
+             stored string as it is, resets a blank one too, throws on an empty list \
+             (its last-element index) and checks once, at the fetch. A size the settings \
+             page saves gives the same image URL in both; a padded size TMDb lists and an \
+             unlisted size saved after the fetch differ (upstream resets the first and \
+             keeps the second), and a blank size reads as original in both.",
+        ],
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -3220,7 +3296,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryController.cs",
         upstream_method: "GetSimilarItems",
         ferrofin: similar_items_path!(),
-        date: "2026-11-15",
+        date: "2026-11-26",
         divergences: SIMILAR_ITEMS_DIVERGENCES,
         refs: &["images", "access-filtering"],
     },
@@ -3249,9 +3325,10 @@ pub const VERIFIED: &[Verified] = &[
                IBatchLocalSimilarItemsProvider and MovieSimilarItemsProvider's \
                GetBatchSimilarItemsAsync for every baseline, whatever its kind, with the user \
                and Limit = itemLimit, no remote provider: similar_items_repository.rs \
-               weighted_scores for all of them, each baseline's top itemLimit * 3 by score then \
-               Id, one score_filter_query get_item_list over the union of those windows, and \
-               each category picked from the rows of that union its baseline scored \
+               weighted_scores for all of them, hiddenVersionIds unscored, each baseline's top \
+               itemLimit * 3 by score then Id, one score_filter_query get_item_list over the \
+               union of those windows, and each category picked from the rows of that union \
+               its baseline scored \
                (scores.ContainsKey), best_scoring_per_key's PrimaryVersionId tie-break and \
                DistinctBy(PresentationUniqueKey), Take(itemLimit), an empty category skipped; \
                next_person_category, the lazy GetPersonRecommendations: Person = name, \
@@ -3261,10 +3338,9 @@ pub const VERIFIED: &[Verified] = &[
                CategoryId = name.GetMD5(); round_robin_categories: recently played, recently \
                played, liked, liked, directors, actors until categoryLimit or a pass adds \
                nothing, then a stable OrderBy RecommendationType)",
-        date: "2026-11-24",
+        date: "2026-11-26",
         divergences: &[
             SIMILAR_SCORE_WINDOW_DIVERGENCE,
-            SIMILAR_ALTERNATE_VERSIONS_DIVERGENCE,
             "An itemLimit above 715827882 overflows upstream's limit * 3 to a negative Take, so \
          every similar-to category is empty; the oversample saturates here. Jellyfin bug not \
          ported.",
@@ -3665,32 +3741,31 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Items/{itemId}/Images/{imageType}",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "DeleteItemImage",
-        ferrofin: "handlers/images.rs delete_item_image (RequireAdmin, as RequiresElevation; \
-               ImageIndexQuery: imageIndex is the action's only query member, so a malformed \
-               one is the binder's 400 before the item is read, a blank one is 0, and no other \
-               query parameter is read, measured on 12.4; require_item, GetItemById(itemId, \
-               User.GetUserId()): a missing item, or one a signed-in user cannot see, is a 404, \
-               and an API key's caller is not checked) → ferrofin-providers \
-               provider_manager.rs delete_image (BaseItem.DeleteImageAsync: a missing slot or a \
-               negative index is nothing to do, with no save; otherwise a local row's file is \
-               deleted and the item saved with ItemUpdateType.ImageUpdate) → ferrofin-core \
-               item_persistence_service.rs delete_item_image (GetImages(type) \
-               .ElementAtOrDefault(index), the row's path expanded as ExpandVirtualPath)",
-        date: "2026-11-11",
-        divergences: &[
-            "A file that cannot be deleted still removes the image: the row goes first and the \
-             file error is dropped, a 204, where DeleteImageAsync deletes the file first and a \
-             failure is a 500 that keeps the image (measured on 12.4). Fix path: gl-1663.",
-            "A Chapter image's file is not deleted: chapter images are not image rows, so the \
-             delete finds nothing and answers 204, where GetImageInfo returns the chapter's \
-             image and DeleteImageAsync deletes its file. Fix path: gl-1663.",
-            "A file in the album-covers directory is kept: earlier builds stored there one \
-             copy of an album's cover that the album and every one of its tracks named, and \
-             rows a library scan has not yet replaced may still name it (docs/MUSIC_ARTWORK.md); \
-             DeleteImageAsync deletes any local file. No build writes there any more (gl-692, \
-             gl-1633).",
-            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
-        ],
+        ferrofin: concat!(
+            "handlers/images.rs delete_item_image (RequireAdmin, as RequiresElevation; \
+             ImageIndexQuery: imageIndex is the action's only query member, so a malformed \
+             one is the binder's 400 before the item is read, a blank one is 0, and no other \
+             query parameter is read, measured on 12.4; ",
+            item_image_delete_tail!()
+        ),
+        date: "2026-11-26",
+        divergences: ITEM_IMAGE_DELETE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "delete",
+        path: "/Items/{itemId}/Images/{imageType}/{imageIndex}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "DeleteItemImageByIndex",
+        ferrofin: concat!(
+            "handlers/images.rs delete_item_image_by_index (RequireAdmin, as \
+             RequiresElevation; the index is the route's, bound by bind_route_number's int \
+             rules (trimmed, the 0x, # and &h hex forms), a malformed one the binder's 400, \
+             and the action declares no query member, so none is read; ",
+            item_image_delete_tail!()
+        ),
+        date: "2026-11-26",
+        divergences: ITEM_IMAGE_DELETE_DIVERGENCES,
         refs: &["images"],
     },
     Verified {
@@ -7651,9 +7726,6 @@ const RESUME_DIVERGENCES: &[&str] = &[
      count each leaf's own played row; v12.4's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
      alternate-version arm in item_count_service's played statements (gl-441).",
-    "Resume positions that Ferrofin builds before gl-46 saved for songs and for Sample, \
-     ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
-     until they are played again; new plays no longer save one. Fix path: gl-717.",
     SEARCH_TERM_ORIGINAL_TITLE_DIVERGENCE,
     "The 400 (an API key with no userId, or a value the query binder cannot convert), \
      403 (another user's id without the administrator role) and 404 (a userId naming no \

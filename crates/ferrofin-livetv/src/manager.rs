@@ -3180,7 +3180,12 @@ impl GuideWrite {
     /// Starts the write's transaction on the database's writer.
     async fn begin(db: &Database) -> Result<Self, ServiceError> {
         Ok(Self {
-            tx: db.writer().begin().await.map_err(db_err)?,
+            // Reads before it writes: lock first (see `Database::writer`).
+            tx: db
+                .writer()
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(db_err)?,
             now: datetime_to_db(Utc::now()),
             written: HashMap::new(),
         })
