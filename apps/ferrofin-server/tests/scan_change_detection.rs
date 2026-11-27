@@ -408,7 +408,7 @@ fn answer(target: &str) -> Option<String> {
         let episode = |n: u32| {
             format!(
                 r#"{{"id": {n}, "episode_number": {n}, "season_number": 1, "name": "{title} episode {n}",
-                    "overview": "Episode {n} of {title}.", "air_date": "2010-01-0{n}", "vote_average": 7.5, "credits": {{"cast":[],"crew":[]}}, "external_ids": {{"imdb_id":"tt900{n}","tvdb_id":900{n}}}, "videos": {{"results":[]}}}}"#
+                    "overview": "Episode {n} of {title}.", "air_date": "2010-01-0{n}", "vote_average": 7.5, "credits": {{"cast":[],"crew":[]}}, "external_ids": {{"imdb_id":"tt900{n}","tvdb_id":300{n}}}, "videos": {{"results":[]}}}}"#
             )
         };
         let external_ids = if *title == "Harbor" {
@@ -472,13 +472,6 @@ fn tvdb(rest: &str) -> Option<String> {
             r#"{{"data":{{"id":{HARBOR_TVDB},"name":"Harbor","overview":"TVDB's Harbor.",
                 "characters":[{{"personName":"Tess Tvdb","peopleType":"Actor","name":"Keeper"}}]}}}}"#
         ));
-    }
-    if rest == format!("series/{HARBOR_TVDB}/episodes/official") {
-        return Some(
-            r#"{"data":{"episodes":[{"id":3001,"seasonNumber":1,"number":1},
-                {"id":3002,"seasonNumber":1,"number":2}]}}"#
-                .to_owned(),
-        );
     }
     let n = rest
         .strip_prefix("episodes/300")?
@@ -1896,8 +1889,10 @@ async fn rows(h: &Harness) {
     // Every provider the Shows library ticks runs, one after the other
     // (`ExecuteRemoteProviders`): TheTVDB after TheMovieDb, for Harbor and
     // each of its episodes. It resolves Harbor by the TVDB id TMDB's answer
-    // carried, never by a search (`MergeNewData`); the Live library, TMDB
-    // only, never reaches it.
+    // carried, and each episode by the Tvdb id TMDB's episode answer carried
+    // (`MergeNewData`; plugin `v24` takes the lookup's own id first, the
+    // series' listing only without one), never by a search; the Live
+    // library, TMDB only, never reaches it.
     let the_tvdb = of(&first.requests, "tvdb");
     assert!(
         the_tvdb
@@ -1914,6 +1909,10 @@ async fn rows(h: &Harness) {
     assert!(
         the_tvdb.iter().all(|r| !r.contains("/tvdb/search")),
         "row 1: TVDB looked Harbor up by the id TMDB found {the_tvdb:?}"
+    );
+    assert!(
+        the_tvdb.iter().all(|r| !r.contains("/episodes/official")),
+        "row 1: TVDB fetched each episode by the id TMDB found {the_tvdb:?}"
     );
     // Alpha's artwork and its cast member: the person refreshed from TMDb,
     // and both images downloaded.
