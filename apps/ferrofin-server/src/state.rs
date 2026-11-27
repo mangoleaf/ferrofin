@@ -2667,9 +2667,10 @@ pub async fn build_app_state(
         // (no channel-plugin mechanism, see `docs/EXTENSIONS.md`), so the task
         // reports itself hidden just like a Jellyfin with no channel plugin.
         task_manager.register(Arc::new(
-            ferrofin_core::scheduled_tasks::channels::RefreshChannelsTask::new(Arc::new(
-                ferrofin_core::FerrofinChannelManager::new(),
-            ))
+            ferrofin_core::scheduled_tasks::channels::RefreshChannelsTask::new(
+                Arc::new(ferrofin_core::FerrofinChannelManager::new()),
+                Arc::clone(&library),
+            )
             .await,
         ));
     }

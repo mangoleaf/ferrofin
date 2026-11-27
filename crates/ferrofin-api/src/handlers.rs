@@ -6931,7 +6931,7 @@ pub const VERIFIED: &[Verified] = &[
          ported.",
             "A body still running STOP_WAIT (2 s) after the stop is dropped and recorded \
          Cancelled; upstream waits for ExecuteAsync however long it takes. The ferrofin-core \
-         bodies check their token where upstream's do (gl-129, gl-1709, gl-2004), but the \
+         bodies check their token where upstream's do (gl-129, gl-1709, gl-2004, gl-2017), but the \
          Keyframe Extractor, the five library bodies, Update Plugins and Migrate Trickplay \
          Image Location hand their per-item work no token, Optimize database checks only \
          before its first statement (gl-2006) and the guide refresh \
