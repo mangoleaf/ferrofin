@@ -156,6 +156,7 @@ impl Extension for MergeVersionsExtension {
             ))
             .to_vec(),
             enable_in_main_menu: false,
+            content_type: None,
         }]
     }
 

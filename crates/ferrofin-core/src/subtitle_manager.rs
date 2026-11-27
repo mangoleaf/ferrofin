@@ -9,9 +9,10 @@
 //!   provider that errors is skipped (logged) rather than failing the whole
 //!   search, matching Jellyfin's per-provider aggregation.
 //! - `Self::download_subtitles` routes the namespaced id back to its provider,
-//!   fetches the content, and **attaches** it to the item (a sidecar in the library
-//!   configured media or internal-metadata folder + an external [`MediaStream`](ferrofin_model::entities_media::MediaStream)
-//!   row). `Self::upload_subtitle` attaches caller-supplied content the same way.
+//!   fetches the content, and **attaches** it to the item: a sidecar in the
+//!   library's configured media or internal-metadata folder. The stream is left
+//!   to the refresh the caller runs next, whose probe finds the file.
+//!   `Self::upload_subtitle` attaches caller-supplied content the same way.
 //!   A failed download is recorded in the activity log
 //!   (`Self::report_download_failure`, `SubtitleDownloadFailureLogger`).
 //! - `Self::get_remote_subtitles` routes an id to its provider and returns the
@@ -30,7 +31,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
-use ferrofin_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::providers::{RemoteSubtitleInfo, SubtitleProviderInfo};
 use uuid::Uuid;
@@ -265,8 +266,8 @@ impl FerrofinSubtitleManager {
     }
 
     /// Writes subtitle content to the configured destination, preserving any
-    /// existing subtitle file, then records an external subtitle stream row
-    /// and the item's `HasSubtitles`.
+    /// existing subtitle file (`TrySaveSubtitle`). Like upstream it records no
+    /// stream: the refresh the caller runs next probes the new file.
     async fn attach(&self, item_id: Uuid, response: &SubtitleResponse) -> Result<(), ServiceError> {
         let item = self
             .library_manager
@@ -308,47 +309,10 @@ impl FerrofinSubtitleManager {
         };
         // The pinned SubtitleManager selects one destination. An unwritable
         // media folder is an error, not permission to write into metadata.
-        let sidecar = write_sidecar(&destination, &response.content, self.self_writes.as_ref())
+        write_sidecar(&destination, &response.content, self.self_writes.as_ref())
             .await
-            .map_err(|error| ServiceError::backend(error.to_string()))?;
-        let sidecar_str = sidecar.to_string_lossy().into_owned();
-
-        // Append the new external subtitle to the item's stream set (the repo
-        // save is a full replace, so re-save the existing streams alongside it).
-        let mut streams = self
-            .media_streams
-            .get_media_streams(&MediaStreamQuery {
-                item_id,
-                stream_type: None,
-                index: None,
-            })
-            .await?;
-        let next_index = streams
-            .iter()
-            .map(|s| s.stream_index)
-            .max()
-            .map_or(0, |m| m + 1);
-        streams.push(MediaStreamInfoEntity {
-            stream_index: next_index,
-            stream_type: media_stream_type_disc(
-                ferrofin_model::entities::MediaStreamType::Subtitle,
-            ),
-            is_external: true,
-            path: Some(sidecar_str),
-            language: (!response.language.is_empty()).then(|| response.language.to_lowercase()),
-            codec: codec_for(&response.format.to_ascii_lowercase()).map(str::to_owned),
-            is_forced: response.is_forced,
-            is_hearing_impaired: Some(response.is_hearing_impaired),
-            ..Default::default()
-        });
-        self.media_streams
-            .save_media_streams(item_id, &streams)
-            .await?;
-        // Upstream's refresh after a download or upload re-probes, and
-        // `FFProbeVideoInfo.cs:270` counts the new subtitle in `HasSubtitles`,
-        // which only `Data` holds (gl-1632). Here the row just saved matches
-        // the sidecar on disk, so the next scan sees no change to re-probe.
-        self.media_streams.sync_has_subtitles(item_id).await
+            .map(drop)
+            .map_err(|error| ServiceError::backend(error.to_string()))
     }
 }
 
@@ -513,20 +477,6 @@ fn sidecar_name(media_path: &str, response: &SubtitleResponse) -> Result<String,
     Ok(format!(
         "{stem}.{language}{forced}{hearing_impaired}.{extension}"
     ))
-}
-
-/// Codec for the immediate external-stream record. Matroska subtitle files
-/// can contain several codecs; the queued probe resolves their contents.
-fn codec_for(extension: &str) -> Option<&str> {
-    match extension {
-        "vtt" => Some("webvtt"),
-        "ssa" => Some("ssa"),
-        "ass" => Some("ass"),
-        "smi" | "sami" => Some("sami"),
-        "sup" => Some("hdmv_pgs_subtitle"),
-        "mks" => None,
-        _ => Some("subrip"),
-    }
 }
 
 #[async_trait]
@@ -1097,8 +1047,11 @@ mod tests {
         );
     }
 
+    /// `TrySaveSubtitle` writes the file and nothing else: the stream is the
+    /// queued refresh's probe to record, in the probe's order and with its
+    /// codec (gl-1641).
     #[tokio::test]
-    async fn download_routes_to_provider_and_attaches() {
+    async fn download_writes_the_sidecar_and_leaves_the_stream_to_the_refresh() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
@@ -1107,31 +1060,36 @@ mod tests {
         let media = tmp.path().join("Movie.mkv");
         std::fs::write(&media, b"x").expect("media");
         set_item_path(&db, item, &media).await;
+        let repo = FerrofinMediaStreamRepository::new(db.clone());
+        let probed = vec![MediaStreamInfoEntity {
+            stream_index: 0,
+            codec: Some("h264".to_owned()),
+            stream_type: media_stream_type_disc(MediaStreamType::Video),
+            ..Default::default()
+        }];
+        repo.save_media_streams(item, &probed).await.expect("seed");
+        let all = MediaStreamQuery {
+            item_id: item,
+            stream_type: None,
+            index: None,
+        };
+        let before = repo.get_media_streams(&all).await.expect("streams");
 
         let mgr = manager(db.clone(), vec![Arc::new(FakeProvider)]);
         mgr.download_subtitles(item, &format!("{}_42", provider_id("fake")))
             .await
             .expect("download");
 
-        // The sidecar was written and an external subtitle row recorded.
         let sidecar = tmp.path().join("Movie.eng.srt");
         assert!(sidecar.exists(), "sidecar written");
-        let repo = FerrofinMediaStreamRepository::new(db.clone());
-        let streams = repo
-            .get_media_streams(&MediaStreamQuery {
-                item_id: item,
-                stream_type: Some(MediaStreamType::Subtitle),
-                index: None,
-            })
-            .await
-            .expect("streams");
-        assert_eq!(streams.len(), 1);
-        assert!(streams[0].is_external);
-        // The video now has a subtitle, which `Data` records (gl-1632).
+        let after = repo.get_media_streams(&all).await.expect("streams");
+        assert_eq!(after, before, "the download must not record a stream");
         let data = crate::test_support::fetch_item(&db, item).await.data;
-        assert_eq!(
-            crate::item_data::parse_data(data.as_deref())["HasSubtitles"],
-            true
+        assert!(
+            crate::item_data::parse_data(data.as_deref())
+                .get("HasSubtitles")
+                .is_none(),
+            "{data:?}"
         );
     }
 
@@ -1462,7 +1420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uploaded_image_subtitles_keep_image_codecs_and_containers_require_probing() {
+    async fn uploaded_image_subtitles_and_containers_are_saved_for_the_probe() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
@@ -1479,35 +1437,22 @@ mod tests {
         mgr.upload_subtitle(item, &response).await.unwrap();
         response.format = "MKS".to_owned();
         mgr.upload_subtitle(item, &response).await.unwrap();
+        for name in ["Movie.eng.sup", "Movie.eng.mks"] {
+            assert_eq!(
+                std::fs::read(tmp.path().join(name)).unwrap(),
+                b"PG",
+                "{name}"
+            );
+        }
         let streams = FerrofinMediaStreamRepository::new(db)
             .get_media_streams(&MediaStreamQuery {
                 item_id: item,
-                stream_type: Some(MediaStreamType::Subtitle),
+                stream_type: None,
                 index: None,
             })
             .await
             .unwrap();
-        assert_eq!(streams.len(), 2);
-        assert_eq!(streams[0].codec.as_deref(), Some("hdmv_pgs_subtitle"));
-        assert_eq!(
-            streams[0].path.as_deref(),
-            tmp.path().join("Movie.eng.sup").to_str()
-        );
-        let image_subtitle = ferrofin_model::entities_media::MediaStream {
-            stream_type: MediaStreamType::Subtitle,
-            codec: streams[0].codec.clone(),
-            is_external: true,
-            ..Default::default()
-        };
-        assert!(!image_subtitle.is_text_subtitle_stream());
-        assert!(
-            streams[1].codec.is_none(),
-            "MKS contents determine the codec at probe time"
-        );
-        assert_eq!(
-            streams[1].path.as_deref(),
-            tmp.path().join("Movie.eng.mks").to_str()
-        );
+        assert!(streams.is_empty(), "{streams:?}");
     }
 
     #[tokio::test]
@@ -1624,26 +1569,12 @@ mod tests {
         let streams = FerrofinMediaStreamRepository::new(db)
             .get_media_streams(&MediaStreamQuery {
                 item_id: item,
-                stream_type: Some(MediaStreamType::Subtitle),
+                stream_type: None,
                 index: None,
             })
             .await
             .unwrap();
-        assert_eq!(streams.len(), 5);
-        for (index, expected) in [
-            tmp.path().join("Movie.eng.0.srt"),
-            tmp.path().join("Movie.eng.1.srt"),
-            internal.join("Movie.eng.srt"),
-            internal.join("Movie.eng.0.srt"),
-            tmp.path().join("Movie.eng.2.srt"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            assert_eq!(streams[index].path.as_deref(), expected.to_str());
-            assert_eq!(streams[index].language.as_deref(), Some("eng"));
-            assert!(streams[index].is_external);
-        }
+        assert!(streams.is_empty(), "the refresh records them: {streams:?}");
     }
 
     /// A [`SelfWriteGuard`] recording each call, in order.
@@ -1759,18 +1690,6 @@ mod tests {
             "subtitle written to configured metadata destination"
         );
 
-        let repo = FerrofinMediaStreamRepository::new(db);
-        let streams = repo
-            .get_media_streams(&MediaStreamQuery {
-                item_id: item,
-                stream_type: Some(MediaStreamType::Subtitle),
-                index: None,
-            })
-            .await
-            .expect("streams");
-        assert_eq!(streams.len(), 1);
-        assert!(streams[0].is_external);
-        assert_eq!(streams[0].path.as_deref(), expected.to_str());
         let replacement = tempfile::tempdir().expect("new metadata");
         *current.write().unwrap() = replacement.path().to_path_buf();
         mgr.upload_subtitle(item, &resp)

@@ -208,6 +208,63 @@ async fn the_compiled_in_counterparts_documents_are_their_configuration_at_boot(
     );
 }
 
+/// The ListenBrainz plugin as a stock 12.4 serves it once its admin saved the
+/// settings page (`Jellyfin.Plugin.ListenBrainz.xml` from `jellyfin/jellyfin:12.4`):
+/// the document comes across, a read adds the get-only `AlgorithmString`, and
+/// the dashboard lists its two pages where Jellyfin does, the notice as
+/// `text/markdown`.
+#[tokio::test]
+async fn an_adopted_listenbrainz_document_is_served_with_its_pages() {
+    use ferrofin_providers::builtin_plugins::LISTENBRAINZ;
+
+    let xml = include_str!("../src/export_cmd/testdata/Jellyfin.Plugin.ListenBrainz.xml");
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (_config, wired) = boot(temp.path(), &[(LISTENBRAINZ.configuration_file_name, xml)]).await;
+
+    assert_eq!(
+        configuration(&wired, LISTENBRAINZ.id).await,
+        serde_json::json!({
+            "LabsServer": "https://labs.example.org",
+            "Algorithm": "SessionBased75Days",
+            "RateLimit": 0.25,
+            "SimilarItemsCacheDays": 30,
+            "AlgorithmString": "session_based_days_75_session_300_contribution_5_threshold_10_limit_100_filter_True_skip_30"
+        })
+    );
+    let plugins = &wired.state.plugins;
+    let pages: Vec<String> = plugins
+        .get_configuration_pages()
+        .await
+        .expect("pages")
+        .into_iter()
+        .filter(|page| {
+            ferrofin_providers::builtin_plugins::ALL
+                .iter()
+                .any(|p| Some(p.id) == page.plugin_id)
+        })
+        .map(|page| page.name)
+        .collect();
+    assert_eq!(
+        pages,
+        [
+            "TMDb",
+            "Studio Images",
+            "OMDb",
+            "MusicBrainz",
+            "ListenBrainz Similarity Provider",
+            "ListenBrainz Similarity ProviderNotice",
+            "AudioDB"
+        ]
+    );
+    let notice = plugins
+        .get_configuration_page("listenbrainz similarity providernotice")
+        .await
+        .expect("lookup")
+        .expect("the notice page");
+    assert_eq!(notice.content_type, Some("text/markdown"));
+    assert!(notice.bytes.starts_with(b"# ListenBrainz logo attribution"));
+}
+
 /// Adoption imports every bundled plugin's document, and the Debian migration
 /// copies every document adoption imports, so a plugin added to either table
 /// is not silently left behind.

@@ -37,9 +37,7 @@ async fn boot_with_network(network: Option<&str>) -> (WiredApp, Database, tempfi
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("config")).unwrap();
     if let Some(network) = network {
-        let named = tmp.path().join("config/users/named");
-        std::fs::create_dir_all(&named).unwrap();
-        std::fs::write(named.join("network.json"), network).unwrap();
+        std::fs::write(tmp.path().join("config/network.json"), network).unwrap();
     }
     let config = test_config(tmp.path());
     let db = Database::connect_in_memory().await.unwrap();

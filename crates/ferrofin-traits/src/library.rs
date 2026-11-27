@@ -1875,10 +1875,15 @@ pub trait UserManager: Send + Sync {
     /// Deletes a user by id.
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError>;
 
-    /// Resets a user's password to empty.
+    /// Resets a user's password to empty: [`Self::change_password`] with an
+    /// empty password.
     async fn reset_password(&self, user_id: Uuid) -> Result<(), ServiceError>;
 
     /// Changes a user's password.
+    ///
+    /// Once the password is saved the implementation writes the
+    /// "Password has been changed" activity entry, as C# `ChangePassword`
+    /// publishes `UserPasswordChangedEventArgs`, so callers write none.
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError>;
 
     /// Authenticates a user by name/password, returning the row on success.
@@ -2918,6 +2923,11 @@ pub trait MediaSourceManager: Send + Sync {
     }
 
     /// Gets the static (non-probed) media sources for an item.
+    ///
+    /// An item that cannot have any (one that is not a video, an audio item
+    /// or a Live TV channel: a folder, a by-name item, a photo, a book) is
+    /// [`ServiceError::InvalidInput`], as upstream's `GetStaticMediaSources`
+    /// throws `ArgumentException` for an item that is not `IHasMediaSources`.
     async fn get_static_media_sources(
         &self,
         item_id: Uuid,
@@ -3583,8 +3593,9 @@ pub trait RemoteSimilarItemsProvider: Send + Sync {
     fn supports(&self, item_kind: BaseItemKind) -> bool;
 
     /// How long the manager may reuse this provider's results from disk.
-    /// `None` disables caching for it.
-    fn cache_duration(&self) -> Option<std::time::Duration> {
+    /// `None` disables caching for it. Async because upstream's
+    /// `CacheDuration` reads the plugin's settings each time it is asked.
+    async fn cache_duration(&self) -> Option<std::time::Duration> {
         None
     }
 

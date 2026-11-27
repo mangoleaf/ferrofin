@@ -2146,7 +2146,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let file = tmp.path().join("config/users/named/encoding.json");
+        let file = tmp.path().join("config/encoding.json");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"{ \"SubtitleExtractionTimeoutMinutes\": 1, }").unwrap();
 

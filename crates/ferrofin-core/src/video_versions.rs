@@ -33,6 +33,7 @@ use ferrofin_traits::persistence::ItemRepository;
 use ferrofin_util::string_extensions::{to_upper_invariant, to_upper_ordinal};
 use uuid::Uuid;
 
+pub(crate) use ferrofin_db::item_data::containing_folder_path_at;
 pub use ferrofin_db::item_data::preferred_primary_version;
 
 /// The delimiters a version label is cut at (`BaseItem.VersionDelimiters`,
@@ -858,32 +859,6 @@ fn file_stem(path: &str) -> String {
 /// ([`crate::item_data::is_disc_folder`]).
 pub(crate) fn containing_folder_path(video: &BaseItemEntity) -> String {
     containing_folder_path_at(video, video.path.as_deref().unwrap_or_default())
-}
-
-/// [`containing_folder_path`] for `video` stored at `path` — its row path
-/// with the `%AppDataPath%`-style prefixes expanded, as a delete removes it.
-/// A path with no parent (`/`) has none: .NET's `GetDirectoryName` is `null`
-/// there, so the result is empty.
-pub(crate) fn containing_folder_path_at(video: &BaseItemEntity, path: &str) -> String {
-    if video.is_folder {
-        return path.to_owned();
-    }
-    // Only a disc rip (a cheap text test first) can name its own folder;
-    // only then is the blob read for a stack.
-    if crate::item_data::is_disc_folder(video.data.as_deref())
-        && !video.data.as_deref().is_some_and(|text| {
-            text.contains(ADDITIONAL_PARTS)
-                && crate::item_data::parse_data(Some(text))
-                    .get(ADDITIONAL_PARTS)
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|parts| !parts.is_empty())
-        })
-    {
-        return path.to_owned();
-    }
-    std::path::Path::new(path)
-        .parent()
-        .map_or_default(|p| p.to_string_lossy().into_owned())
 }
 
 /// The name of the folder a video lives in (`Path.GetFileName(

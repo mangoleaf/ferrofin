@@ -2,11 +2,11 @@
 //! settings XML of every plugin with a Jellyfin counterpart, in
 //! `plugins/configurations/`, where the counterpart reads it.
 //!
-//! The counterparts are the five metadata plugins Jellyfin builds in, which
+//! The counterparts are the six metadata plugins Jellyfin builds in, which
 //! read their files at once, and LDAP-Auth, Intro Skipper, Merge Versions,
 //! File Transformation and OpenSubtitles, which read theirs once installed.
 //! Each one's members are its `PluginConfiguration`'s, at the release
-//! `docs/PLUGINS_UPSTREAM.md` pins (the bundled five: `UPSTREAM_TAG`).
+//! `docs/PLUGINS_UPSTREAM.md` pins (the bundled six: `UPSTREAM_TAG`).
 //!
 //! The same table names the files adoption imports ([`adopted_documents`]).
 //!
@@ -174,12 +174,31 @@ const INTRO_SKIPPER: &[&str] = &[
     "EnableMainMenu",
 ];
 
+/// `PluginConfiguration` of `MediaBrowser.Providers/Plugins/ListenBrainz` at
+/// `v12.4`, without the get-only `AlgorithmString`.
+const LISTENBRAINZ: &[&str] = &[
+    "LabsServer",
+    "Algorithm",
+    "RateLimit",
+    "SimilarItemsCacheDays",
+];
+
+/// `SimilarityAlgorithm` of ListenBrainz at `v12.4`.
+const LISTENBRAINZ_ALGORITHMS: &[&str] = &[
+    "SessionBased1825Days",
+    "SessionBased1800Days",
+    "SessionBased7500Days",
+    "SessionBased7500DaysHighContribution",
+    "SessionBased9000Days",
+    "SessionBased75Days",
+];
+
 /// `ProfileImageFormat` of LDAP-Auth `v24`.
 const LDAP_IMAGE_FORMATS: &[&str] = &["Default", "Binary", "Base64", "Url"];
 
 /// Every plugin with a Jellyfin counterpart.
 #[allow(clippy::too_many_lines)] // one entry per plugin
-fn counterparts() -> [Counterpart; 10] {
+fn counterparts() -> [Counterpart; 11] {
     use ferrofin_providers::builtin_plugins as builtin;
     let document = |file, members, entries, derived| PluginDocument {
         file,
@@ -228,6 +247,18 @@ fn counterparts() -> [Counterpart; 10] {
                 &[],
                 &[],
             ),
+        },
+        Counterpart {
+            id: builtin::LISTENBRAINZ.id,
+            document: PluginDocument {
+                enums: &[("Algorithm", LISTENBRAINZ_ALGORITHMS)],
+                ..document(
+                    builtin::LISTENBRAINZ.configuration_file_name,
+                    LISTENBRAINZ,
+                    &[],
+                    &[],
+                )
+            },
         },
         Counterpart {
             id: ferrofin_extensions::ldap_auth::EXTENSION_ID,
@@ -583,8 +614,6 @@ mod tests {
                 .filter(|m| !keys.contains_key(*m) && !document.derived.contains(m))
                 .collect();
             let (ours, theirs): (&[&str], &[&str]) = match name.as_str() {
-                // gl-220: the similar-items cache is not ported.
-                "TMDb" => (&[], &["SimilarItemsCacheDays"]),
                 // The uid map is kept in the identity store, and filled at export.
                 "LDAP-Auth" => (&[], &["LdapUsers"]),
                 // Ferrofin's own key, for its anonymous search.
@@ -598,42 +627,80 @@ mod tests {
 
     /// TMDb's settings at Ferrofin's defaults are written as the document
     /// Jellyfin 12.4 wrote for its own (`testdata/Jellyfin.Plugin.Tmdb.xml`,
-    /// from `jellyfin/jellyfin:12.4`): the same members and values, but for
-    /// the one Ferrofin does not keep, which is reported; the image sizes,
-    /// null in both, are left out by both.
+    /// from `jellyfin/jellyfin:12.4`): the same members and values; the image
+    /// sizes, null in both, are left out by both.
     #[test]
     fn tmdb_settings_have_the_shape_jellyfin_writes() {
-        use ferrofin_common::config_import::parse;
         use ferrofin_providers::builtin_plugins::TMDB;
 
+        let export = export_defaults(TMDB.id, TMDB.default_config);
+        assert_eq!(
+            members(&export.files[0].contents),
+            members(include_str!("testdata/Jellyfin.Plugin.Tmdb.xml"))
+        );
+        assert!(export.not_exported.is_empty(), "{:?}", export.not_exported);
+    }
+
+    /// ListenBrainz's settings are written as Jellyfin 12.4 writes its own
+    /// (`testdata/Jellyfin.Plugin.ListenBrainz.xml`, saved through
+    /// `POST /Plugins/{id}/Configuration` on `jellyfin/jellyfin:12.4`), in its
+    /// order, with the algorithm by name however it was stored.
+    #[test]
+    fn listenbrainz_settings_have_the_shape_jellyfin_writes() {
+        use ferrofin_providers::builtin_plugins::LISTENBRAINZ;
+
+        for algorithm in [r#""sessionbased75days""#, "5", r#""5""#] {
+            let saved = format!(
+                r#"{{"LabsServer":"https://labs.example.org","Algorithm":{algorithm},"RateLimit":0.25,"SimilarItemsCacheDays":30}}"#
+            );
+            let export = export_defaults(LISTENBRAINZ.id, &saved);
+            let theirs = include_str!("testdata/Jellyfin.Plugin.ListenBrainz.xml");
+            assert_eq!(
+                members(&export.files[0].contents),
+                members(theirs),
+                "{algorithm}"
+            );
+            let order = |xml: &str| -> Vec<String> {
+                ferrofin_common::config_import::parse(xml)
+                    .expect("parses")
+                    .children
+                    .into_iter()
+                    .map(|c| c.name)
+                    .collect()
+            };
+            assert_eq!(order(&export.files[0].contents), order(theirs));
+            assert!(export.not_exported.is_empty(), "{:?}", export.not_exported);
+        }
+    }
+
+    /// The export of the plugin `id`'s settings `saved`, over its registered
+    /// defaults.
+    fn export_defaults(id: Uuid, saved: &str) -> ConfigExport {
         let counterpart = counterparts()
             .into_iter()
-            .find(|c| c.id == TMDB.id)
-            .expect("TMDb");
-        let defaults = object(TMDB.default_config.as_bytes());
-        let mut export = ConfigExport::default();
-        export_plugin(&counterpart.document, &defaults, &defaults, &mut export).expect("writes");
-        let members = |xml: &str| -> std::collections::BTreeMap<String, String> {
-            let root = parse(xml).expect("parses");
-            assert_eq!(root.name, "PluginConfiguration");
-            root.children
-                .into_iter()
-                .map(|c| (c.name, c.text))
-                .collect()
-        };
-        let ours = members(&export.files[0].contents);
-        let mut theirs = members(include_str!("testdata/Jellyfin.Plugin.Tmdb.xml"));
-        assert_eq!(
-            theirs.remove("SimilarItemsCacheDays").as_deref(),
-            Some("90")
-        );
-        assert_eq!(ours, theirs);
-        let reported: Vec<&str> = export
-            .not_exported
+            .find(|c| c.id == id)
+            .expect("a counterpart");
+        let registered = registered();
+        let (_, _, defaults) = registered
             .iter()
-            .map(|n| n.setting.as_str())
-            .collect();
-        assert_eq!(reported, ["SimilarItemsCacheDays"]);
+            .find(|(i, ..)| *i == id)
+            .expect("registered");
+        let defaults = object(defaults);
+        let mut settings = defaults.clone();
+        settings.extend(object(saved.as_bytes()));
+        let mut export = ConfigExport::default();
+        export_plugin(&counterpart.document, &settings, &defaults, &mut export).expect("writes");
+        export
+    }
+
+    /// A settings document's members, by name.
+    fn members(xml: &str) -> std::collections::BTreeMap<String, String> {
+        let root = ferrofin_common::config_import::parse(xml).expect("parses");
+        assert_eq!(root.name, "PluginConfiguration");
+        root.children
+            .into_iter()
+            .map(|c| (c.name, c.text))
+            .collect()
     }
 
     /// A server setting outranks the plugin's own MusicBrainz server and

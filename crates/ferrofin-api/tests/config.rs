@@ -100,6 +100,9 @@ impl ServerApplicationPaths for StubPaths {
         String::new()
     }
     fn user_configuration_directory_path(&self) -> String {
+        self.config_dir.clone() + "/users"
+    }
+    fn configuration_directory_path(&self) -> String {
         self.config_dir.clone()
     }
     fn internal_metadata_path(&self) -> String {
@@ -129,7 +132,7 @@ impl ServerApplicationPaths for StubPaths {
 impl ServerConfigurationManager for StubConfig {
     fn named_configuration_updated(&self, key: &str, json: Arc<str>) {
         let saved = std::fs::read(
-            self.paths.config_dir.clone() + "/named/" + &key.to_ascii_lowercase() + ".json",
+            self.paths.config_dir.clone() + "/" + &key.to_ascii_lowercase() + ".json",
         )
         .unwrap();
         assert_eq!(json.as_bytes(), saved);
@@ -206,10 +209,10 @@ impl ServerConfigurationManager for StubConfig {
 }
 
 impl StubConfig {
-    /// The bytes saved under `named/{key}.json`, `None` when never saved, or
+    /// The bytes saved under `{key}.json`, `None` when never saved, or
     /// an error when the file cannot be read, as the real manager reports it.
     fn saved_named(&self, key: &str) -> Result<Option<Vec<u8>>, ServiceError> {
-        let path = self.paths.config_dir.clone() + "/named/" + key + ".json";
+        let path = self.paths.config_dir.clone() + "/" + key + ".json";
         match std::fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -549,10 +552,8 @@ async fn the_date_added_behavior_round_trips_through_the_metadata_configuration(
             serde_json::json!(saved)
         );
     }
-    let on_disk: ferrofin_model::configuration::MetadataConfiguration = serde_json::from_slice(
-        &std::fs::read(dir.path().join("named").join("metadata.json")).unwrap(),
-    )
-    .unwrap();
+    let on_disk: ferrofin_model::configuration::MetadataConfiguration =
+        serde_json::from_slice(&std::fs::read(dir.path().join("metadata.json")).unwrap()).unwrap();
     assert!(!on_disk.use_file_creation_time_for_date_added);
 
     // Saving it is an administrator's call.
@@ -586,10 +587,8 @@ async fn a_named_configuration_body_binds_member_names_exactly() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let saved: ferrofin_model::configuration::MetadataConfiguration = serde_json::from_slice(
-        &std::fs::read(dir.path().join("named").join("metadata.json")).unwrap(),
-    )
-    .unwrap();
+    let saved: ferrofin_model::configuration::MetadataConfiguration =
+        serde_json::from_slice(&std::fs::read(dir.path().join("metadata.json")).unwrap()).unwrap();
     assert!(
         saved.use_file_creation_time_for_date_added,
         "the camelCase member must not bind"
@@ -709,11 +708,9 @@ async fn with_captured_logs<F: std::future::Future>(future: F) -> (F::Output, Ca
     (output, captured)
 }
 
-/// Writes `body` to `{dir}/named/{key}.json` (creating the `named/` subdir).
+/// Writes `body` to `{dir}/{key}.json`.
 fn write_named_config(dir: &std::path::Path, key: &str, body: &[u8]) {
-    let named = dir.join("named");
-    std::fs::create_dir_all(&named).unwrap();
-    std::fs::write(named.join(format!("{key}.json")), body).unwrap();
+    std::fs::write(dir.join(format!("{key}.json")), body).unwrap();
 }
 
 /// A stored document that cannot be read at all is the manager's error, which
@@ -726,7 +723,7 @@ async fn an_unreadable_named_configuration_is_a_server_error() {
     // A directory where each file belongs: `read` fails with EISDIR, an I/O
     // error that is not "never saved".
     for key in ["encoding", "network"] {
-        std::fs::create_dir_all(dir.path().join("named").join(format!("{key}.json"))).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("{key}.json"))).unwrap();
     }
     let state = state_with_paths(StubPaths {
         log_dir: String::new(),
@@ -771,10 +768,22 @@ async fn an_unregistered_named_configuration_is_neither_served_nor_saved() {
         StatusCode::BAD_REQUEST
     );
     assert_eq!(
-        post(app, "/System/Configuration/never-saved", &document).await,
+        post(app.clone(), "/System/Configuration/never-saved", &document).await,
         StatusCode::INTERNAL_SERVER_ERROR
     );
-    assert!(!dir.path().join("named/never-saved.json").exists());
+    assert!(!dir.path().join("never-saved.json").exists());
+    // The named documents sit beside `system.json` (gl-319): `system` is no
+    // store, refused before any path is built, so its save cannot replace
+    // the server configuration.
+    std::fs::write(dir.path().join("system.json"), b"{}").unwrap();
+    assert_eq!(
+        post(app, "/System/Configuration/system", &document).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("system.json")).unwrap(),
+        b"{}"
+    );
 }
 
 /// Jellyfin's `database` store selects its database provider; Ferrofin runs on
@@ -793,7 +802,7 @@ async fn the_database_configuration_cannot_be_changed() {
         post(app, "/System/Configuration/Database", &document).await,
         StatusCode::BAD_REQUEST
     );
-    assert!(!dir.path().join("named/database.json").exists());
+    assert!(!dir.path().join("database.json").exists());
 }
 
 /// A Live TV manager whose two configuration reads answer the given rows, or
@@ -1057,8 +1066,8 @@ fn live_tv_rows() -> (
             ..row(&[&OPEN_TUNER_MEMBERS, &BLANKED_TUNER_MEMBERS])
         }],
         vec![ListingsProviderInfo {
-            enabled_tuners: vec!["tuner".to_owned()],
-            channel_mappings: vec![ferrofin_model::dto::NameValuePair::new("1", "one")],
+            enabled_tuners: vec![Some("tuner".to_owned())],
+            channel_mappings: vec![Some(ferrofin_model::dto::NameValuePair::new("1", "one"))],
             ..row(&[&OPEN_PROVIDER_MEMBERS, &BLANKED_PROVIDER_MEMBERS])
         }],
     )
@@ -1399,7 +1408,7 @@ async fn named_configuration_converts_values_before_persisting_and_keeps_failed_
         .header("X-Emby-Token", "tok").header("Content-Type", "application/json")
         .body(Body::from(r#"{"EncodingThreadCount":"3","encodingThreadCount":"bad","DownMixAudioBoost":"1.5","TranscodingTempPath":1.50,"DownMixStereoAlgorithm":1}"#)).unwrap()).await.unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let saved_path = dir.path().join("named/encoding.json");
+    let saved_path = dir.path().join("encoding.json");
     let saved = std::fs::read(&saved_path).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&saved).unwrap();
     assert_eq!(value["EncodingThreadCount"], 3);
@@ -1433,8 +1442,7 @@ async fn named_configuration_converts_values_before_persisting_and_keeps_failed_
         StatusCode::NO_CONTENT
     );
     let live: ferrofin_model::live_tv::LiveTvOptions =
-        serde_json::from_slice(&std::fs::read(dir.path().join("named/livetv.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(dir.path().join("livetv.json")).unwrap()).unwrap();
     assert_eq!(live.guide_days, None);
 }
 
@@ -1456,8 +1464,7 @@ async fn null_lists_in_the_livetv_document_are_saved_as_empty() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let live: ferrofin_model::live_tv::LiveTvOptions =
-        serde_json::from_slice(&std::fs::read(dir.path().join("named/livetv.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(dir.path().join("livetv.json")).unwrap()).unwrap();
     let provider = ferrofin_model::live_tv::ListingsProviderInfo {
         type_: Some("xmltv".to_owned()),
         ..Default::default()
@@ -1478,8 +1485,7 @@ async fn null_lists_in_the_livetv_document_are_saved_as_empty() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let live: ferrofin_model::live_tv::LiveTvOptions =
-        serde_json::from_slice(&std::fs::read(dir.path().join("named/livetv.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(dir.path().join("livetv.json")).unwrap()).unwrap();
     assert_eq!(live, ferrofin_model::live_tv::LiveTvOptions::default());
 }
 
@@ -1504,7 +1510,7 @@ async fn nonfinite_encoding_values_survive_storage_and_fail_http_serialization()
                 post(app.clone(), uri, &serde_json::json!({field: literal})).await,
                 StatusCode::NO_CONTENT
             );
-            let saved = std::fs::read(dir.path().join("named/encoding.json")).unwrap();
+            let saved = std::fs::read(dir.path().join("encoding.json")).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&saved).unwrap();
             assert_eq!(value[field], literal);
             // The same ordinary model reader used by the configuration manager
@@ -1578,14 +1584,11 @@ async fn registered_store_validates_before_replacing_configuration() {
             status
         );
         assert_eq!(
-            std::fs::read(dir.path().join("named/encoding.json")).unwrap(),
+            std::fs::read(dir.path().join("encoding.json")).unwrap(),
             original
         );
     }
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("named")).unwrap().count(),
-        1
-    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
 /// A host check run after each committed save; it fails the save with a
@@ -1625,8 +1628,7 @@ async fn a_committed_check_answers_every_named_save_after_it_is_kept() {
         StatusCode::NOT_FOUND
     );
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.path().join("named/network.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(dir.path().join("network.json")).unwrap()).unwrap();
     assert_eq!(saved["CertificatePath"], "missing.pfx");
     // Upstream's handler runs after every named save, branding included.
     assert_eq!(
@@ -1731,8 +1733,7 @@ async fn the_startup_remote_access_toggle_applies_to_the_live_policy() {
         RemoteAccessPolicyResult::RejectDueToRemoteAccessDisabled
     );
     let saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.path().join("named/network.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(dir.path().join("network.json")).unwrap()).unwrap();
     assert_eq!(saved["EnableRemoteAccess"], false);
     assert_eq!(
         saved["LocalNetworkSubnets"],
@@ -1773,18 +1774,15 @@ async fn failed_and_concurrent_network_saves_keep_effective_policy_consistent() 
     let uri = "/System/Configuration/network";
     let body = serde_json::json!({"LocalNetworkSubnets":["203.0.113.0/24"]});
     // A destination directory makes rename fail after the temporary file is written.
-    std::fs::create_dir_all(dir.path().join("named/network.json")).unwrap();
+    std::fs::create_dir_all(dir.path().join("network.json")).unwrap();
     assert!(!state.is_in_local_network(remote));
     assert_eq!(
         post(state.clone(), uri, &body).await,
         StatusCode::INTERNAL_SERVER_ERROR
     );
     assert!(!state.is_in_local_network(remote));
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("named")).unwrap().count(),
-        1
-    );
-    std::fs::remove_dir(dir.path().join("named/network.json")).unwrap();
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    std::fs::remove_dir(dir.path().join("network.json")).unwrap();
     let mut workers = tokio::task::JoinSet::new();
     for index in 0..20 {
         let app = state.clone();
@@ -1806,14 +1804,10 @@ async fn failed_and_concurrent_network_saves_keep_effective_policy_consistent() 
         assert_eq!(result.unwrap(), StatusCode::NO_CONTENT);
     }
     let saved: NetworkConfiguration =
-        serde_json::from_slice(&std::fs::read(dir.path().join("named/network.json")).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(dir.path().join("network.json")).unwrap()).unwrap();
     let expected = NetworkManager::with_defaults(saved, "").is_in_local_network(remote);
     assert_eq!(state.is_in_local_network(remote), expected);
-    assert_eq!(
-        std::fs::read_dir(dir.path().join("named")).unwrap().count(),
-        1
-    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }
 
 #[tokio::test]
@@ -1847,8 +1841,8 @@ async fn only_successful_named_saves_notify_configuration_observers() {
         .await,
         StatusCode::INTERNAL_SERVER_ERROR
     );
-    std::fs::remove_file(dir.path().join("named/metadata.json")).unwrap();
-    std::fs::create_dir(dir.path().join("named/metadata.json")).unwrap();
+    std::fs::remove_file(dir.path().join("metadata.json")).unwrap();
+    std::fs::create_dir(dir.path().join("metadata.json")).unwrap();
     assert_eq!(
         post(app, uri, &serde_json::json!({})).await,
         StatusCode::INTERNAL_SERVER_ERROR
