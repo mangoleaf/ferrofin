@@ -75,7 +75,7 @@ work across subsystems:
 | `job_id` | transcode/other job id |
 | `path` | filesystem path |
 | `config_file` | the bootstrap `config.toml` in use, as context (the startup banner, configuration warnings), when `path` would name the wrong subject |
-| `trigger` | `api` \| `schedule` \| `startup` \| `watcher` \| `webhook` (library scans: `ScanTrigger`); a scheduled task's run can also be `library_change` (a "Scan Media Library" run a library change queued, whose scan is `api`) |
+| `trigger` | `api` \| `schedule` \| `startup` \| `watcher` \| `webhook` (library scans: `ScanTrigger`); a scheduled task's run can also be `library_change` (a "Scan Media Library" run a library change queued, whose scan is `api`), and so is Intro Skipper's automatic analysis |
 | `trigger_trace_id` | originating sampled request's trace id (hex), when known |
 
 `Uuid`s via `tracing::field::display()`. Values born inside a function:

@@ -70,8 +70,8 @@ async fn boot_https_server_with(settings: serde_json::Value) -> HttpsServer {
     let (der, pkcs12) = self_signed_pkcs12("secret");
     let certificate_path = root.join("server.pfx");
     std::fs::write(&certificate_path, pkcs12).expect("write certificate");
-    let named = root.join("config").join("users").join("named");
-    std::fs::create_dir_all(&named).expect("named configuration directory");
+    let named = root.join("config");
+    std::fs::create_dir_all(&named).expect("configuration directory");
     let mut network = serde_json::json!({
         "EnableHttps": true,
         "CertificatePath": certificate_path,

@@ -1785,15 +1785,20 @@ impl LibraryScanner {
                     fold.take(&mut temp, result);
                 }
                 MusicSource::AudioDb => {
-                    let id = artist_id(&fold.lookup);
-                    let (true, Some(adb), Some(id)) = (
+                    // `GetArtist(info.GetMusicBrainzArtistId(),
+                    // info.GetProviderId(AudioDbArtist))`.
+                    let musicbrainz_id = artist_id(&fold.lookup);
+                    let audiodb_id = valid_id(&fold.lookup, "AudioDbArtist");
+                    let (true, Some(adb), true) = (
                         fetch.audiodb || fetch.audiodb_images,
                         &self.audiodb,
-                        id.as_deref(),
+                        musicbrainz_id.is_some() || audiodb_id.is_some(),
                     ) else {
                         continue;
                     };
-                    let artist = adb.artist(id).await;
+                    let artist = adb
+                        .artist(musicbrainz_id.as_deref(), audiodb_id.as_deref())
+                        .await;
                     if fetch.audiodb
                         && let Some(artist) = &artist
                     {
@@ -1812,6 +1817,11 @@ impl LibraryScanner {
                         item.genres = joined(&genres);
                         item.production_year = artist.formed_year.map(i64::from);
                         item.production_locations.clone_from(&artist.country);
+                        // `ProcessResult`: `strWebsite` is the home page.
+                        item.data = artist
+                            .website
+                            .as_ref()
+                            .map(|site| serde_json::json!({ "HomePageUrl": site }).to_string());
                         result.provider_ids = [
                             ("AudioDbArtist", &artist.audiodb_id),
                             ("MusicBrainzArtist", &artist.musicbrainz_id),
@@ -1913,27 +1923,35 @@ impl LibraryScanner {
                 }
                 if fetch.fanart_images
                     && needs(fetcher_names::FANART)
-                    && let (Some(fanart), Some(group), Some(artist)) = (
-                        &self.fanart,
-                        group.as_deref(),
-                        valid_id(ids, "MusicBrainzAlbumArtist"),
-                    )
+                    && let (Some(fanart), Some(artist)) =
+                        (&self.fanart, valid_id(ids, "MusicBrainzAlbumArtist"))
                 {
                     let fanart = fanart
                         .as_ref()
                         .clone()
                         .with_language(&work.policy.metadata_language());
-                    fanart_found.extend(fanart.album_images(&artist, group).await);
+                    let release = valid_id(ids, "MusicBrainzAlbum");
+                    fanart_found.extend(
+                        fanart
+                            .album_images(&artist, release.as_deref(), group.as_deref())
+                            .await,
+                    );
                 }
             }
             MusicKind::Artist | MusicKind::ByNameArtist => {
                 if fetch.audiodb_images && needs(fetcher_names::AUDIODB) {
-                    match (audiodb, &self.audiodb, artist_key.as_deref()) {
-                        (Some(images), ..) => found.extend(images),
-                        (None, Some(adb), Some(id)) => {
-                            found.extend(adb.artist(id).await.map_or_default(|a| a.images));
-                        }
-                        _ => {}
+                    // `AudioDbArtistImageProvider.GetImages`: `GetArtist`.
+                    match (audiodb, &self.audiodb) {
+                        (Some(images), _) => found.extend(images),
+                        (None, Some(adb)) => found.extend(
+                            adb.artist(
+                                artist_key.as_deref(),
+                                valid_id(ids, "AudioDbArtist").as_deref(),
+                            )
+                            .await
+                            .map_or_default(|a| a.images),
+                        ),
+                        (None, None) => {}
                     }
                 }
                 if fetch.fanart_images

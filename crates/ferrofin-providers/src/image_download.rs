@@ -750,8 +750,8 @@ mod quota_tests {
 mod destination_tests {
     use super::*;
     use crate::destination::{self, DestinationPolicy};
-    use crate::guarded_http::MAX_REDIRECTS;
     use crate::mock_http::MockServer;
+    use ferrofin_util::http_client::MAX_REDIRECTS;
     use rstest::rstest;
     use std::net::IpAddr;
     use std::sync::atomic::Ordering;

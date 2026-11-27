@@ -6,7 +6,10 @@
 //! registered. The transform is captured in `to_axum_path` and reused by both
 //! the router builder and the contract-superset test, so they can never drift.
 
-use axum::response::IntoResponse;
+use axum::extract::{FromRequestParts, RawPathParams, Request};
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -128,7 +131,8 @@ pub fn axum_routes() -> Vec<(&'static str, String)> {
 enum Seg {
     /// A literal segment, e.g. `Localization` — matched case-insensitively.
     Literal(String),
-    /// A single-segment parameter, e.g. `{itemId}` — matches any one segment.
+    /// A single-segment parameter, e.g. `{itemId}` — matches any one non-empty
+    /// segment.
     Param,
     /// A catch-all parameter, e.g. `{*path}` — matches one or more remaining
     /// segments.
@@ -233,19 +237,26 @@ impl RouteIndex {
     }
 }
 
-/// `path` split after its first `count` non-empty segments.
+/// `path` split after its first `count` segments, none of them empty.
 fn split_after(path: &str, count: usize) -> (&str, &str) {
     let mut rest = path;
     for _ in 0..count {
-        let segment = rest.trim_start_matches('/');
+        // `fits` left no empty segment before a catch-all, so one `/` leads each.
+        let segment = rest.strip_prefix('/').unwrap_or(rest);
         rest = &segment[segment.find('/').unwrap_or(segment.len())..];
     }
     path.split_at(path.len() - rest.len())
 }
 
-/// The non-empty segments of `path`.
+/// The segments of `path` as ASP.NET's router reads them (`FastPathTokenizer`):
+/// each `/` after the leading one starts a segment, an empty one included,
+/// except that a single trailing `/` adds none.
 fn segments(path: &str) -> impl Iterator<Item = &str> {
-    path.split('/').filter(|s| !s.is_empty())
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    (!rest.is_empty())
+        .then(|| rest.strip_suffix('/').unwrap_or(rest).split('/'))
+        .into_iter()
+        .flatten()
 }
 
 /// Orders `a` and `b` by their ASCII-lowercased bytes: `Equal` exactly when
@@ -256,15 +267,15 @@ fn case_insensitive_order(a: &str, b: &str) -> Ordering {
         .cmp(b.bytes().map(|byte| byte.to_ascii_lowercase()))
 }
 
-/// Whether `path` fits `route`: every literal in any case, one segment per
-/// parameter, and a non-empty remainder for a catch-all (axum matches no
-/// empty one).
+/// Whether `path` fits `route`: every literal in any case, one non-empty
+/// segment per parameter (ASP.NET's router matches none to an empty one), and
+/// a non-empty remainder for a catch-all (axum matches no empty one).
 fn fits(route: &[Seg], path: &str) -> bool {
     let mut incoming = segments(path);
     for seg in route {
         match (seg, incoming.next()) {
             (Seg::Wildcard, Some(_)) => return true,
-            (Seg::Param, Some(_)) => {}
+            (Seg::Param, Some(segment)) if !segment.is_empty() => {}
             (Seg::Literal(literal), Some(segment)) if segment.eq_ignore_ascii_case(literal) => {}
             _ => return false,
         }
@@ -308,7 +319,9 @@ fn spells<'a>(path: &str, spelled: impl Iterator<Item = &'a str>) -> bool {
 /// and clients (including jellyfin-web) call some paths in non-canonical case.
 ///
 /// Only literal segments are re-cased; parameter values (item ids, names, …) are
-/// preserved verbatim, and so is a catch-all's tail, byte for byte. Returns
+/// preserved verbatim, and so is a catch-all's tail, byte for byte. A path with
+/// an empty segment (`//`) before any catch-all fits no route, as in ASP.NET's
+/// router, so it is passed on as sent and finds none (gl-1675). Returns
 /// `Some(canonical)` when a differently-cased match is found, or `None` when
 /// the path is already canonical or matches no API route
 /// (so `/web/*` assets, health, and unknown paths pass through untouched — their
@@ -321,6 +334,26 @@ pub fn canonicalize_path(path: &str) -> Option<String> {
     INDEX
         .get_or_init(|| RouteIndex::new(registered_paths()))
         .canonicalize(path)
+}
+
+/// Answers `404` for a route value axum bound from an empty segment, as an
+/// unmatched path is answered. ASP.NET's router matches no endpoint to an
+/// empty segment, but axum's binds an empty value to a parameter followed by
+/// `/` (`/Sessions//Playing/Pause`). A catch-all never binds an empty value,
+/// so its tail stays its handler's, slashes and all (gl-1675).
+pub(crate) async fn refuse_empty_route_values(request: Request, next: Next) -> Response {
+    // Only a path holding `//` can bind one: the rest pass without a lookup.
+    if !request.uri().path().contains("//") {
+        return next.run(request).await;
+    }
+    let (mut parts, body) = request.into_parts();
+    let bound_empty = RawPathParams::from_request_parts(&mut parts, &())
+        .await
+        .is_ok_and(|params| params.iter().any(|(_, value)| value.is_empty()));
+    if bound_empty {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    next.run(Request::from_parts(parts, body)).await
 }
 
 /// Every route path, sorted: the contract's, the ported plugins' own and
@@ -481,6 +514,79 @@ mod tests {
         );
     }
 
+    /// An empty segment fits no route wherever it sits, as in ASP.NET's
+    /// router, whose tokenizer keeps it and matches no literal or parameter to
+    /// it. So the path is passed on as sent and finds none. A lone trailing `/`
+    /// is no segment, and a catch-all's tail is its handler's (gl-1675).
+    #[test]
+    fn an_empty_segment_fits_no_route() {
+        for path in [
+            "/System//Info/Public",
+            "//System/Info/Public",
+            "/system/info/public//",
+            "/Items//Similar",
+            "/Items//",
+            "/Users//Items",
+            "/plugins//web/Page.js",
+        ] {
+            assert_eq!(canonicalize_path(path), None, "{path}");
+        }
+        assert_eq!(
+            canonicalize_path("/system/info/public/").as_deref(),
+            Some("/System/Info/Public")
+        );
+        assert_eq!(
+            canonicalize_path("/plugins/AbC/web//Page.js").as_deref(),
+            Some("/Plugins/AbC/web//Page.js")
+        );
+    }
+
+    /// axum binds an empty value to a parameter followed by `/`; the route
+    /// layer answers that `404`, as ASP.NET's router does. A catch-all binds
+    /// none, so its tail is its handler's, slashes and all (gl-1675).
+    #[tokio::test]
+    async fn an_empty_route_value_is_not_found() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route(
+                "/Sessions/{sessionId}/Playing/{command}",
+                axum::routing::post(|| async { "reached" }),
+            )
+            .route(
+                "/Plugins/{pluginId}/web/{*path}",
+                get(|| async { "reached" }),
+            )
+            .route_layer(axum::middleware::from_fn(super::refuse_empty_route_values));
+        // The layer wraps a route's method fallback too, so a method the route
+        // lacks is 404 at an empty segment, not 405, as in ASP.NET.
+        for (method, path, expected) in [
+            ("POST", "/Sessions/s1/Playing/Pause", StatusCode::OK),
+            ("POST", "/Sessions//Playing/Pause", StatusCode::NOT_FOUND),
+            (
+                "GET",
+                "/Sessions/s1/Playing/Pause",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            ("GET", "/Sessions//Playing/Pause", StatusCode::NOT_FOUND),
+            ("GET", "/Plugins/p/web/Page.js", StatusCode::OK),
+            ("GET", "/Plugins/p/web//Page.js", StatusCode::OK),
+            ("GET", "/Plugins/p/web/a//b", StatusCode::OK),
+            ("GET", "/Plugins//web/Page.js", StatusCode::NOT_FOUND),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), expected, "{method} {path}");
+        }
+    }
+
     #[test]
     fn canonicalize_returns_none_for_canonical_or_non_api() {
         assert_eq!(canonicalize_path("/Localization/Cultures"), None); // already canonical
@@ -491,15 +597,24 @@ mod tests {
     /// What [`canonicalize_path`] answered when it walked the whole table, the
     /// first matching route winning: the oracle for the indexed lookup.
     fn table_walk(routes: &[Vec<String>], path: &str) -> Option<String> {
-        let incoming: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        // ASP.NET's segments: an empty one kept, a single trailing `/` none.
+        let rest = path.strip_prefix('/').unwrap_or(path);
+        let incoming: Vec<&str> = if rest.is_empty() {
+            Vec::new()
+        } else {
+            rest.strip_suffix('/').unwrap_or(rest).split('/').collect()
+        };
         for pattern in routes {
             if incoming.len() != pattern.len() {
                 continue;
             }
-            let literals_match = pattern
-                .iter()
-                .enumerate()
-                .all(|(i, seg)| seg.starts_with('{') || incoming[i].eq_ignore_ascii_case(seg));
+            let literals_match = pattern.iter().enumerate().all(|(i, seg)| {
+                if seg.starts_with('{') {
+                    !incoming[i].is_empty()
+                } else {
+                    incoming[i].eq_ignore_ascii_case(seg)
+                }
+            });
             if !literals_match {
                 continue;
             }
