@@ -1425,9 +1425,16 @@ impl Group {
         // Playing/Paused `SetState(Waiting)` BEFORE delegating, so even the
         // wrong-item early return below leaves the group in `Waiting`.
         self.enter_waiting(prev);
-        // WaitingGroupState.cs:333-344: the client is on the wrong item, so it is
+        // WaitingGroupState.cs:343-353: the client is on the wrong item, so it is
         // sent the queue and nothing else happens.
         if playlist_item_id != self.queue.playing_item_id() {
+            // A Playing or Paused group hands this to a fresh state, whose
+            // `ResumePlaying` is false, so it settles into Paused once ready (a
+            // Playing group's replayed Pause banks the time played, which a
+            // resume would not). A Waiting group keeps its state and flag.
+            if prev != GroupStateType::Waiting {
+                self.resume_playing = false;
+            }
             self.set_buffering(session_id, true);
             return vec![Outbound::to(
                 Target::CurrentSession,
@@ -1436,7 +1443,7 @@ impl Group {
         }
         let mut out = Vec::new();
         match prev {
-            // WaitingGroupState.cs:346-368.
+            // WaitingGroupState.cs:356-378.
             GroupStateType::Playing => {
                 self.resume_playing = true;
                 self.set_buffering(session_id, true);
@@ -1447,7 +1454,7 @@ impl Group {
                     self.command_env(SendCommandType::Pause, self.last_activity, now),
                 ));
             }
-            // WaitingGroupState.cs:369-379.
+            // WaitingGroupState.cs:379-389.
             GroupStateType::Paused => {
                 self.resume_playing = false;
                 self.set_buffering(session_id, true);
@@ -1456,7 +1463,7 @@ impl Group {
                     self.command_env(SendCommandType::Pause, self.last_activity, now),
                 ));
             }
-            // WaitingGroupState.cs:380-391 — the flag is LEFT ALONE here; only a
+            // WaitingGroupState.cs:390-401 — the flag is LEFT ALONE here; only a
             // group that will not resume force-updates the new buffering client.
             GroupStateType::Waiting => {
                 self.set_buffering(session_id, true);
@@ -3057,6 +3064,56 @@ mod tests {
         );
     }
 
+    /// `PausedGroupState` hands a Buffer to a FRESH `WaitingGroupState`, whose
+    /// `ResumePlaying` starts false, and the wrong-item early return
+    /// (WaitingGroupState.cs:343-353) leaves it so. A paused group that a stale
+    /// Buffer put in Waiting settles back into Paused once its members are
+    /// ready, whatever an earlier wait left the flag at.
+    #[tokio::test]
+    async fn a_wrong_item_buffer_does_not_resume_a_paused_group() {
+        let (m, bus, a, b, gid) = pair().await;
+        // The Play arms the resume; the group then plays and is paused.
+        let pli = start_playing(&m, &bus, &[&a, &b], 2).await;
+        m.handle_request(&a, PlaybackRequest::Pause).await.unwrap();
+
+        m.handle_request(&b, buffer_at(Uuid::new_v4(), 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            m.get_group(&a, gid).await.unwrap().state,
+            GroupStateType::Waiting
+        );
+        m.handle_request(&b, ready_at(pli, 0, false)).await.unwrap();
+
+        assert_eq!(
+            m.get_group(&a, gid).await.unwrap().state,
+            GroupStateType::Paused
+        );
+    }
+
+    /// A stale Buffer on a group ALREADY waiting reaches the same state
+    /// object, so it keeps the flag: the joiner the group was waiting on
+    /// leaving still resumes it.
+    #[tokio::test]
+    async fn a_wrong_item_buffer_on_a_waiting_group_keeps_resume_playing() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        start_playing(&m, &bus, &[&a], 2).await;
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap(); // Playing -> Waiting, resume armed
+
+        m.handle_request(&b, buffer_at(Uuid::new_v4(), 0))
+            .await
+            .unwrap();
+        m.leave_group(&b).await.unwrap();
+
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Playing
+        );
+    }
+
     /// `Group.GetInfo()` stamps `DateTime.UtcNow` at DTO construction, so the
     /// value advances on every read; Ferrofin used to freeze it at the last
     /// mutation. `Participants` is LINQ `Distinct()` — first-join order.
@@ -3519,6 +3576,27 @@ mod tests {
 
     fn bodies(out: &[Outbound]) -> Vec<&str> {
         out.iter().map(|o| o.body.as_str()).collect()
+    }
+
+    /// The same stale Buffer on a PLAYING group skips the Playing arm, so the
+    /// position is not banked and nobody is paused. Once the member is ready
+    /// the group settles into Paused, and the Pause it replays
+    /// (PausedGroupState.cs:66-87) banks the time played meanwhile; resuming
+    /// instead restarted everyone from where the group last banked it.
+    #[test]
+    fn a_wrong_item_buffer_on_a_playing_group_pauses_it_where_it_played_to() {
+        let start = Utc::now();
+        let (mut g, first, _) = playing_pair(start);
+        // As the Play that started the group left it.
+        g.resume_playing = true;
+        let later = start + Duration::minutes(5);
+
+        g.handle("s2", &buffer_at(Uuid::new_v4(), 0), later);
+        assert_eq!(g.state, GroupStateType::Waiting);
+        g.handle("s2", &ready_now(first, minutes(10), false, later), later);
+
+        assert_eq!(g.state, GroupStateType::Paused);
+        assert_eq!(g.position_ticks, minutes(15));
     }
 
     /// v12.2 `Ready_PlayingSessionReportsPositionFromBeforeSeek_IsCorrected`
