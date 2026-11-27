@@ -53,15 +53,16 @@ use crate::state::AppState;
 
 /// `POST /Items/{itemId}` — applies an edited item and persists it.
 ///
-/// Port of `ItemUpdateController.UpdateItem` (scalar/collection subset). A
-/// missing item is a `404`; on success the row is saved and the handler returns
-/// `204`.
+/// Port of `ItemUpdateController.UpdateItem`. A nil id is a `400`
+/// (`GetItemById(Guid.Empty)` throws `ArgumentException`), a missing item a
+/// `404`; on success the row is saved and the handler returns `204`.
 #[utoipa::path(
     post,
     path = "/Items/{itemId}",
     params(("itemId" = String, Path, description = "The item id")),
     responses(
         (status = 204, description = "Item updated"),
+        (status = 400, description = "A nil item id"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -72,6 +73,9 @@ pub(crate) async fn update_item(
     Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     JsonBody(request): JsonBody<Box<UpdateItemRequest>>,
 ) -> Result<StatusCode, ApiError> {
+    if item_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     // Upstream edits the cached item a running refresh also holds, so that
     // refresh's save carries the edit. Here each loads its own row: wait out
     // the provider manager's refresh of this item and the library scan's save

@@ -2068,9 +2068,15 @@ async fn update_item_without_provider_ids_leaves_them_alone() {
     );
 }
 
-/// `POST /Items/{itemId}` for a missing item is a `404`.
+/// `POST /Items/{itemId}` for a missing item is a `404`; for the nil id a
+/// `400`, as `GetItemById(Guid.Empty)` throws `ArgumentException`
+/// ("Guid can't be empty"), which `ExceptionMiddleware` answers 400 (v12.4
+/// `LibraryManager.cs:1691-1694`).
+#[rstest::rstest]
+#[case::missing(Uuid::from_u128(0xF00D), StatusCode::NOT_FOUND)]
+#[case::nil(Uuid::nil(), StatusCode::BAD_REQUEST)]
 #[tokio::test]
-async fn update_missing_item_is_404() {
+async fn update_unresolved_item(#[case] item_id: Uuid, #[case] expected: StatusCode) {
     let router = create_router(state(
         Uuid::from_u128(0x5A),
         Arc::new(Mutex::new(Vec::new())),
@@ -2079,18 +2085,17 @@ async fn update_missing_item_is_404() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri(format!("/Items/{}", Uuid::from_u128(0xF00D)))
+                .uri(format!("/Items/{item_id}"))
                 .header("X-Emby-Token", "valid")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"Id":"{}","Type":"Movie","MediaType":"Video","Name":"X"}}"#,
-                    Uuid::from_u128(0xF00D)
+                    r#"{{"Id":"{item_id}","Type":"Movie","MediaType":"Video","Name":"X"}}"#
                 )))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status(), expected);
 }
 
 /// A folder row of `kind` at `path` for the refresh tests.
