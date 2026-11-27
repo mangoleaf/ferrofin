@@ -2629,7 +2629,20 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              refresh change the one cached BaseItem (LibraryManager.GetItemById): an edit \
              made after RefreshWithProviders' MergeData is saved with what the refresh \
              merged, and one made before it is merged by that rule, so an unlocked field \
-             the providers answer can replace it. Fix path: gl-1961.",
+             the providers answer can replace it. Fix path: gl-1968.",
+            "A refresh the provider manager runs (provider_manager.rs refresh_item) takes \
+             ProviderManager::lock_item_metadata only after its metadata and image \
+             providers, reads the row, its LockedFields and its ids again, and when an \
+             edit, an edit's cascade (item_update.rs rewrite_child, under each child's \
+             lock) or any other writer changed them since its first read, merges again \
+             onto them with the answers it has (RefreshReplay), fetching nothing; a row \
+             deleted meanwhile is not saved back, and two refreshes of one item run one \
+             after the other (upstream's Identify refresh can run beside the queue's). \
+             Upstream merges onto the cached item \
+             when RefreshWithProviders' fetches return, so an edit made while its image \
+             providers run is saved as the edit wrote it there, and merged by the \
+             refresh's rule here, where an unlocked field the providers answer can \
+             replace it under a replacing mode.",
             "In a library with no metadata saver list and SaveLocalMetadata off, \
              ReplaceAllMetadata reads an item's existing NFO, a box set's existing \
              collection.xml or a playlist folder's existing playlist.xml; upstream's \

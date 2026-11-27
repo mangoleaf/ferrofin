@@ -273,13 +273,13 @@ pub trait ProviderManager: Send + Sync {
     ) -> Result<ItemUpdateType, ServiceError>;
 
     /// Holds `item_id`'s metadata for one read-modify-write of its row. The
-    /// provider manager's refresh holds it from loading the row to saving it,
-    /// a metadata edit (`POST /Items/{itemId}`) around its own load and save,
-    /// and the library scan around its check for an edit and the save that
-    /// follows (`scan_item`), so none saves over another with the row it
-    /// loaded first.
-    ///
-    /// TODO(gl-1961): the edit's cascade to child rows takes no lock yet.
+    /// provider manager's refresh holds it from reading the row again after
+    /// its fetches to its last save, a metadata edit (`POST /Items/{itemId}`)
+    /// around its own load and save and then around each child row its
+    /// cascade rewrites, one at a time, and the library scan around its check
+    /// for an edit and the save that follows (`scan_item`), so none saves
+    /// over another with the row it loaded first. No holder waits for a
+    /// second item's lock while it holds one.
     ///
     /// Upstream needs no lock: the edit and the refresh both change the cached
     /// `BaseItem` that `LibraryManager.GetItemById` hands out, so the

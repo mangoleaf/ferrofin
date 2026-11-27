@@ -304,6 +304,9 @@ struct Tree {
     configured_content_type: Option<CollectionType>,
     /// `update_people` calls: the item and the credits written.
     people_written: Mutex<Vec<(String, Vec<PeopleEntity>)>>,
+    /// Every row as last saved (`update_items`, or a test's stand-in for a
+    /// refresh), which `get_item_by_id` reads before the rows above.
+    rows: Mutex<std::collections::HashMap<Uuid, BaseItemEntity>>,
 }
 
 /// The refreshes the library was asked to queue: the item and the options.
@@ -341,18 +344,30 @@ impl LibraryManager for OkLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        if let Some(other) = self.tree.others.iter().find(|row| row.id == id.to_string()) {
+        if let Some(saved) = self.tree.rows.lock().unwrap().get(&id) {
+            return Ok(Some(saved.clone()));
+        }
+        let key = id.to_string();
+        if let Some(other) = self.tree.others.iter().find(|row| row.id == key) {
             return Ok(Some(other.clone()));
         }
-        if let Some(root) = &self.tree.root {
-            return Ok((id == self.item_id).then(|| root.clone()));
+        if id == self.item_id {
+            return Ok(Some(self.tree.root.clone().unwrap_or_else(|| {
+                let mut entity = base_item_entity(self.item_id);
+                entity.is_folder = self.is_folder;
+                entity.top_parent_id = self.top_parent_id.map(|id| id.to_string());
+                entity
+            })));
         }
-        Ok((id == self.item_id).then(|| {
-            let mut entity = base_item_entity(self.item_id);
-            entity.is_folder = self.is_folder;
-            entity.top_parent_id = self.top_parent_id.map(|id| id.to_string());
-            entity
-        }))
+        // A child the cascade reads again by id.
+        Ok(self
+            .tree
+            .children
+            .values()
+            .flatten()
+            .chain(&self.tree.descendants)
+            .find(|row| row.id == key)
+            .cloned())
     }
     async fn queue_item_refresh(
         &self,
@@ -372,6 +387,10 @@ impl LibraryManager for OkLibrary {
     ) -> Result<(), ServiceError> {
         self.assert_metadata_locked();
         self.updated.lock().unwrap().extend(items.iter().cloned());
+        let mut rows = self.tree.rows.lock().unwrap();
+        for item in items {
+            rows.insert(Uuid::parse_str(&item.id).expect("id"), item.clone());
+        }
         Ok(())
     }
     async fn update_item_provider_ids(
@@ -606,6 +625,9 @@ struct RecordingProviders {
 struct MetadataLock {
     lock: Arc<tokio::sync::Mutex<()>>,
     asked: Arc<Mutex<Vec<Uuid>>>,
+    /// Items with a lock of their own instead of `lock`: a test holds one to
+    /// stand in for a refresh of that item alone.
+    own: Arc<Mutex<std::collections::HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// The options of the provider refreshes the handler queued.
@@ -625,7 +647,16 @@ impl ProviderManager for RecordingProviders {
     }
     async fn lock_item_metadata(&self, item_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
         self.metadata_lock.asked.lock().unwrap().push(item_id);
-        Arc::clone(&self.metadata_lock.lock).lock_owned().await
+        let lock = self
+            .metadata_lock
+            .own
+            .lock()
+            .unwrap()
+            .get(&item_id)
+            .cloned();
+        lock.unwrap_or_else(|| Arc::clone(&self.metadata_lock.lock))
+            .lock_owned()
+            .await
     }
     async fn get_external_id_infos(
         &self,
@@ -1399,6 +1430,85 @@ async fn a_changed_series_custom_rating_reaches_the_children_following_it() {
     let open = written(&library, 0xE1);
     assert_eq!(open.custom_rating.as_deref(), Some("XXX"));
     assert_eq!(open.official_rating.as_deref(), Some("TV-14"));
+}
+
+/// gl-1961: the cascade rewrites each child under that child's metadata lock
+/// and reads it again there. A refresh of the season that read its row and
+/// holds its lock while the series is edited saves first, and the cascade
+/// lands on what it saved: neither the refresh's overview nor the cascaded
+/// rating is lost.
+#[tokio::test]
+async fn a_cascade_waits_for_a_childs_refresh_and_lands_on_its_save() {
+    let season_id = Uuid::from_u128(0x51);
+    let library = tree_library(Uuid::from_u128(0x5E), rated_series("TV-PG", &[]));
+    let lock = MetadataLock::default();
+    let season_lock = Arc::new(tokio::sync::Mutex::new(()));
+    lock.own
+        .lock()
+        .unwrap()
+        .insert(season_id, Arc::clone(&season_lock));
+    // The season's refresh holds its lock and has read its row.
+    let refresh = Arc::clone(&season_lock).lock_owned().await;
+    let read = library
+        .get_item_by_id(season_id)
+        .await
+        .expect("read")
+        .expect("season");
+    let router = create_router(build_state(
+        Arc::clone(&library),
+        Arc::default(),
+        RecordedOptions::default(),
+        Arc::new(FakeConfig),
+        lock.clone(),
+    ));
+    let edit = tokio::spawn(
+        router.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{}", Uuid::from_u128(0x5E)))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"OfficialRating":"TV-MA"}"#))
+                .unwrap(),
+        ),
+    );
+    // Enough turns for a cascade that ignored the lock to have written.
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    // The refresh saves the row it read, with what its providers answered.
+    library
+        .update_items(
+            &[BaseItemEntity {
+                overview: Some("From TMDB".into()),
+                ..read
+            }],
+            None,
+        )
+        .await
+        .expect("the refresh's save");
+    drop(refresh);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), edit)
+        .await
+        .expect("the edit finished once the season's lock was free")
+        .expect("join")
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let season = library.tree.rows.lock().unwrap()[&season_id].clone();
+    assert_eq!(
+        season.overview.as_deref(),
+        Some("From TMDB"),
+        "the cascade saved over the refresh"
+    );
+    assert_eq!(
+        season.official_rating.as_deref(),
+        Some("TV-MA"),
+        "the refresh saved over the cascade"
+    );
+    assert!(
+        lock.asked.lock().unwrap().contains(&season_id),
+        "the cascade locked the season"
+    );
 }
 
 /// A series' episodes follow their SEASON's change: a season with a

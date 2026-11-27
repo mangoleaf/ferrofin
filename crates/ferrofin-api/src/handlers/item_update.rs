@@ -20,6 +20,9 @@
 //! episodes, an album's onto its tracks (each child's own `LockedFields`
 //! honoured, and a changed rating only onto the children that followed the
 //! old one), and a change of `LockData` onto every descendant of a folder.
+//! The item, and then each child, is read and saved under its metadata lock,
+//! so a refresh saving it at the same time neither loses the edit nor has its
+//! own save lost.
 //!
 //! The item's people (`request.People`) are written first, through
 //! [`LibraryManager::update_people`](ferrofin_traits::library::LibraryManager::update_people),
@@ -139,8 +142,7 @@ pub(crate) async fn update_item(
             .update_item_locked_fields(item_id, fields)
             .await?;
     }
-    // The item's own writes are done. TODO(gl-1961): the cascade rewrites
-    // whole child rows with no lock of theirs.
+    // The item's own writes are done; the cascade takes each child's lock.
     drop(metadata);
     cascade_to_children(&state, &item, &previous_ratings, &request, &current_tags).await?;
     // `if (displayOrderChanged) QueueRefresh(series, FullRefresh/FullRefresh,
@@ -158,20 +160,9 @@ pub(crate) async fn update_item(
     // `if (isLockedChanged && item.IsFolder)`: every descendant takes the
     // new lock (`ItemUpdateController.cs:104-113`).
     if lock_changed && item.is_folder {
-        let mut descendants = recursive_children(&state, item_id).await?;
-        for child in &mut descendants {
-            child.is_locked = item.is_locked;
-        }
-        state.library.update_items(&descendants, None).await?;
-        for child in &descendants {
+        for child in recursive_children(&state, item_id).await? {
             if let Ok(id) = Uuid::parse_str(&child.id) {
-                state
-                    .providers
-                    .update_to_repository(
-                        id,
-                        ferrofin_traits::providers::ItemUpdateType::MetadataEdit,
-                    )
-                    .await?;
+                rewrite_child(&state, id, |child, _| child.is_locked = item.is_locked).await?;
             }
         }
     }
@@ -861,7 +852,7 @@ fn cascade_onto(
 /// A rating reaches only the children that followed the item's `previous`
 /// one ([`propagate_rating`]). Each child's `LockedFields` shields its
 /// `OfficialRating` and `Tags`; `SeriesName` and `CustomRating` are never
-/// lock-checked.
+/// lock-checked. Each child is saved on its own ([`rewrite_child`]).
 async fn cascade_to_children(
     state: &AppState,
     item: &BaseItemEntity,
@@ -883,81 +874,92 @@ async fn cascade_to_children(
     // `request.OfficialRating = string.IsNullOrWhiteSpace(...) ? null : ...`
     // — the same values the item itself took.
     let new = Ratings::of(item);
-    // A series' seasons, each with its episodes; a season's or album's
-    // children sit directly under the item.
-    let (mut seasons, mut groups) = if kind == Some(BaseItemKind::Series) {
-        let seasons = children_of(state, item_id, Some(BaseItemKind::Season)).await?;
-        let mut episodes = Vec::with_capacity(seasons.len());
-        for season in &seasons {
-            episodes.push(match Uuid::parse_str(&season.id) {
-                Ok(season_id) => season_episodes_of(state, season_id).await?,
-                Err(_) => Vec::new(),
-            });
-        }
-        (seasons, episodes)
-    } else if kind == Some(BaseItemKind::Season) {
-        (Vec::new(), vec![season_episodes_of(state, item_id).await?])
-    } else {
-        (Vec::new(), vec![children_of(state, item_id, None).await?])
-    };
-    let ids: Vec<Uuid> = seasons
-        .iter()
-        .chain(groups.iter().flatten())
-        .filter_map(|c| Uuid::parse_str(&c.id).ok())
-        .collect();
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let locks = state.library.get_locked_fields_batch(&ids).await?;
-    let locked = |child: &BaseItemEntity| {
-        Uuid::parse_str(&child.id)
-            .ok()
-            .and_then(|id| locks.get(&id))
-            .map_or(&[][..], Vec::as_slice)
+    let ids = |children: Vec<BaseItemEntity>| {
+        children
+            .into_iter()
+            .filter_map(|child| Uuid::parse_str(&child.id).ok())
     };
     if kind == Some(BaseItemKind::Series) {
-        for (season, episodes) in seasons.iter_mut().zip(&mut groups) {
-            // `season.SeriesName = rseries.Name`.
-            season.series_name.clone_from(&item.name);
-            let season_previous = Ratings::of(season);
-            let season_locked = locked(season);
-            cascade_onto(season, season_locked, previous, &new, &tags);
+        for season_id in ids(children_of(state, item_id, Some(BaseItemKind::Season)).await?) {
             // Episodes follow the season's own change, so a season whose
             // rating stayed (its own, or locked) leaves theirs alone.
-            let season_new = Ratings::of(season);
-            for episode in episodes {
-                episode.series_name.clone_from(&item.name);
-                let episode_locked = locked(episode);
-                cascade_onto(
-                    episode,
-                    episode_locked,
-                    &season_previous,
-                    &season_new,
-                    &tags,
-                );
+            let mut season_change = None;
+            rewrite_child(state, season_id, |season, locked| {
+                // `season.SeriesName = rseries.Name`.
+                season.series_name.clone_from(&item.name);
+                let season_previous = Ratings::of(season);
+                cascade_onto(season, locked, previous, &new, &tags);
+                season_change = Some((season_previous, Ratings::of(season)));
+            })
+            .await?;
+            let Some((season_previous, season_new)) = season_change else {
+                continue;
+            };
+            for episode_id in ids(season_episodes_of(state, season_id).await?) {
+                rewrite_child(state, episode_id, |episode, locked| {
+                    episode.series_name.clone_from(&item.name);
+                    cascade_onto(episode, locked, &season_previous, &season_new, &tags);
+                })
+                .await?;
             }
         }
+        return Ok(());
+    }
+    // A season's or album's children sit directly under the item.
+    let children = if kind == Some(BaseItemKind::Season) {
+        season_episodes_of(state, item_id).await?
     } else {
-        for child in groups.iter_mut().flatten() {
+        children_of(state, item_id, None).await?
+    };
+    for child_id in ids(children) {
+        rewrite_child(state, child_id, |child, locked| {
             // `ep.SeasonName = season.Name` (v12.2 `ItemUpdateController.cs:365`).
             if kind == Some(BaseItemKind::Season) {
                 child.season_name.clone_from(&item.name);
             }
-            let child_locked = locked(child);
-            cascade_onto(child, child_locked, previous, &new, &tags);
-        }
+            cascade_onto(child, locked, previous, &new, &tags);
+        })
+        .await?;
     }
-    let children: Vec<BaseItemEntity> = seasons
-        .into_iter()
-        .chain(groups.into_iter().flatten())
-        .collect();
-    state.library.update_items(&children, None).await?;
-    for id in ids {
-        state
-            .providers
-            .update_to_repository(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
-            .await?;
-    }
+    Ok(())
+}
+
+/// One child's share of an edit's cascade, as upstream's loop sets the child
+/// and calls `child.UpdateToRepositoryAsync(MetadataEdit)`: `apply` changes
+/// the child's row, given its `LockedFields`, and the row is saved.
+///
+/// Upstream's child is the cached instance a running refresh of it also
+/// holds, so neither write is lost. Here the row is read again and saved
+/// under the child's metadata lock
+/// ([`ProviderManager::lock_item_metadata`](ferrofin_traits::providers::ProviderManager::lock_item_metadata)),
+/// which that refresh and the scan's save hold too. One lock at a time, so
+/// two cascades never wait on each other. A child deleted since it was
+/// listed is passed over, and `apply` is not called.
+async fn rewrite_child(
+    state: &AppState,
+    id: Uuid,
+    apply: impl FnOnce(&mut BaseItemEntity, &[MetadataField]),
+) -> Result<(), ApiError> {
+    let metadata = state.providers.lock_item_metadata(id).await;
+    let Some(mut child) = state.library.get_item_by_id(id).await? else {
+        return Ok(());
+    };
+    let locked = state
+        .library
+        .get_locked_fields_batch(&[id])
+        .await?
+        .remove(&id)
+        .unwrap_or_default();
+    apply(&mut child, &locked);
+    state
+        .library
+        .update_items(std::slice::from_ref(&child), None)
+        .await?;
+    drop(metadata);
+    state
+        .providers
+        .update_to_repository(id, ferrofin_traits::providers::ItemUpdateType::MetadataEdit)
+        .await?;
     Ok(())
 }
 
