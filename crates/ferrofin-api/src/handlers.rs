@@ -3691,12 +3691,14 @@ pub const VERIFIED: &[Verified] = &[
                falls back to the caller, a nil result is a 400, no user or no profile image \
                a 404, and no credentials are needed, as upstream. The hidden \
                get_user_image_legacy and get_user_image_by_index_legacy \
-               (LegacyUserImageQuery; GetUserImageLegacy, GetUserImageByIndexLegacy) take \
+               (LegacyUserImageQuery; GetUserImageLegacy, GetUserImageByIndexLegacy; the \
+               route's imageIndex bound by bind_route_number's int rules, a malformed one \
+               the binder's 400) take \
                userId from the route and bind every member those actions declare, then pass \
                on only tag and format: measured on 12.4, a malformed size, quality, blur, \
                percentPlayed or unplayedCount is a 400 there, a valid one has no effect, and \
                imageIndex is a query member only on the form with no index in its route",
-        date: "2026-10-31",
+        date: "2026-11-26",
         divergences: &[
             "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
@@ -3738,10 +3740,12 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: concat!(
             "handlers/images.rs get_item_image_by_index (ImageQuery: every member the action \
              declares is bound, so a malformed number is a 400; the index is the route's, \
-             and the query's imageIndex, which the action does not declare, is not read) → ",
+             bound by bind_route_number's int rules (trimmed, the 0x, # and &h hex forms), a \
+             malformed one the binder's 400, and the query's imageIndex, which the action \
+             does not declare, is not read) → ",
             item_image_tail!()
         ),
-        date: "2026-11-03",
+        date: "2026-11-26",
         divergences: ITEM_IMAGE_DIVERGENCES,
         refs: &["images"],
     },
@@ -3753,7 +3757,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "HeadItemImageByIndex is GetItemImageByIndex's own action: \
                handlers/images.rs get_item_image_by_index, the GET row's path, with ServeFile \
                sending the headers alone",
-        date: "2026-11-03",
+        date: "2026-11-26",
         divergences: ITEM_IMAGE_DIVERGENCES,
         refs: &["images"],
     },
@@ -3834,9 +3838,10 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-model mime_types.rs to_extension, decode_base64) → ferrofin-core \
                user_manager.rs save_profile_image. The hidden post_user_image_legacy and \
                post_user_image_by_index_legacy (PostUserImageLegacy, \
-               PostUserImageByIndexLegacy) take userId from the route and bind no query \
+               PostUserImageByIndexLegacy; the route's index bound by bind_route_number's \
+               int rules, a malformed one the binder's 400) take userId from the route and bind no query \
                member, measured on 12.4",
-        date: "2026-10-31",
+        date: "2026-11-26",
         divergences: &[
             "The body is decoded in full before anything is written, so a body the decoder \
          rejects is a 400 that changes nothing. Upstream clears the old profile image row \
@@ -3872,10 +3877,11 @@ pub const VERIFIED: &[Verified] = &[
                handlers/items.rs resolve_user, handlers/users.rs assert_can_update_user → \
                ferrofin-core user_manager.rs clear_profile_image. The hidden \
                delete_user_image_legacy (DeleteUserImageLegacy) and \
-               delete_user_image_by_index_legacy (DeleteUserImageByIndexLegacy) take userId \
-               from the route; the first binds its one query member, int? index, and drops \
+               delete_user_image_by_index_legacy (DeleteUserImageByIndexLegacy; the route's \
+               index bound by bind_route_number's int rules, a malformed one the binder's \
+               400) take userId from the route; the first binds its one query member, int? index, and drops \
                it, so ?index=x is a 400 there, and the second binds none, measured on 12.4",
-        date: "2026-10-31",
+        date: "2026-11-26",
         divergences: &[
             "The 400 (a nil effective user, or a value the query binder cannot convert), 403 \
          (another user's id without the administrator role, or a user without \
@@ -6063,8 +6069,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
         upstream_method: "MoveItem",
         ferrofin: "handlers/playlists.rs move_item (blank_route_values playlistId and \
-               itemId: ConvertEmptyStringToNull, then [Required], both in one 400; the \
-               playlist id parses through \
+               itemId: ConvertEmptyStringToNull, then [Required], both in one 400; \
+               newIndex bound by bind_route_number's int rules (trimmed, the 0x, # and &h \
+               hex forms), a malformed one the binder's 400; the playlist id parses through \
                DotnetGuid::parse, Guid.Parse and MoveItemAsync's new Guid; \
                get_playlist_access + require_edit: \
                GetPlaylistForUser and the owner-or-editing-share check) → ferrofin-core \
@@ -6078,7 +6085,7 @@ pub const VERIFIED: &[Verified] = &[
                ProviderManager::update_to_repository, whose ferrofin-providers \
                container_xml.rs ContainerXmlSaver rewrites the folder's playlist.xml in the \
                new order, PlaylistXmlSaver",
-        date: "2026-11-20",
+        date: "2026-11-26",
         divergences: &[
             "The index counts the members GET /Playlists/{id}/Items gave the caller, so the \
          standalone check, library included, where upstream's accessibleChildren take \
@@ -6462,7 +6469,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
         upstream_method: "DeleteSubtitle",
         ferrofin: "handlers/subtitles.rs delete_subtitle (RequireAdmin, the RequiresElevation \
-               policy; a nil itemId is GetItemById's ArgumentException; require_item, \
+               policy; the index bound by bind_route_number's int rules (trimmed, the 0x, # \
+               and &h hex forms), a malformed one the binder's 400; a nil itemId is \
+               GetItemById's ArgumentException; require_item, \
                GetItemById<BaseItem>(itemId, User.GetUserId()): a missing or hidden item is \
                NotFound()'s ProblemDetails 404; every other failure answered as \
                ExceptionMiddleware answers a throw, its status with text/plain \"Error \
@@ -6500,10 +6509,8 @@ pub const VERIFIED: &[Verified] = &[
                missing and a video stream's index, a nil id, an unknown id and an external \
                sidecar's index; and that sidecar's row pointed at a missing file (204), a \
                missing folder (404, row kept) and an http URL (404, row kept)",
-        date: "2026-11-21",
+        date: "2026-11-26",
         divergences: &[
-            "A hex (0x, #, &h) or padded index is a 400; upstream's route binder reads it as \
-         a number. Fix path: gl-1664.",
             "The 400 for an itemId or index the route binder cannot convert (upstream's \
          ValidationProblemDetails), and the 401 and 403 bodies, are Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
@@ -6755,7 +6762,9 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetAttachment",
         ferrofin: "handlers/hls.rs get_video_attachment (RequiredRouteString mediaSourceId, \
                registered as {container}: ConvertEmptyStringToNull, then [Required], before \
-               the item is read) → ferrofin-mediaencoding \
+               the item is read; the index bound by bind_route_number's int rules (trimmed, \
+               the 0x, # and &h hex forms), a malformed one the binder's 400) → \
+               ferrofin-mediaencoding \
                attachments/extractor.rs get_attachment, run_to_completion (the extraction \
                on a task of its own: upstream passes CancellationToken.None), \
                extract_attachment (AttachmentExtractor.GetAttachment, GetAttachmentStream, \

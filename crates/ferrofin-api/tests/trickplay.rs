@@ -369,6 +369,18 @@ async fn trickplay_playlist_ok_and_not_found() {
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("#EXTM3U"));
+    // `{width}` binds as the query binder does: `0x140` is 320 (gl-1664).
+    let hex = create_router(app.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Videos/{ITEM_ID}/Trickplay/0x140/tiles.m3u8"))
+                .header("X-Emby-Token", "tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hex.status(), StatusCode::OK);
 
     let (missing, _) = call(
         app,
@@ -411,6 +423,16 @@ async fn trickplay_tile_serves_file_then_404() {
     )
     .await;
     assert_eq!(ok, StatusCode::OK);
+    // `{width}` and `{index}` bind as the query binder does: the hex forms of
+    // 320 and 0 are the same tile (gl-1664).
+    let (hex, body) = call(
+        app.clone(),
+        "GET",
+        &format!("/Videos/{ITEM_ID}/Trickplay/0x140/0x0.jpg"),
+    )
+    .await;
+    assert_eq!(hex, StatusCode::OK);
+    assert!(body.starts_with(&[0xff, 0xd8]));
     // A non-numeric index is a client error, not a crash or a 404.
     let (bad, _) = call(
         app,

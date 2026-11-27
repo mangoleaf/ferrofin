@@ -248,9 +248,10 @@ struct YearQuery {
 async fn get_year(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(year): Path<i32>,
+    Path(year): Path<String>,
     Query(query): Query<YearQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
+    let year: i32 = crate::query::bind_route_number(&year, "year")?;
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     if year <= 0 {
         return Err(ApiError::BadRequest(format!(
