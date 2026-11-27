@@ -1118,7 +1118,7 @@ async fn an_edit_without_lock_data_leaves_the_item_unlocked() {
 }
 
 /// `item.OriginalLanguage = string.IsNullOrWhiteSpace(request.OriginalLanguage)
-/// ? null : request.OriginalLanguage` (v12.2 `ItemUpdateController.cs:245`)
+/// ? null : request.OriginalLanguage` (v12.4 `ItemUpdateController.cs:245`)
 /// through the `BaseItem.OriginalLanguage` setter: a known language is stored
 /// as its two-letter code, an unknown one untrimmed as sent, whitespace as
 /// null, and an absent member clears the stored `"ja"`.
@@ -1739,7 +1739,7 @@ async fn season_and_album_edits_cascade_to_their_children() {
         assert_eq!(kid.official_rating, None, "{kind}: a blank rating clears");
         assert_eq!(kid.tags.as_deref(), Some("T"), "{kind}");
         assert_eq!(kid.series_name.as_deref(), Some("Old series"), "{kind}");
-        // `ep.SeasonName = season.Name` (v12.2 `ItemUpdateController.cs:365`):
+        // `ep.SeasonName = season.Name` (v12.4 `ItemUpdateController.cs:365`):
         // a season's episodes take its new name; an album's tracks have none.
         let season_name = (kind == "TV.Season").then_some("P");
         assert_eq!(kid.season_name.as_deref(), season_name, "{kind}");
@@ -1776,8 +1776,8 @@ fn data_of(item: &BaseItemEntity) -> serde_json::Value {
         })
 }
 
-/// The editor fields `UpdateItem` writes per kind (v12.2
-/// `ItemUpdateController.cs:259-264, 423-437, 465-473`): a series' status,
+/// The editor fields `UpdateItem` writes per kind (v12.4
+/// `ItemUpdateController.cs:259-264, 429-443, 469-477`): a series' status,
 /// air days, air time and runtime; an episode's special placement, kept in
 /// `Data` compactly; a video's 3D format; a Live TV channel's height.
 #[tokio::test]
@@ -1845,8 +1845,9 @@ async fn an_edit_writes_each_kinds_editor_fields() {
     );
 }
 
-/// A status `Enum.Parse` cannot read, on a series: upstream throws (500);
-/// the request is refused with a 400 instead, and nothing is written. On any
+/// A status `Enum.Parse` cannot read, on a series: upstream throws
+/// `ArgumentException` (a 400) after writing the cast and the cascade; here
+/// the 400 comes first and nothing is written. On any
 /// other kind `Status` is never read, so the edit applies.
 #[tokio::test]
 async fn an_unreadable_series_status_is_a_bad_request() {

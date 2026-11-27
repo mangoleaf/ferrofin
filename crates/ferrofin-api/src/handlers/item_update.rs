@@ -97,13 +97,14 @@ pub(crate) async fn update_item(
             stored_display_order(&item).as_deref().unwrap_or_default(),
             request.display_order.as_deref().unwrap_or_default(),
         );
-    // `previousOfficialRating` / `previousCustomRating` (v12.2
+    // `previousOfficialRating` / `previousCustomRating` (v12.4
     // `ItemUpdateController.cs:295-296`): the cascade moves only the children
     // that followed the item's rating before the edit.
     let previous_ratings = Ratings::of(&item);
     // A series' `Status` must parse (`GetSeriesStatus`, only in the series
     // branch), checked before anything is written. Upstream's throw comes
-    // after `UpdatePeople`, leaving the people written; here nothing is.
+    // after `UpdatePeople` and the series' cascade, leaving the cast, the
+    // seasons and the episodes written; here nothing is.
     if is_series {
         parse_series_status(request.status.as_deref()).map_err(ApiError::BadRequest)?;
     }
@@ -377,8 +378,8 @@ impl PersonRequest {
 ///
 /// # Errors
 ///
-/// Any other value. Upstream's `Enum.Parse` throws there and the request
-/// ends in a 500; the handler answers 400 instead.
+/// Any other value: upstream's `Enum.Parse` throws `ArgumentException`
+/// there, which `ExceptionMiddleware` answers 400, as the handler does.
 fn parse_series_status(value: Option<&str>) -> Result<Option<SeriesStatus>, String> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -582,7 +583,7 @@ fn apply_kind_fields(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
     // subclasses, kept in `Data` beside the disc format.
     if super::videos::is_video(item) {
         set_data_string(item, "AspectRatio", request.aspect_ratio.as_deref());
-        // `video.Video3DFormat = request.Video3DFormat` (`:434-437`).
+        // `video.Video3DFormat = request.Video3DFormat` (`:440-443`).
         set_data_value(
             item,
             "Video3DFormat",
@@ -608,8 +609,8 @@ fn apply_kind_fields(item: &mut BaseItemEntity, request: &UpdateItemRequest) {
             }
         }
         // "Only allow this for series. Runtimes for media comes from
-        // ffprobe" (`:423-427`); then `series.Status`, and the air days and
-        // time when the days are sent (`:465-473`).
+        // ffprobe" (`:429-433`); then `series.Status`, and the air days and
+        // time when the days are sent (`:469-477`).
         Some(BaseItemKind::Series) => {
             item.run_time_ticks = request.run_time_ticks;
             set_data_value(
@@ -824,7 +825,7 @@ impl Ratings {
     }
 }
 
-/// `GetPropagatedRating` (v12.2 `ItemUpdateController.cs:489`): when the
+/// `GetPropagatedRating` (v12.4 `ItemUpdateController.cs:489`): when the
 /// parent's rating moved from `previous` to `new` (ordinal-ignore-case, null
 /// as empty), a child with no rating or with `previous` follows it to `new`;
 /// a child with a rating of its own, or any child when the parent's rating
@@ -844,7 +845,7 @@ fn propagate_rating(child: &mut Option<String>, previous: Option<&str>, new: Opt
 
 /// The rating and tag half of the cascade on one child, as its parent's
 /// ratings moved from `previous` to `new`, skipping a field in the child's
-/// own `LockedFields` (v12.2 `ItemUpdateController.cs:317-402`):
+/// own `LockedFields` (v12.4 `ItemUpdateController.cs:317-402`):
 /// `OfficialRating` unless locked, `CustomRating` always, the tag edit
 /// unless `Tags` is locked.
 fn cascade_onto(
@@ -871,12 +872,11 @@ fn cascade_onto(
     }
 }
 
-/// Port of the child walks in `ItemUpdateController.UpdateItem` (v12.2
-/// `ItemUpdateController.cs:317-402`, but for the season walk's `SeasonName`
-/// — see the module TODO): a `Series` passes its name, rating and tag edits
-/// to its seasons, and its name and tag edits to their episodes, which take
-/// their season's own rating change; a `Season` its rating and tags to its
-/// episodes, a `MusicAlbum` its rating and tags to its children.
+/// Port of the child walks in `ItemUpdateController.UpdateItem` (v12.4
+/// `ItemUpdateController.cs:317-402`): a `Series` passes its name, rating and
+/// tag edits to its seasons, and its name and tag edits to their episodes,
+/// which take their season's own rating change; a `Season` its rating and tags
+/// to its episodes, a `MusicAlbum` its rating and tags to its children.
 /// A rating reaches only the children that followed the item's `previous`
 /// one ([`propagate_rating`]). Each child's `LockedFields` shields its
 /// `OfficialRating` and `Tags`; `SeriesName` and `CustomRating` are never
@@ -941,7 +941,7 @@ async fn cascade_to_children(
     };
     for child_id in ids(children) {
         rewrite_child(state, child_id, |child, locked| {
-            // `ep.SeasonName = season.Name` (v12.2 `ItemUpdateController.cs:365`).
+            // `ep.SeasonName = season.Name` (v12.4 `ItemUpdateController.cs:365`).
             if kind == Some(BaseItemKind::Season) {
                 child.season_name.clone_from(&item.name);
             }
@@ -1366,7 +1366,7 @@ mod tests {
     };
     use rstest::rstest;
 
-    /// `ItemUpdateController.UpdateItem` (v12.2 :417-420): a video
+    /// `ItemUpdateController.UpdateItem` (v12.4 :417-420): a video
     /// (`IHasAspectRatio`) takes the request's `AspectRatio`, a null clearing
     /// it, and keeps the rest of its `Data`; any other kind ignores it.
     #[test]

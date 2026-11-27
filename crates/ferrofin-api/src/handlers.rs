@@ -4593,6 +4593,106 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "post",
+        path: "/Items/{itemId}",
+        upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",
+        upstream_method: "UpdateItem",
+        ferrofin: "handlers/item_update.rs update_item (RequireAdmin for the controller's \
+               RequiresElevation; JsonBody for the [FromBody, Required] BaseItemDto into \
+               UpdateItemRequest, the members UpdateItem reads; a 400 for a nil id, as \
+               GetItemById(Guid.Empty) throws; the item by GetItemById(itemId, \
+               User.GetUserId()), a 404 when it is missing or the caller cannot see it; the \
+               item read and written under ProviderManager::lock_item_metadata, where upstream \
+               edits the cached instance a refresh of it holds). isLockedChanged and \
+               displayOrderChanged (a series only, OrdinalIgnoreCase, null as empty) from the \
+               stored row; a series' Status checked by parse_series_status (GetSeriesStatus) \
+               before any write; the cast first through LibraryManager::update_people \
+               (PersonRequest::entity keeps Name, Role and Type, Unknown when absent, as the \
+               new PersonInfo does) → ferrofin-core library_manager.rs update_people \
+               (SupportsPeople) → people_repository.rs update_people (PeopleRepository \
+               .UpdatePeople and SavePeopleMetadataAsync's person items). apply_update and \
+               apply_kind_fields assign as the private UpdateItem does: Name, ForcedSortName \
+               and Overview as sent; OriginalTitle, OriginalLanguage (through the setter's \
+               normalize_original_language) and OfficialRating blank as null; CustomRating as \
+               sent; CriticRating and CommunityRating through FiniteOrNull; IndexNumber, \
+               ParentIndexNumber, ProductionYear, EndDate and PremiereDate, null clearing; \
+               DateCreated only when sent; Genres, Studios and ProductionLocations \
+               Distinct(OrdinalIgnoreCase), the blank locations dropped as the mapper drops \
+               them; Tags, ArtistItems and AlbumArtists trimmed first; the first of Taglines; \
+               SeriesName on an IHasSeries (AudioBook, Book, Episode, Season); \
+               PreferredMetadataCountryCode and PreferredMetadataLanguage; DisplayOrder on a \
+               series or box set; AspectRatio and Video3DFormat on a video; an episode's \
+               AirsBeforeSeasonNumber, AirsAfterSeasonNumber and AirsBeforeEpisodeNumber; a \
+               Live TV channel's Height when sent; IsLocked = LockData ?? false; a series' \
+               RunTimeTicks, Status, and AirDays with AirTime when the days are sent; Album on \
+               Audio and MusicVideo; ArtistItems on an IHasArtist and AlbumArtists on an \
+               IHasAlbumArtist. Then LibraryManager::update_items (library_manager.rs: \
+               SortName re-derived as the getter does, OnMetadataChanged's \
+               InheritedParentalRatingValue through update_rating_scores, the ItemValues \
+               re-indexed, ItemUpdated from the save), update_item_provider_ids when ProviderIds \
+               is sent (SetProviderIds: the set replaced, its pairs in document order through \
+               ferrofin-providers metadata_merge.rs set_provider_ids, TrySetProviderId's trim, \
+               validity check and canonical names) and update_item_locked_fields when \
+               LockedFields is; cascade_to_children for the series, season and album walks \
+               (rewrite_child reads and saves each child under its own metadata lock; \
+               GetPropagatedRating, the child's LockedFields guarding OfficialRating and Tags, \
+               the tag edit as Concat, Except and Distinct(OrdinalIgnoreCase), SeriesName and \
+               SeasonName); UpdateToRepositoryAsync(MetadataEdit) through \
+               ProviderManager::update_to_repository (the metadata savers, DateLastSaved, \
+               UpdateImagesAsync, the local versions); a changed LockData onto every \
+               descendant of a folder (recursive_children for GetRecursiveChildren, a box set's \
+               or playlist's linked members included) through rewrite_child; last, a series \
+               whose display order changed queues a FullRefresh of metadata and images with \
+               ReplaceAllMetadata through LibraryManager::queue_item_refresh, routed as the \
+               POST /Items/{itemId}/Refresh row routes a series → 204",
+        date: "2026-11-27",
+        divergences: &[
+            "A series' Status that does not parse is a 400 before anything is written; \
+         upstream's Enum.Parse throws ArgumentException (also a 400) only after UpdatePeople \
+         wrote the cast and the series' cascade saved its seasons and episodes. Jellyfin bug \
+         not ported. A number outside 0-2 and a comma-separated list of names are 400s too, \
+         where Enum.Parse stores the number, or the members ORed together. Jellyfin quirk not \
+         ported.",
+            "A People entry whose Name is null or blank is left out and the rest of the edit \
+         saved; upstream's PeopleRepository.UpdatePeople dereferences a null Name \
+         (NullReferenceException, a 500 before anything is written) and credits a blank one \
+         under the empty name. Jellyfin bug not ported.",
+            "A Studios, ArtistItems or AlbumArtists entry with no Name is left out; upstream \
+         keeps a null studio, stored and read back as an empty one, and fails the request on \
+         a null artist name (i.Name.Trim(), a NullReferenceException 500 after the cast and the \
+         cascade were written). Jellyfin bug not ported.",
+            "The body binds only the members UpdateItem reads, so a body whose other \
+         BaseItemDto members do not bind (a non-numeric string where a number belongs, an \
+         unknown enum name) is applied where upstream's binder answers 400; and a null entry in Genres, \
+         Tags, Taglines or ProductionLocations is the binder's 400 here, where upstream binds \
+         it. Fix path: gl-2019.",
+            "A DateCreated, EndDate or PremiereDate with an offset is stored as its UTC \
+         instant; upstream's GetDateTime converts it to the server's local time and \
+         NormalizeDateTime relabels that as UTC, so on a server not running in UTC the date is \
+         stored shifted by the server's offset. Jellyfin bug not ported.",
+            "A season's walk, alone or under its series, reaches the episodes of a virtual \
+         season, which are stored under the series and name the season by SeasonId only, by \
+         ancestry (season_episodes_of); upstream's season.Children reads only the episodes \
+         whose ParentId is the season, so a virtual season's rating, tag and name edits reach \
+         none of its episodes. Jellyfin bug not ported.",
+            "In a library with no metadata saver list and SaveLocalMetadata off, the edit \
+         writes no .nfo into the media folders, and no playlist.xml into a playlist folder in \
+         one, not even over a file already there; upstream's IsSaverEnabledForItem rewrites an \
+         existing .nfo on a MetadataEdit, and Playlist.IsSaveLocalMetadataEnabled always \
+         writes playlist.xml (owner decisions 2026-10-17 and 2026-11-19).",
+            BOX_SET_SAVE_LOCAL_DIVERGENCE,
+            "The display-order refresh is queued as POST /Items/{itemId}/Refresh queues a \
+         series' refresh, so that row's two differences apply to it: a series whose path no \
+         library location covers is not refreshed (gl-1770), and the refresh runs on the \
+         scan queue, behind a running or queued library scan (gl-1814). Fix path: gl-1770, \
+         gl-1814.",
+            "The 400 (a nil id, a Status that does not parse, or a body the binder cannot \
+         read), 401, 403 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &["access-filtering", "metadata-refresh", "metadata-providers"],
+    },
+    Verified {
+        method: "post",
         path: "/Items/{itemId}/ContentType",
         upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",
         upstream_method: "UpdateItemContentType",
