@@ -1563,6 +1563,8 @@ pub async fn build_app_state(
                 std::time::Duration::from_secs(config.image_negative_cache_ttl_secs),
             )
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
+            // A Chapter image's delete removes the file its chapter names.
+            .with_chapters(Arc::clone(&chapter_repository))
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
             .with_dynamic_image_providers(wasm_host.metadata_providers())

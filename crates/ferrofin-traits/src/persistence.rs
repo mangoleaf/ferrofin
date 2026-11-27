@@ -2121,10 +2121,11 @@ pub trait ItemPersistenceService: Send + Sync {
         self.set_item_image(item_id, image).await
     }
 
-    /// Deletes one item image of `image_type`, returning the on-disk path of
-    /// the removed rows so the caller can delete the files
-    /// (`ImageController.DeleteItemImage`). Deletes one slot in insertion order;
-    /// an omitted index selects zero and an invalid index removes nothing.
+    /// Removes `item_id`'s `image_type` image whose path is `path` (as
+    /// [`ItemRepository::get_image_infos`] reads it, expanded), the first in
+    /// insertion order: `RemoveImage` in `BaseItem.DeleteImageAsync`, which
+    /// removes the image its caller read and deleted the file of, wherever it
+    /// sits by then. A path no row names removes nothing.
     ///
     /// The default removes nothing.
     ///
@@ -2135,10 +2136,10 @@ pub trait ItemPersistenceService: Send + Sync {
         &self,
         item_id: Uuid,
         image_type: ferrofin_model::entities::ImageType,
-        index: Option<i32>,
-    ) -> Result<Vec<String>, ServiceError> {
-        let _ = (item_id, image_type, index);
-        Ok(Vec::new())
+        path: &str,
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, image_type, path);
+        Ok(())
     }
 
     /// The external ids already recorded for each of `item_ids`, keyed by item.
