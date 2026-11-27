@@ -432,9 +432,15 @@ pub fn build_media_encoding(
 async fn http_get_bytes(url: &str, headers_timeout: Duration) -> Result<Vec<u8>, String> {
     use ferrofin_providers::rate_limit::{BodyError, read_capped, request_limits};
     // One client, so the reads share a connection pool; `reqwest::get` builds one per call.
+    // `NamedClient.Default`'s defaults, as upstream reads through it.
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let source = ferrofin_util::source_url::redact_url(url);
-    let request = CLIENT.get_or_init(reqwest::Client::new).get(url).send();
+    let client = CLIENT.get_or_init(|| {
+        ferrofin_util::http_client::builder(ferrofin_health::USER_AGENT)
+            .build()
+            .unwrap_or_default()
+    });
+    let request = client.get(url).send();
     let resp = tokio::time::timeout(headers_timeout, request)
         .await
         .map_err(|_| format!("GET {source}: no response headers within {headers_timeout:?}"))?
@@ -943,6 +949,63 @@ mod tests {
         let body = http_get_bytes(&gzip_subtitle_url(srt).await, HTTP_CLIENT_DEFAULT_TIMEOUT).await;
 
         assert_eq!(body.as_deref(), Ok(&srt[..]));
+    }
+
+    /// `SubtitleEncoder.GetSubtitleStream` reads through `NamedClient.Default`:
+    /// the server's `User-Agent` and the `Accept` list. The origin echoes them.
+    #[tokio::test]
+    async fn a_remote_subtitle_is_asked_for_with_the_default_client_headers() {
+        let app = axum::Router::new().fallback(|headers: axum::http::HeaderMap| async move {
+            let header = |name| {
+                headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            format!("{:?}|{:?}", header("user-agent"), header("accept"))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let body = http_get_bytes(
+            &format!("http://{addr}/en.srt"),
+            HTTP_CLIENT_DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        let expected = format!(
+            "{:?}|{:?}",
+            Some(ferrofin_health::USER_AGENT),
+            Some("application/json; q=1.0, application/xml; q=0.9, */*; q=0.8")
+        );
+        assert_eq!(String::from_utf8(body).unwrap(), expected);
+    }
+
+    /// A redirect the client does not follow (https to http, or past the
+    /// limit) fails the read, as `GetStreamAsync`'s
+    /// `EnsureSuccessStatusCode` does.
+    #[tokio::test]
+    async fn a_redirect_the_client_does_not_follow_fails_the_subtitle_read() {
+        let app = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, "/en.srt")],
+            )
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let error = http_get_bytes(
+            &format!("http://{addr}/en.srt"),
+            HTTP_CLIENT_DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("HTTP 302"), "{error}");
     }
 
     /// A small compressed body that decodes past the download limit is

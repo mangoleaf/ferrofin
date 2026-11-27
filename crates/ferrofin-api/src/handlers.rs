@@ -986,7 +986,12 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// which of a series timer's recordings a starting capture deletes past its
 /// "Keep up to", and `direct-recording` how the DVR copies an unshared tuner
 /// URL and how that copy's end settles the timer (completed, or failed and
-/// retried), which no HTTP response describes either. `metadata-refresh` is
+/// retried), which no HTTP response describes either. `outbound-http` is what
+/// the requests Ferrofin sends where upstream sends them through
+/// `NamedClient.Default` carry (their headers) and which redirects they
+/// follow, which shows only where a response carries what such a request got
+/// back: the remote static stream, and the Live TV source operations' errors.
+/// `metadata-refresh` is
 /// which metadata and image providers an item's refresh runs, in which order
 /// and with what lookup, the Identify case first, shared by Identify → Apply,
 /// the item refresh and the library scan, and `metadata-providers` what
@@ -1024,6 +1029,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "recording-images",
     "recording-keep-up-to",
     "direct-recording",
+    "outbound-http",
     "metadata-refresh",
     "metadata-providers",
     "guide-programme-items",
@@ -1432,11 +1438,73 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              timeout on the body, so a stalled connection records nothing more until the \
              programme ends. Jellyfin bug not ported.",
             "The tuner URL is opened with the source's RequiredHttpHeaders (an M3U tuner's \
-             User-Agent), as playback opens it; upstream's recorder sends none, so a provider \
+             User-Agent), as playback opens it; upstream's recorder sends none of them, so a provider \
              that needs them refuses its recordings. Jellyfin bug not ported.",
             "A tuner answering an error status fails the attempt, which retries; upstream never \
              checks the status, records the error body as the programme and settles it \
              Completed. Jellyfin bug not ported.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "outbound-http",
+        upstream_file: "Jellyfin.Server/Startup.cs",
+        upstream_method: "ConfigureServices",
+        ferrofin: "The defaults of the requests upstream sends through NamedClient.Default. \
+                   ferrofin-util http_client.rs builder names the server in the User-Agent, \
+                   sends DEFAULT_ACCEPT (application/json; q=1.0, application/xml; q=0.9, \
+                   */*; q=0.8, as .NET writes the three MediaTypeWithQualityHeaderValues), \
+                   either of which a request's own header replaces, as \
+                   HttpHeaders.AddHeaders keeps a request's own header, decodes gzip, deflate \
+                   and brotli (AutomaticDecompression = All), and answers a redirect from \
+                   https to http, or past MAX_REDIRECTS, with the 3xx, unfollowed, as \
+                   SocketsHttpHandler returns it: the Live TV fetcher and the subtitle read \
+                   fail on it, as EnsureSuccessStatusCode does, the tuner source fails on it \
+                   as on an error status (below), the remote static stream relays its \
+                   status, as GetStaticRemoteStreamResult copies response.StatusCode, and a \
+                   plugin repository is skipped. Built on \
+                   by ferrofin-providers \
+                   http_client.rs builder (every provider client and the guarded downloads, \
+                   for ProviderManager.SaveImage and the AudioDb, OMDb, Studio Images, \
+                   ListenBrainz and TheMovieDb providers; a redirect it does not follow is an \
+                   error there, which a provider reads as it reads the 3xx), ferrofin-livetv \
+                   fetch.rs ReqwestFetcher (M3uParser.GetListingsStream, HdHomerunHost, \
+                   SchedulesDirect and XmlTvListingsProvider) and stream.rs \
+                   ReqwestTunerSource (SharedHttpStream.Open, M3UTunerHost.GetChannelStream's \
+                   HEAD and DirectRecorder.RecordFromMediaSource), ferrofin-core \
+                   plugin_manager.rs list_packages and download_and_verify \
+                   (InstallationManager.GetPackages and PerformPackageInstallation; the \
+                   download keeps its own redirect rule, below), \
+                   handlers/streaming.rs serve_remote_static \
+                   (FileStreamResponseHelpers.GetStaticRemoteStreamResult, for \
+                   VideosController and AudioHelper) and ferrofin-server media_encoding.rs \
+                   http_get_bytes (SubtitleEncoder.GetSubtitleStream). Compared with \
+                   ConfigureServices' AddHttpClient(NamedClient.Default) and those callers at \
+                   the pinned v12.4 tag, and with the headers Jellyfin 12.4 sent a local \
+                   listener for a plugin repository's manifest, an M3U tuner's playlist and \
+                   shared stream, and a .strm movie's static stream. The WASM plugin host and \
+                   the File Transformation and Single Sign-On clients, which upstream does not \
+                   build from the factory, are not part of this row.",
+        date: "2026-11-27",
+        divergences: &[
+            "The User-Agent names Ferrofin (Ferrofin/<version>, ferrofin-health USER_AGENT), \
+             where upstream's product header is Jellyfin-Server/<version>.",
+            "A request follows at most 10 redirects (MAX_REDIRECTS, reqwest's default), \
+             where .NET's handler follows 50.",
+            "A plugin download refuses a source and any redirect that is not https, except \
+             from a loopback repository (the transport is its trust root, as \
+             docs/EXTENSIONS.md's repository install says), and \
+             fails, rather than answering the 3xx, past MAX_REDIRECTS; \
+             PerformPackageInstallation follows NamedClient.Default's rule.",
+            "A tuner stream or recording whose tuner answers a 3xx (one the client does not \
+             follow) fails, as one answering an error status does; upstream's SharedHttpStream \
+             and DirectRecorder never check the status. Jellyfin bug not ported.",
+            "No traceparent header is sent: outbound trace-context injection is out of scope \
+             (docs/conventions/TRACING.md, section 8), where .NET adds one to every request.",
+            "A tuner's stream and its HEAD probe send the source's RequiredHttpHeaders (an \
+             M3U tuner's configured User-Agent, else its browser-shaped default), as the \
+             recorder does (the direct-recording row): upstream's SharedHttpStream and \
+             M3UTunerHost send only the client's own, so a provider that needs the \
+             configured agent refuses a shared stream. Jellyfin bug not ported.",
         ],
     },
     VerifiedSubsystem {
@@ -4668,7 +4736,7 @@ pub const VERIFIED: &[Verified] = &[
          XMLTV file that is not there) bodies are Ferrofin's error shape, not upstream's. \
          Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["outbound-http"],
     },
     Verified {
         method: "get",
@@ -4715,7 +4783,7 @@ pub const VERIFIED: &[Verified] = &[
          local XMLTV file or directory that is not there) bodies are Ferrofin's error shape, \
          not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["outbound-http"],
     },
     Verified {
         method: "post",
@@ -4735,7 +4803,7 @@ pub const VERIFIED: &[Verified] = &[
             "The 404 (an unknown or missing tuner Type, or an M3U playlist file that is not \
          there) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["outbound-http"],
     },
     Verified {
         method: "get",
@@ -5000,7 +5068,7 @@ pub const VERIFIED: &[Verified] = &[
          Type, or a local XMLTV file or directory that is not there) and 500 (a guide that \
          cannot be read) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["outbound-http"],
     },
     Verified {
         method: "post",
@@ -5055,7 +5123,7 @@ pub const VERIFIED: &[Verified] = &[
          guide that cannot be read) bodies are Ferrofin's error shape, not upstream's. Fix \
          path: gl-666.",
         ],
-        refs: &[],
+        refs: &["outbound-http"],
     },
     Verified {
         method: "post",
