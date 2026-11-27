@@ -5225,6 +5225,15 @@ pub const VERIFIED: &[Verified] = &[
          and is retried on every listing, logged at warn the first time and at debug while \
          it keeps failing, until a save succeeds or an options.json appears; the same \
          LOGGING.md rule applies.",
+            "An adopted options.xml element Ferrofin has no field for, or whose value does \
+         not convert, keeps that field's default; the rest of the file is imported. The \
+         fields are named with the file at warn the first time a read converts it and at \
+         debug while it converts the same way (at warn again once what it loses changes, \
+         after it has converted whole, failed or been removed, or after an options.json \
+         that took over is gone). Upstream's XmlSerializer skips an unknown element without \
+         logging, and a value it cannot convert fails the whole file, served as the defaults \
+         and logged at error once per fill of its options cache; the same LOGGING.md rule \
+         applies.",
             "The 401 and 403 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],

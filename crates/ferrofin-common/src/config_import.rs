@@ -37,6 +37,8 @@
 //! - **`database.xml` is deliberately skipped**: it selects Jellyfin's database
 //!   provider, and Ferrofin is SQLite-only, so there is nothing to carry over.
 
+use std::path::Path;
+
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
@@ -193,6 +195,92 @@ pub fn import_over<T>(
 where
     T: Serialize + DeserializeOwned,
 {
+    let (config, unimported) = import_reporting(default, xml, root_name, deny)?;
+    unimported.log(root_name, None, true);
+    Ok(config)
+}
+
+/// The fields an import left at Ferrofin's default.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Unimported {
+    /// The elements Ferrofin's configuration has no field for.
+    pub ignored: Vec<String>,
+    /// Each element whose value `T` rejects under every reading, with the
+    /// error of the last reading tried.
+    pub rejected: Vec<(String, String)>,
+}
+
+impl Unimported {
+    /// Whether every field was imported.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ignored.is_empty() && self.rejected.is_empty()
+    }
+
+    /// Logs the fields of a `document` that were not imported, naming the
+    /// file at `path` when the caller has one: at warn when `first`, at debug
+    /// for a file the caller converts again and has already reported.
+    pub fn log(&self, document: &str, path: Option<&Path>, first: bool) {
+        let path = path.map(|path| tracing::field::display(path.display()));
+        if !self.ignored.is_empty() {
+            let fields = self.ignored.join(", ");
+            if first {
+                // Silent setting loss is the failure this whole module exists
+                // to stop, so a field Ferrofin has no home for is said out
+                // loud, not swallowed.
+                warn!(
+                    document,
+                    path,
+                    fields = %fields,
+                    "jellyfin configuration fields have no ferrofin counterpart and were not imported"
+                );
+            } else {
+                debug!(
+                    document,
+                    path,
+                    fields = %fields,
+                    "jellyfin configuration fields have no ferrofin counterpart and were not imported"
+                );
+            }
+        }
+        for (field, error) in &self.rejected {
+            if first {
+                warn!(
+                    document,
+                    path,
+                    field = %field,
+                    error = %error,
+                    "could not import jellyfin configuration field; keeping ferrofin's default"
+                );
+            } else {
+                debug!(
+                    document,
+                    path,
+                    field = %field,
+                    error = %error,
+                    "could not import jellyfin configuration field; keeping ferrofin's default"
+                );
+            }
+        }
+    }
+}
+
+/// [`import_over`] for a caller that reports the fields left at their
+/// defaults itself, once per file it converts again and again: returns them
+/// beside the configuration instead of logging them.
+///
+/// # Errors
+///
+/// As [`import_over`].
+pub fn import_reporting<T>(
+    default: &T,
+    xml: &str,
+    root_name: &str,
+    deny: &[&str],
+) -> Result<(T, Unimported), ConfigImportError>
+where
+    T: Serialize + DeserializeOwned,
+{
     let root = parse(xml)?;
     if root.name != root_name {
         return Err(ConfigImportError(format!(
@@ -208,7 +296,7 @@ where
     };
 
     let mut applied = 0_usize;
-    let mut ignored: Vec<&str> = Vec::new();
+    let mut unimported = Unimported::default();
     for child in &root.children {
         if deny.contains(&child.name.as_str()) {
             continue;
@@ -218,25 +306,21 @@ where
                 obj = next;
                 applied += 1;
             }
-            Some(Accepted::Unrecognised) => ignored.push(&child.name),
+            Some(Accepted::Unrecognised) => unimported.ignored.push(child.name.clone()),
+            Some(Accepted::Rejected(error)) => {
+                unimported.rejected.push((child.name.clone(), error));
+            }
             None => {}
         }
     }
 
-    if !ignored.is_empty() {
-        // Silent setting loss is the failure this whole module exists to stop,
-        // so a field Ferrofin has no home for is said out loud, not swallowed.
-        warn!(
-            document = root_name,
-            fields = %ignored.join(", "),
-            "jellyfin configuration fields have no ferrofin counterpart and were not imported"
-        );
-    }
     debug!(
         document = root_name,
         applied, "imported jellyfin configuration fields"
     );
-    serde_json::from_value::<T>(Value::Object(obj)).map_err(|e| backend("rebuild", &e))
+    let config =
+        serde_json::from_value::<T>(Value::Object(obj)).map_err(|e| backend("rebuild", &e))?;
+    Ok((config, unimported))
 }
 
 /// What happened to one field.
@@ -245,10 +329,12 @@ enum Accepted {
     Applied(Map<String, Value>),
     /// `T` deserialized but dropped the key — the name is not one of ours.
     Unrecognised,
+    /// `T` rejected the value under every [`Reading`]: the last one's error.
+    Rejected(String),
 }
 
 /// Tries every [`Reading`] of `child` against `obj`, returning the first `T`
-/// accepts, or `None` when the value is rejected under all of them (logged).
+/// accepts, or why it rejected the last when it rejects them all.
 fn accept<T>(obj: &Map<String, Value>, child: &Node) -> Option<Accepted>
 where
     T: Serialize + DeserializeOwned,
@@ -283,14 +369,7 @@ where
             Err(e) => last_error = Some(e),
         }
     }
-    if let Some(e) = last_error {
-        warn!(
-            field = %child.name,
-            error = %e,
-            "could not import jellyfin configuration field; keeping ferrofin's default"
-        );
-    }
-    None
+    last_error.map(|e| Accepted::Rejected(e.to_string()))
 }
 
 /// Whether `field` is still present once `parsed` is serialized again.
@@ -756,6 +835,38 @@ mod tests {
             ),
             "a name ferrofin does serve must be applied"
         );
+    }
+
+    /// gl-1960: the reporting entry point hands back what it could not import,
+    /// for a caller that reports it once per file, and imports the rest.
+    #[test]
+    fn a_reporting_import_returns_the_fields_it_left_at_their_defaults() {
+        let (imported, unimported) = import_reporting(
+            &EncodingOptions::default(),
+            "<EncodingOptions><EnableIPv4>false</EnableIPv4>\
+             <HardwareAccelerationType>abacus</HardwareAccelerationType>\
+             <TranscodingTempPath>/config/transcodes</TranscodingTempPath></EncodingOptions>",
+            "EncodingOptions",
+            &[],
+        )
+        .expect("imports");
+        assert_eq!(
+            imported.transcoding_temp_path.as_deref(),
+            Some("/config/transcodes")
+        );
+        assert_eq!(
+            imported.hardware_acceleration_type,
+            EncodingOptions::default().hardware_acceleration_type
+        );
+        assert_eq!(unimported.ignored, ["EnableIPv4"]);
+        let rejected: Vec<_> = unimported
+            .rejected
+            .iter()
+            .map(|(f, _)| f.as_str())
+            .collect();
+        assert_eq!(rejected, ["HardwareAccelerationType"]);
+        assert!(!unimported.is_empty());
+        assert!(Unimported::default().is_empty());
     }
 
     #[test]
