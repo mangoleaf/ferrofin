@@ -3396,15 +3396,11 @@ const PLUGINS_CONFIGURATION_STORAGE: &str = "The configuration is stored as JSON
 /// What the two toggle rows answer that upstream reports as Restart.
 const PLUGINS_TOGGLE_AT_ONCE: &str = "A toggle is reported at once, GET /Plugins answering \
      Active or Disabled, and a WASM plugin's or compiled-in extension's tasks, events, lookups \
-     and pages follow it at once. Upstream's ProcessAlternative sets RestartRequired, so the \
-     plugin keeps running as it was until the restart and GET /Plugins reports Restart, and \
-     enabling one installed version supersedes another. Fix path: gl-729.";
-
-/// The toggle rows on OpenSubtitles.
-const PLUGINS_TOGGLE_OPENSUBTITLES: &str = "Disabling OpenSubtitles changes only what GET \
-     /Plugins and the manifest report: its subtitle provider never reads the flag and keeps \
-     searching and downloading. On Jellyfin a disabled OpenSubtitles runs \
-     until the restart and is not loaded after it. Fix path: gl-2025.";
+     and pages, and OpenSubtitles' subtitle provider (its searches, downloads and place in the \
+     subtitle fetchers and an item's provider list), follow it at once. Upstream's \
+     ProcessAlternative sets RestartRequired, so the plugin keeps running as it was until the \
+     restart and GET /Plugins reports Restart, and enabling one installed version supersedes \
+     another. Fix path: gl-729.";
 
 /// The toggle rows on an in-tree provider.
 const PLUGINS_TOGGLE_IN_TREE: &str = "A toggle that changes an in-tree provider's status \
@@ -3418,9 +3414,9 @@ const PLUGINS_TOGGLE_IN_TREE: &str = "A toggle that changes an in-tree provider'
 const PLUGINS_UNINSTALL_COMPILED_IN: &str = "A compiled-in plugin other than the in-tree \
      providers (OpenSubtitles and the extensions, Ferrofin Settings and Single Sign-On among \
      them) answers 400: its code is part of the binary, so there is nothing to delete, and \
-     disabling an extension stops it instead (the plugin tiers, docs/EXTENSIONS.md; a \
-     disabled OpenSubtitles keeps working, gl-2025). On Jellyfin, where those with a Jellyfin \
-     counterpart are repository plugins, the request deletes them.";
+     disabling one stops it instead (the plugin tiers, docs/EXTENSIONS.md). On Jellyfin, \
+     where those with a Jellyfin counterpart are repository plugins, the request deletes \
+     them.";
 
 /// What the two uninstall rows delete that upstream keeps.
 const PLUGINS_UNINSTALL_CONFIGURATION: &str = "The uninstall deletes the plugin's \
@@ -7291,8 +7287,10 @@ pub const VERIFIED: &[Verified] = &[
                search_subtitles and enrich (SubtitleManager.SearchSubtitles, both overloads: \
                the language's two-letter code from FindLanguageInfo; [] unless the video's \
                VideoType is VideoFile; the request filled from \
-               a Movie or an Episode and [] for any other kind; every provider that supports \
-               the content type searched, results in provider order, a failing provider \
+               a Movie or an Episode and [] for any other kind; every enabled provider (a \
+               disabled plugin's is dropped at once, upstream's at the restart: \
+               PLUGINS_TOGGLE_AT_ONCE) that supports the content type \
+               searched, results in provider order, a failing provider \
                contributing none; Normalize's MD5 provider-name prefix on each id; \
                isPerfectMatch's hash-match filter applied to every provider's results, \
                where upstream leaves it to the provider, as the plugin's MatchFilter does) → \
@@ -7340,7 +7338,9 @@ pub const VERIFIED: &[Verified] = &[
                answered 204; the try runs on handlers.rs run_detached's task, so for a client \
                that hangs up both still finish and a failure is still logged, as \
                DownloadSubtitles gets CancellationToken.None) → ferrofin-core \
-               subtitle_manager.rs download_subtitles, route and attach \
+               subtitle_manager.rs download_subtitles, route_enabled (an enabled provider \
+               only: a disabled plugin's is dropped at once, upstream's at the restart) and \
+               attach \
                (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
                Split('_', 2): an id naming no provider fails the download; TrySaveSubtitle and \
                TrySaveToFiles: the library's SaveSubtitlesWithMedia picks \
@@ -7384,7 +7384,9 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/subtitles.rs get_remote_subtitles (RequireSubtitleManagement, the \
                SubtitleManagement policy's UserPermissionRequirement; RequiredRouteString \
                subtitleId: ConvertEmptyStringToNull, then [Required]) → ferrofin-core \
-               subtitle_manager.rs get_remote_subtitles and route (SubtitleManager.\
+               subtitle_manager.rs get_remote_subtitles and route_enabled (an enabled \
+               provider only: a disabled plugin's is dropped at once, upstream's at the \
+               restart; SubtitleManager.\
                GetRemoteSubtitles and GetProvider: Split('_', 2), the first provider whose MD5 \
                name id equals the prefix, ordinally, handed the rest of the id, or the whole id \
                when it holds no _) → ferrofin-providers opensubtitles.rs get_subtitles (the \
@@ -8597,7 +8599,6 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             PLUGINS_TOGGLE_AT_ONCE,
             PLUGINS_TOGGLE_IN_TREE,
-            PLUGINS_TOGGLE_OPENSUBTITLES,
             PLUGINS_UNLISTED_ENTRIES,
             PLUGINS_ERROR_BODIES,
         ],
@@ -8621,7 +8622,6 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             PLUGINS_TOGGLE_AT_ONCE,
             PLUGINS_TOGGLE_IN_TREE,
-            PLUGINS_TOGGLE_OPENSUBTITLES,
             PLUGINS_UNLISTED_ENTRIES,
             PLUGINS_ERROR_BODIES,
         ],

@@ -419,9 +419,10 @@ pub(crate) mod tests_support {
     struct OnePlugin {
         id: Uuid,
         config: std::sync::Mutex<Vec<u8>>,
-        /// Whether `get_plugin` reports the plugin, enabled; otherwise it
-        /// reports none.
+        /// Whether `get_plugin` reports the plugin; otherwise it reports none.
         listed: bool,
+        /// The enabled flag `get_plugin` reports.
+        enabled: bool,
     }
 
     #[async_trait]
@@ -432,7 +433,7 @@ pub(crate) mod tests_support {
         async fn get_plugin(&self, id: Uuid) -> Result<Option<PluginDescriptor>, ServiceError> {
             Ok((self.listed && id == self.id).then(|| PluginDescriptor {
                 id,
-                enabled: true,
+                enabled: self.enabled,
                 ..PluginDescriptor::default()
             }))
         }
@@ -487,6 +488,7 @@ pub(crate) mod tests_support {
             id: plugin_id,
             config: std::sync::Mutex::new(config),
             listed: false,
+            enabled: true,
         })
     }
 
@@ -496,6 +498,18 @@ pub(crate) mod tests_support {
             id: plugin_id,
             config: std::sync::Mutex::new(b"{}".to_vec()),
             listed: true,
+            enabled: true,
+        })
+    }
+
+    /// A manager that reports `plugin_id` installed and disabled, with
+    /// `config` as its configuration.
+    pub(crate) fn disabled_plugin(plugin_id: Uuid, config: Vec<u8>) -> Arc<dyn PluginManager> {
+        Arc::new(OnePlugin {
+            id: plugin_id,
+            config: std::sync::Mutex::new(config),
+            listed: true,
+            enabled: false,
         })
     }
 }
