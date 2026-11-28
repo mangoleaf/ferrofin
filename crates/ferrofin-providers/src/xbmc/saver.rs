@@ -26,6 +26,7 @@ use crate::container_types::{MetadataResult, PersonInfo};
 
 use super::config::NfoConfiguration;
 use super::item::{NfoBaseItem, NfoItemKind};
+use super::xml_reader::line_feeds;
 
 /// `Comparer<string>.Default` — the actual `CurrentCulture` collation — which
 /// every `OrderBy(string)` in `BaseNfoSaver` uses. Rust's `str::cmp` orders
@@ -160,17 +161,27 @@ impl NfoWriter {
     }
 }
 
-/// Escapes text content for an XML element body (`&`, `<`, `>`).
+/// Escapes text content for an XML element body (`&`, `<`, `>`) and writes
+/// CR LF and a lone CR as a line feed: `XmlWriter`'s default
+/// `NewLineHandling.Replace` writes each as the writer's newline, which is a
+/// line feed in every file written here (Jellyfin 12.4 saves a stored
+/// `a\r\nb\rc` as `a\nb\nc` in an NFO's `<plot>` and in a `collection.xml`'s
+/// and a `playlist.xml`'s `<Overview>`, gl-2033).
 fn escape_text(value: &str) -> String {
+    line_feeds(&escape_markup(value)).into_owned()
+}
+
+/// Escapes the markup characters of text or of an attribute value.
+fn escape_markup(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
 
-/// Escapes an attribute value (element escapes plus the double quote).
+/// Escapes an attribute value (the markup escapes plus the double quote).
 fn escape_attr(value: &str) -> String {
-    escape_text(value).replace('"', "&quot;")
+    escape_markup(value).replace('"', "&quot;")
 }
 
 /// Strips HTML tags from the overview (`BaseExtensions.StripHtml`).
@@ -1288,6 +1299,7 @@ mod tests {
     #[test]
     fn escape_text_and_attr_escape_the_expected_characters() {
         assert_eq!(escape_text("a & b < c > d"), "a &amp; b &lt; c &gt; d");
+        assert_eq!(escape_text("a\r\nb\rc\nd"), "a\nb\nc\nd");
         assert_eq!(escape_attr("x\"y&z"), "x&quot;y&amp;z");
     }
 

@@ -72,8 +72,8 @@ FROM ${WEB_IMAGE} AS web
 
 # ── server binary ───────────────────────────────────────────────────────
 FROM rust:1.100.0-trixie AS build
-# cmake builds the libjpeg-turbo that turbojpeg-sys vendors, and nasm assembles its
-# x86-64 SIMD (require-simd fails the build without it; arm64 uses Neon intrinsics).
+# cmake builds libjpeg-turbo (scripts/libjpeg-turbo.sh, below), and nasm assembles its
+# x86-64 SIMD (the script fails the build without it; arm64 uses Neon intrinsics).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends cmake nasm \
  && rm -rf /var/lib/apt/lists/*
@@ -85,6 +85,11 @@ RUN cargo install --locked cargo-auditable@0.7.7
 # binary is behind the crate's `cli` feature.
 RUN cargo install --locked --features cli cargo-about@0.9.3
 WORKDIR /src
+# The libjpeg-turbo the binary links statically: the official release the script pins, checks and
+# builds beside itself, in scripts/libjpeg-turbo.sh.out, which the build context never carries
+# (.dockerignore). Before `COPY . .`, so a source change does not build it again.
+COPY scripts/libjpeg-turbo.sh scripts/libjpeg-turbo.sh
+RUN scripts/libjpeg-turbo.sh
 COPY . .
 # .git is excluded from the build context, so bake the release version in from
 # the same SERVICE_VERSION build-arg CI already passes (empty for a local build,
@@ -92,7 +97,9 @@ COPY . .
 ARG SERVICE_VERSION=
 ENV FERROFIN_GIT_DESCRIBE=${SERVICE_VERSION}
 # Strip the container binary while leaving local profiling builds unchanged (the record survives).
-RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo auditable build --locked --release -p ferrofin-server
+# What the image ships must link the pinned libjpeg-turbo, whatever the environment offered.
+RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo auditable build --locked --release -p ferrofin-server \
+ && scripts/libjpeg-turbo.sh --check target/release/ferrofin-server
 RUN scripts/third-party-notices.sh
 
 # ── runtime ─────────────────────────────────────────────────────────────

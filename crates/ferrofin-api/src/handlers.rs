@@ -953,8 +953,13 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// a graphical subtitle's file, most of whose operations have no row of their
 /// own yet.
 /// `escape-charsets` is which 7-bit escape encodings a text subtitle sidecar
-/// or a playlist file is read in, which the subtitle stream operations and the
-/// playlist scan share.
+/// or a playlist file is read in, the tables its legacy Chinese and Korean
+/// text is decoded with, and what is written for bytes with no character in
+/// their charset, which the subtitle stream operations and the playlist scan
+/// share; how an XML document that declares a legacy encoding is read
+/// with the same decoder, a book's `ComicInfo.xml` or OPF and an XMLTV guide;
+/// and which line ends the text of an XML metadata file is read and saved
+/// with (a book's, an NFO, a `collection.xml` or a `playlist.xml`).
 /// `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
@@ -1178,13 +1183,22 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    service, so RefreshGuide's innerProgress passes each report on times 1; a \
                    second ILiveTvService is a plugin's. The task then reports RefreshGuide's \
                    closing 100, and adds none for a refresh its stop ended (one stopped in \
-                   the image pre-cache already reads 100). A refresh a newer one superseded \
-                   while it fetched writes nothing, and goes from 10 to that 100. \
+                   the image pre-cache already reads 100). A Live TV configuration write \
+                   queues a run of the task (handlers/live_tv.rs queue_guide_refresh, \
+                   CancelIfRunningAndQueue<RefreshGuideScheduledTask>), so its refresh \
+                   reports the same values: a run the write stops records Cancelled, and \
+                   the queued run starts again at 10. \
                    Compared with RefreshGuide, RefreshChannelsInternal and CleanDatabase at \
                    the pinned v12.4 tag. Live on a scratch server (gl-2021), GET \
                    /ScheduledTasks/{taskId} polled through a run over 300 channels and a \
                    tuner answering in 4 s: 10 from the first poll, then 15, each of the 300 \
-                   per-channel values in order up to 100, and no value once Idle",
+                   per-channel values in order up to 100, and no value once Idle. Live \
+                   again for the queued runs (gl-54), a tuner answering in 2 s: a tuner save \
+                   then a guide save left the first run Cancelled and the second Running \
+                   from 10 through the per-channel values to Completed; five channel \
+                   mappings 0.4 s apart, then eight at the same moment, each ran one \
+                   refresh at a time, the stopped ones Cancelled and their tuner requests \
+                   dropped, and the guide came to rest on the mapping stored last",
         date: "2026-11-27",
         divergences: &[
             "The clean-ups report nothing, so the value never starts again: upstream runs \
@@ -1204,10 +1218,6 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              every listings provider and writes its airings (insert_programs) before the \
              15, and pre-caches after the 100; the fetches and the pre-cache run outside \
              the guide's write lock. Open: owner decision pending, tracked in gl-2027.",
-            "A guide refresh a Live TV configuration write queues is not a run of the task \
-             (handlers/live_tv.rs queue_guide_refresh spawns refresh_guide), so the task \
-             shows no state, progress or result for it; upstream queues the task itself \
-             (CancelIfRunningAndQueue<RefreshGuideScheduledTask>). Fix path: gl-54.",
         ],
     },
     VerifiedSubsystem {
@@ -2964,18 +2974,41 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    fetch_tmdb_episode with apply_tmdb_episode; for an episode the provider \
                    manager refreshes that has a path, episode.rs tmdb_answer (a path-less one \
                    is not asked, as TmdbEpisodeProvider returns nothing for \
-                   IsMissingEpisode). Both read a multi-episode file's IndexNumberEnd range \
-                   through episode.rs tmdb_episode_in_range; the scan's lookup has its stored \
+                   IsMissingEpisode). Both look an episode up in its series' display order \
+                   (EpisodeInfo.SeriesDisplayOrder) through tmdb.rs episode_group_type and \
+                   episode_group (GetSeriesGroupAsync: the order's TvGroupType compared \
+                   ordinally, the first group of that type the series lists, from \
+                   /tv/{id}/episode_groups where upstream reads the list GetSeriesAsync \
+                   appends, then /tv/episode_group/{id} in the lookup's language; a 404 is no \
+                   group, any other failure no answer, as TMDbLib throws out of \
+                   GetEpisodeAsync) and episode.rs TmdbEpisodeLookup with \
+                   EpisodeGroup::aired_numbers_in (GetEpisodeAsync's mapping, per number of a \
+                   multi-episode file's IndexNumberEnd range: the first group whose Order is \
+                   the season, its first episode whose Order is the number less one, a \
+                   number it does not list kept as numbered; a failed season request no \
+                   answer), and the episode's own request under the first one's aired \
+                   numbers; the scan keeps each group, and a series' miss or failed request, \
+                   for the pass and at most TmdbClientManager's hour, by series, order and \
+                   language (library_scan.rs episode_group_cached). In the scan, an episode \
+                   whose series row cannot be read is not looked up, as for TheTVDB: \
+                   upstream's lookup has no series ids then. The scan's lookup has its stored \
                    row's range end, else its file name's (under Replace all metadata the file \
-                   name's first), never its NFO's (MergeNewData passes ids only). Compared \
+                   name's first), never its NFO's (MergeNewData passes ids only). The same \
+                   mapping serves TheMovieDb's episode image provider in the scan's image \
+                   pass (fetch_tv_still_images, tmdb_episode_image_numbers, \
+                   cached_image_numbers for the next episode's early request) and in \
+                   provider_manager.rs tmdb_images, with no language \
+                   (TmdbEpisodeImageProvider.cs:76). Compared \
                    with TmdbMovieProvider, TmdbSeriesProvider (MapTvShowToSeries), \
                    TmdbSeasonProvider and TmdbEpisodeProvider \
-                   GetMetadata, TmdbClientManager and TmdbUtils at the pinned v12.4 tag. \
+                   GetMetadata, TmdbEpisodeImageProvider's GetEpisodeAsync call, \
+                   TmdbClientManager and TmdbUtils at the pinned v12.4 tag. \
                    TheMovieDb's box-set, person, missing-episode and similar-items providers \
-                   and its image providers, the other providers (TheTVDB, OMDb, MusicBrainz, \
-                   TheAudioDB; gl-1815) and the merge onto the item (gl-1813) are not part of \
-                   this row.",
-        date: "2026-11-26",
+                   and its image providers' other candidates (which images, their ranking \
+                   and sizes), the other providers (TheTVDB, OMDb, \
+                   MusicBrainz, TheAudioDB; gl-1815) and the merge onto the item (gl-1813) \
+                   are not part of this row.",
+        date: "2026-11-27",
         divergences: &[
             "A movie, series, season or episode TMDb has no overview for answers the \
              refresh no Overview, so Identify → Apply and a Replace all metadata refresh \
@@ -2988,9 +3021,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A blank content rating is skipped; upstream takes a blank own-country series \
              rating (storing a bare country prefix such as GB-) and lets a blank US one \
              block its first-entry fallback. Jellyfin bug not ported.",
-            "An episode is looked up in aired order whatever the series' display order; \
-             upstream maps an absolute, DVD, digital, story-arc, production, TV or \
-             original-air-date order through TMDb's episode group. Fix path: gl-1784.",
+            "TheMovieDb's responses are kept only within one scan pass (its seasons and the \
+             series' episode groups), where upstream's TmdbClientManager keeps every response \
+             for an hour across the process: an episode refresh outside the scan (one with \
+             a remote path or outside every library), GET /Items/{itemId}/RemoteImages and a \
+             scan within the hour of another ask TMDb again. Fix path: gl-2034.",
             "An episode with no season number is not looked up; upstream looks it up in \
              season 1 (TmdbEpisodeProvider.cs:99), with its resolver's season-1 default for \
              a loose episode, which Ferrofin's planner lacks too. Fix path: gl-1846.",
@@ -3079,7 +3114,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         upstream_file: "MediaBrowser.MediaEncoding/Subtitles/SubtitleEncoder.cs",
         upstream_method: "GetSubtitleStream",
         ferrofin: "Which 7-bit escape encodings a text subtitle sidecar and a playlist file \
-                   are read in, and how (gl-1657). ferrofin-util escape_charset.rs detect \
+                   are read in, and how (gl-1657), the tables their legacy Chinese and \
+                   Korean text is decoded with (gl-2000), what is written for bytes with no \
+                   character in their charset (gl-2010), and how an XML document that declares \
+                   a legacy encoding is read (gl-2011). ferrofin-util escape_charset.rs detect \
                    ports UTF.Unknown 2.7.0, the version Jellyfin 12.4 pins: \
                    CharsetDetector.Feed and FindInputState (1024-byte chunks, a high byte but \
                    0xA0 dropping the escape prober, an ESC or a { after a ~ starting it) and \
@@ -3100,17 +3138,229 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    0, which the state after ESC errors on, so it never names ISO-2022-CN, and \
                    Jellyfin 12.4 serves such a file as it is, as Ferrofin does. Measured on \
                    Jellyfin 12.4: ISO-2022-KR, HZ (with ~~), ISO-2022-JP and ISO-2022-CN \
-                   sidecars serve the same text as Ferrofin's. 8-bit input and the \
-                   multi-byte and single-byte probers are not part of this row.",
-        date: "2026-11-26",
+                   sidecars serve the same text as Ferrofin's. The tables behind the decoders \
+                   were measured too (gl-2000): sidecars holding every byte pair of GBK, HZ, \
+                   the KS X 1001 square, UHC and ISO-2022-KR, and every four-byte GB18030 \
+                   sequence of the Basic Multilingual Plane, served by Jellyfin 12.4 and by \
+                   Ferrofin and compared sequence by sequence. Jellyfin reads 8-bit Simplified \
+                   Chinese with .NET's GB18030Encoding, HZ with code page 936, Korean with code \
+                   page 949 (cp949, and under ISO-2022-KR) or 51949 (euc-kr), where \
+                   encoding_rs's tables are WHATWG's. ferrofin-util code_page.rs holds what \
+                   .NET has and encoding_rs lacks: code page 949's user-defined rows C9 and \
+                   FE, which are U+E000 to U+E0BB (user_defined, read by the ISO-2022-KR \
+                   decoder and by decode for 8-bit Korean text), and the GB18030 sequence 81 \
+                   35 F4 37, which is U+1E3F (decode). get_subtitle_stream and decode_playlist \
+                   decode 8-bit text through code_page decode. With them every ISO-2022-KR \
+                   pair, every four-byte sequence of the Basic Multilingual Plane that has a \
+                   character and a cp949 sidecar holding both user-defined rows serve the same \
+                   text as Jellyfin's. Playlists were served too: an ISO-2022-KR, a cp949 and \
+                   a GB18030 playlist whose entries name files called U+E000, U+E0BB and \
+                   U+1E3F find the same tracks on both servers. Bytes with no character in \
+                   their charset were measured next (gl-2010), in sidecars Jellyfin 12.4 named \
+                   cp949, gb18030, big5, shift-jis and euc-jp: every high byte before every \
+                   other byte, before a line feed, a CR LF and a NUL and at the end of the \
+                   file, and GB18030's four-byte forms. It is what .NET 10's \
+                   System.Text.Encoding.CodePages source says, read beside the measurement: \
+                   the decoder fallback writes ? (InternalDecoderBestFitFallback), or the code \
+                   page's default character, which LoadManagedCodePage sets: U+30FB for 932 \
+                   (shift-jis) and for 51932 (euc-jp, EUCJPEncoding over 932's table). \
+                   DBCSCodePageEncoding.GetChars (949, 950, 932, 51932) looks a lead byte up \
+                   together with the byte after it, whatever that byte is, so one replacement \
+                   takes both, a line feed included, and a lead byte the text ends in is one \
+                   replacement; 51932 has no three-byte form, so 8F is no lead byte there. \
+                   GB18030Encoding.GetChars writes ? for the first byte alone and reads on \
+                   from the next, and one ? for a well-formed four-byte sequence that has no \
+                   character. The code points themselves are in the code page data, so they \
+                   are the measured ones. \
+                   A byte that is no lead byte has a code point of its own: 80 is U+0080 in \
+                   949, 950 and 51932, FF is U+F8F7 in 949 and U+F8F8 in 950, A0 and FD to FF \
+                   are U+F8F0 to U+F8F3 in 932, as A0 and FF are in 51932, and 81 to 8D and 8F \
+                   to 9F are U+30FB in 51932. \
+                   The single-byte code pages were read through a ComicInfo.xml declaring each \
+                   of twenty encodings, since UTF.Unknown drops a single-byte charset at the \
+                   first byte its model marks illegal (SingleByteCharSetProber.HandleData); \
+                   seven code pages a sidecar was served in gave the same 128 bytes both ways. \
+                   .NET has a Private Use Area code point for every byte the WHATWG index \
+                   leaves out of windows-1253, -1255, -1257, -874 and ISO-8859-6, -7 and -8. \
+                   code_page decode runs encoding_rs's decoder without replacement and, for \
+                   each sequence it cannot decode, writes what dotnet_fallback and lone_bytes \
+                   hold of the above, then reads on after the bytes .NET takes. With it \
+                   decode writes the text Jellyfin serves for every swept line of cp949, \
+                   shift-jis and euc-jp (97,320, and the 44,188 of the gl-2000 sweep but JIS X \
+                   0212), and for gb18030's and big5's but for the differences below. chardetng \
+                   keeps a charset beside few of these sequences (an unassigned pair in Big5, \
+                   Shift_JIS and EUC-JP, the lone bytes, a Mac OS single byte before ASCII) and \
+                   never names a single-byte charset for text with a byte it lacks, so a \
+                   subtitle or a playlist reaches only those. Over HTTP, six sidecars holding \
+                   two to four such sequences each, in the five charsets, are byte for byte \
+                   what Jellyfin serves (one holding six in Shift_JIS is not: chardetng names \
+                   windows-1251 for it), and a Shift_JIS playlist whose entry holds an \
+                   unassigned pair finds the same track. Which charset 8-bit input is read in \
+                   (the multi-byte and single-byte probers) is not part of this row: chardetng \
+                   names it. \
+                   An XML document names its encoding, and was measured last (gl-2011): 1,501 \
+                   books (a ComicInfo.xml beside the comic and one in its archive, a sidecar \
+                   OPF and an EPUB's OPF) and 105 XMLTV guides, scanned and listed by Jellyfin \
+                   12.4 and by Ferrofin: every trail byte after every lead byte under seven \
+                   names, one document for each of the 228 WHATWG labels, and UTF-8, UTF-16 \
+                   and UTF-32 holding invalid input. ExternalComicInfoProvider.LoadXml, \
+                   InternalComicInfoProvider, OpfProvider.ReadOpfData, EpubProvider and \
+                   Jellyfin.XmlTv's XmlTvReader all read through .NET's XmlTextReaderImpl, \
+                   whose CheckEncoding takes Encoding.GetEncoding's decoder for a declared \
+                   name, which replaces what it cannot decode, and a throwing UTF8Encoding for \
+                   utf-8, for a UTF-8 byte-order mark and for no declaration (.NET 10 source, \
+                   read beside the measurement); UTF-16 goes through its own UTF16Decoder and \
+                   the reader's character checks. So a document in a legacy encoding never \
+                   fails to load for its bytes, and its text is the text of the code page a \
+                   detected subtitle is read with: the book and the guide sweeps equal each \
+                   other cell for cell, and the gl-2010 subtitle sweep of the same encoding \
+                   in all 28,544 comparable cells of ks_c_5601-1987, euc-kr, gb18030, big5, \
+                   shift_jis and euc-jp. gb2312, gbk, chinese, csgb2312, csiso58gb231280, \
+                   gb_2312-80 and iso-ir-58 are code page 936 there and only gb18030 is \
+                   GB18030Encoding: 936 is a DBCSCodePageEncoding, so one ? takes a lead byte \
+                   and the byte after it, FF is U+F8F5 and there is no four-byte form. euc-kr \
+                   and cseuckr are code page 51949 and the other seven Korean names 949. \
+                   providers books.rs decode_xml (every book XML document) and livetv xmltv.rs \
+                   Decoded read a declared legacy encoding through code_page Decoder::declared, \
+                   a guide in pieces as it arrives, and keep UTF-8 and UTF-16 strict; \
+                   lone_bytes got code page 936's FF and the unassigned bytes of ISO-8859-3 \
+                   and ISO-8859-8-I from the same measurement. With it the guide sweeps of \
+                   ks_c_5601-1987, shift_jis and euc-jp list what Jellyfin lists for all 28,800 \
+                   sequences each, and those of gb18030, gb2312, euc-kr and big5 but for the \
+                   differences below; the book sweeps are the same as the guide sweeps. Line \
+                   ends were measured with them (gl-2029): XmlReader.Create, which loads a \
+                   ComicInfo.xml beside the comic and, through XDocument.Load, the one in its \
+                   archive, reads CR LF and a lone CR in the document as one line feed, in a \
+                   CDATA section too and not in a character reference, where \
+                   XmlDocument.Load, which loads an OPF, keeps them; books.rs xml_document \
+                   takes the cursor by LineEnds accordingly (xbmc/xml_reader.rs XmlCursor::new \
+                   normalises before tokenizing, XmlCursor::as_written does not), and with it \
+                   the 237 sweep cells that kept a carriage return where Jellyfin reads a \
+                   line feed are Jellyfin's. The NFO parsers and the local XML parser load \
+                   through XmlReader.Create as well (gl-2033): BaseNfoParser.Fetch's stream \
+                   reader and, where a URL may follow the document, its string reader, \
+                   EpisodeNfoParser.ReadEpisodeDetailsFromXml for each <episodedetails> block, \
+                   MovieNfoParser.ParseSetXml over the <set>'s ReadInnerXml, and \
+                   BaseItemXmlParser.Fetch for a collection.xml and a playlist.xml; \
+                   xbmc/base_parser.rs fetch, xbmc/parsers.rs read_details and parse_set_xml \
+                   and local_xml.rs parse_container_xml read through XmlCursor::new and \
+                   up_to_error. Measured on Jellyfin 12.4 and equal with it: the overview of \
+                   a movie's, a series', a season's, an album's and an artist's NFO, of a \
+                   single-block and a two-block episode NFO, of a collection.xml and of a \
+                   playlist.xml holds a line feed for CR LF and for a lone CR, in a CDATA \
+                   section too, and keeps a referenced carriage return; a <set>'s name holds \
+                   a line feed for a referenced carriage return as well, which ReadInnerXml \
+                   writes out raw for the second reader; and an attribute value (a \
+                   <uniqueid>'s type) holds one space for a line end or a tab and keeps a \
+                   referenced one, on both servers before and after. An OPF's attribute \
+                   value is as the document holds it instead: XmlDocument.Load's reader has \
+                   Normalization off for it too, Jellyfin 12.4 stores the line ends and the \
+                   tab of a calibre:series attribute, and XmlCursor::as_written reads a value \
+                   with its references resolved and nothing else changed. The savers write \
+                   text as XmlWriter's default NewLineHandling.Replace does (BaseNfoSaver.Save, \
+                   BaseXmlSaver.Save): xbmc/saver.rs escape_text writes CR LF and a lone CR as \
+                   a line feed, the newline of every file written here, so an overview \
+                   holding them is saved to an NFO's <plot> and to a collection.xml's and a \
+                   playlist.xml's <Overview> with line feeds, as Jellyfin 12.4 saves it, and \
+                   is read back with them on both servers. \
+                   Behind an M3U tuner, the programme titles and overviews of \
+                   guides in nine legacy encodings, each holding a sequence with no \
+                   character, are the same on both servers after a guide refresh, where none \
+                   of them was stored before. A lead byte right before markup takes its < in \
+                   the double-byte code pages, on Jellyfin too, where that guide answers 500 \
+                   and that book is not read; the guide is unreadable here as well.",
+        date: "2026-11-27",
         divergences: &[
             "Two 7-bit ISO-2022-JP variants chardetng rejects, an ISO-2022-JP-2 JIS X 0212 \
              designation and a run left open across a newline, are served as they are, where \
              Jellyfin's escape prober detects ISO-2022-JP and .NET decodes the JIS X 0208 \
              runs (with the 0212 character wrong). Fix path: gl-1998.",
-            "A pair is looked up in encoding_rs's GBK and EUC-KR tables (WHATWG), which may \
-             differ from .NET's code pages 936 and 949 for a few code points (Private Use \
-             Area and GB18030 mappings). Fix path: gl-2000.",
+            "34 Simplified Chinese sequences decode to another code point than Jellyfin's: \
+             in 8-bit text A3A0, A6D9 to A6DF, A6EC, A6ED, A6F3, A8BC, FE59, FE61, FE66, \
+             FE67, FE6D, FE7E, FE90, FEA0 and a lone 80, and under HZ A2E3, the same ten A6 \
+             pairs, A8BC and A8BF. encoding_rs answers U+3000, U+FE10 to U+FE19, U+1E3F, \
+             U+01F9, U+9FB4 to U+9FBB and U+20AC, where .NET answers a Private Use Area code \
+             point (U+E5E5, U+E76C, U+E78D to U+E796, U+E7C7, U+E7C8 and eight from U+E81E \
+             to U+E864) and ? for the lone 80. Owner decision pending, tracked in gl-2008.",
+            "B4D3 is U+B2D2, as code page 949 has it, where code page 51949, which Jellyfin \
+             reads a file it names euc-kr with, answers U+B2D6. Owner decision pending, \
+             tracked in gl-2008.",
+            "Korean text is read as code page 949 reads it whichever of the two Jellyfin would \
+             name, since chardetng answers EUC-KR for both. Code page 51949 reads the bytes \
+             80 to A0, AD to AF, C9, FE and FF alone (U+0080 to U+009F, U+F8E6, U+F8E7 to \
+             U+F8E9, ?, U+F8EA and U+F8EB), and the byte after each starts a new character, \
+             where Ferrofin decodes a UHC syllable or a user-defined pair, writes one ? for \
+             such a byte and the byte after it when the two make no pair, so that a line \
+             feed or an ASCII character 51949 keeps is gone, and reads FF as U+F8F7. Owner \
+             decision pending, tracked in gl-2008.",
+            "Big5 text is decoded with encoding_rs's Big5, the WHATWG index with the Hong \
+             Kong and ETEN extensions, where Jellyfin reads code page 950: 5,059 pairs \
+             decode to another code point, 33 (A3C0 to A3E0) to a control picture where 950 \
+             answers ?, and 1,159 pairs of 950's user-defined ranges stay U+FFFD, with an \
+             ASCII trail byte read again, where 950 answers a Private Use Area code point. \
+             Fix path: gl-2012, which waits on gl-2008.",
+            "EUC-JP's three-byte form (8F and two bytes) is decoded as JIS X 0212 where it \
+             has a character, 6,067 of the 8,836 sequences, where code page 51932 answers \
+             U+30FB for the 8F and reads the two bytes after it as a pair. The other 2,769 \
+             are read as 51932 reads them, so the form is read two ways until that is \
+             decided. Owner decision pending, tracked in gl-2008 (question D).",
+            "Eight bytes of two single-byte charsets decode to another code point than \
+             .NET's code pages 28597 and 28598: ISO-8859-7's A1, A2, A4, A5 and AA are \
+             U+2018, U+2019, U+20AC, U+20AF and U+037A where .NET answers U+02BD, U+02BC \
+             and U+F7C2 to U+F7C4, and ISO-8859-8's AF, FD and FE are U+00AF, U+200E and \
+             U+200F where .NET answers U+203E, U+F7BF and U+F7C0. Owner decision pending, \
+             tracked in gl-2008 with its question A.",
+            "7-bit ISO-2022-JP text holding a pair encoding_rs has no character for is not \
+             named by chardetng and is served as it is, where Jellyfin detects ISO-2022-JP \
+             and code page 50220 answers U+30FB for such a pair (1,437 of the 8,836) and the \
+             half-width katakana for the 63 pairs of row 2A. Fix path: gl-1998.",
+            "An XML document naming code page 936 (gb2312, gbk and their five other names) \
+             is read with encoding_rs's GBK wherever that has a character: 101 pairs are a \
+             character where 936 answers a Private Use Area code point (A2E3, A3A0, A6D9 to \
+             A6DF, A6EC, A6ED, A6F3, A8BC, A8BF, A989 to A995 and 74 pairs from FE50 to \
+             FEA0), and a four-byte GB18030 sequence that has a character keeps it (81 35 F4 \
+             37 as U+E7C7) where 936, which has no such form, answers ??. Owner decision \
+             pending, tracked in gl-2008 (questions A and E).",
+            "An XML document naming euc-kr or cseuckr is read as code page 949 reads it, \
+             where .NET takes code page 51949 for those two names, so the B4D3 and lone-byte \
+             differences above apply to it though its name tells the two apart: a pair of \
+             949's user-defined rows is U+E000 to U+E0BB where 51949 answers two characters, \
+             and such a byte right before markup takes the < where 51949 leaves it: Jellyfin \
+             lists that guide and it is unreadable here. Owner decision pending, tracked in \
+             gl-2008 (questions B and C).",
+            "A book's XML (not a guide's) reads the names .NET gives Latin1Encoding, \
+             ASCIIEncoding and code page 28599 (iso-8859-1, us-ascii, iso-8859-9 and their \
+             other names) as windows-1252 and windows-1254: 80 to 9F are those pages' \
+             characters where .NET answers the C1 controls, and a high byte under us-ascii \
+             is a character where .NET answers ?. Owner decision pending, tracked in gl-2008 \
+             (question F).",
+            "Five bytes of three Mac OS charsets an XML document can name decode to another \
+             character than .NET's code pages: macintosh's BD is U+03A9 where 10000 answers \
+             U+2126, x-mac-cyrillic's A2, B6 and FF are U+0490, U+0491 and U+20AC where \
+             10007 answers U+00A2, U+2202 and U+00A4, and x-mac-ukrainian's FF is U+20AC \
+             where 10017 answers U+00A4. Owner decision pending, tracked in gl-2008 with its \
+             question A.",
+            "An XML document naming iso-2022-jp or csiso2022jp is decoded by encoding_rs, \
+             which writes U+FFFD for a byte or a shift code page 50220 answers U+30FB or the \
+             half-width katakana for, and reads JIS-Roman's 5C and 7E as U+00A5 and U+203E \
+             where 50220 answers \\ and ~. Fix path: gl-1998.",
+            "A book's XML that is not well-formed once decoded is read for what the \
+             tokenizer accepts, where upstream's XDocument.Load and XmlDocument.Load refuse \
+             it: a lead byte of a double-byte code page right before a closing tag leaves \
+             the tag's remains in the text. Owner decision pending, tracked in gl-2032.",
+            "An XML document's encoding name is looked up in the WHATWG labels, not in .NET's \
+             table: 73 labels .NET does not know are read where Jellyfin refuses the \
+             document, hz-gb-2312, iso-2022-kr and csiso2022kr are refused where .NET \
+             decodes them, asmo-708 is read as ISO-8859-6 where .NET has code page 708, and \
+             unicode-1-1-utf-8 is strict UTF-8 where .NET's decoder for that name replaces. \
+             A UTF-8 byte-order mark decides the encoding whatever the declaration then \
+             names, where XmlReader switches to a declared 8-bit encoding. Fix path: gl-939, \
+             which holds the measured lists for the book readers and the guide reader.",
+            "A custom tag the NFO saver carries over from the file it rewrites is copied as \
+             that file holds it, where upstream's AddCustomTags reads it through \
+             XmlReader.Create and writes it through the XmlWriter: Jellyfin 12.4 writes its \
+             text and a CDATA section with line feeds, a referenced carriage return as a \
+             line feed and an attribute's line end as a space. Fix path: gl-2042.",
         ],
     },
 ];
@@ -3206,15 +3456,11 @@ const PLUGINS_CONFIGURATION_STORAGE: &str = "The configuration is stored as JSON
 /// What the two toggle rows answer that upstream reports as Restart.
 const PLUGINS_TOGGLE_AT_ONCE: &str = "A toggle is reported at once, GET /Plugins answering \
      Active or Disabled, and a WASM plugin's or compiled-in extension's tasks, events, lookups \
-     and pages follow it at once. Upstream's ProcessAlternative sets RestartRequired, so the \
-     plugin keeps running as it was until the restart and GET /Plugins reports Restart, and \
-     enabling one installed version supersedes another. Fix path: gl-729.";
-
-/// The toggle rows on OpenSubtitles.
-const PLUGINS_TOGGLE_OPENSUBTITLES: &str = "Disabling OpenSubtitles changes only what GET \
-     /Plugins and the manifest report: its subtitle provider never reads the flag and keeps \
-     searching and downloading. On Jellyfin a disabled OpenSubtitles runs \
-     until the restart and is not loaded after it. Fix path: gl-2025.";
+     and pages, and OpenSubtitles' subtitle provider (its searches, downloads and place in the \
+     subtitle fetchers and an item's provider list), follow it at once. Upstream's \
+     ProcessAlternative sets RestartRequired, so the plugin keeps running as it was until the \
+     restart and GET /Plugins reports Restart, and enabling one installed version supersedes \
+     another. Fix path: gl-729.";
 
 /// The toggle rows on an in-tree provider.
 const PLUGINS_TOGGLE_IN_TREE: &str = "A toggle that changes an in-tree provider's status \
@@ -3228,9 +3474,9 @@ const PLUGINS_TOGGLE_IN_TREE: &str = "A toggle that changes an in-tree provider'
 const PLUGINS_UNINSTALL_COMPILED_IN: &str = "A compiled-in plugin other than the in-tree \
      providers (OpenSubtitles and the extensions, Ferrofin Settings and Single Sign-On among \
      them) answers 400: its code is part of the binary, so there is nothing to delete, and \
-     disabling an extension stops it instead (the plugin tiers, docs/EXTENSIONS.md; a \
-     disabled OpenSubtitles keeps working, gl-2025). On Jellyfin, where those with a Jellyfin \
-     counterpart are repository plugins, the request deletes them.";
+     disabling one stops it instead (the plugin tiers, docs/EXTENSIONS.md). On Jellyfin, \
+     where those with a Jellyfin counterpart are repository plugins, the request deletes \
+     them.";
 
 /// What the two uninstall rows delete that upstream keeps.
 const PLUGINS_UNINSTALL_CONFIGURATION: &str = "The uninstall deletes the plugin's \
@@ -3249,11 +3495,13 @@ const PLUGINS_UNINSTALL_NO_HOOK: &str = "No plugin code runs at the uninstall: t
      as the host holds everything it stored and removes it (the WASM tier, \
      docs/EXTENSIONS.md). Response-invisible.";
 
-/// What the two uninstall rows answer when the file cannot be deleted.
-const PLUGINS_UNINSTALL_DELETE_FAILURE: &str = "A plugin file that cannot be deleted answers \
-     500 and leaves the plugin installed; upstream's RemovePlugin, when it can still save the \
-     plugin's manifest, marks it Deleted, answers 204 and deletes it at the next boot \
-     (LoadAssemblies). Fix path: gl-2024.";
+/// What the two uninstall rows list for a plugin whose file could not be deleted.
+const PLUGINS_UNINSTALL_MARKED_DELETED: &str = "A plugin whose file could not be deleted \
+     leaves GET /Plugins and every lookup at once, as one whose file was deleted does, and \
+     uninstalling it again is a 404 unless that file is the {id}.wasm an install staged. \
+     Upstream keeps its Deleted entry: GET /Plugins reports it as Restart until the restart \
+     and, after a start that still cannot delete the file, as Deleted, and uninstalling it \
+     again answers 204. Fix path: gl-729.";
 
 /// The code path the two scheduled-task read rows share after their handler:
 /// `ScheduledTaskHelpers.GetTaskInfo` over the task's worker.
@@ -3342,7 +3590,10 @@ macro_rules! item_image_tail {
          none of its range processing) → \
          ferrofin-drawing processor.rs process_image (ImageProcessor.ProcessImage) → \
          image_encoder.rs encode_image and composite (SkiaEncoder.EncodeImage: the blur, \
-         backgroundColor and foregroundLayer steps) → limits.rs ImageMemory. Measured on \
+         backgroundColor and foregroundLayer steps) → limits.rs ImageMemory → \
+         scaled_jpeg.rs for a JPEG (SkiaEncoder.Decode: libjpeg-turbo, the codec inside \
+         Skia; a file cut short or with corrupt data is drawn as far as it decodes, as \
+         SKBitmap.Decode and the unchecked codec.GetPixels take an incomplete one). Measured on \
          12.4 with a BMP and a transparent PNG primary: no transform, quality, Range, \
          If-None-Match, If-Modified-Since (past, the file's own date and future, with and \
          without no-cache), Cache-Control spellings, If-Unmodified-Since, \
@@ -3350,8 +3601,9 @@ macro_rules! item_image_tail {
          2147483647, a hex imageIndex and a malformed percentPlayed; the images match in \
          format and size, and, unresized, in pixels within rounding and the blur's box approximation \
          of Skia's Gaussian (with its Decal edges and premultiplied JPEG), not in bytes \
-         (decoded and resized by libraries other than Skia's; a JPEG is written by \
-         libjpeg-turbo, the codec inside Skia, with SkJpegEncoder's settings)"
+         (resized by another library than Skia's, and every format but JPEG decoded by one; \
+         a JPEG is read by libjpeg-turbo, the codec inside Skia, and written by it with \
+         SkJpegEncoder's settings)"
     };
 }
 
@@ -3377,6 +3629,10 @@ const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
      pixels differ from upstream's. These rows never enlarge (GetNewImageSize caps the size \
      at the source); where Ferrofin does, neither side shrinking (a collage cell or \
      splashscreen tile drawn from a smaller image), it uses upstream's Mitchell.",
+    "A JPEG is decoded at a reduced DCT scale when one covers twice the output on both \
+     sides, the smallest of 1/8, 1/4 and 1/2 of its size that does (gl-1015), where \
+     SkiaEncoder.Decode reads every image in full: the full-size bitmap is never built, and \
+     the resized pixels are close to a full decode's, not equal to them.",
     "An anonymous request serves an image of an item whose stored Type names no item \
      kind (a removed plugin's item); upstream's GetItemById is null for it, a 404. A \
      signed-in request is a 404 here too. Fix path: gl-1967.",
@@ -3590,9 +3846,6 @@ const REMOTE_IMAGES_DIVERGENCES: &[&str] = remote_image_provider_divergences!(
      parts (fil, zh-Hans-CN, set through the API) an image whose code is the tag's first two \
      letters is labelled with the tag and ranked first; v12.4 has no such step. Fix path: \
      gl-1716.",
-    "An episode's TheMovieDb stills are those of its aired-order numbers, where \
-     TmdbEpisodeImageProvider passes the series' DisplayOrder, mapped through TMDb's episode \
-     group. Fix path: gl-1784.",
     "TheAudioDB's artist artwork needs the artist's MusicBrainz id, where \
      AudioDbArtistImageProvider falls back to its TheAudioDB id (artist.php). Fix path: \
      gl-497.",
@@ -4754,7 +5007,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/LiveTv/ListingProviders",
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "AddListingProvider",
-        ferrofin: "handlers/live_tv.rs add_listing_provider → ferrofin-livetv manager.rs \
+        ferrofin: "handlers/live_tv.rs add_listing_provider, which ends with \
+               queue_guide_refresh once the provider is stored (the DELETE \
+               /LiveTv/TunerHosts row's) → ferrofin-livetv manager.rs \
                save_listing_provider (ListingsBackend::of, validate_xmltv, \
                store_listing_provider) → schedules_direct.rs SchedulesDirect::validate \
                (ListingsManager.SaveListingProvider, XmlTvListingsProvider.Validate, \
@@ -4791,6 +5046,28 @@ pub const VERIFIED: &[Verified] = &[
          Fix path: gl-666.",
         ],
         refs: &["outbound-http"],
+    },
+    Verified {
+        method: "delete",
+        path: "/LiveTv/ListingProviders",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "DeleteListingProvider",
+        ferrofin: "handlers/live_tv.rs delete_listing_provider (RequireAdmin, \
+               Policies.RequiresElevation; id as string?, other query values ignored) → \
+               ferrofin-livetv manager.rs delete_listing_provider (the row whose Id equals id \
+               ignoring case, as OrdinalIgnoreCase over ids both servers mint as 32 hex \
+               digits; xmltv_cache.rs XmlTvCache::invalidate, for an id of exactly those 32 \
+               digits, as InvalidateListingsProviderCache's Guid.TryParseExact(id, \"N\"), \
+               whose in-memory EPG channel cache has no counterpart to clear; \
+               spawn_recording_folders, as the livetv configuration's \
+               NamedConfigurationUpdated) (ListingsManager.DeleteListingsProvider). A missing, \
+               empty or unknown id deletes nothing, and the answer is 204 either way. The \
+               provider's airings stay listed until the refresh's clean-up drops them \
+               (GuideManager.CleanDatabase). Then queue_guide_refresh, the DELETE \
+               /LiveTv/TunerHosts row's",
+        date: "2026-11-27",
+        divergences: &[],
+        refs: &[],
     },
     Verified {
         method: "get",
@@ -5058,10 +5335,28 @@ pub const VERIFIED: &[Verified] = &[
         path: "/LiveTv/TunerHosts",
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "DeleteTunerHost",
-        ferrofin: "handlers/live_tv.rs delete_tuner_host → ferrofin-livetv manager.rs \
-               delete_tuner_host, then queue_guide_refresh → refresh_guide's clean_database \
-               prune (TunerHostManager.DeleteTunerHost, GuideManager.CleanDatabase)",
-        date: "2026-10-28",
+        ferrofin: "handlers/live_tv.rs delete_tuner_host (RequireAdmin, Policies.RequiresElevation; \
+               id as string?, other query values ignored) → ferrofin-livetv manager.rs \
+               delete_tuner_host (the row whose Id equals id ignoring case, as \
+               OrdinalIgnoreCase over ids both servers mint as 32 hex digits; \
+               spawn_recording_folders, as the livetv configuration's \
+               NamedConfigurationUpdated) (TunerHostManager.DeleteTunerHost, whose \
+               {cache}/{id}_channels file has no counterpart to delete: no tuner's channels \
+               are cached on disk). A missing, empty or unknown id deletes nothing, and the \
+               answer is 204 either way. The host's channels and airings stay listed until \
+               the refresh's clean-up drops them (GuideManager.CleanDatabase). Then \
+               queue_guide_refresh, which the five Live TV configuration writes share → \
+               TaskManager::cancel_if_running_and_queue on the RefreshGuide task's wire id \
+               (TaskManager.CancelIfRunningAndQueue<RefreshGuideScheduledTask>) → \
+               ferrofin-core scheduled_tasks.rs cancel (CancelIfRunning: a Running run's \
+               token is cancelled, and the refresh ends where it checks it) and \
+               queue_scheduled (QueueScheduledTask with new TaskOptions(): started when \
+               Idle, else one run queued until the current one has ended, \
+               ExecuteQueuedTasks). The run that ends last started after the last write \
+               and reads what it stored, and the request waits for none of it. A registry \
+               that refuses the run (the server is shutting down) is logged and the write \
+               still answers; upstream's call cannot fail",
+        date: "2026-11-27",
         divergences: &[],
         refs: &[],
     },
@@ -5135,8 +5430,9 @@ pub const VERIFIED: &[Verified] = &[
                (listing_provider_by_id, the channelMappingExists toggle, \
                store_listing_provider as SaveConfiguration, without the XMLTV cache \
                invalidation SaveListingProvider adds, channels_for_listings_provider, \
-               provider_channels, mapping.rs tuner_channel_mapping), then queue_guide_refresh \
-               (ListingsManager.SetChannelMapping, \
+               provider_channels, mapping.rs tuner_channel_mapping), then, before the 404 for \
+               a tuner channel no lineup has, queue_guide_refresh, the DELETE \
+               /LiveTv/TunerHosts row's (ListingsManager.SetChannelMapping, \
                CancelIfRunningAndQueue<RefreshGuideScheduledTask>). The tuner list and the \
                match ladder are the ChannelMappingOptions row's, so a mapping keyed \
                hdhr_{GuideNumber} applies since gl-1751, and so is the guide read: a local \
@@ -7050,8 +7346,10 @@ pub const VERIFIED: &[Verified] = &[
                search_subtitles and enrich (SubtitleManager.SearchSubtitles, both overloads: \
                the language's two-letter code from FindLanguageInfo; [] unless the video's \
                VideoType is VideoFile; the request filled from \
-               a Movie or an Episode and [] for any other kind; every provider that supports \
-               the content type searched, results in provider order, a failing provider \
+               a Movie or an Episode and [] for any other kind; every enabled provider (a \
+               disabled plugin's is dropped at once, upstream's at the restart: \
+               PLUGINS_TOGGLE_AT_ONCE) that supports the content type \
+               searched, results in provider order, a failing provider \
                contributing none; Normalize's MD5 provider-name prefix on each id; \
                isPerfectMatch's hash-match filter applied to every provider's results, \
                where upstream leaves it to the provider, as the plugin's MatchFilter does) → \
@@ -7099,7 +7397,9 @@ pub const VERIFIED: &[Verified] = &[
                answered 204; the try runs on handlers.rs run_detached's task, so for a client \
                that hangs up both still finish and a failure is still logged, as \
                DownloadSubtitles gets CancellationToken.None) → ferrofin-core \
-               subtitle_manager.rs download_subtitles, route and attach \
+               subtitle_manager.rs download_subtitles, route_enabled (an enabled provider \
+               only: a disabled plugin's is dropped at once, upstream's at the restart) and \
+               attach \
                (SubtitleManager.DownloadSubtitles, GetProvider and GetRemoteSubtitles' \
                Split('_', 2): an id naming no provider fails the download; TrySaveSubtitle and \
                TrySaveToFiles: the library's SaveSubtitlesWithMedia picks \
@@ -7143,7 +7443,9 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/subtitles.rs get_remote_subtitles (RequireSubtitleManagement, the \
                SubtitleManagement policy's UserPermissionRequirement; RequiredRouteString \
                subtitleId: ConvertEmptyStringToNull, then [Required]) → ferrofin-core \
-               subtitle_manager.rs get_remote_subtitles and route (SubtitleManager.\
+               subtitle_manager.rs get_remote_subtitles and route_enabled (an enabled \
+               provider only: a disabled plugin's is dropped at once, upstream's at the \
+               restart; SubtitleManager.\
                GetRemoteSubtitles and GetProvider: Split('_', 2), the first provider whose MD5 \
                name id equals the prefix, ordinally, handed the rest of the id, or the whole id \
                when it holds no _) → ferrofin-providers opensubtitles.rs get_subtitles (the \
@@ -7912,7 +8214,10 @@ pub const VERIFIED: &[Verified] = &[
                person_images (TmdbMovieImageProvider, Order 0, a Tmdb id else an Imdb id \
                through /find; TmdbSeriesImageProvider, 2; TmdbSeasonImageProvider and \
                TmdbEpisodeImageProvider, 1, by the series' Tmdb id and the season and \
-               episode numbers, an episode with no season number in season 1; \
+               episode numbers, an episode with no season number in season 1, an episode's \
+               numbers mapped through the series' episode group of its DisplayOrder, asked \
+               with no language as GetEpisodeAsync asks it, tmdb.rs episode_group (the \
+               metadata-providers row), a failed group request offering nothing; \
                TmdbBoxSetImageProvider and TmdbPersonImageProvider, 0; \
                ConvertToRemoteImageInfo: the size setting per family, the ThumbnailSizes \
                preview, the dimensions only at the original size, vote average and count, \
@@ -7937,7 +8242,7 @@ pub const VERIFIED: &[Verified] = &[
                StudiosImageProvider through studios.rs, GetComparableName against the \
                repository's thumbs.txt, kept a day). Compared at the pinned v12.4 tag, and \
                live on 12.4 with Fanart 15.0.0.0 installed",
-        date: "2026-11-26",
+        date: "2026-11-27",
         divergences: REMOTE_IMAGES_DIVERGENCES,
         refs: &[],
     },
@@ -8356,7 +8661,6 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             PLUGINS_TOGGLE_AT_ONCE,
             PLUGINS_TOGGLE_IN_TREE,
-            PLUGINS_TOGGLE_OPENSUBTITLES,
             PLUGINS_UNLISTED_ENTRIES,
             PLUGINS_ERROR_BODIES,
         ],
@@ -8380,7 +8684,6 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             PLUGINS_TOGGLE_AT_ONCE,
             PLUGINS_TOGGLE_IN_TREE,
-            PLUGINS_TOGGLE_OPENSUBTITLES,
             PLUGINS_UNLISTED_ENTRIES,
             PLUGINS_ERROR_BODIES,
         ],
@@ -8399,9 +8702,17 @@ pub const VERIFIED: &[Verified] = &[
              an install's staged {id}.wasm are deleted with its {config}/plugins/{id} \
              directory, KV state, segment cache, offered-items record and enabled override, it \
              leaves every lookup until the restart, DeletePlugin's _plugins.Remove, and the \
-             restart is flagged, NotifyPendingRestart → 204; a plugin reporting CanUninstall \
-             false, an in-tree provider, is logged at warn and answered 204, the \"Attempt to \
-             delete non removable plugin\" return; no plugin is a 404)"
+             restart is flagged, NotifyPendingRestart → 204; a file that cannot be deleted is \
+             logged at warn and marked in {config}/plugins/state.json, RemovePlugin's \
+             ChangePluginState(plugin, PluginStatus.Deleted), and the uninstall goes on as \
+             above, a mark that cannot be saved answering 500 as SaveManifest's failed write \
+             does; each start then runs delete_plugins_marked_deleted before the WASM host \
+             loads the directory, LoadAssemblies' Deleted loop: a marked file is deleted and \
+             forgotten, one it still cannot delete stays marked and is not loaded, and an \
+             install writing the file again forgets its mark, as PopulateManifest writes the \
+             new status over Deleted; a plugin reporting CanUninstall false, an in-tree \
+             provider, is logged at warn and answered 204, the \"Attempt to delete non \
+             removable plugin\" return; no plugin is a 404)"
         ),
         date: "2026-11-27",
         divergences: &[
@@ -8413,7 +8724,7 @@ pub const VERIFIED: &[Verified] = &[
              name, where upstream removes its Malfunctioned or NotSupported entry. Fix path: \
              gl-729.",
             PLUGINS_UNINSTALL_CONFIGURATION,
-            PLUGINS_UNINSTALL_DELETE_FAILURE,
+            PLUGINS_UNINSTALL_MARKED_DELETED,
             PLUGINS_UNINSTALL_EVENT,
             PLUGINS_UNINSTALL_NO_HOOK,
             PLUGINS_ERROR_BODIES,
@@ -8448,7 +8759,7 @@ pub const VERIFIED: &[Verified] = &[
              {id}.wasm an install staged and is a 404 under any other name, where upstream \
              removes its Malfunctioned or NotSupported entry. Fix path: gl-729.",
             PLUGINS_UNINSTALL_CONFIGURATION,
-            PLUGINS_UNINSTALL_DELETE_FAILURE,
+            PLUGINS_UNINSTALL_MARKED_DELETED,
             PLUGINS_UNINSTALL_EVENT,
             PLUGINS_UNINSTALL_NO_HOOK,
             PLUGINS_ERROR_BODIES,

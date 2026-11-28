@@ -28,6 +28,9 @@ use serde_json::{Value, json};
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
+#[path = "support/guide_refresh.rs"]
+mod guide_refresh;
+
 const ADMIN_USER: &str = "admin";
 const UNKNOWN: &str = "00000000000000000000000000000001";
 
@@ -287,8 +290,6 @@ async fn an_unknown_timer_is_200_null_to_get_and_404_to_delete_with_no_push() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
-/// How long a lineup may take to appear after its tuner is saved.
-const LINEUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// The six fields `FillImages` writes.
 const PARENT_ART: [&str; 6] = [
     "ParentThumbItemId",
@@ -341,6 +342,7 @@ impl Fixture {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        let since = chrono::Utc::now();
         let (status, body) = self
             .call(
                 "POST",
@@ -353,25 +355,10 @@ impl Fixture {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        // Each save queued a refresh, and a later one supersedes an earlier
-        // one's write: once the lineup is listed they have all started, so the
-        // refresh below is the newest and has finished when it returns.
-        let deadline = std::time::Instant::now() + LINEUP_DEADLINE;
-        while self.get("/LiveTv/Channels").await["Items"]
-            .as_array()
-            .is_none_or(Vec::is_empty)
-        {
-            assert!(std::time::Instant::now() < deadline, "no lineup appeared");
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        self.wired
-            .state
-            .live_tv
-            .as_ref()
-            .expect("live tv is wired")
-            .refresh_guide()
-            .await
-            .expect("guide refresh");
+        // Each save queued the "Refresh Guide" task, and the second stopped the
+        // first's run: the guide is whole once the run that started after it has
+        // completed.
+        guide_refresh::guide_refreshed_since(self.wired.state.tasks.as_ref(), since).await;
         let id = |page: Value| page["Items"][0]["Id"].as_str().expect("an id").to_owned();
         (
             id(self.get("/LiveTv/Channels").await),

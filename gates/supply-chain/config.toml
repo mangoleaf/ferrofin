@@ -835,10 +835,6 @@ criteria = "safe-to-deploy"
 version = "0.1.35"
 criteria = "safe-to-deploy"
 
-[[exemptions.jpeg-decoder]]
-version = "0.3.2"
-criteria = "safe-to-deploy"
-
 [[exemptions.jpeg-encoder]]
 version = "0.7.1"
 criteria = "safe-to-run"
@@ -1722,12 +1718,12 @@ criteria = "safe-to-run"
 [[exemptions.turbojpeg]]
 version = "1.5.1"
 criteria = "safe-to-deploy"
-notes = "2026-11-23: new to the workspace with the libjpeg-turbo JPEG encoder of ferrofin-drawing (gl-1346), and no imported audit covers 1.5.1; lifted by an imported or Ferrofin audit of 1.5.1"
+notes = "2026-11-23: new to the workspace with the libjpeg-turbo JPEG encoder of ferrofin-drawing (gl-1346), which decodes with it too since 2026-11-27 (gl-1347), and no imported audit covers 1.5.1; lifted by an imported or Ferrofin audit of 1.5.1"
 
 [[exemptions.turbojpeg-sys]]
 version = "1.2.0"
 criteria = "safe-to-deploy"
-notes = "2026-11-23: new to the workspace with turbojpeg 1.5.1, the libjpeg-turbo JPEG encoder of ferrofin-drawing (gl-1346); it builds the libjpeg-turbo 3.1.0 it vendors, and no imported audit covers 1.2.0; lifted by an imported or Ferrofin audit of 1.2.0"
+notes = "2026-11-23: new to the workspace with turbojpeg 1.5.1, the libjpeg-turbo JPEG encoder of ferrofin-drawing (gl-1346); since 2026-11-27 it is taken without features, so it builds none of the libjpeg-turbo 3.1.0 it vendors and links the release scripts/libjpeg-turbo.sh builds, and no imported audit covers 1.2.0; lifted by an imported or Ferrofin audit of 1.2.0"
 
 [[exemptions.typed-path]]
 version = "0.13.0"

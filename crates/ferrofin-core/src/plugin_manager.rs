@@ -19,7 +19,8 @@
 //! See `docs/EXTENSIONS.md` for the two tiers and `docs/PLUGINS_UPSTREAM.md`
 //! for the compiled-in plugin design.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -395,6 +396,16 @@ struct PersistedState {
     /// can never silently swap bytes under a version the admin vetted).
     #[serde(default)]
     installed_digests: BTreeMap<String, BTreeMap<String, String>>,
+    /// The WASM plugin files an uninstall could not delete, by file name in
+    /// the WASM plugins directory: upstream's `PluginStatus.Deleted`, which
+    /// `RemovePlugin` sets when `DeletePlugin` fails. Each start deletes them
+    /// before the host loads that directory
+    /// ([`FerrofinPluginManager::delete_plugins_marked_deleted`]). An
+    /// `OsString`, which serde writes exactly, so a name that is not UTF-8 is
+    /// kept too; on Unix each is `{"Unix":[<the name's bytes>]}`, not
+    /// something to write by hand.
+    #[serde(default)]
+    delete_on_startup: BTreeSet<OsString>,
 }
 
 /// The registry-backed plugin manager.
@@ -586,6 +597,70 @@ impl FerrofinPluginManager {
         self
     }
 
+    /// Port of the first loop of `PluginManager.LoadAssemblies`, run before
+    /// the WASM host loads `wasm_plugins_dir`: deletes each file an uninstall
+    /// marked for deletion in `{plugins_dir}/state.json` (`PluginStatus.Deleted`)
+    /// and forgets the ones gone. Returns those it still cannot delete, which
+    /// stay marked so every start tries again, and which the host must not
+    /// load ("It will not be loaded, if unable to do so"). Only a marked
+    /// `*.wasm` file name in that directory is ever deleted. A missing or unreadable
+    /// `state.json` deletes nothing ([`Self::new`] reports an unreadable one).
+    #[must_use]
+    pub fn delete_plugins_marked_deleted(
+        plugins_dir: &Path,
+        wasm_plugins_dir: &Path,
+    ) -> Vec<PathBuf> {
+        let Some(mut state) = std::fs::read(plugins_dir.join("state.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PersistedState>(&bytes).ok())
+        else {
+            return Vec::new();
+        };
+        let marked = state.delete_on_startup.len();
+        let mut kept = Vec::new();
+        state.delete_on_startup.retain(|name| {
+            let path = Path::new(name);
+            if path.file_name() != Some(name.as_os_str())
+                || path.extension().is_none_or(|extension| extension != "wasm")
+            {
+                tracing::warn!(
+                    name = %path.display(),
+                    "ignoring a plugin deletion mark that is not a .wasm file name in the plugins directory"
+                );
+                return false;
+            }
+            let file = wasm_plugins_dir.join(name);
+            match std::fs::remove_file(&file) {
+                Ok(()) => {
+                    tracing::info!(
+                        path = %file.display(),
+                        "deleted the plugin file an uninstall marked for deletion"
+                    );
+                    false
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %file.display(),
+                        %error,
+                        "unable to delete the plugin file marked for deletion; it is not loaded"
+                    );
+                    kept.push(file);
+                    true
+                }
+            }
+        });
+        if state.delete_on_startup.len() != marked
+            && let Err(error) = Self::write_state(plugins_dir, &state)
+        {
+            tracing::warn!(
+                %error,
+                "could not save the plugin state after deleting the plugin files marked for deletion; the next start looks for them again"
+            );
+        }
+        kept
+    }
+
     /// A manager with no plugins — the null shape used before any plugin is wired.
     #[must_use]
     pub fn empty(plugins_dir: PathBuf) -> Self {
@@ -677,9 +752,81 @@ impl FerrofinPluginManager {
     /// lock held, so writes land in the order the state changed and an older
     /// snapshot never replaces a newer one.
     fn persist(&self, state: &PersistedState) -> Result<(), ServiceError> {
+        Self::write_state(&self.plugins_dir, state)
+    }
+
+    /// Writes `state` to `{plugins_dir}/state.json`.
+    fn write_state(plugins_dir: &Path, state: &PersistedState) -> Result<(), ServiceError> {
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|e| ServiceError::backend(format!("serialize plugin state: {e}")))?;
-        Self::atomic_write(&self.plugins_dir.join("state.json"), &bytes)
+        Self::atomic_write(&plugins_dir.join("state.json"), &bytes)
+    }
+
+    /// `RemovePlugin`'s fallback when `DeletePlugin` fails: marks each of
+    /// `files` in `state.json` for deletion at the next start
+    /// (`ChangePluginState(plugin, PluginStatus.Deleted)`), logging it as
+    /// upstream's "Unable to delete {Path}, so marking as deleteOnStartup."
+    /// does. A file outside `wasm_dir` or a mark that cannot be saved is the
+    /// uninstall's error, as `SaveManifest`'s failed write is upstream, and
+    /// then nothing is marked.
+    fn mark_deleted_on_startup(
+        &self,
+        id: Uuid,
+        wasm_dir: &Path,
+        files: &[(&Path, std::io::Error)],
+    ) -> Result<(), ServiceError> {
+        let Some((first, first_error)) = files.first() else {
+            return Ok(());
+        };
+        let removing = format!("removing {}: {first_error}", first.display());
+        let mut names = Vec::with_capacity(files.len());
+        for (path, error) in files {
+            match path.file_name() {
+                Some(name) if path.parent() == Some(wasm_dir) => names.push(name.to_os_string()),
+                _ => {
+                    return Err(ServiceError::backend(format!(
+                        "removing {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        let mut state = self.state.lock().expect("plugin state lock poisoned");
+        let added: Vec<OsString> = names
+            .into_iter()
+            .filter(|name| state.delete_on_startup.insert(name.clone()))
+            .collect();
+        if let Err(error) = self.persist(&state) {
+            for name in &added {
+                state.delete_on_startup.remove(name);
+            }
+            return Err(ServiceError::backend(format!(
+                "{removing}; marking it for deletion at the next start: {error}"
+            )));
+        }
+        drop(state);
+        for (path, error) in files {
+            tracing::warn!(
+                plugin = %id,
+                path = %path.display(),
+                %error,
+                "unable to delete the plugin file, so marking it for deletion at the next start"
+            );
+        }
+        Ok(())
+    }
+
+    /// Forgets the deletion mark on the file `name` in the WASM plugins
+    /// directory, which an install has just written again. A mark that cannot
+    /// be forgotten is the install's error: the next start would delete it.
+    fn unmark_deleted_on_startup(&self, name: &OsStr) -> Result<(), ServiceError> {
+        let mut state = self.state.lock().expect("plugin state lock poisoned");
+        if !state.delete_on_startup.remove(name) {
+            return Ok(());
+        }
+        self.persist(&state).inspect_err(|_| {
+            state.delete_on_startup.insert(name.to_os_string());
+        })
     }
 
     /// Refuses an install of `version` when it was installed before with
@@ -1118,18 +1265,20 @@ impl PluginManager for FerrofinPluginManager {
             let loaded = self.find(id).and_then(|plugin| plugin.artifact.clone());
             let staged = Some(wasm_dir.join(format!("{id}.wasm"))).filter(|path| path.exists());
             if loaded.is_some() || staged.is_some() {
-                for artifact in loaded.iter().chain(&staged) {
+                let mut undeletable = Vec::new();
+                // A repository install, once loaded, is both: one attempt
+                // and one warning for it.
+                let staged_too = staged.iter().filter(|path| loaded.as_ref() != Some(*path));
+                for artifact in loaded.iter().chain(staged_too) {
                     match std::fs::remove_file(artifact) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => {
-                            return Err(ServiceError::backend(format!(
-                                "removing {}: {e}",
-                                artifact.display()
-                            )));
-                        }
+                        Err(e) => undeletable.push((artifact.as_path(), e)),
                     }
                 }
+                // `RemovePlugin`: what `DeletePlugin` cannot delete is marked
+                // `Deleted`, and the uninstall goes on.
+                self.mark_deleted_on_startup(id, wasm_dir, &undeletable)?;
                 // Best-effort cleanup of the plugin's KV state, segment cache,
                 // its directory (configuration, private data and image) and
                 // enabled override; the artifact removal above is the
@@ -1429,6 +1578,8 @@ impl PluginManager for FerrofinPluginManager {
         std::fs::create_dir_all(wasm_dir)
             .map_err(|e| ServiceError::backend(format!("create {}: {e}", wasm_dir.display())))?;
         Self::atomic_write(&wasm_dir.join(format!("{}.wasm", package.id)), &bytes)?;
+        // Live again, as `PopulateManifest` writes the new status over `Deleted`.
+        self.unmark_deleted_on_startup(format!("{}.wasm", package.id).as_ref())?;
 
         // Record the installed digest (see step 4b) + declared egress.
         self.record_installed_digest(package.id, &chosen.version, digest);
@@ -2098,6 +2249,7 @@ fn same_json_kind(slot: &serde_json::Value, value: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod delete_on_startup;
     mod repository_images;
 
     use super::{
