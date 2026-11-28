@@ -17,6 +17,10 @@ use sqlx::sqlite::SqliteConnectOptions;
 /// and 12.4 add no schema migration).
 const JELLYFIN_SCHEMA: &str = include_str!("data/jellyfin-12.2-schema.sql");
 
+/// The build this test exports as, whose start the source records: the export
+/// refuses a data directory another build started last (gl-1910).
+const BUILD: &str = "v0.0.0-test";
+
 /// The item every fresh database holds, which the rows below hang on (the
 /// statements spell it out).
 const PLACEHOLDER: &str = "00000000-0000-0000-0000-000000000001";
@@ -110,6 +114,7 @@ async fn native_source(scratch: &Path) -> std::path::PathBuf {
         };
         query.execute(db.writer()).await.unwrap();
     }
+    db.record_started(BUILD).await.unwrap();
     db.pool().close().await;
     db.writer().close().await;
     source
@@ -126,6 +131,7 @@ async fn a_native_database_s_tables_are_exported_in_jellyfin_s_shape() {
         &DOCKER,
         &source.join(EXPORTED_DATABASE),
         &out,
+        BUILD,
     )
     .await
     .unwrap();
