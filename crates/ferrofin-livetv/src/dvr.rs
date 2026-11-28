@@ -1250,27 +1250,66 @@ mod tests {
         assert!(recorded.iter().all(|b| *b == 0x47));
     }
 
-    #[tokio::test]
+    /// A tuner that never ends: one packet every 10 ms.
+    struct TickingTuner;
+
+    struct TickingBody;
+
+    #[async_trait::async_trait]
+    impl crate::stream::TunerStreamBody for TickingBody {
+        async fn next_chunk(
+            &mut self,
+        ) -> Result<Option<Vec<u8>>, ferrofin_traits::error::ServiceError> {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(Some(vec![0x47_u8; 188]))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::stream::TunerStreamSource for TickingTuner {
+        async fn open(
+            &self,
+            _url: &str,
+            _headers: &std::collections::HashMap<String, String>,
+        ) -> Result<Box<dyn crate::stream::TunerStreamBody>, ferrofin_traits::error::ServiceError>
+        {
+            Ok(Box::new(TickingBody))
+        }
+
+        async fn content_type(
+            &self,
+            _url: &str,
+            _headers: &std::collections::HashMap<String, String>,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    /// On the paused clock: on the wall clock a starved runner could pass the
+    /// duration before the first packet, and the recording was rightly empty.
+    #[tokio::test(start_paused = true)]
     async fn a_direct_recording_from_a_url_stops_at_its_duration() {
         let dir = tempfile::tempdir().expect("temp dir");
         let target = dir.path().join("Url.ts");
-        let tuner = crate::stream::tests::LoopingTuner {
-            chunk: vec![0x47_u8; 188],
-            opens: Arc::new(AtomicUsize::new(0)),
-            content_type: None,
-        };
+        let duration = std::time::Duration::from_millis(80);
+        let started = tokio::time::Instant::now();
         record_direct(
-            &tuner,
+            &TickingTuner,
             &RecordingInput::Url {
                 url: "http://tuner/live".to_owned(),
                 headers: std::collections::HashMap::new(),
             },
             &target,
-            std::time::Duration::from_millis(80),
+            duration,
             &AtomicBool::new(false),
         )
         .await
         .expect("record");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= duration && elapsed < duration * 2,
+            "stopped after {elapsed:?}, not at {duration:?}"
+        );
         let size = tokio::fs::metadata(&target).await.expect("recording").len();
         assert!(size > 0, "the endless tuner must have produced something");
     }
