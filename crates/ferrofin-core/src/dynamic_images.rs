@@ -72,10 +72,10 @@
 //! The pass runs at the end of every library validation that was not
 //! cancelled — a rescan that changed nothing included, since a genre or a
 //! playlist the metadata editor or `POST /Playlists` created is no scan
-//! change. It first redraws, forced, the photo albums, folders and playlist
-//! files the validation's walk refreshed with every provider (a first
-//! refresh, a changed folder, an overdue interval), then goes over every
-//! other supported row, each gated by the rule above
+//! change. It first draws the music and photo albums, folders and playlist
+//! files the validation's walk refreshed, forced where that refresh ran every
+//! provider (a first refresh, a changed folder, an overdue interval), then
+//! goes over every other supported row, each gated by the rule above
 //! ([`DynamicImageProviders::refresh_all_between`], which serves the scan's
 //! item-refresh lane between two rows). The two root folders are refreshed
 //! instead at the validation's opening, before any library is walked, as
@@ -93,7 +93,10 @@
 //!   [`GeneratedImageProvider`].
 //! - A photo album or folder refreshes through a scan of its path; that
 //!   scan's closing passes draw every photo album, folder and playlist file it
-//!   refreshed ([`DynamicImageProviders::refresh_rows_between`]).
+//!   refreshed ([`DynamicImageProviders::refresh_rows_between`]). The draw is
+//!   the last of those rows' providers, so it writes the `DateLastRefreshed`
+//!   stamp the rest of the refresh left it, unless it failed, and re-saves a
+//!   row whose image it drew, as upstream's one `RefreshMetadata` does.
 //! - A library's or the root's refresh validates whole libraries the same
 //!   way, and also redraws the library tiles; the root's reaches the user
 //!   root's image too ([`DynamicImageProviders::refresh_roots_between`]).
@@ -247,6 +250,24 @@ pub struct DynamicImageReport {
     pub examined: usize,
     /// Rows whose Primary was (re)generated.
     pub generated: usize,
+}
+
+/// A row an item refresh reached, whose generated Primary
+/// [`DynamicImageProviders::refresh_rows_between`] draws as the last of its
+/// providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshedRow {
+    /// The item.
+    pub id: Uuid,
+    /// Its refresh runs every provider (`runAllProviders`), which forces the
+    /// draw.
+    pub force: bool,
+    /// The rest of its refresh earned its `DateLastRefreshed` stamp and left
+    /// it to the draw, which writes it unless it fails.
+    pub stamp: bool,
+    /// The rest of its refresh saved its row. Otherwise the stamp is written
+    /// only with a drawn image, whose save it rides on.
+    pub saved: bool,
 }
 
 /// What [`DynamicImageProviders::refresh_all_between`] awaits between two
@@ -490,36 +511,87 @@ impl DynamicImageProviders {
     ///
     /// Rows are drawn in the order given — a parent folder before the folder
     /// it copies from, as upstream refreshes a folder before its children — an
-    /// id listed twice once (forced if either listing was). Awaits `between`
-    /// before each row; an id with no row, and a locked row, are skipped.
+    /// id listed twice once (forced, and its stamp owed, if either listing
+    /// was). Awaits `between` before each row; an id with no row, and a locked
+    /// row, are skipped.
+    ///
+    /// The draw is the last of each row's providers, so the tail of its
+    /// `RefreshMetadata` is written here (`MetadataService.cs:216-262`): the
+    /// `DateLastRefreshed` stamp the rest of its refresh left to the draw,
+    /// unless the draw failed (`RunCustomProvider` counts it a failure), and
+    /// the repository save of a drawn image (`SaveInternal`'s `updateType >
+    /// None`, [`touch_item_updated`](ItemPersistenceService::touch_item_updated)).
+    /// Returns the rows drawn too, whose metadata savers the caller runs
+    /// (`SaveItemAsync`'s `SaveMetadataAsync` with `ImageUpdate`).
     ///
     /// # Errors
     ///
-    /// Only when the rows cannot be read; a failure on one row is logged and
-    /// the pass continues.
+    /// Only when the rows cannot be read. A failure drawing one row, or
+    /// writing its stamp or save, is logged, leaves it unstamped, and the pass
+    /// goes on.
     pub async fn refresh_rows_between<'b>(
         &self,
-        rows: &[(Uuid, bool)],
+        rows: &[RefreshedRow],
         between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
-    ) -> Result<DynamicImageReport, ServiceError> {
+    ) -> Result<(DynamicImageReport, Vec<Uuid>), ServiceError> {
         let mut report = DynamicImageReport::default();
-        if !self.processor.supports_image_collage_creation() {
-            return Ok(report);
-        }
-        let mut order: Vec<(Uuid, bool)> = Vec::with_capacity(rows.len());
+        let mut order: Vec<RefreshedRow> = Vec::with_capacity(rows.len());
         let mut at: std::collections::HashMap<Uuid, usize> =
             std::collections::HashMap::with_capacity(rows.len());
-        for &(id, force) in rows {
-            match at.entry(id) {
-                std::collections::hash_map::Entry::Occupied(slot) => order[*slot.get()].1 |= force,
+        for row in rows {
+            match at.entry(row.id) {
+                std::collections::hash_map::Entry::Occupied(slot) => {
+                    let first = &mut order[*slot.get()];
+                    first.force |= row.force;
+                    first.stamp |= row.stamp;
+                    first.saved |= row.saved;
+                }
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(order.len());
-                    order.push((id, force));
+                    order.push(*row);
                 }
             }
         }
-        self.refresh_windows(&order, between, &mut report).await?;
-        Ok(report)
+        // Without a collage-capable encoder nothing is drawn, which is no
+        // failure: the stamps are still owed.
+        let outcomes: std::collections::HashMap<Uuid, PassOutcome> =
+            if self.processor.supports_image_collage_creation() {
+                let forced: Vec<(Uuid, bool)> =
+                    order.iter().map(|row| (row.id, row.force)).collect();
+                self.refresh_windows(&forced, between, &mut report)
+                    .await?
+                    .into_iter()
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+        let mut drawn = Vec::new();
+        for row in &order {
+            let pass = outcomes.get(&row.id).copied().unwrap_or_default();
+            if pass.failed {
+                continue;
+            }
+            // Unsaved, the rest of its refresh wrote no row, so the stamp
+            // waits for a save the draw makes.
+            if row.stamp
+                && (row.saved || pass.changed)
+                && let Err(err) = self
+                    .persistence
+                    .set_date_last_refreshed(row.id, Some(chrono::Utc::now()))
+                    .await
+            {
+                tracing::warn!(%err, item_id = %row.id, "failed to record the item's refresh");
+                continue;
+            }
+            if pass.changed {
+                if let Err(err) = self.persistence.touch_item_updated(row.id).await {
+                    tracing::warn!(%err, item_id = %row.id, "failed to save the item's drawn image");
+                    continue;
+                }
+                drawn.push(row.id);
+            }
+        }
+        Ok((report, drawn))
     }
 
     /// `rows` in order, each behind its gate and forced as listed, tallied
@@ -528,13 +600,15 @@ impl DynamicImageProviders {
     /// is skipped. The window's image rows are read with it, and a row they
     /// settle ([`is_settled`](Self::is_settled)) costs no read of its own: a
     /// rescan of a music library reads no album's images one at a time
-    /// (gl-1277).
+    /// (gl-1277). Returns what each row it drew changed or failed at; a row
+    /// left out of it changed nothing.
     async fn refresh_windows<'b>(
         &self,
         rows: &[(Uuid, bool)],
         between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
         report: &mut DynamicImageReport,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Vec<(Uuid, PassOutcome)>, ServiceError> {
+        let mut outcomes = Vec::new();
         for chunk in rows.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let ids: Vec<Uuid> = chunk.iter().map(|&(id, _)| id).collect();
             let mut found: std::collections::HashMap<Uuid, BaseItemEntity> = self
@@ -554,10 +628,13 @@ impl DynamicImageProviders {
                     report.examined += 1;
                     continue;
                 }
-                self.refresh_tallied(&row, force, report).await;
+                let pass = self.refresh_tallied(&row, force, report).await;
+                if pass != PassOutcome::default() {
+                    outcomes.push((id, pass));
+                }
             }
         }
-        Ok(())
+        Ok(outcomes)
     }
 
     /// One row of a pass, tallied into `report`; a failure is logged and the
@@ -1194,6 +1271,16 @@ mod tests {
     use ferrofin_traits::persistence::LinkedChildrenService;
     use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
+    /// A row an item refresh reached that owes the draw no stamp.
+    fn drawn(id: Uuid, force: bool) -> RefreshedRow {
+        RefreshedRow {
+            id,
+            force,
+            stamp: false,
+            saved: false,
+        }
+    }
+
     /// Writes a small solid-colour PNG and returns its path.
     fn write_png(dir: &Path, name: &str, rgb: [u8; 3]) -> String {
         let mut img = image::RgbImage::new(24, 36);
@@ -1438,15 +1525,15 @@ mod tests {
         let id = |row: &BaseItemEntity| Uuid::parse_str(&row.id).expect("id");
 
         let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
-        let report = fx
+        let (report, _) = fx
             .providers
             .refresh_rows_between(
                 &[
-                    (id(&crime), false),
-                    (id(&drama), false),
-                    (Uuid::new_v4(), true),
+                    drawn(id(&crime), false),
+                    drawn(id(&drama), false),
+                    drawn(Uuid::new_v4(), true),
                     // Listed twice: drawn once, forced as either listing.
-                    (id(&crime), true),
+                    drawn(id(&crime), true),
                 ],
                 &nothing,
             )
@@ -1481,6 +1568,87 @@ mod tests {
             .await
             .expect("pass");
         assert_eq!(report.examined, 1, "{report:?}");
+    }
+
+    /// gl-593: the draw is the last of a row's providers, so it writes the
+    /// stamp the rest of the refresh left it: unless it fails, and for a row
+    /// that refresh did not save only with the image it draws, whose save
+    /// moves `DateLastSaved` and names the row for its metadata savers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refreshed_rows_write_the_stamp_their_draw_owes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fx = fixture().await;
+        let a = write_png(&fx.media_dir(), "a-poster.png", [200, 20, 20]);
+        let genres = ["Saved", "Unsaved", "Failed", "Drawn"];
+        for genre in genres {
+            fx.seed(BaseItemKind::Movie, genre, Some(genre), Some(&a))
+                .await;
+        }
+        assert_eq!(fx.providers.refresh_all().await.expect("pass").generated, 4);
+        let mut ids = Vec::new();
+        for genre in genres {
+            ids.push(
+                Uuid::parse_str(&fx.by_name(BaseItemKind::Genre, genre).await.id).expect("id"),
+            );
+        }
+        let [saved, unsaved, failed, redrawn] = ids[..] else {
+            unreachable!("four genres")
+        };
+        let items = &fx.items;
+        let row = |id| async move { items.retrieve_item(id).await.expect("read").expect("row") };
+        let before = row(redrawn).await.date_last_saved;
+        // The collage is written beside its old file: its folder read-only
+        // fails the draw.
+        let dir = PathBuf::from(fx.primary_of(failed).await.expect("primary").path)
+            .parent()
+            .expect("art dir")
+            .to_owned();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        if std::fs::write(dir.join("probe"), b"").is_ok() {
+            eprintln!("skipped: a read-only folder is writable here (running as root?)");
+            return;
+        }
+
+        let owed = |id, force, saved| RefreshedRow {
+            id,
+            force,
+            stamp: true,
+            saved,
+        };
+        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
+        let (_, drawn) = fx
+            .providers
+            .refresh_rows_between(
+                &[
+                    owed(saved, false, true),
+                    owed(unsaved, false, false),
+                    owed(failed, true, true),
+                    owed(redrawn, true, false),
+                ],
+                &nothing,
+            )
+            .await
+            .expect("pass");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert_eq!(drawn, [redrawn]);
+        assert!(row(saved).await.date_last_refreshed.is_some(), "saved");
+        assert_eq!(
+            row(unsaved).await.date_last_refreshed,
+            None,
+            "nothing saved"
+        );
+        assert_eq!(
+            row(failed).await.date_last_refreshed,
+            None,
+            "the draw failed"
+        );
+        let redrawn = row(redrawn).await;
+        assert!(
+            redrawn.date_last_refreshed.is_some(),
+            "saved with its image"
+        );
+        assert!(redrawn.date_last_saved > before, "the image's save");
     }
 
     /// `HasChangedByDate`: a file modified out of band no longer matches the
@@ -1911,7 +2079,7 @@ mod tests {
         // A copy drawn behind the gate, recording no refresh.
         let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
         fx.providers
-            .refresh_rows_between(&[(user_root, false)], &nothing)
+            .refresh_rows_between(&[drawn(user_root, false)], &nothing)
             .await
             .expect("pass");
         let copy = || async {
@@ -2000,7 +2168,7 @@ mod tests {
         // A copy drawn behind the gate, recording no refresh.
         let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
         fx.providers
-            .refresh_rows_between(&[(aggregate, false)], &nothing)
+            .refresh_rows_between(&[drawn(aggregate, false)], &nothing)
             .await
             .expect("pass");
         let copy = || async {

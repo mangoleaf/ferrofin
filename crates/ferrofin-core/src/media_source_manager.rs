@@ -1018,9 +1018,12 @@ pub type RemoteProbe = Arc<
 ///
 /// The item-refresh lane runs inside a running scan between two of its items,
 /// never beside it, as every scan writer relies on; and an item refresh removes
-/// nothing, so a shortcut whose file is gone is left to the next scan, as
-/// upstream's single-item refresh leaves it. The library manager is held
-/// weakly: the media source manager never keeps it alive.
+/// no item, so a shortcut whose file is gone is left to the next scan, as
+/// upstream's single-item refresh leaves it. Like upstream's `RefreshMetadata`,
+/// it finds the item's extras again (`RefreshExtras`) and, this being a
+/// FullRefresh, refreshes them, removing the ones whose files are gone. The
+/// library manager is held weakly: the media source manager never keeps it
+/// alive.
 #[must_use]
 pub fn item_refresh_remote_probe(library: Weak<dyn LibraryManager>) -> RemoteProbe {
     Arc::new(move |path: String| {

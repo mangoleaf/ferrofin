@@ -7,7 +7,7 @@
 
 /// What each Ferrofin table holds and where Jellyfin keeps the same, if
 /// anywhere, by name.
-const TABLE_NOTES: [(&str, &str); 20] = [
+const TABLE_NOTES: [(&str, &str); 21] = [
     (
         "FerrofinAdoption",
         "which Jellyfin release Ferrofin adopted the database from; nothing Jellyfin needs",
@@ -59,6 +59,10 @@ const TABLE_NOTES: [(&str, &str); 20] = [
     (
         "FerrofinMeta",
         "Ferrofin's settings for this database and the one-time repairs it ran; nothing Jellyfin needs",
+    ),
+    (
+        "FerrofinPendingChildMetadata",
+        "the music albums whose tags from their tracks a stopped library scan still owed; Jellyfin keeps none, as it derives them in the refresh that saves the album",
     ),
     (
         "FerrofinPlaybackSessions",

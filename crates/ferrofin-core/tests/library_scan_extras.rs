@@ -2823,3 +2823,318 @@ async fn a_video_extra_takes_the_year_in_its_file_name() {
     assert!(trailer.owner_id.is_some());
     assert_eq!(trailer.production_year, Some(2013));
 }
+
+/// A file item's own refresh, as `POST /Items/{id}/Refresh` runs it: the scan
+/// of its one path, with the folders above it read for context only.
+async fn refresh_item(f: &Fixture, relative: &str) -> ferrofin_core::ScanOutcome {
+    refresh_item_with(f, relative, &MetadataRefreshOptions::default()).await
+}
+
+/// [`refresh_item`] with `options`.
+async fn refresh_item_with(
+    f: &Fixture,
+    relative: &str,
+    options: &MetadataRefreshOptions,
+) -> ferrofin_core::ScanOutcome {
+    let context = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    f.scanner
+        .scan_target(
+            &ferrofin_traits::library::ScanTarget::Items(vec![
+                f.media.join(relative).to_string_lossy().into_owned(),
+            ]),
+            ferrofin_core::ScanRun::new(options, &context, &ferrofin_core::ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await
+        .unwrap()
+}
+
+/// The paths of the extras `owner` owns, sorted.
+async fn extra_paths(f: &Fixture, owner: &str) -> Vec<String> {
+    let mut paths: Vec<String> = sqlx::query_scalar(
+        r#"SELECT "Path" FROM "BaseItems" WHERE "OwnerId" = ? AND "ExtraType" IS NOT NULL"#,
+    )
+    .bind(owner)
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap();
+    let media = f.media.to_string_lossy().into_owned();
+    for path in &mut paths {
+        *path = path[media.len() + 1..].to_owned();
+    }
+    paths.sort();
+    paths
+}
+
+/// Upstream `BaseItem.RefreshMetadata` → `RefreshedOwnedItems` →
+/// `RefreshExtras` (`BaseItem.cs:1643-1747`): a movie's own refresh finds the
+/// extras added to its folder — a `trailers/` file, a `-trailer` sibling —
+/// and removes the one whose file is gone, while another movie's extras stay
+/// as they were.
+#[tokio::test]
+async fn an_items_refresh_finds_its_new_extras_and_removes_the_gone_ones() {
+    const RONIN: &str = "Ronin (1998)/Ronin.mkv";
+    const RONIN_TEASER: &str = "Ronin (1998)/trailers/Teaser.mkv";
+    let f = Fixture::new(&[MOVIE, EXTRA, RONIN, RONIN_TEASER]).await;
+    f.scanner.scan_all().await.unwrap();
+    let heat = f.row(MOVIE).await.id;
+    let ronin = f.row(RONIN).await.id;
+    std::fs::remove_file(f.media.join(EXTRA)).unwrap();
+    std::fs::remove_file(f.media.join(RONIN_TEASER)).unwrap();
+    for added in [
+        "Heat (1995)/trailers/Teaser.mkv",
+        "Heat (1995)/Heat-trailer.mkv",
+    ] {
+        std::fs::create_dir_all(f.media.join(added).parent().unwrap()).unwrap();
+        std::fs::write(f.media.join(added), b"").unwrap();
+    }
+
+    let outcome = refresh_item(&f, MOVIE).await;
+
+    assert_eq!(
+        extra_paths(&f, &heat).await,
+        [
+            "Heat (1995)/Heat-trailer.mkv",
+            "Heat (1995)/trailers/Teaser.mkv"
+        ]
+    );
+    assert_eq!((outcome.created, outcome.removed), (2, 1), "{outcome:?}");
+    let trailer = f.row("Heat (1995)/trailers/Teaser.mkv").await;
+    assert_eq!(
+        trailer.extra_type,
+        Some(ferrofin_model::entities::ExtraType::Trailer.json_value())
+    );
+    assert!(trailer.parent_id.is_none() && trailer.top_parent_id.is_none());
+    // Ronin's refresh is not this one: its gone teaser waits for it.
+    assert_eq!(extra_paths(&f, &ronin).await, [RONIN_TEASER]);
+    f.assert_browse(2).await;
+}
+
+/// The removal of an item refresh's extras is a listing's word: an extras
+/// folder that fails to list keeps what is stored under it, and the next
+/// refresh that lists it removes what is gone.
+#[tokio::test]
+async fn an_items_refresh_keeps_the_extras_of_a_folder_that_failed_to_list() {
+    const OLD: &str = "Heat (1995)/trailers/Old.mkv";
+    let f = Fixture::new(&[MOVIE, OLD]).await;
+    f.scanner.scan_all().await.unwrap();
+    let heat = f.row(MOVIE).await.id;
+    std::fs::remove_file(f.media.join(OLD)).unwrap();
+    *f.fs.fail.lock().unwrap() = Some(
+        f.media
+            .join("Heat (1995)/trailers")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    assert_eq!(refresh_item(&f, MOVIE).await.removed, 0);
+    assert_eq!(extra_paths(&f, &heat).await, [OLD]);
+
+    *f.fs.fail.lock().unwrap() = None;
+    assert_eq!(refresh_item(&f, MOVIE).await.removed, 1);
+    assert_eq!(extra_paths(&f, &heat).await, Vec::<String>::new());
+}
+
+/// Upstream `RefreshExtras` counts an extra gone as a changed set: an item's
+/// own refresh that finds one fewer gives the others its title metadata
+/// again, as a library scan does, where a refresh that finds them as they
+/// were gives them only its dates.
+#[tokio::test]
+async fn an_items_refresh_that_finds_an_extra_gone_copies_the_title_metadata() {
+    let f = Fixture::new(&[BR, BR_TRAILER, BR_FEATURETTE]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+
+    write_movie_nfo(&f, "Second plot", 1982);
+    refresh_item(&f, BR).await;
+    assert_eq!(f.row(BR).await.overview.as_deref(), Some("Second plot"));
+    assert_eq!(
+        f.row(BR_TRAILER).await.overview.as_deref(),
+        Some("First plot")
+    );
+
+    write_movie_nfo(&f, "Third plot", 1982);
+    std::fs::remove_file(f.media.join(BR_FEATURETTE)).unwrap();
+    assert_eq!(refresh_item(&f, BR).await.removed, 1);
+    assert_eq!(
+        f.row(BR_TRAILER).await.overview.as_deref(),
+        Some("Third plot")
+    );
+}
+
+/// Upstream `RefreshExtras`' early return: an item's refresh that finds its
+/// extras as they were, at Default, refreshes none of them (an extra's own
+/// NFO edit waits for a scan, and each keeps its last refresh), while a
+/// FullRefresh refreshes every one.
+#[tokio::test]
+async fn an_items_refresh_refreshes_its_unchanged_extras_only_in_full() {
+    let f = Fixture::new(&[BR, BR_TRAILER, BR_FEATURETTE]).await;
+    let nfo = f
+        .media
+        .join("Blade Runner (1982)/featurettes/Making of.nfo");
+    std::fs::write(&nfo, "<movie><title>Old cut</title></movie>").unwrap();
+    f.scanner.scan_all().await.unwrap();
+    std::fs::write(&nfo, "<movie><title>New cut</title></movie>").unwrap();
+    let refreshed = || async {
+        [
+            f.row(BR_TRAILER).await.date_last_refreshed,
+            f.row(BR_FEATURETTE).await.date_last_refreshed,
+        ]
+    };
+    let scanned = refreshed().await;
+
+    refresh_item(&f, BR).await;
+    assert_eq!(f.row(BR_FEATURETTE).await.name.as_deref(), Some("Old cut"));
+    assert_eq!(refreshed().await, scanned);
+
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    refresh_item_with(&f, BR, &full).await;
+    let after = refreshed().await;
+    assert!(
+        after
+            .iter()
+            .zip(scanned)
+            .all(|(after, before)| *after > before),
+        "{after:?} after {scanned:?}"
+    );
+}
+
+/// An item refresh whose own file is gone finds no extras for it, so it
+/// removes none: its extras wait, with it, for a folder or library scan.
+#[tokio::test]
+async fn an_items_refresh_with_its_file_gone_leaves_its_extras() {
+    let f = Fixture::new(&[MOVIE, EXTRA]).await;
+    f.scanner.scan_all().await.unwrap();
+    let heat = f.row(MOVIE).await.id;
+    std::fs::remove_file(f.media.join(MOVIE)).unwrap();
+    std::fs::remove_file(f.media.join(EXTRA)).unwrap();
+    assert_eq!(refresh_item(&f, MOVIE).await.removed, 0);
+    assert_eq!(extra_paths(&f, &heat).await, [EXTRA]);
+}
+
+/// An episode that owns videos in a folder of its own searches it for
+/// extras (`Episode.SupportsOwnedItems`): its own refresh finds a new one
+/// and removes the gone one.
+#[tokio::test]
+async fn an_episodes_refresh_finds_the_extras_of_its_own_folder_again() {
+    const MAKING_OF: &str = "Show/Season 01/S01E02/featurettes/Making of.mkv";
+    const INTERVIEW: &str = "Show/Season 01/S01E02/featurettes/Interview.mkv";
+    let f = Fixture::with_type(
+        &[
+            "Show/Season 01/S01E02/Show S01E02 - 1080p.mkv",
+            "Show/Season 01/S01E02/Show S01E02 - 720p.mkv",
+            MAKING_OF,
+        ],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let primary = f
+        .row(MAKING_OF)
+        .await
+        .owner_id
+        .expect("the episode's extra");
+    let path: String = sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?"#)
+        .bind(&primary)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    std::fs::remove_file(f.media.join(MAKING_OF)).unwrap();
+    std::fs::write(f.media.join(INTERVIEW), b"").unwrap();
+
+    let outcome = refresh_item(&f, &path[f.media.to_string_lossy().len() + 1..]).await;
+
+    assert_eq!(extra_paths(&f, &primary).await, [INTERVIEW]);
+    assert_eq!((outcome.created, outcome.removed), (1, 1), "{outcome:?}");
+}
+
+/// `BaseItem.RefreshMetadata` answers a `RefreshExtras` past its early return
+/// with `ForceSave`: an item refresh that finds a new extra saves the item
+/// itself, which a refresh finding them as they were does not.
+#[tokio::test]
+async fn an_items_refresh_whose_extras_changed_saves_the_item() {
+    let f = Fixture::new(&[BR, BR_TRAILER]).await;
+    f.scanner.scan_all().await.unwrap();
+    let saved = f.row(BR).await.date_last_saved;
+    refresh_item(&f, BR).await;
+    assert_eq!(f.row(BR).await.date_last_saved, saved);
+
+    let featurette = f.media.join(BR_FEATURETTE);
+    std::fs::create_dir_all(featurette.parent().unwrap()).unwrap();
+    std::fs::write(featurette, b"").unwrap();
+    refresh_item(&f, BR).await;
+    let now = f.row(BR).await.date_last_saved;
+    assert!(now > saved, "{now:?} after {saved:?}");
+}
+
+/// A theme song an older scan stored under an id the scan now derives
+/// differently keeps that id (`reuse_stored_extra_ids`: an audio extra is no
+/// video the scan moves to its derived id), and an item refresh still
+/// matches it by its path: found as it was at Default, refreshed (not
+/// duplicated) in full.
+#[tokio::test]
+async fn an_items_refresh_reaches_an_extra_stored_under_another_id() {
+    const THEME: &str = "Blade Runner (1982)/theme.mp3";
+    let f = Fixture::new(&[BR, THEME]).await;
+    f.scanner.scan_all().await.unwrap();
+    let derived = f.row(THEME).await.id;
+    let legacy = guid_to_db(Uuid::from_u128(0x0607));
+    for sql in [
+        r#"CREATE TEMP TABLE "Copy" AS SELECT * FROM "BaseItems" WHERE "Id" = ?1"#,
+        r#"UPDATE "Copy" SET "Id" = ?2"#,
+        r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#,
+        r#"INSERT INTO "BaseItems" SELECT * FROM "Copy""#,
+        r#"DROP TABLE "Copy""#,
+    ] {
+        sqlx::query(sql)
+            .bind(&derived)
+            .bind(&legacy)
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+    }
+    let stamp = f.row(THEME).await.date_last_refreshed;
+
+    refresh_item(&f, BR).await;
+    let theme = f.row(THEME).await;
+    assert_eq!(
+        (theme.id.as_str(), theme.date_last_refreshed),
+        (legacy.as_str(), stamp)
+    );
+
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    refresh_item_with(&f, BR, &full).await;
+    assert_eq!(rows_at(&f, THEME).await, 1);
+    let theme = f.row(THEME).await;
+    assert_eq!(theme.id, legacy);
+    assert!(theme.date_last_refreshed > stamp, "{theme:?}");
+}
+
+/// Upstream `RefreshExtras` refreshes the extras when `FindExtras` renamed
+/// one (`renamedExtraIds`), though the set is as it was: an item refresh
+/// at Default gives the trailer back the name the scan generates, where a
+/// quiet one would leave it.
+#[tokio::test]
+async fn an_items_refresh_renews_a_generated_extra_name() {
+    const TRAILER: &str = "Blade Runner (1982)/Blade Runner (1982)-trailer.mkv";
+    let f = Fixture::new(&[BR, TRAILER]).await;
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(TRAILER).await.name.as_deref(), Some("Trailer"));
+    sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ? WHERE "Path" = ?"#)
+        .bind("Blade Runner (1982)-trailer")
+        .bind(f.media.join(TRAILER).to_string_lossy().as_ref())
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    refresh_item(&f, BR).await;
+    assert_eq!(f.row(TRAILER).await.name.as_deref(), Some("Trailer"));
+}

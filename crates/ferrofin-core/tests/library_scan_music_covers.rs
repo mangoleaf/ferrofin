@@ -463,6 +463,50 @@ async fn an_album_names_its_folder_image_or_a_copy_of_its_first_tracks_cover() {
     assert_eq!(lib.primary(ids.embedded_album).await, copy);
 }
 
+// gl-593: the copy is the last of the album's providers, after the music
+// pass, so the stamp that pass earns waits for it: a full refresh whose copy
+// fails leaves the album as last refreshed (`RunCustomProvider` counts the
+// failure), and the next one, drawn, stamps it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_album_copy_withholds_the_albums_refresh_stamp() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let (lib, ids) = Library::scanned(root.path()).await;
+    let stamp = || async {
+        lib.items
+            .retrieve_item(ids.embedded_album)
+            .await
+            .unwrap()
+            .unwrap()
+            .date_last_refreshed
+    };
+    let first = stamp().await.expect("the first scan stamped it");
+    let copy = PathBuf::from(lib.primary(ids.embedded_album).await.path);
+    let full = ferrofin_traits::providers::MetadataRefreshOptions {
+        metadata_refresh_mode: ferrofin_traits::providers::MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: ferrofin_traits::providers::MetadataRefreshMode::FullRefresh,
+        ..Default::default()
+    };
+
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new().write(true).open(&copy).is_ok() {
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        eprintln!("skipped: a read-only file is writable here (running as root?)");
+        return;
+    }
+    let failed = Box::pin(lib.scanner.scan_with(None, &full)).await;
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o644)).unwrap();
+    failed.unwrap();
+    assert_eq!(
+        stamp().await,
+        Some(first),
+        "a failed copy withholds the stamp"
+    );
+
+    Box::pin(lib.scanner.scan_with(None, &full)).await.unwrap();
+    assert!(stamp().await.expect("stamped") > first);
+}
+
 // gl-1633: `MusicAlbumImageProvider` saves with `saveLocallyWithMedia: false`,
 // so an album's copy stays in its own folder when the library saves artwork
 // into its media folders, on the scan that draws it and on every one after.

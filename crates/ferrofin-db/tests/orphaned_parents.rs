@@ -439,7 +439,8 @@ async fn orphan_cleanup_terminates_on_parent_cycles() {
 /// never clears them. Each starts empty after 0042 has run, and Ferrofin writes
 /// them, and deletes items, with foreign keys on, so their `ON DELETE CASCADE`
 /// keeps them clean. Each must not exist yet when 0042 runs.
-const CREATED_EMPTY_AFTER_0042: [&str; 1] = ["FerrofinPluginOfferedItems"];
+const CREATED_EMPTY_AFTER_0042: [&str; 2] =
+    ["FerrofinPluginOfferedItems", "FerrofinPendingChildMetadata"];
 
 /// Every foreign key to `BaseItems` that exists when 0042 runs has its explicit
 /// delete there (nothing cascades with foreign keys off), so a table that gains
