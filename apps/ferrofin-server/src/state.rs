@@ -1794,6 +1794,17 @@ pub async fn build_app_state(
     let item_data_cleanup = Arc::new(ferrofin_core::item_data_cleanup::ItemDataCleanup::new(
         Arc::clone(&paths),
     ));
+    // The files Live TV is writing (`Video.IsActiveRecording`): the scan gives
+    // each its item but does not probe it, and the notifier does not announce
+    // it, until its capture ends.
+    let recording_paths: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+        let live_tv = Arc::downgrade(&live_tv);
+        Arc::new(move || {
+            live_tv
+                .upgrade()
+                .map_or_default(|live_tv| live_tv.paths_being_recorded())
+        })
+    };
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),
@@ -1802,15 +1813,7 @@ pub async fn build_app_state(
     .with_metadata_savers(Arc::clone(&providers))
     .with_image_saver(image_saver)
     .with_self_writes(Arc::clone(&self_writes_guard))
-    // A file being recorded is left alone until its capture ends.
-    .with_recording_paths({
-        let live_tv = Arc::downgrade(&live_tv);
-        Arc::new(move || {
-            live_tv
-                .upgrade()
-                .map_or_default(|live_tv| live_tv.paths_being_recorded())
-        })
-    })
+    .with_recording_paths(Arc::clone(&recording_paths))
     .with_trickplay(Arc::clone(&trickplay), {
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().trickplay_options.scan_behavior
@@ -1991,7 +1994,8 @@ pub async fn build_app_state(
                 ferrofin_core::library_changed_notifier::DEFAULT_LIBRARY_UPDATE_DURATION_SECS,
             ),
         )
-        .with_config(Arc::clone(&config_trait)),
+        .with_config(Arc::clone(&config_trait))
+        .with_recording_paths(recording_paths),
     );
     scanner = scanner
         .with_events(Arc::clone(&event_manager))

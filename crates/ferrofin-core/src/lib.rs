@@ -96,10 +96,8 @@
 //!   reuses the [`kinds`] helpers to branch on an item's kind (the C#
 //!   subclass type-tests). LiveTV channel/programme enrichment runs through the
 //!   late-bound Live TV manager, and `CanDelete` is upstream's `CanDelete(user)`
-//!   in full (`item_deletion::can_delete`). The active-recording rewrite
-//!   (`DtoService.cs:443-466`) is an open work item: the files being written
-//!   are known (`LiveTvManager::active_recording_paths`), the rewrite is not
-//!   applied yet.
+//!   in full (`item_deletion::can_delete`). A video a DVR capture is still
+//!   writing is rewritten as a recording in progress (`DtoService.cs:443-456`).
 //!
 //! ## Unit 7 — session manager + WebSocket wiring
 //!

@@ -17,7 +17,6 @@ use axum::response::Response;
 use chrono::{DateTime, Utc};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::entities::VideoType;
-use ferrofin_model::users::UserPolicy;
 use ferrofin_traits::filesystem::OpenedFile;
 use ferrofin_traits::media_encoding::HlsStreamRequest;
 use ferrofin_traits::options::AuthorizationInfo;
@@ -28,7 +27,6 @@ use uuid::Uuid;
 use crate::auth::user_authorization;
 use crate::error::ApiError;
 use crate::handlers::hls::transcode_stream_fallback;
-use crate::handlers::live_tv::recording_visible;
 use crate::state::AppState;
 
 /// What a static (direct-play) request is served from: the requested media
@@ -79,10 +77,9 @@ pub(crate) struct StaticSource {
 /// the account rules already: running them again reads nothing, and keeps this
 /// the one check every route calls.
 ///
-/// An id with no `BaseItems` row is no item of a library. A DVR recording's id
-/// has none (a scan gives its file a library item with another id) and answers
-/// to [`recording_access`]. Anything else is left for the route, which finds an
-/// unmirrored channel's tuner or answers as it always has. An open live stream
+/// An id with no `BaseItems` row is no item of a library: it is left for the
+/// route, which finds an unmirrored channel's tuner or answers as it always
+/// has. A DVR recording is its file's library item. An open live stream
 /// is not checked: its id is a capability, as on `PlaybackInfo`, which reads it
 /// by id once the item passes.
 ///
@@ -99,15 +96,8 @@ pub(crate) async fn require_streamable_item(
         return Ok(());
     };
     let client = state.client_address_of(extensions, headers);
-    let policy = user_authorization(auth, client, state, true).await?;
-    let refused = match row_access(state, item_id, user).await? {
-        RowAccess::Visible => false,
-        RowAccess::Hidden => true,
-        RowAccess::Absent => {
-            recording_access(state, item_id, Some(user), Some(&policy)).await? == Some(false)
-        }
-    };
-    if refused {
+    user_authorization(auth, client, state, true).await?;
+    if matches!(row_access(state, item_id, user).await?, RowAccess::Hidden) {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
     // `GetStaticMediaSources(item, …, user)` keeps a hidden version out of
@@ -149,39 +139,6 @@ async fn row_access(state: &AppState, id: Uuid, user: &UserEntity) -> Result<Row
     } else {
         RowAccess::Absent
     })
-}
-
-/// Whether the caller may play a DVR recording, or `None` when the id is
-/// not a recording. A request with no user has no user policy to apply.
-pub(crate) async fn recording_access(
-    state: &AppState,
-    id: Uuid,
-    user: Option<&UserEntity>,
-    policy: Option<&UserPolicy>,
-) -> Result<Option<bool>, ApiError> {
-    let Some(live_tv) = state.live_tv.as_ref() else {
-        return Ok(None);
-    };
-    let Some(recording) = live_tv.get_recording_item(id).await? else {
-        return Ok(None);
-    };
-    let Some(user) = user else {
-        return Ok(Some(true));
-    };
-    let loaded;
-    let policy = if let Some(policy) = policy {
-        policy
-    } else {
-        loaded = super::users::user_policy(state, user).await?;
-        let Some(policy) = loaded.as_ref() else {
-            return Ok(Some(false));
-        };
-        policy
-    };
-    if !policy.is_administrator && !policy.enable_live_tv_access {
-        return Ok(Some(false));
-    }
-    Ok(Some(recording_visible(state, recording, user).await?))
 }
 
 /// Resolves the direct-play source a stream request names.

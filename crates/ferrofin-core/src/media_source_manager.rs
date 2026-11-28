@@ -167,6 +167,10 @@ impl FerrofinMediaSourceManager {
         let Some(path) = item.path.clone().filter(|path| !path.is_empty()) else {
             return Ok(None);
         };
+        // An active recording's own sources are `Placeholder` upstream.
+        if self.is_active_recording(&path).await? {
+            return Ok(None);
+        }
         let lacks = |wanted: MediaStreamType| {
             first
                 .media_streams
@@ -294,6 +298,7 @@ impl FerrofinMediaSourceManager {
     /// item's row and the user's row when the caller has read them already (`known`, `user`).
     /// `read_timestamps` (PlaybackInfo only: nothing on the streaming, session or
     /// DTO paths reads the value) reads each local TS/M2TS source's `Timestamp`.
+    #[allow(clippy::too_many_lines)] // the Live TV branches, then `GetStaticMediaSources`' steps
     async fn static_sources(
         &self,
         item_id: Uuid,
@@ -318,8 +323,7 @@ impl FerrofinMediaSourceManager {
         // `MediaSourceManager.GetPlaybackMediaSources` selects on the item's
         // type. Keying on "the row was missing" instead would have made every
         // channel report an unplayable static source the moment the rows
-        // started existing. A DVR recording has no row at all and takes the
-        // same branch.
+        // started existing.
         let is_channel = stored
             .as_ref()
             .and_then(|row| crate::item_type_lookup::kind_from_type_name(&row.type_))
@@ -332,9 +336,6 @@ impl FerrofinMediaSourceManager {
             });
         if stored.is_none() || is_channel {
             let mut sources = self.channel_media_source(item_id).await?;
-            if sources.is_empty() {
-                sources = self.recording_media_source(item_id).await?;
-            }
             if sources.is_empty() {
                 return Ok(sources);
             }
@@ -355,6 +356,12 @@ impl FerrofinMediaSourceManager {
         let Some(item) = stored else {
             return Ok(Vec::new());
         };
+        if let Some(sources) = self
+            .active_recording_sources(item, item_id, enable_path_substitution, user_id)
+            .await?
+        {
+            return Ok(sources);
+        }
         // `hasMediaSources.GetMediaSources(...)` on the item itself
         // (`BaseItem.GetMediaSources`, `BaseItem.cs:1156-1189`): every version
         // in its group, each once, its own source first — so playing an
@@ -737,21 +744,63 @@ impl FerrofinMediaSourceManager {
         Ok(())
     }
 
-    /// The media sources for a DVR recording, or empty when the id is not one.
+    /// The sources of `item` while a live capture writes its file, `None`
+    /// otherwise. `Video.SourceType` is `LiveTV` then, so
+    /// `LiveTvMediaSourceProvider` serves it: the growing file, read through the
+    /// capture's stream, in place of the item's own sources (upstream makes
+    /// those `Placeholder`, which `SortMediaSources` drops), with
+    /// `GetPlaybackMediaSources`' per-user overwrite of a dynamic source.
+    async fn active_recording_sources(
+        &self,
+        item: &BaseItemEntity,
+        item_id: Uuid,
+        enable_path_substitution: bool,
+        user_id: Option<Uuid>,
+    ) -> Result<Option<Vec<MediaSourceInfo>>, ServiceError> {
+        let Some(path) = item.path.as_deref() else {
+            return Ok(None);
+        };
+        if !self.is_active_recording(path).await? {
+            return Ok(None);
+        }
+        let mut sources = self.recording_media_source(path).await?;
+        for source in &mut sources {
+            // Validate that this is actually possible.
+            if source.supports_direct_stream {
+                source.supports_direct_stream =
+                    supports_direct_stream(source.path.as_deref(), source.protocol);
+            }
+        }
+        self.apply_playback_permissions(&mut sources, item_id, item.media_type.as_deref(), user_id)
+            .await?;
+        if enable_path_substitution {
+            self.substitute_paths(&mut sources).await?;
+        }
+        Ok(Some(sources))
+    }
+
+    /// `Video.IsActiveRecording`: whether a live capture is writing `path`.
+    async fn is_active_recording(&self, path: &str) -> Result<bool, ServiceError> {
+        match &self.live_tv {
+            Some(live_tv) => live_tv.is_active_recording(path).await,
+            None => Ok(false),
+        }
+    }
+
+    /// The media source of the capture writing `path`, or empty when none is.
     ///
     /// Port of `LiveTvMediaSourceProvider.GetMediaSources`' active-recording
     /// branch → `MediaSourceManager.GetRecordingStreamMediaSources`: the Live
-    /// TV manager knows whether the capture is still running (and so whether
-    /// there is an `EncoderPath` to hand out), and the probe happens here,
-    /// where the encoder is.
+    /// TV manager knows the capture (and so the `EncoderPath` to hand out),
+    /// and the probe happens here, where the encoder is.
     async fn recording_media_source(
         &self,
-        item_id: Uuid,
+        path: &str,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         let Some(live_tv) = &self.live_tv else {
             return Ok(Vec::new());
         };
-        let mut sources = live_tv.get_recording_media_sources(item_id).await?;
+        let mut sources = live_tv.get_recording_media_sources(path).await?;
         for source in &mut sources {
             // `AddMediaInfoWithProbe(stream, false, false, ct)`: no cache key
             // and no probe delay — the file already has bytes in it.
@@ -2941,6 +2990,55 @@ mod tests {
         }
     }
 
+    /// `LiveTvMediaSourceProvider`: a library video whose file a capture is
+    /// writing plays the growing file through the capture's stream, in place
+    /// of its own source, and is not refreshed for its missing streams (its
+    /// own sources are `Placeholder` upstream). Once the capture ends it plays
+    /// as any video.
+    #[tokio::test]
+    async fn a_video_being_recorded_plays_the_capture() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x213);
+        seed_strm(&db, id, "/rec/News.ts", "{}").await;
+        let probed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let probe: RemoteProbe = {
+            let probed = Arc::clone(&probed);
+            Arc::new(move |path: String| {
+                probed.lock().unwrap().push(path);
+                Box::pin(async { Ok(()) })
+            })
+        };
+        let user = Uuid::from_u128(0x2FF);
+        let recording = manager(&db)
+            .with_remote_probe(Arc::clone(&probe))
+            .with_live_tv(Arc::new(FakeLiveTv {
+                recording: Some("/rec/News.ts".to_owned()),
+                ..FakeLiveTv::default()
+            }));
+        let sources = recording
+            .get_playback_media_sources(id, user, true, false)
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert_eq!(sources[0].id.as_deref(), Some("timer-1"));
+        assert!(sources[0].encoder_path.is_some() && sources[0].is_infinite_stream);
+        assert!(
+            probed.lock().unwrap().is_empty(),
+            "a growing file is not probed"
+        );
+
+        let finished = manager(&db)
+            .with_remote_probe(probe)
+            .with_live_tv(Arc::new(FakeLiveTv::default()));
+        let sources = finished
+            .get_playback_media_sources(id, user, true, false)
+            .await
+            .unwrap();
+        assert_eq!(sources[0].path.as_deref(), Some("/rec/News.ts"));
+        assert!(sources[0].encoder_path.is_none());
+        assert_eq!(probed.lock().unwrap().as_slice(), ["/rec/News.ts"]);
+    }
+
     /// `GetPlaybackMediaSources`: with a probe allowed, a `.strm` — and a video
     /// with no video stream — is refreshed with the remote probe first and its
     /// sources are read again; with no probe allowed, or a source that already
@@ -3082,6 +3180,8 @@ mod tests {
         /// How many consumers to report still watching after each close, in
         /// order (a `false` means "not the last one").
         remaining_consumers: std::sync::Mutex<Vec<bool>>,
+        /// The file a capture is writing, if any.
+        recording: Option<String>,
     }
 
     #[async_trait]
@@ -3216,6 +3316,30 @@ mod tests {
             // `LiveTvChannel.MediaType` for a television channel.
             Ok(Some("Video".to_owned()))
         }
+        async fn active_recording_paths(&self) -> Result<Vec<String>, ServiceError> {
+            Ok(self.recording.iter().cloned().collect())
+        }
+        async fn get_recording_media_sources(
+            &self,
+            path: &str,
+        ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+            Ok(if self.recording.as_deref() == Some(path) {
+                vec![MediaSourceInfo {
+                    id: Some("timer-1".to_owned()),
+                    path: Some(path.to_owned()),
+                    encoder_path: Some(
+                        "http://127.0.0.1:8096/LiveTv/LiveRecordings/timer-1/stream".to_owned(),
+                    ),
+                    protocol: MediaProtocol::File,
+                    supports_direct_stream: true,
+                    supports_transcoding: true,
+                    is_infinite_stream: true,
+                    ..MediaSourceInfo::default()
+                }]
+            } else {
+                Vec::new()
+            })
+        }
         async fn get_channel_media_sources(
             &self,
             id: Uuid,
@@ -3331,23 +3455,6 @@ mod tests {
             Ok(())
         }
         async fn cancel_series_timer(&self, _id: &str) -> Result<(), ServiceError> {
-            Ok(())
-        }
-        async fn get_recordings(
-            &self,
-        ) -> Result<
-            ferrofin_model::querying::QueryResult<ferrofin_model::dto::BaseItemDto>,
-            ServiceError,
-        > {
-            Ok(ferrofin_model::querying::QueryResult::default())
-        }
-        async fn get_recording(
-            &self,
-            _id: Uuid,
-        ) -> Result<Option<ferrofin_model::dto::BaseItemDto>, ServiceError> {
-            Ok(None)
-        }
-        async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
             Ok(())
         }
     }

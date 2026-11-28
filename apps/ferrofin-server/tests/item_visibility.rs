@@ -3224,28 +3224,122 @@ async fn a_visible_item_does_not_lend_out_a_hidden_version() {
     }
 }
 
-/// A DVR recording's row, whose id no `BaseItems` row carries, on a file of its
-/// own at `folder`. `channel` is the channel it was captured from.
-async fn stored_recording(f: &Fixture, folder: &str, name: &str, channel: uuid::Uuid) -> String {
-    let path = f.h.path(&format!("{folder}/{name}.ts"));
-    touch(&path, "captured");
-    let id = uuid::Uuid::new_v4();
-    let timer = ferrofin_livetv::dvr::TimerRecordingInfo {
-        id: format!("timer-{name}"),
-        name: name.to_owned(),
-        channel_id: channel,
-        ..ferrofin_livetv::dvr::TimerRecordingInfo::default()
-    };
-    ferrofin_livetv::dvr_repository::insert_recording(
-        &f.h.db,
-        id,
-        &timer,
-        &path,
-        chrono::Utc::now(),
+/// Makes `recordings` and `recorded-movies` the recording folders, which a
+/// `livetv` save makes the libraries "Recordings" and "Recorded Movies", and
+/// returns the first one's id.
+async fn recording_libraries(f: &Fixture) -> String {
+    let (status, mut options) = call(
+        &f.router,
+        "GET",
+        "/System/Configuration/livetv",
+        Some(&f.admin),
+        None,
     )
-    .await
-    .unwrap();
-    id.simple().to_string()
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for (member, folder) in [
+        ("RecordingPath", "recordings"),
+        ("MovieRecordingPath", "recorded-movies"),
+    ] {
+        let path = f.h.path(folder);
+        std::fs::create_dir_all(&path).unwrap();
+        options[member] = json!(path.to_string_lossy());
+    }
+    let (status, body) = call(
+        &f.router,
+        "POST",
+        "/System/Configuration/livetv",
+        Some(&f.admin),
+        Some(options),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    // The save makes the libraries on a task of its own.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, folders) = call(
+            &f.router,
+            "GET",
+            "/Library/VirtualFolders",
+            Some(&f.admin),
+            None,
+        )
+        .await;
+        let id = |name: &str| {
+            folders
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|folder| folder["Name"] == name)
+                .and_then(|folder| folder["ItemId"].as_str())
+                .map(str::to_owned)
+        };
+        if let (Some(open), Some(_)) = (id("Recordings"), id("Recorded Movies")) {
+            return open;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no recording libraries"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Recordings, as files under the recording folders, scanned: a recording is
+/// the library item of its file (`GetEmbyRecordingsAsync`). The recording
+/// folders are libraries of their own: "Recordings", which the viewer is
+/// granted, and "Recorded Movies", which they are not. Each `(open, name)` is
+/// `{name}/{name}.ts` in the first when `open`, else in the second. Returns
+/// each one's item id, without dashes, in order.
+async fn recorded(f: &Fixture, files: &[(bool, &str)]) -> Vec<String> {
+    let open = recording_libraries(f).await;
+    set_policy(f, &f.viewer_id, |policy| {
+        policy["EnabledFolders"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(open));
+    })
+    .await;
+    let paths: Vec<String> = files
+        .iter()
+        .map(|(open, name)| {
+            let folder = if *open {
+                "recordings"
+            } else {
+                "recorded-movies"
+            };
+            let path = f.h.path(&format!("{folder}/{name}/{name}.ts"));
+            touch(&path, "captured");
+            path.to_string_lossy().into_owned()
+        })
+        .collect();
+    assert!(
+        f.h.wired
+            .state
+            .library
+            .run_library_scan(ScanTrigger::Api, None)
+            .await
+            .unwrap()
+    );
+    let (status, items) = call(
+        &f.router,
+        "GET",
+        "/Items?recursive=true&mediaTypes=Video&fields=Path",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{items}");
+    let by_path: std::collections::HashMap<&str, &str> = items["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| Some((item["Path"].as_str()?, item["Id"].as_str()?)))
+        .collect();
+    paths
+        .iter()
+        .map(|path| by_path[path.as_str()].replace('-', ""))
+        .collect()
 }
 
 /// An M3U tuner with one channel whose stream is a local origin, listed through
@@ -3290,140 +3384,61 @@ async fn stored_channel(f: &Fixture) -> String {
         .to_owned()
 }
 
-/// A recording's id names no `BaseItems` row, and it must still play for every
-/// caller who may reach it. PlaybackInfo and the stream routes apply Live TV
-/// access and check the recording, its containing libraries, and its channel.
-#[allow(
-    clippy::too_many_lines,
-    reason = "one recording, through every rule that reaches it"
-)]
+/// A recording plays as its library item does: for whoever may open it, and
+/// for no one else, on `PlaybackInfo`, the stream routes and its own Live TV
+/// routes alike (gl-1090's rule for a DVR row id is gone with the rows).
 #[tokio::test]
-async fn a_recording_plays_for_whoever_may_read_it() {
+async fn a_recording_plays_as_its_library_item() {
     let f = fixture().await;
-    let channel = stored_channel(&f).await;
-    let channel = channel.parse().unwrap();
-    let id = stored_recording(&f, "recordings", "show", channel).await;
+    let ids = recorded(&f, &[(true, "show"), (false, "kept-out")]).await;
+    let (id, hidden) = (&ids[0], &ids[1]);
     let uri = format!("/Videos/{id}/stream?static=true");
-    let audio = format!("/Audio/{id}/stream?static=true");
     let info = format!("/Items/{id}/PlaybackInfo");
     assert_eq!(status_with(&f.router, &uri, &[]).await, StatusCode::OK);
     for token in [&f.viewer, &f.admin] {
-        assert_eq!(
-            call(
-                &f.router,
-                "GET",
-                &format!("/LiveTv/Recordings/{id}"),
-                Some(token),
-                None
-            )
-            .await
-            .0,
-            StatusCode::OK
-        );
-        for (method, body) in [("GET", None), ("POST", Some(json!({"MediaSourceId": id})))] {
-            let (status, response) = call(&f.router, method, &info, Some(token), body).await;
-            assert_eq!(status, StatusCode::OK, "{method} {info}: {response}");
-            assert_eq!(response["MediaSources"][0]["Id"], id);
-            assert!(response["PlaySessionId"].is_string());
+        for route in [&format!("/LiveTv/Recordings/{id}"), &info, &uri] {
+            let (status, body) = call(&f.router, "GET", route, Some(token), None).await;
+            assert_eq!(status, StatusCode::OK, "{route}: {body}");
         }
-        for uri in [&uri, &audio] {
-            assert_eq!(
-                call(&f.router, "GET", uri, Some(token), None).await.0,
-                StatusCode::OK,
-                "{uri}"
-            );
-        }
-    }
-    let hidden = stored_recording(&f, "more", "kept-out", channel).await;
-    let uri_hidden = format!("/Videos/{hidden}/stream?static=true");
-    let hidden_info = format!("/Items/{hidden}/PlaybackInfo");
-    for (recording, expected) in [
-        (&hidden_info, StatusCode::NOT_FOUND),
-        (&info, StatusCode::OK),
-    ] {
-        assert_eq!(
-            call(
-                &f.router,
-                "POST",
-                recording,
-                Some(&f.viewer),
-                Some(json!({}))
-            )
-            .await
-            .0,
-            expected
-        );
-    }
-    assert_eq!(
-        call(&f.router, "GET", &uri_hidden, Some(&f.viewer), None)
-            .await
-            .0,
-        StatusCode::NOT_FOUND,
-        "a file inside a library the user cannot open"
-    );
-    assert_eq!(
-        call(&f.router, "GET", &uri_hidden, Some(&f.admin), None)
-            .await
-            .0,
-        StatusCode::OK
-    );
-    let lost = stored_recording(&f, "recordings", "gone", uuid::Uuid::from_u128(0xdead)).await;
-    assert_eq!(
-        call(
-            &f.router,
-            "GET",
-            &format!("/Videos/{lost}/stream?static=true"),
-            Some(&f.viewer),
-            None
-        )
-        .await
-        .0,
-        StatusCode::OK,
-        "a channel gone from the lineup leaves its recordings playable"
-    );
-    assert_eq!(
-        call(
-            &f.router,
-            "GET",
-            &format!("/LiveTv/Recordings/{lost}"),
-            Some(&f.viewer),
-            None
-        )
-        .await
-        .0,
-        StatusCode::OK
-    );
-    // Its channel hidden from the user, and then the recording itself: what the
-    // user may not see of it, on the stream and on its own route.
-    for kind in ["LiveTvChannel", "Other"] {
-        set_policy(&f, &f.viewer_id, |policy| {
-            policy["BlockUnratedItems"] = json!([kind]);
-        })
-        .await;
-        for route in [&uri, &info, &format!("/LiveTv/Recordings/{id}")] {
-            assert_eq!(
-                call(&f.router, "GET", route, Some(&f.viewer), None).await.0,
-                StatusCode::NOT_FOUND,
-                "{kind} unrated blocked: {route}"
-            );
-        }
+        let (status, response) = call(&f.router, "POST", &info, Some(token), Some(json!({}))).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["MediaSources"][0]["Id"], id.as_str());
     }
     set_policy(&f, &f.viewer_id, |policy| {
-        policy["BlockUnratedItems"] = json!([]);
-        policy["EnableLiveTvAccess"] = json!(false);
+        policy["EnableLiveTvManagement"] = json!(true);
     })
     .await;
-    for uri in [&uri, &audio, &info] {
+    for route in [
+        format!("/LiveTv/Recordings/{hidden}"),
+        format!("/Items/{hidden}/PlaybackInfo"),
+        format!("/Videos/{hidden}/stream?static=true"),
+    ] {
         assert_eq!(
-            call(&f.router, "GET", uri, Some(&f.viewer), None).await.0,
+            call(&f.router, "GET", &route, Some(&f.viewer), None)
+                .await
+                .0,
             StatusCode::NOT_FOUND,
-            "no Live TV access: {uri}"
+            "a file inside a library the user cannot open: {route}"
+        );
+        assert_eq!(
+            call(&f.router, "GET", &route, Some(&f.admin), None).await.0,
+            StatusCode::OK,
+            "{route}"
         );
     }
-    assert_eq!(status_with(&f.router, &uri, &[]).await, StatusCode::OK);
+    let delete = format!("/LiveTv/Recordings/{hidden}");
     assert_eq!(
-        call(&f.router, "GET", &uri, Some(&f.admin), None).await.0,
-        StatusCode::OK
+        call(&f.router, "DELETE", &delete, Some(&f.viewer), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&f.router, "GET", &delete, Some(&f.admin), None)
+            .await
+            .0,
+        StatusCode::OK,
+        "the refused delete left the recording"
     );
 }
 
@@ -3442,33 +3457,35 @@ async fn listed_recordings(f: &Fixture, query: &str, token: &str) -> (Vec<String
     (ids, page["TotalRecordCount"].as_u64().unwrap())
 }
 
-/// `GET /LiveTv/Recordings` lists only what `GET /LiveTv/Recordings/{id}` lets
-/// the user open, as upstream's library query under the recording folders the
-/// user may see does. A recording inside a library the user cannot open is left
-/// out before paging, so `TotalRecordCount` counts what the user can page
-/// through.
+/// `GET /LiveTv/Recordings` lists the library items under the recording
+/// folders the user may see, queried as that user, so `TotalRecordCount`
+/// counts what the user can page through; and it lists what
+/// `GET /LiveTv/Recordings/{id}` lets the user open.
 #[tokio::test]
 async fn the_recordings_list_keeps_to_what_the_user_may_open() {
     let f = fixture().await;
-    let channel = uuid::Uuid::from_u128(0xdead);
-    let mut open = Vec::new();
-    for name in ["open-a", "open-b"] {
-        open.push(stored_recording(&f, "recordings", name, channel).await);
-    }
-    let mut kept_out = Vec::new();
-    for name in ["kept-out-a", "kept-out-b", "kept-out-c"] {
-        kept_out.push(stored_recording(&f, "more", name, channel).await);
-    }
+    let ids = recorded(
+        &f,
+        &[
+            (true, "open-a"),
+            (true, "open-b"),
+            (false, "kept-out-a"),
+            (false, "kept-out-b"),
+            (false, "kept-out-c"),
+        ],
+    )
+    .await;
     let sorted = |mut ids: Vec<String>| {
         ids.sort();
         ids
     };
-    let everything = sorted(open.iter().chain(&kept_out).cloned().collect());
+    let (open, kept_out) = ids.split_at(2);
+    let everything = sorted(ids.clone());
 
-    let (ids, total) = listed_recordings(&f, "", &f.admin).await;
-    assert_eq!((sorted(ids), total), (everything.clone(), 5));
-    let (ids, total) = listed_recordings(&f, "", &f.viewer).await;
-    assert_eq!((sorted(ids), total), (sorted(open.clone()), 2));
+    let (listed, total) = listed_recordings(&f, "", &f.admin).await;
+    assert_eq!((sorted(listed), total), (everything.clone(), 5));
+    let (listed, total) = listed_recordings(&f, "", &f.viewer).await;
+    assert_eq!((sorted(listed), total), (sorted(open.to_vec()), 2));
     // The same rule as the recording's own route.
     for (id, expected) in open
         .iter()
@@ -3483,79 +3500,28 @@ async fn the_recordings_list_keeps_to_what_the_user_may_open() {
         );
     }
 
-    // Paging runs over what is left, whichever way the rows interleave.
+    // Paging runs over what the user may open.
     let mut paged = Vec::new();
     for start in 0..3 {
         let query = format!("?startIndex={start}&limit=1");
-        let (ids, total) = listed_recordings(&f, &query, &f.viewer).await;
+        let (listed, total) = listed_recordings(&f, &query, &f.viewer).await;
         assert_eq!(total, 2, "{query}");
-        assert_eq!(ids.len(), usize::from(start < 2), "{query}");
-        paged.extend(ids);
+        assert_eq!(listed.len(), usize::from(start < 2), "{query}");
+        paged.extend(listed);
     }
-    assert_eq!(sorted(paged), sorted(open.clone()));
+    assert_eq!(sorted(paged), sorted(open.to_vec()));
 
     // A request naming the user is held to that user, as by id; one with no
-    // user at all (an API key naming none) is not, as by id.
+    // user at all (an API key naming none) is not.
     let viewer_id = &f.viewer_id;
     let named = format!("?userId={viewer_id}");
-    let (ids, total) = listed_recordings(&f, &named, &f.admin).await;
-    assert_eq!((sorted(ids), total), (sorted(open.clone()), 2));
+    let (listed, total) = listed_recordings(&f, &named, &f.admin).await;
+    assert_eq!((sorted(listed), total), (sorted(open.to_vec()), 2));
     let key = only_api_key(&f).await;
-    let (ids, total) = listed_recordings(&f, &named, &key).await;
-    assert_eq!((sorted(ids), total), (sorted(open.clone()), 2));
-    let (ids, total) = listed_recordings(&f, "", &key).await;
-    assert_eq!((sorted(ids), total), (everything, 5));
-}
-
-/// A recording's file is held by a library whose location is spelled in
-/// another case, as upstream compares physical locations (`OrdinalIgnoreCase`,
-/// `LibraryManager.GetCollectionFoldersInternal`) and as every other library
-/// lookup here does. On a case-insensitive mount the two spellings are one
-/// directory, so a user who may not open the library may not open, stream,
-/// list or delete the recording through its DVR id either.
-#[tokio::test]
-async fn a_recording_in_a_library_spelled_in_another_case_keeps_to_that_library() {
-    let f = fixture().await;
-    let channel = uuid::Uuid::from_u128(0xdead);
-    let open = stored_recording(&f, "recordings", "open", channel).await;
-    // "Hidden" is the library at `more`.
-    let kept_out = stored_recording(&f, "MORE", "kept-out", channel).await;
-    set_policy(&f, &f.viewer_id, |policy| {
-        policy["EnableLiveTvManagement"] = json!(true);
-    })
-    .await;
-
-    for route in [
-        format!("/LiveTv/Recordings/{kept_out}"),
-        format!("/Videos/{kept_out}/stream?static=true"),
-    ] {
-        assert_eq!(
-            call(&f.router, "GET", &route, Some(&f.viewer), None)
-                .await
-                .0,
-            StatusCode::NOT_FOUND,
-            "{route}"
-        );
-        assert_eq!(
-            call(&f.router, "GET", &route, Some(&f.admin), None).await.0,
-            StatusCode::OK,
-            "{route}"
-        );
-    }
-    let (ids, total) = listed_recordings(&f, "", &f.viewer).await;
-    assert_eq!((ids, total), (vec![open], 1));
-    let uri = format!("/LiveTv/Recordings/{kept_out}");
-    assert_eq!(
-        call(&f.router, "DELETE", &uri, Some(&f.viewer), None)
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        call(&f.router, "GET", &uri, Some(&f.admin), None).await.0,
-        StatusCode::OK,
-        "the refused delete left the recording"
-    );
+    let (listed, total) = listed_recordings(&f, &named, &key).await;
+    assert_eq!((sorted(listed), total), (sorted(open.to_vec()), 2));
+    let (listed, total) = listed_recordings(&f, "", &key).await;
+    assert_eq!((sorted(listed), total), (everything, 5));
 }
 
 /// A channel is a row with no path, so the library list does not reach it. Its

@@ -23,10 +23,12 @@ use crate::file_system::FerrofinFileSystem;
 use crate::item_persistence_service::FerrofinItemPersistenceService;
 use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
 
-/// A real filesystem that records every directory the planner lists.
+/// A real filesystem that records every directory the planner lists, and
+/// runs `on_list` before each listing.
 #[derive(Default)]
 struct CountingFs {
     listed: Mutex<Vec<String>>,
+    on_list: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl CountingFs {
@@ -38,6 +40,9 @@ impl CountingFs {
 impl FileSystem for CountingFs {
     fn get_file_system_entries(&self, path: &str) -> Vec<FileSystemEntryInfo> {
         self.listed.lock().unwrap().push(path.to_owned());
+        if let Some(on_list) = &self.on_list {
+            on_list();
+        }
         FerrofinFileSystem::new().get_file_system_entries(path)
     }
     fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
@@ -936,12 +941,11 @@ async fn plan_follows_linked_folders_and_stops_at_a_loop() {
     );
 }
 
-/// A file Live TV is writing stays out of the plan until the capture ends, and
-/// is planned like any other file then. The set is read per listing: a capture
-/// that starts during a pass is seen by the listings after it, which is all a
-/// file it created can be in.
+/// A file Live TV is writing is planned like any other, so it has its item
+/// while it is written, as upstream's `OnStarted` refresh gives it one: only
+/// its probe waits for the capture to end (`Video.IsCompleteMedia`).
 #[tokio::test]
-async fn a_file_being_recorded_stays_out_of_the_plan() {
+async fn a_file_being_recorded_is_planned() {
     let tmp = tempfile::tempdir().unwrap();
     let dvr = tmp.path().join("dvr");
     touch(&dvr, "Evening News - 2026-10-30.ts");
@@ -950,37 +954,27 @@ async fn a_file_being_recorded_stays_out_of_the_plan() {
         .join("Evening News - 2026-10-30.ts")
         .display()
         .to_string();
-    let paths = Arc::new(Mutex::new(vec![recording.clone()]));
-    let read = Arc::clone(&paths);
+    let read = recording.clone();
     let folders = vec![library(1, None, &dvr)];
     let scanner = scanner(tmp.path(), Arc::new(CountingFs::default()))
         .await
-        .with_recording_paths(Arc::new(move || read.lock().unwrap().clone()));
-    let planned = |scanner: &LibraryScanner| -> Vec<String> {
-        scanner
-            .plan_in(
-                &folders,
-                &folders,
-                PlanScope::ALL,
-                super::DateAdded::default(),
-                None,
-                None,
-            )
-            .items
-            .iter()
-            .filter_map(|p| p.entity.path.clone())
-            .filter(|path| path.contains("News"))
-            .collect()
-    };
-
-    let during = planned(&scanner);
-    assert_eq!(during.len(), 1, "{during:?}");
-    assert!(!during.contains(&recording), "{during:?}");
-
-    paths.lock().unwrap().clear();
-    let after = planned(&scanner);
-    assert_eq!(after.len(), 2, "{after:?}");
-    assert!(after.contains(&recording), "{after:?}");
+        .with_recording_paths(Arc::new(move || vec![read.clone()]));
+    let planned: Vec<String> = scanner
+        .plan_in(
+            &folders,
+            &folders,
+            PlanScope::ALL,
+            super::DateAdded::default(),
+            None,
+            None,
+        )
+        .items
+        .iter()
+        .filter_map(|p| p.entity.path.clone())
+        .filter(|path| path.contains("News"))
+        .collect();
+    assert_eq!(planned.len(), 2, "{planned:?}");
+    assert!(planned.contains(&recording), "{planned:?}");
 }
 
 /// `DotIgnoreIgnoreRule` (`LibraryManager.IgnoreFile`): a `.ignore` file hides
@@ -1052,16 +1046,17 @@ async fn a_dot_ignore_edited_during_a_pass_decides_the_listings_after_it() {
     std::fs::write(&file, "drafts/\n").unwrap();
     let listings = AtomicUsize::new(0);
     let folders = vec![library(1, Some(CollectionTypeOptions::movies), &movies)];
-    // The hook runs in every listing before its entries are filtered: the
-    // edit lands after the library root's listing, before its folder's.
-    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default()))
-        .await
-        .with_recording_paths(Arc::new(move || {
+    // The hook runs as each directory is listed: the edit lands after the
+    // library root's listing, before its folder's.
+    let fs = CountingFs {
+        on_list: Some(Box::new(move || {
             if listings.fetch_add(1, Ordering::Relaxed) == 1 {
                 std::fs::write(&file, "*.mkv\n").unwrap();
             }
-            Vec::new()
-        }));
+        })),
+        ..CountingFs::default()
+    };
+    let scanner = scanner(tmp.path(), Arc::new(fs)).await;
     let plan = scanner.plan_in(
         &folders,
         &folders,

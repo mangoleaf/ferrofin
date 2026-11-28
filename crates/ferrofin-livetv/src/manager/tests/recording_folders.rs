@@ -13,7 +13,6 @@ use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::live_tv::LiveTvOptions;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::RecordingLibrary;
-use ferrofin_traits::options::DtoOptions;
 use ferrofin_traits::stubs::LiveTvManager;
 use uuid::Uuid;
 
@@ -733,10 +732,11 @@ async fn a_caller_that_goes_away_does_not_stop_the_pass() {
 }
 
 /// The whole of a first recording: its directory does not exist until it
-/// starts, the file stays out of scans while it is written, and the refresh at
-/// the end is what lets a scan find it.
+/// starts, its start makes the library and then refreshes the file, which
+/// gives it its item while it is written (`OnStarted`), and the end refreshes
+/// it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_first_recording_makes_its_library_and_is_refreshed_when_it_ends() {
+async fn a_first_recording_makes_its_library_and_is_refreshed_as_it_starts_and_ends() {
     let dir = tempfile::tempdir().unwrap();
     let library = FakeLibrary::with(Vec::new());
     let mgr = manager(dir.path(), &library).await;
@@ -762,105 +762,24 @@ async fn a_first_recording_makes_its_library_and_is_refreshed_when_it_ends() {
     assert!(made.is_some(), "the recording's start makes the library");
     assert_eq!(library.libraries()[0].0, "Recordings");
     assert_eq!(mgr.paths_being_recorded(), std::slice::from_ref(&path));
-    assert!(library.refreshed().is_empty(), "nothing to scan yet");
+    let started = wait_for(|| async { (!library.refreshed().is_empty()).then_some(()) }).await;
+    assert!(
+        started.is_some(),
+        "the start of a capture refreshes its file"
+    );
+    assert_eq!(library.refreshed(), std::slice::from_ref(&path));
 
     mgr.cancel_timer(&timer_id).await.expect("cancel");
 
-    let refreshed = wait_for(|| async { (!library.refreshed().is_empty()).then_some(()) }).await;
+    let refreshed = wait_for(|| async { (library.refreshed().len() == 2).then_some(()) }).await;
     assert!(
         refreshed.is_some(),
         "the end of a capture refreshes its file"
     );
-    assert_eq!(library.refreshed(), std::slice::from_ref(&path));
+    assert_eq!(library.refreshed(), [path.clone(), path.clone()]);
     let value = mgr.paths_being_recorded();
     assert!(value.is_empty(), "{value:?}");
     let _ = tokio::fs::remove_file(path).await;
-}
-
-/// What is left of a recording after its file went another way than
-/// `DELETE /LiveTv/Recordings/{id}`: a library delete, or the file gone from
-/// under the server. And that delete takes the library item with the file.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_recording_lists_while_it_has_a_file_and_deletes_with_its_item() {
-    let dir = tempfile::tempdir().unwrap();
-    let library = FakeLibrary::with(Vec::new());
-    let mgr = manager(dir.path(), &library).await;
-    let list = |mgr: FerrofinLiveTvManager| async move {
-        mgr.get_recordings_matching(
-            &ferrofin_model::live_tv::RecordingQuery::default(),
-            None,
-            &DtoOptions::default(),
-            None,
-        )
-        .await
-        .expect("recordings")
-    };
-    let program = now_playing(&mgr).await;
-    let defaults = mgr
-        .get_new_timer_defaults(Some(Uuid::parse_str(&program.id).expect("guid")))
-        .await
-        .expect("defaults");
-    let timer_id = mgr
-        .create_timer(timer_from_defaults(&defaults))
-        .await
-        .expect("create");
-    let path = wait_for(|| async {
-        mgr.get_active_recording_path(&timer_id)
-            .await
-            .ok()
-            .flatten()
-    })
-    .await
-    .expect("the capture must start");
-    let bytes = wait_for(|| async {
-        let written = tokio::fs::metadata(&path).await.is_ok_and(|m| m.len() > 0);
-        written.then_some(())
-    })
-    .await;
-    assert!(bytes.is_some(), "the capture wrote something");
-    // Still listed while it is written.
-    assert_eq!(list(mgr.clone()).await.items.len(), 1);
-    mgr.cancel_timer(&timer_id).await.expect("cancel");
-    let settled = wait_for(|| async {
-        let mgr = mgr.clone();
-        let items = list(mgr).await.items;
-        (items.len() == 1 && items[0].status.is_none()).then_some(())
-    })
-    .await;
-    assert!(settled.is_some(), "the capture settles as a recording");
-    let id = list(mgr.clone()).await.items[0].id;
-
-    tokio::fs::rename(&path, format!("{path}.moved"))
-        .await
-        .expect("move");
-    let listed = list(mgr.clone()).await;
-    assert!(listed.items.is_empty(), "{:?}", listed.items);
-    assert_eq!(listed.total_record_count, 0);
-    assert!(mgr.get_recording(id).await.expect("read").is_none());
-
-    tokio::fs::rename(format!("{path}.moved"), &path)
-        .await
-        .expect("move back");
-    let listed = list(mgr.clone()).await;
-    assert_eq!(listed.items.len(), 1);
-    assert!(
-        mgr.get_recording(listed.items[0].id)
-            .await
-            .expect("read")
-            .is_some()
-    );
-
-    // Its folder gone too is an unmounted share, not a deleted recording.
-    let folder = Path::new(&path).parent().expect("a folder").to_path_buf();
-    let offline = folder.with_extension("offline");
-    tokio::fs::rename(&folder, &offline).await.expect("unmount");
-    assert_eq!(list(mgr.clone()).await.items.len(), 1);
-    tokio::fs::rename(&offline, &folder).await.expect("mount");
-
-    let before = library.refreshed().len();
-    mgr.delete_recording(id).await.expect("delete");
-    assert!(!Path::new(&path).exists());
-    assert_eq!(library.refreshed()[before..], [path]);
 }
 
 /// A library delete names the item's path: the file, or a series' folder. It
@@ -871,15 +790,12 @@ async fn a_library_delete_forgets_the_recordings_under_its_path() {
     let library = FakeLibrary::with(Vec::new());
     let mgr = manager(dir.path(), &library).await;
     let listed = |mgr: FerrofinLiveTvManager| async move {
-        mgr.get_recordings_matching(
+        crate::dvr_repository::recording_rows(
+            &mgr.db,
             &ferrofin_model::live_tv::RecordingQuery::default(),
-            None,
-            &DtoOptions::default(),
-            None,
         )
         .await
         .expect("recordings")
-        .items
         .len()
     };
     let program = now_playing(&mgr).await;
@@ -918,20 +834,16 @@ async fn a_library_delete_forgets_the_recordings_under_its_path() {
     mgr.cancel_timer(&timer_id).await.expect("cancel");
     let settled = wait_for(|| async {
         let done = !library.refreshed().is_empty() && mgr.paths_being_recorded().is_empty();
-        let in_progress = mgr
-            .get_recordings_matching(
-                &ferrofin_model::live_tv::RecordingQuery {
-                    is_in_progress: Some(true),
-                    ..ferrofin_model::live_tv::RecordingQuery::default()
-                },
-                None,
-                &DtoOptions::default(),
-                None,
-            )
-            .await
-            .expect("recordings")
-            .items
-            .len();
+        let in_progress = crate::dvr_repository::recording_rows(
+            &mgr.db,
+            &ferrofin_model::live_tv::RecordingQuery {
+                is_in_progress: Some(true),
+                ..ferrofin_model::live_tv::RecordingQuery::default()
+            },
+        )
+        .await
+        .expect("recordings")
+        .len();
         (done && in_progress == 0).then_some(())
     })
     .await;
@@ -974,7 +886,12 @@ async fn a_library_delete_forgets_the_recording_at_its_file() {
     )
     .await
     .expect("finish");
-    assert!(mgr.get_recording(id).await.expect("read").is_some());
+    assert!(
+        crate::dvr_repository::recording_row(&mgr.db, id)
+            .await
+            .expect("read")
+            .is_some()
+    );
 
     mgr.forget_recordings(&path).await.expect("forget");
 

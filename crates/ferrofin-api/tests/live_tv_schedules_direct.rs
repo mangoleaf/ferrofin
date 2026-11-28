@@ -246,15 +246,6 @@ impl LiveTvManager for CountriesLiveTv {
     async fn cancel_series_timer(&self, _id: &str) -> Result<(), ServiceError> {
         unreachable!()
     }
-    async fn get_recordings(&self) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        unreachable!()
-    }
-    async fn get_recording(&self, _id: Uuid) -> Result<Option<BaseItemDto>, ServiceError> {
-        unreachable!()
-    }
-    async fn delete_recording(&self, _id: Uuid) -> Result<(), ServiceError> {
-        unreachable!()
-    }
 }
 
 async fn get(state: AppState) -> (StatusCode, Option<String>, Vec<u8>) {

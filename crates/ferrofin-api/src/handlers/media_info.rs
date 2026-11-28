@@ -383,12 +383,7 @@ async fn playback_info(
         .library
         .get_item_by_id_for_user(item_id, user.as_deref())
         .await?;
-    // Keep hidden library rows hidden even if the id also names a DVR row.
-    if item.is_none()
-        && (super::streaming::recording_access(state, item_id, user.as_deref(), None).await?
-            != Some(true)
-            || state.library.get_item_by_id(item_id).await?.is_some())
-    {
+    if item.is_none() {
         return Err(ApiError::NotFound(format!("item {item_id}")));
     }
     let resolved_user_id = match &user {

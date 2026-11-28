@@ -178,6 +178,9 @@ pub struct ActiveRecording {
     pub timer_id: String,
     /// The file being written.
     pub path: PathBuf,
+    /// The timer being recorded (`ActiveRecordingInfo.Timer`), which the
+    /// recording's DTO reads while it is captured.
+    pub info: TimerRecordingInfo,
     /// When the capture started.
     pub started_at: DateTime<Utc>,
     /// Set to stop the capture (C# `ActiveRecordingInfo.CancellationTokenSource`).
@@ -189,11 +192,22 @@ impl ActiveRecording {
     #[must_use]
     pub fn new(timer_id: String, path: PathBuf) -> Self {
         Self {
+            info: TimerRecordingInfo {
+                id: timer_id.clone(),
+                ..TimerRecordingInfo::default()
+            },
             timer_id,
             path,
             started_at: Utc::now(),
             cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The capture of `info`, the timer's programme facts as it fired.
+    #[must_use]
+    pub fn with_info(mut self, info: TimerRecordingInfo) -> Self {
+        self.info = info;
+        self
     }
 
     /// Stops the capture at its next read (C# `CancellationTokenSource.Cancel`).

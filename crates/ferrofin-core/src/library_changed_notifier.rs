@@ -159,6 +159,9 @@ pub struct LibraryChangedNotifier {
     /// out, so batches filtered together would hold a first scan's every row
     /// in memory at once.
     publishing: tokio::sync::Mutex<()>,
+    /// The files Live TV is recording to right now
+    /// ([`Self::with_recording_paths`]); `None` (unit tests) records none.
+    recording_paths: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
 }
 
 impl LibraryChangedNotifier {
@@ -175,7 +178,20 @@ impl LibraryChangedNotifier {
             next_window: AtomicU64::new(0),
             audience: std::sync::OnceLock::new(),
             publishing: tokio::sync::Mutex::new(()),
+            recording_paths: None,
         }
+    }
+
+    /// Reads the files Live TV is recording to right now: such a file's item
+    /// is `Video.SourceType` `LiveTV` until its capture ends, so its changes
+    /// are not announced. Called once by the composition root.
+    #[must_use]
+    pub fn with_recording_paths(
+        mut self,
+        read: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.recording_paths = Some(read);
+        self
     }
 
     /// Reads each window's length from the server configuration's
@@ -219,16 +235,8 @@ impl LibraryChangedNotifier {
 
     /// `BaseItem.SourceType == SourceType.Library`, which no row stores: Live TV
     /// channels and programmes are `LiveTV`, and a channel and anything with a
-    /// `ChannelId` are `Channel`.
-    ///
-    /// TODO(parity, open work item — NOT an accepted divergence; gl-1077):
-    /// `Video.SourceType` is also `LiveTV` while its file is being recorded.
-    /// No check is needed yet: a scan leaves such a file out
-    /// ([`LibraryScanner::with_recording_paths`]), so no scan makes a row to
-    /// announce until the capture ends. Un-defer path: when a recording gets
-    /// its item as it starts, this check has to come with it.
-    ///
-    /// [`LibraryScanner::with_recording_paths`]: crate::library_scan::LibraryScanner::with_recording_paths
+    /// `ChannelId` are `Channel`. `Video.SourceType` is also `LiveTV` while its
+    /// file is being recorded, which [`Self::record`] checks over the batch.
     fn source_type_is_library(item: &BaseItemEntity, kind: Option<BaseItemKind>) -> bool {
         let live_tv_or_channel = matches!(
             kind,
@@ -274,10 +282,27 @@ impl LibraryChangedNotifier {
         self.record(items, Kind::Removed);
     }
 
+    /// [`Self::filter_item`], and not a file being recorded (`Video.SourceType`
+    /// `LiveTV`), among `recording`, the files being recorded now.
+    fn announced(item: &BaseItemEntity, recording: &[String]) -> bool {
+        Self::filter_item(item)
+            && item
+                .path
+                .as_ref()
+                .is_none_or(|path| !recording.contains(path))
+    }
+
+    /// The files Live TV is recording to right now. Like the scan, a capture
+    /// told to stop counts until its file is closed.
+    fn recording(&self) -> Vec<String> {
+        self.recording_paths.as_ref().map_or_default(|read| read())
+    }
+
     fn record(self: &Arc<Self>, items: &[BaseItemEntity], kind: Kind) {
+        let recording = self.recording();
         let changed: Vec<Changed> = items
             .iter()
-            .filter(|i| Self::filter_item(i))
+            .filter(|i| Self::announced(i, &recording))
             .filter_map(Self::changed_of)
             .collect();
         self.add(changed, kind);
@@ -655,7 +680,7 @@ impl LibraryChangedNotifier {
     /// library folder are library items with paths, which is exactly what it
     /// admits.
     pub fn record_removed_subtree(self: &Arc<Self>, root: &BaseItemEntity, children: &[Uuid]) {
-        let root_changed = Self::filter_item(root)
+        let root_changed = Self::announced(root, &self.recording())
             .then(|| Self::changed_of(root))
             .flatten();
         let root_n = Uuid::parse_str(&root.id)
@@ -821,6 +846,34 @@ mod tests {
             item.channel_id = Some(empty);
             assert!(LibraryChangedNotifier::filter_item(&item));
         }
+    }
+
+    /// `Video.SourceType` is `LiveTV` while its file is being recorded, so its
+    /// item's changes are not announced until the capture ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_file_being_recorded_is_not_announced() {
+        let events = Arc::new(RecordingEvents::default());
+        let recording = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let read = recording.path.clone().into_iter().collect::<Vec<_>>();
+        let n = Arc::new(
+            LibraryChangedNotifier::new(
+                Arc::clone(&events) as Arc<dyn EventManager>,
+                Duration::from_secs(1),
+            )
+            .with_recording_paths(Arc::new(move || read.clone())),
+        );
+        let mut finished = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        finished.path = Some("/media/b.mkv".to_owned());
+        n.record_added(&[recording.clone(), finished.clone()]);
+        n.record_removed_subtree(&recording, &[]);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let pushed = events.library_updates();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(
+            pushed[0].items_added,
+            vec![Uuid::parse_str(&finished.id).unwrap().simple().to_string()]
+        );
+        assert!(pushed[0].items_removed.is_empty(), "{:?}", pushed[0]);
     }
 
     /// Jellyfin 12's window (jellyfin/jellyfin#17762): it runs from the first

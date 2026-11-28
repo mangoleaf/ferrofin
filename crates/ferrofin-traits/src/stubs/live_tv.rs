@@ -22,8 +22,8 @@ use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, NameIdPair, SortOrder};
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::live_tv::{
     ChannelMappingOptionsDto, ChannelType, DayPattern, GuideInfo, ItemSortBy, KeepUntil,
-    ListingsProviderInfo, LiveTvInfo, RecordingQuery, RecordingStatus, SeriesTimerInfoDto,
-    TimerInfoDto, TimerQuery, TunerChannelMapping, TunerHostInfo,
+    ListingsProviderInfo, LiveTvInfo, RecordingStatus, SeriesTimerInfoDto, TimerInfoDto,
+    TimerQuery, TunerChannelMapping, TunerHostInfo,
 };
 use ferrofin_model::querying::QueryResult;
 
@@ -247,25 +247,6 @@ pub fn filter_timers(timers: Vec<TimerInfoDto>, query: &TimerQuery) -> Vec<Timer
     selected.sort_by_key(|timer| timer.base.start_date);
     selected
 }
-
-/// Which recordings a listing may show its caller: the rule the caller's own
-/// read of one applies, which lives above this crate, over the library and the
-/// virtual folders.
-///
-/// Upstream's recordings are library items, so `GetEmbyRecordingsAsync` gets
-/// the same answer from `InternalItemsQuery(user)` under the recording folders
-/// the user may see.
-#[async_trait]
-pub trait RecordingVisibility: Send + Sync {
-    /// Whether the listing may show `recording`, the entity
-    /// [`LiveTvManager::get_recording_item`] resolves for the same row.
-    async fn is_visible(
-        &self,
-        recording: &ferrofin_db::entities::base_items::BaseItemEntity,
-    ) -> Result<bool, ServiceError>;
-}
-
-fn _assert_object_safe_recording_visibility(_: &dyn RecordingVisibility) {}
 
 /// The Live TV manager.
 ///
@@ -729,30 +710,11 @@ pub trait LiveTvManager: Send + Sync {
     }
 
     // ---- DVR: recordings -------------------------------------------------
-
-    /// Lists recordings as `BaseItemDto`s (`Type = "Recording"`).
-    async fn get_recordings(&self) -> Result<QueryResult<BaseItemDto>, ServiceError>;
-
-    /// Lists the recordings a query selects, projected for `user`.
-    ///
-    /// Port of `LiveTvManager.GetRecordingsAsync`: the in-progress/status/
-    /// channel/series-timer filters, then the drop of a finished recording
-    /// whose file has gone (a library item upstream), then `visible` (when
-    /// given) before paging so `TotalRecordCount` counts only what it keeps,
-    /// then the DTO projection with the list-path `RemoveFields` strip and the
-    /// recording post-pass.
-    ///
-    /// The default ignores the query — the "nothing recorded" state.
-    async fn get_recordings_matching(
-        &self,
-        query: &RecordingQuery,
-        user: Option<&UserEntity>,
-        options: &DtoOptions,
-        visible: Option<&dyn RecordingVisibility>,
-    ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        let _ = (query, user, options, visible);
-        self.get_recordings().await
-    }
+    //
+    // A recording is the library item of its file, as upstream's is: `GET
+    // /LiveTv/Recordings` queries the library under the recording folders
+    // (`LiveTvManager.GetEmbyRecordingsAsync`), and a capture in progress is
+    // that item while `Video.IsActiveRecording` holds.
 
     /// The file a capture is writing right now, keyed by the FIRING TIMER's id
     /// — which is what `GET /LiveTv/LiveRecordings/{recordingId}/stream` takes
@@ -799,20 +761,19 @@ pub trait LiveTvManager: Send + Sync {
             .any(|recording| recording == path))
     }
 
-    /// `BaseItem.MediaType` of a Live TV channel or DVR recording — `"Video"`,
-    /// `"Audio"`, or `None` when `id` is neither.
+    /// `BaseItem.MediaType` of a Live TV channel — `"Video"`, `"Audio"`, or
+    /// `None` when `id` is none.
     ///
     /// The media-source manager needs it for the per-user
     /// `SupportsTranscoding`/`SupportsDirectStream` overwrite
     /// (`MediaSourceManager.GetPlaybackMediaSources`, v12.4
     /// Emby.Server.Implementations/Library/MediaSourceManager.cs:409-417),
     /// which branches on `item.MediaType`. Upstream reads it off the
-    /// `LiveTvChannel`/recording `BaseItem` it already has in hand; Ferrofin's
-    /// channels and recordings are not `BaseItems` rows, so the Live TV
-    /// manager answers for them. `LiveTvChannel.MediaType` is
-    /// `ChannelType == Radio ? Audio : Video`, and a recording, a `.ts`
-    /// capture the library resolves as a video item, is `Video` whatever its
-    /// channel.
+    /// `LiveTvChannel` it already has in hand; a channel the guide has not
+    /// mirrored as a `BaseItems` row has none here, so the Live TV manager
+    /// answers for it. `LiveTvChannel.MediaType` is
+    /// `ChannelType == Radio ? Audio : Video`. A recording is a library item
+    /// and carries its own.
     ///
     /// The default reports `None`, which leaves the source exactly as the
     /// tuner built it — upstream's `user is null` behaviour.
@@ -821,19 +782,37 @@ pub trait LiveTvManager: Send + Sync {
         Ok(None)
     }
 
-    /// The media sources for a recording: while it is being captured, the
-    /// growing file plus the `EncoderPath` a transcode reads it through;
-    /// afterwards, the finished file.
+    /// The media source of the capture writing `path`: the growing file plus
+    /// the `EncoderPath` a transcode reads it through. None when nothing is
+    /// recording it ([`is_active_recording`](Self::is_active_recording)).
     ///
-    /// Port of `MediaSourceManager.GetRecordingStreamMediaSources` (reached
-    /// from `LiveTvMediaSourceProvider.GetMediaSources` when the item has an
-    /// active recording). The default reports none.
+    /// Port of `MediaSourceManager.GetRecordingStreamMediaSources`, which
+    /// `LiveTvMediaSourceProvider.GetMediaSources` reaches for an item whose
+    /// `GetActiveRecordingInfo(item.Path)` answers. The default reports none.
     async fn get_recording_media_sources(
         &self,
-        recording_id: Uuid,
+        path: &str,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        let _ = recording_id;
+        let _ = path;
         Ok(Vec::new())
+    }
+
+    /// The capture's half of a recording's DTO, for an item whose file a live
+    /// capture is writing ([`is_active_recording`](Self::is_active_recording)):
+    /// the timer and series-timer links, the programme's window, status and
+    /// flags, how far through it is, and the channel's name and logo tag.
+    /// Leaves `dto` as it is when nothing is recording `path`.
+    ///
+    /// Port of `LiveTvManager.AddInfoToRecordingDto`, which `DtoService`
+    /// calls after its own rewrite (`Type: Recording`, no download, no run
+    /// time). The default has no capture.
+    async fn add_info_to_recording_dto(
+        &self,
+        path: &str,
+        dto: &mut BaseItemDto,
+    ) -> Result<(), ServiceError> {
+        let _ = (path, dto);
+        Ok(())
     }
 
     /// Arms every persisted timer, so a server restart does not lose the
@@ -882,7 +861,7 @@ pub trait LiveTvManager: Send + Sync {
     async fn create_recording_folders(&self) {}
 
     /// The files being written right now, read from memory so a library scan
-    /// can ask for each directory it lists. Unlike
+    /// can ask for each window of items it plans. Unlike
     /// [`active_recording_paths`](Self::active_recording_paths) this keeps a
     /// capture that was told to stop until its file is closed. The default has
     /// none.
@@ -890,30 +869,24 @@ pub trait LiveTvManager: Send + Sync {
         Vec::new()
     }
 
-    /// Drops the finished recordings at or under `path`, whose library item
-    /// was deleted. Upstream's recording is that item, so nothing is left of it
-    /// to list. The default has none.
+    /// Drops the timers' records of their finished files at or under `path`,
+    /// whose library item was deleted, so nothing goes on naming a file that
+    /// is gone. The default has none.
     async fn forget_recordings(&self, path: &str) -> Result<(), ServiceError> {
         let _ = path;
         Ok(())
     }
 
-    /// Gets a single recording by id, or `None` when unknown.
-    async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError>;
-
-    /// Resolves the stored or synthetic recording entity for item authorization.
-    ///
-    /// A recording can live in the DVR store before a library scan creates its
-    /// BaseItems row. Callers must authorize this entity before accessing it.
-    async fn get_recording_item(
-        &self,
-        _id: Uuid,
-    ) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ServiceError> {
-        Ok(None)
+    /// Deletes the file of a recording whose library item is being deleted,
+    /// stopping the capture writing it, if one is, first. `path` is a
+    /// recording when a capture is writing it or it lies under a recording
+    /// folder ([`get_recording_folders`](Self::get_recording_folders)); any
+    /// other file is left. A file already gone is no error. The default
+    /// deletes nothing.
+    async fn delete_recording_file(&self, path: &str) -> Result<(), ServiceError> {
+        let _ = path;
+        Ok(())
     }
-
-    /// Deletes a recording (its DB row and, when present, its file).
-    async fn delete_recording(&self, id: Uuid) -> Result<(), ServiceError>;
 
     // ---- Schedules Direct ------------------------------------------------
 

@@ -1409,8 +1409,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         date: "2026-11-11",
         divergences: &[
             "A file being recorded is never selected; upstream's pass over the series \
-             folder would select one past the limit that was already a library item, which \
-             a Ferrofin capture is not until it ends. The library's delete of a non-episode \
+             folder selects any library item past the limit, so another capture of the \
+             series still running can be one. The library's delete of a non-episode \
              video that is not in a mixed folder still removes that folder, capture included, \
              as upstream's Video.GetDeletePaths does.",
             "Where the library refuses a delete (a protected folder, or a library this \
@@ -1422,10 +1422,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         key: "recording-images",
         upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsMetadataManager.cs",
         upstream_method: "SaveRecordingImages",
-        ferrofin: "ferrofin-livetv manager.rs start_capture (OnStarted's SaveRecordingMetadata: \
-                   spawned, as its async void does not hold the recorder up; the NFO when \
-                   SaveRecordingNFO is on, then the images when SaveRecordingImages is on, a \
-                   failed NFO ending the task as the catch-all does) -> save_recording_images: \
+        ferrofin: "ferrofin-livetv manager.rs start_capture -> save_recording_metadata \
+                   (OnStarted's SaveRecordingMetadata: on a spawned task, as its async void \
+                   does not hold the recorder up, ahead of CreateRecordingFolders and \
+                   TriggerRefresh; the NFO when SaveRecordingNFO is on, then the images when \
+                   SaveRecordingImages is on, a failed NFO ending it as the catch-all does) -> \
+                   save_recording_images: \
                    the guide programme item the timer's facts came from \
                    (TimerRecordingInfo.program_item_id, set by apply_program_to_recording_info; \
                    none, like upstream's stand-in programme, saves nothing), its image rows -> \
@@ -2264,14 +2266,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              404. Upstream's GetStreamingState reads the item with no user, and its stream and \
              Stream.{format} actions are anonymous; only its attachment action already checks \
              the item for a user, and neither the policy nor the version. A channel takes the \
-             same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
-             Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
-             file (found as GetCollectionFolders finds them, ignoring case) and then its \
-             channel. GET and POST PlaybackInfo use that rule for DVR ids as well, resolving \
-             sources through the recording media-source manager. GET and DELETE \
-             /LiveTv/Recordings/{recordingId} share the visibility check, and GET \
-             /LiveTv/Recordings lists by it. Upstream addresses recordings by their \
-             library item ids and has no separate DVR id to resolve. On the routes upstream \
+             same check, as PlaybackInfo does, and so does a DVR recording, which is the \
+             library item of its file (Live TV access does not gate it, as upstream). On the \
+             routes upstream \
              leaves anonymous, no credential, a token that names nobody and an API key \
              stay so, which binds a client that sends its token. The legacy /hls/ \
              routes are outside this: they serve a transcode's file by its random name, and \
@@ -5184,43 +5181,87 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "GetRecordings",
         ferrofin: "handlers/live_tv.rs get_recordings (items.rs resolve_user_opt, \
-               program_dto_options; ListedRecordingVisibility → recording_visible_given, \
-               holding_libraries over ferrofin-model entities_media.rs libraries_holding, \
-               libraries_allow) → ferrofin-livetv manager.rs \
-               get_recordings_matching (dvr_repository.rs recording_rows, \
-               recording_file_is_gone, visible_recording_rows, remove_fields, \
-               recording_dtos, add_info_to_recording_dtos) (RequestHelpers.GetUserId, \
+               program_dto_options, RemoveFields' four fields; recording_folder_items, \
+               GetRecordingFoldersAsync as GET /LiveTv/Recordings/Folders reads it, every \
+               library holding a location for no user; an empty page for no folder; \
+               InternalItemsQuery with set_user: MediaTypes Video, Recursive, AncestorIds the \
+               folders, IsFolder and IsVirtualItem false, DateCreated descending, \
+               enableTotalRecordCount, isMovie and isSeries as the Movie and Episode kinds, \
+               isSports and isKids as their genres; isInProgress=true drops limit, adds Tags \
+               and keeps the page's files LiveTvManager::active_recording_paths names, \
+               counting them; LibraryManager::query_items; DtoService get_base_item_dtos with \
+               IsVisible) → ferrofin-core dto_service.rs build_dto's recording rewrite \
+               (as_recording_in_progress) → ferrofin-livetv manager.rs \
+               add_info_to_recording_dto (active_recording_at; guide_repository.rs \
+               channel_row, channel_image_tags) (RequestHelpers.GetUserId, \
                LiveTvManager.GetRecordingsAsync, GetEmbyRecordingsAsync, \
-               GetRecordingFoldersAsync, LibraryManager.GetCollectionFolders, RemoveFields)",
-        date: "2026-11-05",
+               GetRecordingFoldersAsync, RemoveFields, DtoService.GetBaseItemDto, \
+               AddInfoToRecordingDto, RecordingsManager.GetActiveRecordingInfo)",
+        date: "2026-11-25",
         divergences: &[
-            "Recordings are the rows of Ferrofin's DVR table, not library items under the \
-         recording folders, so the list differs wherever the two models do: an id is the \
-         row's, not the library item's; a recording file with no row (one from an adopted \
-         Jellyfin database, or a partial file) is not listed; a finished recording whose file \
-         has gone from a folder that is still there leaves the list at once, where upstream \
-         lists the library item until a scan removes it; channelId, status, seriesTimerId \
-         and isNews filter the rows, where upstream ignores them; isMovie, isSeries, isKids \
-         and isSports match the programme's flags, either way, where upstream matches the \
-         Movie and Episode kinds and, for true only, the Sports, Kids, Children and Family \
-         genres; isInProgress=false filters the rows, where upstream ignores it, and \
-         isInProgress=true keeps limit and counts every capture in progress, where upstream \
-         drops limit and counts the page; the order is the capture's creation time, newest \
-         first, then the name; enableTotalRecordCount=false still counts every recording, \
-         where upstream reports the page's length; the parental rating, blocked and allowed \
-         tag and unrated rules see a Video with no rating or tags, where upstream applies \
-         them to the library item, its library's tags included; and a recording no library \
-         holds is listed, where upstream lists only under the recording folders the user may \
-         see, and answers an empty page when there is none. Fix path: gl-1077.",
             "A request with no user (an API key naming none, or an administrator naming an \
-         account that does not exist) lists every recording, as GET \
+         account that does not exist) lists the files under every recording folder, as GET \
          /LiveTv/Recordings/{recordingId} answers the same request for each, while GET \
          /LiveTv/Recordings/Folders answers it an empty list; upstream's \
          GetEmbyRecordingsAsync answers an empty page for a null user. Deliberate: API keys \
          are exempt from the library rule gl-1091 made a hard boundary.",
+            "The recording folders are GET /LiveTv/Recordings/Folders' folders, with that \
+         row's divergences: no channel's folder, and a location resolved to the libraries \
+         holding it from their configured locations.",
+            "A recording in progress reports CompletionPercentage as how far through its \
+         padded window it is, from 0 to 100; upstream divides the elapsed ticks by the end \
+         date's ticks since the year 1 (pct /= end), a figure that stays near 0. Jellyfin \
+         bug not ported.",
             "The 400 (a value the query binder cannot convert) and 403 (another user's id \
          without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
          Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/Recordings/{recordingId}",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetRecording",
+        ferrofin: "handlers/live_tv.rs get_recording (RequireLiveTvAccess; items.rs \
+               resolve_user_opt, RequestHelpers.GetUserId; the nil id the user root folder, \
+               LibraryManager::get_user_root_folder, else get_item_by_id_for_user, \
+               GetItemById(id, user), any item the user may open, a 404 otherwise; DtoService \
+               get_base_item_dto with DtoOptions::with_all_fields, new DtoOptions()) → \
+               ferrofin-core dto_service.rs build_dto's recording rewrite \
+               (as_recording_in_progress) → ferrofin-livetv manager.rs \
+               add_info_to_recording_dto (DtoService.GetBaseItemDto, \
+               AddInfoToRecordingDto)",
+        date: "2026-11-25",
+        divergences: &[
+            "The 403 (another user's id without the administrator role) body is \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
+        method: "delete",
+        path: "/LiveTv/Recordings/{recordingId}",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "DeleteRecording",
+        ferrofin: "handlers/live_tv.rs delete_recording (RequireLiveTvManagement; a nil id is \
+               GetItemById's ArgumentException, a 400; get_item_by_id_for_user, \
+               GetItemById<BaseItem>(id, User.GetUserId()): a missing or hidden item is a \
+               404; LiveTvManager::delete_recording_file → ferrofin-livetv manager.rs \
+               cancel_recording and the file's removal; LibraryManager::delete_item with \
+               DeleteFileLocation = false; LiveTvManager::forget_recordings) \
+               (LibraryManager.DeleteItem)",
+        date: "2026-11-25",
+        divergences: &[
+            "A recording's file (one a capture is writing, or under a recording folder) is \
+         deleted before its item, after a capture still writing it is stopped; upstream \
+         deletes the item only (DeleteFileLocation = false), so the file stays, a capture \
+         goes on writing it, and the next scan lists the recording again. Any other item, \
+         and everything beside a recording's file, is deleted as upstream deletes it. Kept \
+         from Ferrofin's delete before recordings were library items, which removed the \
+         recording's file.",
+            "The 400 body (a nil id) is Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
         ],
         refs: &["access-filtering"],
     },

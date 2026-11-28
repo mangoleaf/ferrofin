@@ -336,23 +336,6 @@ mod tests {
         async fn cancel_series_timer(&self, _id: &str) -> Result<(), ServiceError> {
             unimplemented!()
         }
-        async fn get_recordings(
-            &self,
-        ) -> Result<
-            ferrofin_model::querying::QueryResult<ferrofin_model::dto::BaseItemDto>,
-            ServiceError,
-        > {
-            unimplemented!()
-        }
-        async fn get_recording(
-            &self,
-            _id: uuid::Uuid,
-        ) -> Result<Option<ferrofin_model::dto::BaseItemDto>, ServiceError> {
-            unimplemented!()
-        }
-        async fn delete_recording(&self, _id: uuid::Uuid) -> Result<(), ServiceError> {
-            unimplemented!()
-        }
     }
 
     /// gl-2004: a run stopped before it starts refreshes no guide, and is

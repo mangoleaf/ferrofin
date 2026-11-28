@@ -33,18 +33,15 @@
 //! exactly as the sibling managers read `ferrofin-db` for data with no repository
 //! surface.
 //!
-//! ## Not yet ported
+//! ## Live TV
 //!
-//! The active-recording rewrite (`DtoService.cs:443-466`: a library video a
-//! DVR capture is still writing answers `Type: Recording`, `CanDownload:
-//! false` and no run time) is an open work item, not an accepted state: the
-//! files being written are known (`LiveTvManager::active_recording_paths`,
-//! which `CanDelete` already reads), the rewrite is not applied yet. LiveTV
-//! channel/programme enrichment runs through the late-bound Live TV manager,
-//! and `CanDelete` is upstream's `CanDelete(user)` in full
-//! (`crate::item_deletion::can_delete`). Everything else — the full
-//! field/image/user-data/people/media-source/chapter/trickplay mapping — is
-//! ported.
+//! A library video a DVR capture is still writing answers `Type: Recording`,
+//! `CanDownload: false` and no run time, with the capture's own facts
+//! (`DtoService.cs:443-456`, `LiveTvManager.AddInfoToRecordingDto`); the files
+//! being written are `LiveTvManager::active_recording_paths`, which
+//! `CanDelete` reads too. LiveTV channel/programme enrichment runs through the
+//! late-bound Live TV manager, and `CanDelete` is upstream's `CanDelete(user)`
+//! in full (`crate::item_deletion::can_delete`).
 
 // The DTO assembly copies dozens of scalar/collection fields straight from the
 // item row onto a fresh, `Option`-valued DTO field (`dto.name =
@@ -252,6 +249,9 @@ struct Prefetched {
     /// Everything the page's `CanDelete` reads besides the rows (empty unless
     /// the field is requested) — see [`FerrofinDtoService::delete_facts`].
     delete_facts: crate::item_deletion::DeleteFacts,
+    /// The files live captures are writing, each as it is and as stored
+    /// ([`FerrofinDtoService::active_recordings`]), for the recording rewrite.
+    active_recordings: std::collections::HashSet<String>,
     /// The per-NAME `Person` item id for each credited name on the page, so
     /// `People[].Id` points at the favoritable by-name item. Keyed by the credit
     /// row's name *as stored*: the prefetch resolves names case-insensitively
@@ -450,6 +450,28 @@ fn compute_etag(date_last_saved: Option<chrono::DateTime<chrono::Utc>>) -> Strin
     ferrofin_common::extensions::get_md5(&ticks.to_string())
         .simple()
         .to_string()
+}
+
+/// `DtoService.cs:443-456`'s own half of a recording in progress: it is a
+/// `Recording`, not downloadable, with no run time yet, and an episode is
+/// named by its series, its own name becoming the episode title. Its own
+/// sources are `Placeholder`s, as `BaseItem.GetMediaSources` makes an active
+/// recording's: it plays through the capture's source.
+fn as_recording_in_progress(dto: &mut BaseItemDto) {
+    for source in dto.media_sources.iter_mut().flatten() {
+        source.type_ = ferrofin_model::dto::MediaSourceType::Placeholder;
+    }
+    dto.type_ = BaseItemKind::Recording;
+    dto.can_download = Some(false);
+    dto.run_time_ticks = None;
+    if dto
+        .series_name
+        .as_deref()
+        .is_some_and(|name| !name.is_empty())
+    {
+        dto.episode_title = dto.name.take();
+        dto.name.clone_from(&dto.series_name);
+    }
 }
 
 /// Copies a photo's EXIF fields out of the row's `Data` blob onto the DTO —
@@ -2660,6 +2682,21 @@ impl FerrofinDtoService {
                 can_download_file(item, kind)
                     && (user.is_none() || perms.is_some_and(|p| p.enable_content_downloading)),
             );
+        }
+
+        // `DtoService.cs:443-456`: a video a live capture is still writing is
+        // a recording in progress, whatever its library made of it.
+        if let Some(path) = item
+            .path
+            .as_deref()
+            .filter(|path| prefetched.active_recordings.contains(*path))
+        {
+            as_recording_in_progress(&mut dto);
+            if let Some(live_tv) = self.live_tv.get() {
+                live_tv
+                    .add_info_to_recording_dto(&self.virtual_paths.expand(path), &mut dto)
+                    .await?;
+            }
         }
 
         Ok(dto)
@@ -5125,6 +5162,12 @@ impl FerrofinDtoService {
         } else {
             crate::item_deletion::DeleteFacts::default()
         };
+        // Read once a page: `delete_facts` has it when `CanDelete` is asked for.
+        let active_recordings = if options.contains_field(ItemFields::CanDelete) {
+            delete_facts.active_recordings.clone()
+        } else {
+            self.active_recordings(items).await?
+        };
         // `GetMappedPath` maps the `Path` field and the static sources through
         // the configured substitutions: read them once for the page.
         let path_substitutions = match &self.configuration {
@@ -5177,6 +5220,7 @@ impl FerrofinDtoService {
             has_lyrics,
             content_permissions,
             delete_facts,
+            active_recordings,
             person_ids_by_name,
             image_parents,
             parent_images,
@@ -5214,20 +5258,7 @@ impl FerrofinDtoService {
         {
             facts.protected = self.protected_paths().await?;
         }
-        // `Video.IsActiveRecording`: an in-memory set, and only when the page
-        // holds a video at all. Each path also as stored: a row from a reader
-        // outside the item repository keeps a recording under the data
-        // directory as `%AppDataPath%/…`.
-        if let Some(live_tv) = self.live_tv.get()
-            && items.iter().any(|item| kinds::is_video(row_kind(item)))
-        {
-            facts.active_recordings = live_tv
-                .active_recording_paths()
-                .await?
-                .into_iter()
-                .flat_map(|path| [self.virtual_paths.reverse(&path), path])
-                .collect();
-        }
+        facts.active_recordings = self.active_recordings(items).await?;
         let Some(user) = user else {
             return Ok(facts);
         };
@@ -5251,6 +5282,29 @@ impl FerrofinDtoService {
             facts.libraries = self.libraries_of(items).await?;
         }
         Ok(facts)
+    }
+
+    /// `Video.IsActiveRecording` for a page: the files live captures are
+    /// writing, an in-memory set read only when the page holds a video at all.
+    /// Each path also as stored: a row from a reader outside the item
+    /// repository keeps a recording under the data directory as
+    /// `%AppDataPath%/…`.
+    async fn active_recordings(
+        &self,
+        items: &[BaseItemEntity],
+    ) -> Result<std::collections::HashSet<String>, ServiceError> {
+        let Some(live_tv) = self.live_tv.get() else {
+            return Ok(std::collections::HashSet::new());
+        };
+        if !items.iter().any(|item| kinds::is_video(row_kind(item))) {
+            return Ok(std::collections::HashSet::new());
+        }
+        Ok(live_tv
+            .active_recording_paths()
+            .await?
+            .into_iter()
+            .flat_map(|path| [self.virtual_paths.reverse(&path), path])
+            .collect())
     }
 
     /// `LibraryManager.GetCollectionFolders(item)` (`LibraryManager.cs:
@@ -9780,6 +9834,47 @@ mod tests {
         );
         assert_eq!(dto.genre_items.as_ref().unwrap().len(), 2);
         assert_eq!(dto.tags, Some(vec!["imax".to_owned(), "4k".to_owned()]));
+    }
+
+    /// `DtoService.cs:443-456`: a recording in progress is a `Recording` with
+    /// no download and no run time, and an episode takes its series' name.
+    #[test]
+    fn a_recording_in_progress_is_a_recording_named_by_its_series() {
+        let mut episode = BaseItemDto {
+            type_: BaseItemKind::Episode,
+            name: Some("Pilot".to_owned()),
+            series_name: Some("The Show".to_owned()),
+            run_time_ticks: Some(36_000_000_000),
+            can_download: Some(true),
+            media_sources: Some(vec![ferrofin_model::dto::MediaSourceInfo::default()]),
+            ..BaseItemDto::default()
+        };
+        super::as_recording_in_progress(&mut episode);
+        assert_eq!(
+            episode.media_sources.as_deref().unwrap()[0].type_,
+            ferrofin_model::dto::MediaSourceType::Placeholder
+        );
+        assert_eq!(episode.type_, BaseItemKind::Recording);
+        assert_eq!(episode.can_download, Some(false));
+        assert_eq!(episode.run_time_ticks, None);
+        assert_eq!(episode.name.as_deref(), Some("The Show"));
+        assert_eq!(episode.episode_title.as_deref(), Some("Pilot"));
+
+        let mut movie = BaseItemDto {
+            type_: BaseItemKind::Movie,
+            name: Some("Evening Movie".to_owned()),
+            series_name: Some(String::new()),
+            ..BaseItemDto::default()
+        };
+        super::as_recording_in_progress(&mut movie);
+        assert_eq!(movie.type_, BaseItemKind::Recording);
+        assert_eq!(
+            movie.can_download,
+            Some(false),
+            "set whatever fields were asked"
+        );
+        assert_eq!(movie.name.as_deref(), Some("Evening Movie"));
+        assert_eq!(movie.episode_title, None);
     }
 
     #[tokio::test]
