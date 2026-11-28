@@ -896,6 +896,10 @@ pub async fn build_app_state(
     let studios_client = Arc::new(ferrofin_providers::StudiosClient::with_repo_url(
         &config.studios_repo_url,
     ));
+    // Where the plugin manager keeps each plugin's state (`state.json`) and
+    // `config.json`; the boot's plugin deletes and the LDAP-Auth import below
+    // read the same directory.
+    let plugin_state_dir = config.config_dir.join("plugins");
     // Tier-1b: runtime-installed WASM plugins from `{data_dir}/plugins/*.wasm`
     // (see docs/EXTENSIONS.md). Loading compiles components —
     // CPU-heavy, so it runs on the blocking pool. A load failure degrades to
@@ -932,8 +936,18 @@ pub async fn build_app_state(
                 ),
         );
         let wasm_dir = config.data_dir.join("plugins");
+        let plugin_state_dir = plugin_state_dir.clone();
         match tokio::task::spawn_blocking(move || {
-            ferrofin_wasm::WasmPluginHost::load(&wasm_dir, &wasm_settings)
+            // `LoadAssemblies`: the files an uninstall could not delete go
+            // first, and one that still cannot be deleted is not loaded.
+            let undeletable = ferrofin_core::FerrofinPluginManager::delete_plugins_marked_deleted(
+                &plugin_state_dir,
+                &wasm_dir,
+            );
+            ferrofin_wasm::WasmPluginHost::load(
+                &wasm_dir,
+                &wasm_settings.with_skipped_files(undeletable),
+            )
         })
         .await
         {
@@ -2374,9 +2388,6 @@ pub async fn build_app_state(
             db.clone(),
         ),
     );
-    // Where the plugin manager keeps each plugin's state and `config.json`; the
-    // LDAP-Auth import below checks the same directory.
-    let plugin_state_dir = config.config_dir.join("plugins");
     let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> = Arc::new(
         ferrofin_core::FerrofinPluginManager::new(registered_plugins, plugin_state_dir.clone())
             .with_offered_items(Arc::clone(&plugin_offered_items))

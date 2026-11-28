@@ -114,6 +114,7 @@ fn tight_settings() -> WasmSettings {
         subtitle_extract_mb: 10,
         private_http_allow: Vec::new(),
         reserved_ids: Vec::new(),
+        skipped_files: Vec::new(),
     }
 }
 
@@ -224,6 +225,28 @@ fn a_file_squatting_a_compiled_in_id_is_never_loaded() {
     assert!(host.scheduled_tasks(&manager()).is_empty());
     assert!(host.metadata_providers().is_empty());
     assert!(host.registered_plugins().is_empty());
+}
+
+/// A file an uninstall marked for deletion and the start could not delete is
+/// not loaded (`PluginStatus.Deleted`); the others in the directory are.
+#[test]
+fn a_file_marked_deleted_is_never_loaded() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "marked", FIXTURE_WAT);
+    write_fixture(
+        dir.path(),
+        "other",
+        &fixture_with_id("11111111-1111-1111-1111-111111111111"),
+    );
+    let settings = WasmSettings::default().with_skipped_files(vec![dir.path().join("marked.wasm")]);
+    let host = WasmPluginHost::load(dir.path(), &settings).unwrap();
+    let ids: Vec<String> = host
+        .plugins()
+        .iter()
+        .map(|p| p.descriptor.id.to_string())
+        .collect();
+    assert_eq!(ids, ["11111111-1111-1111-1111-111111111111"]);
 }
 
 /// A segment cache as `CachedMediaSegmentProvider` leaves it: its identity

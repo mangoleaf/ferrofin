@@ -656,7 +656,7 @@ impl LibraryScanner {
             .season_details
             .get(&(series_id.to_owned(), number, language.map(str::to_owned)))
         {
-            Some(SeasonLookup::Found(details)) => return Some(details.clone()),
+            Some(SeasonLookup::Found(details)) => return Some(SeasonDetails::clone(details)),
             Some(SeasonLookup::Missing | SeasonLookup::Failed) => return None,
             None => {}
         }

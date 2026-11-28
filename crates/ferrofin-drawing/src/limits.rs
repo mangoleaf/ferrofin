@@ -27,7 +27,7 @@ use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageError, ImageReader};
 
 use crate::error::DrawingError;
-use crate::split_scans;
+use crate::scaled_jpeg::ScalableJpeg;
 
 /// Bytes in a MiB, the unit of the memory settings.
 const MIB: u64 = 1024 * 1024;
@@ -46,7 +46,9 @@ const MEGAPIXEL: u64 = 1_000_000;
 pub struct ImageLimits {
     /// The most pixels (width × height) an image may have to be decoded.
     pub max_pixels: u64,
-    /// The most bytes one decode may allocate, the `image` crate's `max_alloc`.
+    /// The most bytes one decode may allocate, the `image` crate's `max_alloc`:
+    /// the decoded image, and for a JPEG coded in more than one scan the
+    /// coefficients libjpeg-turbo holds for its whole frame beside it.
     pub max_alloc: u64,
     /// The most bytes of scratch memory the resizes and compositing in flight
     /// hold between them. A resize needs, in the image's own pixels, a copy of
@@ -169,11 +171,6 @@ impl ImageMemory {
         }
     }
 
-    /// The limits this runs under.
-    pub(crate) fn limits(&self) -> &ImageLimits {
-        &self.limits
-    }
-
     /// A reader of the image at `path`, its format guessed from the content,
     /// under [`ImageLimits::decode_limits`]. Reading the size through it
     /// decodes nothing, so an image over the limits still reports its size.
@@ -217,33 +214,50 @@ impl ImageMemory {
         Ok(decoder)
     }
 
+    /// The JPEG at `path` when libjpeg-turbo decodes it, its header read and
+    /// its size checked ([`ScalableJpeg::open`]); `None` for any other file,
+    /// which [`Self::decode_with_image_crate`] answers for.
+    /// [`ServiceError::InvalidInput`] when it is over the limits.
+    pub(crate) fn jpeg(&self, path: &str) -> Result<Option<ScalableJpeg>, ServiceError> {
+        ScalableJpeg::open(path, &self.limits)
+            .map_err(|limit| ServiceError::invalid_input(format!("decode {path}: {limit}")))
+    }
+
     /// Decodes the image at `path`, as stored. A missing file is
     /// [`ServiceError::NotFound`]; an undecodable one, or one over the limits,
     /// is [`ServiceError::InvalidInput`] (the port of Skia's
     /// `InvalidDataException`/`return null` fallbacks).
     ///
-    /// A sequential JPEG coded in more than one scan is decoded by
-    /// `jpeg-decoder`, because the `image` crate's decoder gets its colours
-    /// wrong ([`crate::split_scans`]).
+    /// A JPEG is decoded by libjpeg-turbo, Skia's JPEG codec
+    /// ([`crate::scaled_jpeg`]), and by the `image` crate when that fails.
     pub(crate) fn decode(&self, path: &str) -> Result<DynamicImage, ServiceError> {
-        if let Some((image, _)) = split_scans::decode(path, &self.limits) {
+        if let Some(jpeg) = self.jpeg(path)?
+            && let Some(image) = jpeg.decode_full()
+        {
             return Ok(image);
         }
-        let decoder = self.decoder(path)?;
-        DynamicImage::from_decoder(decoder).map_err(|e| undecodable(path, &e))
+        self.decode_with_image_crate(path, false)
     }
 
-    /// `SkiaEncoder.GetBitmap(path, autoOrient: true, …)`: decodes `path` and
-    /// applies its own EXIF origin (`codec.EncodedOrigin` → `OrientImage`), so
-    /// the pixels stand as the photo was taken. A file whose orientation
-    /// cannot be read is taken as stored.
-    pub(crate) fn decode_oriented(&self, path: &str) -> Result<DynamicImage, ServiceError> {
-        if let Some((mut image, orientation)) = split_scans::decode(path, &self.limits) {
-            image.apply_orientation(orientation);
-            return Ok(image);
-        }
+    /// Decodes the image at `path` in full through the `image` crate: every
+    /// format but JPEG, and a JPEG libjpeg-turbo does not take or fails on
+    /// ([`Self::jpeg`]).
+    ///
+    /// `oriented` is `SkiaEncoder.GetBitmap(path, autoOrient: true, …)`: the
+    /// image's own EXIF origin is applied (`codec.EncodedOrigin` →
+    /// `OrientImage`), so the pixels stand as the photo was taken. A file
+    /// whose orientation cannot be read is taken as stored.
+    pub(crate) fn decode_with_image_crate(
+        &self,
+        path: &str,
+        oriented: bool,
+    ) -> Result<DynamicImage, ServiceError> {
         let mut decoder = self.decoder(path)?;
-        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+        let orientation = if oriented {
+            decoder.orientation().unwrap_or(Orientation::NoTransforms)
+        } else {
+            Orientation::NoTransforms
+        };
         let mut image = DynamicImage::from_decoder(decoder).map_err(|e| undecodable(path, &e))?;
         image.apply_orientation(orientation);
         Ok(image)
@@ -899,7 +913,10 @@ mod tests {
         std::fs::write(&path, header_only_png(width, height)).expect("write");
         let path = path.to_str().expect("utf8");
         let memory = ImageMemory::new(ImageLimits::default());
-        for result in [memory.decode(path), memory.decode_oriented(path)] {
+        for result in [
+            memory.decode(path),
+            memory.decode_with_image_crate(path, true),
+        ] {
             match result {
                 Err(ServiceError::InvalidInput(message)) => {
                     assert!(message.contains(setting), "{message}");
@@ -919,29 +936,28 @@ mod tests {
         pixel.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2)
     }
 
-    /// Both decodes of the JPEG at `path`, as RGB.
-    fn both_decodes(path: &Path) -> [image::RgbImage; 2] {
-        let path = path.to_str().expect("utf8");
-        let memory = ImageMemory::new(ImageLimits::default());
-        [memory.decode(path), memory.decode_oriented(path)]
-            .map(|decoded| decoded.expect("decodes").to_rgb8())
+    /// The JPEG at `path` decoded in full, as RGB.
+    fn decoded(path: &Path) -> image::RgbImage {
+        ImageMemory::new(ImageLimits::default())
+            .decode(path.to_str().expect("utf8"))
+            .expect("decodes")
+            .to_rgb8()
     }
 
-    /// gl-1213: libjpeg, ffmpeg and `jpeg-decoder` read the reported file as
-    /// grey corners around a white middle. zune-jpeg 0.5.15 left its chroma
-    /// planes at 0 and returned `(0, 182, 0)` and `(76, 255, 28)`.
+    /// gl-1213: libjpeg and ffmpeg read the reported file as grey corners
+    /// around a white middle. zune-jpeg 0.5.15 left its chroma planes at 0 and
+    /// returned `(0, 182, 0)` and `(76, 255, 28)`.
     #[test]
     fn the_reported_split_scan_jpeg_decodes_to_its_colours() {
         let dir = tempfile::tempdir().expect("tmp");
         let path = dir.path().join("split.jpg");
         std::fs::write(&path, SPLIT_SCAN_JPEG).expect("write");
-        for image in both_decodes(&path) {
-            assert_eq!(image.dimensions(), (64, 64));
-            let corner = image.get_pixel(0, 0).0;
-            let middle = image.get_pixel(32, 32).0;
-            assert!(near(corner, [47, 47, 47]), "corner {corner:?}");
-            assert!(near(middle, [255, 255, 255]), "middle {middle:?}");
-        }
+        let image = decoded(&path);
+        assert_eq!(image.dimensions(), (64, 64));
+        let corner = image.get_pixel(0, 0).0;
+        let middle = image.get_pixel(32, 32).0;
+        assert!(near(corner, [47, 47, 47]), "corner {corner:?}");
+        assert!(near(middle, [255, 255, 255]), "middle {middle:?}");
     }
 
     /// gl-1213: a JPEG coded in one scan per component, the way `jpeg-encoder`
@@ -969,19 +985,17 @@ mod tests {
         encoder
             .encode(ramp.as_raw(), 64, 48, jpeg_encoder::ColorType::Rgb)
             .expect("encode");
-        for image in both_decodes(&path) {
-            for (x, y, pixel) in image.enumerate_pixels() {
-                let expected = ramp.get_pixel(x, y).0;
-                assert!(
-                    pixel
-                        .0
-                        .iter()
-                        .zip(expected)
-                        .all(|(a, b)| a.abs_diff(b) <= 4),
-                    "({x}, {y}) is {:?}, written as {expected:?}",
-                    pixel.0
-                );
-            }
+        for (x, y, pixel) in decoded(&path).enumerate_pixels() {
+            let expected = ramp.get_pixel(x, y).0;
+            assert!(
+                pixel
+                    .0
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, b)| a.abs_diff(b) <= 4),
+                "({x}, {y}) is {:?}, written as {expected:?}",
+                pixel.0
+            );
         }
     }
 
@@ -997,13 +1011,11 @@ mod tests {
             max_pixels: 64 * 64 - 1,
             ..ImageLimits::default()
         });
-        for result in [memory.decode(path), memory.decode_oriented(path)] {
-            match result {
-                Err(ServiceError::InvalidInput(message)) => {
-                    assert!(message.contains("image_decode_max_megapixels"), "{message}");
-                }
-                other => panic!("expected a limit error, got {other:?}"),
+        match memory.decode(path) {
+            Err(ServiceError::InvalidInput(message)) => {
+                assert!(message.contains("image_decode_max_megapixels"), "{message}");
             }
+            other => panic!("expected a limit error, got {other:?}"),
         }
     }
 

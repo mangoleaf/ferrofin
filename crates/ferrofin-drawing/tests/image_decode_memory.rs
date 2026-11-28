@@ -32,11 +32,10 @@ static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
 /// The smallest buffer counted (gl-1980). Every bitmap that would fail a
-/// check is larger. A scaled decode's small buffers depend on thread scheduling:
-/// `jpeg-decoder` sends each MCU row's coefficients (77 KB at most for these
-/// photos) to a thread per colour component over an unbounded channel. On a
-/// loaded host, where those threads fall behind, the queue can hold up to the
-/// whole frame, 2 bytes a sample, which at 4:2:0 is the full bitmap's size.
+/// check is larger, and what is smaller (rows, tables, a resize's weights)
+/// does not tell a reduced decode from a full one. The bitmap libjpeg-turbo
+/// decodes into is a Rust buffer, and so is the file it reads from; its own
+/// working memory comes from C's allocator, which this count never sees.
 const COUNTED_MIN: usize = 256 * 1024;
 
 /// The bytes of a `size`-byte buffer the counters take in.

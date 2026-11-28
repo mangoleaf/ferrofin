@@ -2475,6 +2475,9 @@ pub struct RecordingTasks {
     /// Task ids passed to [`TaskManager::cancel_if_running_and_queue`], in
     /// call order.
     pub requeued: std::sync::Mutex<Vec<String>>,
+    /// When set, [`TaskManager::cancel_if_running_and_queue`] records the
+    /// call and refuses it, as a registry that is shutting down does.
+    pub refuse_queue: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -2504,6 +2507,9 @@ impl TaskManager for RecordingTasks {
             .lock()
             .expect("requeued lock")
             .push(task_id.to_owned());
+        if self.refuse_queue.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ServiceError::unavailable("the server is shutting down"));
+        }
         Ok(())
     }
     async fn update_triggers(

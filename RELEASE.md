@@ -51,6 +51,15 @@ from.
    crate the workspace builds blocks the release too. `main` and `release/vX.Y.Z` get CI on
    every push, and the workflow reads that push run. The release PR (release branch → `main`)
    shows the same run's checks and runs no CI of its own.
+
+   **libjpeg-turbo is checked by hand.** No advisory database covers the C library every build
+   links (`scripts/libjpeg-turbo.sh` pins its release): its fixes, security fixes included, are
+   announced in its change log only. Compare the pin with the newest release
+   (`gh api repos/libjpeg-turbo/libjpeg-turbo/releases/latest --jq .tag_name`; the workflow's
+   `release-advisories` job prints a warning when they differ). When a newer one is out, read
+   its `ChangeLog.md` down to the pinned version: an entry that fixes compression,
+   decompression or the TurboJPEG API (a CVE, an overrun, a hardening) moves the pin before
+   the release, as the script's header describes; anything else can wait for the next one.
 2. **Freeze and measure the release branch.** PRs are not benchmarked individually, so this
    is the only performance gate.
 

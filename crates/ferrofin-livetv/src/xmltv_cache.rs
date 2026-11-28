@@ -74,7 +74,8 @@ impl XmlTvCache {
 
     /// The cache file for provider `id`. Provider ids are generated as
     /// `Guid.ToString("N")`; anything that is not a GUID is kept out of the
-    /// path, as `InvalidateListingsProviderCache` keeps it out.
+    /// path. [`invalidate`](Self::invalidate) is stricter: it takes only the
+    /// 32-digit spelling, as `InvalidateListingsProviderCache` does.
     fn cache_file(&self, id: &str) -> Option<PathBuf> {
         let id = Uuid::try_parse(id).ok()?.simple().to_string();
         Some(self.cache_dir.join(CACHE_SUBDIR).join(format!("{id}.xml")))
@@ -144,8 +145,13 @@ impl XmlTvCache {
     }
 
     /// Drops provider `id`'s cached document, so the next read downloads it.
+    ///
+    /// Only for an id of exactly a GUID's 32 digits, as upstream's
+    /// `InvalidateListingsProviderCache` asks (`Guid.TryParseExact(id, "N", …)`,
+    /// which trims): another spelling of a provider's id is not its id.
     pub async fn invalidate(&self, id: &str) {
-        let Some(cache_file) = self.cache_file(id) else {
+        let id = id.trim();
+        let Some(cache_file) = self.cache_file(id).filter(|_| id.len() == 32) else {
             return;
         };
         match tokio::fs::remove_file(&cache_file).await {
@@ -650,6 +656,36 @@ mod tests {
             "read again from the start"
         );
         assert_eq!(cache_entries(dir.path()), vec![format!("{id}.xml")]);
+    }
+
+    /// `InvalidateListingsProviderCache` parses the id with
+    /// `Guid.TryParseExact(id, "N", …)`: the 32 digits in either case, trimmed.
+    /// A delete naming another spelling of a provider's id deletes no
+    /// provider, and leaves that provider's document cached.
+    #[tokio::test]
+    async fn only_a_providers_32_digit_id_drops_its_document() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guide = dir.path().join("guide.xml");
+        std::fs::write(&guide, "<tv/>").expect("write guide");
+        let cache = XmlTvCache::new(
+            Arc::new(crate::fetch::ReqwestFetcher::new()) as Arc<dyn SourceFetcher>,
+            dir.path(),
+        );
+        let id = uuid::Uuid::new_v4();
+        let minted = id.simple().to_string();
+        let info = provider(Some(&minted), guide.to_str().expect("utf-8"));
+        for (spelling, kept) in [
+            (id.hyphenated().to_string(), true),
+            (id.braced().to_string(), true),
+            ("g".repeat(32), true),
+            (String::new(), true),
+            (minted.to_uppercase(), false),
+            (format!(" {minted} "), false),
+        ] {
+            cache.get_xml(&info).await.expect("cached");
+            cache.invalidate(&spelling).await;
+            assert_eq!(!cache_entries(dir.path()).is_empty(), kept, "{spelling:?}");
+        }
     }
 
     /// A local guide in the encoding it declares loads through the cache, as

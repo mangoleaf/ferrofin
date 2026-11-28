@@ -1337,6 +1337,19 @@ impl SubtitleProvider for OpenSubtitlesProvider {
         PLUGIN_NAME
     }
 
+    /// The OpenSubtitles plugin's enabled flag (gl-2025). A plugin state that
+    /// cannot be read leaves the provider on, as it was before the flag was
+    /// read.
+    async fn is_enabled(&self) -> bool {
+        match self.plugins.get_plugin(PLUGIN_ID).await {
+            Ok(plugin) => plugin.is_none_or(|plugin| plugin.enabled),
+            Err(error) => {
+                tracing::debug!(%error, "could not read the OpenSubtitles plugin's state; using it");
+                true
+            }
+        }
+    }
+
     async fn search(
         &self,
         request: &SubtitleSearchRequest,
@@ -3195,5 +3208,24 @@ mod tests {
         };
         let found = provider.search(&automated).await.expect("search");
         assert_eq!(ids(&found), ["srt-eng-2"]);
+    }
+
+    /// gl-2025: the provider follows the OpenSubtitles plugin's enabled flag;
+    /// a plugin the manager does not report leaves it on.
+    #[tokio::test]
+    async fn the_provider_follows_the_plugins_enabled_flag() {
+        use crate::plugin_config::tests_support::{disabled_plugin, enabled_plugin, manager_with};
+        let disabled = OpenSubtitlesProvider::new(disabled_plugin(PLUGIN_ID, b"{}".to_vec()));
+        assert!(!disabled.is_enabled().await);
+        assert!(
+            OpenSubtitlesProvider::new(enabled_plugin(PLUGIN_ID))
+                .is_enabled()
+                .await
+        );
+        assert!(
+            OpenSubtitlesProvider::new(manager_with(PLUGIN_ID, b"{}".to_vec()))
+                .is_enabled()
+                .await
+        );
     }
 }

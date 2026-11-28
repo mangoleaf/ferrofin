@@ -21,6 +21,7 @@ use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::{MediaProtocol, subtitle_format};
 use ferrofin_traits::media_encoding::TrimmedSubtitle;
+use ferrofin_util::code_page;
 use ferrofin_util::escape_charset::{self, EscapeCharset};
 use ferrofin_util::ticks::UNIX_EPOCH_TICKS;
 
@@ -536,10 +537,10 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
 
             match detect_charset(&bytes) {
                 DetectedCharset::Utf8OrAscii => Ok(SubtitleStream::new(bytes, false)),
-                DetectedCharset::Other(encoding) => {
-                    let (text, _, _) = encoding.decode(&bytes);
-                    Ok(SubtitleStream::new(text.into_owned().into_bytes(), true))
-                }
+                DetectedCharset::Other(encoding) => Ok(SubtitleStream::new(
+                    code_page::decode(encoding, &bytes).into_bytes(),
+                    true,
+                )),
                 DetectedCharset::Escape(charset) => Ok(SubtitleStream::new(
                     charset.decode(&bytes).into_bytes(),
                     true,

@@ -1,6 +1,7 @@
 //! The children of a series whose row cannot be read skip their TheTVDB
-//! lookups without counting a failed request, so their refresh is stamped
-//! instead of repeated on every scan.
+//! lookups, and their episodes their TheMovieDb ones, without counting a
+//! failed request, so their refresh is stamped instead of repeated on every
+//! scan.
 
 use std::sync::Arc;
 
@@ -54,4 +55,52 @@ async fn an_unreadable_series_counts_no_failure_against_its_children() {
         assert!(images.is_empty(), "{images:?}");
         assert_eq!(failures, 0, "{kind}: the TheTVDB lookup");
     }
+}
+
+/// TheMovieDb looks an episode up in its series' display order (gl-1784), so
+/// with no order to read it asks nothing rather than guess the aired one, as
+/// upstream's lookup has no series ids without a series.
+#[tokio::test]
+async fn an_unreadable_series_asks_tmdb_nothing_for_its_episodes() {
+    let db = Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let vf = Arc::new(FerrofinVirtualFolderManager::new(tmp.path().join("views")));
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    // Nothing listens there: a TheMovieDb request would fail, and be counted.
+    let tmdb = ferrofin_providers::TmdbClient::new().with_base_url("http://127.0.0.1:9");
+    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+        .with_items(Arc::new(crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        )))
+        .with_metadata(Arc::new(tmdb), tmp.path().join("metadata"));
+    db.close().await;
+    let series = ferrofin_db::store::guid_to_db(uuid::Uuid::from_u128(1784));
+    let mut cache = ArtworkCache::default();
+    cache.series_tmdb.insert(series.clone(), 1399);
+    let episode = BaseItemEntity {
+        type_: "MediaBrowser.Controller.Entities.TV.Episode".to_owned(),
+        series_id: Some(series.clone()),
+        parent_index_number: Some(1),
+        index_number: Some(1),
+        ..Default::default()
+    };
+
+    let (answer, failures) = count_request_failures(Box::pin(scanner.fetch_tmdb_episode(
+        &episode,
+        &mut cache,
+        &super::ResolverGuesses::default(),
+    )))
+    .await;
+    assert!(answer.is_none());
+    assert_eq!(failures, 0, "the metadata lookup");
+    let (numbers, failures) = count_request_failures(Box::pin(scanner.tmdb_episode_image_numbers(
+        &mut cache,
+        (&series, 1399),
+        (1, 1),
+    )))
+    .await;
+    assert_eq!(numbers, None);
+    assert_eq!(failures, 0, "the image lookup");
 }
