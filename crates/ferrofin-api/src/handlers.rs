@@ -953,8 +953,11 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// a graphical subtitle's file, most of whose operations have no row of their
 /// own yet.
 /// `escape-charsets` is which 7-bit escape encodings a text subtitle sidecar
-/// or a playlist file is read in, which the subtitle stream operations and the
-/// playlist scan share.
+/// or a playlist file is read in, the tables its legacy Chinese and Korean
+/// text is decoded with, and what is written for bytes with no character in
+/// their charset, which the subtitle stream operations and the playlist scan
+/// share; and how an XML document that declares a legacy encoding is read
+/// with the same decoder, a book's `ComicInfo.xml` or OPF and an XMLTV guide.
 /// `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
@@ -3079,7 +3082,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         upstream_file: "MediaBrowser.MediaEncoding/Subtitles/SubtitleEncoder.cs",
         upstream_method: "GetSubtitleStream",
         ferrofin: "Which 7-bit escape encodings a text subtitle sidecar and a playlist file \
-                   are read in, and how (gl-1657). ferrofin-util escape_charset.rs detect \
+                   are read in, and how (gl-1657), the tables their legacy Chinese and \
+                   Korean text is decoded with (gl-2000), what is written for bytes with no \
+                   character in their charset (gl-2010), and how an XML document that declares \
+                   a legacy encoding is read (gl-2011). ferrofin-util escape_charset.rs detect \
                    ports UTF.Unknown 2.7.0, the version Jellyfin 12.4 pins: \
                    CharsetDetector.Feed and FindInputState (1024-byte chunks, a high byte but \
                    0xA0 dropping the escape prober, an ESC or a { after a ~ starting it) and \
@@ -3100,17 +3106,190 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    0, which the state after ESC errors on, so it never names ISO-2022-CN, and \
                    Jellyfin 12.4 serves such a file as it is, as Ferrofin does. Measured on \
                    Jellyfin 12.4: ISO-2022-KR, HZ (with ~~), ISO-2022-JP and ISO-2022-CN \
-                   sidecars serve the same text as Ferrofin's. 8-bit input and the \
-                   multi-byte and single-byte probers are not part of this row.",
-        date: "2026-11-26",
+                   sidecars serve the same text as Ferrofin's. The tables behind the decoders \
+                   were measured too (gl-2000): sidecars holding every byte pair of GBK, HZ, \
+                   the KS X 1001 square, UHC and ISO-2022-KR, and every four-byte GB18030 \
+                   sequence of the Basic Multilingual Plane, served by Jellyfin 12.4 and by \
+                   Ferrofin and compared sequence by sequence. Jellyfin reads 8-bit Simplified \
+                   Chinese with .NET's GB18030Encoding, HZ with code page 936, Korean with code \
+                   page 949 (cp949, and under ISO-2022-KR) or 51949 (euc-kr), where \
+                   encoding_rs's tables are WHATWG's. ferrofin-util code_page.rs holds what \
+                   .NET has and encoding_rs lacks: code page 949's user-defined rows C9 and \
+                   FE, which are U+E000 to U+E0BB (user_defined, read by the ISO-2022-KR \
+                   decoder and by decode for 8-bit Korean text), and the GB18030 sequence 81 \
+                   35 F4 37, which is U+1E3F (decode). get_subtitle_stream and decode_playlist \
+                   decode 8-bit text through code_page decode. With them every ISO-2022-KR \
+                   pair, every four-byte sequence of the Basic Multilingual Plane that has a \
+                   character and a cp949 sidecar holding both user-defined rows serve the same \
+                   text as Jellyfin's. Playlists were served too: an ISO-2022-KR, a cp949 and \
+                   a GB18030 playlist whose entries name files called U+E000, U+E0BB and \
+                   U+1E3F find the same tracks on both servers. Bytes with no character in \
+                   their charset were measured next (gl-2010), in sidecars Jellyfin 12.4 named \
+                   cp949, gb18030, big5, shift-jis and euc-jp: every high byte before every \
+                   other byte, before a line feed, a CR LF and a NUL and at the end of the \
+                   file, and GB18030's four-byte forms. It is what .NET 10's \
+                   System.Text.Encoding.CodePages source says, read beside the measurement: \
+                   the decoder fallback writes ? (InternalDecoderBestFitFallback), or the code \
+                   page's default character, which LoadManagedCodePage sets: U+30FB for 932 \
+                   (shift-jis) and for 51932 (euc-jp, EUCJPEncoding over 932's table). \
+                   DBCSCodePageEncoding.GetChars (949, 950, 932, 51932) looks a lead byte up \
+                   together with the byte after it, whatever that byte is, so one replacement \
+                   takes both, a line feed included, and a lead byte the text ends in is one \
+                   replacement; 51932 has no three-byte form, so 8F is no lead byte there. \
+                   GB18030Encoding.GetChars writes ? for the first byte alone and reads on \
+                   from the next, and one ? for a well-formed four-byte sequence that has no \
+                   character. The code points themselves are in the code page data, so they \
+                   are the measured ones. \
+                   A byte that is no lead byte has a code point of its own: 80 is U+0080 in \
+                   949, 950 and 51932, FF is U+F8F7 in 949 and U+F8F8 in 950, A0 and FD to FF \
+                   are U+F8F0 to U+F8F3 in 932, as A0 and FF are in 51932, and 81 to 8D and 8F \
+                   to 9F are U+30FB in 51932. \
+                   The single-byte code pages were read through a ComicInfo.xml declaring each \
+                   of twenty encodings, since UTF.Unknown drops a single-byte charset at the \
+                   first byte its model marks illegal (SingleByteCharSetProber.HandleData); \
+                   seven code pages a sidecar was served in gave the same 128 bytes both ways. \
+                   .NET has a Private Use Area code point for every byte the WHATWG index \
+                   leaves out of windows-1253, -1255, -1257, -874 and ISO-8859-6, -7 and -8. \
+                   code_page decode runs encoding_rs's decoder without replacement and, for \
+                   each sequence it cannot decode, writes what dotnet_fallback and lone_bytes \
+                   hold of the above, then reads on after the bytes .NET takes. With it \
+                   decode writes the text Jellyfin serves for every swept line of cp949, \
+                   shift-jis and euc-jp (97,320, and the 44,188 of the gl-2000 sweep but JIS X \
+                   0212), and for gb18030's and big5's but for the differences below. chardetng \
+                   keeps a charset beside few of these sequences (an unassigned pair in Big5, \
+                   Shift_JIS and EUC-JP, the lone bytes, a Mac OS single byte before ASCII) and \
+                   never names a single-byte charset for text with a byte it lacks, so a \
+                   subtitle or a playlist reaches only those. Over HTTP, six sidecars holding \
+                   two to four such sequences each, in the five charsets, are byte for byte \
+                   what Jellyfin serves (one holding six in Shift_JIS is not: chardetng names \
+                   windows-1251 for it), and a Shift_JIS playlist whose entry holds an \
+                   unassigned pair finds the same track. Which charset 8-bit input is read in \
+                   (the multi-byte and single-byte probers) is not part of this row: chardetng \
+                   names it. \
+                   An XML document names its encoding, and was measured last (gl-2011): 1,501 \
+                   books (a ComicInfo.xml beside the comic and one in its archive, a sidecar \
+                   OPF and an EPUB's OPF) and 105 XMLTV guides, scanned and listed by Jellyfin \
+                   12.4 and by Ferrofin: every trail byte after every lead byte under seven \
+                   names, one document for each of the 228 WHATWG labels, and UTF-8, UTF-16 \
+                   and UTF-32 holding invalid input. ExternalComicInfoProvider.LoadXml, \
+                   InternalComicInfoProvider, OpfProvider.ReadOpfData, EpubProvider and \
+                   Jellyfin.XmlTv's XmlTvReader all read through .NET's XmlTextReaderImpl, \
+                   whose CheckEncoding takes Encoding.GetEncoding's decoder for a declared \
+                   name, which replaces what it cannot decode, and a throwing UTF8Encoding for \
+                   utf-8, for a UTF-8 byte-order mark and for no declaration (.NET 10 source, \
+                   read beside the measurement); UTF-16 goes through its own UTF16Decoder and \
+                   the reader's character checks. So a document in a legacy encoding never \
+                   fails to load for its bytes, and its text is the text of the code page a \
+                   detected subtitle is read with: the book and the guide sweeps equal each \
+                   other cell for cell, and the gl-2010 subtitle sweep of the same encoding \
+                   in all 28,544 comparable cells of ks_c_5601-1987, euc-kr, gb18030, big5, \
+                   shift_jis and euc-jp. gb2312, gbk, chinese, csgb2312, csiso58gb231280, \
+                   gb_2312-80 and iso-ir-58 are code page 936 there and only gb18030 is \
+                   GB18030Encoding: 936 is a DBCSCodePageEncoding, so one ? takes a lead byte \
+                   and the byte after it, FF is U+F8F5 and there is no four-byte form. euc-kr \
+                   and cseuckr are code page 51949 and the other seven Korean names 949. \
+                   providers books.rs decode_xml (every book XML document) and livetv xmltv.rs \
+                   Decoded read a declared legacy encoding through code_page Decoder::declared, \
+                   a guide in pieces as it arrives, and keep UTF-8 and UTF-16 strict; \
+                   lone_bytes got code page 936's FF and the unassigned bytes of ISO-8859-3 \
+                   and ISO-8859-8-I from the same measurement. With it the guide sweeps of \
+                   ks_c_5601-1987, shift_jis and euc-jp list what Jellyfin lists for all 28,800 \
+                   sequences each, and those of gb18030, gb2312, euc-kr and big5 but for the \
+                   differences below; the book sweeps are the same but for a bare carriage \
+                   return. Behind an M3U tuner, the programme titles and overviews of guides \
+                   in nine legacy encodings, each holding a sequence with no character, are \
+                   the same on both servers after a guide refresh, where none of them was \
+                   stored before. A lead byte right before markup takes its < in the \
+                   double-byte code pages, on Jellyfin too, where that guide answers 500 and \
+                   that book is not read; the guide is unreadable here as well.",
+        date: "2026-11-27",
         divergences: &[
             "Two 7-bit ISO-2022-JP variants chardetng rejects, an ISO-2022-JP-2 JIS X 0212 \
              designation and a run left open across a newline, are served as they are, where \
              Jellyfin's escape prober detects ISO-2022-JP and .NET decodes the JIS X 0208 \
              runs (with the 0212 character wrong). Fix path: gl-1998.",
-            "A pair is looked up in encoding_rs's GBK and EUC-KR tables (WHATWG), which may \
-             differ from .NET's code pages 936 and 949 for a few code points (Private Use \
-             Area and GB18030 mappings). Fix path: gl-2000.",
+            "34 Simplified Chinese sequences decode to another code point than Jellyfin's: \
+             in 8-bit text A3A0, A6D9 to A6DF, A6EC, A6ED, A6F3, A8BC, FE59, FE61, FE66, \
+             FE67, FE6D, FE7E, FE90, FEA0 and a lone 80, and under HZ A2E3, the same ten A6 \
+             pairs, A8BC and A8BF. encoding_rs answers U+3000, U+FE10 to U+FE19, U+1E3F, \
+             U+01F9, U+9FB4 to U+9FBB and U+20AC, where .NET answers a Private Use Area code \
+             point (U+E5E5, U+E76C, U+E78D to U+E796, U+E7C7, U+E7C8 and eight from U+E81E \
+             to U+E864) and ? for the lone 80. Owner decision pending, tracked in gl-2008.",
+            "B4D3 is U+B2D2, as code page 949 has it, where code page 51949, which Jellyfin \
+             reads a file it names euc-kr with, answers U+B2D6. Owner decision pending, \
+             tracked in gl-2008.",
+            "Korean text is read as code page 949 reads it whichever of the two Jellyfin would \
+             name, since chardetng answers EUC-KR for both. Code page 51949 reads the bytes \
+             80 to A0, AD to AF, C9, FE and FF alone (U+0080 to U+009F, U+F8E6, U+F8E7 to \
+             U+F8E9, ?, U+F8EA and U+F8EB), and the byte after each starts a new character, \
+             where Ferrofin decodes a UHC syllable or a user-defined pair, writes one ? for \
+             such a byte and the byte after it when the two make no pair, so that a line \
+             feed or an ASCII character 51949 keeps is gone, and reads FF as U+F8F7. Owner \
+             decision pending, tracked in gl-2008.",
+            "Big5 text is decoded with encoding_rs's Big5, the WHATWG index with the Hong \
+             Kong and ETEN extensions, where Jellyfin reads code page 950: 5,059 pairs \
+             decode to another code point, 33 (A3C0 to A3E0) to a control picture where 950 \
+             answers ?, and 1,159 pairs of 950's user-defined ranges stay U+FFFD, with an \
+             ASCII trail byte read again, where 950 answers a Private Use Area code point. \
+             Fix path: gl-2012, which waits on gl-2008.",
+            "EUC-JP's three-byte form (8F and two bytes) is decoded as JIS X 0212 where it \
+             has a character, 6,067 of the 8,836 sequences, where code page 51932 answers \
+             U+30FB for the 8F and reads the two bytes after it as a pair. The other 2,769 \
+             are read as 51932 reads them, so the form is read two ways until that is \
+             decided. Owner decision pending, tracked in gl-2008 (question D).",
+            "Eight bytes of two single-byte charsets decode to another code point than \
+             .NET's code pages 28597 and 28598: ISO-8859-7's A1, A2, A4, A5 and AA are \
+             U+2018, U+2019, U+20AC, U+20AF and U+037A where .NET answers U+02BD, U+02BC \
+             and U+F7C2 to U+F7C4, and ISO-8859-8's AF, FD and FE are U+00AF, U+200E and \
+             U+200F where .NET answers U+203E, U+F7BF and U+F7C0. Owner decision pending, \
+             tracked in gl-2008 with its question A.",
+            "7-bit ISO-2022-JP text holding a pair encoding_rs has no character for is not \
+             named by chardetng and is served as it is, where Jellyfin detects ISO-2022-JP \
+             and code page 50220 answers U+30FB for such a pair (1,437 of the 8,836) and the \
+             half-width katakana for the 63 pairs of row 2A. Fix path: gl-1998.",
+            "An XML document naming code page 936 (gb2312, gbk and their five other names) \
+             is read with encoding_rs's GBK wherever that has a character: 101 pairs are a \
+             character where 936 answers a Private Use Area code point (A2E3, A3A0, A6D9 to \
+             A6DF, A6EC, A6ED, A6F3, A8BC, A8BF, A989 to A995 and 74 pairs from FE50 to \
+             FEA0), and a four-byte GB18030 sequence that has a character keeps it (81 35 F4 \
+             37 as U+E7C7) where 936, which has no such form, answers ??. Owner decision \
+             pending, tracked in gl-2008 (questions A and E).",
+            "An XML document naming euc-kr or cseuckr is read as code page 949 reads it, \
+             where .NET takes code page 51949 for those two names, so the B4D3 and lone-byte \
+             differences above apply to it though its name tells the two apart: a pair of \
+             949's user-defined rows is U+E000 to U+E0BB where 51949 answers two characters, \
+             and such a byte right before markup takes the < where 51949 leaves it: Jellyfin \
+             lists that guide and it is unreadable here. Owner decision pending, tracked in \
+             gl-2008 (questions B and C).",
+            "A book's XML (not a guide's) reads the names .NET gives Latin1Encoding, \
+             ASCIIEncoding and code page 28599 (iso-8859-1, us-ascii, iso-8859-9 and their \
+             other names) as windows-1252 and windows-1254: 80 to 9F are those pages' \
+             characters where .NET answers the C1 controls, and a high byte under us-ascii \
+             is a character where .NET answers ?. Owner decision pending, tracked in gl-2008 \
+             (question F).",
+            "Five bytes of three Mac OS charsets an XML document can name decode to another \
+             character than .NET's code pages: macintosh's BD is U+03A9 where 10000 answers \
+             U+2126, x-mac-cyrillic's A2, B6 and FF are U+0490, U+0491 and U+20AC where \
+             10007 answers U+00A2, U+2202 and U+00A4, and x-mac-ukrainian's FF is U+20AC \
+             where 10017 answers U+00A4. Owner decision pending, tracked in gl-2008 with its \
+             question A.",
+            "An XML document naming iso-2022-jp or csiso2022jp is decoded by encoding_rs, \
+             which writes U+FFFD for a byte or a shift code page 50220 answers U+30FB or the \
+             half-width katakana for, and reads JIS-Roman's 5C and 7E as U+00A5 and U+203E \
+             where 50220 answers \\ and ~. Fix path: gl-1998.",
+            "A book's XML that is not well-formed once decoded is read for what the \
+             tokenizer accepts, where upstream's XDocument.Load and XmlDocument.Load refuse \
+             it: a lead byte of a double-byte code page right before a closing tag leaves \
+             the tag's remains in the text, and a ComicInfo.xml keeps a bare carriage \
+             return XmlReader reads as a line feed. Fix path: gl-2029.",
+            "An XML document's encoding name is looked up in the WHATWG labels, not in .NET's \
+             table: 73 labels .NET does not know are read where Jellyfin refuses the \
+             document, hz-gb-2312, iso-2022-kr and csiso2022kr are refused where .NET \
+             decodes them, asmo-708 is read as ISO-8859-6 where .NET has code page 708, and \
+             unicode-1-1-utf-8 is strict UTF-8 where .NET's decoder for that name replaces. \
+             A UTF-8 byte-order mark decides the encoding whatever the declaration then \
+             names, where XmlReader switches to a declared 8-bit encoding. Fix path: gl-939, \
+             which holds the measured lists for the book readers and the guide reader.",
         ],
     },
 ];

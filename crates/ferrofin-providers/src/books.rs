@@ -427,15 +427,20 @@ fn xml_document(bytes: &[u8]) -> Result<XmlCursor, &'static str> {
 /// (`XmlTextReaderImpl.DetectEncoding`): a UTF-32 or UTF-16 byte-order mark,
 /// or a leading `<` in one of those encodings, picks the encoding; then a
 /// UTF-8 BOM; otherwise the `<?xml … encoding="…"?>` declaration does, and
-/// without one it is UTF-8. Bytes invalid in that encoding, or an unknown
-/// declared encoding, fail the read as `XmlException` does.
+/// without one it is UTF-8. Bytes invalid in UTF-8, UTF-16 or UTF-32, or an
+/// unknown declared encoding, fail the read as `XmlException` does: for those
+/// `XmlReader` takes a decoder that throws (`UTF8BomThrowing`), or checks the
+/// characters itself. A declared legacy encoding never fails it: `XmlReader`
+/// takes `Encoding.GetEncoding`'s decoder, which replaces what it cannot
+/// decode, and so does [`ferrofin_util::code_page::Decoder`], with what the
+/// .NET code page of that name writes (gl-2011, measured on Jellyfin 12.4).
 ///
 /// `encoding_rs` follows WHATWG labels, so a declared `ISO-8859-1` decodes as
-/// windows-1252; the two differ only in 0x80–0x9F (C1 controls upstream,
-/// punctuation here). The unusual-octet UCS-4 orders (2143, 3412) are not
-/// recognised and read as UTF-8.
+/// windows-1252 (C1 controls upstream in 0x80–0x9F, punctuation here) and
+/// `us-ascii` too (`?` upstream for a high byte). The unusual-octet UCS-4
+/// orders (2143, 3412) are not recognised and read as UTF-8.
 fn decode_xml(bytes: &[u8]) -> Option<String> {
-    use encoding_rs::{UTF_8, UTF_16BE, UTF_16LE};
+    use encoding_rs::{REPLACEMENT, UTF_8, UTF_16BE, UTF_16LE};
     // UTF-32LE's BOM and leading `<` start like UTF-16LE's, so they come first.
     let (encoding, body) = match bytes {
         [0xFF, 0xFE, 0x00, 0x00, rest @ ..] => return decode_utf32(rest, u32::from_le_bytes),
@@ -452,9 +457,14 @@ fn decode_xml(bytes: &[u8]) -> Option<String> {
             None => (UTF_8, bytes),
         },
     };
-    encoding
-        .decode_without_bom_handling_and_without_replacement(body)
-        .map(std::borrow::Cow::into_owned)
+    if [UTF_8, UTF_16LE, UTF_16BE, REPLACEMENT].contains(&encoding) {
+        return encoding
+            .decode_without_bom_handling_and_without_replacement(body)
+            .map(std::borrow::Cow::into_owned);
+    }
+    let mut text = String::new();
+    ferrofin_util::code_page::Decoder::declared(encoding).decode(body, true, &mut text);
+    Some(text)
 }
 
 /// Strict UTF-32 in `unit`'s byte order (`encoding_rs` has none): an invalid
@@ -3485,6 +3495,10 @@ mod tests {
         b"<package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>Caf\xE9</dc:title></metadata></package>".to_vec(),
         None
     )]
+    #[case::declared_cp949_with_an_unassigned_pair(
+        b"<?xml version=\"1.0\" encoding=\"ks_c_5601-1987\"?><package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>\xc7\xd1\xa2\xe8\xc9\xa1</dc:title></metadata></package>".to_vec(),
+        Some("한?\u{E000}")
+    )]
     fn an_opf_sidecar_is_decoded_like_the_xml_reader(
         #[case] bytes: Vec<u8>,
         #[case] expected: Option<&str>,
@@ -3586,6 +3600,108 @@ mod tests {
             read_book_metadata(&path).and_then(|b| b.name).as_deref(),
             Some("Astérix")
         );
+    }
+
+    /// The title of a comic whose `ComicInfo.xml` declares `label` and holds
+    /// `title` there, read from the archive.
+    fn comic_title_in(label: &str, title: &[u8]) -> Option<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let document = [
+            format!("<?xml version=\"1.0\" encoding=\"{label}\"?><ComicInfo><Title>").as_bytes(),
+            title,
+            b"</Title></ComicInfo>",
+        ]
+        .concat();
+        let path = write_archive(
+            &dir,
+            "comic.cbz",
+            &[("ComicInfo.xml", document.as_slice())],
+            None,
+        );
+        read_book_metadata(&path).and_then(|b| b.name)
+    }
+
+    /// What Jellyfin 12.4 reads from a `ComicInfo.xml` that declares a legacy
+    /// encoding (gl-2011): the text .NET's code page of that name gives, with
+    /// its replacement for a sequence it has no character for, never a failed
+    /// read. `gb2312` and `gbk` are code page 936 there, which takes a lead
+    /// byte and the byte after it where `gb18030` takes the lead byte alone.
+    #[rstest::rstest]
+    #[case::cp949_user_defined("ks_c_5601-1987", b"\xc7\xd1 \xc9\xa1", "한 \u{E000}")]
+    #[case::cp949_unassigned("ks_c_5601-1987", b"\xa2\xe8a", "?a")]
+    #[case::euc_kr_unassigned("euc-kr", b"\xa2\xe8a", "?a")]
+    #[case::gb18030_m_acute("gb18030", b"\x81\x35\xf4\x37", "\u{1E3F}")]
+    #[case::gb18030_four_bytes("gb18030", b"\x84\x31\xa5\x30a", "?a")]
+    #[case::gb18030_lead_byte("gb18030", b"\x81 a", "? a")]
+    #[case::cp936_lead_byte("gbk", b"\x81 a", "?a")]
+    #[case::cp936_other_name("gb2312", b"\x81\xffa\xff", "?a\u{F8F5}")]
+    #[case::big5_unassigned("big5", b"\xa4\xa4\xa3\xe2", "中?")]
+    #[case::shift_jis_unassigned("shift_jis", b"\x82\xa0\x81\xad", "あ\u{30FB}")]
+    #[case::euc_jp_unassigned("euc-jp", b"\xa4\xa2\xa3\xa1", "あ\u{30FB}")]
+    #[case::windows_1253_unassigned("windows-1253", b"\xe1\xaa", "α\u{F8F9}")]
+    #[case::iso_8859_3_unassigned("iso-8859-3", b"\xa5", "\u{F7F5}")]
+    #[case::iso_8859_8_i_unassigned("iso-8859-8-i", b"\xe0\xa1", "א\u{F79C}")]
+    fn a_declared_legacy_encoding_is_read_with_dotnets_replacement(
+        #[case] label: &str,
+        #[case] title: &[u8],
+        #[case] expected: &str,
+    ) {
+        assert_eq!(comic_title_in(label, title).as_deref(), Some(expected));
+    }
+
+    /// A double-byte code page takes the byte after a lead byte whatever it
+    /// is, the `<` of a closing tag too, where `gb18030` takes the lead byte
+    /// alone. Jellyfin 12.4 reads the `gb18030` document and none of the
+    /// others: its `XDocument.Load` refuses the element left open. The
+    /// tokenizer here does not check end tags, so the title is read with the
+    /// tag's remains (gl-2029).
+    #[rstest::rstest]
+    #[case("gb18030", b"x\x81", "x?")]
+    #[case("ks_c_5601-1987", b"x\x81", "x?/Title>")]
+    #[case("gbk", b"x\x81", "x?/Title>")]
+    #[case("big5", b"x\x81", "x?/Title>")]
+    #[case("shift_jis", b"x\x81", "x\u{30FB}/Title>")]
+    #[case("euc-jp", b"x\xa1", "x\u{30FB}/Title>")]
+    fn a_lead_byte_before_markup_takes_it_where_dotnets_decoder_does(
+        #[case] label: &str,
+        #[case] title: &[u8],
+        #[case] expected: &str,
+    ) {
+        assert_eq!(comic_title_in(label, title).as_deref(), Some(expected));
+    }
+
+    /// UTF-8 and UTF-16 stay strict, as `XmlReader`'s throwing decoders are:
+    /// Jellyfin 12.4 reads none of these documents.
+    #[rstest::rstest]
+    #[case::declared("utf-8", b"Caf\xe9")]
+    #[case::upper_case("UTF-8", b"Caf\xe9")]
+    #[case::cut_off("utf-8", b"\xe4\xb8")]
+    fn a_declared_utf8_document_with_invalid_bytes_is_not_read(
+        #[case] label: &str,
+        #[case] title: &[u8],
+    ) {
+        assert_eq!(comic_title_in(label, title), None);
+    }
+
+    /// What stays as it was, each an open question of its own: sequences
+    /// `encoding_rs` decodes to a character where the .NET code page of the
+    /// declared name has a Private Use Area code point, `?` or another
+    /// character (gl-2008), and Big5's user-defined pairs (gl-2012).
+    #[rstest::rstest]
+    #[case::cp936_euro("gbk", b"\xa2\xe3", "\u{20AC}")]
+    #[case::cp936_four_bytes("gbk", b"\x81\x30\x81\x30a", "\u{80}a")]
+    #[case::cp51949_user_defined("euc-kr", b"\xc9\xa1a", "\u{E000}a")]
+    #[case::cp51949_b4d3("euc-kr", b"\xb4\xd3", "\u{B2D2}")]
+    #[case::euc_jp_jis_x_0212("euc-jp", b"\x8f\xb0\xa1", "\u{4E02}")]
+    #[case::big5_user_defined("big5", b"\x81\x40", "\u{FFFD}@")]
+    #[case::latin1_is_windows_1252("iso-8859-1", b"\x92", "\u{2019}")]
+    #[case::ascii_is_windows_1252("us-ascii", b"\xe9", "é")]
+    fn declared_encoding_differences_that_wait_for_a_decision_are_left_alone(
+        #[case] label: &str,
+        #[case] title: &[u8],
+        #[case] expected: &str,
+    ) {
+        assert_eq!(comic_title_in(label, title).as_deref(), Some(expected));
     }
 
     #[test]
