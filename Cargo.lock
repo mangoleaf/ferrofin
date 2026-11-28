@@ -1693,7 +1693,6 @@ dependencies = [
  "ferrofin-traits",
  "ferrofin-util",
  "flate2",
- "futures-util",
  "quick-xml",
  "regex",
  "reqwest",
