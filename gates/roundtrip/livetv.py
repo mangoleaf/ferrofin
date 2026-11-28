@@ -12,9 +12,9 @@ in Jellyfin, before and after Jellyfin's first guide refresh.
 Both servers read the fixture at /livetv (run.sh mounts it there), so the tuner's path, which every channel's and
 programme's id is derived from, is the same on both. The guide starts the next day at 18:00 UTC, so no airing ends
 during a run; one of its programmes is in +01:00, whose id embeds the offset. The answers compared are each
-timer's and series timer's ids, name and times, the channels' ids, the favourite channels' names, and the
-programmes' ids. Credentials come from the copy (api.py), and the favourite is the account smoke.sh probes as
-(answers.smoke_user). Exit status 0; 1 with one line per difference on stdout.
+timer's and series timer's ids, name and times, the channels' ids, numbers and types, the favourite channels' names,
+and the programmes' ids. Credentials come from the copy (api.py), and the favourite is the account smoke.sh probes
+as (answers.smoke_user). Exit status 0; 1 with one line per difference on stdout.
 """
 
 import argparse
@@ -33,12 +33,15 @@ MOUNT = "/livetv"
 #: The most programmes one request asks for: the fixture has 8, and a capture that holds fewer than the server
 #: counts fails rather than compare part of the guide.
 PROGRAMME_PAGE = 500
-#: How often the guide refresh's state is polled, in seconds: as api.py polls a scan.
-POLL_SECONDS = 2
+#: How often the guide refresh's state is polled, in seconds: api.py's interval for its waits.
+POLL_SECONDS = api.POLL_SECONDS
 #: The answers compared, per timer and series timer.
 TIMER_KEYS = ("Id", "ExternalId", "ChannelId", "ExternalChannelId", "ProgramId", "ExternalProgramId",
               "SeriesTimerId", "ExternalSeriesTimerId", "Name", "StartDate", "EndDate", "Status")
 SERIES_KEYS = ("Id", "ExternalId", "Name", "ChannelId", "ProgramId", "ExternalProgramId")
+#: The answers compared per channel. Its number and type live only in its item's Data
+#: (MediaBrowser.Controller/LiveTv/LiveTvChannel.cs), so a channel exported without one lists no number.
+CHANNEL_KEYS = ("Id", "Number", "ChannelType")
 
 
 def fixture(directory, now=None):
@@ -128,7 +131,7 @@ def capture(server, user):
     return {
         "timers": sorted(({k: t.get(k) for k in TIMER_KEYS} for t in timers), key=json.dumps),
         "series_timers": sorted(({k: t.get(k) for k in SERIES_KEYS} for t in series), key=json.dumps),
-        "channels": sorted(c.get("Id") for c in channels),
+        "channels": sorted(({k: c.get(k) for k in CHANNEL_KEYS} for c in channels), key=json.dumps),
         "favourite_channels": sorted(c.get("Name") for c in favourites),
         "programmes": sorted(p.get("Id") for p in programmes),
     }
@@ -185,7 +188,7 @@ def main(argv=None):
     parser.add_argument("--data-dir")
     parser.add_argument("--out")
     parser.add_argument("--ferrofin")
-    parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--timeout", type=float, default=600)   # seconds a guide refresh may take; the stages pass SCAN_TIMEOUT
     args = parser.parse_args(argv)
     if args.mode == "fixture":
         fixture(args.directory)

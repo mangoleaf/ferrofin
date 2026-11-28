@@ -27,6 +27,15 @@ The lines (README.md, "The usage-stage contract"):
     prefs <user> <sort by> <sort order> <custom prefs>            every account's home-screen display preferences
     apikeys <app names>                                           the API keys, by app name
     libraries <names>                                             the libraries (/Library/MediaFolders), by name
+    virtualfolder <name> type=<type> locations=<paths> <option>=<value> …
+                                                                  each library as /Library/VirtualFolders reads it
+                                                                   from the libraries' folders, shortcut files and
+                                                                   options, sorted ("-": no location; "<data>" for
+                                                                   the server's ProgramDataPath, /System/Info), with
+                                                                   the LIBRARY_OPTIONS
+    stream <movie> <status> bytes=<n> sha256=<hex>                the first movie by sort name played directly
+                                                                   (/Videos/<id>/stream?static=true): the first
+                                                                   STREAM_BYTES of its file, how many and their hash
     collection <Playlist|BoxSet> <items> <name>                   the smoke user's playlists and collections, and
                                                                    how many items each holds
     members <Playlist|BoxSet> <name> = <item names>               their items: a playlist's in its order, a
@@ -45,18 +54,24 @@ The lines (README.md, "The usage-stage contract"):
     videos <names>                                                the videos the smoke user lists that are no movie
                                                                    or episode, "-" for none
     config <document> <setting>=<value> …                         server settings a dashboard shows, per document
+    castreceivers <id>=<name>,…                                   the system settings' cast receivers (Playback's
+                                                                   Chromecast list), in their order, "-" for none
 The smoke probes run as ADOPTION_USER when it is set (run.sh sets the fixture's oracle user), as smoke.sh
 does. Exit status 0 when the file was written; 1 with one line on stdout when the server could not be
 asked (an answer the server refused is a line, never a failure: the comparison judges it).
 """
 
 import argparse
+import hashlib
+import http.client
 import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 
 import api
@@ -91,8 +106,18 @@ CONFIGURATION = {
                "DisplaySpecialsWithinSeasons", "QuickConnectAvailable", "ActivityLogRetentionDays"),
     "encoding": ("EncodingThreadCount", "HardwareAccelerationType", "EnableThrottling", "ThrottleDelaySeconds",
                  "H264Crf", "H265Crf", "EnableTonemapping", "DownMixAudioBoost"),
-    "network": ("EnableRemoteAccess", "InternalHttpPort", "EnableHttps", "BaseUrl", "EnableIPv6"),
+    "network": ("EnableRemoteAccess", "InternalHttpPort", "EnableHttps", "BaseUrl", "EnableIPv6", "AutoDiscovery"),
+    "branding": ("LoginDisclaimer", "CustomCss", "SplashscreenEnabled"),
+    "metadata": ("UseFileCreationTimeForDateAdded",),
+    "xbmcmetadata": ("ReleaseDateFormat", "SaveImagePathsInNfo", "EnablePathSubstitution", "EnableExtraThumbsDuplication"),
 }
+#: Library options a library's settings page shows, compared per library (/Library/VirtualFolders LibraryOptions).
+LIBRARY_OPTIONS = ("EnableRealtimeMonitor", "EnablePhotos", "EnableInternetProviders", "SaveLocalMetadata",
+                   "EnableChapterImageExtraction", "ExtractChapterImagesDuringLibraryScan",
+                   "EnableTrickplayImageExtraction", "AutomaticRefreshIntervalDays", "PreferredMetadataLanguage",
+                   "MetadataCountryCode")
+#: How much of a movie's file the direct-play probe reads: enough to tell the file, not all of a long one.
+STREAM_BYTES = 65536
 
 
 def smoke_credentials(data_dir, account=None):
@@ -118,6 +143,7 @@ def smoke_user(data_dir):
 def smoke_auth(data_dir, account=None):
     """The Authorization header of that account's (or `account`'s) own web session, as smoke.sh sends it."""
     _, token, device, _ = smoke_credentials(data_dir, account)
+    # Version: the client version smoke.sh sends for a web session (gates/adoption/smoke.sh USERH)
     return f'MediaBrowser Token="{token}", Client="Jellyfin Web", Device="Chrome", DeviceId="{device}", Version="10.11.8"'
 
 
@@ -243,13 +269,35 @@ def server_lines(server):
     out = [f"apikeys {','.join(names) if status == 200 else f'error={status}'}"]
     status, found = items(server, "/Library/MediaFolders")
     out.append(f"libraries {','.join(sorted(row.get('Name') or '' for row in found)) if status == 200 else f'error={status}'}")
+    status, folders = server.send("GET", "/Library/VirtualFolders")
+    if status != 200 or not isinstance(folders, list):
+        out.append(f"virtualfolder error={status}")
+    else:
+        _, info = server.send("GET", "/System/Info")
+        home = info.get("ProgramDataPath") if isinstance(info, dict) else None
+        out += sorted(f"virtualfolder {row.get('Name')} type={row.get('CollectionType')} "
+                      f"locations={','.join(sorted(located(p, home) for p in row.get('Locations') or [])) or '-'} "
+                      + " ".join(f"{field}={number((row.get('LibraryOptions') or {}).get(field))}"
+                                 for field in LIBRARY_OPTIONS) for row in folders)
     for key, fields in CONFIGURATION.items():
         status, document = server.send("GET", "/System/Configuration" + ("" if key == "system" else f"/{key}"))
         if status != 200 or not isinstance(document, dict):
             out.append(f"config {key} error={status}")
             continue
         out.append(f"config {key} " + " ".join(f"{field}={number(document.get(field))}" for field in fields))
+        if key == "system":
+            # in order: the first is the receiver of every account that picked none
+            # (Jellyfin.Server.Implementations/Users/UserManager.cs:481-484)
+            receivers = document.get("CastReceiverApplications") or []
+            out.append("castreceivers " + (",".join(f"{r.get('Id')}={r.get('Name')}" for r in receivers) or "-"))
     return out
+
+
+def located(path, home):
+    """A library location in the server's own directory (a collections library's) named from it, as <data>/…: Ferrofin
+    and Jellyfin run the copy at different paths."""
+    home = (home or "").rstrip("/")
+    return "<data>" + path[len(home):] if home and path.startswith(home + "/") else path
 
 
 def number(value):
@@ -310,6 +358,28 @@ def rated_lines(server):
                      if status == 200 else f"error={status}")
             out.append(f"rated {user.get('Name')} {kind} {names}")
     return out
+
+
+def stream_lines(server, user_id):
+    """The first movie by sort name, as smoke.sh picks it, played directly: the status, and how many of the first
+    STREAM_BYTES of its file came and their hash."""
+    query = urllib.parse.urlencode({"userId": user_id, "Recursive": "true", "IncludeItemTypes": "Movie",
+                                    "SortBy": "SortName", "SortOrder": "Ascending", "Limit": "1"})
+    status, found = items(server, "/Items?" + query)
+    if status != 200 or not found:
+        return [f"stream /Items {status} movies={len(found)}"]
+    request = urllib.request.Request(f"{server.base}/Videos/{found[0].get('Id')}/stream?static=true",
+                                     headers={"Authorization": server.auth})
+    try:
+        with urllib.request.urlopen(request, timeout=api.REQUEST_SECONDS) as response:
+            status, body = response.status, response.read(STREAM_BYTES)
+    except urllib.error.HTTPError as error:
+        status, body = error.code, b""
+        error.close()
+    except (OSError, http.client.HTTPException) as error:
+        raise api.CheckError(f"GET /Videos/<id>/stream: no answer ({type(error).__name__})") from None
+    # 16 hex digits of the hash: enough to tell two files apart on one line
+    return [f"stream {found[0].get('Name')} {status} bytes={len(body)} sha256={hashlib.sha256(body).hexdigest()[:16]}"]
 
 
 def collection_lines(server, user_id):
@@ -381,7 +451,7 @@ def capture(base_url, data_dir):
     return (smoke_lines(base_url, data_dir) + user_data_lines(server) + user_plays_lines(server)
             + account_lines(server) + rated_lines(server) + login_lines(server) + preference_lines(server)
             + server_lines(server) + collection_lines(server, user_id) + share_lines(server, data_dir)
-            + movie_lines(server, user_id))
+            + movie_lines(server, user_id) + stream_lines(server, user_id))
 
 
 def write(path, lines):

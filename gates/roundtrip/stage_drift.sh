@@ -22,6 +22,7 @@ drift_stage() {
     rt_wait_up "$name" "$port" "$READY_TIMEOUT" "$RT_JELLYFIN_START_FAILED" ||
       why+=("the fresh install: $(rt_not_up "$name" "$READY_TIMEOUT")")
   else
+    # the start error's first 300 bytes: docker's reason, short enough for the route's line
     why+=("the fresh install did not start: $(head -c 300 "$dst/fresh-start.err")")
   fi
   [ -s "$dst/fresh-start.err" ] || rm -f -- "$dst/fresh-start.err"

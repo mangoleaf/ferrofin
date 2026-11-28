@@ -29,6 +29,26 @@ class Fixture(unittest.TestCase):
         self.assertEqual(guide.count("<title>Quiz Night</title>"), 6)
 
 
+class Capture(unittest.TestCase):
+    class Server:
+        """Answers livetv.capture's requests: no timer or programme, and one channel with `number`."""
+        def __init__(self, number):
+            self.number = number
+
+        def send(self, method, path, body=None):
+            if path.startswith("/LiveTv/Channels"):
+                return 200, {"Items": [{"Id": "c" * 32, "Name": "Test News", "Number": self.number, "ChannelType": "TV"}]}
+            return 200, {"Items": [], "TotalRecordCount": 0}
+
+    def test_a_channel_s_number_is_compared_with_its_id(self):
+        ferrofin, jellyfin = livetv.capture(self.Server("101"), "u"), livetv.capture(self.Server(None), "u")
+        self.assertEqual(ferrofin["channels"], [{"Id": "c" * 32, "Number": "101", "ChannelType": "TV"}])
+        lines = livetv.differences(ferrofin, jellyfin, "before")
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("Live TV before: channels differ: "), lines)
+        self.assertEqual(livetv.differences(ferrofin, livetv.capture(self.Server("101"), "u"), "before"), [])
+
+
 class Differences(unittest.TestCase):
     FERROFIN = {"timers": [{"Id": "a"}], "favourite_channels": ["Test News"], "programmes": ["p1", "p2"]}
 

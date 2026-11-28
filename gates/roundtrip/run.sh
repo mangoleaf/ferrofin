@@ -5,37 +5,44 @@
 # pristine synthetic fixture (gates/adoption/build-fixtures.sh), each stage records each of its checks:
 #   Ferrofin   IMAGE (default ferrofin:bench) adopts the copy and scans it, the usage stage runs (usage.py:
 #              watch state, accounts, a device, an API key, display preferences, playlists, collections,
-#              libraries, a metadata edit, an image, deletes and a removed share; README.md) and captures
+#              libraries, a metadata edit, an image, settings, deletes and a removed share; README.md) and captures
 #              Ferrofin's answers (answers.py) once its closing library scan has completed, and Ferrofin
 #              is stopped. Checks: ready; boot log (generation, migrations, no ERROR); the scan completes;
 #              the usage stage; a clean stop.
 #   Export     `ferrofin-server export-jellyfin` from IMAGE, in a container of its own, writes what
 #              Ferrofin left into the copy Jellyfin boots on (stage_export.sh). Checks: it completes; every
 #              path the exported database stores resolves in it, in the layout of Jellyfin's image, and
-#              none lies under the directory Ferrofin ran at (checks_paths.py stored).
+#              none lies under the directory Ferrofin ran at (checks_paths.py stored); its database has
+#              Jellyfin's schema and nothing of Ferrofin's, and its loss report names every table of
+#              Ferrofin's that held rows, with its count (checks_db.py export).
 #   Jellyfin   the Jellyfin release UPSTREAM_TAG names (jellyfin/jellyfin:<minor>, or --jellyfin-image)
-#              boots on the export. Checks: ready within ROUNDTRIP_READY_TIMEOUT; every migration it
-#              began finished (a failure names the migration and its SQLite error); it ran the code
-#              migrations its own first start on the route's source ran (routes.sh), but those the export
-#              records as applied, and no schema migration; no ERR or FTL entry outside checks_boot.py's allowlist up to that
-#              point; a full metadata refresh of every playlist completes (api.py refresh-playlists),
-#              then its answers equal Ferrofin's (adoption_normalise: ids, image sizes and the probes
-#              that differ by design left out), so everything answers.py captures came back: users and
-#              their logins, watch state, devices, API keys, settings, playlists and collections, and
-#              more; it serves every image, chapter and profile image, trickplay tile, external subtitle
-#              and attachment its database lists (probes.py, which writes probes.txt); its library scan
-#              completes; integrity_check and foreign_key_check clean once it has stopped; and every
-#              library folder row Ferrofin stopped with is still there after that scan, with its
-#              DateCreated (checks_paths.py libraries).
-# The errors check reads the log up to the probes: an error a probe causes is judged by the answers.
+#              boots on the export (stage_jellyfin.sh). Checks: ready within ROUNDTRIP_READY_TIMEOUT; every
+#              migration it began finished (a failure names the migration and its SQLite error); it ran the
+#              code migrations its own first start on the route's source ran (routes.sh), but those the export
+#              records as applied, and no schema migration; no ERR or FTL entry outside checks_boot.py's
+#              allowlist up to its startup tasks; a full metadata refresh of every playlist completes
+#              (api.py refresh-playlists), then its answers equal Ferrofin's (adoption_normalise: ids, image
+#              sizes and the probes that differ by design left out), so everything answers.py captures came
+#              back: users and their logins, watch state, devices, API keys, settings, libraries, playlists
+#              and collections, a direct play, and more; it serves every image, chapter and profile image,
+#              trickplay tile, external subtitle and attachment its database lists (probes.py, which writes
+#              probes.txt); its library scan completes; it kept every item and the counts by type
+#              (checks_db.py counts), and its answers after the scan equal Ferrofin's too; it stops cleanly,
+#              with no unexpected error in the rest of its log; integrity_check and foreign_key_check clean;
+#              every library folder row Ferrofin stopped with is still there after that scan, with its
+#              DateCreated (checks_paths.py libraries). Then it starts again on the same file: ready, no
+#              migration, no unexpected error, the same answers, a clean stop. Its database is copied at the
+#              end of each window (its start, the gate's requests, its scan, the rest until its stop, its
+#              second start), and every row a window added, removed or changed must be explained by an entry
+#              of allowlist.py (checks_db.py rows, rows-<window>.txt), which run.sh checks first.
 # Each route is a record in routes.sh: its fixture, the directories Ferrofin runs in, the media tree it mounts
 # and its kind (a scale route's time and size are recorded on its line, not gated). One PASS/FAIL line per
 # route listed (a missing fixture is a FAIL line too, never a skip), then how many passed; the exit status is
 # 1 if any failed, 2 if the run was refused (an unknown route in --only, or no route to run). Every check's verdict goes to WORK/results.jsonl
 # as it runs, and WORK/report.html and WORK/result.json (the gates' envelope, gates/result.py, which a
 # gates/run session reads) are built from it however the run ends (report.py). A failed route keeps its
-# copies under WORK; a passed one keeps only its logs and answers. The stages are stage_ferrofin.sh,
-# stage_export.sh and stage_jellyfin.sh.
+# copies and its database snapshots under WORK; a passed one keeps only its logs, answers and row diffs. The
+# stages are stage_ferrofin.sh, stage_export.sh and stage_jellyfin.sh.
 #
 # Several runs can share one host: a run has an id (--run-id, default <time>-<pid>), and its containers
 # (rt-<id>-<route>-<server>), the tag it runs IMAGE as (ferrofin-roundtrip:<id>) and its work directory
@@ -87,6 +94,8 @@ for setting in READY_TIMEOUT SCAN_TIMEOUT STOP_TIMEOUT; do
 done
 [[ "$ROUNDTRIP_DOCKER_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "ROUNDTRIP_DOCKER_TIMEOUT must be a positive integer"
 for t in docker sqlite3 jq curl python3 timeout; do command -v "$t" >/dev/null || die "$t not installed"; done
+# every allowlist entry must name what Jellyfin's schema has, and say why: one that cannot apply explains nothing
+held=$(python3 "$HERE/allowlist.py" check --schema "$RT_SCHEMA" 2>&1) || die "the allowlist does not hold: $held"
 RUN_ID=${RUN_ID:-$(rt_new_run_id)}
 rt_valid_run_id "$RUN_ID" || die "--run-id must be lower-case letters, digits, dots and dashes (at most 48), not '$RUN_ID'"
 IFS=, read -ra WANTED <<<"$ONLY"
@@ -202,8 +211,9 @@ for spec in "${SELECTED[@]}"; do
   printf '%-5s %-14s %s\n' "$verdict" "$route" "$detail"
   record_detail row "$WORK" "$route" "$kind" "$generation" "$verdict" "$detail"
   [ "$verdict" = FAIL ] || passed=$((passed + 1))
-  # a passed route keeps its logs and answers; its copies go (a failed one keeps them to look into)
-  [ "$verdict" = FAIL ] || rm -rf -- "${dst:?}/ferrofin" "${dst:?}/ferrofin-config" "${dst:?}/ferrofin-cache" "${dst:?}/jellyfin" "${dst:?}/jellyfin-cache"
+  # a passed route keeps its logs, answers and row diffs; its copies and snapshots go (a failed one keeps them to
+  # look into, and to run checks_db.py rows on again with another allowlist)
+  [ "$verdict" = FAIL ] || rm -rf -- "${dst:?}/ferrofin" "${dst:?}/ferrofin-config" "${dst:?}/ferrofin-cache" "${dst:?}/jellyfin" "${dst:?}/jellyfin-cache" "${dst:?}/db"
 done
 echo "roundtrip: $passed of ${#SELECTED[@]} route(s) passed"
 exit "$failed"

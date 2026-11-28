@@ -93,7 +93,22 @@ class UsageStage(unittest.TestCase):
                             and line.endswith(" sessions=2 audio=deu subs=Always autoplay=0") for line in lines))
         self.assertTrue(any(line.startswith("prefs synthetic-admin DateCreated Descending ")
                             and "roundtrip=on" in line for line in lines))
-        self.assertEqual([line.split()[1] for line in lines if line.startswith("config ")], ["system", "encoding", "network"])
+        self.assertEqual([line.split()[1] for line in lines if line.startswith("config ")],
+                         ["system", "encoding", "network", "branding", "metadata", "xbmcmetadata"])
+        # one setting of each document, away from its default
+        for document, setting in (("system", "LibraryMonitorDelay=75"), ("encoding", "H264Crf=21"),
+                                  ("network", "AutoDiscovery=False"), ("branding", "LoginDisclaimer=Round-trip"),
+                                  ("metadata", "UseFileCreationTimeForDateAdded=False"),
+                                  ("xbmcmetadata", "EnableExtraThumbsDuplication=True")):
+            self.assertIn(setting, next(line for line in lines if line.startswith(f"config {document} ")).split())
+        # the cast receivers in their order, the fixtures' own kept through the change of the system settings
+        self.assertIn("castreceivers F007D354=Stable,6F511C87=Unstable,synthetic-cast-receiver=Synthetic cast receiver",
+                      lines)
+        unset = " ".join(f"{option}=None" for option in usage.answers.LIBRARY_OPTIONS[1:])
+        self.assertEqual([line for line in lines if line.startswith("virtualfolder ")],
+                         [f"virtualfolder Round trip library type=movies locations=- EnableRealtimeMonitor=False {unset}",
+                          f"virtualfolder Synthetic Movies type=movies locations=- EnableRealtimeMonitor=None {unset}"])
+        self.assertEqual([line.split(" bytes=")[0] for line in lines if line.startswith("stream ")], ["stream Movie 1 200"])
         self.assertFalse(any("deleted" in line for line in lines))
         actions = (self.tmp / "oracle.txt.actions").read_text().splitlines()
         self.assertIn("give the collection a primary image  204", actions)
@@ -158,6 +173,11 @@ class UsageStage(unittest.TestCase):
                 (f"/Items/{DOOMED_PLAYLIST}", "delete the playlist Round trip deleted playlist"),
                 (f"/Items/{DOOMED_COLLECTION}", "delete the collection Round trip deleted collection"),
                 (f"DELETE /Playlists/{SHARED}/Users", f"unshare {SHARED_NAME}"),
+                ("POST /System/Configuration$", "change LibraryMonitorDelay in the system settings"),
+                ("POST /System/Configuration/encoding", "change H264Crf in the encoding settings"),
+                ("POST /System/Configuration/network", "change AutoDiscovery in the network settings"),
+                ("POST /System/Configuration/xbmcmetadata", "change EnableExtraThumbsDuplication in the xbmcmetadata "
+                 "settings"),
                 (f"/Videos/{0x20:032x}/AlternateSources", "split Rowan Ferry"),
                 (f"/Videos/{0x22:032x}/AlternateSources", "split Saffron Gate"),
                 ("/Videos/MergeVersions", "merge Saffron Gate Remastered into Saffron Gate"),
@@ -251,6 +271,16 @@ class UsageStage(unittest.TestCase):
 
         status, err = self.run_stage(NoId())
         self.assertEqual((status, err.strip()), (1, "usage: create the collection Round trip collection: no Id in the answer"))
+
+
+class Located(unittest.TestCase):
+    def test_a_location_in_the_server_s_own_directory_is_named_from_it(self):
+        located = usage.answers.located
+        self.assertEqual(located("/data/data/collections", "/data"), "<data>/data/collections")
+        self.assertEqual(located("/config/data/collections", "/config/"), "<data>/data/collections")
+        self.assertEqual(located("/media/movies", "/config"), "/media/movies")
+        self.assertEqual(located("/datadir/x", "/data"), "/datadir/x")
+        self.assertEqual(located("/data/x", None), "/data/x")
 
 
 class Png(unittest.TestCase):

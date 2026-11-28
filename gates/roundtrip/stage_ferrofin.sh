@@ -34,6 +34,7 @@ ferrofin_stage() {
     url=http://127.0.0.1:$port
     rt_wait_up "$name" "$port" "$READY_TIMEOUT" || why+=("$(rt_not_up "$name" "$READY_TIMEOUT")")
   else
+    # the start error's first 300 bytes: docker's reason, short enough for the route's line
     why+=("did not start: $(head -c 300 "$dst/ferrofin-start.err")")
   fi
   [ -s "$dst/ferrofin-start.err" ] || rm -f -- "$dst/ferrofin-start.err"

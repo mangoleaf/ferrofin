@@ -37,6 +37,14 @@ rt_new_run_id() { printf '%s-%s\n' "$(date +%Y%m%d-%H%M%S)" "$$"; }
 # rt_valid_run_id <id>: whether <id> can name containers, an image tag and a directory.
 rt_valid_run_id() { [[ $1 =~ ^[a-z0-9][a-z0-9.-]{0,47}$ ]]; }
 
+# The Jellyfin schema an exported database must have: the 12.2 pin, as the export's own test has it (12.3 and 12.4
+# add no schema migration). Relative to the repository, where run.sh runs.
+# shellcheck disable=SC2034  # read by run.sh and stage_export.sh
+RT_SCHEMA=crates/ferrofin-db/tests/data/jellyfin-12.2-schema.sql
+# The loss report the export writes into its output (ferrofin_db::export::LOSS_REPORT).
+# shellcheck disable=SC2034
+RT_LOSS_REPORT=ferrofin-export-report.txt
+
 # rt_name <run id> <route> <role>: the container of one server of one route of one run.
 rt_name() { printf 'rt-%s-%s-%s\n' "$1" "$2" "$3"; }
 
@@ -100,6 +108,7 @@ rt_run_once() {
 rt_wait_up() {
   local name=$1 port=$2 deadline=$((SECONDS + $3)) give_up=${4:-} log
   while [ "$SECONDS" -lt "$deadline" ]; do
+    # 5 s per probe: a server that answers does so in milliseconds, and one that hangs is polled again
     curl -sf --max-time 5 "http://127.0.0.1:$port/System/Ping" >/dev/null &&
       curl -sf --max-time 5 "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0
     [ "$(rt_docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ] || return 1
@@ -107,7 +116,7 @@ rt_wait_up() {
       log=$(rt_docker logs "$name" 2>&1)   # whole, not piped: grep -q's early exit would fail the pipe
       ! grep -qE -- "$give_up" <<<"$log" || return 1
     fi
-    sleep 2
+    sleep 2   # between readiness polls, as api.py's POLL_SECONDS
   done
   return 1
 }
