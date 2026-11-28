@@ -160,6 +160,7 @@ pub fn read_book_metadata_with_readers(path: &str, readers: &[&str]) -> Option<B
             &["opf"],
             &["content.opf", "metadata.opf"],
             fetcher_names::OPF,
+            LineEnds::AsWritten,
         )
         .and_then(|(opf, cursor)| {
             // The span gives `calibre_int`'s Debug line its file (see there).
@@ -263,7 +264,13 @@ fn read_comic_metadata(path: &str) -> Option<BookMetadata> {
     }
     // `ExternalComicInfoProvider` logs its Debug line for a sidecar that did
     // not load too, after `read_sidecar`'s warning.
-    if let Some((_, cursor)) = read_sidecar(path, &["xml"], &["ComicInfo.xml"], COMIC) {
+    if let Some((_, cursor)) = read_sidecar(
+        path,
+        &["xml"],
+        &["ComicInfo.xml"],
+        COMIC,
+        LineEnds::Normalized,
+    ) {
         if let Some(book) = comic_info_metadata(cursor) {
             return Some(book);
         }
@@ -326,7 +333,7 @@ fn read_comic_book_info(path: &str, archive: &ZipBook) -> Option<BookMetadata> {
 /// here, for the reason [`read_comic_metadata`] gives.
 fn read_internal_comic_info(path: &str, archive: &mut ZipBook) -> Option<BookMetadata> {
     use crate::library_options::fetcher_names::COMIC;
-    match zip_xml_entry(archive, "comicinfo.xml") {
+    match zip_xml_entry(archive, "comicinfo.xml", LineEnds::Normalized) {
         None => {
             tracing::debug!(
                 provider = COMIC,
@@ -350,7 +357,8 @@ fn read_internal_comic_info(path: &str, archive: &mut ZipBook) -> Option<BookMet
 
 /// Reads the first sidecar that exists beside `path`: one named after the
 /// file's own stem with each of `stem_extensions`, then each of `fixed_names`
-/// in the file's directory. Returns it with its path, as an XML document.
+/// in the file's directory. Returns it with its path, as an XML document
+/// read with `line_ends`.
 ///
 /// A candidate file that exists but cannot be read is skipped for the next one;
 /// a document that does not load ends the search. Both are logged as
@@ -364,6 +372,7 @@ fn read_sidecar(
     stem_extensions: &[&str],
     fixed_names: &[&str],
     provider: &str,
+    line_ends: LineEnds,
 ) -> Option<(std::path::PathBuf, XmlCursor)> {
     let file = Path::new(path);
     let dir = file.parent()?;
@@ -393,7 +402,7 @@ fn read_sidecar(
                 None
             }
         })?;
-    match xml_document(&bytes) {
+    match xml_document(&bytes, line_ends) {
         Ok(cursor) => Some((sidecar, cursor)),
         Err(reason) => {
             tracing::warn!(
@@ -408,34 +417,60 @@ fn read_sidecar(
     }
 }
 
-/// An XML file's bytes as a document, decoded as [`decode_xml`] does: the
-/// reason it does not load otherwise, as `XDocument.Load` would throw.
+/// What the .NET reader that loads a book's XML document does with its line
+/// ends (measured on Jellyfin 12.4, gl-2029).
+#[derive(Clone, Copy)]
+enum LineEnds {
+    /// `XmlReader.Create`, which `XDocument.Load` reads through: CR LF and a
+    /// lone CR in the document are one line feed (XML 1.0, section 2.11). A
+    /// character reference (`&#13;`) is not a line end and stays.
+    Normalized,
+    /// `XmlDocument.Load`, whose `XmlTextReader` has `Normalization` off: the
+    /// text is as the document holds it, and so is an attribute value.
+    AsWritten,
+}
+
+/// An XML file's bytes as a document, decoded as [`decode_xml`] does and read
+/// with `line_ends`: the reason it does not load otherwise, as
+/// `XDocument.Load` would throw.
 ///
 /// An empty or blank file (an interrupted write) fails as "Root element is
 /// missing" does. Beyond that, "does not load" is what the tokenizer refuses:
-/// it accepts a truncated document whose elements are never closed, which
-/// `XDocument.Load` refuses, so such a file is read for what it holds.
-fn xml_document(bytes: &[u8]) -> Result<XmlCursor, &'static str> {
+/// it accepts a document that is not well-formed (an end tag with another
+/// name, a root never closed, a file cut off in its text), which
+/// `XDocument.Load` and `XmlDocument.Load` refuse, so such a file is read for
+/// what it holds. That is an open difference: owner decision pending, tracked
+/// in gl-2032.
+fn xml_document(bytes: &[u8], line_ends: LineEnds) -> Result<XmlCursor, &'static str> {
     let xml = decode_xml(bytes).ok_or("the bytes do not decode in the document's encoding")?;
     if xml.trim().is_empty() {
         return Err("the document is empty");
     }
-    XmlCursor::new(&xml).map_err(|_| "the document is not well-formed XML")
+    match line_ends {
+        LineEnds::Normalized => XmlCursor::new(&xml),
+        LineEnds::AsWritten => XmlCursor::as_written(&xml),
+    }
+    .map_err(|_| "the document is not well-formed XML")
 }
 
 /// Decodes an XML document as `XmlReader`/`XmlDocument.Load` do
 /// (`XmlTextReaderImpl.DetectEncoding`): a UTF-32 or UTF-16 byte-order mark,
 /// or a leading `<` in one of those encodings, picks the encoding; then a
 /// UTF-8 BOM; otherwise the `<?xml … encoding="…"?>` declaration does, and
-/// without one it is UTF-8. Bytes invalid in that encoding, or an unknown
-/// declared encoding, fail the read as `XmlException` does.
+/// without one it is UTF-8. Bytes invalid in UTF-8, UTF-16 or UTF-32, or an
+/// unknown declared encoding, fail the read as `XmlException` does: for those
+/// `XmlReader` takes a decoder that throws (`UTF8BomThrowing`), or checks the
+/// characters itself. A declared legacy encoding never fails it: `XmlReader`
+/// takes `Encoding.GetEncoding`'s decoder, which replaces what it cannot
+/// decode, and so does [`ferrofin_util::code_page::Decoder`], with what the
+/// .NET code page of that name writes (gl-2011, measured on Jellyfin 12.4).
 ///
 /// `encoding_rs` follows WHATWG labels, so a declared `ISO-8859-1` decodes as
-/// windows-1252; the two differ only in 0x80–0x9F (C1 controls upstream,
-/// punctuation here). The unusual-octet UCS-4 orders (2143, 3412) are not
-/// recognised and read as UTF-8.
+/// windows-1252 (C1 controls upstream in 0x80–0x9F, punctuation here) and
+/// `us-ascii` too (`?` upstream for a high byte). The unusual-octet UCS-4
+/// orders (2143, 3412) are not recognised and read as UTF-8.
 fn decode_xml(bytes: &[u8]) -> Option<String> {
-    use encoding_rs::{UTF_8, UTF_16BE, UTF_16LE};
+    use encoding_rs::{REPLACEMENT, UTF_8, UTF_16BE, UTF_16LE};
     // UTF-32LE's BOM and leading `<` start like UTF-16LE's, so they come first.
     let (encoding, body) = match bytes {
         [0xFF, 0xFE, 0x00, 0x00, rest @ ..] => return decode_utf32(rest, u32::from_le_bytes),
@@ -452,9 +487,14 @@ fn decode_xml(bytes: &[u8]) -> Option<String> {
             None => (UTF_8, bytes),
         },
     };
-    encoding
-        .decode_without_bom_handling_and_without_replacement(body)
-        .map(std::borrow::Cow::into_owned)
+    if [UTF_8, UTF_16LE, UTF_16BE, REPLACEMENT].contains(&encoding) {
+        return encoding
+            .decode_without_bom_handling_and_without_replacement(body)
+            .map(std::borrow::Cow::into_owned);
+    }
+    let mut text = String::new();
+    ferrofin_util::code_page::Decoder::declared(encoding).decode(body, true, &mut text);
+    Some(text)
 }
 
 /// Strict UTF-32 in `unit`'s byte order (`encoding_rs` has none): an invalid
@@ -505,7 +545,9 @@ fn read_epub_metadata(path: &str) -> Option<BookMetadata> {
             return None;
         }
     };
-    let container = match zip_xml_entry(&mut archive, EPUB_CONTAINER)? {
+    // `EpubUtils.ReadContentFilePath` loads the container with `XDocument.Load`,
+    // `EpubProvider` the OPF with `XmlDocument.Load`.
+    let container = match zip_xml_entry(&mut archive, EPUB_CONTAINER, LineEnds::Normalized)? {
         Ok(container) => container,
         Err(err) => {
             tracing::warn!(
@@ -518,7 +560,7 @@ fn read_epub_metadata(path: &str) -> Option<BookMetadata> {
         }
     };
     let opf_path = rootfile_path(container)?;
-    let opf = match zip_xml_entry(&mut archive, &opf_path.to_lowercase())? {
+    let opf = match zip_xml_entry(&mut archive, &opf_path.to_lowercase(), LineEnds::AsWritten)? {
         Ok(opf) => opf,
         Err(err) => {
             tracing::warn!(
@@ -674,7 +716,7 @@ fn comic_book_info_metadata(format: ComicBookInfoFormat) -> Option<BookMetadata>
 /// Jellyfin looks for (`calibre:series`/`series_index`/`rating`).
 #[must_use]
 pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
-    opf_metadata(XmlCursor::new(xml).ok()?)
+    opf_metadata(XmlCursor::as_written(xml).ok()?)
 }
 
 /// [`parse_opf`] over a document already loaded.
@@ -1464,7 +1506,7 @@ pub fn read_epub_cover(path: &str) -> Option<(String, Vec<u8>)> {
 
 /// The manifest id an EPUB's `<meta name="cover" content="…"/>` points at.
 fn epub_cover_id(opf: &str) -> Option<String> {
-    let Ok(mut cursor) = XmlCursor::new(opf) else {
+    let Ok(mut cursor) = XmlCursor::as_written(opf) else {
         return None;
     };
     while !cursor.eof() {
@@ -1488,7 +1530,7 @@ fn epub_cover_id(opf: &str) -> Option<String> {
 /// The `href` of the manifest item carrying `properties="…"` — the EPUB 3
 /// declaration, which most modern books use instead of the `<meta>` pointer.
 fn epub_manifest_href_by_property(opf: &str, property: &str) -> Option<String> {
-    let Ok(mut cursor) = XmlCursor::new(opf) else {
+    let Ok(mut cursor) = XmlCursor::as_written(opf) else {
         return None;
     };
     while !cursor.eof() {
@@ -1515,7 +1557,7 @@ fn epub_manifest_href_by_property(opf: &str, property: &str) -> Option<String> {
 /// `href` when a manifest image item has exactly that `href`
 /// (`//opf:item[@href='…']` with an image media type).
 fn epub_manifest_image_at(opf: &str, href: &str) -> Option<String> {
-    let Ok(mut cursor) = XmlCursor::new(opf) else {
+    let Ok(mut cursor) = XmlCursor::as_written(opf) else {
         return None;
     };
     while !cursor.eof() {
@@ -1540,7 +1582,7 @@ fn is_image_media_type(media_type: &str) -> bool {
 
 /// The `href` of the manifest item with `id`.
 fn epub_manifest_href(opf: &str, id: &str) -> Option<String> {
-    let Ok(mut cursor) = XmlCursor::new(opf) else {
+    let Ok(mut cursor) = XmlCursor::as_written(opf) else {
         return None;
     };
     while !cursor.eof() {
@@ -1597,13 +1639,15 @@ fn read_archive_entry_bytes(path: &str, wanted_lower: &str) -> Option<Vec<u8>> {
     read_capped(&mut entry)
 }
 
-/// The archive entry named `wanted_lower` as an XML document: `None` when the
-/// archive has no such entry, else the document or the reason it does not
-/// load. An entry over the size cap also has [`read_stream_capped`]'s line,
-/// which names the entry but not the book; this one names the book.
+/// The archive entry named `wanted_lower` as an XML document read with
+/// `line_ends`: `None` when the archive has no such entry, else the document
+/// or the reason it does not load. An entry over the size cap also has
+/// [`read_stream_capped`]'s line, which names the entry but not the book; this
+/// one names the book.
 fn zip_xml_entry(
     archive: &mut ZipBook,
     wanted_lower: &str,
+    line_ends: LineEnds,
 ) -> Option<Result<XmlCursor, &'static str>> {
     let index = zip_entry_index(archive, wanted_lower)?;
     let bytes = archive
@@ -1613,7 +1657,7 @@ fn zip_xml_entry(
     Some(
         bytes
             .ok_or("the entry is over the size cap or does not decompress")
-            .and_then(|bytes| xml_document(&bytes)),
+            .and_then(|bytes| xml_document(&bytes, line_ends)),
     )
 }
 
@@ -3485,6 +3529,10 @@ mod tests {
         b"<package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>Caf\xE9</dc:title></metadata></package>".to_vec(),
         None
     )]
+    #[case::declared_cp949_with_an_unassigned_pair(
+        b"<?xml version=\"1.0\" encoding=\"ks_c_5601-1987\"?><package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>\xc7\xd1\xa2\xe8\xc9\xa1</dc:title></metadata></package>".to_vec(),
+        Some("한?\u{E000}")
+    )]
     fn an_opf_sidecar_is_decoded_like_the_xml_reader(
         #[case] bytes: Vec<u8>,
         #[case] expected: Option<&str>,
@@ -3585,6 +3633,213 @@ mod tests {
         assert_eq!(
             read_book_metadata(&path).and_then(|b| b.name).as_deref(),
             Some("Astérix")
+        );
+    }
+
+    /// The title of a comic whose `ComicInfo.xml` declares `label` and holds
+    /// `title` there, read from the archive.
+    fn comic_title_in(label: &str, title: &[u8]) -> Option<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let document = [
+            format!("<?xml version=\"1.0\" encoding=\"{label}\"?><ComicInfo><Title>").as_bytes(),
+            title,
+            b"</Title></ComicInfo>",
+        ]
+        .concat();
+        let path = write_archive(
+            &dir,
+            "comic.cbz",
+            &[("ComicInfo.xml", document.as_slice())],
+            None,
+        );
+        read_book_metadata(&path).and_then(|b| b.name)
+    }
+
+    /// What Jellyfin 12.4 reads from a `ComicInfo.xml` that declares a legacy
+    /// encoding (gl-2011): the text .NET's code page of that name gives, with
+    /// its replacement for a sequence it has no character for, never a failed
+    /// read. `gb2312` and `gbk` are code page 936 there, which takes a lead
+    /// byte and the byte after it where `gb18030` takes the lead byte alone.
+    #[rstest::rstest]
+    #[case::cp949_user_defined("ks_c_5601-1987", b"\xc7\xd1 \xc9\xa1", "한 \u{E000}")]
+    #[case::cp949_unassigned("ks_c_5601-1987", b"\xa2\xe8a", "?a")]
+    #[case::euc_kr_unassigned("euc-kr", b"\xa2\xe8a", "?a")]
+    #[case::gb18030_m_acute("gb18030", b"\x81\x35\xf4\x37", "\u{1E3F}")]
+    #[case::gb18030_four_bytes("gb18030", b"\x84\x31\xa5\x30a", "?a")]
+    #[case::gb18030_lead_byte("gb18030", b"\x81 a", "? a")]
+    #[case::cp936_lead_byte("gbk", b"\x81 a", "?a")]
+    #[case::cp936_other_name("gb2312", b"\x81\xffa\xff", "?a\u{F8F5}")]
+    #[case::big5_unassigned("big5", b"\xa4\xa4\xa3\xe2", "中?")]
+    #[case::shift_jis_unassigned("shift_jis", b"\x82\xa0\x81\xad", "あ\u{30FB}")]
+    #[case::euc_jp_unassigned("euc-jp", b"\xa4\xa2\xa3\xa1", "あ\u{30FB}")]
+    #[case::windows_1253_unassigned("windows-1253", b"\xe1\xaa", "α\u{F8F9}")]
+    #[case::iso_8859_3_unassigned("iso-8859-3", b"\xa5", "\u{F7F5}")]
+    #[case::iso_8859_8_i_unassigned("iso-8859-8-i", b"\xe0\xa1", "א\u{F79C}")]
+    fn a_declared_legacy_encoding_is_read_with_dotnets_replacement(
+        #[case] label: &str,
+        #[case] title: &[u8],
+        #[case] expected: &str,
+    ) {
+        assert_eq!(comic_title_in(label, title).as_deref(), Some(expected));
+    }
+
+    /// A double-byte code page takes the byte after a lead byte whatever it
+    /// is, the `<` of a closing tag too, where `gb18030` takes the lead byte
+    /// alone. Jellyfin 12.4 reads the `gb18030` document and none of the
+    /// others: its `XDocument.Load` refuses the element left open. The
+    /// tokenizer here does not check end tags, so the title is read with the
+    /// tag's remains (owner decision pending, tracked in gl-2032).
+    #[rstest::rstest]
+    #[case("gb18030", b"x\x81", "x?")]
+    #[case("ks_c_5601-1987", b"x\x81", "x?/Title>")]
+    #[case("gbk", b"x\x81", "x?/Title>")]
+    #[case("big5", b"x\x81", "x?/Title>")]
+    #[case("shift_jis", b"x\x81", "x\u{30FB}/Title>")]
+    #[case("euc-jp", b"x\xa1", "x\u{30FB}/Title>")]
+    fn a_lead_byte_before_markup_takes_it_where_dotnets_decoder_does(
+        #[case] label: &str,
+        #[case] title: &[u8],
+        #[case] expected: &str,
+    ) {
+        assert_eq!(comic_title_in(label, title).as_deref(), Some(expected));
+    }
+
+    /// UTF-8 and UTF-16 stay strict, as `XmlReader`'s throwing decoders are:
+    /// Jellyfin 12.4 reads none of these documents.
+    #[rstest::rstest]
+    #[case::declared("utf-8", b"Caf\xe9")]
+    #[case::upper_case("UTF-8", b"Caf\xe9")]
+    #[case::cut_off("utf-8", b"\xe4\xb8")]
+    fn a_declared_utf8_document_with_invalid_bytes_is_not_read(
+        #[case] label: &str,
+        #[case] title: &[u8],
+    ) {
+        assert_eq!(comic_title_in(label, title), None);
+    }
+
+    /// What stays as it was, each an open question of its own: sequences
+    /// `encoding_rs` decodes to a character where the .NET code page of the
+    /// declared name has a Private Use Area code point, `?` or another
+    /// character (gl-2008), and Big5's user-defined pairs (gl-2012).
+    #[rstest::rstest]
+    #[case::cp936_euro("gbk", b"\xa2\xe3", "\u{20AC}")]
+    #[case::cp936_four_bytes("gbk", b"\x81\x30\x81\x30a", "\u{80}a")]
+    #[case::cp51949_user_defined("euc-kr", b"\xc9\xa1a", "\u{E000}a")]
+    #[case::cp51949_b4d3("euc-kr", b"\xb4\xd3", "\u{B2D2}")]
+    #[case::euc_jp_jis_x_0212("euc-jp", b"\x8f\xb0\xa1", "\u{4E02}")]
+    #[case::big5_user_defined("big5", b"\x81\x40", "\u{FFFD}@")]
+    #[case::latin1_is_windows_1252("iso-8859-1", b"\x92", "\u{2019}")]
+    #[case::ascii_is_windows_1252("us-ascii", b"\xe9", "é")]
+    fn declared_encoding_differences_that_wait_for_a_decision_are_left_alone(
+        #[case] label: &str,
+        #[case] title: &[u8],
+        #[case] expected: &str,
+    ) {
+        assert_eq!(comic_title_in(label, title).as_deref(), Some(expected));
+    }
+
+    /// CR LF, a lone CR and an LF as a document holds them, then as character
+    /// references and in a CDATA section.
+    const MIXED_LINE_ENDS: &str = "one\r\ntwo\rthree\nfour [&#13;&#10;] [<![CDATA[x\ry\r\nz]]>]";
+
+    /// Jellyfin's `ComicInfo.xml` readers load through `XmlReader.Create`,
+    /// which reads CR LF and a lone CR in the document as one line feed, in a
+    /// CDATA section too; a character reference is no line end (gl-2029,
+    /// measured on Jellyfin 12.4 through all three files).
+    #[rstest::rstest]
+    #[case::beside_the_comic(Some("ComicInfo.xml"))]
+    #[case::named_after_the_comic(Some("comic.xml"))]
+    #[case::inside_the_archive(None)]
+    fn a_comic_infos_line_ends_are_read_as_line_feeds(#[case] sidecar: Option<&str>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let document = format!(
+            "<ComicInfo>\r\n<Title>T</Title>\r\n<Summary>{MIXED_LINE_ENDS}</Summary>\r\n</ComicInfo>\r\n"
+        );
+        let mut entries: Vec<(&str, &[u8])> = vec![("001.jpg", b"page")];
+        match sidecar {
+            Some(name) => std::fs::write(dir.path().join(name), &document).expect("write sidecar"),
+            None => entries.push(("ComicInfo.xml", document.as_bytes())),
+        }
+        let path = write_archive(&dir, "comic.cbz", &entries, None);
+        assert_eq!(
+            read_book_metadata(&path)
+                .and_then(|b| b.overview)
+                .as_deref(),
+            Some("one\ntwo\nthree\nfour [\r\n] [x\ny\nz]")
+        );
+    }
+
+    /// An OPF is loaded by `XmlDocument.Load`, whose reader does not normalise
+    /// line ends: Jellyfin 12.4 stores every carriage return of a sidecar's
+    /// and of an EPUB's description, and so does the reader here.
+    #[rstest::rstest]
+    #[case::sidecar(false)]
+    #[case::epub(true)]
+    fn an_opfs_line_ends_are_kept_as_written(#[case] epub: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opf = format!(
+            "<package xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\r\n<metadata>\r\n\
+             <dc:title>T</dc:title>\r\n<dc:description>{MIXED_LINE_ENDS}</dc:description>\r\n\
+             </metadata>\r\n</package>\r\n"
+        );
+        let path = if epub {
+            let container = br#"<container><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>"#;
+            write_archive(
+                &dir,
+                "book.epub",
+                &[
+                    ("META-INF/container.xml", container),
+                    ("content.opf", opf.as_bytes()),
+                ],
+                None,
+            )
+        } else {
+            std::fs::write(dir.path().join("book.mobi"), b"book").expect("write book");
+            std::fs::write(dir.path().join("book.opf"), &opf).expect("write opf");
+            dir.path().join("book.mobi").to_string_lossy().into_owned()
+        };
+        assert_eq!(
+            read_book_metadata(&path)
+                .and_then(|b| b.overview)
+                .as_deref(),
+            Some("one\r\ntwo\rthree\nfour [\r\n] [x\ry\r\nz]")
+        );
+    }
+
+    /// `XmlDocument.Load`'s reader has `Normalization` off for an attribute
+    /// value too: Jellyfin 12.4 stores the line ends and the tab an OPF's
+    /// `calibre:series` attribute holds as the document has them, where
+    /// `XmlReader.Create` reads each as one space (an NFO's attribute).
+    #[rstest::rstest]
+    #[case::sidecar(false)]
+    #[case::epub(true)]
+    fn an_opfs_attribute_keeps_its_white_space_as_written(#[case] epub: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let opf = "<package xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\r\n<metadata>\r\n\
+                   <dc:title>T</dc:title>\r\n<meta name=\"calibre:series\" \
+                   content=\"crlf[\r\n] cr[\r] lf[\n] tab[\t] ref[&#13;&#10;&#9;]\"/>\r\n\
+                   </metadata>\r\n</package>\r\n";
+        let path = if epub {
+            let container = br#"<container><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>"#;
+            write_archive(
+                &dir,
+                "book.epub",
+                &[
+                    ("META-INF/container.xml", container),
+                    ("content.opf", opf.as_bytes()),
+                ],
+                None,
+            )
+        } else {
+            std::fs::write(dir.path().join("book.mobi"), b"book").expect("write book");
+            std::fs::write(dir.path().join("book.opf"), opf).expect("write opf");
+            dir.path().join("book.mobi").to_string_lossy().into_owned()
+        };
+        assert_eq!(
+            read_book_metadata(&path)
+                .and_then(|b| b.series_name)
+                .as_deref(),
+            Some("crlf[\r\n] cr[\r] lf[\n] tab[\t] ref[\r\n\t]")
         );
     }
 

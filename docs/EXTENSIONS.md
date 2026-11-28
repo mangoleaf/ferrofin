@@ -65,7 +65,10 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
   their settings page (served via `GET /web/ConfigurationPage`).
 - **Runtime enable/disable, no restart.** The persisted enabled flag lives in the
   `PluginManager`; each extension self-gates on it (disabled → its routes return `404`, its
-  scheduled tasks no-op).
+  scheduled tasks no-op). OpenSubtitles, registered by the server rather than as an
+  extension, follows it too: disabled, its subtitle provider is gone from searches,
+  downloads, its login check and the library options' subtitle fetchers, as Jellyfin's
+  unloaded plugin is.
 - **Vendored settings pages.** The upstream plugin's HTML settings page is committed into
   `crates/ferrofin-extensions/assets/<name>/` at build time, so normal builds are hermetic
   (no network fetch). Refresh with `FERROFIN_REFRESH_PLUGIN_ASSETS=1 cargo build -p ferrofin-extensions`.
@@ -285,6 +288,10 @@ plugin id no `*.wasm` file in that directory carries, so a plugin installed agai
 without it. It removes none while a `*.wasm` file fails to load or the directory cannot be
 listed. A plugin taken out by moving its file away or renaming it to something other than
 `*.wasm` loses its segment output the same way and has to analyse the library again.
+
+An uninstall that cannot delete the plugin's file (a read-only `{data_dir}/plugins/`, say)
+still succeeds, as on Jellyfin: the file is marked in `{config_dir}/plugins/state.json`, and
+each start deletes it before loading the directory and does not load it while it cannot.
 
 **The plugin's image.** A package whose repository entry has an `imageUrl` gets that image
 as its dashboard icon, as on Jellyfin: the install downloads it into the plugin's directory

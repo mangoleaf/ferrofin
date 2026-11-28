@@ -46,17 +46,16 @@ private = { ignore = true }
 # The -sys crates also add the license of the C library they vendor and compile into the binary, which
 # their own `license` field leaves out.
 
-# libjpeg-turbo, the TurboJPEG API (BSD-3-Clause, whose text binary distributions must reproduce) over the
-# IJG code (whose license asks for the statement about.hbs prints). Its SIMD code's Zlib license is
-# subsumed by the IJG one (LICENSE.md). The binding itself is "Unlicense OR MIT", ships no license file,
-# and is taken under the Unlicense.
+# libjpeg-turbo, the TurboJPEG API over the IJG code (whose license asks for the statement about.hbs
+# prints). The binary links the release scripts/libjpeg-turbo.sh pins, not the older copy this crate
+# carries. The IJG license is the same file in both (the script's release has this checksum too), so it
+# is taken from the crate. The TurboJPEG API's Modified BSD License, whose text and copyright notice
+# binary distributions must reproduce, differs between them: about.hbs carries the pinned release's, and
+# the script fails when a new pin's LICENSE.md is another file. The licenses of the release's SIMD code,
+# zlib and libspng are subsumed by those two (its LICENSE.md). The binding itself is "Unlicense OR MIT",
+# ships no license file, and is taken under the Unlicense.
 [turbojpeg-sys.clarify]
-license = "Unlicense AND BSD-3-Clause AND IJG"
-
-[[turbojpeg-sys.clarify.files]]
-path = "libjpeg-turbo/LICENSE.md"
-license = "BSD-3-Clause"
-checksum = "96f5b328adbb78eeaaec6980d73fd558cb1e4d62560ed615646bc3cf5e532430"
+license = "Unlicense AND IJG"
 
 [[turbojpeg-sys.clarify.files]]
 path = "libjpeg-turbo/README.ijg"

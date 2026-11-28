@@ -23,6 +23,7 @@
 
 #[cfg(feature = "tokio")]
 pub mod change_watch;
+pub mod code_page;
 pub mod current_culture;
 pub mod directory_path;
 pub mod error;

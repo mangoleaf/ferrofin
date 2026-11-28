@@ -27,13 +27,14 @@
 //! - `CreateSplashscreen` builds `{DataPath}/splashscreen.png` (see
 //!   `crate::splashscreen`). `GetImageBlurHash` is implemented (decode → 128x128 resize → BlurHash-encode);
 //!   its output is valid but not byte-identical to Skia's (see the method doc).
-//! - A JPEG headed for a blur hash, a smaller `EncodeImage` output, a collage
-//!   cell or a splashscreen tile is decoded at the smallest DCT scale (1/8,
-//!   1/4, 1/2) that still covers the target (twice the target for everything
-//!   but the blur hash, `THUMBNAIL_DECODE_FACTOR`), as Skia's codec decodes it
-//!   for upstream's blur hash, so its full-size bitmap is never built (see
-//!   `scaled_jpeg`). Other formats, and targets no reduced scale covers,
-//!   decode in full.
+//! - A JPEG is decoded by libjpeg-turbo, the codec inside Skia (see
+//!   `scaled_jpeg`). One headed for a blur hash, a smaller `EncodeImage`
+//!   output, a collage cell or a splashscreen tile is decoded at the smallest
+//!   DCT scale (1/8, 1/4, 1/2) that still covers the target (twice the target
+//!   for everything but the blur hash, `THUMBNAIL_DECODE_FACTOR`), as Skia's
+//!   codec decodes it for upstream's blur hash, so its full-size bitmap is
+//!   never built. Other formats, and targets no reduced scale covers, decode
+//!   in full.
 //! - Every decode and resize runs under [`ImageLimits`] ([`crate::limits`]),
 //!   which upstream has no counterpart for. An image they refuse is
 //!   [`ServiceError::InvalidInput`], and the processor serves the original.
@@ -514,16 +515,16 @@ impl ImageCrateEncoder {
     fn blur_hash_pixels(memory: &ImageMemory, path: &str) -> Result<RgbaImage, ServiceError> {
         // The `image` crate's Triangle, the tent filter.
         let filter = fast_image_resize::FilterType::Bilinear;
-        if let Some(jpeg) = ScalableJpeg::open(path, memory.limits()) {
+        if let Some(jpeg) = memory.jpeg(path)? {
             let (width, height) = jpeg.dimensions();
             let (fit_width, fit_height) = fit_within(width, height, BLUR_HASH_MAX_SIDE);
-            if let Some(scaled) = jpeg.decode_at_least(fit_width, fit_height, None) {
+            if let Some(scaled) = jpeg.decode_at_least(fit_width, fit_height) {
                 return Ok(memory
                     .resize_exact(&scaled, fit_width, fit_height, filter)?
                     .to_rgba8());
             }
         }
-        let image = memory.decode(path)?;
+        let image = memory.decode_with_image_crate(path, false)?;
         let (fit_width, fit_height) = fit_within(image.width(), image.height(), BLUR_HASH_MAX_SIDE);
         Ok(memory
             .resize_exact(&image, fit_width, fit_height, filter)?
@@ -663,11 +664,10 @@ impl ImageCrateEncoder {
 /// still decode at a reduced scale once the target size is known, or an image
 /// already decoded in full.
 enum EncodeSource {
-    /// A JPEG `jpeg-decoder` handles (boxed: its decoder state is large).
-    /// `orientation` is the EXIF orientation to apply, `None` when the caller
-    /// did not ask for auto-orientation.
+    /// A JPEG libjpeg-turbo decodes. `orientation` is the EXIF orientation to
+    /// apply, `None` when the caller did not ask for auto-orientation.
     Jpeg {
-        jpeg: Box<ScalableJpeg>,
+        jpeg: ScalableJpeg,
         orientation: Option<Orientation>,
     },
     /// Any other input, decoded (and oriented, when asked) in full.
@@ -675,16 +675,16 @@ enum EncodeSource {
 }
 
 impl EncodeSource {
-    /// Opens `path`: reads a JPEG's header only, decodes anything else.
+    /// Opens `path`: reads a JPEG's file and header without decoding it,
+    /// decodes anything else.
     fn open(memory: &ImageMemory, path: &str, auto_orient: bool) -> Result<Self, ServiceError> {
-        if let Some(jpeg) = ScalableJpeg::open(path, memory.limits()) {
+        if let Some(jpeg) = memory.jpeg(path)? {
             let orientation = auto_orient.then(|| jpeg.orientation());
-            return Ok(Self::Jpeg {
-                jpeg: Box::new(jpeg),
-                orientation,
-            });
+            return Ok(Self::Jpeg { jpeg, orientation });
         }
-        Ok(Self::Decoded(full_decode(memory, path, auto_orient)?))
+        Ok(Self::Decoded(
+            memory.decode_with_image_crate(path, auto_orient)?,
+        ))
     }
 
     /// The size of the image as it will be drawn (after any orientation).
@@ -708,35 +708,39 @@ impl EncodeSource {
 
     /// The upright image, decoded at the smallest DCT scale that still covers
     /// [`THUMBNAIL_DECODE_FACTOR`] times `target` on both axes, so the Lanczos3
-    /// resize after it always shrinks by at least that much. A JPEG that no
-    /// reduced scale covers, or that the scaled decoder fails on, decodes in
-    /// full through the `image` crate as before.
+    /// resize after it always shrinks by at least that much, and in full when
+    /// no reduced scale covers it. A JPEG libjpeg-turbo fails on decodes in
+    /// full through the `image` crate.
     fn decode_covering(
         self,
         memory: &ImageMemory,
         path: &str,
         target: ImageDimensions,
     ) -> Result<CoveringImage, ServiceError> {
-        let full_size = |image| CoveringImage {
+        let by_image_crate = |image| CoveringImage {
             image,
-            full_size: true,
+            by_image_crate: true,
         };
         let (jpeg, orientation) = match self {
-            Self::Decoded(image) => return Ok(full_size(image)),
+            Self::Decoded(image) => return Ok(by_image_crate(image)),
             Self::Jpeg { jpeg, orientation } => (jpeg, orientation),
         };
-        if let Some((min_width, min_height)) = thumbnail_decode_minimum(target, orientation)
-            && let Some(mut image) = jpeg.decode_at_least(min_width, min_height, orientation)
-        {
+        let decoded = match thumbnail_decode_minimum(target, orientation) {
+            Some((min_width, min_height)) => jpeg.decode_at_least(min_width, min_height),
+            None => jpeg.decode_full(),
+        };
+        if let Some(mut image) = decoded {
             if let Some(orientation) = orientation {
                 image.apply_orientation(orientation);
             }
             return Ok(CoveringImage {
                 image,
-                full_size: false,
+                by_image_crate: false,
             });
         }
-        full_decode(memory, path, orientation.is_some()).map(full_size)
+        memory
+            .decode_with_image_crate(path, orientation.is_some())
+            .map(by_image_crate)
     }
 
     /// The image resized ([`ImageCrateEncoder::resize_exact`]) to the size
@@ -744,10 +748,10 @@ impl EncodeSource {
     /// [`Self::decode_covering`]; the decoded image itself when `target_of`
     /// gives its own size.
     ///
-    /// A full decode measures the upright image itself. When it differs from
-    /// what the header read planned with (an EXIF orientation stored after the
-    /// frame header, which the header read cannot see), the size is planned
-    /// again from the decoded image.
+    /// The `image` crate's decode measures the upright image itself. When it
+    /// differs from what the header read planned with (the two read a file's
+    /// EXIF orientation apart), the size is planned again from the decoded
+    /// image.
     fn resize_to(
         self,
         memory: &ImageMemory,
@@ -758,7 +762,7 @@ impl EncodeSource {
         let target = target_of(planned);
         let decoded = self.decode_covering(memory, path, target)?;
         let upright = image_dimensions(&decoded.image);
-        let target = if decoded.full_size && upright != planned {
+        let target = if decoded.by_image_crate && upright != planned {
             target_of(upright)
         } else {
             target
@@ -1087,9 +1091,10 @@ fn parse_sk_color(text: &str) -> Option<image::Rgba<u8>> {
 struct CoveringImage {
     /// The upright pixels.
     image: DynamicImage,
-    /// Whether `image` is the full-size decode, whose own size is the image's
-    /// upright size; a reduced-scale decode is smaller by design.
-    full_size: bool,
+    /// Whether the `image` crate decoded `image`, in full: its own size is
+    /// then the image's upright size as that decoder read it. A libjpeg-turbo
+    /// decode is the size and orientation the header read planned with.
+    by_image_crate: bool,
 }
 
 /// The smallest stored-orientation size a JPEG thumbnail of `target` (upright)
@@ -1122,19 +1127,6 @@ fn image_dimensions(image: &DynamicImage) -> ImageDimensions {
         i32::try_from(image.width()).unwrap_or(i32::MAX),
         i32::try_from(image.height()).unwrap_or(i32::MAX),
     )
-}
-
-/// The full-size decode through the `image` crate, oriented when asked.
-fn full_decode(
-    memory: &ImageMemory,
-    path: &str,
-    auto_orient: bool,
-) -> Result<DynamicImage, ServiceError> {
-    if auto_orient {
-        memory.decode_oriented(path)
-    } else {
-        memory.decode(path)
-    }
 }
 
 /// How many times the target size a JPEG thumbnail is decoded at, at least,
@@ -2538,7 +2530,8 @@ mod tests {
     }
 
     /// `jpeg_bytes` with an APP1 EXIF segment holding `exif` inserted right
-    /// after the frame header (SOF0), where the header read cannot see it.
+    /// after the frame header (SOF0), where a reader that stops at the frame
+    /// header does not see it.
     fn with_exif_after_frame_header(jpeg_bytes: &[u8], exif: &[u8]) -> Vec<u8> {
         let mut at = 2; // past SOI
         loop {
@@ -2560,10 +2553,10 @@ mod tests {
         out
     }
 
-    /// gl-1015: an EXIF orientation stored after the frame header is missed by
-    /// the header read, so the scaled decode is discarded; the full decode then
-    /// sizes the thumbnail from the upright image, as it always did, instead of
-    /// stretching it to the size planned for the stored one.
+    /// gl-1015: an EXIF orientation stored after the frame header still sizes
+    /// the thumbnail from the upright image, instead of stretching it to the
+    /// size planned for the stored one: the header read takes in every
+    /// segment before the first scan.
     #[tokio::test]
     async fn an_orientation_after_the_frame_header_still_sizes_the_upright_image() {
         let dir = TempDir::new().expect("tempdir");
@@ -2609,11 +2602,12 @@ mod tests {
         assert!(top_red > 180 && top_blue < 60, "top {top_red}/{top_blue}");
     }
 
-    /// gl-1015: a JPEG whose header reads but whose data is cut short ends as
-    /// the full decode ends it: the scaled decode's failure falls back to the
-    /// `image` crate, so the outcome is the one this path always had.
+    /// A JPEG whose header reads but whose data is cut short is resized from
+    /// the part that is there, as upstream resizes it: Skia's codec reports
+    /// the file as incomplete, and `SkiaEncoder.Decode` takes the bitmap
+    /// (`SKBitmap.Decode`, then `_ = codec.GetPixels(…)`).
     #[tokio::test]
-    async fn a_truncated_jpeg_ends_as_the_full_decode_ends_it() {
+    async fn a_truncated_jpeg_is_resized_from_the_part_that_is_there() {
         let dir = TempDir::new().expect("tempdir");
         let whole = jpeg_fixture(&dir, "whole.jpg", &smooth_photo(1600, 1200), None);
         let bytes = std::fs::read(&whole).expect("read");
@@ -2637,14 +2631,18 @@ mod tests {
                 ImageFormat::Png,
             )
             .await;
-        match image::open(&input) {
-            Ok(_) => {
-                assert_eq!(encoded.expect("the full decode reads it"), output);
-                let thumb = image::open(&output).expect("decodes");
-                assert_eq!((thumb.width(), thumb.height()), (200, 150));
-            }
-            Err(error) => assert!(encoded.is_err(), "the full decode fails ({error})"),
-        }
+        assert_eq!(encoded.expect("the top half decodes"), output);
+        let thumb = image::open(&output).expect("decodes").to_rgb8();
+        assert_eq!(thumb.dimensions(), (200, 150));
+        // The image crate's resize of the whole photo, kept as an independent
+        // oracle for the rows above the cut.
+        let whole = image::open(&whole)
+            .expect("decodes")
+            .resize_exact(200, 150, imageops::FilterType::Lanczos3)
+            .to_rgb8();
+        let rows = 200 * 3 * 60;
+        let diff = mean_abs_diff(&thumb.as_raw()[..rows], &whole.as_raw()[..rows]);
+        assert!(diff < 2.0, "mean difference {diff} levels in the top rows");
     }
 
     /// gl-1015: a JPEG's blur hash comes from a reduced DCT scale, as Skia's

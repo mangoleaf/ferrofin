@@ -22,6 +22,7 @@ use std::io::BufRead;
 
 use chrono::{DateTime, FixedOffset, TimeZone};
 use encoding_rs::{DecoderResult, Encoding};
+use ferrofin_util::code_page;
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -197,11 +198,15 @@ pub fn parse_xmltv_where(xml: &str, keep: impl FnMut(&XmltvProgramme) -> bool) -
 /// The bytes are decoded the way `XmlTvReader`'s `XmlReader` decodes the
 /// cached file (Jellyfin.XmlTv `XmlTvReader.CreateXmlTextReader`): by the
 /// byte-order mark, else by the `<?xml … encoding="…"?>` declaration, else as
-/// UTF-8. A byte sequence that is not valid in that encoding makes the
+/// UTF-8. A byte sequence that is not valid UTF-8 or UTF-16 makes the
 /// document unreadable ([`Xmltv::error`]), as it makes `XmlReader` throw.
 /// `ISO-8859-1`, `US-ASCII` and `ISO-8859-9` (and their other names) decode
 /// as .NET's `Latin1Encoding`, `ASCIIEncoding` and code page 28599 do; any
-/// other name is looked up by the WHATWG rules.
+/// other name is looked up by the WHATWG rules and read as the .NET code page
+/// of that name reads it ([`code_page::Decoder`]): a sequence with no
+/// character in it is replaced, as `Encoding.GetEncoding`'s decoder replaces
+/// it, and never makes the document unreadable (gl-2011, measured on Jellyfin
+/// 12.4).
 ///
 /// `language` is the reader's (`new XmlTvReader(path, language)`). In a run
 /// of sibling `<title>`, `<sub-title>`, `<desc>` or `<display-name>` elements
@@ -279,8 +284,11 @@ const HEAD_BYTES: usize = 1024;
 /// How a document's bytes become text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextEncoding {
-    /// An encoding `encoding_rs` decodes, strictly.
+    /// UTF-8 or UTF-16, decoded strictly.
     Whatwg(&'static Encoding),
+    /// A legacy encoding `encoding_rs` knows, read as its .NET code page
+    /// reads it.
+    CodePage(&'static Encoding),
     /// .NET's `Latin1Encoding`: every byte is the code point of its value.
     Latin1,
     /// .NET's code page 28599 (`ISO-8859-9`): `Latin1` with six Turkish letters.
@@ -378,8 +386,9 @@ fn document_encoding(head: &[u8]) -> Result<TextEncoding, String> {
                 "the XMLTV document declares {name} but is not UTF-16"
             ))
         }
+        Some(encoding) if encoding == encoding_rs::UTF_8 => Ok(TextEncoding::Whatwg(encoding)),
         Some(encoding) if encoding != encoding_rs::REPLACEMENT => {
-            Ok(TextEncoding::Whatwg(encoding))
+            Ok(TextEncoding::CodePage(encoding))
         }
         _ => Err(format!(
             "the XMLTV document declares an unsupported encoding: {name}"
@@ -418,25 +427,30 @@ fn latin5_char(byte: u8) -> char {
     }
 }
 
-/// How much decoded text [`Decoded`] holds at once.
+/// How much decoded text [`Decoded`] makes room for at once.
 const DECODED_BUFFER: usize = 16 * 1024;
 
+/// How [`Decoded`] turns a document's bytes into text.
+enum Decoding {
+    /// UTF-16, strictly; the decoder removes a byte-order mark.
+    Strict(encoding_rs::Decoder),
+    /// A legacy encoding, as its .NET code page reads it.
+    CodePage(code_page::Decoder),
+    /// One of the single-byte .NET encodings: `Latin1`, `Latin5` or `Ascii`.
+    SingleByte(TextEncoding),
+}
+
 /// A byte source decoded to UTF-8 as it is read, for a document in another
-/// encoding. A sequence that is not valid in it is an `InvalidData` error.
+/// encoding. A sequence that is not valid UTF-16 is an `InvalidData` error.
 struct Decoded<R> {
     /// The encoded bytes.
     source: R,
-    /// The decoder for a [`TextEncoding::Whatwg`] document; it removes a
-    /// byte-order mark. `None` for the single-byte .NET encodings.
-    decoder: Option<encoding_rs::Decoder>,
-    /// The document's encoding.
-    encoding: TextEncoding,
-    /// Decoded text; `out[at..len]` is not read yet.
-    out: Box<[u8]>,
+    /// The document's decoder.
+    decoding: Decoding,
+    /// Decoded text; `out[at..]` is not read yet.
+    out: String,
     /// Where the unread text starts.
     at: usize,
-    /// Where the decoded text ends.
-    len: usize,
     /// Whether the source ended and the decoder was flushed.
     finished: bool,
 }
@@ -445,14 +459,19 @@ impl<R> Decoded<R> {
     fn new(source: R, encoding: TextEncoding) -> Self {
         Self {
             source,
-            decoder: match encoding {
-                TextEncoding::Whatwg(encoding) => Some(encoding.new_decoder_with_bom_removal()),
-                TextEncoding::Latin1 | TextEncoding::Latin5 | TextEncoding::Ascii => None,
+            decoding: match encoding {
+                TextEncoding::Whatwg(encoding) => {
+                    Decoding::Strict(encoding.new_decoder_with_bom_removal())
+                }
+                TextEncoding::CodePage(encoding) => {
+                    Decoding::CodePage(code_page::Decoder::declared(encoding))
+                }
+                TextEncoding::Latin1 | TextEncoding::Latin5 | TextEncoding::Ascii => {
+                    Decoding::SingleByte(encoding)
+                }
             },
-            encoding,
-            out: vec![0; DECODED_BUFFER].into_boxed_slice(),
+            out: String::with_capacity(DECODED_BUFFER),
             at: 0,
-            len: 0,
             finished: false,
         }
     }
@@ -470,47 +489,55 @@ impl<R: BufRead> std::io::Read for Decoded<R> {
 
 impl<R: BufRead> BufRead for Decoded<R> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-        while self.at == self.len && !self.finished {
+        while self.at == self.out.len() && !self.finished {
             let input = self.source.fill_buf()?;
             let last = input.is_empty();
             self.at = 0;
-            let Some(decoder) = self.decoder.as_mut() else {
-                // One byte is one character of at most two UTF-8 bytes.
-                let take = input.len().min(self.out.len() / 2);
-                let mut written = 0;
-                for &byte in &input[..take] {
-                    let c = match self.encoding {
-                        TextEncoding::Ascii if !byte.is_ascii() => '?',
-                        TextEncoding::Latin5 => latin5_char(byte),
-                        _ => char::from(byte),
-                    };
-                    written += c.encode_utf8(&mut self.out[written..]).len();
+            self.out.clear();
+            // One byte is one character of at most three UTF-8 bytes.
+            let take = input.len().min(DECODED_BUFFER / 3);
+            let read = match &mut self.decoding {
+                Decoding::SingleByte(encoding) => {
+                    self.out
+                        .extend(input[..take].iter().map(|&byte| match encoding {
+                            TextEncoding::Ascii if !byte.is_ascii() => '?',
+                            TextEncoding::Latin5 => latin5_char(byte),
+                            _ => char::from(byte),
+                        }));
+                    self.finished = last;
+                    take
                 }
-                self.source.consume(take);
-                self.len = written;
-                self.finished = last;
-                continue;
+                Decoding::CodePage(decoder) => {
+                    decoder.decode(&input[..take], last, &mut self.out);
+                    self.finished = last;
+                    take
+                }
+                Decoding::Strict(decoder) => {
+                    let (result, read) =
+                        decoder.decode_to_string_without_replacement(input, &mut self.out, last);
+                    match result {
+                        DecoderResult::Malformed(..) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "a byte sequence is not valid {}",
+                                    decoder.encoding().name()
+                                ),
+                            ));
+                        }
+                        DecoderResult::InputEmpty if last => self.finished = true,
+                        DecoderResult::InputEmpty | DecoderResult::OutputFull => {}
+                    }
+                    read
+                }
             };
-            let (result, read, written) =
-                decoder.decode_to_utf8_without_replacement(input, &mut self.out, last);
             self.source.consume(read);
-            self.len = written;
-            match result {
-                DecoderResult::Malformed(..) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("a byte sequence is not valid {}", decoder.encoding().name()),
-                    ));
-                }
-                DecoderResult::InputEmpty if last => self.finished = true,
-                DecoderResult::InputEmpty | DecoderResult::OutputFull => {}
-            }
         }
-        Ok(&self.out[self.at..self.len])
+        Ok(&self.out.as_bytes()[self.at..])
     }
 
     fn consume(&mut self, amount: usize) {
-        self.at = (self.at + amount).min(self.len);
+        self.at = (self.at + amount).min(self.out.len());
     }
 }
 
@@ -2582,6 +2609,110 @@ mod read_tests {
         let guide = read_xmltv_where(trickle(&document, 7), None, |_| true);
         assert_eq!(guide.error, None);
         assert_eq!(guide.channels[0].display_name, text);
+    }
+
+    /// The display name of the one channel of a guide declaring `label`, read
+    /// `step` bytes at a time.
+    fn display_name_in(label: &str, name: &[u8], step: usize) -> Result<String, String> {
+        let document = [
+            format!(
+                "<?xml version=\"1.0\" encoding=\"{label}\"?><tv><channel id=\"a\"><display-name>"
+            )
+            .as_bytes(),
+            name,
+            b"</display-name></channel></tv>",
+        ]
+        .concat();
+        let guide = read_xmltv_where(trickle(&document, step), None, |_| true);
+        match guide.error {
+            Some(error) => Err(error),
+            None => Ok(guide.channels[0].display_name.clone()),
+        }
+    }
+
+    /// What Jellyfin 12.4 lists for a guide that declares a legacy encoding
+    /// (gl-2011): the text .NET's code page of that name gives, with its
+    /// replacement for a sequence it has no character for, never an unreadable
+    /// guide; the same text however the bytes arrive. `gb2312` and `gbk` are
+    /// code page 936 there, which takes a lead byte and the byte after it
+    /// where `gb18030` takes the lead byte alone.
+    #[rstest::rstest]
+    #[case::cp949_user_defined("ks_c_5601-1987", b"\xc7\xd1 \xc9\xa1", "한 \u{E000}")]
+    #[case::cp949_unassigned("ks_c_5601-1987", b"\xa2\xe8a", "?a")]
+    #[case::euc_kr_unassigned("euc-kr", b"\xa2\xe8a", "?a")]
+    #[case::gb18030_m_acute("gb18030", b"\x81\x35\xf4\x37", "\u{1E3F}")]
+    #[case::gb18030_four_bytes("gb18030", b"\x84\x31\xa5\x30a", "?a")]
+    #[case::gb18030_lead_byte("gb18030", b"\x81 a", "? a")]
+    #[case::cp936_lead_byte("gbk", b"\x81 a", "?a")]
+    #[case::cp936_other_name("gb2312", b"\x81\xffa\xff", "?a\u{F8F5}")]
+    #[case::big5_unassigned("big5", b"\xa4\xa4\xa3\xe2", "中?")]
+    #[case::shift_jis_unassigned("shift_jis", b"\x82\xa0\x81\xad", "あ\u{30FB}")]
+    #[case::euc_jp_unassigned("euc-jp", b"\xa4\xa2\xa3\xa1", "あ\u{30FB}")]
+    #[case::windows_1253_unassigned("windows-1253", b"\xe1\xaa", "α\u{F8F9}")]
+    #[case::iso_8859_3_unassigned("iso-8859-3", b"\xa5", "\u{F7F5}")]
+    #[case::iso_2022_jp_keeps_its_state("iso-2022-jp", b"\x1b$B0!0!\x1b(B", "亜亜")]
+    fn a_declared_legacy_encoding_is_read_with_dotnets_replacement(
+        #[case] label: &str,
+        #[case] name: &[u8],
+        #[case] expected: &str,
+        #[values(1, 2, 3, 5, 8192)] step: usize,
+    ) {
+        assert_eq!(display_name_in(label, name, step).as_deref(), Ok(expected));
+    }
+
+    /// A source may hand over more bytes at once than one decoding step takes:
+    /// the rest stays in the source, and a character cut there is read whole.
+    #[test]
+    fn a_legacy_guide_larger_than_one_decoding_step_is_read_whole() {
+        let characters = super::DECODED_BUFFER;
+        let text = "中".repeat(characters);
+        let (encoded, _, _) = encoding_rs::GB18030.encode(&text);
+        // With and without a byte before them, so a step ends inside a pair.
+        for pad in ["", "x"] {
+            let name = [pad.as_bytes(), encoded.as_ref()].concat();
+            let read = display_name_in("gb18030", &name, 16 * characters).expect("readable");
+            assert!(read.starts_with(pad), "{pad:?}");
+            assert_eq!(read.chars().filter(|c| *c == '中').count(), characters);
+            assert_eq!(read.chars().count(), pad.len() + characters);
+        }
+    }
+
+    /// A double-byte code page takes the byte after a lead byte whatever it
+    /// is, the `<` of a closing tag too: Jellyfin 12.4 answers 500 for such a
+    /// guide in code pages 949, 936, 950, 932 and 51932, and lists it in
+    /// `gb18030`, which takes the lead byte alone.
+    #[rstest::rstest]
+    #[case("ks_c_5601-1987", b"x\x81", None)]
+    #[case("gbk", b"x\x81", None)]
+    #[case("big5", b"x\x81", None)]
+    #[case("shift_jis", b"x\x81", None)]
+    #[case("euc-jp", b"x\xa1", None)]
+    #[case("gb18030", b"x\x81", Some("x?"))]
+    fn a_lead_byte_before_markup_takes_it_where_dotnets_decoder_does(
+        #[case] label: &str,
+        #[case] name: &[u8],
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(display_name_in(label, name, 4).ok().as_deref(), expected);
+    }
+
+    /// What stays as it was, each an open question of its own: sequences
+    /// `encoding_rs` decodes to a character where the .NET code page of the
+    /// declared name has a Private Use Area code point, `?` or another
+    /// character (gl-2008), and Big5's user-defined pairs (gl-2012).
+    #[rstest::rstest]
+    #[case::cp936_euro("gbk", b"\xa2\xe3", "\u{20AC}")]
+    #[case::cp936_four_bytes("gbk", b"\x81\x30\x81\x30a", "\u{80}a")]
+    #[case::cp51949_user_defined("euc-kr", b"\xc9\xa1a", "\u{E000}a")]
+    #[case::cp51949_b4d3("euc-kr", b"\xb4\xd3", "\u{B2D2}")]
+    #[case::euc_jp_jis_x_0212("euc-jp", b"\x8f\xb0\xa1", "\u{4E02}")]
+    #[case::big5_user_defined("big5", b"\x81\x40", "\u{FFFD}@")]
+    fn declared_encoding_differences_that_wait_for_a_decision_are_left_alone(
+        #[case] label: &str,
+        #[case] name: &[u8],
+        #[case] expected: &str,
+    ) {
+        assert_eq!(display_name_in(label, name, 3).as_deref(), Ok(expected));
     }
 
     /// A byte-order mark decides, UTF-16 included.

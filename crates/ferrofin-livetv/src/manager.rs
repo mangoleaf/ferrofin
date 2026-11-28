@@ -539,33 +539,32 @@ pub struct FerrofinLiveTvManager {
     /// Serializes the WRITE half of a guide refresh, so two passes can never
     /// interleave their inserts and prunes.
     ///
-    /// Port of `_taskManager.CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`:
-    /// upstream there is exactly ONE guide-refresh task, and queuing it cancels
-    /// the running one. Ferrofin reaches `refresh_guide` from the scheduled task
-    /// AND from the queued refresh the tuner-host/listings-provider writes
-    /// trigger, so without this two passes could overlap and one's
-    /// `CleanDatabase` prune would delete the listings the other had just
-    /// written.
+    /// Upstream there is exactly ONE guide-refresh task, and the task registry
+    /// runs one of its runs at a time: a Live TV configuration write cancels
+    /// the running one and queues the next
+    /// (`_taskManager.CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`, as
+    /// here). This lock is for a caller of `refresh_guide` outside the task:
+    /// without it two passes could overlap and one's `CleanDatabase` prune
+    /// would delete the listings the other had just written.
     ///
-    /// It is taken AFTER every fetch has returned, never around one: upstream
-    /// cancels the in-flight refresh, we queue behind it (a pass a newer one
-    /// supersedes skips its write, see `refresh_generation`), and queuing behind
-    /// a lock that is waiting on a third-party HTTP source is how one wedged
-    /// tuner URL stalls the whole subsystem. It does cover each guide document's
+    /// It is taken AFTER every fetch has returned, never around one: a pass
+    /// queues behind the one writing (a pass a newer one supersedes skips its
+    /// write, see `refresh_generation`), and queuing behind a lock that is
+    /// waiting on a third-party HTTP source is how one wedged tuner URL stalls
+    /// the whole subsystem. It does cover each guide document's
     /// second, local read (`insert_programs` keeps only the airings of the
     /// channels the stored lineup binds), which is bounded by the document,
     /// not by a remote source.
     guide_lock: Arc<tokio::sync::Mutex<()>>,
     /// Counts guide refreshes, so a newer one supersedes an older one still
-    /// fetching: the half of `CancelIfRunningAndQueue` the write lock does not
-    /// give.
+    /// fetching, for passes the task registry does not order (see
+    /// `guide_lock`): a run of the task is stopped through its own token
+    /// instead.
     ///
     /// Every refresh takes the next generation. A pass that finds a newer
     /// generation stops asking Schedules Direct for more stations and skips its
     /// write half; the newer pass rewrites the guide from the current
-    /// configuration. Without it, the two saves of jellyfin-web's SD setup and
-    /// every mapping edit would each run a full SD pass, up to three requests
-    /// per bound station, against SD's daily request limit.
+    /// configuration.
     refresh_generation: Arc<AtomicU64>,
     /// The Schedules Direct listings provider (and its country list), sharing
     /// the fetcher and caching under the application cache directory.
@@ -4075,8 +4074,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
-        // Nobody watches or stops this one (a configuration write's queued
-        // refresh).
+        // Nobody watches or stops this one: a caller outside the task's run.
         self.refresh_guide_until(&TaskProgress::default())
             .await
             .map(|_| ())
@@ -4101,9 +4099,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // FETCH FIRST, OUTSIDE THE LOCK. `guide_lock` exists to keep two passes
         // from interleaving their WRITES (see the field doc); holding it across
         // the tuner/guide fetches would put unbounded third-party network I/O
-        // inside it, so one wedged M3U source would stall every later refresh —
-        // a failure mode upstream does not have, because its one scheduled task
-        // is CANCELLED when the next run is queued rather than queued behind.
+        // inside it, so one wedged M3U source would stall every later refresh.
         // The one read inside it is local: each fetched document's airings,
         // which bind to the channels the write half stores.
         //
@@ -5982,9 +5978,9 @@ impl FerrofinLiveTvManager {
 
     /// `OnNamedConfigurationUpdated` for a save of a tuner or a listings
     /// provider, which upstream keeps in the `livetv` configuration. Its
-    /// `async void` is waited for by nobody, so neither is this: the handler's
-    /// `queue_guide_refresh` comes right after the save, and a client that
-    /// hangs up during a pass must not lose it.
+    /// `async void` is waited for by nobody, so neither is this: the handler
+    /// queues the guide refresh right after the save, and a client that hangs
+    /// up during a pass must not lose it.
     fn spawn_recording_folders(&self) {
         if self.recording_library.get().is_none() {
             return;
@@ -10421,7 +10417,7 @@ mod tests {
         let only_second = ListingsProviderInfo {
             path: Some("http://guide/xmltv.xml".to_owned()),
             enable_all_tuners: false,
-            enabled_tuners: vec![second.clone()],
+            enabled_tuners: vec![Some(second.clone())],
             ..ListingsProviderInfo::default()
         };
         store_provider_as(&mgr, &id_led_by('2'), only_second).await;
