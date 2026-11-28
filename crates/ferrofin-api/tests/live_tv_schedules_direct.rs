@@ -466,7 +466,7 @@ async fn null_tuner_and_mapping_lists_bind_as_empty() {
 #[tokio::test]
 async fn a_null_list_element_binds_and_is_kept() {
     let manager = CountriesLiveTv::serving(SD_COUNTRIES);
-    let state = elevated_fake_state().with_live_tv(manager.clone());
+    let state = saving_state(&manager);
     let (status, body) = send(
         state,
         "POST",
