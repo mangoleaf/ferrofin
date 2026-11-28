@@ -22,6 +22,7 @@
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_model::tasks::{TaskInfo, TaskTriggerInfo};
@@ -113,11 +114,11 @@ async fn get_task(
 /// `POST /ScheduledTasks/Running/{taskId}` — run a task now.
 ///
 /// Port of `ScheduledTasksController.StartTask` → `ITaskManager.Execute`: the
-/// run is queued (it starts immediately on a background task) and the handler
-/// returns `204 No Content` as soon as the task is `Running`, so the dashboard
-/// can track its progress. A missing task is `404`; the underlying registry
-/// maps an already-running task to `400` (the C# guard that only queues an idle
-/// task).
+/// run starts on a background task and the handler returns `204 No Content`
+/// as soon as the task is `Running`, so the dashboard can track its progress.
+/// A missing task is `404`. A task already running or stopping keeps its run
+/// and the request still answers `204`, as upstream's `ExecuteInternal` throws
+/// out of sight.
 #[utoipa::path(
     post,
     path = "/ScheduledTasks/Running/{taskId}",
@@ -171,8 +172,11 @@ async fn stop_task(
 /// `POST /ScheduledTasks/{taskId}/Triggers` — replace a task's triggers.
 ///
 /// Port of `ScheduledTasksController.UpdateTask` → `task.Triggers = triggerInfos`.
-/// Persists the posted trigger list on the task (surfaced on its next read) and
-/// returns `204 No Content`; a missing task is `404`.
+/// Persists the posted trigger list on the task (surfaced on its next read),
+/// its `null` entries dropped, and returns `204 No Content`; a missing task is
+/// `404`. A trigger upstream cannot build, or a failed save, is answered as
+/// upstream's `ExceptionMiddleware` answers the throw: `400` or `500`,
+/// `text/plain`, "Error processing request.".
 #[utoipa::path(
     post,
     path = "/ScheduledTasks/{taskId}/Triggers",
@@ -188,10 +192,20 @@ async fn update_task_triggers(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     RequiredRouteString(task_id, _): RequiredRouteString<TaskId>,
-    JsonSeqBody(triggers): JsonSeqBody<Vec<TaskTriggerInfo>>,
-) -> Result<StatusCode, ApiError> {
-    state.tasks.update_triggers(&task_id, &triggers).await?;
-    Ok(StatusCode::NO_CONTENT)
+    JsonSeqBody(triggers): JsonSeqBody<Vec<Option<TaskTriggerInfo>>>,
+) -> Response {
+    // The `Triggers` setter drops `null` entries ("bad user input").
+    let triggers: Vec<TaskTriggerInfo> = triggers.into_iter().flatten().collect();
+    match state.tasks.update_triggers(&task_id, &triggers).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // `NotFound()` is an action result, not a throw.
+        Err(error @ ferrofin_traits::error::ServiceError::NotFound(_)) => {
+            ApiError::from(error).into_response()
+        }
+        // `GetTrigger`'s `ArgumentException` and a failed `SaveTriggers` are
+        // throws, answered by `ExceptionMiddleware`.
+        Err(error) => ApiError::from(error).into_exception_response(),
+    }
 }
 
 /// Registers this controller's real routes onto `router`.

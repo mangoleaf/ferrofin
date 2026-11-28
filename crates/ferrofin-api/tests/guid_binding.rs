@@ -214,11 +214,17 @@ fn refuses(name: &str, value: &str, (status, body): &(StatusCode, String)) -> bo
             || body.contains("invalid id"))
 }
 
+/// The routes, as `(METHOD, contract path)`, whose id is a `{name:guid}` route
+/// constraint upstream, not a bound parameter: an id `Guid.TryParse` refuses
+/// matches no route, a bodiless 404.
+const GUID_CONSTRAINED_ROUTES: &[(&str, &str)] = &[("GET", "/SyncPlay/{id}")];
+
 /// Every uuid-typed route and query parameter in the vendored contract binds
 /// through `Guid.Parse`: the P spelling of an id gets past the binder, and the
-/// `urn:uuid:` spelling is refused there. A route id must be refused (every
-/// route binds one); a query id the handler does not model, or binds as a
-/// string, is skipped, as the query-casing sweep skips it.
+/// `urn:uuid:` spelling is refused there (by routing, for a
+/// [`GUID_CONSTRAINED_ROUTES`] id). A route id must be refused (every route
+/// binds one); a query id the handler does not model, or binds as a string, is
+/// skipped, as the query-casing sweep skips it.
 #[tokio::test]
 async fn every_contract_guid_parameter_binds_like_dotnet_guid_parse() {
     // Probes the binder accepts reach fakes that panic (`unimplemented!`); the
@@ -270,8 +276,16 @@ async fn every_contract_guid_parameter_binds_like_dotnet_guid_parse() {
                 }
                 let p_answer = send(&router, &method, &probe(&accepted)).await;
                 let urn_answer = send(&router, &method, &probe(&refused)).await;
-                let took = !refuses(name, &accepted, &p_answer);
-                let refused_urn = refuses(name, &refused, &urn_answer);
+                let no_route = (StatusCode::NOT_FOUND, String::new());
+                let (took, refused_urn) =
+                    if GUID_CONSTRAINED_ROUTES.contains(&(method.as_str(), path)) {
+                        (p_answer != no_route, urn_answer == no_route)
+                    } else {
+                        (
+                            !refuses(name, &accepted, &p_answer),
+                            refuses(name, &refused, &urn_answer),
+                        )
+                    };
                 if is_query && took && !refused_urn {
                     // Not modelled, or bound as a string: nothing to compare.
                     continue;

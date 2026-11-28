@@ -1014,6 +1014,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// library scan stores as a music album's and a track's Primary, which the
 /// item and image operations serve. `route-matching` is which request paths
 /// find a route when one holds an empty segment, which every operation shares.
+/// `sync-play-groups` is the SyncPlay groups, their state machine and play
+/// queue, which every `/SyncPlay` operation drives and whose WebSocket pushes
+/// no HTTP response shows.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -1045,6 +1048,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "guide-listings",
     "music-artwork",
     "route-matching",
+    "sync-play-groups",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -3363,6 +3367,78 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              line feed and an attribute's line end as a space. Fix path: gl-2042.",
         ],
     },
+    VerifiedSubsystem {
+        key: "sync-play-groups",
+        upstream_file: "Emby.Server.Implementations/SyncPlay/Group.cs",
+        upstream_method: "HandleRequest",
+        ferrofin: "The SyncPlay groups every /SyncPlay operation drives, and the messages \
+                   they push, which no HTTP response shows. ferrofin-core \
+                   sync_play_manager.rs FerrofinSyncPlayManager (SyncPlayManager: the \
+                   registry of groups, the session to group map and active_users under one \
+                   lock, the library access checks off it in rounds (has_access_to_queue, \
+                   visible_subset and all_members_have_access for HasAccessToQueue and \
+                   AllUsersHaveAccessToQueue, IsVisibleStandalone through \
+                   get_visible_item_ids), session_ended for OnSessionEnded (called by \
+                   apps/ferrofin-server state.rs's SessionEnded subscriber), and the \
+                   group-wait sweep for _groupWaitTimer and OnGroupWaitTimerTick); Group \
+                   (Group and IGroupStateContext: add_member with DefaultPing, info for \
+                   GetInfo, command_env for NewSyncPlayCommand, play_queue_env for \
+                   GetPlayQueueUpdate, sanitize_position_ticks, set_buffering, \
+                   set_all_buffering, update_group_wait_deadline and \
+                   handle_group_wait_timeout); Group::handle, one match over the state and \
+                   the request for IdleGroupState, WaitingGroupState, PausedGroupState and \
+                   PlayingGroupState over AbstractGroupState, with enter_waiting and \
+                   set_state standing for the fresh state object each transition builds \
+                   (InitialState, PositionJumped, IgnoreBuffering) and session_joined and \
+                   session_leaving for SessionJoined and SessionLeaving; PlayQueue \
+                   (PlayQueueManager: the sorted and shuffled lists, SetPlaylist, Queue, \
+                   QueueNext, ClearPlaylist, RemoveFromPlaylist, MovePlaylistItem, Next, \
+                   Previous, ShufflePlaylist, RestoreSortedPlaylist); deliver_to for \
+                   FilterSessions. Compared with SyncPlayManager.cs, Group.cs, \
+                   GroupStates/*.cs, Queue/PlayQueueManager.cs and PlaybackRequests/*.cs at \
+                   the pinned v12.4 tag, arm by arm: each request's state change in each \
+                   state, the messages it sends, to whom and in what order, and their \
+                   fields.",
+        date: "2026-11-27",
+        divergences: &[
+            "A PlayQueue update's LastUpdate is the time the update is built; upstream \
+             sends PlayQueueManager.LastChange, the time the queue last changed. \
+             jellyfin-web drops an update whose LastUpdate is not newer than the last one \
+             it applied, so upstream's re-sent unchanged queue (the NewPlaylist of an \
+             Unpause on an Idle group, the SetCurrentItem a Buffer or Ready on the wrong \
+             item answers) is ignored by a member that already holds it, and a joiner, \
+             which estimates its start position from LastUpdate, starts ahead by the time \
+             since the queue last changed. Jellyfin bug not ported.",
+            "A creator whose stored NowPlayingQueue does not hold its playing item \
+             starts the group on that item alone; v12.4's CreateGroup sets the stale queue \
+             (the session stores it only when playback stops, which the open \
+             jellyfin/jellyfin#18198 changes) and SetPlayingItemById finds nothing in it, \
+             so the group has nothing playing. Jellyfin bug not ported.",
+            "When a member is an API key's session, a SetNewQueue or Queue that adds items \
+             is the 400 upstream's AllUsersHaveAccessToQueue throws (GetUserById of the \
+             empty user id); for a SetNewQueue upstream throws after an Idle, Playing or \
+             Paused group has switched to Waiting and leaves it waiting, where Ferrofin \
+             leaves the group's state alone. Jellyfin bug not ported (gl-1669).",
+            "Each item's run time, the ceiling sanitize_position_ticks clamps a Seek or \
+             Ready position to, is read once, when the item enters the queue (one query per \
+             request); upstream reads Group.RunTimeTicks from the library each time the \
+             playing item changes, so an item whose run time changes while it is queued is \
+             clamped to the old one here; and a run-time query that fails is logged and \
+             leaves the position floored at 0 only, where upstream's lookup would throw. \
+             Fix path: gl-2026.",
+            "An item deleted from the library while it is queued keeps the run time it \
+             had, where upstream's GetItemById returns null when it becomes the playing \
+             item and the request fails (500). Jellyfin bug not ported.",
+            "After a RemoveFromPlaylist with ClearPlaylist and ClearPlayingItem, upstream's \
+             ClearPlayQueue keeps the cleared item's run time as Group.RunTimeTicks, so \
+             once an Unpause restarts the group with nothing playing a Seek or Ready \
+             position is clamped to that run time; Ferrofin clamps it to 0, as for every \
+             group with nothing playing. Likewise a PreviousItem naming no item while \
+             nothing plays moves the queue to its first item but reports no move, and \
+             upstream keeps the run time it had where Ferrofin clamps to that item's. \
+             Jellyfin bug not ported.",
+        ],
+    },
 ];
 
 /// One contract operation whose Ferrofin implementation was compared against
@@ -3870,6 +3946,75 @@ const REMOTE_IMAGES_DIVERGENCES: &[&str] = remote_image_provider_divergences!(
      Fanart plugin and TheAudioDB's image providers keep each on disk for 2 days, so new \
      artwork there is offered sooner. Fix path: gl-1987.",
 );
+
+/// How a SyncPlay route's `[Authorize(Policy = …)]` is enforced, for the
+/// requirement named.
+macro_rules! sync_play_auth {
+    (@default $requirement:literal) => {
+        concat!(
+            "SyncPlayAuth<",
+            $requirement,
+            ">, before any body binds: RequireAuth for DefaultAuthorizationHandler, which \
+             handles the DefaultAuthorizationRequirement SyncPlayAccessRequirement derives \
+             from (remote access, which only an API key skips; the parental schedule, which \
+             an administrator skips too), so an administrator or an API key satisfies the \
+             requirement without SyncPlayAccessHandler's own check; then \
+             SyncPlayAccessHandler's "
+        )
+    };
+    ("HasAccess") => {
+        concat!(sync_play_auth!(@default "HasAccess"), "HasAccess, the controller's")
+    };
+    ($requirement:literal) => {
+        concat!(
+            sync_play_auth!(@default $requirement),
+            $requirement,
+            ", which implies the controller's HasAccess"
+        )
+    };
+}
+
+/// The code path the SyncPlay playback requests share after their handler, with
+/// the request's own arm of the group state machine.
+macro_rules! sync_play_request_path {
+    ($handler:literal, $arm:literal) => {
+        concat!(
+            "handlers/sync_play.rs ",
+            $handler,
+            " (",
+            sync_play_auth!("IsInGroup"),
+            ") → dispatch (sync_play_session for \
+             RequestHelpers.GetSession) → ferrofin-core sync_play_manager.rs handle_request \
+             (SyncPlayManager.HandleRequest: NotInGroup to a session in no group) → \
+             Group::handle → ",
+            $arm
+        )
+    };
+}
+
+/// The 401 and 403 every SyncPlay row shares.
+const SYNC_PLAY_AUTH_BODIES: &str = "The 401 (no or bad token) and 403 (a SyncPlay policy \
+     refuses the caller; upstream's ForbidResult is empty) bodies are Ferrofin's error shape. \
+     Fix path: gl-666.";
+
+/// The 400 of a SyncPlay operation whose `[FromBody, Required]` body does not bind.
+const SYNC_PLAY_BODY_BINDING: &str = "The error text of the 400 for a body that does not \
+     bind is Ferrofin's, not upstream's. Fix path: gl-666.";
+
+/// The 400 `GetUserById` throws for an API key's session in `JoinGroup`,
+/// `ListGroups` and `GetGroup`.
+const SYNC_PLAY_NO_USER_BODY: &str = "The 400 for an API key's session (upstream's \
+     GetUserById throws for its empty user id) carries Ferrofin's error body, not \
+     ExceptionMiddleware's text/plain \"Error processing request.\". Fix path: gl-666.";
+
+/// The 400s of the two SyncPlay requests that add items to the queue.
+const SYNC_PLAY_QUEUE_BODIES: &str = "The error text of the 400 for a body that does not \
+     bind, and the body of the 400 for a member that is an API key's session (upstream's \
+     GetUserById throws for its empty user id; ExceptionMiddleware's text/plain \"Error \
+     processing request.\"), are Ferrofin's. Fix path: gl-666.";
+
+/// The divergences of the SyncPlay playback requests that carry a body.
+const SYNC_PLAY_BODY_DIVERGENCES: &[&str] = &[SYNC_PLAY_AUTH_BODIES, SYNC_PLAY_BODY_BINDING];
 
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
@@ -7794,9 +7939,9 @@ pub const VERIFIED: &[Verified] = &[
          ported.",
             "A body still running STOP_WAIT (2 s) after the stop is dropped and recorded \
          Cancelled; upstream waits for ExecuteAsync however long it takes. The ferrofin-core \
-         bodies check their token where upstream's do (gl-129, gl-1709, gl-2004, gl-2013), \
-         but work running when the wait ends is still cut off mid-item. The Keyframe \
-         Extractor, the five library bodies, Update Plugins and Migrate Trickplay Image \
+         bodies check their token where upstream's do (gl-129, gl-1709, gl-2004, gl-2013, \
+         gl-2017), but work running when the wait ends is still cut off mid-item. The \
+         Keyframe Extractor, the five library bodies, Update Plugins and Migrate Trickplay Image \
          Location hand their per-item work no token, and Optimize database checks only \
          before its first statement (gl-2006). The guide refresh writes a tuner's channels, \
          and a listings provider's airings, as one write each and checks before it, where \
@@ -7807,6 +7952,75 @@ pub const VERIFIED: &[Verified] = &[
          upstream's catch (Exception) around RunScheduledOptimisation swallows the \
          cancellation, logs it as an error and records the run Completed. Jellyfin bug not \
          ported.",
+            "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
+         id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/ScheduledTasks/Running/{taskId}",
+        upstream_file: "Jellyfin.Api/Controllers/ScheduledTasksController.cs",
+        upstream_method: "StartTask",
+        ferrofin: "handlers/scheduled_tasks.rs start_task (RequireAdmin, \
+               Policies.RequiresElevation; RequiredRouteString taskId: ConvertEmptyStringToNull, \
+               then [Required]; the task looked up first, none is the 404) → ferrofin-core \
+               scheduled_tasks.rs start_task (the Id matched ignoring case, as \
+               OrdinalIgnoreCase) → queue (TaskManager.Execute → ScheduledTaskWorker.Execute \
+               with new TaskOptions(): no max runtime, the run started on its own task and not \
+               awaited, so the request answers 204 at once; a task already running or stopping \
+               keeps its one run and the request still answers 204, as ExecuteInternal's \
+               InvalidOperationException goes unobserved) → execute_contained and finish \
+               (ExecuteInternal: the run's result recorded, then ExecuteQueuedTasks)",
+        date: "2026-11-27",
+        divergences: &[
+            "While the server shuts down, a start of an idle task answers 503 and starts \
+         nothing: the task registry refuses new runs once its shutdown begins, a state \
+         upstream's TaskManager.Execute has no check for. A task still running or stopping \
+         answers 204 then, as at any other time.",
+            "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
+         id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/ScheduledTasks/{taskId}/Triggers",
+        upstream_file: "Jellyfin.Api/Controllers/ScheduledTasksController.cs",
+        upstream_method: "UpdateTask",
+        ferrofin: "handlers/scheduled_tasks.rs update_task_triggers (RequireAdmin, \
+               Policies.RequiresElevation; RequiredRouteString taskId: ConvertEmptyStringToNull, \
+               then [Required]; JsonSeqBody for [FromBody, Required] TaskTriggerInfo[], its null \
+               entries dropped as the Triggers setter's Where(i => i is not null)) → \
+               ferrofin-core scheduled_tasks.rs update_triggers (the Id matched ignoring case; \
+               none is the 404) → set_triggers (GetTrigger's ArgumentException for an unnamed \
+               trigger type, a daily or weekly trigger with no TimeOfDayTicks, a weekly one \
+               with no DayOfWeek and an interval one with no IntervalTicks, and the \
+               ArgumentOutOfRangeException WeeklyTrigger.Start throws for a weekday no member \
+               names: each the 400 ExceptionMiddleware answers, text/plain, \"Error processing \
+               request.\", as a failed SaveTriggers is its 500; then SaveTriggers, a failed \
+               write keeping the old triggers, and the new list in place of the old, daily and \
+               weekly ones re-armed for their next occurrence as ReloadTriggerEvents(false) \
+               re-arms them)",
+        date: "2026-11-27",
+        divergences: &[
+            "A list holding a trigger upstream cannot build is refused before anything is \
+         saved. Upstream's setter runs SaveTriggers first and throws after (for a weekday no \
+         member names, after the new list is also in place), so the file it refused is the \
+         one it loads at its next start, and Jellyfin does not start. Jellyfin bug not \
+         ported.",
+            "The triggers are saved to Ferrofin's trigger store, not to an adopted Jellyfin's \
+         {ConfigurationDirectoryPath}/ScheduledTasks/{id}.js, which is only read.",
+            "A saved interval trigger is anchored on the task's last completion, not re-armed at \
+         now + 1 minute + interval: an interval that has already passed since the last run \
+         starts the task at the next scheduler sweep, and on a task that has never \
+         completed, a save once the first-run delay since startup has passed does too, where \
+         upstream arms now + 1 hour on every save (the accepted divergence recorded at \
+         trigger_due in ferrofin-core scheduled_tasks.rs).",
+            "An IntervalTicks of zero or less is saved and never fires. Upstream checks only \
+         that it is set: a zero interval re-arms a minute after each run, and a negative one \
+         of more than a minute throws from the timer once the task has a result, a 400 after the \
+         list is saved. jellyfin-web offers neither. Jellyfin bug not ported.",
             "The 401 (no or bad token), 403 (not an administrator) and 404 (no task has that \
          id) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -8836,6 +9050,388 @@ pub const VERIFIED: &[Verified] = &[
             PLUGINS_ERROR_BODIES,
         ],
         refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/New",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayCreateGroup",
+        ferrofin: concat!(
+            "handlers/sync_play.rs new_group (",
+            sync_play_auth!("CreateGroup"),
+            "; the [StringLength(200)] GroupName in UTF-16 units on \
+               the name as sent, ValidationProblemDetails; sync_play_session for \
+               RequestHelpers.GetSession; now_playing: the session's FullNowPlayingItem as \
+               the library item, its PlayState and NowPlayingQueue) → ferrofin-core \
+               sync_play_manager.rs new_group (SyncPlayManager.NewGroup: the run times off \
+               the registry lock, leave_locked_with_notices for a session already in a \
+               group, the trimmed name, the active_users count; Group.CreateGroup: \
+               seed_from_now_playing for a playing creator, GroupJoined to the creator, \
+               session_joined, then the GetInfo the response carries)"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            NOW_PLAYING_ITEM_BUILT_ON_READ,
+            SYNC_PLAY_AUTH_BODIES,
+            SYNC_PLAY_BODY_BINDING,
+        ],
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/Join",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayJoinGroup",
+        ferrofin: concat!(
+            "handlers/sync_play.rs join_group (",
+            sync_play_auth!("JoinGroup"),
+            ") → ferrofin-core sync_play_manager.rs join_group \
+               (SyncPlayManager.JoinGroup: require_user for GetUserById; \
+               has_access_to_queue for HasAccessToPlayQueue, off the registry lock in rounds \
+               until no queued item is unchecked, LibraryAccessDenied to the caller; \
+               GroupDoesNotExist with a nil id and empty data; a session already in the group \
+               restored without leaving or being counted again; leave_locked_with_notices \
+               for another group; Group.SessionJoin: GroupJoined to the caller, UserJoined \
+               to the others, session_joined)"
+        ),
+        date: "2026-11-27",
+        divergences: &[
+            SYNC_PLAY_AUTH_BODIES,
+            SYNC_PLAY_NO_USER_BODY,
+            SYNC_PLAY_BODY_BINDING,
+        ],
+        refs: &["sync-play-groups", "access-filtering"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/Leave",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayLeaveGroup",
+        ferrofin: concat!(
+            "handlers/sync_play.rs leave_group (",
+            sync_play_auth!("IsInGroup"),
+            ") → ferrofin-core sync_play_manager.rs leave_group (SyncPlayManager.LeaveGroup: \
+               leave_locked_with_notices, unmapped and uncounted first, session_leaving for \
+               the state's SessionLeaving while the leaver is still a member, remove_member, \
+               an empty group dropped; deliver_leave: the hook's messages, GroupLeft with the \
+               dashed group id, UserLeft to the others; NotInGroup to a session in no group)"
+        ),
+        date: "2026-11-27",
+        divergences: &[SYNC_PLAY_AUTH_BODIES],
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "get",
+        path: "/SyncPlay/List",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayGetGroups",
+        ferrofin: concat!(
+            "handlers/sync_play.rs list_groups (",
+            sync_play_auth!("JoinGroup"),
+            ") → ferrofin-core sync_play_manager.rs list_groups (SyncPlayManager.ListGroups: require_user; \
+               each group's GetInfo, kept when visible_subset shows the user every item of \
+               its queue (HasAccessToPlayQueue), one batched check for all of them; sorted \
+               by group id, where upstream's ConcurrentDictionary order is unspecified)"
+        ),
+        date: "2026-11-27",
+        divergences: &[SYNC_PLAY_AUTH_BODIES, SYNC_PLAY_NO_USER_BODY],
+        refs: &["sync-play-groups", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/SyncPlay/{id}",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayGetGroup",
+        ferrofin: concat!(
+            "handlers/sync_play.rs get_group (GuidRoute: the {id:guid} route constraint, \
+             an id Guid.TryParse refuses matching no route, a bodiless 404 before \
+             authentication; then ",
+            sync_play_auth!("JoinGroup"),
+            ") → \
+               ferrofin-core sync_play_manager.rs get_group (SyncPlayManager.GetGroup: \
+               require_user; the group's GetInfo when has_access_to_queue lets the user see \
+               its queue) → NotFound()'s ProblemDetails 404 for a group that does not exist \
+               or whose queue the user may not see"
+        ),
+        date: "2026-11-27",
+        divergences: &[SYNC_PLAY_AUTH_BODIES, SYNC_PLAY_NO_USER_BODY],
+        refs: &["sync-play-groups", "access-filtering"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/SetNewQueue",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlaySetNewQueue",
+        ferrofin: sync_play_request_path!(
+            "set_new_queue",
+            "handle_play (every state hands the PlayGroupRequest to WaitingGroupState: \
+             SetPlayQueue refuses an empty queue or an out-of-range position, and before \
+             the lock handle_request's all_members_have_access refuses a queue a member may \
+             not see (AllUsersHaveAccessToQueue), checking in rounds whoever joins \
+             meanwhile; refuse_play then sends nothing and leaves a Playing or Paused group \
+             in a fresh state of the same type and a Waiting or Idle one Idle, and a refused \
+             requester that left or moved to another group during the check is dropped, as \
+             upstream drops a request whose session left its group while it waited for the \
+             lock; otherwise the queue is reset with its shuffle and repeat modes, the \
+             start position and LastActivity set, NewPlaylist to the group, every member \
+             buffering)"
+        ),
+        date: "2026-11-27",
+        divergences: &[SYNC_PLAY_AUTH_BODIES, SYNC_PLAY_QUEUE_BODIES],
+        refs: &["sync-play-groups", "access-filtering"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/SetPlaylistItem",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlaySetPlaylistItem",
+        ferrofin: sync_play_request_path!(
+            "set_playlist_item",
+            "handle_set_playlist_item (AbstractGroupState hands it to WaitingGroupState: \
+             SetPlayingItem, nothing playing for an id not queued, the item restarted either \
+             way; SetCurrentItem to the group and every member buffering, or the previous \
+             state's fallback)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/RemoveFromPlaylist",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayRemoveFromPlaylist",
+        ferrofin: sync_play_request_path!(
+            "remove_from_playlist",
+            "handle_remove_from_playlist (AbstractGroupState: ClearPlayQueue, which keeps the \
+             playing item unless ClearPlayingItem, or PlayQueue::remove, the item before a \
+             removed playing one; RemoveItems to the group; Idle and the Stop when the \
+             playing item went and nothing is left playing)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/MovePlaylistItem",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayMovePlaylistItem",
+        ferrofin: sync_play_request_path!(
+            "move_playlist_item",
+            "handle_move_playlist_item (AbstractGroupState: PlayQueue::move_item in the \
+             active list, the index clamped to the list's length once the item is lifted \
+             out; MoveItem to the group, nothing \
+             for an item not queued)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/Queue",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayQueue",
+        ferrofin: sync_play_request_path!(
+            "queue",
+            "the Queue arm (AbstractGroupState: AddToPlayQueue refuses an empty list and, \
+             before the lock in handle_request, items a member may not see; \
+             PlayQueue::enqueue at the end or after the playing item, in both lists while \
+             shuffled; Queue or QueueNext to the group)"
+        ),
+        date: "2026-11-27",
+        divergences: &[SYNC_PLAY_AUTH_BODIES, SYNC_PLAY_QUEUE_BODIES],
+        refs: &["sync-play-groups", "access-filtering"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/Unpause",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayUnpause",
+        ferrofin: sync_play_request_path!(
+            "unpause",
+            "handle_unpause (Idle: Waiting, the item restarted, NewPlaylist and every member \
+             buffering; Waiting: the forced start with IgnoreBuffering, or ResumePlaying \
+             armed; Playing: the caller re-told; Paused: Playing at now plus twice the \
+             highest ping, at least DefaultPing)"
+        ),
+        date: "2026-11-27",
+        divergences: &[SYNC_PLAY_AUTH_BODIES],
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/Pause",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayPause",
+        ferrofin: sync_play_request_path!(
+            "pause",
+            "handle_pause (Idle: the caller's Stop; Playing: Paused with the elapsed time \
+             banked; Paused: the caller re-told; Waiting: ResumePlaying disarmed)"
+        ),
+        date: "2026-11-27",
+        divergences: &[SYNC_PLAY_AUTH_BODIES],
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/Stop",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayStop",
+        ferrofin: sync_play_request_path!(
+            "stop",
+            "send_stop_command (every state goes Idle through IdleGroupState.SendStopCommand: \
+             the Stop to the caller when the group was Idle, else to the group, at the last \
+             activity)"
+        ),
+        date: "2026-11-27",
+        divergences: &[SYNC_PLAY_AUTH_BODIES],
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/Seek",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlaySeek",
+        ferrofin: sync_play_request_path!(
+            "seek",
+            "handle_seek (Idle: the caller's Stop; any other state: Waiting with \
+             ResumePlaying by the previous state, sanitize_position_ticks, the Seek to the \
+             group, every member buffering, the state update)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/Buffering",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayBuffering",
+        ferrofin: sync_play_request_path!(
+            "buffering",
+            "handle_buffer (Idle: the caller's Stop; Playing after a forced start: dropped; \
+             otherwise Waiting: the wrong item's SetCurrentItem to the caller, with \
+             ResumePlaying false for a group that was Playing or Paused, as the fresh \
+             WaitingGroupState has it; or by the previous state the AllReady Pause with the \
+             elapsed time banked, the caller's Pause, or the caller marked buffering; then \
+             the state update)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/Ready",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayReady",
+        ferrofin: sync_play_request_path!(
+            "ready",
+            "handle_ready (Idle: Stop, Playing: Unpause, Paused: Pause, to the caller; \
+             Waiting: the wrong item's SetCurrentItem, the client's clock trusted within \
+             TimeSyncOffset while it plays, MaxCatchUpOffset for a playing member with no \
+             position jump, the Seek correction, the pause when ready, the start of a ready \
+             group, or the settle into Paused by InitialState)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/SetIgnoreWait",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlaySetIgnoreWait",
+        ferrofin: sync_play_request_path!(
+            "set_ignore_wait",
+            "handle_ignore_wait, after handle_request has set the member's IgnoreGroupWait \
+             and the group-wait deadline (SetIgnoreGroupWait) (WaitingGroupState: a group \
+             no longer waiting on anyone resumes or settles into Paused)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/NextItem",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayNextItem",
+        ferrofin: sync_play_request_path!(
+            "next_item",
+            "handle_queue_step (every state hands it to WaitingGroupState: a stale \
+             PlaylistItemId dropped with the group Waiting; PlayQueue::next by the repeat \
+             mode; NextItem to the group and every member buffering, or the previous state's \
+             fallback)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/PreviousItem",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayPreviousItem",
+        ferrofin: sync_play_request_path!(
+            "previous_item",
+            "handle_queue_step (every state hands it to WaitingGroupState: a stale \
+             PlaylistItemId dropped with the group Waiting; PlayQueue::previous by the \
+             repeat mode; PreviousItem to the group and every member buffering, or the \
+             previous state's fallback)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/SetRepeatMode",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlaySetRepeatMode",
+        ferrofin: sync_play_request_path!(
+            "set_repeat_mode",
+            "the SetRepeatMode arm (AbstractGroupState: the mode, RepeatOne for a body \
+             without one and an unnamed value kept, then RepeatMode to the group)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/SetShuffleMode",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlaySetShuffleMode",
+        ferrofin: sync_play_request_path!(
+            "set_shuffle_mode",
+            "the SetShuffleMode arm (AbstractGroupState: PlayQueue::set_shuffle_mode, \
+             ShufflePlaylist around the playing item or RestoreSortedPlaylist; ShuffleMode \
+             to the group)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
+    },
+    Verified {
+        method: "post",
+        path: "/SyncPlay/Ping",
+        upstream_file: "Jellyfin.Api/Controllers/SyncPlayController.cs",
+        upstream_method: "SyncPlayPing",
+        ferrofin: concat!(
+            "handlers/sync_play.rs ping (",
+            sync_play_auth!("HasAccess"),
+            " alone, as the action carries no policy of its own; JsonBody for [FromBody, \
+             Required]) → dispatch → ferrofin-core sync_play_manager.rs \
+               handle_request (SyncPlayManager.HandleRequest: NotInGroup to a session in no \
+               group; AbstractGroupState's UpdatePing, the member's ping clamped to 0 through \
+               MaxPing, which GetHighestPing hands the scheduled resume times)"
+        ),
+        date: "2026-11-27",
+        divergences: SYNC_PLAY_BODY_DIVERGENCES,
+        refs: &["sync-play-groups"],
     },
 ];
 

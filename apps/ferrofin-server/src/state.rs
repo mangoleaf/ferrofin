@@ -2724,9 +2724,10 @@ pub async fn build_app_state(
         // (no channel-plugin mechanism, see `docs/EXTENSIONS.md`), so the task
         // reports itself hidden just like a Jellyfin with no channel plugin.
         task_manager.register(Arc::new(
-            ferrofin_core::scheduled_tasks::channels::RefreshChannelsTask::new(Arc::new(
-                ferrofin_core::FerrofinChannelManager::new(),
-            ))
+            ferrofin_core::scheduled_tasks::channels::RefreshChannelsTask::new(
+                Arc::new(ferrofin_core::FerrofinChannelManager::new()),
+                Arc::clone(&library),
+            )
             .await,
         ));
     }
@@ -3436,18 +3437,20 @@ pub async fn build_app_state(
     // ---- SyncPlay ---------------------------------------------------------
     // The SyncPlay manager shares the session message bus (created with the
     // session manager above) to deliver group commands to member sockets.
-    let sync_play: Arc<dyn ferrofin_traits::stubs::SyncPlayManager> = Arc::new(
+    let sync_play_core = Arc::new(
         ferrofin_core::FerrofinSyncPlayManager::new(Arc::clone(&session_bus))
             // So a group whose queue a user cannot see is hidden from them and
             // refuses their join (C# `Group.HasAccessToPlayQueue`).
             .with_library_access(sync_play_users, sync_play_library),
     );
+    let sync_play: Arc<dyn ferrofin_traits::stubs::SyncPlayManager> =
+        Arc::clone(&sync_play_core) as _;
     // A session that ended (its last socket closed, or it logged out) leaves its
     // SyncPlay group — port of `SyncPlayManager.OnSessionEnded`. Without it the
     // group keeps a participant that can never receive another command, and the
     // registry's session→group map keeps an entry nothing will ever remove.
     {
-        let sync_play = Arc::clone(&sync_play);
+        let sync_play = sync_play_core;
         event_bus.subscribe(
             "SessionEnded",
             Arc::new(move |payload: &str| {
@@ -3464,11 +3467,8 @@ pub async fn build_app_state(
                     user_id: session.user_id,
                     user_name: session.user_name,
                 };
-                let sync_play = Arc::clone(&sync_play);
-                tokio::spawn(tracing::Instrument::in_current_span(async move {
-                    // Not a member of any group: a successful no-op.
-                    let _ = sync_play.leave_group(&member).await;
-                }));
+                // Inline, so it runs in the publisher's span.
+                sync_play.session_ended(&member);
                 ferrofin_core::event_manager::consumer_done()
             }),
         );

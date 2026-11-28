@@ -699,10 +699,10 @@ impl Group {
     /// and resumes once everyone is ready unless the creator was paused.
     ///
     /// The playlist is the reported queue. When the queue lacks the playing
-    /// item it is that item alone, as the open upstream fix
-    /// jellyfin/jellyfin#18198 does: v12.2 stores `NowPlayingQueue` only when
+    /// item it is that item alone: upstream stores `NowPlayingQueue` only when
     /// playback stops, so its queue is stale or empty and a missing item
-    /// leaves the group with nothing playing.
+    /// leaves the group with nothing playing (the open jellyfin/jellyfin#18198
+    /// stores the reported queue during playback instead).
     fn seed_from_now_playing(&mut self, now_playing: &SyncPlayNowPlaying) {
         let item = now_playing.item_id;
         let (ids, at) = match now_playing.queue.iter().position(|id| *id == item) {
@@ -938,14 +938,15 @@ impl Group {
     /// `Group.RunTimeTicks` — the run time of the CURRENT playing item.
     ///
     /// Upstream re-reads it from `_libraryManager.GetItemById(...)` at every
-    /// point the playing item changes (Group.cs:506-507/520-526/550-558/613-614/
-    /// 628-629). Ferrofin resolves the run times ONCE, as the items enter the
+    /// point the playing item changes (Group.cs:305, 561, 576-580, 608-612, 668,
+    /// 683). Ferrofin resolves the run times ONCE, as the items enter the
     /// queue — the manager is already reading those rows for the access check —
     /// and looks the current one up here: a run time is a property of the item,
     /// so the two are equivalent and this one costs no query per transition.
     ///
-    /// `None` means "not known here": the library seam is unwired (unit tests),
-    /// which is the only way an item that passed the access check can be absent.
+    /// `None` when nothing is playing, or when the run time is not known here:
+    /// the library seam is unwired (unit tests), which is the only way an item
+    /// that passed the access check can be absent.
     fn run_time_ticks(&self) -> Option<i64> {
         self.queue
             .current()
@@ -953,10 +954,13 @@ impl Group {
     }
 
     /// Port of `Group.SanitizePositionTicks` — `Math.Clamp(ticks, 0, RunTimeTicks)`
-    /// (Group.cs:429-432). With no library seam wired only the floor applies.
+    /// (Group.cs:476-480). With nothing playing the position is 0, as upstream's
+    /// `RunTimeTicks` is then (except after a ClearPlaylist, which leaves it at
+    /// the cleared item's); with no library seam wired only the floor applies.
     fn sanitize_position_ticks(&self, ticks: i64) -> i64 {
         match self.run_time_ticks() {
             Some(run_time) => ticks.clamp(0, run_time.max(0)),
+            None if !self.queue.is_item_playing() => 0,
             None => ticks.max(0),
         }
     }
@@ -1425,9 +1429,16 @@ impl Group {
         // Playing/Paused `SetState(Waiting)` BEFORE delegating, so even the
         // wrong-item early return below leaves the group in `Waiting`.
         self.enter_waiting(prev);
-        // WaitingGroupState.cs:333-344: the client is on the wrong item, so it is
+        // WaitingGroupState.cs:343-353: the client is on the wrong item, so it is
         // sent the queue and nothing else happens.
         if playlist_item_id != self.queue.playing_item_id() {
+            // A Playing or Paused group hands this to a fresh state, whose
+            // `ResumePlaying` is false, so it settles into Paused once ready (a
+            // Playing group's replayed Pause banks the time played, which a
+            // resume would not). A Waiting group keeps its state and flag.
+            if prev != GroupStateType::Waiting {
+                self.resume_playing = false;
+            }
             self.set_buffering(session_id, true);
             return vec![Outbound::to(
                 Target::CurrentSession,
@@ -1436,7 +1447,7 @@ impl Group {
         }
         let mut out = Vec::new();
         match prev {
-            // WaitingGroupState.cs:346-368.
+            // WaitingGroupState.cs:356-378.
             GroupStateType::Playing => {
                 self.resume_playing = true;
                 self.set_buffering(session_id, true);
@@ -1447,7 +1458,7 @@ impl Group {
                     self.command_env(SendCommandType::Pause, self.last_activity, now),
                 ));
             }
-            // WaitingGroupState.cs:369-379.
+            // WaitingGroupState.cs:379-389.
             GroupStateType::Paused => {
                 self.resume_playing = false;
                 self.set_buffering(session_id, true);
@@ -1456,7 +1467,7 @@ impl Group {
                     self.command_env(SendCommandType::Pause, self.last_activity, now),
                 ));
             }
-            // WaitingGroupState.cs:380-391 — the flag is LEFT ALONE here; only a
+            // WaitingGroupState.cs:390-401 — the flag is LEFT ALONE here; only a
             // group that will not resume force-updates the new buffering client.
             GroupStateType::Waiting => {
                 self.set_buffering(session_id, true);
@@ -1690,11 +1701,13 @@ impl Group {
         // Marked buffering BEFORE the AllReady command is addressed, so the
         // joiner is not one of the sessions told to pause.
         self.set_buffering(session_id, true);
+        // `NewSyncPlayCommand` stamps `When = LastActivity`: now for a group
+        // that was playing (moved above), the group's unchanged one otherwise.
         vec![
             Outbound::to(Target::CurrentSession, queue),
             Outbound::to(
                 Target::AllReady,
-                self.command_env(SendCommandType::Pause, now, now),
+                self.command_env(SendCommandType::Pause, self.last_activity, now),
             ),
         ]
     }
@@ -1975,6 +1988,16 @@ impl FerrofinSyncPlayManager {
             }
         }
         out
+    }
+
+    /// Port of `SyncPlayManager.OnSessionEnded`: a session that ended leaves
+    /// its group as [`SyncPlayManager::leave_group`] does, and one in no group
+    /// is told nothing, where `leave_group` pushes it `NotInGroup`.
+    pub fn session_ended(&self, session: &SyncPlaySession) {
+        let notices = leave_locked_with_notices(&mut self.lock(), session, Utc::now());
+        if let Some(n) = notices {
+            self.deliver_leave(&session.session_id, n);
+        }
     }
 
     /// The registry guard; see [`lock_registry`] for poison recovery.
@@ -2891,7 +2914,7 @@ mod tests {
     }
 
     /// A reported queue that lacks the playing item is replaced by the item
-    /// alone, as jellyfin/jellyfin#18198 does, so the group still plays it.
+    /// alone, so the group still plays it.
     #[tokio::test]
     async fn a_queue_without_the_playing_item_falls_back_to_the_item() {
         let (m, bus) = mgr();
@@ -2986,6 +3009,40 @@ mod tests {
         );
     }
 
+    /// The `When` of the last `command` among `bodies`.
+    fn command_when(bodies: &[String], command: &str) -> String {
+        let body = bodies
+            .iter()
+            .rev()
+            .find(|b| is_cmd(b, command))
+            .expect("the command was pushed");
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        v["Data"]["When"].as_str().unwrap().to_owned()
+    }
+
+    /// `WaitingGroupState.SessionJoined` pauses the ready members with
+    /// `NewSyncPlayCommand`, whose `When` is the group's `LastActivity`. Only a
+    /// group that was playing moves that to now first; any other keeps its own,
+    /// for a paused group the time it paused at.
+    #[tokio::test]
+    async fn joining_a_paused_group_pauses_the_ready_at_its_last_activity() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        start_playing(&m, &bus, &[&a], 2).await;
+        m.handle_request(&a, PlaybackRequest::Pause).await.unwrap();
+        let paused_at = command_when(&bus.bodies_for("s1"), "Pause");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let before = bus.count_for("s1");
+
+        m.join_group(&session("s2", "bob"), info.group_id)
+            .await
+            .unwrap();
+
+        let after = &bus.bodies_for("s1")[before..];
+        assert_eq!(command_when(after, "Pause"), paused_at, "{after:?}");
+    }
+
     /// `WaitingGroupState.SessionLeaving`: the buffering member the group was
     /// waiting on leaves, so playback resumes for everyone still in it.
     #[tokio::test]
@@ -3057,6 +3114,56 @@ mod tests {
         );
     }
 
+    /// `PausedGroupState` hands a Buffer to a FRESH `WaitingGroupState`, whose
+    /// `ResumePlaying` starts false, and the wrong-item early return
+    /// (WaitingGroupState.cs:343-353) leaves it so. A paused group that a stale
+    /// Buffer put in Waiting settles back into Paused once its members are
+    /// ready, whatever an earlier wait left the flag at.
+    #[tokio::test]
+    async fn a_wrong_item_buffer_does_not_resume_a_paused_group() {
+        let (m, bus, a, b, gid) = pair().await;
+        // The Play arms the resume; the group then plays and is paused.
+        let pli = start_playing(&m, &bus, &[&a, &b], 2).await;
+        m.handle_request(&a, PlaybackRequest::Pause).await.unwrap();
+
+        m.handle_request(&b, buffer_at(Uuid::new_v4(), 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            m.get_group(&a, gid).await.unwrap().state,
+            GroupStateType::Waiting
+        );
+        m.handle_request(&b, ready_at(pli, 0, false)).await.unwrap();
+
+        assert_eq!(
+            m.get_group(&a, gid).await.unwrap().state,
+            GroupStateType::Paused
+        );
+    }
+
+    /// A stale Buffer on a group ALREADY waiting reaches the same state
+    /// object, so it keeps the flag: the joiner the group was waiting on
+    /// leaving still resumes it.
+    #[tokio::test]
+    async fn a_wrong_item_buffer_on_a_waiting_group_keeps_resume_playing() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        start_playing(&m, &bus, &[&a], 2).await;
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap(); // Playing -> Waiting, resume armed
+
+        m.handle_request(&b, buffer_at(Uuid::new_v4(), 0))
+            .await
+            .unwrap();
+        m.leave_group(&b).await.unwrap();
+
+        assert_eq!(
+            m.get_group(&a, info.group_id).await.unwrap().state,
+            GroupStateType::Playing
+        );
+    }
+
     /// `Group.GetInfo()` stamps `DateTime.UtcNow` at DTO construction, so the
     /// value advances on every read; Ferrofin used to freeze it at the last
     /// mutation. `Participants` is LINQ `Distinct()` — first-join order.
@@ -3121,6 +3228,32 @@ mod tests {
         let s = session("s1", "alice");
         m.leave_group(&s).await.unwrap();
         assert!(bus.bodies()[0].contains("NotInGroup"));
+    }
+
+    /// `SyncPlayManager.OnSessionEnded` calls `LeaveGroup` only for a session
+    /// in a group, so an ended session in none is told nothing, where
+    /// `LeaveGroup` itself pushes `NotInGroup`.
+    #[tokio::test]
+    async fn an_ended_session_in_no_group_is_told_nothing() {
+        let (m, bus) = mgr();
+        let a = session("s1", "alice");
+        m.session_ended(&a);
+        assert!(bus.bodies().is_empty(), "{:?}", bus.bodies());
+
+        // One in a group leaves it, as `LeaveGroup` does.
+        let info = m.new_group(&a, "g", None).await.unwrap();
+        let b = session("s2", "bob");
+        m.join_group(&b, info.group_id).await.unwrap();
+        let before = bus.count_for("s1");
+        m.session_ended(&b);
+        let alice = &bus.bodies_for("s1")[before..];
+        assert!(alice.iter().any(|x| x.contains("UserLeft")), "{alice:?}");
+        assert!(bus.bodies_for("s2").iter().any(|x| x.contains("GroupLeft")));
+        assert!(!m.is_user_active(b.user_id).await.unwrap());
+        // The last member ending drops the group.
+        m.session_ended(&a);
+        let groups = m.list_groups(&b).await.unwrap();
+        assert!(groups.is_empty(), "{groups:?}");
     }
 
     /// `WaitingGroupState.HandleRequest(PlayGroupRequest)`
@@ -3441,7 +3574,7 @@ mod tests {
     }
 
     /// `Group.SanitizePositionTicks` — `Math.Clamp(ticks, 0, RunTimeTicks)`
-    /// (Group.cs:429-432). Ferrofin had the floor and no ceiling, so a client
+    /// (Group.cs:476-480). Ferrofin had the floor and no ceiling, so a client
     /// could seek the whole group past the end of the file.
     #[test]
     fn seek_clamps_to_the_playing_item_run_time() {
@@ -3469,6 +3602,38 @@ mod tests {
             now,
         );
         assert_eq!(g.position_ticks, 0, "and floored at zero");
+    }
+
+    /// With nothing playing `Group.RunTimeTicks` is 0: `SetPlayingItem`
+    /// zeroes it for an id not in the queue (Group.cs:569-584), as
+    /// `RemoveFromPlayQueue` does for an emptied queue, and a new group starts
+    /// at 0. So `SanitizePositionTicks` lands a Seek on 0.
+    #[test]
+    fn a_seek_with_nothing_playing_lands_on_zero() {
+        let now = Utc::now();
+        let mut g = Group::new(Uuid::new_v4(), "g".into(), now);
+        let item = Uuid::new_v4();
+        g.item_runtimes.insert(item, 10_230_000);
+        g.queue.set(&[item], 0);
+        g.state = GroupStateType::Paused;
+        g.handle(
+            "s1",
+            &PlaybackRequest::SetPlaylistItem {
+                playlist_item_id: Uuid::new_v4(),
+            },
+            now,
+        );
+        assert!(!g.queue.is_item_playing());
+        assert_eq!(g.state, GroupStateType::Paused);
+
+        g.handle(
+            "s1",
+            &PlaybackRequest::Seek {
+                position_ticks: 5_000_000,
+            },
+            now,
+        );
+        assert_eq!(g.position_ticks, 0);
     }
 
     /// Ticks in `n` minutes.
@@ -3519,6 +3684,27 @@ mod tests {
 
     fn bodies(out: &[Outbound]) -> Vec<&str> {
         out.iter().map(|o| o.body.as_str()).collect()
+    }
+
+    /// The same stale Buffer on a PLAYING group skips the Playing arm, so the
+    /// position is not banked and nobody is paused. Once the member is ready
+    /// the group settles into Paused, and the Pause it replays
+    /// (PausedGroupState.cs:66-87) banks the time played meanwhile; resuming
+    /// instead restarted everyone from where the group last banked it.
+    #[test]
+    fn a_wrong_item_buffer_on_a_playing_group_pauses_it_where_it_played_to() {
+        let start = Utc::now();
+        let (mut g, first, _) = playing_pair(start);
+        // As the Play that started the group left it.
+        g.resume_playing = true;
+        let later = start + Duration::minutes(5);
+
+        g.handle("s2", &buffer_at(Uuid::new_v4(), 0), later);
+        assert_eq!(g.state, GroupStateType::Waiting);
+        g.handle("s2", &ready_now(first, minutes(10), false, later), later);
+
+        assert_eq!(g.state, GroupStateType::Paused);
+        assert_eq!(g.position_ticks, minutes(15));
     }
 
     /// v12.2 `Ready_PlayingSessionReportsPositionFromBeforeSeek_IsCorrected`

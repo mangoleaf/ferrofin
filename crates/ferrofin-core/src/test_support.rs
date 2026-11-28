@@ -161,6 +161,8 @@ struct ItemRow<'a> {
     album_artists: Option<&'a str>,
     /// `CleanName`, which by-name lookups join on.
     clean_name: Option<&'a str>,
+    /// `ChannelId` — the channel an item of a channel belongs to.
+    channel: Option<Uuid>,
 }
 
 /// The one `BaseItems` insert every item fixture goes through.
@@ -223,9 +225,9 @@ async fn insert_base_item_raw_id(
             "IsRepeat", "IsSeries", "IsVirtualItem", "Name", "ParentId",
             "TopParentId", "SeriesPresentationUniqueKey", "ParentIndexNumber",
             "IndexNumber", "Data", "MediaType", "PresentationUniqueKey",
-            "SeriesId", "Studios", "Artists", "AlbumArtists", "CleanName")
+            "SeriesId", "Studios", "Artists", "AlbumArtists", "CleanName", "ChannelId")
            VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                   ?14, ?15, ?16, ?17, ?18)"#,
+                   ?14, ?15, ?16, ?17, ?18, ?19)"#,
     )
     .bind(raw_id)
     .bind(type_name(kind))
@@ -249,6 +251,7 @@ async fn insert_base_item_raw_id(
     .bind(row.artists)
     .bind(row.album_artists)
     .bind(row.clean_name)
+    .bind(opt_guid_to_db(row.channel))
     .execute(db.writer())
     .await
     .expect("insert item");
@@ -457,6 +460,38 @@ pub async fn items_at_path(db: &Database, path: &str) -> usize {
 /// Inserts a minimal `BaseItems` row of the given kind.
 pub async fn seed_item(db: &Database, id: Uuid, kind: BaseItemKind) {
     seed_named_item(db, id, kind, "").await;
+}
+
+/// Inserts a `Channel` item as upstream's `ChannelManager.GetChannel` stores
+/// one: its `ChannelId` is its own id, and it has no parent.
+pub async fn seed_channel(db: &Database, id: Uuid) {
+    insert_base_item(
+        db,
+        id,
+        BaseItemKind::Channel,
+        &ItemRow {
+            is_folder: true,
+            channel: Some(id),
+            ..ItemRow::default()
+        },
+    )
+    .await;
+}
+
+/// Inserts an item of `channel` (its `ChannelId`), parented to it, as a
+/// channel plugin's content is stored.
+pub async fn seed_channel_item(db: &Database, id: Uuid, kind: BaseItemKind, channel: Uuid) {
+    insert_base_item(
+        db,
+        id,
+        kind,
+        &ItemRow {
+            parent: Some(channel),
+            channel: Some(channel),
+            ..ItemRow::default()
+        },
+    )
+    .await;
 }
 
 /// Inserts an item whose `MediaType` is `"Video"`.

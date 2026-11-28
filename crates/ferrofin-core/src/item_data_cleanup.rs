@@ -81,7 +81,8 @@ impl ItemDataCleanup {
     /// row's internal metadata folder (`{metadata}/library/{id2}/{id}`), where
     /// its art is saved, the `{metadata}/library/{GUID}` earlier builds saved
     /// art in, and the lower-cased one older scans also wrote art to
-    /// ([`crate::item_folders::item_art_folders`]).
+    /// ([`crate::item_folders::item_art_folders`]); for a channel or an item
+    /// of one, the folder upstream keeps it in ([`channel_metadata_folder`]).
     ///
     /// Upstream's list also names a video's internal extracted data
     /// (trickplay tiles, chapter images, subtitle and attachment caches);
@@ -91,11 +92,17 @@ impl ItemDataCleanup {
         // Every layout: `{metadata}/library/{xx}/{idN}`, and the
         // `{metadata}/library/{GUID}` (and its older lower-cased spelling)
         // earlier builds saved art in.
-        let art_root = std::path::Path::new(&self.paths.internal_metadata_path()).join("library");
+        let metadata = std::path::PathBuf::from(self.paths.internal_metadata_path());
+        let art_root = metadata.join("library");
+        let channels = metadata.join("channels");
         let folders: Vec<std::path::PathBuf> = rows
             .iter()
-            .filter_map(|row| Uuid::parse_str(&row.id).ok())
-            .flat_map(|id| crate::item_folders::item_art_folders(&art_root, id))
+            .filter_map(|row| Some((*row, Uuid::parse_str(&row.id).ok()?)))
+            .flat_map(|(row, id)| {
+                crate::item_folders::item_art_folders(&art_root, id)
+                    .into_iter()
+                    .chain(channel_metadata_folder(&channels, row, id))
+            })
             .collect();
         if folders.is_empty() {
             return;
@@ -214,6 +221,34 @@ impl ItemDataCleanup {
     }
 }
 
+/// `Channel.GetInternalMetadataPath` (`{metadata}/channels/{id:N}/metadata`)
+/// for a channel, and `BaseItem.GetInternalMetadataPath` for an item of one
+/// (`SourceType.Channel`: `{metadata}/channels/{channelId:N}/{id:N}`), under
+/// `channels`, the `{metadata}/channels` folder. A Live TV row also carries a
+/// channel id, its tuner channel's, but upstream keeps nothing there for it,
+/// so the folder named is never one that exists.
+fn channel_metadata_folder(
+    channels: &std::path::Path,
+    row: &BaseItemEntity,
+    id: Uuid,
+) -> Option<std::path::PathBuf> {
+    if crate::item_type_lookup::kind_from_type_name(&row.type_)
+        == Some(ferrofin_model::data::BaseItemKind::Channel)
+    {
+        return Some(channels.join(id.simple().to_string()).join("metadata"));
+    }
+    let channel = row
+        .channel_id
+        .as_deref()
+        .and_then(|channel| Uuid::parse_str(channel).ok())
+        .filter(|channel| !channel.is_nil())?;
+    Some(
+        channels
+            .join(channel.simple().to_string())
+            .join(id.simple().to_string()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -284,6 +319,39 @@ mod tests {
             "the row's folders go"
         );
         assert!(folders(kept).iter().all(|f| f.exists()), "a sibling's stay");
+    }
+
+    /// A channel's folder and its items' folders under `{metadata}/channels`
+    /// go, as upstream's `GetInternalMetadataPath` names them (gl-2017); a
+    /// channel not deleted keeps its own.
+    #[tokio::test]
+    async fn a_channel_and_its_items_lose_their_channel_metadata_folders() {
+        let temp = tempfile::tempdir().expect("temp");
+        let cleanup = cleanup(temp.path());
+        let channels =
+            std::path::Path::new(&cleanup.paths.internal_metadata_path()).join("channels");
+        let (channel, item, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let n = |id: Uuid| id.simple().to_string();
+        let channel_folder = channels.join(n(channel)).join("metadata");
+        let item_folder = channels.join(n(channel)).join(n(item));
+        let other_folder = channels.join(n(other)).join("metadata");
+        for folder in [&channel_folder, &item_folder, &other_folder] {
+            std::fs::create_dir_all(folder.join("x")).expect("folder");
+        }
+        let channel_row = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Channels.Channel".to_owned(),
+            ..row(channel, None)
+        };
+        let item_row = BaseItemEntity {
+            channel_id: Some(guid_to_db(channel)),
+            ..row(item, None)
+        };
+        cleanup
+            .delete_metadata_folders(&[&item_row, &channel_row])
+            .await;
+        assert!(!channel_folder.exists(), "the channel's folder goes");
+        assert!(!item_folder.exists(), "its item's folder goes");
+        assert!(other_folder.exists(), "another channel's stays");
     }
 
     /// A row whose media another item still uses keeps the trickplay folder

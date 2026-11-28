@@ -681,7 +681,9 @@ host capabilities are issues on this repository and land as additive WIT changes
 - **Internet channels** (Jellyfin's `IChannel`) — upstream's channel backends are .NET
   plugins; neither tier supplies one, so Ferrofin registers no channels. The
   `RefreshInternetChannels` scheduled task exists for API parity and, like a Jellyfin with
-  no channel plugin, hides itself while the channel set is empty.
+  no channel plugin, hides itself while the channel set is empty. Its 24 h run still does
+  upstream's `ChannelPostScanTask` cleanup: the channels an adopted Jellyfin database kept
+  from a channel plugin, and their items, are deleted (their media files are left alone).
 
 ## Updating installed plugins
 
